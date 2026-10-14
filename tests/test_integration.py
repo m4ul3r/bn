@@ -1194,6 +1194,53 @@ class TestTypeStringsAndInheritance:
         assert again.returncode == 0, again.stdout + again.stderr
         assert json.loads(again.stdout)["verified_count"] == 2, again.stdout
 
+    def test_preview_that_imported_fails_and_names_every_import(self, shared_bn):
+        """#993 review round 4: untagged library names, a macro hiding the
+        tag, and a user typedef standing in for a library name are not caught
+        up front, and BN imported while the preview reported `verified`, exit
+        0. The preview now judges by what BN did -- new type ids, so a renamed
+        import is counted too -- and fails (`unsupported`, exit 3) listing
+        every import as kept. A preview that verifies changed no type id."""
+        shared_bn.load(HELLO_BINARY)
+        ids = "print(sorted(bv.type_container.type_ids))"
+        shapes = [
+            ("struct U1_993 { rusage r; };", "rusage"),
+            ("struct U2_993 { timespec* p; };", "timespec"),
+            ("struct U3_993 { pthread_mutex_t m; };", "pthread_mutex_t"),
+            ("#define TAGGED(x) struct x\nstruct U4_993 { TAGGED(tms) t; };", "tms"),
+        ]
+        for declaration, library_type in shapes:
+            res = shared_bn.run("types", "declare", declaration, "--preview", "--format", "json", "--summary")
+            assert res.returncode == 3, (declaration, res.stdout, res.stderr)
+            summary = json.loads(res.stdout)
+            assert summary["ok"] is False and summary["verified_count"] == 0, summary
+            assert library_type in summary["kept_library_imports"], summary
+            assert "Run the declare without --preview" in summary["first_error"], summary
+        # A user typedef named like a library type: whatever BN does, a
+        # preview that reports verified must not have changed a type id.
+        shared_bn.json("types", "declare", "typedef int sigset_t;")
+        before = shared_bn.run("py", "exec", "--code", ids).stdout
+        local = shared_bn.run("types", "declare", "struct Local993 { sigset_t s; };", "--preview",
+                              "--format", "json", "--summary")
+        after = shared_bn.run("py", "exec", "--code", ids).stdout
+        summary = json.loads(local.stdout)
+        if local.returncode == 0:
+            assert summary["verified_count"] == 1 and before == after, summary
+        else:
+            assert local.returncode == 3 and summary.get("kept_library_imports"), summary
+
+    def test_member_names_like_library_types_preview_normally(self, shared_bn):
+        """#993 review round 4: the bare-identifier pre-check treated member
+        names as type uses and refused previews that import nothing."""
+        shared_bn.load(HELLO_BINARY)
+        ids = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", ids).stdout
+        res = shared_bn.json("types", "declare",
+                             "struct Names993 { int node; int FILE; int clock_t; int pid_t; int sigset_t; };",
+                             "--preview", "--summary")
+        assert res["ok"] is True and res["verified_count"] == 1, res
+        assert shared_bn.run("py", "exec", "--code", ids).stdout == before
+
     def test_live_imports_rename_collisions_and_later_imports_still_work(self, shared_bn):
         """#993 review rounds 1-2: the live path imports only through BN's own
         import, so a dependency colliding with a user type is renamed, and a

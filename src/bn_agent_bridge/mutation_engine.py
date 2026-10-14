@@ -31,7 +31,7 @@ import difflib
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 try:
     import binaryninja as bn
@@ -201,77 +201,43 @@ def _declaration_include_root(source_path: str | None) -> str | None:
 
 
 # #993 item 2: True while a `--preview` mutation runs, so `types declare`
-# imports nothing on purpose under a preview. BN's own declaration parser
+# imports nothing ON PURPOSE under a preview. BN's own declaration parser
 # imports every type-library type a declaration uses, its undo does not revert
-# that, and REMOVING an import is worse (BN keeps its imported-record and
-# never imports that type again), so a preview that would need a library type
-# is refused up front instead (`_preview_library_needs`).
+# that, and REMOVING an import is worse (BN keeps its imported-record and never
+# imports that type again). What a preview guarantees is that it never
+# reports success while anything was imported: the batch compares BN's type
+# ids before and after (`_new_library_imports`) and fails a preview that
+# gained any. `_preview_library_needs` only avoids the import where the text
+# says so for certain.
 _PREVIEW_PARSE: contextvars.ContextVar[bool] = contextvars.ContextVar("bn_preview_parse", default=False)
 
-# A tag-keyword mention (`struct timespec`, ``struct `ns::X` ``), and any
-# identifier a declaration may name a type by.
+# A tag-keyword mention (`struct timespec`, ``struct `ns::X` ``).
 _TAG_MENTION_RE = re.compile(r"\b(?:struct|class|union|enum)\s+(?:`([^`]+)`|([A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*))")
-_DECLARATION_NAME_RE = re.compile(r"`([^`]+)`|([A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)")
 
 
-def _preview_library_needs(bv, declaration: str, *, source_path: str | None = None) -> list[str]:
-    """The type-library types a LIVE `types declare` of *declaration* would
-    import because the view lacks them, found without parsing through the
-    view (that parse is what imports). Faithfully modelling the import under
-    a preview failed three reviews -- BN renames colliding dependencies and
-    loads further libraries while it imports -- so a preview that needs one
-    is refused instead (#993 review round 3); modelling it is a follow-up.
+def _preview_library_needs(bv, declaration: str) -> list[str]:
+    """Library types a preview of *declaration* is refused for up front,
+    before anything parses: every TAG-KEYWORD mention (`struct timespec`, by
+    value or through a pointer -- the live path imports both) of a name a
+    loaded type library defines and the view lacks, unless the declaration
+    gives it a body or only forward-declares it.
 
-    Two kinds of mention count:
-
-    * a tag mention (`struct timespec`, by value or through a pointer -- the
-      live path imports both) of a name a loaded library defines and the view
-      lacks, unless the declaration gives it a body or only forward-declares it;
-    * when the platform parser cannot parse the declaration on its own (so BN
-      would fall back to the importing view parse), a bare typedef name a
-      library defines, the view lacks, and the platform does not know itself
-      (`size_t`, `uint32_t` stay platform types)."""
+    Only tag mentions, because only they are certain to be type uses: an
+    untagged identifier may be a member name (`int node;`, a field named
+    `FILE`), and treating it as a type refused previews that import nothing
+    (#993 review round 4). Untagged and macro-hidden uses are caught after
+    the fact instead, by the batch's import check."""
     text = _C_LITERAL_RE.sub('""', _strip_c_comments(declaration))
     needs: list[str] = []
-
-    def missing(name: str) -> bool:
-        return (name not in needs and _lookup_named_type(bv, name) is None
-                and _library_type(bv, name) is not None)
-
     for quoted, plain in _TAG_MENTION_RE.findall(text):
         name = re.sub(r"\s*::\s*", "::", quoted or plain)
-        if _declares_body_for(declaration, name):
+        if name in needs or _declares_body_for(declaration, name):
             continue
         mentions = len(re.findall(r"\b(?:struct|class|union|enum)\s+(?:`" + re.escape(name) + r"`|"
                                   + re.escape(name) + r"(?![\w:]))", text))
         if mentions == 1 and _declares_forward(declaration, name):
             continue   # a lone forward declaration imports nothing (reference-only noop)
-        if missing(name):
-            needs.append(name)
-    platform = getattr(bv, "platform", None)
-    parse = getattr(platform, "parse_types_from_source", None)
-    if parse is None:
-        return needs
-    kwargs: dict[str, Any] = {}
-    if source_path:
-        kwargs["filename"] = source_path
-        kwargs["include_dirs"] = [_declaration_include_root(source_path)]
-    try:
-        parse(declaration, **kwargs)
-        return needs          # the platform parse suffices; the view parse never runs
-    except Exception:
-        pass
-    for quoted, plain in _DECLARATION_NAME_RE.findall(text):
-        name = re.sub(r"\s*::\s*", "::", quoted or plain)
-        if not missing(name):
-            continue
-        library_type = _library_type(bv, name)[1]
-        if _type_tag_kind(library_type) is not None:
-            continue          # a bare tag name is not how C names it; counted above when tagged
-        try:
-            parse(f"typedef {name} __bn_preview_probe_t;")
-            continue          # the platform knows it without the library
-        except Exception:
+        if _lookup_named_type(bv, name) is None and _library_type(bv, name) is not None:
             needs.append(name)
     return needs
 
@@ -2565,11 +2531,10 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
             for index, op in enumerate(operations):
                 if not (isinstance(op, dict) and op.get("op") == "types_declare"):
                     continue
-                needs = _preview_library_needs(bv, str(op.get("declaration") or ""),
-                                               source_path=op.get("source_path"))
+                needs = _preview_library_needs(bv, str(op.get("declaration") or ""))
                 if needs:
                     raise OperationFailure(
-                        "unsupported", _preview_library_refusal(bv, needs),
+                        "unsupported", _preview_library_refusal(needs),
                         requested={"op": "types_declare", "index": index,
                                    "declaration": op.get("declaration")},
                         observed={"library_types": needs, "request_applied": False},
@@ -2720,6 +2685,13 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
             type_diffs = _diff_type_snapshots(ctx, type_before, type_after)
             verified_results = [_verify_operation(ctx, bv, result) for result in results]
             annotated_results = _annotate_operation_results(ctx, verified_results, type_diffs)
+            # #993 review round 4: a preview never reports success while BN
+            # imported anything. Judged on what BN did (new type ids, see
+            # `_new_library_imports`), not predicted from the text.
+            preview_imports = (_new_library_imports(bv, library_baseline)
+                               if preview and library_baseline is not None else [])
+            if preview_imports:
+                annotated_results = _fail_importing_preview(annotated_results, preview_imports)
             failed = _has_failed_results(ctx, annotated_results)
             # Origin tag: a direct op (rename/prototype/comment) targets a specific
             # function; mark its affected-function diffs `direct` so a mixed batch
@@ -4457,36 +4429,74 @@ def _import_referenced_library_types(bv, type_objs, *, apply: bool = True) -> li
     return missing
 
 
-def _preview_library_refusal(bv, names) -> str:
-    """Why a `--preview` of a declaration needing library types is refused."""
-    listed = ", ".join(names)
-    found = _library_type(bv, names[0])
-    kind = _type_tag_kind(found[1]) if found is not None else None
-    spelled = f"{'struct' if kind == 'class' else kind} {names[0]}" if kind else names[0]
+def _preview_library_refusal(names) -> str:
+    """Why a `--preview` of a declaration naming library types is refused.
+    It advises nothing but the live run: any declare it printed would itself
+    need those types, or overwrite a user type of the name it picked."""
     return (
-        f"Cannot --preview this declaration: it uses type-library type(s) the view does not "
-        f"have yet ({listed}), and Binary Ninja imports them while it parses the declaration -- "
-        f"an import no undo reverts, and removing one stops Binary Ninja from ever importing "
-        f"it again. bn does not model that import under a preview. Run the declare without "
-        f"--preview (it imports them and lists them as `imported_from_library`), or bring them "
-        f"in first (e.g. `bn types declare 'struct Use {{ {spelled}* p; }};'`), then preview."
+        f"Cannot --preview this declaration: it names type-library type(s) the view does not "
+        f"have yet ({', '.join(names)}), and Binary Ninja imports them while it parses the "
+        f"declaration -- an import no undo reverts, and removing one stops Binary Ninja from "
+        f"ever importing it again. Run the declare without --preview: it imports them and "
+        f"lists them as `imported_from_library`."
     )
 
 
-def _declare_batch_type_names(bv, operations) -> set[str] | None:
-    """The view's type names before a batch that declares types parses
-    anything, or None when the batch declares none (or the view cannot list
-    its types): the baseline the batch's library-import report and its
-    dangling-name cleanup are measured against (#993 item 2)."""
+class _TypeBaseline(NamedTuple):
+    """The view's type names and type ids before a batch that declares types
+    parses anything. Imports are found by ID (#993 review round 4): BN
+    renames an import that collides with a user type (`__time_t` comes in as
+    `__time_t_1` under id `<guid>:["__time_t"]`), so a name diff can be hidden
+    by a same-named user type, while a new id cannot."""
+    names: set[str]
+    ids: set[str] | None
+
+
+def _view_type_ids(bv) -> set[str] | None:
+    """Every type id the view defines, or None when it cannot list them."""
+    try:
+        return {str(type_id) for type_id in bv.type_container.type_ids}
+    except Exception:
+        return None
+
+
+def _declare_batch_type_names(bv, operations) -> _TypeBaseline | None:
+    """The baseline a batch that declares types is measured against -- its
+    library-import report, the preview's import check and every revert
+    path's dangling-name cleanup (#993 item 2) -- or None when the batch
+    declares none (or the view cannot list its types)."""
     if not any(isinstance(op, dict) and op.get("op") == "types_declare" for op in operations):
         return None
-    return _view_type_names(bv)
+    names = _view_type_names(bv)
+    if names is None:
+        return None
+    return _TypeBaseline(names, _view_type_ids(bv))
 
 
-def _new_library_imports(bv, baseline: set[str]) -> list[str]:
-    """The library types the view gained since *baseline*, sorted."""
-    current = _view_type_names(bv) or set()
-    return sorted(name for name in current - baseline if _is_library_import(bv, name))
+def _new_library_imports(bv, baseline: _TypeBaseline) -> list[str]:
+    """The library types the view gained since *baseline*, by their current
+    names, sorted. A new type id counts when BN recorded its name as imported
+    or the id is sourced from a type library loaded on the view (BN may load
+    a further library during an import)."""
+    current_ids = _view_type_ids(bv) if baseline.ids is not None else None
+    if current_ids is None:
+        current = _view_type_names(bv) or set()
+        return sorted(name for name in current - baseline.names if _is_library_import(bv, name))
+    try:
+        guids = {str(library.guid) for library in getattr(bv, "type_libraries", None) or []}
+    except Exception:
+        guids = set()
+    found = []
+    for type_id in current_ids - baseline.ids:
+        try:
+            name = str(bv.get_type_name_by_id(type_id) or "")
+        except Exception:
+            name = ""
+        if not name:
+            continue
+        if _is_library_import(bv, name) or type_id.split(":", 1)[0] in guids:
+            found.append(name)
+    return sorted(set(found))
 
 
 def _reached_type_names(bv, roots) -> set[str]:
@@ -4519,7 +4529,7 @@ def _stamp_library_imports(row: dict[str, Any], names) -> None:
         row.pop("referenced_existing_types", None)
 
 
-def _report_library_imports(bv, baseline: set[str] | None, results: list,
+def _report_library_imports(bv, baseline: _TypeBaseline | None, results: list,
                             failed_row: dict[str, Any] | None = None) -> None:
     """Stamp each `types_declare` row with the library types the batch
     imported that its own defined types reach (`imported_from_library`). An
@@ -4545,7 +4555,29 @@ def _report_library_imports(bv, baseline: set[str] | None, results: list,
         _stamp_library_imports(fallback if fallback is not None else rows[0], unclaimed)
 
 
-def _clear_dangling_type_names(bv, baseline: set[str]) -> None:
+def _fail_importing_preview(results: list, imported: list[str]) -> list:
+    """Stamp a preview that BN imported library types during as failed
+    (`unsupported`): the preview cannot undo the import, so it must not read
+    as a clean dry run. Every declare row is failed, and every import is
+    listed (`imported_from_library`, which the summary reports as kept)."""
+    message = (
+        f"Binary Ninja imported type-library type(s) while previewing this declaration "
+        f"({', '.join(imported)}); a preview cannot undo an import, so it is not reported as "
+        f"verified, and the imported types stay in the view (a rollback cannot remove them). "
+        f"Run the declare without --preview."
+    )
+    out, stamped = [], False
+    for row in results:
+        if isinstance(row, dict) and row.get("op") == "types_declare":
+            row = {**row, "status": "unsupported", "message": message}
+            if not stamped:
+                _stamp_library_imports(row, imported)
+                stamped = True
+        out.append(row)
+    return out
+
+
+def _clear_dangling_type_names(bv, baseline: _TypeBaseline) -> None:
     """Revert step for a batch that declared types (#993 item 2 review).
 
     Defining a type that refers to a name the view lacks (a pointer to a struct
@@ -4558,7 +4590,7 @@ def _clear_dangling_type_names(bv, baseline: set[str]) -> None:
     with nothing behind them are touched. Raises when one stays, so the
     revert reports itself incomplete instead of clean."""
     leftover = []
-    for name in sorted((_view_type_names(bv) or set()) - baseline):
+    for name in sorted((_view_type_names(bv) or set()) - baseline.names):
         try:
             type_id = bv.get_type_id(name)
             if not type_id or bv.get_type_by_id(type_id) is not None:
@@ -5080,7 +5112,7 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
             bv, [type_obj for _, type_obj in named_types], apply=not previewing)
         if previewing and needed:
             raise OperationFailure(
-                "unsupported", _preview_library_refusal(bv, needed),
+                "unsupported", _preview_library_refusal(needed),
                 requested=_operation_requested(ctx, op), observed={"library_types": needed})
     # Read back only once everything is defined: a type rendered while a name it
     # uses was still missing (`void (*)(Leaf*)` before `struct Leaf` lands) reads

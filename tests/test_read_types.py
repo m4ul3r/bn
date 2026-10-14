@@ -1619,3 +1619,6 @@ def test_preview_library_needs_names_library_tags_the_view_lacks(monkeypatch):
     assert me._preview_library_needs(bv, "struct stat { int x; }; struct U { struct stat s; };") == []
     assert me._preview_library_needs(bv, "struct timespec;") == []
     assert me._preview_library_needs(bv, 'struct S { int a; }; const char* m = "struct tms";') == []
+    # Untagged identifiers are never treated as type uses up front: a member
+    # named like a library type imports nothing (#993 review round 4).
+    assert me._preview_library_needs(bv, "struct S { int tms; int stat; struct S* timespec; };") == []
