@@ -962,6 +962,12 @@ def _render_proto_text(value: Any) -> str:
     width_note += "".join(f"\n\nnote: {n}" for n in split_notes)
     fn = value.get("function")
     name = fn.get("name") if isinstance(fn, dict) else None
+    # #999 item 3: the declaration splices the SYMBOL name (a mangled C++ name
+    # is a valid C declarator; `ns::Cls::run(` is not), so the demangled name
+    # `decompile` shows goes on a comment line above it instead.
+    display = _text_value(fn, "display_name") if isinstance(fn, dict) else None
+    if display and display != name:
+        note += f"// {display}\n"
     head, sep, rest = prototype.partition("(")
     if name and sep:
         head = head.rstrip()
@@ -6049,6 +6055,7 @@ def _build_mutation_summary(
     unusable: bool = False,
     overlapping_functions: Sequence[dict[str, Any]] = (),
     declared_types: dict[str, Any] | None = None,
+    preview_skipped: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -6189,6 +6196,12 @@ def _build_mutation_summary(
         # structs and the caller had to `struct show` each one to learn what
         # landed. Conditional like the keys above: only a declare carries it.
         summary["declared_types"] = declared_types
+    if preview_skipped:
+        # #999 item 5: a --preview that left ops out (a prototype it cannot
+        # revert, and the ops that depend on it) previewed only the rest, and
+        # the counts above say nothing about the ops it skipped. Conditional
+        # like the keys above: a preview that covered every op has none.
+        summary["preview_skipped"] = list(preview_skipped)
     return summary
 
 
@@ -6359,6 +6372,8 @@ def _mutation_summary(value: Any) -> Any:
             for o in _row_list(r, "overlaps")
         ],
         declared_types=_declared_types_summary(results),
+        preview_skipped=[row for row in _row_list(value, "preview_skipped")
+                         if isinstance(row, dict)],
     )
 
 
@@ -6693,6 +6708,16 @@ def _render_mutation_summary_text(value: Any) -> str:
                 "skipped_interior_pc", "skipped_changed_during_apply",
             )
         )
+    if _field_declared(value, "preview_skipped"):
+        # #999 item 5: one line per op the preview left out, so the line above
+        # is never read as covering the whole batch.
+        for row in _field_list(value, "preview_skipped"):
+            if not isinstance(row, dict):
+                continue
+            reason = _text_value(row, "reason") or ""
+            reason = reason.removeprefix("not previewed: ")
+            line += (f"\nnot previewed: op {row.get('index')} {_text_value(row, 'op') or '?'}"
+                     + (f" -- {reason}" if reason else ""))
     if value.get("measured") is False:
         # #684 review: `dirty_after` is no longer "UNKNOWN" here -- it is a
         # fail-safe True (see _mutation_summary) precisely so a naive
