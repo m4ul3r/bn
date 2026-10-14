@@ -3262,10 +3262,6 @@ def _vtable_surface_ctx(bv, words, typeinfo, layouts=None):
     if layouts is None:
         layouts = {0x0ff0: 4}
     ctx = _pie_ctx(bv)
-    # 0x7000 is `__cxa_pure_virtual`; every other word names no symbol.
-    bv.get_symbol_at = lambda a: (types.SimpleNamespace(
-        raw_name="__cxa_pure_virtual", name="__cxa_pure_virtual", short_name="")
-        if int(a) == 0x7000 else None)
     ctx._read_pointer_value = lambda b, addr, size=None: words.get(int(addr))
     ctx._typeinfo_name_at = lambda b, addr: typeinfo.get(int(addr))
     ctx._vtable_layout_for = lambda b, addr: (
@@ -3292,19 +3288,25 @@ def _vtable_surface_ctx(bv, words, typeinfo, layouts=None):
         pytest.param({0x0ff0: 0, 0x0ff8: 0x1900}, None, None, id="no-typeinfo-no-label"),
         pytest.param({0x0ff0: 0, 0x0ff8: 0x1800}, {}, None,
                      id="header-the-class-lens-cannot-decode"),
-        pytest.param({0x0ff0: 0, 0x0ff8: 0x1800}, {0x0ff0: 2}, None,
-                     id="run-longer-than-the-decoded-table"),
-        # An abstract class: `{0, &typeid(Sink), 0, 0, __cxa_pure_virtual, push,
-        # flush, close, ...}`. The null destructors and the extern pure-virtual
-        # slot split the run, which starts three slots into the table.
-        pytest.param({0x0fd8: 0, 0x0fe0: 0x1800, 0x0fe8: 0, 0x0ff0: 0, 0x0ff8: 0x7000},
-                     {0x0fd8: 7},
+        # Nothing is inferred from how far the lens decodes: a run that starts
+        # at an accepted address point is that class's table.
+        pytest.param({0x0ff0: 0, 0x0ff8: 0x1800}, {0x0ff0: 2},
                      {"vtable_of": "Dispatcher", "vtable_kind": "primary"},
-                     id="abstract-class-run-starts-past-null-and-pure-slots"),
-        # Round 2: a plain C table one zero word after `vtable for Impl`
-        # (`{0, &typeid(Impl), a, b, c}`). The class lens over-reads Impl's table
-        # through the zero into the handlers, so only the walk can refuse: it
-        # stops at Impl's last CODE slot instead of reaching Impl's header.
+                     id="address-point-labelled-without-a-coverage-test"),
+        # A run that starts INSIDE a vtable -- an abstract class's
+        # `{0, &typeid(Sink), 0, 0, __cxa_pure_virtual, push, flush, close}` -- is
+        # left unlabelled: from the run alone it cannot be told from the next shape.
+        pytest.param({0x0fd8: 0, 0x0fe0: 0x1800, 0x0fe8: 0, 0x0ff0: 0, 0x0ff8: 0x7000},
+                     {0x0fd8: 7}, None,
+                     id="run-starting-inside-a-vtable-stays-unlabelled"),
+        # Round 3: a plain table after an ALL-pure interface,
+        # `{0, &typeid(Abstract), 0, 0, pure, pure, pure}` then `{h0, h1, h2, h3}`.
+        # The lens's slot walk reads through the filler into the handlers.
+        pytest.param({0x0fc0: 0, 0x0fc8: 0x1800, 0x0fd0: 0, 0x0fd8: 0, 0x0fe0: 0x7000,
+                      0x0fe8: 0x7000, 0x0ff0: 0x7000, 0x0ff8: 0},
+                     {0x0fc0: 11}, None,
+                     id="plain-table-after-an-all-pure-interface"),
+        # Round 2: a plain C table one zero word after `vtable for Impl`.
         pytest.param({0x0fd0: 0, 0x0fd8: 0x1800, 0x0fe0: 0x2a00, 0x0fe8: 0x2a10,
                       0x0ff0: 0x2a20, 0x0ff8: 0},
                      {0x0fd0: 10}, None, id="plain-table-after-a-vtable-is-not-that-class"),
@@ -3316,10 +3318,11 @@ def _vtable_surface_ctx(bv, words, typeinfo, layouts=None):
 )
 def test_hidden_surface_labels_vtables_the_class_lens_accepts_997(
         monkeypatch, words, layouts, label):
-    """#997 item 3: a candidate table is labelled with the class whose vtable it
-    lies in, judged by the class lens's own rules -- the table decodes and covers
-    the run, and word[0] passes the lens's offset-to-top checks. Anything the
-    lens rejects stays an unlabelled candidate, never a guessed class."""
+    """#997 item 3: a candidate table is labelled only when it provably STARTS
+    at a vtable address point the class lens accepts -- the typeinfo and
+    offset-to-top words directly before it, the table decoding, word[0] passing
+    the lens's checks. Every other table stays an unlabelled candidate: a
+    mislabelled dispatch table would be hidden by `--unknown-only`."""
     bridge = _load_bridge(monkeypatch)
     re = bridge.read_evidence
     monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})

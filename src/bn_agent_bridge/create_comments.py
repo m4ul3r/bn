@@ -322,12 +322,12 @@ def _create_fallthrough_source(bv, addr: int) -> int | None:
     every other ISA answers None, as does an ARM view: ARM and Thumb code
     share it, and the instruction set of the bytes before *addr* is not known
     there. Anything not decoded as a real instruction, or padding (`nop`),
-    answers None too. A word BN holds as a DATA variable is a literal pool
-    between two routines -- unless the word before it is itself an instruction
-    running into it, which a pool never follows (it sits after a `ret`/`b`):
-    then the data variable is code some other code merely loads, and the
-    fall-through stands. An advisory probe: an unanswerable view yields None,
-    never a refusal.
+    answers None too. A DATA variable over the word(s) before *addr* is a
+    literal pool between two routines -- unless the instruction before the
+    variable's START itself runs into it, which a pool never has (it sits
+    after a `ret`/`b`): then the variable is code some other code merely loads
+    (its every word must decode and run on), and the fall-through stands. An
+    advisory probe: an unanswerable view yields None, never a refusal.
     """
     try:
         arch = getattr(bv, "arch", None)
@@ -341,18 +341,29 @@ def _create_fallthrough_source(bv, addr: int) -> int | None:
         prev = addr - width
         if not _falls_through(bv, arch, width, prev):
             return None
-        if _is_data_var(bv, prev) and (
-                _is_data_var(bv, prev - width)
-                or not _falls_through(bv, arch, width, prev - width)):
-            return None
+        var_start = _data_var_start(bv, prev)
+        if var_start is not None:
+            if var_start > prev or (prev - var_start) % width:
+                return None
+            if any(not _falls_through(bv, arch, width, word)
+                   for word in range(var_start, prev, width)):
+                return None
+            before = var_start - width
+            if _data_var_start(bv, before) is not None or not _falls_through(bv, arch, width, before):
+                return None
         return prev
     except Exception:  # noqa: BLE001 - advisory: no evidence means no warning
         return None
 
 
-def _is_data_var(bv, address: int) -> bool:
+def _data_var_start(bv, address: int) -> int | None:
+    """Start of the data variable BN holds over *address*, or None."""
     get_data_var_at = getattr(bv, "get_data_var_at", None)
-    return callable(get_data_var_at) and get_data_var_at(address) is not None
+    var = get_data_var_at(address) if callable(get_data_var_at) else None
+    if var is None:
+        return None
+    start = getattr(var, "address", None)
+    return int(start) if start is not None else address
 
 
 def _falls_through(bv, arch, width: int, address: int) -> bool:

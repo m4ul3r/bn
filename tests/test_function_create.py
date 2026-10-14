@@ -814,3 +814,24 @@ def test_fallthrough_probe_ignores_literal_pools_and_mixed_arm_thumb_views_997(m
     arm = _A64Arch(program)
     arm.name = "armv7"
     assert probe(view(arm), 0x403000) is None
+
+
+def test_fallthrough_probe_reads_a_wide_data_variable_from_its_start_997(monkeypatch):
+    """#1006 review round 3 (`adrp6`): BN held an 8-byte `int64_t` over the two
+    instruction words before the address because code loads them. The pool test
+    must look before the VARIABLE's start, not one word back -- which is still
+    inside it -- and still skip a wide pool that follows a `ret`."""
+    bridge = _load_bridge(monkeypatch)
+    probe = bridge.create_comments._create_fallthrough_source
+    var = types.SimpleNamespace(address=0x402ff8)
+
+    def view(program):
+        return types.SimpleNamespace(
+            arch=_A64Arch(program), read=lambda a, n: b"\x00" * n,
+            get_data_var_at=lambda a: var if 0x402ff8 <= a < 0x403000 else None)
+
+    loaded = {0x402ff4: ("add", []), 0x402ff8: ("add", []), 0x402ffc: ("add", [])}
+    assert probe(view(loaded), 0x403000) == 0x402ffc
+    pool = {0x402ff4: ("ret", ["FunctionReturn"]), 0x402ff8: ("add", []),
+            0x402ffc: ("add", [])}
+    assert probe(view(pool), 0x403000) is None

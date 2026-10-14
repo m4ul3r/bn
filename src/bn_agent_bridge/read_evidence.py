@@ -1493,7 +1493,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             nonlocal tables_over_cap, vtables_labelled, vtables_hidden
             if len(run_vals) < table_min_run:
                 return
-            label = _vtable_label(ctx, bv, run_addr, len(run_vals), ps)
+            label = _vtable_label(ctx, bv, run_addr, ps)
             if label is not None:
                 vtables_labelled += 1
                 if unknown_only:
@@ -1625,90 +1625,46 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
     }
 
 
-# How far before a run of code pointers `_vtable_label` looks for the Itanium
-# header: an abstract class's null destructor slots and `__cxa_pure_virtual`
-# (an extern, not code) split its slot array, so a run can start a few slots in.
-_VTABLE_LABEL_MAX_BACK = 64
+def _vtable_label(ctx, bv, run_addr: int, ptr: int) -> dict[str, Any] | None:
+    """``{"vtable_of", "vtable_kind"}`` when the run of code pointers at
+    *run_addr* provably STARTS at a vtable address point the class lens
+    accepts, else None (#997 item 3).
 
-# Slot targets that sit INSIDE a vtable without being code: an abstract class's
-# pure and deleted virtuals.
-_VTABLE_FILLER_SYMBOLS = ("__cxa_pure_virtual", "__cxa_deleted_virtual")
-
-
-def _vtable_filler_word(ctx, bv, word: int | None) -> bool:
-    """Can *word* be a non-code slot inside the vtable a later run belongs to?
-
-    Null (an abstract class's D1/D0 entries), `__cxa_pure_virtual` /
-    `__cxa_deleted_virtual`, or a pointer into `.extern` (a cross-module
-    virtual). Anything else -- in particular a CODE pointer, which is the
-    previous table's last slot -- is a boundary the header walk must not cross:
-    crossing it labelled a plain table after `vtable for Impl` as `Impl`
-    (#1006 review round 2)."""
-    if word is None:
-        return False
-    if word == 0:
-        return True
-    try:
-        sym = bv.get_symbol_at(word) if hasattr(bv, "get_symbol_at") else None
-        names = " ".join(str(getattr(sym, attr, "") or "")
-                         for attr in ("raw_name", "name", "short_name")) if sym else ""
-        if any(filler in names for filler in _VTABLE_FILLER_SYMBOLS):
-            return True
-        return any(str(s.get("name") or "").lstrip(".") == "extern"
-                   for s in ctx._sections_at(bv, word) or [])
-    except Exception:  # noqa: BLE001 - an unanswerable word is a boundary
-        return False
-
-
-def _vtable_label(ctx, bv, run_addr: int, entries: int, ptr: int) -> dict[str, Any] | None:
-    """``{"vtable_of", "vtable_kind"}`` when the run of *entries* code pointers at
-    *run_addr* lies inside a vtable the class lens accepts, else None (#997 item 3).
-
-    The header is the nearest word before the run naming a ``typeinfo for X``,
-    reached across filler slots only (:func:`_vtable_filler_word`): the walk
-    stops at the first word that is neither, so it never reaches back through
-    another table's code pointers to that table's header. The class lens then
-    judges the header by its own rules, not a copy of them: the table must
-    decode through `read_class._vtable_layout` (via ``ctx._vtable_layout_for``)
-    with its slots covering the whole run, and word[0] must pass
-    `read_class._classify_backwalk_candidate` -- not a mapped pointer, not
-    positive, and within the offset-to-top bound unless the ABI vouches for it.
-    A table the class lens rejects stays an unlabelled candidate."""
+    Provably: the two words directly before the run are the Itanium header --
+    a ``typeinfo for X`` pointer at ``run_addr - ptr`` and an offset-to-top at
+    ``run_addr - 2*ptr`` -- the table decodes through the class lens
+    (``ctx._vtable_layout_for``), and word[0] passes
+    `read_class._classify_backwalk_candidate` (not a mapped pointer, not
+    positive, within the lens's bound unless thunk slots or BN's group symbol
+    vouch for it). Nothing is inferred from how far the lens decodes the
+    table: its slot walk reads through null and pure-virtual words into
+    whatever follows, so a run that starts INSIDE a vtable (after an abstract
+    class's null or `__cxa_pure_virtual` slots) cannot be told from the plain
+    table placed after an all-pure interface, and stays unlabelled (#1006
+    review, rounds 1-3). An unlabelled vtable is listed like any candidate;
+    a dispatch table labelled as one would be hidden by `--unknown-only`."""
     from . import read_class
 
-    for back in range(_VTABLE_LABEL_MAX_BACK + 1):
-        head = run_addr - (back + 2) * ptr
-        if head < 0:
-            return None
-        try:
-            ti = ctx._read_pointer_value(bv, head + ptr, size=ptr)
-            cls = ctx._typeinfo_name_at(bv, ti) if ti else None
-        except Exception:  # noqa: BLE001 - an unreadable header is no label, not an error
-            return None
+    head = run_addr - 2 * ptr
+    if head < 0:
+        return None
+    try:
+        ti = ctx._read_pointer_value(bv, head + ptr, size=ptr)
+        cls = ctx._typeinfo_name_at(bv, ti) if ti else None
         if not cls:
-            if not _vtable_filler_word(ctx, bv, ti):
-                return None
-            continue
-        try:
-            layout = ctx._vtable_layout_for(bv, head)
-            raw = ctx._read_pointer_value(bv, head, size=ptr)
-            if not layout or raw is None:
-                return None
-            indices = [s.get("index") for s in layout.get("slots") or []
-                       if isinstance(s, dict) and isinstance(s.get("index"), int)]
-            covered = max(indices) + 1 if indices else 0
-            # The run's slots are `back .. back + entries - 1` of this table.
-            if back + entries > covered and not layout.get("truncated"):
-                return None
-            ott, rejection, _proof = read_class._classify_backwalk_candidate(
-                ctx, bv, head, raw, ptr, layout, cls)
-        except Exception:  # noqa: BLE001 - a header the lens cannot judge is no label
             return None
-        if rejection is not None:
+        layout = ctx._vtable_layout_for(bv, head)
+        raw = ctx._read_pointer_value(bv, head, size=ptr)
+        if not layout or not layout.get("slots") or raw is None:
             return None
-        return {"vtable_of": str(cls),
-                "vtable_kind": "primary" if ott == 0 else "secondary"}
-    return None
+        ott, rejection, _proof = read_class._classify_backwalk_candidate(
+            ctx, bv, head, raw, ptr, layout, cls)
+    except Exception:  # noqa: BLE001 - a header the lens cannot judge is no label
+        return None
+    if rejection is not None:
+        return None
+    return {"vtable_of": str(cls),
+            "vtable_kind": "primary" if ott == 0 else "secondary"}
 
 
 def _code_regions(bv) -> list[tuple[int, int]]:
