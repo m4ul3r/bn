@@ -582,6 +582,26 @@ def test_annotation_summary_excludes_a_user_symbol_that_echoes_an_auto_symbol_97
     ]
 
 
+def test_auto_alias_keeps_a_rename_to_one_of_several_alias_names_973(monkeypatch):
+    """#973 review: an address with several automatic names (a C alias) lets an
+    analyst rename the function to one of them. That is a real choice, so the
+    rename stays analyst work -- otherwise a view carrying it passes the
+    `assert_unannotated` gate as clean."""
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    bv = _FakeBV(functions=[], symbols=[
+        SimpleNamespace(auto=True, name="real_worker", address=0x401129),
+        SimpleNamespace(auto=True, name="worker_alias", address=0x401129),
+        SimpleNamespace(auto=False, name="worker_alias", address=0x401129),
+    ])
+
+    summary = bridge.read_listing._annotation_summary(None, bv)
+
+    assert summary["analyst_symbols"] == 1
+    assert summary["symbol_exclusions"] == []
+
+
 def test_function_search_scopes_duplicate_starts_to_the_rows_it_returns_757(monkeypatch):
     """The two listing commands must give `duplicate_starts_collapsed` ONE meaning.
 

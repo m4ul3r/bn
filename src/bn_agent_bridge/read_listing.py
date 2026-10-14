@@ -693,17 +693,20 @@ def _symbol_address_text(symbol) -> str | None:
 
 
 def _mirrors_auto_symbol(bv, address: str, name: str) -> bool:
-    """Does an AUTOMATIC symbol carry exactly *name* at *address* (#973)?
+    """Do the AUTOMATIC symbols at *address* all carry exactly *name* (#973)?
 
     Binary Ninja marks some names it took from the binary itself as user
     (``auto=False``) symbols: a local ``NOTYPE`` symtab entry it promotes to a
     function -- glibc's AArch64 ``_start`` stub ``__wrap_main`` is the case
     measured, a non-auto ``FunctionSymbol`` beside the auto data and library
     symbols of the same name -- so a raw load with no annotations at all
-    reported one analyst symbol. An analyst rename differs from the auto name
-    it shadows (renaming to the same name is a no-op), so the exact echo is
-    the binary's own name, not analyst work. Unreadable means no: an
-    exclusion this cannot prove would hide analyst work from the gate.
+    reported one analyst symbol. When the address has ONE automatic name and
+    the user symbol repeats it, there is nothing an analyst could have chosen:
+    renaming to the current name is a no-op. An address with SEVERAL automatic
+    names (C aliases) is different -- renaming the function to one of its
+    alias names is a real choice -- so any disagreeing auto symbol keeps the
+    user symbol counted. Unreadable means no: an exclusion this cannot prove
+    would hide analyst work from the gate.
     """
     if not name:
         return False
@@ -712,16 +715,21 @@ def _mirrors_auto_symbol(bv, address: str, name: str) -> bool:
         others = list(bv.get_symbols(start, 1) or [])
     except Exception:
         return False
+    matched = False
     for other in others:
         try:
-            if (getattr(other, "auto", None) is True
-                    and int(getattr(other, "address", -1)) == start
-                    and str(getattr(other, "raw_name", "")
-                            or getattr(other, "name", "") or "") == name):
-                return True
+            if getattr(other, "auto", None) is not True:
+                continue
+            if int(getattr(other, "address", -1)) != start:
+                continue
+            other_name = str(getattr(other, "raw_name", "")
+                             or getattr(other, "name", "") or "")
         except Exception:
-            continue
-    return False
+            return False
+        if other_name != name:
+            return False
+        matched = True
+    return matched
 
 
 # ONE bound for every sample array `_annotation_summary` publishes (#733 F2/#793
@@ -921,8 +929,8 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
             "excluded name families may remain undetected. Internal symbol "
             "namespaces also occur on user renames and are not proof of origin. "
             "debug_info requires the imported name and address to match. "
-            "auto_alias requires an automatic symbol with the same name at the "
-            "same address."
+            "auto_alias requires every automatic symbol at that address to carry "
+            "the same name."
         ),
         # No fourth pair: `analyst_symbols <= user_symbols` and both samples cap
         # at `_ANNOTATION_SAMPLE_LIMIT`, so whenever the analyst pair could

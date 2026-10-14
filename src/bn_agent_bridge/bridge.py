@@ -614,6 +614,12 @@ class TargetManager:
             if vid is not None:
                 self._database_paths[vid] = str(path)
 
+    def recorded_database(self, bv) -> str | None:
+        """The database `note_database` recorded for *bv*, or None."""
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            return self._database_paths.get(vid) if vid is not None else None
+
     def open_target_for_path(self, path: str, *, exclude) -> dict[str, Any] | None:
         """The open target whose file IS *path*, other than *exclude*, or None.
 
@@ -3092,6 +3098,30 @@ class BinaryNinjaBridge:
             # of the same binary finds this copy and restores the annotations (#318).
             if cache_path is None:
                 raise exc
+            # The cache is shared by every instance using this BN_CACHE_DIR, and
+            # a view opened from the raw bytes (`--no-bndb`, or `--quick`, which
+            # never restores a cache entry, #956) did not load the entry that
+            # may already sit at this name. Overwriting it silently replaced
+            # another run's saved analysis with this one. Write it only when it
+            # is new, or is this view's own: opened from it, or written by an
+            # earlier save of this view.
+            if Path(cache_path).exists() and not (
+                _same_file(cache_path, filename)
+                or _same_file(self.targets.recorded_database(bv), cache_path)
+            ):
+                _restore_filename()
+                raise OperationFailure(
+                    "invalid_request",
+                    f"save refused: {out} is not writable, and the cache fallback "
+                    f"{cache_path} already holds a database this target was not "
+                    "loaded from (another run's saved analysis of these bytes); "
+                    "overwriting it would discard that work. Save elsewhere with "
+                    "`bn save <path>`, or close this target and `bn load "
+                    f"{shlex.quote(cache_path)}` to continue from that database.",
+                    requested={"path": out},
+                    observed={"cache_entry_exists": cache_path,
+                              "request_sent": True, "written": False},
+                )
             try:
                 saved = _attempt(cache_path, make_parent=True)
             except Exception:
@@ -5773,7 +5803,7 @@ def _choose_sidecar(resolved: Path, prefer_bndb: bool, quick: bool,
     paths: ``(database to open instead, note)``, either may be None.
 
     ``--quick`` never restores a CACHE entry (#956). The cache is one directory
-    for every bn instance on the machine, so the entry a quick look found was
+    for every bn instance sharing a BN_CACHE_DIR, so the entry a quick look found was
     written by whichever earlier run saved these bytes: restoring it replaced
     the ~1s raw load the flag promises with a full database load (54s measured
     on a firmware binary) and started a "fresh" look with that run's renames.
@@ -5827,12 +5857,12 @@ def _sidecar_note(choice: _SidecarChoice, resolved: Path) -> str:
         # firmware image), so the annotations were saved to the writable cache.
         # Restore them instead of silently re-analyzing blank, which looked
         # like total annotation loss (#318) -- and say which entry and whose:
-        # the cache is shared by every bn instance on the machine (#956).
+        # the cache is shared by every bn instance using that cache dir (#956).
         return (
             f"restored cached database {choice.path} "
-            f"({_cache_entry_description(choice, resolved)}; the cache is shared "
-            "by every bn instance on this machine, so its annotations may be "
-            "another run's); pass --no-bndb to load the raw bytes"
+            f"({_cache_entry_description(choice, resolved)}; {choice.path.parent} is "
+            "shared by every bn instance using that cache dir (BN_CACHE_DIR), so "
+            "its annotations may be another run's); pass --no-bndb to load the raw bytes"
         )
     return f"loaded {choice.path} instead of {resolved} (use --no-bndb to skip)"
 

@@ -1729,7 +1729,7 @@ def test_load_binary_no_bndb_skips_cache(monkeypatch, tmp_path):
 
 
 def test_load_binary_quick_never_restores_a_cached_database(monkeypatch, tmp_path):
-    # #956: the cache is one directory for every bn instance on the machine, so
+    # #956: the cache is one directory for every bn instance sharing it, so
     # `--quick` restoring the entry another run saved turned a ~1s raw look into
     # a full database load carrying that run's renames. A quick load opens the
     # raw bytes and names the entry it left alone, with the command to use it.
@@ -1778,7 +1778,6 @@ def test_preload_binary_quick_never_restores_a_cached_database(monkeypatch, tmp_
     assert loaded_paths == [str(raw)]
     assert bv in bridge._quick_loaded_views
     bridge._headless_views.clear()
-
 
 
 def test_load_binary_adjacent_bndb_preferred_over_cache(monkeypatch, tmp_path):
@@ -2000,12 +1999,13 @@ def test_load_binary_restores_content_keyed_cache(monkeypatch, tmp_path):
 
     assert loaded_paths == [str(cache_bndb)]
     notes = " ".join(result["notes"])
-    assert f"restored cached database {cache_bndb} (its name matches the content hash of parse_record; saved " in notes
-    assert "shared by every bn instance on this machine" in notes
+    # The note names the entry, why it matched, and the cache dir it lives in.
+    assert f"restored cached database {cache_bndb}" in notes
+    assert "content hash of parse_record" in notes
+    assert str(cache_bndb.parent) in notes
     assert "unverified" not in notes
     # What the substituted database already held is stated at load (#956).
-    assert (f"{cache_bndb.name} already held 0 comment(s), 0 function doc(s) and "
-            "0 analyst symbol(s) when opened") in notes
+    assert "0 comment(s), 0 function doc(s) and 0 analyst symbol(s)" in notes
     bridge._headless_views.clear()
 
 
@@ -2027,7 +2027,8 @@ def test_load_binary_still_finds_legacy_path_keyed_cache(monkeypatch, tmp_path):
 
     assert loaded_paths == [str(legacy)]
     notes = " ".join(result["notes"])
-    assert f"restored cached database {legacy} (legacy entry named for the path {raw.resolve()}" in notes
+    assert f"restored cached database {legacy}" in notes
+    assert f"legacy entry named for the path {raw.resolve()}" in notes
     assert "database provenance unverified (saved before content validation)" in notes
     bridge._headless_views.clear()
 
@@ -4760,6 +4761,61 @@ def test_save_database_falls_back_to_writable_cache(monkeypatch, tmp_path):
     # explicit --path failure must NOT silently relocate
     with pytest.raises(RuntimeError, match="no file was written"):
         instance._save_database(None, path=ro_bndb)
+
+
+def test_save_fallback_never_overwrites_a_cache_entry_this_target_did_not_load(
+        monkeypatch, tmp_path):
+    """#956 review: a raw-opened target (`--quick` skips the cache entry,
+    `--no-bndb` ignores it) on a read-only mount fell back to the very cache
+    file another run had saved for these bytes and replaced it silently. The
+    fallback now refuses a foreign entry, while the target's own repeat saves
+    into an entry it wrote keep working."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path / "cache")
+    ro_dir = tmp_path / "ro"
+    ro_dir.mkdir()
+    ro_file = str(ro_dir / "widgetd")
+
+    class _SaveBV:
+        def __init__(self):
+            self.file = types.SimpleNamespace(filename=ro_file)
+            self.writes: list[str] = []
+
+        def create_database(self, dest):
+            if str(dest) == ro_file + ".bndb":
+                return False                       # the read-only mount
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_bytes(b"this run")
+            self.writes.append(str(dest))
+            return True
+
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+    cache_entry = bridge._cache_bndb_path(ro_file)
+
+    # Another run's saved analysis already sits at the fallback name.
+    cache_entry.parent.mkdir(parents=True)
+    cache_entry.write_bytes(b"another run")
+    foreign = _SaveBV()
+    monkeypatch.setattr(instance.targets, "resolve", lambda sel: foreign)
+    with pytest.raises(bridge.OperationFailure) as refused:
+        instance._save_database(None)
+    assert refused.value.status == "invalid_request"
+    assert refused.value.observed["written"] is False
+    assert str(cache_entry) in str(refused.value)
+    assert cache_entry.read_bytes() == b"another run"
+    assert foreign.writes == []
+
+    # A target whose first save CREATED the entry may keep saving into it.
+    cache_entry.unlink()
+    own = _SaveBV()
+    instance.targets._ids_by_object[own] = "1"    # a published, tracked target
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])  # keep it tracked
+    monkeypatch.setattr(instance.targets, "resolve", lambda sel: own)
+    first = instance._save_database(None)
+    second = instance._save_database(None)
+    assert first["path"] == second["path"] == str(cache_entry)
+    assert own.writes == [str(cache_entry)] * 2
 
 
 def test_bridge_handler_serialization_failure_returns_clean_error(monkeypatch):

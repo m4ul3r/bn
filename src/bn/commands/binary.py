@@ -252,7 +252,8 @@ def _target_close(args: argparse.Namespace) -> int:
                       "<cache>/bndb/<name>.<first 16 hex of the binary's sha256>.bndb -- "
                       "<cache> is $BN_CACHE_DIR, else the user cache dir (~/.cache/bn on "
                       "Linux) -- which a later `bn load` of the same bytes restores; an "
-                      "explicit path never falls back. The cache is shared by every bn "
+                      "explicit path never falls back, and the fallback refuses to "
+                      "overwrite an existing entry this target was not loaded from. The cache is shared by every bn "
                       "instance using it: set BN_CACHE_DIR per agent or project to keep "
                       "their saved analyses apart"),
              arg("--path", dest="path_flag", default=None,
