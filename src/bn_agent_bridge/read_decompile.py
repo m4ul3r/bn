@@ -2333,12 +2333,23 @@ def _get_prototype(ctx, selector: str | None, identifier):
             "name": func.name,
             "address": hex(func.start),
             "raw_name": getattr(func, "raw_name", func.name),
-            # #999 item 3: the demangled name `decompile` shows; `name` stays
-            # the symbol name the text splices into a pasteable C declaration.
+            # Keep symbol identity beside the descriptive display spelling.
             "display_name": il_format._display_name(func),
         },
         **il_format._function_metadata(func),
     }
+    params = list(getattr(getattr(func, "type", None), "parameters", None) or [])
+    if params and str(getattr(params[0], "name", "")) == "this":
+        result["implicit_object_note"] = (
+            f"BN recovered parameter 1 (`this`, {params[0].type}) as the implicit "
+            "object parameter. This reports BN's recovered prototype, not a "
+            "verified C++ ABI; use `self` as its name in `proto set`.")
+    elif str(getattr(func, "raw_name", func.name)).startswith(("_Z", "?")):
+        result["implicit_object_note"] = (
+            "BN did not identify an implicit object parameter (`this`) in this "
+            "recovered prototype. For a C++ instance method it may be missing; "
+            "do not reinterpret the first named parameter as the object parameter. "
+            "This prototype is not a verified C++ ABI.")
     note = _return_width_inference_note(bv, func)
     if note:
         result["return_width_note"] = note

@@ -6843,3 +6843,23 @@ def test_offset_summary_never_cuts_a_name_1000():
     assert long in summary and "…" not in summary
     assert summary == ("__offset(T, N) is a pointer N bytes into T; no type defined for x; "
                        f"vtable object(s), not types: {long} +1 more")
+
+
+@pytest.mark.parametrize("parameter_name", ["this", "__s"])
+def test_prototype_object_note_reports_recovery_not_assumed_abi(monkeypatch, parameter_name):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _cxx_function(0x401000, "_ZN2ns3Cls4openEPKc", "ns::Cls::open")
+    fn.type = types.SimpleNamespace(parameters=[
+        types.SimpleNamespace(name=parameter_name, type="char const*")])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._get_prototype("active", "0x401000")
+    note = result["implicit_object_note"]
+    if parameter_name == "this":
+        assert "BN recovered parameter 1" in note
+        assert "`this`" in note and "char const*" in note
+        assert "implicit object parameter" in note
+    else:
+        assert "did not identify" in note
+        assert "do not reinterpret the first named parameter" in note

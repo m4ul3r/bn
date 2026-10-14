@@ -999,18 +999,16 @@ def _render_function_info_text(value: Any, verbose: bool = False, mangled: bool 
 
 
 @_discloses
-def _render_proto_text(value: Any) -> str:
+def _render_proto_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     prototype = value.get("prototype")
     if not isinstance(prototype, str):
         return _render_fallback_text(value)
-    # BN renders the prototype anonymously (`uint64_t (int32_t arg1)`); splice in
-    # the function name so the output is a copy-pasteable C declaration (#222).
+    # BN renders the prototype anonymously; show the same name spelling as
+    # other function reads. Display names are descriptive, not C declarators.
     note = _resolution_note(value)
-    # A return width BN inferred from the full register, disclosed rather than
-    # silently trusted (#675 item 5). It trails the declaration so the first
-    # line stays a copy-pasteable C prototype (#222).
+    # Disclose return widths inferred from the full register (#675 item 5).
     # Read through `_text_value`, not an inline isinstance: a shape test here
     # would drop a malformed note and render byte-identically to a payload that
     # carried none, which is the exact skew #619 made a suite-wide invariant.
@@ -1020,14 +1018,11 @@ def _render_proto_text(value: Any) -> str:
     # BN split at a shared tail, is disclosed the same way.
     split_notes = _field_list(value, "split_body_notes") or []
     width_note += "".join(f"\n\nnote: {n}" for n in split_notes)
+    object_note = _text_value(value, "implicit_object_note")
+    if object_note:
+        width_note += f"\n\nnote: {object_note}"
     fn = value.get("function")
-    name = fn.get("name") if isinstance(fn, dict) else None
-    # #999 item 3: the declaration splices the SYMBOL name (a mangled C++ name
-    # is a valid C declarator; `ns::Cls::run(` is not), so the demangled name
-    # `decompile` shows goes on a comment line above it instead.
-    display = _text_value(fn, "display_name") if isinstance(fn, dict) else None
-    if display and display != name:
-        note += f"// {display}\n"
+    name = _shown_name(fn, mangled=mangled) if isinstance(fn, dict) else None
     head, sep, rest = prototype.partition("(")
     if name and sep:
         head = head.rstrip()

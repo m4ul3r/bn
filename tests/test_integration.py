@@ -1461,8 +1461,40 @@ class TestTypeStringsAndInheritance:
         got = shared_bn.json("proto", "get", "svc::dispatch")
         assert got["function"]["display_name"] == "svc::dispatch", got
         assert "svc::Probe999" in got["prototype"], got
-        text = shared_bn.run("proto", "get", "svc::dispatch").stdout
-        assert text.startswith("// svc::dispatch\n"), text
+
+
+class TestPrototypeRecovery:
+    def test_object_parameter_and_display_name(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        got = shared_bn.json("proto", "get", "svc::EchoHandler::handle")
+        note = got["implicit_object_note"]
+        assert "`this`" in note and "implicit object parameter" in note, got
+        text = shared_bn.run("proto", "get", "svc::EchoHandler::handle")
+        assert text.returncode == 0, text.stderr
+        assert "svc::EchoHandler::handle(" in text.stdout.splitlines()[0], text.stdout
+        assert note in text.stdout
+        raw = shared_bn.run("proto", "get", "svc::EchoHandler::handle", "--mangled")
+        assert raw.returncode == 0, raw.stderr
+        assert got["function"]["name"] + "(" in raw.stdout.splitlines()[0], raw.stdout
+
+
+    def test_this_refusal_advice_and_nested_template(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        shared_bn.json("types", "declare", "struct `ns::Box<int, ns::Tag<char> >` { int value; };")
+        prototype = "int handle(struct `ns::Box<int, ns::Tag<char> >`* this)"
+        rejected = shared_bn.run("proto", "set", "svc::EchoHandler::handle",
+                                 prototype, "--format", "json")
+        assert rejected.returncode == 3, (rejected.stdout, rejected.stderr)
+        row = json.loads(rejected.stdout)["results"][0]
+        assert row["status"] == "invalid_request", row
+        assert "`self`" in row["message"], row
+        assert "local retype" not in row["message"] and "declare it first" not in row["message"], row
+        # Apply the exact spelling correction the refusal recommends.
+        applied = shared_bn.json("proto", "set", "svc::EchoHandler::handle",
+                                 prototype.replace("* this", "* self"))
+        assert applied["results"][0]["status"] == "verified", applied
+        got = shared_bn.json("proto", "get", "svc::EchoHandler::handle")
+        assert "ns::Box<int, ns::Tag<char> >* self" in got["prototype"], got
 
 
 class TestDisasmLinear:
