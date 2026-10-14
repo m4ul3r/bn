@@ -64,6 +64,26 @@ def _model_buffer_source_args(model: dict[str, Any]) -> frozenset[int]:
     return frozenset(out)
 
 
+def _model_copy_roles(model: dict[str, Any]) -> tuple[int, int] | None:
+    """``(source_arg, destination_arg)`` of a buffer-copy model: its single
+    ``*arg:S -> *arg:D`` propagation with ``S != D``, or None when it has no
+    such rule or more than one. memcpy is ``(1, 0)``; bcopy, whose arguments
+    are reversed (``bcopy(src, dst, n)``), is ``(0, 1)`` (#980 review)."""
+    roles = set()
+    for rule in model.get("propagates") or []:
+        frm, to = rule.get("from"), rule.get("to")
+        if not (isinstance(frm, str) and isinstance(to, str)
+                and frm.startswith("*arg:") and to.startswith("*arg:")):
+            continue
+        try:
+            src, dst = int(frm[len("*arg:"):]), int(to[len("*arg:"):])
+        except ValueError:
+            continue
+        if src != dst:
+            roles.add((src, dst))
+    return next(iter(roles)) if len(roles) == 1 else None
+
+
 class TaintError(RuntimeError):
     """User-facing taint configuration/resolution error."""
 

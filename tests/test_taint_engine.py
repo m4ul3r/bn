@@ -5119,6 +5119,59 @@ def test_nul_terminated_and_format_readers_get_no_source_check_980(models, calle
     assert all("src_capacity" not in s for s in sinks), sinks
 
 
+def _bcopy_sink(models, src_param, dst_param, n, n0, extra):
+    """``<extra>; bcopy(<src>, <dst>, n)`` -- bcopy takes (src, dst, n)."""
+    instrs = list(extra) + [
+        FInstr(len(extra), 0x14, "MLIL_CALL_SSA", "bcopy(src, dst, n#0)", reads=[n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[src_param, dst_param, FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])]
+    func = FFunc("put", 0x10, FSSAFunc(instrs), params=[n])
+    bv = _GlobalBV({0x2000: "malloc", 0x2010: "bcopy"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "bcopy"]
+    assert len(sinks) == 1, result["reached_sinks"]
+    return sinks[0]
+
+
+class _GlobalBV(FBV):
+    """0x3000 is a 64-byte global BN typed `char[0x40]`."""
+    def get_data_var_at(self, addr):
+        if addr == 0x3000:
+            return type("DV", (), {"type": type("T", (), {
+                "width": 64, "__str__": lambda s: "char[0x40]"})()})()
+        return None
+
+
+def _malloc_n(n0, var):
+    out = FSSA(FVar(var), 1)
+    return out, FInstr(0, 0x10, "MLIL_CALL_SSA", f"{var}#1 = malloc(n#0)", reads=[n0],
+                       writes=[out], dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+                       params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])
+
+
+def test_bcopy_into_a_fixed_global_from_a_sized_source_stays_an_overflow_980(models):
+    # syn3: `src = malloc(n); bcopy(src, slot64, n)` overflows the 64-byte
+    # DESTINATION (arg1). Reading arg0 as bcopy's destination relabelled it
+    # bounded_len with "source holds the copied length".
+    n = FVar("n"); n0 = FSSA(n, 0)
+    src1, alloc = _malloc_n(n0, "src")
+    sink = _bcopy_sink(models, FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                       FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000), n, n0, [alloc])
+    assert sink["class"] == "overflow_len", sink
+    assert "src_capacity" not in sink
+
+
+def test_bcopy_into_a_sized_destination_checks_its_real_source_980(models):
+    # The other direction: `dst = malloc(n); bcopy(slot64, dst, n)` writes a
+    # bounded destination and over-reads the 64-byte SOURCE (arg0).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    dst1, alloc = _malloc_n(n0, "dst")
+    sink = _bcopy_sink(models, FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+                       FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]), n, n0, [alloc])
+    assert sink["class"] == "overread_len", sink
+    assert sink["src_capacity"] == 64
+
+
 def test_exact_length_copy_from_the_same_literal_is_still_an_overread_980(models):
     # Control for the test above: memcpy DOES read n bytes from the literal.
     sink = _memcpy_sink(models, *_dup_with_source(

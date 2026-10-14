@@ -69,6 +69,7 @@ from . import taint_locators as _taint_locators_mod  # noqa: F401
 from . import taint_models as _taint_models_mod  # noqa: F401
 from . import taint_result as _taint_result_mod  # noqa: F401
 from .il_format import _variadic_determination
+from .taint_models import _model_copy_roles
 
 
 # Caller sites the backward ascent follows per function. Module-level (not a
@@ -3462,9 +3463,10 @@ class TaintEngine:
         copies in ``_EXACT_LENGTH_COPIES``; any other model is returned as is."""
         if mkey not in self._EXACT_LENGTH_COPIES:
             return eff_sink
-        srcs = sorted(_model_buffer_source_args(model))
-        if len(srcs) != 1 or srcs[0] >= len(params):
+        roles = _model_copy_roles(model)
+        if roles is None or roles[0] >= len(params):
             return eff_sink
+        srcs = [roles[0]]
         src_expr, len_expr = params[srcs[0]], params[length_idx]
         cap = self._buffer_capacity(ssaf, src_expr)
         unchecked = {**eff_sink, "src_capacity": None,
@@ -4652,9 +4654,16 @@ class TaintEngine:
                                     # (audit D2). No declared dest => no bounded downgrade.
                                     _bnd_reason = None
                                 else:
+                                    # #980 review: the copy's destination is the arg
+                                    # its model copies INTO, not a fixed arg0 --
+                                    # bcopy(src, dst, n) writes arg1, and sizing its
+                                    # SOURCE as the destination relabelled a real
+                                    # overflow of dst bounded_len.
+                                    _roles = _model_copy_roles(model)
                                     _dest_idx = (int(sink["buf_arg"])
                                                  if (sink.get("buf_arg") is not None
-                                                     and argidx == sink.get("len_arg")) else 0)
+                                                     and argidx == sink.get("len_arg"))
+                                                 else (_roles[1] if _roles else 0))
                                     # #808: a declared len_arg+buf_arg pair IS a
                                     # bounded-write declaration, so the provably-bounded
                                     # relabel must not hinge on the model's class hint --
