@@ -1109,6 +1109,9 @@ def _evidence_virtual_call(args: argparse.Namespace) -> int:
                  help="Cap on reported missing-function candidates (disclosed when hit)"),
              arg("--max-scan-bytes", dest="max_scan_bytes", type=_positive_int, default=16_000_000,
                  help="Cap on total data bytes scanned for pointer tables (disclosed when hit)"),
+             arg("--unknown-only", dest="unknown_only", action="store_true",
+                 help="Hide candidate tables already identified as a C++ vtable (Itanium "
+                      "header naming an RTTI class); the count hidden is reported"),
          ],
          estimable=True)
 def _evidence_surface(args: argparse.Namespace) -> int:
@@ -1120,6 +1123,7 @@ def _evidence_surface(args: argparse.Namespace) -> int:
             "max_tables": args.max_tables,
             "max_candidates": args.max_candidates,
             "max_scan_bytes": args.max_scan_bytes,
+            "unknown_only": args.unknown_only,
         },
         require_target=True,
         text_renderer=_render_surface_text,

@@ -2194,6 +2194,31 @@ def test_render_orient_text_card(monkeypatch):
     assert "--quick" in out2 and "unavailable" in out2
 
 
+def test_render_orient_text_prints_every_returned_row_997():
+    """#997 item 1: the card printed 15 strings and 12 section names whatever the
+    header said (`sample 39 of 39`, `sections: 25`), so a default call dropped
+    5 rows silently. Every returned row is printed, and `filtered` -- the
+    strings the min-length / data-section filter dropped -- is named in the
+    header so the total reconciles."""
+    from bn.formatters import _render_orient_text
+    strings = [{"address": hex(0x401000 + 0x20 * i), "value": f"message {i:02d}"}
+               for i in range(39)]
+    sections = [{"name": f".sec{i}"} for i in range(25)]
+    out = _render_orient_text({
+        "kind": "orient_digest", "target": {"basename": "demo"}, "analyzed": True,
+        "sections": {"items": sections, "total": 25}, "strings_min_length": 6,
+        "strings_sample": {"items": strings, "total": 39, "filtered": 52,
+                           "sample_sections": [".rodata"]}})
+    assert "sections: 25  " + " ".join(s["name"] for s in sections) in out
+    assert ("strings (min-length 6; sample 39 of 39; from .rodata; "
+            "52 dropped by min-length / non-data-section filter):") in out
+    assert all(f"'{s['value']}'" in out for s in strings)
+    # Nothing filtered, nothing said.
+    quiet = _render_orient_text({"strings_sample": {"items": strings[:1], "total": 1,
+                                                    "filtered": 0}})
+    assert "dropped" not in quiet
+
+
 def test_orient_digest_discloses_the_duplicate_start_collapse_757(monkeypatch):
     """The digest's function count is the LISTING's post-collapse total, so it
     carries the same disclosure obligation `target info` does.
@@ -3173,6 +3198,113 @@ def test_hidden_surface_code_ref_scan_failures_are_disclosed_967(monkeypatch):
     assert len(partial) == 1
     assert "1 code region(s)" in partial[0] and "1 address(es)" in partial[0]
 
+
+def _adrp_llil(page, offset, idx=0):
+    """`adrp x2, page` then `add x3, x2, #offset` as LLIL, in one block."""
+    def node(op, **kw):
+        ops = [v for v in kw.values() if hasattr(v, "operation")]
+        return types.SimpleNamespace(operation=types.SimpleNamespace(name=op), operands=ops, **kw)
+    adrp = node("LLIL_SET_REG", dest=types.SimpleNamespace(name="x2"),
+                src=node("LLIL_CONST_PTR", constant=page), instr_index=idx)
+    add = node("LLIL_SET_REG", dest=types.SimpleNamespace(name="x3"),
+               src=node("LLIL_ADD", left=node("LLIL_REG", name="x2"),
+                        right=node("LLIL_CONST", constant=offset)),
+               instr_index=idx + 1)
+    adrp.il_basic_block = add.il_basic_block = [adrp, add]
+    return adrp
+
+
+class _AdrpSurfBV(_CodeRefSurfBV):
+    """Two page-aligned, function-less `.text` addresses that decode cleanly, each
+    only materialised by an `adrp`: 0x4000's consumer adds #0x60 (the page base of
+    a handler further into the page -- the #997 shape), 0x5000's adds #0 (the
+    address itself is taken)."""
+    _DATA_VARS = (0x4000, 0x5000)
+
+    def __init__(self):
+        super().__init__()
+        install = _CodeRefFunc("_start", {}, [(0x2100, 0x2200, [])])
+        llil = {0x2148: _adrp_llil(0x4000, 0x60), 0x2158: _adrp_llil(0x5000, 0)}
+        for site, il in llil.items():
+            install._sites[site] = (il, None)
+        install.get_low_level_il_at = lambda a: llil.get(int(a))
+        self._refs = {0x4000: [(0x2148, install)], 0x5000: [(0x2158, install)]}
+        self._adrp_sites = {0x2148: 0x4000, 0x2158: 0x5000}
+
+    def get_disassembly(self, a):
+        a = int(a)
+        if a in self._adrp_sites:
+            return f"adrp x2, {hex(self._adrp_sites[a])}"
+        return "add x1, x1, #0x7" if 0x4000 <= a < 0x6000 else super().get_disassembly(a)
+
+
+def test_hidden_surface_drops_adrp_page_bases_like_xrefs_997(monkeypatch):
+    """#997 item 2: an `adrp` whose every consumer adds a nonzero page offset
+    references the page's CONTENTS, not its base. `bn xrefs` already drops it
+    (#284); `evidence surface` nominated the base as a `code-likely` missing
+    function -- measured 40 of 86 candidates, all mid-body. The same predicate
+    now applies, and a zero-offset take (a real `&fn`) still nominates."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _AdrpSurfBV()
+    out = re._hidden_surface(_pie_ctx(bv), None)
+    assert [c["address"] for c in out["missing_function_candidates"]] == ["0x5000"]
+    # The two commands agree about both addresses.
+    assert bridge.read_xrefs._genuine_code_refs(bv, 0x4000) == []
+    assert len(bridge.read_xrefs._genuine_code_refs(bv, 0x5000)) == 1
+
+
+def _vtable_surface_ctx(bv, words, typeinfo):
+    ctx = _pie_ctx(bv)
+    ctx._read_pointer_value = lambda b, addr, size=None: words.get(int(addr))
+    ctx._typeinfo_name_at = lambda b, addr: typeinfo.get(int(addr))
+    return ctx
+
+
+@pytest.mark.parametrize(
+    ("words", "label"),
+    [
+        pytest.param({0x0ff0: 0, 0x0ff8: 0x1800}, {"vtable_of": "Dispatcher",
+                                                   "vtable_kind": "primary"}, id="primary"),
+        pytest.param({0x0ff0: (1 << 64) - 16, 0x0ff8: 0x1800},
+                     {"vtable_of": "Dispatcher", "vtable_kind": "secondary"}, id="secondary"),
+        pytest.param({0x0ff0: 16, 0x0ff8: 0x1800}, None, id="positive-offset-is-no-header"),
+        pytest.param({0x0ff0: 0, 0x0ff8: 0x1900}, None, id="no-typeinfo-no-label"),
+    ],
+)
+def test_hidden_surface_labels_vtables_from_the_itanium_header_997(monkeypatch, words, label):
+    """#997 item 3: a candidate table whose two header words are an offset-to-top
+    (0, or negative for a secondary base) and a `typeinfo for X` pointer is X's
+    vtable -- the class lens's own gate. The row says so; anything else stays an
+    unlabelled candidate, never a guessed class."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    ctx = _vtable_surface_ctx(_SurfBV(), words, {0x1800: "Dispatcher"})
+    out = re._hidden_surface(ctx, None)
+    row = out["candidate_tables"][0]
+    assert {k: row[k] for k in ("vtable_of", "vtable_kind") if k in row} == (label or {})
+    assert out["summary"]["vtables_labelled"] == (1 if label else 0)
+
+
+def test_hidden_surface_unknown_only_hides_known_vtables_and_counts_them_997(monkeypatch):
+    """#997 item 3: on a C++ image almost every table is a known vtable, so the
+    few real dispatch tables drowned (632 tables, capped at 64). `unknown_only`
+    hides the labelled ones BEFORE the cap, says how many, and still lets their
+    slots nominate missing functions."""
+    from bn.formatters import _render_surface_text
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    ctx = _vtable_surface_ctx(_SurfBV(), {0x0ff0: 0, 0x0ff8: 0x1800}, {0x1800: "Dispatcher"})
+    shown = re._hidden_surface(ctx, None)
+    hidden = re._hidden_surface(ctx, None, unknown_only=True)
+    assert hidden["candidate_tables"] == []
+    assert hidden["summary"]["vtables_hidden"] == 1
+    assert hidden["missing_function_candidates"] == shown["missing_function_candidates"]
+    assert "vtable: Dispatcher" in _render_surface_text(shown)
+    assert "(1 known C++ vtable(s) hidden by --unknown-only)" in _render_surface_text(hidden)
 
 
 # --- #466 cross-target virtual-call slot extraction --------------------------
@@ -5164,6 +5296,51 @@ def _callee(bv):
             {"status": "unavailable", "reason": "no_library_entry"},
             {"status": "refused", "reason": "variadic_callee"},
             "recovered", id="varargs-determined-variadic"),
+        # #994 item 3: an UNDETERMINED flag only blocks a contradiction. A body
+        # reading nothing past the declared count is consistent with the
+        # prototype whether or not the callee is variadic -- and says so.
+        pytest.param(
+            lambda bv: (_with_varargs_flag(bv, _VarargsFlag(False, 0)),
+                        _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)),
+                                  _SSARead(0x401104, _ssa_var(1)))),
+            {"status": "unavailable", "reason": "no_library_entry"},
+            {"status": "agreement", "reason": None, "declared_arity": 2,
+             "witness_arity": 2, "register": "x1", "variadic": "undetermined"},
+            "recovered", id="varargs-undetermined-agreement-needs-no-settlement"),
+        # ... and an applicable type library settles what BN did not: a
+        # reserved-name local the library declares non-variadic may contradict.
+        pytest.param(
+            lambda bv: (setattr(_callee(bv), "name", "__hw_get_version"),
+                        _with_type_library(bv, symbol="__hw_get_version", params=2),
+                        _with_varargs_flag(bv, _VarargsFlag(False, 0)),
+                        _with_ssa(bv, *[_SSARead(0x401100 + 4 * i, _ssa_var(i))
+                                        for i in range(3)])),
+            {"status": "agreement", "reason": None, "declared_arity": 2,
+             "witness_arity": 2, "source": "libc_x86_64.so.6"},
+            {"status": "contradiction", "reason": None, "declared_arity": 2,
+             "witness_arity": 3, "register": "x2", "variadic_settled_by": "type_library"},
+            "inferred", id="type-library-settles-not-variadic"),
+        pytest.param(
+            lambda bv: (setattr(_callee(bv), "name", "__hw_get_version"),
+                        _with_type_library(bv, symbol="__hw_get_version", params=1,
+                                           variadic=True),
+                        _with_varargs_flag(bv, _VarargsFlag(False, 0)),
+                        _with_ssa(bv, *[_SSARead(0x401100 + 4 * i, _ssa_var(i))
+                                        for i in range(6)])),
+            {"status": "refused", "reason": "variadic_signature"},
+            {"status": "refused", "reason": "variadic_callee",
+             "variadic_settled_by": "type_library"},
+            "recovered", id="type-library-settles-variadic"),
+        # A library naming an ORDINARY local definition is a name collision,
+        # not evidence (#862): it settles nothing.
+        pytest.param(
+            lambda bv: (_with_type_library(bv, symbol="hw_get_version", params=2),
+                        _with_varargs_flag(bv, _VarargsFlag(False, 0)),
+                        _with_ssa(bv, *[_SSARead(0x401100 + 4 * i, _ssa_var(i))
+                                        for i in range(3)])),
+            {"status": "refused", "reason": "not_library_provenance"},
+            {"status": "refused", "reason": "variadic_undetermined"},
+            "recovered", id="colliding-library-name-settles-nothing"),
     ],
 )
 def test_each_arity_witness_reports_its_own_verdict_865(
@@ -5915,6 +6092,40 @@ def test_variadic_format_helpers(monkeypatch):
     assert il_format._count_format_conversions("%d%%", is_scanf=True) == 1
     assert il_format._count_format_conversions("%*d %d", is_scanf=True) == 1
     assert il_format._count_format_conversions("%[^,],%d", is_scanf=True) == 2
+
+
+def test_fortified_printf_family_shares_the_taint_models_format_index_994(monkeypatch):
+    """#994 item 1: on a default FORTIFY build every printf-family call is a
+    `__*printf_chk`, and the leading flag (plus destlen/maxlen) shifts the format
+    right -- unrecognised, every such row took the generic `unknown` path. The
+    taint models already state those shifts; where both tables name a callee
+    they must agree, or one of them is wrong."""
+    import pathlib
+    bridge = _load_bridge(monkeypatch)
+    family = bridge.il_format._variadic_format_family
+    assert family("__printf_chk") == (1, False)
+    assert family("__fprintf_chk@plt") == (2, False)
+    assert family("__snprintf_chk") == (4, False)
+    assert family("__vsnprintf_chk") is None        # a va_list, not varargs
+
+    def find(node):
+        if isinstance(node, dict):
+            if "printf_chk" in node:
+                return node
+            for child in node.values():
+                if (found := find(child)) is not None:
+                    return found
+        return None
+
+    path = pathlib.Path(bridge.il_format.__file__).with_name("taint_models.json")
+    models = find(json.loads(path.read_text()))
+    checked = 0
+    for name, (fmt_index, _is_scanf) in bridge.il_format._VARIADIC_FORMAT_FAMILY.items():
+        sink = (models.get(name) or {}).get("sink") or {}
+        if "tainted_args" in sink:
+            assert sink["tainted_args"][0] == fmt_index, name
+            checked += 1
+    assert checked >= 4
 
 
 def _variadic_caller_bv(monkeypatch, instance, *, params, name="sscanf", symbol_kind=None,

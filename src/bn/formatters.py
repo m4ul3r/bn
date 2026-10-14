@@ -3320,6 +3320,12 @@ def _arity_witness_text(name: str, verdict: dict[str, Any]) -> str:
             register = _text_value(verdict, "register")
             via = f" up to {register}" if register else ""
             detail = f"body uses {observed}{via}, prototype {declared}"
+            # #994 item 3: how the "not variadic" question was answered, when
+            # it was not BN's own determination.
+            if _text_value(verdict, "variadic") == "undetermined":
+                detail += ", varargs undetermined"
+            elif settled := _text_value(verdict, "variadic_settled_by"):
+                detail += f", non-variadic per {settled.replace('_', ' ')}"
         else:
             detail = f"witness {observed}, prototype {declared}"
     else:
@@ -3407,16 +3413,25 @@ def _render_surface_text(value: Any) -> str:
                 f"fn={sec.get('resolved_functions', 0)}  missing={sec.get('missing_functions', 0)}")
 
     tables = _field_list(value, "candidate_tables")
-    if tables:
+    hidden = s.get("vtables_hidden")
+    if tables or (isinstance(hidden, int) and hidden > 0):
         lines.append("")
         lines.append("candidate vtable / dispatch tables (runs of pointers-to-code):")
         for t in tables:
             if not isinstance(t, dict):
                 continue
+            # #997 item 3: name the class whose vtable this is, so the few
+            # unlabelled (non-vtable) dispatch tables stand out.
+            owner = _text_value(t, "vtable_of")
+            kind = _text_value(t, "vtable_kind")
+            label = (f"  vtable: {owner}" + (" (secondary)" if kind == "secondary" else "")
+                     if owner else "")
             lines.append(
                 f"  {t.get('address', '?')} [{t.get('section', '?')}]  "
                 f"entries={t.get('entries', '?')}  fn={t.get('resolved_functions', 0)}  "
-                f"missing={t.get('missing_functions', 0)}")
+                f"missing={t.get('missing_functions', 0)}{label}")
+        if isinstance(hidden, int) and hidden > 0:
+            lines.append(f"  ({hidden} known C++ vtable(s) hidden by --unknown-only)")
 
     cands = _field_list(value, "missing_function_candidates")
     if cands:
@@ -3835,7 +3850,9 @@ def _render_orient_text(value: Any) -> str:
     # disagreed with the helper about an explicit null and printed a confident
     # `sections: 0` for a payload that had claimed nothing (#619).
     if sec_items or _field_present(secs, "items"):
-        names = " ".join(str(s.get("name", "?")) for s in sec_items[:12] if isinstance(s, dict))
+        # #997 item 1: every returned name. The section listing is the whole
+        # table (not a sample), so a silent head cut read as the full list.
+        names = " ".join(str(s.get("name", "?")) for s in sec_items if isinstance(s, dict))
         lines.append(f"  sections: {secs.get('total', len(sec_items))}  {names}")
     # PRESENT, not DECLARED and not raw truth: an `existing_annotations` the
     # payload CLAIMED renders its counts even when every count is zero (base
@@ -3893,9 +3910,17 @@ def _render_orient_text(value: Any) -> str:
         fallback = ss.get("sample_fallback")
         if fallback:
             from_where += f"; {fallback}"
+        # #997 item 1: name what `filtered` dropped, so `total` reconciles with
+        # the candidates the reader expected to see.
+        filtered = ss.get("filtered")
+        if isinstance(filtered, int) and not isinstance(filtered, bool) and filtered > 0:
+            from_where += f"; {filtered} dropped by min-length / non-data-section filter"
         lines.append(
             f"  strings ({filt}sample {len(items)} of {ss.get('total', len(items))}{from_where}):")
-        for s in items[:15]:
+        # #997 item 1: the sample is already bounded by `--strings-limit`, and the
+        # header states its size -- so the body prints every returned row rather
+        # than a silent head cut that disagreed with that header.
+        for s in items:
             if isinstance(s, dict):
                 # `or ''` (not just the .get default) guards an explicit value:None.
                 raw = s.get("value")
@@ -6038,6 +6063,7 @@ def _build_mutation_summary(
     unusable: bool = False,
     overlapping_functions: Sequence[dict[str, Any]] = (),
     declared_types: dict[str, Any] | None = None,
+    fallthrough_entries: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -6178,6 +6204,11 @@ def _build_mutation_summary(
         # structs and the caller had to `struct show` each one to learn what
         # landed. Conditional like the keys above: only a declare carries it.
         summary["declared_types"] = declared_types
+    if fallthrough_entries:
+        # #997 item 2: a `function create` at an address the previous
+        # instruction runs straight into -- likely mid-function. Conditional
+        # like the keys above; the row's `note` carries the sentence.
+        summary["fallthrough_entries"] = list(fallthrough_entries)
     return summary
 
 
@@ -6348,6 +6379,12 @@ def _mutation_summary(value: Any) -> Any:
             for o in _row_list(r, "overlaps")
         ],
         declared_types=_declared_types_summary(results),
+        fallthrough_entries=[
+            {"address": _text_value(r, "address") or "<unknown>",
+             "fallthrough_from": _text_value(r, "fallthrough_from")}
+            for r in results if r.get("status") in ("verified", "rollback_failed")
+            and _text_value(r, "fallthrough_from")
+        ],
     )
 
 
@@ -6674,6 +6711,10 @@ def _render_mutation_summary_text(value: Any) -> str:
         if stubs:
             line += ("\ncreated empty (only mentioned, never defined -- check the spelling): "
                      + ", ".join(stubs))
+    for entry in _row_list(value, "fallthrough_entries"):
+        line += (f"\nwarning: {_text_value(entry, 'address') or '<unknown>'} is reached by "
+                 f"fall-through from {_text_value(entry, 'fallthrough_from') or '<unknown>'}; "
+                 "likely mid-function, not an entry")
     if _field_declared(value, "go_rename"):
         go = _field_dict(value, "go_rename")
         line += "\ngo rename: " + "  ".join(

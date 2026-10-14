@@ -689,11 +689,18 @@ def _callee_body_witness(bv, callee_fn, *, variadic: bool | None,
 
     ``refused``, each leaving the row untouched rather than guessing:
 
-    * `variadic_undetermined` / `variadic_callee` -- a variadic body reads the
-      argument registers through the register save area / `va_list`, so a
-      register read is not an arity there, and a flag BN never DETERMINED cannot
-      tell the two apart (the 72-row false-demotion class of #882 round 2). See
-      :func:`il_format._variadic_determination`;
+    * `variadic_callee` -- a variadic body reads the argument registers through
+      the register save area / `va_list`, so a register read is not an arity
+      there. Settled by BN's DETERMINED flag (:func:`il_format._variadic_determination`)
+      or, where BN never settled it, by :func:`_library_variadic_settlement`;
+    * `variadic_undetermined` -- (#994 item 3) neither BN nor an applicable type
+      library settled the question AND the body reads a register beyond the
+      declared count: that read is either an under-recovered parameter or a
+      register-save-area spill, and nothing here tells the two apart (the
+      72-row false-demotion class of #882 round 2). The opposite answer needs no
+      settlement -- a body that reads no register beyond the declared count is
+      consistent with the prototype whether or not the callee is variadic, so
+      that row is `agreement` and carries ``variadic: "undetermined"``;
     * `decorated_name` -- the refusal `_library_witness` makes, from the other
       direction: a method's implicit `this` and a by-value class return's sret
       slot are ARGUMENT REGISTERS the body legitimately reads and the parameter
@@ -703,19 +710,24 @@ def _callee_body_witness(bv, callee_fn, *, variadic: bool | None,
       convention, or an architecture exposing no register-storage ids: there is
       no position to compare against;
     * `no_declared_arity` -- the prototype states no count to compare with.
+
+    A comparison that relied on a settlement says which: ``variadic_settled_by``
+    is ``"type_library"`` when the library answered for BN.
     """
     if is_imported_function(callee_fn):
         return _witness(WITNESS_UNAVAILABLE, "imported_callee")
-    # Only a DETERMINED "not variadic" licenses the comparison at all: `None` is
-    # BN never having settled the question, and a guess there is the 72-row
-    # false-demotion class (#882 round 2).
-    if variadic is None:
-        return _witness(WITNESS_REFUSED, "variadic_undetermined")
     if variadic:
         return _witness(WITNESS_REFUSED, "variadic_callee")
     name = str(getattr(callee_fn, "name", "") or getattr(callee_fn, "raw_name", "") or "")
     if not _undecorated_name(name):
         return _witness(WITNESS_REFUSED, "decorated_name")
+    settled_by = None
+    if variadic is None:
+        variadic = _library_variadic_settlement(bv, callee_fn, name)
+        if variadic is not None:
+            settled_by = "type_library"
+        if variadic:
+            return _witness(WITNESS_REFUSED, "variadic_callee", variadic_settled_by=settled_by)
     arg_regs = _abi_arg_register_names(bv, callee_fn)
     if not arg_regs:
         return _witness(WITNESS_REFUSED, "no_abi_registers")
@@ -731,11 +743,41 @@ def _callee_body_witness(bv, callee_fn, *, variadic: bool | None,
     if declared_count is None:
         return _witness(WITNESS_REFUSED, "no_declared_arity")
     used_arity = position + 1
+    if used_arity > declared_count and variadic is None:
+        # Only a CONTRADICTION needs "not variadic" settled: see the docstring.
+        return _witness(WITNESS_REFUSED, "variadic_undetermined")
     observed: dict[str, Any] = {"declared_arity": declared_count, "witness_arity": used_arity}
     if position >= 0:
         observed["register"] = arg_regs[position]
+    if variadic is None:
+        observed["variadic"] = "undetermined"
+    elif settled_by is not None:
+        observed["variadic_settled_by"] = settled_by
     status = WITNESS_CONTRADICTION if used_arity > declared_count else WITNESS_AGREEMENT
     return _witness(status, **observed)
+
+
+def _library_variadic_settlement(bv, callee_fn, name: str) -> bool | None:
+    """Whether the attached type libraries settle *name* as variadic (#994 item 3).
+
+    Only where the library's signature is evidence about THIS callee
+    (:func:`_library_signature_applies` -- an ordinary-named local definition is
+    a name collision, not the library's function), and only when every library
+    naming it agrees: True / False is their shared answer, None is no answer.
+    """
+    if not _library_signature_applies(callee_fn, name):
+        return None
+    answers: set[bool] = set()
+    for lib in (getattr(bv, "type_libraries", None) or []):
+        try:
+            obj = lib.get_named_object(name)
+        except Exception:  # noqa: BLE001 - a malformed library must not fail the read
+            continue
+        if obj is None or getattr(obj, "parameters", None) is None:
+            continue
+        flag = getattr(obj, "has_variable_arguments", False)
+        answers.add(bool(getattr(flag, "value", flag)))
+    return answers.pop() if len(answers) == 1 else None
 
 
 def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,

@@ -304,6 +304,66 @@ def _with_overlap_note(row: dict, overlapped: list[dict[str, Any]]) -> dict:
     return row
 
 
+# Branch kinds after which execution still reaches the NEXT instruction: a
+# conditional branch's not-taken edge. A call is deliberately absent -- the
+# instruction after a call to a noreturn routine is a routine start often.
+_FALLTHROUGH_BRANCH_KINDS = frozenset({"FalseBranch"})
+
+
+def _fallthrough_predecessor(bv, addr: int) -> int | None:
+    """The instruction that runs straight into *addr*, if one provably does.
+
+    #997 item 2: an address the previous instruction falls through into is
+    the middle of a body, not an entry -- the shape of an aarch64 `adrp` page
+    base nominated as a missing function. Only a FIXED-WIDTH ISA can name the
+    previous instruction (on x86 any byte before *addr* might start one), so
+    every other ISA answers None, as does anything not decoded as a real
+    instruction or that is padding (`nop`) between two routines. An advisory
+    probe: an unanswerable view yields None, never a refusal.
+    """
+    try:
+        arch = getattr(bv, "arch", None)
+        width = int(getattr(arch, "instr_alignment", 0) or 0)
+        if width <= 0 or width != int(getattr(arch, "max_instr_length", 0) or 0):
+            return None
+        prev = addr - width
+        data = bytes(bv.read(prev, width) or b"")
+        if len(data) != width:
+            return None
+        info = arch.get_instruction_info(data, prev)
+        if info is None or int(getattr(info, "length", 0) or 0) != width:
+            return None
+        tokens, _length = arch.get_instruction_text(data, prev) or ([], 0)
+        mnemonic = str(tokens[0]).strip().lower() if tokens else ""
+        if not mnemonic or mnemonic in ("nop", "udf", "hlt", "brk"):
+            return None
+        kinds = {str(getattr(getattr(b, "type", None), "name", ""))
+                 for b in (getattr(info, "branches", None) or ())}
+        if kinds and not (kinds & _FALLTHROUGH_BRANCH_KINDS):
+            return None
+        return prev
+    except Exception:  # noqa: BLE001 - advisory: no evidence means no warning
+        return None
+
+
+def _with_fallthrough_note(row: dict, predecessor: int | None) -> dict:
+    """Disclose a create at an address reached by fall-through (#997 item 2).
+
+    ONE builder for both create paths. The create still goes ahead -- BN's
+    own boundaries are not authoritative there, and the address may be an
+    entry of a routine laid out after a non-returning tail -- but the row
+    and the compact summary say what the bytes before it show.
+    """
+    if predecessor is None:
+        return row
+    row = dict(row)
+    row["fallthrough_from"] = hex(predecessor)
+    warning = (f"{row.get('address', '<unknown>')} is reached by fall-through from "
+               f"{hex(predecessor)}; likely mid-function, not an entry")
+    row["note"] = f"{row['note']}; {warning}" if row.get("note") else warning
+    return row
+
+
 def _function_ranges(fn) -> list:
     ranges = getattr(fn, "address_ranges", None)
     return list(ranges) if ranges is not None else []
@@ -703,6 +763,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *,
         # tail were left shortened behind `rolled_back: true`), so record
         # them now and verify them after every revert below.
         hosts = _snapshot_split_hosts(bv, overlapped) if overlapped else {"hosts": {}}
+        fallthrough_from = _fallthrough_predecessor(bv, addr)
         state = bv.begin_undo_actions()
     try:
         with exclusive_scope():
@@ -848,13 +909,13 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *,
                 "committed": committed,
                 "message": message,
                 "results": [
-                    _with_overlap_note({
+                    _with_fallthrough_note(_with_overlap_note({
                         "op": "function_create",
                         "status": op_status,
                         "address": hex(addr),
                         "function": function_name,
                         "requested": requested,
-                    }, overlapped)
+                    }, overlapped), fallthrough_from)
                 ],
                 # The host(s) a deliberate split cut are affected functions
                 # too (#927 review): the compact face carries them under

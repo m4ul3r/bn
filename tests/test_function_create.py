@@ -714,3 +714,75 @@ def test_function_create_rejects_unmapped_address_with_no_memory_seeded_at_all(m
         instance._function_create(None, "0x1000", False)
 
     assert bv.added == []
+
+
+class _A64Arch:
+    """A fixed-width ISA: every word decodes as the instruction the table names,
+    with the branch kinds BN's InstructionInfo would report for it."""
+    instr_alignment = 4
+    max_instr_length = 4
+
+    def __init__(self, program):
+        self.program = program          # address -> (mnemonic, [branch kind names])
+
+    def get_instruction_info(self, data, address):
+        entry = self.program.get(int(address))
+        if entry is None:
+            return None
+        return types.SimpleNamespace(length=4, branches=[
+            types.SimpleNamespace(type=types.SimpleNamespace(name=kind)) for kind in entry[1]])
+
+    def get_instruction_text(self, data, address):
+        entry = self.program.get(int(address))
+        return ([entry[0]], 4) if entry else None
+
+
+@pytest.mark.parametrize(
+    ("previous", "expected"),
+    [
+        pytest.param(("add", []), 0x402ffc, id="straight-line-falls-through"),
+        pytest.param(("b.ne", ["TrueBranch", "FalseBranch"]), 0x402ffc,
+                     id="conditional-branch-not-taken-falls-through"),
+        pytest.param(("ret", ["FunctionReturn"]), None, id="after-ret-is-an-entry"),
+        pytest.param(("b", ["UnconditionalBranch"]), None, id="after-b-is-an-entry"),
+        pytest.param(("bl", ["CallDestination"]), None, id="after-a-call-may-be-noreturn"),
+        pytest.param(("nop", []), None, id="padding-is-not-a-body"),
+        pytest.param(None, None, id="undecodable-says-nothing"),
+    ],
+)
+def test_fallthrough_predecessor_names_the_instruction_running_into_the_address_997(
+        monkeypatch, previous, expected):
+    """#997 item 2: `function create` accepted an `adrp` page base in the middle of
+    a loop body. On a fixed-width ISA the instruction before the address is known,
+    and if it neither returns nor branches away, execution runs straight in: the
+    address is mid-body. Anything the bytes do not settle answers None."""
+    bridge = _load_bridge(monkeypatch)
+    program = {0x402ffc: previous} if previous else {}
+    bv = types.SimpleNamespace(arch=_A64Arch(program), read=lambda a, n: b"\x00" * n)
+    assert bridge.create_comments._fallthrough_predecessor(bv, 0x403000) == expected
+
+
+def test_fallthrough_predecessor_is_silent_on_a_variable_length_isa(monkeypatch):
+    """x86: any byte before the address may start an instruction, so no single
+    predecessor exists to name."""
+    bridge = _load_bridge(monkeypatch)
+    arch = _A64Arch({0x402fff: ("add", [])})
+    arch.instr_alignment, arch.max_instr_length = 1, 15
+    bv = types.SimpleNamespace(arch=arch, read=lambda a, n: b"\x00" * n)
+    assert bridge.create_comments._fallthrough_predecessor(bv, 0x403000) is None
+
+
+def test_fallthrough_create_is_disclosed_on_the_compact_status_997():
+    """The warning rides on the line every loop reads, not only the verbose row."""
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+    row = {"op": "function_create", "status": "verified", "address": "0x403000",
+           "fallthrough_from": "0x402ffc", "note": "..."}
+    summary = _mutation_summary({"success": True, "committed": False, "preview": True,
+                                 "rolled_back": True, "results": [row]})
+    assert summary["fallthrough_entries"] == [
+        {"address": "0x403000", "fallthrough_from": "0x402ffc"}]
+    assert ("warning: 0x403000 is reached by fall-through from 0x402ffc; likely "
+            "mid-function, not an entry") in _render_mutation_summary_text(summary)
+    plain = _mutation_summary({"success": True, "committed": True, "results": [
+        {"op": "function_create", "status": "verified", "address": "0x403110"}]})
+    assert "fallthrough_entries" not in plain

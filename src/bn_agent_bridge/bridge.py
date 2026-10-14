@@ -5237,6 +5237,8 @@ def _bind_hidden_surface(bridge, params, target):
         max_tables=int(params.get("max_tables", 64)),
         max_candidates=int(params.get("max_candidates", 128)),
         max_scan_bytes=int(params.get("max_scan_bytes", 16_000_000)),
+        unknown_only=_validate_bool(params.get("unknown_only"), label="unknown_only",
+                                    default=False),
     )
 
 

@@ -1291,7 +1291,8 @@ _STRONG_DECODE_DEPTH = 8
 
 def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
                     max_tables: int = 64, max_candidates: int = 128,
-                    max_scan_bytes: int = 16_000_000) -> dict[str, Any]:
+                    max_scan_bytes: int = 16_000_000,
+                    unknown_only: bool = False) -> dict[str, Any]:
     """#503: enumerate the HIDDEN code surface a passive `function list` misses -- code
     reachable through data, not direct calls. READ-ONLY: it reports addresses BN did not
     turn into functions, it does NOT create them (that stays the agent's separate write).
@@ -1468,6 +1469,10 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
 
     candidate_tables: list[dict[str, Any]] = []
     tables_over_cap = 0
+    # #997 item 3: tables the Itanium header identifies as a class's vtable,
+    # and how many of them `unknown_only` kept out of the listing.
+    vtables_labelled = 0
+    vtables_hidden = 0
     scanned = 0
     scan_capped = False
     for name, start, end in scan_regions:
@@ -1485,9 +1490,19 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         run: list[int] = []
 
         def flush(run_addr: int, run_vals: list[int]) -> None:
-            nonlocal tables_over_cap
+            nonlocal tables_over_cap, vtables_labelled, vtables_hidden
             if len(run_vals) < table_min_run:
                 return
+            label = _vtable_label(ctx, bv, run_addr, ps)
+            if label is not None:
+                vtables_labelled += 1
+                if unknown_only:
+                    # Hidden, not dropped: its slots still nominate missing
+                    # functions, exactly as when it is listed.
+                    vtables_hidden += 1
+                    for v in run_vals:
+                        note_missing(v, f"table:{hex(run_addr)}")
+                    return
             if len(candidate_tables) >= max_tables:
                 tables_over_cap += 1   # #653.5: disclose the total, not a silent prefix
                 return
@@ -1498,7 +1513,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             miss = sum(1 for v in run_vals if not has_fn(norm_ptr(v)))
             for v in run_vals:
                 note_missing(v, f"table:{hex(run_addr)}")
-            candidate_tables.append({
+            row = {
                 "address": hex(run_addr),
                 "section": str(name),
                 "entries": len(run_vals),        # the TRUE slot count
@@ -1506,7 +1521,10 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
                 "missing_functions": miss,
                 "slots": [hex(v) for v in run_vals[:32]],
                 "slots_truncated": len(run_vals) > 32,   # `slots` shows the first 32
-            })
+            }
+            if label is not None:
+                row.update(label)
+            candidate_tables.append(row)
 
         run_start = start
         off = 0
@@ -1597,9 +1615,46 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             "missing_function_candidates_total": candidates_total,
             # the high-confidence subset (aligned + long clean decode run) -- start here.
             "code_likely_candidates": sum(1 for m in missing.values() if m["code_likely"]),
+            # #997 item 3: tables (listed, capped or hidden) whose Itanium header
+            # names an RTTI class, and how many `--unknown-only` hid -- the
+            # listing above excludes those, and `candidate_tables_total` too.
+            "vtables_labelled": vtables_labelled,
+            "vtables_hidden": vtables_hidden,
         },
         "warnings": warnings,
     }
+
+
+def _vtable_label(ctx, bv, address_point: int, ptr: int) -> dict[str, Any] | None:
+    """``{"vtable_of", "vtable_kind"}`` when *address_point* is an Itanium
+    vtable's slot array, else None (#997 item 3).
+
+    The class lens's own gate (`read_class._vtable_layout`): the word before
+    the slots points at a ``typeinfo for X`` object, and the word before that
+    is the offset-to-top -- 0 for the primary table, negative for a secondary
+    (multiple-inheritance) one. A run of code pointers cannot START inside a
+    vtable (the two header words are not code pointers), so testing the run's
+    first address is enough. A positive offset-to-top is not an Itanium
+    header, and a typeinfo pointer that names no class is no evidence; both
+    leave the table unlabelled rather than guessed."""
+    head = address_point - 2 * ptr
+    if head < 0:
+        return None
+    try:
+        ti = ctx._read_pointer_value(bv, address_point - ptr, size=ptr)
+        cls = ctx._typeinfo_name_at(bv, ti) if ti else None
+        if not cls:
+            return None
+        raw = ctx._read_pointer_value(bv, head, size=ptr)
+    except Exception:  # noqa: BLE001 - an unreadable header is no label, not an error
+        return None
+    if raw is None:
+        return None
+    offset_to_top = raw - (1 << (8 * ptr)) if raw >> (8 * ptr - 1) else raw
+    if offset_to_top > 0:
+        return None
+    return {"vtable_of": str(cls),
+            "vtable_kind": "primary" if offset_to_top == 0 else "secondary"}
 
 
 def _code_regions(bv) -> list[tuple[int, int]]:
@@ -1757,8 +1812,17 @@ class _CodeRefScan:
                     self.code_ref_failures += 1
                     continue
                 sites: list[tuple[int, str]] = []
+                page_aligned = not (addr & 0xFFF)
                 for ref in refs:
                     if _code_ref_site_kind(ref, addr) in _NON_NOMINATING_SITE_KINDS:
+                        continue
+                    # #997 item 2: an aarch64 `adrp` that only materialises the
+                    # PAGE this address starts (every consumer adds a nonzero
+                    # page offset) is not a reference to it. `bn xrefs` drops
+                    # exactly these sites (#284); the scan uses the same
+                    # predicate so the two commands agree about one address --
+                    # measured as 40 of 86 `code-likely` leads, all mid-body.
+                    if page_aligned and read_xrefs._is_spurious_adrp_pagebase(bv, ref, addr):
                         continue
                     func = getattr(ref, "function", None)
                     sites.append((int(getattr(ref, "address", 0) or 0),

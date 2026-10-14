@@ -3968,6 +3968,9 @@ _GO_RENAME_NON_COUNT_READS = {
     # #964: the paired renderer reads the per-type `types declare` disclosure
     # back off the summary; a listing, not a count, and absent on every `go rename`.
     "declared_types",
+    # #997 item 2: the paired renderer reads the fall-through create warnings
+    # back off the summary; a listing, not a count, and absent on every `go rename`.
+    "fallthrough_entries",
 }
 
 
