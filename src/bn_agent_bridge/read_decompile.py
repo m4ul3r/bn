@@ -1825,24 +1825,28 @@ def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
             block = getattr(func.get_llil_at(address), "il_basic_block", None)
             if block is None or list(getattr(block, "outgoing_edges", None) or []):
                 continue
+            table = _jump_data_address(bv, dest)
         except Exception:  # noqa: BLE001 - one odd jump must not hide the rest
             continue
-        rows[address] = {"address": address, "target": str(dest),
-                         "table": _jump_data_address(bv, func, dest)}
+        rows[address] = {"address": address, "target": str(dest), "table": table}
     return list(rows.values())
 
 
-def _jump_data_address(bv, func, dest) -> int | None:
+def _jump_data_address(bv, dest) -> int | None:
     """The first mapped, non-code address in the jump target's expression --
-    the table (or pointer) the target is read from, `&data_435ea0` in
-    `*(int32_t*)(&data_435ea0 + (i << 2)) + &data_435ea0` -- or None."""
+    the data the target is read from, `&data_435ea0` in
+    `*(int32_t*)(&data_435ea0 + (i << 2)) + &data_435ea0` -- or None. An
+    operand that cannot be read names no table; it never costs the row."""
     pending = [dest]
-    while pending:
-        expr = pending.pop(0)
-        if il_format._il_op_name(expr) == "HLIL_CONST_PTR" and _is_data_address(bv, expr):
-            return int(expr.constant)
-        pending.extend(o for o in list(getattr(expr, "operands", None) or [])
-                       if hasattr(o, "operation"))
+    try:
+        while pending:
+            expr = pending.pop(0)
+            if il_format._il_op_name(expr) == "HLIL_CONST_PTR" and _is_data_address(bv, expr):
+                return int(expr.constant)
+            pending.extend(o for o in list(getattr(expr, "operands", None) or [])
+                           if hasattr(o, "operation"))
+    except Exception:  # noqa: BLE001 - an unreadable operand names no table
+        return None
     return None
 
 
@@ -1861,14 +1865,12 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
     """The neutral `jump` warning: what `❓` means, the target, and both
     readings with how to check each. It never says which one this is.
 
-    The jump-table advice must lead to where control can go (#1000 review
-    round 5): a window around the jump missed targets before it, and a whole
-    function listing misses them too, because BN never added unresolved
-    targets to the function. They are reached through data: the table the
-    target expression reads (named when it is a constant address) and
-    `evidence surface`'s table-referenced code."""
+    The jump-table half is honest rather than complete (#1000 review rounds
+    5-6): every step below was run as printed on a run-time-filled `.bss`
+    table, a static absolute table, a 4-byte relative table and stack-built
+    label arrays, and each says when it does not help. None is promised to
+    find the targets."""
     where = hex(row["address"])
-    start = hex(int(func.start))
     try:
         cc = getattr(func, "calling_convention", None)
         arg_regs = [str(r) for r in (getattr(cc, "int_arg_regs", None) or [])]
@@ -1876,13 +1878,20 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
         arg_regs = []
     regs = f" ({', '.join(arg_regs)})" if arg_regs else ""
     table = row.get("table")
-    table_advice = (
-        f" The target is read from data at {hex(table)}: `bn evidence table {hex(table)}` "
-        "lists absolute entries, and `bn evidence table "
-        f"{hex(table)} --stride 4 --width 4` lists 4-byte entries that are signed offsets "
-        f"to add to {hex(table)} (`tbl + *(int32_t*)(tbl + i * 4)`); disassemble each "
-        "target with `bn disasm <target> --linear 16`."
-        if table is not None else "")
+    steps = []
+    if table is not None:
+        steps.append(
+            f"`bn xrefs {hex(table)}` lists the code that reads and writes the data the "
+            "jump reads from; when it is filled at run time (a `.bss` table) its writes "
+            "are where the target addresses are stored")
+        steps.append(
+            f"`bn evidence table {hex(table)}` reads that data's current bytes, which name "
+            "targets only for a static table (absolute pointers; with `--stride 4 --width "
+            f"4`, 4-byte signed offsets that are added to the table base {hex(table)}); a "
+            "table filled at run time reads as zeros")
+    steps.append(
+        "stores in this decompile that write code or table addresses into what the jump "
+        "reads (`tbl = &data_...`, `var_10 = &a.1`) may name the targets or their table")
     detail = (
         f"unresolved indirect jump at {where} to `{row['target']}`: BN renders it as "
         "`❓ /* jump -> ... */` -- the ❓ marks control flow it could not resolve -- and "
@@ -1891,11 +1900,10 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
         f"arguments are then in the argument registers{regs} at the jump and are not "
         f"rendered; read them in `bn disasm {where}`, and type the callee (`bn proto "
         "set`) or the object the pointer is loaded from so BN can render the call. Or a "
-        "computed goto or jump table BN did not resolve, staying in this function: its "
-        "targets are code BN never added to the function, so neither this decompile nor "
-        f"`bn disasm {start}` shows them. `bn evidence surface` lists code reached only "
-        "through a data table (a computed goto's labels appear as `via table:<addr>`)."
-        + table_advice
+        "computed goto or jump table BN did not resolve, staying in this function: the "
+        "code it reaches is not part of this function's decompile or disassembly. None "
+        "of these steps is sure to find the targets: " + "; ".join(steps) + ". Read a "
+        "target address's code with `bn disasm <target> --linear 16`."
         + (" Every line that shows this jump carries a `/* bn: ... */` note." if inline else "")
     )
     summary = (f"unresolved jump at {where} (❓): a tail call whose args are not rendered, "

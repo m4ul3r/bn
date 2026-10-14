@@ -6436,31 +6436,51 @@ def test_every_unresolved_exit_jump_gets_one_neutral_warning_1000(dest):
     # Neither reading is stated as fact: leaving the function is the tail
     # call's, staying in it the jump table's.
     assert "leaving the function" in detail and "staying in this function" in detail
-    # The jump-table reading points at commands that reach the targets, which
-    # BN never added to the function: not a window around the jump.
-    assert "bn evidence surface" in detail and "--linear" not in detail
+    # The jump-table half promises nothing: no table here, so only the
+    # decompile's own stores are offered, as a "may".
+    assert "None of these steps is sure to find the targets" in detail
+    assert "may name the targets" in detail and "bn xrefs" not in detail
     note = read_decompile._JUMP_LINE_NOTE
     assert note.startswith("/* bn:") and note.endswith("*/")
     assert "tail call" in note and "computed goto" in note and "virtual" not in note
 
 
-def test_a_jump_reading_a_data_table_names_the_table_and_how_to_read_it_1000():
-    # ninja's `tbl + *(int32_t*)(tbl + i*4)` and a label array `tbl[i]`: the
-    # targets are entries of the table the expression reads.
+def test_a_jump_reading_a_data_table_names_the_steps_and_their_limits_1000():
+    # A `.bss` table filled at run time (`jt`), a static absolute table
+    # (`idxjump`) and a relative one (ninja) all read from one data address.
     table = _hop("HLIL_CONST_PTR", "&tbl", constant=0x420010)
     bv, func = _jump_case(dest=_load(_plus(table, _hop("HLIL_LSL", "(op & 3) << 3"))))
     bv.is_valid_offset = lambda value: 0x400000 <= value < 0x430000
     bv.get_functions_containing = lambda value: [func] if 0x400570 <= value < 0x400590 else []
     [row] = read_decompile._unresolved_jump_findings(bv, func)
-    warning = read_decompile._unresolved_jump_warning(func, row, False)
-    assert warning["table"] == "0x420010"
-    assert "`bn evidence table 0x420010`" in warning["detail"]
-    assert "`bn evidence table 0x420010 --stride 4 --width 4`" in warning["detail"]
-    assert "`bn disasm <target> --linear 16`" in warning["detail"]
+    detail = read_decompile._unresolved_jump_warning(func, row, False)["detail"]
+    assert row["table"] == 0x420010
+    # xrefs: the writes of a table filled at run time.
+    assert "`bn xrefs 0x420010`" in detail and "filled at run time" in detail
+    # evidence table: only a static table, and it says what relative entries mean.
+    assert "`bn evidence table 0x420010`" in detail
+    assert "added to the table base 0x420010" in detail and "reads as zeros" in detail
+    assert "`bn disasm <target> --linear 16`" in detail
     # A target with no data address (a stack array, a register) names none.
     bv, func = _jump_case(dest=_var("arg2"))
     [row] = read_decompile._unresolved_jump_findings(bv, func)
-    assert read_decompile._unresolved_jump_warning(func, row, False)["table"] is None
+    assert row["table"] is None
+
+
+def test_an_operand_that_raises_names_no_table_and_keeps_the_row_1000():
+    # `_jump_data_address` walks HLIL operands; one that raises used to escape
+    # the per-jump `try` and abort the whole read. It costs only the table.
+    class _Raising(_Expr):
+        @property
+        def operands(self):
+            raise RuntimeError("operand list unavailable")
+
+    bad = _Raising(operation=types.SimpleNamespace(name="HLIL_DEREF"), text="*(?)")
+    bv, func = _jump_case(dest=bad)
+    bv.is_valid_offset = lambda value: True
+    bv.get_functions_containing = lambda value: []
+    [row] = read_decompile._unresolved_jump_findings(bv, func)
+    assert row["address"] == 0x40058c and row["table"] is None
 
 
 def test_a_jump_bn_repeats_in_switch_cases_is_one_row_with_a_note_on_every_copy_1000(
