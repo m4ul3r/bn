@@ -3882,13 +3882,10 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         ]
         if call_index is not None:
             lines.append(f"call_index: {call_index}")
-        within_query = row.get("within_query")
-        if within_query:
-            # With no --within the bridge echoes each caller's raw name here;
-            # show that the way the containing_function line does (#978).
-            if within_query == containing.get("name"):
-                within_query = containing_name
-            lines.append(f"within_query: {within_query}")
+        if row.get("within_query"):
+            # Verbatim, like every other labelled value: the text must carry
+            # the JSON value a filter written from it will compare (#979).
+            lines.append(f"within_query: {row['within_query']}")
         if row.get("hlil_statement"):
             lines.append(f"hlil_statement: {row['hlil_statement']}")
         elif row.get("hlil_statement_reason"):
@@ -3899,10 +3896,15 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         variadic = _field_dict(row, "callee_variadic")
         if variadic.get("is_variadic"):
             # #558: steer to the argument-recovery views for an imported variadic callee.
+            # #978: name the caller as the line above does; when that shown name
+            # is not the raw symbol (a demangled one, which overloads can share)
+            # the runnable command uses the caller's address, which is unique.
+            target = (containing_name if containing_name == containing.get("name")
+                      else containing.get("address", containing_name))
             lines.append(
                 f"callee_variadic: {variadic.get('name', '?')} — HLIL may show only fixed "
-                f"args; run `bn evidence function {containing.get('name', '<caller>')}` "
-                f"or `bn disasm {containing.get('name', '<caller>')} --linear`"
+                f"args in {containing_name}; run `bn evidence function {target}` "
+                f"or `bn disasm {target} --linear`"
             )
 
         call_instruction = _field_dict(row, "call_instruction")

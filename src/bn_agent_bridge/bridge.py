@@ -4674,6 +4674,8 @@ def _bind_list_functions(bridge, params, target):
         # only, matching `target info`'s buckets.
         named=(_validate_bool(params.get("named"), label="named", default=False)
                if params.get("named") is not None else None),
+        # #978: `--sort name` orders by the raw name instead of the display name.
+        mangled=_validate_bool(params.get("mangled"), label="mangled", default=False),
     )
 
 

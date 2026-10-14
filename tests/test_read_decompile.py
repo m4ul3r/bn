@@ -3517,6 +3517,47 @@ def test_function_search_matches_the_display_name_by_default_978(monkeypatch):
         assert names(instance._search_functions(None, "main", mangled=mangled)) == ["main"]
 
 
+def _sort_population():
+    return [
+        _cxx_function(0x401000, "_Z10pump_queueiPc", "pump_queue"),
+        _cxx_function(0x402000, "_Z9copy_tailPcPKcim", "copy_tail"),
+        _FakeFunction(0x403000, "main"),
+    ]
+
+
+def test_sort_name_orders_by_the_name_the_text_shows_978(monkeypatch):
+    """#978 review: text shows display names, so `--sort name` sorting by the
+    mangled `fn.name` printed pump_queue before copy_tail. Sort by the display
+    name by default and by the raw name under `mangled`, on list and search."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=_sort_population())
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    for read in (lambda **k: instance._list_functions(None, **k),
+                 lambda **k: instance._search_functions(None, ".", regex=True, **k)):
+        shown = read(sort="name")["items"]
+        assert [item["name"] for item in shown] == [
+            "_Z9copy_tailPcPKcim", "main", "_Z10pump_queueiPc"]
+        raw = read(sort="name", mangled=True)["items"]
+        assert [item["name"] for item in raw] == [
+            "_Z10pump_queueiPc", "_Z9copy_tailPcPKcim", "main"]
+        assert [item["name"] for item in read(sort="name", reverse=True)["items"]] == [
+            "_Z10pump_queueiPc", "main", "_Z9copy_tailPcPKcim"]
+
+
+def test_implicit_callsite_scope_echoes_the_display_name_978(monkeypatch):
+    """#979 review: with no --within the bridge fills `within_query` itself. It
+    echoes the caller's display name, the spelling the text prints, so a jq
+    filter written from the text matches the JSON value."""
+    _load_bridge(monkeypatch)
+    from bn_agent_bridge import read_listing
+    callers = _sort_population()
+    bv = _FakeBV(functions=callers)
+    bv.get_code_refs = lambda address: [types.SimpleNamespace(function=fn) for fn in callers]
+    scope = read_listing._all_caller_functions(bv, {0x400100})
+    assert [query for query, _fn in scope] == ["pump_queue", "copy_tail", "main"]
+
 
 def test_backward_slice_constant_arg_reports_value_hint(monkeypatch):
     """A constant/immediate arg (e.g. read(fd, buf, 0x1fff)'s count) has no SSA

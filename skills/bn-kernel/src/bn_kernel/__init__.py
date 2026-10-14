@@ -703,7 +703,8 @@ _ACTIVE_SCOPED_BINDINGS: dict[int, tuple[str | None, str | None]] = {}
 _SCOPED_CALLBACK_LOCK = threading.Lock()
 _SCOPED_BINDING_ATTRIBUTE = "__bn_kernel_binding__"
 _FUNCTION_FILTERS = frozenset(
-    {"min_address", "max_address", "min_size", "offset", "sort", "reverse", "named"}
+    {"min_address", "max_address", "min_size", "offset", "sort", "reverse", "named",
+     "mangled"}
 )
 _SEARCH_FILTERS = frozenset(
     {

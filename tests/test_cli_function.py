@@ -1199,6 +1199,9 @@ def test_callsites_routes_within_scope_and_renders_text(fake_transport, capsys):
         "callee": {"name": "crt_rand", "address": "0x461746"},
         "containing_function": {
             "name": "bonus_pick_random_type",
+            # A display name distinct from the raw one, so a renderer that
+            # rewrote a raw-valued field into it would show (#979 review).
+            "display_name": "bonus::pick_random_type",
             "address": "0x412470",
         },
         "within_query": "bonus_pick_random_type",
@@ -1241,20 +1244,31 @@ def test_callsites_routes_within_scope_and_renders_text(fake_transport, capsys):
     assert calls[-1]["params"]["caller_static"] is True
     output = capsys.readouterr().out
     assert output.startswith("caller_static 0x4124a5 | call_addr 0x4124a0")
-    assert "containing_function: bonus_pick_random_type @ 0x412470" in output
+    assert "containing_function: bonus::pick_random_type @ 0x412470" in output
     assert "call_index: 0" in output
     assert "within_query: bonus_pick_random_type" in output
     assert "hlil_statement: edx_1:eax_1 = sx.q(crt_rand())" in output
     assert "pre_branch_condition: result == 2" in output
     assert "> 0x4124a0  call crt_rand" in output
-    # #979: a jq filter written from the text labels must find the fields, so
-    # every name the text prints as a label is a JSON key of the row.
+    # #979: a jq filter written from the text must find the field AND the
+    # value, so every label the text prints is a JSON key of the row and every
+    # labelled scalar is printed exactly as JSON carries it.
     lines = output.splitlines()
-    labels = {line.split(":", 1)[0] for line in lines if re.match(r"^[a-z_]+: ", line)}
-    labels |= set(lines[0].replace("|", " ").split()[0::2])
-    context = next(line for line in lines if line.startswith("context: "))
-    labels |= set(context.removeprefix("context: ").replace(">", "").replace(",", " ").split())
-    assert labels - {"context"} <= set(row)
+    labelled = dict(line.split(": ", 1) for line in lines if re.match(r"^[a-z_]+: ", line))
+    primary = lines[0].replace("|", " ").split()
+    labelled.update(zip(primary[0::2], primary[1::2]))
+    context = labelled.pop("context")
+    keys = set(labelled) | set(context.replace(">", "").replace(",", " ").split())
+    assert keys <= set(row)
+    for key, value in labelled.items():
+        if isinstance(row[key], dict):
+            # an object prints as `<name> @ <address>`, the name being one of its
+            # two JSON spellings
+            name, address = value.rsplit(" @ ", 1)
+            assert address == row[key]["address"], key
+            assert name in (row[key]["name"], row[key].get("display_name")), key
+        else:
+            assert value == str(row[key]), key
 
 
 _WIDGET = {"name": "_ZN4demo6Widget6handleEi", "display_name": "demo::Widget::handle",
@@ -1275,7 +1289,7 @@ _WIDGET = {"name": "_ZN4demo6Widget6handleEi", "display_name": "demo::Widget::ha
           "caller_function": _WIDGET}], "total": 1}),
     (["callsites", "memcpy"], "callsites",
      {"items": [{"callee": {"name": "memcpy", "display_name": "memcpy", "address": "0x400100"},
-                 "containing_function": _WIDGET, "within_query": _WIDGET["name"],
+                 "containing_function": _WIDGET,
                  "call_addr": "0x402a60",
                  "caller_static": "0x402a64", "previous_instructions": [],
                  "next_instructions": []}], "total": 1}),

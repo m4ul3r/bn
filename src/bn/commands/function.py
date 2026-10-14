@@ -52,7 +52,8 @@ from ..transport import BridgeError
              arg("--count", action="store_true", default=False,
                  help="Show total function count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
-                 help="Order results ascending by address (default), size, or name"),
+                 help="Order results ascending by address (default), size, or name "
+                      "(the name the text shows: demangled, or raw under --mangled)"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
                  help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
              mangled_arg(), demangle_compat_arg(),
@@ -114,6 +115,8 @@ def _function_list(args: argparse.Namespace) -> int:
         params["sort"] = args.sort
     if args.reverse:
         params["reverse"] = True
+    if args.mangled:
+        params["mangled"] = True
     return _call(
         args,
         "list_functions",
@@ -141,7 +144,8 @@ def _function_list(args: argparse.Namespace) -> int:
              arg("--count", action="store_true", default=False,
                  help="Show match count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
-                 help="Order results ascending by address (default), size, or name"),
+                 help="Order results ascending by address (default), size, or name "
+                      "(the name the text shows: demangled, or raw under --mangled)"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
                  help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
              demangle_compat_arg(),

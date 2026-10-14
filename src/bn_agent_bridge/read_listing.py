@@ -356,8 +356,12 @@ def _all_caller_functions(
                 start = int(getattr(function, "start", -1))
                 if start >= 0:
                     callers.setdefault(start, function)
+    # #978/#979: with no --within there is no user query to echo, so each row's
+    # `within_query` names its caller by the display name -- the spelling the
+    # text prints, so text and JSON carry one value. The raw name stays on
+    # `containing_function.name`.
     return [
-        (str(getattr(function, "name", "") or hex(start)), function)
+        (il_format._display_name(function) or hex(start), function)
         for start, function in sorted(callers.items())
     ]
 
@@ -404,7 +408,7 @@ def _scan_caller_functions(
             if function is not None:
                 callers.setdefault(start, function)
     scope_functions = [
-        (str(getattr(function, "name", "") or hex(start)), function)
+        (il_format._display_name(function) or hex(start), function)
         for start, function in sorted(callers.items())
     ]
     return scope_functions, truncated, "; ".join(notes) if notes else None
@@ -1235,7 +1239,7 @@ def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
     return result
 
 
-def _function_population_key(fn, sort: str, sizes: dict[int, Any]) -> Any:
+def _function_population_key(fn, sort: str, sizes: dict[int, Any], name: str = "") -> Any:
     """The order key for *sort* read off the LIVE Function (#814) -- the same
     keys ``--sort`` used on a materialized row before it (``size`` or 0 for
     ``size``, the lowercased name for ``name``, the address otherwise).
@@ -1246,7 +1250,8 @@ def _function_population_key(fn, sort: str, sizes: dict[int, Any]) -> Any:
     tie-break included. ``size`` is the one key that costs a per-function read
     (``il_format._function_size``: ``total_bytes`` or a basic-block walk); it is
     recorded in *sizes* so the page rows reuse it instead of paying twice, the
-    way the full build handed each row its size. ``address``/``name`` read a
+    way the full build handed each row its size. ``name`` is the spelling the
+    caller sorts by -- the one its text shows (#978) -- and ``address`` reads a
     field the filter pass already touched.
     """
     if sort == "size":
@@ -1254,7 +1259,7 @@ def _function_population_key(fn, sort: str, sizes: dict[int, Any]) -> Any:
         sizes[id(fn)] = size
         return size or 0
     if sort == "name":
-        return str(getattr(fn, "name", "")).lower()
+        return name.lower()
     return int(fn.start)
 
 
@@ -1263,6 +1268,9 @@ def _order_function_population(
     sort: str,
     reverse: bool = False,
     function_of=None,
+    *,
+    mangled: bool = False,
+    name_of=None,
 ) -> dict[int, Any]:
     """Order address, size, or name ascending unless ``reverse`` is set.
 
@@ -1271,7 +1279,12 @@ def _order_function_population(
     had to read (``{id(fn): size}``; empty unless *sort* is ``size``). #814:
     ordering the population instead of the rows is what lets the row build, the
     display projection and the xref enrichment happen for the returned page
-    only."""
+    only.
+
+    ``--sort name`` orders by the name the text SHOWS (#978): the demangled
+    display name by default, the raw ``fn.name`` under ``mangled``. *name_of*
+    supplies an already-computed display name per item (search keeps one per
+    match), so only ``function list --sort name`` pays a symbol read for it."""
     if sort not in _FUNCTION_SORTS:
         raise OperationFailure(
             "invalid_request",
@@ -1283,8 +1296,16 @@ def _order_function_population(
         # address order, tie-break included -- so this is not a skip.
         return sizes
     get_fn = function_of or (lambda item: item)
+
+    def name(item) -> str:
+        if sort != "name":
+            return ""
+        if mangled:
+            return str(getattr(get_fn(item), "name", ""))
+        return name_of(item) if name_of else il_format._display_name(get_fn(item))
+
     population.sort(
-        key=lambda item: _function_population_key(get_fn(item), sort, sizes),
+        key=lambda item: _function_population_key(get_fn(item), sort, sizes, name(item)),
         reverse=reverse,
     )
     return sizes
@@ -1339,6 +1360,7 @@ def _list_functions(
     sort: str = "address",
     reverse: bool = False,
     named: bool | None = None,
+    mangled: bool = False,
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -1383,7 +1405,7 @@ def _list_functions(
     # --limit 100` over a 50k-function target no longer materializes (and sorts)
     # 50k rows to hand back 100. `_fn` carries the live Function to the page
     # projection, then drops.
-    sizes = _order_function_population(functions, sort, reverse)
+    sizes = _order_function_population(functions, sort, reverse, mangled=mangled)
     start, stop = read_misc._page_window(len(functions), offset=offset, limit=limit)
     # Per-row labels for the collided records, built once for the page. Empty
     # dict on a clean view, so this costs nothing where nothing collided.
@@ -1602,7 +1624,8 @@ def _search_functions(
         result = {"kind": "functions", "count": len(matched), "total": len(matched),
                   **hint, **_analysis_state_fields(bv)}
         return _disclose_collapsed_starts(result, collapsed_starts, unresolved_starts)
-    sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0])
+    sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0],
+                                       mangled=mangled, name_of=lambda pair: pair[1])
     start, stop = read_misc._page_window(len(matched), offset=offset, limit=limit)
     # Same per-row labels as `function list`: one record of a collided start
     # must not read differently depending on which command returned it.
