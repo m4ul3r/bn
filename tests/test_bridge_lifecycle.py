@@ -1549,6 +1549,9 @@ def test_restart_bridge_stops_the_old_instance_before_starting_a_new_one(monkeyp
     class _FakeBridge:
         targets = None
 
+        def succeed(self, predecessor):
+            events.append(("succeed", id(predecessor)))
+
         def start(self):
             events.append(("start", id(self)))
 
@@ -1562,8 +1565,9 @@ def test_restart_bridge_stops_the_old_instance_before_starting_a_new_one(monkeyp
     module.restart_bridge()
 
     assert events[0] == ("stop", id(old))
-    assert events[1][0] == "start"
-    assert events[1][1] != id(old)
+    assert events[1] == ("succeed", id(old))
+    assert events[2][0] == "start"
+    assert events[2][1] != id(old)
     assert module._bridge is not None
     assert module._bridge is not old
 
@@ -1581,6 +1585,9 @@ def test_restart_bridge_leaves_global_none_when_the_new_start_fails(monkeypatch)
     monkeypatch.setattr(module, "_bridge", _StopOnlyBridge())
 
     class _BoomBridge:
+        def succeed(self, predecessor):
+            pass
+
         def start(self):
             raise RuntimeError("bind failed")
 
@@ -1592,23 +1599,17 @@ def test_restart_bridge_leaves_global_none_when_the_new_start_fails(monkeypatch)
 
 
 def _restartable_gui_bridge(module, monkeypatch, targets):
-    """A GUI bridge stand-in that owns a REAL TargetManager, so restart_bridge()
-    runs its real handover; only the socket lifecycle is faked."""
+    """A REAL GUI bridge owning *targets*, so restart_bridge() runs its real
+    handover; only the socket lifecycle is faked."""
     monkeypatch.setattr(module, "ui", object())
-    monkeypatch.setattr(module, "_retired_targets", None)
-
-    class _GuiBridge:
-        def __init__(self, manager=None):
-            self.targets = manager if manager is not None else module.TargetManager()
-
-        def start(self):
-            pass
-
-        def stop(self):
-            pass
-
-    monkeypatch.setattr(module, "BinaryNinjaBridge", _GuiBridge)
-    monkeypatch.setattr(module, "_bridge", _GuiBridge(targets))
+    monkeypatch.setattr(module, "_retired_bridge", None)
+    monkeypatch.setattr(module.BinaryNinjaBridge, "start", lambda self: None)
+    monkeypatch.setattr(module.BinaryNinjaBridge, "stop", lambda self: None)
+    bridge = module.BinaryNinjaBridge()
+    bridge.targets = targets
+    bridge.ctx = module.BridgeContext(targets)
+    monkeypatch.setattr(module, "_bridge", bridge)
+    return bridge
 
 
 def _rows_by_file(manager):
@@ -1647,7 +1648,7 @@ def test_gui_restart_keeps_unsaved_state_of_retained_tabs(monkeypatch):
     assert after["/work/sample-b"]["unsaved"] is False
     for path in after:
         assert after[path]["view_id"] == before[path]["view_id"]
-    assert module._retired_targets is None
+    assert module._retired_bridge is None
     module._headless_views.clear()
 
 
@@ -1729,6 +1730,112 @@ def test_gui_restart_after_a_failed_start_still_carries_the_ledger(monkeypatch):
 
     assert _rows_by_file(module._bridge.targets)["/work/sample-a"]["unsaved"] is True
     module._headless_views.clear()
+
+
+def _verified_comment(address: int, body: str | None) -> dict:
+    row = {"op": "set_comment" if body is not None else "delete_comment",
+           "status": "verified", "address": hex(address)}
+    if body is not None:
+        row["requested"] = {"comment": body}
+    return row
+
+
+def test_gui_restart_carries_and_forwards_the_session_comment_ledger(monkeypatch):
+    """#992 item 3: the #977 ledger of comments this session wrote stayed with
+    the retired manager, so after Restart Bridge the agent's own notes rendered
+    `<annotation redacted>` again. The new bridge must still credit them, and a
+    comment the old bridge commits after the handover must reach it too --
+    on the retained tab only."""
+    from _bridge_fakes import _ClosableBV, _register_views
+
+    module = _load_bridge(monkeypatch)
+    handle = types.SimpleNamespace(closed=False)
+    other_handle = types.SimpleNamespace(closed=False)
+    old = module.TargetManager()
+    tab = _ClosableBV("/work/sample-a", handle=handle)
+    other = _ClosableBV("/work/sample-b", handle=other_handle)
+    _register_views(module, tab, other)
+    old.refresh()
+    old.note_session_annotations(tab, [_verified_comment(0x401000, "early note"),
+                                       _verified_comment(0x401010, "dropped later")])
+    _restartable_gui_bridge(module, monkeypatch, old)
+
+    module.restart_bridge()
+    new = module._bridge.targets
+
+    # Late commits by requests the old bridge admitted before it stopped.
+    old.note_session_annotations(tab, [_verified_comment(0x401020, "late note"),
+                                       _verified_comment(0x401010, None)])
+    # The new bridge sees fresh wrapper objects for the same tabs.
+    fresh_tab = _ClosableBV("/work/sample-a", handle=handle)
+    fresh_other = _ClosableBV("/work/sample-b", handle=other_handle)
+    _register_views(module, fresh_tab, fresh_other)
+    new.refresh()
+    assert new.session_annotations(fresh_tab) == {
+        ("address", 0x401000): "early note",
+        ("address", 0x401020): "late note",
+    }
+    assert new.session_annotations(fresh_other) == {}
+    # The carried ledger is the successor's own: a write on the new bridge does
+    # not leak back into the retired manager.
+    new.note_session_annotations(fresh_tab, [_verified_comment(0x401030, "new note")])
+    assert ("address", 0x401030) not in old.session_annotations(tab)
+    module._headless_views.clear()
+
+
+def test_gui_restart_hands_the_write_locks_to_the_successor(monkeypatch):
+    """#992 item 3: each bridge built its own write gate and target lock, so a
+    write the old bridge admitted before Restart Bridge and a write on the new
+    bridge held different locks and ran together on the same view. A write
+    still running on the old bridge must hold off the new bridge's writes and
+    reads, and BN_NO_WAIT requests -- writes and reads -- must be refused
+    naming it."""
+    module = _load_bridge(monkeypatch)
+    old_bridge = _restartable_gui_bridge(module, monkeypatch, module.TargetManager())
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def late_write():
+        with module._gate_request_context("batch_apply", "req-old", False), \
+                old_bridge._write_operation_lock():
+            holding.set()
+            release.wait(10)
+
+    writer = threading.Thread(target=late_write)
+    writer.start()
+    try:
+        assert holding.wait(5)
+        module.restart_bridge()
+        new_bridge = module._bridge
+        assert new_bridge is not old_bridge
+
+        with module._gate_request_context("rename_symbol", "req-new", True), \
+                pytest.raises(RuntimeError, match="busy: batch_apply in progress"), \
+                new_bridge._write_gate:
+            pass
+
+        refused = new_bridge.dispatch(
+            {"op": "list_targets", "params": {}, "id": "req-read", "no_wait": True})
+        assert refused["ok"] is False
+        assert refused["error"].startswith("busy: batch_apply in progress")
+
+        read_done = threading.Event()
+
+        def new_read():
+            with new_bridge._target_lock.read():
+                read_done.set()
+
+        reader = threading.Thread(target=new_read)
+        reader.start()
+        assert not read_done.wait(0.2), "a read ran inside the old bridge's write"
+        release.set()
+        writer.join(5)
+        assert read_done.wait(5)
+        reader.join(5)
+    finally:
+        release.set()
+        writer.join(5)
 
 
 # --------------------------------------------------------------------------
