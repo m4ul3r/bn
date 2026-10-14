@@ -598,7 +598,7 @@ def test_backward_slice_assumptions_nonempty_when_ip_depth_exhausted(monkeypatch
     assert result["frontiers"] == [
         {"reason": "call_or_jump_boundary", "count": 1,
          "examples": [{"ssa_label": "r0#3", "address": "0x1000c", "depth": 0,
-                       "callee": "callee_fn"}]},
+                       "callee": "callee_fn", "callee_display_name": "callee_fn"}]},
     ]
 
 
@@ -649,13 +649,25 @@ def test_build_backward_trace_call_depth_guard_marks_boundary_not_dangling_cross
     assert rts._summarize_frontiers(trace) == [
         {"reason": "call_or_jump_boundary", "count": 1,
          "examples": [{"ssa_label": "r0#3", "address": "0x1000c", "depth": 0,
-                       "callee": "callee_fn"}]},
+                       "callee": "callee_fn", "callee_display_name": "callee_fn"}]},
     ]
     assert rts._trace_assumptions(trace, truncated=False, max_depth=10) == [
         "interprocedural crossing stopped at the internal recursion-depth "
         "safety limit (not adjustable via --ip-depth); the slice may be "
         "incomplete beyond that boundary"
     ]
+
+
+def test_out_param_caveat_keeps_the_raw_callee_name_1001(monkeypatch):
+    # #1001 review round 3: free-text caveats keep raw names, so `--mangled`
+    # and the default print the same caveat; the demangled name rides on the
+    # step (`out_param_callee_display_name`) for the step line and roll-up.
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    trace = [{"reason": "out_param_not_followed", "terminates": True,
+              "out_param_callee": "_ZN2ns4fillEPl", "out_param_callee_display_name": "ns::fill"}]
+    assert rts._trace_assumptions(trace, truncated=False, max_depth=10) == [
+        "value crosses an out-parameter fill by _ZN2ns4fillEPl that this trace did not "
+        "follow; the true origin may be inside it"]
 
 
 def test_build_backward_trace_records_step_for_unsupported_ssa_form(monkeypatch):
@@ -715,8 +727,10 @@ def test_output_pointer_hint_names_callee_not_param_name(monkeypatch):
     assert result["arg_label"]["callee"] == "fill_record"
     assert result["arg_label"]["name"] == "out"
     assert len(result["hints"]) == 1
-    assert "fill_record writes into the pointee" in result["hints"][0]
-    assert "out writes into the pointee" not in result["hints"][0]
+    assert "if fill_record fills it instead" in result["hints"][0]
+    # fill_record has no source model, so the runnable seed is the arg itself.
+    assert "--source arg:fill_record:0`" in result["hints"][0]
+    assert "out fills" not in result["hints"][0]
 
 
 def test_backward_slice_states_the_callee_structurally_755(monkeypatch):

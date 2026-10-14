@@ -6,6 +6,7 @@ engine re-exports these names for back-compat.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from .taint_models import TaintError
@@ -156,17 +157,36 @@ def _render_source(source: Any) -> str:
 
 
 def _make_signature(source: Any, chain: list[str], sink_class: str | None,
-                    sink_callee: str | None) -> dict[str, Any]:
+                    sink_callee: str | None, *,
+                    display: Callable[[str], str | None] | None = None,
+                    symbol: Callable[[str], str | None] | None = None) -> dict[str, Any]:
     cls = f"[{sink_class}] " if sink_class else ""
     src = _render_source(source)
     parts = [src] + [str(c) for c in chain] + [f"{cls}{sink_callee}"]
-    return {
+    sig = {
         "source": src,
         "chain": [str(c) for c in chain],
         "sink_class": sink_class,
         "sink_callee": sink_callee,
         "rendered": " → ".join(parts),
     }
+    # #1001 item 4: the same signature with every function named as `decompile`
+    # names it (`rendered_display`), and with the real raw symbols
+    # (`rendered_symbol`, what --mangled prints: the model key drops a C++
+    # symbol's leading underscore, so the sink in `rendered` is not a real
+    # symbol). `rendered` stays the raw, address-free grouping key. Each is
+    # always present when its resolver was given (equal to `rendered` when the
+    # names do not change).
+    for key, resolve in (("rendered_display", display), ("rendered_symbol", symbol)):
+        if resolve is None:
+            continue
+
+        def _named(name: Any, resolve=resolve) -> str:
+            return (resolve(str(name)) or str(name)) if name else str(name)
+        named_src = _named(src) if not isinstance(source, dict) else src
+        sig[key] = " → ".join([named_src] + [_named(c) for c in chain]
+                              + [f"{cls}{_named(sink_callee)}"])
+    return sig
 
 
 def derive_flow_facts(*, direction: str,
@@ -177,6 +197,8 @@ def derive_flow_facts(*, direction: str,
                       fn_name: str | None = None,
                       origin: dict[str, Any] | None = None,
                       crossed_functions: list[str] | None = None,
+                      display: Callable[[str], str | None] | None = None,
+                      symbol: Callable[[str], str | None] | None = None,
                       ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Structural triage facts + an address-free grouping signature for one flow.
 
@@ -203,7 +225,8 @@ def derive_flow_facts(*, direction: str,
                         for lf in (leaves or []) if lf.get("address"))
         metrics = {"steps": len(steps), "fns_spanned": 1 + len(chain),
                    "traverses_unresolved": bool(traverses)}
-        return metrics, _make_signature(source, chain, sink_class, sink_callee)
+        return metrics, _make_signature(source, chain, sink_class, sink_callee,
+                                        display=display, symbol=symbol)
 
     # backward
     crossed = [str(c) for c in (crossed_functions or [])]
@@ -218,4 +241,5 @@ def derive_flow_facts(*, direction: str,
                                   "address_of_local_unresolved", "global"}
     metrics = {"steps": len(steps), "fns_spanned": max(1, len(set(crossed)) + 1),
                "traverses_unresolved": bool(traverses)}
-    return metrics, _make_signature(source, chain, None, sink_callee)
+    return metrics, _make_signature(source, chain, None, sink_callee,
+                                    display=display, symbol=symbol)

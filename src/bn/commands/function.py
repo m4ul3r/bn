@@ -1225,6 +1225,7 @@ def _evidence_init(args: argparse.Namespace) -> int:
                       "intra mode (this flag off), for a call in the same function."),
              arg("--ip-depth", type=_depth_int, default=2,
                  help="Max call depth for interprocedural tracing (default: 2; 0 disables crossing)"),
+             mangled_arg(),
          ],
          estimable=True)
 def _trace(args: argparse.Namespace) -> int:
@@ -1241,6 +1242,6 @@ def _trace(args: argparse.Namespace) -> int:
             "ip_depth": args.ip_depth,
         },
         require_target=True,
-        text_renderer=_render_trace_text,
+        text_renderer=lambda v: _render_trace_text(v, mangled=args.mangled),
         stem="trace",
     )
