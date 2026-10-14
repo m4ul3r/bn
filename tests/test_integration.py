@@ -508,6 +508,61 @@ class TestBatchManifestTarget:
         assert payload["preview"] is True
         assert payload["results"][0]["status"] == "verified"
 
+    def test_a_name_an_earlier_op_renamed_names_the_rename_975(self, shared_bn, tmp_path):
+        """#975: a later op that names a function by the `sub_<addr>` spelling an
+        earlier op in the same batch replaced must say so -- not offer
+        close-but-unrelated "Did you mean" functions, which reads as a wrong
+        address. Stripped, so the name is BN's synthesized one: a named ELF
+        symbol would keep resolving after the rename and hide the defect.
+
+        The hint must stay silent when the name still resolves -- a round trip
+        gave it back, or a later rename reused it for another function -- and
+        the op failed for its own reason; otherwise it buries that reason and
+        points at the function the name used to denote."""
+        stripped = tmp_path / "add_stripped"
+        build = subprocess.run(["strip", "-o", str(stripped), str(ADD_BINARY)],
+                               capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        shared_bn.load(stripped, copy=False)
+        autos = [f for f in shared_bn.json("function", "list", "--limit", "500")["items"]
+                 if f["name"].startswith("sub_")]
+        (old, address), (other, _) = [(f["name"], f["address"]) for f in autos[:2]]
+
+        def failed_row(*ops):
+            manifest = tmp_path / "batch.json"
+            manifest.write_text(json.dumps({"ops": list(ops)}), encoding="utf-8")
+            result = shared_bn.run("batch", "apply", str(manifest), "--preview",
+                                   "--format", "json")
+            assert result.returncode == 3, (result.stdout, result.stderr)
+            payload = json.loads(result.stdout)
+            assert payload["rolled_back"] is True
+            return payload["results"][len(ops) - 1]
+
+        def rename(src, dst):
+            return {"op": "rename_symbol", "identifier": src, "new_name": dst}
+
+        failed = failed_row(rename(old, "handle_request"),
+                            {"op": "set_comment", "function": old, "comment": "entry"})
+        assert failed["status"] == "unsupported"
+        assert "Did you mean" not in failed["message"]
+        assert (f"operation 0 of this batch renamed {old} (at {address}) to "
+                "handle_request") in failed["message"], failed["message"]
+
+        def bad_local(fn):
+            return {"op": "local_rename", "function": fn, "variable": "no_such_var",
+                    "new_name": "unused"}
+
+        for ops in (
+            # Round trip: the name is back, so it resolves.
+            (rename(old, "foo"), rename("foo", old), bad_local(old)),
+            # Reuse: `alpha` now names the OTHER function.
+            (rename(old, "alpha"), rename("alpha", "gamma"), rename(other, "alpha"),
+             bad_local("alpha")),
+        ):
+            failed = failed_row(*ops)
+            assert "no_such_var" in failed["message"], failed["message"]
+            assert "of this batch renamed" not in failed["message"], failed["message"]
+
 
 class TestProtoSetUnnamedParams:
     """Regression for #254: a `proto set` whose prototype omits parameter names

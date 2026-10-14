@@ -113,7 +113,7 @@ bn batch apply -t <selector> --preview - <<'BN_EOF'
 BN_EOF
 ```
 
-The manifest must be an object with an `ops` array. Validation runs before apply; a missing field or an unknown op refuses the batch. Do not write the same key twice in one batch: each op is verified against the final state, so a later write would invalidate the earlier op's result. Large batches hold the exclusive write lock; split a manifest that exceeds the default 5000-op or 32 MiB request limits.
+The manifest must be an object with an `ops` array. Validation runs before apply; a missing field or an unknown op refuses the batch. Do not write the same key twice in one batch: each op is verified against the final state, so a later write would invalidate the earlier op's result. Ops apply in order and each resolves names against the state the earlier ops left, so after a `rename_symbol` refer to that function by its new name or its address, not the old `sub_*` name. Large batches hold the exclusive write lock; split a manifest that exceeds the default 5000-op or 32 MiB request limits.
 
 ### Batch op kinds and required fields
 

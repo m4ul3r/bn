@@ -1547,6 +1547,8 @@ def test_restart_bridge_stops_the_old_instance_before_starting_a_new_one(monkeyp
     events: list[tuple[str, int]] = []
 
     class _FakeBridge:
+        targets = None
+
         def start(self):
             events.append(("start", id(self)))
 
@@ -1571,6 +1573,8 @@ def test_restart_bridge_leaves_global_none_when_the_new_start_fails(monkeypatch)
     monkeypatch.setattr(module, "ui", object())
 
     class _StopOnlyBridge:
+        targets = None
+
         def stop(self):
             pass
 
@@ -1585,6 +1589,146 @@ def test_restart_bridge_leaves_global_none_when_the_new_start_fails(monkeypatch)
     module.restart_bridge()  # must not raise -- logs and returns
 
     assert module._bridge is None
+
+
+def _restartable_gui_bridge(module, monkeypatch, targets):
+    """A GUI bridge stand-in that owns a REAL TargetManager, so restart_bridge()
+    runs its real handover; only the socket lifecycle is faked."""
+    monkeypatch.setattr(module, "ui", object())
+    monkeypatch.setattr(module, "_retired_targets", None)
+
+    class _GuiBridge:
+        def __init__(self, manager=None):
+            self.targets = manager if manager is not None else module.TargetManager()
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(module, "BinaryNinjaBridge", _GuiBridge)
+    monkeypatch.setattr(module, "_bridge", _GuiBridge(targets))
+
+
+def _rows_by_file(manager):
+    return {row["filename"]: row for row in manager.refresh()}
+
+
+def test_gui_restart_keeps_unsaved_state_of_retained_tabs(monkeypatch):
+    """#953: Restart Bridge replaced the TargetManager, so a retained tab with a
+    committed-but-unsaved mutation came back `unsaved=false` with nothing
+    saved. The new bridge must report the dirty tab dirty and the clean tab
+    clean, under the same stable ids -- matched by the view's handle (fresh
+    wrapper objects, as BN hands out for non-focused tabs), not by filename."""
+    from _bridge_fakes import _ClosableBV, _register_views
+
+    module = _load_bridge(monkeypatch)
+    dirty_handle = types.SimpleNamespace(closed=False)
+    clean_handle = types.SimpleNamespace(closed=False)
+    old = module.TargetManager()
+    dirty = _ClosableBV("/work/sample-a", handle=dirty_handle)
+    clean = _ClosableBV("/work/sample-b", handle=clean_handle)
+    _register_views(module, dirty, clean)
+    before = _rows_by_file(old)
+    old.mark_dirty(dirty)
+    _restartable_gui_bridge(module, monkeypatch, old)
+
+    module.restart_bridge()
+
+    new = module._bridge.targets
+    assert new is not old
+    # The GUI walk after restart yields NEW wrapper objects for the same tabs.
+    _register_views(module,
+                    _ClosableBV("/work/sample-a", handle=dirty_handle),
+                    _ClosableBV("/work/sample-b", handle=clean_handle))
+    after = _rows_by_file(new)
+    assert after["/work/sample-a"]["unsaved"] is True
+    assert after["/work/sample-b"]["unsaved"] is False
+    for path in after:
+        assert after[path]["view_id"] == before[path]["view_id"]
+    assert module._retired_targets is None
+    module._headless_views.clear()
+
+
+def test_gui_restart_closed_or_new_view_inherits_no_unsaved_state(monkeypatch):
+    """#953: the carried ledger must not leak onto another view. A dirty tab
+    closed across the restart is pruned; a tab opened at the SAME path afterwards
+    is a different view and starts clean, under a fresh id."""
+    from _bridge_fakes import _ClosableBV, _register_views
+
+    module = _load_bridge(monkeypatch)
+    old = module.TargetManager()
+    closed = _ClosableBV("/work/sample-a")
+    _register_views(module, closed)
+    old_id = _rows_by_file(old)["/work/sample-a"]["view_id"]
+    old.mark_dirty(closed)
+    _restartable_gui_bridge(module, monkeypatch, old)
+
+    module.restart_bridge()
+
+    reopened = _ClosableBV("/work/sample-a")  # same path, different core view
+    _register_views(module, reopened)
+    row = _rows_by_file(module._bridge.targets)["/work/sample-a"]
+    assert row["unsaved"] is False
+    assert row["view_id"] != old_id
+    module._headless_views.clear()
+
+
+def test_gui_restart_forwards_late_ledger_changes_from_the_old_bridge(monkeypatch):
+    """#953: a mutation the old bridge admitted can commit after the handover
+    (stop's drain is bounded); its dirty mark -- and a late save's clear -- must
+    reach the bridge that now answers, not die with the retired manager."""
+    from _bridge_fakes import _ClosableBV, _register_views
+
+    module = _load_bridge(monkeypatch)
+    old = module.TargetManager()
+    late_commit = _ClosableBV("/work/sample-a")
+    late_save = _ClosableBV("/work/sample-b")
+    _register_views(module, late_commit, late_save)
+    old.refresh()
+    old.mark_dirty(late_save)
+    _restartable_gui_bridge(module, monkeypatch, old)
+
+    module.restart_bridge()
+    new = module._bridge.targets
+
+    old.mark_dirty(late_commit)   # the old bridge's in-flight mutation commits
+    old.clear_dirty(late_save)    # ...and its in-flight save lands
+
+    rows = _rows_by_file(new)
+    assert rows["/work/sample-a"]["unsaved"] is True
+    assert rows["/work/sample-b"]["unsaved"] is False
+    module._headless_views.clear()
+
+
+def test_gui_restart_after_a_failed_start_still_carries_the_ledger(monkeypatch):
+    """#953: a Restart whose start fails leaves no bridge; the next Restart
+    must still hand the retained tabs' ledger to the bridge that does start."""
+    from _bridge_fakes import _ClosableBV, _register_views
+
+    module = _load_bridge(monkeypatch)
+    old = module.TargetManager()
+    dirty = _ClosableBV("/work/sample-a")
+    _register_views(module, dirty)
+    old.refresh()
+    old.mark_dirty(dirty)
+    _restartable_gui_bridge(module, monkeypatch, old)
+    working = module.BinaryNinjaBridge
+
+    class _BoomBridge(working):
+        def start(self):
+            raise RuntimeError("bind failed")
+
+    monkeypatch.setattr(module, "BinaryNinjaBridge", _BoomBridge)
+    module.restart_bridge()
+    assert module._bridge is None
+
+    monkeypatch.setattr(module, "BinaryNinjaBridge", working)
+    module.restart_bridge()
+
+    assert _rows_by_file(module._bridge.targets)["/work/sample-a"]["unsaved"] is True
+    module._headless_views.clear()
 
 
 # --------------------------------------------------------------------------

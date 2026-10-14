@@ -402,6 +402,35 @@ def test_go_rename_preview_applies_and_reverts(monkeypatch):
     assert fns[0x401000].name == "sub_401000"
 
 
+@pytest.mark.parametrize("preview", [False, True])
+def test_go_rename_refuses_a_quick_view_until_refresh_952(monkeypatch, preview):
+    """#952: `go rename` bypasses the generic engine, so it skipped the engine's
+    quick-view refusal and reported a measured zero-candidate success over a view
+    whose functions were never discovered. Live and preview must refuse before
+    any write with the engine's structured error; once `bn refresh` drops the
+    quick mark, the same view renames normally."""
+    blob = _build_pclntab()
+    bv = _GoBV(blob, defined={0x401000})
+    fns, get_function_at = _fake_functions({0x401000: "sub_401000"})
+    monkeypatch.setattr(bv, "get_function_at", get_function_at)
+    bridge, inst = _ctx(monkeypatch, bv)
+    bridge._quick_loaded_views.add(bv)
+
+    with pytest.raises(bridge.OperationFailure) as err:
+        inst._go_rename(None, preview=preview)
+    assert err.value.status == "invalid_request"
+    assert "--quick" in str(err.value) and "bn refresh" in str(err.value)
+    assert err.value.requested == {"op": "go_rename", "preview": preview}
+    assert fns[0x401000].name == "sub_401000"
+
+    bridge._quick_loaded_views.discard(bv)       # what `bn refresh` does
+    out = inst._go_rename(None, preview=preview)
+    assert out["success"] is True
+    assert out["go_verified_count"] == 1
+    assert fns[0x401000].name == ("sub_401000" if preview else "main.foo")
+
+
+
 def test_go_rename_readback_failure_rolls_back(monkeypatch):
     class _RejectingFn:
         def __init__(self):
