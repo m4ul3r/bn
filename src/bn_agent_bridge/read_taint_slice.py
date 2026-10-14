@@ -1226,8 +1226,9 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
     out_param_reasons = {"interprocedural_out_param_not_followed", "out_param_not_followed"}
     for step in trace:
         if isinstance(step, dict) and step.get("reason") in out_param_reasons:
-            callee = (step.get("out_param_callee_display_name")
-                      or step.get("out_param_callee") or "a callee")
+            # Free-text caveats keep raw names (the step and roll-up carry the
+            # display name), so `--mangled` and the default agree here.
+            callee = step.get("out_param_callee") or "a callee"
             assumptions.append(
                 f"value crosses an out-parameter fill by {callee} that this "
                 f"trace did not follow; the true origin may be inside it"

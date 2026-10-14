@@ -4528,7 +4528,8 @@ def _render_flow_line(f: dict[str, Any], *, mangled: bool = False) -> str:
         # on its own row, not only in a frontier further down.
         arity = _field_dict(sink, "arity_mismatch")
         via = (f" via {arity.get('register') or 'ABI register'}, arity mismatch"
-               if sink.get("via") == "abi_register" else "")
+               if sink.get("via") == "abi_register"
+               else (", arity mismatch" if arity else ""))
         arg = f" (arg {ai}{via})"
     m = _field_dict(f, "metrics")
     sig = _signature_text(_field_dict(f, "signature"), mangled=mangled)
@@ -4697,16 +4698,20 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                     lines.append(f"  {f!r}")
                     continue
                 lines.append(_render_flow_line(f, mangled=mangled))
-                # #1001 item 1: the arity mismatch behind an ABI-register sink,
-                # and the command that settles it, on the compact view.
+                # #1001 item 1: the arity mismatch behind the sink, that its
+                # class is the model's own and unproven, and the command that
+                # settles it, on the compact view.
                 _arity = _field_dict(_field_dict(f, "sink"), "arity_mismatch")
-                if _field_dict(f, "sink").get("via") == "abi_register" and _arity:
+                if _arity:
                     _ref = _text_value(_arity, "callee_ref")
+                    _reg = _text_value(_arity, "register")
                     lines.append(
-                        f"      read from ABI register {_arity.get('register') or '?'}: "
-                        f"BN recovered {_arity.get('recovered', '?')} param(s) for this call"
-                        + (f" -- confirm with `bn proto get {_ref}`, then `bn proto set`"
-                           if _ref else " -- the call target did not resolve"))
+                        "      class unproven: BN recovered "
+                        f"{_arity.get('recovered', '?')} param(s) for this call and dropped the "
+                        f"model's arg(s) {_field_list(_arity, 'dropped')}"
+                        + (f"; the tainted arg was read from ABI register {_reg}" if _reg else "")
+                        + (f" -- fix the prototype (`bn proto get {_ref}`, then `bn proto set`) "
+                           "and re-run" if _ref else " -- the call target did not resolve"))
                 # #980: a finding whose class differs from its catalog entry says
                 # so, and why, on the compact view -- `taint models` lists the
                 # call as `[overflow_len] memcpy`, and two names for one sink with

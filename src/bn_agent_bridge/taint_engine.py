@@ -77,10 +77,9 @@ class _RegisterOperand:
     the value its calling-convention register holds at the call (#1001 item 1).
 
     Shaped like an ``MLIL_VAR_SSA`` read of that value (``operation.name``,
-    ``src``, ``vars_read``) so the sink classifiers that take a call operand
-    judge it exactly as they judge a recovered parameter. ``var`` is None when no
-    single reaching value is known: the operand then reads nothing, so no
-    classifier can resolve it -- it is never a guess."""
+    ``src``, ``vars_read``) so the forward walk's taint check can ask whether
+    the dropped arg carries taint. It is evidence of REACH only: it is never
+    handed to a sink classifier, so no class is lowered from a register read."""
 
     class _Op:
         name = "MLIL_VAR_SSA"
@@ -89,11 +88,11 @@ class _RegisterOperand:
 
     def __init__(self, var: Any, register: str | None) -> None:
         self.src = var
-        self.vars_read = [var] if var is not None else []
+        self.vars_read = [var]
         self.register = register
 
     def __str__(self) -> str:
-        return f"{self.src if self.src is not None else '?'} (via {self.register or '?'})"
+        return f"{self.src} (via {self.register or '?'})"
 
 
 # Caller sites the backward ascent follows per function. Module-level (not a
@@ -3931,15 +3930,16 @@ class TaintEngine:
             return "Binary Ninja produced no MLIL for it"
         return None
 
-    def _thunk_tail_target(self, fn: Any) -> Any | None:
-        """The function a thunk tail-calls, found on ANY of its instructions --
-        `follow_thunk` only takes a one-instruction body, but BN also marks a
-        longer body that ends in a tail jump (an oversized function after
-        `--force-analysis`) a thunk (#1001 review). None when no tail call has
-        a constant target that is a function."""
+    def _thunk_tail_targets(self, fn: Any) -> list[Any]:
+        """Every function a thunk tail-calls, found on ANY of its instructions
+        and in instruction order -- `follow_thunk` only takes a one-instruction
+        body, but BN also marks a longer body that ends in a tail jump (an
+        oversized function after `--force-analysis`) a thunk (#1001 review).
+        Empty when no tail call has a constant target that is a function."""
         ssa = _mlil_ssa(fn)
         if ssa is None:
-            return None
+            return []
+        targets: list[Any] = []
         for insn in _ssa_instructions(ssa):
             if "TAILCALL" not in op_name(insn) or getattr(insn, "dest", None) is None:
                 continue
@@ -3948,9 +3948,9 @@ class TaintEngine:
             except Exception:
                 addr = None
             target = function_at(self.bv, addr) if addr is not None else None
-            if target is not None and target is not fn:
-                return target
-        return None
+            if target is not None and target is not fn and target not in targets:
+                targets.append(target)
+        return targets
 
     def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int) -> dict[str, Any]:
         """Analyze *callee* with the given tainted parameter indices, caching the
@@ -4556,68 +4556,55 @@ class TaintEngine:
                 if leaf not in leaves:
                     leaves.append(leaf)
 
-            def _dropped_operand(i: int) -> Any:
-                """A dropped arg the classification may consult (a copy's
-                destination, a bounded write's buffer): its register's single
-                reaching value, else an operand no classifier can resolve --
-                never a guess."""
-                try:
-                    r_i, s_i = self._reaching_arg_seeds_via_reg(func, [ins], i)
-                except Exception:
-                    r_i, s_i = None, []
-                return _RegisterOperand(s_i[0][0] if len(s_i) == 1 else None, r_i)
+            def _sink_arg_reach(argidx: int, sink: dict[str, Any]) -> tuple[list, dict | None]:
+                """``(hit_nodes, arity)`` for a modeled sink's arg.
 
-            def _sink_arg_operands(argidx: int, sink: dict[str, Any]
-                                   ) -> tuple[list[Any] | None, list, dict | None]:
-                """``(operands, hit_nodes, abi)`` for a modeled sink's arg.
+                In range: the taint the call's own param carries. Out of range
+                (#577: an ARM-Thumb `j_memcpy` typed `memcpy(int32_t)` drops the
+                length register) the arg is recovered through its calling-
+                convention register (the #433 reg bridge) and reported only when
+                that value really carries taint, so a merely under-recovered but
+                quiet sink does not cry wolf (#1001 item 1: it used to be an
+                `arg_under_recovered` frontier LEAF, which kept a sink the engine
+                SAW reached out of the verdict and `flows`).
 
-                The operands are the call's own params, extended past BN's
-                recovered arity (#577: an ARM-Thumb `j_memcpy` typed
-                `memcpy(int32_t)` drops the length register) with register
-                stand-ins for EVERY index the model declares -- the checked arg,
-                `len_arg`, `buf_arg` and the copy roles, in whatever order the
-                model puts them (#1001 review: `app_recv(fd, len, buf)` has its
-                buffer AFTER its length). So the SAME classification the
-                in-range path runs (bounded copy, receive bound, index-only, ...)
-                judges the arg. A dropped checked arg is reported only when its
-                register value really carries taint, so a merely under-recovered
-                but quiet sink does not cry wolf; ``abi`` names the register and
-                the arity mismatch for the finding. This used to be an
-                `arg_under_recovered` frontier LEAF, which kept a modeled sink the
-                engine SAW reached out of the verdict and `flows`."""
+                ``arity`` is None when BN recovered every arg the model declares
+                (the checked arg, `tainted_args`, `len_arg`, `buf_arg`, the copy
+                roles); otherwise it names them in ``dropped``. A register value
+                is evidence of REACH only: no class is ever lowered from it (a
+                bounded copy, a receive bound, ...), because the register bridge
+                cannot stand behind what a dropped arg holds -- the class a
+                dropped arg would decide stays the model's own until the
+                prototype is fixed. Precise classification through dropped
+                registers is a follow-up (#1001 review round 3)."""
                 declared = [argidx, *(sink.get("tainted_args") or [])]
                 declared += [sink[k] for k in ("len_arg", "buf_arg") if sink.get(k) is not None]
                 declared += list(_model_copy_roles(model) or ())
-                need = max(int(i) for i in declared if isinstance(i, int) and not isinstance(i, bool))
+                dropped = sorted({int(i) for i in declared
+                                  if isinstance(i, int) and not isinstance(i, bool) and i >= len(params)})
+                reg = None
                 if argidx < len(params):
                     hit = arg_taint(params[argidx])
-                    if need < len(params) or not hit:
-                        return params, hit, None
-                    return (list(params) + [_dropped_operand(i) for i in range(len(params), need + 1)],
-                            hit, None)
-                try:
-                    reg, seeds = self._reaching_arg_seeds_via_reg(func, [ins], argidx)
-                except Exception:
-                    return None, [], None
-                operand = hit = None
-                for v, _site in seeds:
-                    cand = _RegisterOperand(v, reg)
-                    nodes = arg_taint(cand)
-                    if not nodes and self._var_buffer_tainted(ssaf, v, tainted, set(), 0):
-                        # A pointer reaching a tainted buffer the store/load keys
-                        # do not name (a PHI of allocations): cite the register.
-                        nodes = [(var_key(v), getattr(v, "version", None))]
-                    if nodes:
-                        operand, hit = cand, nodes
-                        break
-                if operand is None:
-                    return None, [], None
-                operands: list[Any] = list(params) + [
-                    operand if i == argidx else _dropped_operand(i)
-                    for i in range(len(params), max(need, argidx) + 1)]
+                else:
+                    try:
+                        reg, seeds = self._reaching_arg_seeds_via_reg(func, [ins], argidx)
+                    except Exception:
+                        return [], None
+                    hit = []
+                    for v, _site in seeds:
+                        nodes = arg_taint(_RegisterOperand(v, reg))
+                        if not nodes and self._var_buffer_tainted(ssaf, v, tainted, set(), 0):
+                            # A pointer reaching a tainted buffer the store/load
+                            # keys do not name (a PHI of allocations): cite it.
+                            nodes = [(var_key(v), getattr(v, "version", None))]
+                        if nodes:
+                            hit = nodes
+                            break
+                if not hit or not dropped:
+                    return hit, None
                 taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
-                return operands, hit, {"register": reg, "recovered": len(params),
-                                       "callee_ref": hex(int(taddr)) if taddr is not None else None}
+                return hit, {"recovered": len(params), "dropped": dropped, "register": reg,
+                             "callee_ref": hex(int(taddr)) if taddr is not None else None}
 
             sink = model.get("sink")
             # opt-in sinks (e.g. file_write) stay silent unless their gate was
@@ -4707,232 +4694,239 @@ class TaintEngine:
                 if sink.get("len_arg") is not None and sink["len_arg"] not in _sink_args:
                     _sink_args.append(int(sink["len_arg"]))
                 for argidx in _sink_args:
-                    aparams, ht, abi = _sink_arg_operands(argidx, sink)
-                    if aparams is not None:
-                        if ht:
-                            sig = (addr, argidx) if site_taddr is None else (addr, argidx, site_taddr)
-                            if sig not in recorded_sinks:
-                                recorded_sinks.add(sig)
-                                eff_sink = sink
-                                # Downgrade a tainted memcpy-family LENGTH from
-                                # overflow to bounded when the copy provably fits
-                                # the buffer the destination was allocated with in
-                                # this function -- the exact dst=malloc(n);
-                                # memcpy(dst,src,n) case AND the generalized
-                                # dst=alloc(len+C); memcpy(dst+c,src,len+D) with
-                                # c+D<=C, plus unmodeled single-arg allocator
-                                # wrappers (#46 item 1, #229). The length is
-                                # attacker-derived but the copy cannot overflow.
-                                # Still reported, just relabeled, so it's not noise
-                                # in the overflow set.
-                                # #443: for a recv-style bounded-write sink the
-                                # destination is `buf_arg` (not memcpy's arg0), so the
-                                # provably-bounded downgrade checks the right buffer.
-                                if argidx == sink.get("len_arg") and sink.get("buf_arg") is None:
-                                    # Armed by len_arg but NO buf_arg declared: do NOT
-                                    # guess arg0 as the destination -- arg0 may be a
-                                    # sibling buffer sized to the length while the real
-                                    # write dest is a different, smaller arg, which would
-                                    # wrongly downgrade a real overflow to bounded_len
-                                    # (audit D2). No declared dest => no bounded downgrade.
-                                    _bnd_reason = None
-                                else:
-                                    # #980 review: the copy's destination is the arg
-                                    # its model copies INTO, not a fixed arg0 --
-                                    # bcopy(src, dst, n) writes arg1, and sizing its
-                                    # SOURCE as the destination relabelled a real
-                                    # overflow of dst bounded_len.
-                                    _roles = _model_copy_roles(model)
-                                    _dest_idx = (int(sink["buf_arg"])
-                                                 if (sink.get("buf_arg") is not None
-                                                     and argidx == sink.get("len_arg"))
-                                                 else (_roles[1] if _roles else 0))
-                                    # #808: a declared len_arg+buf_arg pair IS a
-                                    # bounded-write declaration, so the provably-bounded
-                                    # relabel must not hinge on the model's class hint --
-                                    # one entry arms several args under ONE class, and a
-                                    # class describing a sibling arg (snprintf: the write
-                                    # length arg1 shares format_or_overflow with the
-                                    # format arg2) says nothing about this length. Still
-                                    # gated on argidx == len_arg, so a non-length arg of
-                                    # such an entry is never relabeled by another arg's
-                                    # length. Inert for every pre-existing model: the
-                                    # read/recv family reaches the same `_bnd_reason`
-                                    # through its `overflow_len` class already, and a
-                                    # `len_arg` without `buf_arg` took the branch above.
-                                    _len_pair = (sink.get("buf_arg") is not None
+                    ht, arity = _sink_arg_reach(argidx, sink)
+                    # Only the call's own params classify a sink. A checked arg
+                    # BN dropped was read from its ABI register, which is evidence
+                    # of reach, not of value: no class is lowered from it, so the
+                    # model's class stands (#1001 review round 3).
+                    classify = argidx < len(params)
+                    if ht:
+                        sig = (addr, argidx) if site_taddr is None else (addr, argidx, site_taddr)
+                        if sig not in recorded_sinks:
+                            recorded_sinks.add(sig)
+                            eff_sink = sink
+                            # Downgrade a tainted memcpy-family LENGTH from
+                            # overflow to bounded when the copy provably fits
+                            # the buffer the destination was allocated with in
+                            # this function -- the exact dst=malloc(n);
+                            # memcpy(dst,src,n) case AND the generalized
+                            # dst=alloc(len+C); memcpy(dst+c,src,len+D) with
+                            # c+D<=C, plus unmodeled single-arg allocator
+                            # wrappers (#46 item 1, #229). The length is
+                            # attacker-derived but the copy cannot overflow.
+                            # Still reported, just relabeled, so it's not noise
+                            # in the overflow set.
+                            # #443: for a recv-style bounded-write sink the
+                            # destination is `buf_arg` (not memcpy's arg0), so the
+                            # provably-bounded downgrade checks the right buffer.
+                            if argidx == sink.get("len_arg") and sink.get("buf_arg") is None:
+                                # Armed by len_arg but NO buf_arg declared: do NOT
+                                # guess arg0 as the destination -- arg0 may be a
+                                # sibling buffer sized to the length while the real
+                                # write dest is a different, smaller arg, which would
+                                # wrongly downgrade a real overflow to bounded_len
+                                # (audit D2). No declared dest => no bounded downgrade.
+                                _bnd_reason = None
+                            else:
+                                # #980 review: the copy's destination is the arg
+                                # its model copies INTO, not a fixed arg0 --
+                                # bcopy(src, dst, n) writes arg1, and sizing its
+                                # SOURCE as the destination relabelled a real
+                                # overflow of dst bounded_len.
+                                _roles = _model_copy_roles(model)
+                                _dest_idx = (int(sink["buf_arg"])
+                                             if (sink.get("buf_arg") is not None
                                                  and argidx == sink.get("len_arg"))
-                                    _bnd_reason = (self._bounded_copy_reason(ssaf, aparams, argidx, dest_idx=_dest_idx)
-                                                   if (sink.get("class") == "overflow_len" or _len_pair) else None)
-                                if _bnd_reason is not None:
+                                             else (_roles[1] if _roles else 0))
+                                # #808: a declared len_arg+buf_arg pair IS a
+                                # bounded-write declaration, so the provably-bounded
+                                # relabel must not hinge on the model's class hint --
+                                # one entry arms several args under ONE class, and a
+                                # class describing a sibling arg (snprintf: the write
+                                # length arg1 shares format_or_overflow with the
+                                # format arg2) says nothing about this length. Still
+                                # gated on argidx == len_arg, so a non-length arg of
+                                # such an entry is never relabeled by another arg's
+                                # length. Inert for every pre-existing model: the
+                                # read/recv family reaches the same `_bnd_reason`
+                                # through its `overflow_len` class already, and a
+                                # `len_arg` without `buf_arg` took the branch above.
+                                _len_pair = (sink.get("buf_arg") is not None
+                                             and argidx == sink.get("len_arg"))
+                                _bnd_reason = (self._bounded_copy_reason(ssaf, params, argidx, dest_idx=_dest_idx)
+                                               if classify and (sink.get("class") == "overflow_len" or _len_pair)
+                                               else None)
+                            if _bnd_reason is not None:
+                                eff_sink = {
+                                    **sink,
+                                    "class": "bounded_len",
+                                    "detail": (sink.get("detail") or "")
+                                    + f" (attacker-derived length, but {_bnd_reason})",
+                                    "relabel": "destination sized by the copy length",
+                                }
+                                # #980: bounding the WRITE says nothing about the
+                                # READ. Size the copy source and re-headline to
+                                # `overread_len` when it is a fixed-size object
+                                # the length is not provably within.
+                                eff_sink = self._source_side_verdict(
+                                    ssaf, params, argidx, mkey, model, eff_sink)
+                            elif classify and sink.get("class") == "overflow_len":
+                                # Length is the return of a modeled receive
+                                # call bounded by a constant count arg
+                                # (n = read(fd, buf, MAX); memcpy(dst, buf, n)):
+                                # attacker-derived but provably <= MAX (#159).
+                                _bnd = self._syscall_bound_for_length(ssaf, params[argidx])
+                                if _bnd is not None:
                                     eff_sink = {
                                         **sink,
                                         "class": "bounded_len",
+                                        "source_bound": hex(_bnd),
                                         "detail": (sink.get("detail") or "")
-                                        + f" (attacker-derived length, but {_bnd_reason})",
-                                        "relabel": "destination sized by the copy length",
+                                        + f" (length is a modeled receive return provably "
+                                        f"bounded by {hex(_bnd)} -- bounded copy, not an "
+                                        "unbounded overflow)",
                                     }
-                                    # #980: bounding the WRITE says nothing about the
-                                    # READ. Size the copy source and re-headline to
-                                    # `overread_len` when it is a fixed-size object
-                                    # the length is not provably within.
-                                    eff_sink = self._source_side_verdict(
-                                        ssaf, aparams, argidx, mkey, model, eff_sink)
-                                elif sink.get("class") == "overflow_len":
-                                    # Length is the return of a modeled receive
-                                    # call bounded by a constant count arg
-                                    # (n = read(fd, buf, MAX); memcpy(dst, buf, n)):
-                                    # attacker-derived but provably <= MAX (#159).
-                                    _bnd = self._syscall_bound_for_length(ssaf, aparams[argidx])
-                                    if _bnd is not None:
-                                        eff_sink = {
-                                            **sink,
-                                            "class": "bounded_len",
-                                            "source_bound": hex(_bnd),
-                                            "detail": (sink.get("detail") or "")
-                                            + f" (length is a modeled receive return provably "
-                                            f"bounded by {hex(_bnd)} -- bounded copy, not an "
-                                            "unbounded overflow)",
-                                        }
-                                # Reserve overflow_* for buffer/length-operand
-                                # taint: if the taint reaches this sink only
-                                # through an array index/offset (`base + i*stride`)
-                                # and the buffer itself is untainted, reclassify to
-                                # the distinct, lower-confidence `tainted_index`
-                                # (an OOB-access risk, not an unbounded/length
-                                # overflow) rather than over-stating overflow_*
-                                # (#163). Conservative: ambiguous cases stay
-                                # overflow_* so a real overflow is never hidden.
-                                # The arg is a copy-SOURCE pointer (vs a length
-                                # scalar) when the model propagates a buffer FROM
-                                # it (`*arg:<argidx>` in propagates.from) -- true
-                                # for strcpy/strcpy_chk arg1, false for the memcpy/
-                                # memcpy_chk length arg2. This drives the register-
-                                # base index broadening per-arg, so a fortified
-                                # length stays an overflow while a fortified source
-                                # index downgrades.
-                                _ptr_arg = eff_sink.get("class") == "overflow_unbounded" \
-                                    or argidx in _model_buffer_source_args(model)
-                                if eff_sink.get("class") in _OVERFLOW_INDEX_CLASSES \
-                                        and self._sink_taint_is_index_only(
-                                            ssaf, aparams[argidx], tainted, pointer_arg=_ptr_arg):
-                                    _prior = eff_sink.get("class")
+                            # Reserve overflow_* for buffer/length-operand
+                            # taint: if the taint reaches this sink only
+                            # through an array index/offset (`base + i*stride`)
+                            # and the buffer itself is untainted, reclassify to
+                            # the distinct, lower-confidence `tainted_index`
+                            # (an OOB-access risk, not an unbounded/length
+                            # overflow) rather than over-stating overflow_*
+                            # (#163). Conservative: ambiguous cases stay
+                            # overflow_* so a real overflow is never hidden.
+                            # The arg is a copy-SOURCE pointer (vs a length
+                            # scalar) when the model propagates a buffer FROM
+                            # it (`*arg:<argidx>` in propagates.from) -- true
+                            # for strcpy/strcpy_chk arg1, false for the memcpy/
+                            # memcpy_chk length arg2. This drives the register-
+                            # base index broadening per-arg, so a fortified
+                            # length stays an overflow while a fortified source
+                            # index downgrades.
+                            _ptr_arg = eff_sink.get("class") == "overflow_unbounded" \
+                                or argidx in _model_buffer_source_args(model)
+                            if classify and eff_sink.get("class") in _OVERFLOW_INDEX_CLASSES \
+                                    and self._sink_taint_is_index_only(
+                                        ssaf, params[argidx], tainted, pointer_arg=_ptr_arg):
+                                _prior = eff_sink.get("class")
+                                eff_sink = {
+                                    **eff_sink,
+                                    "class": "tainted_index",
+                                    "via": "index",
+                                    "detail": (eff_sink.get("detail") or "")
+                                    + " (taint reaches this sink through an array "
+                                    "index/offset, not the copied buffer or the length "
+                                    f"operand -- reclassified from {_prior}; an "
+                                    "out-of-bounds access risk, not a plain "
+                                    "unbounded/length overflow)",
+                                }
+                            # #307 FP-1: a still-`overflow_len` length that
+                            # reads a reused/address-taken stack slot whose
+                            # taint arrived version-agnostically (an out-param
+                            # write through &slot) with a competing in-function
+                            # writer is a path-ambiguous reaching def -- the
+                            # engine can't stand behind the "attacker-controlled
+                            # length" VERDICT (that needs control-dependence it
+                            # lacks). Re-headline to the NEUTRAL `tainted_len`
+                            # (propagation fact: a tainted value reaches this
+                            # length; overflow-vs-bounded deferred). Nothing is
+                            # hidden -- the same taint-reaches-arg flow stays in
+                            # reached_sinks, so there is NO false-negative, only
+                            # the unsound overflow label is dropped. Runs after
+                            # the bounded_len / tainted_index reclassifications
+                            # so those more-specific verdicts take precedence.
+                            if classify and eff_sink.get("class") == "overflow_len" \
+                                    and self._length_is_reused_aliased_slot(
+                                        ssaf, instrs, params[argidx], tainted):
+                                eff_sink = {
+                                    **eff_sink,
+                                    "class": "tainted_len",
+                                    "via": "reused_aliased_slot",
+                                    "detail": "a tainted value reaches this length "
+                                    "argument via a reused/address-taken stack slot "
+                                    "(written through &slot by an out-param call, with a "
+                                    "competing in-function writer); the reaching definition "
+                                    "is path-ambiguous, so overflow-vs-bounded is deferred -- "
+                                    "corroborate with `taint backward`",
+                                }
+                            # #791 (residual of #499): the chunked-read
+                            # residual idiom `n = total - cursor;
+                            # read(buf + cursor, n)`. #499's closing note
+                            # asked for this to be SUPPRESSED so
+                            # recv_overflow became usable by default. It is
+                            # deliberately NOT suppressed and NOT downgraded
+                            # -- see `_residual_chunk_length` for why the
+                            # shape cannot carry that conclusion: the
+                            # invariant bounds the write by `total`, while
+                            # safety needs `total <= sizeof(dest)`, and this
+                            # engine can size neither a stack array nor the
+                            # loop guard. #791's own repro is precisely the
+                            # unsafe case (an attacker-controlled `cap` into
+                            # a fixed stack buffer), so suppressing on shape
+                            # would have cleared a real overflow.
+                            #
+                            # What IS honest is naming the open question, so
+                            # a reader triaging an opt-in recv_overflow queue
+                            # can see in the row itself that the length is a
+                            # residual chunk and that the single thing to
+                            # check is the destination's capacity against
+                            # `total`. The class is untouched.
+                            if classify and eff_sink.get("class") == "overflow_len":
+                                _resid = self._residual_chunk_length(
+                                    ssaf, params, argidx,
+                                    int(eff_sink.get("buf_arg") or 0))
+                                if _resid is not None:
+                                    _total, _cursor = _resid
                                     eff_sink = {
                                         **eff_sink,
-                                        "class": "tainted_index",
-                                        "via": "index",
+                                        "length_shape": "residual_chunk",
+                                        "residual_total": _total,
+                                        "residual_cursor": _cursor,
                                         "detail": (eff_sink.get("detail") or "")
-                                        + " (taint reaches this sink through an array "
-                                        "index/offset, not the copied buffer or the length "
-                                        f"operand -- reclassified from {_prior}; an "
-                                        "out-of-bounds access risk, not a plain "
-                                        "unbounded/length overflow)",
+                                        + f" (length is the residual chunk "
+                                        f"`{_total} - {_cursor}` written at offset "
+                                        f"`{_cursor}`, so the loop's cumulative extent "
+                                        f"is bounded by `{_total}` -- NOT downgraded: "
+                                        "bounded-by-total is only safe when the "
+                                        "destination holds `total` bytes, which this "
+                                        "engine cannot establish here (it sizes a buffer "
+                                        "only from an allocating call, and proving "
+                                        "cursor <= total needs the loop guard). Check "
+                                        "the destination's capacity against the total. "
+                                        "residual_total/residual_cursor are IL variable "
+                                        "names, not source identifiers -- an optimised "
+                                        "build reuses registers, so read them against "
+                                        "the IL rather than expecting `cap`/`progress`)",
                                     }
-                                # #307 FP-1: a still-`overflow_len` length that
-                                # reads a reused/address-taken stack slot whose
-                                # taint arrived version-agnostically (an out-param
-                                # write through &slot) with a competing in-function
-                                # writer is a path-ambiguous reaching def -- the
-                                # engine can't stand behind the "attacker-controlled
-                                # length" VERDICT (that needs control-dependence it
-                                # lacks). Re-headline to the NEUTRAL `tainted_len`
-                                # (propagation fact: a tainted value reaches this
-                                # length; overflow-vs-bounded deferred). Nothing is
-                                # hidden -- the same taint-reaches-arg flow stays in
-                                # reached_sinks, so there is NO false-negative, only
-                                # the unsound overflow label is dropped. Runs after
-                                # the bounded_len / tainted_index reclassifications
-                                # so those more-specific verdicts take precedence.
-                                if eff_sink.get("class") == "overflow_len" \
-                                        and self._length_is_reused_aliased_slot(
-                                            ssaf, instrs, aparams[argidx], tainted):
-                                    eff_sink = {
-                                        **eff_sink,
-                                        "class": "tainted_len",
-                                        "via": "reused_aliased_slot",
-                                        "detail": "a tainted value reaches this length "
-                                        "argument via a reused/address-taken stack slot "
-                                        "(written through &slot by an out-param call, with a "
-                                        "competing in-function writer); the reaching definition "
-                                        "is path-ambiguous, so overflow-vs-bounded is deferred -- "
-                                        "corroborate with `taint backward`",
-                                    }
-                                # #791 (residual of #499): the chunked-read
-                                # residual idiom `n = total - cursor;
-                                # read(buf + cursor, n)`. #499's closing note
-                                # asked for this to be SUPPRESSED so
-                                # recv_overflow became usable by default. It is
-                                # deliberately NOT suppressed and NOT downgraded
-                                # -- see `_residual_chunk_length` for why the
-                                # shape cannot carry that conclusion: the
-                                # invariant bounds the write by `total`, while
-                                # safety needs `total <= sizeof(dest)`, and this
-                                # engine can size neither a stack array nor the
-                                # loop guard. #791's own repro is precisely the
-                                # unsafe case (an attacker-controlled `cap` into
-                                # a fixed stack buffer), so suppressing on shape
-                                # would have cleared a real overflow.
-                                #
-                                # What IS honest is naming the open question, so
-                                # a reader triaging an opt-in recv_overflow queue
-                                # can see in the row itself that the length is a
-                                # residual chunk and that the single thing to
-                                # check is the destination's capacity against
-                                # `total`. The class is untouched.
-                                if eff_sink.get("class") == "overflow_len":
-                                    _resid = self._residual_chunk_length(
-                                        ssaf, aparams, argidx,
-                                        int(eff_sink.get("buf_arg") or 0))
-                                    if _resid is not None:
-                                        _total, _cursor = _resid
-                                        eff_sink = {
-                                            **eff_sink,
-                                            "length_shape": "residual_chunk",
-                                            "residual_total": _total,
-                                            "residual_cursor": _cursor,
-                                            "detail": (eff_sink.get("detail") or "")
-                                            + f" (length is the residual chunk "
-                                            f"`{_total} - {_cursor}` written at offset "
-                                            f"`{_cursor}`, so the loop's cumulative extent "
-                                            f"is bounded by `{_total}` -- NOT downgraded: "
-                                            "bounded-by-total is only safe when the "
-                                            "destination holds `total` bytes, which this "
-                                            "engine cannot establish here (it sizes a buffer "
-                                            "only from an allocating call, and proving "
-                                            "cursor <= total needs the loop guard). Check "
-                                            "the destination's capacity against the total. "
-                                            "residual_total/residual_cursor are IL variable "
-                                            "names, not source identifiers -- an optimised "
-                                            "build reuses registers, so read them against "
-                                            "the IL rather than expecting `cap`/`progress`)",
-                                        }
-                                # #980: a finding re-headlined away from its catalog
-                                # class names that class, so `taint models` and the
-                                # finding are visibly the same sink.
-                                if eff_sink.get("class") != sink.get("class"):
-                                    eff_sink = {**eff_sink, "catalog_class": sink.get("class")}
-                                if abi is not None:
-                                    # #1001 item 1: the evidence is the register,
-                                    # not BN's prototype -- say so on the finding.
-                                    _ref = abi["callee_ref"]
-                                    eff_sink = {
-                                        **eff_sink,
-                                        "via": "abi_register",
-                                        "arity_mismatch": {"recovered": abi["recovered"],
-                                                           "dropped": [argidx],
-                                                           "register": abi["register"],
-                                                           "callee_ref": _ref},
-                                        "detail": (eff_sink.get("detail") or "")
-                                        + f" (reached through ABI register {abi['register']}: "
-                                        f"Binary Ninja recovered only {abi['recovered']} "
-                                        f"parameter(s) for this call, so arg {argidx} is read "
-                                        "from the register rather than the call's parameter "
-                                        "list"
-                                        + (f" -- confirm the prototype with `bn proto get {_ref}`"
-                                           if _ref else "") + ")",
-                                    }
-                                findings.append(_tag_unconditional_flow(
-                                    self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
+                            # #980: a finding re-headlined away from its catalog
+                            # class names that class, so `taint models` and the
+                            # finding are visibly the same sink.
+                            if eff_sink.get("class") != sink.get("class"):
+                                eff_sink = {**eff_sink, "catalog_class": sink.get("class")}
+                            if arity is not None:
+                                # #1001 item 1: the model declares args BN's
+                                # prototype dropped. Say so on the finding, and
+                                # that its class is the model's own -- unproven
+                                # until the prototype is fixed -- rather than
+                                # a bound the engine could not check.
+                                _ref = arity["callee_ref"]
+                                _reg = arity["register"]
+                                eff_sink = {
+                                    **eff_sink,
+                                    **({"via": "abi_register"} if _reg else {}),
+                                    "arity_mismatch": arity,
+                                    "detail": (eff_sink.get("detail") or "")
+                                    + (f" (reached through ABI register {_reg}" if _reg else " (")
+                                    + f"{': ' if _reg else ''}Binary Ninja recovered only "
+                                    f"{arity['recovered']} parameter(s) for this call and the "
+                                    f"model's arg(s) {arity['dropped']} were dropped, so the "
+                                    "class is the model's own and unproven -- fix the "
+                                    "prototype"
+                                    + (f" (`bn proto get {_ref}`, then `bn proto set`)" if _ref else "")
+                                    + " and re-run)",
+                                }
+                            findings.append(_tag_unconditional_flow(
+                                self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
             co = model.get("continuation")
             if co is not None:
                 cidx = int(co.get("null_arg", 0))
@@ -5446,14 +5440,18 @@ class TaintEngine:
                                 # still calls a thunk (an oversized function after
                                 # `--force-analysis`) stops here even when its
                                 # tail-call target resolves -- name that target.
-                                _tail = self._thunk_tail_target(descend_fn)
-                                if _tail is not None:
-                                    _ta = hex(int(getattr(_tail, "start", 0)))
-                                    _thunk = (f"in-binary {_who} is a thunk Binary Ninja made of a "
-                                              f"tail call to {getattr(_tail, 'name', _ta)} @ {_ta}, "
-                                              "which taint does not follow through a multi-"
+                                _tails = self._thunk_tail_targets(descend_fn)
+                                if _tails:
+                                    _named = [(getattr(t, "name", None) or hex(int(getattr(t, "start", 0))),
+                                               hex(int(getattr(t, "start", 0)))) for t in _tails]
+                                    _thunk = (f"in-binary {_who} is a thunk Binary Ninja made of "
+                                              + ("a tail call" if len(_named) == 1 else "tail calls")
+                                              + " to " + ", ".join(f"{n} @ {a}" for n, a in _named)
+                                              + ", which taint does not follow through a multi-"
                                               "instruction thunk",
-                                              f"read the target with `bn decompile {_ta}`")
+                                              ("read the target with " if len(_named) == 1
+                                               else "read the targets with ")
+                                              + ", ".join(f"`bn decompile {a}`" for _n, a in _named))
                                 else:
                                     _thunk = (f"in-binary {_who} is a thunk whose tail-call "
                                               "target did not resolve",
@@ -5465,7 +5463,7 @@ class TaintEngine:
                             if _thunk is not None:
                                 _caveat = (f"{_thunk[0]}; it has no model; return conservatively "
                                            f"tainted -- {_thunk[1]}")
-                                _stop_desc = f"in-binary thunk ({_thunk[0]}; {_thunk[1]})"
+                                _stop_desc = f"thunk ({_thunk[0]}; {_thunk[1]})"
                             elif _unread is not None:
                                 _caveat = (f"in-binary {_who} was not analysed ({_unread}) and has no "
                                            f"model; return conservatively tainted -- {_fix}")
