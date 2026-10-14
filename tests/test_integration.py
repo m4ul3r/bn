@@ -5,6 +5,7 @@ the binaryninja module is not available.
 """
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import os
@@ -4232,13 +4233,23 @@ l1: return v * 3;
 int idxjump(long *p);
 __asm__(IDXJUMP);
 __attribute__((noinline)) char *use_c_locale(void) { return setlocale(LC_ALL, "C"); }
+/* Several switch cases tail-call one field pointer: on AArch64 -O2 BN shows
+   one of the `br`s in two cases (#1000 review round 5, `dup.c` d1). */
+__attribute__((noinline)) int d1(struct ops *o, int op, int x) {
+  switch (op) {
+    case 0: x += 1; break; case 1: x *= 3; break; case 2: x -= 7; break; case 3: x ^= 0x55; break;
+    case 4: x <<= 2; break; case 5: x /= 3; break; case 6: x |= 9; break; case 7: x %= 11; break;
+    default: return -1;
+  }
+  return o->cb(x);
+}
 static int inc(int v) { return v + 1; }
 static const struct vtbl vt = { inc, inc };
 int main(int argc, char **argv) {
   struct ops o = { 0, inc }; struct obj ob = { &vt }; long z = 0;
   gfp = inc;
   return tc_param(inc, argc) + tc_global(argc) + tc_field(&o, argc) + tc_table(&ob, argc)
-       + labels2(argc, 2) + idxjump(&z) + !!use_c_locale();
+       + labels2(argc, 2) + idxjump(&z) + !!use_c_locale() + d1(&o, argc, argc);
 }
 """
 # A jump through a label table indexed by a loaded value: `jmp [rax + tbl]`.
@@ -4283,24 +4294,32 @@ class TestDecompileUnresolvedJumps1000:
     computed goto alike -- gets exactly one neutral `jump` row and a note on
     every line that shows it, and neither ever claims which it is. The
     expected rows come from the disassembly, not from a list of fixtures:
-    which ones the compiler leaves as jumps varies by gcc version, but every
-    indirect branch it emits here is one BN cannot resolve."""
+    which ones the compiler leaves as jumps varies by gcc version. An
+    indirect branch counts only when BN rendered it as an unresolved
+    `jump ->` -- a jump-table branch BN resolved renders as a `switch`."""
 
     _INDIRECT_BRANCH = re.compile(
         r"^(0x[0-9a-f]+)\s+(?:[0-9a-f]{2} )+\s*(?:notrack\s+)?(?:br|jmp)\s+(?!0x)\S")
+
+    @staticmethod
+    def _jump_lines(text):
+        return [(int(line.split()[0], 16), line) for line in text.splitlines()
+                if line.startswith("0x") and "jump ->" in line]
 
     def test_one_neutral_row_per_indirect_branch_and_a_note_on_each_copy(
             self, shared_bn, tail_jump_binaries, arch):
         shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
         for function in ("tc_param", "tc_global", "tc_field", "tc_table", "labels2",
-                         "idxjump"):
+                         "idxjump", "d1"):
             disasm = shared_bn.run("disasm", function)
             assert disasm.returncode == 0, disasm.stderr
-            expected = {int(m.group(1), 16) for line in disasm.stdout.splitlines()
+            branches = {int(m.group(1), 16) for line in disasm.stdout.splitlines()
                         if (m := self._INDIRECT_BRANCH.match(line))}
-            if function == "idxjump":
-                assert len(expected) == 1, disasm.stdout  # hand-written `br`/`jmp`
             result = shared_bn.json("decompile", function, "--addresses")
+            jump_lines = self._jump_lines(result["text"])
+            expected = branches & {address for address, _ in jump_lines}
+            if function == "idxjump":
+                assert len(expected) == 1, (disasm.stdout, result["text"])  # hand-written
             jumps = [row for row in result["warning_rows"] if row["code"] == "jump"]
             addresses = [int(row["address"], 16) for row in jumps]
             assert sorted(addresses) == sorted(expected), (function, jumps, disasm.stdout)
@@ -4309,12 +4328,31 @@ class TestDecompileUnresolvedJumps1000:
                 for claim in ("virtual", "slot", "through the function pointer"):
                     assert claim not in row["summary"] and claim not in row["detail"], row
                 assert row["target"] and f"`{row['target']}`" in row["detail"], row
-            # Every line BN renders for one of those jumps carries the note,
-            # and no other line does.
+            # Every line BN renders for one of those jumps carries the note
+            # exactly once, and no other line carries it.
             for line in result["text"].splitlines():
                 address = int(line.split()[0], 16) if line.startswith("0x") else None
                 shows_jump = "jump ->" in line and address in expected
-                assert ("/* bn: unresolved jump" in line) == shows_jump, (function, line)
+                assert line.count("/* bn: unresolved jump") == int(shows_jump), (function, line)
+
+
+class TestDecompileRepeatedJump1000:
+    """On AArch64 -O2, BN shows one of `d1`'s `br`s in two switch cases
+    (#1000 review round 5): one row for it, and one note on each copy."""
+
+    def test_a_jump_bn_repeats_is_one_row_with_a_note_on_every_copy(
+            self, shared_bn, tail_jump_binaries):
+        shared_bn.load(tail_jump_binaries["aarch64"], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        result = shared_bn.json("decompile", "d1", "--addresses")
+        lines = TestDecompileUnresolvedJumps1000._jump_lines(result["text"])
+        copies = collections.Counter(address for address, _ in lines)
+        repeated = [address for address, count in copies.items() if count > 1]
+        assert repeated, ("premise: BN no longer repeats a jump in d1", result["text"])
+        jumps = [int(row["address"], 16) for row in result["warning_rows"]
+                 if row["code"] == "jump"]
+        assert sorted(jumps) == sorted(copies), (jumps, result["text"])
+        for _, line in lines:
+            assert line.count("/* bn: unresolved jump") == 1, line
 
 
 class TestShortLiteralBehindDataName994:

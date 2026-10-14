@@ -1827,8 +1827,31 @@ def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
                 continue
         except Exception:  # noqa: BLE001 - one odd jump must not hide the rest
             continue
-        rows[address] = {"address": address, "target": str(dest)}
+        rows[address] = {"address": address, "target": str(dest),
+                         "table": _jump_data_address(bv, func, dest)}
     return list(rows.values())
+
+
+def _jump_data_address(bv, func, dest) -> int | None:
+    """The first mapped, non-code address in the jump target's expression --
+    the table (or pointer) the target is read from, `&data_435ea0` in
+    `*(int32_t*)(&data_435ea0 + (i << 2)) + &data_435ea0` -- or None."""
+    pending = [dest]
+    while pending:
+        expr = pending.pop(0)
+        if il_format._il_op_name(expr) == "HLIL_CONST_PTR" and _is_data_address(bv, expr):
+            return int(expr.constant)
+        pending.extend(o for o in list(getattr(expr, "operands", None) or [])
+                       if hasattr(o, "operation"))
+    return None
+
+
+def _is_data_address(bv, expr) -> bool:
+    try:
+        value = int(expr.constant)
+        return bool(bv.is_valid_offset(value)) and not list(bv.get_functions_containing(value) or [])
+    except Exception:  # noqa: BLE001 - an unreadable constant names no table
+        return False
 
 
 _JUMP_LINE_NOTE = "/* bn: unresolved jump: a tail call (args not rendered) or a computed goto */"
@@ -1836,30 +1859,49 @@ _JUMP_LINE_NOTE = "/* bn: unresolved jump: a tail call (args not rendered) or a 
 
 def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[str, Any]:
     """The neutral `jump` warning: what `❓` means, the target, and both
-    readings with how to check each. It never says which one this is."""
+    readings with how to check each. It never says which one this is.
+
+    The jump-table advice must lead to where control can go (#1000 review
+    round 5): a window around the jump missed targets before it, and a whole
+    function listing misses them too, because BN never added unresolved
+    targets to the function. They are reached through data: the table the
+    target expression reads (named when it is a constant address) and
+    `evidence surface`'s table-referenced code."""
     where = hex(row["address"])
+    start = hex(int(func.start))
     try:
         cc = getattr(func, "calling_convention", None)
         arg_regs = [str(r) for r in (getattr(cc, "int_arg_regs", None) or [])]
     except Exception:  # noqa: BLE001
         arg_regs = []
     regs = f" ({', '.join(arg_regs)})" if arg_regs else ""
+    table = row.get("table")
+    table_advice = (
+        f" The target is read from data at {hex(table)}: `bn evidence table {hex(table)}` "
+        "lists absolute entries, and `bn evidence table "
+        f"{hex(table)} --stride 4 --width 4` lists 4-byte entries that are signed offsets "
+        f"to add to {hex(table)} (`tbl + *(int32_t*)(tbl + i * 4)`); disassemble each "
+        "target with `bn disasm <target> --linear 16`."
+        if table is not None else "")
     detail = (
         f"unresolved indirect jump at {where} to `{row['target']}`: BN renders it as "
         "`❓ /* jump -> ... */` -- the ❓ marks control flow it could not resolve -- and "
-        "found no target for it. It is one of two things, and the IL alone does not say "
+        "finds no target for it. It is one of two things, and the IL alone does not say "
         "which. A tail call through a pointer, leaving the function: the callee's "
         f"arguments are then in the argument registers{regs} at the jump and are not "
         f"rendered; read them in `bn disasm {where}`, and type the callee (`bn proto "
         "set`) or the object the pointer is loaded from so BN can render the call. Or a "
-        "computed goto or jump table BN did not resolve, staying in this function: the "
-        "code it reaches may be missing from this decompile; read the table and its "
-        f"targets with `bn disasm {where} --linear 16`."
+        "computed goto or jump table BN did not resolve, staying in this function: its "
+        "targets are code BN never added to the function, so neither this decompile nor "
+        f"`bn disasm {start}` shows them. `bn evidence surface` lists code reached only "
+        "through a data table (a computed goto's labels appear as `via table:<addr>`)."
+        + table_advice
         + (" Every line that shows this jump carries a `/* bn: ... */` note." if inline else "")
     )
     summary = (f"unresolved jump at {where} (❓): a tail call whose args are not rendered, "
-               f"or a computed goto/jump table; read it in `bn disasm {where}`")
-    return _warning_row("jump", summary, detail, address=where, target=row["target"])
+               "or a computed goto/jump table; --explain says how to read each")
+    return _warning_row("jump", summary, detail, address=where, target=row["target"],
+                        table=hex(table) if table is not None else None)
 
 
 _OFFSET_RE = re.compile(r"__offset\((.+?), (-?(?:0x[0-9a-fA-F]+|\d+))\)")

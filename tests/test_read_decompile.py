@@ -6426,7 +6426,7 @@ def test_every_unresolved_exit_jump_gets_one_neutral_warning_1000(dest):
     assert warning["target"] == str(row["target"])
     assert warning["summary"] == (
         "unresolved jump at 0x40058c (❓): a tail call whose args are not rendered, or a "
-        "computed goto/jump table; read it in `bn disasm 0x40058c`")
+        "computed goto/jump table; --explain says how to read each")
     detail = warning["detail"]
     assert f"to `{row['target']}`" in detail and "❓ marks control flow" in detail
     assert "argument registers (x0, x1, x2)" in detail and "bn proto set" in detail
@@ -6436,10 +6436,31 @@ def test_every_unresolved_exit_jump_gets_one_neutral_warning_1000(dest):
     # Neither reading is stated as fact: leaving the function is the tail
     # call's, staying in it the jump table's.
     assert "leaving the function" in detail and "staying in this function" in detail
-    assert "bn disasm 0x40058c --linear" in detail
+    # The jump-table reading points at commands that reach the targets, which
+    # BN never added to the function: not a window around the jump.
+    assert "bn evidence surface" in detail and "--linear" not in detail
     note = read_decompile._JUMP_LINE_NOTE
     assert note.startswith("/* bn:") and note.endswith("*/")
     assert "tail call" in note and "computed goto" in note and "virtual" not in note
+
+
+def test_a_jump_reading_a_data_table_names_the_table_and_how_to_read_it_1000():
+    # ninja's `tbl + *(int32_t*)(tbl + i*4)` and a label array `tbl[i]`: the
+    # targets are entries of the table the expression reads.
+    table = _hop("HLIL_CONST_PTR", "&tbl", constant=0x420010)
+    bv, func = _jump_case(dest=_load(_plus(table, _hop("HLIL_LSL", "(op & 3) << 3"))))
+    bv.is_valid_offset = lambda value: 0x400000 <= value < 0x430000
+    bv.get_functions_containing = lambda value: [func] if 0x400570 <= value < 0x400590 else []
+    [row] = read_decompile._unresolved_jump_findings(bv, func)
+    warning = read_decompile._unresolved_jump_warning(func, row, False)
+    assert warning["table"] == "0x420010"
+    assert "`bn evidence table 0x420010`" in warning["detail"]
+    assert "`bn evidence table 0x420010 --stride 4 --width 4`" in warning["detail"]
+    assert "`bn disasm <target> --linear 16`" in warning["detail"]
+    # A target with no data address (a stack array, a register) names none.
+    bv, func = _jump_case(dest=_var("arg2"))
+    [row] = read_decompile._unresolved_jump_findings(bv, func)
+    assert read_decompile._unresolved_jump_warning(func, row, False)["table"] is None
 
 
 def test_a_jump_bn_repeats_in_switch_cases_is_one_row_with_a_note_on_every_copy_1000(
