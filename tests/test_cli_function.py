@@ -2344,7 +2344,32 @@ def test_xrefs_any_batch_probes_symbols(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "memcpy: 12 code refs across 4 fn(s)" in out
     assert "strcpy: absent" in out
+    assert "--with-xrefs" not in out  # no string probed, no tip
 
+
+def test_xrefs_any_points_string_addresses_at_strings_with_xrefs(monkeypatch, capsys):
+    """#1002: `--any` rows count the functions referencing a string but do not
+    name them, so an agent mapping strings to functions looped `xrefs` per
+    address. A probed string address gets a tip naming the one-call path."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {
+            "kind": "symbol_presence", "count": 3, "present": 3,
+            "items": [
+                {"symbol": "0x403011", "present": True, "code_ref_count": 1,
+                 "caller_function_count": 1, "address": "0x403011", "target_kind": "string"},
+                {"symbol": "0x40301c", "present": True, "code_ref_count": 2,
+                 "caller_function_count": 2, "address": "0x40301c", "target_kind": "string"},
+                {"symbol": "log_print", "present": True, "code_ref_count": 9,
+                 "caller_function_count": 9, "address": "0x401200"},
+            ]}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["xrefs", "--target", "active", "--any", "0x403011", "0x40301c", "log_print"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "tip: 2 probed address(es) are strings" in out
+    assert "bn strings --query <text> --with-xrefs" in out
 
 
 

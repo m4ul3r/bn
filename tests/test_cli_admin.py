@@ -75,6 +75,26 @@ def test_plugin_install_copy_mode(tmp_path):
     assert (destination / "bridge.py").exists()
 
 
+def test_plugin_install_accepts_its_own_install_and_names_a_stale_one(tmp_path, capsys):
+    # #1002: a link already pointing at this source is not an error; a link
+    # into another tree is refused with what it points at and --force named.
+    destination = tmp_path / "bn_agent_bridge"
+    destination.symlink_to(bn.cli.plugin_source_dir())
+
+    assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["installed"] is False
+    assert result["note"].startswith("already installed: symlink to ")
+
+    destination.unlink()
+    destination.symlink_to(tmp_path / "old-checkout")
+    assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 2
+    err = capsys.readouterr().err
+    assert f"dangling symlink to {tmp_path / 'old-checkout'}" in err
+    assert "--force" in err
+    assert os.readlink(destination) == str(tmp_path / "old-checkout")
+
+
 def test_skill_install_copy_mode(tmp_path):
     destination = tmp_path / "skill-copy"
     rc = bn.cli.main(
@@ -150,14 +170,14 @@ def test_skill_install_defaults_to_claude_and_codex_when_codex_home_exists(tmp_p
     assert (codex_root / "bn-vr" / "SKILL.md").exists()
 
 
-def test_skill_install_defaults_skip_existing_destinations(tmp_path, monkeypatch):
+def test_skill_install_defaults_skip_up_to_date_destinations(tmp_path, monkeypatch):
     claude_root = tmp_path / "claude" / "skills"
     codex_home = tmp_path / "codex"
     codex_root = codex_home / "skills"
     codex_home.mkdir()
-    (claude_root / "bn").mkdir(parents=True)
-    (claude_root / "bn-re").mkdir()
-    (claude_root / "bn-vr").mkdir()
+    claude_root.mkdir(parents=True)
+    for name in ("bn", "bn-re", "bn-vr"):
+        (claude_root / name).symlink_to(bn.cli.skills_source_dir() / name)
     monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
     monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
     monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_root)
@@ -168,6 +188,89 @@ def test_skill_install_defaults_skip_existing_destinations(tmp_path, monkeypatch
     assert (codex_root / "bn" / "SKILL.md").exists()
     assert (codex_root / "bn-re" / "SKILL.md").exists()
     assert (codex_root / "bn-vr" / "SKILL.md").exists()
+    assert (claude_root / "bn").is_symlink()  # left as it was
+
+
+def _one_skill_source(tmp_path, monkeypatch):
+    source_root = tmp_path / "bundled-skills"
+    skill = source_root / "sample"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: sample\n---\n")
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: source_root)
+    claude_root = tmp_path / "claude" / "skills"
+    claude_root.mkdir(parents=True)
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: tmp_path / "codex")
+    return skill, claude_root / "sample"
+
+
+@pytest.mark.parametrize("leftover", ["other_tree", "dangling", "foreign_dir"])
+def test_skill_install_reports_a_stale_default_destination_and_fails(
+    tmp_path, monkeypatch, capsys, leftover
+):
+    # #1002: a default destination holding anything but this install -- most
+    # often a link into a previous checkout -- used to print "Skills already
+    # installed." with exit 0 while nothing was updated.
+    _, dest = _one_skill_source(tmp_path, monkeypatch)
+    old_tree = tmp_path / "old-checkout" / "sample"
+    if leftover == "foreign_dir":
+        dest.mkdir()
+        (dest / "notes.txt").write_text("mine")
+    else:
+        old_tree.mkdir(parents=True)
+        dest.symlink_to(old_tree)
+        if leftover == "dangling":
+            old_tree.rmdir()
+
+    rc = bn.cli.main(["skill", "install"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "already installed" not in out
+    assert "re-run with --force" in out
+    assert str(dest) in out
+    if leftover == "foreign_dir":
+        assert (dest / "notes.txt").read_text() == "mine"
+    else:
+        assert os.readlink(dest) == str(old_tree)  # untouched without --force
+        assert ("dangling" in out) == (leftover == "dangling")
+
+
+def test_skill_install_reports_stale_destinations_in_json(tmp_path, monkeypatch, capsys):
+    _, dest = _one_skill_source(tmp_path, monkeypatch)
+    dest.symlink_to(tmp_path / "gone")
+
+    rc = bn.cli.main(["skill", "install", "--format", "json"])
+
+    assert rc == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["installed"] is False
+    assert result["not_updated_destinations"] == [{
+        "destination": str(dest),
+        "state": "stale",
+        "detail": f"dangling symlink to {tmp_path / 'gone'}",
+    }]
+
+
+@pytest.mark.parametrize("mode", ["symlink", "copy"])
+def test_skill_install_treats_a_current_install_as_up_to_date(
+    tmp_path, monkeypatch, capsys, mode
+):
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    assert bn.cli.main(["skill", "install", "--mode", mode]) == 0
+    capsys.readouterr()
+
+    rc = bn.cli.main(["skill", "install", "--mode", mode])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Skills already installed.\n")
+    assert "- " + str(dest) in out
+    if mode == "copy":
+        # A copy that no longer matches the source is not current.
+        (skill / "SKILL.md").write_text("---\nname: sample\nversion: 2\n---\n")
+        assert bn.cli.main(["skill", "install", "--mode", mode]) == 1
+        assert "does not match" in capsys.readouterr().out
 
 
 def test_skill_install_default_output_is_text(tmp_path, monkeypatch, capsys):
@@ -200,20 +303,11 @@ def test_skill_install_json_output_remains_available(tmp_path, monkeypatch, caps
 
 
 def test_skill_install_all_skipped_reports_installed_false(tmp_path, monkeypatch, capsys):
-    # #620(b): when every destination already exists and is skipped, nothing
-    # was actually installed -- the result must say so instead of always
-    # claiming success.
-    source_root = tmp_path / "bundled-skills"
-    skill = source_root / "sample"
-    skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text("---\nname: sample\n---\n")
-    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: source_root)
-
-    claude_root = tmp_path / "claude" / "skills"
-    codex_home = tmp_path / "codex"
-    (claude_root / "sample").mkdir(parents=True)
-    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
-    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    # #620(b): when every destination is already installed and is skipped,
+    # nothing was actually installed -- the result must say so instead of
+    # always claiming success.
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    dest.symlink_to(skill)
 
     rc = bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"])
 
@@ -221,7 +315,7 @@ def test_skill_install_all_skipped_reports_installed_false(tmp_path, monkeypatch
     output = capsys.readouterr().out
     assert '"installed":false' in output
     assert '"installed_destinations":[]' in output
-    assert str(claude_root / "sample") in output  # skipped_destinations explains why
+    assert str(dest) in output  # skipped_destinations explains why
 
 
 def test_skill_install_custom_dest_still_fails_when_destination_exists(tmp_path):

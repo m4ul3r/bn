@@ -900,13 +900,16 @@ def _render_result(
             "or raise BN_SPILL_TOKENS.",
             file=sys.stderr,
         )
-    elif result.truncation_risk:
-        # Spill is opt-in, so this payload reaches stdout in full and the consuming
-        # agent's harness truncates it. Name this command's own slicing knob -- the
-        # one thing no harness can derive (#409).
+    elif result.truncation_risk and not _stdout_is_regular_file():
+        # Spill is opt-in, so this payload reaches stdout in full; if stdout is an
+        # agent's tool capture, its harness truncates it. Name this command's own
+        # slicing knob -- the one thing no harness can derive (#409). Only a
+        # redirect to a regular file is known not to be that capture: an agent
+        # harness reads through a pipe too, so a pipe cannot be told apart from
+        # `| jq` and keeps the note (#1002).
         print(
-            f"note: output is {result.token_count} estimated tokens; a consuming agent "
-            f"truncates long tool output -- "
+            f"note: output is {result.token_count} estimated tokens; if it lands in an "
+            f"agent's context, the harness truncates long tool output -- "
             f"{_spill_next_step_hint(stem, paged=paged, text_format=(fmt == 'text'), slice_hint=slice_hint)}.",
             file=sys.stderr,
         )
@@ -1154,6 +1157,19 @@ def _stdout_is_pipe() -> bool:
     yields False, so the caution stays quiet rather than misfiring."""
     try:
         return stat.S_ISFIFO(os.fstat(sys.stdout.fileno()).st_mode)
+    except Exception:
+        return False
+
+
+def _stdout_is_regular_file() -> bool:
+    """True when stdout is redirected to a regular file, e.g. ``bn ... > out.json``.
+
+    The one destination known not to be a consuming agent's context, so the
+    truncation-risk note (#409) stays quiet there (#1002). Defensive like
+    `_stdout_is_pipe`: an fd that cannot be inspected yields False, so the note
+    still fires rather than going silent."""
+    try:
+        return stat.S_ISREG(os.fstat(sys.stdout.fileno()).st_mode)
     except Exception:
         return False
 

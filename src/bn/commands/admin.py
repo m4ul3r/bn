@@ -240,23 +240,33 @@ def _doctor(args: argparse.Namespace) -> int:
          args=[
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
-             arg("--force", action="store_true"),
+             arg("--force", action="store_true",
+                 help="Replace an existing destination: a link to another tree, or a "
+                      "previous install of this plugin"),
          ])
 def _plugin_install(args: argparse.Namespace) -> int:
     source = cli.plugin_source_dir()
     dest = args.dest or cli.plugin_install_dir()
-    _install_tree(source, dest, mode=args.mode, force=args.force)
-
-    cli._emit_result(
-        args,
-        {
-            "installed": True,
-            "mode": args.mode,
-            "source": str(source),
-            "destination": str(dest),
-        },
-        stem="plugin-install",
+    state = (
+        _existing_install_state(source, dest)
+        if source.exists() and not args.force else None
     )
+    # An install that already points at this source is not an error (#1002);
+    # anything else at the destination is refused by `_plan_install`, which
+    # names what is there and the --force escape hatch.
+    up_to_date = state is not None and state[0] == "up_to_date"
+    if not up_to_date:
+        _install_tree(source, dest, mode=args.mode, force=args.force)
+
+    result: dict[str, Any] = {
+        "installed": not up_to_date,
+        "mode": args.mode,
+        "source": str(source),
+        "destination": str(dest),
+    }
+    if up_to_date:
+        result["note"] = f"already installed: {state[1]}"
+    cli._emit_result(args, result, stem="plugin-install")
     return 0
 
 
@@ -346,6 +356,52 @@ def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
             "still matches the source tree)"
         )
     return None
+
+
+def _copy_matches_source(dest: Path, source: Path) -> bool:
+    """Whether directory `dest` is exactly what a copy-mode install of `source`
+    writes: the same entries, every file byte-identical. Bytecode is ignored on
+    both sides, as the copy omits it and importing in place regenerates it."""
+    if _foreign_install_entry(dest, source) is not None:
+        return False
+    for entry in source.iterdir():
+        if _is_install_bytecode(entry.name):
+            continue
+        counterpart = dest / entry.name
+        if entry.is_dir():
+            if not counterpart.is_dir() or not _copy_matches_source(counterpart, entry):
+                return False
+        elif not counterpart.is_file() or counterpart.read_bytes() != entry.read_bytes():
+            return False
+    return True
+
+
+def _existing_install_state(source: Path, dest: Path) -> tuple[str, str] | None:
+    """How whatever sits at `dest` relates to an install of `source`.
+
+    None when nothing is there. Otherwise `(state, detail)`, where `state` is
+    `up_to_date` (a symlink to `source`, or a copy matching it), `stale` (a
+    symlink to anything else, dangling included: the usual leftover of a
+    reinstall onto a new checkout) or `existing` (a directory or file that is
+    not a current copy). Only `up_to_date` is an install that needs nothing;
+    reporting the other two as "already installed" left every link pointing at
+    the previous tree with exit 0 (#1002).
+    """
+    if dest.is_symlink():
+        link = Path(os.readlink(dest))
+        target = link if link.is_absolute() else dest.parent / link
+        if not target.exists():
+            return "stale", f"dangling symlink to {link}"
+        if target.resolve() == source.resolve():
+            return "up_to_date", f"symlink to {source}"
+        return "stale", f"symlink to {target.resolve()}, not {source}"
+    if not dest.exists():
+        return None
+    if dest.is_dir() and _copy_matches_source(dest, source):
+        return "up_to_date", f"copy matching {source}"
+    if dest.is_dir():
+        return "existing", f"directory that does not match {source}"
+    return "existing", "not a directory"
 
 
 def _install_path(dest: Path) -> Path:
@@ -476,8 +532,12 @@ def _plan_install(source: Path, dest: Path, *, force: bool) -> Path:
     if unusable is not None:
         raise BridgeError(f"Cannot install into {dest}: {unusable}.")
     if not force:
-        if dest.exists() or dest.is_symlink():
-            raise BridgeError(f"Destination already exists: {dest}")
+        state = _existing_install_state(source, dest)
+        if state is not None:
+            raise BridgeError(
+                f"Destination already exists: {dest} ({state[1]}). Re-run with "
+                "--force to replace it."
+            )
         return dest
     if dest.is_symlink() or not dest.exists():
         return dest
@@ -493,7 +553,9 @@ def _plan_install(source: Path, dest: Path, *, force: bool) -> Path:
          args=[
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
-             arg("--force", action="store_true"),
+             arg("--force", action="store_true",
+                 help="Replace existing destinations: links to another tree, or "
+                      "previous installs of these skills"),
          ])
 def _skill_install(args: argparse.Namespace) -> int:
     skills_root = cli.skills_source_dir()
@@ -520,10 +582,23 @@ def _skill_install(args: argparse.Namespace) -> int:
 
     pending_installs = []
     skipped_destinations = []
+    not_updated_destinations = []
     for source, dest in install_plan:
-        if not explicit_dest and not args.force and (dest.exists() or dest.is_symlink()):
-            skipped_destinations.append(str(dest))
-            continue
+        if not args.force:
+            state = _existing_install_state(source, dest)
+            if state is not None and state[0] == "up_to_date":
+                skipped_destinations.append(str(dest))
+                continue
+            if state is not None and not explicit_dest:
+                # A default root holds something else -- most often a link into
+                # a previous checkout. Leave it, but say so and fail the run:
+                # "already installed" here kept every link on the old tree with
+                # exit 0 (#1002). An explicit --dest is refused by the plan.
+                skipped_destinations.append(str(dest))
+                not_updated_destinations.append(
+                    {"destination": str(dest), "state": state[0], "detail": state[1]}
+                )
+                continue
         # Planned, not just checked: the path validated here is the path the
         # install writes to, and every destination is refused before the first
         # one is written -- so no refusal can leave half a store installed. An
@@ -547,11 +622,14 @@ def _skill_install(args: argparse.Namespace) -> int:
         "installed": bool(pending_installs),
         "mode": args.mode,
         "installed_destinations": [str(dest) for _, dest in pending_installs],
+        # Every destination left as it was; the ones that are not a current
+        # install of this source are also in not_updated_destinations.
         "skipped_destinations": skipped_destinations,
+        "not_updated_destinations": not_updated_destinations,
         "skills": results,
     }
     cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
-    return 0
+    return 1 if not_updated_destinations else 0
 
 
 def _default_skill_install_roots() -> list[Path]:
