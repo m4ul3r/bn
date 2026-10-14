@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import os
 import shlex
 import shutil
@@ -29,6 +30,7 @@ from ..formatters import (
     _render_instance_gc_text,
     _render_instance_use_text,
     _render_pin_clear_text,
+    _render_plugin_install_text,
     _render_session_list_text,
     _render_session_start_text,
     _render_session_status_text,
@@ -284,13 +286,13 @@ def _doctor(args: argparse.Namespace) -> int:
     return 1 if unhealthy else 0
 
 
-@command("plugin", "install", help="Install the GUI plugin", fmt="json",
+@command("plugin", "install", help="Install the GUI plugin", fmt="text",
          args=[
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
              arg("--force", action="store_true",
-                 help="Replace an existing destination: a link to another tree, or a "
-                      "previous install of this plugin"),
+                 help="Replace a link, an empty directory, or a marked copy "
+                      "(discarding local edits in that copy)"),
          ])
 def _plugin_install(args: argparse.Namespace) -> int:
     source = cli.plugin_source_dir()
@@ -315,7 +317,9 @@ def _plugin_install(args: argparse.Namespace) -> int:
     }
     if up_to_date:
         result["note"] = f"already installed: {state[1]}"
-    cli._emit_result(args, result, stem="plugin-install")
+    cli._emit_result(
+        args, result, text_renderer=_render_plugin_install_text, stem="plugin-install"
+    )
     return 0
 
 
@@ -325,7 +329,10 @@ def _plugin_install(args: argparse.Namespace) -> int:
 # ownership: a directory holding only bytecode is refused, because nothing in
 # it proves an install of this artifact wrote it.
 _INSTALL_BYTECODE_PATTERNS = ("__pycache__", "*.pyc", "*.pyo")
-_IGNORED_INSTALL_ENTRIES = shutil.ignore_patterns(*_INSTALL_BYTECODE_PATTERNS)
+_COPY_INSTALL_MARKER = ".bn-copy-install.json"
+_IGNORED_INSTALL_ENTRIES = shutil.ignore_patterns(
+    *_INSTALL_BYTECODE_PATTERNS, _COPY_INSTALL_MARKER
+)
 
 
 def _is_install_bytecode(name: str) -> bool:
@@ -333,13 +340,19 @@ def _is_install_bytecode(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in _INSTALL_BYTECODE_PATTERNS)
 
 
-def _foreign_install_entry(dest: Path, source: Path) -> str | None:
+def _copy_install_identity(source: Path) -> dict[str, str]:
+    return {"format": "bn-copy-install-v1", "artifact": source.name}
+
+
+def _foreign_install_entry(dest: Path, source: Path, *, root: bool = True) -> str | None:
     """The first entry under `dest` a copy-mode install of `source` would not
     have produced, as a slash-joined path relative to `dest`, or None when
     every entry mirrors the source tree -- directories included, so a user file
     added inside a directory the source also has is not mistaken for ours.
     """
     for entry in sorted(dest.iterdir()):
+        if root and entry.name == _COPY_INSTALL_MARKER:
+            continue
         if _is_install_bytecode(entry.name):
             continue
         counterpart = source / entry.name
@@ -348,88 +361,50 @@ def _foreign_install_entry(dest: Path, source: Path) -> str | None:
         if entry.is_dir() != counterpart.is_dir():
             return entry.name
         if entry.is_dir():
-            nested = _foreign_install_entry(entry, counterpart)
+            nested = _foreign_install_entry(entry, counterpart, root=False)
             if nested is not None:
                 return f"{entry.name}/{nested}"
     return None
 
 
-def _any_file_matches_source(dest: Path, source: Path) -> bool:
-    """Whether one readable file under `dest` is still byte-identical to its
-    source counterpart. That is the content proof this tree is an install of
-    `source` rather than a directory that merely reuses its entry names -- a
-    user's own `plugin.json` sitting where ours sits is not ours (#766).
-    An entry that cannot be read is skipped rather than raised, so the answer
-    depends on what the tree holds, not on where an unreadable file sorts.
-    """
-    try:
-        entries = sorted(dest.iterdir())
-    except OSError:
-        return False
-    for entry in entries:
-        if _is_install_bytecode(entry.name):
-            continue
-        counterpart = source / entry.name
-        if entry.is_symlink():
-            continue
-        if entry.is_dir():
-            if counterpart.is_dir() and _any_file_matches_source(entry, counterpart):
-                return True
-        elif counterpart.is_file():
-            try:
-                if entry.read_bytes() == counterpart.read_bytes():
-                    return True
-            except OSError:
-                continue
-    return False
-
-
 def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
-    """Why `--force` must not remove directory `dest`, or None when it may.
+    """Accept empty directories or explicitly marked copies, never lookalikes.
 
-    `--dest` is caller-supplied, so `--force` used to `shutil.rmtree` whatever
-    was there -- unrelated user data included (#766). A directory is only
-    replaceable when it is provably this artifact's own: empty, or a previous
-    install of `source` -- the source tree's own layout, entry for entry, with
-    at least one file still byte-identical to the source's, and the bytecode
-    caches importing it in place leaves behind tolerated but never counted as
-    proof. Entry names alone decide nothing: a directory that merely reuses
-    them is somebody else's. Everything else is refused with the deliberate
-    alternative named, the same "refuse and name the escape hatch" shape as
-    the bridge's destructive-op gate, rather than learned from a half-populated
-    install. Paths are compared as `_install_path` resolved them, so a symlinked
-    ancestor cannot smuggle the rmtree past the check, and the pure path rules
-    (`_never_an_install_destination`) were already applied to this same path.
+    The marker identifies the artifact, not a checkout or its current bytes:
+    upgrading a single-file skill and removing old source files must both work.
+    It grants replacement of the whole copy, including local edits. Unmarked
+    legacy copies cannot be distinguished from user directories.
     """
     if not any(dest.iterdir()):
         return None
-    foreign = _foreign_install_entry(dest, source)
-    if foreign is not None:
-        return (
-            "it is not a previous install of this artifact "
-            f"({foreign} is not what this install writes)"
-        )
-    if not _any_file_matches_source(dest, source):
-        return (
-            "it is not a previous install of this artifact (no file under it "
-            "still matches the source tree)"
-        )
-    return None
+    marker = dest / _COPY_INSTALL_MARKER
+    if not marker.is_symlink() and marker.is_file():
+        try:
+            identity = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            identity = None
+        if identity == _copy_install_identity(source):
+            return None
+    return (
+        f"ownership cannot be proved: it has no valid {_COPY_INSTALL_MARKER} "
+        f"marker for {source.name!r}. This may be an unmarked older copy or an "
+        "unrelated directory"
+    )
 
 
-def _copy_matches_source(dest: Path, source: Path) -> bool:
+def _copy_matches_source(dest: Path, source: Path, *, root: bool = True) -> bool:
     """Whether directory `dest` is exactly what a copy-mode install of `source`
     writes: the same entries, every file byte-identical. Bytecode is ignored on
     both sides, as the copy omits it and importing in place regenerates it.
     An unreadable entry raises `OSError`; the caller reports it."""
-    if _foreign_install_entry(dest, source) is not None:
+    if _foreign_install_entry(dest, source, root=root) is not None:
         return False
     for entry in source.iterdir():
-        if _is_install_bytecode(entry.name):
+        if _is_install_bytecode(entry.name) or entry.name == _COPY_INSTALL_MARKER:
             continue
         counterpart = dest / entry.name
         if entry.is_dir():
-            if not counterpart.is_dir() or not _copy_matches_source(counterpart, entry):
+            if not counterpart.is_dir() or not _copy_matches_source(counterpart, entry, root=False):
                 return False
         elif not counterpart.is_file() or counterpart.read_bytes() != entry.read_bytes():
             return False
@@ -493,14 +468,14 @@ def _removal_blocker(dest: Path) -> str | None:
     pending = [dest]
     while pending:
         directory = pending.pop()
+        entries = list(directory.iterdir())
         missing = [
             name for flag, name in ((os.R_OK, "read"), (os.X_OK, "search"))
-            if not os.access(directory, flag)
+            if (flag == os.R_OK or entries) and not os.access(directory, flag)
         ]
         if missing:
             return (f"{directory} lacks {' and '.join(missing)} permission, so its "
-                    "contents cannot be listed")
-        entries = list(directory.iterdir())
+                    "contents cannot be removed")
         if entries and not os.access(directory, os.W_OK):
             return f"{directory} lacks write permission, so its contents cannot be removed"
         for entry in entries:
@@ -522,18 +497,11 @@ def _force_refusal_reason(dest: Path, source: Path) -> str | None:
         return f"it could not be read ({exc})"
 
 
-# Printed under destinations an install left alone. One plain line rather than
-# a per-destination verdict on whether --force would succeed (split out of
-# #1004 to its own follow-up), so it states the rule instead of a promise: it
-# must stay true for every state it is printed under.
+# Ownership is explicit for copies; old unmarked copies require manual removal.
 FORCE_NOTE = ("--force replaces only what it can remove and proves is this "
-              "install's own (a link, an empty directory, or a previous copy, "
+              "install's own (a link, an empty directory, or a marked copy, "
               "losing any local edits in that copy); it refuses anything else "
               "and then changes no destination.")
-FORCE_NOTE_ONE = ("--force replaces it only if it can remove it and it is a link, "
-                  "an empty directory, or a previous copy of this install (losing "
-                  "any local edits in that copy); otherwise it refuses and "
-                  "changes nothing.")
 
 
 def _install_path(dest: Path) -> Path:
@@ -605,9 +573,6 @@ def _unusable_parent_reason(dest: Path) -> str | None:
 
 
 def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
-    if not source.exists():
-        raise BridgeError(f"Source directory is missing: {source}")
-
     dest = _plan_install(source, dest, mode=mode, force=force)
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -624,18 +589,25 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
     except OSError as exc:
         raise BridgeError(f"Cannot replace {dest}: {exc}") from exc
 
-    if mode == "copy":
-        shutil.copytree(source, dest, ignore=_IGNORED_INSTALL_ENTRIES)
-    else:
-        os.symlink(source, dest, target_is_directory=True)
+    try:
+        if mode == "copy":
+            shutil.copytree(source, dest, ignore=_IGNORED_INSTALL_ENTRIES)
+            (dest / _COPY_INSTALL_MARKER).write_text(
+                json.dumps(_copy_install_identity(source), separators=(",", ":")) + "\n"
+            )
+        else:
+            os.symlink(source, dest, target_is_directory=True)
+    except OSError as exc:
+        raise BridgeError(f"Cannot install into {dest}: {exc}") from exc
 
 
 def _refuse_replacement(dest: Path, reason: str) -> NoReturn:
     raise BridgeError(
         f"Refusing to replace {dest} with --force: {reason}. "
         "--force replaces only what it can prove is an install of this "
-        "artifact (a link, an empty directory, or a previous copy), never an "
-        "unrelated path. Move it aside by hand and re-run if that is what you want."
+        "artifact (a link, an empty directory, or a marked copy), never an "
+        "unrelated path. Move this destination aside by hand, then re-run the "
+        "same install command without --force to create a fresh install."
     )
 
 
@@ -655,6 +627,8 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
     install of `source` that rmtree can empty may be replaced; a regular file
     under `--dest` is somebody else's and is refused instead of unlinked.
     """
+    if not source.exists():
+        raise BridgeError(f"Source directory is missing: {source}")
     dest = _install_path(dest)
     forbidden = _never_an_install_destination(dest, source)
     if forbidden is not None:
@@ -669,8 +643,15 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
     if not force:
         state = _existing_install_state(source, dest, mode=mode)
         if state is not None:
+            try:
+                _plan_install(source, dest, mode=mode, force=True)
+            except BridgeError as exc:
+                force_detail = f"--force preflight refuses: {exc}"
+            else:
+                force_detail = "--force preflight accepts this destination"
             raise BridgeError(
-                f"Destination already exists: {dest} ({state[1]}). {FORCE_NOTE_ONE}"
+                f"Destination already exists: {dest} ({state[1]}).\n"
+                f"{force_detail}\n{FORCE_NOTE}"
             )
         return dest
     reason = _force_refusal_reason(dest, source)
@@ -689,13 +670,41 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
     return dest
 
 
+def _plan_forced_installs(
+    installs: list[tuple[Path, Path]], *, mode: str
+) -> tuple[list[tuple[Path, Path]], list[dict[str, Any]]]:
+    """The forced run's preflight, also used as a no-write dry run.
+
+    Include every destination, even one a normal install skips as current:
+    a forced run replaces current copies too, and may refuse their permissions.
+    Filesystem races and errors during writing remain possible after preflight.
+    """
+    pending: list[tuple[Path, Path]] = []
+    verdicts: list[dict[str, Any]] = []
+    for source, dest in installs:
+        row: dict[str, Any] = {"destination": str(dest)}
+        if _is_install_source(source, dest):
+            row.update(allowed=True, detail="install source itself; no replacement needed")
+        else:
+            try:
+                planned = _plan_install(source, dest, mode=mode, force=True)
+            except BridgeError as exc:
+                row.update(allowed=False, detail=str(exc))
+            else:
+                row.update(allowed=True, detail="passes --force preflight")
+                if not any(queued == planned for _, queued in pending):
+                    pending.append((source, planned))
+        verdicts.append(row)
+    return pending, verdicts
+
+
 @command("skill", "install", help="Install the bundled agent skills", fmt="text",
          args=[
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
              arg("--force", action="store_true",
-                 help="Replace existing destinations: links to another tree, or "
-                      "previous installs of these skills"),
+                 help="Replace links, empty directories, or marked copies "
+                      "(discarding local edits in those copies)"),
          ])
 def _skill_install(args: argparse.Namespace) -> int:
     skills_root = cli.skills_source_dir()
@@ -720,40 +729,36 @@ def _skill_install(args: argparse.Namespace) -> int:
             }
         )
 
+    forced_pending, force_plan = _plan_forced_installs(install_plan, mode=args.mode)
     pending_installs = []
     skipped_destinations = []
     not_updated_destinations = []
-    for source, dest in install_plan:
-        if args.force and _is_install_source(source, dest):
-            skipped_destinations.append(str(dest))
-            continue
-        if not args.force:
+    if args.force:
+        refusals = [row["detail"] for row in force_plan if not row["allowed"]]
+        if refusals:
+            raise BridgeError(
+                "Forced install refused; no destinations changed:\n"
+                + "\n".join(f"- {reason}" for reason in refusals)
+            )
+        pending_installs = forced_pending
+        skipped_destinations = [
+            str(dest) for source, dest in install_plan if _is_install_source(source, dest)
+        ]
+    else:
+        for source, dest in install_plan:
             state = _existing_install_state(source, dest, mode=args.mode)
             if state is not None and state[0] == "up_to_date":
                 skipped_destinations.append(str(dest))
                 continue
             if state is not None and not explicit_dest:
-                # A default root holds something else -- most often a link into
-                # a previous checkout. Leave it, but say so and fail the run:
-                # "already installed" here kept every link on the old tree with
-                # exit 0 (#1002). An explicit --dest is refused by the plan.
                 skipped_destinations.append(str(dest))
                 not_updated_destinations.append(
                     {"destination": str(dest), "state": state[0], "detail": state[1]}
                 )
                 continue
-        # Planned, not just checked: the path validated here is the path the
-        # install writes to, and every destination is refused before the first
-        # one is written -- so no refusal can leave half a store installed. An
-        # OS error while writing (a filesystem that fills, a race) still can,
-        # with the destinations reached first left in place.
-        # Two target roots can name one directory (a symlinked skills root, or
-        # an equal CLAUDE_HOME and CODEX_HOME), and installing there twice would
-        # write the same skills over the copy the first entry just made.
-        planned = _plan_install(source, dest, mode=args.mode, force=args.force)
-        if any(queued == planned for _, queued in pending_installs):
-            continue
-        pending_installs.append((source, planned))
+            planned = _plan_install(source, dest, mode=args.mode, force=False)
+            if not any(queued == planned for _, queued in pending_installs):
+                pending_installs.append((source, planned))
 
     for source, dest in pending_installs:
         _install_tree(source, dest, mode=args.mode, force=args.force)
@@ -773,6 +778,8 @@ def _skill_install(args: argparse.Namespace) -> int:
     }
     if not_updated_destinations:
         result["force_note"] = FORCE_NOTE
+        result["force_plan"] = force_plan
+        result["force_ready"] = all(row["allowed"] for row in force_plan)
     cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
     return 1 if not_updated_destinations else 0
 

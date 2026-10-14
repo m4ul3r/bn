@@ -2368,6 +2368,10 @@ def test_xrefs_any_points_string_addresses_at_strings_with_xrefs(monkeypatch, ca
 
     assert rc == 0
     out = capsys.readouterr().out
+    rows = {line.split(":")[0].strip(): line for line in out.splitlines() if line.startswith("  ")}
+    assert "[string]" in rows["0x403011"]
+    assert "[string]" in rows["0x40301c"]
+    assert "[string]" not in rows["log_print"]
     assert "tip: 2 probed address(es) point into strings" in out
     assert "bn strings --query <text> --with-xrefs" in out
 

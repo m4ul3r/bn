@@ -11,6 +11,34 @@ import pytest
 from _cli_helpers import *  # noqa: F401,F403
 
 
+def _install_disk_snapshot(root):
+    """Capture content and metadata without following destination symlinks."""
+    snapshot = {}
+
+    def visit(path):
+        stat = path.lstat()
+        state = (stat.st_mode, stat.st_ino, stat.st_mtime_ns)
+        if path.is_symlink():
+            state += (os.readlink(path),)
+        elif path.is_dir():
+            try:
+                children = list(path.iterdir())
+            except OSError as exc:
+                state += (type(exc).__name__,)
+            else:
+                for child in children:
+                    visit(child)
+        else:
+            try:
+                state += (path.read_bytes(),)
+            except OSError as exc:
+                state += (type(exc).__name__,)
+        snapshot[str(path.relative_to(root))] = state
+
+    visit(root)
+    return snapshot
+
+
 @pytest.fixture(autouse=True)
 def _isolate_omp_skill_destination(monkeypatch, tmp_path):
     # A throwaway HOME, with the variables that override it cleared, so no
@@ -28,6 +56,20 @@ def _isolate_omp_skill_destination(monkeypatch, tmp_path):
     monkeypatch.setattr(
         bn.cli, "omp_skills_dir", lambda: agent_dir / "skills", raising=False
     )
+    original_main = bn.cli.main
+
+    def checked_main(argv=None):
+        install = argv is not None and any(
+            argv[i:i + 2] in (["plugin", "install"], ["skill", "install"])
+            for i in range(len(argv) - 1)
+        )
+        before = _install_disk_snapshot(tmp_path) if install else None
+        rc = original_main(argv)
+        if install and rc == 2:
+            assert _install_disk_snapshot(tmp_path) == before, "refusal changed the disk"
+        return rc
+
+    monkeypatch.setattr(bn.cli, "main", checked_main)
 
 
 def test_skills_source_dir_prefers_repo_then_falls_back_to_prefix(monkeypatch, tmp_path):
@@ -89,7 +131,9 @@ def test_plugin_install_accepts_its_own_install_and_names_a_stale_one(tmp_path, 
     destination = tmp_path / "bn_agent_bridge"
     destination.symlink_to(bn.cli.plugin_source_dir())
 
-    assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 0
+    assert bn.cli.main(
+        ["plugin", "install", "--dest", str(destination), "--format", "json"]
+    ) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["installed"] is False
     assert result["note"].startswith("already installed: symlink to ")
@@ -236,10 +280,8 @@ def _seed_leftover(leftover, skill, dest, tmp_path):
         (dest / "SKILL.md").write_text((skill / "SKILL.md").read_text())
         (dest / "old.md").write_text("gone upstream")
     elif leftover == "read_only_old_copy":
-        # A previous copy (its SKILL.md still matches), out of date because the
-        # source gained a file, and read-only: rmtree cannot empty it.
-        dest.mkdir()
-        (dest / "SKILL.md").write_text((skill / "SKILL.md").read_text())
+        # A marked copy, out of date because the source gained a file.
+        bn.cli.main(["skill", "install", "--mode", "copy"])
         (skill / "extra.md").write_text("new upstream")
         dest.chmod(0o555)
     elif leftover == "read_only_empty_dir":
@@ -281,6 +323,7 @@ def test_skill_install_reports_a_non_current_destination_and_fails(
     skill, dest = _one_skill_source(tmp_path, monkeypatch)
     old_tree = _seed_leftover(leftover, skill, dest, tmp_path)
     state, detail_words, forced_rc = _LEFTOVERS[leftover]
+    capsys.readouterr()
     try:
         rc = bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"])
 
@@ -288,15 +331,16 @@ def test_skill_install_reports_a_non_current_destination_and_fails(
         result = json.loads(capsys.readouterr().out)
         [row] = result["not_updated_destinations"]
         assert row == {"destination": str(dest), "state": state, "detail": row["detail"]}
+        assert result["force_ready"] is (forced_rc == 0)
+        assert result["force_plan"][0]["allowed"] is (forced_rc == 0)
         assert detail_words in row["detail"]
-        assert result["force_note"] == bn.commands.admin.FORCE_NOTE
         if old_tree is not None:
             assert os.readlink(dest) == str(old_tree)  # untouched without --force
 
         assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 1
         text = capsys.readouterr().out
         assert "already installed" not in text
-        assert text.rstrip().endswith(bn.commands.admin.FORCE_NOTE)
+        assert str(dest) in text
 
         forced = bn.cli.main(["skill", "install", "--mode", "copy", "--force"])
         captured = capsys.readouterr()
@@ -341,7 +385,9 @@ def test_install_maps_a_failing_rmtree_to_a_structured_error(tmp_path, monkeypat
         raise PermissionError(13, "Permission denied", str(path))
 
     monkeypatch.setattr(bn.commands.admin.shutil, "rmtree", failing_rmtree)
-    rc = bn.cli.main(["plugin", "install", "--dest", str(destination), "--force"])
+    rc = bn.cli.main(
+        ["plugin", "install", "--dest", str(destination), "--force", "--format", "json"]
+    )
 
     assert rc == 2
     captured = capsys.readouterr()
@@ -349,44 +395,6 @@ def test_install_maps_a_failing_rmtree_to_a_structured_error(tmp_path, monkeypat
     assert "Traceback" not in captured.err
 
 
-@pytest.mark.parametrize("kind", ["foreign_dir", "regular_file", "read_only_empty_dir"])
-def test_plugin_install_force_note_is_true_for_what_is_there(tmp_path, capsys, kind):
-    # Review round 4: the note said "--force replaces it" for destinations
-    # --force then refuses. It states the rule instead, so it holds for every
-    # state it is printed under -- and the forced run follows that rule.
-    if kind == "read_only_empty_dir" and os.geteuid() == 0:
-        from conftest import refuse_silent_skip
-        refuse_silent_skip("root bypasses the permission this case denies; run as a user")
-    destination = tmp_path / "bn_agent_bridge"
-    if kind == "regular_file":
-        destination.write_text("not ours")
-    else:
-        destination.mkdir()
-        if kind == "foreign_dir":
-            (destination / "notes.txt").write_text("mine")
-        else:
-            destination.chmod(0o555)
-    try:
-        assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 2
-        err = capsys.readouterr().err
-        assert bn.commands.admin.FORCE_NOTE_ONE in err
-        assert "--force replaces it," not in err  # no unconditional promise
-
-        forced = bn.cli.main(["plugin", "install", "--dest", str(destination), "--force"])
-        captured = capsys.readouterr()
-        assert "Traceback" not in captured.err
-        if kind == "read_only_empty_dir":
-            assert forced == 0, captured  # an empty directory: replaced, as on base
-            assert destination.is_symlink()
-        else:
-            assert forced == 2, captured  # not provably ours: refused, unchanged
-            if kind == "foreign_dir":
-                assert (destination / "notes.txt").read_text() == "mine"
-            else:
-                assert destination.read_text() == "not ours"
-    finally:
-        if destination.is_dir() and not destination.is_symlink():
-            destination.chmod(0o755)
 
 
 def test_install_with_dest_equal_to_the_source_is_a_no_op(tmp_path, monkeypatch, capsys):
@@ -404,7 +412,9 @@ def test_install_with_dest_equal_to_the_source_is_a_no_op(tmp_path, monkeypatch,
         assert bn.cli.main(argv) == 0, argv
         assert capsys.readouterr().out.startswith("Skills already installed.\n")
     for extra in ([], ["--mode", "copy", "--force"]):
-        assert bn.cli.main(["plugin", "install", "--dest", str(plugin), *extra]) == 0
+        assert bn.cli.main(
+            ["plugin", "install", "--dest", str(plugin), "--format", "json", *extra]
+        ) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["installed"] is False
         assert "is the install source" in result["note"]
@@ -439,7 +449,7 @@ def test_skill_install_dest_in_the_other_mode_names_a_force_that_converts(tmp_pa
 
     assert rc == 2
     err = capsys.readouterr().err
-    assert "not the requested copy" in err and "--force replaces it" in err
+    assert "not the requested copy" in err
     assert bn.cli.main(
         ["skill", "install", "--mode", "copy", "--dest", str(destination), "--force"]
     ) == 0
@@ -456,7 +466,7 @@ def test_plugin_install_symlink_over_a_copy_names_a_force_that_converts(tmp_path
 
     assert rc == 2
     err = capsys.readouterr().err
-    assert "not the requested symlink" in err and "--force replaces it" in err
+    assert "not the requested symlink" in err
     assert bn.cli.main(["plugin", "install", "--dest", str(destination), "--force"]) == 0
     assert destination.is_symlink()
 
@@ -511,19 +521,21 @@ def test_install_reports_an_unreadable_copy_as_structured_output(
         assert rc == 1
         [row] = json.loads(capsys.readouterr().out)["not_updated_destinations"]
         assert "could not be read" in row["detail"]
-        # Only file, unreadable: nothing proves the copy is ours, so --force
-        # refuses, with a message rather than a traceback.
-        assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 2
-        assert "Traceback" not in capsys.readouterr().err
+        # Ownership comes from the marker, not the unreadable file.
+        assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 0
+        assert (dest / "SKILL.md").read_text() == (skill / "SKILL.md").read_text()
+        capsys.readouterr()
 
-        rc = bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(plugin_dest)])
+        rc = bn.cli.main(
+            ["plugin", "install", "--mode", "copy", "--dest", str(plugin_dest),
+             "--format", "json"]
+        )
         assert rc == 2
         captured = capsys.readouterr()
         error = json.loads(captured.out)["error"]
         assert "could not be read" in error
         assert "Traceback" not in captured.err
-        # The other file still matches, so --force replaces the copy wherever
-        # the unreadable one sorts.
+        # A marked copy is replaceable regardless of which file is unreadable.
         assert bn.cli.main(
             ["plugin", "install", "--mode", "copy", "--dest", str(plugin_dest), "--force"]
         ) == 0
@@ -544,7 +556,7 @@ def test_plugin_install_up_to_date_check_respects_the_requested_mode(tmp_path, c
 
     assert rc == 2
     err = capsys.readouterr().err
-    assert "not the requested copy" in err and "--force replaces it" in err
+    assert "not the requested copy" in err
     assert bn.cli.main(
         ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
     ) == 0
@@ -751,25 +763,6 @@ def test_force_refuses_a_destination_holding_only_bytecode(tmp_path):
     assert (destination / "loose.pyc").read_bytes() == b"user bytecode"
 
 
-def test_force_refuses_a_foreign_file_inside_a_source_named_directory(tmp_path):
-    # The source's own directory names are not a licence to recurse into them:
-    # a file the user added inside one makes the destination not ours.
-    skills_root = bn.cli.skills_source_dir()
-    skill = next(entry for entry in sorted(skills_root.iterdir()) if entry.is_dir())
-    nested = next(entry.name for entry in sorted(skill.iterdir()) if entry.is_dir())
-    destination_root = tmp_path / "skill-store"
-    destination = destination_root / skill.name
-    assert bn.cli.main(
-        ["skill", "install", "--mode", "copy", "--dest", str(destination_root)]
-    ) == 0
-    (destination / nested / "mine.md").write_text("the user's own file\n")
-
-    rc = bn.cli.main(
-        ["skill", "install", "--mode", "copy", "--dest", str(destination_root), "--force"]
-    )
-
-    assert rc == 2
-    assert (destination / nested / "mine.md").read_text() == "the user's own file\n"
 
 
 def test_force_refuses_a_file_destination(tmp_path, capsys):
@@ -5076,3 +5069,155 @@ def test_session_stop_dead_bridge_skips_the_unsaved_guard(monkeypatch, capsys):
     assert rc == 0
     assert signallers[0].sent == [signal_mod.SIGTERM]
     assert json.loads(capsys.readouterr().out)["method"] == "sigterm"
+
+
+def test_marked_single_file_skill_upgrades_and_discards_local_edits(
+    tmp_path, monkeypatch, capsys
+):
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 0
+    (dest / "SKILL.md").write_text("local edit")
+    (dest / "removed-upstream.md").write_text("old copy content")
+    (skill / "SKILL.md").write_text("new version")
+    capsys.readouterr()
+
+    before = _install_disk_snapshot(tmp_path)
+    assert bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["force_ready"] is True
+    assert result["force_plan"][0]["allowed"] is True
+    assert _install_disk_snapshot(tmp_path) == before
+    assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 0
+    assert (dest / "SKILL.md").read_text() == "new version"
+    assert not (dest / "removed-upstream.md").exists()
+
+
+@pytest.mark.parametrize("marker", ["missing", "invalid_json", "wrong_artifact", "symlink", "directory"])
+def test_force_refuses_unproved_copy_even_when_all_source_bytes_match(
+    tmp_path, monkeypatch, capsys, marker
+):
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    dest.mkdir()
+    (dest / "SKILL.md").write_bytes((skill / "SKILL.md").read_bytes())
+    marker_path = dest / ".bn-copy-install.json"
+    if marker == "invalid_json":
+        marker_path.write_text("{")
+    elif marker in ("wrong_artifact", "symlink"):
+        identity = {"format": "bn-copy-install-v1", "artifact": "other"}
+        if marker == "symlink":
+            identity["artifact"] = skill.name
+            outside = tmp_path / "identity.json"
+            outside.write_text(json.dumps(identity))
+            marker_path.symlink_to(outside)
+        else:
+            marker_path.write_text(json.dumps(identity))
+    elif marker == "directory":
+        marker_path.mkdir()
+
+    assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 2
+    err = capsys.readouterr().err
+    assert "ownership cannot be proved" in err
+    assert "unmarked older copy" in err
+    assert "Move this destination aside by hand" in err
+    assert "not a previous install" not in err
+
+
+def test_forced_skill_install_lists_every_blocker_and_preserves_linked_checkout(
+    tmp_path, monkeypatch, capsys
+):
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    source_root = skill.parent
+    for name in ("another", "third"):
+        sibling = source_root / name
+        sibling.mkdir()
+        (sibling / "SKILL.md").write_text(name)
+    old = tmp_path / "older-checkout" / "skills"
+    old.mkdir(parents=True)
+    for source in source_root.iterdir():
+        copy = old / source.name
+        copy.mkdir()
+        (copy / "SKILL.md").write_bytes((source / "SKILL.md").read_bytes())
+    (old / "sample" / "SKILL.md").write_text("local edits in another checkout")
+    dest.parent.rmdir()
+    dest.parent.symlink_to(old)
+    before = _install_disk_snapshot(tmp_path)
+
+    assert bn.cli.main(["skill", "install", "--format", "json"]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["force_ready"] is False
+    assert len(result["force_plan"]) == 3
+    assert all(not row["allowed"] for row in result["force_plan"])
+    assert _install_disk_snapshot(tmp_path) == before
+    assert bn.cli.main(["skill", "install", "--force"]) == 2
+    err = capsys.readouterr().err
+    for source in source_root.iterdir():
+        assert str(old / source.name) in err
+    assert (old / "sample" / "SKILL.md").read_text() == "local edits in another checkout"
+
+
+@pytest.mark.parametrize("mode", [0o444, 0o400, 0o500, 0o555])
+def test_force_replaces_read_only_empty_directory_without_search(
+    tmp_path, monkeypatch, capsys, mode
+):
+    if os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses the permissions this case denies")
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    dest.mkdir()
+    dest.chmod(mode)
+    try:
+        before = _install_disk_snapshot(tmp_path)
+        assert bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"]) == 1
+        assert json.loads(capsys.readouterr().out)["force_ready"] is True
+        assert _install_disk_snapshot(tmp_path) == before
+        assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 0
+        assert (dest / "SKILL.md").read_bytes() == (skill / "SKILL.md").read_bytes()
+    finally:
+        if dest.is_dir():
+            dest.chmod(0o755)
+
+
+def test_force_dry_run_includes_current_destinations_that_block_the_whole_run(
+    tmp_path, monkeypatch, capsys
+):
+    if os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses the permissions this case denies")
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 0
+    codex_root = tmp_path / "codex" / "skills"
+    codex_root.mkdir(parents=True)
+    other = codex_root / skill.name
+    other.symlink_to(tmp_path / "gone")
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_root)
+    dest.chmod(0o555)
+    capsys.readouterr()
+    try:
+        before = _install_disk_snapshot(tmp_path)
+        assert bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"]) == 1
+        result = json.loads(capsys.readouterr().out)
+        assert result["force_ready"] is False
+        verdicts = {row["destination"]: row for row in result["force_plan"]}
+        assert verdicts[str(dest)]["allowed"] is False
+        assert verdicts[str(other)]["allowed"] is True
+        assert _install_disk_snapshot(tmp_path) == before
+        assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 2
+        assert os.readlink(other) == str(tmp_path / "gone")
+    finally:
+        dest.chmod(0o755)
+
+
+def test_plugin_default_refusal_is_one_text_diagnostic_and_json_is_explicit(
+    tmp_path, capsys
+):
+    dest = tmp_path / "foreign"
+    dest.mkdir()
+    (dest / "notes.txt").write_text("keep")
+    argv = ["plugin", "install", "--dest", str(dest), "--force"]
+    assert bn.cli.main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.count("Refusing to replace") == 1
+    assert bn.cli.main(argv + ["--format", "json"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["ok"] is False

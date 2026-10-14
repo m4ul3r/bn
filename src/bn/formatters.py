@@ -2853,7 +2853,8 @@ def _render_xrefs_any_text(value: Any) -> str:
         if s.get("present"):
             lines.append(
                 f"  {s.get('symbol')}: {s.get('code_ref_count', 0)} code refs across "
-                f"{s.get('caller_function_count', 0)} fn(s)  @ {s.get('address', '?')}")
+                f"{s.get('caller_function_count', 0)} fn(s)  @ {s.get('address', '?')}"
+                + (" [string]" if s.get("target_kind") == "string" else ""))
             if s.get("target_kind") == "string":
                 string_targets += 1
         else:
@@ -7222,6 +7223,15 @@ def _render_py_exec_text(value: Any) -> str:
 
 
 @_discloses
+def _render_plugin_install_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if value.get("installed"):
+        return f"Installed plugin ({value.get('mode')}): {value.get('destination')}\n"
+    return f"Plugin {value.get('note', 'already installed')}.\n"
+
+
+@_discloses
 def _render_skill_install_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -7233,6 +7243,15 @@ def _render_skill_install_text(value: Any) -> str:
     # A list, not a set: membership must not hash wire values (#619).
     not_updated_paths = [row.get("destination") for row in not_updated]
     up_to_date = [dest for dest in skipped if dest not in not_updated_paths]
+    force_plan = [row for row in _field_list(value, "force_plan")
+                  if isinstance(row, dict)]
+
+    def force_detail(dest: Any) -> str:
+        row = next((row for row in force_plan if row.get("destination") == dest), None)
+        if row is None:
+            return ""
+        return f"; --force: {row.get('detail')}"
+
     lines = []
 
     if installed:
@@ -7243,15 +7262,22 @@ def _render_skill_install_text(value: Any) -> str:
 
     if up_to_date:
         lines.append("Already up to date:")
-        lines.extend(f"- {dest}" for dest in up_to_date)
+        lines.extend(f"- {dest}{force_detail(dest)}" for dest in up_to_date)
 
-    # #1002: these were left alone and are NOT this install -- a link into a
-    # previous checkout, dangling, another mode, or a foreign directory. Never
-    # "installed". One closing note about --force, not a per-row verdict.
+    # Existing destinations are not claimed as installed. The force verdicts
+    # come from the forced run's own no-write preflight, including current rows.
     if not_updated:
         lines.append("Not updated, existing destination differs from the requested install:")
-        lines.extend(f"- {row.get('destination')} ({row.get('detail')})"
-                     for row in not_updated)
+        lines.extend(
+            f"- {row.get('destination')} ({row.get('detail')})"
+            f"{force_detail(row.get('destination'))}" for row in not_updated
+        )
+        if force_plan:
+            ready = "ready" if value.get("force_ready") else "refused; fix every blocker first"
+            lines.append(
+                f"--force preflight: {ready}. Checked without writes; "
+                "filesystem races or write errors can still fail the install."
+            )
         force_note = _text_value(value, "force_note")
         if force_note:
             lines.append(force_note)
