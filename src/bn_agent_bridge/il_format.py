@@ -936,12 +936,54 @@ def _function_signature(func) -> str:
     return f"{ret} {func.name}({', '.join(params)})"
 
 
-def _pseudo_c_text(func, *, addresses: bool = False) -> str:
+# Consume literals and block comments before looking for a line-comment span,
+# so a quoted URL or a `//` inside `/* ... */` cannot start a line comment.
+# Shared by the decompile redaction (#740) and the note placement below.
+_COMMENT_SPAN_RE = re.compile(
+    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|/\*.*?(?:\*/|\Z)|//(?P<body>[^\r\n]*)""",
+    re.DOTALL,
+)
+
+
+def _code_and_comment(text: str) -> tuple[str, str]:
+    """*text* split before its trailing `//` comment (``""`` when none)."""
+    for match in _COMMENT_SPAN_RE.finditer(text):
+        if match.group("body") is not None:
+            return text[:match.start()].rstrip(), text[match.start():]
+    return text, ""
+
+
+def _with_line_note(text: str, note: str) -> str | None:
+    """*text* with *note* after its code and before any trailing `//` comment,
+    or None when the code part is no statement a note belongs to (it carries
+    neither a call's `(` nor BN's `jump ->`).
+
+    Appending past the comment put the note INSIDE it: the stored body no
+    longer matched, so the #740 redaction printed an inherited comment in full
+    and a comment this session wrote lost its `[this session]` mark."""
+    code, comment = _code_and_comment(text)
+    if "(" not in code and "jump ->" not in code:
+        return None
+    return f"{code}  {note}" + (f"  {comment}" if comment else "")
+
+
+def _pseudo_c_text(func, *, addresses: bool = False,
+                   line_notes: dict[int, list[str]] | None = None,
+                   placed: set[int] | None = None,
+                   jump_notes: dict[int, str] | None = None) -> str:
     """Render Binary Ninja's Pseudo C for one function (GUI-equivalent).
 
     Walks the language-representation linear view a batch of lines at a
     time. Each line carries its own address, so the optional gutter matches
     what Binary Ninja shows in its UI. Comments are rendered inline by BN.
+
+    *line_notes* maps an instruction address to notes added to the first
+    statement line BN renders at that address (`_with_line_note`), ahead of
+    any trailing `//` comment. *jump_notes* maps a jump's address to one note
+    added to EVERY `jump ->` line at that address: BN repeats one machine
+    jump in several switch cases, and each copy reads the same. Each address
+    placed is added to *placed*, so the caller can say which notes it could
+    not attach.
     """
     settings = bn.DisassemblySettings()
     # Suppress BN's built-in address column so `--addresses` controls the
@@ -969,14 +1011,29 @@ def _pseudo_c_text(func, *, addresses: bool = False) -> str:
                 # not on the prefixed string).
                 out.append("")
                 continue
-            if not seen_content:
+            header = not seen_content
+            if header:
                 # BN indents the function-header (signature) line by two
                 # spaces; the braces and body don't share that indent, so
                 # left-justify the header to line up with them.
                 text = text.lstrip()
                 seen_content = True
+            addr = getattr(line.contents, "address", None)
+            noted = None
+            # Never on the signature: it carries the entry address too, so a
+            # jump at a function's first instruction put its note there (#1000).
+            if addr is not None and not header:
+                if jump_notes and int(addr) in jump_notes \
+                        and "jump ->" in _code_and_comment(text)[0]:
+                    noted = _with_line_note(text, jump_notes[int(addr)])
+                elif (line_notes and int(addr) in line_notes
+                        and int(addr) not in (placed or ())):
+                    noted = _with_line_note(text, " ".join(line_notes[int(addr)]))
+            if noted is not None:
+                text = noted
+                if placed is not None:
+                    placed.add(int(addr))
             if addresses:
-                addr = getattr(line.contents, "address", None)
                 prefix = f"{hex(int(addr))}        " if addr is not None else " " * 16
                 out.append(f"{prefix}{text}")
             else:
@@ -990,11 +1047,17 @@ def _pseudo_c_text(func, *, addresses: bool = False) -> str:
     return "\n".join(out)
 
 
-def _decompile_text(bv, func, *, addresses: bool = False) -> str:
-    """Pseudo C for a function, degrading to wrapped HLIL if it is unavailable."""
+def _decompile_text(bv, func, *, addresses: bool = False,
+                    line_notes: dict[int, list[str]] | None = None,
+                    placed: set[int] | None = None,
+                    jump_notes: dict[int, str] | None = None) -> str:
+    """Pseudo C for a function, degrading to wrapped HLIL if it is unavailable.
+    *line_notes*/*placed*/*jump_notes* are `_pseudo_c_text`'s; the HLIL
+    fallback places none."""
     marker = ""
     try:
-        text = _pseudo_c_text(func, addresses=addresses)
+        text = _pseudo_c_text(func, addresses=addresses, line_notes=line_notes, placed=placed,
+                              jump_notes=jump_notes)
     except Exception as exc:
         # Make the failure visible instead of silently returning the HLIL
         # fallback (or worse, an empty body) with ok:true.
@@ -1009,6 +1072,8 @@ def _decompile_text(bv, func, *, addresses: bool = False) -> str:
         text = ""
     if text.strip():
         return text
+    if placed is not None:
+        placed.clear()  # the fallback below carries none of the notes
     sig = _function_signature(func)
     body = _function_text(bv, func, view="hlil", addresses=addresses)
     if addresses:
@@ -1188,7 +1253,14 @@ def _iter_il_instructions(il_func):
 def _render_warnings(text: str) -> list[str]:
     warnings: list[str] = []
     if "__offset(" in text:
+        # No `types show` advice as "the authoritative layout": T is routinely
+        # a named reference with no definition, which that command cannot find
+        # (#1000 item 4). `decompile` names which T exist; this shared,
+        # view-free note can only say what the spelling means.
         warnings.append(
-            "Decompile still contains raw __offset(...) expressions; use `bn types show` or `bn struct show` as the authoritative layout until Binary Ninja refreshes the presentation."
+            "Decompile contains raw __offset(T, N) expressions: BN's spelling for a pointer N "
+            "bytes into an object of type T. T is often a named reference with no definition "
+            "(BN made the name from a symbol or demangled signature); `bn decompile` on the "
+            "function says which T are defined."
         )
     return warnings

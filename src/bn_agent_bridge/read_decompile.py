@@ -49,6 +49,30 @@ from .bridge_state import require_analysis
 from .read_listing import _analysis_state_fields
 
 
+def _warning_row(code: str, summary: str, detail: str, **extra: Any) -> dict[str, Any]:
+    """One decompile warning (#1000 item 1): a stable *code* to filter on, a
+    one-line *summary* text mode prints, and the full *detail* (what it means
+    and what to do) `--explain` prints and JSON always carries. *extra* holds
+    the structured facts the summary was cut from (addresses, per-call rows).
+
+    Text used to print *detail* alone, and agents filtered every `warning:` line
+    out wholesale -- dropping the ones that mattered with the boilerplate."""
+    return {"code": code, "summary": summary, "detail": detail, **extra}
+
+
+def _stub_warning_row(func, detail: str, forced: bool) -> dict[str, Any]:
+    """Wrap `il_format._analysis_stub_warning`'s sentence (shared with `bundle`)."""
+    try:
+        raw = func.analysis_skip_reason
+        reason = getattr(raw, "name", None) or str(raw)
+    except Exception:  # noqa: BLE001
+        reason = None
+    because = f" ({reason})" if reason else ""
+    summary = (f"still an incomplete stub after --force-analysis{because}" if forced else
+               f"incomplete stub: BN skipped analysis{because}; re-run with --force-analysis")
+    return _warning_row("stub", summary, detail)
+
+
 def _force_function_analysis(ctx, bv, func):
     """Override a skipped function's analysis and reanalyze it in place.
 
@@ -75,7 +99,7 @@ def _force_function_analysis(ctx, bv, func):
 _FORCED_DATA_MIN_BYTES = 0x4000
 
 
-def _forced_data_region_warning(bv, func) -> str | None:
+def _forced_data_region_warning(bv, func) -> dict[str, Any] | None:
     """A hedged verify-nudge when a force-analyzed function looks like it may be
     a DATA region BN tentatively typed as code (#371.1).
 
@@ -101,11 +125,13 @@ def _forced_data_region_warning(bv, func) -> str | None:
             return None
     except Exception:
         return None
-    return (
+    return _warning_row(
+        "forced_data",
+        f"forced decode of {size} bytes with no inbound refs: may be a data region; verify",
         f"{func.name}: forced analysis decoded {size} bytes with 0 inbound code refs. "
         "BN sometimes makes a function on a DATA region (string/pointer table or packed "
         "data) that grows under forced decode; if the body reads as tables/strings/garbage "
-        "rather than coherent code, treat this decode as suspect and verify before acting on it."
+        "rather than coherent code, treat this decode as suspect and verify before acting on it.",
     )
 
 
@@ -121,7 +147,7 @@ def _annotate_containment(ctx, result, identifier, func) -> None:
         result["resolved_from"] = meta
 
 
-def _thunk_veneer_warning(ctx, bv, func) -> str | None:
+def _thunk_veneer_warning(ctx, bv, func) -> dict[str, Any] | None:
     """A `thunk/veneer -> <target>` warning when *func* is a PLT/GOT trampoline
     (#446), reusing `evidence function`'s detector so the signal is consistent.
     None when it is not a thunk."""
@@ -135,11 +161,15 @@ def _thunk_veneer_warning(ctx, bv, func) -> str | None:
         name, addr = fn.get("name"), fn.get("address")
         dest = f"{name} @ {addr}" if name and addr else (name or addr)
         if fn.get("exact_start") is False:
-            return (f"thunk/veneer: the branch target lands inside {dest}, not at its "
-                    f"entry -- a mid-function destination is not a trampoline entry "
-                    f"point, so this is not confirmed as a PLT/GOT thunk.")
-        return (f"thunk/veneer -> {dest}: this is a PLT/GOT trampoline (a jump to "
-                f"the real body), not a self-recursive function.")
+            return _warning_row(
+                "thunk", f"thunk/veneer: branch lands inside {dest}, not at its entry; not confirmed",
+                f"thunk/veneer: the branch target lands inside {dest}, not at its "
+                f"entry -- a mid-function destination is not a trampoline entry "
+                f"point, so this is not confirmed as a PLT/GOT thunk.")
+        return _warning_row(
+            "thunk", f"thunk/veneer -> {dest}",
+            f"thunk/veneer -> {dest}: this is a PLT/GOT trampoline (a jump to "
+            f"the real body), not a self-recursive function.")
     # #704 round 3: no target was resolved here -- the candidate was flagged
     # either because the function merely starts in a PLT/import section, or
     # because BN's pseudo-C rendered a bare `/* tailcall */` with no branch
@@ -148,16 +178,10 @@ def _thunk_veneer_warning(ctx, bv, func) -> str | None:
     # the tool never made. State only the reason the candidate was flagged;
     # make no claim about what the unresolved target actually is.
     reason = summary.get("reason") or "no branch target could be resolved"
-    return (f"thunk/veneer: {reason}; the branch target was not resolved, so "
-            f"this may be a trampoline/veneer but that is not confirmed.")
-
-
-# Consume literals and block comments before looking for a line-comment span,
-# so a quoted URL or a `//` inside `/* ... */` cannot start a redaction.
-_COMMENT_SPAN_RE = re.compile(
-    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|/\*.*?(?:\*/|\Z)|//(?P<body>[^\r\n]*)""",
-    re.DOTALL,
-)
+    return _warning_row(
+        "thunk", "thunk/veneer candidate; branch target not resolved",
+        f"thunk/veneer: {reason}; the branch target was not resolved, so "
+        f"this may be a trampoline/veneer but that is not confirmed.")
 
 
 _SESSION_ANNOTATION_MARK = "[this session] "
@@ -209,7 +233,7 @@ def _redact_rendered_annotations(
             return f"//{leading}{_SESSION_ANNOTATION_MARK}{stripped}{trailing}"
         return match.group(0)
 
-    redacted = _COMMENT_SPAN_RE.sub(redact, text)
+    redacted = il_format._COMMENT_SPAN_RE.sub(redact, text)
     return redacted, counts["hidden"], counts["session"]
 
 
@@ -299,7 +323,7 @@ _FLATTENED_GUARD_MNEMONICS = {
 }
 
 
-def _flattened_guard_warning(bv, func) -> str | None:
+def _flattened_guard_warning(bv, func) -> dict[str, Any] | None:
     """Name the branch-free selects in *func*, or say nothing (#676 item 12).
 
     The harm is specific and has faked critical findings: HLIL flattens a
@@ -318,6 +342,7 @@ def _flattened_guard_warning(bv, func) -> str | None:
     try:
         arch = getattr(func, "arch", None)
         seen: list[str] = []
+        sites: list[int] = []
         for block in list(func.basic_blocks):
             addr = int(block.start)
             end = int(block.end)
@@ -327,22 +352,31 @@ def _flattened_guard_warning(bv, func) -> str | None:
                     break
                 if text:
                     mnemonic = str(text).split(None, 1)[0].strip().lower()
-                    if mnemonic in _FLATTENED_GUARD_MNEMONICS and mnemonic not in seen:
-                        seen.append(mnemonic)
+                    if mnemonic in _FLATTENED_GUARD_MNEMONICS:
+                        sites.append(addr)
+                        if mnemonic not in seen:
+                            seen.append(mnemonic)
                 addr += length
         if not seen:
             return None
     except Exception:  # noqa: BLE001 - no listing is not evidence of no select
         return None
     names = ", ".join(sorted(seen))
-    return (
+    sites.sort()
+    where = ", ".join(hex(a) for a in sites[:3]) + (
+        f" +{len(sites) - 3} more" if len(sites) > 3 else "")
+    return _warning_row(
+        "select",
+        f"branch-free {names} at {where}: a guard there may read as a ternary or "
+        "flag math; confirm it in `bn disasm`",
         f"branch-free conditional(s) in this function ({names}): Pseudo-C "
         f"renders these as ternaries, folds them into one compound condition, "
         f"or decomposes them into raw flag arithmetic (`v`/`z`/`n` locals) -- "
         f"a two-sided range guard can come out as none of the three shapes a "
         f"reader is looking for, so a bound that IS enforced can read as one "
         f"that never fires. Confirm it in `bn disasm` before concluding on an "
-        f"off-by-one, truncation or missing check."
+        f"off-by-one, truncation or missing check.",
+        addresses=[hex(a) for a in sites],
     )
 
 
@@ -454,7 +488,7 @@ _SCALAR_TYPE_CLASSES = frozenset({
 })
 
 
-def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
+def _struct_layout_warnings(bv: Any, func: Any) -> list[dict[str, Any]]:
     """Evidence-qualified known-layout assistance; never writes a type (#903).
 
     Match complete scalar members of concrete, base-less structs, resolving
@@ -541,7 +575,10 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
         )
         pointer_type = f"{qualifiers + ' ' if qualifiers else ''}struct {name} *"
         address = hex(int(func.start))
-        warnings.append(
+        warnings.append(_warning_row(
+            "layout",
+            f"struct layout candidate: parameter {index + 1} ({var.name}) matches struct "
+            f"{name} at {len(observed)} offset(s); no type applied",
             f"struct layout candidate for parameter {index + 1} ({var.name}): "
             f"observed direct MLIL accesses {evidence} match declared struct {name}. "
             "Only flat scalar members of base-less struct/class layouts were compared; "
@@ -552,8 +589,8 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
             f"if confirmed, use `bn proto get {address}`, then `bn proto set {address}` "
             f"with the full prototype, changing only this parameter to "
             f"`{pointer_type}` (preserve other parameters, qualifiers and calling convention). "
-            "No type was applied."
-        )
+            "No type was applied.",
+        ))
     return warnings
 
 
@@ -588,7 +625,7 @@ def _llil_regs_read(arch, expr, acc: set[str]) -> None:
             _llil_regs_read(arch, item, acc)
 
 
-def _argument_setup_count(arch, window: list, arg_regs: list[str]) -> tuple[int, list[str]]:
+def _argument_setup_count(arch, window: list, arg_regs: list[str]) -> tuple[int, dict[str, Any]]:
     """How many leading argument registers *window* writes for the call after it.
 
     *window* is the LLIL between the previous call (or the block start) and the
@@ -602,9 +639,9 @@ def _argument_setup_count(arch, window: list, arg_regs: list[str]) -> tuple[int,
     one that is read before the call (a temporary), and GCC's stack-protector
     scrub -- `ldr xN, [guard]; str xN, [sp, ..]; mov xN, #0` -- which zeroes a
     register it just stored, and is where the issue's invented `__stack_chk_guard`
-    argument came from (#955). Returns (count, written register names): the count
-    is the highest written argument register's position + 1, because the ABI
-    passes every lower register too.
+    argument came from (#955). Returns (count, {written register: its LLIL write}),
+    in argument order: the count is the highest written argument register's
+    position + 1, because the ABI passes every lower register too.
     """
     read_after: set[str] = set()
     written: dict[str, Any] = {}
@@ -629,27 +666,91 @@ def _argument_setup_count(arch, window: list, arg_regs: list[str]) -> tuple[int,
         else:
             _llil_regs_read(arch, ins, read_after)
     if not written:
-        return 0, []
+        return 0, {}
     names = sorted(written, key=arg_regs.index)
-    return arg_regs.index(names[-1]) + 1, names
+    return arg_regs.index(names[-1]) + 1, {name: written[name] for name in names}
 
 
 _CALL_OPS = ("LLIL_CALL", "LLIL_TAILCALL", "LLIL_CALL_STACK_ADJUST")
+# A chain of selects (`ccmp`, then `csel`) lifts to one diamond per select.
+_SELECT_DIAMOND_DEPTH = 4
+
+
+def _block_key(block) -> int | None:
+    try:
+        return int(block.start)
+    except Exception:  # noqa: BLE001 - a block without an index cannot be matched
+        return None
+
+
+def _lifted_select_prefix(block, depth: int = 0) -> tuple[list, set[int]]:
+    """The set-up that precedes *block* when *block* is the join of a lifted
+    branch-free select, and ``([], set())`` otherwise.
+
+    BN lifts one `csel w2, w2, w3, ls` into a diamond: the block before it
+    ends in `if (w2 u<= w3)`, and each arm is a one-instruction block that sets
+    w2 and jumps to the join. A call right after the `csel` therefore starts
+    its own LLIL block, and the window `_calls_with_setup_windows` hands
+    `_argument_setup_count` held nothing -- so `ostream::write(this, buf, n)`,
+    whose length is that `csel`, rendered two arguments with no warning
+    (#1000 item 2). Returns (the head's tail after its last call + every arm,
+    the ids of the arm instructions). Only that exact shape is followed: two
+    or more arms, every arm lifted from ONE instruction at the head's `if`
+    address and entered only from the head."""
+    if depth >= _SELECT_DIAMOND_DEPTH:
+        return [], set()
+    try:
+        arms = [edge.source for edge in list(block.incoming_edges)]
+        if len(arms) < 2:
+            return [], set()
+        arm_bodies = [list(arm) for arm in arms]
+        sites = {int(ins.address) for body in arm_bodies for ins in body}
+        heads = [[edge.source for edge in list(arm.incoming_edges)] for arm in arms]
+        if len(sites) != 1 or any(len(h) != 1 for h in heads):
+            return [], set()
+        head = heads[0][0]
+        if any(_block_key(h[0]) != _block_key(head) for h in heads) or _block_key(head) is None:
+            return [], set()
+        head_body = list(head)
+        if (not head_body or il_format._il_op_name(head_body[-1]) != "LLIL_IF"
+                or int(head_body[-1].address) not in sites):
+            return [], set()
+    except Exception:  # noqa: BLE001 - an unreadable CFG is simply not a diamond
+        return [], set()
+    tail: list = []
+    reset = False
+    # The `if` itself stays in: a register only its condition reads (`cmp x6,
+    # x7` before the `csel`) is consumed there, not handed to the call.
+    for ins in head_body:
+        op = il_format._il_op_name(ins)
+        if "CALL" in op or op == "LLIL_SYSCALL":
+            tail, reset = [], True
+        else:
+            tail.append(ins)
+    prefix, arm_ids = ([], set()) if reset else _lifted_select_prefix(head, depth + 1)
+    # Every arm, not one: an arm reads its other operand (`w2 = w3`), and a
+    # register only one arm reads must not count as written-and-unread.
+    arm = [ins for body in arm_bodies for ins in body
+           if il_format._il_op_name(ins) != "LLIL_GOTO"]
+    return prefix + tail + arm, arm_ids | {id(ins) for ins in arm}
 
 
 def _calls_with_setup_windows(llil):
-    """Yield ``(call, window)`` for each LLIL call, *window* being the
-    instructions since the previous call or the start of the call's block.
-    One linear pass, so the cost is the function's LLIL size, not its square."""
+    """Yield ``(call, window, select_ids)`` for each LLIL call, *window* being
+    the instructions since the previous call or the start of the call's block.
+    A block that is the join of a lifted select continues the window back
+    through the select (`_lifted_select_prefix`), whose arm instructions are
+    *select_ids*. One linear pass, so the cost is the function's LLIL size,
+    not its square."""
     for block in list(getattr(llil, "basic_blocks", None) or []):
-        window: list = []
+        window, select_ids = _lifted_select_prefix(block)
         for ins in block:
             op = il_format._il_op_name(ins)
             if op in _CALL_OPS:
-                yield ins, window
-                window = []
+                yield ins, window, select_ids
+                window, select_ids = [], set()
             elif "CALL" in op or op == "LLIL_SYSCALL":
-                window = []
+                window, select_ids = [], set()
             else:
                 window.append(ins)
 
@@ -685,9 +786,9 @@ def _demangled_arity(bv, raw_name: str) -> tuple[int, int, bool] | None:
     return len(params), len(params) - int(has_this), variadic
 
 
-def _call_arity_warning(bv, func) -> str | None:
-    """Name calls whose rendered argument list is shorter than the call site's
-    (#955), or -- for a mangled callee -- longer than its signature.
+def _call_arity_findings(bv, func) -> list[dict[str, Any]]:
+    """One row per call whose rendered argument list is shorter than the call
+    site's (#955), or -- for a mangled callee -- longer than its signature.
 
     HLIL renders exactly the callee prototype's parameter count. When that
     prototype is short -- BN's bundled C++ type libraries declare many library
@@ -706,7 +807,11 @@ def _call_arity_warning(bv, func) -> str | None:
         cannot be a value the caller keeps across the call.
     An excess (more rendered than the signature takes, the invented argument
     the issue saw) is reported against the mangled signature only, and never
-    for a variadic one. Returns None when every call agrees, and never raises.
+    for a variadic one.
+
+    Each row keeps what the inline note needs (#1000 item 2): the argument
+    registers past the rendered ones, with the value the call site wrote into
+    each when it wrote one. Empty when every call agrees; never raises.
     """
     try:
         llil = getattr(func, "llil", None) or getattr(func, "low_level_il", None)
@@ -714,9 +819,9 @@ def _call_arity_warning(bv, func) -> str | None:
         cc = getattr(func, "calling_convention", None)
         arg_regs = [_full_reg(bv.arch, str(r)) for r in (getattr(cc, "int_arg_regs", None) or [])]
     except Exception:  # noqa: BLE001 - no IL means nothing to compare
-        return None
-    groups: dict[tuple[int, int, int], dict[str, Any]] = {}
-    for call, window in calls:
+        return []
+    rows: list[dict[str, Any]] = []
+    for call, window, select_ids in calls:
         try:
             target = il_format._llil_constant_value(getattr(call, "dest", None))
             address = int(getattr(call, "address", 0))
@@ -735,10 +840,10 @@ def _call_arity_warning(bv, func) -> str | None:
                 continue
             no_body = kind in _IMPORT_SYMBOL_KINDS or bool(getattr(callee, "is_thunk", False))
             signature = _demangled_arity(bv, raw_name)
-            setup, regs = _argument_setup_count(bv.arch, window, arg_regs) if arg_regs else (0, [])
+            setup, writes = _argument_setup_count(bv.arch, window, arg_regs) if arg_regs else (0, {})
         except Exception:  # noqa: BLE001 - one odd call must not hide the rest
             continue
-        setup_text = f"the call site writes {', '.join(regs)} just before it"
+        setup_text = f"the call site writes {', '.join(writes)} just before it"
         if signature is not None:
             # The demangled signature is the arity whenever there is one: the
             # register witness only corroborates it, never overrides it.
@@ -758,21 +863,225 @@ def _call_arity_warning(bv, func) -> str | None:
             expected, evidence = setup, [setup_text]
         else:
             continue
+        values = _window_values(bv, func, window, select_ids)
+        missing = [(reg, values.get(reg) if reg in writes else None)
+                   for reg in arg_regs[rendered:expected]]
+        rows.append({
+            "address": address, "target": target,
+            "label": _callee_label(symbol, callee, target),
+            "rendered": rendered, "expected": expected,
+            "evidence": tuple(evidence), "missing": missing,
+        })
+    return rows
+
+
+_WRITE_TEXT_MAX = 40
+_IL_VAR_ANNOTATION_RE = re.compile(r"\s*\{[^{}]*\}")
+
+
+def _reg_bits(arch, name: str) -> int | None:
+    try:
+        size = int(arch.regs[name].size)
+    except Exception:  # noqa: BLE001 - an unknown register has no known width
+        return None
+    return size * 8 if size > 0 else None
+
+
+def _narrowed(arch, spelled: str, text: str, bits: int | None) -> tuple[str, int | None]:
+    """*text*, a value *bits* wide (None: as wide as the full register), as
+    read through the register spelling *spelled*, with the width it then
+    has: `mov w0, w1` copies only the low 32 bits of a 64-bit `arg2`, which
+    is `(uint32_t)arg2`, not `arg2`."""
+    narrow = _reg_bits(arch, spelled)
+    full = _reg_bits(arch, _full_reg(arch, spelled))
+    if narrow is None or full is None or narrow >= full or (bits is not None and bits <= narrow):
+        return text, bits
+    if re.fullmatch(r"0x[0-9a-fA-F]+", text):
+        return hex(int(text, 16) & ((1 << narrow) - 1)), narrow
+    cast = f"(uint{narrow}_t){text}" if re.fullmatch(r"\w+", text) else f"(uint{narrow}_t)({text})"
+    return cast, narrow
+
+
+def _entry_name(bv, func, address: int | None, reg: str) -> tuple[str, int | None] | None:
+    """What *reg* holds at *address* by BN's own dataflow, as (text, bits): a
+    constant, or the function's parameter (with its width) when the register
+    still holds its entry value. None otherwise."""
+    if address is None:
+        return None
+    try:
+        value = func.get_reg_value_at(address, reg)
+        kind = str(getattr(getattr(value, "type", None), "name", ""))
+        if kind in ("ConstantValue", "ConstantPointerValue"):
+            return hex(int(value.value)), None
+        if kind != "EntryValue":
+            return None
+        entry = _full_reg(bv.arch, str(getattr(value, "reg", "") or ""))
+        for var in list(getattr(func, "parameter_vars", None) or []):
+            if _register_name(bv.arch, var) == entry:
+                width = getattr(getattr(var, "type", None), "width", None)
+                return str(var.name), int(width) * 8 if isinstance(width, int) and width > 0 else None
+    except Exception:  # noqa: BLE001 - no dataflow: say nothing rather than guess
+        return None
+    return None
+
+
+def _llil_writes(arch, ins) -> list[str]:
+    """Every register *ins* writes, full width: a plain set, a split pair
+    (`mul`'s rdx:rax), any other `LLIL_SET_REG*` form, and an intrinsic's
+    outputs (`mrs x5, tpidr_el0`). A write this misses would let a note name
+    a value the register no longer holds."""
+    op = il_format._il_op_name(ins)
+    if op == "LLIL_INTRINSIC":
+        targets = list(getattr(ins, "output", None) or [])
+    elif op.startswith("LLIL_SET_REG"):
+        targets = [getattr(ins, key, None) for key in ("dest", "hi", "lo")]
+    else:
+        return []
+    names = [str(getattr(t, "name", "")) for t in targets if getattr(t, "name", None)]
+    return [_full_reg(arch, name) for name in names]
+
+
+def _window_values(bv, func, window: list, select_ids: set[int]) -> dict[str, str | None]:
+    """The value each register holds after *window*, in words a note can show.
+
+    Taking a write's LLIL source text as its value was wrong whenever a
+    register that source reads changed before the call: `mov x2, x0` copies
+    `strlen`'s result, then `x0 = &s`, and the note said `x2 = x0`. So the
+    window is evaluated forward: a register copy carries the copied value
+    along (`w4 = w2; w2 = w3; w3 = w4` leaves x3 holding the old x2), and a
+    register read at the window's start is named by BN's dataflow there (a
+    parameter or a constant) or left as itself only if nothing in the window
+    writes it. Any other source is shown with the same naming applied to each
+    register it reads (`w1 + 1` -> `arg2 + 1` when x1 is overwritten later),
+    and not at all when one it reads was already rewritten in the window or
+    cannot be named. A value read through a narrower register keeps that
+    width (`(uint32_t)arg2`), a write narrower than 32 bits (or any partial
+    write on an architecture that does not zero-extend) leaves the value
+    unknown, and a write this does not model (a split pair, an intrinsic)
+    clobbers the register. A lifted select arm is its mnemonic and address
+    (`csel @ 0x4015cc`): one arm is not the value. None means unknown, never
+    a guess."""
+    arch = bv.arch
+    written = {reg for ins in window for reg in _llil_writes(arch, ins)}
+    start = None
+    if window:
+        try:
+            start = int(window[0].address)
+        except Exception:  # noqa: BLE001
+            start = None
+    # Each value is (text, bits): bits is how wide the value is when narrower
+    # than its register, so a later copy through a narrower spelling knows
+    # whether it truncates.
+    values: dict[str, tuple[str, int | None] | None] = {}
+    written_so_far: set[str] = set()
+    regs = getattr(arch, "regs", None) or {}
+    zero_extends = str(getattr(arch, "name", "")) in _ZERO_EXTENDING_RETURN_ARCHS
+
+    def spelled_bits(spelled: str) -> int | None:
+        narrow, full = _reg_bits(arch, spelled), _reg_bits(arch, _full_reg(arch, spelled))
+        return narrow if narrow is not None and full is not None and narrow < full else None
+
+    def at_start(reg: str, spelled: str) -> tuple[str, int | None] | None:
+        named = _entry_name(bv, func, start, reg)
+        if named is not None:
+            return _narrowed(arch, spelled, *named)
+        return (spelled, spelled_bits(spelled)) if reg not in written else None
+
+    def named_source(src, bits: int | None) -> tuple[str, int | None] | None:
+        read: set[str] = set()
+        _llil_regs_read(arch, src, read)
+        if read & written_so_far:
+            return None
+        text = _IL_VAR_ANNOTATION_RE.sub("", str(src or "")).strip()
+        unknown = False
+
+        def rename(match: re.Match[str]) -> str:
+            nonlocal unknown
+            token = match.group(0)
+            if token not in regs:
+                return token
+            named = _entry_name(bv, func, start, _full_reg(arch, token))
+            if named is not None:
+                return _narrowed(arch, token, *named)[0]
+            if _full_reg(arch, token) in written:
+                unknown = True
+            return token
+
+        text = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", rename, text)
+        if unknown or not text or len(text) > _WRITE_TEXT_MAX:
+            return None
+        return text, bits
+
+    for ins in window:
+        if il_format._il_op_name(ins) != "LLIL_SET_REG":
+            for reg in _llil_writes(arch, ins):
+                values[reg] = None
+                written_so_far.add(reg)
+            continue
+        spelled_dest = str(getattr(getattr(ins, "dest", None), "name", ""))
+        dest = _full_reg(arch, spelled_dest)
+        src = getattr(ins, "src", None)
+        try:
+            dest_bits = spelled_bits(spelled_dest)
+            if dest_bits is not None and not (dest_bits == 32 and zero_extends):
+                values[dest] = None  # the rest of the register keeps an older value
+            elif id(ins) in select_ids:
+                words = str(bv.get_disassembly(int(ins.address)) or "").split()
+                values[dest] = (f"{words[0]} @ {hex(int(ins.address))}", dest_bits) if words else None
+            elif il_format._il_op_name(src) == "LLIL_REG":
+                name = str(getattr(getattr(src, "src", None), "name", ""))
+                full = _full_reg(arch, name)
+                if full in values:
+                    held = values[full]
+                    values[dest] = None if held is None else _narrowed(arch, name, *held)
+                else:
+                    values[dest] = at_start(full, name)
+            else:
+                values[dest] = named_source(src, dest_bits)
+        except Exception:  # noqa: BLE001 - a value is a nicety; the register stands alone
+            values[dest] = None
+        written_so_far.add(dest)
+    return {reg: (value[0] if value is not None else None) for reg, value in values.items()}
+
+
+def _arity_line_note(row: dict[str, Any]) -> str:
+    """The `/* bn: ... */` note appended to the rendered call line."""
+    if row["rendered"] > row["expected"]:
+        return (f"/* bn: renders {row['rendered']} args, "
+                f"signature takes {row['expected']} */")
+    regs = ", ".join(f"{reg} = {value}" if value else reg for reg, value in row["missing"])
+    count = row["expected"] - row["rendered"]
+    return f"/* bn: +{count} arg{'s' if count != 1 else ''} not rendered: {regs} */"
+
+
+def _short_callee(label: str) -> str:
+    return label.rsplit(" @ ", 1)[0]
+
+
+def _call_arity_warning(bv, func, findings: list[dict[str, Any]] | None = None,
+                        inline: set[int] = frozenset()) -> dict[str, Any] | None:
+    """The `arity` warning for *findings* (computed when not given): grouped
+    per callee and shape in its detail, one short line in its summary, and one
+    `calls` row per call. *inline* holds the call addresses whose rendered
+    line carries the `/* bn: ... */` note (#1000 item 2)."""
+    if findings is None:
+        findings = _call_arity_findings(bv, func)
+    if not findings:
+        return None
+    groups: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for row in findings:
         # One entry per callee and shape, so ten identical calls cannot push a
         # rarer finding past the listing cap (#985 review).
-        group = groups.setdefault((target, rendered, expected), {
-            "label": _callee_label(symbol, callee, target),
-            "addresses": [], "evidence": {},
+        group = groups.setdefault((row["target"], row["rendered"], row["expected"]), {
+            "label": row["label"], "addresses": [], "evidence": {},
         })
-        group["addresses"].append(address)
+        group["addresses"].append(row["address"])
         # Every call's evidence, counted: calls to one callee can differ (the
         # signature alone at one, signature plus register writes at another),
         # and the first call's text must not stand for all (#985 re-review).
-        key = tuple(evidence)
-        group["evidence"][key] = group["evidence"].get(key, 0) + 1
-    if not groups:
-        return None
-    findings = []
+        group["evidence"][row["evidence"]] = group["evidence"].get(row["evidence"], 0) + 1
+    described = []
+    short = []
     for (_target, rendered, expected), group in groups.items():
         addrs = group["addresses"]
         where = ", ".join(hex(a) for a in addrs[:3]) + (
@@ -785,23 +1094,54 @@ def _call_arity_warning(bv, func) -> str | None:
             evidence = " / ".join(f"{n} of {len(addrs)}: {'; '.join(ev)}"
                                   for ev, n in variants.items())
         if rendered > expected:
-            findings.append(f"{group['label']} ({noun} at {where}) renders {rendered} "
-                            f"arguments but {evidence}")
+            described.append(f"{group['label']} ({noun} at {where}) renders {rendered} "
+                             f"arguments but {evidence}")
         else:
-            findings.append(f"{group['label']} ({noun} at {where}) renders {rendered} of "
-                            f"{expected} arguments ({evidence})")
-    calls = sum(len(g["addresses"]) for g in groups.values())
-    listed = findings[:_ARITY_LISTED_MAX]
-    more = len(findings) - len(listed)
-    return (
+            described.append(f"{group['label']} ({noun} at {where}) renders {rendered} of "
+                             f"{expected} arguments ({evidence})")
+        short.append(f"{_short_callee(group['label'])} {rendered}/{expected} @ "
+                     + ", ".join(hex(a) for a in addrs[:2])
+                     + (f" +{len(addrs) - 2}" if len(addrs) > 2 else ""))
+    calls = len(findings)
+    listed = described[:_ARITY_LISTED_MAX]
+    more = len(described) - len(listed)
+    marked = sum(1 for row in findings if row["address"] in inline)
+    if marked == calls:
+        marked_text = ("Each call is marked inline with a `/* bn: ... */` note naming "
+                       "the registers it does not render. ")
+        summary_mark = ", marked inline"
+    elif marked:
+        marked_text = (f"{marked} of the {calls} calls are marked inline with a "
+                       "`/* bn: ... */` note; the rest share a line BN rendered "
+                       "differently. ")
+        summary_mark = f", {marked} marked inline"
+    else:
+        marked_text = ""
+        summary_mark = ""
+    head = short[:3]
+    summary = (f"{calls} call(s) render the wrong argument count{summary_mark}: "
+               + "; ".join(head) + (f"; +{len(short) - 3} more callee(s)" if len(short) > 3 else ""))
+    detail = (
         f"call arity: {calls} call(s) render a different argument count than "
         f"the call site passes: {'; '.join(listed)}"
         + (f"; and {more} more callee(s)" if more > 0 else "")
         + ". The callee's prototype (often from a type library) has the wrong arity, so "
-        "the decompiled call silently drops or invents arguments. Read the real "
-        f"arguments with `bn callsites <callee address> --within {hex(int(func.start))} "
-        "--context 4`; fix the callee with `bn proto set`."
+        "the decompiled call silently drops or invents arguments. " + marked_text
+        + "Read the real arguments with `bn callsites <callee address> --within "
+        f"{hex(int(func.start))} --context 4`; fix the callee with `bn proto set`."
     )
+    return _warning_row("arity", summary, detail, calls=[
+        {
+            "address": hex(row["address"]),
+            "callee": _short_callee(row["label"]),
+            "callee_address": hex(row["target"]),
+            "rendered": row["rendered"],
+            "expected": row["expected"],
+            "missing": [{"register": reg, "value": value} for reg, value in row["missing"]],
+            "inline": row["address"] in inline,
+        }
+        for row in findings
+    ])
 
 
 def _callee_label(symbol, callee, target: int) -> str:
@@ -1057,7 +1397,7 @@ def _has_callers(bv, start: int) -> bool:
     return bool(list(bv.get_data_refs(start) or []))
 
 
-def _split_body_notes(bv, func) -> list[str]:
+def _split_body_notes(bv, func) -> list[dict[str, Any]]:
     """Disclose a function body BN split at a shared tail (#966).
 
     When another function branches into the tail of this one, BN can make the
@@ -1072,17 +1412,20 @@ def _split_body_notes(bv, func) -> list[str]:
     parameters are its parent's live registers, which nothing should drop.
     So do they on any piece entered only by jumps or fall-through: the
     `proto set` advice is only for a function something actually calls."""
-    notes: list[str] = []
+    notes: list[dict[str, Any]] = []
     memo: dict[int, bool] = {}
     try:
         params = _callee_saved_parameters(bv, func)
         if params and _is_eh_fragment(bv, func, memo):
-            return [(
+            return [_warning_row(
+                "fragment",
+                f"EH/cold fragment: its register parameters ({', '.join(params)}) are "
+                "the parent's live registers, not arguments",
                 "EH/cold fragment: BN made this exception-cleanup (landing pad) or "
                 "cold-path code a function of its own. It runs inside its parent's frame, "
                 f"so its register parameters ({', '.join(params)}) are the parent's live "
                 "registers, not arguments and not a split to repair. Read it together with "
-                f"the code that jumps here (`bn xrefs {hex(int(func.start))}`)."
+                f"the code that jumps here (`bn xrefs {hex(int(func.start))}`).",
             )]
         called = bool(params) and _has_callers(bv, int(func.start))
         successor = _fallthrough_successor(bv, func)
@@ -1091,34 +1434,46 @@ def _split_body_notes(bv, func) -> list[str]:
         return notes
     if successor is not None:
         other, source = successor
-        notes.append(
+        notes.append(_warning_row(
+            "split",
+            f"block ending at {hex(source)} runs into {_function_label(other)}: "
+            "part of this body is listed under that function",
             f"split body: the block ending at {hex(source)} runs straight into "
             f"{_function_label(other)} without a branch or return -- BN likely split "
             "this function at a shared tail, so part of its code is listed under that "
-            "one. Read both (`bn disasm`) before trusting either decompile."
-        )
+            "one. Read both (`bn disasm`) before trusting either decompile.",
+        ))
     if predecessor is not None:
-        notes.append(
+        notes.append(_warning_row(
+            "split",
+            f"{_function_label(predecessor)} runs into this entry: this may be its "
+            "shared tail, not a function of its own",
             f"split body: {_function_label(predecessor)} runs straight into this "
             "function's entry -- this may be the shared tail of that function, not a "
-            "function of its own; its parameters are likely that function's saved registers."
-        )
+            "function of its own; its parameters are likely that function's saved registers.",
+        ))
     if params and called:
-        notes.append(
+        notes.append(_warning_row(
+            "split",
+            f"prototype takes parameters in callee-saved/link registers ({', '.join(params)}); "
+            "drop them with `bn proto set`",
             f"prototype takes parameters in callee-saved/link registers ({', '.join(params)}): "
             "no calling convention passes arguments there, so BN is reading a value the "
             "body only saves or restores -- typically because it split the body at a "
             "shared tail, or a path reads the register before setting it. Callers render "
-            "stray arguments for them; drop them with `bn proto set`."
-        )
+            "stray arguments for them; drop them with `bn proto set`.",
+        ))
     elif params:
-        notes.append(
+        notes.append(_warning_row(
+            "split",
+            f"parameters in callee-saved/link registers ({', '.join(params)}) are live-ins "
+            "of the code that jumps here, not arguments; nothing calls this function",
             f"prototype takes parameters in callee-saved/link registers ({', '.join(params)}), "
             "and nothing calls this function -- it is entered only by jumps or fall-through, "
             "so it is a piece of another function's body and these are registers live in "
             "the code that jumps here, not arguments. Do not drop them; read it with the "
-            f"code that jumps here (`bn xrefs {hex(int(func.start))}`)."
-        )
+            f"code that jumps here (`bn xrefs {hex(int(func.start))}`).",
+        ))
     return notes
 
 
@@ -1126,7 +1481,7 @@ def _function_label(func) -> str:
     return f"{il_format._display_name(func)} @ {hex(int(func.start))}"
 
 
-def _callee_split_notes(bv, func) -> list[str]:
+def _callee_split_notes(bv, func) -> list[dict[str, Any]]:
     """#966 from the CALLER's side, where the symptom is read: a direct callee
     whose prototype takes callee-saved/link-register parameters gets stray
     arguments rendered at every call."""
@@ -1149,12 +1504,15 @@ def _callee_split_notes(bv, func) -> list[str]:
             continue
         params = _callee_saved_parameters(bv, callee)
         if params and not _is_eh_fragment(bv, callee):
-            notes.append(
+            notes.append(_warning_row(
+                "callee_split",
+                f"callee {_function_label(callee)} takes callee-saved/link-register "
+                f"parameters ({', '.join(params)}): their arguments here are not real",
                 f"callee {_function_label(callee)} takes parameters in callee-saved/link "
                 f"registers ({', '.join(params)}), so the arguments rendered for them here "
                 "are not real arguments -- its body is likely split at a shared tail "
-                f"(`bn decompile {hex(target)}` names the split)."
-            )
+                f"(`bn decompile {hex(target)}` names the split).",
+            ))
     return notes
 
 
@@ -1165,6 +1523,61 @@ _STRING_NOTE_LISTED_MAX = 8
 # reads as "A" (#985 review). Three printable bytes is the issue's own `" -n"`.
 _UNTYPED_STRING_MIN = 3
 _CHAR_POINTER_RE = re.compile(r"^(?:const\s+)?(?:(?:un)?signed\s+)?char\b[^*]*\*(?:\s*const)?$")
+
+# Narrow `char *` parameter positions of C library functions, keyed by the
+# `il_format._normalize_libc_name` spelling (`__isoc99_sscanf`, `strcmp@plt`
+# and `_strcmp` all land on one key). The fallback for an import BN has no
+# type for (#994 item 2): BN's aarch64 libc type library has no `strcmp`, so
+# `strcmp(arg2, "C")` rendered `0x661bd8` with no note while the identical
+# call on a typed import rendered the literal. A curated list rather than a
+# heuristic because the name is the whole witness: only a callee that IS this
+# libc function (an import, or a body whose prototype stops short of the
+# argument) consults it, so the three-character rule for unknown callees holds.
+# The printf/scanf format positions are NOT repeated here: they are
+# `il_format._VARIADIC_FORMAT_FAMILY`'s, read through `_variadic_format_family`,
+# so the two tables cannot disagree.
+_LIBC_CHAR_POINTER_PARAMS: dict[str, frozenset[int]] = {
+    name: frozenset(positions) for name, positions in {
+        # comparison and search
+        "strcmp": (0, 1), "strncmp": (0, 1), "strcasecmp": (0, 1),
+        "strncasecmp": (0, 1), "strcoll": (0, 1), "strstr": (0, 1),
+        "strcasestr": (0, 1), "strspn": (0, 1), "strcspn": (0, 1),
+        "strpbrk": (0, 1), "strchr": (0,), "strrchr": (0,), "strchrnul": (0,),
+        "strlen": (0,), "strnlen": (0,), "strtok": (0, 1), "strtok_r": (0, 1),
+        "strsep": (1,), "fnmatch": (0, 1),
+        # copying and duplication
+        "strcpy": (0, 1), "strncpy": (0, 1), "stpcpy": (0, 1), "stpncpy": (0, 1),
+        "strcat": (0, 1), "strncat": (0, 1), "strlcpy": (0, 1), "strlcat": (0, 1),
+        "strdup": (0,), "strndup": (0,), "strcpy_chk": (0, 1), "strcat_chk": (0, 1),
+        "strncpy_chk": (0, 1), "stpcpy_chk": (0, 1),
+        # conversion
+        "atoi": (0,), "atol": (0,), "atoll": (0,), "atof": (0,), "strtol": (0,),
+        "strtoul": (0,), "strtoll": (0,), "strtoull": (0,), "strtod": (0,),
+        "strtof": (0,), "strtold": (0,), "strtoimax": (0,), "strtoumax": (0,),
+        # formatted I/O beyond the format family's format argument
+        "asprintf": (1,), "vprintf": (0,), "vfprintf": (1,), "vsprintf": (1,),
+        "vsnprintf": (2,), "sscanf": (0,), "err": (1,), "errx": (1,), "warn": (0,),
+        "warnx": (0,), "puts": (0,), "fputs": (0,), "perror": (0,), "strftime": (2,),
+        # environment, locale, process
+        "getenv": (0,), "secure_getenv": (0,), "setenv": (0, 1), "unsetenv": (0,),
+        "putenv": (0,), "setlocale": (1,), "newlocale": (1,), "system": (0,),
+        "popen": (0, 1), "execl": (0, 1), "execlp": (0, 1), "execle": (0, 1),
+        "execv": (0,), "execvp": (0,), "execve": (0,), "dlopen": (0,), "dlsym": (1,),
+        "bindtextdomain": (0, 1), "textdomain": (0,), "gettext": (0,),
+        "dgettext": (0, 1), "iconv_open": (0, 1), "openlog": (0,),
+        # files and paths
+        "fopen": (0, 1), "fopen64": (0, 1), "freopen": (0, 1), "fdopen": (1,),
+        "open": (0,), "open64": (0,), "openat": (1,), "creat": (0,), "access": (0,),
+        "stat": (0,), "lstat": (0,), "stat64": (0,), "lstat64": (0,), "unlink": (0,),
+        "remove": (0,), "rename": (0, 1), "mkdir": (0,), "rmdir": (0,), "chdir": (0,),
+        "chmod": (0,), "chown": (0,), "opendir": (0,), "realpath": (0,),
+        "readlink": (0,), "symlink": (0, 1), "link": (0, 1), "truncate": (0,),
+        "mkstemp": (0,), "mkdtemp": (0,), "tmpnam": (0,),
+        # networking
+        "inet_addr": (0,), "inet_aton": (0,), "inet_pton": (1,),
+        "gethostbyname": (0,), "getaddrinfo": (0, 1), "getservbyname": (0, 1),
+    }.items()
+}
 
 
 def _read_only_data(bv, address: int) -> bool:
@@ -1204,10 +1617,18 @@ def _undefined_c_string(bv, address: int, *, min_length: int) -> str | None:
     return body.decode("ascii")
 
 
-def _char_pointer_parameter(bv, target: int | None, index: int) -> bool:
+def _char_pointer_parameter(bv, target: int | None, index: int,
+                            memo: dict[str, Any] | None = None) -> bool:
     """True when the callee at *target* declares parameter *index* as a narrow
     `char *`, by its prototype or by its demangled signature. Either may be off
-    by `this` (#955), so agreement from either is enough."""
+    by `this` (#955), so agreement from either is enough.
+
+    A callee BN has no prototype for at *index* -- an import (its body is not
+    here, so BN's parameters are a guess) or a prototype that stops short --
+    is looked up by its C library name instead (#994 item 2; see
+    `_libc_char_pointer`). A prototype the analyst applied (`bn proto set`)
+    is never second-guessed by that lookup. *memo* caches the type-library
+    lookups across one read."""
     if target is None:
         return False
     spellings: list[str] = []
@@ -1226,10 +1647,48 @@ def _char_pointer_parameter(bv, target: int | None, index: int) -> bool:
                 spellings.append(str(getattr(dparams[index], "type", "")))
         except Exception:  # noqa: BLE001
             pass
-    return any(_CHAR_POINTER_RE.match(s.strip()) for s in spellings)
+    if any(_CHAR_POINTER_RE.match(s.strip()) for s in spellings):
+        return True
+    kind = str(getattr(getattr(symbol, "type", None), "name", ""))
+    untyped = (index >= len(params) or kind in _IMPORT_SYMBOL_KINDS
+               or bool(getattr(callee, "is_thunk", False)))
+    user_typed = bool(getattr(callee, "has_user_type", False))
+    if not untyped or user_typed or not raw_name or raw_name.startswith("_Z"):
+        return False
+    return _libc_char_pointer(bv, raw_name, index, {} if memo is None else memo)
 
 
-def _raw_string_pointer_note(bv, func, text: str) -> str | None:
+def _libc_char_pointer(bv, raw_name: str, index: int, memo: dict[str, Any]) -> bool:
+    """Whether the C library function *raw_name* takes a narrow `char *` at
+    *index*: by `_LIBC_CHAR_POINTER_PARAMS` or the format family's format
+    argument for a name either lists -- both checked against glibc's
+    prototypes, which BN's type library does not always match (its aarch64
+    `setlocale` takes an `int64_t*`) -- else by the platform type library."""
+    name = raw_name.split("@", 1)[0]
+    key = il_format._normalize_libc_name(name)
+    family = il_format._variadic_format_family(name)
+    if key in _LIBC_CHAR_POINTER_PARAMS or family is not None:
+        return (index in _LIBC_CHAR_POINTER_PARAMS.get(key, ())
+                or (family is not None and family[0] == index))
+    if name not in memo:
+        found = None
+        try:
+            platform = getattr(bv, "platform", None)
+            libraries = list(getattr(platform, "type_libraries", None) or [])
+            libraries += list(getattr(bv, "type_libraries", None) or [])
+            for library in libraries:
+                found = library.get_named_object(name)
+                if found is not None:
+                    break
+        except Exception:  # noqa: BLE001 - no library is not evidence either way
+            found = None
+        memo[name] = list(getattr(found, "parameters", None) or []) if found is not None else None
+    library_params = memo[name]
+    return bool(library_params is not None and index < len(library_params)
+                and _CHAR_POINTER_RE.match(str(getattr(library_params[index], "type", "")).strip()))
+
+
+def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
     """Name call arguments rendered as a raw address that point at a short C
     string BN never defined (#970).
 
@@ -1250,9 +1709,19 @@ def _raw_string_pointer_note(bv, func, text: str) -> str | None:
     except Exception:  # noqa: BLE001
         return None
     found: dict[int, tuple[str, int]] = {}
+    memo: dict[str, Any] = {}
     # Every address the text renders raw, tokenised once rather than searched
     # per operand (#985 review: decompile cost on large functions).
-    rendered = {int(token, 16) for token in re.findall(r"\b0x[0-9a-fA-F]+\b", text)}
+    # BN's placeholder name for untyped data counts too: a library prototype
+    # that types the argument as a pointer (aarch64 libc's `setlocale(int32_t,
+    # int64_t*)`) renders it `&data_400b90`, not `0x400b90` (#1000 review).
+    # But BN gave that address a data variable, which on a stripped binary is
+    # as often an `int[]` or a struct (`memcmp(p, &data_4008f0, 0x10)` read as
+    # "ABC"), so a placeholder is named only on the evidence the short-literal
+    # rule already demands: a callee that takes a narrow `char *` there.
+    raw = {int(token, 16) for token in re.findall(r"\b0x[0-9a-fA-F]+\b", text)}
+    placeholders = {int(token, 16)
+                    for token in re.findall(r"\bdata_([0-9a-fA-F]+)\b", text)} - raw
     for ins in instructions:
         if "CALL" not in il_format._il_op_name(ins):
             continue
@@ -1265,9 +1734,11 @@ def _raw_string_pointer_note(bv, func, text: str) -> str | None:
                 continue
             try:
                 address = int(param.constant)
-                if address in found or address not in rendered:
+                if address in found or (address not in raw and address not in placeholders):
                     continue
-                typed = _char_pointer_parameter(bv, target, index)
+                typed = _char_pointer_parameter(bv, target, index, memo)
+                if address in placeholders and not typed:
+                    continue
                 value = _undefined_c_string(
                     bv, address, min_length=1 if typed else _UNTYPED_STRING_MIN)
             except Exception:  # noqa: BLE001 - one odd operand must not hide the rest
@@ -1280,12 +1751,17 @@ def _raw_string_pointer_note(bv, func, text: str) -> str | None:
             for a, (v, c) in list(found.items())[:_STRING_NOTE_LISTED_MAX]]
     more = len(found) - len(rows)
     first, (value, _) = next(iter(found.items()))
-    return (
+    retype = f"bn data retype {hex(first)} 'char[{len(value) + 1}]'"
+    return _warning_row(
+        "string",
+        f"{len(found)} raw address(es) hold an undefined string: {'; '.join(rows[:2])}"
+        + (f"; +{len(found) - 2} more" if len(found) > 2 else "")
+        + f"; define with `{retype}`",
         f"raw string pointer(s): {len(found)} call argument(s) render as an address "
         f"that holds a NUL-terminated string BN did not define (so `bn strings` does not "
         f"list it either): {'; '.join(rows)}" + (f"; and {more} more" if more > 0 else "")
-        + f". To render it inline, define it: `bn data retype {hex(first)} "
-        f"'char[{len(value) + 1}]'`."
+        + f". To render it inline, define it: `{retype}`.",
+        strings=[{"address": hex(a), "value": v, "call": hex(c)} for a, (v, c) in found.items()],
     )
 
 
@@ -1293,6 +1769,275 @@ def _c_quote(value: str) -> str:
     escaped = (value.replace("\\", "\\\\").replace('"', '\\"')
                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
     return f'"{escaped}"'
+
+
+_RESOLVED_JUMP_OPS = ("HLIL_CONST", "HLIL_CONST_PTR", "HLIL_IMPORT", "HLIL_EXTERN_PTR")
+
+
+def _is_plt_stub(bv, func) -> bool:
+    """An import stub or the PLT header (`push [..]; jmp [GOT+16]`): its jump
+    is the dynamic linker's business, not code a reader needs explained."""
+    try:
+        start = int(func.start)
+        symbol = bv.get_symbol_at(start)
+        if str(getattr(getattr(symbol, "type", None), "name", "")) in _IMPORT_SYMBOL_KINDS:
+            return True
+        if bool(getattr(func, "is_thunk", False)):
+            return True
+        return any(".plt" in str(getattr(section, "name", ""))
+                   for section in list(bv.get_sections_at(start) or []))
+    except Exception:  # noqa: BLE001 - unknown: treat as ordinary code
+        return False
+
+
+def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
+    """Indirect jumps that leave *func* with no target BN resolved (#1000 item 3).
+
+    BN renders one as `❓ /* jump -> <expr> */` with no warning. It is EITHER
+    a tail call through a pointer -- whose arguments sit unrendered in the
+    argument registers at the jump -- OR a computed goto / jump table BN
+    could not follow. Telling the two apart from the IL failed three review
+    rounds (a dispatch BN split into its own function, a label stored into a
+    global first, an object picked by an index), so this states both and
+    claims neither; the classification is a follow-up. A jump with a
+    successor block (one BN resolved), an import stub and the PLT header are
+    skipped. One row per jump. Never raises."""
+    if _is_plt_stub(bv, func):
+        return []
+    try:
+        hlil = getattr(func, "hlil", None) or getattr(func, "high_level_il", None)
+        statements = list(hlil.instructions) if hlil is not None else []
+    except Exception:  # noqa: BLE001 - no HLIL means nothing rendered to explain
+        return []
+    # Keyed by address: BN repeats one machine jump in several switch cases,
+    # and each HLIL copy is the same jump -- one row, not one per copy.
+    rows: dict[int, dict[str, Any]] = {}
+    for ins in statements:
+        if il_format._il_op_name(ins) != "HLIL_JUMP":
+            continue
+        try:
+            dest = getattr(ins, "dest", None)
+            if il_format._il_op_name(dest) in _RESOLVED_JUMP_OPS:
+                continue
+            address = int(ins.address)
+            if address in rows:
+                continue
+            block = getattr(func.get_llil_at(address), "il_basic_block", None)
+            if block is None or list(getattr(block, "outgoing_edges", None) or []):
+                continue
+            table = _jump_data_address(bv, dest)
+            target = str(dest)
+        except Exception:  # noqa: BLE001 - one odd jump must not hide the rest
+            continue
+        rows[address] = {"address": address, "target": target, "table": table}
+    return list(rows.values())
+
+
+def _jump_data_address(bv, dest) -> int | None:
+    """The first mapped, non-code address in the jump target's expression --
+    the data the target is read from, `&data_435ea0` in
+    `*(int32_t*)(&data_435ea0 + (i << 2)) + &data_435ea0` -- or None. An
+    operand that cannot be read names no table; it never costs the row."""
+    pending = [dest]
+    try:
+        while pending:
+            expr = pending.pop(0)
+            if il_format._il_op_name(expr) == "HLIL_CONST_PTR" and _is_data_address(bv, expr):
+                return int(expr.constant)
+            pending.extend(o for o in list(getattr(expr, "operands", None) or [])
+                           if hasattr(o, "operation"))
+    except Exception:  # noqa: BLE001 - an unreadable operand names no table
+        return None
+    return None
+
+
+def _is_data_address(bv, expr) -> bool:
+    try:
+        value = int(expr.constant)
+        return bool(bv.is_valid_offset(value)) and not list(bv.get_functions_containing(value) or [])
+    except Exception:  # noqa: BLE001 - an unreadable constant names no table
+        return False
+
+
+_JUMP_LINE_NOTE = "/* bn: unresolved jump: a tail call (args not rendered) or a computed goto */"
+
+
+def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[str, Any]:
+    """The neutral `jump` warning: what `❓` means, the target, and both
+    readings with how to check each. It never says which one this is.
+
+    The jump-table half is honest rather than complete (#1000 review rounds
+    5-6): every step below was run as printed on a run-time-filled `.bss`
+    table, a static absolute table, a 4-byte relative table and stack-built
+    label arrays, and each says when it does not help. None is promised to
+    find the targets."""
+    where = hex(row["address"])
+    try:
+        cc = getattr(func, "calling_convention", None)
+        arg_regs = [str(r) for r in (getattr(cc, "int_arg_regs", None) or [])]
+    except Exception:  # noqa: BLE001
+        arg_regs = []
+    regs = f" ({', '.join(arg_regs)})" if arg_regs else ""
+    table = row.get("table")
+    steps = []
+    if table is not None:
+        steps.append(
+            f"`bn xrefs {hex(table)}` lists the code that reads and writes the data the "
+            "jump reads from -- references to its base address only, so a store to a later "
+            "entry may be missing; when it is filled at run time (a `.bss` table) its "
+            "writes are where the target addresses are stored")
+        steps.append(
+            f"`bn evidence table {hex(table)}` reads that data's current bytes, which name "
+            "targets only for a static table (absolute pointers; with `--stride 4 --width "
+            f"4`, 4-byte signed offsets that are added to the table base {hex(table)}); a "
+            "table filled at run time reads as zeros")
+    steps.append(
+        "stores in this decompile that write code or table addresses into what the jump "
+        "reads (`tbl = &data_...`, `var_10 = &a.1`) may name the targets or their table; "
+        "a table a store names is read with `bn evidence table <address>`, where a "
+        "`data_420010` name is the address 0x420010 and a symbol name resolves with "
+        "`bn xrefs a.1` (it prints `resolved 'a.1' as a data symbol @ <address>`)")
+    detail = (
+        f"unresolved indirect jump at {where} to `{row['target']}`: BN renders it as "
+        "`❓ /* jump -> ... */` -- the ❓ marks control flow it could not resolve -- and "
+        "finds no target for it. It is one of two things, and the IL alone does not say "
+        "which. A tail call through a pointer, leaving the function: the callee's "
+        f"arguments are then in the argument registers{regs} at the jump and are not "
+        f"rendered; read them in `bn disasm {where}`, and type the callee (`bn proto "
+        "set`) or the object the pointer is loaded from so BN can render the call. Or a "
+        "computed goto or jump table BN did not resolve, staying in this function: the "
+        "code it reaches may not be part of this function's decompile or disassembly. None "
+        "of these steps is sure to find the targets: " + "; ".join(steps) + ". Read a "
+        "target address's code with `bn disasm <target> --linear 16`."
+        + (" Every line that shows this jump carries a `/* bn: ... */` note." if inline else "")
+    )
+    summary = (f"unresolved jump at {where} (❓): a tail call whose args are not rendered, "
+               "or a computed goto/jump table; --explain says how to read each")
+    return _warning_row("jump", summary, detail, address=where, target=row["target"],
+                        table=hex(table) if table is not None else None)
+
+
+_OFFSET_RE = re.compile(r"__offset\((.+?), (-?(?:0x[0-9a-fA-F]+|\d+))\)")
+_OFFSET_SUMMARY_NAMES = 100
+
+
+def _type_lookup(bv):
+    """`name -> defined?`, resolved the way `bn types show` resolves it
+    (`seam._find_type`): BN's own lookup first, then the view's type names
+    compared as rendered, case-insensitively. `get_type_by_name("std::X")`
+    takes the whole string as ONE name component and misses every namespaced
+    type (#1000 review round 8), and splitting on `::` would cut through
+    template arguments (`std::map<std::string, int>`); comparing against
+    each type's rendered qualified name does neither. The name list is built
+    once, on the first miss."""
+    names: set[str] | None = None
+
+    def by_bn(name: str) -> bool:
+        try:
+            return bv.get_type_by_name(name) is not None
+        except Exception:  # noqa: BLE001 - an unparseable name falls back to the scan
+            return False
+
+    def defined(name: str) -> bool:
+        nonlocal names
+        if by_bn(name):
+            return True
+        if names is None:
+            try:
+                names = {str(key).lower() for key in list(bv.types.keys())}
+            except Exception:  # noqa: BLE001 - no type list: nothing more is known
+                names = set()
+        return name.lower() in names
+
+    return defined
+
+
+def _this_pointee(func) -> str | None:
+    """The named type `this` points at, when *func* has a `this` parameter."""
+    for var in list(getattr(func, "parameter_vars", None) or [])[:1]:
+        if str(getattr(var, "name", "")) != "this":
+            return None
+        target = getattr(getattr(var, "type", None), "target", None)
+        if target is None:
+            return None
+        ref = getattr(target, "named_type_reference", None)
+        name = getattr(ref, "name", None) if ref is not None and not callable(ref) else None
+        if name is None:
+            text = str(target)
+            for prefix in ("const ", "struct ", "class ", "union "):
+                text = text.removeprefix(prefix)
+            name = text.removesuffix(" const").strip()
+        return str(name) or None
+    return None
+
+
+def _name_list(names: list[str]) -> str:
+    """Whole names only -- never cut inside one -- while they fit the summary;
+    the rest as a count."""
+    shown: list[str] = []
+    for name in names:
+        if shown and len(", ".join([*shown, name])) > _OFFSET_SUMMARY_NAMES:
+            break
+        shown.append(name)
+    rest = len(names) - len(shown)
+    return ", ".join(shown) + (f" +{rest} more" if rest else "")
+
+
+def _offset_warning(bv, func, text: str) -> dict[str, Any] | None:
+    """Explain raw `__offset(T, N)` expressions and say which T exist (#1000
+    item 4). The old note sent the reader to `bn types show T` / `bn struct
+    show T` "as the authoritative layout" without checking T existed; T is
+    routinely a name BN made from a symbol or a demangled signature with no
+    definition behind it, so both commands answered `Type not found` and the
+    reader started doubting the decompile. Each base type, and the type `this`
+    points at, is looked up: the ones that exist are named, and the ones that
+    do not are called what they are, with the command that would create one."""
+    names: list[str] = []
+    for match in _OFFSET_RE.finditer(text):
+        if match.group(1) not in names:
+            names.append(match.group(1))
+    if not names and "__offset(" not in text:
+        return None
+    this_type = _this_pointee(func)
+    checked = names + ([this_type] if this_type and this_type not in names else [])
+    _type_defined = _type_lookup(bv)
+    defined = [name for name in checked if _type_defined(name)]
+    missing = [name for name in checked if name not in defined]
+    parts = [("Decompile contains raw `__offset(T, N)` expressions: BN's spelling for a "
+              "pointer N bytes into an object of type T where T has no member it can name there.")]
+    if defined:
+        parts.append(f"Defined here: {', '.join(defined)} (`bn types show <name>` has the layout).")
+    vtables = [n for n in missing if n.startswith("vtable_for_")]
+    plain = [n for n in missing if n not in vtables]
+    if plain:
+        with_vtable = [n for n in plain if _type_defined(f"{n}::VTable")]
+        parts.append(
+            f"No definition: {', '.join(plain)} -- "
+            + ("each is a named reference" if len(plain) > 1 else "a named reference")
+            + " BN created (from a symbol or a demangled signature) with no layout, so "
+            "`bn types show` reports it as not found. Declare one with "
+            "`bn types declare` (a `::` name goes in backticks: struct `ns::T` { ... };)."
+            + (f" {', '.join(with_vtable)} already has a `::VTable` type, and `bn struct "
+               f"show {shlex.quote(with_vtable[0])}` prints the declaration to start from."
+               if with_vtable else ""))
+    if vtables:
+        parts.append(
+            f"{', '.join(vtables)} name{'s' if len(vtables) == 1 else ''} a class's vtable "
+            "OBJECT, not a struct to declare: `__offset(vtable_for_C, 2 * pointer size)` is "
+            "the vtable's address point, the value a constructor stores into an object's vptr.")
+    if this_type and this_type in missing and this_type not in names:
+        parts.append(f"`this` points at {this_type}, which has no definition either.")
+    summary_parts = []
+    if plain:
+        summary_parts.append(f"no type defined for {_name_list(plain)}")
+    if vtables:
+        summary_parts.append(f"vtable object(s), not types: {_name_list(vtables)}")
+    if defined:
+        summary_parts.append(f"defined: {_name_list(defined)}")
+    summary = ("__offset(T, N) is a pointer N bytes into T; "
+               + ("; ".join(summary_parts) or "its base types could not be read"))
+    return _warning_row("offset", summary, " ".join(parts),
+                        types={"defined": defined, "missing": missing})
 
 
 def _decompile_batch(
@@ -1362,7 +2107,19 @@ def _decompile(
         forced = True
 
     comments = il_format._comment_map(bv, func)
-    text = il_format._decompile_text(bv, func, addresses=addresses)
+    # Computed before rendering so the rendered call line can carry its own
+    # note (#1000 items 2-3): a trailing warning alone left the line reading
+    # like the whole call.
+    arity = _call_arity_findings(bv, func)
+    jumps = _unresolved_jump_findings(bv, func)
+    line_notes: dict[int, list[str]] = {}
+    for row in arity:
+        line_notes.setdefault(row["address"], []).append(_arity_line_note(row))
+    jump_notes = {row["address"]: _JUMP_LINE_NOTE for row in jumps}
+    placed: set[int] = set()
+    text = il_format._decompile_text(bv, func, addresses=addresses,
+                                     line_notes=line_notes, placed=placed,
+                                     jump_notes=jump_notes)
     if include_annotations:
         annotation_summary = {
             "comment_count": len(_annotation_entries(func, comments)),
@@ -1375,10 +2132,13 @@ def _decompile(
             ctx, bv, func, comments, text
         )
 
-    warnings = il_format._render_warnings(text)
+    warnings: list[dict[str, Any]] = []
+    offset_warn = _offset_warning(bv, func, text)
+    if offset_warn:
+        warnings.append(offset_warn)
     stub = il_format._analysis_stub_warning(func, text, forced=forced)
     if stub:
-        warnings.append(stub)
+        warnings.append(_stub_warning_row(func, stub, forced))
     if "/* tailcall */" in text:
         thunk_warn = _thunk_veneer_warning(ctx, bv, func)
         if thunk_warn:
@@ -1391,9 +2151,11 @@ def _decompile(
     if guard_warn:
         warnings.append(guard_warn)
     warnings.extend(_struct_layout_warnings(bv, func))
-    arity_warn = _call_arity_warning(bv, func)
+    arity_warn = _call_arity_warning(bv, func, arity, placed)
     if arity_warn:
         warnings.append(arity_warn)
+    warnings.extend(_unresolved_jump_warning(func, row, row["address"] in placed)
+                    for row in jumps)
     warnings.extend(_split_body_notes(bv, func))
     warnings.extend(_callee_split_notes(bv, func))
     string_note = _raw_string_pointer_note(bv, func, text)
@@ -1404,7 +2166,13 @@ def _decompile(
         "text": text,
         "comments": comments if include_annotations else {},
         "annotation_summary": annotation_summary,
-        "warnings": warnings,
+        # `warnings` keeps the one shape every read op uses -- a list of
+        # sentences, each the full detail -- so a reader of `il`, `bundle`,
+        # `evidence` or an older decompile is unaffected (#1000 review).
+        # `warning_rows` is the same list, in order, as `{code, summary,
+        # detail, ...}` with the structured facts; text mode prints from it.
+        "warnings": [row["detail"] for row in warnings],
+        "warning_rows": warnings,
         "analysis_skipped": bool(getattr(func, "analysis_skipped", False)),
         "analysis_force_requested": bool(force_analysis),
         "analysis_forced": forced,
@@ -1574,7 +2342,7 @@ def _get_prototype(ctx, selector: str | None, identifier):
     note = _return_width_inference_note(bv, func)
     if note:
         result["return_width_note"] = note
-    split_notes = _split_body_notes(bv, func)
+    split_notes = [row["detail"] for row in _split_body_notes(bv, func)]
     if split_notes:
         result["split_body_notes"] = split_notes
     _annotate_containment(ctx, result, identifier, func)

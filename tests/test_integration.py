@@ -5,6 +5,7 @@ the binaryninja module is not available.
 """
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import os
@@ -4291,9 +4292,11 @@ class TestStructLayoutAssistance903:
         for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth", "bn proto set"):
             assert witness in hint
         assert shared_bn.json("proto", "get", "handle") == before
-        text_result = shared_bn.run("decompile", "handle")
+        # Text prints the one-line summary; the full sentence is --explain's.
+        text_result = shared_bn.run("decompile", "handle", "--explain")
         assert text_result.returncode == 0, text_result.stderr
-        assert hint in text_result.stdout
+        # --explain wraps the detail into short lines: compare word sequences.
+        assert " ".join(hint.split()) in " ".join(text_result.stdout.split())
 
         # Accesses through a copy of the parameter must not be dropped from
         # the witness while the body visibly uses an offset cfg cannot hold.
@@ -4547,3 +4550,200 @@ class TestStringsReadImportsBurndownG:
         assert any("DT_SYMENT" in note for note in summary["dynamic_section_notes"]), summary
         # The bridge is still alive for the next command.
         assert shared_bn.run("imports", "--count").returncode == 0
+
+
+# #1000 item 3 / #994 item 2: unresolved jumps out of a function (pointer tail
+# calls and computed gotos), and a short literal BN renders as `&data_<addr>`.
+# Built at -O2 because the shapes only exist after the compiler forms tail
+# calls; AArch64 for the type library whose `setlocale(int32_t, int64_t*)`
+# hides the string.
+_TAIL_JUMPS_C = r"""
+#include <locale.h>
+typedef int (*fn_t)(int);
+struct ops { long pad; fn_t cb; };
+struct vtbl { fn_t f; fn_t g; };
+struct obj { const struct vtbl *ops; };
+fn_t gfp;
+__attribute__((noinline)) int tc_param(fn_t fn, int x) { return fn(x + 1); }
+__attribute__((noinline)) int tc_global(int x) { return gfp(x * 2); }
+__attribute__((noinline)) int tc_field(struct ops *o, int v) { return o->cb(v + 1); }
+__attribute__((noinline)) int tc_table(struct obj *o, int x) { return o->ops->g(x + 3); }
+__attribute__((noinline)) int labels2(int op, int v) {
+  static void *const a[] = { &&l0, &&l1 };
+  static void *const b[] = { &&l1, &&l0 };
+  void *const *tables[] = { a, b };
+  __asm__ volatile("" : : "r"(tables) : "memory");
+  goto *tables[op & 1][0];
+l0: return v + 1;
+l1: return v * 3;
+}
+int idxjump(long *p);
+__asm__(IDXJUMP);
+__attribute__((noinline)) char *use_c_locale(void) { return setlocale(LC_ALL, "C"); }
+/* Several switch cases tail-call one field pointer: on AArch64 -O2 BN shows
+   one of the `br`s in two cases (#1000 review round 5, `dup.c` d1). */
+__attribute__((noinline)) int d1(struct ops *o, int op, int x) {
+  switch (op) {
+    case 0: x += 1; break; case 1: x *= 3; break; case 2: x -= 7; break; case 3: x ^= 0x55; break;
+    case 4: x <<= 2; break; case 5: x /= 3; break; case 6: x |= 9; break; case 7: x %= 11; break;
+    default: return -1;
+  }
+  return o->cb(x);
+}
+static int inc(int v) { return v + 1; }
+static const struct vtbl vt = { inc, inc };
+int main(int argc, char **argv) {
+  struct ops o = { 0, inc }; struct obj ob = { &vt }; long z = 0;
+  gfp = inc;
+  return tc_param(inc, argc) + tc_global(argc) + tc_field(&o, argc) + tc_table(&ob, argc)
+       + labels2(argc, 2) + idxjump(&z) + !!use_c_locale() + d1(&o, argc, argc);
+}
+"""
+# A jump through a label table indexed by a loaded value: `jmp [rax + tbl]`.
+_IDXJUMP_ASM = {
+    "aarch64": (
+        r'".text\n.globl idxjump\n.type idxjump, %function\nidxjump:\n'
+        r'  ldr x1, [x0]\n  adrp x2, tbl\n  add x2, x2, :lo12:tbl\n  ldr x3, [x2, x1]\n'
+        r'  br x3\n1: mov w0, #1\n  ret\n2: mov w0, #2\n  ret\n.size idxjump, .-idxjump\n'
+        r'.section .rodata\n.p2align 3\ntbl: .quad 1b, 2b\n.text\n"'),
+    "x86_64": (
+        r'".text\n.globl idxjump\n.type idxjump, @function\nidxjump:\n'
+        r'  mov (%rdi), %rax\n  jmp *tbl(%rax)\n1: mov $1, %eax\n  ret\n2: mov $2, %eax\n'
+        r'  ret\n.size idxjump, .-idxjump\n.section .rodata\n.p2align 3\n'
+        r'tbl: .quad 1b, 2b\n.text\n"'),
+}
+
+
+@pytest.fixture(scope="session")
+def tail_jump_binaries(tmp_path_factory) -> dict[str, Path]:
+    workdir = tmp_path_factory.mktemp("tail-jumps")
+    built: dict[str, Path] = {}
+    for arch, compiler in (("aarch64", "aarch64-linux-gnu-gcc"), ("x86_64", "cc")):
+        cc = shutil.which(compiler)
+        if cc is None:
+            refuse_silent_skip(f"{compiler} not available, so the #1000 tail-jump lane did not run")
+        src = workdir / f"tail_jumps_{arch}.c"
+        src.write_text(_TAIL_JUMPS_C.replace("IDXJUMP", _IDXJUMP_ASM[arch]))
+        out = workdir / f"tail_jumps_{arch}"
+        build = subprocess.run(
+            [cc, "-O2", "-fno-stack-protector", "-no-pie", str(src), "-o", str(out)],
+            capture_output=True, text=True, timeout=120)
+        if build.returncode != 0:
+            refuse_silent_skip(f"{compiler} failed to build the #1000 tail-jump fixture: "
+                               f"{build.stderr.strip()}")
+        built[arch] = out
+    return built
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+class TestDecompileUnresolvedJumps1000:
+    """An unresolved jump out of a function -- a pointer tail call or a
+    computed goto alike -- gets exactly one neutral `jump` row and a note on
+    every line that shows it, and neither ever claims which it is. The
+    expected rows come from the disassembly, not from a list of fixtures:
+    which ones the compiler leaves as jumps varies by gcc version. An
+    indirect branch counts only when BN rendered it as an unresolved
+    `jump ->` -- a jump-table branch BN resolved renders as a `switch`."""
+
+    _INDIRECT_BRANCH = re.compile(
+        r"^(0x[0-9a-f]+)\s+(?:[0-9a-f]{2} )+\s*(?:notrack\s+)?(?:br|jmp)\s+(?!0x)\S")
+
+    @staticmethod
+    def _jump_lines(text):
+        return [(int(line.split()[0], 16), line) for line in text.splitlines()
+                if line.startswith("0x") and "jump ->" in line]
+
+    def test_one_neutral_row_per_indirect_branch_and_a_note_on_each_copy(
+            self, shared_bn, tail_jump_binaries, arch):
+        shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        for function in ("tc_param", "tc_global", "tc_field", "tc_table", "labels2",
+                         "idxjump", "d1"):
+            disasm = shared_bn.run("disasm", function)
+            assert disasm.returncode == 0, disasm.stderr
+            branches = {int(m.group(1), 16) for line in disasm.stdout.splitlines()
+                        if (m := self._INDIRECT_BRANCH.match(line))}
+            result = shared_bn.json("decompile", function, "--addresses")
+            jump_lines = self._jump_lines(result["text"])
+            expected = branches & {address for address, _ in jump_lines}
+            if function == "idxjump":
+                assert len(expected) == 1, (disasm.stdout, result["text"])  # hand-written
+            jumps = [row for row in result["warning_rows"] if row["code"] == "jump"]
+            addresses = [int(row["address"], 16) for row in jumps]
+            assert sorted(addresses) == sorted(expected), (function, jumps, disasm.stdout)
+            for row in jumps:
+                assert "tail call" in row["summary"] and "computed goto" in row["summary"], row
+                for claim in ("virtual", "slot", "through the function pointer"):
+                    assert claim not in row["summary"] and claim not in row["detail"], row
+                assert row["target"] and f"`{row['target']}`" in row["detail"], row
+            # Every line BN renders for one of those jumps carries the note
+            # exactly once, and no other line carries it.
+            for line in result["text"].splitlines():
+                address = int(line.split()[0], 16) if line.startswith("0x") else None
+                shows_jump = "jump ->" in line and address in expected
+                assert line.count("/* bn: unresolved jump") == int(shows_jump), (function, line)
+
+
+class TestDecompileRepeatedJump1000:
+    """On AArch64 -O2, BN shows one of `d1`'s `br`s in two switch cases
+    (#1000 review round 5): one row for it, and one note on each copy."""
+
+    def test_a_jump_bn_repeats_is_one_row_with_a_note_on_every_copy(
+            self, shared_bn, tail_jump_binaries):
+        shared_bn.load(tail_jump_binaries["aarch64"], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        result = shared_bn.json("decompile", "d1", "--addresses")
+        lines = TestDecompileUnresolvedJumps1000._jump_lines(result["text"])
+        copies = collections.Counter(address for address, _ in lines)
+        repeated = [address for address, count in copies.items() if count > 1]
+        assert repeated, ("premise: BN no longer repeats a jump in d1", result["text"])
+        jumps = [int(row["address"], 16) for row in result["warning_rows"]
+                 if row["code"] == "jump"]
+        assert sorted(jumps) == sorted(copies), (jumps, result["text"])
+        for _, line in lines:
+            assert line.count("/* bn: unresolved jump") == 1, line
+
+
+class TestShortLiteralBehindDataName994:
+    def test_setlocale_literal_rendered_as_data_name_is_named(self, shared_bn, tail_jump_binaries):
+        shared_bn.load(tail_jump_binaries["aarch64"], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        result = shared_bn.json("decompile", "use_c_locale")
+        match = re.search(r"setlocale\(6, &data_([0-9a-f]+)\)", result["text"])
+        assert match, result["text"]  # the premise: BN hides the literal as data
+        strings = [row for row in result["warning_rows"] if row["code"] == "string"]
+        assert strings and strings[0]["strings"][0]["value"] == "C", result["warning_rows"]
+        assert strings[0]["strings"][0]["address"] == hex(int(match.group(1), 16))
+
+
+class TestOffsetTypeLookup1000:
+    """#1000 item 4 (review round 8): a type BN keys by a multi-part qualified
+    name -- every type a library or the demangler supplies -- is not found by
+    `bv.get_type_by_name("std::X")`, which reads the string as ONE name part,
+    so the `__offset` note called defined types missing. The lookup must
+    agree with `bn types show` for a namespaced type, a missing one, and a
+    templated name whose arguments contain `::` themselves."""
+
+    _NAMES = {
+        "demo::Leaf": True,
+        "demo::Box<std::pair<int, demo::Leaf> >": True,
+        "demo::Missing": False,
+    }
+
+    def test_type_lookup_agrees_with_types_show(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        lookup = shared_bn.json(
+            "py", "exec", "--code",
+            "import binaryninja as bn\n"
+            "from bn_agent_bridge import read_decompile as rd\n"
+            "leaf = bn.Type.structure(members=[(bn.Type.int(4), 'x')])\n"
+            "bv.define_user_type(bn.QualifiedName(['demo', 'Leaf']), leaf)\n"
+            "bv.define_user_type(bn.QualifiedName(['demo', 'Box<std::pair<int, demo::Leaf> >']),"
+            " leaf)\n"
+            f"names = {list(self._NAMES)!r}\n"
+            "defined = rd._type_lookup(bv)\n"
+            "result = {'naive': {n: bv.get_type_by_name(n) is not None for n in names},\n"
+            "          'lookup': {n: defined(n) for n in names}}\n")["result"]
+        # The premise: BN's string lookup misses the multi-part names.
+        assert lookup["naive"]["demo::Leaf"] is False, lookup
+        assert lookup["lookup"] == self._NAMES, lookup
+        for name, exists in self._NAMES.items():
+            shown = shared_bn.run("types", "show", name)
+            assert (shown.returncode == 0) == exists, (name, shown.stdout, shown.stderr)

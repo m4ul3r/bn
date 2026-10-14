@@ -30,6 +30,7 @@ from ..formatters import (
     _render_xrefs_any_text,
     _render_xrefs_text,
     _quick_partial_prefix,
+    _render_decompile_warnings,
     _resolution_note,
     _slice_text_lines,
     _text_field,
@@ -418,6 +419,15 @@ def _decompile_many(
                       "and reanalyze it before decompiling (may be slow; takes the write lock)"),
              arg("--include-annotations", action="store_true", default=False,
                  help="Include inherited comment bodies in text/JSON (default: redact)"),
+             arg("--explain", action="store_true", default=False,
+                 help="Print each warning's full explanation and next step under its "
+                      "one-line `warning[<code>]:` summary (text mode; json carries "
+                      "the sentences in `warnings` and `{code, summary, detail}` rows "
+                      "in `warning_rows`). In the Pseudo C, a `❓` line is control "
+                      "flow BN could not resolve -- an indirect jump with no known "
+                      "target, which may be a tail call (its arguments are not "
+                      "rendered) or a computed goto / jump table -- and a "
+                      "`/* bn: ... */` note is added by bn, not by Binary Ninja"),
          ],
          estimable=True)
 def _decompile(args: argparse.Namespace) -> int:
@@ -425,11 +435,13 @@ def _decompile(args: argparse.Namespace) -> int:
     if lines_range is not None:
         _require_text_format(args, "--lines")
 
+    explain = bool(getattr(args, "explain", False))
+
     def _render_decompile_text(value: Any) -> str:
         text = _slice_text_lines(_text_field("text")(value), lines_range)
-        warnings = value.get("warnings") if isinstance(value, dict) else None
-        if warnings:
-            text = text + "\n\n" + "\n".join(f"warning: {warning}" for warning in warnings)
+        warning_text = _render_decompile_warnings(value, explain=explain)
+        if warning_text:
+            text = text + "\n\n" + warning_text
         # #977: `<annotation redacted>` alone read as a comment that never
         # landed. Say how many were hidden and the flag that shows them; counts
         # cover the whole function, not just a --lines slice.

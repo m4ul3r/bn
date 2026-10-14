@@ -706,6 +706,66 @@ def _slice_text_lines(
     return header + "\n" + "\n".join(sliced)
 
 
+@_discloses
+def _render_decompile_warnings(value: Any, *, explain: bool = False) -> str:
+    """One `warning[<code>]: <summary>` line per decompile warning (#1000 item 1).
+
+    The bridge sends `warning_rows` -- `{code, summary, detail, ...}` -- beside
+    the `warnings` sentences every read op carries. Text printed each sentence
+    as a 450-870 character paragraph, mostly the same boilerplate on every
+    function, so agents filtered `^warning` wholesale and lost the
+    dropped-argument findings with it (and harnesses cut the longest ones off
+    before their advice). The summary is the finding; `--explain` adds the
+    detail -- what it means and what to do -- indented under it. A bridge
+    older than the rows sends only `warnings`, which print as they always did."""
+    lines: list[str] = []
+    explained = False
+    for warning in _field_list(value, "warning_rows", "warnings"):
+        if not isinstance(warning, dict):
+            lines.append(f"warning: {warning}")
+            continue
+        # Through the choke point: a non-string field is a skew to disclose,
+        # not a line to drop (#619). A row with neither text prints whole.
+        code = _text_value(warning, "code")
+        summary = _text_value(warning, "summary")
+        detail = _text_value(warning, "detail")
+        head = f"warning[{code}]: " if code else "warning: "
+        body = summary or detail or json.dumps(warning, sort_keys=True, default=str)
+        lines.append(head + body)
+        if detail and detail != body:
+            explained = True
+            if explain:
+                lines.extend(_wrap_detail(detail))
+    if explained and not explain:
+        lines.append("(--explain: what each warning means and what to do)")
+    return "\n".join(lines)
+
+
+_DETAIL_WIDTH = 120
+# A word, where a backticked command counts as one word: wrapping must never
+# split `bn evidence table 0x435ea0 --stride 4 --width 4` across lines. A
+# backtick with no partner is an ordinary character.
+_DETAIL_TOKEN = re.compile(r"(?:`[^`]*`|[^\s`]|`)+")
+
+
+def _wrap_detail(detail: str) -> list[str]:
+    """*detail* as indented lines of at most ~120 characters (#1000 review
+    round 8). One 1100-character line was cut by agent harnesses at 768
+    bytes, before the advice it ended with -- the original #1000 item 1
+    problem, back in the opt-in view."""
+    lines: list[str] = []
+    current = ""
+    for token in _DETAIL_TOKEN.findall(detail):
+        if current and len(current) + 1 + len(token) > _DETAIL_WIDTH:
+            lines.append(f"  {current}")
+            current = token
+        else:
+            current = f"{current} {token}" if current else token
+    if current:
+        lines.append(f"  {current}")
+    return lines
+
+
 # A BOUNDARY, not just a reader: every CLI caller concatenates this note ahead of
 # another render and none of them wraps it, so without one of its own the skew it
 # records below reaches no recorder and the note disappears in silence (#619).
