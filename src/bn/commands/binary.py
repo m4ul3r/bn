@@ -9,7 +9,8 @@ from .. import cli
 from ..cli import _call, _pick, arg, command
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT
 from ..target_hint import (
-    LISTED_SELECTOR_LEAD, format_multi_target_hint, respell_for_positional,
+    LISTED_SELECTOR_LEAD, format_multi_target_hint, positional_selector,
+    respell_for_positional, target_option,
 )
 from ..formatters import (
     _render_close_text,
@@ -290,9 +291,13 @@ def _close_hint_in_run_form(args: argparse.Namespace, exc: BridgeError) -> Bridg
     if LISTED_SELECTOR_LEAD not in message:
         return exc
     head, quoted = message.rsplit(LISTED_SELECTOR_LEAD, 1)
-    command = (f"{_target_close_prefix(args)} {quoted}"
+    try:
+        [selector] = shlex.split(quoted)
+    except ValueError:
+        return exc
+    command = (f"{_target_close_prefix(args)} {positional_selector(selector)}"
                if getattr(args, "_close_spelling", None) == "target close"
-               else f"bn {_routing(args)}close -t {quoted}")
+               else f"bn {_routing(args)}close {target_option(selector)}")
     return BridgeError(f"{head}close it with `{command}`.")
 
 

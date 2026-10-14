@@ -19,6 +19,7 @@ cannot drift.
 """
 from __future__ import annotations
 
+import re
 import shlex
 from typing import Any, Callable
 
@@ -33,14 +34,35 @@ STABLE_ID_NOTE = "note: view_id / target_id are stable across `bn save`"
 LISTED_SELECTOR_LEAD = "close it by its listed selector instead: "
 
 
+def _escape_controls(text: str) -> str:
+    """*text* on one line: backslash, newline and carriage return escaped, so a
+    crafted file name cannot start a line of its own in a listing."""
+    return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+
+
+def target_option(selector: str) -> str:
+    """The `-t` argument for *selector*, shell-quoted. A selector starting with
+    `-` would be read as the next option after a bare `-t`, so it is attached:
+    `--target=<sel>` (#996 re-check)."""
+    quoted = shlex.quote(selector)
+    return f"--target={quoted}" if selector.startswith("-") else f"-t {quoted}"
+
+
+def positional_selector(selector: str) -> str:
+    """*selector* as a positional argument, shell-quoted, after `--` when it
+    starts with `-` so argparse does not read it as an option (#996 re-check)."""
+    quoted = shlex.quote(selector)
+    return f"-- {quoted}" if selector.startswith("-") else quoted
+
+
 def target_row(target: dict[str, Any]) -> str:
     """One listing row, indent and active marker included."""
     marker = "*" if target.get("active") else " "
     return (
-        f"  {marker} -t {shlex.quote(str(target.get('selector', '')))}"
+        f"  {marker} {target_option(str(target.get('selector', '')))}"
         f"  view_id={target.get('view_id', '')}"
         f"  target_id={target.get('target_id', '')}"
-        f"  {target.get('filename', '')}"
+        f"  {_escape_controls(str(target.get('filename', '')))}"
     )
 
 
@@ -66,6 +88,32 @@ def format_multi_target_hint(
     return "\n".join([headline, SELECT_HINT_LINE, *open_target_lines(targets, row=row)])
 
 
+_ROW_START = re.compile(r"^  ([* ]) (?:-t |--target=)")
+
+
+def _parse_row(text: str) -> tuple[bool, str, str] | None:
+    """``(active, selector, metadata)`` of one `target_row` (which may span
+    lines when the quoted selector holds a newline), or None when *text* is
+    not a complete row."""
+    start = _ROW_START.match(text)
+    if start is None:
+        return None
+    rest = text[start.end():]
+    lexer = shlex.shlex(rest, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        selector = lexer.get_token()
+    except ValueError:              # the quoted selector continues on a later line
+        return None
+    if selector is None:
+        return None
+    metadata = rest[lexer.instream.tell():].strip()
+    if not metadata.startswith("view_id="):
+        return None
+    return start.group(1) == "*", selector, metadata
+
+
 def respell_for_positional(message: str, command: str) -> str:
     """Rewrite a refusal's `-t` rows and instruction line for a command whose
     selector is POSITIONAL (`bn target close <sel>`), where `-t` is rejected.
@@ -73,18 +121,40 @@ def respell_for_positional(message: str, command: str) -> str:
     The bridge and the CLI both render this module's grammar, whatever command
     the selector will go to; only the CLI knows that command. *command* is the
     full prefix to print, e.g. ``bn -i demo target close`` (#996 re-dogfood).
-    Rows keep their quoting, columns and active marker; every other line is
-    left as it is.
+
+    Each row becomes ONE complete, shell-safe command: the selector quoted (and
+    after `--` when it starts with `-`), the active marker and the metadata
+    after a `#` comment with control characters escaped, so a whole pasted
+    line runs exactly that command and nothing else (#996 re-check). Rows are
+    parsed by their grammar, so a line inside a selector that contains a
+    newline is never mistaken for a row of its own.
     """
-    out = []
-    for line in message.split("\n"):
+    lines = message.split("\n")
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if line == SELECT_HINT_LINE:
-            out.append(f"Run one of these to choose: {command} <selector>.")
+            out.append(f"Run one of these to choose: {command} <selector>")
+            index += 1
             continue
-        for marker in ("*", " "):
-            lead = f"  {marker} -t "
-            if line.startswith(lead):
-                line = f"  {marker} {command} {line[len(lead):]}"
-                break
-        out.append(line)
+        parsed = None
+        end = index
+        if _ROW_START.match(line):
+            # A quoted selector holding a newline continues the row; join
+            # until it parses (bounded by the message).
+            for end in range(index, len(lines)):
+                parsed = _parse_row("\n".join(lines[index:end + 1]))
+                if parsed is not None:
+                    break
+        if parsed is None:
+            out.append(line)
+            index += 1
+            continue
+        active, selector, metadata = parsed
+        # The metadata is one line by construction: `target_row` escapes the
+        # file name, and the parse stops at the end of the quoted selector.
+        note = ("active  " if active else "") + metadata
+        out.append(f"  {command} {positional_selector(selector)}  # {note}")
+        index = end + 1
     return "\n".join(out)
