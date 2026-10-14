@@ -816,6 +816,32 @@ def test_abi_register_sink_runs_the_in_range_classification_1001(models, monkeyp
     assert sink["arity_mismatch"]["recovered"] == 1
 
 
+def test_abi_register_sink_builds_a_buffer_arg_after_the_length_1001(models, monkeypatch):
+    # #1001 review round 2 blocker: `app_recv(fd, len, buf)` declares its buffer
+    # AFTER its length (the `reading.md` example). With BN's prototype cut to
+    # `app_recv(fd)`, the length is recovered from x1 -- and the buffer the
+    # bounded-write check needs from x2, though it comes after the checked arg.
+    # `p = malloc(n); app_recv(0, n, p)` stays `bounded_len`.
+    n = FVar("n"); n0 = FSSA(n, 0); p1 = FSSA(FVar("p"), 1)
+    alloc = FInstr(0, 0x10, "MLIL_CALL_SSA", "p#1 = malloc(n#0)", reads=[n0], writes=[p1],
+                   dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+                   params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])
+    call = FInstr(1, 0x14, "MLIL_CALL_SSA", "app_recv(0)", reads=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+                  params=[FExpr("MLIL_CONST", "0", constant=0)])
+    func = FFunc("reordered", 0x10, FSSAFunc([alloc, call]), params=[n])
+    user = te.load_models({"app_recv": {"sink": {"class": "overflow_len",
+                                                 "len_arg": 1, "buf_arg": 2}}})
+    engine = te.TaintEngine(FBV({0x2000: "malloc", 0x2010: "app_recv"}), user)
+    regs = {1: ("x1", [(n0, call)]), 2: ("x2", [(p1, call)])}
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                        lambda f, sites, idx: regs.get(idx, (None, [])), raising=False)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sink = next(s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "app_recv")
+    assert (sink["class"], sink["via"], sink["tainted_arg_index"]) == (
+        "bounded_len", "abi_register", 1)
+
+
 def test_abi_register_sinks_counted_per_class_in_verdict_1001():
     # The verdict counts every reached sink and, per class, how many of them
     # rest on a dropped ABI register; a class with none carries no marker.
@@ -833,8 +859,8 @@ def test_symbol_names_restore_a_model_keys_stripped_underscore_1001(models):
     # #1001 item 4: a finding names its callee by MODEL key, which strips a C++
     # symbol's leading underscore, so it is not a real symbol and neither reads
     # nor demangles. The real symbol and its display name come from the raw
-    # symbol with the underscore restored; a C symbol keeps its model spelling
-    # as its display name, and an unknown name falls back to itself.
+    # symbol with the underscore restored; a C symbol shows as its real name (an
+    # identifier that resolves), and an unknown name falls back to itself.
     syms = {"_ZN5store4openEPKc": types.SimpleNamespace(name="_ZN5store4openEPKc",
                                                          short_name="store::open"),
             "__strcpy_chk": types.SimpleNamespace(name="__strcpy_chk", short_name="__strcpy_chk")}
@@ -846,7 +872,7 @@ def test_symbol_names_restore_a_model_keys_stripped_underscore_1001(models):
     engine = te.TaintEngine(SymBV({}), models)
     assert engine._symbol_names("ZN5store4openEPKc") == ("_ZN5store4openEPKc", "store::open")
     assert engine._symbol_names("_ZN5store4openEPKc") == ("_ZN5store4openEPKc", "store::open")
-    assert engine._symbol_names("strcpy_chk") == ("__strcpy_chk", "strcpy_chk")
+    assert engine._symbol_names("strcpy_chk") == ("__strcpy_chk", "__strcpy_chk")
     assert engine._symbol_names("not_a_symbol") == ("not_a_symbol", "not_a_symbol")
 
 
@@ -868,8 +894,8 @@ def test_flow_signature_display_keeps_the_raw_grouping_key_1001():
 
 def test_unresolved_in_binary_thunk_is_not_called_external_1001(models):
     # #1001 review nit: after `--force-analysis` BN can turn an oversized body
-    # into an in-binary tail-jump thunk whose target does not resolve. It is
-    # neither an import nor an external symbol, so it is not "external".
+    # into an in-binary thunk. It is neither an import nor an external symbol,
+    # so it is not "external". With no tail call to name, say that.
     p = FVar("p", ident=40)
     p0 = FSSA(p, 0)
     stub = FFunc("fetch_input", 0xB00, FSSAFunc([]), is_thunk=True)
@@ -879,15 +905,42 @@ def test_unresolved_in_binary_thunk_is_not_called_external_1001(models):
     func = FFunc("handle", 0x10, FSSAFunc([call]), params=[p])
     result = te.TaintEngine(FBV({}, funcs={0xB00: stub}), models).forward(
         func, [te.parse_locator("param:0")])
-    assert ("in-binary fetch_input was not analysed (Binary Ninja made it a thunk and its "
-            "target did not resolve) and has no model; return conservatively tainted -- "
-            "read it with `bn disasm 0xb00`") in result["assumptions"]
+    assert ("in-binary fetch_input is a thunk whose tail-call target did not resolve; "
+            "it has no model; return conservatively tainted -- read it with "
+            "`bn disasm 0xb00`") in result["assumptions"]
     # An import stub is still external, even though BN also marks it a thunk.
     plt = FFunc("fetch_input", 0xB00, FSSAFunc([]), is_thunk=True,
                 symbol_type="ImportedFunctionSymbol")
     result = te.TaintEngine(FBV({}, funcs={0xB00: plt}), models).forward(
         func, [te.parse_locator("param:0")])
     assert "external fetch_input has no model; return conservatively tainted" in result["assumptions"]
+
+
+def test_multi_instruction_thunk_names_its_resolved_tail_call_target_1001(models):
+    # #1001 review round 2: `follow_thunk` takes only a one-instruction body, so
+    # the oversized function BN turns into a thunk after `--force-analysis`
+    # (nops, then a tail call into the split-off body) stops here even though
+    # its target RESOLVES. The caveat names that target instead of claiming it
+    # did not resolve, and does not call the thunk unanalysed.
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    body = FFunc("sub_c00", 0xC00, FSSAFunc([FInstr(0, 0xC00, "MLIL_RET", "return")]))
+    stub = FFunc("fetch_input", 0xB00, FSSAFunc([
+        FInstr(0, 0xB00, "MLIL_NOP", "nop"),
+        FInstr(1, 0xB04, "MLIL_TAILCALL_SSA", "return 0xc00() __tailcall",
+               dest=FExpr("MLIL_CONST_PTR", "0xc00", constant=0xC00)),
+    ]), is_thunk=True)
+    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(p#0)", reads=[p0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0xB00", constant=0xB00),
+                  params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])])
+    func = FFunc("handle", 0x10, FSSAFunc([call]), params=[p])
+    result = te.TaintEngine(FBV({}, funcs={0xB00: stub, 0xC00: body}), models).forward(
+        func, [te.parse_locator("param:0")])
+    assert ("in-binary fetch_input is a thunk Binary Ninja made of a tail call to sub_c00 "
+            "@ 0xc00, which taint does not follow through a multi-instruction thunk; it has "
+            "no model; return conservatively tainted -- read the target with "
+            "`bn decompile 0xc00`") in result["assumptions"]
+    assert result["stats"]["analysis_incomplete"] is False
 
 
 def test_forward_modeled_sink_arg_out_of_range_silent_when_untainted(models, monkeypatch):

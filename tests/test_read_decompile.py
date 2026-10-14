@@ -2969,6 +2969,22 @@ def test_address_of_local_hint_prints_no_command_for_an_unresolved_callee_1001(m
     hint = next(h for h in result["hints"] if "var_68" in h)
     assert "did not resolve" in hint
     assert "`bn taint" not in hint and "<callee>" not in hint
+    # The one command it does print runs as printed (a bare `bn decompile` exits 2).
+    assert "`bn decompile 0x401660`" in hint
+
+
+@pytest.mark.parametrize("arg_index, source", [
+    (1, "call:recvfrom"),          # the model sources *arg:1, the payload buffer
+    (5, "arg:recvfrom:5"),         # addrlen: `call:recvfrom` would not seed it
+])
+def test_address_of_local_hint_uses_call_only_for_a_modeled_output_1001(monkeypatch, arg_index, source):
+    """#1001 review round 2: `call:<callee>` seeds what the callee's model
+    declares it writes, so it is the forward source only for an argument the
+    model writes; any other address-of argument is seeded as itself."""
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    hint = rts._address_of_local_hint(arg_index, "addr", {"callee": "recvfrom"},
+                                      types.SimpleNamespace(start=0x4007c0))
+    assert f"`bn taint forward -f 0x4007c0 --source {source}`" in hint
 
 
 def test_value_loaded_from_a_local_is_not_called_its_address_1001(monkeypatch):

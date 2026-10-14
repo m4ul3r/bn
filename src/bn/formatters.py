@@ -4531,8 +4531,7 @@ def _render_flow_line(f: dict[str, Any], *, mangled: bool = False) -> str:
                if sink.get("via") == "abi_register" else "")
         arg = f" (arg {ai}{via})"
     m = _field_dict(f, "metrics")
-    sig = _shown_name(_field_dict(f, "signature"), mangled=mangled, name_key="rendered",
-                      display_key="rendered_display") or ""
+    sig = _signature_text(_field_dict(f, "signature"), mangled=mangled)
     unresolved = "y" if m.get("traverses_unresolved") else "n"
     facts = f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} unresolved={unresolved}}}"
     callee = _sink_callee_text(sink, mangled=mangled) or "?"
@@ -4548,6 +4547,15 @@ def _sink_callee_text(sink: dict[str, Any], *, mangled: bool = False) -> Any:
     return _shown_name(sink, mangled=mangled,
                        name_key="callee_symbol" if mangled and sink.get("callee_symbol") else "callee",
                        display_key="callee_display_name")
+
+
+def _signature_text(sig: dict[str, Any], *, mangled: bool = False) -> str:
+    """A flow signature as text prints it (#1001 item 4): demangled names, or
+    under ``--mangled`` the real raw symbols -- the same spelling the row's sink
+    head uses, not the model key `rendered` groups by. Falls back to
+    `rendered` for an older bridge."""
+    key = "rendered_symbol" if mangled and sig.get("rendered_symbol") else "rendered"
+    return _shown_name(sig, mangled=mangled, name_key=key, display_key="rendered_display") or ""
 
 
 def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
@@ -4735,8 +4743,7 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
             sink = _field_dict(sl, "sink")
             origin = _field_dict(sl, "origin")
             m = _field_dict(sl, "metrics")
-            sig = _shown_name(_field_dict(sl, "signature"), mangled=mangled, name_key="rendered",
-                              display_key="rendered_display") or ""
+            sig = _signature_text(_field_dict(sl, "signature"), mangled=mangled)
             n = sl.get("reached_via_call_sites", 1)
             xn = (f"  (reached via {n} callsites)"
                   if isinstance(n, int) and not isinstance(n, bool) and n > 1 else "")
@@ -4760,7 +4767,9 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                     _vs = f"{_val:#x}" if isinstance(_val, int) else str(_val)
                     _extra = _vs + (f" ({origin['var']})" if origin.get("var") else "")
                 else:
-                    _extra = origin.get("callee") or origin.get("var") or origin.get("address") or ""
+                    _extra = (((sl.get("origin_callee_display_name") if not mangled else None)
+                               or origin.get("callee"))
+                              or origin.get("var") or origin.get("address") or "")
                 _spill = " (via spill)" if origin.get("via_spill") else ""
                 lines.append(f"  origin: {_ok} {_extra}{_spill}".rstrip())
                 crossed = _field_list(sl, "crossed_functions")
@@ -7103,7 +7112,9 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
                 line += f" ({_shown_name(step, mangled=mangled, name_key='callee', display_key='callee_display_name')})"
             if (reason in ("interprocedural_out_param_not_followed", "out_param_not_followed")
                     and step.get("out_param_callee")):
-                line += f" (via {step['out_param_callee']})"
+                _fill = _shown_name(step, mangled=mangled, name_key="out_param_callee",
+                                    display_key="out_param_callee_display_name")
+                line += f" (via {_fill})"
             if reason == "function_parameter":
                 slot = _trace_param_slot(step)
                 if slot:
@@ -7179,6 +7190,7 @@ def _render_trace_frontiers(frontiers: Any, *, mangled: bool = False) -> list[st
             if not isinstance(ex, dict):
                 continue
             nm = ((ex.get("callee_display_name") if not mangled else None) or ex.get("callee")
+                  or (ex.get("out_param_callee_display_name") if not mangled else None)
                   or ex.get("out_param_callee") or ex.get("local"))
             if not nm and reason == "function_parameter":
                 slot = _trace_param_slot(ex)

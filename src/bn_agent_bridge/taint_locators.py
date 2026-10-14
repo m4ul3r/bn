@@ -158,7 +158,8 @@ def _render_source(source: Any) -> str:
 
 def _make_signature(source: Any, chain: list[str], sink_class: str | None,
                     sink_callee: str | None, *,
-                    display: Callable[[str], str | None] | None = None) -> dict[str, Any]:
+                    display: Callable[[str], str | None] | None = None,
+                    symbol: Callable[[str], str | None] | None = None) -> dict[str, Any]:
     cls = f"[{sink_class}] " if sink_class else ""
     src = _render_source(source)
     parts = [src] + [str(c) for c in chain] + [f"{cls}{sink_callee}"]
@@ -170,15 +171,21 @@ def _make_signature(source: Any, chain: list[str], sink_class: str | None,
         "rendered": " → ".join(parts),
     }
     # #1001 item 4: the same signature with every function named as `decompile`
-    # names it. `rendered` stays the raw, address-free grouping key; text shows
-    # this one unless --mangled. Always present when a resolver was given, like
-    # every other display-name field (equal to `rendered` for C-only flows).
-    if display is not None:
-        def _shown(name: Any) -> str:
-            return (display(str(name)) or str(name)) if name else str(name)
-        shown_src = _shown(src) if not isinstance(source, dict) else src
-        sig["rendered_display"] = " → ".join([shown_src] + [_shown(c) for c in chain]
-                                             + [f"{cls}{_shown(sink_callee)}"])
+    # names it (`rendered_display`), and with the real raw symbols
+    # (`rendered_symbol`, what --mangled prints: the model key drops a C++
+    # symbol's leading underscore, so the sink in `rendered` is not a real
+    # symbol). `rendered` stays the raw, address-free grouping key. Each is
+    # always present when its resolver was given (equal to `rendered` when the
+    # names do not change).
+    for key, resolve in (("rendered_display", display), ("rendered_symbol", symbol)):
+        if resolve is None:
+            continue
+
+        def _named(name: Any, resolve=resolve) -> str:
+            return (resolve(str(name)) or str(name)) if name else str(name)
+        named_src = _named(src) if not isinstance(source, dict) else src
+        sig[key] = " → ".join([named_src] + [_named(c) for c in chain]
+                              + [f"{cls}{_named(sink_callee)}"])
     return sig
 
 
@@ -191,6 +198,7 @@ def derive_flow_facts(*, direction: str,
                       origin: dict[str, Any] | None = None,
                       crossed_functions: list[str] | None = None,
                       display: Callable[[str], str | None] | None = None,
+                      symbol: Callable[[str], str | None] | None = None,
                       ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Structural triage facts + an address-free grouping signature for one flow.
 
@@ -217,7 +225,8 @@ def derive_flow_facts(*, direction: str,
                         for lf in (leaves or []) if lf.get("address"))
         metrics = {"steps": len(steps), "fns_spanned": 1 + len(chain),
                    "traverses_unresolved": bool(traverses)}
-        return metrics, _make_signature(source, chain, sink_class, sink_callee, display=display)
+        return metrics, _make_signature(source, chain, sink_class, sink_callee,
+                                        display=display, symbol=symbol)
 
     # backward
     crossed = [str(c) for c in (crossed_functions or [])]
@@ -232,4 +241,5 @@ def derive_flow_facts(*, direction: str,
                                   "address_of_local_unresolved", "global"}
     metrics = {"steps": len(steps), "fns_spanned": max(1, len(set(crossed)) + 1),
                "traverses_unresolved": bool(traverses)}
-    return metrics, _make_signature(source, chain, None, sink_callee, display=display)
+    return metrics, _make_signature(source, chain, None, sink_callee,
+                                    display=display, symbol=symbol)

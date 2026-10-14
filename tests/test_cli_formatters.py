@@ -413,7 +413,8 @@ _CXX_TAINT = {
         "path": [],
         "metrics": {"steps": 4, "fns_spanned": 2, "traverses_unresolved": False},
         "signature": {"rendered": "arg:recv:1 → _Z8read_keyPc → [path_injection] ZN5store4openEPKc",
-                      "rendered_display": "arg:recv:1 → read_key → [path_injection] store::open"},
+                      "rendered_display": "arg:recv:1 → read_key → [path_injection] store::open",
+                      "rendered_symbol": "arg:recv:1 → _Z8read_keyPc → [path_injection] _ZN5store4openEPKc"},
     }],
     "leaves": [{"kind": "unmodeled_callee", "address": "0x402040",
                 "callee": {"name": "_ZN5cache3getEi", "display_name": "cache::get",
@@ -431,10 +432,10 @@ def test_taint_text_names_functions_demangled_unless_mangled_1001():
     assert "unmodeled_callee @ 0x402040  -> cache::get @ 0x403000" in out
     raw = _render_taint_text(_CXX_TAINT, mangled=True)
     assert raw.splitlines()[0] == "forward taint in _Z9load_userPK4Conn @ 0x402000"
-    # --mangled prints the REAL symbol, not the model key (leading `_` restored);
-    # the signature stays the raw grouping key.
+    # --mangled prints the REAL symbol, not the model key (leading `_` restored),
+    # in the row head and its signature alike.
     assert ("[path_injection] _ZN5store4openEPKc @ 0x402080 (arg 1)   "
-            "arg:recv:1 → _Z8read_keyPc → [path_injection] ZN5store4openEPKc") in raw
+            "arg:recv:1 → _Z8read_keyPc → [path_injection] _ZN5store4openEPKc") in raw
     assert "-> _ZN5cache3getEi @ 0x403000" in raw
 
 
@@ -469,6 +470,22 @@ def test_trace_steps_and_frontiers_name_callees_demangled_unless_mangled_1001():
     assert "call boundary  [1 step] (_ZN3app6appendEPKc)" in raw
 
 
+def test_trace_out_param_fill_names_its_callee_demangled_unless_mangled_1001():
+    from bn.formatters import _render_trace_text
+    step = {"ssa_label": "n#0", "terminates": True, "reason": "out_param_not_followed",
+            "out_param_callee": "_ZN2ns4fillEPl", "out_param_callee_display_name": "ns::fill"}
+    value = {"function": "f", "function_address": "0x401660", "target_address": "0x401884",
+             "arg_index": 0, "trace": [step],
+             "frontiers": [{"reason": "out_param_not_followed", "count": 1,
+                            "examples": [{k: step[k] for k in ("out_param_callee",
+                                                               "out_param_callee_display_name")}]}]}
+    out = _render_trace_text(value)
+    assert "out-param fill not followed (via ns::fill)" in out
+    assert "out-param fill not followed  [1 step] (ns::fill)" in out
+    raw = _render_trace_text(value, mangled=True)
+    assert "(via _ZN2ns4fillEPl)" in raw and "[1 step] (_ZN2ns4fillEPl)" in raw
+
+
 def test_backward_slice_row_names_its_sink_demangled_unless_mangled_1001():
     from bn.formatters import _render_taint_text
     value = {"direction": "backward",
@@ -477,12 +494,16 @@ def test_backward_slice_row_names_its_sink_demangled_unless_mangled_1001():
                  "sink": {"kind": "arg", "callee": "_Z8run_toolPK3Req",
                           "callee_symbol": "_Z8run_toolPK3Req", "callee_display_name": "run_tool",
                           "address": "0x4013d8", "seed": "x0#6"},
+                 "origin": {"kind": "call", "callee": "_Z12save_profilePK3Req"},
+                 "origin_callee_display_name": "save_profile",
                  "metrics": {"steps": 4, "fns_spanned": 1},
                  "signature": {"rendered": "_Z12save_profilePK3Req → _Z8run_toolPK3Req",
                                "rendered_display": "save_profile → run_tool"}}]}
     assert "[arg] run_tool @ 0x4013d8 (seed x0#6)   save_profile → run_tool" in _render_taint_text(value)
     assert ("[arg] _Z8run_toolPK3Req @ 0x4013d8 (seed x0#6)   "
             "_Z12save_profilePK3Req → _Z8run_toolPK3Req") in _render_taint_text(value, mangled=True)
+    assert "origin: call save_profile" in _render_taint_text(value, full=True)
+    assert "origin: call _Z12save_profilePK3Req" in _render_taint_text(value, full=True, mangled=True)
 
 
 # --- compact-default taint output (Thread C) ---------------------------------

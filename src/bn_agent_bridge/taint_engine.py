@@ -2615,7 +2615,8 @@ class TaintEngine:
             fm, fs = derive_flow_facts(
                 direction="forward", path=f.get("path"), sink=f.get("sink"),
                 sources=[] if _unconditional else sources_echo,
-                leaves=sub["leaves"], fn_name=str(func.name), display=self._display_for_name)
+                leaves=sub["leaves"], fn_name=str(func.name), display=self._display_for_name,
+                symbol=self._raw_symbol_for)
             f["metrics"] = fm
             f["signature"] = fs
         result = {
@@ -3928,8 +3929,27 @@ class TaintEngine:
             return f"Binary Ninja skipped its analysis: {why}"
         if reason == "no_mlil":
             return "Binary Ninja produced no MLIL for it"
-        if reason == "thunk_unresolved":
-            return "Binary Ninja made it a thunk and its target did not resolve"
+        return None
+
+    def _thunk_tail_target(self, fn: Any) -> Any | None:
+        """The function a thunk tail-calls, found on ANY of its instructions --
+        `follow_thunk` only takes a one-instruction body, but BN also marks a
+        longer body that ends in a tail jump (an oversized function after
+        `--force-analysis`) a thunk (#1001 review). None when no tail call has
+        a constant target that is a function."""
+        ssa = _mlil_ssa(fn)
+        if ssa is None:
+            return None
+        for insn in _ssa_instructions(ssa):
+            if "TAILCALL" not in op_name(insn) or getattr(insn, "dest", None) is None:
+                continue
+            try:
+                addr = extract_dest_address(self.bv, insn.dest)
+            except Exception:
+                addr = None
+            target = function_at(self.bv, addr) if addr is not None else None
+            if target is not None and target is not fn:
+                return target
         return None
 
     def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int) -> dict[str, Any]:
@@ -4536,24 +4556,45 @@ class TaintEngine:
                 if leaf not in leaves:
                     leaves.append(leaf)
 
-            def _sink_arg_operands(argidx: int) -> tuple[list[Any] | None, list, dict | None]:
+            def _dropped_operand(i: int) -> Any:
+                """A dropped arg the classification may consult (a copy's
+                destination, a bounded write's buffer): its register's single
+                reaching value, else an operand no classifier can resolve --
+                never a guess."""
+                try:
+                    r_i, s_i = self._reaching_arg_seeds_via_reg(func, [ins], i)
+                except Exception:
+                    r_i, s_i = None, []
+                return _RegisterOperand(s_i[0][0] if len(s_i) == 1 else None, r_i)
+
+            def _sink_arg_operands(argidx: int, sink: dict[str, Any]
+                                   ) -> tuple[list[Any] | None, list, dict | None]:
                 """``(operands, hit_nodes, abi)`` for a modeled sink's arg.
 
-                In range: the call's own params. Out of range (#577) -- the sink's
-                declared index sits beyond the params BN recovered for this call,
-                the shape an ARM-Thumb `j_memcpy` typed `memcpy(int32_t)` produces
-                by dropping the length register -- the arg is recovered through
-                its calling-convention register (the #433 reg bridge) and the
-                operand list is extended with register stand-ins, so the SAME
-                classification the in-range path runs (bounded copy, receive
-                bound, index-only, ...) judges it (#1001 item 1 review). Reported
-                only when the register value really carries taint, so a merely
-                under-recovered but quiet sink does not cry wolf; ``abi`` names
-                the register and the arity mismatch for the finding. This used to
-                be an `arg_under_recovered` frontier LEAF, which kept a modeled
-                sink the engine SAW reached out of the verdict and `flows`."""
+                The operands are the call's own params, extended past BN's
+                recovered arity (#577: an ARM-Thumb `j_memcpy` typed
+                `memcpy(int32_t)` drops the length register) with register
+                stand-ins for EVERY index the model declares -- the checked arg,
+                `len_arg`, `buf_arg` and the copy roles, in whatever order the
+                model puts them (#1001 review: `app_recv(fd, len, buf)` has its
+                buffer AFTER its length). So the SAME classification the
+                in-range path runs (bounded copy, receive bound, index-only, ...)
+                judges the arg. A dropped checked arg is reported only when its
+                register value really carries taint, so a merely under-recovered
+                but quiet sink does not cry wolf; ``abi`` names the register and
+                the arity mismatch for the finding. This used to be an
+                `arg_under_recovered` frontier LEAF, which kept a modeled sink the
+                engine SAW reached out of the verdict and `flows`."""
+                declared = [argidx, *(sink.get("tainted_args") or [])]
+                declared += [sink[k] for k in ("len_arg", "buf_arg") if sink.get(k) is not None]
+                declared += list(_model_copy_roles(model) or ())
+                need = max(int(i) for i in declared if isinstance(i, int) and not isinstance(i, bool))
                 if argidx < len(params):
-                    return params, arg_taint(params[argidx]), None
+                    hit = arg_taint(params[argidx])
+                    if need < len(params) or not hit:
+                        return params, hit, None
+                    return (list(params) + [_dropped_operand(i) for i in range(len(params), need + 1)],
+                            hit, None)
                 try:
                     reg, seeds = self._reaching_arg_seeds_via_reg(func, [ins], argidx)
                 except Exception:
@@ -4571,17 +4612,9 @@ class TaintEngine:
                         break
                 if operand is None:
                     return None, [], None
-                operands: list[Any] = list(params)
-                for i in range(len(params), argidx):
-                    # Another dropped arg the classification may consult (a copy's
-                    # destination): its register's single reaching value, else an
-                    # operand no classifier can resolve (never a guess).
-                    try:
-                        r_i, s_i = self._reaching_arg_seeds_via_reg(func, [ins], i)
-                    except Exception:
-                        r_i, s_i = None, []
-                    operands.append(_RegisterOperand(s_i[0][0] if len(s_i) == 1 else None, r_i))
-                operands.append(operand)
+                operands: list[Any] = list(params) + [
+                    operand if i == argidx else _dropped_operand(i)
+                    for i in range(len(params), max(need, argidx) + 1)]
                 taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
                 return operands, hit, {"register": reg, "recovered": len(params),
                                        "callee_ref": hex(int(taddr)) if taddr is not None else None}
@@ -4674,7 +4707,7 @@ class TaintEngine:
                 if sink.get("len_arg") is not None and sink["len_arg"] not in _sink_args:
                     _sink_args.append(int(sink["len_arg"]))
                 for argidx in _sink_args:
-                    aparams, ht, abi = _sink_arg_operands(argidx)
+                    aparams, ht, abi = _sink_arg_operands(argidx, sink)
                     if aparams is not None:
                         if ht:
                             sig = (addr, argidx) if site_taddr is None else (addr, argidx, site_taddr)
@@ -5402,27 +5435,47 @@ class TaintEngine:
                             # and record it as an unread body (#811). The phrase
                             # keeps "has no model": taint_result's gate keys on it.
                             _reason = self._not_internal_reason(descend_fn)
-                            if _reason == "thunk" and self._follow_thunk_cached(descend_fn) is None:
-                                # In-binary, and not a stub onto an import either
-                                # (that one resolves): e.g. a body BN turned into a
-                                # tail-jump after `--force-analysis`.
-                                _reason = "thunk_unresolved"
                             _unread = self._unanalysed_body_phrase(_reason)
                             _who = nm or hex(taddr)
                             _at = hex(int(getattr(descend_fn, "start", taddr)))
-                            if _reason == "thunk_unresolved":
-                                _fix = f"read it with `bn disasm {_at}`"
+                            _thunk = None
+                            if _reason == "thunk" and self._follow_thunk_cached(descend_fn) is None:
+                                # In-binary, and not a stub onto an import either
+                                # (that one resolves). `follow_thunk` only takes a
+                                # one-instruction tail call, so a longer body BN
+                                # still calls a thunk (an oversized function after
+                                # `--force-analysis`) stops here even when its
+                                # tail-call target resolves -- name that target.
+                                _tail = self._thunk_tail_target(descend_fn)
+                                if _tail is not None:
+                                    _ta = hex(int(getattr(_tail, "start", 0)))
+                                    _thunk = (f"in-binary {_who} is a thunk Binary Ninja made of a "
+                                              f"tail call to {getattr(_tail, 'name', _ta)} @ {_ta}, "
+                                              "which taint does not follow through a multi-"
+                                              "instruction thunk",
+                                              f"read the target with `bn decompile {_ta}`")
+                                else:
+                                    _thunk = (f"in-binary {_who} is a thunk whose tail-call "
+                                              "target did not resolve",
+                                              f"read it with `bn disasm {_at}`")
                             elif _unread is not None:
                                 self._analysis_incomplete.add(str(_who))
                                 _fix = (f"run `bn decompile {_at} --force-analysis` (may be slow) "
                                         "and re-run this taint query")
+                            if _thunk is not None:
+                                _caveat = (f"{_thunk[0]}; it has no model; return conservatively "
+                                           f"tainted -- {_thunk[1]}")
+                                _stop_desc = f"in-binary thunk ({_thunk[0]}; {_thunk[1]})"
+                            elif _unread is not None:
+                                _caveat = (f"in-binary {_who} was not analysed ({_unread}) and has no "
+                                           f"model; return conservatively tainted -- {_fix}")
+                                _stop_desc = f"in-binary function ({_unread}; {_fix})"
+                            else:
+                                _caveat = f"external {_who} has no model; return conservatively tainted"
+                                _stop_desc = "external"
                             if self.unknown_call_policy != "stop":
                                 ret_tainted = True
-                                add_assumption(
-                                    f"external {_who} has no model; return conservatively tainted"
-                                    if _unread is None else
-                                    f"in-binary {_who} was not analysed ({_unread}) and has no "
-                                    f"model; return conservatively tainted -- {_fix}")
+                                add_assumption(_caveat)
                             else:
                                 # F4/#562: `stop` deliberately does NOT propagate taint
                                 # through an unmodeled external -- but taint DID reach it,
@@ -5441,8 +5494,7 @@ class TaintEngine:
                                                "address": hex(int(taddr))},
                                     "tainted_args": sorted(tainted_args.keys()),
                                     "note": ("--unknown-call stop: taint reached this unmodeled "
-                                             + ("external" if _unread is None else
-                                                f"in-binary function ({_unread}; {_fix})")
+                                             + _stop_desc
                                              + " and was NOT propagated through it; flow past "
                                              "this call is not analyzed -- NOT an all-clear"),
                                 }
@@ -6370,12 +6422,12 @@ class TaintEngine:
         (#1001 item 4); both fall back to *name* itself when no symbol has it.
 
         Models key a callee with its leading underscores stripped
-        (``ZNSt13basic_filebuf...``), which is not a real symbol, neither reads
-        nor demangles, and does not resolve in `bn proto get`; the raw spelling
-        is tried with them restored. The display name is the symbol's
-        ``short_name`` -- the spelling ``decompile`` prints (#978) -- when it
-        differs from the raw name, else the name asked for (a C symbol keeps
-        its model spelling, so `strcpy_chk` does not turn into `__strcpy_chk`)."""
+        (``ZNSt13basic_filebuf...``, ``strcpy_chk``), which is not a real
+        symbol, neither reads nor demangles, and does not resolve in `bn proto
+        get`; the raw spelling is tried with them restored. The display name is
+        the symbol's ``short_name`` -- the spelling ``decompile`` prints (#978)
+        and an identifier that resolves -- so a C symbol shows as its real name
+        (``__strcpy_chk``), not the model key (#1001 review)."""
         name = str(name) if name else ""
         cache = self.__dict__.setdefault("_symbol_name_cache", {})
         if name in cache:
@@ -6386,7 +6438,7 @@ class TaintEngine:
             raw = getattr(sym, "name", None) if sym is not None else None
             if isinstance(raw, str) and raw:
                 short = getattr(sym, "short_name", None)
-                found = (raw, short if isinstance(short, str) and short and short != raw else name)
+                found = (raw, short if isinstance(short, str) and short else raw)
                 break
         cache[name] = found
         return found
@@ -6394,6 +6446,10 @@ class TaintEngine:
     def _display_for_name(self, name: Any) -> str:
         """The demangled display name for *name* (see :meth:`_symbol_names`)."""
         return self._symbol_names(name)[1]
+
+    def _raw_symbol_for(self, name: Any) -> str:
+        """The real raw symbol for *name* (see :meth:`_symbol_names`)."""
+        return self._symbol_names(name)[0]
 
     def _reconstruct_path(self, node, why) -> list[dict[str, Any]]:
         chain = []
@@ -6530,7 +6586,7 @@ class TaintEngine:
             sm, ss = derive_flow_facts(
                 direction="backward", path=sl.get("slice"), sink=sl.get("sink"),
                 origin=sl.get("origin"), crossed_functions=sl.get("crossed_functions"),
-                display=self._display_for_name)
+                display=self._display_for_name, symbol=self._raw_symbol_for)
             sl["metrics"] = sm
             sl["signature"] = ss
             # #1001 item 4 review: the slice row names its sink callee as the
@@ -6539,6 +6595,11 @@ class TaintEngine:
             if isinstance(_sk, dict) and _sk.get("callee"):
                 _sym, _shown = self._symbol_names(_sk["callee"])
                 sl["sink"] = {**_sk, "callee_symbol": _sym, "callee_display_name": _shown}
+            # The origin's display name rides on the slice, beside `origin`, so
+            # the origin object -- the slice's provenance claim -- is unchanged.
+            _og = sl.get("origin")
+            if isinstance(_og, dict) and _og.get("callee"):
+                sl["origin_callee_display_name"] = self._display_for_name(_og["callee"])
         return {
             "direction": "backward",
             "function": {"name": str(func.name), "display_name": _display_name(func),

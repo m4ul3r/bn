@@ -1031,6 +1031,7 @@ def _build_backward_trace(
                     entry["reason"] = ("interprocedural_out_param_not_followed" if interprocedural
                                         else "out_param_not_followed")
                     entry["out_param_callee"] = out_callee
+                    entry["out_param_callee_display_name"] = _shown_symbol_name(bv, out_callee)
             trace.append(entry)
             continue
 
@@ -1118,6 +1119,7 @@ def _build_backward_trace(
                 entry["reason"] = ("interprocedural_out_param_not_followed" if interprocedural
                                     else "out_param_not_followed")
                 entry["out_param_callee"] = out_callee
+                entry["out_param_callee_display_name"] = _shown_symbol_name(bv, out_callee)
                 # The value's true origin is the callee's write through the
                 # out-pointer; mark the load as a boundary. Index/base
                 # provenance (`*(&local + idx)`) is still walked below, so a
@@ -1175,7 +1177,8 @@ def _build_backward_trace(
 # fields, so a capped boundary and a genuinely terminal one look identical here.
 _FRONTIER_EXAMPLE_KEYS = (
     "ssa_label", "address", "depth", "callee", "callee_display_name", "out_param_callee",
-    "base", "offset", "width", "function_context", "param_index", "param_register", "local",
+    "base", "offset", "width", "function_context", "function_context_display_name",
+    "out_param_callee_display_name", "param_index", "param_register", "local",
 )
 _FRONTIER_EXAMPLE_CAP = 3
 
@@ -1223,7 +1226,8 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
     out_param_reasons = {"interprocedural_out_param_not_followed", "out_param_not_followed"}
     for step in trace:
         if isinstance(step, dict) and step.get("reason") in out_param_reasons:
-            callee = step.get("out_param_callee") or "a callee"
+            callee = (step.get("out_param_callee_display_name")
+                      or step.get("out_param_callee") or "a callee")
             assumptions.append(
                 f"value crosses an out-parameter fill by {callee} that this "
                 f"trace did not follow; the true origin may be inside it"
@@ -1761,15 +1765,19 @@ def _address_of_local_hint(arg_index: int, local_name: str, arg_label: dict, fun
     head = (f"arg {arg_index} is the address of {what}: trace follows where the "
             f"pointer came from, not the bytes stored into it.")
     callee = arg_label.get("callee")
+    fn_ref = hex(int(func.start))
     if not callee:
         return (head + " The call's target did not resolve, so no `arg:` locator can "
-                "name it; read the stores into the local with `bn decompile`, or "
-                "resolve the target before slicing.")
+                f"name it; read the stores into the local with `bn decompile {fn_ref}`, "
+                "or resolve the target before slicing.")
     shown = arg_label.get("callee_display_name") or callee
-    fn_ref = hex(int(func.start))
     _, model = _taint.lookup_model(_taint.load_models(), callee)
-    source = (f"call:{callee}" if (model or {}).get("sources")
-              else f"arg:{callee}:{arg_index}")
+    # `call:` seeds what the model declares the callee writes; use it only when
+    # that includes THIS argument's buffer (`*arg:N`) -- for recvfrom's
+    # `addrlen`, `call:recvfrom` seeds the payload and return, not addrlen.
+    writes_this = any(str((s or {}).get("to", "")) == f"*arg:{arg_index}"
+                      for s in (model or {}).get("sources") or [])
+    source = f"call:{callee}" if writes_this else f"arg:{callee}:{arg_index}"
     return (head + f" To slice the stores into it before the call (array elements, "
             f"struct fields), run `bn taint backward -f {fn_ref} --sink "
             f"arg:{callee}:{arg_index}`; if {shown} fills it instead (an output "
