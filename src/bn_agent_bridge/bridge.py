@@ -695,16 +695,21 @@ class TargetManager:
         `unsaved=false` the moment the new bridge answered, with nothing saved
         (#953). Carrying the handle-keyed id map over (not a filename or a
         selector, which another view can share) keeps each RETAINED view's
-        stable id, and with it its unsaved marker and backing-database path. A
-        view that closed meanwhile is pruned by the first complete `refresh()`
-        exactly as it would have been in the old manager: the carried map holds
-        strong references, so no other view can arrive under its handle.
+        stable id, and with it its unsaved marker, backing-database path and
+        session-comment ledger (#992). A view that closed meanwhile is pruned
+        by the first complete `refresh()` exactly as it would have been in the
+        old manager: the carried map holds strong references, so no other view
+        can arrive under its handle.
         """
         with predecessor._lock, self._lock:
             self._ids_by_object = dict(predecessor._ids_by_object)
             self._next_id = max(self._next_id, predecessor._next_id)
             self._dirty_view_ids = set(predecessor._dirty_view_ids)
             self._database_paths = dict(predecessor._database_paths)
+            self._session_annotations = {
+                vid: dict(ledger)
+                for vid, ledger in predecessor._session_annotations.items()
+            }
             predecessor._successor = self
 
     def _stable_view_id(self, bv) -> str | None:
@@ -755,14 +760,16 @@ class TargetManager:
             return
         with self._lock:
             vid = self._stable_view_id(bv)
-            if vid is None:
-                return
-            ledger = self._session_annotations.setdefault(vid, {})
-            for key, body in entries:
-                if body is None:
-                    ledger.pop(key, None)
-                else:
-                    ledger[key] = body
+            if vid is not None:
+                ledger = self._session_annotations.setdefault(vid, {})
+                for key, body in entries:
+                    if body is None:
+                        ledger.pop(key, None)
+                    else:
+                        ledger[key] = body
+            successor = self._successor
+        if successor is not None:
+            successor.note_session_annotations(bv, results)
 
     def session_annotations(self, bv) -> dict[tuple[str, int], str]:
         """The comments this bridge wrote on *bv*, keyed by (scope, address)."""
@@ -1661,6 +1668,24 @@ class BinaryNinjaBridge:
         self._inflight: int = 0
         self._shutting_down: bool = False
         self._last_activity: float = time.monotonic()
+
+    def succeed(self, predecessor: BinaryNinjaBridge) -> None:
+        """Take over a retired GUI bridge's per-view state before serving.
+
+        The tabs outlive a "Restart Bridge", and so can the old bridge's
+        requests: `stop()`'s drain is bounded, so a write it admitted can still
+        be running -- and commit -- after this bridge answers. The ledger moves
+        with `TargetManager.succeed`. The write gate and the target lock move as
+        the SAME objects, because what they serialize is access to those views,
+        not to a bridge: two bridges each holding their own let a late write
+        from the old one run alongside a write -- or a read -- on the new one
+        against the same view (#992). A write still holding them delays this
+        bridge's writes and reads exactly as it would have delayed the old
+        bridge's, and `write_gate_status` / BN_NO_WAIT name it as the holder.
+        """
+        self.targets.succeed(predecessor.targets)
+        self._write_gate = predecessor._write_gate
+        self._target_lock = predecessor._target_lock
 
     @property
     def bridge_identity(self) -> dict[str, Any]:
@@ -6355,7 +6380,7 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     return bv
 
 
-def start_bridge(predecessor: TargetManager | None = None):  # pragma: no cover - GUI runtime
+def start_bridge(predecessor: BinaryNinjaBridge | None = None):  # pragma: no cover - GUI runtime
     global _bridge
     if ui is None:
         return
@@ -6364,8 +6389,9 @@ def start_bridge(predecessor: TargetManager | None = None):  # pragma: no cover 
     bridge = BinaryNinjaBridge()
     if predecessor is not None:
         # Before start(): the first request the new bridge answers must already
-        # see the retained tabs' unsaved state (#953).
-        bridge.targets.succeed(predecessor)
+        # see the retained tabs' unsaved state (#953) and session comments, and
+        # queue behind a write the old bridge is still running (#992).
+        bridge.succeed(predecessor)
     bridge.start()
     _bridge = bridge
 
@@ -6447,10 +6473,11 @@ def _restart_bridge_command(_):  # pragma: no cover - GUI runtime
     restart_bridge()
 
 
-# The TargetManager of a GUI bridge that Restart Bridge stopped and no successor
-# has replaced yet: its per-view ledger (unsaved markers, backing databases)
-# belongs to tabs that are still open (#953).
-_retired_targets: TargetManager | None = None
+# The GUI bridge that Restart Bridge stopped and no successor has replaced yet:
+# its per-view ledger (unsaved markers, backing databases, session comments)
+# belongs to tabs that are still open (#953), and its write gate and target
+# lock may still be held by a write it admitted (#992).
+_retired_bridge: BinaryNinjaBridge | None = None
 
 
 def restart_bridge():  # pragma: no cover - GUI runtime
@@ -6461,21 +6488,21 @@ def restart_bridge():  # pragma: no cover - GUI runtime
     running (#585). This tears the live bridge down first so a fresh instance
     always gets constructed and started.
     """
-    global _bridge, _retired_targets
+    global _bridge, _retired_bridge
     if ui is None:
         return
     if _bridge is not None:
         # Kept until a successor actually starts, so a failed start followed by
-        # another Restart still carries the retained tabs' ledger (#953).
-        _retired_targets = _bridge.targets
+        # another Restart still carries the retained tabs' state (#953).
+        _retired_bridge = _bridge
         _stop_bridge()
     try:
-        start_bridge(_retired_targets)
+        start_bridge(_retired_bridge)
     except Exception as exc:
         bn.log_error(f"BN Agent Bridge restart failed: {exc}")
         return
     if _bridge is not None:
-        _retired_targets = None
+        _retired_bridge = None
         bn.log_info("BN Agent Bridge restarted")
     else:
         bn.log_error("BN Agent Bridge restart failed: bridge did not start")

@@ -1762,7 +1762,10 @@ class _SignalUnwind:
     installed because a KeyboardInterrupt unwound the owner before `restore()`
     ran, which a host that catches it (a REPL, a `Client` user) survives --
     restores the dispositions and re-delivers, so such a host still dies of its
-    SIGTERM/SIGHUP instead of silently ignoring it.
+    SIGTERM/SIGHUP instead of silently ignoring it. The next spawn in that host
+    ADOPTS such a leftover rather than reading it as the host's own handler:
+    left in place it would re-deliver a signal from that spawn's wait at once,
+    killing the host before the new child is reaped (#992).
     """
 
     _SIGNALS = (signal.SIGTERM, signal.SIGHUP)
@@ -1778,10 +1781,27 @@ class _SignalUnwind:
             return
         for signum in self._SIGNALS:
             try:
-                if signal.getsignal(signum) is signal.SIG_DFL:
+                current = signal.getsignal(signum)
+                stale = self._stale_unwind(current)
+                if stale is not None:
+                    # The leftover only ever replaced SIG_DFL, which is the
+                    # disposition to restore; dropping its entry keeps it from
+                    # undoing this install should it ever run `restore()`.
+                    signal.signal(signum, self._handle)
+                    self._previous[signum] = stale._previous.pop(signum, signal.SIG_DFL)
+                elif current is signal.SIG_DFL:
                     self._previous[signum] = signal.signal(signum, self._handle)
             except (ValueError, OSError):
                 continue
+
+    def _stale_unwind(self, handler: Any) -> _SignalUnwind | None:
+        """The `_SignalUnwind` whose `_handle` *handler* is, if its owner is gone."""
+        unwind = getattr(handler, "__self__", None)
+        if not isinstance(unwind, _SignalUnwind) or unwind is self:
+            return None
+        if getattr(handler, "__func__", None) is not _SignalUnwind._handle:
+            return None
+        return None if unwind._owner_running(self._owner) else unwind
 
     def _owner_running(self, frame: Any) -> bool:
         while frame is not None:
@@ -1910,7 +1930,8 @@ def _spawn_instance_unlocked(
     # the cleanup below before `_reap_child` runs, which leaves the child
     # running. Handlers that any KeyboardInterrupt leaves installed (there, or
     # mid-install) hand the next SIGTERM/SIGHUP to the default action rather
-    # than swallowing it; see `_SignalUnwind`.
+    # than swallowing it, and the next spawn takes them over as its own (#992);
+    # see `_SignalUnwind`.
     unwind = _SignalUnwind()
     proc: subprocess.Popen | None = None
     owned = True

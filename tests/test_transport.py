@@ -2242,6 +2242,91 @@ def test_signal_during_spawn_reaps_child_and_still_kills_cli(tmp_path, mode, sig
                 os.kill(child_pid, signal.SIGKILL)
 
 
+_LEAKED_HANDLER_DRIVER = """
+import inspect, os, signal, sys, time
+import bn.transport as transport
+
+pidfile = sys.argv[1]
+transport.list_instances = lambda **kwargs: []
+transport._find_bn_agent = lambda: [sys.executable, "-c", "import time; time.sleep(60)"]
+real_popen = transport.subprocess.Popen
+
+def recording_popen(*args, **kwargs):
+    proc = real_popen(*args, **kwargs)
+    with open(pidfile, "a") as stream:
+        stream.write(f"{proc.pid}\\n")
+    return proc
+
+transport.subprocess.Popen = recording_popen
+
+# First spawn: a KeyboardInterrupt at `unwind.restore()` leaves its handlers
+# installed, and the host catches it.
+code = transport._spawn_instance_unlocked.__code__
+lines, first = inspect.getsourcelines(transport._spawn_instance_unlocked)
+target = first + max(i for i, text in enumerate(lines) if text.strip() == "unwind.restore()")
+
+def local(frame, event, arg):
+    if event == "line" and frame.f_lineno == target:
+        sys.settrace(None)
+        raise KeyboardInterrupt
+    return local
+
+sys.settrace(lambda frame, event, arg: local if frame.f_code is code else None)
+try:
+    transport.spawn_instance("sample-1", timeout=0.5, poll_interval=0.05)
+except (transport.BridgeError, KeyboardInterrupt) as exc:
+    print("first spawn ended:", type(exc).__name__, flush=True)
+sys.settrace(None)
+
+# Second spawn in the same host: the test SIGTERMs it during the wait.
+try:
+    transport.spawn_instance("sample-2", timeout=60, poll_interval=0.05)
+except transport.BridgeError as exc:
+    print("spawn failed:", exc)
+"""
+
+
+def test_spawn_after_a_leaked_handler_still_reaps_its_child(tmp_path):
+    # #992 item 4: a KeyboardInterrupt that skips `restore()` leaves the first
+    # spawn's handler installed. The next spawn in that host saw a non-default
+    # disposition, took it for the host's own and installed nothing, so a
+    # SIGTERM in its registration wait reached the stale handler, which
+    # re-delivered at once: the host died with the second child still running.
+    pidfile = tmp_path / "children.pid"
+    env = {**os.environ, "BN_CACHE_DIR": str(tmp_path / "cache")}
+    cli = subprocess.Popen(
+        [sys.executable, "-c", _LEAKED_HANDLER_DRIVER, str(pidfile)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    pids: list[int] = []
+    try:
+        deadline = time.monotonic() + 30
+        while len(pids) < 2:
+            assert cli.poll() is None, cli.stdout.read().decode(errors="replace")
+            assert time.monotonic() < deadline, "the driver never started its second child"
+            time.sleep(0.02)
+            if pidfile.exists():
+                pids = [int(line) for line in pidfile.read_text().split()]
+        time.sleep(0.3)  # well inside the second registration wait
+        cli.send_signal(signal.SIGTERM)
+        cli.wait(timeout=15)
+
+        output = cli.stdout.read().decode(errors="replace")
+        assert "first spawn ended: KeyboardInterrupt" in output, output
+        assert cli.returncode == -signal.SIGTERM, output
+        for pid in pids:
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+        pids = []
+    finally:
+        if cli.poll() is None:
+            cli.kill()
+            cli.wait(timeout=5)
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+
+
 def test_named_spawn_refuses_live_owner_missed_by_initial_discovery(monkeypatch, tmp_path):
     # #916: `bn -i sample-1 load` first looks with NORMAL discovery, which hides
     # a live bridge whose socket is not reachable yet. The spawn path must look
