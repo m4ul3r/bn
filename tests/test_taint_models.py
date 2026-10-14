@@ -327,11 +327,12 @@ class _FnFull:
 
 class _BVTriage:
     """Present sink ``system`` with one real application caller (parse_record) and
-    one import-thunk site (the ``system`` PLT veneer). Exercises #553 (function per
-    callsite) and #560 (thunk labeling / audit count)."""
-    def __init__(self):
+    one self-stub site (``system``'s own statically linked body referencing
+    itself). Exercises #553 (function per callsite) and #560 (non-audit label /
+    audit count). ``imported=True`` turns the body into an import stub (#958)."""
+    def __init__(self, imported=False):
         self._app = _FnFull("parse_record", 0x5000)
-        self._thunk = _FnFull("system", 0x1000, is_thunk=True, imported=True)
+        self._thunk = _FnFull("system", 0x1000, is_thunk=True, imported=imported)
         self.functions = [self._app, self._thunk]
         self._syms = {"system": [_Sym("system", 0x1000)]}
         self._refs = {0x1000: [_Ref(0x5010), _Ref(0x2000)]}
@@ -368,28 +369,40 @@ def test_present_callsites_include_function_553():
     assert rows["0x5010"]["kind"] == "app_caller"
 
 
-# --- #560: label import-thunk / self-stub callsites, expose audit count -----
+# --- #560: label self-stub callsites, expose audit count --------------------
 
-def test_present_callsites_label_import_thunk_560():
+def test_present_callsites_label_self_stub_560():
     res = rts._taint_models_op(_CtxWithBV(_BVTriage()), "active",
                                {"present": True, "callsites": True, "all_sites": True})
     system = _sink_entry(res, "system")
     rows = {c["address"]: c for c in system["callsites"]}
-    assert rows["0x2000"]["kind"] == "import_thunk"
-    # Raw count includes the thunk; the audit count excludes it (the real queue).
+    assert rows["0x2000"]["kind"] == "self_stub"
+    # Raw count includes the stub; the audit count excludes it (the real queue).
     assert system["callsite_count"] == 2
     assert system["audit_callsite_count"] == 1
 
 
 def test_present_callsites_hide_non_audit_rows_by_default_958():
-    # #958: the stub rows are counted but not listed unless --all-sites, so the
-    # callsite list is the work queue an agent walks.
+    # #958: the non-audit rows are counted but not listed unless --all-sites, so
+    # the callsite list is the work queue an agent walks.
     res = rts._taint_models_op(_CtxWithBV(_BVTriage()), "active",
                                {"present": True, "callsites": True})
     system = _sink_entry(res, "system")
     assert [c["address"] for c in system["callsites"]] == ["0x5010"]
     assert system["callsite_count"] == 2 and system["audit_callsite_count"] == 1
-    assert system["hidden_callsites"] == {"import_thunk": 1}
+    assert system["hidden_callsites"] == {"self_stub": 1}
+
+
+def test_import_stub_forwarding_jump_is_not_a_callsite_958():
+    # The x86 `.plt.sec` stub's own `jmp [GOT]` is how the import is reached,
+    # not a caller of it (AArch64's `br x17` was never counted): leaving it in
+    # made the same import's count differ by architecture.
+    for all_sites in (False, True):
+        res = rts._taint_models_op(_CtxWithBV(_BVTriage(imported=True)), "active",
+                                   {"present": True, "callsites": True, "all_sites": all_sites})
+        system = _sink_entry(res, "system")
+        assert [c["address"] for c in system["callsites"]] == ["0x5010"]
+        assert system["callsite_count"] == 1 and system["hidden_callsites"] == {}
 
 
 class _Llil:
@@ -540,7 +553,7 @@ def test_present_callsite_context_reaches_catalog_text_794():
                                {"present": True, "callsites": True, "all_sites": True})
     text = _render_taint_models_text(res)
     assert "0x5010  parse_record  call    system" in text
-    assert "0x2000  system [import_thunk]  jmp     qword [rip+0x2f1a]" in text
+    assert "0x2000  system [self_stub]  jmp     qword [rip+0x2f1a]" in text
 
 
 def test_present_callsites_degrade_when_the_view_cannot_disassemble_794():
@@ -741,7 +754,7 @@ def test_render_taint_models_text_non_finding_banner_and_rows():
     text = _render_taint_models_text(res)
     assert "NOT taint findings" in text
     assert "parse_record" in text                         # #553 function context
-    assert "[import_thunk]" in text                       # #560 non-audit label
+    assert "[self_stub]" in text                          # #560 non-audit label
     assert "2 callsites, 1 application" in text           # raw vs audit count
 
 

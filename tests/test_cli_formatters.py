@@ -1147,7 +1147,7 @@ def test_render_orient_non_dict_imports_summary_is_disclosed_not_dropped():
 
 def test_render_grouped_leaves_distinct_malformed_leaves_each_render():
     # Grouping malformed leaves by TYPE collapsed every distinct one behind an
-    # `(xN)` count on the first, so all but one were unreadable.
+    # `[N leaves]` count on the first, so all but one were unreadable.
     from bn.formatters import _render_grouped_leaves
     out = "\n".join(_render_grouped_leaves(["alpha", "beta", "alpha"]))
     assert "'alpha'" in out and "'beta'" in out

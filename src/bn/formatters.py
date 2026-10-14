@@ -4496,11 +4496,11 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             m = _field_dict(sl, "metrics")
             sig = _field_dict(sl, "signature").get("rendered", "")
             n = sl.get("reached_via_call_sites", 1)
-            xn = (f"  (x{n} callsites)"
+            xn = (f"  (reached via {n} callsites)"
                   if isinstance(n, int) and not isinstance(n, bool) and n > 1 else "")
             unresolved = "y" if m.get("traverses_unresolved") else "n"
             lines.append("")
-            # Compact one line per slice by default; (xN) surfaces the engine's existing
+            # Compact one line per slice by default; "reached via N callsites" surfaces the engine's existing
             # per-(seed,sink,origin) call-site count. --full shows origin/crosses/steps.
             lines.append(
                 f"  [{sink.get('class') or sink.get('kind') or '?'}] "
@@ -4701,7 +4701,7 @@ def _sink_arg_spec(e: dict[str, Any]) -> str:
     return ", ".join(parts) if parts else "unconditional"
 
 
-_HIDDEN_KIND_LABELS = {"import_thunk": "import stub", "self_stub": "self stub",
+_HIDDEN_KIND_LABELS = {"self_stub": "self stub",
                        "inline_builtin": "constant-argument inline builtin"}
 
 
@@ -6717,7 +6717,7 @@ def _render_trace_frontiers(frontiers: Any) -> list[str]:
             if not nm and reason == "function_parameter":
                 slot = _trace_param_slot(ex)
                 var = str(ex.get("ssa_label") or "").split("#", 1)[0]
-                nm = f"{var} = {slot}" if var and slot else (var or slot)
+                nm = f"{var} ({slot})" if var and slot else (var or slot)
             if nm and nm not in named:
                 named.append(str(nm))
         # #959: the count is bracketed and spelled out. `x{count}` collided with
@@ -6726,7 +6726,12 @@ def _render_trace_frontiers(frontiers: Any) -> list[str]:
         count = g.get("count", 0)
         noun = "step" if count == 1 else "steps"
         line = f"    {label}  [{count} {noun}]"
-        if named:
+        if named and reason == "function_parameter":
+            # A parameter entry has commas and parentheses of its own
+            # (`arg1 (param 0, x0)`), so the list is introduced by `: ` and its
+            # entries separated by `; ` to stay parseable.
+            line += ": " + "; ".join(named)
+        elif named:
             line += f" ({', '.join(named)})"
         out.append(line)
     return out

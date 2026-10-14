@@ -217,9 +217,10 @@ def _classify_callsite(bv, addr: int, sink_key: str, models) -> tuple[str | None
     """(containing-function-name, kind) for a present-model callsite.
 
     ``kind`` is one of ``app_caller`` (a real application caller body),
-    ``import_thunk`` (an import stub -- #560/#958), or ``self_stub`` (the
+    ``import_thunk`` (an import stub -- #560; its forwarding jump is not a
+    caller, so `_present_models` drops the row, #958), or ``self_stub`` (the
     modeled symbol's own body referencing itself, e.g. a self-tailcall stub).
-    Thunk/self-stub sites are NON-audit: they inflate a sink's callsite count
+    Self-stub sites are NON-audit: they inflate a sink's callsite count
     without being places an analyst would triage."""
     fn = _containing_fn(bv, addr)
     if fn is None:
@@ -346,9 +347,12 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
     #958: a row is a callsite only when the instruction CALLS the symbol (or
     tail-branches to it). A code reference is not a call: every `adrp` of the
     page an import's GOT slot sits on references that slot, which listed 47
-    `memcpy` "callsites" for a binary with three. Non-audit rows (stubs and
-    constant-argument inline builtins) are counted but, unless ``all_sites``,
-    left out of ``callsites`` so the list is the work queue it is used as."""
+    `memcpy` "callsites" for a binary with three. An import stub's own forwarding
+    jump (the x86 `.plt.sec` `jmp [GOT]`) is not a caller either, and AArch64's
+    `br x17` never was one, so neither is counted and the count is the same on
+    both. The remaining non-audit rows (self stubs and constant-argument inline
+    builtins) are counted but, unless ``all_sites``, left out of ``callsites``
+    so the list is the work queue it is used as."""
     present: set[str] = set()
     info: dict[str, dict[str, Any]] = {}
     # #472: several distinct binary symbol spellings can normalize to the SAME
@@ -392,6 +396,8 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
                 if shape == "data":
                     continue
                 fname, kind = _classify_callsite(bv, ai, key, models)
+                if kind == "import_thunk":
+                    continue
                 if shape == "inline" and kind == "app_caller":
                     kind = "inline_builtin"
                 # #794: carry one line of context per row. `disasm` is the key
@@ -841,9 +847,9 @@ def _out_of_range_arg_msg(func, arg_index: int, n: int, *,
         )
     if variadic_callee:
         msg += (
-            f" {variadic_callee} is already declared variadic, so a missing argument "
-            f"here is a limit of BN's call recovery at this site, not a prototype "
-            f"defect -- redeclaring the prototype will not add it."
+            f" {variadic_callee} is already declared variadic: if an argument is "
+            f"missing here, that is a limit of BN's call recovery at this site, not a "
+            f"prototype defect -- redeclaring the prototype will not add it."
         )
     return msg
 

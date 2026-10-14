@@ -5079,6 +5079,53 @@ def test_bounded_copy_from_an_unsized_source_says_it_was_not_checked_980(models)
     assert "source capacity not checked" in sink["relabel"]
 
 
+class _LiteralBV(FBV):
+    """A view whose 0x3000 is a 6-byte string literal BN typed `char const[0x6]`."""
+    def get_data_var_at(self, addr):
+        if addr == 0x3000:
+            return type("DV", (), {"type": type("T", (), {
+                "width": 6, "__str__": lambda s: "char const[0x6]"})()})()
+        return None
+
+
+@pytest.mark.parametrize("callee,order", [
+    ("strncpy", ("dst", "lit", "n")),       # strncpy(p, "guest", n): reads to the NUL
+    ("strncat", ("dst", "lit", "n")),
+    ("snprintf", ("dst", "n", "lit")),      # snprintf(p, n, "id=%d"): lit is the FORMAT
+])
+def test_nul_terminated_and_format_readers_get_no_source_check_980(models, callee, order):
+    # #980 review: `p = malloc(n); snprintf(p, n, "id=%d", id)` is the canonical
+    # safe idiom. None of these reads n bytes from the literal, so the base's
+    # bounded_len must stand -- the literal's 6-byte size says nothing.
+    n = FVar("n"); n0 = FSSA(n, 0); dst1 = FSSA(FVar("dst"), 1)
+    arg = {"dst": FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+           "n": FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+           "lit": FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000)}
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = malloc(n#0)", reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", f"{callee}(...)", reads=[dst1, n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[arg[k] for k in order]),
+    ]
+    func = FFunc("fmt_id", 0x10, FSSAFunc(instrs), params=[n])
+    bv = _LiteralBV({0x2000: "malloc", 0x2010: callee})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == callee]
+    assert sinks, result["reached_sinks"]
+    assert any(s["class"] == "bounded_len" for s in sinks), sinks
+    assert all(s["class"] != "overread_len" for s in sinks), sinks
+    assert all("src_capacity" not in s for s in sinks), sinks
+
+
+def test_exact_length_copy_from_the_same_literal_is_still_an_overread_980(models):
+    # Control for the test above: memcpy DOES read n bytes from the literal.
+    sink = _memcpy_sink(models, *_dup_with_source(
+        FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000), bv_cls=_LiteralBV))
+    assert sink["class"] == "overread_len" and sink["src_capacity"] == 6
+
+
 def test_bounded_copy_from_a_same_length_allocation_fits_980(models):
     # `s = malloc(n); ...; memcpy(dst, s, n)`: the source holds exactly n bytes.
     n0 = FSSA(FVar("n"), 0); s1 = FSSA(FVar("s"), 1)

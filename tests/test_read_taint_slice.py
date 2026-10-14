@@ -457,7 +457,7 @@ def test_parameter_frontier_text_cannot_read_as_a_register_959(monkeypatch):
     rts, ssa_func, arg4 = _aarch64_param_slice_fixture(monkeypatch)
     trace = rts._build_backward_trace(None, None, ssa_func, [arg4], 8)
     text = _render_trace_text({"trace": trace, "frontiers": rts._summarize_frontiers(trace)})
-    assert "function parameter  [1 step] (arg4 = param 3, x3)" in text
+    assert "function parameter  [1 step]: arg4 (param 3, x3)" in text
     assert "arg4#0  —  function parameter (param 3, x3)" in text
     assert " x1" not in text
 

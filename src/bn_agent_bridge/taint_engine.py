@@ -3436,8 +3436,19 @@ class TaintEngine:
         """Backward-compatible bool wrapper over :meth:`_bounded_copy_reason`."""
         return self._bounded_copy_reason(ssaf, params, length_idx, dest_idx) is not None
 
+    # #980 review: the copies that read EXACTLY the length argument's byte count
+    # from their source. A NUL-stopping reader (strncpy, strncat, strlcpy,
+    # memccpy) reads at most `n` and usually far less, and snprintf's "source"
+    # is its format string -- sizing those against `n` turned the canonical safe
+    # `snprintf(malloc(n), n, "id=%d", id)` into a false over-read. The wide
+    # copies count ELEMENTS, not bytes, so a byte capacity cannot judge them.
+    _EXACT_LENGTH_COPIES = frozenset({"memcpy", "memmove", "mempcpy", "bcopy",
+                                      "__builtin_memcpy", "memcpy_chk", "memmove_chk",
+                                      "mempcpy_chk"})
+
     def _source_side_verdict(self, ssaf: Any, params: list[Any], length_idx: int,
-                             model: dict[str, Any], eff_sink: dict[str, Any]) -> dict[str, Any]:
+                             mkey: str | None, model: dict[str, Any],
+                             eff_sink: dict[str, Any]) -> dict[str, Any]:
         """#980: the copy-SOURCE half of a destination-bounded copy.
 
         ``dst = malloc(n); memcpy(dst, src, n)`` cannot overflow ``dst``, but with
@@ -3447,7 +3458,10 @@ class TaintEngine:
         constant-size allocation) and the length is not provably within it;
         otherwise still ``bounded_len``, stating whether the source fit or could
         not be sized at all -- a bounded write is never left reading as "safe"
-        while the read side was never looked at."""
+        while the read side was never looked at. Only for the exact-length
+        copies in ``_EXACT_LENGTH_COPIES``; any other model is returned as is."""
+        if mkey not in self._EXACT_LENGTH_COPIES:
+            return eff_sink
         srcs = sorted(_model_buffer_source_args(model))
         if len(srcs) != 1 or srcs[0] >= len(params):
             return eff_sink
@@ -4671,7 +4685,7 @@ class TaintEngine:
                                     # `overread_len` when it is a fixed-size object
                                     # the length is not provably within.
                                     eff_sink = self._source_side_verdict(
-                                        ssaf, params, argidx, model, eff_sink)
+                                        ssaf, params, argidx, mkey, model, eff_sink)
                                 elif sink.get("class") == "overflow_len":
                                     # Length is the return of a modeled receive
                                     # call bounded by a constant count arg
