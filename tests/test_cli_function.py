@@ -1633,6 +1633,57 @@ def test_disasm_lines_slices_output_with_header(fake_transport, capsys):
     assert "ccc" not in out and "ddd" not in out
 
 
+_LISTING = ("0x55e7e0  cmp     w0, #0\n"
+            "0x55e7e4  bl      0x401000\n"
+            "0x55e7e8  ret")
+
+
+@pytest.mark.parametrize("text,expected", [
+    # The note follows the instruction that runs into the other function, even
+    # mid-listing -- not the last line, which here is a `ret`.
+    (_LISTING, ("0x55e7e0  cmp     w0, #0\n0x55e7e4  bl      0x401000\n"
+                "// falls through into sub_55e7f0 @ 0x55e7f0\n0x55e7e8  ret")),
+    # A slice that does not show that instruction gets no note.
+    ("0x55e7e8  ret", "0x55e7e8  ret"),
+])
+def test_disasm_notes_where_execution_continues_966(fake_transport, capsys, text, expected):
+    fake_transport({"disasm": {"ok": True, "result": {
+        "text": text, "total_lines": 3, "line_range": None,
+        "continues_into": {"name": "sub_55e7f0", "address": "0x55e7f0", "from": "0x55e7e4",
+                           "note": "falls through into sub_55e7f0 @ 0x55e7f0"},
+    }}})
+
+    rc = bn.cli.main(["disasm", "0x55e700", "--target", "active"])
+
+    assert rc == 0
+    assert capsys.readouterr().out.rstrip("\n") == expected
+
+
+@pytest.mark.parametrize("hidden,expected", [
+    (1, ("note: 1 stored comment line hidden as <annotation redacted>; "
+         "--include-annotations to show them")),
+    (0, None),
+])
+def test_decompile_text_footer_counts_hidden_annotations_977(fake_transport, capsys,
+                                                            hidden, expected):
+    fake_transport({"decompile": {"ok": True, "result": {
+        "function": {"name": "sub_401200", "address": "0x401200"},
+        "text": "void sub_401200()\n{\n    return;  // <annotation redacted>\n}",
+        "warnings": [],
+        "annotation_summary": {"comment_count": 1, "redacted": True,
+                               "hidden": hidden, "session_shown": 0},
+    }}})
+
+    rc = bn.cli.main(["decompile", "sub_401200", "--target", "active"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    if expected is None:
+        assert "include-annotations" not in out
+    else:
+        assert out.rstrip().endswith(expected)
+
+
 def test_function_list_count_prints_total(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "list_targets":
