@@ -395,7 +395,7 @@ def test_arg_under_recovered_leaves_group_per_callee():
                        "callee": {"name": "f", "address": "0x3000"},
                        "recovered_params": 1, "dropped_args": [1], "note": "n"}
     out = "\n".join(_render_grouped_leaves([mk("0x10"), mk("0x20")]))
-    assert "(x2)" in out                                   # two call sites of f collapse
+    assert "[2 leaves]" in out                             # two call sites of f collapse
 # --- compact-default taint output (Thread C) ---------------------------------
 
 _FWD_FLOW = {
@@ -1184,11 +1184,11 @@ def test_render_orient_non_dict_imports_summary_is_disclosed_not_dropped():
 
 def test_render_grouped_leaves_distinct_malformed_leaves_each_render():
     # Grouping malformed leaves by TYPE collapsed every distinct one behind an
-    # `(xN)` count on the first, so all but one were unreadable.
+    # `[N leaves]` count on the first, so all but one were unreadable.
     from bn.formatters import _render_grouped_leaves
     out = "\n".join(_render_grouped_leaves(["alpha", "beta", "alpha"]))
     assert "'alpha'" in out and "'beta'" in out
-    assert "(x2)" in out          # two IDENTICAL malformed leaves still collapse
+    assert "[2 leaves]" in out    # two IDENTICAL malformed leaves still collapse
 
 
 def test_render_data_symbols_non_dict_row_degrades():

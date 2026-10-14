@@ -64,6 +64,26 @@ def _model_buffer_source_args(model: dict[str, Any]) -> frozenset[int]:
     return frozenset(out)
 
 
+def _model_copy_roles(model: dict[str, Any]) -> tuple[int, int] | None:
+    """``(source_arg, destination_arg)`` of a buffer-copy model: its single
+    ``*arg:S -> *arg:D`` propagation with ``S != D``, or None when it has no
+    such rule or more than one. memcpy is ``(1, 0)``; bcopy, whose arguments
+    are reversed (``bcopy(src, dst, n)``), is ``(0, 1)`` (#980 review)."""
+    roles = set()
+    for rule in model.get("propagates") or []:
+        frm, to = rule.get("from"), rule.get("to")
+        if not (isinstance(frm, str) and isinstance(to, str)
+                and frm.startswith("*arg:") and to.startswith("*arg:")):
+            continue
+        try:
+            src, dst = int(frm[len("*arg:"):]), int(to[len("*arg:"):])
+        except ValueError:
+            continue
+        if src != dst:
+            roles.add((src, dst))
+    return next(iter(roles)) if len(roles) == 1 else None
+
+
 class TaintError(RuntimeError):
     """User-facing taint configuration/resolution error."""
 
@@ -469,14 +489,25 @@ def _canonical_cxx_alloc(name: str) -> str | None:
 # sink and an internal `close64` running `system()` would falsely borrow the
 # benign empty `close` model (suppressing descent -> a confident false
 # all-clear). Only names on this list alias, and only when the base is itself a
-# real model key (enforced in ``lookup_model``). Restricted to the offset-taking
-# APIs this catalog actually models; add a pair here only when its base model is
-# present. Other genuine LFS64 symbols exist (lseek64, open64/openat64, mmap64,
-# ftruncate64/truncate64, preadv64/pwritev64) but are omitted until their base
-# is modeled.
+# real model key (enforced in ``lookup_model``). Restricted to the LFS APIs
+# this catalog actually models; add a pair here only when its base model is
+# present. Other genuine LFS64 symbols exist (lseek64, mmap64, ftruncate64,
+# preadv64/pwritev64) but are omitted until their base is modeled.
 _LFS64_ALIASES: dict[str, str] = {
     "pread64": "pread",
     "pwrite64": "pwrite",
+    # #957: the path_injection sinks' large-file spellings.
+    "open64": "open",
+    "openat64": "openat",
+    "creat64": "creat",
+    "fopen64": "fopen",
+    "freopen64": "freopen",
+    "stat64": "stat",
+    "lstat64": "lstat",
+    "fstatat64": "fstatat",
+    "xstat64": "xstat",
+    "lxstat64": "lxstat",
+    "truncate64": "truncate",
 }
 
 

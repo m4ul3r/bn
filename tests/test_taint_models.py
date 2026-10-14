@@ -175,6 +175,77 @@ def test_builtin_catalog_covers_fortify_and_exec_sinks():
     assert "pread" in src_syms, "pread must be a modeled source"
 
 
+@pytest.mark.parametrize("spelling,key,role,detail", [
+    ("mq_receive", "mq_receive", "source", None),
+    ("mq_timedreceive", "mq_timedreceive", "source", None),
+    ("__mq_timedreceive_time64", "mq_timedreceive_time64", "source", None),
+    ("msgrcv", "msgrcv", "source", None),
+    ("posix_spawn", "posix_spawn", "command_injection", [1, 4]),
+    ("posix_spawnp", "posix_spawnp", "command_injection", [1, 4]),
+    ("execvpe", "execvpe", "command_injection", [0]),
+    ("execle", "execle", "command_injection", [0]),
+    ("open64", "open", "path_injection", [0]),
+    ("openat", "openat", "path_injection", [1]),
+    ("fopen64", "fopen", "path_injection", [0]),
+    ("__xstat64", "xstat", "path_injection", [1]),
+    ("renameat", "renameat", "path_injection", [1, 3]),
+    ("_ZNSt13basic_filebufIcSt11char_traitsIcEE4openEPKcSt13_Ios_Openmode",
+     "ZNSt13basic_filebufIcSt11char_traitsIcEE4openEPKcSt13_Ios_Openmode", "path_injection", [1]),
+    ("_ZNSt14basic_ofstreamIcSt11char_traitsIcEEC1EPKcSt13_Ios_Openmode",
+     "ZNSt14basic_ofstreamIcSt11char_traitsIcEEC1EPKcSt13_Ios_Openmode", "path_injection", [1]),
+])
+def test_queue_spawn_and_path_spellings_resolve_to_models_957(spelling, key, role, detail):
+    # #957: the binary spelling (mangled, LFS64, time64, __-prefixed) is what
+    # `taint models --present` and the engine look up; each must land on a model
+    # that arms the path/argv argument, or seeds the received buffer + length.
+    from bn_agent_bridge.taint_engine import load_models, lookup_model
+    got, model = lookup_model(load_models(), spelling)
+    assert got == key
+    if role == "source":
+        assert [s["to"] for s in model["sources"]] == ["*arg:1", "ret"]
+        assert model["return_bound"] == {"max_from_arg": 2}
+    else:
+        assert model["sink"]["class"] == role
+        assert model["sink"]["tainted_args"] == detail
+        assert not model["sink"].get("optional")      # armed by default
+
+
+def _queue_to_path_and_spawn_program():
+    """``mq_timedreceive(q, &msg, 0x400, 0, &ts); fopen(&msg, "r");
+    posix_spawn(&pid, &msg, 0, 0, argv, envp)`` -- the dogfood shape: the
+    binary's input arrives through a message queue and reaches a path and a
+    spawned program."""
+    F = _fakes()
+    msg = F.FVar("msg", typ="char[0x400]")
+    c = lambda v: F.FExpr("MLIL_CONST", hex(v), constant=v)
+    at = lambda name: F.FExpr("MLIL_ADDRESS_OF", f"&{name}", src=msg if name == "msg"
+                              else F.FVar(name, typ="int32_t"))
+    instrs = [
+        F.FInstr(0, 0x10, "MLIL_CALL_SSA", "mq_timedreceive(q, &msg, 0x400, 0, &ts)",
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+                 params=[c(3), at("msg"), c(0x400), c(0), at("ts")]),
+        F.FInstr(1, 0x20, "MLIL_CALL_SSA", "fopen(&msg, \"r\")",
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+                 params=[at("msg"), c(0x2000)]),
+        F.FInstr(2, 0x30, "MLIL_CALL_SSA", "posix_spawn(&pid, &msg, 0, 0, 0, 0)",
+                 dest=F.FExpr("MLIL_CONST_PTR", "0x902", constant=0x902),
+                 params=[at("pid"), at("msg"), c(0), c(0), c(0), c(0)]),
+    ]
+    return (F.FFunc("pump", 0x10, F.FSSAFunc(instrs)),
+            F.FBV({0x900: "mq_timedreceive", 0x901: "fopen", 0x902: "posix_spawn"}))
+
+
+def test_message_queue_input_reaches_path_and_spawn_sinks_957():
+    from bn_agent_bridge import taint_engine as te
+    func, bv = _queue_to_path_and_spawn_program()
+    result = te.TaintEngine(bv, te.load_models()).forward(
+        func, [te.parse_locator("call:mq_timedreceive")])
+    got = sorted((s["sink"]["callee"], s["sink"]["class"], s["sink"]["tainted_arg_index"])
+                 for s in result["reached_sinks"])
+    assert got == [("fopen", "path_injection", 0),
+                   ("posix_spawn", "command_injection", 1)], result["reached_sinks"]
+
+
 def test_build_catalog_includes_underscore_prefixed_real_models_849():
     # #849: build_catalog must NOT skip models whose names start with a single
     # `_` but are NOT doc-key prefixed (_comment). Real model names like
@@ -244,19 +315,24 @@ def test_build_catalog_multi_arg_description_555():
 # --- #553: containing function + context per callsite ----------------------
 
 class _FnFull:
-    def __init__(self, name, start, is_thunk=False):
+    def __init__(self, name, start, is_thunk=False, imported=False):
         self.name = name
         self.start = start
         self.is_thunk = is_thunk
+        # An import stub carries BN's ImportedFunctionSymbol (#958); a plain
+        # function carries FunctionSymbol.
+        sym_type = "ImportedFunctionSymbol" if imported else "FunctionSymbol"
+        self.symbol = type("S", (), {"type": type("T", (), {"name": sym_type})()})()
 
 
 class _BVTriage:
     """Present sink ``system`` with one real application caller (parse_record) and
-    one import-thunk site (the ``system`` PLT veneer). Exercises #553 (function per
-    callsite) and #560 (thunk labeling / audit count)."""
-    def __init__(self):
+    one self-stub site (``system``'s own statically linked body referencing
+    itself). Exercises #553 (function per callsite) and #560 (non-audit label /
+    audit count). ``imported=True`` turns the body into an import stub (#958)."""
+    def __init__(self, imported=False):
         self._app = _FnFull("parse_record", 0x5000)
-        self._thunk = _FnFull("system", 0x1000, is_thunk=True)
+        self._thunk = _FnFull("system", 0x1000, is_thunk=True, imported=imported)
         self.functions = [self._app, self._thunk]
         self._syms = {"system": [_Sym("system", 0x1000)]}
         self._refs = {0x1000: [_Ref(0x5010), _Ref(0x2000)]}
@@ -293,17 +369,177 @@ def test_present_callsites_include_function_553():
     assert rows["0x5010"]["kind"] == "app_caller"
 
 
-# --- #560: label import-thunk / self-stub callsites, expose audit count -----
+# --- #560: label self-stub callsites, expose audit count --------------------
 
-def test_present_callsites_label_import_thunk_560():
+def test_present_callsites_label_self_stub_560():
+    res = rts._taint_models_op(_CtxWithBV(_BVTriage()), "active",
+                               {"present": True, "callsites": True, "all_sites": True})
+    system = _sink_entry(res, "system")
+    rows = {c["address"]: c for c in system["callsites"]}
+    assert rows["0x2000"]["kind"] == "self_stub"
+    # Raw count includes the stub; the audit count excludes it (the real queue).
+    assert system["callsite_count"] == 2
+    assert system["audit_callsite_count"] == 1
+
+
+def test_present_callsites_hide_non_audit_rows_by_default_958():
+    # #958: the non-audit rows are counted but not listed unless --all-sites, so
+    # the callsite list is the work queue an agent walks.
     res = rts._taint_models_op(_CtxWithBV(_BVTriage()), "active",
                                {"present": True, "callsites": True})
     system = _sink_entry(res, "system")
-    rows = {c["address"]: c for c in system["callsites"]}
-    assert rows["0x2000"]["kind"] == "import_thunk"
-    # Raw count includes the thunk; the audit count excludes it (the real queue).
-    assert system["callsite_count"] == 2
-    assert system["audit_callsite_count"] == 1
+    assert [c["address"] for c in system["callsites"]] == ["0x5010"]
+    assert system["callsite_count"] == 2 and system["audit_callsite_count"] == 1
+    assert system["hidden_callsites"] == {"self_stub": 1}
+
+
+def test_import_stub_forwarding_jump_is_not_a_callsite_958():
+    # The x86 `.plt.sec` stub's own `jmp [GOT]` is how the import is reached,
+    # not a caller of it (AArch64's `br x17` was never counted): leaving it in
+    # made the same import's count differ by architecture.
+    for all_sites in (False, True):
+        res = rts._taint_models_op(_CtxWithBV(_BVTriage(imported=True)), "active",
+                                   {"present": True, "callsites": True, "all_sites": all_sites})
+        system = _sink_entry(res, "system")
+        assert [c["address"] for c in system["callsites"]] == ["0x5010"]
+        assert system["callsite_count"] == 1 and system["hidden_callsites"] == {}
+
+
+class _Llil:
+    def __init__(self, op, dest=None, mlil=None):
+        self.operation = type("Op", (), {"name": op})()
+        self.dest = dest
+        self.mlil = mlil
+
+
+def _const(v):
+    c = _Llil("LLIL_CONST_PTR")
+    c.constant = v
+    return c
+
+
+class _ILFn(_FnFull):
+    def __init__(self, name, start, llil, **kw):
+        super().__init__(name, start, **kw)
+        self._llil = llil
+
+    def get_llil_at(self, a):
+        return self._llil.get(a)
+
+
+class _BVGotPage:
+    """`memcpy` imported through a PLT stub at 0x1000 whose GOT slot is 0x9000,
+    the first word of its page. Real calls: `bl 0x1000` in copy_tail and a
+    `b 0x1000` tail branch in log_copy, an ordinary one-call wrapper BN flags
+    is_thunk. Noise: an unrelated function's `adrp x0, 0x9000` (a code ref to
+    the slot because the slot is page-aligned) and the stub's own slot load."""
+    def __init__(self):
+        self._stub = _ILFn("memcpy", 0x1000, {0x1004: _Llil("LLIL_SET_REG")}, imported=True)
+        self._app = _ILFn("copy_tail", 0x5000, {0x5010: _Llil("LLIL_CALL", _const(0x1000))})
+        self._wrap = _ILFn("log_copy", 0x6000,
+                           {0x6000: _Llil("LLIL_TAILCALL", _const(0x1000))}, is_thunk=True)
+        self._other = _ILFn("register_tm_clones", 0x7000, {0x7004: _Llil("LLIL_SET_REG")})
+        self.functions = [self._stub, self._app, self._wrap, self._other]
+        self._syms = {"memcpy": [_Sym("memcpy", 0x1000), _Sym("memcpy", 0x9000)]}
+        self._refs = {0x1000: [_Ref(0x5010), _Ref(0x6000)],
+                      0x9000: [_Ref(0x1004), _Ref(0x7004)]}
+        self._contain = {0x1004: self._stub, 0x5010: self._app, 0x6000: self._wrap,
+                         0x7004: self._other}
+
+    def get_symbols(self):
+        return [s for syms in self._syms.values() for s in syms]
+
+    def get_symbols_by_name(self, n):
+        return self._syms.get(n, [])
+
+    def get_code_refs(self, a):
+        return self._refs.get(a, [])
+
+    def get_functions_containing(self, a):
+        f = self._contain.get(a)
+        return [f] if f else []
+
+    def get_sections_at(self, a):
+        return []
+
+
+def test_present_callsites_count_calls_not_got_page_references_958():
+    res = rts._taint_models_op(_CtxWithBV(_BVGotPage()), "active",
+                               {"present": True, "callsites": True, "all_sites": True})
+    mc = _sink_entry(res, "memcpy")
+    rows = {c["address"]: c["kind"] for c in mc["callsites"]}
+    # The adrp of the slot's page and the stub's slot load are data references.
+    assert rows == {"0x5010": "app_caller", "0x6000": "app_caller"}
+    # A one-call application wrapper's tail branch is an audit site, not a stub.
+    assert mc["callsite_count"] == 2 and mc["audit_callsite_count"] == 2
+
+
+def test_constant_inline_builtin_rows_are_non_audit_958():
+    # BN lifts a `str xzr` run to `__builtin_memset(&var, 0, 0x20)`: not a call
+    # in LLIL, and its flagged length is a constant, so no taint can arm it.
+    zero, length = _const(0), _const(0x20)
+    mlil = _Llil("MLIL_CALL", _const(0x9100))
+    mlil.params = [_const(0x10), zero, length]
+    fn = _ILFn("cat_cmd", 0x5000, {0x5008: _Llil("LLIL_STORE", mlil=mlil)})
+
+    class _BV(_BVGotPage):
+        def __init__(self):
+            self.functions = [fn]
+            self._syms = {"__builtin_memset": [_Sym("__builtin_memset", 0x9100)]}
+            self._refs = {0x9100: [_Ref(0x5008)]}
+            self._contain = {0x5008: fn}
+
+    res = rts._taint_models_op(_CtxWithBV(_BV()), "active", {"present": True, "callsites": True})
+    ms = _sink_entry(res, "__builtin_memset")
+    assert ms["callsites"] == [] and ms["hidden_callsites"] == {"inline_builtin": 1}
+    # A variable length (`rep movsb` lifted with rcx) stays an audit site.
+    mlil.params = [_const(0x10), zero, _Llil("LLIL_REG")]
+    res = rts._taint_models_op(_CtxWithBV(_BV()), "active", {"present": True, "callsites": True})
+    assert _sink_entry(res, "__builtin_memset")["audit_callsite_count"] == 1
+
+
+def test_callsite_rows_name_the_caller_demangled_unless_mangled():
+    # #978's rule for text: the containing function by its demangled display
+    # name, the raw symbol under --mangled; JSON keeps the raw name.
+    from bn.formatters import _render_taint_models_text
+
+    class _BV(_BVGotPage):
+        def __init__(self):
+            app = _ILFn("_Z9copy_tailPcPKcim", 0x5000,
+                        {0x5010: _Llil("LLIL_CALL", _const(0x1000))})
+            app.symbol.short_name = "copy_tail"
+            self.functions = [app]
+            self._syms = {"memcpy": [_Sym("memcpy", 0x1000)]}
+            self._refs = {0x1000: [_Ref(0x5010)]}
+            self._contain = {0x5010: app}
+
+    res = rts._taint_models_op(_CtxWithBV(_BV()), "active", {"present": True, "callsites": True})
+    row = _sink_entry(res, "memcpy")["callsites"][0]
+    assert row["function"] == "_Z9copy_tailPcPKcim"
+    assert row["function_display_name"] == "copy_tail"
+    assert "0x5010  copy_tail" in _render_taint_models_text(res)
+    assert "0x5010  _Z9copy_tailPcPKcim" in _render_taint_models_text(res, mangled=True)
+
+
+def test_source_callsites_and_bounded_write_args_reach_the_text_958():
+    from bn.formatters import _render_taint_models_text
+
+    class _BV(_BVGotPage):
+        def __init__(self):
+            app = _ILFn("main", 0x5000, {0x5010: _Llil("LLIL_CALL", _const(0x1000))})
+            self.functions = [app]
+            self._syms = {"read": [_Sym("read", 0x1000)]}
+            self._refs = {0x1000: [_Ref(0x5010)]}
+            self._contain = {0x5010: app}
+
+    res = rts._taint_models_op(_CtxWithBV(_BV()), "active",
+                               {"present": True, "callsites": True})
+    text = _render_taint_models_text(res)
+    src = text.split("sources")[1].split("sinks")[0]
+    assert "read  ->  *arg:1, ret [present] (1 callsite)" in src
+    assert "0x5010  main" in src
+    # read/recv arm through len_arg/buf_arg; the line used to say `arg []`.
+    assert "read (len arg 2 into arg 1) [present]" in text
 
 
 class _BVDisasm(_BVTriage):
@@ -321,7 +557,7 @@ def test_present_callsites_carry_one_line_of_context_794():
     # NOT one of them: `il_format._disasm_entry` returns {address, text} under a
     # different key. An earlier version of this comment cited it and was wrong.)
     res = rts._taint_models_op(_CtxWithBV(_BVDisasm()), "active",
-                               {"present": True, "callsites": True})
+                               {"present": True, "callsites": True, "all_sites": True})
     rows = {c["address"]: c for c in _sink_entry(res, "system")["callsites"]}
     assert rows["0x5010"]["disasm"] == "call    system"
     assert rows["0x2000"]["disasm"] == "jmp     qword [rip+0x2f1a]"
@@ -337,10 +573,10 @@ def test_present_callsite_context_reaches_catalog_text_794():
     from bn.formatters import _render_taint_models_text
 
     res = rts._taint_models_op(_CtxWithBV(_BVDisasm()), "active",
-                               {"present": True, "callsites": True})
+                               {"present": True, "callsites": True, "all_sites": True})
     text = _render_taint_models_text(res)
     assert "0x5010  parse_record  call    system" in text
-    assert "0x2000  system [import_thunk]  jmp     qword [rip+0x2f1a]" in text
+    assert "0x2000  system [self_stub]  jmp     qword [rip+0x2f1a]" in text
 
 
 def test_present_callsites_degrade_when_the_view_cannot_disassemble_794():
@@ -364,7 +600,7 @@ def test_present_callsites_degrade_when_disassembly_raises_794():
             return super().get_disassembly(a)
 
     res = rts._taint_models_op(_CtxWithBV(_BVFailingDisasm()), "active",
-                               {"present": True, "callsites": True})
+                               {"present": True, "callsites": True, "all_sites": True})
     system = _sink_entry(res, "system")
     rows = {c["address"]: c for c in system["callsites"]}
     assert system["callsite_count"] == 2
@@ -503,7 +739,7 @@ def test_present_self_stub_labeled_non_audit_560():
             return self._body if a == 0x1000 else None
 
     res = rts._taint_models_op(_CtxWithBV(_BVSelf()), "active",
-                               {"present": True, "callsites": True})
+                               {"present": True, "callsites": True, "all_sites": True})
     mc = _sink_entry(res, "memcpy")
     assert mc["callsites"][0]["kind"] == "self_stub"
     assert mc["audit_callsite_count"] == 0
@@ -537,11 +773,11 @@ def test_catalog_only_has_model_name_but_no_raw_symbol_556():
 def test_render_taint_models_text_non_finding_banner_and_rows():
     from bn.formatters import _render_taint_models_text
     res = rts._taint_models_op(_CtxWithBV(_BVTriage()), "active",
-                               {"present": True, "callsites": True})
+                               {"present": True, "callsites": True, "all_sites": True})
     text = _render_taint_models_text(res)
     assert "NOT taint findings" in text
     assert "parse_record" in text                         # #553 function context
-    assert "[import_thunk]" in text                       # #560 non-audit label
+    assert "[self_stub]" in text                          # #560 non-audit label
     assert "2 callsites, 1 application" in text           # raw vs audit count
 
 

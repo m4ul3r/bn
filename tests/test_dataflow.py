@@ -394,7 +394,7 @@ def test_render_taint_groups_repeated_leaves():
              "assumptions": [], "soundness": "x"}
     text = _render_taint_text(value)
     assert "frontiers (38 in 2 group(s))" in text
-    assert "g_free" in text and "(x37)" in text
+    assert "g_free" in text and "[37 leaves]" in text
     assert "g_slist_append" in text
     # the 38 leaves collapse to exactly two rendered leaf lines
     assert text.count("unmodeled_callee @") == 2
