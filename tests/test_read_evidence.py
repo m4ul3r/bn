@@ -3262,6 +3262,10 @@ def _vtable_surface_ctx(bv, words, typeinfo, layouts=None):
     if layouts is None:
         layouts = {0x0ff0: 4}
     ctx = _pie_ctx(bv)
+    # 0x7000 is `__cxa_pure_virtual`; every other word names no symbol.
+    bv.get_symbol_at = lambda a: (types.SimpleNamespace(
+        raw_name="__cxa_pure_virtual", name="__cxa_pure_virtual", short_name="")
+        if int(a) == 0x7000 else None)
     ctx._read_pointer_value = lambda b, addr, size=None: words.get(int(addr))
     ctx._typeinfo_name_at = lambda b, addr: typeinfo.get(int(addr))
     ctx._vtable_layout_for = lambda b, addr: (
@@ -3297,6 +3301,17 @@ def _vtable_surface_ctx(bv, words, typeinfo, layouts=None):
                      {0x0fd8: 7},
                      {"vtable_of": "Dispatcher", "vtable_kind": "primary"},
                      id="abstract-class-run-starts-past-null-and-pure-slots"),
+        # Round 2: a plain C table one zero word after `vtable for Impl`
+        # (`{0, &typeid(Impl), a, b, c}`). The class lens over-reads Impl's table
+        # through the zero into the handlers, so only the walk can refuse: it
+        # stops at Impl's last CODE slot instead of reaching Impl's header.
+        pytest.param({0x0fd0: 0, 0x0fd8: 0x1800, 0x0fe0: 0x2a00, 0x0fe8: 0x2a10,
+                      0x0ff0: 0x2a20, 0x0ff8: 0},
+                     {0x0fd0: 10}, None, id="plain-table-after-a-vtable-is-not-that-class"),
+        # ... and a -fno-rtti class's table after an RTTI class's: Beta's header
+        # is two zero words, then Alpha's code slots, then Alpha's header.
+        pytest.param({0x0fd8: 0, 0x0fe0: 0x1800, 0x0fe8: 0x2a00, 0x0ff0: 0, 0x0ff8: 0},
+                     {0x0fd8: 9}, None, id="no-rtti-class-after-an-rtti-class"),
     ],
 )
 def test_hidden_surface_labels_vtables_the_class_lens_accepts_997(
@@ -5323,37 +5338,6 @@ def _callee(bv):
             {"status": "unavailable", "reason": "no_library_entry"},
             {"status": "refused", "reason": "variadic_callee"},
             "recovered", id="varargs-determined-variadic"),
-        # #994 item 3: with the flag UNDETERMINED, a body whose highest read is
-        # below the last argument register and within the declared count says
-        # the same thing whether or not the callee is variadic -- and says so.
-        pytest.param(
-            lambda bv: (_with_varargs_flag(bv, _VarargsFlag(False, 0)),
-                        _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)),
-                                  _SSARead(0x401104, _ssa_var(1)))),
-            {"status": "unavailable", "reason": "no_library_entry"},
-            {"status": "agreement", "reason": None, "declared_arity": 2,
-             "witness_arity": 2, "register": "x1", "variadic": "undetermined"},
-            "recovered", id="varargs-undetermined-agreement-below-the-last-register"),
-        # The review's static `__printf_chk`: BN absorbed the va_start spill
-        # into an 11-parameter prototype, so the spill (x0..x7) stays WITHIN the
-        # declared count. It reaches the last argument register, which is the
-        # spill shape, so it is still refused rather than called agreement.
-        pytest.param(
-            lambda bv: (_with_varargs_flag(bv, _VarargsFlag(False, 0)),
-                        setattr(_callee(bv).type, "parameters", list(range(11))),
-                        _with_ssa(bv, *[_SSARead(0x401100 + 4 * i, _ssa_var(i))
-                                        for i in range(8)])),
-            {"status": "unavailable", "reason": "no_library_entry"},
-            {"status": "refused", "reason": "variadic_undetermined"},
-            "inferred", id="absorbed-spill-reaching-the-last-register-is-refused"),
-        # An undetermined flag on a decorated name keeps its pre-#994 reason.
-        pytest.param(
-            lambda bv: (setattr(_callee(bv), "name", "_ZN4Impl7combineEii"),
-                        _with_varargs_flag(bv, _VarargsFlag(False, 0)),
-                        _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)))),
-            {"status": "unavailable", "reason": "no_library_entry"},
-            {"status": "refused", "reason": "variadic_undetermined"},
-            "recovered", id="decorated-and-undetermined-keeps-its-reason"),
     ],
 )
 def test_each_arity_witness_reports_its_own_verdict_865(
@@ -7290,8 +7274,9 @@ def test_evidence_card_target_line_follows_the_978_naming_rule_994(monkeypatch):
     raw_entry = {"name": "_ZdlPvm", "address": "0x401030", "exact_start": True}
     ctx = types.SimpleNamespace(_normalize_code_pointer=lambda b, v: {
         "raw": hex(v), "normalized": hex(v), "function": dict(raw_entry)})
-    target = bridge.read_evidence._target_entry_for_call(ctx, bv, 0x401030)
+    target = bridge.read_evidence._target_entry_for_call(ctx, bv, 0x401030, display_name=True)
     assert target["function"] == {**raw_entry, "display_name": "operator delete"}
+    assert bridge.read_evidence._target_entry_for_call(ctx, bv, 0x401030)["function"] == raw_entry
     assert "display_name" not in bridge.BinaryNinjaBridge().ctx._function_entry_for_address(
         bv, 0x401030)
 
@@ -7305,3 +7290,26 @@ def test_evidence_card_target_line_follows_the_978_naming_rule_994(monkeypatch):
     raw = _render_function_evidence_text(card, mangled=True)
     assert "  target: _ZdlPvm @ 0x401030" in raw
     assert "  tail branch -> _ZdlPvm @ 0x401030" in raw
+
+
+def test_only_the_evidence_card_demangles_its_thunk_target_994(monkeypatch):
+    """#1006 review round 2: `class show` builds each method's thunk label through
+    the same thunk summary as the card, so adding `display_name` there demangled
+    the class card's labels and grew its JSON. The card asks for the display name;
+    every other caller (`class show`, `decompile`'s veneer note) keeps the raw entry."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    helper = _FakeFunction(0x461746, "_ZN4Impl4initEv")
+    helper.symbol = _FakeSymbol("FunctionSymbol")
+    helper.symbol.short_name = "Impl::init"
+    ctor = _FakeFunction(0x500000, "init_array_0")
+    ctor.basic_blocks = [_FakeBasicBlock(0x500000, 0x500004)]
+    ctor.low_level_il = [[_FakeLLILInstruction(0x500000, _FakeConstPtr(0x461746), operation="LLIL_TAILCALL")]]
+    bv = _FakeBV(functions=[helper, ctor], disassembly={0x500000: "b _ZN4Impl4initEv"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    card = instance._function_evidence("active", "init_array_0", context=0)
+    assert card["thunk"]["target"]["function"]["display_name"] == "Impl::init"
+    shared = bridge.read_evidence._function_thunk_summary(instance.ctx, bv, ctor)
+    assert shared["target"]["function"]["name"] == "_ZN4Impl4initEv"
+    assert "display_name" not in shared["target"]["function"]

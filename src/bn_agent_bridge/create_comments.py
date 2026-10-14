@@ -321,9 +321,12 @@ def _create_fallthrough_source(bv, addr: int) -> int | None:
     previous instruction (on x86 any byte before *addr* might start one), so
     every other ISA answers None, as does an ARM view: ARM and Thumb code
     share it, and the instruction set of the bytes before *addr* is not known
-    there. Anything not decoded as a real instruction, padding (`nop`), or a
-    word BN holds as a DATA variable (a literal pool between two routines)
-    answers None too. An advisory probe: an unanswerable view yields None,
+    there. Anything not decoded as a real instruction, or padding (`nop`),
+    answers None too. A word BN holds as a DATA variable is a literal pool
+    between two routines -- unless the word before it is itself an instruction
+    running into it, which a pool never follows (it sits after a `ret`/`b`):
+    then the data variable is code some other code merely loads, and the
+    fall-through stands. An advisory probe: an unanswerable view yields None,
     never a refusal.
     """
     try:
@@ -336,26 +339,39 @@ def _create_fallthrough_source(bv, addr: int) -> int | None:
         if width <= 0 or width != int(getattr(arch, "max_instr_length", 0) or 0):
             return None
         prev = addr - width
-        get_data_var_at = getattr(bv, "get_data_var_at", None)
-        if callable(get_data_var_at) and get_data_var_at(prev) is not None:
+        if not _falls_through(bv, arch, width, prev):
             return None
-        data = bytes(bv.read(prev, width) or b"")
-        if len(data) != width:
-            return None
-        info = arch.get_instruction_info(data, prev)
-        if info is None or int(getattr(info, "length", 0) or 0) != width:
-            return None
-        tokens, _length = arch.get_instruction_text(data, prev) or ([], 0)
-        mnemonic = str(tokens[0]).strip().lower() if tokens else ""
-        if not mnemonic or mnemonic in ("nop", "udf", "hlt", "brk"):
-            return None
-        kinds = {str(getattr(getattr(b, "type", None), "name", ""))
-                 for b in (getattr(info, "branches", None) or ())}
-        if kinds and not (kinds & _FALLTHROUGH_BRANCH_KINDS):
+        if _is_data_var(bv, prev) and (
+                _is_data_var(bv, prev - width)
+                or not _falls_through(bv, arch, width, prev - width)):
             return None
         return prev
     except Exception:  # noqa: BLE001 - advisory: no evidence means no warning
         return None
+
+
+def _is_data_var(bv, address: int) -> bool:
+    get_data_var_at = getattr(bv, "get_data_var_at", None)
+    return callable(get_data_var_at) and get_data_var_at(address) is not None
+
+
+def _falls_through(bv, arch, width: int, address: int) -> bool:
+    """Does the fixed-width instruction at *address* run into the next one?
+    No branch, or a conditional branch's not-taken edge; never padding or a
+    word that does not decode."""
+    data = bytes(bv.read(address, width) or b"")
+    if len(data) != width:
+        return False
+    info = arch.get_instruction_info(data, address)
+    if info is None or int(getattr(info, "length", 0) or 0) != width:
+        return False
+    tokens, _length = arch.get_instruction_text(data, address) or ([], 0)
+    mnemonic = str(tokens[0]).strip().lower() if tokens else ""
+    if not mnemonic or mnemonic in ("nop", "udf", "hlt", "brk"):
+        return False
+    kinds = {str(getattr(getattr(b, "type", None), "name", ""))
+             for b in (getattr(info, "branches", None) or ())}
+    return not kinds or bool(kinds & _FALLTHROUGH_BRANCH_KINDS)
 
 
 def _with_fallthrough_note(row: dict, predecessor: int | None) -> dict:

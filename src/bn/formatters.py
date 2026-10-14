@@ -3323,10 +3323,6 @@ def _arity_witness_text(name: str, verdict: dict[str, Any]) -> str:
             register = _text_value(verdict, "register")
             via = f" up to {register}" if register else ""
             detail = f"body uses {observed}{via}, prototype {declared}"
-            # #994 item 3: an agreement BN's varargs flag never backed (it
-            # holds either way -- see `_callee_body_witness`).
-            if _text_value(verdict, "variadic") == "undetermined":
-                detail += ", varargs undetermined"
         else:
             detail = f"witness {observed}, prototype {declared}"
     else:

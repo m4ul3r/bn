@@ -791,9 +791,11 @@ def test_fallthrough_create_is_disclosed_on_the_compact_status_997():
 def test_fallthrough_probe_ignores_literal_pools_and_mixed_arm_thumb_views_997(monkeypatch):
     """#1006 review: an ARMv7 literal-pool word before a real entry decodes as
     `andeq` with no branches and read as a fall-through. A word BN holds as a
-    data variable is data, not an instruction running into the address; and an
-    ARM view mixes ARM and Thumb code, so the instruction before an address is
-    not knowable from the view's architecture at all."""
+    data variable after a `ret` is a literal pool, not an instruction running
+    into the address -- but one that a straight-line instruction runs into is
+    code that something merely loads (round 2), and still warns. An ARM view
+    mixes ARM and Thumb code, so the instruction before an address is not
+    knowable from the view's architecture at all."""
     bridge = _load_bridge(monkeypatch)
     probe = bridge.create_comments._create_fallthrough_source
     program = {0x402ffc: ("add", [])}
@@ -803,7 +805,12 @@ def test_fallthrough_probe_ignores_literal_pools_and_mixed_arm_thumb_views_997(m
                                      get_data_var_at=lambda a: object() if a in data_vars else None)
 
     assert probe(view(_A64Arch(program)), 0x403000) == 0x402ffc
-    assert probe(view(_A64Arch(program), data_vars={0x402ffc}), 0x403000) is None
+    after_ret = {0x402ff8: ("ret", ["FunctionReturn"]), **program}
+    assert probe(view(_A64Arch(after_ret), data_vars={0x402ffc}), 0x403000) is None
+    pool_run = {0x402ff8: ("add", []), **program}
+    assert probe(view(_A64Arch(pool_run), data_vars={0x402ff8, 0x402ffc}), 0x403000) is None
+    loaded_code = {0x402ff8: ("add", []), **program}
+    assert probe(view(_A64Arch(loaded_code), data_vars={0x402ffc}), 0x403000) == 0x402ffc
     arm = _A64Arch(program)
     arm.name = "armv7"
     assert probe(view(arm), 0x403000) is None

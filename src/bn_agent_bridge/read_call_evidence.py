@@ -54,14 +54,19 @@ def _call_destination_value(ctx, insn) -> int | None:
     return il_format._llil_constant_value(getattr(insn, "dest", None))
 
 
-def _target_entry_for_call(ctx, bv, value: int | None) -> dict[str, Any] | None:
-    """The `evidence function` card's call/branch target. Its function entry
-    carries `display_name` beside the raw `name`, the #978 pair
-    `il_format._function_identity` gives every other row pointing at a function,
-    so the card's text can print the demangled callee (raw under --mangled)."""
+def _target_entry_for_call(ctx, bv, value: int | None, *,
+                           display_name: bool = False) -> dict[str, Any] | None:
+    """A call/branch target entry. With *display_name* (only the `evidence
+    function` card asks), its function entry carries `display_name` beside the
+    raw `name` -- the #978 pair `il_format._function_identity` gives every other
+    row pointing at a function -- so the card's text can print the demangled
+    callee (raw under --mangled). Every other caller (`class show` thunk labels,
+    `decompile`'s veneer note) keeps the raw entry it always had."""
     if value is None:
         return None
     entry = ctx._normalize_code_pointer(bv, value)
+    if not display_name:
+        return entry
     fn_entry = entry.get("function") if isinstance(entry, dict) else None
     if isinstance(fn_entry, dict) and fn_entry.get("address"):
         try:
@@ -703,29 +708,16 @@ def _callee_body_witness(bv, callee_fn, *, variadic: bool | None,
 
     ``refused``, each leaving the row untouched rather than guessing:
 
-    * `variadic_callee` -- a variadic body reads the argument registers through
-      the register save area / `va_list`, so a register read is not an arity
-      there (BN's DETERMINED flag, :func:`il_format._variadic_determination`);
-    * `variadic_undetermined` -- BN never determined whether the callee is
-      variadic, and the body's reads could be a register-save-area spill (the
-      72-row false-demotion class of #882 round 2). #994 item 3 narrows this to
-      where it can matter, by one ABI fact: `va_start` spills EVERY argument
-      register from the first unnamed one through the LAST one (SysV x86-64
-      saves all six GPRs -- `al` gates only the vector half -- AAPCS64 x0..x7,
-      the Windows x64 home area rcx..r9), so a variadic body that touches its
-      varargs reads the last argument register. A body whose highest read is
-      BELOW the last register and within the declared count therefore states
-      the same agreement whether or not the callee is variadic: that row is
-      `agreement` with ``variadic: "undetermined"``. A read of the last
-      register (the spill shape, including a prototype that absorbed the
-      spill as fixed parameters) or one beyond the declared count is still
-      refused;
+    * `variadic_undetermined` / `variadic_callee` -- a variadic body reads the
+      argument registers through the register save area / `va_list`, so a
+      register read is not an arity there, and a flag BN never DETERMINED cannot
+      tell the two apart (the 72-row false-demotion class of #882 round 2). See
+      :func:`il_format._variadic_determination`;
     * `decorated_name` -- the refusal `_library_witness` makes, from the other
       direction: a method's implicit `this` and a by-value class return's sret
       slot are ARGUMENT REGISTERS the body legitimately reads and the parameter
       count never mentions, so a body-vs-count comparison is meaningless there
-      without real ABI-location mapping (an undetermined flag is reported
-      first, as before #994);
+      without real ABI-location mapping;
     * `no_abi_registers` -- a stack-arguments-only platform, an unknown calling
       convention, or an architecture exposing no register-storage ids: there is
       no position to compare against;
@@ -733,12 +725,16 @@ def _callee_body_witness(bv, callee_fn, *, variadic: bool | None,
     """
     if is_imported_function(callee_fn):
         return _witness(WITNESS_UNAVAILABLE, "imported_callee")
+    # Only a DETERMINED "not variadic" licenses the comparison at all: `None` is
+    # BN never having settled the question, and a guess there is the 72-row
+    # false-demotion class (#882 round 2).
+    if variadic is None:
+        return _witness(WITNESS_REFUSED, "variadic_undetermined")
     if variadic:
         return _witness(WITNESS_REFUSED, "variadic_callee")
     name = str(getattr(callee_fn, "name", "") or getattr(callee_fn, "raw_name", "") or "")
     if not _undecorated_name(name):
-        return _witness(WITNESS_REFUSED,
-                        "variadic_undetermined" if variadic is None else "decorated_name")
+        return _witness(WITNESS_REFUSED, "decorated_name")
     arg_regs = _abi_arg_register_names(bv, callee_fn)
     if not arg_regs:
         return _witness(WITNESS_REFUSED, "no_abi_registers")
@@ -754,15 +750,9 @@ def _callee_body_witness(bv, callee_fn, *, variadic: bool | None,
     if declared_count is None:
         return _witness(WITNESS_REFUSED, "no_declared_arity")
     used_arity = position + 1
-    if variadic is None and (used_arity > declared_count or position == len(arg_regs) - 1):
-        # A possible spill: see the docstring. Only a body that stops short of
-        # the last argument register, within the declared count, needs no answer.
-        return _witness(WITNESS_REFUSED, "variadic_undetermined")
     observed: dict[str, Any] = {"declared_arity": declared_count, "witness_arity": used_arity}
     if position >= 0:
         observed["register"] = arg_regs[position]
-    if variadic is None:
-        observed["variadic"] = "undetermined"
     status = WITNESS_CONTRADICTION if used_arity > declared_count else WITNESS_AGREEMENT
     return _witness(status, **observed)
 
@@ -1152,7 +1142,7 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
 
         mlil = _true_mlil(insn)
         dest_value = _call_destination_value(ctx, insn)
-        target = _target_entry_for_call(ctx, bv, dest_value)
+        target = _target_entry_for_call(ctx, bv, dest_value, display_name=True)
         arg_source, arguments, argument_candidates = _call_arguments(ctx, bv, insn, call_addr)
         # #549: `arguments` (from `argument_source`) is canonical only when it came
         # from HLIL/ABI recovery; an mlil/llil fallback is itself heuristic. Surface
@@ -1227,7 +1217,7 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
     return calls
 
 
-def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
+def _function_thunk_summary(ctx, bv, func, *, display_names: bool = False) -> dict[str, Any]:
     sections = ctx._sections_at(bv, int(func.start))
     if any("plt" in str(section.get("name", "")).lower() for section in sections):
         return {
@@ -1276,7 +1266,7 @@ def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
         if op_name not in {"LLIL_JUMP", "LLIL_TAILCALL", "LLIL_CALL", "LLIL_CALL_STACK_ADJUST"}:
             continue
         dest_value = _call_destination_value(ctx, insn)
-        target = _target_entry_for_call(ctx, bv, dest_value)
+        target = _target_entry_for_call(ctx, bv, dest_value, display_name=display_names)
         if target is None:
             continue
         # #673: only an EXTERNAL branch target (import/PLT/GOT/external symbol) is a
@@ -1486,7 +1476,7 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
             "raw_name": getattr(func, "raw_name", func.name),
         },
         **il_format._function_metadata(func),
-        "thunk": _function_thunk_summary(ctx, bv, func),
+        "thunk": _function_thunk_summary(ctx, bv, func, display_names=True),
         "calls": calls,
         # #471 pagination metadata (present for both text and JSON consumers).
         "total_calls": total_calls,
