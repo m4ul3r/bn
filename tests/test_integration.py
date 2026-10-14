@@ -557,17 +557,57 @@ class TestBatchManifestTarget:
         assert "no_such_var" in failed["message"], failed["message"]
         assert "of this batch renamed" not in failed["message"], failed["message"]
 
-        # #995: renaming one function twice is refused before anything applies.
+        # #995: renaming one function twice fails at the second rename, by name
+        # or by address, naming both operations; the batch is rolled back.
         for second in (rename("foo", "bar"), rename(address, "bar")):
+            failed = failed_row(rename(old, "foo"), second)
+            assert failed["status"] == "invalid_request", failed
+            assert f"renames the symbol at {address} again" in failed["message"], failed
+            assert "Rename it once, to bar" in failed["message"], failed
+
+    def test_rename_chains_are_judged_by_where_the_rename_lands_995(self, shared_bn, tmp_path):
+        """#995 review rounds 1-2, on BN's own resolver: a chain is refused only
+        when a later rename LANDS on a symbol an earlier one renamed -- through a
+        case variant, an address, a data rename at the function's address, or past
+        an unrelated rename to the same name -- and batches whose renames land on
+        different symbols (a case-folded function beside a data symbol, a data
+        symbol holding a name a function rename took) apply."""
+        shared_bn.load(ADD_BINARY)
+        address = next(f["address"] for f in
+                       shared_bn.json("function", "list", "--limit", "500")["items"]
+                       if f["name"] == "add")
+
+        def preview(*ops):
             manifest = tmp_path / "chain.json"
-            manifest.write_text(json.dumps({"ops": [rename(old, "foo"), second]}),
-                                encoding="utf-8")
+            manifest.write_text(json.dumps({"ops": list(ops)}), encoding="utf-8")
             result = shared_bn.run("batch", "apply", str(manifest), "--preview",
                                    "--format", "json")
-            assert result.returncode == 3, (result.stdout, result.stderr)
-            payload = json.loads(result.stdout)
-            assert payload["status"] == "invalid_request", payload
-            assert f"{old} -> foo, then -> bar" in payload["error"], payload
+            return result.returncode, json.loads(result.stdout)
+
+        def rename(src, dst, kind="auto"):
+            return {"op": "rename_symbol", "identifier": src, "new_name": dst, "kind": kind}
+
+        chains = [
+            ([rename("add", "Q1"), rename("q1", "zz")], 1),
+            ([rename(address, "alias", "data"), rename("alias", "q2", "function")], 1),
+            ([rename("add", "q1", "function"), rename(address, "q2", "data")], 1),
+            ([rename("add", "both", "function"), rename("__dso_handle", "both", "data"),
+              rename("both", "lastadd", "function")], 2),
+        ]
+        for ops, failed_index in chains:
+            code, payload = preview(*ops)
+            assert code == 3, (ops, payload)
+            row = payload["results"][failed_index]
+            assert row["status"] == "invalid_request", (ops, row)
+            assert f"renames the symbol at {address} again" in row["message"], (ops, row)
+            assert payload["rolled_back"] is True, (ops, payload)
+
+        for ops in ([rename("__dso_handle", "ADD", "data"), rename("ADD", "newadd")],
+                    [rename("add", "__dso_handle", "function"),
+                     rename("__dso_handle", "marker", "data")]):
+            code, payload = preview(*ops)
+            assert code == 0, (ops, payload)
+            assert [r["status"] for r in payload["results"]] == ["verified", "verified"], payload
 
 
 class TestProtoSetUnnamedParams:

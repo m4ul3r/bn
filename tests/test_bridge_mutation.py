@@ -517,104 +517,73 @@ def test_a_name_renamed_earlier_in_the_batch_is_explained_975(monkeypatch):
     assert row["message"] == "Variable not found: no_such_var"
 
 
-@pytest.mark.parametrize("second", [
-    {"op": "rename_symbol", "identifier": "foo", "new_name": "bar"},
-    {"op": "rename_symbol", "identifier": "0x401129", "new_name": "bar"},
-])
-def test_a_rename_chain_is_refused_before_apply_995(monkeypatch, second):
-    """#995: renaming one function twice in a batch -- through the name the first
-    rename gave it, or by its address -- always failed verification on the first
-    rename (every op is verified against the END state) and rolled back, reading
-    as a BN problem at an address. It is refused before anything is applied,
-    naming both ops and the final name to use."""
+def _rename_rows_batch(monkeypatch, landed):
+    """Run a live batch of renames whose apply LANDED where *landed* says:
+    ``[(address, before_name, new_name), ...]``, one per op -- the address the
+    real resolver chose, which is all the #995 chain check reads."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
-    applied = []
-    _mutation_with_stubs(monkeypatch, bridge, instance, bv,
-                         apply=lambda bv_, op, restores=None, **kw: applied.append(op))
-    monkeypatch.setattr(
-        instance.ctx, "_resolve_rename_target",
-        lambda _bv, ident, kind: {"kind": "function", "address": 0x401129, "before_name": "add"}
-        if ident in ("add", "0x401129") else (_ for _ in ()).throw(
-            bridge.OperationFailure("unsupported", f"Function not found: {ident}")))
+    rows = iter(landed)
 
-    with pytest.raises(bridge.OperationFailure) as exc:
-        instance._mutation("active", False, [
-            {"op": "rename_symbol", "identifier": "add", "new_name": "foo"}, second])
+    def apply(bv_, op, restores=None, **kwargs):
+        address, before, new = next(rows)
+        return {"op": "rename_symbol", "kind": "function", "address": hex(address),
+                "before_name": before, "new_name": new, "requested": dict(op)}
 
-    assert exc.value.status == "invalid_request"
-    assert exc.value.requested["conflicting_op_indices"] == [0, 1]
-    assert "at 0x401129: add -> foo, then -> bar" in exc.value.message
-    assert "Rename it once, to bar" in exc.value.message
-    assert applied == []
-    assert not _has_event(bv, "begin")
-
-
-def _symbol_table_resolver(bridge, table):
-    """A `_resolve_rename_target` stand-in over ``{(name, kind): (address,
-    result_kind)}``, where an `auto` lookup takes a function before data."""
-    def resolve(_bv, ident, kind):
-        for probe in (("function", "data") if kind == "auto" else (kind,)):
-            hit = table.get((ident, probe))
-            if hit is not None:
-                return {"kind": hit[1], "address": hit[0], "before_name": ident}
-        raise bridge.OperationFailure("unsupported", f"Symbol not found: {ident}")
-    return resolve
-
-
-def test_a_rename_into_another_kind_is_not_a_chain_995(monkeypatch):
-    """#995 review: a name a function rename assigned is not that function to a
-    `kind: data` lookup, which never sees function symbols -- renaming the data
-    symbol that already holds the name is a separate write, and worked before
-    the chain check existed."""
-    bridge = _load_bridge(monkeypatch)
-    instance = bridge.BinaryNinjaBridge()
-    bv = _FakeMutationBV()
-    applied = []
-    _mutation_with_stubs(monkeypatch, bridge, instance, bv,
-                         apply=lambda bv_, op, restores=None, **kw: applied.append(op) or {
-                             "op": op["op"], "requested": {}},
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply,
                          verify=lambda bv_, result: {**result, "status": "verified"})
-    monkeypatch.setattr(instance.ctx, "_resolve_rename_target", _symbol_table_resolver(bridge, {
-        ("add", "function"): (0x401129, "function"),
-        ("__dso_handle", "data"): (0x404008, "data"),
-    }))
-    ops = [{"op": "rename_symbol", "identifier": "add", "new_name": "__dso_handle",
-            "kind": "function"},
-           {"op": "rename_symbol", "identifier": "__dso_handle", "new_name": "marker",
-            "kind": "data"}]
-
-    result = instance._mutation("active", True, ops)
-
-    assert applied == ops
-    assert result["success"] is True
+    ops = [{"op": "rename_symbol", "identifier": ident, "new_name": new}
+           for ident, (_, _, new) in zip(("add", "foo", "both"), landed)]
+    return instance._mutation("active", False, ops), bv
 
 
-def test_a_name_two_symbols_will_hold_is_refused_as_a_clash_995(monkeypatch):
-    """#995 review: after `x -> foo` while another function is already `foo`, a
-    `foo -> bar` names two functions. It is not a chain on `x`, so the refusal
-    must say what it is, not advise renaming `x` once to `bar`."""
-    bridge = _load_bridge(monkeypatch)
-    instance = bridge.BinaryNinjaBridge()
-    bv = _FakeMutationBV()
-    _mutation_with_stubs(monkeypatch, bridge, instance, bv,
-                         apply=lambda bv_, op, restores=None, **kw: pytest.fail("applied"))
-    monkeypatch.setattr(instance.ctx, "_resolve_rename_target", _symbol_table_resolver(bridge, {
-        ("x", "function"): (0x401300, "function"),
-        ("foo", "function"): (0x401200, "function"),
-    }))
+@pytest.mark.parametrize("landed,failed_index,first", [
+    # `add -> foo`, then `foo -> bar` (or its address, a case variant, a data
+    # rename at the function's address): the second landed on the same symbol.
+    ([(0x401129, "add", "foo"), (0x401129, "foo", "bar")], 1, 0),
+    # An unrelated rename between the two does not hide the chain.
+    ([(0x401129, "add", "both"), (0x404010, "datum", "both"),
+      (0x401129, "both", "lastadd")], 2, 0),
+])
+def test_a_rename_landing_on_a_symbol_already_renamed_fails_the_batch_995(
+        monkeypatch, landed, failed_index, first):
+    """#995: renaming one symbol twice in a batch always failed verification on
+    the first rename (every op is verified against the END state) and rolled
+    back as `Live rename verification failed at <addr>`, which reads as a BN
+    problem. The second rename is now refused where it lands, naming both ops
+    and the one rename that would do, and the batch is rolled back."""
+    result, bv = _rename_rows_batch(monkeypatch, landed)
 
-    with pytest.raises(bridge.OperationFailure) as exc:
-        instance._mutation("active", True, [
-            {"op": "rename_symbol", "identifier": "x", "new_name": "foo"},
-            {"op": "rename_symbol", "identifier": "foo", "new_name": "bar"}])
+    row = result["results"][failed_index]
+    assert row["status"] == "invalid_request"
+    assert row["requested"]["conflicting_op_indices"] == [first, failed_index]
+    assert f"renames the symbol at {hex(landed[first][0])} again" in row["message"]
+    assert f"Rename it once, to {landed[failed_index][2]}" in row["message"]
+    assert result["rolled_back"] is True and result["success"] is False
+    assert all(r["status"] == "reverted" for r in result["results"][:failed_index])
+    assert _has_event(bv, "revert")
 
-    assert exc.value.status == "invalid_request"
-    assert "a name two symbols will hold" in exc.value.message
-    assert "the function at 0x401300" in exc.value.message
-    assert "the function at 0x401200 already has it" in exc.value.message
-    assert "Rename it once" not in exc.value.message
+
+@pytest.mark.parametrize("landed", [
+    # The review's false refusals: the later rename LANDED on a different symbol
+    # (a case-folded function beside a data symbol named by the earlier rename;
+    # a data symbol holding a name a function rename also took; an existing
+    # function sharing the name). None of them is a chain.
+    [(0x40401c, "datum", "ADD"), (0x401136, "add", "newadd")],
+    [(0x401129, "add", "__dso_handle"), (0x404008, "__dso_handle", "marker")],
+    [(0x401300, "x", "foo"), (0x401200, "foo", "bar")],
+    # Same symbol, same final name: both renames verify, so nothing to refuse.
+    [(0x401129, "add", "foo"), (0x401129, "foo", "foo")],
+])
+def test_renames_that_land_on_different_symbols_are_not_refused_995(monkeypatch, landed):
+    """#995 review rounds 1-2: an up-front simulation of the resolver refused
+    batches like these and advised renaming the wrong symbol. The check reads
+    only where each rename actually landed, so they apply."""
+    result, _ = _rename_rows_batch(monkeypatch, landed)
+
+    assert result["success"] is True, result["results"]
+    assert [r["status"] for r in result["results"]] == ["verified"] * len(landed)
 
 
 def test_preview_drift_restore_failure_is_not_success(monkeypatch):
@@ -4052,14 +4021,57 @@ def test_preview_misspelled_prototype_field_gets_the_field_hint_999(monkeypatch)
     assert not _has_event(bv, "begin")
 
 
-def test_a_prototype_parse_error_quotes_what_was_typed_999(monkeypatch):
-    """The declarator quoting is internal: the error shows the user's text."""
+def test_preview_reports_an_unresolvable_prototype_beside_a_rename_999(monkeypatch):
+    """#999 review round 2: beside a rename the target is never PROVEN, but one
+    that does not resolve now and that no rename in the batch could name still
+    fails the live apply -- so the preview fails on it too."""
+    bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", True, [
+            {"op": "set_prototype", "identifier": "nosuchfn", "prototype": "int f(void)"},
+            {"op": "rename_symbol", "identifier": "other", "new_name": "other2"},
+        ])
+
+    assert exc.value.message == "Function not found: nosuchfn"
+    assert applied == []
+
+
+@pytest.mark.parametrize("supplier", [
+    {"op": "rename_symbol", "identifier": "other", "new_name": "NewFn"},   # case-folded
+    {"op": "rename_symbol", "identifier": "other", "new_name": "_ZN2ns5newfnEv"},  # mangled
+])
+def test_preview_skips_a_prototype_target_a_rename_may_supply_999(monkeypatch, supplier):
+    """The miss is only reported when no rename could make the name resolve; a
+    rename to it (in any case, or to a mangled name that may demangle to it) can,
+    so that prototype is skipped as unprovable instead."""
+    bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
+
+    result = instance._mutation("active", True, [
+        {"op": "set_prototype", "identifier": "newfn", "prototype": "int f(void)"},
+        supplier,
+    ])
+
+    assert [row["index"] for row in result["preview_skipped"]] == [0]
+    assert applied == [supplier]
+
+
+@pytest.mark.parametrize("bn_column,typed_column", [
+    (32, 30),   # `this`, after the quoted name: both backticks before it
+    (6, 5),     # inside the name: only the opening backtick before it
+    (1, 1),     # before the name: none
+])
+def test_a_prototype_parse_error_quotes_what_was_typed_999(monkeypatch, bn_column,
+                                                            typed_column):
+    """The declarator quoting is internal: the error shows the user's text, and
+    BN's column -- which counts the quoted rewrite -- points into that text."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
     def reject(text):
-        raise SyntaxError("error: string.hpp:1:32 invalid parameter name: 'this' is a keyword")
+        raise SyntaxError(f"error: string.hpp:1:{bn_column} invalid parameter name: "
+                          "'this' is a keyword")
 
     monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
     typed = "int ns::Cls::run(struct Cls* this)"
@@ -4068,6 +4080,7 @@ def test_a_prototype_parse_error_quotes_what_was_typed_999(monkeypatch):
             instance.ctx, bv, {"op": "set_prototype", "prototype": typed})
     assert exc.value.message.startswith(f"could not parse prototype {typed!r}")
     assert "`ns::Cls::run`" not in exc.value.message
+    assert f"string.hpp:1:{typed_column} " in exc.value.message
 
 
 @pytest.mark.parametrize("text,expected", [

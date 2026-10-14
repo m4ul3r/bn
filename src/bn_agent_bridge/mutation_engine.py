@@ -789,7 +789,7 @@ def _explain_renamed_reference(op: Any, results: list[dict[str, Any]],
         address = row.get("address")
         renamed_to = row.get("new_name")
         # A second rename of the same symbol never reaches here: a rename chain
-        # is refused before apply (`_reject_rename_chains`, #995).
+        # fails at the second rename's apply (`_refuse_rename_chain`, #995).
         return OperationFailure(
             exc.status,
             f"{before} not found: operation {index} of this batch renamed {before} "
@@ -1109,6 +1109,32 @@ def _resolve_prototype_target(ctx, bv, op: dict[str, Any]):
 _PROTOTYPE_DEPENDENT_OPS = frozenset({"local_rename", "local_retype"})
 
 
+def _batch_could_supply_function(identifier: Any, operations) -> bool:
+    """Whether some op in the batch could make *identifier* resolve to a function
+    when it does not resolve in the view the batch starts from.
+
+    Answered on the safe side, never by simulating the resolver: a function
+    create or an op off the resolution-safe whitelist could supply anything; an
+    address is supplied only by those (a rename never creates a function); a name
+    by any rename whose new name contains it, ignoring case (the resolver also
+    folds case and matches demangled spellings, which a mangled new name may
+    carry). Only a "no" is used, to fail a preview the live apply would fail."""
+    for op in operations:
+        kind = op.get("op") if isinstance(op, dict) else None
+        if kind not in _RESOLUTION_SAFE_OPS and kind != "rename_symbol":
+            return True
+    try:
+        _parse_address(identifier)
+    except (ValueError, TypeError):
+        wanted = str(identifier).casefold()
+        return any(
+            isinstance(op, dict) and op.get("op") == "rename_symbol"
+            and (wanted in str(op.get("new_name", "")).casefold()
+                 or str(op.get("new_name", "")).startswith(("_Z", "?")))
+            for op in operations)
+    return False
+
+
 def _unpreviewable_operations(ctx, bv, operations) -> dict[int, str]:
     """``{index: reason}`` for the ops a ``--preview`` must leave out (#999 item 5).
 
@@ -1126,14 +1152,25 @@ def _unpreviewable_operations(ctx, bv, operations) -> dict[int, str]:
         offending_op, is_known = offending
         cause = (f"a rename or a symbol/function create ({offending_op})" if is_known
                  else f"the operation {offending_op!r}, which may change how a symbol resolves")
-        # The target cannot be resolved here, but the prototype TEXT can still
-        # be checked: a string that does not parse fails the live apply too
-        # (#999 review), so the preview says so instead of only skipping it.
+        # The target cannot be PROVEN here, but two failures the live apply would
+        # hit can still be shown (#999 review): a prototype string that does not
+        # parse, and a target that does not resolve now when nothing in the batch
+        # could make it resolve (`_batch_could_supply_function`).
         check_parse = not _declares_types(operations)
         for index, op in enumerate(operations):
             if isinstance(op, dict) and op.get("op") == "set_prototype":
                 if check_parse:
                     _parse_prototype(ctx, bv, op)
+                try:
+                    _resolve_prototype_target(ctx, bv, op)
+                except OperationFailure as exc:
+                    # Only a plain miss: an ambiguous name may be made unique by a
+                    # rename that moves one of its holders away.
+                    missed = exc.message.startswith(("Function not found: ",
+                                                     "No function found at address "))
+                    if missed and not _batch_could_supply_function(op.get("identifier"),
+                                                                   operations):
+                        raise
                 skipped[index] = (
                     f"not previewed: this batch also carries {cause}, so the function "
                     "this prototype lands on cannot be proven from the pre-mutation view, "
@@ -2430,118 +2467,49 @@ def _reject_duplicate_write_keys(ctx, operations: list[dict[str, Any]]) -> None:
         )
 
 
-def _reject_rename_chains(ctx, bv, operations: list[dict[str, Any]]) -> None:
-    """Refuse a manifest that renames one symbol twice, up front (#995).
+def _refuse_rename_chain(row: dict[str, Any], results: list[dict[str, Any]],
+                         index: int) -> None:
+    """Fail a batch that renames one symbol twice, at the second rename (#995).
 
-    `_reject_duplicate_write_keys` keys a rename on its identifier STRING, so a
-    chain (`add -> foo`, then `foo -> bar`, or the second rename naming the same
-    symbol by address) slipped past it, and the first rename then failed
-    verification against the end state (`bar` at the address it expected `foo`)
-    -- a rollback that read as a BN problem at an address, not as a manifest
-    that renames one function twice.
+    Every op is verified against the batch's END state, so the first rename of
+    a chain (`add -> foo`, then `foo -> bar`) was judged against `bar` and
+    failed as `Live rename verification failed at <addr>` -- a rollback that read
+    as a BN problem at an address, not as a manifest that renames one function
+    twice.
 
-    Key on the SYMBOL a rename resolves to -- its address and kind (a function,
-    or a data symbol, which may share a function's address) -- the way
-    `_resolve_rename_target` will resolve it at apply time:
-
-    * a name an earlier rename in this batch assigned resolves to THAT symbol
-      only when this op's `kind` can reach it (a `kind: data` lookup never sees
-      a function symbol, and an `auto` lookup prefers a function) and no OTHER
-      live symbol holds the name -- then it is a chain. When another existing
-      symbol does hold it, the op names two symbols at once: that clash is
-      refused as what it is, never mistaken for a chain on one of them;
-    * any other identifier resolves against the view the batch starts from,
-      and one that does not resolve there is keyed by its spelling, so a chain
-      through it is still caught while a lone miss is left to fail at apply,
-      where the #975 hint explains a name an earlier rename replaced."""
-    renamed: dict[tuple, tuple[int, Any, str]] = {}
-    assigned: dict[str, tuple[tuple, int]] = {}
-
-    def live_holder(name: str, kind: str) -> tuple | None:
-        """The symbol the view the batch starts from resolves *name* to under
-        *kind*, unless an earlier rename in this batch already took it away. A
-        case-folded-only match does not count: at apply time the exact name the
-        earlier rename assigned wins over it."""
-        try:
-            target = ctx._resolve_rename_target(bv, name, kind)
-        except Exception:
-            return None
-        held = str(target.get("before_name") or "")
-        if held != name and held.casefold() == name.casefold():
-            return None
-        key = ("addr", int(target["address"]), str(target.get("kind")))
-        return None if key in renamed else key
-
-    for index, op in enumerate(operations):
-        if not isinstance(op, dict) or op.get("op") != "rename_symbol":
+    The proof is the apply itself: *row* is what `_op_rename_symbol` did, and
+    its address is where Binary Ninja's resolver -- with its own case-folding,
+    impl-over-stub, `kind` and raw-symbol rules, against the state the earlier
+    ops left -- actually landed the rename. Two renames at one address rename
+    one symbol slot (a `kind: data` rename at a function's address renames that
+    function), so the batch can never verify unless both chose the same name.
+    Two review rounds showed that simulating the resolver up front misses some
+    chains and, worse, refuses batches that work while advising a rename of the
+    wrong symbol; this check cannot do either, because it never predicts. The
+    cost is that the refusal comes after the earlier ops applied, so the batch
+    is rolled back like any other apply failure."""
+    if row.get("op") != "rename_symbol" or row.get("address") is None:
+        return
+    for first, earlier in enumerate(results):
+        if (earlier.get("op") != "rename_symbol" or earlier.get("address") != row["address"]
+                or earlier.get("new_name") == row.get("new_name")):
             continue
-        identifier = op.get("identifier")
-        new_name = op.get("new_name")
-        if not isinstance(new_name, str):
-            continue
-        kind = str(op.get("kind", "auto"))
-        before_name: Any = identifier
-        key: tuple | None = None
-        if isinstance(identifier, str) and identifier in assigned:
-            assigned_key, assigner = assigned[identifier]
-            assigned_kind = assigned_key[-1]
-            # An `auto` lookup takes a function before any data symbol.
-            reachable = (kind == "auto" and (assigned_kind != "data"
-                                             or live_holder(identifier, "function") is None)
-                         or assigned_kind in (kind, "unknown"))
-            if reachable:
-                other = live_holder(identifier, assigned_kind if assigned_kind != "unknown" else kind)
-                if other is not None and other != assigned_key:
-                    raise OperationFailure(
-                        "invalid_request",
-                        f"operation {index} renames {identifier}, a name two symbols "
-                        f"will hold when it runs: operation {assigner} gives it to "
-                        f"{_rename_key_label(assigned_key)}, and "
-                        f"{_rename_key_label(other)} already has it. Name the "
-                        f"symbol operation {index} means by its address instead.",
-                        requested={
-                            "op": "rename_symbol",
-                            "conflicting_op_indices": [assigner, index],
-                            "conflict_key": identifier,
-                        },
-                    )
-                key = assigned_key
-        if key is None:
-            try:
-                target = ctx._resolve_rename_target(bv, identifier, kind)
-                key = ("addr", int(target["address"]), str(target.get("kind")))
-                before_name = target.get("before_name") or identifier
-            except Exception:
-                key = ("name", str(identifier), kind if kind in ("function", "data") else "unknown")
-        previous = renamed.get(key)
-        if previous is not None:
-            first, first_before, first_new = previous
-            where = hex(key[1]) if key[0] == "addr" else str(first_before)
-            at = f"at {where}: " if key[0] == "addr" else ""
-            raise OperationFailure(
-                "invalid_request",
-                f"operation {index} renames the symbol operation {first} already renamed "
-                f"({at}{first_before} -> {first_new}, then -> {new_name}). "
-                f"Every op is verified against the batch's END state, so operation "
-                f"{first} would be judged against operation {index}'s name, fail "
-                f"verification, and roll the whole batch back. Rename it once, to "
-                f"{new_name}, or split the renames across two batches.",
-                requested={
-                    "op": "rename_symbol",
-                    "conflicting_op_indices": [first, index],
-                    "conflict_key": where,
-                },
-            )
-        renamed[key] = (index, before_name, new_name)
-        assigned[new_name] = (key, index)
-
-
-def _rename_key_label(key: tuple) -> str:
-    """How `_reject_rename_chains` names a symbol key in its messages."""
-    if key[0] == "addr":
-        noun = "the data symbol" if key[2] == "data" else "the function"
-        return f"{noun} at {hex(key[1])}"
-    return f"the symbol first named {key[1]}"
+        raise OperationFailure(
+            "invalid_request",
+            f"operation {index} renames the symbol at {row['address']} again: operation "
+            f"{first} already renamed it ({earlier.get('before_name')} -> "
+            f"{earlier.get('new_name')}), and operation {index}'s identifier "
+            f"{(row.get('requested') or {}).get('identifier')!r} resolved to that same "
+            f"symbol, so it would be renamed again to {row.get('new_name')}. Every op is "
+            f"verified against the batch's END state, so operation {first} could never "
+            f"verify. Rename it once, to {row.get('new_name')}, or split the renames "
+            f"across two batches.",
+            requested={
+                **(row.get("requested") or {}),
+                "conflicting_op_indices": [first, index],
+                "conflict_key": row["address"],
+            },
+        )
 
 
 def _later_create_needs_ranges(operations: list, index: int) -> bool:
@@ -2644,8 +2612,6 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         for index, op in enumerate(operations):
             if isinstance(op, dict):
                 _validate_operation_request(ctx, op, index=index)
-        # #995: a rename chain (one symbol renamed twice) can never verify.
-        _reject_rename_chains(ctx, bv, operations)
         # #630: a --preview of a prototype set on a function with no user type would
         # pin has_user_type, which BN cannot clear -- so the preview could not honor
         # its non-destructive contract, and neither can a prototype set whose target
@@ -2717,7 +2683,9 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 results.append(_not_previewed_result(ctx, op, skipped[index]))
                 continue
             with exclusive_scope():
-                results.append(_apply_operation(ctx, bv, op, restores, defer_reanalysis=True))
+                row = _apply_operation(ctx, bv, op, restores, defer_reanalysis=True)
+                _refuse_rename_chain(row, results, index)
+                results.append(row)
             if _later_create_needs_ranges(operations, index):
                 # #927 P2: a create's interior guard reads the ranges of the
                 # functions already there, and an EARLIER create in this batch
@@ -3589,7 +3557,7 @@ def _type_spelling_hint(bv, text: str, detail: str, *, limit: int = 5) -> str:
 
 
 def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: str,
-                        shown: str | None = None):
+                        shown: str | None = None, column_of=None):
     """``bv.parse_type_string`` with a friendly, actionable error.
 
     A prototype/type that references a struct or type not defined yet fails to
@@ -3597,7 +3565,8 @@ def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: s
     generic ``unsupported: <ExceptionClass>: ...`` the catch-all in
     ``_apply_operation`` would otherwise emit -- which leaks the Python
     exception class name and gives no way forward (#122). *shown* is the text
-    the error quotes when *type_text* is a rewrite of what the caller typed."""
+    the error quotes when *type_text* is a rewrite of what the caller typed, and
+    *column_of* maps a 1-based column of *type_text* to the same spot in it."""
     try:
         return bv.parse_type_string(str(type_text))
     except OperationFailure:
@@ -3613,6 +3582,11 @@ def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: s
         # Collapse BN's multi-line parser output ("error: ...\n1 error
         # generated.") into a single clean clause.
         detail = " ".join(str(exc).split()).rstrip(".")
+        if column_of is not None:
+            # BN's `file:line:col` positions count the parsed text; translate
+            # them to the text the error quotes.
+            detail = re.sub(r"(\S+:1:)(\d+)",
+                            lambda m: f"{m.group(1)}{column_of(int(m.group(2)))}", detail)
         raise OperationFailure(
             "invalid_request",
             f"could not parse {label} {shown if shown is not None else str(type_text)!r}"
@@ -3656,6 +3630,18 @@ _PROTOTYPE_DECLARATOR = re.compile(
     r"^(?P<head>.*[\s*&])(?P<name>[A-Za-z_~][\w~]*(?:::[A-Za-z_~][\w~]*)+)\s*$", re.DOTALL)
 
 
+def _qualified_declarator_span(text: str) -> tuple[int, int] | None:
+    """``(start, end)`` of an unquoted ``::``-qualified function name in a
+    prototype, or None when there is none to quote (see below)."""
+    head, sep, _ = text.partition("(")
+    if not sep:
+        return None
+    match = _PROTOTYPE_DECLARATOR.match(head)
+    if match is None or not match.group("head").strip():
+        return None
+    return match.start("name"), match.end("name")
+
+
 def _quote_qualified_declarator(text: str) -> str:
     """#999 item 2: backtick-quote a ``::``-qualified function name in a
     prototype (``int ns::Cls::run(int x)``). BN's parser reads it as an
@@ -3663,21 +3649,36 @@ def _quote_qualified_declarator(text: str) -> str:
     ``set_user_type`` sets a type, never a symbol -- so quoting it changes nothing
     but whether the string parses. A name already in backticks, or a prototype
     with no return type in front of the qualified token, is left alone."""
-    head, sep, rest = text.partition("(")
-    if not sep:
+    span = _qualified_declarator_span(text)
+    if span is None:
         return text
-    match = _PROTOTYPE_DECLARATOR.match(head)
-    if match is None or not match.group("head").strip():
-        return text
-    return f"{match.group('head')}`{match.group('name')}`{sep}{rest}"
+    start, end = span
+    return f"{text[:start]}`{text[start:end]}`{text[end:]}"
 
 
 def _parse_prototype(ctx, bv, op: dict[str, Any]):
     """The prototype a ``set_prototype`` op requests, parsed to a ``Type``.
-    Its parse error quotes the prototype as typed, not the quoted rewrite."""
+    Its parse error quotes the prototype as typed, not the quoted rewrite, and
+    BN's column numbers are translated back to that text (#999 review)."""
     typed = str(op.get("prototype"))
+    span = _qualified_declarator_span(typed)
+    column_of = None
+    if span is not None:
+        start, end = span
+
+        def column_of(column: int) -> int:
+            # The rewrite adds one backtick before index `start` and one after
+            # index `end - 1` of the typed text.
+            position = column - 1
+            if position > end + 1:
+                position -= 2
+            elif position > start:
+                position -= 1
+            return position + 1
+
     expected_type, _ = _parse_type_or_hint(
-        ctx, bv, op, _quote_qualified_declarator(typed), label="prototype", shown=typed)
+        ctx, bv, op, _quote_qualified_declarator(typed), label="prototype", shown=typed,
+        column_of=column_of)
     return expected_type
 
 
