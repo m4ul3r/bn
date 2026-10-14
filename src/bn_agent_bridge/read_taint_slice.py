@@ -913,6 +913,7 @@ def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any
         callee_nm = str(getattr(callee, "name", "") or "")
         if callee_nm:
             label["callee"] = callee_nm
+            label["callee_display_name"] = il_format._display_name(callee) or callee_nm
         pvars = list(getattr(callee, "parameter_vars", []) or []) if callee else []
         if 0 <= arg_index < len(pvars):
             nm = getattr(pvars[arg_index], "name", None)
@@ -1030,6 +1031,7 @@ def _build_backward_trace(
                     entry["reason"] = ("interprocedural_out_param_not_followed" if interprocedural
                                         else "out_param_not_followed")
                     entry["out_param_callee"] = out_callee
+                    entry["out_param_callee_display_name"] = _shown_symbol_name(bv, out_callee)
             trace.append(entry)
             continue
 
@@ -1049,6 +1051,7 @@ def _build_backward_trace(
                             if callee_ret_vars:
                                 entry["cross_function"] = True
                                 entry["callee"] = callee.name
+                                entry["callee_display_name"] = il_format._display_name(callee)
                                 entry["terminates"] = False
                                 entry["reason"] = "cross_function"
                                 trace.append(entry)
@@ -1070,6 +1073,8 @@ def _build_backward_trace(
                                 )
                                 for ct in callee_trace:
                                     ct.setdefault("function_context", callee.name)
+                                    ct.setdefault("function_context_display_name",
+                                                  il_format._display_name(callee))
                                 trace.extend(callee_trace)
                                 continue
             entry["terminates"] = True
@@ -1083,6 +1088,7 @@ def _build_backward_trace(
             callee_nm = _callee_display_name(ctx, bv, def_insn)
             if callee_nm:
                 entry["callee"] = callee_nm
+                entry["callee_display_name"] = _shown_symbol_name(bv, callee_nm)
             trace.append(entry)
             continue
 
@@ -1113,6 +1119,7 @@ def _build_backward_trace(
                 entry["reason"] = ("interprocedural_out_param_not_followed" if interprocedural
                                     else "out_param_not_followed")
                 entry["out_param_callee"] = out_callee
+                entry["out_param_callee_display_name"] = _shown_symbol_name(bv, out_callee)
                 # The value's true origin is the callee's write through the
                 # out-pointer; mark the load as a boundary. Index/base
                 # provenance (`*(&local + idx)`) is still walked below, so a
@@ -1133,13 +1140,29 @@ def _build_backward_trace(
                     worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
             continue
 
-        entry["terminates"] = False
-        # Populate `reason` from a controlled vocabulary instead of leaving it
-        # null on ordinary steps: a phi merge is `phi_source`, everything else is
-        # a plain `definition` (#162).
-        entry["reason"] = "phi_source" if "PHI" in def_op else "definition"
+        # #1001 item 2: `p = &local` (or `&local + k`) has no SSA reads, so a
+        # plain definition here ended the worklist with no frontier and no
+        # hint -- the slice just stopped one step after the call. The value is
+        # a POINTER to a stack object; what the sink consumes is the bytes stored
+        # into it, which this use-def walk does not follow. Stop here honestly,
+        # naming the local, so the roll-up, caveat and hint can point at the
+        # command that does walk those stores (`taint backward`).
+        taken = (_address_of_target(getattr(def_insn, "src", None))
+                 if "SET_VAR" in def_op else None)
+        if taken is not None:
+            entry["terminates"] = True
+            entry["reason"] = "address_of_local"
+            entry["local"] = str(getattr(taken, "name", None) or taken)
+        else:
+            entry["terminates"] = False
+            # Populate `reason` from a controlled vocabulary instead of leaving it
+            # null on ordinary steps: a phi merge is `phi_source`, everything else is
+            # a plain `definition` (#162).
+            entry["reason"] = "phi_source" if "PHI" in def_op else "definition"
         trace.append(entry)
 
+        # Still walk any index/offset operand (`&local + i`): a tainted index
+        # is provenance too.
         for rv in _ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
             if rv not in visited:
                 worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
@@ -1153,8 +1176,9 @@ def _build_backward_trace(
 # top-level cap markers surfaced only via `_trace_assumptions`, not per-step
 # fields, so a capped boundary and a genuinely terminal one look identical here.
 _FRONTIER_EXAMPLE_KEYS = (
-    "ssa_label", "address", "depth", "callee", "out_param_callee",
-    "base", "offset", "width", "function_context", "param_index", "param_register",
+    "ssa_label", "address", "depth", "callee", "callee_display_name", "out_param_callee",
+    "base", "offset", "width", "function_context", "function_context_display_name",
+    "out_param_callee_display_name", "param_index", "param_register", "local",
 )
 _FRONTIER_EXAMPLE_CAP = 3
 
@@ -1202,6 +1226,8 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
     out_param_reasons = {"interprocedural_out_param_not_followed", "out_param_not_followed"}
     for step in trace:
         if isinstance(step, dict) and step.get("reason") in out_param_reasons:
+            # Free-text caveats keep raw names (the step and roll-up carry the
+            # display name), so `--mangled` and the default agree here.
             callee = step.get("out_param_callee") or "a callee"
             assumptions.append(
                 f"value crosses an out-parameter fill by {callee} that this "
@@ -1226,6 +1252,15 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
             "a value's SSA definition could not be queried on one or more "
             "steps (the SSA form does not support the lookup there); the "
             "slice stops at that value without full provenance"
+        )
+    locals_taken = [str(step.get("local")) for step in trace
+                    if isinstance(step, dict) and step.get("reason") == "address_of_local"]
+    if locals_taken:
+        assumptions.append(
+            f"the slice reaches the address of local {locals_taken[0]}"
+            + (f" (and {len(locals_taken) - 1} more)" if len(locals_taken) > 1 else "")
+            + "; stores into it (array elements, struct fields) are not followed, so "
+            "the bytes the call consumes have no provenance here"
         )
     return assumptions
 
@@ -1319,6 +1354,19 @@ def _callee_display_name(ctx, bv, def_insn) -> str | None:
         if sym is not None and getattr(sym, "name", None):
             return str(sym.name)
     return None
+
+
+def _shown_symbol_name(bv, raw_name: str | None) -> str | None:
+    """The demangled display name (the symbol's ``short_name``, #978) for a raw
+    symbol name a trace step carries, else the raw name itself (#1001 item 4)."""
+    if not raw_name:
+        return raw_name
+    try:
+        sym = bv.get_symbol_by_raw_name(raw_name)
+    except Exception:
+        sym = None
+    short = getattr(sym, "short_name", None) if sym is not None else None
+    return short if isinstance(short, str) and short else raw_name
 
 
 def _resolve_thunk(ctx, bv, fn):
@@ -1599,21 +1647,15 @@ def _backward_slice(
             f"arg), so the trace seeds from the register's reaching definition "
             f"rather than the MLIL call's parameter list (#433)."
         )
-    # An address-of arg with no SSA value reads is an output-pointer dead-end:
-    # tracing it would follow where the *pointer* came from (a local buffer),
-    # not the data the callee writes through it. Surface that instead of the
-    # misleading "constant or immediate -- no SSA trace" (#166).
-    if param_expr is not None and not initial_vars and _is_address_of(param_expr):
-        callee_nm = arg_label.get("callee") or "the callee"
-        callee_ref = arg_label.get("callee") or "<callee>"
-        hints.append(
-            f"arg {arg_index} is a pointer (address-of); this traces where the "
-            f"pointer came from, not the data written through it. To follow data "
-            f"{callee_nm} writes into the pointee, run a forward taint from the "
-            f"call site (e.g. `taint forward --source call:{callee_ref}`) or trace the "
-            f"buffer's later consumers."
-        )
-    elif param_expr is not None and not initial_vars:
+    # An address-of arg is a pointer to a local: tracing it follows where the
+    # *pointer* came from, not the bytes stored into the pointee. The hint used
+    # to fire only when the MLIL call parameter itself was `&local` (#166); on
+    # AArch64 the address arrives through a register copy (`x1 = &var_68`), so
+    # the same dead end is now also recognised on the parameter's resolved
+    # definition (#1001 item 2). Constant args keep their own hint.
+    direct_addr = (param_expr is not None and not initial_vars
+                   and (_is_address_of(param_expr) or _address_of_target(param_expr) is not None))
+    if param_expr is not None and not initial_vars and not direct_addr:
         # A constant/immediate arg (e.g. a literal length/flag) has no SSA
         # definition to trace. Surface the value as a structured hint so both
         # text and JSON consumers see *which* constant -- not just the renderer's
@@ -1636,9 +1678,24 @@ def _backward_slice(
         seed_addr=target_addr,
     )
 
+    if direct_addr:
+        _taken = _address_of_target(param_expr)
+        local_name = str(getattr(_taken, "name", None) or _taken) if _taken is not None else ""
+    else:
+        # Only when the argument's OWN value is that address: its definition
+        # chain is pure copies down to `&local`. A value LOADED from a local, or
+        # a phi of two locals, also reaches an `address_of_local` step, but
+        # "arg N is the address of local X" would be false there (#1001 review).
+        local_name = _copied_address_of_local(ssa_func, initial_vars)
+    if local_name is not None:
+        hints.append(_address_of_local_hint(arg_index, local_name, arg_label, func))
+
     truncated = len(trace) >= max_depth
     return {
         "function": func.name,
+        # #1001 item 4: text names the function and callee as `decompile` does;
+        # JSON keeps the raw names beside them.
+        "function_display_name": il_format._display_name(func),
         "function_address": hex(func.start),
         "target_address": hex(target_addr),
         "arg_index": arg_index,
@@ -1667,3 +1724,62 @@ def _backward_slice(
         "assumptions": _trace_assumptions(trace, truncated=truncated, max_depth=max_depth),
         "hints": hints,
     }
+
+
+def _copied_address_of_local(ssa_func, initial_vars: list) -> str | None:
+    """The local whose address the traced value IS, through pure SSA copies
+    (``x1 = x8; x8 = &var_68``), or None -- a load, phi, arithmetic on a
+    non-address or a call anywhere on the chain means the value is something
+    else that merely involves the local."""
+    if len(initial_vars) != 1:
+        return None
+    cur = initial_vars[0]
+    for _ in range(8):
+        try:
+            d = ssa_func.get_ssa_var_definition(cur)
+        except Exception:
+            return None
+        if d is None or "SET_VAR" not in il_format._il_op_name(d):
+            return None
+        src = getattr(d, "src", None)
+        taken = _address_of_target(src)
+        if taken is not None:
+            return str(getattr(taken, "name", None) or taken)
+        if il_format._il_op_name(src) != "MLIL_VAR_SSA":
+            return None
+        reads = _ssa_vars_from(getattr(src, "vars_read", []) or [])
+        if len(reads) != 1:
+            return None
+        cur = reads[0]
+    return None
+
+
+def _address_of_local_hint(arg_index: int, local_name: str, arg_label: dict, func) -> str:
+    """The #166 / #1001 item 2 hint for an argument that is the address of a
+    local: trace follows the pointer, not the bytes in the pointee. Every
+    command it prints runs as printed (#1001 review): the `arg:` sink locator
+    and the forward source need a resolved callee, and `call:` seeds only a
+    callee whose model declares outputs -- otherwise the source is the arg
+    itself. The callee is named by its demangled display name in prose and by
+    its raw symbol in the commands."""
+    what = f"local {local_name}" if local_name else "a local"
+    head = (f"arg {arg_index} is the address of {what}: trace follows where the "
+            f"pointer came from, not the bytes stored into it.")
+    callee = arg_label.get("callee")
+    fn_ref = hex(int(func.start))
+    if not callee:
+        return (head + " The call's target did not resolve, so no `arg:` locator can "
+                f"name it; read the stores into the local with `bn decompile {fn_ref}`, "
+                "or resolve the target before slicing.")
+    shown = arg_label.get("callee_display_name") or callee
+    _, model = _taint.lookup_model(_taint.load_models(), callee)
+    # `call:` seeds what the model declares the callee writes; use it only when
+    # that includes THIS argument's buffer (`*arg:N`) -- for recvfrom's
+    # `addrlen`, `call:recvfrom` seeds the payload and return, not addrlen.
+    writes_this = any(str((s or {}).get("to", "")) == f"*arg:{arg_index}"
+                      for s in (model or {}).get("sources") or [])
+    source = f"call:{callee}" if writes_this else f"arg:{callee}:{arg_index}"
+    return (head + f" To slice the stores into it before the call (array elements, "
+            f"struct fields), run `bn taint backward -f {fn_ref} --sink "
+            f"arg:{callee}:{arg_index}`; if {shown} fills it instead (an output "
+            f"pointer), run `bn taint forward -f {fn_ref} --source {source}`.")

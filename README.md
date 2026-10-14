@@ -41,6 +41,8 @@ bn skill install
 
 That symlinks the bundled skills into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
 
+Re-running either install is safe: an existing link (or copy, under `--mode copy`) of the same source, or a skills root that is linked to the source itself, is reported as already installed. A destination holding anything else, typically a link into a previous checkout, is never reported as installed: `skill install` lists it with what it points at (or that it dangles, cannot be read, or is a foreign directory) and exits `1`, and `plugin install` refuses it. `--force` replaces only what it can remove and proves is this install's own: a link, an empty directory, or a previous copy, losing any local edits in that copy, so check them first. It refuses anything else (a foreign directory or file, an unreadable or read-only copy, an unwritable parent), and a forced run is all-or-nothing: a refusal changes no destination.
+
 If the plugin code changes, reload Binary Ninja Python plugins or restart Binary Ninja.
 
 ## How It Works
@@ -89,6 +91,8 @@ bn instance clear
 
 Spawn naming is separate from routing: `bn session start /path/to/bin --instance-id myid` names the new bridge; subsequent commands use `bn -i myid …` to talk to it.
 
+`BN_CACHE_DIR` moves more than the database cache: the instance registry (`instances/`) and the sticky `instance use` / `target use` pins live under it too. A bridge started with it set is only visible to bn commands run with the same value, so set it on every command (in a harness where each shell call is fresh, export it per call or wrap `bn`). When an id is missing from the searched registry but registered under another root, the error names that root and the `export BN_CACHE_DIR=…` that reaches it. With exactly one bridge running and no `-i`, commands use it from any directory; `target list` / `target info` name the answering instance, and stderr notes when that bridge is not associated with the current project.
+
 `bn load` and `bn close` are available for dynamic binary management (useful in headless, but also work with the GUI bridge). All commands work identically in GUI and headless mode.
 
 If exactly one BinaryView is open, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`, or pin one with `bn target use <selector>` (and `bn target clear` to undo).
@@ -107,6 +111,7 @@ Ready immediately after `--quick`:
 Need `bn refresh` first — these depend on the analysis pass:
 
 - `bn strings` **errors** until you refresh — it refuses with "Strings are not available: this target was loaded with --quick (no analysis). Run bn refresh …" rather than return an empty list that looks like "this binary has no strings".
+  While a `bn refresh` is already analysing that target, the refusal says `… full analysis is in progress (N/M), started Ns ago by bn refresh. Retry when it finishes -- do not start another refresh.` instead; wait rather than start a second refresh.
 - `bn function list` / `bn function search` return a **partial** set — only entry-point and symbol functions exist before analysis; the count grows once the analysis pass recovers the rest.
 - `bn decompile` / `bn il` / `bn disasm` / `bn xrefs` across the binary are partial for the same reason (functions BN hasn't discovered yet aren't there to read).
 - Every mutation, `bn go rename` included, **refuses** with `invalid_request` (exit 3) until you refresh: mutations reanalyze under the write lock, and `go rename` would only see the few functions a quick view defines.
@@ -212,6 +217,8 @@ summary: kind=object count=3
 The only exception is `bn bundle function`, which writes the bundle artifact from inside the bridge and prints the envelope back to the CLI.
 
 `bn function list` and `bn function search` return the full matching set for the selected target or address range, and by default that full set goes to stdout — `bn` writes nothing to disk unless you ask it to. Spilling is opt-in: set `BN_SPILL_TOKENS=<positive N>` to divert any result over N estimated tokens to an artifact, in which case stdout carries the compact envelope above (with `spilled: true`) and stderr a short warning naming the path. Any other value — unset, empty, `0`, negative, non-numeric — means no spill, so a typo cannot silently re-arm disk output; `--out <path>` writes the body wherever you name regardless. With spilling off, a payload over 10 000 estimated tokens still draws one stderr `note:` naming that command's own slicing flag (`--limit`/`--offset` for lists, `--lines` for `decompile`/`il`/`disasm`), because what truncates a long payload then is the consuming agent's harness rather than `bn`.
+
+The note is skipped when stdout is redirected to a regular file (`> out.json`) or `/dev/null`: nothing there lands in an agent's context. A pipe keeps it, because an agent harness captures stdout through a pipe too and `bn` cannot tell that pipe from `| jq`.
 
 ## Extraction Commands
 

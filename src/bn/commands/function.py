@@ -703,7 +703,9 @@ def _function_cfg(args: argparse.Namespace) -> int:
                  help="Struct field xref spec (e.g., TrackRowCell.tile_type)"),
              arg("--any", nargs="+", dest="any_symbols", metavar="SYMBOL",
                  help="Batch-probe several symbols (a sink sweep); absent symbols are "
-                      "reported, not errors"),
+                      "reported, not errors. Rows carry counts only: for string "
+                      "addresses, `bn strings --with-xrefs` lists the referencing "
+                      "functions"),
              arg("--fn-pointer-scan", action="store_true",
                  help="Also scan stored function pointers for references"),
              mangled_arg(),
@@ -1225,6 +1227,7 @@ def _evidence_init(args: argparse.Namespace) -> int:
                       "intra mode (this flag off), for a call in the same function."),
              arg("--ip-depth", type=_depth_int, default=2,
                  help="Max call depth for interprocedural tracing (default: 2; 0 disables crossing)"),
+             mangled_arg(),
          ],
          estimable=True)
 def _trace(args: argparse.Namespace) -> int:
@@ -1241,6 +1244,6 @@ def _trace(args: argparse.Namespace) -> int:
             "ip_depth": args.ip_depth,
         },
         require_target=True,
-        text_renderer=_render_trace_text,
+        text_renderer=lambda v: _render_trace_text(v, mangled=args.mangled),
         stem="trace",
     )

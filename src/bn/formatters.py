@@ -962,6 +962,12 @@ def _render_proto_text(value: Any) -> str:
     width_note += "".join(f"\n\nnote: {n}" for n in split_notes)
     fn = value.get("function")
     name = fn.get("name") if isinstance(fn, dict) else None
+    # #999 item 3: the declaration splices the SYMBOL name (a mangled C++ name
+    # is a valid C declarator; `ns::Cls::run(` is not), so the demangled name
+    # `decompile` shows goes on a comment line above it instead.
+    display = _text_value(fn, "display_name") if isinstance(fn, dict) else None
+    if display and display != name:
+        note += f"// {display}\n"
     head, sep, rest = prototype.partition("(")
     if name and sep:
         head = head.rstrip()
@@ -1395,6 +1401,9 @@ def _render_session_start_text(value: Any) -> str:
         f"pid: {value.get('pid', '<unknown>')}",
         f"socket: {value.get('socket_path', '<unknown>')}",
     ]
+    # #992: which checkout this bridge runs.
+    if value.get("source_dir"):
+        lines.append(f"source: {value['source_dir']}")
     loaded = _field_list(value, "loaded")
     if loaded:
         lines.append("")
@@ -1423,7 +1432,13 @@ def _render_session_start_text(value: Any) -> str:
                 else:
                     mark = "  [not analyzed]" if item.get("analyzed") is False else ""
                     lines.append(f"- {item.get('path', '<unknown>')}{mark}")
-                    for tgt in _field_list(item, "targets"):
+                    # #996: the target THIS load opened. `targets` is every open
+                    # view, so listing it repeated earlier binaries' selectors
+                    # under later paths; an older bridge without `target` keeps
+                    # the full list.
+                    own = _field_dict(item, "target")
+                    rows = [own] if own else _field_list(item, "targets")
+                    for tgt in rows:
                         if isinstance(tgt, dict) and tgt.get("selector"):
                             lines.append(
                                 f"  target: {tgt['selector']}"
@@ -1547,6 +1562,9 @@ def _render_session_list_text(value: Any) -> str:
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
+        # #992: which checkout this bridge runs.
+        if item.get("source_dir"):
+            lines.append(f"  source: {item['source_dir']}")
         binaries = _field_list(item, "binaries")
         if binaries:
             lines.append(f"  open: {', '.join(str(b) for b in binaries)}")
@@ -1635,6 +1653,10 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         lines[0] += " [unsaved]"
 
     details = [
+        # #996: which bridge answered. `target info` stamps it on the one row;
+        # `target list` puts it on the envelope (one header line), so a row
+        # without the key renders as before.
+        ("instance", value.get("instance")),
         ("target", value.get("target_id")),
         ("view", value.get("view_id")),
         ("kind", value.get("view_name")),
@@ -1757,12 +1779,14 @@ def _render_target_list_text(value: Any) -> str:
         items = value
     if not isinstance(items, list):
         return _render_fallback_text(value)
-    if not items:
-        return _empty_result("targets")
-    return "\n\n".join(
+    body = "\n\n".join(
         _render_target_summary(item) if isinstance(item, dict) else _render_fallback_text(item)
         for item in items
-    )
+    ) if items else _empty_result("targets")
+    # #996: the answering instance, once, above the rows it owns -- an empty
+    # listing included, since "which bridge has nothing open" is the question.
+    instance = _text_value(value, "instance") if isinstance(value, dict) else None
+    return f"instance: {instance}\n{body}" if instance else body
 
 
 @_discloses
@@ -2754,11 +2778,15 @@ def _xref_buckets(value: dict[str, Any]) -> tuple[list[Any], list[Any], int, int
 @_discloses
 def _render_xrefs_any_text(value: Any) -> str:
     """Render the multi-symbol sink-sweep (`xrefs --any`): one line per symbol,
-    present (with counts) or absent (#218)."""
+    present (with counts) or absent (#218). When a probed symbol is a string
+    address, close with a pointer to `strings --with-xrefs`: these rows only
+    count the referencing functions, and agents mapping strings to functions
+    otherwise loop `xrefs` once per address (#1002)."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     syms = _field_list(value, "items")  # #275: was `symbols`
     lines = [f"xrefs --any: {value.get('present', 0)}/{value.get('count', len(syms))} symbol(s) present"]
+    string_targets = 0
     for s in syms:
         if not isinstance(s, dict):
             continue
@@ -2766,8 +2794,15 @@ def _render_xrefs_any_text(value: Any) -> str:
             lines.append(
                 f"  {s.get('symbol')}: {s.get('code_ref_count', 0)} code refs across "
                 f"{s.get('caller_function_count', 0)} fn(s)  @ {s.get('address', '?')}")
+            if s.get("target_kind") == "string":
+                string_targets += 1
         else:
             lines.append(f"  {s.get('symbol')}: absent")
+    if string_targets:
+        lines.append(
+            f"tip: {string_targets} probed address(es) point into strings; "
+            "`bn strings --query <text> --with-xrefs` names the functions "
+            "referencing every matching string in one call")
     return "\n".join(lines)
 
 
@@ -4275,8 +4310,9 @@ def _render_values_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_leaf_line(leaf: Any) -> str:
-    """One text line for a single unresolved-frontier leaf."""
+def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
+    """One text line for a single unresolved-frontier leaf. A callee/function is
+    named by its demangled display name unless ``mangled`` (#1001 item 4)."""
     if not isinstance(leaf, dict):
         return f"  {leaf!r}"
     kind = leaf.get("kind")
@@ -4285,7 +4321,7 @@ def _render_leaf_line(leaf: Any) -> str:
         args = _field_list(leaf, "tainted_args")
         return (
             f"  unmodeled_callee @ {leaf.get('address')}"
-            f"  -> {cal.get('name', '?')} @ {cal.get('address', '?')}"
+            f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
             f"  (tainted arg(s) {args})"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
@@ -4310,7 +4346,7 @@ def _render_leaf_line(leaf: Any) -> str:
         cal = _field_dict(leaf, "callee")
         return (
             f"  arg_under_recovered @ {leaf.get('address')}"
-            f"  -> {cal.get('name', '?')} @ {cal.get('address', '?')}"
+            f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
             f"  (recovered {leaf.get('recovered_params', '?')} param(s); "
             f"dropped arg(s) {_field_list(leaf, 'dropped_args')})"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
@@ -4319,7 +4355,7 @@ def _render_leaf_line(leaf: Any) -> str:
         fn = _field_dict(leaf, "function")
         return (
             f"  caller_sites_truncated @ {leaf.get('address')}"
-            f"  -> {fn.get('name', '?')} @ {fn.get('address', '?')}"
+            f"  -> {_shown_name(fn, mangled=mangled) or '?'} @ {fn.get('address', '?')}"
             f"  ({leaf.get('callers_followed', '?')} of {leaf.get('callers_total', '?')} "
             f"caller(s) followed; {leaf.get('callers_dropped', '?')} dropped)"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
@@ -4350,7 +4386,7 @@ def _leaf_group_key(leaf: Any) -> tuple:
     return (kind,)
 
 
-def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12) -> list[str]:
+def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12, mangled: bool = False) -> list[str]:
     """Render unresolved leaves grouped by kind/callee with counts and a top-N
     cap (full detail stays in --format json) so real binaries don't flood the
     text output with a wall of near-identical leaves (#160)."""
@@ -4374,7 +4410,7 @@ def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12) -> list[str]:
     out = [hdr]
     for gk in order[:top_n]:
         g = groups[gk]
-        line = _render_leaf_line(g["rep"])
+        line = _render_leaf_line(g["rep"], mangled=mangled)
         if g["count"] > 1:
             # Spelled out, never `x{count}`: on AArch64 `x3` is a register (#959).
             line += f"  [{g['count']} leaves]"
@@ -4481,7 +4517,28 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
     trunc = _taint_truncation_note(stats)
     if findings:
         sinks = [_field_dict(f, "sink") for f in findings]
-        classes = ", ".join(sorted({str(s.get("class") or "?") for s in sinks}))
+        # #1001 item 1: a sink reached through a dropped ABI register, or one
+        # whose model declares an arg BN's prototype dropped (an arity
+        # mismatch), is counted like any other, and its class says how many of
+        # its rows rest on the register / on a prototype missing model args.
+        abi: dict[str, int] = {}
+        mismatch: dict[str, int] = {}
+        for s in sinks:
+            cls = str(s.get("class") or "?")
+            if s.get("via") == "abi_register":
+                abi[cls] = abi.get(cls, 0) + 1
+            elif _field_dict(s, "arity_mismatch"):
+                mismatch[cls] = mismatch.get(cls, 0) + 1
+
+        def _marks(cls: str) -> str:
+            parts: list[str] = []
+            if cls in abi:
+                parts.append(f"{abi[cls]} via ABI register")
+            if cls in mismatch:
+                parts.append(f"{mismatch[cls]} arity mismatch")
+            return f"[{', '.join(parts)}]" if parts else ""
+        classes = ", ".join(cls + _marks(cls)
+                            for cls in sorted({str(s.get("class") or "?") for s in sinks}))
         return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
     if leaves:
         return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
@@ -4518,18 +4575,47 @@ def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | No
     return ("via: " + " → ".join(chain)) if len(chain) >= 2 else None
 
 
-def _render_flow_line(f: dict[str, Any]) -> str:
+def _render_flow_line(f: dict[str, Any], *, mangled: bool = False) -> str:
     """One compact line for a forward finding: sink + address + arg + grouping
-    signature + structural metrics. The full SSA path is shown only under --full."""
+    signature + structural metrics. The full SSA path is shown only under --full.
+    The sink callee is its demangled display name unless ``mangled`` (#1001)."""
     sink = _field_dict(f, "sink")
     ai = sink.get("tainted_arg_index")
-    arg = f" (arg {ai})" if ai is not None else ""
+    arg = ""
+    if ai is not None:
+        # #1001 item 1: a sink reached through a dropped ABI register says so
+        # on its own row, not only in a frontier further down.
+        arity = _field_dict(sink, "arity_mismatch")
+        via = (f" via {arity.get('register') or 'ABI register'}, arity mismatch"
+               if sink.get("via") == "abi_register"
+               else (", arity mismatch" if arity else ""))
+        arg = f" (arg {ai}{via})"
     m = _field_dict(f, "metrics")
-    sig = _field_dict(f, "signature").get("rendered", "")
+    sig = _signature_text(_field_dict(f, "signature"), mangled=mangled)
     unresolved = "y" if m.get("traverses_unresolved") else "n"
     facts = f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} unresolved={unresolved}}}"
-    head = f"[{sink.get('class') or '?'}] {sink.get('callee', '?')} @ {sink.get('address')}{arg}"
+    callee = _sink_callee_text(sink, mangled=mangled) or "?"
+    head = f"[{sink.get('class') or '?'}] {callee} @ {sink.get('address')}{arg}"
     return f"  {head}   {sig}   {facts}".rstrip()
+
+
+def _sink_callee_text(sink: dict[str, Any], *, mangled: bool = False) -> Any:
+    """A taint sink's callee as text prints it (#1001 item 4): the demangled
+    display name, or under ``--mangled`` the real raw symbol -- not the model
+    key, which drops a C++ symbol's leading underscore. Falls back to the key
+    (an older bridge, or no symbol by that name)."""
+    return _shown_name(sink, mangled=mangled,
+                       name_key="callee_symbol" if mangled and sink.get("callee_symbol") else "callee",
+                       display_key="callee_display_name")
+
+
+def _signature_text(sig: dict[str, Any], *, mangled: bool = False) -> str:
+    """A flow signature as text prints it (#1001 item 4): demangled names, or
+    under ``--mangled`` the real raw symbols -- the same spelling the row's sink
+    head uses, not the model key `rendered` groups by. Falls back to
+    `rendered` for an older bridge."""
+    key = "rendered_symbol" if mangled and sig.get("rendered_symbol") else "rendered"
+    return _shown_name(sig, mangled=mangled, name_key=key, display_key="rendered_display") or ""
 
 
 def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
@@ -4628,12 +4714,13 @@ def _render_backward_diagnostics(diag: dict[str, Any]) -> list[str]:
 
 
 @_discloses
-def _render_taint_text(value: Any, full: bool = False) -> str:
+def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
     direction = value.get("direction", "forward")
-    lines = [f"{direction} taint in {fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
+    lines = [f"{direction} taint in {_shown_name(fn, mangled=mangled) or '<unknown>'} "
+             f"@ {fn.get('address', '<unknown>')}"]
 
     if direction == "forward":
         srcs = _field_list(value, "sources")
@@ -4669,7 +4756,25 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                 if not isinstance(f, dict):
                     lines.append(f"  {f!r}")
                     continue
-                lines.append(_render_flow_line(f))
+                lines.append(_render_flow_line(f, mangled=mangled))
+                # #1001 item 1: the arity mismatch behind the sink, that its
+                # class is the model's own and unproven, and the command that
+                # settles it, on the compact view.
+                _arity = _field_dict(_field_dict(f, "sink"), "arity_mismatch")
+                if _arity:
+                    _ref = _text_value(_arity, "callee_ref")
+                    _reg = _text_value(_arity, "register")
+                    _basis = (
+                        "class from the recovered args only, without the dropped ones"
+                        if _text_value(_arity, "class_from") == "recovered_args"
+                        else "class unproven (the model's own)")
+                    lines.append(
+                        f"      {_basis}: BN recovered "
+                        f"{_arity.get('recovered', '?')} param(s) for this call and dropped the "
+                        f"model's arg(s) {_field_list(_arity, 'dropped')}"
+                        + (f"; the tainted arg was read from ABI register {_reg}" if _reg else "")
+                        + (f" -- fix the prototype (`bn proto get {_ref}`, then `bn proto set`) "
+                           "and re-run" if _ref else " -- the call target did not resolve"))
                 # #980: a finding whose class differs from its catalog entry says
                 # so, and why, on the compact view -- `taint models` lists the
                 # call as `[overflow_len] memcpy`, and two names for one sink with
@@ -4706,7 +4811,7 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             sink = _field_dict(sl, "sink")
             origin = _field_dict(sl, "origin")
             m = _field_dict(sl, "metrics")
-            sig = _field_dict(sl, "signature").get("rendered", "")
+            sig = _signature_text(_field_dict(sl, "signature"), mangled=mangled)
             n = sl.get("reached_via_call_sites", 1)
             xn = (f"  (reached via {n} callsites)"
                   if isinstance(n, int) and not isinstance(n, bool) and n > 1 else "")
@@ -4716,13 +4821,13 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             # per-(seed,sink,origin) call-site count. --full shows origin/crosses/steps.
             lines.append(
                 f"  [{sink.get('class') or sink.get('kind') or '?'}] "
-                f"{sink.get('callee') or sink.get('kind') or '?'} @ {sink.get('address')} "
+                f"{_sink_callee_text(sink, mangled=mangled) or sink.get('kind') or '?'} @ {sink.get('address')} "
                 f"(seed {sink.get('seed', '?')})   {sig}   "
                 f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} "
                 f"unresolved={unresolved}}}{xn}".rstrip())
             if full:
                 lines.append(
-                    f"  slice for {sink.get('callee') or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
+                    f"  slice for {_sink_callee_text(sink, mangled=mangled) or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
                 )
                 _ok = origin.get("kind")
                 if _ok == "constant" and origin.get("value") is not None:
@@ -4730,7 +4835,9 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                     _vs = f"{_val:#x}" if isinstance(_val, int) else str(_val)
                     _extra = _vs + (f" ({origin['var']})" if origin.get("var") else "")
                 else:
-                    _extra = origin.get("callee") or origin.get("var") or origin.get("address") or ""
+                    _extra = (((sl.get("origin_callee_display_name") if not mangled else None)
+                               or origin.get("callee"))
+                              or origin.get("var") or origin.get("address") or "")
                 _spill = " (via spill)" if origin.get("via_spill") else ""
                 lines.append(f"  origin: {_ok} {_extra}{_spill}".rstrip())
                 crossed = _field_list(sl, "crossed_functions")
@@ -4778,7 +4885,8 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             bleaves = _field_list(br, "leaves")
             if bsinks:
                 desc = ", ".join(
-                    f"{_field_dict(s, 'sink').get('class', '?')} {_field_dict(s, 'sink').get('callee', '?')}"
+                    f"{_field_dict(s, 'sink').get('class', '?')} "
+                    f"{_sink_callee_text(_field_dict(s, 'sink'), mangled=mangled) or '?'}"
                     for s in bsinks)
             else:
                 desc = "no sinks"
@@ -4805,7 +4913,7 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
     leaves = _field_list(value, "leaves")
     if leaves:
         lines.append("")
-        lines.extend(_render_grouped_leaves(leaves))
+        lines.extend(_render_grouped_leaves(leaves, mangled=mangled))
     assumptions = _field_list(value, "assumptions")
     if assumptions:
         lines.append("")
@@ -5588,13 +5696,27 @@ def _render_doctor_text(value: Any) -> str:
             bn_build = item.get("bn_build_id")
             suffix = f" (build {bn_build})" if bn_build else ""
             lines.append(f"  binary ninja: {bn_version}{suffix}")
+        # #992: the checkout this bridge's code came from.
+        if item.get("bridge_source_dir"):
+            lines.append(f"  source: {item['bridge_source_dir']}")
+        if item.get("other_checkout"):
+            lines.append(
+                "  note: bridge built from another checkout: "
+                f"{item.get('bridge_source_dir')} (this CLI runs "
+                f"{value.get('plugin_source_dir', '<unknown>')}); its build is not "
+                "compared with this CLI's. `bn session restart "
+                + str(item.get("instance_id") or "<id>")
+                + "` from this CLI would respawn it on this CLI's checkout")
         if item.get("stale_plugin_version"):
             lines.append("  stale: loaded plugin version differs from CLI version")
+        # The reference differs by kind (#992): a GUI bridge loads the installed
+        # plugin file, a headless one this CLI's own source.
+        reference = "installed plugin file" if item.get("gui", True) else "this CLI's source"
         if item.get("stale_plugin_code"):
-            lines.append("  stale: loaded plugin code does not match installed plugin file")
+            lines.append(f"  stale: loaded plugin code does not match {reference}")
         if item.get("stale_engine"):
             lines.append(
-                "  stale: loaded engine code (taint/IL modules) is out of date -- "
+                f"  stale: loaded engine code (taint/IL modules) does not match {reference} -- "
                 "run `bn session restart " + str(item.get("instance_id") or "<id>") + "`")
         if item.get("started_at"):
             lines.append(f"  started: {item['started_at']}")
@@ -6052,6 +6174,7 @@ def _build_mutation_summary(
     overlapping_functions: Sequence[dict[str, Any]] = (),
     declared_types: dict[str, Any] | None = None,
     fallthrough_entries: Sequence[dict[str, Any]] = (),
+    preview_skipped: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -6197,6 +6320,12 @@ def _build_mutation_summary(
         # instruction runs straight into -- likely mid-function. Conditional
         # like the keys above; the row's `note` carries the sentence.
         summary["fallthrough_entries"] = list(fallthrough_entries)
+    if preview_skipped:
+        # #999 item 5: a --preview that left ops out (a prototype it cannot
+        # revert, and the ops that depend on it) previewed only the rest, and
+        # the counts above say nothing about the ops it skipped. Conditional
+        # like the keys above: a preview that covered every op has none.
+        summary["preview_skipped"] = list(preview_skipped)
     return summary
 
 
@@ -6373,6 +6502,8 @@ def _mutation_summary(value: Any) -> Any:
             for r in results if r.get("status") in ("verified", "rollback_failed")
             and _text_value(r, "fallthrough_from")
         ],
+        preview_skipped=[row for row in _row_list(value, "preview_skipped")
+                         if isinstance(row, dict)],
     )
 
 
@@ -6711,6 +6842,16 @@ def _render_mutation_summary_text(value: Any) -> str:
                 "skipped_interior_pc", "skipped_changed_during_apply",
             )
         )
+    if _field_declared(value, "preview_skipped"):
+        # #999 item 5: one line per op the preview left out, so the line above
+        # is never read as covering the whole batch.
+        for row in _field_list(value, "preview_skipped"):
+            if not isinstance(row, dict):
+                continue
+            reason = _text_value(row, "reason") or ""
+            reason = reason.removeprefix("not previewed: ")
+            line += (f"\nnot previewed: op {row.get('index')} {_text_value(row, 'op') or '?'}"
+                     + (f" -- {reason}" if reason else ""))
     if value.get("measured") is False:
         # #684 review: `dirty_after` is no longer "UNKNOWN" here -- it is a
         # fail-safe True (see _mutation_summary) precisely so a naive
@@ -6914,17 +7055,33 @@ def _render_skill_install_text(value: Any) -> str:
 
     installed = _field_list(value, "installed_destinations")
     skipped = _field_list(value, "skipped_destinations")
+    not_updated = [row for row in _field_list(value, "not_updated_destinations")
+                   if isinstance(row, dict)]
+    # A list, not a set: membership must not hash wire values (#619).
+    not_updated_paths = [row.get("destination") for row in not_updated]
+    up_to_date = [dest for dest in skipped if dest not in not_updated_paths]
     lines = []
 
     if installed:
         lines.append(f"Installed skills ({value.get('mode', 'unknown')}):")
         lines.extend(f"- {dest}" for dest in installed)
-    else:
+    elif not not_updated:
         lines.append("Skills already installed.")
 
-    if skipped:
-        lines.append("Skipped existing destinations:")
-        lines.extend(f"- {dest}" for dest in skipped)
+    if up_to_date:
+        lines.append("Already up to date:")
+        lines.extend(f"- {dest}" for dest in up_to_date)
+
+    # #1002: these were left alone and are NOT this install -- a link into a
+    # previous checkout, dangling, another mode, or a foreign directory. Never
+    # "installed". One closing note about --force, not a per-row verdict.
+    if not_updated:
+        lines.append("Not updated, existing destination differs from the requested install:")
+        lines.extend(f"- {row.get('destination')} ({row.get('detail')})"
+                     for row in not_updated)
+        force_note = _text_value(value, "force_note")
+        if force_note:
+            lines.append(force_note)
 
     return "\n".join(lines) + "\n"
 
@@ -6947,14 +7104,19 @@ _TRACE_REASON_LABELS: dict[str, str] = {
     # mode.
     "interprocedural_out_param_not_followed": "out-param fill not followed",
     "out_param_not_followed": "out-param fill not followed",
+    # #1001 item 2: the value is a pointer to a stack object; the stores into
+    # that object are what the call consumes, and trace does not follow them.
+    "address_of_local": "address of local (stores into it not followed)",
 }
 
 
 @_discloses
-def _render_trace_text(value: Any) -> str:
+def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    fn_name = value.get("function", "<unknown>")
+    # #1001 item 4: the demangled display name `decompile` prints, unless --mangled.
+    fn_name = _shown_name(value, mangled=mangled, name_key="function",
+                          display_key="function_display_name") or "<unknown>"
     fn_addr = value.get("function_address", "<unknown>")
     target_addr = value.get("target_address", "<unknown>")
     # `_stated_count`, not a bare `.get`: the int sibling of the `_text_value`
@@ -7010,7 +7172,9 @@ def _render_trace_text(value: Any) -> str:
     # (#858 review round 3 minor).
     label_callee = _text_value(arg_lbl, "callee")
     top_callee = _text_value(value, "callee")
-    callee_name = label_callee or top_callee
+    shown_callee = _text_value(arg_lbl, "callee_display_name")
+    callee_name = ((shown_callee if not mangled else None)
+                   or label_callee or top_callee)
     if callee_name:
         arg_desc += f" of {callee_name}"
     elif computed:
@@ -7060,12 +7224,16 @@ def _render_trace_text(value: Any) -> str:
 
         if cross_fn:
             callee = step.get("callee", "")
-            lines.append(f"  ── enters {callee} ──")
+            shown = _shown_name(step, mangled=mangled, name_key="callee",
+                                display_key="callee_display_name") or callee
+            lines.append(f"  ── enters {shown} ──")
             current_fn = callee
             continue
 
         if fn_ctx and fn_ctx != current_fn:
-            lines.append(f"  ── in {fn_ctx} ──")
+            shown = _shown_name(step, mangled=mangled, name_key="function_context",
+                                display_key="function_context_display_name") or fn_ctx
+            lines.append(f"  ── in {shown} ──")
             current_fn = fn_ctx
 
         if terminates:
@@ -7074,10 +7242,12 @@ def _render_trace_text(value: Any) -> str:
             # Name the resolved callee at a call boundary so a library-call origin
             # reads as `call boundary (strlen)` not a bare PLT address (#193).
             if reason == "call_or_jump_boundary" and step.get("callee"):
-                line += f" ({step['callee']})"
+                line += f" ({_shown_name(step, mangled=mangled, name_key='callee', display_key='callee_display_name')})"
             if (reason in ("interprocedural_out_param_not_followed", "out_param_not_followed")
                     and step.get("out_param_callee")):
-                line += f" (via {step['out_param_callee']})"
+                _fill = _shown_name(step, mangled=mangled, name_key="out_param_callee",
+                                    display_key="out_param_callee_display_name")
+                line += f" (via {_fill})"
             if reason == "function_parameter":
                 slot = _trace_param_slot(step)
                 if slot:
@@ -7100,7 +7270,7 @@ def _render_trace_text(value: Any) -> str:
     # backward trace byte-identically to one whose frontier was genuinely empty,
     # so the terminal steps a reader uses to judge the slice went missing with
     # no note (#619).
-    lines.extend(_render_trace_frontiers(_field_list(value, "frontiers")))
+    lines.extend(_render_trace_frontiers(_field_list(value, "frontiers"), mangled=mangled))
     assumptions = [a for a in _field_list(value, "assumptions") if a]
     if assumptions:
         lines.append("")
@@ -7129,7 +7299,7 @@ def _trace_param_slot(step: Any) -> str:
     return ", ".join(parts)
 
 
-def _render_trace_frontiers(frontiers: Any) -> list[str]:
+def _render_trace_frontiers(frontiers: Any, *, mangled: bool = False) -> list[str]:
     """Concise top-level roll-up of where the slice stopped (#552): one line per
     reason group with its count and a couple of examples. A factual summary of
     stopping conditions, not a verdict."""
@@ -7152,7 +7322,9 @@ def _render_trace_frontiers(frontiers: Any) -> list[str]:
         for ex in (_field_list(g, "examples")):
             if not isinstance(ex, dict):
                 continue
-            nm = ex.get("callee") or ex.get("out_param_callee")
+            nm = ((ex.get("callee_display_name") if not mangled else None) or ex.get("callee")
+                  or (ex.get("out_param_callee_display_name") if not mangled else None)
+                  or ex.get("out_param_callee") or ex.get("local"))
             if not nm and reason == "function_parameter":
                 slot = _trace_param_slot(ex)
                 var = str(ex.get("ssa_label") or "").split("#", 1)[0]

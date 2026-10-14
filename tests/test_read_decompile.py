@@ -2913,6 +2913,139 @@ def test_backward_slice_arg_label_and_output_pointer_hint(monkeypatch):
     assert "pointer" in result["hints"][0]
 
 
+def _addr_of_local_call_fixture(monkeypatch, *, callee):
+    """run_tool: x1 = &var_68; <callee>(path, x1) -- `&local` arriving through a
+    register copy, as on AArch64. `callee` names the call target, or None for an
+    unresolved (indirect) call."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    var_68 = types.SimpleNamespace(name="var_68")
+    x1 = _FakeSSAVariable("x1_9#20")
+    addr_def = _FakeMLILInsn(
+        0x4017f0, operation="MLIL_SET_VAR_SSA", vars_written=[x1],
+        src=_FakeMLILInsn(0x4017f0, operation="MLIL_ADDRESS_OF", src=var_68))
+    call_insn = _FakeMLILInsn(
+        0x401804, operation="MLIL_CALL_SSA", vars_read=[x1],
+        dest=_FakeConstPtr(0x401100) if callee else None,
+        params=[_FakeMLILInsn(0x401804, operation="MLIL_CONST_PTR", constant=0x401d30),
+                _FakeMLILInsn(0x401804, operation="MLIL_VAR_SSA", vars_read=[x1])])
+    fn = _FakeFunction(0x401660, "run_tool")
+    fn.medium_level_il = _FakeMLILFunction([addr_def, call_insn], definitions={x1: addr_def})
+    functions = [fn] + ([_FakeFunction(0x401100, callee)] if callee else [])
+    bv = _FakeBV(functions=functions)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return instance._backward_slice("active", "run_tool", "0x401804", arg_index=1)
+
+
+@pytest.mark.parametrize("callee, source", [
+    ("execv", "arg:execv:1"),       # no model sources: `call:execv` would exit 2
+    ("read", "call:read"),          # a source model: `call:` seeds its outputs
+])
+def test_backward_slice_address_of_local_via_register_copy_1001(monkeypatch, callee, source):
+    """#1001 item 2: on AArch64 `&local` reaches the call through a register
+    copy (`x1 = &var_68; execv(path, x1)`), so the #166 check on the call
+    parameter never fired and the slice stopped after one plain definition with
+    no frontier, caveat or hint. The definition is now the frontier, named, and
+    the hint names commands that run as printed (#1001 review)."""
+    from bn import formatters
+    result = _addr_of_local_call_fixture(monkeypatch, callee=callee)
+
+    step = result["trace"][0]
+    assert (step["reason"], step["terminates"], step["local"]) == ("address_of_local", True, "var_68")
+    assert [(g["reason"], g["count"], g["examples"][0]["local"]) for g in result["frontiers"]] == [
+        ("address_of_local", 1, "var_68")]
+    assert any("address of local var_68" in a for a in result["assumptions"]), result["assumptions"]
+    hint = next(h for h in result["hints"] if "var_68" in h)
+    assert f"`bn taint backward -f 0x401660 --sink arg:{callee}:1`" in hint
+    assert f"`bn taint forward -f 0x401660 --source {source}`" in hint
+    text = formatters._render_trace_text(result)
+    assert "address of local (stores into it not followed)  [1 step] (var_68)" in text
+
+
+def test_address_of_local_hint_prints_no_command_for_an_unresolved_callee_1001(monkeypatch):
+    """An indirect call has no name an `arg:` locator could use; a printed
+    `--sink arg:<callee>:N` fails, so the hint prints no command at all."""
+    result = _addr_of_local_call_fixture(monkeypatch, callee=None)
+    hint = next(h for h in result["hints"] if "var_68" in h)
+    assert "did not resolve" in hint
+    assert "`bn taint" not in hint and "<callee>" not in hint
+    # The one command it does print runs as printed (a bare `bn decompile` exits 2).
+    assert "`bn decompile 0x401660`" in hint
+
+
+@pytest.mark.parametrize("arg_index, source", [
+    (1, "call:recvfrom"),          # the model sources *arg:1, the payload buffer
+    (5, "arg:recvfrom:5"),         # addrlen: `call:recvfrom` would not seed it
+])
+def test_address_of_local_hint_uses_call_only_for_a_modeled_output_1001(monkeypatch, arg_index, source):
+    """#1001 review round 2: `call:<callee>` seeds what the callee's model
+    declares it writes, so it is the forward source only for an argument the
+    model writes; any other address-of argument is seeded as itself."""
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    hint = rts._address_of_local_hint(arg_index, "addr", {"callee": "recvfrom"},
+                                      types.SimpleNamespace(start=0x4007c0))
+    assert f"`bn taint forward -f 0x4007c0 --source {source}`" in hint
+
+
+def test_value_loaded_from_a_local_is_not_called_its_address_1001(monkeypatch):
+    """#1001 review: `p = c ? &a : &b; puts(p[1])` -- the argument is a value
+    computed FROM the locals, not the address of either. The frontier still
+    names both locals; the "arg is the address of local" hint must not fire."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    pa, pb = _FakeSSAVariable("x0_1#2"), _FakeSSAVariable("x0_1#3")
+    p, x0 = _FakeSSAVariable("x0_1#4"), _FakeSSAVariable("x0_2#5")
+    defs = {
+        pa: _FakeMLILInsn(0x4008c0, operation="MLIL_SET_VAR_SSA", vars_written=[pa],
+                          src=_FakeMLILInsn(0x4008c0, operation="MLIL_ADDRESS_OF",
+                                            src=types.SimpleNamespace(name="var_28"))),
+        pb: _FakeMLILInsn(0x4008c8, operation="MLIL_SET_VAR_SSA", vars_written=[pb],
+                          src=_FakeMLILInsn(0x4008c8, operation="MLIL_ADDRESS_OF",
+                                            src=types.SimpleNamespace(name="var_38"))),
+        p: _FakeMLILInsn(0x4008d0, operation="MLIL_VAR_PHI", vars_read=[pa, pb]),
+        x0: _FakeMLILInsn(0x4008e8, operation="MLIL_SET_VAR_SSA", vars_written=[x0],
+                          vars_read=[p],
+                          src=_FakeMLILInsn(0x4008e8, operation="MLIL_ADD", vars_read=[p])),
+    }
+    call_insn = _FakeMLILInsn(
+        0x4008f0, operation="MLIL_CALL_SSA", vars_read=[x0],
+        params=[_FakeMLILInsn(0x4008f0, operation="MLIL_VAR_SSA", vars_read=[x0])])
+    fn = _FakeFunction(0x4008a0, "sel")
+    fn.medium_level_il = _FakeMLILFunction(list(defs.values()) + [call_insn], definitions=defs)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _FakeBV(functions=[fn]))
+
+    result = instance._backward_slice("active", "sel", "0x4008f0", arg_index=0)
+
+    assert sorted(s["local"] for s in result["trace"] if s.get("reason") == "address_of_local") == [
+        "var_28", "var_38"]
+    assert not any("is the address of" in h for h in result["hints"]), result["hints"]
+
+
+def test_backward_slice_plain_copy_is_not_an_address_of_local_1001(monkeypatch):
+    """Must-not-fire twin: an ordinary register copy stays a non-terminal
+    `definition` step and adds no address-of hint or caveat."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    x1 = _FakeSSAVariable("x1#2")
+    x8 = _FakeSSAVariable("x8#1")
+    copy_def = _FakeMLILInsn(0x4010, operation="MLIL_SET_VAR_SSA", vars_written=[x1],
+                             vars_read=[x8],
+                             src=_FakeMLILInsn(0x4010, operation="MLIL_VAR_SSA", vars_read=[x8]))
+    call_insn = _FakeMLILInsn(
+        0x4020, operation="MLIL_CALL_SSA", vars_read=[x1],
+        params=[_FakeMLILInsn(0x4020, operation="MLIL_VAR_SSA", vars_read=[x1])])
+    fn = _FakeFunction(0x4000, "f")
+    fn.medium_level_il = _FakeMLILFunction([copy_def, call_insn], definitions={x1: copy_def})
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._backward_slice("active", "f", "0x4020", arg_index=0)
+
+    assert (result["trace"][0]["reason"], result["trace"][0]["terminates"]) == ("definition", False)
+    assert not any("address of" in h for h in result["hints"]), result["hints"]
+    assert not any("address of local" in a for a in result["assumptions"]), result["assumptions"]
+
+
 def test_backward_slice_no_call_at_address(monkeypatch):
     """Address with no call instruction should raise."""
     bridge = _load_bridge(monkeypatch)
