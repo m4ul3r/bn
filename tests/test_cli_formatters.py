@@ -3968,6 +3968,10 @@ _GO_RENAME_NON_COUNT_READS = {
     # #964: the paired renderer reads the per-type `types declare` disclosure
     # back off the summary; a listing, not a count, and absent on every `go rename`.
     "declared_types",
+    # #999 item 4 / #993 item 3: the paired renderer reads the `struct field
+    # set` replaced-member listing and the `class apply-types` plan back off the
+    # summary; listings, not counts, and absent on every `go rename`.
+    "replaced_members", "class_apply_types",
 }
 
 

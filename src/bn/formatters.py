@@ -6038,6 +6038,8 @@ def _build_mutation_summary(
     unusable: bool = False,
     overlapping_functions: Sequence[dict[str, Any]] = (),
     declared_types: dict[str, Any] | None = None,
+    replaced_members: Sequence[dict[str, Any]] = (),
+    class_apply_types: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -6172,12 +6174,23 @@ def _build_mutation_summary(
         # the residue key: an ordinary create must not grow an empty list for
         # every consumer to learn to ignore.
         summary["overlapping_functions"] = list(overlapping_functions)
+    if replaced_members:
+        # #999 item 4: the members a `struct field set` removed because the new
+        # field overlaps them. Overwriting is the default and is fine; the
+        # compact status saying only `changed=1 verified=1` while `_unk78`
+        # vanished is not. Conditional like the keys above.
+        summary["replaced_members"] = list(replaced_members)
     if declared_types:
         # #964: `types declare` is ONE op however many types it declares, so the
         # op counts above said `changed=1 verified=1` for a header of eleven
         # structs and the caller had to `struct show` each one to learn what
         # landed. Conditional like the keys above: only a declare carries it.
         summary["declared_types"] = declared_types
+    if class_apply_types:
+        # #993 item 3: what `class apply-types` planned beside its ops' counts --
+        # the vptr's table type, what happened to the instance struct, and the
+        # methods whose `this` it did NOT retype, with why.
+        summary["class_apply_types"] = class_apply_types
     return summary
 
 
@@ -6197,6 +6210,7 @@ def _declared_types_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]
     unattached: dict[str, Any] = {}
     referenced: list[str] = []
     stubs: list[str] = []
+    imported: list[str] = []
     landed = False
     for row in results:
         if row.get("op") != "types_declare" or row.get("status") not in ("verified", "noop"):
@@ -6206,6 +6220,7 @@ def _declared_types_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]
         row_stubs = [str(name) for name in _field_list(row, "created_by_reference")]
         referenced.extend(row_referenced)
         stubs.extend(row_stubs)
+        imported.extend(str(name) for name in _field_list(row, "imported_from_library"))
         # Neither a referenced type nor an empty type created by a bare mention
         # was DECLARED; both are listed on their own lines instead.
         names.extend(str(name) for name in _field_dict(row, "defined_types")
@@ -6225,6 +6240,8 @@ def _declared_types_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]
         out["referenced_existing"] = list(dict.fromkeys(referenced))
     if stubs:
         out["created_by_reference"] = list(dict.fromkeys(stubs))
+    if imported:
+        out["imported_from_library"] = list(dict.fromkeys(imported))
     return out
 
 
@@ -6348,6 +6365,16 @@ def _mutation_summary(value: Any) -> Any:
             for o in _row_list(r, "overlaps")
         ],
         declared_types=_declared_types_summary(results),
+        # #999 item 4: every member a landed `struct field set` removed (a
+        # preview's rows are `verified` too, so a preview names them first).
+        replaced_members=[
+            {"struct_name": r.get("struct_name"), **m}
+            for r in results if r.get("op") == "struct_field_set"
+            and r.get("status") in ("verified", "rollback_failed")
+            for m in _row_list(r, "replaced_members")
+        ],
+        class_apply_types=(_field_dict(value, "class_apply_types")
+                           if _field_declared(value, "class_apply_types") else None),
     )
 
 
@@ -6651,9 +6678,17 @@ def _render_mutation_summary_text(value: Any) -> str:
     overlaps = _overlap_rows(value)
     if overlaps:
         parts.append(f"overlaps={len(overlaps)}")
+    replaced = _row_list(value, "replaced_members")
+    if replaced:
+        parts.append(f"replaced={len(replaced)}")
     line = "  ".join(parts)
     if overlaps:
         line += "\noverlapping_functions: " + _overlap_listing(overlaps)
+    if replaced:
+        line += "\nreplaced: " + ", ".join(
+            f"{_text_value(m, 'struct_name') or '<unknown>'}::{_text_value(m, 'field_name') or '<unnamed>'} "
+            f"({_text_value(m, 'field_type') or '<unknown>'} @{_text_value(m, 'offset') or '<unknown>'})"
+            for m in replaced)
     if _field_declared(value, "declared_types"):
         declared = _field_dict(value, "declared_types")
         names = [str(name) for name in _field_list(declared, "names")]
@@ -6674,6 +6709,25 @@ def _render_mutation_summary_text(value: Any) -> str:
         if stubs:
             line += ("\ncreated empty (only mentioned, never defined -- check the spelling): "
                      + ", ".join(stubs))
+        imported = [str(name) for name in _field_list(declared, "imported_from_library")]
+        if imported:
+            line += "\nimported from a type library: " + ", ".join(imported)
+    if _field_declared(value, "class_apply_types"):
+        plan = _field_dict(value, "class_apply_types")
+        action = _text_value(plan, "instance_struct") or "<unknown>"
+        size_note = ""
+        if action == "declared":
+            size = _text_value(plan, "size")
+            size_note = f" (size {size})" if size else " (size unknown: only the vptr is declared)"
+        line += (f"\nclass: {_text_value(plan, 'class') or '<unknown>'}  "
+                 f"vptr: struct `{_text_value(plan, 'vtable_type') or '<unknown>'}`*  "
+                 f"instance struct: {action}{size_note}")
+        line += f"\nthis retyped: {len(_row_list(plan, 'retyped_methods'))} method(s)"
+        skipped = _row_list(plan, "skipped_methods")
+        if skipped:
+            line += "\nskipped: " + ", ".join(
+                f"{_text_value(m, 'name') or '<unnamed>'} @{_text_value(m, 'address') or '<unknown>'} "
+                f"({_text_value(m, 'reason') or 'unknown reason'})" for m in skipped)
     if _field_declared(value, "go_rename"):
         go = _field_dict(value, "go_rename")
         line += "\ngo rename: " + "  ".join(

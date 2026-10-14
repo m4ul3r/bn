@@ -265,6 +265,12 @@ AUDITED_BESPOKE_SAFE_OPS = {
     # success/preview row -- instead of calling bridge._mutation() (verified by
     # reading src/bn_agent_bridge/create_comments.py:_function_create).
     "function_create",
+    # #993 item 3: the binder calls bridge._class_apply_types, which plans the
+    # ops (raising, with no result, when there is nothing to apply) and returns
+    # self._mutation(...)'s own result -- one results[] row per planned op --
+    # with only a `class_apply_types` key added (verified by reading
+    # src/bn_agent_bridge/bridge.py:_class_apply_types).
+    "class_apply_types",
 }
 
 

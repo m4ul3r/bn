@@ -1124,15 +1124,60 @@ class TestTypeStringsAndInheritance:
         # The bare-mention stub is not counted as declared.
         assert summary["declared_types"]["names"] == ["Use989"], summary
         # A type only a loaded type library defines is not shadowed by an empty
-        # user stub (libc's `struct timespec` on this dynamically linked fixture).
+        # user stub (libc's `struct timespec` on this dynamically linked fixture);
+        # the library's own type is imported instead, with its dependencies, and
+        # named (#993 item 2).
         lib = shared_bn.json("types", "declare", "struct Lib989 { struct timespec* ts; };", "--summary")
         assert lib["declared_types"]["referenced_existing"] == ["timespec"], lib
-        assert shared_bn.run("types", "show", "timespec").returncode == 2
-        # A header of only forward declarations of library types is a noop too.
-        fwd = shared_bn.run("types", "declare", "struct timespec;", "--format", "json")
+        assert "timespec" in lib["declared_types"]["imported_from_library"], lib
+        assert shared_bn.json("types", "show", "timespec")["layout"].startswith("struct timespec // size=0x10")
+        # A header of only forward declarations of library types is a noop.
+        fwd = shared_bn.run("types", "declare", "struct timeval;", "--format", "json")
         assert fwd.returncode == 0, fwd.stdout
         assert json.loads(fwd.stdout)["results"][0]["status"] == "noop"
-        assert shared_bn.run("types", "show", "timespec").returncode == 2
+        assert shared_bn.run("types", "show", "timeval").returncode == 2
+
+    def test_function_pointer_typedef_references_existing_struct(self, shared_bn):
+        """#993 item 1: a struct mentioned only in a function-pointer parameter
+        list came back from BN's parser as a named `void`; defining it redefined
+        the existing struct as `void` and verification rolled the typedef back."""
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct Node993 { int a; };")
+        res = shared_bn.run("types", "declare", "typedef void (*visit993_cb)(struct Node993*);",
+                            "--format", "json", "--summary")
+        assert res.returncode == 0, res.stdout + res.stderr
+        summary = json.loads(res.stdout)
+        assert summary["declared_types"]["names"] == ["visit993_cb"], summary
+        assert summary["declared_types"]["referenced_existing"] == ["Node993"], summary
+        assert "int32_t a" in shared_bn.run("struct", "show", "Node993").stdout
+        assert shared_bn.json("types", "show", "visit993_cb")["decl"] == "void (*)(struct Node993*)"
+        # A NEW name mentioned there becomes an empty struct, not a `void` typedef.
+        fresh = shared_bn.json("types", "declare", "typedef void (*leaf993_cb)(struct Leaf993*);", "--summary")
+        assert fresh["declared_types"]["created_by_reference"] == ["Leaf993"], fresh
+        assert shared_bn.json("types", "show", "Leaf993")["layout"] == "struct Leaf993 // size=0x0"
+
+    def test_preview_leaves_no_library_import_behind(self, shared_bn):
+        """#993 item 2: parsing a declaration that uses a library type by value
+        makes BN import it, and BN's undo does not revert an import, so a
+        `--preview` left libc's `timespec` in the view. The preview now removes
+        it; the live declare after it still lands the type (BN keeps its
+        imported-record when the type is removed, so its own import no longer
+        fires) and names every type it imported."""
+        shared_bn.load(HELLO_BINARY)
+        probe = "print(sorted(str(n) for n in bv.type_names))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
+        preview = shared_bn.json("types", "declare", "struct Stamp993 { struct timespec ts; int y; };",
+                                 "--preview", "--summary")
+        assert preview["preview"] is True and preview["verified_count"] == 1, preview
+        assert "timespec" in preview["declared_types"]["imported_from_library"], preview
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
+        live = shared_bn.json("types", "declare", "struct Stamp993 { struct timespec ts; int y; };",
+                              "--summary")
+        assert live["committed"] is True, live
+        assert {"timespec", "__time_t"} <= set(live["declared_types"]["imported_from_library"]), live
+        shown = shared_bn.run("types", "show", "timespec").stdout
+        assert "__time_t tv_sec" in shown, shown
+        assert shared_bn.run("types", "show", "__time_t").returncode == 0
 
     def test_typed_vptr_keeps_bn_vtable_and_renders_named_virtual_call(self, shared_bn):
         """#963: BN's parser returns a type a declaration only references as an
@@ -1157,6 +1202,42 @@ class TestTypeStringsAndInheritance:
         shared_bn.json("local", "retype", "svc::dispatch", this["local_id"], "struct `svc::Handler`*")
         text = shared_bn.json("decompile", "svc::dispatch")["text"]
         assert "this->vtable->handle(" in text, text
+
+    def test_class_apply_types_types_the_vptr_and_this_as_one_mutation(self, shared_bn):
+        """#993 item 3: `class apply-types` declares the instance struct with a
+        vptr typed as BN's own `<Base>::<Class>::VTable*` and retypes `this` on
+        the class's methods, previewable and verified as one mutation; a class
+        BN made no table of its own for is refused, naming the derived tables."""
+        shared_bn.load(CLASSES_BINARY)
+        vtable = "svc::Handler::svc::EchoHandler::VTable"
+        before = shared_bn.json("types", "show", vtable)["layout"]
+        preview = shared_bn.json("class", "apply-types", "svc::EchoHandler", "--preview", "--summary")
+        plan = preview["class_apply_types"]
+        assert preview["preview"] is True and preview["failed_count"] == 0, preview
+        assert plan["vtable_type"] == vtable and plan["instance_struct"] == "declared", plan
+        assert {m["name"] for m in plan["retyped_methods"]} >= {
+            "svc::EchoHandler::handle", "svc::EchoHandler::name"}, plan
+        assert shared_bn.run("types", "show", "svc::EchoHandler").returncode == 2
+
+        live = shared_bn.json("class", "apply-types", "svc::EchoHandler", "--summary")
+        assert live["committed"] is True and live["failed_count"] == 0, live
+        assert shared_bn.run("struct", "show", "svc::EchoHandler").stdout.splitlines() == [
+            "struct svc::EchoHandler // size=0x8",
+            f"0x0000: struct {vtable}* vtable",
+        ]
+        assert shared_bn.json("types", "show", vtable)["layout"] == before
+        handle = shared_bn.json("local", "list", "svc::EchoHandler::handle")["items"]
+        this = next(v for v in handle if v["is_parameter"] and v["name"] == "this")
+        assert this["type"] == "struct svc::EchoHandler*", this
+
+        again = shared_bn.json("class", "apply-types", "svc::EchoHandler", "--summary")
+        assert again["class_apply_types"]["instance_struct"] == "unchanged", again
+        assert again["changed_count"] == 0 and again["dirty_after"] is False, again
+
+        refused = shared_bn.run("class", "apply-types", "svc::Handler")
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        assert "no table type of its own" in refused.stderr + refused.stdout
+        assert vtable in refused.stderr + refused.stdout
 
 
 class TestDisasmLinear:

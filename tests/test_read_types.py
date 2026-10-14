@@ -829,13 +829,44 @@ def test_declaration_references_to_existing_types_are_not_redefined(monkeypatch)
                    "struct `ns::W::VTabl`* typo; }; struct Fresh; struct Alpha { long a; long b; };")
     parsed = [("ns::W", holder), ("ns::W::VTable", stub("ns::W::VTable")), ("timespec", stub("timespec")),
               ("ns::W::VTabl", stub("ns::W::VTabl")), ("Fresh", stub("Fresh")), ("Alpha", stub("Alpha"))]
-    kept, referenced, by_mention = me._drop_references_to_existing_types(bv, declaration, parsed)
+    kept, referenced, by_mention = me._drop_references_to_existing_types(None, bv, declaration, parsed)
     # The view's VTable and the type library's `timespec` are only referenced.
     assert referenced == ["ns::W::VTable", "timespec"]
     # `Fresh` is new (an intentional forward declaration); `Alpha` has a body
     # here; the misspelled `ns::W::VTabl` is created but disclosed.
     assert [name for name, _ in kept] == ["ns::W", "ns::W::VTabl", "Fresh", "Alpha"]
     assert by_mention == ["ns::W::VTabl"]
+
+
+def test_function_pointer_parameter_tags_are_references_not_void_types(monkeypatch):
+    """#993 item 1: a tag mentioned only in a function-pointer parameter list
+    comes back from BN's parser as a named `void`. Defining it redefined an
+    existing `struct Node` as `void` (rolled back as verification_failed); for
+    a new name it defined a `void` typedef where the forward declaration's
+    empty struct belongs."""
+    me = _load_bridge(monkeypatch).mutation_engine
+    node = _FakeType("struct Node", width=0x10, members=[_FakeMember(0, "next", "struct Node*")])
+    bv = _FakeBV(functions=[], types_={"Node": node})
+    forward_stub = _FakeType("struct", width=0, members=[])
+    parses = []
+
+    def parse_types_from_string(text):
+        parses.append(text)
+        return types.SimpleNamespace(types={"Leaf": forward_stub}, variables={}, functions={})
+
+    bv.parse_types_from_string = parse_types_from_string
+    cb = _FakeType("void (*)(Node*, Leaf*)", width=8, type_class="PointerTypeClass")
+    void = _FakeType("void", type_class="VoidTypeClass")
+    declaration = "typedef void (*visit_cb)(struct Node* n, struct Leaf* l);"
+    parsed = [("visit_cb", cb), ("Node", void), ("Leaf", void)]
+    kept, referenced, by_mention = me._drop_references_to_existing_types(None, bv, declaration, parsed)
+    assert referenced == ["Node"]
+    assert kept == [("visit_cb", cb), ("Leaf", forward_stub)]
+    assert parses == ["struct Leaf;"]
+    assert by_mention == ["Leaf"]
+    # A `void` the declaration never spells as a tag is a real typedef and stays.
+    plain = [("Node", void)]
+    assert me._drop_references_to_existing_types(None, bv, "typedef void Node;", plain)[0] == plain
 
 
 def test_every_base_clause_is_reported_never_dropped(monkeypatch):

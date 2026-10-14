@@ -55,6 +55,9 @@ EXPECTED_SELF_MANAGED = {
     "struct_field_set", "struct_field_rename", "struct_field_delete",
     "types_declare", "batch_apply", "tag_add", "tag_remove",
     "tag_type_create", "tag_type_remove",
+    # #993 item 3: holds the write gate across its read-locked plan and the
+    # bridge._mutation() that applies it.
+    "class_apply_types",
 }
 
 
