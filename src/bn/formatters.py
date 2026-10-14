@@ -6915,14 +6915,14 @@ def _render_skill_install_text(value: Any) -> str:
 
     # #1002: these were left alone and are NOT this install -- a link into a
     # previous checkout, dangling, another mode, or a foreign directory. Never
-    # "installed". Each row carries its own remedy: --force refuses some of
-    # them, so one blanket "re-run with --force" would be false.
+    # "installed". One closing note about --force, not a per-row verdict.
     if not_updated:
         lines.append("Not updated, existing destination differs from the requested install:")
-        for row in not_updated:
-            remedy = _text_value(row, "remedy")
-            tail = f"; {remedy}" if remedy else ""
-            lines.append(f"- {row.get('destination')} ({row.get('detail')}){tail}")
+        lines.extend(f"- {row.get('destination')} ({row.get('detail')})"
+                     for row in not_updated)
+        force_note = _text_value(value, "force_note")
+        if force_note:
+            lines.append(force_note)
 
     return "\n".join(lines) + "\n"
 

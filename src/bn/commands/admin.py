@@ -443,8 +443,13 @@ def _removal_blocker(dest: Path) -> str | None:
     pending = [dest]
     while pending:
         directory = pending.pop()
-        if not os.access(directory, os.R_OK | os.W_OK | os.X_OK):
-            return f"{directory} cannot be emptied (it is not readable and writable)"
+        missing = [
+            name for flag, name in ((os.R_OK, "read"), (os.W_OK, "write"), (os.X_OK, "search"))
+            if not os.access(directory, flag)
+        ]
+        if missing:
+            return (f"{directory} lacks {' and '.join(missing)} permission, so its "
+                    "contents cannot be removed")
         for entry in directory.iterdir():
             if entry.is_dir() and not entry.is_symlink():
                 pending.append(entry)
@@ -452,42 +457,25 @@ def _removal_blocker(dest: Path) -> str | None:
 
 
 def _force_refusal_reason(dest: Path, source: Path) -> str | None:
-    """Why `--force` would refuse to replace what sits at `dest` (already
-    `_install_path`'d), or None when it would replace it."""
+    """Why `--force` must not replace what sits at `dest` (already
+    `_install_path`'d) because it may not be this install's own, or None."""
     if dest.is_symlink() or not dest.exists():
         return None
     if not dest.is_dir():
         return "it is not a directory"
     try:
-        return _unsafe_replace_reason(dest, source) or _removal_blocker(dest)
+        return _unsafe_replace_reason(dest, source)
     except OSError as exc:
         return f"it could not be read ({exc})"
 
 
-def _force_preflight_refusal(source: Path, dest: Path) -> tuple[str, str] | None:
-    """`(reason, what to do instead)` when a `--force` install at `dest` would
-    be refused, else None. Every check the forced `_plan_install` makes, in its
-    order, so a hint never names a --force that then refuses (#1004 review)."""
-    dest = _install_path(dest)
-    forbidden = _never_an_install_destination(dest, source)
-    if forbidden is not None:
-        return forbidden, "choose another destination"
-    unusable = _unusable_parent_reason(dest)
-    if unusable is not None:
-        return unusable, "fix that by hand"
-    reason = _force_refusal_reason(dest, source)
-    if reason is not None:
-        return reason, "move it aside by hand"
-    return None
-
-
-def _replace_remedy(source: Path, dest: Path) -> tuple[bool, str]:
-    """`(force_replaces, remedy)` for a destination left as it was."""
-    refusal = _force_preflight_refusal(source, dest)
-    if refusal is None:
-        return True, "re-run with --force to replace it"
-    reason, action = refusal
-    return False, f"--force will not replace it ({reason}); {action} and re-run"
+# Printed under destinations an install left alone. One plain line rather than
+# a per-destination verdict on whether --force would succeed: that verdict is
+# split out of #1004 to its own follow-up.
+FORCE_NOTE = ("--force replaces these destinations, including any local edits "
+              "in copied directories; check them first.")
+FORCE_NOTE_ONE = ("--force replaces it, including any local edits in a copied "
+                  "directory; check it first.")
 
 
 def _install_path(dest: Path) -> Path:
@@ -587,9 +575,9 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
 def _refuse_replacement(dest: Path, reason: str) -> NoReturn:
     raise BridgeError(
         f"Refusing to replace {dest} with --force: {reason}. "
-        "--force replaces this install's own destination (an empty directory, "
-        "or a previous install of the same artifact), never an unrelated path. "
-        "Move it aside by hand and re-run if that is what you want."
+        "--force replaces only what it can prove is an install of this "
+        "artifact (a link, an empty directory, or a previous copy), never an "
+        "unrelated path. Move it aside by hand and re-run if that is what you want."
     )
 
 
@@ -604,11 +592,10 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
 
     The pure path rules come first and hold for a destination that does not
     exist yet (`_never_an_install_destination`). Without `--force` any existing
-    destination is an error, naming what is there and whether `--force` would
-    replace it. With it, only a symlink (removed as a link, never
-    recursed into), an empty directory, or a previous install of `source` may
-    be replaced; a regular file under `--dest` is somebody else's and is refused
-    instead of unlinked.
+    destination is an error, naming what is there. With it, only a symlink
+    (removed as a link, never recursed into), an empty directory, or a previous
+    install of `source` that rmtree can empty may be replaced; a regular file
+    under `--dest` is somebody else's and is refused instead of unlinked.
     """
     dest = _install_path(dest)
     forbidden = _never_an_install_destination(dest, source)
@@ -625,13 +612,22 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
         state = _existing_install_state(source, dest, mode=mode)
         if state is not None:
             raise BridgeError(
-                f"Destination already exists: {dest} ({state[1]}); "
-                f"{_replace_remedy(source, dest)[1]}."
+                f"Destination already exists: {dest} ({state[1]}). {FORCE_NOTE_ONE}"
             )
         return dest
     reason = _force_refusal_reason(dest, source)
     if reason is not None:
         _refuse_replacement(dest, reason)
+    if dest.is_dir() and not dest.is_symlink():
+        try:
+            blocker = _removal_blocker(dest)
+        except OSError as exc:
+            blocker = f"it could not be read ({exc})"
+        if blocker is not None:
+            raise BridgeError(
+                f"Cannot replace {dest} with --force: {blocker}. Fix the "
+                "permissions, or move it aside by hand, and re-run."
+            )
     return dest
 
 
@@ -683,12 +679,10 @@ def _skill_install(args: argparse.Namespace) -> int:
                 # a previous checkout. Leave it, but say so and fail the run:
                 # "already installed" here kept every link on the old tree with
                 # exit 0 (#1002). An explicit --dest is refused by the plan.
-                force_replaces, remedy = _replace_remedy(source, dest)
                 skipped_destinations.append(str(dest))
-                not_updated_destinations.append({
-                    "destination": str(dest), "state": state[0], "detail": state[1],
-                    "force_replaces": force_replaces, "remedy": remedy,
-                })
+                not_updated_destinations.append(
+                    {"destination": str(dest), "state": state[0], "detail": state[1]}
+                )
                 continue
         # Planned, not just checked: the path validated here is the path the
         # install writes to, and every destination is refused before the first
@@ -702,17 +696,6 @@ def _skill_install(args: argparse.Namespace) -> int:
         if any(queued == planned for _, queued in pending_installs):
             continue
         pending_installs.append((source, planned))
-
-    if any(not row["force_replaces"] for row in not_updated_destinations):
-        # A forced run refuses as a whole before writing anything, so while one
-        # destination needs a hand fix the others' --force does not apply yet.
-        for row in not_updated_destinations:
-            if row["force_replaces"]:
-                row["remedy"] = (
-                    "re-run with --force to replace it, after fixing the "
-                    "destinations --force will not replace (a forced run is "
-                    "all-or-nothing)"
-                )
 
     for source, dest in pending_installs:
         _install_tree(source, dest, mode=args.mode, force=args.force)
@@ -730,6 +713,8 @@ def _skill_install(args: argparse.Namespace) -> int:
         "not_updated_destinations": not_updated_destinations,
         "skills": results,
     }
+    if not_updated_destinations:
+        result["force_note"] = FORCE_NOTE
     cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
     return 1 if not_updated_destinations else 0
 
