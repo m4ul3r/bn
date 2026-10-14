@@ -3,7 +3,16 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from ..cli import _call, _effective_limit, _refuse_count_only_slices, arg, command
+from ..cli import (
+    _call,
+    _effective_limit,
+    _mutate,
+    _refuse_count_only_slices,
+    arg,
+    command,
+    mutation_output_args,
+    preview_arg,
+)
 from ..formatters import _render_class_list_text, _render_class_show_text
 
 
@@ -77,3 +86,14 @@ def _class_show(args: argparse.Namespace) -> int:
         result_exit_code=lambda r: 2 if isinstance(r, dict) and r.get("ambiguous") else 0,
         stem="class-show",
     )
+
+
+@command("class", "apply-types",
+         help="Type a C++ class for named virtual calls: its instance struct's vptr as BN's "
+              "<Class>::VTable* and `this` on its methods, as one verified mutation",
+         target=True, fmt="json",
+         see_also=("class show", "struct show", "local retype"),
+         args=[preview_arg(), *mutation_output_args(), arg("name")])
+def _class_apply_types(args: argparse.Namespace) -> int:
+    return _mutate(args, "class_apply_types", {"name": args.name},
+                   preview=bool(args.preview), stem="class-apply-types")

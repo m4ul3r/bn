@@ -3272,15 +3272,16 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
         "joins or leaves this set is a deliberate change to the coverage claim, so "
         "move the number in the same commit")
     # ...of which the two dual-role leaves cannot carry the flag (see above), so
-    # 47 advertise it and 46 refuse it by absence: default added `spill gc`,
-    # which is an administrative mutation and cannot estimate a read payload.
-    assert len(advertised) == 47 and len(bn.cli._COMMANDS) - len(advertised) == 46
+    # 47 advertise it and 47 refuse it by absence: default added `spill gc`,
+    # which is an administrative mutation and cannot estimate a read payload,
+    # and #993 added the `class apply-types` mutation.
+    assert len(advertised) == 47 and len(bn.cli._COMMANDS) - len(advertised) == 47
     # ...and everything else refuses it BY ABSENCE (argparse's own rc 2), which is
     # stronger than a bespoke refusal: there is no path on which the flag is
     # accepted and ignored, because the parser never builds it.
     assert all(not spec.get("estimable") for spec in bn.cli._COMMANDS
                if tuple(spec["path"]) not in marked)
-    assert len(bn.cli._COMMANDS) - len(marked) == 44
+    assert len(bn.cli._COMMANDS) - len(marked) == 45
 
     # THE COVERAGE CLAIM, observed. One invariant over every marked command in
     # every emit mode its parser offers: whatever lands on stdout is the

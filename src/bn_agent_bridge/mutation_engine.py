@@ -26,11 +26,12 @@ imports it), and ``read_types`` no longer reaches into it -- the cycle-breakers
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import difflib
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 try:
     import binaryninja as bn
@@ -197,6 +198,48 @@ def _declaration_include_root(source_path: str | None) -> str | None:
     if not source_path:
         return None
     return str(Path(source_path).expanduser().resolve().parent)
+
+
+# #993 item 2: True while a `--preview` mutation runs, so `types declare`
+# imports nothing ON PURPOSE under a preview. BN's own declaration parser
+# imports every type-library type a declaration uses, its undo does not revert
+# that, and REMOVING an import is worse (BN keeps its imported-record and never
+# imports that type again). What a preview guarantees is that it never
+# reports success while anything was imported: the batch compares BN's type
+# ids before and after (`_new_library_imports`) and fails a preview that
+# gained any. `_preview_library_needs` only avoids the import where the text
+# says so for certain.
+_PREVIEW_PARSE: contextvars.ContextVar[bool] = contextvars.ContextVar("bn_preview_parse", default=False)
+
+# A tag-keyword mention (`struct timespec`, ``struct `ns::X` ``).
+_TAG_MENTION_RE = re.compile(r"\b(?:struct|class|union|enum)\s+(?:`([^`]+)`|([A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*))")
+
+
+def _preview_library_needs(bv, declaration: str) -> list[str]:
+    """Library types a preview of *declaration* is refused for up front,
+    before anything parses: every TAG-KEYWORD mention (`struct timespec`, by
+    value or through a pointer -- the live path imports both) of a name a
+    loaded type library defines and the view lacks, unless the declaration
+    gives it a body or only forward-declares it.
+
+    Only tag mentions, because only they are certain to be type uses: an
+    untagged identifier may be a member name (`int node;`, a field named
+    `FILE`), and treating it as a type refused previews that import nothing
+    (#993 review round 4). Untagged and macro-hidden uses are caught after
+    the fact instead, by the batch's import check."""
+    text = _C_LITERAL_RE.sub('""', _strip_c_comments(declaration))
+    needs: list[str] = []
+    for quoted, plain in _TAG_MENTION_RE.findall(text):
+        name = re.sub(r"\s*::\s*", "::", quoted or plain)
+        if name in needs or _declares_body_for(declaration, name):
+            continue
+        mentions = len(re.findall(r"\b(?:struct|class|union|enum)\s+(?:`" + re.escape(name) + r"`|"
+                                  + re.escape(name) + r"(?![\w:]))", text))
+        if mentions == 1 and _declares_forward(declaration, name):
+            continue   # a lone forward declaration imports nothing (reference-only noop)
+        if _lookup_named_type(bv, name) is None and _library_type(bv, name) is not None:
+            needs.append(name)
+    return needs
 
 
 def _parse_declaration_source(ctx, bv, declaration: str, *, source_path: str | None = None):
@@ -2573,6 +2616,18 @@ def refuse_quick_view(bv, *, requested: dict[str, Any],
 
 def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
               exclusive=None):
+    """`_apply_batch` with `_PREVIEW_PARSE` set for a `--preview`, so a
+    previewed `types declare` never imports a type-library type on purpose
+    (#993 item 2)."""
+    token = _PREVIEW_PARSE.set(bool(preview))
+    try:
+        return _apply_batch(ctx, selector, preview, operations, exclusive=exclusive)
+    finally:
+        _PREVIEW_PARSE.reset(token)
+
+
+def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
+                 exclusive=None):
     """Apply, verify, and (on failure or --preview) revert a batch of mutations.
 
     #628 lock split: ``exclusive`` is the caller's EXCLUSIVE target-lock scope -- a
@@ -2623,6 +2678,10 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         # generalizes the per-op function_create guard to bn type/comment/rename/proto/
         # struct-field/batch-apply on a quick view.
         refuse_quick_view(bv, requested={"op": "mutation", "operations": len(operations)})
+        # #993 item 2: taken before anything parses a declaration -- the
+        # pre-apply snapshot below already does -- for the live batch's
+        # library-import report and every revert path's dangling-name cleanup.
+        library_baseline = _declare_batch_type_names(bv, operations)
         # #650: validate EVERY op's shape before applying ANY. The batch is atomic, so a
         # guessed op or field name in op 13 previously rolled back 12 good ops -- and with
         # no argparse layer on this path, guessing is the norm, not the exception. It runs
@@ -2633,6 +2692,22 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         for index, op in enumerate(operations):
             if isinstance(op, dict):
                 _validate_operation_request(ctx, op, index=index)
+        if preview:
+            # #993 review rounds 3-4: refuse up front only what the text says for
+            # certain -- a tag-keyword mention of a library type the view lacks --
+            # before the snapshot below, whose parse is already one that imports.
+            # Anything else BN imports is caught after the fact (`_new_library_imports`).
+            for index, op in enumerate(operations):
+                if not (isinstance(op, dict) and op.get("op") == "types_declare"):
+                    continue
+                needs = _preview_library_needs(bv, str(op.get("declaration") or ""))
+                if needs:
+                    raise OperationFailure(
+                        "unsupported", _preview_library_refusal(needs),
+                        requested={"op": "types_declare", "index": index,
+                                   "declaration": op.get("declaration")},
+                        observed={"library_types": needs, "request_applied": False},
+                    )
         # #630: a --preview of a prototype set on a function with no user type would
         # pin has_user_type, which BN cannot clear -- so the preview could not honor
         # its non-destructive contract, and neither can a prototype set whose target
@@ -2691,6 +2766,10 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     # Explicit restores for local var ops, which BN's undo buffer can't
     # revert (see _run_local_restores). Replayed on every revert path.
     restores: list = []
+    if library_baseline is not None:
+        # Registered first, so it runs last on every revert path, after the
+        # journal has removed the batch's own types.
+        restores.append(lambda: _clear_dangling_type_names(bv, library_baseline))
     try:
         for index, op in enumerate(operations):
             # #780: function_create is the one op that reanalyzes while it
@@ -2720,6 +2799,13 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     except OperationFailure as exc:
         exc = _explain_renamed_reference(operations[len(results)], results, exc)
         with exclusive_scope():
+            # #993 review round 2: the revert below keeps a live declare's
+            # library imports (BN cannot un-import), so the rows must say so --
+            # the failing op's row too, when its own parse imported (round 3).
+            failed_row = _operation_failure_result(ctx, operations[len(results)], exc)
+            # A preview's rows are stamped too: it imports nothing on purpose, so
+            # anything stamped there is an import BN made that the pre-check missed.
+            _report_library_imports(bv, library_baseline, results, failed_row)
             # Run BOTH revert steps unconditionally: an `and` would short-circuit
             # past the explicit restores when the undo revert fails, leaving
             # non-journaled local/prototype changes applied.
@@ -2766,7 +2852,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 "rolled_back": reverted,
                 "message": message,
                 "results": _mark_unverified_results(ctx, results, result_note, status=result_status)
-                + [_operation_failure_result(ctx, operations[len(results)], exc)]
+                + [failed_row]
                 + [_not_previewed_result(ctx, op, skipped[index]) if index in skipped
                    else _unattempted_results(ctx, [op])[0]
                    for index, op in enumerate(operations)
@@ -2791,6 +2877,9 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     try:
         bv.update_analysis_and_wait()
         with exclusive_scope():
+            # On a preview anything stamped is an import BN made that the
+            # pre-check missed; the summary reports it as kept.
+            _report_library_imports(bv, library_baseline, results)
             after = _capture_function_snapshots(ctx, bv, affected)
             type_after = _capture_type_snapshots(ctx, bv, operations)
             diffs = _diff_snapshots(ctx, before, after)
@@ -2798,6 +2887,13 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             verified_results = [result if result.get("status") == NOT_PREVIEWED
                                 else _verify_operation(ctx, bv, result) for result in results]
             annotated_results = _annotate_operation_results(ctx, verified_results, type_diffs)
+            # #993 review round 4: a preview never reports success while BN
+            # imported anything. Judged on what BN did (new type ids, see
+            # `_new_library_imports`), not predicted from the text.
+            preview_imports = (_new_library_imports(bv, library_baseline)
+                               if preview and library_baseline is not None else [])
+            if preview_imports:
+                annotated_results = _fail_importing_preview(annotated_results, preview_imports)
             failed = _has_failed_results(ctx, annotated_results)
             # Origin tag: a direct op (rename/prototype/comment) targets a specific
             # function; mark its affected-function diffs `direct` so a mixed batch
@@ -4149,6 +4245,25 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
                 "that member's offset instead.",
                 requested=_operation_requested(ctx, op),
             )
+    # #999 item 4: add_member_at_offset(overwrite=True) removes every member the
+    # new field overlaps, and the result named only the member at the exact
+    # offset (`before_member`), so `_unk78` at 0x78 vanished under a field set
+    # at 0x118 behind `changed=1 verified=1`. Name each one it removes; the
+    # member rewritten in place under its own name is `before_member`'s.
+    replaced_members = []
+    if overwrite and before_type is not None:
+        for member in list(getattr(before_type, "members", None) or []):
+            if not _member_overlaps(member, offset, new_width):
+                continue
+            member_offset = int(getattr(member, "offset", 0))
+            member_name = str(getattr(member, "name", ""))
+            if member_offset == offset and member_name == str(op["field_name"]):
+                continue
+            replaced_members.append({
+                "field_name": member_name,
+                "field_type": str(getattr(member, "type", "")),
+                "offset": hex(member_offset),
+            })
     builder.add_member_at_offset(str(op["field_name"]), field_type, offset, overwrite)
     try:
         builder.width = max(int(builder.width), int(offset) + int(field_type.width))
@@ -4163,6 +4278,7 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
         "field_type": str(field_type),
         "member_offset": int(offset),
         "before_member": before_member,
+        **({"replaced_members": replaced_members} if replaced_members else {}),
         "requested": _operation_requested(ctx, op),
     }
 
@@ -4510,20 +4626,285 @@ def _declares_body_for(declaration: str, name: str) -> bool:
     return re.search(pattern, text) is not None
 
 
-def _library_has_type(bv, name: str) -> bool:
-    """Whether a type library loaded on the view defines *name* (e.g. libc's
-    `struct timespec`) although the view itself has not imported it yet."""
+def _library_type(bv, name: str):
+    """``(library, type)`` for the first type library loaded on the view that
+    defines *name* (e.g. libc's `struct timespec`), whether or not the view has
+    imported it, else None."""
     try:
         libraries = list(getattr(bv, "type_libraries", None) or [])
     except Exception:
-        return False
+        return None
     for library in libraries:
         try:
-            if library.get_named_type(name) is not None:
-                return True
+            found = library.get_named_type(name)
         except Exception:
             continue
-    return False
+        if found is not None:
+            return library, found
+    return None
+
+
+def _named_type_references(type_obj) -> list[str]:
+    """Names of the named types *type_obj* refers to (through pointers, arrays,
+    members, parameters and return values), in first-seen order. A reference is
+    a leaf: the referenced type's own references are not followed.
+
+    No visited set: a type tree can only loop back through a named reference,
+    which is a leaf here, so the walk is finite without one. The first version
+    tracked visited wrappers by `id()`; BN hands out temporary wrappers whose
+    ids Python reuses, so later members were skipped and only the first of
+    several pointer-reached library types was found (#993 review round 2)."""
+    names: list[str] = []
+    stack = [type_obj]
+    while stack:
+        current = stack.pop()
+        if current is None:
+            continue
+        if "NamedTypeReference" in _type_class_name(current):
+            name = str(getattr(current, "name", "") or "")
+            if name and name not in names:
+                names.append(name)
+            continue
+        children = []
+        for attr in ("target", "element_type", "return_value"):
+            try:
+                children.append(getattr(current, attr, None))
+            except Exception:
+                continue
+        for attr in ("members", "parameters"):
+            try:
+                children.extend(getattr(item, "type", None) for item in getattr(current, attr, None) or [])
+            except Exception:
+                continue
+        stack.extend(reversed(children))
+    return names
+
+
+def _view_type_names(bv) -> set[str] | None:
+    """Every type name the view defines, or None when the view cannot list them."""
+    try:
+        return {str(name) for name in bv.type_names}
+    except Exception:
+        return None
+
+
+def _is_library_import(bv, name: str) -> bool:
+    """Whether the view's *name* is an AUTO type imported from a type library
+    (never a user type: those are the undo journal's to revert)."""
+    try:
+        return (bv.lookup_imported_type_library(name) is not None
+                and bool(bv.is_type_auto_defined(name)))
+    except Exception:
+        return False
+
+
+def _import_referenced_library_types(bv, type_objs, *, apply: bool = True) -> list[str]:
+    """#993 item 2: every type a loaded type library defines that *type_objs*
+    reference, transitively, and that the view lacks -- imported through BN's
+    own ``import_library_type`` when *apply* (so a declaration that points at
+    libc's `struct timespec` lands with the type it names, and BN renames a
+    dependency that collides with a user type, `__time_t` -> `__time_t_1`), or
+    only named when not. Returns the names found missing, in discovery order.
+
+    BN's import is the only path: bn never removes an imported type (BN would
+    keep its imported-record and refuse to import it again), so the record and
+    the view always agree and the import does what BN's parser would."""
+    pending = [name for type_obj in type_objs for name in _named_type_references(type_obj)]
+    seen: set[str] = set()
+    missing: list[str] = []
+    while pending:
+        name = pending.pop(0)
+        if name in seen or _lookup_named_type(bv, name) is not None:
+            continue
+        seen.add(name)
+        found = _library_type(bv, name)
+        if found is None:
+            continue
+        library, library_type = found
+        missing.append(name)
+        if apply:
+            try:
+                bv.import_library_type(name, library)
+            except Exception as exc:
+                bn.log_error(f"BN Agent Bridge: importing library type {name!r} failed: {exc!r}")
+        pending.extend(_named_type_references(library_type))
+    return missing
+
+
+def _preview_library_refusal(names) -> str:
+    """Why a `--preview` of a declaration naming library types is refused.
+    It advises nothing but the live run: any declare it printed would itself
+    need those types, or overwrite a user type of the name it picked."""
+    return (
+        f"Cannot --preview this declaration: it names type-library type(s) the view does not "
+        f"have yet ({', '.join(names)}), and Binary Ninja imports them while it parses the "
+        f"declaration -- an import no undo reverts, and removing one stops Binary Ninja from "
+        f"ever importing it again. Run the declare without --preview: it imports them and "
+        f"lists them as `imported_from_library`."
+    )
+
+
+class _TypeBaseline(NamedTuple):
+    """The view's type names and type ids before a batch that declares types
+    parses anything. Imports are found by ID (#993 review round 4): BN
+    renames an import that collides with a user type (`__time_t` comes in as
+    `__time_t_1` under id `<guid>:["__time_t"]`), so a name diff can be hidden
+    by a same-named user type, while a new id cannot."""
+    names: set[str]
+    ids: set[str] | None
+
+
+def _view_type_ids(bv) -> set[str] | None:
+    """Every type id the view defines, or None when it cannot list them."""
+    try:
+        return {str(type_id) for type_id in bv.type_container.type_ids}
+    except Exception:
+        return None
+
+
+def _declare_batch_type_names(bv, operations) -> _TypeBaseline | None:
+    """The baseline a batch that declares types is measured against -- its
+    library-import report, the preview's import check and every revert
+    path's dangling-name cleanup (#993 item 2) -- or None when the batch
+    declares none (or the view cannot list its types)."""
+    if not any(isinstance(op, dict) and op.get("op") == "types_declare" for op in operations):
+        return None
+    names = _view_type_names(bv)
+    if names is None:
+        return None
+    return _TypeBaseline(names, _view_type_ids(bv))
+
+
+def _new_library_imports(bv, baseline: _TypeBaseline) -> list[str]:
+    """The library types the view gained since *baseline*, by their current
+    names, sorted. A new type id counts when BN recorded its name as imported
+    or the id is sourced from a type library loaded on the view (BN may load
+    a further library during an import)."""
+    current_ids = _view_type_ids(bv) if baseline.ids is not None else None
+    if current_ids is None:
+        current = _view_type_names(bv) or set()
+        return sorted(name for name in current - baseline.names if _is_library_import(bv, name))
+    try:
+        guids = {str(library.guid) for library in getattr(bv, "type_libraries", None) or []}
+    except Exception:
+        guids = set()
+    found = []
+    for type_id in current_ids - baseline.ids:
+        try:
+            name = str(bv.get_type_name_by_id(type_id) or "")
+        except Exception:
+            name = ""
+        if not name:
+            continue
+        if _is_library_import(bv, name) or type_id.split(":", 1)[0] in guids:
+            found.append(name)
+    return sorted(set(found))
+
+
+def _reached_type_names(bv, roots) -> set[str]:
+    """*roots* and every named type the view's types reach from them."""
+    reached: set[str] = set()
+    pending = [str(name) for name in roots]
+    while pending:
+        name = pending.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        type_obj = _lookup_named_type(bv, name)
+        if type_obj is not None:
+            pending.extend(_named_type_references(type_obj))
+    return reached
+
+
+def _stamp_library_imports(row: dict[str, Any], names) -> None:
+    """Record *names* as the row's `imported_from_library`, and take them off
+    its `referenced_existing_types`: a library type the view did not have is
+    not an existing type the declaration left unchanged."""
+    names = sorted(set(row.get("imported_from_library") or []) | set(names))
+    if not names:
+        return
+    row["imported_from_library"] = names
+    kept = [name for name in row.get("referenced_existing_types") or [] if name not in names]
+    if kept:
+        row["referenced_existing_types"] = kept
+    else:
+        row.pop("referenced_existing_types", None)
+
+
+def _report_library_imports(bv, baseline: _TypeBaseline | None, results: list,
+                            failed_row: dict[str, Any] | None = None) -> None:
+    """Stamp each `types_declare` row with the library types the batch
+    imported that its own defined types reach (`imported_from_library`). An
+    import no row reaches is stamped on *failed_row* when that row is a
+    declare -- BN's parse imported for the op that then failed, which has no
+    defined types to reach it by (#993 review round 3) -- else on the first
+    declare row, so none is unreported."""
+    if baseline is None:
+        return
+    imported = _new_library_imports(bv, baseline)
+    rows = [row for row in results if isinstance(row, dict) and row.get("op") == "types_declare"]
+    fallback = failed_row if isinstance(failed_row, dict) and failed_row.get("op") == "types_declare" else None
+    if not imported or not (rows or fallback):
+        return
+    unclaimed = list(imported)
+    for row in rows:
+        reached = _reached_type_names(bv, row.get("defined_types") or {})
+        mine = [name for name in imported if name in reached]
+        if mine:
+            _stamp_library_imports(row, mine)
+            unclaimed = [name for name in unclaimed if name not in mine]
+    if unclaimed:
+        _stamp_library_imports(fallback if fallback is not None else rows[0], unclaimed)
+
+
+def _fail_importing_preview(results: list, imported: list[str]) -> list:
+    """Stamp a preview that BN imported library types during as failed
+    (`unsupported`): the preview cannot undo the import, so it must not read
+    as a clean dry run. Every declare row is failed, and every import is
+    listed (`imported_from_library`, which the summary reports as kept)."""
+    message = (
+        f"Binary Ninja imported type-library type(s) while previewing this declaration "
+        f"({', '.join(imported)}); a preview cannot undo an import, so it is not reported as "
+        f"verified, and the imported types stay in the view (a rollback cannot remove them). "
+        f"Run the declare without --preview."
+    )
+    out, stamped = [], False
+    for row in results:
+        if isinstance(row, dict) and row.get("op") == "types_declare":
+            row = {**row, "status": "unsupported", "message": message}
+            if not stamped:
+                _stamp_library_imports(row, imported)
+                stamped = True
+        out.append(row)
+    return out
+
+
+def _clear_dangling_type_names(bv, baseline: _TypeBaseline) -> None:
+    """Revert step for a batch that declared types (#993 item 2 review).
+
+    Defining a type that refers to a name the view lacks (a pointer to a struct
+    nothing defines yet) can register that name with
+    no type behind it, and the undo journal does not remove the entry. Left
+    there it poisons the next parse: BN takes the name as present, will not
+    import it, and `struct timespec ts;` then fails as an incomplete type.
+    `undefine_type` alone does not drop such an entry; defining a placeholder
+    under its id and undefining that does. Only names added since *baseline*
+    with nothing behind them are touched. Raises when one stays, so the
+    revert reports itself incomplete instead of clean."""
+    leftover = []
+    for name in sorted((_view_type_names(bv) or set()) - baseline.names):
+        try:
+            type_id = bv.get_type_id(name)
+            if not type_id or bv.get_type_by_id(type_id) is not None:
+                continue
+            bv.define_type(type_id, name, bn.Type.void())
+            bv.undefine_type(type_id)
+        except Exception as exc:
+            bn.log_error(f"BN Agent Bridge: clearing dangling type name {name!r} failed: {exc!r}")
+        if name in (_view_type_names(bv) or set()):
+            leftover.append(name)
+    if leftover:
+        raise RuntimeError(f"could not clear dangling type name(s): {', '.join(leftover)}")
 
 
 def _declares_forward(declaration: str, name: str) -> bool:
@@ -4535,7 +4916,41 @@ def _declares_forward(declaration: str, name: str) -> bool:
     return re.search(pattern, _strip_c_comments(declaration)) is not None
 
 
-def _drop_references_to_existing_types(bv, declaration: str,
+# A C string or character literal, escapes included.
+_C_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'')
+
+
+def _tag_keyword_mentioning(declaration: str, name: str) -> str | None:
+    """The tag keyword (`struct`/`class`/`union`) *declaration* spells *name*
+    with (`struct name*`, ``struct `ns::name`*``), or None when it never does.
+    Comments, string/character literals and attribute arguments are not code,
+    so a `"struct name"` inside one is no mention (#993 review)."""
+    text = _C_LITERAL_RE.sub('""', _strip_c_comments(declaration))
+    try:
+        text = _strip_head_attributes(text)
+    except ValueError:
+        pass
+    quoted = re.escape(name)
+    match = re.search(r"\b(struct|class|union)\s+(?:`" + quoted + r"`|" + quoted + r"(?![\w:]))", text)
+    return match.group(1) if match else None
+
+
+def _opaque_tag_stub(ctx, bv, keyword: str, name: str):
+    """The empty aggregate BN's parser makes for a forward declaration
+    (`struct name;`), or None when it makes none. Parsed rather than built so
+    the stub is exactly what a member mention of a NEW name already defines."""
+    spelled = name if re.fullmatch(r"[A-Za-z_]\w*", name) else f"`{name}`"
+    try:
+        parsed = _parse_declaration_source(ctx, bv, f"{keyword} {spelled};")
+    except Exception:
+        return None
+    for parsed_name, type_obj in parsed.get("types") or []:
+        if str(parsed_name) == name:
+            return type_obj
+    return None
+
+
+def _drop_references_to_existing_types(ctx, bv, declaration: str,
                                        named_types: list) -> tuple[list, list[str], list[str]]:
     """#963: BN's declaration parser does not see the view's types, so a member
     such as ``struct `ns::Widget::VTable`* vtable;`` or ``struct Alpha* a;``
@@ -4552,21 +4967,35 @@ def _drop_references_to_existing_types(bv, declaration: str,
     on the view does (a 0-byte user `timespec` would shadow libc's). A forward
     declaration of a NEW name still creates its opaque type, as before.
 
+    #993 item 1: a tag mentioned only inside a function-pointer parameter list
+    (`typedef void (*cb)(struct A*);`) comes back from the parser as a named
+    `void` rather than an empty struct, which redefined an existing `A` as
+    `void` and failed verification. Such a `void` is the same reference: left
+    alone when the name exists, and replaced by the forward declaration's empty
+    aggregate when it does not, so a new name never becomes a `void` typedef.
+
     Returns the types to apply, the names left untouched, and the new empty
     types created only because a member MENTIONED them (no body, no forward
     declaration of their own) -- typically a misspelled name -- so the result
     can say so instead of passing them off as declared."""
     kept, referenced, by_mention = [], [], []
     for name, type_obj in named_types:
+        mention_keyword = (_tag_keyword_mentioning(declaration, str(name))
+                           if "Void" in _type_class_name(type_obj) else None)
         empty = (not list(getattr(type_obj, "members", None) or [])
                  and int(getattr(type_obj, "width", 0) or 0) == 0
-                 and _type_tag_kind(type_obj) is not None)
+                 and (_type_tag_kind(type_obj) is not None or mention_keyword is not None))
         if not empty or _declares_body_for(declaration, str(name)):
             kept.append((name, type_obj))
             continue
-        if _lookup_named_type(bv, str(name)) is not None or _library_has_type(bv, str(name)):
+        if _lookup_named_type(bv, str(name)) is not None or _library_type(bv, str(name)) is not None:
             referenced.append(str(name))
             continue
+        if mention_keyword is not None:
+            # Not `stub or type_obj`: a 0-byte BN type is falsy.
+            stub = _opaque_tag_stub(ctx, bv, mention_keyword, str(name))
+            if stub is not None:
+                type_obj = stub
         if not _declares_forward(declaration, str(name)):
             by_mention.append(str(name))
         kept.append((name, type_obj))
@@ -4948,7 +5377,7 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
             )
     parsed_type_count = len(named_types)
     named_types, referenced_existing, created_by_mention = _drop_references_to_existing_types(
-        bv, declaration, named_types)
+        ctx, bv, declaration, named_types)
     reference_only = not named_types
     if reference_only:
         # #989 review: `struct Alpha;` against an existing Alpha used to apply
@@ -4969,15 +5398,32 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
     defined_types = {}
     defined_type_layouts = {}
     before_defined_types = {}
-    for name, type_obj in named_types:
+    for name, _type_obj in named_types:
         existing = ctx._current_type_entry(bv, str(name))
         before_defined_types[str(name)] = existing["decl"] if existing is not None else None
-        if not reference_only:
+    if not reference_only:
+        for name, type_obj in named_types:
             bv.define_user_type(name, type_obj)
+        # #993 item 2: BN imports a library type the parser needed BY VALUE and
+        # leaves one only pointed at dangling; import both on purpose (the
+        # batch reports what came in). A preview imports nothing: one that
+        # needs a library type is refused before it starts, and this backstop
+        # refuses any the pre-check did not foresee.
+        previewing = _PREVIEW_PARSE.get()
+        needed = _import_referenced_library_types(
+            bv, [type_obj for _, type_obj in named_types], apply=not previewing)
+        if previewing and needed:
+            raise OperationFailure(
+                "unsupported", _preview_library_refusal(needed),
+                requested=_operation_requested(ctx, op), observed={"library_types": needed})
+    # Read back only once everything is defined: a type rendered while a name it
+    # uses was still missing (`void (*)(Leaf*)` before `struct Leaf` lands) reads
+    # differently afterwards, and verification compares against the final view.
+    for name, type_obj in named_types:
         current = ctx._current_type_entry(bv, str(name))
         defined_types[str(name)] = current["decl"] if current is not None else str(type_obj)
         defined_type_layouts[str(name)] = current["layout"] if current is not None else ctx._render_type_layout(type_obj)
-    return {
+    result = {
         "op": "types_declare",
         "defined_types": defined_types,
         "defined_type_layouts": defined_type_layouts,
@@ -5025,6 +5471,7 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
             "unapplied_note": _unapplied_note} if _unapplied_note else {}),
         "requested": _operation_requested(ctx, op),
     }
+    return result
 
 
 def _function_looks_like_code(bv, created, addr: int) -> str | None:
@@ -5301,3 +5748,277 @@ def _verify_function_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             # The overlap note is rebuilt whole; put #997's clause back on it.
             item = create_comments._with_fallthrough_note(item, int(fallthrough_from, 16))
     return item
+
+
+def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """#993 item 3: the batch `class apply-types` runs, and what it covers.
+
+    Typing a class for named virtual calls took one declaration and one
+    `local retype` per method, by hand: the instance struct with a vptr typed as
+    BN's own ``<Base>::<Class>::VTable*`` (the table type sits on the data
+    variable at the vtable's slot array), then `this` on every method. This
+    builds exactly those ops for the ordinary engine to apply, verify and, under
+    `--preview` or on a failure, revert as one mutation:
+
+    * the instance struct is DECLARED when the view has none (sized from the
+      class card's ``size`` when one was recovered, padding after the vptr), or
+      its offset-0 member is retyped when it exists, keeping that member's name;
+      nothing when it already holds the typed vptr;
+    * `this` is retyped on each of the class's own methods that has a parameter
+      of that name. A thunk, or a method without one (a static member, or a
+      stripped build where BN did not name it), is skipped and listed, never
+      guessed at.
+
+    Refuses when the class has no primary vtable or BN defined no VTable type
+    for it: then there is no table type for the vptr to point at."""
+    from . import read_class
+    card = read_class._class_show(ctx, selector, name)
+    requested = {"op": "class_apply_types", "name": name}
+    if card.get("ambiguous"):
+        names = ", ".join(str(m.get("name")) for m in card.get("matches") or [])
+        raise OperationFailure(
+            "invalid_request",
+            f"{name!r} names more than one class ({names}); pass the full name of one.",
+            requested=requested,
+        )
+    cls = str(card.get("name") or name)
+    bv = ctx._resolve_view(selector)
+    vtable = card.get("vtable") or {}
+    if not vtable.get("address"):
+        raise OperationFailure(
+            "invalid_request",
+            f"class {cls} has no primary vtable bn could locate, so there is no vptr to type. "
+            "Declare the instance struct with `bn types declare` and retype `this` with "
+            "`bn local retype <function> this '<type>'`.",
+            requested=requested,
+        )
+    ptr = int(getattr(bv, "address_size", 8) or 8)
+    slot_start = int(str(vtable["address"]), 16) + 2 * ptr
+    vtable_type = read_class._bn_vtable_type_name(bv, slot_start)
+    instance = _lookup_named_type(bv, cls)
+    if vtable_type is None:
+        if instance is None:
+            # The struct-show note names a derived class's table when BN made
+            # only those (an abstract base), with the caveat that borrowing one
+            # is a choice this command does not make for the caller.
+            note = ctx._class_vtable_note(cls, sorted(_view_type_names(bv) or ()))
+        else:
+            # #993 review: that note says the struct does not exist and offers
+            # a declare that would replace it; this one is about the vptr only.
+            derived = sorted(n for n in _view_type_names(bv) or ()
+                             if n.startswith(f"{cls}::") and n.endswith("::VTable"))
+            note = (f" BN made VTable types only for classes derived from {cls} "
+                    f"({', '.join(derived[:3])}); their leading slots are {cls}'s virtuals, but "
+                    f"their `this` types belong to the derived class. To borrow one, retype the "
+                    f"vptr yourself: bn struct field set {cls} 0x0 <member> 'struct `{derived[0]}`*'."
+                    if derived else "")
+        raise OperationFailure(
+            "invalid_request",
+            f"Binary Ninja defined no `<Class>::VTable` type at {cls}'s slot array "
+            f"({hex(slot_start)}), so there is no table type of its own for the vptr to point "
+            "at." + (note or " Declare one with `bn types declare`, then type the vptr with "
+                     "`bn struct field set`."),
+            requested=requested,
+        )
+    vptr_type = f"struct `{vtable_type}`*"
+    operations: list[dict[str, Any]] = []
+    size = card.get("size") or {}
+    width = 0
+    try:
+        width = int(str(size.get("value")), 16) if size.get("value") else 0
+    except ValueError:
+        width = 0
+    vptr_before: dict[str, str] | None = None
+    if instance is None:
+        body = f"struct `{vtable_type}`* vtable;"
+        if width > ptr:
+            body += f" uint8_t _unk{ptr:x}[{hex(width - ptr)}];"
+        operations.append({"op": "types_declare", "declaration": f"struct `{cls}` {{ {body} }};"})
+        struct_action = "declared"
+    else:
+        if _type_tag_kind(instance) not in ("struct", "class"):
+            # #993 review round 2: a union also has a Structure type class, and
+            # passed this check only to fail later in `local retype`.
+            raise OperationFailure(
+                "invalid_request",
+                f"{cls} names a {str(instance)!r} type, not a struct, so it cannot carry a vptr.",
+                requested=requested,
+            )
+        # #993 review: the vptr's 8 bytes may only replace ONE pointer-width
+        # scalar at offset 0 (a `void* vtable`, a `uint64_t`); an embedded base,
+        # a padding array, a union or two narrow fields there are layout the
+        # write would destroy, so they are refused, not overwritten.
+        occupying = [m for m in getattr(instance, "members", None) or []
+                     if int(getattr(m, "offset", 0)) < ptr]
+        first = occupying[0] if len(occupying) == 1 and int(getattr(occupying[0], "offset", -1)) == 0 else None
+        if first is not None and _is_pointer_to(getattr(first, "type", None), vtable_type):
+            struct_action = "unchanged"
+        elif occupying and (first is None or not _replaceable_vptr_slot(bv, getattr(first, "type", None), ptr)):
+            listed = ", ".join(
+                f"{getattr(m, 'name', '') or '<unnamed>'} ({getattr(m, 'type', '')} @{hex(int(getattr(m, 'offset', 0)))})"
+                for m in occupying)
+            # An embedded base is typed with ITS class's own table, not this
+            # class's (that is the borrowing the abstract-base refusal warns of).
+            resolved, base = _resolve_typedefs(bv, getattr(first, "type", None) if first is not None else None)
+            base_hint = ""
+            if base and "Structure" in _type_class_name(resolved or object()):
+                # Its own table exists iff BN named one `<base>::VTable` or
+                # `<Root>::<base>::VTable`; an abstract base has none.
+                own_table = any(n == f"{base}::VTable" or n.endswith(f"::{base}::VTable")
+                                for n in _view_type_names(bv) or ())
+                base_hint = (f"If {first.name} is an embedded base, type its vptr with "
+                             f"`bn class apply-types {base}`. " if own_table else
+                             f"If {first.name} is an embedded base, BN made no VTable type of "
+                             f"{base}'s own, so type the vptr inside {base} by hand "
+                             f"(`bn struct field set {base} 0x0 <member> '<type>'`). ")
+            raise OperationFailure(
+                "invalid_request",
+                f"struct {cls} holds {listed} where the {ptr}-byte vptr goes, and writing the vptr "
+                f"would replace it; only a single pointer-width pointer or integer member at 0x0 "
+                f"(typedefs of one included) is retyped. {base_hint}To replace it anyway, which "
+                f"removes it, run `bn struct field set {cls} 0x0 vtable '{vptr_type}'`.",
+                requested=requested,
+            )
+        else:
+            operations.append({
+                "op": "struct_field_set", "struct_name": cls, "offset": "0x0",
+                "field_name": str(getattr(first, "name", "") or "vtable") if first is not None else "vtable",
+                "field_type": vptr_type, "overwrite_existing": True,
+            })
+            struct_action = "vptr_retyped" if first is not None else "vptr_added"
+            if first is not None:
+                vptr_before = {"field_name": str(getattr(first, "name", "")),
+                               "field_type": str(getattr(first, "type", ""))}
+    retyped: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    seen: set[int] = set()
+    for method in card.get("methods") or []:
+        try:
+            address = int(str(method.get("address")), 16)
+        except ValueError:
+            continue
+        if address in seen:
+            continue
+        seen.add(address)
+        row = {"address": hex(address), "name": str(method.get("demangled") or method.get("mangled") or "")}
+        if (method.get("thunk") or {}).get("is_candidate"):
+            skipped.append({**row, "reason": "thunk"})
+            continue
+        fn = bv.get_function_at(address)
+        params = list(getattr(fn, "parameter_vars", None) or []) if fn is not None else []
+        if not any(str(getattr(var, "name", "")) == "this" for var in params):
+            skipped.append({**row, "reason": "no parameter named `this`"})
+            continue
+        operations.append({"op": "local_retype", "function": hex(address), "variable": "this",
+                           "new_type": f"struct `{cls}`*"})
+        retyped.append(row)
+    # #993 review: a vtable slot that is not one of the class's own methods --
+    # inherited, or every slot of a stripped build, whose card has no methods
+    # -- is not retyped (its `this` may be a base's), but it is listed.
+    for slot in vtable.get("slots") or []:
+        target = (slot or {}).get("method") or {}
+        try:
+            address = int(str(target.get("address")), 16)
+        except ValueError:
+            continue
+        if address in seen:
+            continue
+        seen.add(address)
+        skipped.append({"address": hex(address),
+                        "name": str(target.get("display_name") or target.get("name") or ""),
+                        "reason": "vtable slot that is not one of the class's own methods "
+                                  "(inherited, or unnamed in a stripped build)"})
+    plan = {
+        "class": cls,
+        "vtable_type": vtable_type,
+        "instance_struct": struct_action,
+        "size": size.get("value") if width else None,
+        "size_source": card.get("size_source"),
+        "retyped_methods": retyped,
+        "skipped_methods": skipped,
+        **({"vptr_member_before": vptr_before} if vptr_before else {}),
+    }
+    return operations, plan
+
+
+def _is_pointer_to(type_obj, name: str) -> bool:
+    """Whether *type_obj* is exactly a pointer to the named type *name* (not a
+    pointer to a pointer, an array of them, or the type by value)."""
+    if type_obj is None or "Pointer" not in _type_class_name(type_obj):
+        return False
+    target = getattr(type_obj, "target", None)
+    if target is None:
+        return False
+    if "NamedTypeReference" in _type_class_name(target):
+        return str(getattr(target, "name", "") or "") == name
+    registered = getattr(target, "registered_name", None)
+    return registered is not None and str(getattr(registered, "name", "") or "") == name
+
+
+def _resolve_typedefs(bv, type_obj):
+    """*type_obj* with every typedef (named reference) followed, and the name
+    of the last named type on the way (`HB` -> `struct svc::Handler` gives the
+    struct and `svc::Handler`). The walk is keyed by name, so a cycle stops it
+    and a long chain does not."""
+    name = ""
+    seen: set[str] = set()
+    while type_obj is not None and "NamedTypeReference" in _type_class_name(type_obj):
+        name = str(getattr(type_obj, "name", "") or "")
+        if not name or name in seen:
+            return None, name
+        seen.add(name)
+        type_obj = _lookup_named_type(bv, name)
+    registered = getattr(type_obj, "registered_name", None) if type_obj is not None else None
+    registered_name = str(getattr(registered, "name", "") or "") if registered is not None else ""
+    return type_obj, registered_name or name
+
+
+def _replaceable_vptr_slot(bv, type_obj, ptr: int) -> bool:
+    """Whether an offset-0 member of this type may be retyped as the vptr: a
+    pointer or integer exactly one pointer wide, through any typedefs (a
+    `typedef void* opaque_ptr` member counts, #993 review round 2)."""
+    type_obj, _ = _resolve_typedefs(bv, type_obj)
+    try:
+        width = int(getattr(type_obj, "width", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    kind = _type_class_name(type_obj)
+    return width == ptr and ("Pointer" in kind or "Integer" in kind)
+
+
+def _with_class_apply_types_plan(result: Any, plan: dict[str, Any]) -> Any:
+    """Attach *plan* to the batch result, each retyped method stamped with its
+    own row's status (`verified`, or `noop` when `this` already had the type),
+    so `this retyped:` counts what changed rather than what was planned."""
+    if not isinstance(result, dict):
+        return result
+    rows = [row for row in result.get("results") or []
+            if isinstance(row, dict) and row.get("op") == "local_retype"]
+    plan = dict(plan)
+    plan["retyped_methods"] = [
+        {**method, "status": rows[index].get("status")} if index < len(rows) else dict(method)
+        for index, method in enumerate(plan.get("retyped_methods") or [])
+    ]
+    result["class_apply_types"] = plan
+    return result
+
+
+def _class_apply_types_noop(plan: dict[str, Any], *, preview: bool) -> dict[str, Any]:
+    """The result of a `class apply-types` with nothing left to write: the
+    struct already holds the typed vptr and no method has a `this` to retype
+    (a re-run on a stripped build). One `noop` row, like any all-noop batch,
+    so it exits 0 rather than being refused (#993 review)."""
+    return {
+        "preview": preview,
+        "success": True,
+        "committed": not preview,
+        "message": f"Nothing to apply: {plan.get('class')} is already typed.",
+        "results": [{"op": "class_apply_types", "status": "noop",
+                     "requested": {"op": "class_apply_types", "name": plan.get("class")}}],
+        "affected_functions": [],
+        "affected_types": [],
+        "affected_summary": {"referenced": 0, "reflowed": 0},
+        # Same convention as the engine: a preview reports its (empty) revert.
+        "rolled_back": bool(preview),
+        "class_apply_types": plan,
+    }

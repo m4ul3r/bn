@@ -1703,12 +1703,16 @@ class BridgeContext:
                       "slots belong to the derived class; declare your own VTable struct "
                       "for an exact fit)")
         vt = (own or derived)[0]
+        # #993 item 3: with a table of its own, `class apply-types` does both
+        # steps; it refuses to borrow a derived class's table, so it is not
+        # offered for that case.
+        shortcut = f" `bn class apply-types {name}` does both steps as one mutation." if own else ""
         return (f" No struct named {name} is defined: {listed}; BN names a derived class's "
                 f"vtable type `<Base>::<Class>::VTable`. Declare the instance struct with a typed "
                 f"vptr, e.g. bn types declare 'struct `{name}` {{ struct `{vt}`* vtable; }};'"
                 f"{caveat}, then type each method's `this` with bn local retype <function> "
                 f"this 'struct `{name}`*' so virtual calls render as "
-                f"this->vtable-><method>().")
+                f"this->vtable-><method>().{shortcut}")
 
     @staticmethod
     def _is_anonymous_aggregate(member_type) -> bool:

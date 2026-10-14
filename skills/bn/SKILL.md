@@ -18,7 +18,7 @@ Use `bn` for Binary Ninja reads and writes through the bridge. Choose a methodol
 ## Command index
 
 - **Read** — `target info/list`, `function list/search/info/cfg/structured-il`, `decompile`, `il`, `disasm`, `xrefs`, `callsites`, `evidence function/xrefs/table/message/init/calls/orient/surface/virtual-call`, `trace`, `dataflow defuse/callgraph/values`, `taint forward/backward/models`, `go functions`, `proto get`, `local list`, `data vars/symbols`, `read`, `types [show]`, `struct show`, `class list/show`, `strings`, `imports`, `exports`, `sections`, `tag list/get/types`, `comment list/get`, `bundle function` → `reference/reading.md`
-- **Mutate** — `symbol rename`, `proto set`, `local rename/retype`, `comment set/delete`, `struct field set/rename/delete`, `types declare`, `data retype`, `function create`, `tag add/remove`, `tag type create/remove`, `go rename`, `batch apply` → `reference/mutating.md`
+- **Mutate** — `symbol rename`, `proto set`, `local rename/retype`, `comment set/delete`, `struct field set/rename/delete`, `types declare`, `class apply-types`, `data retype`, `function create`, `tag add/remove`, `tag type create/remove`, `go rename`, `batch apply` → `reference/mutating.md`
 - **Discover** — `capabilities` → `reference/runtime.md`
 - **Session** — `load`, `save`, `close`, `refresh`, `session start/list/stop/restart/status`, `instance list/find/gc`, `target close` → `reference/runtime.md`
 - **Tooling** — `doctor`, `help`, `plugin install`, `skill install`, `spill gc` → `reference/runtime.md`

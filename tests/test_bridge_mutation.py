@@ -2441,6 +2441,54 @@ def test_struct_field_set_overwrite_narrower_retype_reusing_removed_name_succeed
     assert builder.added and builder.added[0] == ("wide", 4, True)
 
 
+def test_struct_field_set_names_every_member_the_overwrite_removes(monkeypatch):
+    """#999 item 4: overwrite removes EVERY member the new field overlaps, and
+    the result named only the one at its exact offset (`before_member`), so a
+    padding array starting below the new field vanished behind `verified`.
+    Each removed member is listed; the member rewritten in place under its own
+    name is not (it is `before_member`), and a member beside the range is kept."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    builder = _AddableStructBuilder()
+
+    class _SizedType:
+        def __init__(self, text, width):
+            self.text, self.width = text, width
+
+        def __str__(self):
+            return self.text
+
+    def member(offset, name, type_text, width):
+        return types.SimpleNamespace(offset=offset, name=name, type=_SizedType(type_text, width))
+
+    layout = types.SimpleNamespace(members=[
+        member(0x0, "head", "uint64_t", 8),
+        member(0x8, "_unk8", "char[0x70]", 0x70),
+        member(0x78, "_unk78", "uint8_t[0x1e0]", 0x1e0),
+    ])
+
+    class _BV:
+        def parse_type_string(self, s):
+            return types.SimpleNamespace(width=8), None
+
+        def get_type_by_name(self, n):
+            return layout
+
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("Pad", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
+    res = instance._op_struct_field_set(_BV(), {
+        "struct_name": "Pad", "offset": "0x118", "field_name": "worker",
+        "field_type": "uint64_t", "overwrite_existing": True})
+    assert res["before_member"] is None
+    assert res["replaced_members"] == [
+        {"field_name": "_unk78", "field_type": "uint8_t[0x1e0]", "offset": "0x78"}]
+    # Retyping `head` in place replaces nothing else, so the key stays absent.
+    in_place = instance._op_struct_field_set(_BV(), {
+        "struct_name": "Pad", "offset": "0x0", "field_name": "head",
+        "field_type": "uint64_t", "overwrite_existing": True})
+    assert "replaced_members" not in in_place
+
+
 def test_struct_field_set_overwrite_minting_surviving_duplicate_refused(monkeypatch):
     """#666 round 3 follow-up, the genuine case: `a` at 0x0 and `b` at 0x8 do
     NOT overlap a 4-byte write at 0x0 (only `a` is removed), so naming the new
@@ -6656,3 +6704,129 @@ def test_batch_revert_gate_reads_the_shared_failure_status_set_777():
         assert me._has_failed_results(None, [{"status": status}]) is True, status
     for status in ("verified", "noop", "reverted"):
         assert me._has_failed_results(None, [{"status": status}]) is False, status
+
+
+def test_class_apply_types_plan_builds_the_typing_batch(monkeypatch):
+    """#993 item 3: the plan declares the instance struct around BN's own
+    VTable type (padded to a recovered size), retypes `this` only where a
+    method has one, lists every method it skipped with why, and on an existing
+    struct retypes offset 0 under that member's own name."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+    method = _FakeFunction(0x401200, "demo::Widget::run")
+    method.parameter_vars = [types.SimpleNamespace(name="this")]
+    factory = _FakeFunction(0x401260, "demo::Widget::make")
+    bv = _FakeBV(functions=[method, factory], arch=_FakeArch(address_size=8))
+    card = {"name": "demo::Widget", "vtable": {"address": "0x404000"},
+            "size": {"value": "0x20", "source": "operator_new"}, "size_source": "operator_new",
+            "methods": [
+                {"address": "0x401200", "demangled": "demo::Widget::run", "thunk": {"is_candidate": False}},
+                {"address": "0x401260", "demangled": "demo::Widget::make", "thunk": {"is_candidate": False}},
+                {"address": "0x4012a0", "demangled": "demo::Widget::stub", "thunk": {"is_candidate": True}},
+            ]}
+    slots = []
+    monkeypatch.setattr(bridge.read_class, "_class_show", lambda ctx, selector, name: dict(card))
+    monkeypatch.setattr(bridge.read_class, "_bn_vtable_type_name",
+                        lambda view, start: slots.append(start) or "demo::Base::demo::Widget::VTable")
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert slots == [0x404010]                  # past offset-to-top and typeinfo
+    assert operations == [
+        {"op": "types_declare", "declaration":
+            "struct `demo::Widget` { struct `demo::Base::demo::Widget::VTable`* vtable; uint8_t _unk8[0x18]; };"},
+        {"op": "local_retype", "function": "0x401200", "variable": "this",
+         "new_type": "struct `demo::Widget`*"},
+    ]
+    assert plan["instance_struct"] == "declared" and plan["size"] == "0x20"
+    assert [m["name"] for m in plan["retyped_methods"]] == ["demo::Widget::run"]
+    assert plan["skipped_methods"] == [
+        {"address": "0x401260", "name": "demo::Widget::make", "reason": "no parameter named `this`"},
+        {"address": "0x4012a0", "name": "demo::Widget::stub", "reason": "thunk"}]
+
+    vt_name = "demo::Base::demo::Widget::VTable"
+
+    def member(offset, name, decl, width, type_class, target=None):
+        type_obj = _FakeType(decl, width=width, type_class=type_class)
+        type_obj.target = target
+        return types.SimpleNamespace(offset=offset, name=name, type=type_obj)
+
+    def struct_with(*members):
+        bv.types["demo::Widget"] = _FakeType("struct demo::Widget", width=0x20, members=list(members))
+
+    vt_ref = _FakeType(f"struct {vt_name}", type_class="NamedTypeReferenceClass")
+    vt_ref.name = vt_name
+
+    # A pointer-width pointer at 0x0 is retyped under its own name.
+    struct_with(member(0, "vptr", "void*", 8, "PointerTypeClass"))
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert operations[0] == {"op": "struct_field_set", "struct_name": "demo::Widget", "offset": "0x0",
+                             "field_name": "vptr", "field_type": f"struct `{vt_name}`*",
+                             "overwrite_existing": True}
+    assert plan["instance_struct"] == "vptr_retyped"
+    assert plan["vptr_member_before"] == {"field_name": "vptr", "field_type": "void*"}
+
+    # #993 review: layout the 8-byte vptr would destroy is refused, not
+    # overwritten -- an embedded base, a padding array, two narrow fields.
+    for layout in ([member(0, "base", "struct demo::Base", 0x18, "StructureTypeClass")],
+                   [member(0, "_unk0", "uint8_t[0x20]", 0x20, "ArrayTypeClass")],
+                   [member(0, "a", "int32_t", 4, "IntegerTypeClass"),
+                    member(4, "b", "int32_t", 4, "IntegerTypeClass")]):
+        struct_with(*layout)
+        with pytest.raises(bridge.OperationFailure) as excinfo:
+            me._class_apply_types_plan(instance.ctx, None, "Widget")
+        assert "would replace it" in excinfo.value.message, layout
+
+    # Only EXACTLY a pointer to the VTable is already typed; a pointer to a
+    # pointer to it is retyped, not mistaken for done.
+    struct_with(member(0, "table", f"struct {vt_name}*", 8, "PointerTypeClass", target=vt_ref))
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert plan["instance_struct"] == "unchanged"
+    assert [op["op"] for op in operations] == ["local_retype"]
+    inner = _FakeType(f"struct {vt_name}*", width=8, type_class="PointerTypeClass")
+    inner.target = vt_ref
+    struct_with(member(0, "table", f"struct {vt_name}**", 8, "PointerTypeClass", target=inner))
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert plan["instance_struct"] == "vptr_retyped"
+
+    # #993 review round 2: a pointer-width TYPEDEF at 0x0 is retyped like the
+    # pointer it names, and a union instance is refused as not a struct.
+    bv.types["opaque_ptr"] = _FakeType("void*", width=8, type_class="PointerTypeClass")
+    opaque = _FakeType("opaque_ptr", width=8, type_class="NamedTypeReferenceClass")
+    opaque.name = "opaque_ptr"
+    struct_with(types.SimpleNamespace(offset=0, name="vptr", type=opaque))
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert plan["instance_struct"] == "vptr_retyped", plan
+    union = _FakeType("union demo::Widget", width=8, members=[member(0, "p", "void*", 8, "PointerTypeClass")])
+    union.type = "UnionStructureType"
+    bv.types["demo::Widget"] = union
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert "not a struct" in excinfo.value.message
+
+    # A stripped card: no methods, slots only. Nothing is left to write once
+    # the struct is typed -- an empty plan, not a refusal -- and every slot
+    # function is listed as skipped.
+    card["methods"] = []
+    card["vtable"] = {"address": "0x404000", "slots": [
+        {"index": 0, "method": {"address": "0x401300", "display_name": "sub_401300"}},
+        {"index": 1, "method": None}]}
+    struct_with(member(0, "table", f"struct {vt_name}*", 8, "PointerTypeClass", target=vt_ref))
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert operations == []
+    assert [(m["address"], m["name"]) for m in plan["skipped_methods"]] == [("0x401300", "sub_401300")]
+    noop = me._class_apply_types_noop(plan, preview=False)
+    assert [row["status"] for row in noop["results"]] == ["noop"] and noop["success"] is True
+
+    # No VTable type of its own: refused before any op is built, and an
+    # existing struct is not told it does not exist.
+    monkeypatch.setattr(bridge.read_class, "_bn_vtable_type_name", lambda view, start: None)
+    bv.types["demo::Widget::demo::Leaf::VTable"] = _FakeType("struct VT", width=8)
+    bv.type_names = list(bv.types)
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert excinfo.value.status == "invalid_request"
+    assert "no table type of its own" in excinfo.value.message
+    assert "No struct named" not in excinfo.value.message
+    assert "demo::Widget::demo::Leaf::VTable" in excinfo.value.message

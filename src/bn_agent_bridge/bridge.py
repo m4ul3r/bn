@@ -4935,7 +4935,7 @@ class BinaryNinjaBridge:
     def _run_local_restores(self, *a, **k):
         return mutation_engine._run_local_restores(self.ctx, *a, **k)
 
-    def _mutation(self, *a, **k):
+    def _mutation(self, *a, gate_held: bool = False, **k):
         # #628: mutation ops are @op lock="none" -- they reanalyze inside their
         # own body, so holding the exclusive target lock for the whole op starved
         # every concurrent read for the length of update_analysis_and_wait(). Lock
@@ -4951,7 +4951,10 @@ class BinaryNinjaBridge:
         #     alone so concurrent reads stay live.
         # Revert/settle stays exclusive on purpose: a reader must never observe a
         # half-reverted view. The #479 quick-load refusal is unchanged.
-        with self._write_gate:
+        # `gate_held`: the caller already holds the write gate (which is not
+        # reentrant) because it planned the batch under it -- `class apply-types`
+        # reads the class card and applies the ops it built as one writer.
+        with contextlib.nullcontext() if gate_held else self._write_gate:
             try:
                 result = mutation_engine._mutation(
                     self.ctx, *a, exclusive=self._target_lock.write, **k
@@ -5034,6 +5037,18 @@ class BinaryNinjaBridge:
                 except Exception:
                     pass
             return result
+
+    def _class_apply_types(self, selector, name: str, *, preview: bool = False):
+        """#993 item 3: plan the class's typing ops (read_class's card, under the
+        read lock) and apply them as ONE mutation, holding the write gate across
+        both so no other writer can change the class between plan and apply."""
+        with self._write_gate:
+            with self._target_lock.read():
+                operations, plan = mutation_engine._class_apply_types_plan(self.ctx, selector, name)
+            if not operations:
+                return mutation_engine._class_apply_types_noop(plan, preview=preview)
+            result = self._mutation(selector, preview, operations, gate_held=True)
+        return mutation_engine._with_class_apply_types_plan(result, plan)
 
     def _op_rename_symbol(self, *a, **k):
         return mutation_engine._op_rename_symbol(self.ctx, *a, **k)
@@ -5393,6 +5408,16 @@ def _bind_class_list(bridge, params, target):
 @op("class_show", lock="read")
 def _bind_class_show(bridge, params, target):
     return bridge._class_show(target, str(params["name"]))
+
+
+# lock="none": it takes the write gate itself and the read lock only while it
+# plans, then applies through the ordinary mutation engine (#993 item 3).
+@op("class_apply_types", lock="none")
+def _bind_class_apply_types(bridge, params, target):
+    return bridge._class_apply_types(
+        target, str(params["name"]),
+        preview=_validate_bool(params.get("preview"), label="preview", default=False),
+    )
 
 
 @op("defuse", lock="read")
