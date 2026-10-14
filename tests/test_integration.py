@@ -1216,18 +1216,16 @@ class TestTypeStringsAndInheritance:
             assert summary["ok"] is False and summary["verified_count"] == 0, summary
             assert library_type in summary["kept_library_imports"], summary
             assert "Run the declare without --preview" in summary["first_error"], summary
-        # A user typedef named like a library type: whatever BN does, a
-        # preview that reports verified must not have changed a type id.
-        shared_bn.json("types", "declare", "typedef int sigset_t;")
+        # The reviewed shape as ONE declaration: the user typedef and its use
+        # parse together, and BN imports libc's `sigset_t` (and `__sigset_t`)
+        # while parsing -- the preview must fail and name both (review round 5).
         before = shared_bn.run("py", "exec", "--code", ids).stdout
-        local = shared_bn.run("types", "declare", "struct Local993 { sigset_t s; };", "--preview",
-                              "--format", "json", "--summary")
-        after = shared_bn.run("py", "exec", "--code", ids).stdout
+        local = shared_bn.run("types", "declare", "typedef int sigset_t; struct Local993 { sigset_t s; };",
+                              "--preview", "--format", "json", "--summary")
         summary = json.loads(local.stdout)
-        if local.returncode == 0:
-            assert summary["verified_count"] == 1 and before == after, summary
-        else:
-            assert local.returncode == 3 and summary.get("kept_library_imports"), summary
+        assert before != shared_bn.run("py", "exec", "--code", ids).stdout, "BN imported nothing"
+        assert local.returncode == 3 and summary["verified_count"] == 0, summary
+        assert {"sigset_t", "__sigset_t"} <= set(summary["kept_library_imports"]), summary
 
     def test_member_names_like_library_types_preview_normally(self, shared_bn):
         """#993 review round 4: the bare-identifier pre-check treated member

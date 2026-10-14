@@ -2524,10 +2524,10 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
             if isinstance(op, dict):
                 _validate_operation_request(ctx, op, index=index)
         if preview:
-            # #993 review round 3: a preview never imports a type-library type and
-            # never models the import (that failed three reviews), so a declare
-            # that would need one is refused here -- before the snapshot below,
-            # whose parse is already one that imports.
+            # #993 review rounds 3-4: refuse up front only what the text says for
+            # certain -- a tag-keyword mention of a library type the view lacks --
+            # before the snapshot below, whose parse is already one that imports.
+            # Anything else BN imports is caught after the fact (`_new_library_imports`).
             for index, op in enumerate(operations):
                 if not (isinstance(op, dict) and op.get("op") == "types_declare"):
                     continue
