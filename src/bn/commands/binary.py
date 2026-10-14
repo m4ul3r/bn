@@ -43,10 +43,14 @@ def _render_target_info_text_with_annotations(value: Any) -> str:
                  metavar="INSTANCE",
                  help="ID for the bridge instance to auto-spawn (alias of --instance)"),
              arg("--no-bndb", action="store_true",
-                 help="Don't auto-prefer a sibling .bndb file"),
+                 help="Open the raw bytes: skip both an adjacent <binary>.bndb and a "
+                      "database saved to the cache. The cache is machine-wide; set "
+                      "BN_CACHE_DIR per agent or project to isolate them"),
              arg("--quick", "--no-analysis", action="store_true",
                  help="Load without full analysis (fast, ~1s): sections/imports/symbols are ready "
-                      "immediately; strings and the full function set need `bn refresh`"),
+                      "immediately; strings and the full function set need `bn refresh`. Never "
+                      "restores a cached database (the note names it); an adjacent "
+                      "<binary>.bndb is still preferred unless --no-bndb"),
          ])
 def _load(args: argparse.Namespace) -> int:
     import os
@@ -240,7 +244,21 @@ def _target_close(args: argparse.Namespace) -> int:
 
 @command("save", help="Save the current analysis database (.bndb)", target=True,
          args=[
-             arg("path", nargs="?", help="Output path (defaults to <filename>.bndb)"),
+             arg("path", nargs="?",
+                 help="Output path; a relative path resolves against the invoking shell's "
+                      "cwd, not the bridge's. Default: <binary path>.bndb (a target opened "
+                      "from a .bndb saves back to it). When that default cannot be written "
+                      "(e.g. a read-only mount) the save falls back to "
+                      "<cache>/bndb/<name>.<first 16 hex of the binary's sha256>.bndb -- "
+                      "<cache> is $BN_CACHE_DIR, else the user cache dir (~/.cache/bn on "
+                      "Linux) -- which a later `bn load` of the same bytes restores; an "
+                      "explicit path never falls back, and the fallback refuses to "
+                      "overwrite an existing entry this target was not loaded from (exit 2; JSON "
+                      "{ok: false, status: invalid_request, observed: {cache_entry_exists, "
+                      "request_sent: true, written: false}} -- exit 2, not the mutation exit 3, "
+                      "because save is a file write, not a mutation). The cache is shared by every bn "
+                      "instance using it: set BN_CACHE_DIR per agent or project to keep "
+                      "their saved analyses apart"),
              arg("--path", dest="path_flag", default=None,
                  help="Output path (alias for the positional)"),
          ])
