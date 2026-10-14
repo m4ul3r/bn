@@ -3974,6 +3974,9 @@ _GO_RENAME_NON_COUNT_READS = {
     "replaced_members", "class_apply_types",
     # #993 review round 2: the rolled-back declare's kept library imports.
     "kept_library_imports",
+    # #999 item 5: the paired renderer reads the ops a --preview left out back
+    # off the summary; a listing, not a count, and absent on every `go rename`.
+    "preview_skipped",
 }
 
 

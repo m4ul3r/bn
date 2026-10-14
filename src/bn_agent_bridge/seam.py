@@ -1710,7 +1710,8 @@ class BridgeContext:
         return (f" No struct named {name} is defined: {listed}; BN names a derived class's "
                 f"vtable type `<Base>::<Class>::VTable`. Declare the instance struct with a typed "
                 f"vptr, e.g. bn types declare 'struct `{name}` {{ struct `{vt}`* vtable; }};'"
-                f"{caveat}, then type `this` as struct `{name}`* so virtual calls render as "
+                f"{caveat}, then type each method's `this` with bn local retype <function> "
+                f"this 'struct `{name}`*' so virtual calls render as "
                 f"this->vtable-><method>().{shortcut}")
 
     @staticmethod

@@ -908,6 +908,10 @@ def test_type_not_found_explains_class_vtable_types(monkeypatch):
         ctx._find_type(bv, "app::Widget")
     assert "No struct named app::Widget is defined" in str(own.value)
     assert "struct `app::Base::app::Widget::VTable`* vtable" in str(own.value)
+    # #999 item 2: `this` cannot be named in a `proto set`, so the hint types it
+    # through the command that can.
+    assert ("bn local retype <function> this 'struct `app::Widget`*'"
+            in str(own.value))
     with pytest.raises(RuntimeError) as unrelated:
         ctx._find_type(bv, "app::Other")
     assert "No struct named" not in str(unrelated.value)
