@@ -1058,26 +1058,61 @@ def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[tuple[int, str
     for index, op in enumerate(operations):
         if not (isinstance(op, dict) and op.get("op") == "set_prototype"):
             continue
-        identifier = op.get("identifier")
-        if identifier is None:
-            continue
-        fn = _resolve_prototype_target(ctx, bv, op)
-        if bool(getattr(fn, "has_user_type", False)):
-            # A genuine prior user type: re-asserting it on revert is correct.
-            continue
-        label = str(il_format._display_name(fn) or identifier)
-        try:
-            expected_type = _parse_prototype(ctx, bv, op)
-        except OperationFailure:
-            if not declares_types:
-                raise
-            # Cannot determine whether the prototype differs from this AUTO
-            # function's current type, so cannot prove it is a no-op -> refuse.
-            flagged.append((index, label))
-            continue
-        if str(fn.type) != str(expected_type):
+        label = _unrevertible_label(ctx, bv, op, declares_types)
+        if label is not None:
             flagged.append((index, label))
     return flagged
+
+
+def _unrevertible_label(ctx, bv, op: dict[str, Any], declares_types: bool) -> str | None:
+    """The function label when this set_prototype would pin has_user_type on an
+    AUTO function under --preview (see above), else None. Its target is resolved
+    with BN's real lookup against the current view, which is the apply-time view
+    when no earlier op in the batch moves resolution; a miss raises the apply's
+    own error."""
+    identifier = op.get("identifier")
+    if identifier is None:
+        return None
+    fn = _resolve_prototype_target(ctx, bv, op)
+    if bool(getattr(fn, "has_user_type", False)):
+        # A genuine prior user type: re-asserting it on revert is correct.
+        return None
+    label = str(il_format._display_name(fn) or identifier)
+    try:
+        expected_type = _parse_prototype(ctx, bv, op)
+    except OperationFailure:
+        if not declares_types:
+            raise
+        # Cannot determine whether the prototype differs from this AUTO
+        # function's current type, so cannot prove it is a no-op -> refuse.
+        return label
+    return label if str(fn.type) != str(expected_type) else None
+
+
+def _earlier_supplier(identifier: Any, earlier) -> tuple[int, str] | None:
+    """``(index, what it may do)`` for the first op in *earlier* that could make
+    an unresolvable set_prototype target resolve, or None. Not a prediction of
+    whether it does: only which op KINDS can. A function create (or an op this
+    engine does not know) can supply any target; a rename can supply a NAME but
+    never an address, since it creates no function; every other known op -- a
+    data retype included -- neither creates nor renames anything."""
+    try:
+        _parse_address(identifier)
+        is_address = True
+    except (ValueError, TypeError):
+        is_address = False
+    for index, op in enumerate(earlier):
+        kind = op.get("op") if isinstance(op, dict) else None
+        if kind == "function_create":
+            return index, "create a function"
+        if kind == "rename_symbol":
+            if not is_address:
+                return index, "rename a symbol to it"
+            continue
+        if kind in _RESOLUTION_SAFE_OPS or kind == "data_retype":
+            continue
+        return index, f"change symbols (it is {kind!r}, an op this check does not know)"
+    return None
 
 
 def _declares_types(operations) -> bool:
@@ -1122,43 +1157,49 @@ def _unpreviewable_operations(ctx, bv, operations) -> dict[int, str]:
     elsewhere -- and previews the rest."""
     skipped: dict[int, str] = {}
     offending = _resolution_affecting_op(operations)
-    if offending is not None:
-        offending_op, is_known = offending
-        cause = (f"a rename or a symbol/function create ({offending_op})" if is_known
-                 else f"the operation {offending_op!r}, which may change how a symbol resolves")
+    declares_types = _declares_types(operations)
+    for index, op in enumerate(operations):
+        if not (isinstance(op, dict) and op.get("op") == "set_prototype"):
+            continue
+        # A prototype applies in the view the ops BEFORE it leave, so only they
+        # can move what it resolves to; an op after it cannot.
+        earlier = _resolution_affecting_op(operations[:index])
+        if earlier is None:
+            label = _unrevertible_label(ctx, bv, op, declares_types)
+            if label is not None:
+                skipped[index] = (
+                    f"not previewed: {label} has no user prototype yet, and setting one "
+                    "pins its has_user_type flag, which Binary Ninja exposes no API to "
+                    "clear, so the preview could not be cleanly reverted")
+            continue
         # The target cannot be PROVEN here, but two failures the live apply would
         # hit can still be shown (#999 review): a prototype string that does not
-        # parse, and a target that does not resolve when no EARLIER op could
-        # change name resolution. When one could, whether it supplies the target
-        # is not predicted (that prediction is a follow-up): the op is left out
-        # and says plainly that its target was not checked.
-        check_parse = not _declares_types(operations)
-        for index, op in enumerate(operations):
-            if isinstance(op, dict) and op.get("op") == "set_prototype":
-                if check_parse:
-                    _parse_prototype(ctx, bv, op)
-                try:
-                    _resolve_prototype_target(ctx, bv, op)
-                except OperationFailure as exc:
-                    if _resolution_affecting_op(operations[:index]) is None:
-                        raise
-                    skipped[index] = (
-                        "not previewed: its target does not resolve yet "
-                        f"({exc.message.splitlines()[0] if exc.message else 'not found'}); "
-                        "an earlier operation in this batch may create or rename it, so "
-                        "it is only checked when the batch is applied")
-                    continue
-                skipped[index] = (
-                    f"not previewed: this batch also carries {cause}, so the function "
-                    "this prototype lands on cannot be proven from the pre-mutation view, "
-                    "and a prototype set on a function with no user prototype pins its "
-                    "has_user_type flag, which Binary Ninja cannot clear")
-    else:
-        for index, label in _unrevertible_preview_prototypes(ctx, bv, operations):
+        # parse, and a target that does not resolve when no earlier op is of a
+        # kind that could supply it. When one is, whether it does is not
+        # predicted (a follow-up): the op is left out, saying it was not checked.
+        if not declares_types:
+            _parse_prototype(ctx, bv, op)
+        try:
+            _resolve_prototype_target(ctx, bv, op)
+        except OperationFailure as exc:
+            supplier = _earlier_supplier(op.get("identifier"), operations[:index])
+            if supplier is None:
+                raise
+            source, may = supplier
             skipped[index] = (
-                f"not previewed: {label} has no user prototype yet, and setting one pins "
-                "its has_user_type flag, which Binary Ninja exposes no API to clear, so "
-                "the preview could not be cleanly reverted")
+                "not previewed: its target does not resolve yet "
+                f"({exc.message.splitlines()[0] if exc.message else 'not found'}); "
+                f"operation {source} earlier in this batch may {may}, so it is only "
+                "checked when the batch is applied")
+            continue
+        offending_op, is_known = earlier
+        cause = (f"a rename or a symbol/function create ({offending_op})" if is_known
+                 else f"the operation {offending_op!r}, which may change how a symbol resolves")
+        skipped[index] = (
+            f"not previewed: an earlier operation in this batch is {cause}, so the "
+            "function this prototype lands on cannot be proven from the pre-mutation "
+            "view, and a prototype set on a function with no user prototype pins its "
+            "has_user_type flag, which Binary Ninja cannot clear")
     if not skipped:
         return skipped
     first = min(skipped)
@@ -2479,9 +2520,11 @@ def _refuse_rename_chain(row: dict[str, Any], results: list[dict[str, Any]],
             f"{(row.get('requested') or {}).get('identifier')!r} resolved to that same "
             f"symbol, so it would be renamed again to {row.get('new_name')}. Every op is "
             f"verified against the batch's END state, so operation {first} could never "
-            f"verify. Rename the symbol at {row['address']} once, by that address, to "
-            f"{row.get('new_name')} (by name it may be ambiguous mid-batch), or split "
-            f"the renames across two batches.",
+            f"verify. Drop operation {first} and make operation {index} rename the "
+            f"symbol by its address: {{\"op\": \"rename_symbol\", \"identifier\": "
+            f"\"{row['address']}\", \"new_name\": \"{row.get('new_name')}\"}} -- kept in "
+            f"that position, after the renames between them (moved first, it can run into "
+            f"an ambiguous name) -- or split the renames across two batches.",
             requested={
                 **(row.get("requested") or {}),
                 "conflicting_op_indices": [first, index],

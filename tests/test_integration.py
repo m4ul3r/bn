@@ -563,8 +563,9 @@ class TestBatchManifestTarget:
             failed = failed_row(rename(old, "foo"), second)
             assert failed["status"] == "invalid_request", failed
             assert f"renames the symbol at {address} again" in failed["message"], failed
-            assert f"Rename the symbol at {address} once, by that address, to bar" \
-                in failed["message"], failed
+            assert (f'Drop operation 0 and make operation 1 rename the symbol by its '
+                    f'address: {{"op": "rename_symbol", "identifier": "{address}", '
+                    f'"new_name": "bar"}}') in failed["message"], failed
 
     def test_rename_chains_are_judged_by_where_the_rename_lands_995(self, shared_bn, tmp_path):
         """#995 review rounds 1-2, on BN's own resolver: a chain is refused only

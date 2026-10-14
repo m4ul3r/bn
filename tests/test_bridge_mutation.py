@@ -559,8 +559,11 @@ def test_a_rename_landing_on_a_symbol_already_renamed_fails_the_batch_995(
     assert row["status"] == "invalid_request"
     assert row["requested"]["conflicting_op_indices"] == [first, failed_index]
     assert f"renames the symbol at {hex(landed[first][0])} again" in row["message"]
-    assert (f"Rename the symbol at {hex(landed[first][0])} once, by that address, to "
-            f"{landed[failed_index][2]}") in row["message"]
+    assert (f"Drop operation {first} and make operation {failed_index} rename the symbol "
+            f'by its address: {{"op": "rename_symbol", "identifier": '
+            f'"{hex(landed[first][0])}", "new_name": "{landed[failed_index][2]}"}}'
+            ) in row["message"]
+    assert "kept in that position" in row["message"]
     assert result["rolled_back"] is True and result["success"] is False
     assert all(r["status"] == "reverted" for r in result["results"][:failed_index])
     assert _has_event(bv, "revert")
@@ -3893,21 +3896,22 @@ def test_preview_skips_an_unrevertible_prototype_and_its_dependents_999(monkeypa
 
 
 def test_preview_skips_every_prototype_beside_a_rename_999(monkeypatch):
-    """A rename in the same --preview batch means no prototype target can be
-    proven from the pre-mutation view (#630 round 5). Every set_prototype, and
-    every local op, is left out; the rename and comment are still previewed."""
+    """A rename EARLIER in the same --preview batch means no later prototype
+    target can be proven from the pre-mutation view (#630 round 5). Every such
+    set_prototype, and every local op, is left out; the rename and comment are
+    still previewed."""
     bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
     ops = [
+        {"op": "rename_symbol", "identifier": "other", "new_name": "renamed"},
         {"op": "set_prototype", "identifier": "touch", "prototype": "int touch(void* b)"},
         {"op": "local_retype", "function": "other", "variable": "arg1", "new_type": "int"},
-        {"op": "rename_symbol", "identifier": "other", "new_name": "renamed"},
         {"op": "set_comment", "address": "0x401200", "comment": "hi"},
     ]
 
     result = instance._mutation("active", True, ops)
 
-    assert applied == [ops[2], ops[3]]
-    assert [row["index"] for row in result["preview_skipped"]] == [0, 1]
+    assert applied == [ops[0], ops[3]]
+    assert [row["index"] for row in result["preview_skipped"]] == [1, 2]
     assert "rename_symbol" in result["preview_skipped"][0]["reason"]
 
 
@@ -3991,13 +3995,62 @@ def test_preview_skip_reason_names_a_cause_that_is_not_a_rename_999(monkeypatch)
     bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
 
     result = instance._mutation("active", True, [
-        {"op": "set_prototype", "identifier": "touch", "prototype": "int touch(void* b)"},
         {"op": "data_retype", "address": "0x404000", "new_type": "int32_t"},
+        {"op": "set_prototype", "identifier": "touch", "prototype": "int touch(void* b)"},
     ])
 
     reason = result["preview_skipped"][0]["reason"]
     assert "the operation 'data_retype', which may change how a symbol resolves" in reason
     assert "rename" not in reason
+
+
+@pytest.mark.parametrize("earlier,excused", [
+    # #999 round 4 nit 1: a data retype neither creates nor renames a function.
+    ({"op": "data_retype", "address": "0x404000", "new_type": "int32_t"}, None),
+    # Nit 2: a rename never creates a function, so it cannot supply an ADDRESS.
+    ({"op": "rename_symbol", "identifier": "other", "new_name": "o2"}, None),
+    # A function create can.
+    ({"op": "function_create", "address": "0x401300"}, "may create a function"),
+])
+def test_only_an_op_kind_that_can_supply_an_address_target_excuses_it_999(
+        monkeypatch, earlier, excused):
+    bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
+    ops = [earlier,
+           {"op": "set_prototype", "identifier": "0x401300", "prototype": "int f(void)"}]
+    if excused is None:
+        with pytest.raises(bridge.OperationFailure) as exc:
+            instance._mutation("active", True, ops)
+        assert "0x401300" in exc.value.message
+        assert applied == []
+    else:
+        result = instance._mutation("active", True, ops)
+        assert excused in result["preview_skipped"][0]["reason"]
+
+
+def test_a_data_retype_does_not_excuse_an_unresolvable_name_target_999(monkeypatch):
+    bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", True, [
+            {"op": "data_retype", "address": "0x404000", "new_type": "int32_t"},
+            {"op": "set_prototype", "identifier": "nosuchfn", "prototype": "int f(void)"},
+        ])
+    assert exc.value.message == "Function not found: nosuchfn"
+
+
+def test_a_rename_after_a_prototype_does_not_make_it_unprovable_999(monkeypatch):
+    """#999 round 4 nit 3: a prototype applies in the view the ops BEFORE it
+    leave, so a later rename cannot move its target. On a user-typed function
+    it previews like any other op instead of being skipped as unprovable."""
+    bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
+    auto_fn.set_user_type("int32_t()")
+    ops = [{"op": "set_prototype", "identifier": "touch", "prototype": "int touch(void* b)"},
+           {"op": "rename_symbol", "identifier": "other", "new_name": "o2"}]
+
+    result = instance._mutation("active", True, ops)
+
+    assert "preview_skipped" not in result
+    assert applied == ops
 
 
 def test_preview_misspelled_prototype_field_gets_the_field_hint_999(monkeypatch):
@@ -4364,7 +4417,8 @@ def test_preview_never_applies_a_prototype_beside_a_rename(monkeypatch, function
     # Either reason is honest: the rename is named, or the target was not
     # checked because an earlier op may create it -- never "checked".
     assert ("rename_symbol" in row["message"]
-            or "only checked when the batch is applied" in row["message"]), row["message"]
+            or "only checked when the batch is applied" in row["message"]
+            or "has no user prototype yet" in row["message"]), row["message"]
     assert [item["index"] for item in result["preview_skipped"]] == [proto_index]
     assert {fn.start: (fn.name, fn.has_user_type, str(fn.type)) for fn in fns} == before
     others = [r["status"] for i, r in enumerate(result["results"]) if i != proto_index]
