@@ -2121,10 +2121,10 @@ def test_spawn_instance_reaps_child_when_registration_wait_raises(monkeypatch, t
 
 
 _SPAWN_WAIT_DRIVER = """
-import sys, time
+import inspect, os, signal, sys
 import bn.transport as transport
 
-pidfile = sys.argv[1]
+pidfile, mode, signum = sys.argv[1], sys.argv[2], int(sys.argv[3])
 transport.list_instances = lambda **kwargs: []
 transport._find_bn_agent = lambda: [sys.executable, "-c", "import time; time.sleep(60)"]
 real_popen = transport.subprocess.Popen
@@ -2133,36 +2133,69 @@ def recording_popen(*args, **kwargs):
     proc = real_popen(*args, **kwargs)
     with open(pidfile, "w") as stream:
         stream.write(str(proc.pid))
+    if mode == "popen":
+        # The child is running and Popen has not returned: the CLI's owner
+        # has not been entered yet.
+        os.kill(os.getpid(), signum)
     return proc
 
 transport.subprocess.Popen = recording_popen
-transport.spawn_instance("sample-1", timeout=60, poll_interval=0.05)
+
+if mode == "defer":
+    # Deliver the signal exactly on the `unwind.defer()` line of the reaping
+    # finally, which the registration timeout below reaches.
+    code = transport._spawn_instance_unlocked.__code__
+    lines, first = inspect.getsourcelines(transport._spawn_instance_unlocked)
+    defer_line = first + next(i for i, text in enumerate(lines) if "unwind.defer()" in text)
+
+    def local(frame, event, arg):
+        if event == "line" and frame.f_lineno == defer_line:
+            os.kill(os.getpid(), signum)
+        return local
+
+    def tracer(frame, event, arg):
+        return local if frame.f_code is code else None
+
+    sys.settrace(tracer)
+
+timeout = 1.0 if mode == "defer" else 60
+try:
+    transport.spawn_instance("sample-1", timeout=timeout, poll_interval=0.05)
+except transport.BridgeError as exc:
+    print("spawn failed:", exc)
 """
 
 
-@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
-def test_signal_during_registration_wait_reaps_child_and_still_kills_cli(tmp_path, signum):
+@pytest.mark.parametrize("mode, signum", [
+    ("external", signal.SIGTERM),  # during the registration wait
+    ("external", signal.SIGHUP),
+    ("popen", signal.SIGTERM),     # child started, owner not yet entered
+    ("defer", signal.SIGTERM),     # at the top of the reaping finally
+])
+def test_signal_during_spawn_reaps_child_and_still_kills_cli(tmp_path, mode, signum):
     # #916 review: Python's default SIGTERM/SIGHUP action runs no `finally`, so
-    # a harness timeout or a closed terminal during the registration wait left
-    # the never-registering child alive in its own session. The CLI must reap
-    # it and then still die OF that signal, as it would have without the fix.
+    # a harness timeout or a closed terminal while the CLI waited for its child
+    # to register left that never-registering child alive in its own session.
+    # The same orphan followed from a signal in either edge of the owner: while
+    # Popen was returning, or on entry to the finally's `unwind.defer()`, which
+    # let the exception skip the reap. In every window the CLI must reap the
+    # child and then still die OF the signal, as it would have without the fix.
     pidfile = tmp_path / "child.pid"
     env = {**os.environ, "BN_CACHE_DIR": str(tmp_path / "cache")}
     cli = subprocess.Popen(
-        [sys.executable, "-c", _SPAWN_WAIT_DRIVER, str(pidfile)],
+        [sys.executable, "-c", _SPAWN_WAIT_DRIVER, str(pidfile), mode, str(int(signum))],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     child_pid = None
     try:
         deadline = time.monotonic() + 30
         while not (pidfile.exists() and pidfile.read_text()):
-            assert cli.poll() is None, cli.stdout.read().decode(errors="replace")
             assert time.monotonic() < deadline, "the driver never spawned its child"
             time.sleep(0.02)
         child_pid = int(pidfile.read_text())
-        time.sleep(0.3)  # well inside the registration wait
-
-        cli.send_signal(signum)
+        if mode == "external":
+            time.sleep(0.3)  # well inside the registration wait
+            cli.send_signal(signum)
         cli.wait(timeout=15)
 
         assert cli.returncode == -signum, cli.stdout.read().decode(errors="replace")

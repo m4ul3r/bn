@@ -1751,9 +1751,12 @@ class _SignalUnwind:
 
     Only signals still at SIG_DFL are taken over -- a host that installed its
     own handler (or a `nohup` SIG_IGN) keeps it -- and only on the main thread,
-    the one place Python lets a handler be installed. Once the reap begins
-    (`defer()`) a signal is only recorded, never raised, so it cannot cut the
-    reap short; the first one caught is the one re-delivered.
+    the one place Python lets a handler be installed. The handlers go in before
+    the child is started and only RECORD a signal until `arm()`, which is the
+    first statement inside the owner's try (and raises at once for a signal
+    recorded meanwhile); from `defer()`, where the reap begins, they record
+    again, so a signal cannot cut the reap short. The first one caught is the
+    one re-delivered.
     """
 
     _SIGNALS = (signal.SIGTERM, signal.SIGHUP)
@@ -1761,7 +1764,9 @@ class _SignalUnwind:
     def __init__(self) -> None:
         self._previous: dict[int, Any] = {}
         self._caught: int | None = None
-        self._deferred = False
+        # Installed RECORDING: until `arm()` there is no owned child for an
+        # exception to be unwound to, so a signal is only noted.
+        self._deferred = True
         if threading.current_thread() is not threading.main_thread():
             return
         for signum in self._SIGNALS:
@@ -1777,6 +1782,12 @@ class _SignalUnwind:
         self._caught = signum
         if not self._deferred:
             raise _SpawnWaitSignalled(signum)
+
+    def arm(self) -> None:
+        """Raise from here on; first, for a signal recorded before arming."""
+        self._deferred = False
+        if self._caught is not None:
+            raise _SpawnWaitSignalled(self._caught)
 
     def defer(self) -> None:
         self._deferred = True
@@ -1861,6 +1872,11 @@ def _spawn_instance_unlocked(
     log_file = open(log_path, "a" if keep_log else "w")  # noqa: SIM115
 
     cmd = _find_bn_agent() + ["--instance-id", instance_id]
+    # Handlers go in BEFORE Popen, recording only (see `_SignalUnwind`), so a
+    # SIGTERM/SIGHUP arriving while the child starts -- or while the log handle
+    # below closes -- is held for the owner instead of killing this process
+    # with the child already running and nobody left to reap it (#916 review).
+    unwind = _SignalUnwind()
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1869,6 +1885,10 @@ def _spawn_instance_unlocked(
             stderr=subprocess.STDOUT,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
+    except BaseException:
+        # No child to reap: put the dispositions back and re-deliver a held signal.
+        unwind.restore()
+        raise
     finally:
         # The child inherits the fd across a successful Popen; close the parent's
         # copy either way. Without this the write handle on a failed spawn lives
@@ -1888,11 +1908,14 @@ def _spawn_instance_unlocked(
     # never registered and that no `instance list/find/gc` or `session stop`
     # could see (#916). The child we hold is the thing reaped, never a pid read
     # from a registry, and no discovery file is unlinked here. What still
-    # escapes: SIGKILL, which runs no code at all, and a SIGTERM/SIGHUP landing
-    # in the instants between Popen returning and the handlers going in.
+    # escapes: SIGKILL, which runs no code at all; and SIGTERM/SIGHUP when this
+    # runs off the main thread or the process already had its own disposition
+    # for them, since those are left exactly as they were.
     owned = True
-    unwind = _SignalUnwind()
     try:
+        # First statement INSIDE the try: a signal held since before Popen
+        # raises here, where the finally below reaps the child.
+        unwind.arm()
         while time.monotonic() < deadline:
             if reg_path.exists():
                 remaining = _remaining_deadline(deadline, "waiting for bridge registration")
@@ -1945,7 +1968,13 @@ def _spawn_instance_unlocked(
         raise BridgeError(f"{message}{leftover_note}")
     finally:
         # No signal may cut the reap short: from here one is only recorded.
-        unwind.defer()
+        # Python runs a pending handler on entry to defer() itself, before the
+        # flag is set, so that one can still raise here; it is already
+        # recorded, and restore() re-delivers it once the child is reaped.
+        try:
+            unwind.defer()
+        except _SpawnWaitSignalled:
+            pass
         # An exited child was already collected by poll(); only a live one needs
         # the terminate/kill escalation. The original failure keeps propagating.
         try:
