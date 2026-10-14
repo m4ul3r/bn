@@ -2686,8 +2686,13 @@ def _group_refs_by_caller(refs: list[Any], *, mangled: bool = False) -> list[dic
             # never coalesced -- it keys on its own address so each renders as a
             # distinct "<unknown>" line with its own context.
             fn_label = ref.get("function")
-            label = (_unknown_ref_label(_field_dict(ref, "context"))
-                     or ("" if fn_label is None else str(fn_label)))
+            vslot = _field_dict(ref, "vtable_slot")
+            if vslot.get("class") is not None:
+                # #998 item 1: a vtable slot names its table, not just a section.
+                label = f"vtable for {vslot['class']} [slot {vslot.get('slot_index', '?')}]"
+            else:
+                label = (_unknown_ref_label(_field_dict(ref, "context"))
+                         or ("" if fn_label is None else str(fn_label)))
             if label:
                 key = ("label", label)
             else:
@@ -3956,6 +3961,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
     scan_truncated = False
     has_more = False
     caller_scan_note = None
+    vtable_note = None
     if _field_declared(value, "items"):
         total = value.get("total")
         offset = value.get("offset")
@@ -3965,6 +3971,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         scan_truncated = bool(value.get("scan_truncated"))
         has_more = bool(value.get("has_more"))
         caller_scan_note = value.get("caller_scan_note")
+        vtable_note = _callsites_vtable_note(value.get("vtable_slots"))
         value = _field_list(value, "items")
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -4022,6 +4029,13 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         ]
         if call_index is not None:
             lines.append(f"call_index: {call_index}")
+        also_in = [f for f in _field_list(row, "also_in") if isinstance(f, dict)]
+        if also_in:
+            # #998 item 2: one call instruction in a block BN gives to several
+            # functions is one call site; the other containers ride on it.
+            lines.append("also_in: " + ", ".join(
+                f"{_shown_name(f, mangled=mangled) or '<unknown>'} @ {f.get('address', '<unknown>')}"
+                for f in also_in))
         if scoped and row.get("within_query"):
             # Verbatim, like every other labelled value: the text must carry
             # the JSON value a filter written from it will compare (#979).
@@ -4111,7 +4125,32 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         body = f"{body}\n\n{note}" if body else note
     if not blocks and not body:
         body = _empty_result("callsites")
+    if vtable_note:
+        body = f"{body}\n\n{vtable_note}" if body else vtable_note
     return body
+
+
+def _callsites_vtable_note(raw_slots: Any) -> str | None:
+    """#998 item 1: the callee sits in vtable slots, so its virtual callers --
+    which no call instruction names -- are absent from the rows above. One
+    phrase per (slot, offset), the classes whose tables hold it. Read through
+    the choke point so a skewed `vtable_slots` is disclosed, not dropped."""
+    groups: dict[tuple[str, str], list[str]] = {}
+    for slot in _field_list({"vtable_slots": raw_slots}, "vtable_slots"):
+        if not isinstance(slot, dict):
+            continue
+        key = (str(slot.get("slot_index", "?")), str(slot.get("slot_offset", "?")))
+        cls = str(slot.get("class") or "?")
+        if key not in groups:
+            groups[key] = []
+        if cls not in groups[key]:
+            groups[key].append(cls)
+    if not groups:
+        return None
+    where = "; ".join(f"slot {index} (+{offset}) of {', '.join(classes)}"
+                      for (index, offset), classes in groups.items())
+    return (f"note: the callee is a vtable slot -- {where}; virtual calls through it "
+            "are not direct callsites and are not listed above")
 
 
 @_discloses
@@ -7418,12 +7457,21 @@ def _render_one_class(rec: Any) -> str:
     if size_s is not None:
         bits.append(f"size {size_s}")
     if vt_addr:
+        # #998 item 3: `address` is the object start the `_ZTV` symbol names;
+        # objects (and so xrefs) hold the address point two words in.
+        vt_ap = _text_value(vt, "address_point")
         bits.append(f"vtable @ {vt_addr}")
+        if vt_ap:
+            bits.append(f"address point {vt_ap}")
     if bases:
         bits.append(f"base: {bases}")
     if bits:
         head += "  (" + ", ".join(bits) + ")"
     lines = [head, f"  [{rec.get('confidence', '?')}]"]
+    size_reason = _text_value(rec, "size_reason")
+    if size_s is None and size_reason:
+        # #998 item 4: an unknown size says which recovery outcome it hit.
+        lines.append(f"  size: unknown ({size_reason})")
     # #922 (d): one class, several demangled spellings -- the card is the merge.
     for alias in _field_list(rec, "aliases"):
         lines.append(f"  aka: {alias}")
@@ -7490,7 +7538,9 @@ def _render_one_class(rec: Any) -> str:
         # fact; say so on the line an analyst would quote.
         conf = _text_value(sec, "confidence")
         conf_s = f" [{conf}]" if conf else ""
-        lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}{conf_s}:")
+        sec_ap = _text_value(sec, "address_point")
+        ap_s = f" (address point {sec_ap})" if sec_ap else ""
+        lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ap_s}{ott_s}{conf_s}:")
         for s in _field_list(sec, "slots"):
             if not isinstance(s, dict):
                 lines.append(f"    {s!r}")

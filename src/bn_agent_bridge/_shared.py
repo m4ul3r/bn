@@ -104,7 +104,7 @@ _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "xrefs": (
         "address", "kind", "function", "caller_function", "context",
-        "function_pointer", "thumb_pointer",
+        "function_pointer", "thumb_pointer", "vtable_slot",
     ),
     "callsites": (
         "callee", "containing_function", "call_addr", "call_kind",
@@ -112,6 +112,7 @@ _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
         "previous_instructions", "next_instructions", "disasm_context_reason",
         "hlil_statement", "hlil_statement_reason", "pre_branch_condition",
         "callee_variadic", "call_index", "within_query", "decompile_excerpt",
+        "also_in",
     ),
 }
 

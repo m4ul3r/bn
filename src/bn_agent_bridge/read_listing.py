@@ -516,9 +516,21 @@ def _callsites(
             )
     # #558: an imported variadic (scanf/printf-family) callee's HLIL callsite text
     # can show only the fixed argument; attach a steer to the argument-recovery views.
+    # #998 item 1: a virtual method's real callers dispatch through a vtable
+    # slot, which no call instruction names; report the slots so a short (or
+    # empty) direct-call list is never read as "rarely called".
+    from . import read_class   # read_class imports this module; import lazily
+    vtable_slots = ([] if callee_symbol_only
+                    else read_class._vtable_slots_referencing(ctx, bv, int(callee.start)))
     variadic_hint = _callee_variadic_hint(callee)
 
     rows = []
+    # #998 item 2: BN puts a block shared by two functions (a tail one jumps
+    # into) in BOTH, so the per-function scan below returns that block's call
+    # instructions once per containing function. A call site is an
+    # INSTRUCTION: keep the first row for each `call_addr` and list the other
+    # containing functions under its `also_in`, so `total` counts call sites.
+    rows_by_call: dict[Any, dict[str, Any]] = {}
     callers_scanned = 0
     scan_truncated = False
     row_scan_target = offset + limit + 1 if limit is not None else None
@@ -528,9 +540,15 @@ def _callsites(
             variadic_hint=variadic_hint)
         callers_scanned += 1
         for call_index, row in enumerate(function_rows):
+            first = rows_by_call.get(row["call_addr"])
+            if first is not None:
+                first["also_in"].append(row["containing_function"])
+                continue
             row["call_index"] = call_index
             row["within_query"] = str(within_query)
-        rows.extend(function_rows)
+            row["also_in"] = []
+            rows_by_call[row["call_addr"]] = row
+            rows.append(row)
         if (
             row_scan_target is not None
             and len(rows) >= row_scan_target
@@ -569,6 +587,7 @@ def _callsites(
                 # stopped early that number is unknown, not `len(scope_functions)`.
                 "caller_total": None,
                 "callee_symbol_only": callee_symbol_only,
+                "vtable_slots": vtable_slots,
             }
         )
         _attach_callsite_excerpts(bv, result["items"])
@@ -593,6 +612,7 @@ def _callsites(
             "callers_scanned": callers_scanned,
             "caller_total": len(scope_functions),
             "callee_symbol_only": callee_symbol_only,
+            "vtable_slots": vtable_slots,
         }
 
     result = read_misc._paged_list_result(
@@ -606,6 +626,7 @@ def _callsites(
             "callers_scanned": callers_scanned,
             "caller_total": len(scope_functions),
             "callee_symbol_only": callee_symbol_only,
+            "vtable_slots": vtable_slots,
         }
     )
     _attach_callsite_excerpts(bv, result["items"])

@@ -26,6 +26,7 @@ make -C tests/fixtures clean
 | `classes_x86_64`       | a C++ PIE: single-inheritance vtables, an exception subclass of an imported class, a template class, an abstract class with zeroed destructor slots, one multiple-inheritance class (class lens, #922) |
 | `classes_stripped_x86_64` | the same C++ PIE built with `-s`: synthesized slot-array vtable symbols must recover the same object heads and slot contents without phantom secondaries (#935) |
 | `canary_x86_64`        | a stack-protected buffer: frame-map canary evidence and slot-to-canary distances |
+| `vcalls_x86_64`        | a C++ binary whose virtual methods are reached only through vtable slots, and whose classes are heap-constructed by out-of-line ctors (`callsites` slot notes, `class` sizes, #998) |
 
 The paired class-lens regression checks slot addresses against each view's raw
 words. Across the symbolized/stripped views, local and null slots, object heads,

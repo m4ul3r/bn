@@ -1887,6 +1887,37 @@ def test_callsite_excerpt_page_projection_holds_on_a_truncated_scan_792(monkeypa
     assert rendered == [caller.start for caller in callers[8:10]], rendered
 
 
+def test_a_call_in_a_block_shared_by_two_functions_is_one_callsite_998(monkeypatch):
+    """#998 item 2: BN puts a block one function jumps into (a shared tail) in
+    BOTH functions, so the per-function scan saw each call instruction twice.
+    A call site is an instruction: one row per `call_addr`, the other
+    containing function under `also_in`, and `total` counts call sites."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    target_addr, shared = 0x4000D4, (0x4000E0, 0x4000E4)
+    f1 = _FakeFunction(0x4000DC, "f1")
+    f2 = _FakeFunction(0x4000F0, "f2")
+    for fn in (f1, f2):
+        fn.basic_blocks = [_FakeBasicBlock(shared[0], shared[1] + 4)]
+        fn.arch = _FakeArch(lengths={addr: 4 for addr in shared})
+        fn.low_level_il = [[_FakeLLILInstruction(addr, _FakeConstPtr(target_addr))
+                            for addr in shared]]
+    refs = [_FakeCodeRef(addr, fn) for fn in (f1, f2) for addr in shared]
+    bv = _FakeBV(functions=[_FakeFunction(target_addr, "target"), f1, f2],
+                 code_refs={target_addr: refs},
+                 disassembly={addr: "bl 0x4000d4" for addr in shared},
+                 instruction_lengths={addr: 4 for addr in shared})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites(None, "target", within_identifiers=[])
+
+    assert result["total"] == 2 and result["caller_total"] == 2
+    assert [(row["call_addr"], row["containing_function"]["name"]) for row in result["items"]] == [
+        ("0x4000e0", "f1"), ("0x4000e4", "f1")]
+    assert all([f["name"] for f in row["also_in"]] == ["f2"] for row in result["items"])
+
+
+
 def _rendered_lines(bridge, monkeypatch, batches):
     """(lines, gutter addresses) as the callsite excerpt sees them, through the
     real render + gutter parser rather than a hand-built pair."""

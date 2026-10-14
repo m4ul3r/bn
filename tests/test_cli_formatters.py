@@ -739,6 +739,64 @@ def _callsite_row(call_addr: str) -> dict:
     }
 
 
+def test_render_callsites_names_vtable_slots_even_with_no_rows_998():
+    """#998 item 1: a virtual method's callers dispatch through its slot, so an
+    empty direct-call list must say the method IS a slot, per slot and class."""
+    from bn.formatters import _render_callsites_text
+    slot = {"vtable": "0x41fc40", "address_point": "0x41fc50", "slot_address": "0x41fc68",
+            "offset_to_top": 0}
+    value = {
+        "items": [], "total": 0, "has_more": False, "scan_truncated": False,
+        "vtable_slots": [
+            {**slot, "class": "Dispatcher", "slot_index": 3, "slot_offset": "0x18"},
+            {**slot, "class": "VideoDisp", "slot_index": 3, "slot_offset": "0x18"},
+        ],
+    }
+    out = _render_callsites_text(value)
+    assert out.startswith("(no callsites)")
+    assert ("note: the callee is a vtable slot -- slot 3 (+0x18) of Dispatcher, VideoDisp; "
+            "virtual calls through it are not direct callsites") in out
+    assert "vtable slot" not in _render_callsites_text({**value, "vtable_slots": []})
+
+
+def test_render_callsites_lists_the_other_containing_functions_998():
+    from bn.formatters import _render_callsites_text
+    row = {**_callsite_row("0x4000e0"),
+           "also_in": [{"name": "f2", "display_name": "f2", "address": "0x4000f0"}]}
+    out = _render_callsites_text({"items": [row], "total": 1, "has_more": False})
+    assert "also_in: f2 @ 0x4000f0" in out
+    assert "also_in" not in _render_callsites_text(
+        {"items": [{**row, "also_in": []}], "total": 1, "has_more": False})
+
+
+def test_render_xrefs_labels_a_vtable_slot_data_ref_998():
+    from bn.formatters import _render_xrefs_text
+    ctx = {"sections": [{"name": ".data.rel.ro"}]}
+    refs = [
+        {"address": "0x41fc68", "kind": "data", "function": None, "caller_function": None,
+         "context": ctx, "vtable_slot": {"class": "Dispatcher", "slot_index": 3}},
+        {"address": "0x41fcc8", "kind": "data", "function": None, "caller_function": None,
+         "context": ctx, "vtable_slot": {"class": "VideoDisp", "slot_index": 3}},
+        {"address": "0x41fd00", "kind": "data", "function": None, "caller_function": None,
+         "context": ctx},
+    ]
+    out = _render_xrefs_text({"address": "0x400db0", "items": refs})
+    assert "vtable for Dispatcher [slot 3]  (1 site: 0x41fc68)" in out
+    assert "vtable for VideoDisp [slot 3]  (1 site: 0x41fcc8)" in out
+    assert ".data.rel.ro  (1 site: 0x41fd00)" in out
+
+
+def test_render_class_card_shows_the_vtable_address_point_998():
+    from bn.formatters import _render_one_class
+    rec = {"name": "Dispatcher", "confidence": "rtti", "methods": [],
+           "vtable": {"address": "0x41fc40", "address_point": "0x41fc50", "slots": []},
+           "secondary_vtables": [{"address": "0x41fd00", "address_point": "0x41fd10",
+                                  "offset_to_top": -8, "slots": []}]}
+    out = _render_one_class(rec)
+    assert out.splitlines()[0] == "class Dispatcher  (vtable @ 0x41fc40, address point 0x41fc50)"
+    assert "  secondary vtable @ 0x41fd00 (address point 0x41fd10) (offset-to-top -8):" in out
+
+
 def test_render_callsites_footer_on_partial_last_page():
     # #611: a partial LAST page (offset > 0, has_more False, fewer rows than the
     # total) must still say so -- it used to read as the complete result.

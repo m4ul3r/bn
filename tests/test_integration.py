@@ -30,6 +30,7 @@ PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
 CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
 CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
+VCALLS_BINARY = FIXTURES_DIR / "vcalls_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -3882,6 +3883,65 @@ int main() { return global_b.b() + global_r.r(); }
         assert cards[0]["vtable"] == cards[1]["vtable"]
         assert cards[0]["instances"]["stored_globals"][0]["symbol"] == "global_r"
         assert cards[1]["instances"]["stored_globals"][0]["symbol"] is None
+
+
+class TestVirtualMethodsAndClassSize998:
+    """#998 on a real g++ build (`src/vcalls.cpp`): a virtual method reached
+    only through its vtable slot, the vtable's address point, and the object
+    size read from the `operator new(N)` feeding an out-of-line constructor."""
+
+    def _json(self, shared_bn, *args):
+        res = shared_bn.run(*args, "--format", "json")
+        assert res.returncode == 0, (res.stdout, res.stderr)
+        return json.loads(res.stdout)
+
+    def test_virtual_only_method_names_its_vtable_slots(self, shared_bn):
+        shared_bn.load(VCALLS_BINARY)
+        # `reg` is never called directly; AudioDisp inherits it, so both
+        # tables hold it at slot 3 (after the two destructors and dispatch).
+        out = self._json(shared_bn, "callsites", "vc::Dispatcher::reg")
+        assert out["total"] == 0, out
+        assert sorted((s["class"], s["slot_index"], s["slot_offset"]) for s in out["vtable_slots"]) == [
+            ("vc::AudioDisp", 3, "0x18"), ("vc::Dispatcher", 3, "0x18")]
+        text = shared_bn.run("callsites", "vc::Dispatcher::reg").stdout
+        assert "the callee is a vtable slot -- slot 3 (+0x18) of vc::AudioDisp, vc::Dispatcher" in text
+        # The override lives only in its own class's table.
+        out = self._json(shared_bn, "callsites", "vc::AudioDisp::dispatch")
+        assert [(s["class"], s["slot_index"]) for s in out["vtable_slots"]] == [("vc::AudioDisp", 2)]
+        # A plain function is in no vtable.
+        assert self._json(shared_bn, "callsites", "vc::run_table")["vtable_slots"] == []
+        # xrefs labels those data refs with the table and slot.
+        text = shared_bn.run("xrefs", "vc::Dispatcher::reg").stdout
+        assert "vtable for vc::Dispatcher [slot 3]" in text, text
+        assert "vtable for vc::AudioDisp [slot 3]" in text, text
+
+    def test_vtable_address_point_is_what_objects_reference(self, shared_bn):
+        shared_bn.load(VCALLS_BINARY)
+        card = self._json(shared_bn, "class", "show", "vc::Dispatcher")
+        vt = card["vtable"]
+        assert int(vt["address_point"], 16) == int(vt["address"], 16) + 16, vt
+        # The ctor stores the address point, so xrefs on it finds code and on
+        # the object start (what the card printed alone before) finds none.
+        assert self._json(shared_bn, "xrefs", vt["address_point"])["code_ref_count"] >= 1
+        assert self._json(shared_bn, "xrefs", vt["address"])["code_ref_count"] == 0
+        text = shared_bn.run("class", "show", "vc::Dispatcher").stdout
+        assert f"vtable @ {vt['address']}, address point {vt['address_point']}" in text
+
+    def test_size_comes_from_operator_new_at_the_ctor_call(self, shared_bn):
+        shared_bn.load(VCALLS_BINARY)
+        disp = self._json(shared_bn, "class", "show", "vc::Dispatcher")
+        assert disp["size"]["value"] == "0x40" and disp["size_source"] == "operator_new", disp
+        assert disp["size_reason"] is None
+        sites = {s["function"]: s for s in disp["instances"]["construction_sites"]}
+        assert sites["vc::make"]["size"] == "0x40"
+        # AudioDisp's ctor calls the base ctor on its own `this`: a real
+        # construction site with no allocation to read, so no size.
+        assert sites["vc::AudioDisp::AudioDisp"]["size"] is None
+        audio = self._json(shared_bn, "class", "show", "vc::AudioDisp")
+        assert audio["size"]["value"] == "0x80", audio
+        listing = self._json(shared_bn, "class", "list")
+        sizes = {row["name"]: (row["size"] or {}).get("value") for row in listing["items"]}
+        assert sizes["vc::Dispatcher"] == "0x40" and sizes["vc::AudioDisp"] == "0x80", sizes
 
 
 class TestStructLayoutAssistance903:

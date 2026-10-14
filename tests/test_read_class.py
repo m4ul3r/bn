@@ -494,7 +494,7 @@ def test_enrich_backwalks_vtable_for_stripped_class():
     # primary + secondary vtables recovered via the typeinfo backwalk in _enrich.
     class _EnrichCtx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None
+            return None, "no_construction_site"
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -525,7 +525,7 @@ def test_enrich_recovers_secondary_for_symbolized_primary_class():
     # symbolized primary layout.
     class _EnrichCtx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None
+            return None, "no_construction_site"
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -918,6 +918,78 @@ def test_vtable_layout_skips_header_and_marks_slots():
     assert s2["pure_virtual"] is True
 
 
+class _SlotRefCtx:
+    """Two tables in fake memory: `Base` @ 0x9000 (slots at 0x9010) and
+    `Derived` @ 0x9100 (slots at 0x9110). Each table's word[1] is its typeinfo;
+    slot words are code pointers, which are not typeinfo."""
+
+    def __init__(self, words, tables):
+        self._words = words
+        self._tables = tables          # vtable addr -> [slot values]
+
+    def _pointer_size(self, bv):
+        return 8
+
+    def _read_pointer_value(self, bv, addr, *, size=None):
+        return self._words.get(addr)
+
+    def _typeinfo_name_at(self, bv, addr):
+        return {0x9800: "Base", 0x9900: "Derived"}.get(addr)
+
+    def _vtable_layout_for(self, bv, addr):
+        slots = self._tables.get(addr)
+        if slots is None:
+            return {"address": hex(addr), "slots": [], "truncated_reason": "no_local_vtable_body"}
+        return {"address": hex(addr), "address_point": hex(addr + 16),
+                "slots": [{"index": i, "address": hex(v), "method": {"name": f"m{i}"}}
+                          for i, v in enumerate(slots)]}
+
+    def _sections_at(self, bv, addr):
+        return []
+
+    def _segment_at(self, bv, addr):
+        return None
+
+
+def test_vtable_slots_referencing_names_each_table_and_slot_998():
+    """#998 item 1: the data refs to a method that are vtable slots, each with
+    its class, slot index and byte offset from the address point."""
+    reg, other = 0x401000, 0x402000
+    words = {0x9000: 0, 0x9008: 0x9800, 0x9010: 0x400100, 0x9018: other, 0x9020: reg,
+             0x9100: 0, 0x9108: 0x9900, 0x9110: 0x400200, 0x9118: 0x402100, 0x9120: reg,
+             # A function-pointer array no typeinfo header precedes.
+             0x9500: reg}
+    ctx = _SlotRefCtx(words, {0x9000: [0x400100, other, reg],
+                              0x9100: [0x400200, 0x402100, reg]})
+    bv = types.SimpleNamespace(get_data_refs=lambda addr: {
+        reg: [0x9020, 0x9120, 0x9500], other: [0x9018]}.get(addr, []))
+
+    assert read_class._vtable_slots_referencing(ctx, bv, reg) == [
+        {"class": "Base", "vtable": "0x9000", "address_point": "0x9010", "slot_index": 2,
+         "slot_offset": "0x10", "slot_address": "0x9020", "offset_to_top": 0},
+        {"class": "Derived", "vtable": "0x9100", "address_point": "0x9110", "slot_index": 2,
+         "slot_offset": "0x10", "slot_address": "0x9120", "offset_to_top": 0},
+    ]
+    assert [s["slot_index"] for s in read_class._vtable_slots_referencing(ctx, bv, other)] == [1]
+
+
+def test_vtable_slots_referencing_requires_the_decoded_slot_to_hold_the_target_998():
+    """A data ref past the table's decoded end (the layout stopped before it)
+    is not a slot, even with a typeinfo header within reach."""
+    target = 0x401000
+    words = {0x9000: 0, 0x9008: 0x9800, 0x9010: 0x400100, 0x9018: 0x7777, 0x9020: target}
+    ctx = _SlotRefCtx(words, {0x9000: [0x400100]})
+    bv = types.SimpleNamespace(get_data_refs=lambda addr: [0x9020])
+    assert read_class._vtable_slots_referencing(ctx, bv, target) == []
+
+
+def test_vtable_layout_reports_the_address_point_998():
+    """#998 item 3: objects hold the slot array's address, not the `_ZTV`
+    object start the layout is keyed by."""
+    layout = read_class._vtable_layout(_VtableCtx([(0x40e8b0, "onData")]), object(), 0x9000)
+    assert layout["address"] == "0x9000" and layout["address_point"] == "0x9010"
+
+
 def test_vtable_layout_stops_at_unmapped_slot():
     # The scan must terminate at the first non-function/unreadable slot (the next
     # object / padding), not skip it and keep collecting later rows.
@@ -945,9 +1017,9 @@ def test_vtable_layout_stops_at_unmapped_slot():
 
 
 class _SizeCtx:
-    def __init__(self, type_width=None, new_size=None):
+    def __init__(self, type_width=None, sites=()):
         self._type_width = type_width
-        self._new_size = new_size
+        self._sites = list(sites)
 
     def _find_type(self, bv, name):
         if self._type_width is None:
@@ -956,21 +1028,45 @@ class _SizeCtx:
             width = self._type_width
         return name, _T()
 
-    def _operator_new_size_at_ctor(self, bv, record):
-        return self._new_size  # (size, addr) or None
+    def _ctor_construction_sites(self, bv, record):
+        return [dict(site) for site in self._sites]
+
+
+def _site(address, size=None, allocation=None, kind="ctor-call"):
+    return {"address": address, "function": "make", "kind": kind,
+            "size": size, "allocation": allocation}
 
 
 def test_size_prefers_bn_type_width():
     rec = {"name": "net::Session", "methods": [], "vtable": None}
-    out = read_class._object_size(_SizeCtx(type_width=0xD0), object(), rec)
-    assert out == {"value": "0xd0", "source": "bn_type"}
+    ctx = _SizeCtx(type_width=0xD0, sites=[_site("0x1000", "0x40", "0xff0")])
+    assert read_class._object_size(ctx, object(), rec) == (
+        {"value": "0xd0", "source": "bn_type"}, None)
 
 
 def test_size_from_operator_new_when_no_type():
+    """#998 item 4: the size every traced construction site agrees on, with the
+    first one's `operator new` call as provenance; an untraced site (a base
+    ctor called from a derived ctor, a stack object) does not veto it."""
     rec = {"name": "net::Session", "methods": []}
-    out = read_class._object_size(_SizeCtx(new_size=(0xD0, 0x443abc)), object(), rec)
-    assert out["value"] == "0xd0" and out["source"] == "operator_new"
-    assert out["at"] == "0x443abc"
+    ctx = _SizeCtx(sites=[_site("0x443abc", "0xd0", "0x443ab0"), _site("0x4500a0"),
+                          _site("0x460000", "0xd0", "0x45fff0", kind="inline-new")])
+    size, reason = read_class._object_size(ctx, object(), rec)
+    assert size == {"value": "0xd0", "source": "operator_new", "at": "0x443ab0", "sites": 2}
+    assert reason is None
+
+
+@pytest.mark.parametrize(("sites", "reason"), [
+    ([], "no_construction_site"),
+    ([_site("0x1000"), _site("0x2000")], "operator_new_not_traced"),
+    ([_site("0x1000", "0x40", "0xff0"), _site("0x2000", "0x80", "0x1ff0")],
+     "operator_new_sizes_disagree"),
+])
+def test_size_miss_names_its_reason_998(sites, reason):
+    """A miss stays a bare `None`, NOT a value-less envelope (#619: the card
+    renders any size dict as `size ?`); WHY it missed rides beside it."""
+    rec = {"name": "net::Session", "methods": []}
+    assert read_class._object_size(_SizeCtx(sites=sites), object(), rec) == (None, reason)
 
 
 class _EnrichCtx(_SizeCtx):
@@ -990,40 +1086,32 @@ class _EnrichCtx(_SizeCtx):
         return []
 
 
-def test_size_none_when_nothing_resolves():
-    """A miss stays a bare `None`, NOT a value-less envelope: `_render_one_class`
-    renders any `size` dict as `size ?` on purpose (#619 -- an envelope that
-    carries no value still CLAIMED a size), so an envelope per miss would change
-    the default card of every size-less class and make that #619 distinction
-    vacuous. #817's provenance lives beside the size instead."""
-    rec = {"name": "net::Session", "methods": []}
-    assert read_class._object_size(_SizeCtx(), object(), rec) is None
-
-
-def test_class_card_for_a_sizeless_class_is_unchanged_817():
-    """The size-less default card, composed end to end: what `_object_size`
-    produces, rendered by the real text formatter."""
+def test_class_card_for_a_sizeless_class_states_why_998():
+    """The size-less card, composed end to end: the head keeps no size, and
+    the reason `_object_size` produced is printed on its own line."""
     formatters = importlib.import_module("bn.formatters")
     rec = {"name": "net::Session", "methods": [], "confidence": "rtti"}
-    read_class._enrich(_EnrichCtx(), object(), rec)
+    read_class._enrich(_EnrichCtx(sites=[_site("0x1000")]), object(), rec)
 
-    assert formatters._render_one_class(rec).splitlines()[0] == "class net::Session"
+    lines = formatters._render_one_class(rec).splitlines()
+    assert lines[0] == "class net::Session"
+    assert "  size: unknown (operator_new_not_traced)" in lines
 
 
 def test_class_record_states_where_the_size_came_from_817():
-    """#817: `class show` reported `size: null` with no `size_source` and no note
-    that the ctor-new path is a permanent stub, so a miss was indistinguishable
-    from a search that tried both paths. Provenance is now always readable in one
-    place, and the miss names the stub."""
     missed = read_class._enrich(_EnrichCtx(), object(), {"name": "net::Session", "methods": []})
     assert missed["size"] is None
     assert missed["size_source"] == "unavailable"
-    assert missed["size_reason"] == "operator_new_recovery_unimplemented"
+    assert missed["size_reason"] == "no_construction_site"
 
     hit = read_class._enrich(_EnrichCtx(type_width=0xD0), object(),
                              {"name": "net::Session", "methods": []})
     assert hit["size"] == {"value": "0xd0", "source": "bn_type"}
     assert hit["size_source"] == "bn_type" and hit["size_reason"] is None
+
+    traced = read_class._enrich(_EnrichCtx(sites=[_site("0x1000", "0x58", "0xff8")]),
+                                object(), {"name": "net::Session", "methods": []})
+    assert traced["size_source"] == "operator_new" and traced["size_reason"] is None
 
 
 def test_size_survives_find_type_raising():
@@ -1032,8 +1120,9 @@ def test_size_survives_find_type_raising():
     class _RaisingCtx(_SizeCtx):
         def _find_type(self, bv, name):
             raise RuntimeError("Type not found: " + name)
-    out = read_class._object_size(_RaisingCtx(new_size=(0x40, 0x1000)), object(), {"name": "X", "methods": []})
-    assert out["value"] == "0x40" and out["source"] == "operator_new"
+    size, _ = read_class._object_size(
+        _RaisingCtx(sites=[_site("0x1000", "0x40", "0xff0")]), object(), {"name": "X", "methods": []})
+    assert size["value"] == "0x40" and size["source"] == "operator_new"
 
 
 class _RttiCtx:
@@ -1162,7 +1251,7 @@ def test_class_show_assembles_full_record():
                 {"index": 0, "address": "0x40e8b0", "method": {"name": "onData"},
                  "pure_virtual": False, "unnamed": False}]}
         def _object_size_for(self, b, rec):
-            return {"value": "0xd0", "source": "operator_new", "at": "0x443abc"}
+            return {"value": "0xd0", "source": "operator_new", "at": "0x443abc"}, None
         def _bases_for(self, b, rec):
             return [{"name": "net::Endpoint", "address": "0x9200", "kind": "public"}]
         def _instances_for(self, b, rec):
@@ -1178,7 +1267,7 @@ def test_class_show_assembles_full_record():
 @pytest.fixture
 def class_method_ctx(monkeypatch):
     ctx = seam.BridgeContext(None)
-    monkeypatch.setattr(ctx, "_object_size_for", lambda bv, rec: None)
+    monkeypatch.setattr(ctx, "_object_size_for", lambda bv, rec: (None, "no_construction_site"))
     monkeypatch.setattr(ctx, "_bases_for", lambda bv, rec: [])
     monkeypatch.setattr(ctx, "_instances_for", lambda bv, rec: {
         "construction_sites": [], "stored_globals": []})
@@ -1333,7 +1422,7 @@ def test_class_show_ambiguous_returns_all_matches():
         def _vtable_layout_for(self, b, a):
             return None
         def _object_size_for(self, b, r):
-            return None
+            return None, "no_construction_site"
         def _bases_for(self, b, r):
             return []
         def _instances_for(self, b, r):
@@ -1858,6 +1947,8 @@ def test_vtable_layout_early_return_carries_truncation_keys():
         "scan_truncated": False,
         "truncated_reason": "no_local_vtable_body",
         "bn_vtable_slots": None,
+        # #998 item 3: no decoded header, so no proven address point.
+        "address_point": None,
     }
 
 
@@ -2671,7 +2762,7 @@ def _declared_ctx(monkeypatch, bv):
     seam's own builder, so the test reads the shape a live call produces."""
     ctx = seam.BridgeContext(None)
     monkeypatch.setattr(ctx, "_resolve_view", lambda sel: bv)
-    monkeypatch.setattr(ctx, "_object_size_for", lambda b, r: None)
+    monkeypatch.setattr(ctx, "_object_size_for", lambda b, r: (None, "no_construction_site"))
     monkeypatch.setattr(ctx, "_bases_for", lambda b, r: [])
     monkeypatch.setattr(ctx, "_instances_for", lambda b, r: {
         "construction_sites": [], "stored_globals": []})
@@ -3848,7 +3939,7 @@ def test_enrich_skips_the_backwalk_for_an_import_slot_typeinfo_922():
     # record as this class's vtable (and listed it as a secondary of itself).
     class _Ctx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None
+            return None, "no_construction_site"
         def _bases_for(self, bv, rec):
             return read_class._bases_for_record(self, bv, rec)
         def _instances_for(self, bv, rec):
@@ -4038,7 +4129,7 @@ def test_recover_rejects_an_rtti_record_as_a_secondary_vtable_922():
 def test_enrich_discloses_rejected_secondary_candidates_922():
     class _Ctx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None
+            return None, "no_construction_site"
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -4325,7 +4416,7 @@ def test_sole_nonzero_candidate_is_never_promoted_to_primary_922():
 
     class _Ctx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None
+            return None, "no_construction_site"
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -4355,7 +4446,7 @@ def test_sole_nonzero_candidate_is_never_promoted_to_primary_922():
 def test_enrich_notes_rtti_secondaries_as_such_922():
     class _Ctx(_MappedRecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None
+            return None, "no_construction_site"
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
