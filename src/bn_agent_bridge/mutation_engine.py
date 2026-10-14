@@ -28,6 +28,8 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import difflib
+import functools
+import json
 import re
 import uuid
 from pathlib import Path
@@ -211,6 +213,30 @@ def _declaration_include_root(source_path: str | None) -> str | None:
 # says so for certain.
 _PREVIEW_PARSE: contextvars.ContextVar[bool] = contextvars.ContextVar("bn_preview_parse", default=False)
 
+# Request-local attribution includes snapshot and preflight parses, not only apply.
+_IMPORT_TRACE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "bn_mutation_import_trace", default=None)
+
+
+def _track_type_imports(handler: Any) -> Any:
+    @functools.wraps(handler)
+    def tracked(ctx: Any, bv: Any, op: Any, *args: Any, **kwargs: Any) -> Any:
+        trace = _IMPORT_TRACE.get()
+        if trace is None or trace.get("baseline") is None:
+            return handler(ctx, bv, op, *args, **kwargs)
+        baseline = _TypeBaseline(_view_type_names(bv) or set(), _view_type_ids(bv))
+        try:
+            return handler(ctx, bv, op, *args, **kwargs)
+        except Exception:
+            trace["failed_op"] = id(op)
+            raise
+        finally:
+            imports = set(_new_library_imports(bv, baseline)) - trace["claimed"]
+            if imports:
+                trace["imports"].setdefault(id(op), set()).update(imports)
+                trace["claimed"].update(imports)
+    return tracked
+
 # A tag-keyword mention (`struct timespec`, ``struct `ns::X` ``).
 _TAG_MENTION_RE = re.compile(r"\b(?:struct|class|union|enum)\s+(?:`([^`]+)`|([A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*))")
 
@@ -244,7 +270,6 @@ def _preview_library_needs(bv, declaration: str) -> list[str]:
 
 def _parse_declaration_source(ctx, bv, declaration: str, *, source_path: str | None = None):
     parse_result = None
-    source_error: Exception | None = None
     platform = getattr(bv, "platform", None)
     if platform is not None and hasattr(platform, "parse_types_from_source"):
         kwargs: dict[str, Any] = {}
@@ -253,16 +278,14 @@ def _parse_declaration_source(ctx, bv, declaration: str, *, source_path: str | N
             kwargs["include_dirs"] = [_declaration_include_root(source_path)]
         try:
             parse_result = platform.parse_types_from_source(declaration, **kwargs)
-        except Exception as exc:
-            source_error = exc
+        except Exception:
+            # The platform parser has no view type-library context. Its error
+            # may call a valid library type unknown; the view fallback below
+            # supplies the authoritative result, including any parse failure.
+            pass
 
     if parse_result is None:
-        try:
-            parse_result = bv.parse_types_from_string(declaration)
-        except Exception:
-            if source_error is not None:
-                raise source_error
-            raise
+        parse_result = bv.parse_types_from_string(declaration)
 
     return {
         "types": [(str(name), type_obj) for name, type_obj in list(getattr(parse_result, "types", {}).items())],
@@ -272,6 +295,7 @@ def _parse_declaration_source(ctx, bv, declaration: str, *, source_path: str | N
 
 
 
+@_track_type_imports
 def _operation_type_names(ctx, bv, op: dict[str, Any]) -> list[str]:
     kind = op.get("op") or "rename_symbol"
     if kind.startswith("struct_") and op.get("struct_name"):
@@ -1013,162 +1037,69 @@ def _restamp_reverted_siblings(
 # that creates a DataSymbol at an address), ``function_create`` (materializes a
 # function/symbol at an address), and any unknown/future op -- is treated as
 # possibly resolution-affecting. A WHITELIST (not a blocklist) is deliberate: a
-# newly added op defaults to "could move resolution" -> refuse, which is the safe
-# side of the #630 guard.
+# newly added op defaults to "could move resolution" -> defer its successors'
+# preflight checks until that op has actually run inside the preview.
 _RESOLUTION_SAFE_OPS = frozenset({
     "set_comment", "delete_comment", "set_prototype",
-    "local_rename", "local_retype",
+    "local_rename", "local_retype", "data_retype",
     "struct_field_set", "struct_field_rename", "struct_field_delete",
     "types_declare",
     "tag_add", "tag_remove", "tag_type_create", "tag_type_remove",
 })
 
 
-# Ops whose name IS recognized and whose resolution-affecting cause is a rename or
-# a symbol/function create -- used only to WORD the preview refusal accurately, so
-# an unknown/future op is not mislabelled as one of these (#630 follow-up).
-_KNOWN_RESOLUTION_AFFECTING_OPS = frozenset({"rename_symbol", "function_create"})
-
-
-def _resolution_affecting_op(operations):
-    """The FIRST batch element that could change function/symbol NAME-or-ADDRESS
-    resolution, as ``(op_name, is_known)``, or ``None`` when the whole batch is
-    resolution-safe.
-
-    ``op_name`` is the offending op's ``op`` value (or a placeholder describing a
-    malformed/absent one); ``is_known`` is True only for a recognized
-    rename/symbol-create (``_KNOWN_RESOLUTION_AFFECTING_OPS``). An unknown/future
-    op -- or a malformed element -- is resolution-affecting too (whitelist default)
-    but is NOT a rename/create, so callers must word its refusal differently."""
-    for op in operations:
-        if not isinstance(op, dict):
-            # A malformed element is not provably safe -> treat conservatively.
-            return ("<malformed batch element>", False)
-        name = str(op.get("op") or "")
-        if name not in _RESOLUTION_SAFE_OPS:
-            display = name or "<missing op key>"
-            return (display, name in _KNOWN_RESOLUTION_AFFECTING_OPS)
-    return None
-
-
 def _batch_changes_symbol_resolution(operations) -> bool:
     """True if any op in *operations* could change function/symbol NAME-or-ADDRESS
     resolution (a rename, a symbol/function create, or an unrecognized op).
 
-    Whitelist-based (see ``_RESOLUTION_SAFE_OPS``): an op whose kind is not on the
-    known-safe list -- including a malformed non-dict element or a missing ``op``
-    key -- defaults to "could affect resolution". This is the conservative,
-    sound-by-construction replacement for simulating BN's apply-time name
-    resolver (#630): we do not predict resolution, we refuse to prototype-preview
-    across it. Derived from :func:`_resolution_affecting_op` so the boolean gate
-    and the refusal wording never disagree about what counts."""
-    return _resolution_affecting_op(operations) is not None
+    Whitelist-based: unknown or malformed ops default to possibly affecting
+    resolution. This decides only where preflight must stop; preview checks
+    after that point use BN's actual current-state lookup, not a name prediction."""
+    return any(not isinstance(op, dict) or op.get("op") not in _RESOLUTION_SAFE_OPS
+               for op in operations)
 
 
 def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[tuple[int, str]]:
-    """``(index, function label)`` of each ``--preview`` set_prototype that would
-    irreversibly pin ``has_user_type`` on (#630), for a batch that does NOT change
-    symbol resolution.
+    """AUTO-changing prototypes in the prefix safe to inspect before applying.
 
-    Setting a prototype routes through ``set_user_type``, which pins
-    ``BNFunctionHasUserType``. Binary Ninja exposes NO API to clear it: verified
-    live on BN 5.4, ``set_auto_type`` and ``revert_undo_actions`` both restore the
-    prototype VALUE but leave the flag set, ``has_user_type`` has no setter, and
-    there is no ``delete_user_type``. The flag is behaviorally meaningful -- once
-    set, analysis will not re-derive the signature -- so it is NOT value-neutral
-    metadata. A ``--preview`` promises a clean, non-destructive revert, which is
-    impossible for such an op, so the batch is REFUSED before any mutation
-    (pristine view) rather than applied and reported as a false clean rollback. A
-    function that already has a user type is fine: re-asserting its genuine
-    override on revert is correct, not residue.
-
-    Round-5 conservative rule: we STOP simulating BN's apply-time name resolution
-    (four review rounds proved every simulation loses to some resolution edge --
-    case-fold, future-rename hijack, raw ``FunctionSymbol`` aliases, in-batch data
-    symbols at a function address, stale impl/stub name forms). The caller has
-    already verified via :func:`_batch_changes_symbol_resolution` that NOTHING in
-    this batch moves function/symbol resolution, so the CURRENT view resolves each
-    ``set_prototype`` target to EXACTLY what the apply will hit. We therefore call
-    BN's REAL lookup (``ctx._find_function`` -- the same path apply uses, including
-    the raw-symbol-at-address fallback at seam.py ~129), never a simulation. A
-    target that resolves to an AUTO function (``has_user_type`` false) whose
-    prototype would DIFFER is flagged. A target that does not resolve is not a
-    preview question at all: the same batch applied live fails on it, so the
-    preview reports that failure (#999 review) instead of skipping the op as if
-    it had found a function."""
-    declares_types = _declares_types(operations)
+    Setting a prototype pins ``has_user_type``, which BN cannot clear. Preserve
+    the pristine refusal for a standalone AUTO-changing prototype, but never
+    parse or resolve across an earlier declaration or resolution-changing op:
+    those prototypes are checked against the actual preview state instead."""
     flagged: list[tuple[int, str]] = []
     for index, op in enumerate(operations):
-        if not (isinstance(op, dict) and op.get("op") == "set_prototype"):
+        if (not isinstance(op, dict) or op.get("op") == "types_declare"
+                or _batch_changes_symbol_resolution([op])):
+            break
+        if op.get("op") != "set_prototype":
             continue
-        label = _unrevertible_label(ctx, bv, op, declares_types)
+        label = _unrevertible_label(ctx, bv, op)
         if label is not None:
             flagged.append((index, label))
     return flagged
 
 
-def _unrevertible_label(ctx, bv, op: dict[str, Any], declares_types: bool) -> str | None:
-    """The function label when this set_prototype would pin has_user_type on an
-    AUTO function under --preview (see above), else None. Its target is resolved
-    with BN's real lookup against the current view, which is the apply-time view
-    when no earlier op in the batch moves resolution; a miss raises the apply's
-    own error."""
-    identifier = op.get("identifier")
-    if identifier is None:
+@_track_type_imports
+def _unrevertible_label(ctx, bv, op: dict[str, Any], *, fn=None) -> str | None:
+    """Label an AUTO-changing prototype using BN's lookup and parsed Type.
+
+    Call only when preceding ops have already run, or in a prefix whose targets
+    and declarations are unchanged. A parse or resolution failure is a real
+    error, never evidence that an op can be skipped."""
+    if op.get("identifier") is None:
         return None
-    fn = _resolve_prototype_target(ctx, bv, op)
+    if fn is None:
+        fn = _resolve_prototype_target(ctx, bv, op)
     if bool(getattr(fn, "has_user_type", False)):
-        # A genuine prior user type: re-asserting it on revert is correct.
         return None
-    label = str(il_format._display_name(fn) or identifier)
-    try:
-        expected_type = _parse_prototype(ctx, bv, op)
-    except OperationFailure:
-        if not declares_types:
-            raise
-        # Cannot determine whether the prototype differs from this AUTO
-        # function's current type, so cannot prove it is a no-op -> refuse.
-        return label
-    return label if str(fn.type) != str(expected_type) else None
+    expected_type = _parse_prototype(ctx, bv, op)
+    if str(fn.type) == str(expected_type):
+        return None
+    return str(il_format._display_name(fn) or op["identifier"])
 
 
-def _earlier_supplier(identifier: Any, earlier) -> tuple[int, str] | None:
-    """``(index, what it may do)`` for the first op in *earlier* that could make
-    an unresolvable set_prototype target resolve, or None. Not a prediction of
-    whether it does: only which op KINDS can. A function create (or an op this
-    engine does not know) can supply any target; a rename can supply a NAME but
-    never an address, since it creates no function; every other known op -- a
-    data retype included -- neither creates nor renames anything."""
-    try:
-        _parse_address(identifier)
-        is_address = True
-    except (ValueError, TypeError):
-        is_address = False
-    for index, op in enumerate(earlier):
-        kind = op.get("op") if isinstance(op, dict) else None
-        if kind == "function_create":
-            return index, "create a function"
-        if kind == "rename_symbol":
-            if not is_address:
-                return index, "rename a symbol to it"
-            continue
-        if kind in _RESOLUTION_SAFE_OPS or kind == "data_retype":
-            continue
-        return index, f"change symbols (it is {kind!r}, an op this check does not know)"
-    return None
-
-
-def _declares_types(operations) -> bool:
-    """Whether a batch declares types, which a later prototype may use: such a
-    prototype cannot be parse-checked before the batch applies."""
-    return any(isinstance(op, dict) and op.get("op") == "types_declare" for op in operations)
-
-
-def _resolve_prototype_target(ctx, bv, op: dict[str, Any]):
-    """The function a set_prototype op names, under BN's REAL lookup, or the
-    failure the apply would report for it (`Function not found: ...`, an
-    ambiguous name) as an OperationFailure."""
-    identifier = op.get("identifier")
+def _resolve_preview_function(ctx, bv, op: dict[str, Any], identifier):
+    """Resolve read-only with the live mutation lookup and preserve its error."""
     try:
         fn = ctx._find_function(bv, identifier)
     except OperationFailure:
@@ -1182,96 +1113,61 @@ def _resolve_prototype_target(ctx, bv, op: dict[str, Any]):
     return fn
 
 
+def _resolve_prototype_target(ctx, bv, op: dict[str, Any]):
+    return _resolve_preview_function(ctx, bv, op, op.get("identifier"))
+
+
 # The ops whose meaning depends on a function's prototype: a parameter is a
 # local, so renaming or retyping one means nothing until the prototype lands.
 _PROTOTYPE_DEPENDENT_OPS = frozenset({"local_rename", "local_retype"})
 
 
-def _unpreviewable_operations(ctx, bv, operations) -> dict[int, str]:
-    """``{index: reason}`` for the ops a ``--preview`` must leave out (#999 item 5).
+@_track_type_imports
+def _preview_operation_skip(ctx, bv, op: dict[str, Any], index: int,
+                            skipped_prototypes: dict[int, int]) -> str | None:
+    """Check one op immediately before applying it to the current preview view.
 
-    A set_prototype on a function with no user prototype cannot be previewed
-    (it pins has_user_type, #630), and neither can any set_prototype in a batch
-    that may move name resolution, since its target cannot be proven from the
-    pre-mutation view. Refusing the whole batch for it meant the comments and
-    renames beside it could not be previewed either, so the preview skips those
-    ops plus every op that depends on them -- a local op on the same function,
-    or one whose function cannot be resolved here and so cannot be proven
-    elsewhere -- and previews the rest."""
-    skipped: dict[int, str] = {}
-    offending = _resolution_affecting_op(operations)
-    declares_types = _declares_types(operations)
-    for index, op in enumerate(operations):
-        if not (isinstance(op, dict) and op.get("op") == "set_prototype"):
-            continue
-        # A prototype applies in the view the ops BEFORE it leave, so only they
-        # can move what it resolves to; an op after it cannot.
-        earlier = _resolution_affecting_op(operations[:index])
-        if earlier is None:
-            label = _unrevertible_label(ctx, bv, op, declares_types)
-            if label is not None:
-                skipped[index] = (
-                    f"not previewed: {label} has no user prototype yet, and setting one "
-                    "pins its has_user_type flag, which Binary Ninja exposes no API to "
-                    "clear, so the preview could not be cleanly reverted")
-            continue
-        # The target cannot be PROVEN here, but two failures the live apply would
-        # hit can still be shown (#999 review): a prototype string that does not
-        # parse, and a target that does not resolve when no earlier op is of a
-        # kind that could supply it. When one is, whether it does is not
-        # predicted (a follow-up): the op is left out, saying it was not checked.
-        if not declares_types:
-            _parse_prototype(ctx, bv, op)
-        try:
-            _resolve_prototype_target(ctx, bv, op)
-        except OperationFailure as exc:
-            supplier = _earlier_supplier(op.get("identifier"), operations[:index])
-            if supplier is None:
-                raise
-            source, may = supplier
-            skipped[index] = (
-                "not previewed: its target does not resolve yet "
-                f"({exc.message.splitlines()[0] if exc.message else 'not found'}); "
-                f"operation {source} earlier in this batch may {may}, so it is only "
-                "checked when the batch is applied")
-            continue
-        offending_op, is_known = earlier
-        cause = (f"a rename or a symbol/function create ({offending_op})" if is_known
-                 else f"the operation {offending_op!r}, which may change how a symbol resolves")
-        skipped[index] = (
-            f"not previewed: an earlier operation in this batch is {cause}, so the "
-            "function this prototype lands on cannot be proven from the pre-mutation "
-            "view, and a prototype set on a function with no user prototype pins its "
-            "has_user_type flag, which Binary Ninja cannot clear")
-    if not skipped:
-        return skipped
-    first = min(skipped)
-    starts: dict[int, int] = {}
-    names: dict[str, int] = {}
-    for index in list(skipped):
-        identifier = operations[index].get("identifier")
-        names.setdefault(str(identifier), index)
-        try:
-            starts.setdefault(int(ctx._find_function(bv, identifier).start), index)
-        except Exception:
-            continue
-    for index, op in enumerate(operations):
-        if not (isinstance(op, dict) and op.get("op") in _PROTOTYPE_DEPENDENT_OPS):
-            continue
-        function = op.get("function")
-        source = names.get(str(function))
-        if source is None and offending is not None:
-            # Names may move under this batch, so no local op can be proven to
-            # sit outside the functions whose prototype is left out.
-            source = first
-        if source is None:
-            try:
-                source = starts.get(int(ctx._find_function(bv, function).start))
-            except Exception:
-                source = first
+    ``skipped_prototypes`` maps actual function starts to earlier skipped
+    prototype indices. Only read-only target resolution and prototype parsing
+    happen here: never set a user type to discover whether it can be reverted.
+    A target miss, ambiguity, malformed address or parse failure propagates the
+    live error. Names are never matched against earlier rename requests."""
+    if not isinstance(op, dict):
+        return None
+    if op.get("op") == "set_prototype":
+        fn = _resolve_prototype_target(ctx, bv, op)
+        label = _unrevertible_label(ctx, bv, op, fn=fn)
+        if label is not None:
+            skipped_prototypes.setdefault(int(fn.start), index)
+            return (
+                f"not previewed: {label} has no user prototype yet, and setting one "
+                "pins its has_user_type flag, which Binary Ninja exposes no API to "
+                "clear, so the preview could not be cleanly reverted")
+    elif op.get("op") in _PROTOTYPE_DEPENDENT_OPS and skipped_prototypes:
+        fn = _resolve_preview_function(ctx, bv, op, op.get("function"))
+        source = skipped_prototypes.get(int(fn.start))
         if source is not None:
-            skipped[index] = (f"not previewed: depends on operation {source}, a prototype "
-                              "change this preview leaves out")
+            return (f"not previewed: depends on operation {source}, a prototype "
+                    "change this preview leaves out")
+    return None
+
+
+def _unpreviewable_operations(ctx, bv, operations) -> dict[int, str]:
+    """Preflight only the prefix whose resolution/declarations are unchanged.
+
+    This preserves the pristine all-skipped/standalone refusal. Every operation
+    is checked again immediately before apply by ``_preview_operation_skip``;
+    after an earlier rename, function create or type declaration, only that
+    outcome-based check can decide skip versus a real error."""
+    skipped: dict[int, str] = {}
+    skipped_prototypes: dict[int, int] = {}
+    for index, op in enumerate(operations):
+        if (not isinstance(op, dict) or op.get("op") == "types_declare"
+                or _batch_changes_symbol_resolution([op])):
+            break
+        reason = _preview_operation_skip(ctx, bv, op, index, skipped_prototypes)
+        if reason is not None:
+            skipped[index] = reason
     return skipped
 
 
@@ -1449,7 +1345,9 @@ def _verify_rename_symbol(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
         symbol = bv.get_symbol_at(address)
         observed_name = str(symbol.name) if symbol is not None else None
     item["observed"] = {"address": item["address"], "name": observed_name}
-    if observed_name != requested_name:
+    # A rename that wrote nothing is not invalidated by a later real rename
+    # through another locator. Keep its no-op verdict and report the live name.
+    if observed_name != requested_name and before_name != requested_name:
         raise OperationFailure(
             "verification_failed",
             f"Live rename verification failed at {item['address']}",
@@ -2137,6 +2035,7 @@ def _validate_operation_request(ctx, op: dict[str, Any], *, index: int | None = 
     return kind
 
 
+@_track_type_imports
 def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None, *,
                      defer_reanalysis: bool = False):
     # A manifest op must be a JSON object; a non-object element (e.g.
@@ -2553,8 +2452,14 @@ def _refuse_rename_chain(row: dict[str, Any], results: list[dict[str, Any]],
         return
     for first, earlier in enumerate(results):
         if (earlier.get("op") != "rename_symbol" or earlier.get("address") != row["address"]
+                or earlier.get("before_name") == earlier.get("new_name")
                 or earlier.get("new_name") == row.get("new_name")):
             continue
+        advice = json.dumps({
+            "op": "rename_symbol",
+            "identifier": row["address"],
+            "new_name": row.get("new_name"),
+        })
         raise OperationFailure(
             "invalid_request",
             f"operation {index} renames the symbol at {row['address']} again: operation "
@@ -2564,10 +2469,11 @@ def _refuse_rename_chain(row: dict[str, Any], results: list[dict[str, Any]],
             f"symbol, so it would be renamed again to {row.get('new_name')}. Every op is "
             f"verified against the batch's END state, so operation {first} could never "
             f"verify. Drop operation {first} and make operation {index} rename the "
-            f"symbol by its address: {{\"op\": \"rename_symbol\", \"identifier\": "
-            f"\"{row['address']}\", \"new_name\": \"{row.get('new_name')}\"}} -- kept in "
+            f"symbol by its address: {advice} -- kept in "
             f"that position, after the renames between them (moved first, it can run into "
-            f"an ambiguous name) -- or split the renames across two batches.",
+            f"an ambiguous name). Dropping operation {first} means its intermediate name "
+            f"{earlier.get('new_name')!r} disappears; update any operations that refer to "
+            f"it to use the address too -- or split the renames across two batches.",
             requested={
                 **(row.get("requested") or {}),
                 "conflicting_op_indices": [first, index],
@@ -2616,13 +2522,53 @@ def refuse_quick_view(bv, *, requested: dict[str, Any],
 
 def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
               exclusive=None):
-    """`_apply_batch` with `_PREVIEW_PARSE` set for a `--preview`, so a
-    previewed `types declare` never imports a type-library type on purpose
-    (#993 item 2)."""
+    """Run a mutation with request-local preview and parser-import attribution."""
     token = _PREVIEW_PARSE.set(bool(preview))
+    trace: dict[str, Any] = {
+        "imports": {}, "claimed": set(), "parsed": set(), "import_errors": {},
+    }
+    trace_token = _IMPORT_TRACE.set(trace)
     try:
-        return _apply_batch(ctx, selector, preview, operations, exclusive=exclusive)
+        try:
+            result = _apply_batch(ctx, selector, preview, operations, exclusive=exclusive)
+        except Exception as exc:
+            # A preflight/snapshot can parse before an undo group exists. Even
+            # this exit must disclose its irreversible imports and their owner.
+            if not trace["claimed"] or trace.get("transaction_started"):
+                if trace["claimed"] and isinstance(exc, OperationFailure):
+                    exc.observed["kept_library_imports"] = sorted(trace["claimed"])
+                raise
+            ops = trace["operations"]
+            failed_id = trace.get("failed_op")
+            rows = [
+                _operation_failure_result(ctx, op, exc)
+                if id(op) == failed_id and isinstance(exc, OperationFailure)
+                else _unattempted_results(ctx, [op])[0]
+                for op in ops
+            ]
+            _report_library_imports(trace["bv"], trace["baseline"], rows)
+            if preview:
+                rows = _fail_importing_preview(rows)
+            result = {
+                "preview": preview, "success": False, "committed": False,
+                "rolled_back": True, "message": str(exc), "results": rows,
+                "affected_functions": [], "affected_types": [],
+                "affected_summary": {"referenced": 0, "reflowed": 0},
+            }
+        if trace["claimed"]:
+            _report_library_imports(trace["bv"], trace["baseline"], result["results"])
+            if preview or not result.get("committed"):
+                result["kept_library_imports"] = sorted(trace["claimed"])
+            if preview:
+                result["results"] = _fail_importing_preview(result["results"])
+                result["success"] = False
+                result["message"] = (
+                    "Preview failed; see per-operation results and rolled_back for the "
+                    "revert outcome. Imported library types stay in the view "
+                    "(a rollback cannot remove them).")
+        return result
     finally:
+        _IMPORT_TRACE.reset(trace_token)
         _PREVIEW_PARSE.reset(token)
 
 
@@ -2682,6 +2628,9 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
         # pre-apply snapshot below already does -- for the live batch's
         # library-import report and every revert path's dangling-name cleanup.
         library_baseline = _declare_batch_type_names(bv, operations)
+        trace = _IMPORT_TRACE.get()
+        if trace is not None:
+            trace.update(bv=bv, baseline=library_baseline, operations=operations)
         # #650: validate EVERY op's shape before applying ANY. The batch is atomic, so a
         # guessed op or field name in op 13 previously rolled back 12 good ops -- and with
         # no argparse layer on this path, guessing is the norm, not the exception. It runs
@@ -2762,6 +2711,8 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
         # with this baseline (`_split_hosts_at_baseline`).
         host_baseline = create_comments._split_host_baseline(ctx, bv, operations)
         state = bv.begin_undo_actions()
+        if trace is not None:
+            trace["transaction_started"] = True
     results = []
     # Explicit restores for local var ops, which BN's undo buffer can't
     # revert (see _run_local_restores). Replayed on every revert path.
@@ -2770,6 +2721,7 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
         # Registered first, so it runs last on every revert path, after the
         # journal has removed the batch's own types.
         restores.append(lambda: _clear_dangling_type_names(bv, library_baseline))
+    skipped_prototypes: dict[int, int] = {}
     try:
         for index, op in enumerate(operations):
             # #780: function_create is the one op that reanalyzes while it
@@ -2779,6 +2731,14 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
             # every concurrent read. Defer it -- the same #628 deferral -- and
             # _verify_function_create does the post-analysis readback + #386
             # code guard afterwards.
+            if preview:
+                with exclusive_scope():
+                    reason = _preview_operation_skip(
+                        ctx, bv, op, index, skipped_prototypes)
+                if reason is None:
+                    skipped.pop(index, None)
+                else:
+                    skipped[index] = reason
             if index in skipped:
                 results.append(_not_previewed_result(ctx, op, skipped[index]))
                 continue
@@ -2886,6 +2846,7 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
             type_diffs = _diff_type_snapshots(ctx, type_before, type_after)
             verified_results = [result if result.get("status") == NOT_PREVIEWED
                                 else _verify_operation(ctx, bv, result) for result in results]
+            _report_library_imports(bv, library_baseline, verified_results)
             annotated_results = _annotate_operation_results(ctx, verified_results, type_diffs)
             # #993 review round 4: a preview never reports success while BN
             # imported anything. Judged on what BN did (new type ids, see
@@ -2893,7 +2854,7 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
             preview_imports = (_new_library_imports(bv, library_baseline)
                                if preview and library_baseline is not None else [])
             if preview_imports:
-                annotated_results = _fail_importing_preview(annotated_results, preview_imports)
+                annotated_results = _fail_importing_preview(annotated_results)
             failed = _has_failed_results(ctx, annotated_results)
             # Origin tag: a direct op (rename/prototype/comment) targets a specific
             # function; mark its affected-function diffs `direct` so a mixed batch
@@ -2960,8 +2921,7 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
             # non-commit is already advertised).
             if not failed:
                 output_results = [_slim_type_result_for_output(item) for item in annotated_results]
-            elif preview:
-                output_results = annotated_results
+            # Failed previews have reverted siblings just like failed live batches.
             else:
                 output_results = _restamp_reverted_siblings(ctx, annotated_results, values_reverted)
             message = None
@@ -3775,10 +3735,14 @@ def _quote_qualified_declarator(text: str) -> str:
     return f"{text[:start]}`{text[start:end]}`{text[end:]}"
 
 
+@_track_type_imports
 def _parse_prototype(ctx, bv, op: dict[str, Any]):
     """The prototype a ``set_prototype`` op requests, parsed to a ``Type``.
     Its parse error quotes the prototype as typed, not the quoted rewrite, and
     BN's column numbers are translated back to that text (#999 review)."""
+    trace = _IMPORT_TRACE.get()
+    if trace is not None:
+        trace["parsed"].add(id(op))
     typed = str(op.get("prototype"))
     span = _qualified_declarator_span(typed)
     column_of = None
@@ -3903,11 +3867,10 @@ def _register_prototype_restore(ctx, bv, restores, *, fn, before_prototype, befo
         if rfn is None:
             raise RuntimeError(f"function {hex(fn_start)} missing on prototype restore")
         if had_user_type:
-            # Genuine prior user prototype: put the EXACT prior type back as a
-            # user type. The .type setter (which calls set_user_type) is correct
-            # here. Fall back to the type string only if the object path fails.
+            # Restore the type without routing through the string-sensitive
+            # Function.type setter, which can also rename the function.
             try:
-                rfn.type = before_type_obj
+                rfn.set_user_type(before_type_obj)
             except Exception:
                 rfn.set_user_type(before_prototype)
         else:
@@ -4745,8 +4708,8 @@ def _preview_library_refusal(names) -> str:
 
 
 class _TypeBaseline(NamedTuple):
-    """The view's type names and type ids before a batch that declares types
-    parses anything. Imports are found by ID (#993 review round 4): BN
+    """The view's type names and ids before a type-parsing step.
+    Imports are found by ID (#993 review round 4): BN
     renames an import that collides with a user type (`__time_t` comes in as
     `__time_t_1` under id `<guid>:["__time_t"]`), so a name diff can be hidden
     by a same-named user type, while a new id cannot."""
@@ -4763,11 +4726,13 @@ def _view_type_ids(bv) -> set[str] | None:
 
 
 def _declare_batch_type_names(bv, operations) -> _TypeBaseline | None:
-    """The baseline a batch that declares types is measured against -- its
-    library-import report, the preview's import check and every revert
-    path's dangling-name cleanup (#993 item 2) -- or None when the batch
-    declares none (or the view cannot list its types)."""
-    if not any(isinstance(op, dict) and op.get("op") == "types_declare" for op in operations):
+    """Baseline all type-parsing mutation kinds, including declare-free batches.
+
+    It covers import disclosure, preview outcome checking and dangling-name
+    cleanup; None means no type parser or a view that cannot list its types."""
+    if not any(isinstance(op, dict) and op.get("op") in {
+        "types_declare", "struct_field_set", "set_prototype", "local_retype", "data_retype",
+    } for op in operations):
         return None
     names = _view_type_names(bv)
     if names is None:
@@ -4801,21 +4766,6 @@ def _new_library_imports(bv, baseline: _TypeBaseline) -> list[str]:
     return sorted(set(found))
 
 
-def _reached_type_names(bv, roots) -> set[str]:
-    """*roots* and every named type the view's types reach from them."""
-    reached: set[str] = set()
-    pending = [str(name) for name in roots]
-    while pending:
-        name = pending.pop()
-        if name in reached:
-            continue
-        reached.add(name)
-        type_obj = _lookup_named_type(bv, name)
-        if type_obj is not None:
-            pending.extend(_named_type_references(type_obj))
-    return reached
-
-
 def _stamp_library_imports(row: dict[str, Any], names) -> None:
     """Record *names* as the row's `imported_from_library`, and take them off
     its `referenced_existing_types`: a library type the view did not have is
@@ -4833,48 +4783,43 @@ def _stamp_library_imports(row: dict[str, Any], names) -> None:
 
 def _report_library_imports(bv, baseline: _TypeBaseline | None, results: list,
                             failed_row: dict[str, Any] | None = None) -> None:
-    """Stamp each `types_declare` row with the library types the batch
-    imported that its own defined types reach (`imported_from_library`). An
-    import no row reaches is stamped on *failed_row* when that row is a
-    declare -- BN's parse imported for the op that then failed, which has no
-    defined types to reach it by (#993 review round 3) -- else on the first
-    declare row, so none is unreported."""
-    if baseline is None:
+    """Attribute imports to the exact op whose parse/apply introduced them."""
+    trace = _IMPORT_TRACE.get()
+    if trace is None:
         return
-    imported = _new_library_imports(bv, baseline)
-    rows = [row for row in results if isinstance(row, dict) and row.get("op") == "types_declare"]
-    fallback = failed_row if isinstance(failed_row, dict) and failed_row.get("op") == "types_declare" else None
-    if not imported or not (rows or fallback):
-        return
-    unclaimed = list(imported)
-    for row in rows:
-        reached = _reached_type_names(bv, row.get("defined_types") or {})
-        mine = [name for name in imported if name in reached]
+    rows = results + ([failed_row] if failed_row is not None else [])
+    for op, row in zip(trace["operations"], rows):
+        if id(op) in trace["parsed"]:
+            row["parse_performed"] = True
+        names = trace["imports"].get(id(op), ())
+        if names:
+            _stamp_library_imports(row, names)
+            row["parse_performed"] = True
+
+
+def _fail_importing_preview(results: list) -> list:
+    """Fail only the importing steps, including preflight-only parses."""
+    out = []
+    trace = _IMPORT_TRACE.get()
+    for index, row in enumerate(results):
+        mine = row.get("imported_from_library") or []
         if mine:
-            _stamp_library_imports(row, mine)
-            unclaimed = [name for name in unclaimed if name not in mine]
-    if unclaimed:
-        _stamp_library_imports(fallback if fallback is not None else rows[0], unclaimed)
-
-
-def _fail_importing_preview(results: list, imported: list[str]) -> list:
-    """Stamp a preview that BN imported library types during as failed
-    (`unsupported`): the preview cannot undo the import, so it must not read
-    as a clean dry run. Every declare row is failed, and every import is
-    listed (`imported_from_library`, which the summary reports as kept)."""
-    message = (
-        f"Binary Ninja imported type-library type(s) while previewing this declaration "
-        f"({', '.join(imported)}); a preview cannot undo an import, so it is not reported as "
-        f"verified, and the imported types stay in the view (a rollback cannot remove them). "
-        f"Run the declare without --preview."
-    )
-    out, stamped = [], False
-    for row in results:
-        if isinstance(row, dict) and row.get("op") == "types_declare":
-            row = {**row, "status": "unsupported", "message": message}
-            if not stamped:
-                _stamp_library_imports(row, imported)
-                stamped = True
+            # Keep the real parse/apply failure as well as the import warning.
+            # This helper runs before rollback and again on final disclosure.
+            prior = (str(row.get("message") or "")
+                     if row.get("status") in FAILED_MUTATION_STATUSES else "")
+            if trace is not None:
+                prior = trace["import_errors"].setdefault(index, prior)
+            message = (
+                "Binary Ninja imported type-library type(s) while parsing this operation "
+                f"({', '.join(mine)}); a preview cannot undo an import, so the imported "
+                "types stay in the view (a rollback cannot remove them). "
+                + ("Run the declare without --preview." if row.get("op") == "types_declare"
+                   else "Run the operation without --preview only if the change is intended.")
+            )
+            row = {**row, "status": ("rollback_failed" if row.get("status") == "rollback_failed"
+                                    else "unsupported"),
+                   "message": f"{prior} {message}".strip() if prior else message}
         out.append(row)
     return out
 

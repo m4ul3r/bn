@@ -47,6 +47,35 @@ def test_parse_declaration_source_uses_platform_parser_with_source_path(monkeypa
     assert recorded["kwargs"]["include_dirs"] == [str(header_path.parent.resolve())]
 
 
+@pytest.mark.parametrize("view_error", [
+    SyntaxError("error: input:1:27 expected ';' at end of declaration"),
+    RuntimeError("view parser could not import the requested library dependency"),
+    SyntaxError("error: input:1:21 unknown type name 'missing_type'"),
+])
+def test_declaration_fallback_keeps_the_actual_view_error_1012(monkeypatch, view_error):
+    """A platform-only unknown-type failure cannot replace the view's answer."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _Platform:
+        def parse_types_from_source(self, source, **kwargs):
+            raise SyntaxError("error: source.hpp:1:21 unknown type name 'pid_t'")
+
+    class _LibraryBV(_FakeBV):
+        platform = _Platform()
+
+        def parse_types_from_string(self, declaration):
+            raise view_error
+
+    with pytest.raises(bridge.OperationFailure) as mutation_exc:
+        instance._apply_operation(_LibraryBV(), {
+            "op": "types_declare", "declaration": "struct Process { pid_t pid };",
+        })
+    assert mutation_exc.value.status == "invalid_request"
+    assert str(view_error) in mutation_exc.value.message
+    assert "unknown type name 'pid_t'" not in mutation_exc.value.message
+
+
 def test_types_declare_discloses_the_include_root_it_actually_searched_825(
         monkeypatch, tmp_path):
     # #825 item 3: the header's parent directory becomes an implicit include

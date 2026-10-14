@@ -4747,3 +4747,154 @@ class TestOffsetTypeLookup1000:
         for name, exists in self._NAMES.items():
             shown = shared_bn.run("types", "show", name)
             assert (shown.returncode == 0) == exists, (name, shown.stdout, shown.stderr)
+
+
+class TestBatchPreviewImports1012:
+    @pytest.mark.parametrize("kind", [
+        "struct_field_set", "set_prototype", "local_retype", "data_retype",
+    ])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_every_type_parser_discloses_kept_imports(self, shared_bn, tmp_path, kind, batched):
+        shared_bn.load(ADD_BINARY)
+        address = shared_bn.json("function", "info", "add")["function"]["address"]
+        shared_bn.json("types", "declare", "struct PreviewSlot { int a; int b; };")
+        if kind == "set_prototype":
+            shared_bn.json("proto", "set", "add", "int add(int a, int b)")
+            op = {"op": kind, "identifier": "add", "prototype": "int add(struct passwd* p)"}
+            command = ["proto", "set", "add", op["prototype"]]
+        elif kind == "local_retype":
+            op = {"op": kind, "function": "add", "variable": "arg1", "new_type": "struct passwd*"}
+            command = ["local", "retype", "add", "arg1", op["new_type"]]
+        elif kind == "data_retype":
+            op = {"op": kind, "address": address, "new_type": "struct passwd*"}
+            command = ["data", "retype", address, op["new_type"]]
+        else:
+            op = {"op": kind, "struct_name": "PreviewSlot", "offset": "0x10",
+                  "field_name": "p", "field_type": "struct passwd*"}
+            command = ["struct", "field", "set", "PreviewSlot", "0x10", "p", op["field_type"]]
+        probe = ("import json\nprint(json.dumps(sorted((str(i), str(bv.get_type_name_by_id(i))) "
+                 "for i in bv.type_container.type_ids)))")
+        before = dict(json.loads(shared_bn.run("py", "exec", "--code", probe).stdout))
+        if batched:
+            manifest = tmp_path / "preview.json"
+            manifest.write_text(json.dumps({"ops": [
+                {"op": "set_comment", "function": "mul", "comment": "preview only"}, op]}))
+            command = ["batch", "apply", str(manifest)]
+        response = shared_bn.run(*command, "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        after = dict(json.loads(shared_bn.run("py", "exec", "--code", probe).stdout))
+        imported = {name for type_id, name in after.items() if type_id not in before}
+        assert "passwd" in imported, result
+        assert set(result["kept_library_imports"]) == imported, result
+        assert set(result["results"][-1]["imported_from_library"]) == imported, result
+        assert result["results"][-1]["status"] == "unsupported", result
+        if batched:
+            assert result["results"][0]["status"] == "reverted", result
+            assert "imported_from_library" not in result["results"][0], result
+
+    def test_snapshot_import_belongs_to_unattempted_later_declare(self, shared_bn, tmp_path):
+        shared_bn.load(ADD_BINARY)
+        manifest = tmp_path / "late.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "set_comment", "function": "missing_function", "comment": "x"},
+            {"op": "types_declare", "declaration": "struct LateImport { timespec* p; };"}]}))
+        response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert "timespec" in result["kept_library_imports"], result
+        assert "imported_from_library" not in result["results"][0], result
+        assert "timespec" in result["results"][1]["imported_from_library"], result
+        assert result["results"][1]["parse_performed"] is True, result
+        assert result["results"][1]["status"] == "unsupported", result
+
+    def test_skipped_auto_prototype_parse_is_an_importing_step(self, shared_bn, tmp_path):
+        shared_bn.load(ADD_BINARY)
+        manifest = tmp_path / "auto.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "set_prototype", "identifier": "add", "prototype": "int add(struct passwd* p)"},
+            {"op": "set_comment", "function": "mul", "comment": "preview only"}]}))
+        response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert "passwd" in result["kept_library_imports"], result
+        assert result["results"][0]["status"] == "unsupported", result
+        assert result["results"][0]["parse_performed"] is True, result
+        assert result["results"][1]["status"] == "reverted", result
+        assert shared_bn.json("proto", "get", "add")["function"]["name"] == "add"
+
+    def test_preflight_import_survives_later_preflight_error_honestly(self, shared_bn, tmp_path):
+        shared_bn.load(ADD_BINARY)
+        manifest = tmp_path / "preflight.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "set_prototype", "identifier": "add", "prototype": "int add(struct passwd* p)"},
+            {"op": "set_prototype", "identifier": "missing", "prototype": "int missing(int x)"}]}))
+        response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert "passwd" in result["kept_library_imports"], result
+        assert result["results"][0]["status"] == "unsupported", result
+        assert result["results"][0]["parse_performed"] is True, result
+        assert "imported_from_library" not in result["results"][1], result
+        assert "Function not found: missing" in result["results"][1]["message"], result
+        assert result["results"][1]["status"] == "unsupported", result
+
+    @pytest.mark.parametrize("kind", ["function", "data"])
+    @pytest.mark.parametrize("user_type", [False, True])
+    def test_renamed_prototype_uses_preview_state(self, shared_bn, tmp_path, user_type, kind):
+        shared_bn.load(ADD_BINARY)
+        if user_type:
+            shared_bn.json("proto", "set", "add", "int add(int a, int b)")
+        identifier = (shared_bn.json("function", "info", "add")["function"]["address"]
+                      if kind == "data" else "add")
+        manifest = tmp_path / "renamed.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": identifier, "kind": kind, "new_name": "preview_sum"},
+            {"op": "set_prototype", "identifier": "preview_sum",
+             "prototype": "int preview_sum(long a, int b)"}]}))
+        response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert response.returncode == 0, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert result["results"][0]["status"] == "verified", result
+        assert result["results"][1]["status"] == ("verified" if user_type else "not_previewed"), result
+        if not user_type:
+            assert result["results"][1]["parse_performed"] is True, result
+        assert shared_bn.json("function", "info", "add")["function"]["name"] == "add"
+        assert shared_bn.run("function", "info", "preview_sum").returncode == 2
+
+    def test_import_warning_preserves_the_real_declaration_failure(self, shared_bn):
+        shared_bn.load(ADD_BINARY)
+        response = shared_bn.run(
+            "types", "declare",
+            "struct ImportThenFail { rusage r; }; struct uint32_t { int x; };",
+            "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert "rusage" in result["kept_library_imports"], result
+        row = result["results"][0]
+        assert row["status"] == "unsupported", result
+        assert "uint32_t" in row["message"], result
+        assert "a preview cannot undo an import" in row["message"], result
+
+    def test_rename_advice_runs_with_an_earlier_noop(self, shared_bn, tmp_path):
+        shared_bn.load(ADD_BINARY)
+        address = shared_bn.json("function", "info", "add")["function"]["address"]
+        operations = [
+            {"op": "rename_symbol", "identifier": "add", "new_name": "add"},
+            {"op": "rename_symbol", "identifier": address, "new_name": "intermediate"},
+            {"op": "rename_symbol", "identifier": "intermediate", "new_name": 'final"sum'},
+        ]
+        manifest = tmp_path / "rename.json"
+        manifest.write_text(json.dumps({"ops": operations}))
+        response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        row = json.loads(response.stdout)["results"][2]
+        assert row["requested"]["conflicting_op_indices"] == [1, 2], row
+        message = row["message"]
+        replacement = json.JSONDecoder().raw_decode(message[message.index('{"op"'):])[0]
+        manifest.write_text(json.dumps({"ops": [operations[0], replacement]}))
+        corrected = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json", "--summary")
+        assert corrected.returncode == 0, corrected.stdout + corrected.stderr
+        summary = json.loads(corrected.stdout)
+        assert summary["noop_count"] == 1 and summary["verified_count"] == 1, summary
+        assert shared_bn.json("function", "info", "add")["function"]["name"] == "add"
