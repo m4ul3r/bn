@@ -15,9 +15,11 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+import re
+import shlex
 
 import pytest
-from conftest import FixtureBuildError
+from conftest import FixtureBuildError, refuse_silent_skip
 
 CORPUS = Path(__file__).parent / "taint_corpus"
 
@@ -236,3 +238,100 @@ def test_trace_slices_an_indirect_call_site(tmp_path, shared_bn):
     # the length argument (arg 2) has a non-empty backward slice; real key is "trace"
     steps = result["trace"]
     assert steps, f"trace produced no slice at indirect call {call_addr}: {result}"
+
+
+
+def _run_diagnostic_commands(shared_bn, prose):
+    """Execute complete diagnostic commands without supplementing their routing."""
+    from conftest import _BN_CLI
+
+    commands = re.findall(r"`(bn [^`]+)`", prose)
+    assert commands, prose
+    outputs = []
+    for command in commands:
+        argv = shlex.split(command)
+        result = subprocess.run(
+            [*_BN_CLI, *argv[1:]], capture_output=True,
+            text=True, env=shared_bn.env(), timeout=300.0)
+        assert result.returncode == 0, f"{command}: {result.stderr}"
+        outputs.append(result.stdout)
+    return outputs
+
+
+def test_trace_local_hints_run_as_printed_with_multiple_targets(tmp_path, shared_bn):
+    src = tmp_path / "hint.c"
+    src.write_text("""
+extern long read(int, void *, unsigned long);
+extern int puts(const char *);
+__attribute__((noinline)) void handle(void) {
+    char line[32]; read(0, line, sizeof(line)); puts(line);
+}
+int main(void) { handle(); return 0; }
+""")
+    first, second = tmp_path / "hint one", tmp_path / "hint two"
+    _compile(src, first)
+    shutil.copy2(first, second)
+    target = shared_bn.load(first, copy=False)
+    shared_bn.load(second, copy=False)
+    calls = _bn_json(shared_bn, "-t", target, "callsites", "puts", "--within", "handle")
+    site = calls["items"][0]["call_addr"]
+    trace = _bn_json(shared_bn, "-t", target, "trace", "handle", site, "--arg", "0")
+    outputs = _run_diagnostic_commands(shared_bn, " ".join(trace["hints"]))
+    assert {out.split()[0] for out in outputs} == {"backward", "forward"}
+    assert all(f"handle @ {trace['function_address']}" in out for out in outputs)
+
+
+def test_aarch64_oversized_big_preserves_flow_after_force_analysis(tmp_path, shared_bn):
+    """Public 84,004-byte add body; inspect BN's actual analysis, not a split prediction."""
+    cc = shutil.which("aarch64-linux-gnu-gcc")
+    if cc is None:
+        refuse_silent_skip(
+            "aarch64-linux-gnu-gcc is required for the oversized AArch64 taint fixture; "
+            "install the cross toolchain (Debian/Ubuntu: gcc-aarch64-linux-gnu)")
+    src = tmp_path / "oversized_big.c"
+    src.write_text(r"""
+extern long read(int, void *, unsigned long);
+extern void *__memcpy_chk(void *, const void *, unsigned long, unsigned long);
+__attribute__((noinline)) long big(const char *p, long n) {
+    __asm__ volatile(
+        ".rept 21001\n"
+        "add %0, %0, #1\n"
+        ".endr\n"
+        : "+r"(n) : "r"(p));
+    return n;
+}
+int main(void) {
+    char input[32], output[16];
+    long n = read(0, input, sizeof(input));
+    n = big(input, n);
+    __memcpy_chk(output, input, (unsigned long)n, sizeof(output));
+    return output[0];
+}
+""")
+    binary = tmp_path / "oversized_big"
+    built = subprocess.run(
+        [cc, "-O1", "-g", "-fno-stack-protector", "-fno-builtin", "-no-pie",
+         str(src), "-o", str(binary)],
+        capture_output=True, text=True, timeout=120.0)
+    if built.returncode:
+        raise FixtureBuildError(f"AArch64 oversized fixture compile failed: {built.stderr}")
+    shared_bn.load(binary, copy=False)
+    main_addr = _resolve_addr(shared_bn, "main")
+    # A second live target makes the printed hint's target routing necessary.
+    other = tmp_path / "other_big"
+    shutil.copy2(binary, other)
+    target = str(binary.resolve())
+    shared_bn.load(other, copy=False)
+
+    def assert_flow():
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", main_addr,
+                          "--source", "call:read", timeout=300.0)
+        assert any(s["sink"]["class"] == "fortified_overflow"
+                   and s["sink"]["tainted_arg_index"] == 2
+                   for s in result["reached_sinks"]), result
+        return result
+
+    before = assert_flow()
+    force_hint = next(a for a in before["assumptions"] if "--force-analysis" in a)
+    _run_diagnostic_commands(shared_bn, force_hint)
+    assert_flow()

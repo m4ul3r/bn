@@ -4845,13 +4845,12 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                     lines.append(f"  {f!r}")
                     continue
                 lines.append(_render_flow_line(f, mangled=mangled))
-                # #1001 item 1: the arity mismatch behind the sink, that its
-                # class is the model's own and unproven, and the command that
-                # settles it, on the compact view.
+                # Keep the class basis and the engine's prototype-aware recovery
+                # guidance visible in the compact view as well as full detail.
                 _arity = _field_dict(_field_dict(f, "sink"), "arity_mismatch")
                 if _arity:
-                    _ref = _text_value(_arity, "callee_ref")
                     _reg = _text_value(_arity, "register")
+                    _advice = _text_value(_arity, "recovery_advice")
                     _basis = (
                         "class from the recovered args only, without the dropped ones"
                         if _text_value(_arity, "class_from") == "recovered_args"
@@ -4861,8 +4860,8 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                         f"{_arity.get('recovered', '?')} param(s) for this call and dropped the "
                         f"model's arg(s) {_field_list(_arity, 'dropped')}"
                         + (f"; the tainted arg was read from ABI register {_reg}" if _reg else "")
-                        + (f" -- fix the prototype (`bn proto get {_ref}`, then `bn proto set`) "
-                           "and re-run" if _ref else " -- the call target did not resolve"))
+                        + (f" -- {_advice}" if _advice else
+                           " -- call argument recovery is incomplete; inspect its provenance"))
                 # #980: a finding whose class differs from its catalog entry says
                 # so, and why, on the compact view -- `taint models` lists the
                 # call as `[overflow_len] memcpy`, and two names for one sink with

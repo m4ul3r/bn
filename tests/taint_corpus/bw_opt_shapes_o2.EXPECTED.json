@@ -27,7 +27,7 @@
      "forbid_leaves": [{"kind": "address_of_local_unresolved"}]},
     {"function": "literal_with_length", "sink": "arg:popen:0",
      "origin_kinds": ["parameter", "call"],
-     "step_reasons_contain": ["length argument 2 of memcpy"],
+     "expect_crossed": "literal_with_length",
      "forbid_leaves": [{"kind": "address_of_local_unresolved"}],
      "forbid_origin_kinds": ["constant"],
      "complete_slice": true}

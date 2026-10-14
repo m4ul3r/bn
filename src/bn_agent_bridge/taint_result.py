@@ -306,12 +306,19 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
             "variadic, which the engine does not follow -- its prototype is correct, "
             "so do not redeclare it; inspect how the callee consumes its va_list or "
             "re-run `bn taint forward` seeded inside it")
+    elif unmodeled_reached and not ext_no_model and all(
+            lf.get("cause") == "signature_under_recovered"
+            for lf in leaves if str(lf.get("kind", "?")) in UNRESOLVED):
+        next_action = (
+            "confirmed extra arguments disagree with a determined nonvariadic "
+            "declaration; recover the actual callee prototype with `bn proto set` "
+            "and re-run, or seed inside the callee to inspect the incomplete flow")
     elif unmodeled_reached:
         next_action = (
-            "taint reached an unmodeled call frontier (an unresolved/in-binary "
-            "callee or an external callee with no taint model); recover the "
-            "callee prototype with `bn proto set` or re-run `bn taint forward` "
-            "seeded inside it to follow the flow further")
+            "taint reached an unmodeled call frontier; inspect the frontier leaves "
+            "and callee argument consumption, or re-run `bn taint forward` seeded "
+            "inside it. Repair a prototype only where confirmed extra arguments "
+            "disagree with a determined nonvariadic declaration")
     elif coarse_n:
         next_action = (
             "taint escaped through a coarse-memory frontier (a pointer/store not "

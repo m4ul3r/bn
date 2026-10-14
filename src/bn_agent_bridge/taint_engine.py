@@ -151,6 +151,7 @@ class TaintEngine:
         resolve_map: dict[str, Any] | None = None,
         max_iters: int = 256,
         max_depth: int = 64,
+        mangled: bool = False,
     ):
         self.bv = bv
         self.models = models
@@ -160,6 +161,7 @@ class TaintEngine:
         self.resolve_map = resolve_map or {}
         self.max_iters = max_iters
         self.max_depth = max_depth
+        self.mangled = mangled
         # follow_thunk is deterministic for a given (bv, function) and the
         # engine is created per request, so resolved thunks are cached for the
         # engine's lifetime -- avoids re-materializing a veneer's MLIL on every
@@ -2476,17 +2478,17 @@ class TaintEngine:
                 continue
             detail = via
             if via == "value-set" and len(cands) > 1:
-                detail = f"value-set ({callee} is 1 of {len(cands)} candidate targets)"
+                detail = f"value-set ({self._prose_name(callee)} is 1 of {len(cands)} candidate targets)"
             wrapper = self._thin_wrapper_for(c, callee, wrapper_arg) if wrapper_arg is not None else None
             if wrapper is not None:
                 add_assumption(
-                    f"{callee} anchored at indirect callsite "
+                    f"{self._prose_name(callee)} anchored at indirect callsite "
                     f"{hex(int(getattr(c, 'address', 0)))} via thin wrapper "
-                    f"{getattr(wrapper, 'name', '?')} (forwards arg{wrapper_arg} to {callee}; "
+                    f"{self._prose_function(wrapper)} (forwards arg{wrapper_arg} to {self._prose_name(callee)}; "
                     f"resolved via {detail})")
             else:
                 add_assumption(
-                    f"{callee} anchored at indirect callsite "
+                    f"{self._prose_name(callee)} anchored at indirect callsite "
                     f"{hex(int(getattr(c, 'address', 0)))} (resolved via {detail})")
 
     def _no_callsite_error(self, instrs: list[Any], callee: str, func: Any,
@@ -3960,7 +3962,7 @@ class TaintEngine:
             cached = self._cache[key]
             if cached is None:  # in-progress -> recursion cycle
                 return {"reached_return": True, "out_params": frozenset(), "findings": [], "leaves": [],
-                        "assumptions": [f"recursion cycle at {callee.name}; return conservatively tainted"],
+                        "assumptions": [f"recursion cycle at {self._prose_function(callee)}; return conservatively tainted"],
                         "frontier": "recursion cycle stopped descent"}
             return cached
         self._cache[key] = None  # mark in-progress (cycle guard)
@@ -3977,7 +3979,7 @@ class TaintEngine:
             # only the disclosure is added, never the propagation polarity.
             self._analysis_incomplete.add(str(getattr(callee, "name", "?")))
             sub = {"reached_return": True, "out_params": frozenset(), "findings": [], "leaves": [],
-                   "assumptions": [f"could not analyze {callee.name}: {exc}; return conservatively tainted"],
+                   "assumptions": [f"could not analyze {self._prose_function(callee)}: {exc}; return conservatively tainted"],
                    "frontier": f"body could not be analyzed ({exc})"}
         finally:
             self._bt_func_token = saved_tok
@@ -4015,6 +4017,23 @@ class TaintEngine:
           store to the outgoing-argument stack slot is a deliberate argument, so the
           taint into it is disclosed rather than silently dropped (previously these
           were skipped, the "emit a truncation frontier" half of #324)."""
+        variadic = _variadic_determination(callee_fn)
+        if variadic is True:
+            cc = getattr(callee_fn, "calling_convention", None)
+            arg_regs = list(getattr(cc, "int_arg_regs", []) or [])
+            # Named formals never enumerate the variadic tail. Every recovered
+            # tainted tail argument is an untracked flow, regardless of ABI.
+            name = str(getattr(callee_fn, "name", "?"))
+            return {
+                "kind": "arg_under_recovered",
+                "address": hex(int(getattr(ins, "address", 0))),
+                "callee": {"name": name, "display_name": _display_name(callee_fn) or name,
+                           "address": hex(int(getattr(callee_fn, "start", 0)))},
+                "recovered_params": n_params, "dropped_args": sorted(dropped),
+                "stack_dropped_args": [i for i in sorted(dropped) if cc is not None and i >= len(arg_regs)],
+                "cause": "varargs_not_followed", "callee_variadic": True,
+                "note": self._varargs_tail_note(self._prose_function(callee_fn), n_params, dropped),
+            }
         try:
             cc = (getattr(callee_fn, "calling_convention", None)
                   or self.bv.platform.default_calling_convention)
@@ -4056,31 +4075,22 @@ class TaintEngine:
             "dropped_args": confirmed,
             "stack_dropped_args": stack_confirmed,
         }
-        # #948: a callee whose type BN DETERMINED to be variadic is not
-        # under-recovered -- its named formals are all there is, and the dropped
-        # indices are its `...` arguments, which the engine maps nowhere. Saying
-        # "recover the prototype" sent the reader to redeclare a correct one.
-        variadic = _variadic_determination(callee_fn)
-        if variadic is True:
-            return {**common, "cause": "varargs_not_followed", "callee_variadic": True,
-                    "note": self._varargs_tail_note(name, n_params, confirmed)}
-        stack_note = ""
-        if stack_confirmed:
-            stack_note = (
-                f" Arg(s) {stack_confirmed} are STACK-passed (beyond the "
-                f"{len(arg_regs)} integer-arg register(s)) -- most often a variadic "
-                f"callee auto-typed as fixed-arity, so declare it variadic: "
-                f"`bn proto set {name} \"<ret> {name}(<fixed args>, ...)\"`.")
+        if variadic is None:
+            return {
+                **common, "cause": "prototype_status_unknown", "callee_variadic": None,
+                "note": (f"tainted arg(s) {confirmed} passed to {self._prose_function(callee_fn)} "
+                         f"exceed its {n_params} recovered named parameter(s); these flows "
+                         f"were NOT followed. Variadic status is undetermined: inspect the "
+                         f"callee prototype and argument consumption before diagnosing a "
+                         f"signature discrepancy or a tracking limitation."),
+            }
         return {
-            **common,
-            "cause": "signature_under_recovered",
-            "callee_variadic": variadic,
-            "note": (f"tainted arg(s) {confirmed} passed to {name} but Binary Ninja "
-                     f"recovered only {n_params} parameter(s) -- the callee's "
-                     f"signature is likely under-recovered, so taint into it was "
-                     f"dropped. Recover the real prototype and apply "
-                     f"`bn proto set {name} \"<prototype>\"`, then re-run this taint "
-                     f"query.{stack_note}"),
+            **common, "cause": "signature_under_recovered", "callee_variadic": False,
+            "note": (f"tainted arg(s) {confirmed} passed to {self._prose_function(callee_fn)} "
+                     f"exceed its {n_params} recovered parameter(s), and the callee is "
+                     f"determined nonvariadic. The confirmed extra arguments disagree with "
+                     f"that declaration; their flow was NOT followed. Recover the real "
+                     f"prototype and apply `bn proto set {name} \"<prototype>\"`, then re-run."),
         }
 
     @staticmethod
@@ -4114,21 +4124,29 @@ class TaintEngine:
             out["reached_return"] = True
             leaf = self._frontier_leaf(
                 ins, callee_fn, tainted_args,
-                "tainted data passed to in-binary callee whose parameters BN did not "
-                "recover, so taint into it was dropped. If it is a real callee with a "
-                "wrong signature, apply `bn proto set <callee> \"<prototype>\"` and "
-                "re-run; otherwise investigate")
-            if _variadic_determination(callee_fn) is True:
+                f"tainted arg(s) {sorted(tainted_args)} exceed the {n_params} recovered "
+                f"named parameter(s) of {self._prose_function(callee_fn)}; flow was NOT "
+                "followed. Inspect the callee prototype and argument consumption.")
+            variadic = _variadic_determination(callee_fn)
+            leaf.update(callee_variadic=variadic)
+            if variadic is True:
                 # #948: every tainted arg is in a correctly-variadic tail.
                 leaf.update(cause="varargs_not_followed", callee_variadic=True,
                             note=self._varargs_tail_note(
-                                str(callee_fn.name), n_params, list(tainted_args)))
+                                self._prose_function(callee_fn), n_params, list(tainted_args)))
                 out["assumptions"].append(
-                    f"tainted args to {callee_fn.name} land in its variadic tail, which "
+                    f"tainted args to {self._prose_function(callee_fn)} land in its variadic tail, which "
                     f"is not followed; conservative")
             else:
+                if variadic is False:
+                    leaf.update(cause="signature_under_recovered",
+                                note=leaf["note"] + " Recovered call arguments exceed a determined "
+                                "nonvariadic declaration: recover the actual signature with "
+                                f"`bn proto set {callee_fn.name} \"<prototype>\"` and re-run.")
+                else:
+                    leaf["cause"] = "prototype_status_unknown"
                 out["assumptions"].append(
-                    f"tainted args to {callee_fn.name} fall beyond its parameters; conservative")
+                    f"tainted args to {self._prose_function(callee_fn)} fall beyond its parameters; conservative")
             out["leaves"].append(leaf)
             return out
         if depth + 1 > max_depth:
@@ -4136,7 +4154,7 @@ class TaintEngine:
             self._truncation_causes.add("max_depth")
             out["reached_return"] = True
             out["assumptions"].append(
-                f"max interprocedural depth {max_depth} reached at {callee_fn.name}; not descended")
+                f"max interprocedural depth {max_depth} reached at {self._prose_function(callee_fn)}; not descended")
             out["leaves"].append(self._frontier_leaf(
                 ins, callee_fn, tainted_args,
                 f"tainted data passed to in-binary callee with no model; depth bound "
@@ -4145,7 +4163,7 @@ class TaintEngine:
         sub = self._summarize(callee_fn, valid, depth + 1, max_depth)
         first_hit = tainted_args[sorted(valid)[0]][0]
         prefix = self._reconstruct_path(first_hit, why)
-        note = f"calls {callee_fn.name} with tainted arg(s) {sorted(valid)}"
+        note = f"calls {self._prose_function(callee_fn)} with tainted arg(s) {sorted(valid)}"
         if via:
             note = f"[{via}-resolved] " + note
         prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)],
@@ -4440,7 +4458,7 @@ class TaintEngine:
             sample = ", ".join(hex(a) for a in unimpl[:5])
             more = "" if len(unimpl) <= 5 else f", +{len(unimpl) - 5} more"
             add_assumption(
-                f"{func.name} contains {len(unimpl)} unlifted/unimplemented "
+                f"{self._prose_function(func)} contains {len(unimpl)} unlifted/unimplemented "
                 f"instruction(s) (e.g. {sample}{more}); BN's lifter could not model "
                 f"them, so a tainted value passing through is not tracked (possible "
                 f"silent hole) -- see `bn function info` for the full list")
@@ -4488,6 +4506,12 @@ class TaintEngine:
             return hit
 
         def cons_return(ins: Any, reason: str) -> bool:
+            nonlocal reached_return
+            if "TAILCALL" in op_name(ins):
+                if reached_return:
+                    return False
+                reached_return = True
+                return True
             done = False
             for w in ssa_writes(ins):
                 node = (var_key(w), getattr(w, "version", None))
@@ -4522,6 +4546,14 @@ class TaintEngine:
             per resolved target so distinct indirect targets each record once."""
             changed = False
             propagated: set[int] = set()
+
+            def apply_token(tok, parents):
+                # Tail calls have no SSA result: a modeled return instead exits
+                # this function. Only invoke this after the model's source hit.
+                if tok in ("ret", "*ret") and "TAILCALL" in op_name(ins):
+                    return cons_return(ins, f"return of {name or '?'} (model propagate)")
+                return self._apply_to_token(
+                    ssaf, ins, params, tok, taint_node, name or "?", parents=parents)
             addr = int(getattr(ins, "address", 0))
 
             def _note_unkeyed_store(dest_tok):
@@ -4574,8 +4606,8 @@ class TaintEngine:
                 is evidence of REACH only: no class is ever lowered from it (a
                 bounded copy, a receive bound, ...), because the register bridge
                 cannot stand behind what a dropped arg holds -- the class a
-                dropped arg would decide stays the model's own until the
-                prototype is fixed. Precise classification through dropped
+                dropped arg would decide stays the model's own until argument
+                recovery is complete. Precise classification through dropped
                 registers is a follow-up (#1001 review round 3)."""
                 declared = [argidx, *(sink.get("tainted_args") or [])]
                 declared += [sink[k] for k in ("len_arg", "buf_arg") if sink.get(k) is not None]
@@ -4603,6 +4635,20 @@ class TaintEngine:
                 if not hit or not dropped:
                     return hit, None
                 taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
+                variadic = _variadic_determination(function_at(self.bv, taddr)) if taddr is not None else None
+                inspect = f"inspect `bn proto get {hex(int(taddr))}` and the call's argument provenance" \
+                    if taddr is not None else "resolve the call target and inspect its argument provenance"
+                if variadic is True:
+                    advice = ("the callee is already declared variadic; this is incomplete "
+                              "call recovery, not evidence of a prototype defect. Redeclaring "
+                              "the same prototype does not recover its arguments; " + inspect)
+                elif variadic is False:
+                    advice = ("the callee is determined nonvariadic; " + inspect
+                              + ", and apply `bn proto set` only if independent evidence "
+                              "demonstrates a declaration discrepancy, then re-run")
+                else:
+                    advice = ("the callee's variadic status is undetermined; " + inspect
+                              + " before diagnosing a signature discrepancy or recovery limit")
                 # `class_from` says what the finding's class rests on:
                 # `recovered_args` -- the checked arg was recovered, so the
                 # in-range classifiers ran on the recovered args and the dropped
@@ -4610,6 +4656,7 @@ class TaintEngine:
                 # was dropped, so no classifier ran and the model's class stands.
                 return hit, {"recovered": len(params), "dropped": dropped, "register": reg,
                              "callee_ref": hex(int(taddr)) if taddr is not None else None,
+                             "callee_variadic": variadic, "recovery_advice": advice,
                              "class_from": "recovered_args" if argidx < len(params) else "model"}
 
             sink = model.get("sink")
@@ -4687,7 +4734,7 @@ class TaintEngine:
                         else:
                             _taint_phrase = "injects no buffer taint (no declared destination) "
                         add_assumption(
-                            f"{mkey or name}(): unconditional {sink.get('class') or '?'} sink "
+                            f"{self._prose_name(mkey or name)}(): unconditional {sink.get('class') or '?'} sink "
                             + _taint_phrase
                             + f"at {hex(addr)} independently of --source (always-unsafe API; "
                             "the finding does not require any tracked taint to reach this call)")
@@ -4915,17 +4962,14 @@ class TaintEngine:
                                 # what its class rests on: the recovered args
                                 # only (dropped ones not used), or -- when the
                                 # checked arg itself was dropped -- the model's
-                                # own class, unproven until the prototype is fixed.
-                                _ref = arity["callee_ref"]
+                                # own class, unproven until argument recovery is complete.
                                 _reg = arity["register"]
-                                _fix = ("fix the prototype"
-                                        + (f" (`bn proto get {_ref}`, then `bn proto set`)" if _ref else "")
-                                        + " and re-run")
+                                _fix = arity["recovery_advice"]
                                 if arity["class_from"] == "model":
                                     _basis = (f"so the class is the model's own and unproven -- {_fix}")
                                 else:
                                     _basis = ("so the class was decided from the recovered args only, "
-                                              f"without the dropped ones -- {_fix} to classify with them")
+                                              f"without the dropped ones -- {_fix}")
                                 eff_sink = {
                                     **eff_sink,
                                     **({"via": "abi_register"} if _reg else {}),
@@ -4964,23 +5008,21 @@ class TaintEngine:
                                 for rule in model.get("propagates") or []:
                                     if _try_arg_index(str(rule.get("from") or "")) != cidx:
                                         continue
-                                    if self._apply_to_token(ssaf, ins, params, rule.get("to"),
-                                                            taint_node, name or "?",
-                                                            parents=[st_node]):
+                                    if apply_token(rule.get("to"), [st_node]):
                                         changed = True
                                 partial = ""
                                 if resets:
                                     partial = (
-                                        f"; a clean {name or mkey} @ "
+                                        f"; a clean {self._prose_name(name or mkey)} @ "
                                         f"{', '.join(hex(ra) for ra, _ in resets)} resets "
                                         f"the state on SOME path but not on every path "
                                         f"from the tainted call to this one, so the tainted "
                                         f"line continues on the others")
                                 add_assumption(
-                                    f"{name or mkey}(NULL, ...) @ {hex(addr)} continues the "
-                                    f"tokenizer state of the tainted {name or mkey} call @ "
+                                    f"{self._prose_name(name or mkey)}(NULL, ...) @ {hex(addr)} continues the "
+                                    f"tokenizer state of the tainted {self._prose_name(name or mkey)} call @ "
                                     f"{hex(st_addr)}: modeled flow-insensitively (the most "
-                                    f"recent tainted {name or mkey} in this function), not by "
+                                    f"recent tainted {self._prose_name(name or mkey)} in this function), not by "
                                     f"control flow; a continuation of a buffer tokenized in "
                                     f"ANOTHER function is not followed{partial}")
                     else:
@@ -4998,7 +5040,7 @@ class TaintEngine:
                 hit = self._token_hit_node(ssaf, params, frm, tainted)
                 applied = False
                 if hit is not None:
-                    applied = self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?", parents=[hit])
+                    applied = apply_token(to, [hit])
                     if applied:
                         changed = True
                     else:
@@ -5063,7 +5105,7 @@ class TaintEngine:
                         if src_i is not None and src_i >= 1 and src_i not in sink_args:
                             add_assumption(
                                 f"tainted buffer copied into the destination of "
-                                f"{name or '?'} at {hex(int(getattr(ins, 'address', 0)))} "
+                                f"{self._prose_name(name or '?')} at {hex(int(getattr(ins, 'address', 0)))} "
                                 f"(arg{src_i} -> arg0); propagated to the destination, "
                                 f"not itself flagged as a sink")
             # #863: a model may decline to claim its callee's real destinations
@@ -5087,7 +5129,7 @@ class TaintEngine:
                     arg_taint(p) for p in params):
                 add_assumption(
                     f"destinations_unmodeled @ {hex(int(getattr(ins, 'address', 0)))}: "
-                    f"tainted input reaches {name or '?'}, whose destination "
+                    f"tainted input reaches {self._prose_name(name or '?')}, whose destination "
                     "operands this model deliberately does not claim (they are "
                     "reached through a va_list the engine cannot resolve). Writes "
                     "into those destinations are not followed, so a 'no sinks "
@@ -5113,7 +5155,7 @@ class TaintEngine:
                     _ca = hex(int(getattr(ins, "address", 0)))
                     _mx, _mn = max(_prop_dests), min(_prop_dests)
                     add_assumption(
-                        f"scanf_arity_residual @ {_ca}: {name or '?'} model "
+                        f"scanf_arity_residual @ {_ca}: {self._prose_name(name or '?')} model "
                         f"covers *arg:{_mn}..{_mx} ({len(_prop_dests)} "
                         f"destination(s)); call has {len(params)} param(s) -- "
                         f"{len(params) - (_mx + 1)} potential destination(s) "
@@ -5159,7 +5201,7 @@ class TaintEngine:
                     if not ht:
                         continue
                     if vto:
-                        if self._apply_to_token(ssaf, ins, params, vto, taint_node, name or "?", parents=[ht[0]]):
+                        if apply_token(vto, [ht[0]]):
                             changed = True
                         else:
                             _note_unkeyed_store(vto)
@@ -5377,7 +5419,7 @@ class TaintEngine:
                                 descend_fn = local
                                 descend_internal = True
                                 add_assumption(
-                                    f"bridged re-imported export {nm} to its in-binary "
+                                    f"bridged re-imported export {self._prose_name(nm)} to its in-binary "
                                     f"definition at {hex(int(getattr(local, 'start', 0)))}")
                         # EVERY distinct model in the chain applies at this call: the
                         # call site's own already did above, and here the resolved
@@ -5442,6 +5484,7 @@ class TaintEngine:
                             _reason = self._not_internal_reason(descend_fn)
                             _unread = self._unanalysed_body_phrase(_reason)
                             _who = nm or hex(taddr)
+                            _shown = self._prose_name(nm) if nm else hex(taddr)
                             _at = hex(int(getattr(descend_fn, "start", taddr)))
                             _thunk = None
                             if _reason == "thunk" and self._follow_thunk_cached(descend_fn) is None:
@@ -5453,9 +5496,9 @@ class TaintEngine:
                                 # tail-call target resolves -- name every target.
                                 _tails = self._thunk_tail_targets(descend_fn)
                                 if _tails:
-                                    _named = [(getattr(t, "name", None) or hex(int(getattr(t, "start", 0))),
+                                    _named = [(self._prose_function(t),
                                                hex(int(getattr(t, "start", 0)))) for t in _tails]
-                                    _thunk = (f"in-binary {_who} is a thunk Binary Ninja made of "
+                                    _thunk = (f"in-binary {_shown} is a thunk Binary Ninja made of "
                                               + ("a tail call" if len(_named) == 1 else "tail calls")
                                               + " to " + ", ".join(f"{n} @ {a}" for n, a in _named)
                                               + ", which taint does not follow through a multi-"
@@ -5464,7 +5507,7 @@ class TaintEngine:
                                                else "read the targets with ")
                                               + ", ".join(f"`bn decompile {a}`" for _n, a in _named))
                                 else:
-                                    _thunk = (f"in-binary {_who} is a thunk whose tail-call "
+                                    _thunk = (f"in-binary {_shown} is a thunk whose tail-call "
                                               "target did not resolve",
                                               f"read it with `bn disasm {_at}`")
                             elif _unread is not None:
@@ -5476,11 +5519,11 @@ class TaintEngine:
                                            f"tainted -- {_thunk[1]}")
                                 _stop_desc = f"thunk ({_thunk[0]}; {_thunk[1]})"
                             elif _unread is not None:
-                                _caveat = (f"in-binary {_who} was not analysed ({_unread}) and has no "
+                                _caveat = (f"in-binary {_shown} was not analysed ({_unread}) and has no "
                                            f"model; return conservatively tainted -- {_fix}")
                                 _stop_desc = f"in-binary function ({_unread}; {_fix})"
                             else:
-                                _caveat = f"external {_who} has no model; return conservatively tainted"
+                                _caveat = f"external {_shown} has no model; return conservatively tainted"
                                 _stop_desc = "external"
                             if self.unknown_call_policy != "stop":
                                 ret_tainted = True
@@ -5552,7 +5595,7 @@ class TaintEngine:
                     if via:
                         add_assumption(
                             f"indirect call at {hex(int(getattr(ins, 'address', 0)))} resolved via {via} to: "
-                            f"{', '.join(resolved_names)}")
+                            f"{', '.join(self._prose_name(n) for n in resolved_names)}")
                     continue
 
                 # typed-struct field store: MLIL_SET_VAR_FIELD / _ALIASED_FIELD write
@@ -5813,13 +5856,13 @@ class TaintEngine:
                 continue
             partial = ""
             if resets:
-                partial = (f" (a clean {ckey} @ "
+                partial = (f" (a clean {self._prose_name(ckey)} @ "
                            f"{', '.join(hex(ra) for ra, _ in resets)} resets it on some "
                            f"path but not on every path to a return)")
             add_assumption(
                 f"tokenizer_state_escapes @ {hex(st_addr)}: the static tokenizer "
-                f"state of {ckey} is tainted by the {ckey} call @ {hex(st_addr)} when "
-                f"{func.name} returns{partial}; a {ckey}(NULL, ...) continuation in "
+                f"state of {self._prose_name(ckey)} is tainted by the {self._prose_name(ckey)} call @ {hex(st_addr)} when "
+                f"{self._prose_function(func)} returns{partial}; a {self._prose_name(ckey)}(NULL, ...) continuation in "
                 f"ANOTHER function (a caller or a callee) is not followed, so a 'no "
                 f"sinks reached' result is NOT an all-clear -- seed `bn taint forward` "
                 f"inside the function that continues the tokenizer")
@@ -6024,7 +6067,7 @@ class TaintEngine:
                 # the silent miss becomes actionable.
                 if kind == "arg" and (callee or "").split("@", 1)[0].lstrip("_") in _RECVMSG_FAMILY:
                     add_assumption(
-                        f"{callee} writes the received bytes to the scatter-gather iov "
+                        f"{self._prose_name(callee)} writes the received bytes to the scatter-gather iov "
                         f"buffer(s) (msghdr->msg_iov[i].iov_base; for recvmmsg, per msgvec "
                         f"entry), not the header pointer this --source seeds; the payload "
                         f"taint is NOT followed from here. Use --source call:{callee}, which "
@@ -6071,7 +6114,7 @@ class TaintEngine:
                     )
                     if _outs and not sibling_covers_output:
                         add_assumption(
-                            f"{callee} also writes tainted data to {', '.join(_outs)} per its "
+                            f"{self._prose_name(callee)} also writes tainted data to {', '.join(_outs)} per its "
                             f"model; --source ret:{callee} seeds only the return -- try "
                             f"--source call:{callee} to also taint the output buffer(s)"
                         )
@@ -6083,9 +6126,9 @@ class TaintEngine:
                              if (int(getattr(c, "address", 0)) & ~1) == (only & ~1)]
                     if not calls:
                         continue  # this source has no callsite at the attributed address
-                    add_assumption(f"seeded from {callee} callsite at {hex(only)} (per-source attribution)")
+                    add_assumption(f"seeded from {self._prose_name(callee)} callsite at {hex(only)} (per-source attribution)")
                 elif len(calls) > 1:
-                    add_assumption(f"{len(calls)} callsites of {callee}; seeded from all")
+                    add_assumption(f"{len(calls)} callsites of {self._prose_name(callee)}; seeded from all")
                 self._seed_callsites += len(calls)   # #559 frontier diagnostics
                 ret_seeded = False
                 for c in calls:
@@ -6178,9 +6221,9 @@ class TaintEngine:
                              if (int(getattr(c, "address", 0)) & ~1) == (only & ~1)]
                     if not calls:
                         continue
-                    add_assumption(f"seeded from {callee} callsite at {hex(only)} (per-source attribution)")
+                    add_assumption(f"seeded from {self._prose_name(callee)} callsite at {hex(only)} (per-source attribution)")
                 elif len(calls) > 1:
-                    add_assumption(f"{len(calls)} callsites of {callee}; seeded from all")
+                    add_assumption(f"{len(calls)} callsites of {self._prose_name(callee)}; seeded from all")
                 self._seed_callsites += len(calls)   # #559 frontier diagnostics
                 _, model = lookup_model(self.models, callee)
                 src_defs = (model or {}).get("sources") or []
@@ -6249,7 +6292,7 @@ class TaintEngine:
                                     _out_param_seen.add(pidx)
                                     _ca = hex(int(getattr(c, "address", 0)))
                                     add_assumption(
-                                        f"recvmsg_out_param @ {_ca}: {callee} fills the "
+                                        f"recvmsg_out_param @ {_ca}: {self._prose_name(callee)} fills the "
                                         f"caller-provided buffer passed as param:{pidx} "
                                         f"(msg_iov[i].iov_base is this function's parameter). "
                                         f"The received payload lands in the CALLER's buffer, "
@@ -6265,7 +6308,7 @@ class TaintEngine:
                             if not iov_seeded:
                                 _ca = hex(int(getattr(c, "address", 0)))
                                 add_assumption(
-                                    f"recvmsg_iovec_unresolved @ {_ca}: {callee} fills the "
+                                    f"recvmsg_iovec_unresolved @ {_ca}: {self._prose_name(callee)} fills the "
                                     f"scatter-gather buffer(s) at msghdr->msg_iov[i].iov_base, but "
                                     f"the iovec setup (msg_iov -> iov_base) at this callsite could "
                                     f"not be statically resolved -- likely a dynamically-built "
@@ -6319,7 +6362,7 @@ class TaintEngine:
                             _mn = min(_modeled_idxs)
                             _n_extra = len(params) - (_mx + 1)
                             add_assumption(
-                                f"scanf_arity_residual @ {_ca}: {callee} model "
+                                f"scanf_arity_residual @ {_ca}: {self._prose_name(callee)} model "
                                 f"covers *arg:{_mn}..{_mx} "
                                 f"({len(_modeled_idxs)} destination(s)); "
                                 f"call has {len(params)} param(s) -- "
@@ -6405,8 +6448,8 @@ class TaintEngine:
                 **({"format_constant": sink["format_constant"]} if sink.get("format_constant") is not None else {}),
                 **({"source_bound": sink["source_bound"]} if sink.get("source_bound") else {}),
                 **({"via": sink["via"]} if sink.get("via") else {}),
-                # #1001 item 1: a sink reached through a dropped ABI register
-                # carries the arity mismatch that made it one.
+                # A model-declared argument was dropped, whether the tainted
+                # argument itself came through a register or was recovered.
                 **({"arity_mismatch": sink["arity_mismatch"]} if sink.get("arity_mismatch") else {}),
                 # #791: the residual-chunk disclosure. This dict is an explicit
                 # allow-list, not a spread of `sink`, so a classifier field that
@@ -6459,6 +6502,14 @@ class TaintEngine:
     def _raw_symbol_for(self, name: Any) -> str:
         """The real raw symbol for *name* (see :meth:`_symbol_names`)."""
         return self._symbol_names(name)[0]
+
+    def _prose_name(self, name: Any) -> str:
+        """Name a callee in diagnostic prose, without changing machine keys."""
+        return self._symbol_names(name)[0 if self.mangled else 1]
+
+    def _prose_function(self, func: Any) -> str:
+        return (str(getattr(func, "name", "?")) if self.mangled
+                else _display_name(func) or str(getattr(func, "name", "?")))
 
     def _reconstruct_path(self, node, why) -> list[dict[str, Any]]:
         chain = []
@@ -6838,30 +6889,30 @@ class TaintEngine:
                 elif kind == "benign":
                     _, _, callee = w
                     steps.append(_instr_dict(
-                        wdefn, reason=f"local buffer {label} passed to {callee} "
+                        wdefn, reason=f"local buffer {label} passed to {self._prose_name(callee)} "
                                       f"(benign model: writes nothing tainted)"))
                     # The completeness claim now RESTS on a `{}` declaration
                     # for a callee that was handed the buffer -- say so where
                     # a reader of the result looks (round 4 P3).
                     self._bw_assume(
-                        f"local buffer {label} is passed to {callee} @ "
+                        f"local buffer {label} is passed to {self._prose_name(callee)} @ "
                         f"{hex(int(getattr(wdefn, 'address', 0)))}, whose model is {{}} "
                         f"(benign: writes nothing tainted); the slice trusts that "
-                        f"declaration -- if {callee} copies an input into the buffer, "
+                        f"declaration -- if {self._prose_name(callee)} copies an input into the buffer, "
                         f"model it with `propagates` or the slice is incomplete")
                 elif kind == "fill":
                     _, _, mkey, params, from_idxs, is_source, len_idxs = w
                     steps.append(_instr_dict(
-                        wdefn, reason=f"local buffer {label} written by {mkey}"))
+                        wdefn, reason=f"local buffer {label} written by {self._prose_name(mkey)}"))
                     if is_source:
                         _set_origin({"kind": "source", "callee": mkey})
                     states = [_follow_input(wdefn, params[i], d, wmv, label,
-                                            f"input {i} of {mkey} writing")
+                                            f"input {i} of {self._prose_name(mkey)} writing")
                               for i in from_idxs]
                     for i in len_idxs:
                         if expr_reads(params[i]):
                             steps.append(_instr_dict(
-                                wdefn, reason=f"length argument {i} of {mkey} bounds "
+                                wdefn, reason=f"length argument {i} of {self._prose_name(mkey)} bounds "
                                               f"how much of the input lands in {label}"))
                             for r in expr_reads(params[i]):
                                 walk(r, d + 1, wmv)
@@ -6873,10 +6924,10 @@ class TaintEngine:
                 else:  # opaque: a call may have written the bytes
                     _, _, callee, why = w
                     steps.append(_instr_dict(
-                        wdefn, reason=f"local buffer {label} may be written by {callee}"))
+                        wdefn, reason=f"local buffer {label} may be written by {self._prose_name(callee)}"))
                     _buffer_leaf(
                         wdefn, label,
-                        f"{callee} {why} {label}; whether it wrote the bytes the sink "
+                        f"{self._prose_name(callee)} {why} {label}; whether it wrote the bytes the sink "
                         "reads is unknown, so the slice is NOT complete -- model the "
                         "call or seed inside it",
                         callee=callee)
@@ -7158,7 +7209,7 @@ class TaintEngine:
                                     + self._folded_buffer_seeds(cparams[pidx]))
                 if not seeds:
                     self._bw_assume(
-                        f"arg {pidx} at {hex(addr)} in {caller.name} is not a trackable "
+                        f"arg {pidx} at {hex(addr)} in {self._prose_function(caller)} is not a trackable "
                         "scalar; caller slice not followed")
                     continue
                 boundary = _instr_dict(call_ins, reason=f"passed as arg {pidx} to {func.name}")
@@ -7202,7 +7253,7 @@ class TaintEngine:
         assumption as the human-readable half carrying the same measurement."""
         dropped = int(total) - int(followed)
         unresolved = int(considered) - int(followed)
-        self._bw_assume(f"{func.name} has {total} callers; "
+        self._bw_assume(f"{self._prose_function(func)} has {total} callers; "
                         f"caller ascent followed {followed}, capped at {MAX_CALLERS}")
         self._bw_truncated = True
         self._bw_truncation_causes.add("caller_cap")
@@ -7286,10 +7337,10 @@ class TaintEngine:
                         if reg_seeds:
                             out.extend(reg_seeds)
                             self._bw_assume(
-                                f"--sink arg {idx} of {callee} was recovered from "
+                                f"--sink arg {idx} of {self._prose_name(callee)} was recovered from "
                                 f"calling-convention register {reg}: this call site "
-                                f"under-recovered its arguments (a thunk/import with a "
-                                f"too-narrow prototype dropped the arg), so the value "
+                                f"did not recover the modeled argument in MLIL; that alone "
+                                f"does not diagnose a prototype defect. The value "
                                 f"is read from the register's reaching definition rather "
                                 f"than the MLIL call's parameter list (#433)")
                 if not out and not saw_in_range:
@@ -7302,16 +7353,26 @@ class TaintEngine:
                         detail = (
                             f"its call site(s) expose {max_params} argument(s), so valid "
                             f"indices are 0..{max_params - 1} (arg indices are 0-based)")
-                    # #464: an index past the recovered arity is frequently BN
-                    # under-recovering the callee's signature (e.g. an ARM IFUNC libc
-                    # sink typed by its resolver as 0/1 args), which silently drops the
-                    # length/src slice. Name the proto-set remedy, not just "out of range".
-                    detail += (
-                        f". If {callee} is a real sink whose signature BN under-recovered "
-                        f"(a common IFUNC / stripped-proto shape), apply "
-                        f"`bn proto set {callee} \"<prototype>\"` and re-run this slice")
+                    determinations = []
+                    for site in sites:
+                        try:
+                            target = resolve_call_target(self.bv, site, follow_thunks=True)
+                            determinations.append(_variadic_determination(target.function))
+                        except Exception:
+                            determinations.append(None)
+                    if determinations and all(v is True for v in determinations):
+                        detail += (". The callee is already declared variadic; omitted "
+                                   "arguments are a call-recovery limitation, not evidence "
+                                   "of a prototype defect. Inspect the call's argument provenance.")
+                    elif determinations and all(v is False for v in determinations):
+                        detail += (". The callee is determined nonvariadic. Only if independent "
+                                   "argument evidence demonstrates a declaration discrepancy, "
+                                   f"apply `bn proto set {callee} \"<prototype>\"` and re-run.")
+                    else:
+                        detail += (". Variadic status is undetermined; inspect the callee "
+                                   "prototype and argument provenance before diagnosing a discrepancy.")
                     raise TaintError(
-                        f"--sink arg index {idx} is out of range for {callee}: {detail}")
+                        f"--sink arg index {idx} is out of range for {self._prose_name(callee)}: {detail}")
                 if not out:
                     # Nothing to slice. A scalar CONSTANT literal (e.g. a fixed copy
                     # length) is a provably-bounded SUCCESS (#310). Gate on the

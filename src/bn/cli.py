@@ -5,6 +5,7 @@ import json
 import os
 import re
 import select
+import shlex
 import stat
 import sys
 import time
@@ -2162,6 +2163,43 @@ def _mutate(
     )
 
 
+def _contextualize_diagnostic_hints(
+    value: Any, *, target: str | None, instance: str | None,
+) -> Any:
+    """Bind commands in diagnostic prose to the invocation's routing context.
+
+    Only prose fields are visited: symbol keys, locators and IL are data, not
+    commands. Both text and JSON consumers receive the same runnable hints.
+    """
+    flags = []
+    if instance:
+        flags.append(f"-i {shlex.quote(instance)}")
+    if target:
+        flags.append(f"-t {shlex.quote(target)}" if not target.startswith("-")
+                     else shlex.quote(f"--target={target}"))
+    if not flags:
+        return value
+    prefix = "`bn " + " ".join(flags) + " "
+    prose_keys = {"hints", "assumptions", "note", "detail", "next_action", "recovery_advice"}
+
+    def visit(item: Any, *, prose: bool = False) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key in prose_keys and isinstance(child, str):
+                    item[key] = child.replace("`bn ", prefix)
+                elif isinstance(child, (dict, list)):
+                    visit(child, prose=key in prose_keys)
+        elif isinstance(item, list):
+            for index, child in enumerate(item):
+                if prose and isinstance(child, str):
+                    item[index] = child.replace("`bn ", prefix)
+                elif isinstance(child, (dict, list)):
+                    visit(child, prose=prose)
+
+    visit(value)
+    return value
+
+
 def _call(
     args: argparse.Namespace,
     op: str,
@@ -2192,6 +2230,7 @@ def _call(
     # #996: copy the answering instance (stamped by `send_request`) into a dict
     # result, so the output names which bridge answered.
     stamp_instance: bool = False,
+    contextual_hints: bool = False,
 ) -> int:
     _require_nonempty_instance(args)
     # THE BOUNDARY (#101/#715/#716). Every transform a handler hands this call is
@@ -2267,6 +2306,9 @@ def _call(
         **timeout_kwargs,
     )
     result = unwrap_result(response, op)
+    if contextual_hints:
+        result = _contextualize_diagnostic_hints(
+            result, target=target, instance=getattr(args, "instance", None))
     if stamp_instance and isinstance(result, dict) and isinstance(response, dict):
         answering = response.get("instance")
         if isinstance(answering, str) and answering:
