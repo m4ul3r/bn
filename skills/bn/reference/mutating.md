@@ -76,7 +76,7 @@ Mutations print a compact **text status line** by default. Use `--format json --
 
 ### Compact status keys
 
-This table describes the stable object from `--format json --summary`; the default text line shows fewer fields, while full `--format json` is the detailed audit without these summary counts. Every key below is present except `prototype_user_type_residue` (only when true), `overlapping_functions` (only for a create inside an existing function), `declared_types` (only when a `types declare` landed), `preview_skipped` (only when a preview left ops out), and `go_rename` (only for Go rename):
+This table describes the stable object from `--format json --summary`; the default text line shows fewer fields, while full `--format json` is the detailed audit without these summary counts. Every key below is present except `prototype_user_type_residue` (only when true), `overlapping_functions` (only for a create inside an existing function), `fallthrough_entries` (only for a create reached by fall-through), `declared_types` (only when a `types declare` landed), `preview_skipped` (only when a preview left ops out), and `go_rename` (only for Go rename):
 
 | key | meaning |
 |---|---|
@@ -92,6 +92,7 @@ This table describes the stable object from `--format json --summary`; the defau
 | `dirty_after` | whether a live change may need saving; true is the safe value when measurement or rollback failed |
 | `prototype_user_type_residue` | unclearable user-type override after a failed/reverted prototype change |
 | `overlapping_functions` | the `{name, address, offset, instruction_boundary, truncated}` of each function a `function create --allow-overlap` landed inside (`truncated` says whether the host was cut at the new start or left intact); absent for an ordinary create |
+| `fallthrough_entries` | the `{address, fallthrough_from}` of each `function create` whose previous instruction (fixed-width ISAs other than ARM/Thumb only; padding `nop`s and calls excluded, and a data variable over the preceding words counts as a literal pool unless the instruction before the variable's start runs into it) runs straight into the address -- likely mid-function; also rendered as a `warning:` line. The create still goes ahead |
 | `go_rename` | Go-only compact scan disclosure: `candidates`, `skipped_user_named`, `skipped_already_named`, `skipped_interior_pc`, and `skipped_changed_during_apply`; also rendered as a second text line |
 | `declared_types` | `types declare` counts operations, not types (one declaration is one op however many types it holds), so this carries the per-type view: `count`, the first 10 `names`, `truncated`, `unattached_bases` (`{type: reason}` for every C++ base clause, none of which is recorded yet, #965), `referenced_existing` (existing types only referenced and left unchanged) and `created_by_reference` (empty types created because a member mentioned an unknown name); also rendered as `types: N declared (...)` (omitted when nothing was declared) plus one line per non-empty list |
 | `preview_skipped` | the `{index, op, reason}` of each op a `--preview` left out (a prototype it cannot revert, and the ops that depend on it); the counts cover only the other ops. Also rendered as one `not previewed: op N <op> -- <reason>` line each |

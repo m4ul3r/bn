@@ -54,10 +54,29 @@ def _call_destination_value(ctx, insn) -> int | None:
     return il_format._llil_constant_value(getattr(insn, "dest", None))
 
 
-def _target_entry_for_call(ctx, bv, value: int | None) -> dict[str, Any] | None:
+def _target_entry_for_call(ctx, bv, value: int | None, *,
+                           display_name: bool = False) -> dict[str, Any] | None:
+    """A call/branch target entry. With *display_name* (only the `evidence
+    function` card asks), its function entry carries `display_name` beside the
+    raw `name` -- the #978 pair `il_format._function_identity` gives every other
+    row pointing at a function -- so the card's text can print the demangled
+    callee (raw under --mangled). Every other caller (`class show` thunk labels,
+    `decompile`'s veneer note) keeps the raw entry it always had."""
     if value is None:
         return None
-    return ctx._normalize_code_pointer(bv, value)
+    entry = ctx._normalize_code_pointer(bv, value)
+    if not display_name:
+        return entry
+    fn_entry = entry.get("function") if isinstance(entry, dict) else None
+    if isinstance(fn_entry, dict) and fn_entry.get("address"):
+        try:
+            fn = bv.get_function_at(int(str(fn_entry["address"]), 16))
+        except (AttributeError, TypeError, ValueError):
+            fn = None
+        if fn is not None:
+            entry = {**entry, "function": {**fn_entry,
+                                           "display_name": il_format._display_name(fn)}}
+    return entry
 
 
 def _true_mlil(insn):
@@ -1123,7 +1142,7 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
 
         mlil = _true_mlil(insn)
         dest_value = _call_destination_value(ctx, insn)
-        target = _target_entry_for_call(ctx, bv, dest_value)
+        target = _target_entry_for_call(ctx, bv, dest_value, display_name=True)
         arg_source, arguments, argument_candidates = _call_arguments(ctx, bv, insn, call_addr)
         # #549: `arguments` (from `argument_source`) is canonical only when it came
         # from HLIL/ABI recovery; an mlil/llil fallback is itself heuristic. Surface
@@ -1198,7 +1217,7 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
     return calls
 
 
-def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
+def _function_thunk_summary(ctx, bv, func, *, display_names: bool = False) -> dict[str, Any]:
     sections = ctx._sections_at(bv, int(func.start))
     if any("plt" in str(section.get("name", "")).lower() for section in sections):
         return {
@@ -1247,7 +1266,7 @@ def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
         if op_name not in {"LLIL_JUMP", "LLIL_TAILCALL", "LLIL_CALL", "LLIL_CALL_STACK_ADJUST"}:
             continue
         dest_value = _call_destination_value(ctx, insn)
-        target = _target_entry_for_call(ctx, bv, dest_value)
+        target = _target_entry_for_call(ctx, bv, dest_value, display_name=display_names)
         if target is None:
             continue
         # #673: only an EXTERNAL branch target (import/PLT/GOT/external symbol) is a
@@ -1457,7 +1476,7 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
             "raw_name": getattr(func, "raw_name", func.name),
         },
         **il_format._function_metadata(func),
-        "thunk": _function_thunk_summary(ctx, bv, func),
+        "thunk": _function_thunk_summary(ctx, bv, func, display_names=True),
         "calls": calls,
         # #471 pagination metadata (present for both text and JSON consumers).
         "total_calls": total_calls,
