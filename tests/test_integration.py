@@ -1128,7 +1128,8 @@ class TestTypeStringsAndInheritance:
         # the library's own type is imported instead, with its dependencies, and
         # named (#993 item 2).
         lib = shared_bn.json("types", "declare", "struct Lib989 { struct timespec* ts; };", "--summary")
-        assert lib["declared_types"]["referenced_existing"] == ["timespec"], lib
+        # Imported, so not also listed as an existing type left unchanged.
+        assert "timespec" not in lib["declared_types"].get("referenced_existing", []), lib
         assert "timespec" in lib["declared_types"]["imported_from_library"], lib
         assert shared_bn.json("types", "show", "timespec")["layout"].startswith("struct timespec // size=0x10")
         # A header of only forward declarations of library types is a noop.
@@ -1178,6 +1179,25 @@ class TestTypeStringsAndInheritance:
         shown = shared_bn.run("types", "show", "timespec").stdout
         assert "__time_t tv_sec" in shown, shown
         assert shared_bn.run("types", "show", "__time_t").returncode == 0
+
+    def test_preview_leaves_later_imports_working(self, shared_bn):
+        """#993 review: removing a preview's imports kept BN's imported-record,
+        so a later declare landed the user's colliding `__time_t` inside libc's
+        `timespec`, and a later `proto set` no longer imported `passwd`. A
+        preview now imports nothing at all, so both behave as on a fresh view."""
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "typedef uint32_t __time_t;")
+        shared_bn.json("types", "declare", "struct Collide993 { struct timespec ts; };", "--preview")
+        live = shared_bn.json("types", "declare", "struct Collide993 { struct timespec ts; };", "--summary")
+        assert live["committed"] is True, live
+        shown = shared_bn.run("struct", "show", "timespec").stdout
+        assert "__time_t_1 tv_sec" in shown, shown
+        assert "int64_t" in shared_bn.run("types", "show", "__time_t_1").stdout
+
+        shared_bn.json("types", "declare", "struct Pw993 { struct passwd pw; };", "--preview")
+        shared_bn.json("proto", "set", "main", "int main(struct passwd* a, int b)")
+        probe = shared_bn.run("py", "exec", "--code", "print(bv.get_type_by_name('passwd') is not None)")
+        assert probe.stdout.strip().endswith("True"), probe.stdout
 
     def test_typed_vptr_keeps_bn_vtable_and_renders_named_virtual_call(self, shared_bn):
         """#963: BN's parser returns a type a declaration only references as an
@@ -1238,6 +1258,32 @@ class TestTypeStringsAndInheritance:
         assert refused.returncode == 3, refused.stdout + refused.stderr
         assert "no table type of its own" in refused.stderr + refused.stdout
         assert vtable in refused.stderr + refused.stdout
+
+    def test_class_apply_types_refuses_layout_at_offset_zero(self, shared_bn):
+        """#993 review: an embedded base at offset 0 was overwritten by the
+        8-byte vptr and reported `verified`; it is refused and left intact."""
+        shared_bn.load(CLASSES_BINARY)
+        shared_bn.json("types", "declare", "struct `svc::Handler` { void* vtable; int64_t id; int64_t flags; };")
+        shared_bn.json("types", "declare", "struct `svc::EchoHandler` { struct `svc::Handler` base; int64_t extra; };")
+        before = shared_bn.run("struct", "show", "svc::EchoHandler").stdout
+        refused = shared_bn.run("class", "apply-types", "svc::EchoHandler")
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        assert "would replace it" in refused.stdout + refused.stderr
+        assert shared_bn.run("struct", "show", "svc::EchoHandler").stdout == before
+
+    def test_class_apply_types_stripped_rerun_is_a_noop(self, shared_bn):
+        """#993 review: a re-run on a stripped build, where nothing is left to
+        write, is a clean noop rather than an exit-3 refusal, and the vtable's
+        slot functions are listed as skipped."""
+        shared_bn.load(CLASSES_STRIPPED_BINARY)
+        first = shared_bn.json("class", "apply-types", "svc::Codec", "--summary")
+        assert first["committed"] is True and first["failed_count"] == 0, first
+        assert first["class_apply_types"]["skipped_methods"], first
+        again = shared_bn.run("class", "apply-types", "svc::Codec", "--format", "json", "--summary")
+        assert again.returncode == 0, again.stdout + again.stderr
+        summary = json.loads(again.stdout)
+        assert summary["noop_count"] == 1 and summary["dirty_after"] is False, summary
+        assert summary["class_apply_types"]["instance_struct"] == "unchanged", summary
 
 
 class TestDisasmLinear:

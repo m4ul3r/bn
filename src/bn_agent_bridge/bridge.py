@@ -4743,10 +4743,10 @@ class BinaryNinjaBridge:
         with self._write_gate:
             with self._target_lock.read():
                 operations, plan = mutation_engine._class_apply_types_plan(self.ctx, selector, name)
+            if not operations:
+                return mutation_engine._class_apply_types_noop(plan, preview=preview)
             result = self._mutation(selector, preview, operations, gate_held=True)
-        if isinstance(result, dict):
-            result["class_apply_types"] = plan
-        return result
+        return mutation_engine._with_class_apply_types_plan(result, plan)
 
     def _op_rename_symbol(self, *a, **k):
         return mutation_engine._op_rename_symbol(self.ctx, *a, **k)

@@ -164,6 +164,18 @@ def test_class_apply_types_summary_states_the_plan():
         "class_apply_types": {**plan, "size": "0x20", "skipped_methods": []},
         "results": [{"op": "types_declare", "status": "verified"}]}))
     assert "instance struct: declared (size 0x20)" in sized and "\nskipped:" not in sized
+    # The count is what each retype's row says happened: an already-typed
+    # `this` is `noop`, not "retyped".
+    rerun = _render_mutation_summary_text(_mutation_summary({
+        "success": True, "committed": True, "rolled_back": False,
+        "class_apply_types": {**plan, "instance_struct": "vptr_retyped",
+                              "vptr_member_before": {"field_name": "vptr", "field_type": "void*"},
+                              "retyped_methods": [{"address": "0x401200", "name": "a", "status": "noop"},
+                                                  {"address": "0x401220", "name": "b", "status": "verified"}]},
+        "results": [{"op": "struct_field_set", "status": "verified"},
+                    {"op": "local_retype", "status": "noop"}, {"op": "local_retype", "status": "verified"}]}))
+    assert "instance struct: vptr_retyped (was void* vptr)" in rerun
+    assert "\nthis retyped: 1 method(s), already typed: 1" in rerun
 
 
 

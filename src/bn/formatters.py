@@ -6719,10 +6719,20 @@ def _render_mutation_summary_text(value: Any) -> str:
         if action == "declared":
             size = _text_value(plan, "size")
             size_note = f" (size {size})" if size else " (size unknown: only the vptr is declared)"
+        elif _field_declared(plan, "vptr_member_before"):
+            before = _field_dict(plan, "vptr_member_before")
+            size_note = (f" (was {_text_value(before, 'field_type') or '<unknown>'} "
+                         f"{_text_value(before, 'field_name') or '<unnamed>'})")
         line += (f"\nclass: {_text_value(plan, 'class') or '<unknown>'}  "
                  f"vptr: struct `{_text_value(plan, 'vtable_type') or '<unknown>'}`*  "
                  f"instance struct: {action}{size_note}")
-        line += f"\nthis retyped: {len(_row_list(plan, 'retyped_methods'))} method(s)"
+        # #993 review: count what each retype's own row says happened, not the
+        # plan; a method whose `this` already had the type is `noop`.
+        methods = _row_list(plan, "retyped_methods")
+        already = sum(1 for m in methods if _text_value(m, "status") == "noop")
+        line += f"\nthis retyped: {len(methods) - already} method(s)"
+        if already:
+            line += f", already typed: {already}"
         skipped = _row_list(plan, "skipped_methods")
         if skipped:
             line += "\nskipped: " + ", ".join(

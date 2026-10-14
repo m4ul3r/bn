@@ -867,6 +867,12 @@ def test_function_pointer_parameter_tags_are_references_not_void_types(monkeypat
     # A `void` the declaration never spells as a tag is a real typedef and stays.
     plain = [("Node", void)]
     assert me._drop_references_to_existing_types(None, bv, "typedef void Node;", plain)[0] == plain
+    # Nor does a tag spelled only inside a string literal or an attribute
+    # argument: that is not code (#993 review).
+    for text in ('typedef void Marker; const char* tag = "struct Marker";',
+                 'typedef void Marker __attribute__((annotate("struct Marker")));'):
+        typedef = [("Marker", void)]
+        assert me._drop_references_to_existing_types(None, bv, text, typedef)[0] == typedef, text
 
 
 def test_every_base_clause_is_reported_never_dropped(monkeypatch):

@@ -6500,18 +6500,73 @@ def test_class_apply_types_plan_builds_the_typing_batch(monkeypatch):
         {"address": "0x401260", "name": "demo::Widget::make", "reason": "no parameter named `this`"},
         {"address": "0x4012a0", "name": "demo::Widget::stub", "reason": "thunk"}]
 
-    # An existing instance struct keeps its own offset-0 member name.
-    bv.types["demo::Widget"] = _FakeType(
-        "struct demo::Widget", width=0x20, members=[_FakeMember(0, "vptr", "void*")])
+    vt_name = "demo::Base::demo::Widget::VTable"
+
+    def member(offset, name, decl, width, type_class, target=None):
+        type_obj = _FakeType(decl, width=width, type_class=type_class)
+        type_obj.target = target
+        return types.SimpleNamespace(offset=offset, name=name, type=type_obj)
+
+    def struct_with(*members):
+        bv.types["demo::Widget"] = _FakeType("struct demo::Widget", width=0x20, members=list(members))
+
+    vt_ref = _FakeType(f"struct {vt_name}", type_class="NamedTypeReferenceClass")
+    vt_ref.name = vt_name
+
+    # A pointer-width pointer at 0x0 is retyped under its own name.
+    struct_with(member(0, "vptr", "void*", 8, "PointerTypeClass"))
     operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
     assert operations[0] == {"op": "struct_field_set", "struct_name": "demo::Widget", "offset": "0x0",
-                             "field_name": "vptr", "field_type": "struct `demo::Base::demo::Widget::VTable`*",
+                             "field_name": "vptr", "field_type": f"struct `{vt_name}`*",
                              "overwrite_existing": True}
     assert plan["instance_struct"] == "vptr_retyped"
+    assert plan["vptr_member_before"] == {"field_name": "vptr", "field_type": "void*"}
 
-    # No VTable type of its own: refused before any op is built.
+    # #993 review: layout the 8-byte vptr would destroy is refused, not
+    # overwritten -- an embedded base, a padding array, two narrow fields.
+    for layout in ([member(0, "base", "struct demo::Base", 0x18, "StructureTypeClass")],
+                   [member(0, "_unk0", "uint8_t[0x20]", 0x20, "ArrayTypeClass")],
+                   [member(0, "a", "int32_t", 4, "IntegerTypeClass"),
+                    member(4, "b", "int32_t", 4, "IntegerTypeClass")]):
+        struct_with(*layout)
+        with pytest.raises(bridge.OperationFailure) as excinfo:
+            me._class_apply_types_plan(instance.ctx, None, "Widget")
+        assert "would replace it" in excinfo.value.message, layout
+
+    # Only EXACTLY a pointer to the VTable is already typed; a pointer to a
+    # pointer to it is retyped, not mistaken for done.
+    struct_with(member(0, "table", f"struct {vt_name}*", 8, "PointerTypeClass", target=vt_ref))
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert plan["instance_struct"] == "unchanged"
+    assert [op["op"] for op in operations] == ["local_retype"]
+    inner = _FakeType(f"struct {vt_name}*", width=8, type_class="PointerTypeClass")
+    inner.target = vt_ref
+    struct_with(member(0, "table", f"struct {vt_name}**", 8, "PointerTypeClass", target=inner))
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert plan["instance_struct"] == "vptr_retyped"
+
+    # A stripped card: no methods, slots only. Nothing is left to write once
+    # the struct is typed -- an empty plan, not a refusal -- and every slot
+    # function is listed as skipped.
+    card["methods"] = []
+    card["vtable"] = {"address": "0x404000", "slots": [
+        {"index": 0, "method": {"address": "0x401300", "display_name": "sub_401300"}},
+        {"index": 1, "method": None}]}
+    struct_with(member(0, "table", f"struct {vt_name}*", 8, "PointerTypeClass", target=vt_ref))
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert operations == []
+    assert [(m["address"], m["name"]) for m in plan["skipped_methods"]] == [("0x401300", "sub_401300")]
+    noop = me._class_apply_types_noop(plan, preview=False)
+    assert [row["status"] for row in noop["results"]] == ["noop"] and noop["success"] is True
+
+    # No VTable type of its own: refused before any op is built, and an
+    # existing struct is not told it does not exist.
     monkeypatch.setattr(bridge.read_class, "_bn_vtable_type_name", lambda view, start: None)
+    bv.types["demo::Widget::demo::Leaf::VTable"] = _FakeType("struct VT", width=8)
+    bv.type_names = list(bv.types)
     with pytest.raises(bridge.OperationFailure) as excinfo:
         me._class_apply_types_plan(instance.ctx, None, "Widget")
     assert excinfo.value.status == "invalid_request"
     assert "no table type of its own" in excinfo.value.message
+    assert "No struct named" not in excinfo.value.message
+    assert "demo::Widget::demo::Leaf::VTable" in excinfo.value.message
