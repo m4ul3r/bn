@@ -1633,30 +1633,35 @@ def test_disasm_lines_slices_output_with_header(fake_transport, capsys):
     assert "ccc" not in out and "ddd" not in out
 
 
-@pytest.mark.parametrize("line_range,shown", [
-    (None, True),
-    ({"start": 1, "end": 2}, True),
-    # A slice that stops before the last instruction must not end in the note.
-    ({"start": 1, "end": 1}, False),
+_LISTING = ("0x55e7e0  cmp     w0, #0\n"
+            "0x55e7e4  bl      0x401000\n"
+            "0x55e7e8  ret")
+
+
+@pytest.mark.parametrize("text,expected", [
+    # The note follows the instruction that runs into the other function, even
+    # mid-listing -- not the last line, which here is a `ret`.
+    (_LISTING, ("0x55e7e0  cmp     w0, #0\n0x55e7e4  bl      0x401000\n"
+                "// falls through into sub_55e7f0 @ 0x55e7f0\n0x55e7e8  ret")),
+    # A slice that does not show that instruction gets no note.
+    ("0x55e7e8  ret", "0x55e7e8  ret"),
 ])
-def test_disasm_notes_where_execution_continues_966(fake_transport, capsys, line_range, shown):
-    text = "aaa\nbbb" if line_range is None or line_range["end"] == 2 else "aaa"
+def test_disasm_notes_where_execution_continues_966(fake_transport, capsys, text, expected):
     fake_transport({"disasm": {"ok": True, "result": {
-        "text": text, "total_lines": 2, "line_range": line_range,
-        "continues_into": {"name": "sub_4000f8", "address": "0x4000f8",
-                           "note": "execution falls through into sub_4000f8 @ 0x4000f8"},
+        "text": text, "total_lines": 3, "line_range": None,
+        "continues_into": {"name": "sub_55e7f0", "address": "0x55e7f0", "from": "0x55e7e4",
+                           "note": "falls through into sub_55e7f0 @ 0x55e7f0"},
     }}})
 
-    rc = bn.cli.main(["disasm", "0x4000dc", "--target", "active"])
+    rc = bn.cli.main(["disasm", "0x55e700", "--target", "active"])
 
     assert rc == 0
-    out = capsys.readouterr().out
-    assert ("// execution falls through into sub_4000f8 @ 0x4000f8" in out) is shown
+    assert capsys.readouterr().out.rstrip("\n") == expected
 
 
 @pytest.mark.parametrize("hidden,expected", [
-    (1, "note: 1 stored comment line not written by this session shown as "
-        "<annotation redacted>; --include-annotations to show them"),
+    (1, ("note: 1 stored comment line hidden as <annotation redacted>; "
+         "--include-annotations to show them")),
     (0, None),
 ])
 def test_decompile_text_footer_counts_hidden_annotations_977(fake_transport, capsys,

@@ -4555,10 +4555,10 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
 
 
-def test_annotation_bodies_tolerate_dict_mutation_during_iteration_861():
+def test_annotation_entries_tolerate_dict_mutation_during_iteration_861():
     # #861: the SAME live-collection shape #850 fixed in `_comment_map`, at the
-    # two sites that fix did not reach. Here it is `_annotation_bodies`, which
-    # unpacked `func.comments.values()` -- a view of BN's per-function map, which
+    # two sites that fix did not reach. Here it is `_annotation_entries` (formerly
+    # `_annotation_bodies`), which unpacked `func.comments` -- a view of BN's per-function map, which
     # the analysis threads can add to while the walk is in flight. The store
     # below mutates DURING that walk (the #850 store's mechanism, walked through
     # `values()` because this site unpacked the value view), so the pre-fix code
@@ -5447,9 +5447,15 @@ def _set_reg(name, src):
 
 
 class _Llil(list):
+    """One LLIL basic block holding every instruction, in order."""
+
     @property
     def instructions(self):
         return list(self)
+
+    @property
+    def basic_blocks(self):
+        return [list(self)]
 
 
 def _aarch64_arch():
@@ -5464,21 +5470,16 @@ _ARG_REGS = [f"x{i}" for i in range(8)]
 
 
 def _arity_case(monkeypatch, setup, *, rendered, raw_name, kind="ImportedFunctionSymbol",
-                signature=None):
-    """One call at 0x401040 to an import at 0x400e00, preceded in its block by
-    *setup* LLIL instructions. *signature* is the demangled (params, variadic)."""
-    llil = _Llil()
-    block = types.SimpleNamespace(start=0)
-    for index, ins in enumerate(setup):
-        ins.instr_index = index
-        ins.il_basic_block = block
-        llil.append(ins)
-    call = _op("LLIL_CALL", dest=_op("LLIL_CONST_PTR", constant=0x400e00))
-    call.address = 0x401040
-    call.instr_index = len(llil)
-    call.il_basic_block = block
-    call.mlil = types.SimpleNamespace(params=[object()] * rendered)
-    llil.append(call)
+                signature=None, call_op="LLIL_CALL", calls=1):
+    """*calls* identical calls at 0x401040.. to an import at 0x400e00, the first
+    preceded in its block by *setup* LLIL instructions. *signature* is the
+    demangled (params, variadic)."""
+    llil = _Llil(setup)
+    for n in range(calls):
+        call = _op(call_op, dest=_op("LLIL_CONST_PTR", constant=0x400e00))
+        call.address = 0x401040 + 8 * n
+        call.mlil = types.SimpleNamespace(params=[object()] * rendered)
+        llil.append(call)
     func = types.SimpleNamespace(
         start=0x401000, llil=llil,
         calling_convention=types.SimpleNamespace(int_arg_regs=_ARG_REGS),
@@ -5542,6 +5543,46 @@ def test_call_arity_does_not_count_the_stack_protector_scrub_955(monkeypatch):
     assert "renders 1 of 2 arguments" in read_decompile._call_arity_warning(bv, func)
 
 
+def test_call_arity_scrub_lookback_stops_at_the_previous_call_955(monkeypatch):
+    # The canary store sits before an EARLIER call in the same LLIL block (LLIL
+    # blocks do not end at calls). It cannot explain the `x1 = 0` set up for the
+    # later call: that is a real NULL argument (`basic_ios::init(nullptr)`).
+    earlier = _op("LLIL_CALL", dest=_op("LLIL_CONST_PTR", constant=0x400f00))
+    earlier.address = 0x401020
+    earlier.mlil = None
+    bv, func = _arity_case(
+        monkeypatch,
+        [_set_reg("x1", _op("LLIL_LOAD", src=_reg("x0"))),
+         _op("LLIL_STORE", dest=_reg("sp"), src=_reg("x1")),
+         _set_reg("x1", _const(0)), _set_reg("x0", _reg("sp")), earlier,
+         _set_reg("x1", _const(0)), _set_reg("x0", _reg("sp"))],
+        rendered=1, raw_name="widget_init",
+    )
+    assert "renders 1 of 2 arguments" in read_decompile._call_arity_warning(bv, func)
+
+
+def test_call_arity_skips_sized_operator_delete_955(monkeypatch):
+    # BN's type library declares `operator delete(void*)`; the size every sized
+    # delete also passes is allocator bookkeeping, not data, and it flooded the
+    # warning on ordinary C++.
+    bv, func = _arity_case(
+        monkeypatch, [_set_reg("x1", _const(0x18)), _set_reg("x0", _reg("x19"))],
+        rendered=1, raw_name="_ZdlPvm", signature=(["", ""], False),
+    )
+    assert read_decompile._call_arity_warning(bv, func) is None
+
+
+def test_call_arity_groups_repeated_calls_and_sees_stack_adjusting_calls_955(monkeypatch):
+    bv, func = _arity_case(
+        monkeypatch, [], rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
+        signature=(["this", "", ""], False), call_op="LLIL_CALL_STACK_ADJUST", calls=4,
+    )
+    warning = read_decompile._call_arity_warning(bv, func)
+    assert warning.startswith("call arity: 4 call(s)")
+    assert "(4 calls at 0x401040, 0x401048, 0x401050 and 1 more) renders 1 of 3" in warning
+    assert warning.count("renders 1 of 3") == 1
+
+
 def test_call_arity_ignores_a_register_read_before_the_call_955(monkeypatch):
     # x1 is a temporary consumed by the x0 computation, not an argument.
     bv, func = _arity_case(
@@ -5584,9 +5625,17 @@ def _param_var(name, reg):
         source_type=types.SimpleNamespace(name="RegisterVariableSourceType"))
 
 
-def _split_view(*, tail_mnemonics):
+def _ref(owner_op, start):
+    """A code reference from a function at *start* whose instruction there lifts
+    as *owner_op*."""
+    owner = types.SimpleNamespace(start=start, get_llil_at=lambda a: _op(owner_op))
+    return types.SimpleNamespace(function=owner, address=start + 0x10)
+
+
+def _split_view(*, tail_mnemonics, tail_returns=True, tail_refs=None):
     """build_widget @ 0x4000dc ends at 0x4000f8, where sub_4000f8 begins. Its
-    last instructions are *tail_mnemonics* (4 bytes each)."""
+    last instructions are *tail_mnemonics* (4 bytes each). By default the tail
+    returns and reset_widget tail-jumps into it -- an ordinary shared tail."""
     arch = _aarch64_arch()
     arch.get_reg_name = lambda storage: storage
     arch.max_instr_length = 4
@@ -5595,7 +5644,8 @@ def _split_view(*, tail_mnemonics):
     tail = types.SimpleNamespace(start=0x4000f8, name="sub_4000f8",
                                  symbol=None, calling_convention=cc,
                                  parameter_vars=[_param_var("arg1", "x19")],
-                                 basic_blocks=[])
+                                 type=types.SimpleNamespace(parameters=[]),
+                                 can_return=tail_returns, basic_blocks=[])
     first = 0x4000f8 - 4 * len(tail_mnemonics)
     mnemonics = {first + 4 * i: m for i, m in enumerate(tail_mnemonics)}
     block = types.SimpleNamespace(start=first, end=0x4000f8)
@@ -5603,6 +5653,7 @@ def _split_view(*, tail_mnemonics):
         start=0x4000dc, name="build_widget", symbol=None, calling_convention=cc,
         parameter_vars=[_param_var("arg1", "x0"), _param_var("arg3", "x19"),
                         _param_var("arg5", "fp")],
+        type=types.SimpleNamespace(parameters=[]), can_return=True,
         basic_blocks=[block],
         get_llil_at=lambda a: _op("LLIL_CALL" if mnemonics.get(a) == "blr" else "LLIL_STORE"),
     )
@@ -5614,6 +5665,10 @@ def _split_view(*, tail_mnemonics):
         return types.SimpleNamespace(branches=[types.SimpleNamespace(
             type=types.SimpleNamespace(name=kind), target=0)] if kind else [])
 
+    refs = {
+        0x4000f8: [_ref("LLIL_TAILCALL", 0x400108)] if tail_refs is None else tail_refs,
+        0x4000dc: [_ref("LLIL_CALL", 0x400120)],
+    }
     arch.get_instruction_info = info
     bv = types.SimpleNamespace(
         arch=arch,
@@ -5622,6 +5677,8 @@ def _split_view(*, tail_mnemonics):
         get_disassembly=lambda a: f"{mnemonics.get(a, 'mov')}  x0, x1",
         get_function_at=lambda a: {0x4000f8: tail, 0x4000dc: head}.get(a),
         get_basic_blocks_at=lambda a: [block] if first <= a < 0x4000f8 else [],
+        get_code_refs=lambda a: refs.get(a, []),
+        get_data_refs=lambda a: [],
     )
     return bv, head, tail
 
@@ -5629,7 +5686,8 @@ def _split_view(*, tail_mnemonics):
 def test_split_body_notes_name_the_fall_through_and_saved_register_params_966():
     bv, head, tail = _split_view(tail_mnemonics=["str"])
     head_notes = read_decompile._split_body_notes(bv, head)
-    assert any("runs straight into sub_4000f8 @ 0x4000f8" in n for n in head_notes)
+    assert any("the block ending at 0x4000f4 runs straight into sub_4000f8 @ 0x4000f8" in n
+               for n in head_notes)
     assert any("(arg3 @ x19, arg5 @ fp)" in n for n in head_notes)
     # The argument register x0 is never reported.
     assert not any("arg1 @ x0" in n for n in head_notes)
@@ -5657,18 +5715,107 @@ def test_disasm_discloses_where_execution_continues_966(monkeypatch):
     monkeypatch.setattr(bridge.il_format, "_disasm_text", lambda *a, **k: "0x4000f4  str")
     result = instance._disasm("active", "build_widget")
     assert result["continues_into"]["address"] == "0x4000f8"
+    assert result["continues_into"]["from"] == "0x4000f4"
     assert "bn disasm 0x4000f8" in result["continues_into"]["note"]
 
 
-def _string_view(memory: bytes, *, semantics="ReadOnlyDataSectionSemantics", string=None):
+@pytest.mark.parametrize("tail_refs,tail_returns", [
+    # A landing pad: nothing references it (the unwinder enters it via the LSDA).
+    ([], True),
+    # Cleanup reached only by a jump from its parent, and it never returns.
+    ([_ref("LLIL_GOTO", 0x400200)], False),
+])
+def test_eh_fragment_gets_one_note_and_no_proto_set_advice_966(tail_refs, tail_returns):
+    # The fragment's x19 is its parent's live register: dropping it with
+    # `proto set` would break the frame accesses (#985 review).
+    bv, head, tail = _split_view(tail_mnemonics=["str"], tail_returns=tail_returns,
+                                 tail_refs=tail_refs)
+    notes = read_decompile._split_body_notes(bv, tail)
+    assert len(notes) == 1 and notes[0].startswith("EH/cold fragment:")
+    assert "(arg1 @ x19)" in notes[0] and "proto set" not in notes[0]
+    # Its parent running into it is not a shared-tail split either.
+    assert read_decompile._fallthrough_successor(bv, head) is None
+    assert not any("runs straight into" in n for n in read_decompile._split_body_notes(bv, head))
+
+
+def test_callee_note_skips_an_eh_fragment_but_not_a_shared_tail_966():
+    bv, _head, tail = _split_view(tail_mnemonics=["ret"])
+    call = _op("LLIL_CALL", dest=_op("LLIL_CONST_PTR", constant=0x4000f8))
+    caller = types.SimpleNamespace(start=0x400300, llil=_Llil([call]))
+    assert len(read_decompile._callee_split_notes(bv, caller)) == 1
+    tail.type = types.SimpleNamespace(parameters=[types.SimpleNamespace(
+        type="struct _Unwind_Exception*")])
+    assert read_decompile._callee_split_notes(bv, caller) == []
+
+
+def test_jump_only_tail_gets_no_proto_set_advice_966():
+    # The tail is entered only by reset_widget's tail jump and build_widget's
+    # fall-through: its x19 is live in that code, so `proto set` advice is wrong.
+    bv, head, tail = _split_view(tail_mnemonics=["str"])
+    tail_notes = read_decompile._split_body_notes(bv, tail)
+    saved = [n for n in tail_notes if "callee-saved/link registers" in n]
+    assert len(saved) == 1 and "nothing calls this function" in saved[0]
+    assert "proto set" not in saved[0]
+    # The head IS called (from main), so its stray parameters keep the advice.
+    head_saved = [n for n in read_decompile._split_body_notes(bv, head)
+                  if "callee-saved/link registers" in n]
+    assert "drop them with `bn proto set`" in head_saved[0]
+
+
+def test_eh_fragment_chain_longer_than_three_links_966():
+    # BN chains cleanup fragments through synthetic calls; each never returns,
+    # and the chain's root is entered only by a jump.
+    chain = [types.SimpleNamespace(start=0x405600 + 0xc * i, name=f"sub_{i}",
+                                   type=types.SimpleNamespace(parameters=[]),
+                                   can_return=False) for i in range(8)]
+    for fn in chain:
+        fn.get_llil_at = lambda a: _op("LLIL_CALL")
+    refs = {chain[0].start: [_ref("LLIL_GOTO", 0x414f00)]}
+    for prev, nxt in itertools.pairwise(chain):
+        refs[nxt.start] = [types.SimpleNamespace(function=prev, address=prev.start + 4)]
+    bv = types.SimpleNamespace(get_code_refs=lambda a: refs.get(a, []),
+                               get_data_refs=lambda a: [])
+    assert read_decompile._is_eh_fragment(bv, chain[-1])
+    # ...while the same chain under a root that returns is ordinary code.
+    chain[0].can_return = True
+    refs[chain[0].start] = [_ref("LLIL_CALL", 0x400100)]
+    assert not read_decompile._is_eh_fragment(bv, chain[-1])
+
+
+def test_a_named_unreferenced_function_is_not_an_eh_fragment_966():
+    # An exported method nothing in the binary calls has no references either;
+    # only BN's placeholder `sub_` name can be a carved-out fragment.
+    bv, _head, tail = _split_view(tail_mnemonics=["ret"], tail_refs=[])
+    assert read_decompile._is_eh_fragment(bv, tail)
+    tail.name = "_ZNSi8readsomeEPcl"
+    assert not read_decompile._is_eh_fragment(bv, tail)
+
+
+def test_running_into_a_noreturn_piece_is_not_a_split_966():
+    # BN outlines a bare `call __stack_chk_fail` as a noreturn function of its
+    # own; the block that falls into it hides no return path.
+    bv, head, _ = _split_view(tail_mnemonics=["str"], tail_returns=False,
+                              tail_refs=[_ref("LLIL_CALL", 0x400400)])
+    assert read_decompile._fallthrough_successor(bv, head) is None
+
+
+def _string_view(memory: bytes, *, semantics="ReadOnlyDataSectionSemantics", string=None,
+                 param_type="void*"):
+    """A call `put(x0, 0x402ae0)` to a callee at 0x401100 whose second
+    parameter is declared *param_type*, with *memory* at 0x402ae0."""
     section = types.SimpleNamespace(semantics=types.SimpleNamespace(name=semantics))
+    callee = types.SimpleNamespace(type=types.SimpleNamespace(parameters=[
+        types.SimpleNamespace(type="void*"), types.SimpleNamespace(type=param_type)]))
     bv = types.SimpleNamespace(
         get_string_at=lambda a: string,
         get_data_var_at=lambda a: None,
         get_sections_at=lambda a: [section],
         read=lambda a, n: memory[:n],
+        get_function_at=lambda a: callee if a == 0x401100 else None,
+        get_symbol_at=lambda a: None,
     )
-    call = _op("MLIL_CALL", params=[_op("MLIL_VAR"), _op("MLIL_CONST_PTR", constant=0x402ae0)])
+    call = _op("MLIL_CALL", dest=_op("MLIL_CONST_PTR", constant=0x401100),
+               params=[_op("MLIL_VAR"), _op("MLIL_CONST_PTR", constant=0x402ae0)])
     call.address = 0x4023dc
     func = types.SimpleNamespace(mlil=types.SimpleNamespace(instructions=[call]))
     return bv, func
@@ -5683,6 +5830,13 @@ def test_raw_string_pointer_note_names_an_undefined_short_literal_970():
     assert "bn data retype 0x402ae0 'char[4]'" in note
 
 
+@pytest.mark.parametrize("param_type", ["char const*", "const char*", "char*"])
+def test_raw_string_pointer_note_takes_a_short_run_passed_as_char_pointer_970(param_type):
+    bv, func = _string_view(b"/\0\0\0", param_type=param_type)
+    note = read_decompile._raw_string_pointer_note(bv, func, "    put(x0, 0x402ae0);")
+    assert note is not None and '0x402ae0 = "/"' in note
+
+
 @pytest.mark.parametrize("memory,kwargs,text", [
     # Already rendered as a literal: the address is not in the text.
     (b" -n\0", {}, '    std::__ostream_insert<char>(x0, " -n");'),
@@ -5693,6 +5847,16 @@ def test_raw_string_pointer_note_names_an_undefined_short_literal_970():
     # Not printable, or not terminated within the window.
     (b"\x01\x02\0", {}, "    f(x0, 0x402ae0);"),
     (b"A" * 80, {}, "    f(x0, 0x402ae0);"),
+    # Printable-then-NUL data that is not a string, passed where the callee does
+    # not take a `char *` (#985 review): an int[] {0x41, ...}, a UTF-16 "hi", a
+    # struct {0x2a, 0}, and a two-byte run.
+    (b"A\0\0\0B\0\0\0", {}, "    sum_ints(0x402ae0);"),
+    (b"h\0i\0\0\0", {"param_type": "uint16_t const*"}, "    wlen(0x402ae0);"),
+    (b"*\0\0\0\0\0\0\0", {"param_type": "void const*"}, "    cfg_id(0x402ae0);"),
+    (b"ok\0", {}, "    f(x0, 0x402ae0);"),
+    # A wide or double-pointer parameter is not narrow-string evidence.
+    (b"h\0i\0\0\0", {"param_type": "wchar_t const*"}, "    f(x0, 0x402ae0);"),
+    (b"A\0", {"param_type": "char**"}, "    f(x0, 0x402ae0);"),
 ])
 def test_raw_string_pointer_note_is_silent_without_an_undefined_literal_970(memory, kwargs, text):
     bv, func = _string_view(memory, **kwargs)

@@ -432,9 +432,10 @@ def _decompile(args: argparse.Namespace) -> int:
         hidden = summary.get("hidden") if isinstance(summary, dict) else None
         if isinstance(hidden, int) and hidden > 0:
             noun = "line" if hidden == 1 else "lines"
-            text += (f"\n\nnote: {hidden} stored comment {noun} not written by this "
-                     "session shown as <annotation redacted>; --include-annotations "
-                     "to show them")
+            # Not "not written by this session": a line this session wrote is
+            # hidden too when the same body is also stored elsewhere.
+            text += (f"\n\nnote: {hidden} stored comment {noun} hidden as "
+                     "<annotation redacted>; --include-annotations to show them")
         # #820: a --quick view's body is unresolved-name Pseudo-C with an empty
         # `warnings` list, so text mode stated nothing was wrong. Lead with the
         # view-level state -- `analysis_skipped` is a PER-FUNCTION flag and is
@@ -531,19 +532,38 @@ def _function_structured_il(args: argparse.Namespace) -> int:
     )
 
 
+def _insert_after_address(text: str, address: str, line: str) -> str:
+    """*text* with *line* inserted after the listing row for *address*, or
+    unchanged when no row starts with that address."""
+    try:
+        wanted = int(address, 16)
+    except ValueError:
+        return text
+    rows = text.split("\n")
+    for index, row in enumerate(rows):
+        head = row.split(None, 1)[0] if row.strip() else ""
+        try:
+            if head and int(head, 16) == wanted:
+                return "\n".join([*rows[:index + 1], line, *rows[index + 1:]])
+        except ValueError:
+            continue
+    return text
+
+
 def _render_disasm_text(value: Any) -> str:
     text = _text_field("text")(value)
     if not isinstance(value, dict):
         return text
-    # #966: the function's last instruction runs into another function's entry.
-    # Only where the listing reaches that instruction: under a --lines slice
-    # that stops earlier the note would sit after an unrelated line.
+    # #966: a block runs into another function's entry. The note goes right
+    # after the instruction that runs into it (`from`), which is often in the
+    # middle of the listing (#985 review); a slice that does not show that
+    # instruction gets no note, since it would sit after an unrelated line.
     continues = value.get("continues_into")
     selected = value.get("line_range")
     total = value.get("total_lines")
-    reaches_end = not isinstance(selected, dict) or selected.get("end") == total
-    if isinstance(continues, dict) and continues.get("note") and reaches_end:
-        text = f"{text}\n// {continues['note']}"
+    if isinstance(continues, dict) and continues.get("note") and continues.get("from"):
+        text = _insert_after_address(text, str(continues["from"]),
+                                     f"// {continues['note']}")
     if not isinstance(selected, dict) or not isinstance(total, int):
         return text
     start = selected.get("start")
