@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Callable
 
-from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, _refuse_count_only_slices, arg, command, mutex, mutation_output_args, preview_arg, read_text_input
+from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, _refuse_count_only_slices, arg, command, demangle_compat_arg, mangled_arg, mutex, mutation_output_args, preview_arg, read_text_input
 from ..formatters import (
     disclosure_boundary,
     _render_call_descriptors_text,
@@ -52,11 +52,11 @@ from ..transport import BridgeError
              arg("--count", action="store_true", default=False,
                  help="Show total function count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
-                 help="Order results ascending by address (default), size, or name"),
+                 help="Order results ascending by address (default), size, or name "
+                      "(the name the text shows: demangled, or raw under --mangled)"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
                  help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
-             arg("--demangle", action="store_true", default=False,
-                 help="Show demangled C++ names in text (JSON always carries display_name)"),
+             mangled_arg(), demangle_compat_arg(),
              arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
                  help="Only functions whose byte size is >= N (drop tiny PLT/GOT thunk "
                       "veneers, typically <= 16 bytes)"),
@@ -115,12 +115,14 @@ def _function_list(args: argparse.Namespace) -> int:
         params["sort"] = args.sort
     if args.reverse:
         params["reverse"] = True
+    if args.mangled:
+        params["mangled"] = True
     return _call(
         args,
         "list_functions",
         params,
         require_target=True,
-        text_renderer=lambda value: _render_function_list_text(value, demangle=args.demangle),
+        text_renderer=lambda value: _render_function_list_text(value, mangled=args.mangled),
         page_label="function list",
         paged_spill=True,
         stem="functions",
@@ -135,17 +137,20 @@ def _function_list(args: argparse.Namespace) -> int:
          see_also=("function list",),
          args=[
              arg("query", nargs="?",
-                 help="Substring or regex to match function names"),
+                 help="Substring or regex to match function names (the demangled "
+                      "display name; --mangled matches raw symbol names)"),
              arg("--query", dest="query_flag", default=None,
                  help="Alias for the positional query (matches `strings --query` / `types --query`)"),
              arg("--count", action="store_true", default=False,
                  help="Show match count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
-                 help="Order results ascending by address (default), size, or name"),
+                 help="Order results ascending by address (default), size, or name "
+                      "(the name the text shows: demangled, or raw under --mangled)"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
                  help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
-             arg("--demangle", action="store_true", default=False,
-                 help="Show demangled C++ names in text (JSON always carries display_name)"),
+             demangle_compat_arg(),
+             mangled_arg("Match and show raw (mangled) C++ symbol names instead of the "
+                         "demangled display names; JSON always carries both"),
              arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
                  help="Only functions whose byte size is >= N (drop tiny PLT/GOT thunk "
                       "veneers, typically <= 16 bytes)"),
@@ -156,7 +161,7 @@ def _function_list(args: argparse.Namespace) -> int:
                        help="Interpret query as a case-insensitive regular expression"),
                    arg("--exact", action="store_true", default=False,
                        help="Match function names exactly (case-insensitive); avoids substring "
-                            "false positives in C++ mangled names"),
+                            "false positives"),
                    arg("--word", action="store_true", default=False,
                        help="Match the query as a whole identifier token (word-boundary): for a "
                             "sink survey, `--word popen` hits popen/popen@plt but not the "
@@ -172,6 +177,7 @@ def _function_search(args: argparse.Namespace) -> int:
         "regex": bool(args.regex),
         "exact": bool(args.exact),
         "word": bool(getattr(args, "word", False)),
+        "mangled": bool(args.mangled),
     }
     if args.min_address is not None:
         params["min_address"] = args.min_address
@@ -213,7 +219,7 @@ def _function_search(args: argparse.Namespace) -> int:
         "search_functions",
         params,
         require_target=True,
-        text_renderer=lambda value: _render_function_list_text(value, demangle=args.demangle),
+        text_renderer=lambda value: _render_function_list_text(value, mangled=args.mangled),
         page_label="function search",
         paged_spill=True,
         stem="function-search",
@@ -226,8 +232,7 @@ def _function_search(args: argparse.Namespace) -> int:
          args=[arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
                arg("--verbose", "-v", action="store_true", default=False,
                    help="Show full parameter and local variable details"),
-               arg("--demangle", action="store_true", default=False,
-                   help="Show the demangled C++ name in text (JSON always carries display_name)"),
+               mangled_arg(), demangle_compat_arg(),
                # #653.10: `--lines` slices a decompile blindly because the line
                # numbers are unknowable until after the full decompile. Block ranges
                # make a huge dispatcher targetable (`disasm --linear <block start>`,
@@ -239,13 +244,13 @@ def _function_search(args: argparse.Namespace) -> int:
          estimable=True)
 def _function_info(args: argparse.Namespace) -> int:
     verbose = getattr(args, "verbose", False)
-    demangle = getattr(args, "demangle", False)
+    mangled = getattr(args, "mangled", False)
     return _call(
         args,
         "function_info",
         {"identifier": args.identifier, "blocks": bool(getattr(args, "blocks", False))},
         require_target=True,
-        text_renderer=lambda v: _render_function_info_text(v, verbose=verbose, demangle=demangle),
+        text_renderer=lambda v: _render_function_info_text(v, verbose=verbose, mangled=mangled),
         stem="function-info",
     )
 
@@ -701,6 +706,7 @@ def _function_cfg(args: argparse.Namespace) -> int:
                       "reported, not errors"),
              arg("--fn-pointer-scan", action="store_true",
                  help="Also scan stored function pointers for references"),
+             mangled_arg(),
          ],
          estimable=True)
 def _xrefs(args: argparse.Namespace) -> int:
@@ -752,7 +758,7 @@ def _xrefs(args: argparse.Namespace) -> int:
             "field_xrefs",
             field_params,
             require_target=True,
-            text_renderer=_render_field_xrefs_text,
+            text_renderer=lambda v: _render_field_xrefs_text(v, mangled=args.mangled),
             stem="field-xrefs",
         )
     if not identifier:
@@ -819,7 +825,7 @@ def _xrefs(args: argparse.Namespace) -> int:
         "xrefs",
         params,
         require_target=True,
-        text_renderer=lambda v: _render_xrefs_text(v, limit=limit),
+        text_renderer=lambda v: _render_xrefs_text(v, limit=limit, mangled=args.mangled),
         offset_hint_identifier=identifier,
         truncation_note=_xrefs_pipe_truncation_note,
         paged_spill=True,
@@ -857,6 +863,7 @@ def _load_within_identifiers(path: Path) -> list[str]:
                  help="Number of previous and next instructions to include around each callsite"),
              arg("--caller-static", action="store_true",
                  help="Prefer caller_static-first text output for return-address mapping workflows"),
+             mangled_arg(),
          ],
          mutex_groups=[
              mutex(False,
@@ -897,6 +904,8 @@ def _callsites(args: argparse.Namespace) -> int:
         text_renderer=lambda value: _render_callsites_text(
             value,
             prefer_caller_static=bool(args.caller_static),
+            mangled=bool(args.mangled),
+            scoped=bool(within_identifiers),
         ),
         paged_spill=True,
         stem="callsites",

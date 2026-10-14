@@ -846,15 +846,27 @@ def _render_capabilities_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _shown_name(entry: Any, *, mangled: bool = False, name_key: str = "name",
+                display_key: str = "display_name") -> Any:
+    """The function/symbol name a text row prints (#978): the demangled
+    ``display_name`` the bridge sends beside the raw name -- the spelling
+    ``decompile`` and ``class show`` print, so a name carries from one command to
+    the next -- unless ``--mangled`` asked for the raw one. Falls back to the raw
+    name when there is no display name (a C symbol, an older bridge)."""
+    if not isinstance(entry, dict):
+        return None
+    if not mangled and entry.get(display_key):
+        return entry[display_key]
+    return entry.get(name_key)
+
+
 @_discloses
-def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool = False) -> str:
+def _render_function_info_text(value: Any, verbose: bool = False, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
     function = _field_dict(value, "function")
-    header_name = function.get("name", "<unknown>")
-    if demangle and function.get("display_name"):
-        header_name = function["display_name"]
+    header_name = _shown_name(function, mangled=mangled) or "<unknown>"
     lines = [
         f"{_escape_control_chars(header_name)} @ {function.get('address', '<unknown>')}",
         str(value.get("prototype", "")),
@@ -1085,7 +1097,7 @@ def _render_type_info_text(value: Any) -> str:
 
 
 @_discloses
-def _render_field_xrefs_text(value: Any) -> str:
+def _render_field_xrefs_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
@@ -1106,8 +1118,10 @@ def _render_field_xrefs_text(value: Any) -> str:
     if code_refs:
         for ref in code_refs:
             details = [str(ref.get("address", "<unknown>"))]
-            if ref.get("function"):
-                details.append(str(ref["function"]))
+            function = _shown_name(ref, mangled=mangled, name_key="function",
+                                   display_key="function_display_name")
+            if function:
+                details.append(str(function))
             if ref.get("incoming_type"):
                 details.append(f"type={ref['incoming_type']}")
             if ref.get("disasm"):
@@ -1191,11 +1205,12 @@ def _render_comment_text(value: Any) -> str:
 
 
 @_discloses
-def _render_comment_list_text(value: Any) -> str:
+def _render_comment_list_text(value: Any, *, mangled: bool = False) -> str:
     # Paged envelope ({items,total,...}) -> render the page + the shared footer;
     # a bare list falls through to the per-item body below (back-compat) (#131).
     if _field_declared(value, "items"):
-        return _render_paged_list_text(value, "items", _render_comment_list_text)
+        return _render_paged_list_text(
+            value, "items", lambda items: _render_comment_list_text(items, mangled=mangled))
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -1206,7 +1221,8 @@ def _render_comment_list_text(value: Any) -> str:
             lines.append(_render_fallback_text(item))
             continue
         address = item.get("address", "<unknown>")
-        func = item.get("function") or "<global>"
+        func = _shown_name(item, mangled=mangled, name_key="function",
+                           display_key="function_display_name") or "<global>"
         comment = item.get("comment", "")
         # #643: mark function documentation comments so the two stores are
         # distinguishable in one listing -- same `[doc]` marker `comment get
@@ -1972,10 +1988,10 @@ def _render_spill_gc_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
-    """Render a BARE list of name/address rows (imports, function pages). With
-    ``demangle``, show the demangled ``display_name`` instead of the raw name so
-    a C++ listing is greppable/clusterable without c++filt (#196)."""
+def _render_name_address_rows(value: Any, *, mangled: bool = False) -> str:
+    """Render a BARE list of name/address rows (imports, exports, function pages).
+    A row's demangled ``display_name`` is shown unless ``mangled`` (#196/#978),
+    so a C++ listing is greppable/clusterable without c++filt."""
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -1987,9 +2003,8 @@ def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
             lines.append(_render_fallback_text(item))
             continue
         address = item.get("address", "<unknown>")
-        name = item.get("name") or item.get("function") or "<unknown>"
-        if demangle and item.get("display_name"):
-            name = item["display_name"]
+        name = (_shown_name(item, mangled=mangled) or item.get("function")
+                or "<unknown>")
         line = f"{address}  {_escape_control_chars(name)}"
         kind = item.get("kind")
         if kind and kind != "function":
@@ -2034,10 +2049,11 @@ def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
 
 
 @_discloses
-def _render_name_address_list_text(value: Any) -> str:
-    """Render imports: the paged {items, total, ...} envelope (with a footer),
-    or a bare list for back-compat / internal callers (#122)."""
-    body = _render_paged_list_text(value, "items", _render_name_address_rows)
+def _render_name_address_list_text(value: Any, *, mangled: bool = False) -> str:
+    """Render imports/exports: the paged {items, total, ...} envelope (with a
+    footer), or a bare list for back-compat / internal callers (#122)."""
+    body = _render_paged_list_text(
+        value, "items", lambda items: _render_name_address_rows(items, mangled=mangled))
     # Surface PIC self-references dropped from the survey so the exclusion isn't
     # silent (#202) -- through the ONE READER the three imports surfaces share,
     # so the decision cannot be made three ways. `isinstance(excluded, int)`
@@ -2074,6 +2090,12 @@ def _render_name_address_list_text(value: Any) -> str:
         note = f"// dynamic section: {dynamic_note}"
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     return body
+
+
+def _render_mangled_name_address_list_text(value: Any) -> str:
+    """``exports --mangled``: :func:`_render_name_address_list_text` printing the
+    raw symbol names instead of the demangled display names (#978)."""
+    return _render_name_address_list_text(value, mangled=True)
 
 
 @_discloses
@@ -2589,20 +2611,36 @@ def _render_function_count_text(value: Any, *, label: str = "Total functions",
     # trace of the 16th record is the JSON-only disclosure the text face was
     # missing. Absent keys add nothing.
     note = _duplicate_starts_note(value, total_key="count")
-    return line if not note else f"{line}\n{note}"
+    for extra in (note, _mangled_only_note(value)):
+        if extra:
+            line = f"{line}\n{extra}"
+    return line
+
+
+def _mangled_only_note(value: Any) -> str:
+    """`function search` matches the demangled display name by default (#978);
+    say how many functions only a raw (mangled) spelling would have matched, so
+    a mangled query that now finds nothing points at `--mangled` instead of
+    reading as absence."""
+    count = _nonnegative_count(value, "mangled_only_matches")
+    if not count:
+        return ""
+    noun = "function matches" if count == 1 else "functions match"
+    return (f"// {count} more {noun} only by mangled name; "
+            "pass --mangled to search raw symbol names")
 
 
 @_discloses
-def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
+def _render_function_list_text(value: Any, *, mangled: bool = False) -> str:
     """Render a paged function listing, with a footer stating the true total and
     remainder (#59). Prefers the canonical `items` key (every other list command
     uses it), falling back to the deprecated byte-identical `functions` alias for
-    an older bridge that emits only the latter (#223). ``demangle`` shows the
-    demangled display_name (#196). A quick-loaded (partial) listing is prefixed
-    with a warning so the page isn't mistaken for the whole binary (#437)."""
+    an older bridge that emits only the latter (#223). Rows show the demangled
+    display_name unless ``mangled`` (#978). A quick-loaded (partial) listing is
+    prefixed with a warning so the page isn't mistaken for the whole binary (#437)."""
     page_key = "items" if _field_declared(value, "items") else "functions"
     body = _quick_partial_prefix(value) + _render_paged_list_text(
-        value, page_key, lambda items: _render_name_address_rows(items, demangle=demangle))
+        value, page_key, lambda items: _render_name_address_rows(items, mangled=mangled))
     # The #757 collapse counts ride the ENVELOPE, not a row, so the note survives
     # `--offset`/`--limit` slicing and sits after the paging footer -- the same
     # placement `_render_name_address_list_text` gives `self_defined_excluded`
@@ -2613,11 +2651,13 @@ def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
     # of 15"); this note does not, so borrowing that rule rendered an empty
     # listing as a bare `// duplicate starts: ...` -- the alarm with no answer
     # beside it (#757 review).
-    note = _duplicate_starts_note(value)
-    return body if not note else f"{body}\n{note}"
+    for note in (_duplicate_starts_note(value), _mangled_only_note(value)):
+        if note:
+            body = f"{body}\n{note}"
+    return body
 
 
-def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
+def _group_refs_by_caller(refs: list[Any], *, mangled: bool = False) -> list[dict[str, Any]]:
     groups: dict[tuple, dict[str, Any]] = {}
     order: list[tuple] = []
     for ref in refs:
@@ -2637,7 +2677,7 @@ def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
         if caller or isinstance(ref.get("caller_function"), dict):
             key = ("fn", str(caller.get("address")), str(caller.get("name")))
             caller_address = caller.get("address")
-            caller_name = caller.get("name")
+            caller_name = _shown_name(caller, mangled=mangled)
         else:
             # No containing function: group by the ref's own resolved label
             # (symbol, else section) so refs under DIFFERENT symbols/sections do
@@ -2732,7 +2772,7 @@ def _render_xrefs_any_text(value: Any) -> str:
 
 
 @_discloses
-def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
+def _render_xrefs_text(value: Any, limit: int | None = None, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
@@ -2744,7 +2784,7 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
         import_label = f"import: {value.get('import_name', '<unknown>')}{scanned}"
 
     def _render_group(refs: list[Any], total: int, label: str) -> list[str]:
-        groups = _group_refs_by_caller(refs)
+        groups = _group_refs_by_caller(refs, mangled=mangled)
         if not groups:
             return [f"{label}:", "- none"]
         site_word = "site" if total == 1 else "sites"
@@ -3188,21 +3228,22 @@ def _render_function_evidence_text(value: Any) -> str:
             # HEURISTIC -- `read_evidence` stamps the diagnostic
             # `confidence: heuristic` / `provenance: abi-format-heuristic` -- but
             # that stamp reached JSON only. A text reader saw "expected >= N
-            # argument(s)" in the same authoritative voice the recovered facts on
-            # this card use, with nothing saying the count came from counting
+            # argument(s)" in the same firm voice the recovered facts on this
+            # card use, with nothing saying the count came from counting
             # conversion specifiers in a string literal. Print the marker the
             # payload already carries rather than inventing a second vocabulary.
             #
-            # Spelled `count: <confidence>` because #886 asks for a marker that
-            # reads as "this COUNT is a heuristic". That spelling is also why
-            # there is NO omission rule: `[count: authoritative]` STATES the
-            # count is authoritative, so printing a firm word does not hedge it,
-            # where a bare `[authoritative]` beside `UNDER-RECOVERED` would have
-            # hedged the whole finding. An earlier cut omitted the marker for the
-            # firm word instead, and that made a payload CALLING the count firm
-            # render byte-identically to one that said nothing about it -- the
-            # silent absence this marker exists to close, on a branch no producer
-            # in this repo can even reach.
+            # This marker is the VARIADIC DIAGNOSTIC's own `confidence`, not
+            # `argument_confidence` (#865 retired `authoritative` there). The
+            # bridge only ever stamps it `heuristic`, so the only marker it
+            # produces is `[count: heuristic]`. The renderer still prints
+            # whatever word a payload carries: a firm word (a hypothetical
+            # `[count: firm]`) states the count is firm and does not hedge it,
+            # where a bare `[firm]` beside `UNDER-RECOVERED` would hedge the
+            # whole finding -- so there is NO omission rule. An earlier cut
+            # omitted the marker for a firm word, and that made a payload
+            # CALLING the count firm render byte-identically to one that said
+            # nothing about it, on a branch no producer in this repo reaches.
             #
             # Read through `_text_value`, not an inline isinstance: a bare shape
             # test DROPS a present-but-unreadable confidence with nothing
@@ -3902,7 +3943,8 @@ def _render_init_arrays_text(value: Any) -> str:
 
 
 @_discloses
-def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) -> str:
+def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
+                           mangled: bool = False, scoped: bool = True) -> str:
     # callsites returns the {items,total,...} envelope (#131 / item 11). Keep the
     # paging metadata (#454: callsites now pages bridge-side like xrefs) so a
     # truncated high-fan-in survey states the true total + remainder in a footer.
@@ -3960,50 +4002,68 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         # A tailcall (tail-branch into the target) has no real return site, so flag
         # it -- its caller_static is the byte after the branch, not a return addr (#47).
         kind_tag = "  [tailcall]" if row.get("call_kind") == "tailcall" else ""
+        # #979: every label is the row's JSON key, so a filter written from the
+        # text (`.containing_function`, `.hlil_statement`) finds the field.
         primary = (
-            f"caller_static {caller_static} | call {call_addr}{kind_tag}"
+            f"caller_static {caller_static} | call_addr {call_addr}{kind_tag}"
             if prefer_caller_static
-            else f"call {call_addr} | caller_static {caller_static}{kind_tag}"
+            else f"call_addr {call_addr} | caller_static {caller_static}{kind_tag}"
         )
+        # #978: the demangled display name, the spelling decompile prints.
+        containing_name = _shown_name(containing, mangled=mangled) or "<unknown>"
+        callee_name = _shown_name(callee, mangled=mangled) or "<unknown>"
         lines = [
             primary,
             (
-                f"within: {containing.get('name', '<unknown>')} @ "
+                f"containing_function: {containing_name} @ "
                 f"{containing.get('address', '<unknown>')}"
             ),
-            f"callee: {callee.get('name', '<unknown>')} @ {callee.get('address', '<unknown>')}",
+            f"callee: {callee_name} @ {callee.get('address', '<unknown>')}",
         ]
         if call_index is not None:
-            lines.append(f"call-index: {call_index}")
-        if row.get("within_query"):
-            lines.append(f"within-query: {row['within_query']}")
+            lines.append(f"call_index: {call_index}")
+        if scoped and row.get("within_query"):
+            # Verbatim, like every other labelled value: the text must carry
+            # the JSON value a filter written from it will compare (#979).
+            # Unscoped (no --within), the bridge fills it with the caller's raw
+            # name, which the containing_function line already names, so the
+            # line is left out rather than reintroducing a mangled name (#978).
+            lines.append(f"within_query: {row['within_query']}")
         if row.get("hlil_statement"):
-            lines.append(f"hlil: {row['hlil_statement']}")
+            lines.append(f"hlil_statement: {row['hlil_statement']}")
         elif row.get("hlil_statement_reason"):
             # #557: say WHY the HLIL statement is null instead of silently omitting it.
-            lines.append(f"hlil: null ({row['hlil_statement_reason']})")
+            lines.append(f"hlil_statement: null ({row['hlil_statement_reason']})")
         if row.get("pre_branch_condition"):
-            lines.append(f"pre-branch: {row['pre_branch_condition']}")
+            lines.append(f"pre_branch_condition: {row['pre_branch_condition']}")
         variadic = _field_dict(row, "callee_variadic")
         if variadic.get("is_variadic"):
             # #558: steer to the argument-recovery views for an imported variadic callee.
+            # #978: name the caller as the line above does; when that shown name
+            # is not the raw symbol (a demangled one, which overloads can share)
+            # the runnable command uses the caller's address, which is unique.
+            target = (containing_name if containing_name == containing.get("name")
+                      else containing.get("address", containing_name))
             lines.append(
-                f"variadic-callee: {variadic.get('name', '?')} — HLIL may show only fixed "
-                f"args; run `bn evidence function {containing.get('name', '<caller>')}` "
-                f"or `bn disasm {containing.get('name', '<caller>')} --linear`"
+                f"callee_variadic: {variadic.get('name', '?')} — HLIL may show only fixed "
+                f"args in {containing_name}; run `bn evidence function {target}` "
+                f"or `bn disasm {target} --linear`"
             )
 
         call_instruction = _field_dict(row, "call_instruction")
         previous = _field_list(row, "previous_instructions")
         next_instructions = _field_list(row, "next_instructions")
-        lines.append("context:")
+        # The context block spans three JSON keys; name them once so the `>`
+        # row is findable as `call_instruction` (#979).
+        lines.append("context: previous_instructions, > call_instruction, next_instructions")
         for item in previous:
             if isinstance(item, dict):
                 lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
         if row.get("disasm_context_reason"):
             # #816: the call site is real (its identity fields are usable) but the
             # disassembly sweep produced no entry at its address, so the context is
-            # null by evidence, not by omission -- say WHY, mirroring `hlil: null (...)`.
+            # null by evidence, not by omission -- say WHY, mirroring
+            # `hlil_statement: null (...)`.
             lines.append(f"> unavailable ({row['disasm_context_reason']})")
         else:
             lines.append(
@@ -4263,8 +4323,8 @@ def _leaf_group_key(leaf: Any) -> tuple:
     if not isinstance(leaf, dict):
         # Group malformed leaves by (type, repr): a type key can't collide with a
         # real `kind` string, and keying on the repr too means two DISTINCT
-        # broken leaves each render instead of one hiding behind an `(xN)` count
-        # of rows that only look alike because both are broken.
+        # broken leaves each render instead of one hiding behind a `[N leaves]`
+        # count of rows that only look alike because both are broken.
         return (type(leaf), repr(leaf))
     kind = leaf.get("kind")
     kind = kind if isinstance(kind, str) else str(kind)
@@ -4303,7 +4363,8 @@ def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12) -> list[str]:
         g = groups[gk]
         line = _render_leaf_line(g["rep"])
         if g["count"] > 1:
-            line += f"  (x{g['count']})"
+            # Spelled out, never `x{count}`: on AArch64 `x3` is a register (#959).
+            line += f"  [{g['count']} leaves]"
         out.append(line)
     if ngroups > top_n:
         hidden = order[top_n:]
@@ -4596,6 +4657,16 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                     lines.append(f"  {f!r}")
                     continue
                 lines.append(_render_flow_line(f))
+                # #980: a finding whose class differs from its catalog entry says
+                # so, and why, on the compact view -- `taint models` lists the
+                # call as `[overflow_len] memcpy`, and two names for one sink with
+                # no explanation sent the reader to the source to find out.
+                _sink_d = _field_dict(f, "sink")
+                _cat = _text_value(_sink_d, "catalog_class")
+                if _cat:
+                    _why = _text_value(_sink_d, "relabel")
+                    lines.append(f"      {_cat} → {_sink_d.get('class') or '?'}"
+                                 + (f": {_why}" if _why else ""))
                 if full:
                     _detail = _field_dict(f, "sink").get('detail') or ''
                     if _detail:
@@ -4624,11 +4695,11 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
             m = _field_dict(sl, "metrics")
             sig = _field_dict(sl, "signature").get("rendered", "")
             n = sl.get("reached_via_call_sites", 1)
-            xn = (f"  (x{n} callsites)"
+            xn = (f"  (reached via {n} callsites)"
                   if isinstance(n, int) and not isinstance(n, bool) and n > 1 else "")
             unresolved = "y" if m.get("traverses_unresolved") else "n"
             lines.append("")
-            # Compact one line per slice by default; (xN) surfaces the engine's existing
+            # Compact one line per slice by default; "reached via N callsites" surfaces the engine's existing
             # per-(seed,sink,origin) call-site count. --full shows origin/crosses/steps.
             lines.append(
                 f"  [{sink.get('class') or sink.get('kind') or '?'}] "
@@ -4739,7 +4810,7 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
 
 
 @_discloses
-def _render_taint_models_text(value: Any) -> str:
+def _render_taint_models_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     lines: list[str] = []
@@ -4757,7 +4828,11 @@ def _render_taint_models_text(value: Any) -> str:
                 lines.append(f"  {s!r}")
                 continue
             p = " [present]" if s.get("present") else (" [absent]" if "present" in s else "")
-            lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}")
+            # #958: `--callsites` expands sources too; the JSON always carried
+            # them and the text dropped them, so the flag read as ignored.
+            lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}"
+                         f"{_callsite_count_note(s)}")
+            lines.extend(_render_callsite_rows(s, indent="    ", mangled=mangled))
     sbc = _field_dict(value, "sinks_by_class")
     if sbc:
         lines.append("")
@@ -4780,7 +4855,7 @@ def _render_taint_models_text(value: Any) -> str:
                 if not isinstance(e, dict):
                     lines.append(f"    {e!r}")
                     continue
-                lines.extend(_render_taint_sink_entry(e))
+                lines.extend(_render_taint_sink_entry(e, mangled=mangled))
     props = _field_list(value, "propagators")
     if props:
         lines.append("")
@@ -4798,26 +4873,49 @@ def _render_taint_models_text(value: Any) -> str:
     return "\n".join(lines) if lines else _empty_result("models matching the filter")
 
 
-def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
-    """One present/catalog sink entry: the model line plus, under --callsites, its
-    enriched callsite rows (address + containing function + non-audit kind)."""
-    p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
+def _callsite_count_note(e: dict[str, Any]) -> str:
+    """` (3 callsites)` / ` (4 callsites, 3 application)`, or "" without --callsites."""
     count = e.get("callsite_count")
-    if count is not None:
-        audit = e.get("audit_callsite_count")
-        if isinstance(audit, int) and audit != count:
-            cs = f" ({count} callsites, {audit} application)"
-        else:
-            cs = f" ({count} callsites)"
-    else:
-        cs = ""
-    desc = f"  -- {e['model_description']}" if e.get("model_description") else ""
-    out = [f"    {e.get('symbol', '<unknown>')} (arg {e.get('tainted_args')}){p}{cs}{desc}"]
+    if count is None:
+        return ""
+    noun = "callsite" if count == 1 else "callsites"
+    audit = e.get("audit_callsite_count")
+    if isinstance(audit, int) and audit != count:
+        return f" ({count} {noun}, {audit} application)"
+    return f" ({count} {noun})"
+
+
+def _sink_arg_spec(e: dict[str, Any]) -> str:
+    """Which arguments arm a catalog sink: `arg [2]`, `len arg 2 into arg 1`
+    (the read/recv bounded-write pair, #958 -- previously `arg []`), both for an
+    entry that arms a format AND a length (snprintf), `unconditional` for gets."""
+    parts = []
+    targs = e.get("tainted_args")
+    if targs:
+        parts.append(f"arg {targs}")
+    la = e.get("len_arg")
+    if la is not None:
+        ba = e.get("buf_arg")
+        parts.append(f"len arg {la}" + (f" into arg {ba}" if ba is not None else ""))
+    return ", ".join(parts) if parts else "unconditional"
+
+
+_HIDDEN_KIND_LABELS = {"self_stub": "self stub",
+                       "inline_builtin": "constant-argument inline builtin"}
+
+
+def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = False) -> list[str]:
+    """The enriched callsite rows of a present model entry (address + containing
+    function + non-audit kind + one line of disassembly), then a count of the
+    non-audit rows the bridge left out (#958: `--all-sites` shows them)."""
+    out = []
     for c in _field_list(e, "callsites"):
         if not isinstance(c, dict):
-            out.append(f"      {c!r}")
+            out.append(f"{indent}{c!r}")
             continue
-        fn = c.get("function") or "?"
+        # #978: the containing function by its demangled name unless --mangled.
+        fn = _shown_name(c, mangled=mangled, name_key="function",
+                         display_key="function_display_name") or "?"
         kind = c.get("kind")
         tag = f" [{kind}]" if kind and kind != "app_caller" else ""
         # #794: append the one-line disassembly the bridge now carries per row.
@@ -4826,7 +4924,26 @@ def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
         # queue. Omitted when empty so a view that cannot disassemble (or a
         # bridge older than this CLI) renders exactly the previous row.
         dis = str(c.get("disasm") or "").strip()
-        out.append(f"      {c.get('address')}  {fn}{tag}" + (f"  {dis}" if dis else ""))
+        out.append(f"{indent}{c.get('address')}  {fn}{tag}" + (f"  {dis}" if dis else ""))
+    hidden = _field_dict(e, "hidden_callsites")
+    shown = [(k, n) for k, n in hidden.items()
+             if isinstance(n, int) and not isinstance(n, bool) and n > 0]
+    if shown:
+        total = sum(n for _, n in shown)
+        what = ", ".join(f"{n} {_HIDDEN_KIND_LABELS.get(k, k)}" for k, n in shown)
+        out.append(f"{indent}+{total} non-audit row(s) hidden ({what}); --all-sites to show")
+    return out
+
+
+def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False) -> list[str]:
+    """One present/catalog sink entry: the model line plus, under --callsites, its
+    enriched callsite rows (address + containing function + non-audit kind)."""
+    p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
+    desc = f"  -- {e['model_description']}" if e.get("model_description") else ""
+    head = (f"    {e.get('symbol', '<unknown>')} ({_sink_arg_spec(e)}){p}"
+            f"{_callsite_count_note(e)}{desc}")
+    out = [head]
+    out.extend(_render_callsite_rows(e, indent="      ", mangled=mangled))
     return out
 
 
@@ -4960,8 +5077,9 @@ def _render_imports_summary_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_strings_rows(value: Any) -> str:
-    """Render a BARE list of string rows."""
+def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
+    """Render a BARE list of string rows. ``mangled`` names `--with-xrefs`
+    functions by their raw names instead of display names (#978)."""
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -4998,16 +5116,29 @@ def _render_strings_rows(value: Any) -> str:
         # #968 --with-xrefs: the functions that reference this string, capped
         # by the bridge; the stated total names how many the cap left out.
         if _field_declared(item, "xref_functions"):
-            row += _string_xref_suffix(item)
+            row += _string_xref_suffix(item, mangled=mangled)
         lines.append(row)
     return "\n".join(lines)
 
 
-def _string_xref_suffix(item: dict[str, Any]) -> str:
+def _string_xref_suffix(item: dict[str, Any], *, mangled: bool = False) -> str:
     """The `[xrefs: ...]` tail of one `strings --with-xrefs` row (#968)."""
     functions = [fn for fn in _field_list(item, "xref_functions") if isinstance(fn, dict)]
-    names = [_escape_control_chars(_text_value(fn, "name") or _text_value(fn, "address") or "?")
-             for fn in functions]
+    # #978: the demangled display name, as every other function-name surface,
+    # unless --mangled. Overloads share a display name, so a name that repeats
+    # in this list gets its address -- copying it back must name ONE function.
+    # Every read goes through the text choke point, so a non-text name is
+    # disclosed rather than silently dropped.
+    shown = [((None if mangled else _text_value(fn, "display_name"))
+              or _text_value(fn, "name")) for fn in functions]
+    repeated = {name for name in shown if name and shown.count(name) > 1}
+    names = []
+    for fn, name in zip(functions, shown):
+        if not name:
+            names.append(_escape_control_chars(_text_value(fn, "address") or "?"))
+            continue
+        label = f"{name} @ {fn.get('address', '?')}" if name in repeated else name
+        names.append(_escape_control_chars(label))
     total = _nonnegative_count(item, "xref_function_count")
     text = ", ".join(names) if names else "0 functions"
     if total > len(names):
@@ -5023,7 +5154,7 @@ def _string_xref_suffix(item: dict[str, Any]) -> str:
     return f"  [xrefs: {text}]"
 
 
-def _strings_listing_text(value: Any, *, narrowed: bool) -> str:
+def _strings_listing_text(value: Any, *, narrowed: bool, mangled: bool = False) -> str:
     """The body of the two `strings` listing faces below: the paged {items,
     total, ...} envelope (with a footer), or a bare list for back-compat /
     internal callers (#122). *narrowed* is whether the caller's own filters
@@ -5031,7 +5162,8 @@ def _strings_listing_text(value: Any, *, narrowed: bool) -> str:
     noise tip then states where the matches sit instead of recommending a
     flag the caller is already using. The faces are the `@_discloses`
     boundaries; this records through them."""
-    body = _render_paged_list_text(value, "items", _render_strings_rows)
+    body = _render_paged_list_text(
+        value, "items", lambda items: _render_strings_rows(items, mangled=mangled))
     # #795: state how many strings the ACTIVE filter chain dropped, so the
     # denominator does not need a second unfiltered invocation (`strings --count`
     # reported 1359 where `--probable-format-strings --count` reported 30, and
@@ -5097,6 +5229,20 @@ def _render_strings_narrowed_text(value: Any) -> str:
     shaped: the noise note states where the matches sit instead of
     recommending a flag in use (M-12)."""
     return _strings_listing_text(value, narrowed=True)
+
+
+@_discloses
+def _render_strings_mangled_text(value: Any) -> str:
+    """``strings --mangled``: :func:`_render_strings_text` naming `--with-xrefs`
+    functions by their raw (mangled) names (#978)."""
+    return _strings_listing_text(value, narrowed=False, mangled=True)
+
+
+@_discloses
+def _render_strings_narrowed_mangled_text(value: Any) -> str:
+    """``strings --mangled`` with the caller's own filters: the narrowed face
+    naming `--with-xrefs` functions by their raw names (#978)."""
+    return _strings_listing_text(value, narrowed=True, mangled=True)
 
 
 def _render_sections_rows(value: Any) -> str:
@@ -6903,6 +7049,10 @@ def _render_trace_text(value: Any) -> str:
             if (reason in ("interprocedural_out_param_not_followed", "out_param_not_followed")
                     and step.get("out_param_callee")):
                 line += f" (via {step['out_param_callee']})"
+            if reason == "function_parameter":
+                slot = _trace_param_slot(step)
+                if slot:
+                    line += f" ({slot})"
             if reason == "field_load":
                 meta = " ".join(
                     f"{k}={step[k]}" for k in ("base", "offset", "width") if step.get(k) is not None)
@@ -6934,6 +7084,22 @@ def _render_trace_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _trace_param_slot(step: Any) -> str:
+    """`param 3, x3` for a function-parameter terminal (#959): the 0-based
+    parameter position and the register it arrives in, or "" when the bridge
+    sent neither. A malformed index renders nothing rather than a wrong slot."""
+    if not isinstance(step, dict):
+        return ""
+    idx = step.get("param_index")
+    parts = []
+    if isinstance(idx, int) and not isinstance(idx, bool) and idx >= 0:
+        parts.append(f"param {idx}")
+    reg = _text_value(step, "param_register")
+    if reg:
+        parts.append(reg)
+    return ", ".join(parts)
+
+
 def _render_trace_frontiers(frontiers: Any) -> list[str]:
     """Concise top-level roll-up of where the slice stopped (#552): one line per
     reason group with its count and a couple of examples. A factual summary of
@@ -6951,17 +7117,32 @@ def _render_trace_frontiers(frontiers: Any) -> list[str]:
             reason = str(reason)
         label = _TRACE_REASON_LABELS.get(reason, reason.replace("_", " "))
         # Name the resolved callee(s) at a boundary so the roll-up reads
-        # `call boundary x3 (strlen, memcpy)` rather than a bare count.
-        callees = []
+        # `call boundary [3 steps] (strlen, memcpy)` rather than a bare count,
+        # and the parameter(s) a slice ended at with their slot (#959).
+        named = []
         for ex in (_field_list(g, "examples")):
             if not isinstance(ex, dict):
                 continue
             nm = ex.get("callee") or ex.get("out_param_callee")
-            if nm and nm not in callees:
-                callees.append(str(nm))
-        line = f"    {label}  x{g.get('count', 0)}"
-        if callees:
-            line += f" ({', '.join(callees)})"
+            if not nm and reason == "function_parameter":
+                slot = _trace_param_slot(ex)
+                var = str(ex.get("ssa_label") or "").split("#", 1)[0]
+                nm = f"{var} ({slot})" if var and slot else (var or slot)
+            if nm and nm not in named:
+                named.append(str(nm))
+        # #959: the count is bracketed and spelled out. `x{count}` collided with
+        # AArch64 register names -- `function parameter  x1` read as "arrives in
+        # x1" while the slice actually ended at the fourth parameter (x3).
+        count = g.get("count", 0)
+        noun = "step" if count == 1 else "steps"
+        line = f"    {label}  [{count} {noun}]"
+        if named and reason == "function_parameter":
+            # A parameter entry has commas and parentheses of its own
+            # (`arg1 (param 0, x0)`), so the list is introduced by `: ` and its
+            # entries separated by `; ` to stay parseable.
+            line += ": " + "; ".join(named)
+        elif named:
+            line += f" ({', '.join(named)})"
         out.append(line)
     return out
 

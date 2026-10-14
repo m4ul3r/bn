@@ -71,6 +71,19 @@ def _display_name(func) -> str:
     return str(getattr(func, "name", ""))
 
 
+def _function_identity(func) -> dict[str, str]:
+    """``{name, display_name, address}`` for a function a row points AT (an xref's
+    caller, a callsite's container or callee, a comment's owner). ``name`` stays
+    the raw ``fn.name`` (mangled for C++) and ``display_name`` is
+    :func:`_display_name`, so every text renderer can show one demangled spelling
+    while JSON keeps both (#978)."""
+    return {
+        "name": str(func.name),
+        "display_name": _display_name(func),
+        "address": hex(int(func.start)),
+    }
+
+
 def _unimplemented_instructions(func, *, cap: int = 64) -> dict[str, Any]:
     """Aggregate signal for instructions Binary Ninja's lifter could not model.
 
@@ -543,6 +556,54 @@ def _function_is_variadic(func) -> bool:
         return bool(value)
     except Exception:
         return False
+
+
+def _variadic_determination(callee_fn) -> bool | None:
+    """Did BN DETERMINE whether this callee is variadic, and what did it decide?
+
+    ``True``/``False`` is a determination; ``None`` means BN never made one, and
+    the two must not be collapsed. BN states ``has_variable_arguments`` as a
+    ``BoolWithConfidence`` -- a value AND whether analysis ever settled it -- and
+    the object is truthy by its VALUE, so ``bool(flag)`` silently reads
+    "never determined" as a firm "not variadic". Measured cost of reading it that
+    way: 72 of 1242 call rows on an unmutated image demoted, every one of them a
+    printf-style helper BN recovered as ``T(fixed..., char argN @ rax)`` without
+    marking it variadic. Its prologue spills the whole register save area, and
+    those spills are honest version-0 reads -- def-use soundness cannot separate
+    them from consumed arguments, only the varargs flag can, and a flag nobody
+    determined separates nothing.
+
+    So the answer is only a determination when the flag is both PRESENT and
+    DETERMINED. Absent type, absent flag, zero confidence, or a confidence that
+    is not a number at all -> ``None``. A flag carrying no ``confidence``
+    attribute is not a ``BoolWithConfidence`` but a stated bool (a declared
+    signature, a test fake), and a stated value is a determination.
+
+    Shared by the call-evidence arity witness (#882) and the taint/trace
+    varargs diagnostics (#948). ``is_variadic`` in ``read_call_evidence`` stays
+    the two-state :func:`_function_is_variadic`: for a diagnostic that only
+    reports what the prototype SAYS (#558) and for `arity_mismatch` (#704), "not
+    marked variadic" is the right reading. A caller that contradicts or
+    re-diagnoses the prototype may not guess.
+    """
+    func_type = getattr(callee_fn, "type", None)
+    if func_type is None:
+        return None
+    flag = getattr(func_type, "has_variable_arguments", None)
+    if flag is None:
+        return None
+    confidence = getattr(flag, "confidence", None)
+    if confidence is not None:
+        try:
+            determined = int(confidence) > 0
+        except (TypeError, ValueError):
+            return None
+        if not determined:
+            return None
+    try:
+        return bool(getattr(flag, "value", flag))
+    except Exception:  # noqa: BLE001 - an unreadable flag determined nothing
+        return None
 
 
 def _extract_format_literal(text: str) -> str | None:

@@ -12,6 +12,7 @@ from ..cli import (
     arg,
     command,
     decode_json_input,
+    mangled_arg,
     read_text_input,
 )
 from ..formatters import (
@@ -308,7 +309,11 @@ def _taint_backward(args: argparse.Namespace) -> int:
              arg("--present", action="store_true", default=False,
                  help="With a target: show only models present in the binary (errors without a target)"),
              arg("--callsites", action="store_true", default=False,
-                 help="With --present: expand each present sink's callsite addresses"),
+                 help="With --present: expand each present model's call sites (application callers only)"),
+             arg("--all-sites", action="store_true", default=False,
+                 help="With --callsites: also list the self-stub and constant-argument "
+                      "inline-builtin rows that are otherwise only counted (implies --callsites)"),
+             mangled_arg(),
              _models_arg(),
          ],
          estimable=True)
@@ -320,8 +325,10 @@ def _taint_models(args: argparse.Namespace) -> int:
         params["class"] = args.sink_class
     if args.present:
         params["present"] = True
-    if args.callsites:
+    if args.callsites or args.all_sites:
         params["callsites"] = True
+    if args.all_sites:
+        params["all_sites"] = True
     # #615 review F7: `bn taint models` is the documented "confirm an overlay
     # landed" check -- it must honor --models/$BN_TAINT_MODELS identically to
     # `taint forward`/`taint backward`, not silently reflect only the bridge's
@@ -331,12 +338,12 @@ def _taint_models(args: argparse.Namespace) -> int:
     # target for them -- which lets `_resolve_target` auto-select the single open
     # target like every other read command (no spurious "need a target" when one is
     # open and only --instance is given). Catalog-only mode needs no target.
-    needs_target = bool(args.present or args.callsites)
+    needs_target = bool(args.present or args.callsites or args.all_sites)
     return _call(
         args,
         "taint_models",
         params,
         require_target=needs_target,
-        text_renderer=_render_taint_models_text,
+        text_renderer=lambda value: _render_taint_models_text(value, mangled=args.mangled),
         stem="taint-models",
     )

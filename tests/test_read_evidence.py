@@ -344,8 +344,10 @@ def test_callsites_keeps_call_absent_from_disasm_index_with_a_reason(monkeypatch
     assert [row["call_addr"] for row in result["items"]] == ["0x4124a0", "0x4124a6"]
     kept = result["items"][1]
     # The identity of the site stays usable even though its context is missing.
-    assert kept["callee"] == {"name": "target_fn", "address": "0x461746"}
-    assert kept["containing_function"] == {"name": "caller_fn", "address": "0x412470"}
+    assert kept["callee"] == {"name": "target_fn", "display_name": "target_fn",
+                              "address": "0x461746"}
+    assert kept["containing_function"] == {"name": "caller_fn", "display_name": "caller_fn",
+                                           "address": "0x412470"}
     assert kept["call_kind"] == "call"
     assert kept["instruction_length"] == 5
     assert kept["caller_static"] == "0x4124ab"

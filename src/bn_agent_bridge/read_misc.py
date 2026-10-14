@@ -33,6 +33,7 @@ try:
 except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
     bn = None  # type: ignore[assignment]
 
+from . import il_format
 from . import read_xrefs
 from .bridge_state import _quick_loaded_views
 from ._shared import OperationFailure, _parse_address, _validate_count
@@ -542,12 +543,12 @@ def _string_xref_functions(bv, address: int) -> dict[str, Any]:
     functions; data refs are counted, not resolved, because a pointer table
     holding the string is not a function that uses it."""
     code_refs = read_xrefs._genuine_code_refs(bv, address)
-    functions: dict[int, str] = {}
+    functions: dict[int, Any] = {}
     for ref in code_refs:
         fn = getattr(ref, "function", None)
         if fn is None:
             continue
-        functions.setdefault(int(fn.start), str(fn.name))
+        functions.setdefault(int(fn.start), fn)
     entry: dict[str, Any] = {"code_ref_count": len(code_refs)}
     try:
         entry["data_ref_count"] = len(read_xrefs._data_refs_once(bv, address))
@@ -558,9 +559,11 @@ def _string_xref_functions(bv, address: int) -> dict[str, Any]:
         entry["data_ref_note"] = f"data refs could not be read: {type(exc).__name__}: {exc}"
     ordered = sorted(functions.items())
     entry["xref_function_count"] = len(ordered)
+    # #978: raw `name` plus the demangled `display_name` the text shows, read
+    # for the capped rows only.
     entry["xref_functions"] = [
-        {"address": hex(start), "name": name}
-        for start, name in ordered[:_STRING_XREF_FUNCTION_CAP]
+        il_format._function_identity(fn)
+        for _start, fn in ordered[:_STRING_XREF_FUNCTION_CAP]
     ]
     return entry
 

@@ -856,6 +856,68 @@ def test_forward_modeled_sink_arg_out_of_range_no_leaf_when_untainted(models, mo
     assert not any(l["kind"] == "arg_under_recovered" for l in result["leaves"]), result["leaves"]
 
 
+def _variadic_logger_program(variadic):
+    """``handle(user_text) { app_log("%s", user_text); }`` with a LOCAL
+    ``void app_log(const char *fmt, ...)``: one named formal, two call args
+    (#948). `variadic` is the varargs flag BN states for app_log's type."""
+    text = FVar("user_text", ident=1); text0 = FSSA(text, 0)
+    app_log = FFunc("app_log", 0x800, FSSAFunc([FInstr(0, 0x800, "MLIL_RET", "return")]),
+                    params=[FVar("fmt", ident=2)])
+    app_log.type = type("T", (), {"has_variable_arguments": variadic})()
+    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "app_log(\"%s\", user_text#0)", reads=[text0],
+                  dest=FExpr("MLIL_CONST_PTR", "0x800", constant=0x800),
+                  params=[FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+                          FExpr("MLIL_VAR_SSA", "user_text#0", reads=[text0])])
+    handler = FFunc("handle", 0x10, FSSAFunc([call]), params=[text])
+    return handler, FBV({}, funcs={0x800: app_log}), app_log, call
+
+
+def test_taint_into_a_correct_varargs_tail_is_not_a_prototype_defect_948(models):
+    handler, bv, _, _ = _variadic_logger_program(True)
+    result = te.TaintEngine(bv, models).forward(handler, [te.parse_locator("param:0")])
+    leaf = next(l for l in result["leaves"] if l["kind"] == "unmodeled_callee")
+    assert leaf["cause"] == "varargs_not_followed" and leaf["callee_variadic"] is True
+    assert "proto set" not in leaf["note"]
+    assert "already variadic" in leaf["note"] and "1 named" in leaf["note"]
+    diag = result["diagnostics"]
+    # Still a frontier: an untracked varargs flow is never an all-clear.
+    assert diag["safe_to_report_all_clear"] is False
+    assert "proto set" not in diag["next_action"]
+    assert "do not redeclare" in diag["next_action"]
+
+
+@pytest.mark.parametrize("variadic", [False, None])
+def test_nonvariadic_or_undetermined_callee_keeps_prototype_advice_948(models, variadic):
+    # A determined-nonvariadic callee taking more args than it declares IS the
+    # type discrepancy prototype advice is for; an undetermined flag is not
+    # evidence either way, so the advice stays.
+    handler, bv, _, _ = _variadic_logger_program(variadic)
+    result = te.TaintEngine(bv, models).forward(handler, [te.parse_locator("param:0")])
+    leaf = next(l for l in result["leaves"] if l["kind"] == "unmodeled_callee")
+    assert "cause" not in leaf
+    assert "proto set" in leaf["note"]
+    assert "proto set" in result["diagnostics"]["next_action"]
+
+
+def test_partial_drop_into_a_varargs_tail_does_not_ask_to_declare_varargs_948(models, monkeypatch):
+    # The stack-passed branch used to say "declare it variadic" -- to a callee
+    # that already is.
+    _, bv, app_log, call = _variadic_logger_program(True)
+    app_log.calling_convention = type("CC", (), {"int_arg_regs": ["x0", "x1"]})()
+    engine = te.TaintEngine(bv, models)
+    monkeypatch.setattr(engine, "_reg_reads_as_input", lambda fn, reg: True)
+    leaf = engine._arg_under_recovered_leaf(call, app_log, [1, 3], 1)
+    assert leaf["dropped_args"] == [1, 3] and leaf["stack_dropped_args"] == [3]
+    assert leaf["cause"] == "varargs_not_followed"
+    assert "proto set" not in leaf["note"] and "declare it variadic" not in leaf["note"]
+    # Undetermined: the established advice is unchanged.
+    app_log.type = type("T", (), {"has_variable_arguments": type(
+        "B", (), {"value": False, "confidence": 0})()})()
+    leaf = engine._arg_under_recovered_leaf(call, app_log, [1, 3], 1)
+    assert leaf["cause"] == "signature_under_recovered" and leaf["callee_variadic"] is None
+    assert "declare it variadic" in leaf["note"]
+
+
 def test_forward_modeled_sink_full_arity_untainted_stays_all_clear(models):
     # Negative control (a): FULL recovered arity, untainted length -> the
     # out-of-range branch never fires, no leaf, all-clear True as today.
@@ -4948,6 +5010,197 @@ def test_forward_downgrades_overflow_when_dest_alloc_matches_length(models):
     assert len(memcpy_sinks) == 1
     assert memcpy_sinks[0]["class"] == "bounded_len"          # downgraded
     assert "provably bounded" in memcpy_sinks[0]["detail"]
+
+
+def _dup_with_source(src_param, *, extra_instrs=(), names=None, bv_cls=FBV):
+    """``dst = malloc(n); memcpy(dst, <src>, n)`` for a tainted ``n`` (#980):
+    the destination is sized by the copy length, so only the SOURCE decides
+    whether the copy is safe."""
+    n = FVar("n"); n0 = FSSA(n, 0)
+    dst1 = FSSA(FVar("dst"), 1)
+    instrs = list(extra_instrs) + [
+        FInstr(len(extra_instrs), 0x10, "MLIL_CALL_SSA", "dst#1 = malloc(n#0)",
+               reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+        FInstr(len(extra_instrs) + 1, 0x14, "MLIL_CALL_SSA", "memcpy(dst#1, src, n#0)",
+               reads=[dst1, n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]), src_param,
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+    ]
+    func = FFunc("dup_entry", 0x10, FSSAFunc(instrs), params=[n])
+    bv = bv_cls({0x2000: "malloc", 0x2010: "memcpy", **(names or {})})
+    return func, bv
+
+
+def _memcpy_sink(models, func, bv):
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(sinks) == 1, result["reached_sinks"]
+    return sinks[0]
+
+
+def test_bounded_copy_from_a_fixed_stack_buffer_is_an_overread_980(models):
+    # `char table[0x40]; dst = malloc(n); memcpy(dst, table, n)`: the write fits,
+    # the READ of a 64-byte local with an attacker-controlled n does not.
+    table = FVar("table", typ="char[0x40]")
+    sink = _memcpy_sink(models, *_dup_with_source(FExpr("MLIL_ADDRESS_OF", "&table", src=table)))
+    assert sink["class"] == "overread_len"
+    assert sink["catalog_class"] == "overflow_len"
+    assert sink["src_capacity"] == 0x40
+    assert "over-read" in sink["detail"]
+    assert sink["relabel"].startswith("destination sized by the copy length; source is a 64-byte")
+
+
+def test_bounded_copy_from_a_typed_global_is_an_overread_980(models):
+    class _BV(FBV):
+        def get_data_var_at(self, addr):
+            if addr == 0x3000:
+                return type("DV", (), {"type": type("T", (), {
+                    "width": 64, "__str__": lambda s: "char const[0x40]"})()})()
+            return None
+
+    sink = _memcpy_sink(models, *_dup_with_source(
+        FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000), bv_cls=_BV))
+    assert sink["class"] == "overread_len"
+    assert sink["src_capacity"] == 64
+    assert "0x3000" in sink["src_capacity_source"]
+
+
+def test_bounded_copy_from_an_unsized_source_says_it_was_not_checked_980(models):
+    # A parameter pointer cannot be sized here: still bounded_len for the write,
+    # but the finding must not read as "safe" -- it says the source is unchecked.
+    src0 = FSSA(FVar("src"), 0)
+    sink = _memcpy_sink(models, *_dup_with_source(FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])))
+    assert sink["class"] == "bounded_len"
+    assert sink["catalog_class"] == "overflow_len"
+    assert sink["src_capacity"] is None
+    assert "source capacity not checked" in sink["relabel"]
+
+
+class _LiteralBV(FBV):
+    """A view whose 0x3000 is a 6-byte string literal BN typed `char const[0x6]`."""
+    def get_data_var_at(self, addr):
+        if addr == 0x3000:
+            return type("DV", (), {"type": type("T", (), {
+                "width": 6, "__str__": lambda s: "char const[0x6]"})()})()
+        return None
+
+
+@pytest.mark.parametrize("callee,order", [
+    ("strncpy", ("dst", "lit", "n")),       # strncpy(p, "guest", n): reads to the NUL
+    ("strncat", ("dst", "lit", "n")),
+    ("snprintf", ("dst", "n", "lit")),      # snprintf(p, n, "id=%d"): lit is the FORMAT
+])
+def test_nul_terminated_and_format_readers_get_no_source_check_980(models, callee, order):
+    # #980 review: `p = malloc(n); snprintf(p, n, "id=%d", id)` is the canonical
+    # safe idiom. None of these reads n bytes from the literal, so the base's
+    # bounded_len must stand -- the literal's 6-byte size says nothing.
+    n = FVar("n"); n0 = FSSA(n, 0); dst1 = FSSA(FVar("dst"), 1)
+    arg = {"dst": FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+           "n": FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+           "lit": FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000)}
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = malloc(n#0)", reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", f"{callee}(...)", reads=[dst1, n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[arg[k] for k in order]),
+    ]
+    func = FFunc("fmt_id", 0x10, FSSAFunc(instrs), params=[n])
+    bv = _LiteralBV({0x2000: "malloc", 0x2010: callee})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == callee]
+    assert sinks, result["reached_sinks"]
+    assert any(s["class"] == "bounded_len" for s in sinks), sinks
+    assert all(s["class"] != "overread_len" for s in sinks), sinks
+    assert all("src_capacity" not in s for s in sinks), sinks
+
+
+def _bcopy_sink(models, src_param, dst_param, n, n0, extra):
+    """``<extra>; bcopy(<src>, <dst>, n)`` -- bcopy takes (src, dst, n)."""
+    instrs = list(extra) + [
+        FInstr(len(extra), 0x14, "MLIL_CALL_SSA", "bcopy(src, dst, n#0)", reads=[n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[src_param, dst_param, FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])]
+    func = FFunc("put", 0x10, FSSAFunc(instrs), params=[n])
+    bv = _GlobalBV({0x2000: "malloc", 0x2010: "bcopy"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "bcopy"]
+    assert len(sinks) == 1, result["reached_sinks"]
+    return sinks[0]
+
+
+class _GlobalBV(FBV):
+    """0x3000 is a 64-byte global BN typed `char[0x40]`."""
+    def get_data_var_at(self, addr):
+        if addr == 0x3000:
+            return type("DV", (), {"type": type("T", (), {
+                "width": 64, "__str__": lambda s: "char[0x40]"})()})()
+        return None
+
+
+def _malloc_n(n0, var):
+    out = FSSA(FVar(var), 1)
+    return out, FInstr(0, 0x10, "MLIL_CALL_SSA", f"{var}#1 = malloc(n#0)", reads=[n0],
+                       writes=[out], dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+                       params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])
+
+
+def test_bcopy_into_a_fixed_global_from_a_sized_source_stays_an_overflow_980(models):
+    # syn3: `src = malloc(n); bcopy(src, slot64, n)` overflows the 64-byte
+    # DESTINATION (arg1). Reading arg0 as bcopy's destination relabelled it
+    # bounded_len with "source holds the copied length".
+    n = FVar("n"); n0 = FSSA(n, 0)
+    src1, alloc = _malloc_n(n0, "src")
+    sink = _bcopy_sink(models, FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                       FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000), n, n0, [alloc])
+    assert sink["class"] == "overflow_len", sink
+    assert "src_capacity" not in sink
+
+
+def test_bcopy_into_a_sized_destination_checks_its_real_source_980(models):
+    # The other direction: `dst = malloc(n); bcopy(slot64, dst, n)` writes a
+    # bounded destination and over-reads the 64-byte SOURCE (arg0).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    dst1, alloc = _malloc_n(n0, "dst")
+    sink = _bcopy_sink(models, FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+                       FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]), n, n0, [alloc])
+    assert sink["class"] == "overread_len", sink
+    assert sink["src_capacity"] == 64
+
+
+def test_exact_length_copy_from_the_same_literal_is_still_an_overread_980(models):
+    # Control for the test above: memcpy DOES read n bytes from the literal.
+    sink = _memcpy_sink(models, *_dup_with_source(
+        FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000), bv_cls=_LiteralBV))
+    assert sink["class"] == "overread_len" and sink["src_capacity"] == 6
+
+
+def test_bounded_copy_from_a_same_length_allocation_fits_980(models):
+    # `s = malloc(n); ...; memcpy(dst, s, n)`: the source holds exactly n bytes.
+    n0 = FSSA(FVar("n"), 0); s1 = FSSA(FVar("s"), 1)
+    alloc = FInstr(0, 0x08, "MLIL_CALL_SSA", "s#1 = malloc(n#0)", reads=[n0], writes=[s1],
+                   dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+                   params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])
+    sink = _memcpy_sink(models, *_dup_with_source(
+        FExpr("MLIL_VAR_SSA", "s#1", reads=[s1]), extra_instrs=[alloc]))
+    assert sink["class"] == "bounded_len"
+    assert "source holds the copied length" in sink["relabel"]
+
+
+def test_relabel_reaches_the_compact_text_980():
+    from bn.formatters import _render_taint_text
+    value = {"direction": "forward", "function": {"name": "dup_entry", "address": "0x10"},
+             "sources": [], "reached_sinks": [{"sink": {
+                 "callee": "memcpy", "address": "0x14", "tainted_arg_index": 2,
+                 "class": "overread_len", "catalog_class": "overflow_len",
+                 "relabel": "destination sized by the copy length; source is a 64-byte local"}}]}
+    text = _render_taint_text(value)
+    assert ("overflow_len → overread_len: destination sized by the copy length; "
+            "source is a 64-byte local") in text
 
 
 def test_forward_keeps_overflow_when_alloc_size_differs_from_length(models):

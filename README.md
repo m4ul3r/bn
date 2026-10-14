@@ -254,7 +254,7 @@ bn imports
 Each callsite row also includes:
 
 - `call_index`: zero-based ordinal for matching callsites in the containing function, ordered by `call_addr`
-- `within_query`: the original unresolved scope token from `--within` or `--within-file`
+- `within_query`: the scope token from `--within` or `--within-file`, as given; with no `--within`, the containing function's raw (mangled for C++) name, unique across overloads so it can be passed back as `--within`. Text prints it only when `--within`/`--within-file` was given
 - `hlil_statement`: the smallest recoverable HLIL expression or statement containing the call, or `null` when Binary Ninja only exposes a coarse enclosing region
 - `pre_branch_condition`: the nearest enclosing pre-call HLIL condition when it can be recovered confidently, otherwise `null`
 

@@ -649,53 +649,6 @@ def _callee_used_arg_position(callee_fn, storage_positions: dict[int, int]) -> i
     return highest
 
 
-def _variadic_determination(callee_fn) -> bool | None:
-    """Did BN DETERMINE whether this callee is variadic, and what did it decide?
-
-    ``True``/``False`` is a determination; ``None`` means BN never made one, and
-    the two must not be collapsed. BN states ``has_variable_arguments`` as a
-    ``BoolWithConfidence`` -- a value AND whether analysis ever settled it -- and
-    the object is truthy by its VALUE, so ``bool(flag)`` silently reads
-    "never determined" as a firm "not variadic". Measured cost of reading it that
-    way: 72 of 1242 call rows on an unmutated image demoted, every one of them a
-    printf-style helper BN recovered as ``T(fixed..., char argN @ rax)`` without
-    marking it variadic. Its prologue spills the whole register save area, and
-    those spills are honest version-0 reads -- def-use soundness cannot separate
-    them from consumed arguments, only the varargs flag can, and a flag nobody
-    determined separates nothing.
-
-    So the answer is only a determination when the flag is both PRESENT and
-    DETERMINED. Absent type, absent flag, zero confidence, or a confidence that
-    is not a number at all -> ``None``. A flag carrying no ``confidence``
-    attribute is not a ``BoolWithConfidence`` but a stated bool (a declared
-    signature, a test fake), and a stated value is a determination.
-
-    ``is_variadic`` elsewhere in this module stays the two-state
-    :func:`il_format._function_is_variadic`: for a diagnostic that only reports
-    what the prototype SAYS (#558) and for `arity_mismatch` (#704), "not marked
-    variadic" is the right reading. It is this witness, which contradicts the
-    prototype rather than reporting it, that may not guess.
-    """
-    func_type = getattr(callee_fn, "type", None)
-    if func_type is None:
-        return None
-    flag = getattr(func_type, "has_variable_arguments", None)
-    if flag is None:
-        return None
-    confidence = getattr(flag, "confidence", None)
-    if confidence is not None:
-        try:
-            determined = int(confidence) > 0
-        except (TypeError, ValueError):
-            return None
-        if not determined:
-            return None
-    try:
-        return bool(getattr(flag, "value", flag))
-    except Exception:  # noqa: BLE001 - an unreadable flag determined nothing
-        return None
-
-
 def _callee_body_witness(bv, callee_fn, *, variadic: bool | None,
                          declared_count: int | None) -> dict[str, Any]:
     """What the callee's own body DEMONSTRATES about its arity by USING incoming
@@ -740,7 +693,7 @@ def _callee_body_witness(bv, callee_fn, *, variadic: bool | None,
       argument registers through the register save area / `va_list`, so a
       register read is not an arity there, and a flag BN never DETERMINED cannot
       tell the two apart (the 72-row false-demotion class of #882 round 2). See
-      :func:`_variadic_determination`;
+      :func:`il_format._variadic_determination`;
     * `decorated_name` -- the refusal `_library_witness` makes, from the other
       direction: a method's implicit `this` and a by-value class return's sret
       slot are ARGUMENT REGISTERS the body legitimately reads and the parameter
@@ -912,7 +865,7 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
                 bv, callee_fn, str(getattr(callee_fn, "name", "") or ""),
                 declared_count=declared_count, is_variadic=is_variadic),
             "callee_body": _callee_body_witness(
-                bv, callee_fn, variadic=_variadic_determination(callee_fn),
+                bv, callee_fn, variadic=il_format._variadic_determination(callee_fn),
                 declared_count=declared_count),
         }
         if witness_cache is not None:
@@ -934,6 +887,7 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     # and this adds nothing. Only an HLIL-sourced list is compared, for #704
     # round 3's reason: an MLIL/LLIL list is the CALLER's ABI registers (#661) and
     # its count is not a claim about the callee's operands.
+
     if (
         arg_source == "hlil"
         and body["status"] == WITNESS_CONTRADICTION

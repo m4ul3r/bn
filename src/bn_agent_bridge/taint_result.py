@@ -294,6 +294,18 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
             "the filled buffer/iovec payload) or --source var:<buf> so the "
             "payload is followed -- an empty result here means the seed was "
             "wrong, not that the path is clean")
+    elif unmodeled_reached and not ext_no_model and all(
+            lf.get("cause") == "varargs_not_followed"
+            for lf in leaves if str(lf.get("kind", "?")) in UNRESOLVED):
+        # #948: every unresolved frontier is taint entering the `...` tail of a
+        # callee BN already types variadic. Prototype repair is the wrong
+        # advice there: the declaration is correct, the engine just does not
+        # map varargs onto anything.
+        next_action = (
+            "taint reached the variadic tail (`...`) of a callee already declared "
+            "variadic, which the engine does not follow -- its prototype is correct, "
+            "so do not redeclare it; inspect how the callee consumes its va_list or "
+            "re-run `bn taint forward` seeded inside it")
     elif unmodeled_reached:
         next_action = (
             "taint reached an unmodeled call frontier (an unresolved/in-binary "
