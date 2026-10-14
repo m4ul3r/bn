@@ -2956,7 +2956,7 @@ def _render_evidence_xrefs_text(value: Any, limit: int | None = None) -> str:
     return "\n".join(lines)
 
 
-def _render_target_line(target: Any) -> str:
+def _render_target_line(target: Any, *, mangled: bool = False) -> str:
     if not isinstance(target, dict):
         return "<unknown>"
     if target.get("status") == "unmapped":
@@ -2967,9 +2967,12 @@ def _render_target_line(target: Any) -> str:
     raw = target.get("raw")
     normalized = target.get("normalized")
     fn = _field_dict(target, "function")
-    if fn.get("name"):
+    # #978 (#994 comment): the demangled `display_name` the bridge sends beside
+    # the raw name, unless --mangled; the raw name when there is none.
+    fn_name = _shown_name(fn, mangled=mangled)
+    if fn_name:
         fn_address = fn.get("address", normalized or raw or "<unknown>")
-        base = f"{fn.get('name')} @ {fn_address}"
+        base = f"{fn_name} @ {fn_address}"
         if fn.get("exact_start") is False:
             offset = fn.get("offset")
             if offset:
@@ -3022,7 +3025,7 @@ def _render_target_line(target: Any) -> str:
 
 
 @_discloses
-def _render_function_evidence_text(value: Any) -> str:
+def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     function = _field_dict(value, "function")
@@ -3046,7 +3049,7 @@ def _render_function_evidence_text(value: Any) -> str:
     if thunk.get("is_candidate"):
         lines.append(f"thunk: candidate ({thunk.get('reason', 'no reason recorded')})")
         if thunk_target:
-            lines.append(f"  target: {_render_target_line(thunk_target)}")
+            lines.append(f"  target: {_render_target_line(thunk_target, mangled=mangled)}")
     elif thunk_target:
         lines.append("thunk: no (tail branch to a local function, not a trampoline)")
         lines.append(f"  tail branch -> {_render_target_line(thunk_target)}")
@@ -3116,7 +3119,7 @@ def _render_function_evidence_text(value: Any) -> str:
         lines.append(f"- {call_addr}  {operation}  {direct}")
         target = _field_dict(call, "target")
         if target:
-            lines.append(f"  target: {_render_target_line(target)}")
+            lines.append(f"  target: {_render_target_line(target, mangled=mangled)}")
         instr = _field_dict(call, "call_instruction")
         if instr:
             lines.append(f"  instruction: {instr.get('address', call_addr)}  {instr.get('text', '')}".rstrip())

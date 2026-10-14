@@ -7260,3 +7260,26 @@ def test_a_plain_c_identifier_is_still_admitted_759(monkeypatch):
 
     assert call["prototype_unverified"] is True
     assert call["argument_confidence"] == "inferred"
+
+
+def test_evidence_card_target_line_follows_the_978_naming_rule_994(monkeypatch):
+    """#994 comment: the card's `target:` line printed `_ZdlPvm` where `callsites`
+    prints `operator delete`. The bridge now sends `display_name` beside the raw
+    name (only where they differ); text shows it, `--mangled` shows the raw one,
+    and JSON keeps `name` raw."""
+    from bn.formatters import _render_function_evidence_text
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    fn = types.SimpleNamespace(start=0x401030, name="_ZdlPvm",
+                               symbol=types.SimpleNamespace(short_name="operator delete"))
+    plain = types.SimpleNamespace(start=0x401040, name="free", symbol=None)
+    bv = types.SimpleNamespace(get_function_at=lambda a: {0x401030: fn, 0x401040: plain}.get(a))
+    entry = ctx._function_entry_for_address(bv, 0x401030)
+    assert entry["name"] == "_ZdlPvm" and entry["display_name"] == "operator delete"
+    assert "display_name" not in ctx._function_entry_for_address(bv, 0x401040)
+
+    card = {"function": {"name": "main", "address": "0x401100"}, "calls": [
+        {"address": "0x401120", "operation": "MLIL_CALL", "direct": True,
+         "target": {"raw": "0x401030", "normalized": "0x401030", "function": entry}}]}
+    assert "  target: operator delete @ 0x401030" in _render_function_evidence_text(card)
+    assert "  target: _ZdlPvm @ 0x401030" in _render_function_evidence_text(card, mangled=True)

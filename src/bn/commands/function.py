@@ -925,6 +925,7 @@ def _callsites(args: argparse.Namespace) -> int:
                  help="Skip the first OFFSET call-evidence records (pagination, with --limit)"),
              arg("--address-window", dest="address_window", default=None, metavar="A:B",
                  help="Only calls whose address is in [A, B) (hex 0x.. or decimal), e.g. 0x402000:0x402200"),
+             mangled_arg(),
          ],
          estimable=True)
 def _evidence_function(args: argparse.Namespace) -> int:
@@ -940,7 +941,8 @@ def _evidence_function(args: argparse.Namespace) -> int:
         "function_evidence",
         params,
         require_target=True,
-        text_renderer=lambda value: _resolution_note(value) + _render_function_evidence_text(value),
+        text_renderer=lambda value: _resolution_note(value) + _render_function_evidence_text(
+            value, mangled=args.mangled),
         stem="function-evidence",
     )
 
