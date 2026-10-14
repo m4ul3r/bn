@@ -1217,13 +1217,6 @@ class BridgeContext:
             "address": hex(function_start),
             "exact_start": function_start == int(address),
         }
-        # #978 on the target entry (#994 comment): the demangled spelling beside
-        # the raw name, only where they differ, so a renderer can show what
-        # `decompile` shows while JSON keeps the raw symbol.
-        from . import il_format
-        display = il_format._display_name(fn)
-        if display and display != entry["name"]:
-            entry["display_name"] = display
         if function_start != int(address):
             delta = int(address) - function_start
             entry["offset"] = f"-{hex(abs(delta))}" if delta < 0 else hex(delta)

@@ -4858,7 +4858,7 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     # below can verify -- and repair -- them rather than assume removing the
     # created function put them back.
     hosts = create_comments._snapshot_split_hosts(bv, overlapped) if overlapped else {"hosts": {}}
-    fallthrough_from = create_comments._fallthrough_predecessor(bv, addr)
+    fallthrough_from = create_comments._create_fallthrough_source(bv, addr)
     # create_user_function (FORCED), not add_function (an advisory auto hint that
     # declines exactly the auto-skipped data-table / missed-handler addresses this
     # op exists to recover -- #360). Mirrors the standalone create_comments path.

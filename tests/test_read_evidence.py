@@ -3255,33 +3255,60 @@ def test_hidden_surface_drops_adrp_page_bases_like_xrefs_997(monkeypatch):
     assert len(bridge.read_xrefs._genuine_code_refs(bv, 0x5000)) == 1
 
 
-def _vtable_surface_ctx(bv, words, typeinfo):
+def _vtable_surface_ctx(bv, words, typeinfo, layouts=None):
+    """`words` are the pointer-sized reads, `typeinfo` the `typeinfo for X`
+    symbols, `layouts` what the class lens decodes at each object head (by
+    default a 4-slot table at 0x0ff0, the `_SurfBV` run's own header)."""
+    if layouts is None:
+        layouts = {0x0ff0: 4}
     ctx = _pie_ctx(bv)
     ctx._read_pointer_value = lambda b, addr, size=None: words.get(int(addr))
     ctx._typeinfo_name_at = lambda b, addr: typeinfo.get(int(addr))
+    ctx._vtable_layout_for = lambda b, addr: (
+        {"address": hex(addr), "slots": [{"index": i} for i in range(layouts[addr])]}
+        if addr in layouts else None)
+    ctx._sections_at = lambda b, addr: []
+    ctx._segment_at = lambda b, addr: None
     return ctx
 
 
 @pytest.mark.parametrize(
-    ("words", "label"),
+    ("words", "layouts", "label"),
     [
-        pytest.param({0x0ff0: 0, 0x0ff8: 0x1800}, {"vtable_of": "Dispatcher",
-                                                   "vtable_kind": "primary"}, id="primary"),
-        pytest.param({0x0ff0: (1 << 64) - 16, 0x0ff8: 0x1800},
+        pytest.param({0x0ff0: 0, 0x0ff8: 0x1800}, None,
+                     {"vtable_of": "Dispatcher", "vtable_kind": "primary"}, id="primary"),
+        pytest.param({0x0ff0: (1 << 64) - 16, 0x0ff8: 0x1800}, None,
                      {"vtable_of": "Dispatcher", "vtable_kind": "secondary"}, id="secondary"),
-        pytest.param({0x0ff0: 16, 0x0ff8: 0x1800}, None, id="positive-offset-is-no-header"),
-        pytest.param({0x0ff0: 0, 0x0ff8: 0x1900}, None, id="no-typeinfo-no-label"),
+        pytest.param({0x0ff0: 16, 0x0ff8: 0x1800}, None, None,
+                     id="positive-offset-is-no-header"),
+        # The review's data record `{INT64_MIN + 1, &typeid(Widget), {h_a, ...}}`:
+        # the class lens rejects an offset-to-top past its bound, so must this.
+        pytest.param({0x0ff0: (1 << 63) + 1, 0x0ff8: 0x1800}, None, None,
+                     id="offset-to-top-past-the-class-lens-bound"),
+        pytest.param({0x0ff0: 0, 0x0ff8: 0x1900}, None, None, id="no-typeinfo-no-label"),
+        pytest.param({0x0ff0: 0, 0x0ff8: 0x1800}, {}, None,
+                     id="header-the-class-lens-cannot-decode"),
+        pytest.param({0x0ff0: 0, 0x0ff8: 0x1800}, {0x0ff0: 2}, None,
+                     id="run-longer-than-the-decoded-table"),
+        # An abstract class: `{0, &typeid(Sink), 0, 0, __cxa_pure_virtual, push,
+        # flush, close, ...}`. The null destructors and the extern pure-virtual
+        # slot split the run, which starts three slots into the table.
+        pytest.param({0x0fd8: 0, 0x0fe0: 0x1800, 0x0fe8: 0, 0x0ff0: 0, 0x0ff8: 0x7000},
+                     {0x0fd8: 7},
+                     {"vtable_of": "Dispatcher", "vtable_kind": "primary"},
+                     id="abstract-class-run-starts-past-null-and-pure-slots"),
     ],
 )
-def test_hidden_surface_labels_vtables_from_the_itanium_header_997(monkeypatch, words, label):
-    """#997 item 3: a candidate table whose two header words are an offset-to-top
-    (0, or negative for a secondary base) and a `typeinfo for X` pointer is X's
-    vtable -- the class lens's own gate. The row says so; anything else stays an
-    unlabelled candidate, never a guessed class."""
+def test_hidden_surface_labels_vtables_the_class_lens_accepts_997(
+        monkeypatch, words, layouts, label):
+    """#997 item 3: a candidate table is labelled with the class whose vtable it
+    lies in, judged by the class lens's own rules -- the table decodes and covers
+    the run, and word[0] passes the lens's offset-to-top checks. Anything the
+    lens rejects stays an unlabelled candidate, never a guessed class."""
     bridge = _load_bridge(monkeypatch)
     re = bridge.read_evidence
     monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
-    ctx = _vtable_surface_ctx(_SurfBV(), words, {0x1800: "Dispatcher"})
+    ctx = _vtable_surface_ctx(_SurfBV(), words, {0x1800: "Dispatcher"}, layouts)
     out = re._hidden_surface(ctx, None)
     row = out["candidate_tables"][0]
     assert {k: row[k] for k in ("vtable_of", "vtable_kind") if k in row} == (label or {})
@@ -5296,9 +5323,9 @@ def _callee(bv):
             {"status": "unavailable", "reason": "no_library_entry"},
             {"status": "refused", "reason": "variadic_callee"},
             "recovered", id="varargs-determined-variadic"),
-        # #994 item 3: an UNDETERMINED flag only blocks a contradiction. A body
-        # reading nothing past the declared count is consistent with the
-        # prototype whether or not the callee is variadic -- and says so.
+        # #994 item 3: with the flag UNDETERMINED, a body whose highest read is
+        # below the last argument register and within the declared count says
+        # the same thing whether or not the callee is variadic -- and says so.
         pytest.param(
             lambda bv: (_with_varargs_flag(bv, _VarargsFlag(False, 0)),
                         _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)),
@@ -5306,41 +5333,27 @@ def _callee(bv):
             {"status": "unavailable", "reason": "no_library_entry"},
             {"status": "agreement", "reason": None, "declared_arity": 2,
              "witness_arity": 2, "register": "x1", "variadic": "undetermined"},
-            "recovered", id="varargs-undetermined-agreement-needs-no-settlement"),
-        # ... and an applicable type library settles what BN did not: a
-        # reserved-name local the library declares non-variadic may contradict.
+            "recovered", id="varargs-undetermined-agreement-below-the-last-register"),
+        # The review's static `__printf_chk`: BN absorbed the va_start spill
+        # into an 11-parameter prototype, so the spill (x0..x7) stays WITHIN the
+        # declared count. It reaches the last argument register, which is the
+        # spill shape, so it is still refused rather than called agreement.
         pytest.param(
-            lambda bv: (setattr(_callee(bv), "name", "__hw_get_version"),
-                        _with_type_library(bv, symbol="__hw_get_version", params=2),
-                        _with_varargs_flag(bv, _VarargsFlag(False, 0)),
+            lambda bv: (_with_varargs_flag(bv, _VarargsFlag(False, 0)),
+                        setattr(_callee(bv).type, "parameters", list(range(11))),
                         _with_ssa(bv, *[_SSARead(0x401100 + 4 * i, _ssa_var(i))
-                                        for i in range(3)])),
-            {"status": "agreement", "reason": None, "declared_arity": 2,
-             "witness_arity": 2, "source": "libc_x86_64.so.6"},
-            {"status": "contradiction", "reason": None, "declared_arity": 2,
-             "witness_arity": 3, "register": "x2", "variadic_settled_by": "type_library"},
-            "inferred", id="type-library-settles-not-variadic"),
-        pytest.param(
-            lambda bv: (setattr(_callee(bv), "name", "__hw_get_version"),
-                        _with_type_library(bv, symbol="__hw_get_version", params=1,
-                                           variadic=True),
-                        _with_varargs_flag(bv, _VarargsFlag(False, 0)),
-                        _with_ssa(bv, *[_SSARead(0x401100 + 4 * i, _ssa_var(i))
-                                        for i in range(6)])),
-            {"status": "refused", "reason": "variadic_signature"},
-            {"status": "refused", "reason": "variadic_callee",
-             "variadic_settled_by": "type_library"},
-            "recovered", id="type-library-settles-variadic"),
-        # A library naming an ORDINARY local definition is a name collision,
-        # not evidence (#862): it settles nothing.
-        pytest.param(
-            lambda bv: (_with_type_library(bv, symbol="hw_get_version", params=2),
-                        _with_varargs_flag(bv, _VarargsFlag(False, 0)),
-                        _with_ssa(bv, *[_SSARead(0x401100 + 4 * i, _ssa_var(i))
-                                        for i in range(3)])),
-            {"status": "refused", "reason": "not_library_provenance"},
+                                        for i in range(8)])),
+            {"status": "unavailable", "reason": "no_library_entry"},
             {"status": "refused", "reason": "variadic_undetermined"},
-            "recovered", id="colliding-library-name-settles-nothing"),
+            "inferred", id="absorbed-spill-reaching-the-last-register-is-refused"),
+        # An undetermined flag on a decorated name keeps its pre-#994 reason.
+        pytest.param(
+            lambda bv: (setattr(_callee(bv), "name", "_ZN4Impl7combineEii"),
+                        _with_varargs_flag(bv, _VarargsFlag(False, 0)),
+                        _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)))),
+            {"status": "unavailable", "reason": "no_library_entry"},
+            {"status": "refused", "reason": "variadic_undetermined"},
+            "recovered", id="decorated-and-undetermined-keeps-its-reason"),
     ],
 )
 def test_each_arity_witness_reports_its_own_verdict_865(
@@ -7264,22 +7277,31 @@ def test_a_plain_c_identifier_is_still_admitted_759(monkeypatch):
 
 def test_evidence_card_target_line_follows_the_978_naming_rule_994(monkeypatch):
     """#994 comment: the card's `target:` line printed `_ZdlPvm` where `callsites`
-    prints `operator delete`. The bridge now sends `display_name` beside the raw
-    name (only where they differ); text shows it, `--mangled` shows the raw one,
-    and JSON keeps `name` raw."""
+    prints `operator delete`. The card's call target now carries `display_name`
+    beside the raw name (always, like `_function_identity`); text shows it,
+    `--mangled` the raw one -- on the tail-branch line too -- and JSON keeps
+    `name` raw. The shared function entry `evidence table` / `evidence init`
+    render (no `--mangled` there, and D1/D0 destructors would collide) stays raw."""
     from bn.formatters import _render_function_evidence_text
     bridge = _load_bridge(monkeypatch)
-    ctx = bridge.BinaryNinjaBridge().ctx
     fn = types.SimpleNamespace(start=0x401030, name="_ZdlPvm",
                                symbol=types.SimpleNamespace(short_name="operator delete"))
-    plain = types.SimpleNamespace(start=0x401040, name="free", symbol=None)
-    bv = types.SimpleNamespace(get_function_at=lambda a: {0x401030: fn, 0x401040: plain}.get(a))
-    entry = ctx._function_entry_for_address(bv, 0x401030)
-    assert entry["name"] == "_ZdlPvm" and entry["display_name"] == "operator delete"
-    assert "display_name" not in ctx._function_entry_for_address(bv, 0x401040)
+    bv = types.SimpleNamespace(get_function_at=lambda a: {0x401030: fn}.get(a))
+    raw_entry = {"name": "_ZdlPvm", "address": "0x401030", "exact_start": True}
+    ctx = types.SimpleNamespace(_normalize_code_pointer=lambda b, v: {
+        "raw": hex(v), "normalized": hex(v), "function": dict(raw_entry)})
+    target = bridge.read_evidence._target_entry_for_call(ctx, bv, 0x401030)
+    assert target["function"] == {**raw_entry, "display_name": "operator delete"}
+    assert "display_name" not in bridge.BinaryNinjaBridge().ctx._function_entry_for_address(
+        bv, 0x401030)
 
-    card = {"function": {"name": "main", "address": "0x401100"}, "calls": [
-        {"address": "0x401120", "operation": "MLIL_CALL", "direct": True,
-         "target": {"raw": "0x401030", "normalized": "0x401030", "function": entry}}]}
-    assert "  target: operator delete @ 0x401030" in _render_function_evidence_text(card)
-    assert "  target: _ZdlPvm @ 0x401030" in _render_function_evidence_text(card, mangled=True)
+    card = {"function": {"name": "main", "address": "0x401100"},
+            "thunk": {"is_candidate": False, "target": target},
+            "calls": [{"address": "0x401120", "operation": "MLIL_CALL", "direct": True,
+                       "target": target}]}
+    text = _render_function_evidence_text(card)
+    assert "  target: operator delete @ 0x401030" in text
+    assert "  tail branch -> operator delete @ 0x401030" in text
+    raw = _render_function_evidence_text(card, mangled=True)
+    assert "  target: _ZdlPvm @ 0x401030" in raw
+    assert "  tail branch -> _ZdlPvm @ 0x401030" in raw

@@ -3052,7 +3052,7 @@ def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
             lines.append(f"  target: {_render_target_line(thunk_target, mangled=mangled)}")
     elif thunk_target:
         lines.append("thunk: no (tail branch to a local function, not a trampoline)")
-        lines.append(f"  tail branch -> {_render_target_line(thunk_target)}")
+        lines.append(f"  tail branch -> {_render_target_line(thunk_target, mangled=mangled)}")
     else:
         lines.append("thunk: no")
 
@@ -3323,12 +3323,10 @@ def _arity_witness_text(name: str, verdict: dict[str, Any]) -> str:
             register = _text_value(verdict, "register")
             via = f" up to {register}" if register else ""
             detail = f"body uses {observed}{via}, prototype {declared}"
-            # #994 item 3: how the "not variadic" question was answered, when
-            # it was not BN's own determination.
+            # #994 item 3: an agreement BN's varargs flag never backed (it
+            # holds either way -- see `_callee_body_witness`).
             if _text_value(verdict, "variadic") == "undetermined":
                 detail += ", varargs undetermined"
-            elif settled := _text_value(verdict, "variadic_settled_by"):
-                detail += f", non-variadic per {settled.replace('_', ' ')}"
         else:
             detail = f"witness {observed}, prototype {declared}"
     else:

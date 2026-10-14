@@ -310,23 +310,35 @@ def _with_overlap_note(row: dict, overlapped: list[dict[str, Any]]) -> dict:
 _FALLTHROUGH_BRANCH_KINDS = frozenset({"FalseBranch"})
 
 
-def _fallthrough_predecessor(bv, addr: int) -> int | None:
+def _create_fallthrough_source(bv, addr: int) -> int | None:
     """The instruction that runs straight into *addr*, if one provably does.
 
     #997 item 2: an address the previous instruction falls through into is
     the middle of a body, not an entry -- the shape of an aarch64 `adrp` page
-    base nominated as a missing function. Only a FIXED-WIDTH ISA can name the
+    base nominated as a missing function. (Named apart from
+    `read_decompile._fallthrough_predecessor`, which asks about a FUNCTION's
+    neighbour by different rules.) Only a FIXED-WIDTH ISA can name the
     previous instruction (on x86 any byte before *addr* might start one), so
-    every other ISA answers None, as does anything not decoded as a real
-    instruction or that is padding (`nop`) between two routines. An advisory
-    probe: an unanswerable view yields None, never a refusal.
+    every other ISA answers None, as does an ARM view: ARM and Thumb code
+    share it, and the instruction set of the bytes before *addr* is not known
+    there. Anything not decoded as a real instruction, padding (`nop`), or a
+    word BN holds as a DATA variable (a literal pool between two routines)
+    answers None too. An advisory probe: an unanswerable view yields None,
+    never a refusal.
     """
     try:
         arch = getattr(bv, "arch", None)
+        arch_name = str(getattr(arch, "name", "") or "").lower()
+        if ("arm" in arch_name or "thumb" in arch_name) and "aarch64" not in arch_name \
+                and "arm64" not in arch_name:
+            return None
         width = int(getattr(arch, "instr_alignment", 0) or 0)
         if width <= 0 or width != int(getattr(arch, "max_instr_length", 0) or 0):
             return None
         prev = addr - width
+        get_data_var_at = getattr(bv, "get_data_var_at", None)
+        if callable(get_data_var_at) and get_data_var_at(prev) is not None:
+            return None
         data = bytes(bv.read(prev, width) or b"")
         if len(data) != width:
             return None
@@ -763,7 +775,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *,
         # tail were left shortened behind `rolled_back: true`), so record
         # them now and verify them after every revert below.
         hosts = _snapshot_split_hosts(bv, overlapped) if overlapped else {"hosts": {}}
-        fallthrough_from = _fallthrough_predecessor(bv, addr)
+        fallthrough_from = _create_fallthrough_source(bv, addr)
         state = bv.begin_undo_actions()
     try:
         with exclusive_scope():
