@@ -3143,6 +3143,36 @@ def test_hidden_surface_code_ref_probe_cap_is_disclosed_967(monkeypatch):
     assert any("code-referenced address scan stopped" in w for w in out["warnings"])
 
 
+class _FailingCodeRefSurfBV(_CodeRefSurfBV):
+    """`get_code_refs` raises for the handler; the data-variable walk raises after it."""
+
+    def get_code_refs(self, addr):
+        if int(addr) == 0x2020:
+            raise RuntimeError("code refs unavailable")
+        return super().get_code_refs(addr)
+
+    def get_next_data_var_start_after(self, addr):
+        if int(addr) >= 0x2020:
+            raise RuntimeError("data variable walk failed")
+        return super().get_next_data_var_start_after(addr)
+
+
+def test_hidden_surface_code_ref_scan_failures_are_disclosed_967(monkeypatch):
+    """A BN error that skips an address or ends a region's walk must not leave the
+    scan reading as complete: the handler goes unreported, and the output says why."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    clean = re._hidden_surface(_pie_ctx(_CodeRefSurfBV()), None)
+    assert not any("PARTIAL" in w for w in clean["warnings"])
+    out = re._hidden_surface(_pie_ctx(_FailingCodeRefSurfBV()), None)
+    assert out["missing_function_candidates"] == []
+    partial = [w for w in out["warnings"] if "PARTIAL" in w]
+    assert len(partial) == 1
+    assert "1 code region(s)" in partial[0] and "1 address(es)" in partial[0]
+
+
+
 # --- #466 cross-target virtual-call slot extraction --------------------------
 
 def _vc_expr(opname, **kw):

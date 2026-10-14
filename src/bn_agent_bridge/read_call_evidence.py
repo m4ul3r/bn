@@ -41,7 +41,12 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
     bn = None  # type: ignore[assignment]
 
 from . import il_format
-from ._shared import _parse_address, _validate_count, is_imported_function, is_imported_symbol
+from ._shared import (
+    _parse_address,
+    _validate_count,
+    is_imported_function,
+    is_imported_symbol,
+)
 from .read_listing import _analysis_state_fields
 
 

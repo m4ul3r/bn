@@ -1555,6 +1555,13 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         warnings.append(
             f"code-referenced address scan stopped after {_MAX_CODE_REF_PROBES} data "
             "variable(s) in executable regions; addresses beyond them were not checked")
+    if code_ref_scan.region_walk_failures or code_ref_scan.code_ref_failures:
+        warnings.append(
+            "code-referenced address scan is PARTIAL: BN raised while walking data "
+            f"variables in {code_ref_scan.region_walk_failures} code region(s) (the rest "
+            "of each was not visited) and while reading code refs for "
+            f"{code_ref_scan.code_ref_failures} address(es) (skipped) -- missing "
+            "code_ref candidates are not evidence of absence")
     if scan_capped:
         warnings.append(
             f"data scan capped at {max_scan_bytes} bytes; regions (or their tails) beyond "
@@ -1611,23 +1618,6 @@ def _code_regions(bv) -> list[tuple[int, int]]:
             if getattr(seg, "executable", False):
                 regions.append((int(seg.start), int(seg.end)))
     return sorted(regions)
-
-
-def _data_var_starts(bv, start: int, end: int):
-    """Addresses of BN's data variables in ``[start, end)``, in order."""
-    stepper = getattr(bv, "get_next_data_var_start_after", None)
-    if not callable(stepper):
-        return
-    addr = start - 1
-    while True:
-        try:
-            nxt = int(stepper(addr))
-        except Exception:
-            return
-        if nxt <= addr or nxt >= end:
-            return
-        yield nxt
-        addr = nxt
 
 
 def _il_reference_kind(expr, target: int, depth: int = 0) -> str | None:
@@ -1718,7 +1708,11 @@ _MAX_CODE_REF_SITES = 4
 class _CodeRefScan:
     """#967: iterate ``(address, [(site, function name), ...])`` for every
     function-less, code-referenced address in a code region, sites sorted. After
-    iteration ``capped`` says whether the probe budget stopped the walk early."""
+    iteration ``capped`` says whether the probe budget stopped the walk early, and
+    the two failure counters say whether BN errors made it PARTIAL: a region whose
+    data-variable walk raised (the rest of that region was not visited) and an
+    address whose code refs could not be read (it was skipped). A partial scan
+    must not read as a complete one."""
 
     def __init__(self, bv, has_fn, exec_target, *, max_probes: int):
         self._bv = bv
@@ -1726,12 +1720,31 @@ class _CodeRefScan:
         self._exec_target = exec_target
         self._max_probes = max_probes
         self.capped = False
+        self.region_walk_failures = 0
+        self.code_ref_failures = 0
+
+    def _data_var_starts(self, start: int, end: int):
+        """Addresses of BN's data variables in ``[start, end)``, in order."""
+        stepper = getattr(self._bv, "get_next_data_var_start_after", None)
+        if not callable(stepper):
+            return
+        addr = start - 1
+        while True:
+            try:
+                nxt = int(stepper(addr))
+            except Exception:
+                self.region_walk_failures += 1
+                return
+            if nxt <= addr or nxt >= end:
+                return
+            yield nxt
+            addr = nxt
 
     def __iter__(self):
         bv = self._bv
         probes = 0
         for start, end in _code_regions(bv):
-            for addr in _data_var_starts(bv, start, end):
+            for addr in self._data_var_starts(start, end):
                 if probes >= self._max_probes:
                     self.capped = True
                     return
@@ -1741,6 +1754,7 @@ class _CodeRefScan:
                 try:
                     refs = list(bv.get_code_refs(addr) or [])
                 except Exception:
+                    self.code_ref_failures += 1
                     continue
                 sites: list[tuple[int, str]] = []
                 for ref in refs:
