@@ -3253,12 +3253,109 @@ def test_resolve_strips_bndb_in_path_suffix_selector(monkeypatch):
 
 def test_resolve_bndb_strip_does_not_silently_pick_on_ambiguity(monkeypatch):
     # The high-risk case for the .bndb strip: a raw `foo` AND a `foo.bndb` both
-    # open -> `-t foo` matches both. resolve() must raise ambiguous, never
-    # silently pick one.
+    # open, with no save tying them -> `-t foo` matches both. resolve() must
+    # raise ambiguous, never silently pick one -- in either open order, and for
+    # an unrelated `/x/foo.bndb` + `/y/foo` alike (#996 review).
     bridge = _load_bridge(monkeypatch)
-    raw = _FakeFileBV("/x/foo", session_id="1")
-    db = _FakeFileBV("/x/foo.bndb", session_id="2")
+    for first, second in (("/x/foo", "/x/foo.bndb"), ("/x/foo.bndb", "/x/foo"),
+                          ("/x/foo.bndb", "/y/foo")):
+        _register_views(bridge, _FakeFileBV(first, session_id="1"))
+        manager = bridge.TargetManager()
+        manager.refresh()
+        _register_views(bridge, _FakeFileBV(first, session_id="1"),
+                        _FakeFileBV(second, session_id="2"))
+        with pytest.raises(Exception) as exc:
+            manager.resolve("foo")
+        assert "mbiguous" in str(exc.value), (first, second)
+    bridge._headless_views.clear()
+
+
+def test_opening_a_view_never_moves_an_advertised_selector_onto_it_996(monkeypatch):
+    # #996 review (blocker): `target list` advertised `2` for the file `/public/2`;
+    # a second view then opened and got view id 2. The ranked resolver let the
+    # view id outrank the basename, so `-t 2` -- and `bn close 2` -- silently
+    # moved to the NEW view. It must stay the old view or be refused.
+    bridge = _load_bridge(monkeypatch)
+    named_two = _FakeFileBV("/public/2", session_id="1")
+    _register_views(bridge, named_two)
+    manager = bridge.TargetManager()
+    [row] = manager.refresh()
+    assert row["selector"] == "2"
+    fetch = _FakeFileBV("/public/fetch", session_id="2")
+    _register_views(bridge, named_two, fetch)
+    rows = {r["filename"]: r for r in manager.refresh()}
+    assert rows["/public/fetch"]["view_id"] == "2"
+    try:
+        resolved = manager.resolve("2")
+    except RuntimeError as exc:
+        assert "mbiguous" in str(exc)
+    else:
+        assert resolved is named_two, (
+            "previously advertised selector silently resolves to a different view")
+    for r in rows.values():                 # every listed selector still resolves
+        assert manager.resolve(r["selector"]) is (
+            named_two if r["filename"] == "/public/2" else fetch)
+    bridge._headless_views.clear()
+
+
+def test_saved_database_keeps_the_raw_views_selector_996(monkeypatch, tmp_path):
+    # #996: the one exception to "every alias counts equally". `bn save` of the
+    # raw `foo` then `bn load foo.bndb`: the raw view's own name and path still
+    # mean the raw view, the database answers to `foo.bndb`, and the listing
+    # advertises exactly those -- only because THIS bridge recorded the save,
+    # and only while the `.bndb` is still the file it wrote (#996 review N2).
+    bridge = _load_bridge(monkeypatch)
+    raw_path, db_path = tmp_path / "foo", tmp_path / "foo.bndb"
+    raw_path.write_bytes(b"raw")
+    raw = _FakeFileBV(str(raw_path), session_id="1")
+    _register_views(bridge, raw)
+    manager = bridge.TargetManager()
+    manager.refresh()
+    db_path.write_bytes(b"database written by this bridge")
+    manager.note_database(raw, str(db_path))
+    db = _FakeFileBV(str(db_path), session_id="2")
     _register_views(bridge, raw, db)
+    try:
+        selectors = {row["filename"]: row["selector"] for row in manager.refresh()}
+        assert selectors == {str(raw_path): "foo", str(db_path): "foo.bndb"}
+        assert manager.resolve("foo") is raw
+        assert manager.resolve(str(raw_path)) is raw
+        assert manager.resolve(f"{tmp_path.name}/foo") is raw
+        assert manager.resolve("foo.bndb") is db
+        assert manager.resolve(str(db_path)) is db
+
+        # The database view loaded as UNVERIFIED against its raw bytes: no pair.
+        bridge._source_verified["2"] = False
+        with pytest.raises(Exception, match="mbiguous"):
+            manager.resolve("foo")
+        bridge._source_verified.pop("2")
+        assert manager.resolve("foo") is raw
+
+        # The file at that path was replaced since the save: no pair either.
+        replacement = tmp_path / "other.bndb"
+        replacement.write_bytes(b"another binary's database")
+        os.replace(replacement, db_path)
+        with pytest.raises(Exception, match="mbiguous"):
+            manager.resolve("foo")
+        assert manager.refresh()[0]["selector"] != "foo"
+
+        # A later save through this bridge re-pairs with what it wrote.
+        manager.note_database(raw, str(db_path))
+        assert manager.resolve("foo") is raw
+
+        # A third, unrelated `foo` is a real ambiguity again.
+        _register_views(bridge, raw, db, _FakeFileBV("/y/foo", session_id="3"))
+        with pytest.raises(Exception, match="mbiguous"):
+            manager.resolve("foo")
+    finally:
+        bridge._headless_views.clear()
+
+
+def test_resolve_stays_ambiguous_for_two_views_sharing_a_basename(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    left = _FakeFileBV("/a/foo", session_id="1")
+    right = _FakeFileBV("/b/foo", session_id="2")
+    _register_views(bridge, left, right)
     manager = bridge.TargetManager()
     with pytest.raises(Exception) as exc:
         manager.resolve("foo")
@@ -5978,6 +6075,76 @@ def test_close_binary_pinned_target_id_errors_when_view_was_replaced(monkeypatch
     bridge._headless_views.clear()
 
 
+def test_close_binary_pinned_target_flag_never_falls_back_to_a_file_named_like_the_id(
+    monkeypatch, tmp_path
+):
+    # #996 review N1: the CLI read the id from a listing. If that target closes
+    # first and another open file is literally NAMED that id, a plain selector
+    # falls back to the basename and closes the other file. `pinned_target`
+    # resolves the id and nothing else.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    first = _ClosableBV("/proj/first.so", session_id="11")
+    _register_views(bridge, first)
+    pinned = instance.targets.refresh()[0]["target_id"]
+    _close_on_watchdog(instance, target=pinned)
+    namesake = _ClosableBV(f"/proj/{pinned}", session_id="33")
+    _register_views(bridge, namesake)
+
+    response = instance.dispatch({"op": "close_binary", "target": pinned,
+                                  "params": {"pinned_target": True}, "id": "r1"})
+    assert response["ok"] is False
+    assert "Unknown target selector" in response["error"]
+    assert not namesake.closed
+
+    # Without the flag the same request is a human selector, which is the hazard.
+    response = instance.dispatch({"op": "close_binary", "target": pinned,
+                                  "params": {}, "id": "r2"})
+    assert response["ok"] is True and namesake.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_refuses_a_target_named_only_by_its_bndb_stripped_alias(
+    monkeypatch, tmp_path
+):
+    # #996 review nit: once the raw `hello` is closed, `close -t hello` reached
+    # `hello.bndb` through the #312 strip. A destructive close names it.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    db = _ClosableBV("/proj/hello.bndb", session_id="11")
+    _register_views(bridge, db)
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target="hello")
+    assert str(exc.value).endswith("close it by its listed selector instead: hello.bndb")
+    assert not db.closed
+    _close_on_watchdog(instance, target="hello.bndb")
+    assert db.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_stripped_refusal_suggests_a_selector_that_resolves(
+    monkeypatch, tmp_path
+):
+    # #996 round-3 nit: with `a/hello.bndb` and `b/hello.bndb` open, the hint
+    # for `close -t a/hello` named the basename `hello.bndb`, itself ambiguous.
+    # It names the LISTED selector, which resolves to exactly that target.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    left = _ClosableBV("/proj/a/hello.bndb", session_id="11")
+    right = _ClosableBV("/proj/b/hello.bndb", session_id="22")
+    _register_views(bridge, left, right)
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target="a/hello")
+    suggested = str(exc.value).rsplit("listed selector instead: ", 1)[1]
+    assert suggested == "a/hello.bndb"
+    assert instance.targets.resolve(suggested) is left
+    assert not left.closed and not right.closed
+    bridge._headless_views.clear()
+
+
 def test_close_binary_rejects_empty_path(monkeypatch, tmp_path):
     # A raw {"path": ""} is neither a real path nor a bare request; it must not
     # slip past the bare-close refusal (path is not None) into the by-path
@@ -7479,3 +7646,179 @@ def test_the_degraded_rehomed_save_also_discloses_a_collision_857(monkeypatch, t
     assert excinfo.value.status == "invalid_request"
     assert "already open as target" in excinfo.value.message
     assert sidecar.read_text() == "bndb"          # nothing written
+
+
+# --- #996 re-dogfood: every printed close suggestion runs as printed ---------
+
+
+def _shell_argv(line: str, tmp_path: Path) -> list[str]:
+    """Run *line* through a real `sh -c` with a recording stub `bn` on PATH and
+    return the argv `bn` received. The cwd holds an executable named `aaa` and
+    `.` is on PATH, so an unquoted glob (`*`) or a `;` in a pasted line would
+    run something else and the stub would not see the command it should."""
+    import subprocess
+
+    stub_dir = tmp_path / "stub"
+    glob_dir = tmp_path / "globtrap"
+    record = tmp_path / "argv.bin"
+    if not stub_dir.exists():
+        stub_dir.mkdir()
+        glob_dir.mkdir()
+        (stub_dir / "bn").write_text(f'#!/bin/sh\nprintf "%s\\0" "$@" > {record}\n')
+        (stub_dir / "bn").chmod(0o755)
+        (glob_dir / "aaa").write_text("#!/bin/sh\nexit 0\n")
+        (glob_dir / "aaa").chmod(0o755)
+    record.unlink(missing_ok=True)
+    env = dict(os.environ, PATH=f"{stub_dir}:.:{os.environ.get('PATH', '')}")
+    done = subprocess.run(["sh", "-c", line], cwd=glob_dir, env=env,
+                          capture_output=True, text=True, timeout=10)
+    assert done.returncode == 0 and record.exists(), (line, done.stderr)
+    return [part for part in record.read_bytes().decode().split("\0")][:-1]
+
+
+def _close_suggestions(err: str, routing: str = "") -> list[tuple[str, str | None]]:
+    """The shell lines a close refusal hands over, with the filename each row
+    says it closes (None for a `close it with` line).
+
+    A `bn target close` row IS a complete command, so the whole printed line is
+    run. A `bn close` listing keeps the shared `-t <sel>` fragment rows, which
+    are run as `bn [-i ID] close <fragment>`, with the routing of the refused
+    command (a fragment row carries no routing of its own)."""
+    import re
+
+    found: list[tuple[str, str | None]] = []
+    lines = err.split("\n")
+    for index, line in enumerate(lines):
+        command = re.match(r"^  (bn .*?)  # (?:active  )?view_id=\S*  target_id=\S*  (.*)$", line)
+        if command:
+            found.append((line, command.group(2)))
+            continue
+        fragment = re.match(r"^  [* ] ((?:-t |--target=).*?)  view_id=\S*  target_id=\S*  (.*)$", line)
+        if fragment:
+            found.append((f"bn {routing}close {fragment.group(1)}", fragment.group(2)))
+        hint = re.search(r"close it with `([^`]*)`", line)
+        if hint:
+            found.append((hint.group(1), None))
+    return found
+
+
+_SCENARIOS = {
+    "several": ["/p/hello.bndb", "/p/hello2", "/p/a/x", "/p/b/x", "/p/-x.bndb"],
+    "single": ["/p/-x.bndb"],
+}
+
+
+@pytest.mark.parametrize("scenario, argv, closes", [
+    ("several", ["close", "-t", "nosuch"], None),                # unknown selector
+    ("several", ["target", "close", "nosuch"], None),
+    ("several", ["-i", "demo", "target", "close", "nosuch"], None),
+    ("several", ["close", "-t", "x"], None),                     # ambiguous selector
+    ("several", ["target", "close", "x"], None),
+    ("several", ["close", "-t", "hello"], "/p/hello.bndb"),      # strip-only alias
+    ("several", ["target", "close", "hello"], "/p/hello.bndb"),
+    ("several", ["-i", "demo", "target", "close", "hello"], "/p/hello.bndb"),
+    ("several", ["close", "--target=-x"], "/p/-x.bndb"),         # leading `-`
+    ("several", ["target", "close", "--", "-x"], "/p/-x.bndb"),
+    ("several", ["close"], None),                                # several open, no selector
+    ("several", ["close", "-t", "active"], None),
+    ("several", ["target", "close", "active"], None),
+    ("several", ["close", "nosuch"], None),                      # bare name, no match
+    ("several", ["close", "x"], None),                           # bare name, two matches
+    ("single", ["target", "close", "nosuch"], None),                  # the ACTIVE row
+    ("single", ["-i", "demo", "close", "-t", "nosuch"], None),
+])
+def test_every_close_refusal_suggestion_runs_as_printed_996(
+    monkeypatch, tmp_path, capsys, scenario, argv, closes
+):
+    """#996 re-dogfood and re-check: each refusal of `bn close` / `bn target
+    close` is run, then EVERY suggestion it printed is run as printed through
+    a real `sh -c` -- the whole line for a `target close` row -- against a
+    fresh copy of the same views. Each must succeed, close exactly the target
+    it names, and stay routed to the instance the refusal was run with."""
+    import bn.cli
+
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    paths = _SCENARIOS[scenario]
+    routed = "demo" if "-i" in argv else None
+    seen_instances: list[str | None] = []
+
+    def fresh():
+        instance = bridge.BinaryNinjaBridge()
+        _hermetic_registry(instance, tmp_path)
+        views = [_ClosableBV(p, session_id=str(i)) for i, p in enumerate(paths, 1)]
+        _register_views(bridge, *views)
+        instance.targets.refresh()
+
+        def send(op, *, params=None, target=None, instance_id=None, **_kwargs):
+            seen_instances.append(instance_id)
+            request = {"op": op, "params": params or {}, "id": "r"}
+            if target is not None:
+                request["target"] = target
+            response = instance.dispatch(request)
+            if not response.get("ok"):
+                raise bn.cli.BridgeError(response["error"])
+            return response
+
+        monkeypatch.setattr(bn.cli, "send_request", send)
+        return views
+
+    try:
+        views = fresh()
+        assert bn.cli.main(argv) == 2
+        err = capsys.readouterr().err
+        assert not any(v.closed for v in views)
+        suggestions = _close_suggestions(err, "-i demo " if routed else "")
+        assert suggestions, err
+        if "target" in argv:
+            assert "  -t " not in err and "  * " not in err, err
+        for line, filename in suggestions:
+            suggested = _shell_argv(line, tmp_path)
+            assert suggested[:1] != ["aaa"], line
+            views = fresh()
+            seen_instances.clear()
+            rc = bn.cli.main(suggested)
+            out = capsys.readouterr()
+            assert rc == 0, (argv, line, out.err)
+            assert set(seen_instances) == {routed}, (line, seen_instances)
+            closed = [v.file.filename for v in views if v.closed]
+            assert closed == [filename or closes], (line, closed)
+    finally:
+        bridge._headless_views.clear()
+
+
+def test_respelled_rows_are_parsed_by_grammar_not_prefix_996():
+    """#996 re-check nit: a selector holding a newline must not have its second
+    line respelled as a row of its own, and a crafted file name cannot start a
+    line of its own in the listing."""
+    from bn.target_hint import format_multi_target_hint, respell_for_positional
+
+    crafted = "foo\n    -t bar"
+    message = format_multi_target_hint("h", [
+        {"selector": crafted, "view_id": "3", "target_id": "9:3:3", "filename": f"/p/{crafted}"},
+    ])
+    respelled = respell_for_positional(message, "bn target close")
+    assert "bn target close bar" not in respelled
+    assert "bn target close 'foo\n    -t bar'  # view_id=3" in respelled
+    assert "/p/foo\\n    -t bar" in respelled           # escaped, on one line
+
+
+def test_ambiguous_refusal_lists_matching_rows_for_any_command_996(monkeypatch):
+    """The ambiguous-selector refusal lists the matching targets as the shared
+    `-t` rows for every command, e.g. a read, not only for close."""
+    bridge = _load_bridge(monkeypatch)
+    left = _FakeFileBV("/p/a/x", session_id="1")
+    right = _FakeFileBV("/p/b/x", session_id="2")
+    _register_views(bridge, left, right)
+    manager = bridge.TargetManager()
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            manager.resolve("x")
+        lines = str(exc.value).split("\n")
+        assert lines[1] == "Matching targets:"
+        assert [line.split("  view_id=")[0] for line in lines[2:]] == [
+            "    -t a/x", "    -t b/x"]
+        assert manager.resolve("a/x") is left and manager.resolve("b/x") is right
+    finally:
+        bridge._headless_views.clear()

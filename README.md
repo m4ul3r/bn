@@ -91,6 +91,8 @@ bn instance clear
 
 Spawn naming is separate from routing: `bn session start /path/to/bin --instance-id myid` names the new bridge; subsequent commands use `bn -i myid …` to talk to it.
 
+`BN_CACHE_DIR` moves more than the database cache: the instance registry (`instances/`) and the sticky `instance use` / `target use` pins live under it too. A bridge started with it set is only visible to bn commands run with the same value, so set it on every command (in a harness where each shell call is fresh, export it per call or wrap `bn`). When an id is missing from the searched registry but registered under another root, the error names that root and the `export BN_CACHE_DIR=…` that reaches it. With exactly one bridge running and no `-i`, commands use it from any directory; `target list` / `target info` name the answering instance, and stderr notes when that bridge is not associated with the current project.
+
 `bn load` and `bn close` are available for dynamic binary management (useful in headless, but also work with the GUI bridge). All commands work identically in GUI and headless mode.
 
 If exactly one BinaryView is open, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`, or pin one with `bn target use <selector>` (and `bn target clear` to undo).
@@ -109,6 +111,7 @@ Ready immediately after `--quick`:
 Need `bn refresh` first — these depend on the analysis pass:
 
 - `bn strings` **errors** until you refresh — it refuses with "Strings are not available: this target was loaded with --quick (no analysis). Run bn refresh …" rather than return an empty list that looks like "this binary has no strings".
+  While a `bn refresh` is already analysing that target, the refusal says `… full analysis is in progress (N/M), started Ns ago by bn refresh. Retry when it finishes -- do not start another refresh.` instead; wait rather than start a second refresh.
 - `bn function list` / `bn function search` return a **partial** set — only entry-point and symbol functions exist before analysis; the count grows once the analysis pass recovers the rest.
 - `bn decompile` / `bn il` / `bn disasm` / `bn xrefs` across the binary are partial for the same reason (functions BN hasn't discovered yet aren't there to read).
 - Every mutation, `bn go rename` included, **refuses** with `invalid_request` (exit 3) until you refresh: mutations reanalyze under the write lock, and `go rename` would only see the few functions a quick view defines.

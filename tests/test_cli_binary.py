@@ -579,7 +579,9 @@ def test_close_bare_single_target_pins_peeked_target_id(fake_transport, monkeypa
         assert rc == 0, argv
         assert [c["op"] for c in calls] == ["list_targets", "close_binary"], argv
         assert calls[-1]["target"] == "123:1:7", argv
-        assert calls[-1]["params"] == {}, argv
+        # ...and sends it with `pinned_target`, so the bridge resolves that id
+        # by identity only, never a file whose name spells it (#996 review N1).
+        assert calls[-1]["params"] == {"pinned_target": True}, argv
         assert "closed: /tmp/foo" in capsys.readouterr().out
 
 
@@ -877,6 +879,162 @@ def test_load_refuses_ambient_routing_with_multiple_instances(
     assert rc == 2
     assert calls == []
     assert "explicit -i/--instance" in capsys.readouterr().err
+
+
+def test_load_routes_on_bn_instance_with_multiple_instances_992(
+    fake_transport, monkeypatch, tmp_path
+):
+    """#992: BN_INSTANCE names an instance for `load` exactly as for every other
+    command; only the sticky `bn instance use` pin stays ambient and refused."""
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [
+        types.SimpleNamespace(instance_id="one"), types.SimpleNamespace(instance_id="two"),
+    ])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    loaded = {"ok": True, "result": {"loaded": True, "path": str(raw), "targets": []}}
+
+    monkeypatch.setenv("BN_INSTANCE", "one")
+    calls = fake_transport({"load_binary": loaded})
+    assert bn.cli.main(["load", str(raw)]) == 0
+    assert [(c["op"], c["instance_id"]) for c in calls] == [("load_binary", "one")]
+
+    monkeypatch.delenv("BN_INSTANCE")
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"instance_id": "one"})
+    calls = fake_transport({"load_binary": loaded})
+    assert bn.cli.main(["load", str(raw)]) == 2
+    assert calls == []
+
+
+_NAMED_TARGETS = {
+    "ok": True,
+    "result": [
+        # A view whose FILE is named `5`, beside one that holds view id 5, and
+        # a raw `hello` beside a `hello.bndb`.
+        {"target_id": "123:4:1", "selector": "5", "view_id": "4",
+         "basename": "5", "filename": "/pub/5"},
+        {"target_id": "123:5:2", "selector": "fetch", "view_id": "5",
+         "basename": "fetch", "filename": "/pub/fetch"},
+        {"target_id": "123:6:3", "selector": "hello.bndb", "view_id": "6",
+         "basename": "hello.bndb", "filename": "/pub/hello.bndb"},
+    ],
+}
+
+
+def test_close_takes_a_bare_name_as_its_exact_file_name_996(
+    fake_transport, monkeypatch, tmp_path, capsys
+):
+    """#996: `bn close hello` from an unrelated cwd resolved it as
+    `<cwd>/hello` and failed. A bare name that is no file here closes the ONE
+    open target with exactly that file name, pinned by target_id -- never a
+    view id, never a `.bndb`-stripped alias, never the volatile `active` (#996
+    review). An existing file stays a path."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    closed = {"ok": True, "result": {"closed": ["/pub/5"]}}
+
+    calls = fake_transport({"list_targets": _NAMED_TARGETS, "close_binary": closed})
+    assert bn.cli.main(["close", "5"]) == 0
+    assert [c["op"] for c in calls] == ["list_targets", "close_binary"]
+    assert calls[-1]["target"] == "123:4:1"          # the file `5`, not view id 5
+    # Sent as a PIN: the bridge resolves exactly that id, never a file named
+    # like it (#996 review N1).
+    assert calls[-1]["params"] == {"pinned_target": True}
+
+    # `hello` is only a `.bndb`-stripped alias of `hello.bndb`: nothing closes.
+    calls = fake_transport({"list_targets": _NAMED_TARGETS, "close_binary": closed})
+    assert bn.cli.main(["close", "hello"]) == 2
+    assert [c["op"] for c in calls] == ["list_targets"]
+    err = capsys.readouterr().err
+    assert "No open target is named 'hello'" in err
+    assert "-t hello.bndb" in err
+
+    # `active` is not a name: it stays a path, as on base.
+    calls = fake_transport({"close_binary": closed})
+    assert bn.cli.main(["close", "active"]) == 0
+    assert calls[-1]["target"] is None
+    assert calls[-1]["params"] == {"path": str(tmp_path / "active")}
+
+    (tmp_path / "fetch").write_bytes(b"")
+    calls = fake_transport({"close_binary": closed})
+    assert bn.cli.main(["close", "fetch"]) == 0
+    assert calls[-1]["target"] is None
+    assert calls[-1]["params"] == {"path": str(tmp_path / "fetch")}
+
+
+def test_close_by_name_refuses_two_targets_with_that_file_name_996(
+    fake_transport, monkeypatch, tmp_path, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    twins = {"ok": True, "result": [
+        {"target_id": "1:1:1", "selector": "a/foo", "view_id": "1", "basename": "foo"},
+        {"target_id": "1:2:2", "selector": "b/foo", "view_id": "2", "basename": "foo"},
+    ]}
+    calls = fake_transport({"list_targets": twins})
+    assert bn.cli.main(["close", "foo"]) == 2
+    assert [c["op"] for c in calls] == ["list_targets"]
+    err = capsys.readouterr().err
+    assert "2 open targets are named 'foo'" in err
+    assert "-t a/foo" in err and "-t b/foo" in err
+
+    # Nothing open at all: say so, without an empty "Open targets:" listing.
+    calls = fake_transport({"list_targets": {"ok": True, "result": []}})
+    assert bn.cli.main(["close", "foo"]) == 2
+    err = capsys.readouterr().err
+    assert "No targets are open" in err
+    assert "Open targets:" not in err
+
+
+def test_stripped_close_refusal_is_spelled_as_the_command_that_was_run_996(
+    monkeypatch, capsys
+):
+    """#996 round-3 nit: the bridge names the listed selector; `bn close` gets
+    `bn close -t <sel>` and `bn target close` (positional) `bn target close <sel>`
+    -- never a `-t` the second command rejects."""
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    refusal = (
+        "close_binary: 'a/hello' names /p/a/hello.bndb only through its "
+        "`.bndb`-stripped name; close it by its listed selector instead: "
+        "'a/hello db.bndb'")
+
+    def refuse(op, **kwargs):
+        assert op == "close_binary"
+        raise bn.cli.BridgeError(refusal)  # what send_request raises for ok:false
+
+    for argv, expected in (
+        (["close", "-t", "a/hello"], "`bn close -t 'a/hello db.bndb'`"),
+        (["target", "close", "a/hello"], "`bn target close 'a/hello db.bndb'`"),
+        (["-i", "demo", "target", "close", "a/hello"],
+         "`bn -i demo target close 'a/hello db.bndb'`"),
+    ):
+        monkeypatch.setattr(bn.cli, "send_request", refuse)
+        assert bn.cli.main(argv) == 2, argv
+        err = capsys.readouterr().err
+        assert f"close it with {expected}." in err, (argv, err)
+        assert "listed selector instead" not in err
+
+
+def test_target_list_and_info_name_the_answering_instance_996(fake_transport, capsys):
+    """#996: a lone instance answers from any cwd, so the output names it."""
+    row = {"target_id": "123:1:7", "selector": "hello", "view_id": "1"}
+    fake_transport({
+        "list_targets": {"ok": True, "result": [row], "instance": "demo"},
+        "target_info": {"ok": True, "result": dict(row), "instance": "demo"},
+    })
+    assert bn.cli.main(["target", "list"]) == 0
+    assert capsys.readouterr().out.startswith("instance: demo\n")
+    assert bn.cli.main(["target", "list", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["instance"] == "demo"
+    assert bn.cli.main(["-t", "hello", "target", "info"]) == 0
+    assert "\tinstance: demo" in capsys.readouterr().out
+    assert bn.cli.main(["-t", "hello", "target", "info", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["instance"] == "demo"
+
+    # An empty listing still says which bridge has nothing open.
+    fake_transport({"list_targets": {"ok": True, "result": [], "instance": "demo"}})
+    assert bn.cli.main(["target", "list"]) == 0
+    assert capsys.readouterr().out.startswith("instance: demo\n")
 
 
 def test_load_quick_flag_sets_quick_param(monkeypatch, tmp_path):

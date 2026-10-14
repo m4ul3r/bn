@@ -65,7 +65,9 @@ from .paths import (
 from .proc_identity import identity_payload
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
-from .target_hint import format_multi_target_hint, open_target_lines
+from .target_hint import (
+    LISTED_SELECTOR_LEAD, format_multi_target_hint, open_target_lines, target_row,
+)
 from .version import VERSION, build_id_for_file, build_id_for_package
 
 try:
@@ -79,6 +81,11 @@ PLUGIN_BUILD_ID = build_id_for_file(Path(__file__).resolve())
 # is actually running. `doctor` compares it to the on-disk package so an edited
 # engine module (e.g. taint_engine.py) is flagged stale, not just bridge.py (#161).
 ENGINE_BUILD_ID = build_id_for_package(Path(__file__).resolve().parent)
+# The checkout this process's code came from (symlinks resolved, so a GUI
+# plugin symlinked into BN's plugins dir names its source tree). Published in
+# the registry and the doctor ping so `doctor`/`session list` can say which
+# checkout a bridge runs (#992).
+SOURCE_DIR = str(Path(__file__).resolve().parent)
 
 # Upper bound on a single newline-terminated JSON request. Anything larger is
 # rejected with a clean error instead of being buffered without limit.
@@ -729,6 +736,11 @@ class TargetManager:
         # load-time sidecar/cache substitution OPENS the database, so `filename`
         # already names it.
         self._database_paths: dict[str, str] = {}
+        # Stable view_id -> (st_dev, st_ino, st_size, st_mtime_ns) of the file at
+        # `_database_paths[vid]` right after this bridge last wrote it. Pairs a
+        # database view with its raw view for selector resolution only while
+        # that file is still the one written (#996 review).
+        self._database_identities: dict[str, tuple[int, int, int, int] | None] = {}
         # Stable view_id -> the comments THIS bridge wrote and verified, keyed
         # (scope, address) -> body, scope "address" (a global address comment)
         # or "function_doc" (fn.comment, keyed at the function start). Decompile
@@ -845,6 +857,7 @@ class TargetManager:
         """
         if not path:
             return
+        identity = _file_identity(path)
         # Only when it DIVERGES from the live filename. A target loaded from a
         # `.bndb` and saved in place has `saved == filename`, and recording that
         # contradicted this field's own contract ("the database when it is not the
@@ -856,12 +869,18 @@ class TargetManager:
             live = str(getattr(getattr(bv, "file", None), "filename", "") or "")
         except Exception:  # noqa: BLE001 - an odd view must not break a save
             live = ""
-        if live and str(path) == live:
-            return
         with self._lock:
-            vid = self._stable_view_id(bv)
-            if vid is not None:
-                self._database_paths[vid] = str(path)
+            # A save rewrote *path*: every record pointing at that file now
+            # pairs with what this bridge just wrote -- including a save of the
+            # database view itself, which records nothing of its own below.
+            for other, recorded in self._database_paths.items():
+                if _same_file(recorded, path):
+                    self._database_identities[other] = identity
+            if not (live and str(path) == live):
+                vid = self._stable_view_id(bv)
+                if vid is not None:
+                    self._database_paths[vid] = str(path)
+                    self._database_identities[vid] = identity
             successor = self._successor
         if successor is not None:
             successor.note_database(bv, path)
@@ -934,6 +953,7 @@ class TargetManager:
             if vid is not None:
                 self._dirty_view_ids.discard(vid)
                 self._database_paths.pop(vid, None)
+                self._database_identities.pop(vid, None)
                 self._session_annotations.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
@@ -952,32 +972,34 @@ class TargetManager:
         return type(bv).__name__
 
     def _compute_selectors(self, records: dict[str, TargetRecord]) -> dict[str, str]:
-        # Index the resolver's exact aliases and component suffixes once per
-        # snapshot. Candidate lookup must not re-split every other view's path.
-        exact: dict[str, set[str]] = {}
-        tails: dict[tuple[str, ...], set[str]] = {}
+        """The shortest path suffix that RESOLVES to each view, else its target_id.
+
+        A candidate counts when `_matching_records` would return this view
+        alone for it -- the same relation, including the saved-database pair
+        rule (`_drop_saved_databases`), so every advertised selector resolves and
+        the raw `hello` stays `hello` once the `hello.bndb` it saved is open
+        (#996). The resolver's aliases and component suffixes are indexed once
+        per snapshot; candidate lookup must not re-split every other view's path.
+        """
+        exact: dict[str, dict[str, str]] = {}
+        tails: dict[tuple[str, ...], dict[str, str]] = {}
         paths = {}
         identities = {}
+
+        def _index(table: dict, key, vid: str, kind: str) -> None:
+            kinds = table.setdefault(key, {})
+            if kinds.get(vid) != self._STRONG:
+                kinds[vid] = kind
+
         for vid, record in records.items():
             identities[record.target_id()] = vid
             parts = paths[vid] = _path_components(record.filename)
-            aliases = [record.view_id, record.filename, record.basename]
-            variants = [parts]
-            if record.basename.endswith(".bndb"):
-                core = record.basename[:-len(".bndb")]
-                aliases.append(core)
-                stem, dot, digest = core.rpartition(".")
-                if dot and len(digest) == 16 and all(
-                    c in "0123456789abcdef" for c in digest
-                ):
-                    aliases.append(stem)
-            if parts and parts[-1].endswith(".bndb"):
-                variants.append(parts[:-1] + (parts[-1][:-len(".bndb")],))
-            for alias in aliases:
-                exact.setdefault(alias, set()).add(vid)
-            for variant in variants:
+            for alias, kind in self._aliases(record):
+                _index(exact, alias, vid, kind)
+            for variant, kind in self._tail_variants(parts):
                 for depth in range(1, len(variant) + 1):
-                    tails.setdefault(variant[-depth:], set()).add(vid)
+                    _index(tails, variant[-depth:], vid, kind)
+        saved_pairs = self._saved_pairs(records)
 
         selectors: dict[str, str] = {}
         for vid, record in records.items():
@@ -991,18 +1013,64 @@ class TargetManager:
                 if normalized in identities:
                     matches = {identities[normalized]}
                 else:
-                    matches = exact.get(normalized, set()) | tails.get(
-                        _path_components(normalized), set()
-                    )
+                    kinds: dict[str, str] = {}
+                    for source in (exact.get(normalized, {}),
+                                   tails.get(_path_components(normalized), {})):
+                        for other, kind in source.items():
+                            if kinds.get(other) != self._STRONG:
+                                kinds[other] = kind
+                    matches = set(self._drop_saved_databases(kinds, saved_pairs))
                 if matches == {vid}:
                     chosen = candidate
                     break
             selectors[vid] = chosen
         return selectors
 
-    def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
+    # How a human selector names a record. Every alias counts equally -- view
+    # id, filename, basename, path tail and the `.bndb`-stripped forms -- so a
+    # selector matching two views is refused as ambiguous, whichever view
+    # opened first. A ranking between aliases was tried and rejected: opening
+    # a view could then silently MOVE a selector that used to be refused onto
+    # the new view (`close 5` closing the view whose id became 5, #996 review).
+    # The kind is kept only for the one narrow exception `_drop_saved_databases`
+    # makes.
+    _STRONG = "strong"        # view id, filename, basename, path tail
+    _STRIPPED = "stripped"    # only through a `.bndb`-stripped alias
+
+    def _aliases(self, record: TargetRecord) -> list[tuple[str, str]]:
+        """Every exact-string alias of *record* with its kind."""
+        aliases = [
+            (record.view_id, self._STRONG),
+            (record.filename, self._STRONG),
+            (record.basename, self._STRONG),
+        ]
+        # A .bndb corpus loads <binary>.bndb, but the obvious selector is
+        # <binary>; `-t foo` resolves `foo.bndb` (#312).
+        if record.basename.endswith(".bndb"):
+            core = record.basename[: -len(".bndb")]
+            aliases.append((core, self._STRIPPED))
+            # Read-only-mount targets restore the GLOBAL cache DB, named
+            # `<stem>.<16-hex content digest>.bndb` by `_cache_bndb_path`; strip
+            # a trailing `.<16 hex>` so the cache name resolves by stem.
+            stem, dot, digest = core.rpartition(".")
+            if dot and len(digest) == 16 and all(
+                c in "0123456789abcdef" for c in digest
+            ):
+                aliases.append((stem, self._STRIPPED))
+        return [(alias, kind) for alias, kind in aliases if alias]
+
+    def _tail_variants(self, parts: tuple[str, ...]) -> list[tuple[tuple[str, ...], str]]:
+        """The component sequences whose suffixes a path-tail selector matches."""
+        variants = [(parts, self._STRONG)] if parts else []
+        if parts and parts[-1].endswith(".bndb"):
+            variants.append(
+                (parts[:-1] + (parts[-1][: -len(".bndb")],), self._STRIPPED))
+        return variants
+
+    def _match_kind(self, record: TargetRecord, selector: str | None) -> str | None:
+        """How *selector* names *record* (strong over stripped), or None."""
         if selector is None:
-            return False
+            return None
         if isinstance(selector, PinnedTarget):
             # An identity the BRIDGE pinned (the destructive gate) resolves by
             # exact target_id and by nothing else. Every fallback below is a
@@ -1011,47 +1079,95 @@ class TargetManager:
             # DIFFERENT view whose filename happened to spell the pinned id,
             # which is exactly the wrong-target write the pin prevents (#736
             # review rounds 2 and 3).
-            return str(selector) == record.target_id()
+            return self._STRONG if str(selector) == record.target_id() else None
         candidate = str(selector).strip()
         if candidate in ("", "active"):
-            return False
-        if candidate in (
-            record.target_id(),
-            record.view_id,
-            record.filename,
-            record.basename,
-        ):
-            return True
-        # A .bndb corpus loads <binary>.bndb, but the obvious selector is
-        # <binary>; match a candidate against the basename / path tail with a
-        # trailing .bndb stripped so `-t foo` resolves `foo.bndb` (#312).
-        if record.basename.endswith(".bndb"):
-            core = record.basename[: -len(".bndb")]
-            if candidate == core:
-                return True
-            # Read-only-mount targets restore the GLOBAL cache DB, named
-            # `<stem>.<16-hex content digest>.bndb` by `_cache_bndb_path`. Its core
-            # is `<stem>.<digest>`, so `-t <stem>` (e.g. `-t foo`, the obvious
-            # base name) would miss the exact/`.bndb`-strip cases above. Strip a
-            # trailing `.<16 hex>` so the cache name resolves by stem.
-            stem, dot, digest = core.rpartition(".")
-            if (
-                dot
-                and candidate == stem
-                and len(digest) == 16
-                and all(c in "0123456789abcdef" for c in digest)
-            ):
-                return True
+            return None
+        if candidate == record.target_id():
+            return self._STRONG
+        found: str | None = None
+        for alias, kind in self._aliases(record):
+            if candidate == alias:
+                if kind == self._STRONG:
+                    return kind
+                found = kind
         suffix = _path_components(candidate)
         if suffix:
-            parts = _path_components(record.filename)
-            if len(parts) >= len(suffix) and parts[-len(suffix):] == suffix:
-                return True
-            if parts and parts[-1].endswith(".bndb"):
-                stripped = tuple(parts[:-1]) + (parts[-1][: -len(".bndb")],)
-                if len(stripped) >= len(suffix) and tuple(stripped[-len(suffix):]) == tuple(suffix):
-                    return True
-        return False
+            for variant, kind in self._tail_variants(_path_components(record.filename)):
+                if len(variant) >= len(suffix) and variant[-len(suffix):] == suffix:
+                    if kind == self._STRONG:
+                        return kind
+                    found = kind
+        return found
+
+    def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
+        return self._match_kind(record, selector) is not None
+
+    def _saved_pairs(self, records: dict[str, TargetRecord]) -> dict[str, str]:
+        """database view id -> the raw view id THIS bridge saved it from.
+
+        From the save ledger, never from filename spelling: two unrelated `foo`
+        and `foo.bndb` views form no pair. The path alone is not enough either
+        (#996 review): the database view must still be the file this bridge
+        wrote -- same device, inode, size and mtime as recorded right after the
+        save -- and must not have loaded as unverified against its raw bytes.
+        A database replaced since, or one that failed that check, pairs with
+        nothing, so `-t foo` is ambiguous again exactly as without a save.
+        """
+        pairs: dict[str, str] = {}
+        for raw_vid, path in self._database_paths.items():
+            identity = self._database_identities.get(raw_vid)
+            if raw_vid not in records or identity is None:
+                continue
+            for vid, record in records.items():
+                if (
+                    vid != raw_vid
+                    and _same_file(record.filename, path)
+                    and _file_identity(record.filename) == identity
+                    and _source_verified.get(record.session_id) is not False
+                ):
+                    pairs[vid] = raw_vid
+        return pairs
+
+    def stripped_only_match(self, selector: str | None, bv) -> tuple[str, str] | None:
+        """``(filename, listed selector)`` of *bv* when *selector* names it ONLY
+        through a `.bndb`-stripped alias (`hello` for `hello.bndb`), else None.
+        A destructive close refuses that convenience (#996 review). The listed
+        selector is the one `target list` advertises, which resolves to exactly
+        this view -- unlike its basename, which another open view may share."""
+        if selector is None or isinstance(selector, PinnedTarget):
+            return None
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            record = self._records.get(vid) if vid is not None else None
+            if record is None or self._match_kind(record, selector) != self._STRIPPED:
+                return None
+        row = next((r for r in self.refresh() if r.get("view_id") == vid), None)
+        listed = str(row.get("selector") or "") if row else ""
+        return record.filename, listed or record.target_id()
+
+    def _drop_saved_databases(
+        self, kinds: dict[str, str], saved_pairs: dict[str, str]
+    ) -> list[str]:
+        """The matched view ids, minus a database its own raw view outranks.
+
+        The one exception to "every alias counts equally" (#996): `bn save` on
+        the raw `hello` then `bn load hello.bndb` -- the round trip the skills
+        recommend -- must not break the `hello` selector `session start`
+        printed. A database view is dropped only when it matched solely through
+        a `.bndb`-stripped alias AND the raw view this bridge saved it from
+        matched strongly. Stable whichever order they opened in, so no
+        selector moves onto a newly opened view; anything else that matches
+        twice stays ambiguous.
+        """
+        return [
+            vid for vid, kind in kinds.items()
+            if not (
+                kind == self._STRIPPED
+                and saved_pairs.get(vid) is not None
+                and kinds.get(saved_pairs[vid]) == self._STRONG
+            )
+        ]
 
     def _matching_records(
         self, records: dict[str, TargetRecord], selector: str | None
@@ -1060,6 +1176,8 @@ class TargetManager:
 
         A live full target_id outranks filename aliases, so the last-resort
         selector remains usable even with a file named after another view's ID.
+        Every other alias counts equally (see `_STRONG`), less only a database
+        whose own saved-from raw view also matched (`_drop_saved_databases`).
         PinnedTarget retains its stricter identity-only semantics, including
         when its view has disappeared.
         """
@@ -1068,10 +1186,14 @@ class TargetManager:
             for record in records.values():
                 if candidate == record.target_id():
                     return [record]
-        return [
-            record for record in records.values()
-            if self._matches_record(record, selector)
-        ]
+        kinds = {
+            vid: kind for vid, record in records.items()
+            if (kind := self._match_kind(record, selector)) is not None
+        }
+        if len(kinds) > 1:
+            return [records[vid] for vid in
+                    self._drop_saved_databases(kinds, self._saved_pairs(records))]
+        return [records[vid] for vid in kinds]
 
     def matches_target(self, target_id: str, selector: str | None) -> bool:
         """Whether ``selector`` names the record with ``target_id``. Locked."""
@@ -1173,6 +1295,10 @@ class TargetManager:
                 # restart would then reopen its raw bytes (#753 review).
                 self._database_paths = {
                     vid: path for vid, path in self._database_paths.items()
+                    if vid in alive
+                }
+                self._database_identities = {
+                    vid: ident for vid, ident in self._database_identities.items()
                     if vid in alive
                 }
                 self._session_annotations = {
@@ -1283,9 +1409,16 @@ class TargetManager:
                 selectors_by_view.get(record.view_id, record.target_id())
                 for record in matches
             )
-            raise RuntimeError(
-                f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})"
-            )
+            # #996 re-dogfood: the candidates as the shared `-t` rows too, so
+            # the refusal hands over selectors that each resolve to ONE target
+            # (a CLI command with a positional selector re-spells them).
+            matched = {record.view_id for record in matches}
+            rows = [target_row(t) for t in targets if t.get("view_id") in matched]
+            raise RuntimeError("\n".join([
+                f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})",
+                "Matching targets:",
+                *rows,
+            ]))
         return matches[0].view, targets
 
     def pin_destructive_target(self, op_name: str, selector: Any) -> str | None:
@@ -2168,6 +2301,7 @@ class BinaryNinjaBridge:
             "plugin_name": PLUGIN_NAME,
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
+            "source_dir": SOURCE_DIR,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "gui": ui is not None,
         }
@@ -2465,6 +2599,7 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             # Whole-package fingerprint of the code this process loaded (#161).
             "engine_build_id": ENGINE_BUILD_ID,
+            "source_dir": SOURCE_DIR,
             # Which Binary Ninja this process is actually driving. Nothing else
             # in the tool's output names it: a major-version jump (5.x -> 6.x)
             # changes analysis and IL semantics, so "the same command behaved
@@ -2500,6 +2635,19 @@ class BinaryNinjaBridge:
                 continue
         return None
 
+    def _loaded_target_row(self, targets: list[dict[str, Any]], bv) -> dict[str, Any] | None:
+        """The row of *targets* that IS *bv*: the target this load opened.
+
+        `targets` lists every open view, so a reader that wants "the selector of
+        what I just loaded" -- `session start` printing one `target:` line per
+        binary -- needs it named rather than guessed from the list (#996).
+        """
+        with self.targets._lock:
+            view_id = self.targets._stable_view_id(bv)
+        if view_id is None:
+            return None
+        return next((row for row in targets if row.get("view_id") == view_id), None)
+
     def _load_existing_result(
         self,
         load_path: Path,
@@ -2531,6 +2679,7 @@ class BinaryNinjaBridge:
             "already_open": True,
             "notes": notes,
             "targets": targets,
+            "target": self._loaded_target_row(targets, existing),
         }
 
     def _load_binary_async(
@@ -2957,6 +3106,7 @@ class BinaryNinjaBridge:
                 ),
                 "notes": notes,
                 "targets": targets,
+                "target": self._loaded_target_row(targets, bv),
             }
         except BaseException:
             # #609: a view opened by binaryninja.load() above but not yet published
@@ -3083,6 +3233,18 @@ class BinaryNinjaBridge:
             target_bv = self._resolve_sole_target_for_close()
         else:
             target_bv = self.targets.resolve(target)
+            # #996 review: a destructive close does not take the `.bndb`-strip
+            # convenience (#312). Once the raw `hello` is closed, `-t hello`
+            # names `hello.bndb` only through that alias -- say so, rather than
+            # tear down the database the caller may not have meant.
+            stripped = self.targets.stripped_only_match(target, target_bv)
+            if stripped is not None:
+                filename, listed = stripped
+                raise RuntimeError(
+                    f"close_binary: {str(target)!r} names {filename} only through "
+                    f"its `.bndb`-stripped name; {LISTED_SELECTOR_LEAD}"
+                    f"{shlex.quote(listed)}"
+                )
 
         # Target-based close takes priority and must succeed even when
         # _headless_views is empty: GUI-opened views resolve fine but are not
@@ -3128,7 +3290,10 @@ class BinaryNinjaBridge:
                     to_close.append(bv)
 
             if not to_close:
-                raise RuntimeError(f"No loaded binary matches path: {path}")
+                raise RuntimeError(
+                    f"No loaded binary matches path: {path}. To close by selector "
+                    f"(as `bn target list` shows it), use `bn close -t <selector>`."
+                )
 
         # Dedup by BN's handle-based equality, not id(). _collect_open_views()
         # already collapses wrappers per core view (#714), but this is the
@@ -3667,14 +3832,20 @@ class BinaryNinjaBridge:
         # against those writers before we ever touch the view.
         with self._write_gate:
             bv = self._resolve_view(selector)
-            bv.update_analysis_and_wait()
-            with self._target_lock.write():
-                _quick_loaded_views.discard(bv)
-                # Only clear the #458 unanalyzed flag if analysis actually produced
-                # functions -- a refresh on a raw-only container (no product view)
-                # is a no-op and must stay "unanalyzed", not be mislabeled "full".
-                if _view_function_count(bv) > 0:
-                    _unanalyzed_views.discard(bv)
+            # #996: gated reads on other connections see the refresh running and
+            # say "retry", instead of telling the agent to start another one.
+            _refreshing_views[bv] = time.monotonic()
+            try:
+                bv.update_analysis_and_wait()
+                with self._target_lock.write():
+                    _quick_loaded_views.discard(bv)
+                    # Only clear the #458 unanalyzed flag if analysis actually produced
+                    # functions -- a refresh on a raw-only container (no product view)
+                    # is a no-op and must stay "unanalyzed", not be mislabeled "full".
+                    if _view_function_count(bv) > 0:
+                        _unanalyzed_views.discard(bv)
+            finally:
+                _refreshing_views.pop(bv, None)
         # Build the response under the READ lock: the tail read touches live view
         # state (bv.functions / arch / analysis_progress), and the instant we drop
         # the write gate a queued mutation can begin writing the same view -- so
@@ -4931,6 +5102,7 @@ from .bridge_state import (  # noqa: E402
     _headless_views_lock,
     _quick_loaded_views,
     _opened_annotations,
+    _refreshing_views,
     _source_verified,
     _unanalyzed_views,
     view_session_key,
@@ -5056,9 +5228,18 @@ def _bind_close_binary(bridge, params, target):
             "close_binary: pass \"target\" at the top level of the request, "
             "not inside params"
         )
+    # #996 review: `pinned_target` makes the selector an identity -- resolved
+    # by exact target_id and nothing else (`PinnedTarget`) -- for a CLI that
+    # read the id from a listing. Without it a target closed in between could
+    # hand the close to a file NAMED like that id. A flag, not a selector
+    # spelling, so no filename can ever carry pin semantics.
+    pinned = _validate_bool(params.get("pinned_target"), label="pinned_target",
+                            default=False)
+    if pinned and not (isinstance(target, str) and target.strip()):
+        raise ValueError("close_binary: pinned_target needs a target_id selector")
     return bridge._close_binary(
         params.get("path"),
-        target,
+        PinnedTarget(target) if pinned else target,
         _validate_bool(params.get("all"), label="all", default=False),
     )
 
@@ -5742,6 +5923,17 @@ def _bind_batch_apply(bridge, params, target):
 READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 
+
+
+def _file_identity(path: str | None) -> tuple[int, int, int, int] | None:
+    """(device, inode, size, mtime_ns) of *path*, or None when it cannot be read."""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def _same_file(a: str | None, b: str | None) -> bool:
