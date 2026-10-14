@@ -1887,11 +1887,8 @@ def test_callsite_excerpt_page_projection_holds_on_a_truncated_scan_792(monkeypa
     assert rendered == [caller.start for caller in callers[8:10]], rendered
 
 
-def test_a_call_in_a_block_shared_by_two_functions_is_one_callsite_998(monkeypatch):
-    """#998 item 2: BN puts a block one function jumps into (a shared tail) in
-    BOTH functions, so the per-function scan saw each call instruction twice.
-    A call site is an instruction: one row per `call_addr`, the other
-    containing function under `also_in`, and `total` counts call sites."""
+def _shared_tail_view(monkeypatch):
+    """`f1` and `f2` both contain the block `0x4000e0: bl target; bl target`."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     target_addr, shared = 0x4000D4, (0x4000E0, 0x4000E4)
@@ -1907,7 +1904,21 @@ def test_a_call_in_a_block_shared_by_two_functions_is_one_callsite_998(monkeypat
                  code_refs={target_addr: refs},
                  disassembly={addr: "bl 0x4000d4" for addr in shared},
                  instruction_lengths={addr: 4 for addr in shared})
+    # BN's containment is by BLOCK: `f2` (which starts after the block) still
+    # contains it. The shared fake measures a start..end span, so say it here.
+    monkeypatch.setattr(bv, "get_functions_containing", lambda address: [
+        fn for fn in bv.functions
+        if any(block.start <= int(address) < block.end for block in fn.basic_blocks)])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return instance
+
+
+def test_a_call_in_a_block_shared_by_two_functions_is_one_callsite_998(monkeypatch):
+    """#998 item 2: BN puts a block one function jumps into (a shared tail) in
+    BOTH functions, so the per-function scan saw each call instruction twice.
+    A call site is an instruction: one row per `call_addr`, the other
+    containing function under `also_in`, and `total` counts call sites."""
+    instance = _shared_tail_view(monkeypatch)
 
     result = instance._callsites(None, "target", within_identifiers=[])
 
@@ -1915,6 +1926,23 @@ def test_a_call_in_a_block_shared_by_two_functions_is_one_callsite_998(monkeypat
     assert [(row["call_addr"], row["containing_function"]["name"]) for row in result["items"]] == [
         ("0x4000e0", "f1"), ("0x4000e4", "f1")]
     assert all([f["name"] for f in row["also_in"]] == ["f2"] for row in result["items"])
+
+
+def test_also_in_does_not_depend_on_how_far_the_scan_reached_998(monkeypatch):
+    """#998 review: `also_in` was collected from the callers the scan visited,
+    so a page whose scan stopped after `f1` (and `Client.collect` built from
+    such pages) lost `f2`, and `--within f2` lost `f1`. It is read from BN for
+    the row itself, so every read of the same row carries the same set."""
+    instance = _shared_tail_view(monkeypatch)
+
+    first_page = instance._callsites(None, "target", within_identifiers=[], limit=1)
+    assert first_page["scan_truncated"] is True
+    assert [(row["call_addr"], [f["name"] for f in row["also_in"]])
+            for row in first_page["items"]] == [("0x4000e0", ["f2"])]
+
+    scoped = instance._callsites(None, "target", within_identifiers=["f2"])
+    assert [(row["containing_function"]["name"], [f["name"] for f in row["also_in"]])
+            for row in scoped["items"]] == [("f2", ["f1"]), ("f2", ["f1"])]
 
 
 

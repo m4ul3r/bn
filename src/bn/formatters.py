@@ -2689,10 +2689,17 @@ def _group_refs_by_caller(refs: list[Any], *, mangled: bool = False) -> list[dic
             vslot = _field_dict(ref, "vtable_slot")
             if vslot.get("class") is not None:
                 # #998 item 1: a vtable slot names its table, not just a section.
-                label = f"vtable for {vslot['class']} [slot {vslot.get('slot_index', '?')}]"
+                ott = vslot.get("offset_to_top")
+                table = (f"secondary vtable (offset-to-top {ott}) for"
+                         if isinstance(ott, int) and not isinstance(ott, bool) and ott != 0
+                         else "vtable for")
+                label = f"{table} {vslot['class']} [slot {vslot.get('slot_index', '?')}]"
             else:
+                # A run of code pointers the slot walk could not resolve.
+                maybe = (" [may be a vtable slot]"
+                         if ref.get("vtable_slot_undecided") is True else "")
                 label = (_unknown_ref_label(_field_dict(ref, "context"))
-                         or ("" if fn_label is None else str(fn_label)))
+                         or ("" if fn_label is None else str(fn_label))) + maybe
             if label:
                 key = ("label", label)
             else:
@@ -3971,7 +3978,8 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         scan_truncated = bool(value.get("scan_truncated"))
         has_more = bool(value.get("has_more"))
         caller_scan_note = value.get("caller_scan_note")
-        vtable_note = _callsites_vtable_note(value.get("vtable_slots"))
+        vtable_note = _callsites_vtable_note(value.get("vtable_slots"),
+                                             value.get("vtable_slots_undecided"))
         value = _field_list(value, "items")
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -4130,27 +4138,46 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
     return body
 
 
-def _callsites_vtable_note(raw_slots: Any) -> str | None:
+def _vtable_table_phrase(slot: dict[str, Any]) -> str:
+    """``of`` for a primary vtable, ``of the secondary vtable (offset-to-top
+    -16) of`` for a secondary one: a secondary table's slot N is not the
+    primary's slot N, so the text must not read as if it were (#998 review)."""
+    ott = slot.get("offset_to_top")
+    if isinstance(ott, int) and not isinstance(ott, bool) and ott != 0:
+        return f"of the secondary vtable (offset-to-top {ott}) of"
+    return "of"
+
+
+def _callsites_vtable_note(raw_slots: Any, raw_undecided: Any = None) -> str | None:
     """#998 item 1: the callee sits in vtable slots, so its virtual callers --
     which no call instruction names -- are absent from the rows above. One
-    phrase per (slot, offset), the classes whose tables hold it. Read through
-    the choke point so a skewed `vtable_slots` is disclosed, not dropped."""
-    groups: dict[tuple[str, str], list[str]] = {}
+    phrase per (slot, offset, table), the classes whose tables hold it. Data
+    refs the slot walk could not decide are disclosed too. Read through the
+    choke point so a skewed field is disclosed, not dropped."""
+    groups: dict[tuple[str, str, str], list[str]] = {}
     for slot in _field_list({"vtable_slots": raw_slots}, "vtable_slots"):
         if not isinstance(slot, dict):
             continue
-        key = (str(slot.get("slot_index", "?")), str(slot.get("slot_offset", "?")))
+        key = (str(slot.get("slot_index", "?")), str(slot.get("slot_offset", "?")),
+               _vtable_table_phrase(slot))
         cls = str(slot.get("class") or "?")
         if key not in groups:
             groups[key] = []
         if cls not in groups[key]:
             groups[key].append(cls)
-    if not groups:
-        return None
-    where = "; ".join(f"slot {index} (+{offset}) of {', '.join(classes)}"
-                      for (index, offset), classes in groups.items())
-    return (f"note: the callee is a vtable slot -- {where}; virtual calls through it "
-            "are not direct callsites and are not listed above")
+    notes = []
+    if groups:
+        where = "; ".join(f"slot {index} (+{offset}) {table} {', '.join(classes)}"
+                          for (index, offset, table), classes in groups.items())
+        notes.append(f"note: the callee is a vtable slot -- {where}; virtual calls through "
+                     "it are not direct callsites and are not listed above")
+    undecided = [str(a) for a in _field_list({"vtable_slots_undecided": raw_undecided},
+                                             "vtable_slots_undecided")]
+    if undecided:
+        notes.append(f"note: {len(undecided)} data ref(s) to the callee ({', '.join(undecided)}) "
+                     "sit in a run of code pointers too long to walk back to a vtable header; "
+                     "they may be vtable slots, so virtual callers are not ruled out")
+    return "\n".join(notes) if notes else None
 
 
 @_discloses
@@ -7370,6 +7397,14 @@ def _render_class_list_text(value: Any) -> str:
             f"size={size_s if size_s is not None else '?'}  "
             f"[{rec.get('confidence', '?')}]{base_s}{art_s}{aka_s}"
         )
+    uncomputed = sum(1 for rec in rows
+                     if isinstance(rec, dict) and rec.get("size_reason") == "not_computed")
+    if uncomputed:
+        # #998 review: the default listing reads only BN types; say so rather
+        # than let `size=?` read as "no size recoverable".
+        lines.extend(["", f"size=? on {uncomputed} row(s): not computed by default; "
+                          "`class list --sizes` (slower; bound it with --limit) or "
+                          "`class show <Name>` recovers it"])
     footer = _paging_footer(value, rows, page_unreadable)
     if footer is not None:
         lines.extend(["", footer])
@@ -7470,8 +7505,11 @@ def _render_one_class(rec: Any) -> str:
     lines = [head, f"  [{rec.get('confidence', '?')}]"]
     size_reason = _text_value(rec, "size_reason")
     if size_s is None and size_reason:
-        # #998 item 4: an unknown size says which recovery outcome it hit.
-        lines.append(f"  size: unknown ({size_reason})")
+        # #998 item 4: an unknown size says which recovery outcome it hit,
+        # and the largest size the evidence still allows.
+        bound = _text_value(rec, "size_upper_bound")
+        bound_s = f"; at most {bound}" if bound else ""
+        lines.append(f"  size: unknown ({size_reason}{bound_s})")
     # #922 (d): one class, several demangled spellings -- the card is the merge.
     for alias in _field_list(rec, "aliases"):
         lines.append(f"  aka: {alias}")
@@ -7578,7 +7616,10 @@ def _render_one_class(rec: Any) -> str:
         if not isinstance(site, dict):
             parts.append(repr(site))
             continue
-        sz = f" (size {site['size']})" if site.get("size") else ""
+        # #998 review: the allocation a constructor ran on is an upper bound on
+        # the class size (it may hold a derived or enclosing object), so it is
+        # labelled as the allocation, never as the size.
+        sz = f" (allocation {site['allocation_size']})" if site.get("allocation_size") else ""
         fn = f" (in {site['function']})" if site.get("function") else ""
         parts.append(f"{site.get('kind', '?')} @ {site.get('address', '?')}{sz}{fn}")
     for g in _field_list(inst, "stored_globals"):

@@ -494,7 +494,7 @@ def test_enrich_backwalks_vtable_for_stripped_class():
     # primary + secondary vtables recovered via the typeinfo backwalk in _enrich.
     class _EnrichCtx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None, "no_construction_site"
+            return _NO_SIZE
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -525,7 +525,7 @@ def test_enrich_recovers_secondary_for_symbolized_primary_class():
     # symbolized primary layout.
     class _EnrichCtx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None, "no_construction_site"
+            return _NO_SIZE
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -918,6 +918,9 @@ def test_vtable_layout_skips_header_and_marks_slots():
     assert s2["pure_virtual"] is True
 
 
+_NO_SIZE = read_class._SizeFinding(None, "no_size_evidence", None)
+
+
 class _SlotRefCtx:
     """Two tables in fake memory: `Base` @ 0x9000 (slots at 0x9010) and
     `Derived` @ 0x9100 (slots at 0x9110). Each table's word[1] is its typeinfo;
@@ -951,36 +954,57 @@ class _SlotRefCtx:
         return None
 
 
+def _slot_bv(data_refs):
+    """A view whose code is 0x400000-0x403000 (what a vtable entry may hold)."""
+    return types.SimpleNamespace(
+        get_data_refs=lambda addr: data_refs.get(addr, []),
+        get_function_at=lambda addr: object() if 0x400000 <= addr < 0x403000 else None)
+
+
 def test_vtable_slots_referencing_names_each_table_and_slot_998():
     """#998 item 1: the data refs to a method that are vtable slots, each with
     its class, slot index and byte offset from the address point."""
     reg, other = 0x401000, 0x402000
     words = {0x9000: 0, 0x9008: 0x9800, 0x9010: 0x400100, 0x9018: other, 0x9020: reg,
              0x9100: 0, 0x9108: 0x9900, 0x9110: 0x400200, 0x9118: 0x402100, 0x9120: reg,
-             # A function-pointer array no typeinfo header precedes.
-             0x9500: reg}
+             # A function-pointer array preceded by a data word, not a header.
+             0x94f8: 0x7777, 0x9500: reg}
     ctx = _SlotRefCtx(words, {0x9000: [0x400100, other, reg],
                               0x9100: [0x400200, 0x402100, reg]})
-    bv = types.SimpleNamespace(get_data_refs=lambda addr: {
-        reg: [0x9020, 0x9120, 0x9500], other: [0x9018]}.get(addr, []))
+    bv = _slot_bv({reg: [0x9020, 0x9120, 0x9500], other: [0x9018]})
 
-    assert read_class._vtable_slots_referencing(ctx, bv, reg) == [
+    found = read_class._vtable_slots_referencing(ctx, bv, reg)
+    assert found.slots == [
         {"class": "Base", "vtable": "0x9000", "address_point": "0x9010", "slot_index": 2,
          "slot_offset": "0x10", "slot_address": "0x9020", "offset_to_top": 0},
         {"class": "Derived", "vtable": "0x9100", "address_point": "0x9110", "slot_index": 2,
          "slot_offset": "0x10", "slot_address": "0x9120", "offset_to_top": 0},
     ]
-    assert [s["slot_index"] for s in read_class._vtable_slots_referencing(ctx, bv, other)] == [1]
+    # The fn-pointer array's walk met a word no vtable can hold: decided, not a slot.
+    assert found.undecided == []
+    assert [s["slot_index"] for s in read_class._vtable_slots_referencing(ctx, bv, other).slots] == [1]
 
 
 def test_vtable_slots_referencing_requires_the_decoded_slot_to_hold_the_target_998():
     """A data ref past the table's decoded end (the layout stopped before it)
     is not a slot, even with a typeinfo header within reach."""
     target = 0x401000
-    words = {0x9000: 0, 0x9008: 0x9800, 0x9010: 0x400100, 0x9018: 0x7777, 0x9020: target}
+    words = {0x9000: 0, 0x9008: 0x9800, 0x9010: 0x400100, 0x9018: 0x401100, 0x9020: target}
     ctx = _SlotRefCtx(words, {0x9000: [0x400100]})
-    bv = types.SimpleNamespace(get_data_refs=lambda addr: [0x9020])
-    assert read_class._vtable_slots_referencing(ctx, bv, target) == []
+    found = read_class._vtable_slots_referencing(ctx, _slot_bv({target: [0x9020]}), target)
+    assert found == read_class._SlotRefs([], [])
+
+
+def test_vtable_slot_walk_that_never_ends_is_disclosed_not_dropped_998():
+    """#998 review: a ref deep inside a long run of code pointers with no
+    header in reach was dropped silently; it is reported as undecided."""
+    target = 0x401000
+    run_end = 0x100000
+    words = {run_end - 8 * k: 0x400100 for k in range(1, 5000)}
+    words[run_end] = target
+    ctx = _SlotRefCtx(words, {})
+    found = read_class._vtable_slots_referencing(ctx, _slot_bv({target: [run_end]}), target)
+    assert found == read_class._SlotRefs([], [hex(run_end)])
 
 
 def test_vtable_layout_reports_the_address_point_998():
@@ -1016,57 +1040,234 @@ def test_vtable_layout_stops_at_unmapped_slot():
     assert [s["index"] for s in layout["slots"]] == [0]   # stopped at the gap
 
 
-class _SizeCtx:
-    def __init__(self, type_width=None, sites=()):
-        self._type_width = type_width
-        self._sites = list(sites)
+# --- #998 item 4: fake MLIL SSA for the size readers ------------------------
 
-    def _find_type(self, bv, name):
-        if self._type_width is None:
-            return None
-        class _T:
-            width = self._type_width
-        return name, _T()
+
+class _Il:
+    """One MLIL SSA expression/instruction: `operation.name` plus operands."""
+
+    def __init__(self, op, **operands):
+        self.operation = types.SimpleNamespace(name=op)
+        self.__dict__.update(operands)
+
+
+def _ssa(name, version=0):
+    return types.SimpleNamespace(var=name, version=version)
+
+
+def _var(name, version=0, function=None):
+    return _Il("MLIL_VAR_SSA", src=_ssa(name, version), function=function)
+
+
+def _const(value):
+    return _Il("MLIL_CONST", constant=value)
+
+
+def _add(left, right):
+    return _Il("MLIL_ADD", left=left, right=right)
+
+
+def _store(dest, size, address=0):
+    return _Il("MLIL_STORE_SSA", dest=dest, size=size, src=_const(0), address=address)
+
+
+def _copy(dest, src):
+    return _Il("MLIL_SET_VAR_SSA", dest=_ssa(*dest), src=src)
+
+
+def _call(target, params, address, op="MLIL_CALL_SSA"):
+    return _Il(op, dest=_Il("MLIL_CONST_PTR", constant=target), params=params, address=address)
+
+
+class _RegValue:
+    def __init__(self, kind, value=None, reg=None):
+        self.type = types.SimpleNamespace(name=kind)
+        self.value = value
+        self.reg = reg
+
+
+class _MlilFn:
+    """A function with an MLIL SSA body, a SysV-style argument list and BN's
+    per-address register dataflow (``regs``: {address: {reg: _RegValue}})."""
+
+    def __init__(self, start, name, instructions, *, regs=None, symbol=None):
+        self.start = start
+        self.name = name
+        self.symbol = symbol
+        self.parameter_vars = ["this"]
+        self.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi", "rdx"])
+        self._regs = regs or {}
+        self.mlil = types.SimpleNamespace(ssa_form=types.SimpleNamespace(
+            instructions=instructions, source_function=self))
+
+    def get_reg_value_at(self, address, reg):
+        return self._regs.get(address, {}).get(reg, _RegValue("UndeterminedValue"))
+
+
+_OP_NEW, _OP_NEW_ARRAY, _SIZED_DELETE, _DELETE, _MEMSET = (
+    0x400620, 0x400630, 0x4010c0, 0x4010d0, 0x4010e0)
+
+
+class _MlilBV:
+    """Imports by raw name, plus local functions by address."""
+
+    _IMPORTS = {_OP_NEW: "_Znwm", _OP_NEW_ARRAY: "_Znam", _SIZED_DELETE: "_ZdlPvm",
+                _DELETE: "_ZdlPv", _MEMSET: "memset"}
+
+    def __init__(self, functions=(), type_widths=None):
+        self._functions = {fn.start: fn for fn in functions}
+        self._type_widths = type_widths or {}
+
+    def get_symbol_at(self, address):
+        name = self._IMPORTS.get(address)
+        return types.SimpleNamespace(raw_name=name, name=name) if name else None
+
+    def get_function_at(self, address):
+        return self._functions.get(address)
+
+    def get_functions_containing(self, address):
+        return [fn for fn in self._functions.values() if fn.start <= address < fn.start + 0x100]
+
+    def get_type_by_name(self, name):
+        width = self._type_widths.get(str(name))
+        return types.SimpleNamespace(width=width) if width else None
+
+
+def _d0(start, size, *, this_reg="rdi", delete=_SIZED_DELETE):
+    """`X::~X() [D0]`: `rsi = size; tailcall delete(this)` (BN's import type
+    drops the size parameter from the IL; the register still holds it)."""
+    call = start + 9
+    this_value = (_RegValue("EntryValue", reg=this_reg) if this_reg
+                  else _RegValue("UndeterminedValue"))
+    return _MlilFn(start, "_ZN1XD0Ev", [
+        _copy(("rsi", 1), _const(size)),
+        _call(delete, [_var("this")], call, op="MLIL_TAILCALL_SSA"),
+    ], regs={call: {"rdi": this_value, "rsi": _RegValue("ConstantValue", value=size)}})
+
+
+def test_deleting_destructor_names_the_object_size_998():
+    """The ABI's sized `operator delete(this, sizeof(X))` in X's own deleting
+    destructor is exact, whatever allocation the object came from."""
+    bv = _MlilBV()
+    assert read_class._deleting_dtor_size(bv, _d0(0x12b0, 0x28)) == (0x28, 0x12b9)
+    # `this` adjusted first (a thunk) or an unsized delete: no evidence.
+    assert read_class._deleting_dtor_size(bv, _d0(0x12b0, 0x28, this_reg=None)) is None
+    assert read_class._deleting_dtor_size(bv, _d0(0x12b0, 0x28, delete=_DELETE)) is None
+
+
+def _ctor(start, body):
+    return _MlilFn(start, "_ZN1XC2Ev", body,
+                   symbol=types.SimpleNamespace(short_name="X::X", name="X::X"))
+
+
+def test_ctor_write_extent_follows_copies_memset_and_member_ctors_998():
+    """The extent is the furthest byte the ctor writes through `this`, through
+    SSA copies, `memset(this + o, 0, n)` and a member ctor on `this + o`;
+    a store at a computed offset only lowers the bound."""
+    member = _MlilFn(0x5000, "_ZN1MC2Ev", [_store(_var("this"), 8)])
+    bv = _MlilBV([member])
+    # `_classify_function` decides "ctor" from the demangled name.
+    member.symbol = types.SimpleNamespace(short_name="M::M()", name="M::M()",
+                                          full_name="M::M()", raw_name="_ZN1MC2Ev")
+    ctor = _ctor(0x4000, [
+        _copy(("x19", 1), _var("this")),
+        _store(_add(_var("x19", 1), _const(0x10)), 8),
+        _call(_MEMSET, [_add(_var("this"), _const(0x18)), _const(0), _const(0x20)], 0x4010),
+        _store(_add(_var("this"), _var("idx", 1)), 8),
+    ])
+    assert read_class._ctor_write_extent(bv, ctor) == 0x38
+    with_member = _ctor(0x4100, [_call(0x5000, [_add(_var("this"), _const(0x40))], 0x4110)])
+    assert read_class._ctor_write_extent(bv, with_member) == 0x48
+
+
+def _allocating_caller(start, new_target, size, *, via_copy=False):
+    """`p = operator new(size); [q = p;] X::X(q)` with the ctor call at start+0x10."""
+    ssa = types.SimpleNamespace()
+    new_call = _call(new_target, [_const(size)], start + 4)
+    definitions = {("result", 1): new_call}
+    arg = _var("result", 1, function=ssa)
+    if via_copy:
+        definitions[("x3", 1)] = _copy(("x3", 1), arg)
+        arg = _var("x3", 1, function=ssa)
+    fn = _MlilFn(start, "make", [])
+    ssa.get_ssa_var_definition = lambda var: definitions.get((var.var, var.version))
+    ssa.source_function = fn
+    ctor_call = types.SimpleNamespace(params=[arg])
+    fn.get_llil_at = lambda addr: types.SimpleNamespace(
+        mlil=types.SimpleNamespace(ssa_form=ctor_call))
+    return fn
+
+
+def test_operator_new_size_at_traces_scalar_new_only_998():
+    caller = _allocating_caller(0x6000, _OP_NEW, 0x58, via_copy=True)
+    assert read_class._operator_new_size_at(_MlilBV([caller]), 0x6010) == (0x58, 0x6004)
+    # `operator new[]` is an array: never one object.
+    array = _allocating_caller(0x6000, _OP_NEW_ARRAY, 0x30)
+    assert read_class._operator_new_size_at(_MlilBV([array]), 0x6010) is None
+
+
+class _SizeCtx:
+    def __init__(self, sites=()):
+        self._sites = list(sites)
 
     def _ctor_construction_sites(self, bv, record):
         return [dict(site) for site in self._sites]
 
 
-def _site(address, size=None, allocation=None, kind="ctor-call"):
-    return {"address": address, "function": "make", "kind": kind,
-            "size": size, "allocation": allocation}
+def _site(allocation_size=None, ctor="0x4000", allocation="0x6004", address="0x6010"):
+    return {"address": address, "function": "make", "kind": "ctor-call", "ctor": ctor,
+            "allocation_size": allocation_size, "allocation": allocation}
+
+
+def _record(*methods):
+    return {"name": "net::Session", "methods": list(methods)}
+
+
+_D0_METHOD = {"address": "0x12b0", "mangled": "_ZN3net7SessionD0Ev", "kind": "dtor"}
 
 
 def test_size_prefers_bn_type_width():
-    rec = {"name": "net::Session", "methods": [], "vtable": None}
-    ctx = _SizeCtx(type_width=0xD0, sites=[_site("0x1000", "0x40", "0xff0")])
-    assert read_class._object_size(ctx, object(), rec) == (
-        {"value": "0xd0", "source": "bn_type"}, None)
+    bv = _MlilBV([_d0(0x12b0, 0x28)], type_widths={"net::Session": 0xD0})
+    finding = read_class._object_size(_SizeCtx(), bv, _record(_D0_METHOD))
+    assert finding == read_class._SizeFinding({"value": "0xd0", "source": "bn_type"}, None, None)
 
 
-def test_size_from_operator_new_when_no_type():
-    """#998 item 4: the size every traced construction site agrees on, with the
-    first one's `operator new` call as provenance; an untraced site (a base
-    ctor called from a derived ctor, a stack object) does not veto it."""
-    rec = {"name": "net::Session", "methods": []}
-    ctx = _SizeCtx(sites=[_site("0x443abc", "0xd0", "0x443ab0"), _site("0x4500a0"),
-                          _site("0x460000", "0xd0", "0x45fff0", kind="inline-new")])
-    size, reason = read_class._object_size(ctx, object(), rec)
-    assert size == {"value": "0xd0", "source": "operator_new", "at": "0x443ab0", "sites": 2}
-    assert reason is None
+def test_size_from_the_deleting_destructor_998():
+    """A class's D0 fixes its size even when every allocation is larger."""
+    bv = _MlilBV([_d0(0x12b0, 0x28), _ctor(0x4000, [_store(_var("this"), 8)])])
+    finding = read_class._object_size(_SizeCtx([_site("0x50")]), bv, _record(_D0_METHOD))
+    assert finding == read_class._SizeFinding(
+        {"value": "0x28", "source": "deleting_destructor", "at": "0x12b9"}, None, 0x50)
 
 
-@pytest.mark.parametrize(("sites", "reason"), [
-    ([], "no_construction_site"),
-    ([_site("0x1000"), _site("0x2000")], "operator_new_not_traced"),
-    ([_site("0x1000", "0x40", "0xff0"), _site("0x2000", "0x80", "0x1ff0")],
-     "operator_new_sizes_disagree"),
-])
-def test_size_miss_names_its_reason_998(sites, reason):
+def test_allocation_is_the_size_only_when_the_ctor_fills_it_998():
+    """#998 review: array new, an enclosing object, a derived class built
+    around this ctor and placement new all hand the ctor a LARGER block, so an
+    allocation is the size only when the ctor's own writes reach its end;
+    otherwise it is an upper bound."""
+    fills = _ctor(0x4000, [_store(_var("this"), 8),
+                           _store(_add(_var("this"), _const(8)), 0x10)])
+    bv = _MlilBV([fills])
+    exact = read_class._object_size(_SizeCtx([_site("0x18")]), bv, _record())
+    assert exact == read_class._SizeFinding(
+        {"value": "0x18", "source": "operator_new", "at": "0x6004"}, None, 0x18)
+
+    larger = read_class._object_size(_SizeCtx([_site("0x50"), _site(None)]), bv, _record())
+    assert larger == read_class._SizeFinding(None, "allocation_upper_bound_only", 0x50)
+
+
+def test_exact_readers_that_disagree_report_no_size_998():
+    fills = _ctor(0x4000, [_store(_add(_var("this"), _const(0x10)), 8)])
+    bv = _MlilBV([_d0(0x12b0, 0x28), fills])
+    finding = read_class._object_size(_SizeCtx([_site("0x18")]), bv, _record(_D0_METHOD))
+    assert finding == read_class._SizeFinding(None, "size_evidence_disagrees", 0x18)
+
+
+def test_size_miss_with_nothing_to_read_998():
     """A miss stays a bare `None`, NOT a value-less envelope (#619: the card
     renders any size dict as `size ?`); WHY it missed rides beside it."""
-    rec = {"name": "net::Session", "methods": []}
-    assert read_class._object_size(_SizeCtx(sites=sites), object(), rec) == (None, reason)
+    finding = read_class._object_size(_SizeCtx(), _MlilBV(), _record())
+    assert finding == _NO_SIZE
 
 
 class _EnrichCtx(_SizeCtx):
@@ -1088,41 +1289,35 @@ class _EnrichCtx(_SizeCtx):
 
 def test_class_card_for_a_sizeless_class_states_why_998():
     """The size-less card, composed end to end: the head keeps no size, and
-    the reason `_object_size` produced is printed on its own line."""
+    the reason `_object_size` produced is printed on its own line with the
+    largest size the evidence still allows."""
     formatters = importlib.import_module("bn.formatters")
     rec = {"name": "net::Session", "methods": [], "confidence": "rtti"}
-    read_class._enrich(_EnrichCtx(sites=[_site("0x1000")]), object(), rec)
+    read_class._enrich(_EnrichCtx([_site("0x50")]), _MlilBV(), rec)
 
     lines = formatters._render_one_class(rec).splitlines()
     assert lines[0] == "class net::Session"
-    assert "  size: unknown (operator_new_not_traced)" in lines
+    assert "  size: unknown (allocation_upper_bound_only; at most 0x50)" in lines
 
 
 def test_class_record_states_where_the_size_came_from_817():
-    missed = read_class._enrich(_EnrichCtx(), object(), {"name": "net::Session", "methods": []})
+    missed = read_class._enrich(_EnrichCtx(), _MlilBV(), _record())
     assert missed["size"] is None
     assert missed["size_source"] == "unavailable"
-    assert missed["size_reason"] == "no_construction_site"
+    assert missed["size_reason"] == "no_size_evidence"
+    assert missed["size_upper_bound"] is None
 
-    hit = read_class._enrich(_EnrichCtx(type_width=0xD0), object(),
-                             {"name": "net::Session", "methods": []})
+    hit = read_class._enrich(_EnrichCtx(), _MlilBV(type_widths={"net::Session": 0xD0}), _record())
     assert hit["size"] == {"value": "0xd0", "source": "bn_type"}
     assert hit["size_source"] == "bn_type" and hit["size_reason"] is None
 
-    traced = read_class._enrich(_EnrichCtx(sites=[_site("0x1000", "0x58", "0xff8")]),
-                                object(), {"name": "net::Session", "methods": []})
-    assert traced["size_source"] == "operator_new" and traced["size_reason"] is None
 
-
-def test_size_survives_find_type_raising():
-    # Real ctx._find_type RAISES on a missing type; _object_size must treat that
-    # as "no type" and fall through, not propagate the exception.
-    class _RaisingCtx(_SizeCtx):
-        def _find_type(self, bv, name):
-            raise RuntimeError("Type not found: " + name)
-    size, _ = read_class._object_size(
-        _RaisingCtx(sites=[_site("0x1000", "0x40", "0xff0")]), object(), {"name": "X", "methods": []})
-    assert size["value"] == "0x40" and size["source"] == "operator_new"
+def test_namespaced_bn_type_is_found_by_its_components_998():
+    """#998 review: a plain-string lookup misses a namespaced BN type, so
+    `class list` and `class show` disagreed about the size source. The
+    components are tried as a `QualifiedName` when BN is present."""
+    assert read_class._split_toplevel_scopes("a::b<c::d, e::f>::g") == ["a", "b<c::d, e::f>", "g"]
+    assert read_class._split_toplevel_scopes("Plain") == ["Plain"]
 
 
 class _RttiCtx:
@@ -1251,7 +1446,8 @@ def test_class_show_assembles_full_record():
                 {"index": 0, "address": "0x40e8b0", "method": {"name": "onData"},
                  "pure_virtual": False, "unnamed": False}]}
         def _object_size_for(self, b, rec):
-            return {"value": "0xd0", "source": "operator_new", "at": "0x443abc"}, None
+            return read_class._SizeFinding(
+                {"value": "0xd0", "source": "operator_new", "at": "0x443abc"}, None, 0xd0)
         def _bases_for(self, b, rec):
             return [{"name": "net::Endpoint", "address": "0x9200", "kind": "public"}]
         def _instances_for(self, b, rec):
@@ -1267,7 +1463,7 @@ def test_class_show_assembles_full_record():
 @pytest.fixture
 def class_method_ctx(monkeypatch):
     ctx = seam.BridgeContext(None)
-    monkeypatch.setattr(ctx, "_object_size_for", lambda bv, rec: (None, "no_construction_site"))
+    monkeypatch.setattr(ctx, "_object_size_for", lambda bv, rec: _NO_SIZE)
     monkeypatch.setattr(ctx, "_bases_for", lambda bv, rec: [])
     monkeypatch.setattr(ctx, "_instances_for", lambda bv, rec: {
         "construction_sites": [], "stored_globals": []})
@@ -1422,7 +1618,7 @@ def test_class_show_ambiguous_returns_all_matches():
         def _vtable_layout_for(self, b, a):
             return None
         def _object_size_for(self, b, r):
-            return None, "no_construction_site"
+            return _NO_SIZE
         def _bases_for(self, b, r):
             return []
         def _instances_for(self, b, r):
@@ -1443,14 +1639,15 @@ def test_render_class_show_text_matches_mock_shape():
             {"index": 1, "address": "0x0", "method": None, "pure_virtual": True, "unnamed": False}]},
         "bases": [{"name": "net::Endpoint"}],
         "methods": [{"kind": "ctor", "address": "0x40abc0", "demangled": "net::Session::Session()"}],
-        "instances": {"construction_sites": [{"kind": "new", "address": "0x443abc", "size": "0xd0"}],
+        "instances": {"construction_sites": [{"kind": "ctor-call", "address": "0x443abc",
+                                              "allocation_size": "0xd0"}],
                       "stored_globals": [{"symbol": "g_session", "address": "0x4cabcd"}]},
     }
     text = _render_class_show_text(rec)
     assert "class net::Session" in text and "size 0xd0" in text and "base: net::Endpoint" in text
     assert "vtable [0] 0x40e8b0  onData" in text
     assert "vtable [1] 0x0  __cxa_pure_virtual" in text
-    assert "instances: new @ 0x443abc (size 0xd0) ; stored -> g_session @ 0x4cabcd" in text
+    assert "instances: ctor-call @ 0x443abc (allocation 0xd0) ; stored -> g_session @ 0x4cabcd" in text
 
 
 def test_render_class_show_lists_non_virtual_methods_and_empty_vtable_note():
@@ -2762,7 +2959,7 @@ def _declared_ctx(monkeypatch, bv):
     seam's own builder, so the test reads the shape a live call produces."""
     ctx = seam.BridgeContext(None)
     monkeypatch.setattr(ctx, "_resolve_view", lambda sel: bv)
-    monkeypatch.setattr(ctx, "_object_size_for", lambda b, r: (None, "no_construction_site"))
+    monkeypatch.setattr(ctx, "_object_size_for", lambda b, r: _NO_SIZE)
     monkeypatch.setattr(ctx, "_bases_for", lambda b, r: [])
     monkeypatch.setattr(ctx, "_instances_for", lambda b, r: {
         "construction_sites": [], "stored_globals": []})
@@ -3939,7 +4136,7 @@ def test_enrich_skips_the_backwalk_for_an_import_slot_typeinfo_922():
     # record as this class's vtable (and listed it as a secondary of itself).
     class _Ctx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None, "no_construction_site"
+            return _NO_SIZE
         def _bases_for(self, bv, rec):
             return read_class._bases_for_record(self, bv, rec)
         def _instances_for(self, bv, rec):
@@ -4129,7 +4326,7 @@ def test_recover_rejects_an_rtti_record_as_a_secondary_vtable_922():
 def test_enrich_discloses_rejected_secondary_candidates_922():
     class _Ctx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None, "no_construction_site"
+            return _NO_SIZE
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -4416,7 +4613,7 @@ def test_sole_nonzero_candidate_is_never_promoted_to_primary_922():
 
     class _Ctx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None, "no_construction_site"
+            return _NO_SIZE
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -4446,7 +4643,7 @@ def test_sole_nonzero_candidate_is_never_promoted_to_primary_922():
 def test_enrich_notes_rtti_secondaries_as_such_922():
     class _Ctx(_MappedRecoverCtx):
         def _object_size_for(self, bv, rec):
-            return None, "no_construction_site"
+            return _NO_SIZE
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):

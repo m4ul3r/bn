@@ -11,6 +11,11 @@ import functools
 import re
 from typing import Any, NamedTuple
 
+try:
+    import binaryninja as bn
+except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
+    bn = None  # type: ignore[assignment]
+
 from . import il_format
 from ._shared import OperationFailure, _validate_count
 from .read_listing import _analysis_state_fields
@@ -1069,6 +1074,7 @@ def _class_list(
     offset: int = 0,
     limit: int | None = None,
     count_only: bool = False,
+    sizes: bool = False,
 ) -> dict[str, Any]:
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -1187,9 +1193,9 @@ def _class_list(
     # Populate RTTI bases for the RETURNED PAGE only: base decode is cheap (a few
     # typeinfo reads per class) and bounded to the page, so a single `class list`
     # recovers the inheritance graph without N `class show` calls. Vtable layout
-    # stays show-only (far costlier per class); the object size is read here too
-    # (#998 item 4) with the exact-name type lookup and the per-site
-    # operator-new trace, both bounded to the page.
+    # stays show-only (far costlier per class). The object size is the exact
+    # BN-type lookup by default; `sizes=True` runs the full readers of
+    # `_object_size` for the page (#998 item 4 and its review).
     rows = []
     for rec in page:
         if rec["confidence"] == _DECLARED_CONFIDENCE:
@@ -1198,16 +1204,23 @@ def _class_list(
             type_obj = declared_types.get(rec["name"])
             if type_obj is not None:
                 rec["size"] = _declared_size(type_obj)
+        elif sizes:
+            # `--sizes`: the same readers `class show` runs, for this page.
+            _apply_size(rec, ctx._object_size_for(bv, rec))
         else:
-            try:
-                rec["size"], _ = _object_size(ctx, bv, rec, exact_type=True)
-            except Exception:
-                rec["size"] = None
+            # Default listing: only the cheap exact BN-type lookup. Tracing
+            # destructors and construction sites for every row made a large
+            # listing minutes slower (#998 review).
+            width = _bn_type_width(bv, rec["name"])
+            rec["size"] = {"value": hex(width), "source": "bn_type"} if width else None
+        row_reason = (None if rec["confidence"] == _DECLARED_CONFIDENCE or rec.get("size")
+                      else rec.get("size_reason") if sizes
+                      else _SIZE_NOT_COMPUTED)
         try:
             rec["bases"] = ctx._bases_for(bv, rec)
         except Exception:
             rec["bases"] = []
-        rows.append(_list_row(rec))
+        rows.append({**_list_row(rec), "size_reason": row_reason})
     returned = len(rows)
     result = {
         "kind": "classes",
@@ -1220,6 +1233,7 @@ def _class_list(
         "include_all": include_all,
         "no_stl": no_stl,
         "no_vendor": no_vendor,
+        "sizes": sizes,
         "library_suppressed": library_suppressed,
         "vendor_suppressed": vendor_suppressed,
         "construction_vtables_suppressed": construction_vtables_suppressed,
@@ -1899,81 +1913,114 @@ def _infer_rtti_kind(ctx, bv, typeinfo_addr: int, ptr: int) -> str:
     return "base"
 
 
-#: #998 item 4: why ``size`` is null when neither path produced one. The BN type
-#: path is a lookup; the operator-new path reads each construction site, so a
-#: miss says WHICH of its three outcomes it hit rather than a bare "unknown".
-#:   * ``no_construction_site`` -- no ctor call and no inlined ``operator new``
-#:     + vptr store for this class was found, so there was nothing to read;
-#:   * ``operator_new_not_traced`` -- sites exist, but none of their ``this``
-#:     traced back to an ``operator new(<constant>)`` (stack/global objects, a
-#:     base ctor called from a derived ctor, a size computed at run time);
-#:   * ``operator_new_sizes_disagree`` -- traced sites name DIFFERENT sizes, so
-#:     no one of them is the class's size (each site still carries its own).
-_SIZE_NO_SITE = "no_construction_site"
-_SIZE_NOT_TRACED = "operator_new_not_traced"
-_SIZE_DISAGREE = "operator_new_sizes_disagree"
+class _SizeFinding(NamedTuple):
+    """What the size readers established about one class (#998 item 4).
 
-#: Raw-name prefixes of the Itanium allocation functions: ``operator new`` and
-#: ``operator new[]`` in every overload (``_Znwm``, ``_Znwj``, the nothrow and
-#: aligned forms), whose first argument is the allocation size.
-_OPERATOR_NEW_PREFIXES = ("_Znw", "_Zna")
+    ``size`` is an exact size with provenance, or None. ``reason`` says why it
+    is None (None on a hit). ``upper_bound`` is the smallest ``operator new(N)``
+    that a constructor of this class was called on, or None: the object lives
+    at offset 0 of that allocation, so its size is at most N -- but the
+    allocation may hold a derived class, an enclosing object or a placement
+    buffer, so N alone is never reported as the size."""
+
+    size: dict[str, Any] | None
+    reason: str | None
+    upper_bound: int | None
 
 
-def _object_size(ctx, bv, record: dict[str, Any], *,
-                 exact_type: bool = False) -> tuple[dict[str, Any] | None, str | None]:
-    """``(size, reason)``: the object size with provenance, and why it is None.
+#: #998 item 4: why ``size`` is null.
+#:   * ``no_size_evidence`` -- no BN type of this name, no sized ``operator
+#:     delete`` in the class's deleting destructor, and no constructor call on
+#:     an ``operator new(<constant>)`` result;
+#:   * ``allocation_upper_bound_only`` -- a constructor runs on an
+#:     ``operator new(N)`` result, but its own writes do not reach N, so N is
+#:     only an upper bound (``size_upper_bound``);
+#:   * ``size_evidence_disagrees`` -- two exact readers named different sizes.
+_SIZE_NO_EVIDENCE = "no_size_evidence"
+_SIZE_UPPER_BOUND_ONLY = "allocation_upper_bound_only"
+_SIZE_DISAGREE = "size_evidence_disagrees"
 
-    A defined BN type's width wins (authoritative when present); else the size
-    every traced construction site agrees on (``operator new(N)`` feeding the
-    object, #998 item 4); else ``(None, reason)`` -- never fabricated.
-    ``ctx._find_type`` raises on a miss, so the lookup is guarded.
-    ``exact_type`` restricts the type lookup to an exact-name hit, the cheap
-    form `class list` affords per row (``_find_type``'s miss path walks the
-    whole type table).
+#: A `class list` row whose size readers did not run (the default listing
+#: runs only the BN-type lookup; `--sizes` runs them all).
+_SIZE_NOT_COMPUTED = "not_computed"
 
-    A miss stays ``None`` rather than becoming a value-less envelope: the class
-    card renders any ``size`` DICT as ``size ?`` because #619 requires that "an
-    envelope that carries no value still CLAIMED a size" be visible. The
-    provenance of a miss travels beside the size instead -- see ``_enrich``'s
-    ``size_source`` / ``size_reason`` (#817)."""
-    type_obj = None
-    if exact_type:
-        getter = getattr(bv, "get_type_by_name", None)
+
+def _apply_size(rec: dict[str, Any], finding: _SizeFinding) -> None:
+    """Write a :class:`_SizeFinding` onto a class record. #817: where the size
+    came from rides BESIDE the size (``size_source``), with ``size_reason`` on
+    a miss (null on a hit, mirroring ``hlil_statement_reason``) and
+    ``size_upper_bound``, the smallest allocation a constructor ran on."""
+    rec["size"] = finding.size
+    rec["size_source"] = finding.size["source"] if finding.size else "unavailable"
+    rec["size_reason"] = finding.reason
+    rec["size_upper_bound"] = hex(finding.upper_bound) if finding.upper_bound else None
+
+
+#: Raw-name prefix of SCALAR ``operator new`` in every overload (``_Znwm``,
+#: ``_Znwj``, the nothrow and aligned forms): its first argument is the size.
+#: ``operator new[]`` (``_Zna``) is excluded -- an array allocation is never
+#: one object.
+_OPERATOR_NEW_PREFIX = "_Znw"
+
+#: Raw-name prefixes of SIZED scalar ``operator delete`` (``_ZdlPvm``,
+#: ``_ZdlPvj`` and their aligned forms): its second argument is the size of
+#: the object being deleted.
+_SIZED_DELETE_PREFIXES = ("_ZdlPvm", "_ZdlPvj")
+
+_CALL_OPS = frozenset({"MLIL_CALL_SSA", "MLIL_TAILCALL_SSA"})
+_MEMSET_NAMES = frozenset({"memset", "__builtin_memset"})
+
+
+def _split_toplevel_scopes(name: str) -> list[str]:
+    """``a::b<c::d>::e`` -> ``["a", "b<c::d>", "e"]``: ``::`` inside template
+    arguments or a parameter list is not a scope separator."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        if ch in "<(":
+            depth += 1
+        elif ch in ">)":
+            depth = max(0, depth - 1)
+        elif ch == ":" and depth == 0 and name.startswith("::", i):
+            parts.append(name[start:i])
+            i += 2
+            start = i
+            continue
+        i += 1
+    parts.append(name[start:])
+    return [p for p in parts if p]
+
+
+def _bn_type_width(bv, name: str) -> int:
+    """Width of the BN type named exactly *name*, else 0.
+
+    A plain-string lookup misses a namespaced type (``a::B``): BN keys types by
+    ``QualifiedName`` components, so the components are tried too. One lookup,
+    shared by `class list` and `class show`, so the two never disagree about
+    whether a class has a BN type (#998 review)."""
+    getter = getattr(bv, "get_type_by_name", None)
+    if not callable(getter) or not name:
+        return 0
+    keys: list[Any] = [name]
+    parts = _split_toplevel_scopes(name)
+    qualified = getattr(bn, "QualifiedName", None) if bn is not None else None
+    if len(parts) > 1 and qualified is not None:
+        keys.append(qualified(parts))
+    for key in keys:
         try:
-            type_obj = getter(record["name"]) if callable(getter) else None
+            type_obj = getter(key)
         except Exception:
-            type_obj = None
-    else:
-        try:
-            found = ctx._find_type(bv, record["name"])
-        except Exception:
-            found = None
-        if found is not None:
-            _, type_obj = found
-    width = int(getattr(type_obj, "width", 0) or 0) if type_obj is not None else 0
-    if width > 0:
-        return {"value": hex(width), "source": "bn_type"}, None
-    sites = ctx._ctor_construction_sites(bv, record)
-    if not sites:
-        return None, _SIZE_NO_SITE
-    traced = [s for s in sites if isinstance(s, dict) and s.get("size")]
-    if not traced:
-        return None, _SIZE_NOT_TRACED
-    sizes = {int(str(s["size"]), 16) for s in traced}
-    if len(sizes) != 1:
-        return None, _SIZE_DISAGREE
-    first = traced[0]
-    return {"value": hex(sizes.pop()), "source": "operator_new",
-            "at": first.get("allocation") or first.get("address"),
-            "sites": len(traced)}, None
+            continue
+        width = int(getattr(type_obj, "width", 0) or 0) if type_obj is not None else 0
+        if width > 0:
+            return width
+    return 0
 
 
-def _is_operator_new(bv, dest) -> bool:
-    """True when the MLIL call *dest* is a constant pointer to ``operator new``
-    or ``operator new[]`` (the PLT stub, the import, or a local body)."""
-    address = getattr(dest, "constant", None)
-    if not isinstance(address, int):
-        return False
+def _symbol_names_at(bv, address: int) -> list[str]:
     names: list[str] = []
     sym = bv.get_symbol_at(address) if hasattr(bv, "get_symbol_at") else None
     fn = bv.get_function_at(address) if hasattr(bv, "get_function_at") else None
@@ -1982,8 +2029,25 @@ def _is_operator_new(bv, dest) -> bool:
             value = getattr(obj, attr, None)
             if value:
                 names.append(str(value))
-    return any(n.startswith(_OPERATOR_NEW_PREFIXES) or n.startswith("operator new")
-               for n in names)
+    return names
+
+
+def _call_target(insn) -> int | None:
+    dest = getattr(insn, "dest", None)
+    value = getattr(dest, "constant", None)
+    return int(value) if isinstance(value, int) else None
+
+
+def _is_operator_new(bv, address: int | None) -> bool:
+    if address is None:
+        return False
+    return any(n.startswith(_OPERATOR_NEW_PREFIX) for n in _symbol_names_at(bv, address))
+
+
+def _is_sized_delete(bv, address: int | None) -> bool:
+    if address is None:
+        return False
+    return any(n.startswith(_SIZED_DELETE_PREFIXES) for n in _symbol_names_at(bv, address))
 
 
 def _mlil_const(expr) -> int | None:
@@ -1994,54 +2058,193 @@ def _mlil_const(expr) -> int | None:
     return int(value) if isinstance(value, int) else None
 
 
-def _new_allocation(bv, expr, *, depth: int = 0):
-    """``(ssa_var, size, call)`` when MLIL SSA *expr* is the result of a call to
-    ``operator new(<constant>)``, following plain SSA copies; else None."""
+def _arg_regs(bv, fn) -> list[str]:
+    cc = getattr(fn, "calling_convention", None)
+    if cc is None:
+        platform = getattr(bv, "platform", None)
+        cc = getattr(platform, "default_calling_convention", None)
+    return [str(r) for r in (getattr(cc, "int_arg_regs", None) or [])]
+
+
+def _reg_value(fn, address: int, reg: str) -> tuple[str, Any]:
+    """``(kind, value)`` of BN's dataflow for *reg* just before *address*:
+    ``("const", int)``, ``("entry", reg_name)`` or ``("other", None)``."""
+    try:
+        value = fn.get_reg_value_at(address, reg)
+    except Exception:
+        return "other", None
+    kind = str(getattr(getattr(value, "type", None), "name", ""))
+    if kind == "ConstantValue" and isinstance(getattr(value, "value", None), int):
+        return "const", int(value.value)
+    if kind == "EntryValue":
+        return "entry", str(getattr(value, "reg", "") or "")
+    return "other", None
+
+
+def _call_arg_const(fn, insn, index: int, regs: list[str]) -> int | None:
+    """Constant argument *index* of a call: from its MLIL parameter list, else
+    from the argument register's dataflow value at the call (BN's type for an
+    import such as ``operator delete(void*, unsigned long)`` can drop the size
+    parameter from the IL while the register still holds it)."""
+    params = list(getattr(insn, "params", None) or [])
+    if len(params) > index:
+        value = _mlil_const(params[index])
+        if value is not None:
+            return value
+    if len(regs) > index:
+        kind, value = _reg_value(fn, int(insn.address), regs[index])
+        if kind == "const":
+            return value
+    return None
+
+
+def _deleting_dtor_size(bv, fn) -> tuple[int, int] | None:
+    """``(N, call_addr)`` when deleting destructor *fn* ends in a sized
+    ``operator delete(this, N)``: the Itanium ABI's own statement of the
+    complete object's size. ``this`` must be the destructor's untouched first
+    argument (BN's entry value of that register), so a thunk that adjusts it
+    or a delete of some other pointer never counts. Two different sizes in one
+    body decide nothing."""
+    regs = _arg_regs(bv, fn)
+    if len(regs) < 2:
+        return None
+    try:
+        instructions = list(fn.mlil.ssa_form.instructions)
+    except Exception:
+        return None
+    found: dict[int, int] = {}
+    for insn in instructions:
+        if il_format._il_op_name(insn) not in _CALL_OPS:
+            continue
+        if not _is_sized_delete(bv, _call_target(insn)):
+            continue
+        kind, reg = _reg_value(fn, int(insn.address), regs[0])
+        if kind != "entry" or reg != regs[0]:
+            continue
+        size = _call_arg_const(fn, insn, 1, regs)
+        if size:
+            found.setdefault(size, int(insn.address))
+    if len(found) != 1:
+        return None
+    ((size, at),) = found.items()
+    return size, at
+
+
+def _ssa_key(ssa_var) -> tuple[Any, Any]:
+    return getattr(ssa_var, "var", None), getattr(ssa_var, "version", None)
+
+
+def _ptr_offset(expr, offsets: dict[tuple[Any, Any], int]) -> int | None:
+    """Byte offset from ``this`` that MLIL SSA *expr* evaluates to, when it is
+    a tracked variable or a tracked variable plus/minus a constant."""
+    if expr is None:
+        return None
+    op = il_format._il_op_name(expr)
+    if op == "MLIL_VAR_SSA":
+        return offsets.get(_ssa_key(expr.src))
+    if op in ("MLIL_ADD", "MLIL_SUB"):
+        left, right = expr.left, expr.right
+        pairs = ((left, right), (right, left)) if op == "MLIL_ADD" else ((left, right),)
+        for base_expr, const_expr in pairs:
+            base = _ptr_offset(base_expr, offsets)
+            const = _mlil_const(const_expr)
+            if base is not None and const is not None:
+                return base + const if op == "MLIL_ADD" else base - const
+    return None
+
+
+def _this_offsets(instructions: list[Any], this_var) -> dict[tuple[Any, Any], int]:
+    """``{ssa_var: offset}`` for every SSA variable that holds ``this`` plus a
+    constant: the parameter at version 0, and copies/additions of it."""
+    offsets = {(this_var, 0): 0}
+    for _ in range(4):
+        before = len(offsets)
+        for insn in instructions:
+            if il_format._il_op_name(insn) != "MLIL_SET_VAR_SSA":
+                continue
+            offset = _ptr_offset(insn.src, offsets)
+            if offset is not None:
+                offsets.setdefault(_ssa_key(insn.dest), offset)
+        if len(offsets) == before:
+            break
+    return offsets
+
+
+def _ctor_write_extent(bv, fn, *, depth: int = 0) -> int:
+    """A LOWER bound on the size of the object constructor *fn* builds: the
+    end of the furthest byte it writes through ``this`` at a constant offset
+    (stores, ``memset(this + o, _, n)``, and member/base constructors run on
+    ``this + o``). Writes it cannot place (computed offsets, loops) are
+    skipped, which only lowers the bound."""
+    try:
+        this_var = list(fn.parameter_vars)[0]
+        instructions = list(fn.mlil.ssa_form.instructions)
+    except Exception:
+        return 0
+    offsets = _this_offsets(instructions, this_var)
+    extent = 0
+    for insn in instructions:
+        op = il_format._il_op_name(insn)
+        if op == "MLIL_STORE_SSA":
+            offset = _ptr_offset(insn.dest, offsets)
+            if offset is not None and offset >= 0:
+                extent = max(extent, offset + int(getattr(insn, "size", 0) or 0))
+        elif op == "MLIL_STORE_STRUCT_SSA":
+            base = _ptr_offset(insn.dest, offsets)
+            if base is not None:
+                offset = base + int(getattr(insn, "offset", 0) or 0)
+                if offset >= 0:
+                    extent = max(extent, offset + int(getattr(insn, "size", 0) or 0))
+        elif op in _CALL_OPS:
+            target = _call_target(insn)
+            params = list(getattr(insn, "params", None) or [])
+            offset = _ptr_offset(params[0], offsets) if params else None
+            if target is None or offset is None or offset < 0:
+                continue
+            names = _symbol_names_at(bv, target)
+            if any(n in _MEMSET_NAMES for n in names):
+                length = _mlil_const(params[2]) if len(params) > 2 else None
+                if length:
+                    extent = max(extent, offset + length)
+                continue
+            callee = bv.get_function_at(target) if hasattr(bv, "get_function_at") else None
+            if callee is None or depth >= 2:
+                continue
+            try:
+                _demangled, _cls, kind = _classify_function(callee)
+            except Exception:
+                continue
+            if kind == "ctor":
+                extent = max(extent, offset + _ctor_write_extent(bv, callee, depth=depth + 1))
+    return extent
+
+
+def _new_allocation(bv, expr, *, depth: int = 0) -> tuple[int, int] | None:
+    """``(N, call_addr)`` when MLIL SSA *expr* is, through plain SSA copies,
+    the result of scalar ``operator new(<constant N>)``; else None."""
     if expr is None or il_format._il_op_name(expr) != "MLIL_VAR_SSA":
         return None
-    var = expr.src
-    definition = expr.function.get_ssa_var_definition(var)
+    definition = expr.function.get_ssa_var_definition(expr.src)
     if definition is None:
         return None
     op = il_format._il_op_name(definition)
     if op == "MLIL_SET_VAR_SSA" and depth < 8:
         return _new_allocation(bv, definition.src, depth=depth + 1)
-    if op != "MLIL_CALL_SSA" or not _is_operator_new(bv, definition.dest):
+    if op != "MLIL_CALL_SSA" or not _is_operator_new(bv, _call_target(definition)):
         return None
-    params = list(definition.params or [])
-    size = _mlil_const(params[0]) if params else None
+    fn = getattr(expr.function, "source_function", None)
+    size = (_call_arg_const(fn, definition, 0, _arg_regs(bv, fn)) if fn is not None
+            else _mlil_const((list(definition.params or []) or [None])[0]))
     if not size:
         return None
-    return var, size, definition
+    return size, int(definition.address)
 
 
-def _vptr_stores(ssa_function) -> dict[Any, list[tuple[int, int, Any]]]:
-    """``{ssa_var: [(instr_index, stored_constant, insn), ...]}`` for every store
-    of a constant pointer to offset 0 of an SSA variable -- the vptr stores of
-    an object held in that variable, in instruction order."""
-    stores: dict[Any, list[tuple[int, int, Any]]] = {}
-    for insn in ssa_function.instructions:
-        if il_format._il_op_name(insn) != "MLIL_STORE_SSA":
-            continue
-        dest = insn.dest
-        if il_format._il_op_name(dest) != "MLIL_VAR_SSA":
-            continue
-        value = _mlil_const(insn.src)
-        if value is None:
-            continue
-        stores.setdefault(dest.src, []).append((int(insn.instr_index), value, insn))
-    return stores
-
-
-def _operator_new_size_at(bv, call_addr: int,
-                          address_point: int | None) -> tuple[int, int] | None:
-    """``(size, allocation_addr)`` when the ctor call at *call_addr* constructs
-    an object fresh from ``operator new(<constant>)``, else None.
-
-    The object must not be re-stamped with ANOTHER vptr in the same function:
-    a derived ctor inlined around an out-of-line base ctor passes the derived
-    allocation to the base ctor and then stores the derived vptr, and that size
-    belongs to the derived class, not this one."""
+def _operator_new_size_at(bv, call_addr: int) -> tuple[int, int] | None:
+    """``(N, allocation_addr)`` when the constructor call at *call_addr* runs
+    on the result of scalar ``operator new(<constant N>)``, else None. N is the
+    ALLOCATION: the object sits at its offset 0, so N bounds its size from
+    above and says nothing more by itself."""
     try:
         functions = list(bv.get_functions_containing(call_addr) or [])
     except Exception:
@@ -2052,92 +2255,80 @@ def _operator_new_size_at(bv, call_addr: int,
             mlil = getattr(llil, "mlil", None) if llil is not None else None
             call = mlil.ssa_form if mlil is not None else None
             params = list(getattr(call, "params", None) or [])
-            alloc = _new_allocation(bv, params[0]) if params else None
-            if alloc is None:
-                continue
-            var, size, new_call = alloc
-            stamped = {value for _, value, _ in _vptr_stores(call.function).get(var, [])}
+            traced = _new_allocation(bv, params[0]) if params else None
         except Exception:
             continue
-        if stamped - ({address_point} if address_point is not None else set()):
-            continue
-        return size, int(new_call.address)
+        if traced is not None:
+            return traced
     return None
 
 
-def _inline_new_sites(ctx, bv, address_point: int) -> list[dict[str, Any]]:
-    """Construction sites where the ctor was INLINED: an ``operator
-    new(<constant>)`` result whose LAST vptr store is this class's address
-    point. Only the last store counts -- an inlined derived ctor stores each
-    base's vptr before its own."""
-    try:
-        refs = list(bv.get_code_refs(address_point) or [])
-    except Exception:
-        return []
-    functions: dict[int, Any] = {}
-    for ref in refs:
-        fn = getattr(ref, "function", None)
-        if fn is not None:
-            functions.setdefault(int(fn.start), fn)
-    sites: list[dict[str, Any]] = []
-    for _start, fn in sorted(functions.items()):
-        try:
-            ssa = fn.mlil.ssa_form
-            stores = _vptr_stores(ssa)
-        except Exception:
+_D0_SUFFIX = "D0Ev"
+
+
+def _object_size(ctx, bv, record: dict[str, Any]) -> _SizeFinding:
+    """The class's size, only from evidence that fixes it exactly (#998 item 4):
+
+    1. a BN type of exactly this name (its width);
+    2. the sized ``operator delete(this, N)`` in the class's own deleting
+       destructor (``D0``), which the ABI emits with ``sizeof`` the class;
+    3. a constructor call on ``operator new(N)`` whose constructor's own writes
+       reach exactly N: the object sits at offset 0 of the allocation, so its
+       size lies between that write extent and N, and they are equal.
+
+    An allocation alone is never the size -- array new, an enclosing object
+    whose first member is this class, a derived class built around this
+    constructor and placement new all hand the constructor a LARGER block --
+    so it is reported only as ``upper_bound``. Readers 2 and 3 must agree."""
+    width = _bn_type_width(bv, record["name"])
+    if width > 0:
+        return _SizeFinding({"value": hex(width), "source": "bn_type"}, None, None)
+    exact: dict[int, dict[str, Any]] = {}
+    for method in record.get("methods", []):
+        mangled = str(method.get("mangled") or "")
+        if method.get("kind") != "dtor" or not mangled.endswith(_D0_SUFFIX) \
+                or mangled.startswith(("_ZTh", "_ZTv", "_ZTc")):
             continue
-        for var_stores in stores.values():
-            _, value, insn = max(var_stores, key=lambda item: item[0])
-            if value != address_point:
-                continue
-            try:
-                alloc = _new_allocation(bv, insn.dest)
-            except Exception:
-                alloc = None
-            if alloc is None:
-                continue
-            _var, size, new_call = alloc
-            sym = getattr(fn, "symbol", None)
-            name = getattr(sym, "short_name", None) or getattr(fn, "name", None)
-            sites.append({
-                "address": hex(int(insn.address)),
-                "function": str(name) if name else None,
-                "kind": "inline-new",
-                "size": hex(size),
-                "allocation": hex(int(new_call.address)),
-            })
-    return sites
-
-
-def _record_address_point(ctx, bv, record: dict[str, Any]) -> int | None:
-    """The vptr value objects of this class carry: the decoded layout's
-    ``address_point``, else the object start + 2 words when word[1] of a
-    registry entry is a typeinfo (the Itanium header), else None."""
-    vt = record.get("vtable")
-    if not isinstance(vt, dict) or not vt.get("address"):
-        return None
-    if vt.get("address_point"):
-        return int(str(vt["address_point"]), 16)
-    if "truncated_reason" in vt:
-        return None   # a decoded layout that refused the header
-    addr = int(str(vt["address"]), 16)
-    ptr = ctx._pointer_size(bv)
-    ti = ctx._read_pointer_value(bv, addr + ptr, size=ptr)
-    if ti and ctx._typeinfo_name_at(bv, ti) is not None:
-        return addr + 2 * ptr
-    return None
+        fn = bv.get_function_at(int(method["address"], 16)) \
+            if hasattr(bv, "get_function_at") else None
+        found = _deleting_dtor_size(bv, fn) if fn is not None else None
+        if found is not None:
+            exact.setdefault(found[0], {"value": hex(found[0]),
+                                        "source": "deleting_destructor", "at": hex(found[1])})
+    upper: int | None = None
+    extents: dict[str, int] = {}
+    for site in ctx._ctor_construction_sites(bv, record):
+        if not isinstance(site, dict) or not site.get("allocation_size"):
+            continue
+        allocation = int(str(site["allocation_size"]), 16)
+        upper = allocation if upper is None else min(upper, allocation)
+        ctor = site.get("ctor")
+        if not ctor:
+            continue
+        if ctor not in extents:
+            fn = bv.get_function_at(int(str(ctor), 16)) if hasattr(bv, "get_function_at") else None
+            extents[ctor] = _ctor_write_extent(bv, fn) if fn is not None else 0
+        if extents[ctor] == allocation:
+            exact.setdefault(allocation, {"value": hex(allocation), "source": "operator_new",
+                                          "at": site.get("allocation")})
+    if len(exact) == 1:
+        return _SizeFinding(next(iter(exact.values())), None, upper)
+    if exact:
+        return _SizeFinding(None, _SIZE_DISAGREE, upper)
+    return _SizeFinding(None, _SIZE_UPPER_BOUND_ONLY if upper is not None else _SIZE_NO_EVIDENCE,
+                        upper)
 
 
 def _construction_sites(ctx, bv, record: dict[str, Any]) -> list[dict[str, Any]]:
     """Where this class is constructed: each ctor's inbound call sites, from
-    code xrefs (``kind: "ctor-call"``), plus inlined constructions found from
-    the vtable address point (``kind: "inline-new"``). A site whose object is
-    traced to ``operator new(N)`` carries ``size`` (hex) and ``allocation`` (the
-    ``operator new`` call); otherwise ``size`` is None (#998 item 4)."""
+    code xrefs (``kind: "ctor-call"``, ``ctor`` the constructor called). A site
+    whose object is the result of ``operator new(<constant N>)`` carries
+    ``allocation_size`` (N, hex) and ``allocation`` (the ``operator new``
+    call); otherwise both are None. N is the allocation, an upper bound on
+    the class size -- see :func:`_object_size` (#998 item 4)."""
     get_refs = getattr(bv, "get_code_refs", None)
     if not callable(get_refs):
         return []
-    address_point = _record_address_point(ctx, bv, record)
     sites: list[dict[str, Any]] = []
     seen: set[int] = set()
     for m in record.get("methods", []):
@@ -2156,17 +2347,15 @@ def _construction_sites(ctx, bv, record: dict[str, Any]) -> list[dict[str, Any]]
             csym = getattr(caller, "symbol", None) if caller is not None else None
             cname = (getattr(csym, "short_name", None) or getattr(caller, "name", None)) \
                 if caller is not None else None
-            traced = _operator_new_size_at(bv, ra, address_point)
+            traced = _operator_new_size_at(bv, ra)
             sites.append({
                 "address": hex(ra),
                 "function": str(cname) if cname else None,
                 "kind": "ctor-call",
-                "size": hex(traced[0]) if traced else None,
+                "ctor": hex(addr),
+                "allocation_size": hex(traced[0]) if traced else None,
                 "allocation": hex(traced[1]) if traced else None,
             })
-    if address_point is not None:
-        sites.extend(s for s in _inline_new_sites(ctx, bv, address_point)
-                     if int(s["address"], 16) not in seen)
     return sites
 
 
@@ -2280,15 +2469,7 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
                 # not the primary; the card keeps `vtable: null` and says why.
                 rec.setdefault("notes", []).append(_NO_PRIMARY_NOTE)
             _note_rejected_secondaries(rec, recovered["rejected"])
-    size, size_reason = ctx._object_size_for(bv, rec)
-    rec["size"] = size
-    # #817: where the size came from is a JSON-surface fact of its own, so it
-    # rides BESIDE the size instead of inside it -- one place to read the
-    # provenance whether or not a size was recovered. On a miss `size_reason`
-    # says which outcome of the operator-new path was hit (#998 item 4), and
-    # the text card prints it. Null on a hit, mirroring `hlil_statement_reason`.
-    rec["size_source"] = size["source"] if size else "unavailable"
-    rec["size_reason"] = size_reason
+    _apply_size(rec, ctx._object_size_for(bv, rec))
     rec["bases"] = ctx._bases_for(bv, rec)
     rec["instances"] = ctx._instances_for(bv, rec)
     return rec
@@ -2521,45 +2702,91 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
     return {"primary": primary, "secondary": secondary, "rejected": rejected}
 
 
-def _vtable_slots_referencing(ctx, bv, target: int, *, max_slots: int = 64,
-                              data_refs: Any = None) -> list[dict[str, Any]]:
+class _SlotRefs(NamedTuple):
+    """:func:`_vtable_slots_referencing`'s answer: the confirmed ``slots`` and
+    the data refs it could not decide (``undecided``, hex addresses)."""
+
+    slots: list[dict[str, Any]]
+    undecided: list[str]
+
+
+def _plausible_slot_word(bv, value: int | None) -> bool:
+    """Can *value* be a vtable entry: null (pure-virtual placeholder), code,
+    or an imported/external function? Anything else (unreadable, data) ends a
+    vtable, so a backward walk that meets it is not inside one."""
+    if value is None:
+        return False
+    if value == 0:
+        return True
+    get_function_at = getattr(bv, "get_function_at", None)
+    if callable(get_function_at) and get_function_at(value) is not None:
+        return True
+    get_segment_at = getattr(bv, "get_segment_at", None)
+    segment = get_segment_at(value) if callable(get_segment_at) else None
+    if segment is not None and getattr(segment, "executable", False):
+        return True
+    sym = bv.get_symbol_at(value) if hasattr(bv, "get_symbol_at") else None
+    sym_type = str(getattr(getattr(sym, "type", None), "name", "") or "")
+    return sym_type in {"ImportedFunctionSymbol", "ExternalSymbol", "ImportAddressSymbol"}
+
+
+def _vtable_slots_referencing(ctx, bv, target: int, *, data_refs: Any = None) -> _SlotRefs:
     """#998 item 1: every Itanium vtable slot that holds *target*.
 
     Reads BN's data refs to *target*; for each, walks back word by word to the
-    nearest header whose word[1] is a typeinfo (slot words are code pointers,
-    so the first typeinfo word met is this table's own header), then confirms
-    with the same layout decoder `class show` uses: the slot must be inside the
-    decoded table and hold *target*, and word[0] must be an offset-to-top.
-    The class is the one the header's typeinfo names (for a secondary table,
-    the complete class). Bounded by ``max_slots``, the layout's own cap.
-    ``data_refs`` are the refs to *target* when the caller already read them."""
+    nearest header whose word[1] is a typeinfo, over words that can be vtable
+    entries (:func:`_plausible_slot_word`) -- the first word that cannot ends
+    the walk: the ref is not in a vtable. The slot is then confirmed with the
+    decoder `class show` uses (past its 64-slot window, with the #822 slot
+    probe): it must be inside the table and hold *target*, and word[0] must be
+    an offset-to-top. The class is the one the header's typeinfo names (for a
+    secondary table, the complete class; ``offset_to_top`` says which table).
+
+    A walk that reaches ``_VTABLE_SLOT_PROBE_MAX_ROWS`` words, or a slot the
+    probe cannot decide, lands in ``undecided`` -- never silently dropped
+    (#998 review). ``data_refs`` are the refs when the caller already read them."""
     if data_refs is None:
         getter = getattr(bv, "get_data_refs", None)
         if not callable(getter):
-            return []
+            return _SlotRefs([], [])
         try:
             data_refs = getter(int(target))
         except Exception:
-            return []
+            return _SlotRefs([], [])
     try:
         refs = sorted({int(r) for r in data_refs or []})
     except (TypeError, ValueError):
-        return []
+        return _SlotRefs([], [])
     ptr = ctx._pointer_size(bv)
     out: list[dict[str, Any]] = []
+    undecided: list[str] = []
     for ref in refs:
-        for index in range(max_slots):
-            vt_addr = ref - (index + 2) * ptr
-            ti = ctx._read_pointer_value(bv, vt_addr + ptr, size=ptr)
-            class_name = ctx._typeinfo_name_at(bv, ti) if ti else None
+        header: tuple[int, int, str] | None = None
+        walked_out = False
+        for index in range(_VTABLE_SLOT_PROBE_MAX_ROWS):
+            word = ctx._read_pointer_value(bv, ref - (index + 1) * ptr, size=ptr)
+            class_name = ctx._typeinfo_name_at(bv, word) if word else None
             if class_name is not None:
+                header = (ref - (index + 2) * ptr, index, class_name)
                 break
-        else:
+            if not _plausible_slot_word(bv, word):
+                walked_out = True
+                break
+        if header is None:
+            if not walked_out:
+                undecided.append(hex(ref))
             continue
-        layout = ctx._vtable_layout_for(bv, vt_addr)
-        slots = {s.get("index"): s for s in (layout or {}).get("slots") or []
-                 if isinstance(s, dict)}
+        vt_addr, index, class_name = header
+        layout = ctx._vtable_layout_for(bv, vt_addr) or {}
+        slots = {s.get("index"): s for s in layout.get("slots") or [] if isinstance(s, dict)}
         slot = slots.get(index)
+        if slot is None and layout.get("truncated"):
+            probe = _vtable_slot_probe(ctx, bv, vt_addr, index,
+                                       scanned_through=int(layout.get("scanned") or 0))
+            if probe["status"] in ("unknown", "limit_reached"):
+                undecided.append(hex(ref))
+                continue
+            slot = probe["slot"]
         try:
             value = int(str(slot.get("address")), 16) if slot else None
         except ValueError:
@@ -2580,7 +2807,7 @@ def _vtable_slots_referencing(ctx, bv, target: int, *, max_slots: int = 64,
             "slot_address": hex(ref),
             "offset_to_top": ott,
         })
-    return out
+    return _SlotRefs(out, undecided)
 
 
 def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
