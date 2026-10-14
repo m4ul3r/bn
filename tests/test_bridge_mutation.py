@@ -2407,6 +2407,44 @@ def test_struct_field_set_overwrite_minting_surviving_duplicate_refused(monkeypa
     assert builder.added == []                 # never reached add_member_at_offset
 
 
+def test_struct_field_set_retype_under_own_name_succeeds_with_fresh_member_objects(monkeypatch):
+    """#961: BN hands out NEW member objects on every `.members` access, so a
+    guard that matched the members a write removes by `id()` across two reads
+    refused a same-name retype (`vtable` at 0x0 -> `void**`) as a duplicate of
+    itself. The type below mints fresh members per access, as BN does."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    builder = _AddableStructBuilder()
+
+    class _FreshMembersType:
+        @property
+        def members(self):
+            return [types.SimpleNamespace(offset=0, name="vtable", type=types.SimpleNamespace(width=8)),
+                    types.SimpleNamespace(offset=8, name="field", type=types.SimpleNamespace(width=4))]
+
+    class _BV:
+        def parse_type_string(self, s):
+            return types.SimpleNamespace(width=8), None
+
+        def get_type_by_name(self, n):
+            return _FreshMembersType()
+
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("Probe", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
+    res = instance._op_struct_field_set(_BV(), {
+        "struct_name": "Probe", "offset": "0x0", "field_name": "vtable",
+        "field_type": "int64_t", "overwrite_existing": True})
+    assert res["before_member"]["field_name"] == "vtable"
+    assert builder.added and builder.added[0] == ("vtable", 0, True)
+    # The surviving member still guards its name.
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_struct_field_set(_BV(), {
+            "struct_name": "Probe", "offset": "0x0", "field_name": "field",
+            "field_type": "int64_t", "overwrite_existing": True})
+    assert "0x8" in str(exc.value)
+
+
+
 def test_types_declare_rejects_bitfield(monkeypatch):
     # #322: BN's parser silently drops `:N` bit widths and lays each bitfield out
     # as a full-width integer at the byte offset of its bit position -> overlapping,

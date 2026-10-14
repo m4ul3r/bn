@@ -385,7 +385,7 @@ def _capture_type_snapshots(ctx, bv, operations: list[dict[str, Any]]):
         snapshots[type_name] = {
             "type_name": type_name,
             "decl": str(type_obj),
-            "layout": ctx._render_type_layout(type_obj),
+            "layout": ctx._render_type_layout(type_obj, bv),
         }
     return snapshots
 
@@ -1086,25 +1086,25 @@ def _member_byte_width(member) -> int:
         return 0
 
 
+def _member_overlaps(member, offset: int, width: int) -> bool:
+    """True when *member*'s byte range intersects the range a new field of
+    *width* bytes at *offset* would occupy. Width 0/unknown is treated as 1
+    byte (on either side) so an exact start-offset collision always counts."""
+    new_start = int(offset)
+    new_end = new_start + max(int(width or 0), 1)
+    m_start = int(getattr(member, "offset", 0))
+    m_end = m_start + max(_member_byte_width(member), 1)
+    return new_start < m_end and m_start < new_end
+
+
 def _overlapping_members(type_obj, offset: int, width: int) -> list:
     """Every existing member whose byte range intersects the range a new field
-    of *width* bytes at *offset* would occupy. Width 0/unknown is treated as 1
-    byte so an exact start-offset collision is always caught. Shared by the
-    ``--no-overwrite`` clash check and the struct-field-set duplicate-name
-    guard, which needs to know EVERY member ``add_member_at_offset(overwrite=
-    True)`` would remove, not just the first (#56, #666)."""
+    of *width* bytes at *offset* would occupy (see ``_member_overlaps``). Used
+    by the ``--no-overwrite`` clash check (#56)."""
     members = getattr(type_obj, "members", None)
     if members is None:
         return []
-    new_start = int(offset)
-    new_end = new_start + max(int(width or 0), 1)
-    result = []
-    for member in list(members):
-        m_start = int(getattr(member, "offset", 0))
-        m_end = m_start + max(_member_byte_width(member), 1)
-        if new_start < m_end and m_start < new_end:
-            result.append(member)
-    return result
+    return [member for member in list(members) if _member_overlaps(member, offset, width)]
 
 
 def _first_overlapping_member(ctx, type_obj, offset: int, width: int):
@@ -1774,6 +1774,18 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     # op path, so "today's only caller cannot produce it" is a weaker guarantee
     # than it looks. Unreachable-by-construction is a reason to keep a boundary
     # check cheap, not a reason to delete it.
+    # #989 review: a declaration of only forward declarations of types a type
+    # library defines (`struct timespec;`) changes nothing and has no view type
+    # to read back. What CAN be observed is that no user stub now shadows them;
+    # that is the whole claim, so it is checked rather than assumed.
+    if not defined_types and item.get("reference_only"):
+        referenced = [str(name) for name in item.get("referenced_existing_types") or []]
+        shadowed = [name for name in referenced if bv.get_type_by_name(name) is not None]
+        item["observed"] = {"defined_types": {}, "referenced_existing_types": referenced,
+                            "shadowing_view_types": shadowed}
+        if referenced and not shadowed:
+            item["status"] = "noop"
+            return item
     if not defined_types:
         item["observed"] = {
             "defined_types": {},
@@ -1788,7 +1800,7 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     for name, expected in defined_types.items():
         type_obj = bv.get_type_by_name(name)
         observed_types[name] = str(type_obj) if type_obj is not None else None
-        observed_type_layouts[name] = ctx._render_type_layout(type_obj) if type_obj is not None else None
+        observed_type_layouts[name] = ctx._render_type_layout(type_obj, bv) if type_obj is not None else None
         if observed_types[name] != expected:
             if defined_type_layouts.get(name) and observed_type_layouts[name] == defined_type_layouts[name]:
                 continue
@@ -3193,6 +3205,36 @@ def _lookup_named_type(bv, base: str):
         return None
 
 
+# The C tag keywords a type string may carry before a named aggregate
+# (`struct ns::Foo*`). `struct` and `class` are interchangeable in C++.
+_TAG_KEYWORDS = ("struct", "class", "union", "enum")
+
+
+def _type_tag_kind(type_obj) -> str | None:
+    """The tag keyword a named BN type is spelled with (`struct`/`union`/`enum`;
+    `class` for a C++ class structure), or None for a type that is not an
+    aggregate tag (a typedef, a primitive, a function type)."""
+    tc = _type_class_name(type_obj)
+    if "Enumeration" in tc:
+        return "enum"
+    if "Structure" not in tc:
+        return None
+    kind = getattr(type_obj, "type", None)
+    kind_name = str(getattr(kind, "name", kind) or "")
+    if "Union" in kind_name:
+        return "union"
+    if "Class" in kind_name:
+        return "class"
+    return "struct"
+
+
+def _tag_keyword_matches(keyword: str, type_obj) -> bool:
+    kind = _type_tag_kind(type_obj)
+    if keyword in ("struct", "class"):
+        return kind in ("struct", "class")
+    return kind == keyword
+
+
 def _resolve_named_type_string(bv, text: str):
     """Build a Type for a string that names an existing user/named type,
     optionally with trailing ``*`` pointer levels, or None when the base name is
@@ -3202,7 +3244,13 @@ def _resolve_named_type_string(bv, text: str):
     identifier 'ns'"), so a recovered C++ class type can't be applied by name
     even when it's defined. This rebuilds the type directly from
     ``get_type_by_name`` + a named-type reference, so ``ns::demo::Foo`` /
-    ``ns::demo::Foo*`` resolve without a flat-name alias workaround (#200)."""
+    ``ns::demo::Foo*`` resolve without a flat-name alias workaround (#200).
+    A leading tag keyword (``struct ns::Foo*``) and backtick quoting
+    (``struct `ns::Foo`*``) are accepted too: they are how BN itself spells
+    these types, so an agent copying a decl from ``types show`` reaches here
+    with them (#962). A tag keyword must agree with the type it names (``union
+    Foo`` never resolves a struct ``Foo``), so the fallback cannot widen what a
+    spelling means."""
     base = str(text).strip()
     depth = 0
     while base.endswith("*"):
@@ -3220,6 +3268,7 @@ def _resolve_named_type_string(bv, text: str):
     # `const Foo*`) are normalized; the rarer east-const-on-the-pointer forms
     # (`Foo *const`) leave a stray mid-string `*` after the qualifier strip and
     # fail closed (clean "declare it first"), never silently mis-resolve.
+    tag_keyword = None
     changed = True
     while changed:
         changed = False
@@ -3233,10 +3282,19 @@ def _resolve_named_type_string(bv, text: str):
             elif base.endswith(" " + q):
                 base = base[: -(len(q) + 1)].rstrip()
                 changed = True
-    if not base:
+        for keyword in _TAG_KEYWORDS:
+            if tag_keyword is None and base.startswith(keyword + " "):
+                base = base[len(keyword) + 1:].lstrip()
+                tag_keyword = keyword
+                changed = True
+    if len(base) > 2 and base.startswith("`") and base.endswith("`"):
+        base = base[1:-1]
+    if not base or "`" in base:
         return None
     named = _lookup_named_type(bv, base)
     if named is None:
+        return None
+    if tag_keyword is not None and not _tag_keyword_matches(tag_keyword, named):
         return None
     try:
         # Pointer directly to the named type: BN preserves the registered name
@@ -3249,6 +3307,72 @@ def _resolve_named_type_string(bv, text: str):
     except Exception:
         return None
     return resolved
+
+
+# The parser diagnostics that name a type the declaration could not resolve:
+# a bare unknown name (`pthread_mutex_t` where the view only has `union
+# pthread_mutex_t`), the first component of a `::`-qualified name the C parser
+# reads as an identifier (`demo` of `demo::Widget::VTable`), and a tagged
+# reference to a structure the view does not have under that spelling.
+_UNRESOLVED_TYPE_DIAGNOSTICS = (
+    re.compile(r"unknown type name '([^']+)'"),
+    re.compile(r"use of undeclared identifier '([^']+)'"),
+    re.compile(r"Referencing unknown (?:structure|union|enum|enumeration) type:? `?([^\s`]+)`?"),
+)
+
+
+def _type_spelling(name: str, type_obj) -> str:
+    """How a type-string must spell the existing type *name*: its tag keyword
+    when it is an aggregate (C does not make a tag name a type name), and
+    backticks around a ``::``-qualified name (BN's parser reads a bare one as a
+    scope expression)."""
+    shown = f"`{name}`" if "::" in name else name
+    tag = _type_tag_kind(type_obj)
+    return f"{tag} {shown}" if tag else shown
+
+
+def _type_spelling_hint(bv, text: str, detail: str, *, limit: int = 5) -> str:
+    """#962: a ``" Existing type(s): ..."`` sentence naming the exact spelling of
+    the view's types that the failed parse most plausibly meant, or "".
+
+    The parser's message names only a token (`unknown type name 'X'`, or for a
+    qualified name its FIRST component); the full name is recovered from the
+    text that was parsed, then looked up -- exactly, else by its last component,
+    else fuzzily -- in ``bv.types``, the same population ``types --query``
+    searches, so every suggestion is a spelling that resolves."""
+    tokens: list[str] = []
+    for pattern in _UNRESOLVED_TYPE_DIAGNOSTICS:
+        tokens.extend(pattern.findall(detail))
+    if not tokens:
+        return ""
+    try:
+        population = {str(name): type_obj for name, type_obj in list(bv.types.items())}
+    except Exception:
+        return ""
+    if not population:
+        return ""
+    suggestions: list[str] = []
+    for token in dict.fromkeys(tokens):
+        # Widen a leading component back to the qualified name it started.
+        full = token
+        widened = re.search(r"(?<![\w:])" + re.escape(token) + r"(?:::[A-Za-z_~]\w*)+", str(text))
+        if widened:
+            full = widened.group(0).strip()
+        leaf = _split_qualified_name(full)[-1]
+        matches = [name for name in (full, token) if name in population]
+        if not matches:
+            matches = sorted(name for name in population
+                             if _split_qualified_name(name)[-1] == leaf)
+        if not matches:
+            matches = difflib.get_close_matches(full, list(population), n=3, cutoff=0.75)
+        suggestions.extend(_type_spelling(name, population[name]) for name in matches)
+    ordered = list(dict.fromkeys(suggestions))
+    if not ordered:
+        return ""
+    shown = ", ".join(ordered[:limit]) + (f" (+{len(ordered) - limit} more)" if len(ordered) > limit else "")
+    return (f" Closest existing type(s), spelled the way a type string must name them: {shown}. "
+            "A struct/union/enum needs its tag keyword, and a `::`-qualified name "
+            "needs backticks (struct `ns::Foo`*).")
 
 
 def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: str):
@@ -3273,13 +3397,15 @@ def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: s
             return resolved, None
         # Collapse BN's multi-line parser output ("error: ...\n1 error
         # generated.") into a single clean clause.
-        detail = " ".join(str(exc).split())
+        detail = " ".join(str(exc).split()).rstrip(".")
         raise OperationFailure(
             "invalid_request",
             f"could not parse {label} {str(type_text)!r}"
             + (f": {detail}" if detail else "")
-            + ". If it references a struct or type that isn't defined yet, "
-            "declare it first (e.g. with `bn types declare`), then retry.",
+            + "."
+            + (_type_spelling_hint(bv, str(type_text), detail)
+               or " If it references a struct or type that isn't defined yet, "
+               "declare it first (e.g. with `bn types declare`), then retry."),
             requested=_operation_requested(ctx, op),
         ) from exc
 
@@ -3702,12 +3828,12 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
     # requested name, is a real duplicate.
     if before_type is not None:
         requested_field_name = str(op["field_name"])
-        removed = (
-            {id(m) for m in _overlapping_members(before_type, offset, new_width)}
-            if overwrite else set()
-        )
+        # One snapshot, judged member by member: BN returns NEW member objects
+        # on every `.members` access, so a set of `id()`s collected from one
+        # read never matched the members of a second read, and retyping a field
+        # under its own name was refused as a duplicate of itself (#961).
         for member in list(getattr(before_type, "members", None) or []):
-            if id(member) in removed:
+            if overwrite and _member_overlaps(member, offset, new_width):
                 continue
             if str(getattr(member, "name", "")) != requested_field_name:
                 continue
@@ -4066,6 +4192,239 @@ def _declaration_has_bitfield(declaration: str) -> bool:
     return False
 
 
+def _declares_body_for(declaration: str, name: str) -> bool:
+    """Whether *declaration* gives the aggregate *name* a body (`struct name {`,
+    `class name : Base {`, backtick-quoted or not), as opposed to only naming
+    it (`struct name*`, `struct name;`)."""
+    quoted = re.escape(name)
+    pattern = (r"\b(?:struct|class|union|enum)\s+(?:`" + quoted + r"`|" + quoted + r"(?![\w:]))"
+               r"\s*(?:final\s*)?(?::(?!:)[^{};]*)?\{")
+    text = _strip_c_comments(declaration)
+    try:
+        # `struct alignas(8) name {` / `struct __attribute__((packed)) name {`
+        text = _strip_head_attributes(text)
+    except ValueError:
+        pass
+    return re.search(pattern, text) is not None
+
+
+def _library_has_type(bv, name: str) -> bool:
+    """Whether a type library loaded on the view defines *name* (e.g. libc's
+    `struct timespec`) although the view itself has not imported it yet."""
+    try:
+        libraries = list(getattr(bv, "type_libraries", None) or [])
+    except Exception:
+        return False
+    for library in libraries:
+        try:
+            if library.get_named_type(name) is not None:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _declares_forward(declaration: str, name: str) -> bool:
+    """Whether *declaration* forward-declares *name* as a statement of its own
+    (`struct name;`), as opposed to only mentioning it in a member type."""
+    quoted = re.escape(name)
+    pattern = (r"(?:^|[;{}])\s*(?:struct|class|union|enum)\s+(?:`" + quoted + r"`|" + quoted
+               + r"(?![\w:]))\s*;")
+    return re.search(pattern, _strip_c_comments(declaration)) is not None
+
+
+def _drop_references_to_existing_types(bv, declaration: str,
+                                       named_types: list) -> tuple[list, list[str], list[str]]:
+    """#963: BN's declaration parser does not see the view's types, so a member
+    such as ``struct `ns::Widget::VTable`* vtable;`` or ``struct Alpha* a;``
+    comes back as a NAMED, EMPTY forward-declared struct -- and defining every
+    parsed type overwrote the existing ``ns::Widget::VTable`` (BN's own, with
+    its slot members) or ``Alpha`` with a 0-byte stub, reported `verified`.
+    That silently destroyed the very type the declaration was pointing at: the
+    typed vptr then led to an empty VTable, so virtual calls kept rendering as
+    raw offsets.
+
+    A parsed type is a mere reference -- and is NOT applied -- when it is an
+    empty aggregate (no members, zero width), the declaration gives it no body,
+    and the view already defines a type of that name, or a type library loaded
+    on the view does (a 0-byte user `timespec` would shadow libc's). A forward
+    declaration of a NEW name still creates its opaque type, as before.
+
+    Returns the types to apply, the names left untouched, and the new empty
+    types created only because a member MENTIONED them (no body, no forward
+    declaration of their own) -- typically a misspelled name -- so the result
+    can say so instead of passing them off as declared."""
+    kept, referenced, by_mention = [], [], []
+    for name, type_obj in named_types:
+        empty = (not list(getattr(type_obj, "members", None) or [])
+                 and int(getattr(type_obj, "width", 0) or 0) == 0
+                 and _type_tag_kind(type_obj) is not None)
+        if not empty or _declares_body_for(declaration, str(name)):
+            kept.append((name, type_obj))
+            continue
+        if _lookup_named_type(bv, str(name)) is not None or _library_has_type(bv, str(name)):
+            referenced.append(str(name))
+            continue
+        if not _declares_forward(declaration, str(name)):
+            by_mention.append(str(name))
+        kept.append((name, type_obj))
+    return kept, referenced, by_mention
+
+
+# What may sit between `struct`/`class` and the name, or after the name, in a
+# definition head without being part of either: `alignas(N)`,
+# `__attribute__((...))`, `__declspec(...)` and `[[...]]`.
+_HEAD_ATTRIBUTE_RE = re.compile(r"\b(?:alignas|__attribute__|__attribute|__declspec)\s*\(")
+_AGGREGATE_NAME_RE = re.compile(r"`[^`]+`|[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*")
+_BASE_SPECIFIER_WORDS = {"public", "protected", "private", "virtual", "struct", "class"}
+
+
+def _split_base_list(text: str) -> list[str]:
+    """Split a base clause at top-level commas only (template arguments carry
+    their own)."""
+    parts, buf, depth = [], [], 0
+    for ch in text:
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        elif ch == "," and depth <= 0:
+            parts.append("".join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf).strip())
+    return [part for part in parts if part]
+
+
+def _strip_head_attributes(head: str) -> str:
+    """*head* without `alignas(...)`, `__attribute__((...))`, `__declspec(...)`
+    and `[[...]]`, each removed with its balanced brackets."""
+    out = head
+    while True:
+        match = _HEAD_ATTRIBUTE_RE.search(out)
+        opener = "("
+        if match is None:
+            start = out.find("[[")
+            if start < 0:
+                return out
+            body, opener = start + 1, "["
+        else:
+            start, body = match.start(), match.end() - 1
+        depth, end = 0, None
+        closer = ")" if opener == "(" else "]"
+        for i in range(body, len(out)):
+            if out[i] == opener:
+                depth += 1
+            elif out[i] == closer:
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end is None:
+            raise ValueError(f"unbalanced attribute in {head.strip()!r}")
+        if opener == "[":
+            end += 1   # the second `]` of `[[...]]`
+        out = out[:start] + " " + out[end:]
+
+
+def _top_level_colon(head: str) -> int:
+    """Index of the first `:` in *head* that is not half of `::` and not inside
+    brackets, or -1."""
+    depth = 0
+    i = 0
+    while i < len(head):
+        ch = head[i]
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        elif ch == ":" and depth <= 0:
+            if head[i:i + 2] == "::":
+                i += 2
+                continue
+            return i
+        i += 1
+    return -1
+
+
+def _unrecorded_base_clauses(declaration: str) -> dict[str, str]:
+    """#965 (split out of #989): bn does not record C++ bases. BN's type parser
+    lays a derived struct's own members out after its bases but keeps no base
+    (`base_structures` comes back empty), and three reviews of a reconstruction
+    found shapes whose layout it got wrong. So nothing is recorded, and every
+    base clause in the declaration -- whatever attributes precede or follow the
+    name (`struct alignas(32) D : A`, `struct __attribute__((packed)) D : A`,
+    `struct D final : A`) -- is reported as ``{derived name: reason}`` so no
+    base is ever dropped silently.
+
+    A definition head with a base clause this cannot read raises
+    `OperationFailure` rather than being skipped."""
+    text = _strip_c_comments(declaration)
+    unrecorded: dict[str, str] = {}
+    for match in re.finditer(r"\b(?:struct|class)\b", text):
+        before = text[:match.start()].rstrip()
+        if before.endswith("enum"):
+            continue   # `enum class E : int {` -- an underlying type, not a base
+        # The definition head runs to the first top-level `{`; a `;`, `}` or an
+        # unbalanced `)` first means this keyword names a type in a member,
+        # parameter or forward declaration instead.
+        end = match.end()
+        stop = _definition_head_end(text, end)
+        if stop is None:
+            continue
+        raw_head = text[end:stop]
+        try:
+            head = _strip_head_attributes(raw_head)
+        except ValueError as exc:
+            raise OperationFailure(
+                "invalid_request",
+                f"could not read the struct/class head {raw_head.strip()!r}: {exc}",
+            ) from exc
+        colon = _top_level_colon(head)
+        if colon < 0:
+            continue
+        name_part = re.sub(r"\bfinal\b", " ", head[:colon]).strip()
+        bases = [" ".join(w for w in spec.split() if w not in _BASE_SPECIFIER_WORDS).strip("`")
+                 for spec in _split_base_list(head[colon + 1:])]
+        if not _AGGREGATE_NAME_RE.fullmatch(name_part) or not bases or not all(bases):
+            raise OperationFailure(
+                "invalid_request",
+                f"could not read the base clause in {('struct' + raw_head).strip()!r}; bn reports "
+                "every C++ base it does not record (#965) and will not drop one it cannot read. "
+                "Declare the struct without the base clause, or with a plainer head.",
+            )
+        name = re.sub(r"\s*::\s*", "::", name_part.strip("`"))
+        unrecorded[name] = (
+            f"bn does not yet record C++ bases (see #965): declared without its base(s) "
+            f"{', '.join(bases)}. Its own members keep the offsets the parser gave them, after "
+            f"the bases, but no base or inherited field is recorded. Those offsets can differ "
+            f"from the compiler's when a base is empty or non-POD (for `struct E {{}}; struct D "
+            f": E {{ int x; }}` the parser puts x at 0x4, g++ at 0x0), so check them"
+        )
+    return unrecorded
+
+
+def _definition_head_end(text: str, start: int) -> int | None:
+    """Index of the `{` that opens an aggregate body after *start*, or None when
+    a `;`, `}` or unbalanced `)` (outside brackets) comes first."""
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0:
+            if ch == "{":
+                return i
+            if ch in ";}":
+                return None
+    return None
+
+
 def _bitfield_member_width(member) -> int:
     """The declared byte width of a struct member's type, or 0 when unknown."""
     try:
@@ -4191,10 +4550,11 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         # a clean invalid_request carrying BN's parser message, instead of
         # leaking the raw SyntaxError class / mislabeling it internal_error.
         # Mirrors _parse_type_or_hint for the other type-taking ops (#122).
-        detail = " ".join(str(exc).split())
+        detail = " ".join(str(exc).split()).rstrip(".")
         raise OperationFailure(
             "invalid_request",
-            "could not parse declaration" + (f": {detail}" if detail else "") + ".",
+            "could not parse declaration" + (f": {detail}" if detail else "") + "."
+            + _type_spelling_hint(bv, declaration, detail),
             requested=_operation_requested(ctx, op),
         ) from exc
     named_types = list(parsed["types"])
@@ -4284,13 +4644,34 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
                 f"The parser produced an inconsistent struct; refusing to apply it.",
                 requested=_operation_requested(ctx, op),
             )
+    parsed_type_count = len(named_types)
+    named_types, referenced_existing, created_by_mention = _drop_references_to_existing_types(
+        bv, declaration, named_types)
+    reference_only = not named_types
+    if reference_only:
+        # #989 review: `struct Alpha;` against an existing Alpha used to apply
+        # (as the clobbering stub) and exit 0; a header of forward declarations
+        # must stay a success. It is now the no-op it always should have been:
+        # report each view type as declared-and-unchanged so verification
+        # observes it and stamps `noop`. A type only a type library defines
+        # (`struct timespec;`) has nothing in the view to observe; the result's
+        # `reference_only` marker lets the verifier stamp that case `noop` too.
+        named_types = [(name, bv.get_type_by_name(name)) for name in referenced_existing
+                       if bv.get_type_by_name(name) is not None]
+    # #965: bn records no C++ base; every base clause is reported instead.
+    # Read before anything is defined, so an unreadable clause applies nothing.
+    try:
+        unattached_bases = _unrecorded_base_clauses(declaration)
+    except OperationFailure as exc:
+        raise OperationFailure(exc.status, exc.message, requested=_operation_requested(ctx, op)) from exc
     defined_types = {}
     defined_type_layouts = {}
     before_defined_types = {}
     for name, type_obj in named_types:
         existing = ctx._current_type_entry(bv, str(name))
         before_defined_types[str(name)] = existing["decl"] if existing is not None else None
-        bv.define_user_type(name, type_obj)
+        if not reference_only:
+            bv.define_user_type(name, type_obj)
         current = ctx._current_type_entry(bv, str(name))
         defined_types[str(name)] = current["decl"] if current is not None else str(type_obj)
         defined_type_layouts[str(name)] = current["layout"] if current is not None else ctx._render_type_layout(type_obj)
@@ -4299,12 +4680,29 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         "defined_types": defined_types,
         "defined_type_layouts": defined_type_layouts,
         "before_defined_types": before_defined_types,
-        "count": len(defined_types),
+        "count": 0 if reference_only else len(defined_types),
         "parsed_functions": [name for name, _ in parsed["functions"]],
         "parsed_variables": [name for name, _ in parsed["variables"]],
-        "parsed_type_count": len(named_types),
+        # What the parser returned, before references to existing types were
+        # set aside (#989 review): `count` is what was applied, and
+        # `referenced_existing_types` names the rest.
+        "parsed_type_count": parsed_type_count,
         "parsed_function_count": len(parsed["functions"]),
         "parsed_variable_count": len(parsed["variables"]),
+        # #965: every C++ base clause in the declaration, none of which bn
+        # records (BN's parser drops them), named with the reason; absent when
+        # the declaration has none, so an ordinary result grows no key.
+        **({"unattached_bases": unattached_bases} if unattached_bases else {}),
+        # #963: existing types the declaration only REFERENCED (left as they
+        # were rather than overwritten by the parser's empty forward stub).
+        **({"referenced_existing_types": referenced_existing} if referenced_existing else {}),
+        # #989 review: NEW empty types created only because a member mentioned
+        # an unknown name (no body, no forward declaration of their own) --
+        # usually a misspelling, e.g. ``struct `ns::W::VTabl`*``.
+        **({"created_by_reference": created_by_mention} if created_by_mention else {}),
+        **({"reference_only": True,
+            "note": "the declaration only forward-declares existing types; nothing was changed"}
+           if reference_only else {}),
         # #825 item 3: a `--file` declaration parses with the header's PARENT
         # DIRECTORY as an implicit include root, so `#include "sibling.h"`
         # resolves. The root was derivable from `requested.source_path` but

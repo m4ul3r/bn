@@ -74,7 +74,10 @@ def _types_show(args: argparse.Namespace) -> int:
              preview_arg(), *mutation_output_args(),
              arg("--file", type=Path, help="Read declarations from a file"),
              arg("--stdin", action="store_true", help="Read declarations from stdin"),
-             arg("declaration", nargs="?"),
+             arg("declaration", nargs="?",
+                 help="C declarations. Name an existing aggregate with its tag keyword "
+                      "(`union pthread_mutex_t`) and a `::`-qualified type in backticks "
+                      "(struct `ns::Foo::VTable`*)"),
          ])
 def _types_declare(args: argparse.Namespace) -> int:
     # Exactly one declaration source. The handler used to pick file > stdin >
@@ -144,7 +147,10 @@ def _struct_show(args: argparse.Namespace) -> int:
              arg("struct_name"),
              arg("offset"),
              arg("field_name"),
-             arg("field_type"),
+             arg("field_type",
+                 help="Field type, e.g. uint32_t, `Foo*`, or a C++ type as "
+                      "struct `ns::Foo::VTable`* (backticks are optional here; "
+                      "a tag keyword must match the type's kind)"),
          ])
 def _struct_field_set(args: argparse.Namespace) -> int:
     return _mutate(
