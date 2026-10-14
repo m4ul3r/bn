@@ -551,6 +551,72 @@ def test_a_rename_chain_is_refused_before_apply_995(monkeypatch, second):
     assert not _has_event(bv, "begin")
 
 
+def _symbol_table_resolver(bridge, table):
+    """A `_resolve_rename_target` stand-in over ``{(name, kind): (address,
+    result_kind)}``, where an `auto` lookup takes a function before data."""
+    def resolve(_bv, ident, kind):
+        for probe in (("function", "data") if kind == "auto" else (kind,)):
+            hit = table.get((ident, probe))
+            if hit is not None:
+                return {"kind": hit[1], "address": hit[0], "before_name": ident}
+        raise bridge.OperationFailure("unsupported", f"Symbol not found: {ident}")
+    return resolve
+
+
+def test_a_rename_into_another_kind_is_not_a_chain_995(monkeypatch):
+    """#995 review: a name a function rename assigned is not that function to a
+    `kind: data` lookup, which never sees function symbols -- renaming the data
+    symbol that already holds the name is a separate write, and worked before
+    the chain check existed."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    applied = []
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv,
+                         apply=lambda bv_, op, restores=None, **kw: applied.append(op) or {
+                             "op": op["op"], "requested": {}},
+                         verify=lambda bv_, result: {**result, "status": "verified"})
+    monkeypatch.setattr(instance.ctx, "_resolve_rename_target", _symbol_table_resolver(bridge, {
+        ("add", "function"): (0x401129, "function"),
+        ("__dso_handle", "data"): (0x404008, "data"),
+    }))
+    ops = [{"op": "rename_symbol", "identifier": "add", "new_name": "__dso_handle",
+            "kind": "function"},
+           {"op": "rename_symbol", "identifier": "__dso_handle", "new_name": "marker",
+            "kind": "data"}]
+
+    result = instance._mutation("active", True, ops)
+
+    assert applied == ops
+    assert result["success"] is True
+
+
+def test_a_name_two_symbols_will_hold_is_refused_as_a_clash_995(monkeypatch):
+    """#995 review: after `x -> foo` while another function is already `foo`, a
+    `foo -> bar` names two functions. It is not a chain on `x`, so the refusal
+    must say what it is, not advise renaming `x` once to `bar`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv,
+                         apply=lambda bv_, op, restores=None, **kw: pytest.fail("applied"))
+    monkeypatch.setattr(instance.ctx, "_resolve_rename_target", _symbol_table_resolver(bridge, {
+        ("x", "function"): (0x401300, "function"),
+        ("foo", "function"): (0x401200, "function"),
+    }))
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", True, [
+            {"op": "rename_symbol", "identifier": "x", "new_name": "foo"},
+            {"op": "rename_symbol", "identifier": "foo", "new_name": "bar"}])
+
+    assert exc.value.status == "invalid_request"
+    assert "a name two symbols will hold" in exc.value.message
+    assert "the function at 0x401300" in exc.value.message
+    assert "the function at 0x401200 already has it" in exc.value.message
+    assert "Rename it once" not in exc.value.message
+
+
 def test_preview_drift_restore_failure_is_not_success(monkeypatch):
     """If reverting BN's propagation onto aliased siblings (the var-drift
     restore) fails, the preview left the view modified and must report
@@ -3910,12 +3976,109 @@ def test_preview_reports_an_unparseable_prototype_as_a_parse_error_999(monkeypat
     assert applied == []
 
 
+def test_preview_reports_an_unresolvable_prototype_target_999(monkeypatch):
+    """#999 review: a set_prototype whose function does not exist was skipped as
+    if it had found one ("has no user prototype yet") and the preview exited 0,
+    while the same batch live fails on it. The preview reports the miss."""
+    bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", True, [
+            {"op": "set_prototype", "identifier": "nosuchfn", "prototype": "int f(void)"},
+            {"op": "set_comment", "address": "0x4011aa", "comment": "hello"},
+        ])
+
+    assert exc.value.message == "Function not found: nosuchfn"
+    assert applied == []
+
+
+def test_preview_parse_checks_a_prototype_beside_a_rename_999(monkeypatch):
+    """#999 review: the rename branch skipped every prototype without checking
+    that it parses, so a typo previewed as exit 0 and failed only on commit."""
+    bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
+
+    def reject(text):
+        raise SyntaxError("error: string.hpp:1:11 unknown type name 'nosuch'")
+
+    monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", True, [
+            {"op": "set_prototype", "identifier": "touch", "prototype": "int f(struct nosuch* p)"},
+            {"op": "rename_symbol", "identifier": "other", "new_name": "other2"},
+        ])
+
+    assert exc.value.status == "invalid_request"
+    assert exc.value.message.startswith(
+        "could not parse prototype 'int f(struct nosuch* p)'")
+    assert applied == []
+
+
+def test_preview_skip_reason_names_a_cause_that_is_not_a_rename_999(monkeypatch):
+    """An op that is not a rename but is not on the resolution-safe whitelist
+    either (`data_retype`) is named as such in the skip reason -- never blamed
+    as a rename (#630 follow-up wording, kept through #999 item 5)."""
+    bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
+
+    result = instance._mutation("active", True, [
+        {"op": "set_prototype", "identifier": "touch", "prototype": "int touch(void* b)"},
+        {"op": "data_retype", "address": "0x404000", "new_type": "int32_t"},
+    ])
+
+    reason = result["preview_skipped"][0]["reason"]
+    assert "the operation 'data_retype', which may change how a symbol resolves" in reason
+    assert "rename" not in reason
+
+
+def test_preview_misspelled_prototype_field_gets_the_field_hint_999(monkeypatch):
+    """#999 review: the preview preflights read `prototype` before the #650 shape
+    check ran, so a misspelled field was `internal error: KeyError` under
+    --preview and the field-name hint only without it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x4011AA, "touch")
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", True, [
+            {"op": "set_prototype", "identifier": "touch", "proto": "int touch(void* b)"},
+            {"op": "set_comment", "address": "0x4011aa", "comment": "hello"},
+        ])
+
+    assert exc.value.status == "invalid_request"
+    assert "did you mean 'prototype'" in exc.value.message
+    assert not _has_event(bv, "begin")
+
+
+def test_a_prototype_parse_error_quotes_what_was_typed_999(monkeypatch):
+    """The declarator quoting is internal: the error shows the user's text."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def reject(text):
+        raise SyntaxError("error: string.hpp:1:32 invalid parameter name: 'this' is a keyword")
+
+    monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
+    typed = "int ns::Cls::run(struct Cls* this)"
+    with pytest.raises(bridge.OperationFailure) as exc:
+        bridge.mutation_engine._parse_prototype(
+            instance.ctx, bv, {"op": "set_prototype", "prototype": typed})
+    assert exc.value.message.startswith(f"could not parse prototype {typed!r}")
+    assert "`ns::Cls::run`" not in exc.value.message
+
+
 @pytest.mark.parametrize("text,expected", [
     ("int ns::Cls::run(int x)", "int `ns::Cls::run`(int x)"),
     ("struct `ns::Cls`* Cls::get(void)", "struct `ns::Cls`* `Cls::get`(void)"),
     ("int `Cls::run`(int x)", "int `Cls::run`(int x)"),       # already quoted
     ("int run(struct ns::Cls* self)", "int run(struct ns::Cls* self)"),  # only the name
     ("ns::Cls(int x)", "ns::Cls(int x)"),                     # no return type: not a name
+    ("void *ns::Cls::method(void* p)", "void *`ns::Cls::method`(void* p)"),
+    ("int &ns::Cls::ref(void)", "int &`ns::Cls::ref`(void)"),
+    ("void * ns::Cls::method(void* p)", "void * `ns::Cls::method`(void* p)"),
 ])
 def test_a_qualified_prototype_name_is_quoted_999(monkeypatch, text, expected):
     """#999 item 2: the name in a prototype is ignored, but BN's parser reads an
@@ -4138,7 +4301,9 @@ def test_preview_never_applies_a_prototype_beside_a_rename(monkeypatch, function
     view, so it could pin has_user_type on an AUTO function. Every one of the
     review rounds' bypasses must leave the prototype out -- since #999 item 5 by
     skipping it (`not_previewed`, naming the rename) while the rest is previewed,
-    no longer by refusing the batch -- and leave every AUTO function unpinned."""
+    no longer by refusing the batch -- and leave every AUTO function unpinned.
+    The rest of the batch must preview cleanly too, or this would pass on a
+    rename that never ran; and the reverted preview leaves no symbol behind."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fns = functions()
@@ -4156,6 +4321,11 @@ def test_preview_never_applies_a_prototype_beside_a_rename(monkeypatch, function
     assert "rename_symbol" in row["message"]
     assert [item["index"] for item in result["preview_skipped"]] == [proto_index]
     assert {fn.start: (fn.name, fn.has_user_type, str(fn.type)) for fn in fns} == before
+    others = [r["status"] for i, r in enumerate(result["results"]) if i != proto_index]
+    assert others == ["verified"] * len(others), result["results"]
+    assert result["success"] is True and result["rolled_back"] is True, result["message"]
+    assert bv.user_symbols == {}
+    assert bv.get_symbol_at(0x401000) is None
 
 
 # ---------------------------------------------------------------------------

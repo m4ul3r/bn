@@ -1101,16 +1101,26 @@ class _FakeMutationBV(_FakeBV):
     collections, the view-level data tags and the tag types -- all verified live
     on BN 5.4: a reverted transaction restores the prior comment, the prior
     tags (including ones it removed) and the prior tag types (#782).
+
+    User symbols (`define_user_symbol`, the data-rename write) are journaled the
+    same way, so a reverted data rename leaves no symbol behind.
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.events: list[tuple[str, str] | str] = []
+        self.user_symbols: dict[int, object] = {}
         # (state, function provenance snapshots, address-comment snapshot,
         #  function tag/comment snapshots, tag-type snapshot, view data-tag
-        #  snapshot) per open transaction, newest last.
-        self._undo_journal: list[tuple[str, list, dict, list, dict, dict]] = []
+        #  snapshot, user-symbol snapshot) per open transaction, newest last.
+        self._undo_journal: list[tuple[str, list, dict, list, dict, dict, dict]] = []
         self._undo_states = 0
+
+    def define_user_symbol(self, symbol):
+        self.user_symbols[int(symbol.address)] = symbol
+
+    def get_symbol_at(self, address):
+        return self.user_symbols.get(int(address)) or super().get_symbol_at(address)
 
     def begin_undo_actions(self):
         # Real BN hands back a DISTINCT handle per transaction; a constant would
@@ -1130,7 +1140,8 @@ class _FakeMutationBV(_FakeBV):
              dict(self._tag_types),
              # Tag objects are immutable here, so the lists can be re-snapshotted
              # rather than deep-copied.
-             {addr: list(bucket) for addr, bucket in self._data_tags.items()})
+             {addr: list(bucket) for addr, bucket in self._data_tags.items()},
+             dict(self.user_symbols))
         )
         return state
 
@@ -1153,7 +1164,8 @@ class _FakeMutationBV(_FakeBV):
         entry = self._pop_journal(state)
         if entry is None:
             return
-        _, fn_snapshots, comments, tag_snapshots, tag_types, data_tags = entry
+        _, fn_snapshots, comments, tag_snapshots, tag_types, data_tags, user_symbols = entry
+        self.user_symbols = dict(user_symbols)
         self._comments = dict(comments)
         for fn, snapshot in fn_snapshots:
             fn.provenance_restore(snapshot)

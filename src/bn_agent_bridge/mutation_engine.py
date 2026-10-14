@@ -1049,14 +1049,11 @@ def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[tuple[int, str
     BN's REAL lookup (``ctx._find_function`` -- the same path apply uses, including
     the raw-symbol-at-address fallback at seam.py ~129), never a simulation. A
     target that resolves to an AUTO function (``has_user_type`` false) whose
-    prototype would DIFFER is flagged; so is one that is ambiguous or unresolvable
-    (we cannot PROVE it lands on a non-AUTO function). Over-flagging is safe; an
-    irreversible AUTO-prototype pin under ``--preview`` is not."""
-    # A prototype that fails to parse is reported as a parse error (#999 item 1),
-    # not as "cannot preview": every attempt was otherwise live. The one case it
-    # cannot be judged yet is a batch that declares types the prototype may use.
-    declares_types = any(isinstance(op, dict) and op.get("op") == "types_declare"
-                         for op in operations)
+    prototype would DIFFER is flagged. A target that does not resolve is not a
+    preview question at all: the same batch applied live fails on it, so the
+    preview reports that failure (#999 review) instead of skipping the op as if
+    it had found a function."""
+    declares_types = _declares_types(operations)
     flagged: list[tuple[int, str]] = []
     for index, op in enumerate(operations):
         if not (isinstance(op, dict) and op.get("op") == "set_prototype"):
@@ -1064,17 +1061,7 @@ def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[tuple[int, str
         identifier = op.get("identifier")
         if identifier is None:
             continue
-        try:
-            fn = ctx._find_function(bv, identifier)
-        except Exception:
-            # Ambiguous or unresolvable under BN's REAL lookup: we cannot prove
-            # the target is a non-AUTO function, so an irreversible AUTO pin can't
-            # be ruled out -> refuse (over-refusal is safe).
-            flagged.append((index, str(identifier)))
-            continue
-        if fn is None:
-            flagged.append((index, str(identifier)))
-            continue
+        fn = _resolve_prototype_target(ctx, bv, op)
         if bool(getattr(fn, "has_user_type", False)):
             # A genuine prior user type: re-asserting it on revert is correct.
             continue
@@ -1091,6 +1078,30 @@ def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[tuple[int, str
         if str(fn.type) != str(expected_type):
             flagged.append((index, label))
     return flagged
+
+
+def _declares_types(operations) -> bool:
+    """Whether a batch declares types, which a later prototype may use: such a
+    prototype cannot be parse-checked before the batch applies."""
+    return any(isinstance(op, dict) and op.get("op") == "types_declare" for op in operations)
+
+
+def _resolve_prototype_target(ctx, bv, op: dict[str, Any]):
+    """The function a set_prototype op names, under BN's REAL lookup, or the
+    failure the apply would report for it (`Function not found: ...`, an
+    ambiguous name) as an OperationFailure."""
+    identifier = op.get("identifier")
+    try:
+        fn = ctx._find_function(bv, identifier)
+    except OperationFailure:
+        raise
+    except Exception as exc:
+        raise OperationFailure("unsupported", str(exc),
+                               requested=_operation_requested(ctx, op)) from exc
+    if fn is None:
+        raise OperationFailure("unsupported", f"Function not found: {identifier}",
+                               requested=_operation_requested(ctx, op))
+    return fn
 
 
 # The ops whose meaning depends on a function's prototype: a parameter is a
@@ -1115,8 +1126,14 @@ def _unpreviewable_operations(ctx, bv, operations) -> dict[int, str]:
         offending_op, is_known = offending
         cause = (f"a rename or a symbol/function create ({offending_op})" if is_known
                  else f"the operation {offending_op!r}, which may change how a symbol resolves")
+        # The target cannot be resolved here, but the prototype TEXT can still
+        # be checked: a string that does not parse fails the live apply too
+        # (#999 review), so the preview says so instead of only skipping it.
+        check_parse = not _declares_types(operations)
         for index, op in enumerate(operations):
             if isinstance(op, dict) and op.get("op") == "set_prototype":
+                if check_parse:
+                    _parse_prototype(ctx, bv, op)
                 skipped[index] = (
                     f"not previewed: this batch also carries {cause}, so the function "
                     "this prototype lands on cannot be proven from the pre-mutation view, "
@@ -2421,14 +2438,40 @@ def _reject_rename_chains(ctx, bv, operations: list[dict[str, Any]]) -> None:
     symbol by address) slipped past it, and the first rename then failed
     verification against the end state (`bar` at the address it expected `foo`)
     -- a rollback that read as a BN problem at an address, not as a manifest
-    that renames one function twice. Key on the address the rename resolves to
-    instead: a name an earlier rename in this batch assigned resolves to THAT
-    rename's target; any other identifier resolves against the view the batch
-    starts from, and one that does not resolve there is keyed by its spelling,
-    so a chain through it is still caught while a lone miss is left to fail at
-    apply, where the #975 hint explains a name an earlier rename replaced."""
+    that renames one function twice.
+
+    Key on the SYMBOL a rename resolves to -- its address and kind (a function,
+    or a data symbol, which may share a function's address) -- the way
+    `_resolve_rename_target` will resolve it at apply time:
+
+    * a name an earlier rename in this batch assigned resolves to THAT symbol
+      only when this op's `kind` can reach it (a `kind: data` lookup never sees
+      a function symbol, and an `auto` lookup prefers a function) and no OTHER
+      live symbol holds the name -- then it is a chain. When another existing
+      symbol does hold it, the op names two symbols at once: that clash is
+      refused as what it is, never mistaken for a chain on one of them;
+    * any other identifier resolves against the view the batch starts from,
+      and one that does not resolve there is keyed by its spelling, so a chain
+      through it is still caught while a lone miss is left to fail at apply,
+      where the #975 hint explains a name an earlier rename replaced."""
     renamed: dict[tuple, tuple[int, Any, str]] = {}
-    assigned: dict[str, tuple] = {}
+    assigned: dict[str, tuple[tuple, int]] = {}
+
+    def live_holder(name: str, kind: str) -> tuple | None:
+        """The symbol the view the batch starts from resolves *name* to under
+        *kind*, unless an earlier rename in this batch already took it away. A
+        case-folded-only match does not count: at apply time the exact name the
+        earlier rename assigned wins over it."""
+        try:
+            target = ctx._resolve_rename_target(bv, name, kind)
+        except Exception:
+            return None
+        held = str(target.get("before_name") or "")
+        if held != name and held.casefold() == name.casefold():
+            return None
+        key = ("addr", int(target["address"]), str(target.get("kind")))
+        return None if key in renamed else key
+
     for index, op in enumerate(operations):
         if not isinstance(op, dict) or op.get("op") != "rename_symbol":
             continue
@@ -2436,16 +2479,40 @@ def _reject_rename_chains(ctx, bv, operations: list[dict[str, Any]]) -> None:
         new_name = op.get("new_name")
         if not isinstance(new_name, str):
             continue
+        kind = str(op.get("kind", "auto"))
         before_name: Any = identifier
+        key: tuple | None = None
         if isinstance(identifier, str) and identifier in assigned:
-            key = assigned[identifier]
-        else:
+            assigned_key, assigner = assigned[identifier]
+            assigned_kind = assigned_key[-1]
+            # An `auto` lookup takes a function before any data symbol.
+            reachable = (kind == "auto" and (assigned_kind != "data"
+                                             or live_holder(identifier, "function") is None)
+                         or assigned_kind in (kind, "unknown"))
+            if reachable:
+                other = live_holder(identifier, assigned_kind if assigned_kind != "unknown" else kind)
+                if other is not None and other != assigned_key:
+                    raise OperationFailure(
+                        "invalid_request",
+                        f"operation {index} renames {identifier}, a name two symbols "
+                        f"will hold when it runs: operation {assigner} gives it to "
+                        f"{_rename_key_label(assigned_key)}, and "
+                        f"{_rename_key_label(other)} already has it. Name the "
+                        f"symbol operation {index} means by its address instead.",
+                        requested={
+                            "op": "rename_symbol",
+                            "conflicting_op_indices": [assigner, index],
+                            "conflict_key": identifier,
+                        },
+                    )
+                key = assigned_key
+        if key is None:
             try:
-                target = ctx._resolve_rename_target(bv, identifier, str(op.get("kind", "auto")))
-                key = ("addr", int(target["address"]))
+                target = ctx._resolve_rename_target(bv, identifier, kind)
+                key = ("addr", int(target["address"]), str(target.get("kind")))
                 before_name = target.get("before_name") or identifier
             except Exception:
-                key = ("name", str(identifier))
+                key = ("name", str(identifier), kind if kind in ("function", "data") else "unknown")
         previous = renamed.get(key)
         if previous is not None:
             first, first_before, first_new = previous
@@ -2466,8 +2533,15 @@ def _reject_rename_chains(ctx, bv, operations: list[dict[str, Any]]) -> None:
                 },
             )
         renamed[key] = (index, before_name, new_name)
-        assigned[new_name] = key
+        assigned[new_name] = (key, index)
 
+
+def _rename_key_label(key: tuple) -> str:
+    """How `_reject_rename_chains` names a symbol key in its messages."""
+    if key[0] == "addr":
+        noun = "the data symbol" if key[2] == "data" else "the function"
+        return f"{noun} at {hex(key[1])}"
+    return f"the symbol first named {key[1]}"
 
 
 def _later_create_needs_ranges(operations: list, index: int) -> bool:
@@ -2560,6 +2634,16 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         # generalizes the per-op function_create guard to bn type/comment/rename/proto/
         # struct-field/batch-apply on a quick view.
         refuse_quick_view(bv, requested={"op": "mutation", "operations": len(operations)})
+        # #650: validate EVERY op's shape before applying ANY. The batch is atomic, so a
+        # guessed op or field name in op 13 previously rolled back 12 good ops -- and with
+        # no argparse layer on this path, guessing is the norm, not the exception. It runs
+        # right after the --quick refusal (target state) and BEFORE the #995/#630
+        # preflights below, which read op fields: run first, a misspelled field there
+        # surfaced as `internal error: KeyError` instead of its field-name hint (#999
+        # review). Still strictly before the first mutation, which is what matters.
+        for index, op in enumerate(operations):
+            if isinstance(op, dict):
+                _validate_operation_request(ctx, op, index=index)
         # #995: a rename chain (one symbol renamed twice) can never verify.
         _reject_rename_chains(ctx, bv, operations)
         # #630: a --preview of a prototype set on a function with no user type would
@@ -2586,15 +2670,6 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 "that already has a user-defined prototype.",
                 requested={"op": "set_prototype", "functions": unrevertible},
             )
-        # #650: validate EVERY op's shape before applying ANY. The batch is atomic, so a
-        # guessed op or field name in op 13 previously rolled back 12 good ops -- and with
-        # no argparse layer on this path, guessing is the norm, not the exception. Placed
-        # last among the pre-apply gates so the --quick refusal (target state) and the
-        # #630 preview refusals keep owning their more specific messages; still strictly
-        # before the first mutation, which is the property that matters.
-        for index, op in enumerate(operations):
-            if isinstance(op, dict):
-                _validate_operation_request(ctx, op, index=index)
         affected = _guess_affected_functions(ctx, bv, operations)
         # Partition for blast-radius attribution: a type op's reach is "functions
         # referencing the type"; a direct op targets one function. direct_starts are
@@ -3513,14 +3588,16 @@ def _type_spelling_hint(bv, text: str, detail: str, *, limit: int = 5) -> str:
             "needs backticks (struct `ns::Foo`*).")
 
 
-def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: str):
+def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: str,
+                        shown: str | None = None):
     """``bv.parse_type_string`` with a friendly, actionable error.
 
     A prototype/type that references a struct or type not defined yet fails to
     parse. Surface a clear ``invalid_request`` with a next step instead of the
     generic ``unsupported: <ExceptionClass>: ...`` the catch-all in
     ``_apply_operation`` would otherwise emit -- which leaks the Python
-    exception class name and gives no way forward (#122)."""
+    exception class name and gives no way forward (#122). *shown* is the text
+    the error quotes when *type_text* is a rewrite of what the caller typed."""
     try:
         return bv.parse_type_string(str(type_text))
     except OperationFailure:
@@ -3538,7 +3615,7 @@ def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: s
         detail = " ".join(str(exc).split()).rstrip(".")
         raise OperationFailure(
             "invalid_request",
-            f"could not parse {label} {str(type_text)!r}"
+            f"could not parse {label} {shown if shown is not None else str(type_text)!r}"
             + (f": {detail}" if detail else "")
             + "."
             + _parse_failure_hint(bv, str(type_text), detail),
@@ -3574,9 +3651,9 @@ def _parse_failure_hint(bv, text: str, detail: str) -> str:
 
 
 # The declarator name of a prototype: the identifier right before its first `(`,
-# with something (the return type) in front of it.
-_PROTOTYPE_DECLARATOR = re.compile(r"^(?P<head>.*\S)\s+(?P<name>[A-Za-z_~][\w~]*(?:::[A-Za-z_~][\w~]*)+)\s*$",
-                                   re.DOTALL)
+# with something (the return type, ending in a space, `*` or `&`) in front of it.
+_PROTOTYPE_DECLARATOR = re.compile(
+    r"^(?P<head>.*[\s*&])(?P<name>[A-Za-z_~][\w~]*(?:::[A-Za-z_~][\w~]*)+)\s*$", re.DOTALL)
 
 
 def _quote_qualified_declarator(text: str) -> str:
@@ -3590,15 +3667,17 @@ def _quote_qualified_declarator(text: str) -> str:
     if not sep:
         return text
     match = _PROTOTYPE_DECLARATOR.match(head)
-    if match is None or match.group("head").endswith(("::", "`")):
+    if match is None or not match.group("head").strip():
         return text
-    return f"{match.group('head')} `{match.group('name')}`{sep}{rest}"
+    return f"{match.group('head')}`{match.group('name')}`{sep}{rest}"
 
 
 def _parse_prototype(ctx, bv, op: dict[str, Any]):
-    """The prototype a ``set_prototype`` op requests, parsed to a ``Type``."""
+    """The prototype a ``set_prototype`` op requests, parsed to a ``Type``.
+    Its parse error quotes the prototype as typed, not the quoted rewrite."""
+    typed = str(op.get("prototype"))
     expected_type, _ = _parse_type_or_hint(
-        ctx, bv, op, _quote_qualified_declarator(str(op["prototype"])), label="prototype")
+        ctx, bv, op, _quote_qualified_declarator(typed), label="prototype", shown=typed)
     return expected_type
 
 
