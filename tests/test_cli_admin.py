@@ -13,11 +13,14 @@ from _cli_helpers import *  # noqa: F401,F403
 
 @pytest.fixture(autouse=True)
 def _isolate_omp_skill_destination(monkeypatch, tmp_path):
-    # A throwaway HOME, so no install test can reach the real skill or plugin
-    # roots through a default that was not monkeypatched (#1004 review).
+    # A throwaway HOME, with the variables that override it cleared, so no
+    # install test can reach the real skill or plugin roots through a default
+    # that was not monkeypatched (#1004 review).
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    for var in ("CLAUDE_HOME", "CODEX_HOME", "BN_PLUGIN_DIR", "PI_CONFIG_DIR"):
+        monkeypatch.delenv(var, raising=False)
     config_root = tmp_path / "absent-omp-config"
     agent_dir = config_root / "agent"
     monkeypatch.setattr(bn.cli, "omp_config_root", lambda: config_root, raising=False)
@@ -212,11 +215,13 @@ def _one_skill_source(tmp_path, monkeypatch):
 def _seed_leftover(leftover, skill, dest, tmp_path):
     """Put a non-current install of `skill` at `dest`; return the old link target."""
     old_tree = tmp_path / "old-checkout" / "sample"
-    if leftover in ("other_tree", "dangling"):
+    if leftover in ("other_tree", "dangling", "unwritable_parent"):
         old_tree.mkdir(parents=True)
         dest.symlink_to(old_tree)
-        if leftover == "dangling":
+        if leftover != "other_tree":
             old_tree.rmdir()
+        if leftover == "unwritable_parent":
+            dest.parent.chmod(0o555)
         return old_tree
     if leftover == "foreign_dir":
         dest.mkdir()
@@ -230,18 +235,30 @@ def _seed_leftover(leftover, skill, dest, tmp_path):
         dest.mkdir()
         (dest / "SKILL.md").write_text((skill / "SKILL.md").read_text())
         (dest / "old.md").write_text("gone upstream")
+    elif leftover == "read_only_old_copy":
+        # A previous copy (its SKILL.md still matches), out of date because the
+        # source gained a file, and read-only: rmtree cannot empty it.
+        dest.mkdir()
+        (dest / "SKILL.md").write_text((skill / "SKILL.md").read_text())
+        (skill / "extra.md").write_text("new upstream")
+        dest.chmod(0o555)
     return None
 
 
 _LEFTOVERS = {
-    # leftover: (state, words in detail, --force replaces it)
-    "other_tree": ("stale", "symlink to", True),
-    "dangling": ("stale", "dangling symlink", True),
-    "foreign_dir": ("existing", "does not match", False),
-    "empty_dir": ("existing", "empty directory", True),
-    "other_mode": ("other_mode", "not the requested copy", True),
-    "old_copy_with_removed_file": ("existing", "does not match", False),
+    # leftover: (state, words in detail, --force replaces it, words in remedy)
+    "other_tree": ("stale", "symlink to", True, "re-run with --force"),
+    "dangling": ("stale", "dangling symlink", True, "re-run with --force"),
+    "foreign_dir": ("existing", "does not match", False, "move it aside by hand"),
+    "empty_dir": ("existing", "empty directory", True, "re-run with --force"),
+    "other_mode": ("other_mode", "not the requested copy", True, "re-run with --force"),
+    "old_copy_with_removed_file": ("existing", "does not match", False, "move it aside by hand"),
+    # Round 2 of the #1004 review: the remedy skipped the path guards and the
+    # rmtree permissions the forced run hits.
+    "unwritable_parent": ("stale", "dangling symlink", False, "is not writable"),
+    "read_only_old_copy": ("existing", "does not match", False, "cannot be emptied"),
 }
+_PERMISSION_LEFTOVERS = {"unwritable_parent", "read_only_old_copy"}
 
 
 @pytest.mark.parametrize("leftover", sorted(_LEFTOVERS))
@@ -253,31 +270,108 @@ def test_skill_install_reports_a_non_current_destination_with_a_remedy_that_work
     # installed." with exit 0 while nothing was updated. Each row names its
     # remedy, and that remedy must hold: --force is offered exactly where a
     # --force run then replaces the destination (review of #1004).
+    if leftover in _PERMISSION_LEFTOVERS and os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses the permission this case denies; run as a user")
     skill, dest = _one_skill_source(tmp_path, monkeypatch)
     old_tree = _seed_leftover(leftover, skill, dest, tmp_path)
-    state, detail_words, force_replaces = _LEFTOVERS[leftover]
+    state, detail_words, force_replaces, remedy_words = _LEFTOVERS[leftover]
+    try:
+        rc = bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"])
 
-    rc = bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"])
+        assert rc == 1
+        [row] = json.loads(capsys.readouterr().out)["not_updated_destinations"]
+        assert row["destination"] == str(dest)
+        assert row["state"] == state
+        assert detail_words in row["detail"]
+        assert row["force_replaces"] is force_replaces
+        assert remedy_words in row["remedy"]
+        if old_tree is not None:
+            assert os.readlink(dest) == str(old_tree)  # untouched without --force
 
-    assert rc == 1
-    [row] = json.loads(capsys.readouterr().out)["not_updated_destinations"]
-    assert row["destination"] == str(dest)
-    assert row["state"] == state
-    assert detail_words in row["detail"]
-    assert row["force_replaces"] is force_replaces
-    if old_tree is not None:
-        assert os.readlink(dest) == str(old_tree)  # untouched without --force
+        assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 1
+        text = capsys.readouterr().out
+        assert "already installed" not in text
+        assert ("re-run with --force" in text) is force_replaces
+        assert ("--force will not replace it" in text) is not force_replaces
 
-    assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 1
-    text = capsys.readouterr().out
-    assert "already installed" not in text
-    assert ("re-run with --force" in text) is force_replaces
-    assert ("move it aside by hand" in text) is not force_replaces
+        forced = bn.cli.main(["skill", "install", "--mode", "copy", "--force"])
+        captured = capsys.readouterr()
+        assert (forced == 0) is force_replaces, captured
+        assert "Traceback" not in captured.err
+        if force_replaces:
+            assert (dest / "SKILL.md").read_text() == (skill / "SKILL.md").read_text()
+    finally:
+        dest.parent.chmod(0o755)
+        if dest.is_dir() and not dest.is_symlink():
+            dest.chmod(0o755)
 
-    forced = bn.cli.main(["skill", "install", "--mode", "copy", "--force"])
-    assert (forced == 0) is force_replaces
-    if force_replaces:
-        assert (dest / "SKILL.md").read_text() == (skill / "SKILL.md").read_text()
+
+def test_skill_install_remedy_says_a_forced_run_is_all_or_nothing(tmp_path, monkeypatch, capsys):
+    # A forced run refuses as a whole, so a replaceable row beside one that
+    # needs a hand fix must not read as if --force alone would fix it.
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    codex_home = tmp_path / "codex"
+    (codex_home / "skills" / "sample").mkdir(parents=True)
+    (codex_home / "skills" / "sample" / "notes.txt").write_text("mine")
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_home / "skills")
+    dest.symlink_to(tmp_path / "gone")
+
+    assert bn.cli.main(["skill", "install", "--format", "json"]) == 1
+    rows = {row["destination"]: row for row in
+            json.loads(capsys.readouterr().out)["not_updated_destinations"]}
+    assert rows[str(dest)]["force_replaces"] is True
+    assert "all-or-nothing" in rows[str(dest)]["remedy"]
+    assert rows[str(codex_home / "skills" / "sample")]["force_replaces"] is False
+    assert bn.cli.main(["skill", "install", "--force"]) == 2
+
+
+def test_skill_install_into_its_own_source_is_already_installed(tmp_path, monkeypatch, capsys):
+    # A skills root symlinked to the checkout's own skills/ holds the source
+    # itself: base said "already installed" (exit 0); the remedy must not
+    # offer a --force that refuses it as "the install source itself".
+    skill, _ = _one_skill_source(tmp_path, monkeypatch)
+    root_link = tmp_path / "linked-root"
+    root_link.symlink_to(skill.parent)
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: root_link)
+
+    for argv in (["skill", "install"], ["skill", "install", "--mode", "copy"],
+                 ["skill", "install", "--force"]):
+        assert bn.cli.main(argv) == 0, argv
+        out = capsys.readouterr().out
+        assert out.startswith("Skills already installed.\n"), argv
+    assert (skill / "SKILL.md").is_file()
+
+
+def test_skill_install_dest_in_the_other_mode_names_a_force_that_converts(tmp_path, capsys):
+    destination = tmp_path / "store"
+    destination.mkdir()
+    (destination / "bn").symlink_to(bn.cli.skills_source_dir() / "bn")
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy", "--dest", str(destination)])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "not the requested copy" in err and "re-run with --force" in err
+    assert bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    ) == 0
+    assert not (destination / "bn").is_symlink()
+    assert (destination / "bn" / "SKILL.md").is_file()
+
+
+def test_plugin_install_symlink_over_a_copy_names_a_force_that_converts(tmp_path, capsys):
+    destination = tmp_path / "bn_agent_bridge"
+    assert bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(destination)]) == 0
+    capsys.readouterr()
+
+    rc = bn.cli.main(["plugin", "install", "--dest", str(destination)])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "not the requested symlink" in err and "re-run with --force" in err
+    assert bn.cli.main(["plugin", "install", "--dest", str(destination), "--force"]) == 0
+    assert destination.is_symlink()
 
 
 @pytest.mark.parametrize("mode", ["symlink", "copy"])
@@ -321,16 +415,30 @@ def test_install_reports_an_unreadable_copy_as_structured_output(
         assert rc == 1
         [row] = json.loads(capsys.readouterr().out)["not_updated_destinations"]
         assert "could not be read" in row["detail"]
+        # Only file, unreadable: no readable file proves it ours, so --force
+        # refuses -- and the hint says so.
         assert row["force_replaces"] is False
+        assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 2
+        capsys.readouterr()
 
         rc = bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(plugin_dest)])
         assert rc == 2
         captured = capsys.readouterr()
-        assert "could not be read" in json.loads(captured.out)["error"]
+        error = json.loads(captured.out)["error"]
+        assert "could not be read" in error
         assert "Traceback" not in captured.err
+        # Other files still match, so --force replaces it, wherever the
+        # unreadable one sorts -- and the hint says so.
+        assert "re-run with --force" in error
+        assert bn.cli.main(
+            ["plugin", "install", "--mode", "copy", "--dest", str(plugin_dest), "--force"]
+        ) == 0
+        assert (plugin_dest / "bridge.py").read_bytes() == (
+            bn.cli.plugin_source_dir() / "bridge.py").read_bytes()
     finally:
         (dest / "SKILL.md").chmod(0o644)
-        (plugin_dest / "bridge.py").chmod(0o644)
+        if (plugin_dest / "bridge.py").exists():
+            (plugin_dest / "bridge.py").chmod(0o644)
 
 
 def test_plugin_install_up_to_date_check_respects_the_requested_mode(tmp_path, capsys):

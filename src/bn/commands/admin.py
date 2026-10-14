@@ -249,7 +249,8 @@ def _plugin_install(args: argparse.Namespace) -> int:
     dest = args.dest or cli.plugin_install_dir()
     state = (
         _existing_install_state(source, dest, mode=args.mode)
-        if source.exists() and not args.force else None
+        if source.exists() and (not args.force or _is_install_source(source, dest))
+        else None
     )
     # An install of this source in the requested mode is not an error (#1002);
     # anything else at the destination is refused by `_plan_install`, which
@@ -306,12 +307,18 @@ def _foreign_install_entry(dest: Path, source: Path) -> str | None:
 
 
 def _any_file_matches_source(dest: Path, source: Path) -> bool:
-    """Whether one file under `dest` is still byte-identical to its source
-    counterpart. That is the content proof this tree is an install of `source`
-    rather than a directory that merely reuses its entry names -- a user's own
-    `plugin.json` sitting where ours sits is not ours (#766).
+    """Whether one readable file under `dest` is still byte-identical to its
+    source counterpart. That is the content proof this tree is an install of
+    `source` rather than a directory that merely reuses its entry names -- a
+    user's own `plugin.json` sitting where ours sits is not ours (#766).
+    An entry that cannot be read is skipped rather than raised, so the answer
+    depends on what the tree holds, not on where an unreadable file sorts.
     """
-    for entry in sorted(dest.iterdir()):
+    try:
+        entries = sorted(dest.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
         if _is_install_bytecode(entry.name):
             continue
         counterpart = source / entry.name
@@ -320,8 +327,12 @@ def _any_file_matches_source(dest: Path, source: Path) -> bool:
         if entry.is_dir():
             if counterpart.is_dir() and _any_file_matches_source(entry, counterpart):
                 return True
-        elif counterpart.is_file() and entry.read_bytes() == counterpart.read_bytes():
-            return True
+        elif counterpart.is_file():
+            try:
+                if entry.read_bytes() == counterpart.read_bytes():
+                    return True
+            except OSError:
+                continue
     return False
 
 
@@ -389,6 +400,8 @@ def _existing_install_state(source: Path, dest: Path, *, mode: str) -> tuple[str
     that needs nothing; reporting the others as "already installed" left every
     link pointing at the previous tree with exit 0 (#1002).
     """
+    if _is_install_source(source, dest):
+        return "up_to_date", f"is the install source {source} itself"
     if dest.is_symlink():
         link = Path(os.readlink(dest))
         target = link if link.is_absolute() else dest.parent / link
@@ -416,27 +429,65 @@ def _existing_install_state(source: Path, dest: Path, *, mode: str) -> tuple[str
     return "other_mode", f"copy of {source}, not the requested symlink"
 
 
+def _is_install_source(source: Path, dest: Path) -> bool:
+    """Whether `dest` is the install source itself, reached through a symlinked
+    ancestor -- a skills root linked to the checkout's own `skills/`. Nothing
+    can be installed there and nothing needs to be, `--force` included."""
+    return not dest.is_symlink() and dest.exists() and dest.resolve() == source.resolve()
+
+
+def _removal_blocker(dest: Path) -> str | None:
+    """Why `shutil.rmtree(dest)` would fail on permissions, or None. Emptying a
+    directory needs read, write and search on it and on every directory under
+    it; a read-only previous copy used to crash `--force` in rmtree."""
+    pending = [dest]
+    while pending:
+        directory = pending.pop()
+        if not os.access(directory, os.R_OK | os.W_OK | os.X_OK):
+            return f"{directory} cannot be emptied (it is not readable and writable)"
+        for entry in directory.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                pending.append(entry)
+    return None
+
+
 def _force_refusal_reason(dest: Path, source: Path) -> str | None:
-    """Why `--force` would refuse to replace `dest` (already `_install_path`'d),
-    or None when it would replace it. The one rule both the --force install and
-    the hint printed without --force read, so a hint never names a --force that
-    then refuses (#1002 review)."""
+    """Why `--force` would refuse to replace what sits at `dest` (already
+    `_install_path`'d), or None when it would replace it."""
     if dest.is_symlink() or not dest.exists():
         return None
     if not dest.is_dir():
         return "it is not a directory"
     try:
-        return _unsafe_replace_reason(dest, source)
+        return _unsafe_replace_reason(dest, source) or _removal_blocker(dest)
     except OSError as exc:
         return f"it could not be read ({exc})"
 
 
+def _force_preflight_refusal(source: Path, dest: Path) -> tuple[str, str] | None:
+    """`(reason, what to do instead)` when a `--force` install at `dest` would
+    be refused, else None. Every check the forced `_plan_install` makes, in its
+    order, so a hint never names a --force that then refuses (#1004 review)."""
+    dest = _install_path(dest)
+    forbidden = _never_an_install_destination(dest, source)
+    if forbidden is not None:
+        return forbidden, "choose another destination"
+    unusable = _unusable_parent_reason(dest)
+    if unusable is not None:
+        return unusable, "fix that by hand"
+    reason = _force_refusal_reason(dest, source)
+    if reason is not None:
+        return reason, "move it aside by hand"
+    return None
+
+
 def _replace_remedy(source: Path, dest: Path) -> tuple[bool, str]:
     """`(force_replaces, remedy)` for a destination left as it was."""
-    reason = _force_refusal_reason(_install_path(dest), source)
-    if reason is None:
+    refusal = _force_preflight_refusal(source, dest)
+    if refusal is None:
         return True, "re-run with --force to replace it"
-    return False, f"--force will not replace it ({reason}); move it aside by hand and re-run"
+    reason, action = refusal
+    return False, f"--force will not replace it ({reason}); {action} and re-run"
 
 
 def _install_path(dest: Path) -> Path:
@@ -519,10 +570,13 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
             f"Cannot create the parent directory of {dest}: {exc}"
         ) from exc
 
-    if dest.is_symlink():
-        dest.unlink()
-    elif dest.is_dir():
-        shutil.rmtree(dest)
+    try:
+        if dest.is_symlink():
+            dest.unlink()
+        elif dest.is_dir():
+            shutil.rmtree(dest)
+    except OSError as exc:
+        raise BridgeError(f"Cannot replace {dest}: {exc}") from exc
 
     if mode == "copy":
         shutil.copytree(source, dest, ignore=_IGNORED_INSTALL_ENTRIES)
@@ -616,6 +670,9 @@ def _skill_install(args: argparse.Namespace) -> int:
     skipped_destinations = []
     not_updated_destinations = []
     for source, dest in install_plan:
+        if args.force and _is_install_source(source, dest):
+            skipped_destinations.append(str(dest))
+            continue
         if not args.force:
             state = _existing_install_state(source, dest, mode=args.mode)
             if state is not None and state[0] == "up_to_date":
@@ -645,6 +702,17 @@ def _skill_install(args: argparse.Namespace) -> int:
         if any(queued == planned for _, queued in pending_installs):
             continue
         pending_installs.append((source, planned))
+
+    if any(not row["force_replaces"] for row in not_updated_destinations):
+        # A forced run refuses as a whole before writing anything, so while one
+        # destination needs a hand fix the others' --force does not apply yet.
+        for row in not_updated_destinations:
+            if row["force_replaces"]:
+                row["remedy"] = (
+                    "re-run with --force to replace it, after fixing the "
+                    "destinations --force will not replace (a forced run is "
+                    "all-or-nothing)"
+                )
 
     for source, dest in pending_installs:
         _install_tree(source, dest, mode=args.mode, force=args.force)

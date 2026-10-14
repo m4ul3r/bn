@@ -41,7 +41,7 @@ bn skill install
 
 That symlinks the bundled skills into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
 
-Re-running either install is safe: an existing link (or copy, under `--mode copy`) of the same source is reported as already installed. A destination holding anything else, typically a link into a previous checkout, is never reported as installed: `skill install` lists it with what it points at and exits `1`, and `plugin install` refuses it. Each names its remedy: `--force` where `--force` will replace it (a link, an empty directory, a previous install of the same source, or one in the other mode), otherwise moving it aside by hand.
+Re-running either install is safe: an existing link (or copy, under `--mode copy`) of the same source, or a skills root that is linked to the source itself, is reported as already installed. A destination holding anything else, typically a link into a previous checkout, is never reported as installed: `skill install` lists it with what it points at and exits `1`, and `plugin install` refuses it. Each names its remedy: `--force` where a forced run will replace it (a link, an empty directory, a previous install of the same source, or one in the other mode), otherwise what to fix by hand first (move it aside, or make its directory writable). A forced run is all-or-nothing: it refuses before writing anything while any destination needs a hand fix.
 
 If the plugin code changes, reload Binary Ninja Python plugins or restart Binary Ninja.
 

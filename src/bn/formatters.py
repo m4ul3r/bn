@@ -6918,7 +6918,7 @@ def _render_skill_install_text(value: Any) -> str:
     # "installed". Each row carries its own remedy: --force refuses some of
     # them, so one blanket "re-run with --force" would be false.
     if not_updated:
-        lines.append("Not updated, existing destination is not this install:")
+        lines.append("Not updated, existing destination differs from the requested install:")
         for row in not_updated:
             remedy = _text_value(row, "remedy")
             tail = f"; {remedy}" if remedy else ""
