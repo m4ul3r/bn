@@ -46,6 +46,17 @@ _unanalyzed_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
 # `target list`. A plain dict that `TargetManager.refresh()` prunes to the open
 # set (on a complete snapshot) outlives any wrapper and drops closed views.
 _source_verified: dict[str, bool] = {}
+# File session id -> what the view carried when THIS bridge opened it (#973):
+# None for a view opened from raw bytes, which cannot have inherited an
+# annotation; for a view opened from a database, the annotation counts it held
+# at open (`read_listing._annotation_summary`'s comments / function_comments /
+# analyst_symbols / placeholder_symbols) plus the database's ``path``. Absent
+# for a view the bridge did not open (a GUI tab) or whose counts could not be
+# read at open, so the provenance hint keeps judging those by filename and
+# current counts. Recorded once, before publish, so annotations written by
+# this session -- and a save that re-homes the view -- never count as
+# inherited. Pruned with `_source_verified`.
+_opened_annotations: dict[str, dict[str, Any] | None] = {}
 
 
 def view_session_key(bv: Any) -> str:
