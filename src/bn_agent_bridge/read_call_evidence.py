@@ -341,7 +341,7 @@ def _library_signature_applies(callee_fn, name: str) -> bool:
     the collision shape. Two costs, stated plainly rather than discovered later:
     a statically linked ordinary-named library function (a static ``memcpy``) is
     out of reach here, and so is any callee whose name carries a mangling prefix,
-    since ``_library_param_count`` refuses those outright whatever their
+    since ``_library_witness`` refuses those outright whatever their
     provenance. Both are part of the residual tracked in #865.
     """
     # `is_imported_function` is the module's existing predicate for this, already
@@ -378,7 +378,7 @@ def _undecorated_name(name: str) -> bool:
     punctuation (MSVC `?name@@...`, current Swift `$s...`), clone suffixes
     (`.cold`, `.part`) and versioned symbols, which it does.
 
-    Two callers, one rule: `_library_param_count` refuses a decorated name whose
+    Two callers, one rule: `_library_witness` refuses a decorated name whose
     library signature might differ by an invisible parameter, and the #882
     callee-body witness refuses it for the same reason from the other direction.
     """
@@ -386,25 +386,90 @@ def _undecorated_name(name: str) -> bool:
         and _C_IDENTIFIER_RE.match(name) is not None
 
 
-def _library_param_count(bv, callee_fn, name: str) -> tuple[int, str] | None:
-    """The parameter count an attached type library declares for *name*, with the
-    library that declared it -- or None when no library makes a usable claim.
+# `argument_confidence` (#549/#648/#865): `recovered` is what HLIL recovered for a
+# resolved callee with no positive contradiction -- a neutral statement of
+# provenance, NOT a claim that any witness corroborated it (see
+# `arity_witnesses` for that). `inferred` is an HLIL list with a positive reason
+# to doubt its arity; `heuristic` is a lower-IL list or an unresolved callee.
+ARGUMENT_RECOVERED = "recovered"
+ARGUMENT_INFERRED = "inferred"
+ARGUMENT_HEURISTIC = "heuristic"
+
+# The four answers an arity witness can give (#865). Kept apart on purpose:
+# `unavailable` is "this witness had nothing to look at" and `refused` is "it
+# looked and the comparison would be meaningless here", and NEITHER is evidence
+# for or against the recovered prototype -- absence of a witness is never an
+# under-recovery accusation, and never proof of correctness either.
+WITNESS_AGREEMENT = "agreement"
+WITNESS_CONTRADICTION = "contradiction"
+WITNESS_UNAVAILABLE = "unavailable"
+WITNESS_REFUSED = "refused"
+WITNESS_STATUSES = (WITNESS_AGREEMENT, WITNESS_CONTRADICTION,
+                    WITNESS_UNAVAILABLE, WITNESS_REFUSED)
+# The witnesses each row reports, in the order they are rendered.
+ARITY_WITNESSES = ("library", "callee_body")
+
+
+def _witness(status: str, reason: str | None = None, **observed: Any) -> dict[str, Any]:
+    """One witness verdict: its status, the reason code for an `unavailable` or
+    `refused` answer (None for a comparison that was made), and the counts it
+    observed. Observed fields are present only when the witness measured them."""
+    return {"status": status, "reason": reason, **observed}
+
+
+def _unresolved_witnesses() -> dict[str, dict[str, Any]]:
+    """Every witness's verdict for a call no callee function was found for: there
+    is no prototype to check and no callee to ask."""
+    return {name: _witness(WITNESS_UNAVAILABLE, "callee_unresolved") for name in ARITY_WITNESSES}
+
+
+def _library_witness(bv, callee_fn, name: str, *, declared_count: int | None,
+                     is_variadic: bool) -> dict[str, Any]:
+    """What the attached type libraries say about the callee's ARITY, as a
+    witness verdict (#865).
 
     This is the INDEPENDENT witness #742 lacked. That guard compares the rendered
     argument list against the callee's own recovered prototype, so a callee whose
-    type was itself mis-recovered agrees with itself and keeps `authoritative`
-    (#759). A bundled library signature is not derived from this binary's
-    analysis, so it can contradict the recovery.
+    type was itself mis-recovered agrees with itself (#759). A bundled library
+    signature is not derived from this binary's analysis, so it can contradict
+    the recovery -- or agree with it.
 
-    Two refusals, both measured rather than assumed:
+    ``unavailable`` (`no_library_entry`) when no attached library names the
+    callee. Refusals, all measured rather than assumed:
 
-    * **Mangled C++ names.** `this` on a method and an sret return-slot pointer on
+    * `decorated_name` -- `this` on a method and an sret return-slot pointer on
       a by-value class return are implicit parameters a count comparison cannot
       see, so either side can differ by one with nothing wrong. On a C++-heavy
-      target 3 of 4 raw firings were exactly that; excluding mangled names took
+      target 3 of 4 raw firings were exactly that; excluding decorated names took
       the false-positive rate to 0 over 13,009 comparable call rows.
-    * **A variadic library signature**, which states only its fixed count.
+    * `not_library_provenance` -- see :func:`_library_signature_applies`.
+    * `variadic_signature` -- a variadic library signature states only its fixed
+      count.
+    * `libraries_disagree` -- two attached libraries stating different counts
+      settle nothing (#862 review round 2 minor a: first-wins made the verdict
+      depend on `bv.type_libraries` order).
+    * `variadic_callee` / `no_declared_arity` -- the recovered side has no fixed
+      count to compare.
     """
+    claims: list[tuple[int, str]] = []
+    variadic_signature = False
+    for lib in (getattr(bv, "type_libraries", None) or []):
+        try:
+            obj = lib.get_named_object(name) if name else None
+            if obj is None:
+                continue
+            if bool(getattr(obj, "has_variable_arguments", False)):
+                variadic_signature = True
+                continue
+            params = getattr(obj, "parameters", None)
+            if params is None:
+                continue
+            claims.append(
+                (len(list(params)), str(getattr(lib, "name", "") or "type library")))
+        except Exception:  # noqa: BLE001 - a malformed library must not fail the read
+            continue
+    if not claims and not variadic_signature:
+        return _witness(WITNESS_UNAVAILABLE, "no_library_entry")
     # `_Z` FIRST, and not merely as one decoration among many: an Itanium mangled
     # name IS a valid C identifier, so the identifier rule cannot exclude it --
     # and every such name begins `_Z`, which the reserved-identifier arm of
@@ -413,33 +478,21 @@ def _library_param_count(bv, callee_fn, name: str) -> tuple[int, str] | None:
     # identifier rule then covers the schemes that use punctuation (MSVC
     # `?name@@...`, Swift `$s...`) plus clone suffixes and versioned symbols.
     if not _undecorated_name(name):
-        return None
+        return _witness(WITNESS_REFUSED, "decorated_name")
     if not _library_signature_applies(callee_fn, name):
-        return None
-    # EVERY attached library, not the first that happens to name the symbol
-    # (#862 review round 2 minor a): with two libraries stating different counts,
-    # first-wins made both the verdict and the reported `library_source` depend on
-    # `bv.type_libraries` order, and a later library that AGREED with the recovery
-    # was never consulted. Libraries that disagree with each other cannot settle
-    # anything, so that is a refusal rather than a coin toss.
-    claims: list[tuple[int, str]] = []
-    for lib in (getattr(bv, "type_libraries", None) or []):
-        try:
-            obj = lib.get_named_object(name)
-            if obj is None:
-                continue
-            if bool(getattr(obj, "has_variable_arguments", False)):
-                return None
-            params = getattr(obj, "parameters", None)
-            if params is None:
-                continue
-            claims.append(
-                (len(list(params)), str(getattr(lib, "name", "") or "type library")))
-        except Exception:  # noqa: BLE001 - a malformed library must not fail the read
-            continue
-    if not claims or len({count for count, _ in claims}) != 1:
-        return None
-    return claims[0]
+        return _witness(WITNESS_REFUSED, "not_library_provenance")
+    if variadic_signature:
+        return _witness(WITNESS_REFUSED, "variadic_signature")
+    if len({count for count, _ in claims}) != 1:
+        return _witness(WITNESS_REFUSED, "libraries_disagree")
+    if is_variadic:
+        return _witness(WITNESS_REFUSED, "variadic_callee")
+    if declared_count is None:
+        return _witness(WITNESS_REFUSED, "no_declared_arity")
+    library_count, source = claims[0]
+    status = WITNESS_AGREEMENT if library_count == declared_count else WITNESS_CONTRADICTION
+    return _witness(status, declared_arity=declared_count,
+                    witness_arity=library_count, source=source)
 
 
 # BN resolves a variable by REGISTER-STORAGE ID, not by name: `Variable.storage`
@@ -596,11 +649,12 @@ def _callee_used_arg_position(callee_fn, storage_positions: dict[int, int]) -> i
     return highest
 
 
-def _callee_arg_use_witness(bv, callee_fn, *, variadic: bool | None) -> tuple[int, str] | None:
-    """The arity the callee's own body DEMONSTRATES by USING an incoming argument,
-    with the register that witnessed it -- or None for no claim.
+def _callee_body_witness(bv, callee_fn, *, variadic: bool | None,
+                         declared_count: int | None) -> dict[str, Any]:
+    """What the callee's own body DEMONSTRATES about its arity by USING incoming
+    arguments, as a witness verdict (#865).
 
-    The callee-side witness of #865, sound this time (#882): it needs no name, no
+    The callee-side witness of #865, sound since #882: it needs no name, no
     library and no import, because the question is asked of the callee's own
     variables. A parameter's incoming value is version 0 of the variable BN
     materialized for its argument register, so "a parameter beyond the declared
@@ -619,60 +673,74 @@ def _callee_arg_use_witness(bv, callee_fn, *, variadic: bool | None) -> tuple[in
     needed -- measured on a corpus function whose under-recovered prototype declares
     one parameter while the extra register it consumes appears in ``func.vars``.
 
-    A measurement that lands inside the declared registers answers None as well:
-    nothing is under-recovered when the body uses only the parameters the
-    prototype already declares. Refusals, each leaving the row untouched rather
-    than guessing:
+    The witness only bounds the arity from BELOW (a body need not read every
+    parameter it is passed), so ``agreement`` means "every incoming argument the
+    body uses is one the prototype declares" -- consistent, not proven right --
+    and ``contradiction`` means it uses one beyond them. ``witness_arity`` is the
+    demonstrated lower bound (0 for a body that reads no incoming argument
+    register) and ``register`` the highest register that demonstrated it.
 
-    * a **decorated name** -- the same refusal `_library_param_count` makes, from
-      the other direction: a method's implicit `this` and a by-value class
-      return's sret slot are ARGUMENT REGISTERS the body legitimately reads and
-      the parameter count never mentions, so a body-vs-count comparison is
-      meaningless there. Measured on the C++ probe: BN's own recovered prototype
-      counts `this` consistently on both sides (declared 3 / body reads 3 for a
-      2-parameter method), so nothing fires today -- but a prototype from a
-      library or an analyst that omits `this` would otherwise be demoted for a
-      parameter that is not missing at all;
-    * a callee whose **variadic flag BN did not DETERMINE**, and a callee it
-      determined IS variadic -- a variadic body reads the argument registers
-      through the register save area / `va_list`, so a register read is not an
-      arity there, and an undetermined flag cannot tell the two apart. See
+    ``unavailable``:
+
+    * `imported_callee` -- the implementation is not in this image; what BN
+      shows as its body is a stub, whose reads say nothing about the callee;
+    * `no_body` -- a body BN built no MLIL/SSA for (a truncated view, a function
+      BN never analyzed), or a malformed one that must not fail the read.
+
+    ``refused``, each leaving the row untouched rather than guessing:
+
+    * `variadic_undetermined` / `variadic_callee` -- a variadic body reads the
+      argument registers through the register save area / `va_list`, so a
+      register read is not an arity there, and a flag BN never DETERMINED cannot
+      tell the two apart (the 72-row false-demotion class of #882 round 2). See
       :func:`il_format._variadic_determination`;
-    * **no ABI register list** (a stack-arguments-only platform, or a view whose
-      calling convention is unknown) -- no register is an argument register, so
-      there is no position to compare against, and a view whose architecture
-      exposes no register-storage ids maps nothing either;
-    * a **body BN built no MLIL/SSA for** -- an import with no implementation in
-      the image, a truncated view, or a malformed body that must not fail a read
-      the way `_library_param_count` already refuses to let a malformed library
-      fail one.
+    * `decorated_name` -- the refusal `_library_witness` makes, from the other
+      direction: a method's implicit `this` and a by-value class return's sret
+      slot are ARGUMENT REGISTERS the body legitimately reads and the parameter
+      count never mentions, so a body-vs-count comparison is meaningless there
+      without real ABI-location mapping;
+    * `no_abi_registers` -- a stack-arguments-only platform, an unknown calling
+      convention, or an architecture exposing no register-storage ids: there is
+      no position to compare against;
+    * `no_declared_arity` -- the prototype states no count to compare with.
     """
+    if is_imported_function(callee_fn):
+        return _witness(WITNESS_UNAVAILABLE, "imported_callee")
     # Only a DETERMINED "not variadic" licenses the comparison at all: `None` is
     # BN never having settled the question, and a guess there is the 72-row
     # false-demotion class (#882 round 2).
-    if variadic is not False:
-        return None
+    if variadic is None:
+        return _witness(WITNESS_REFUSED, "variadic_undetermined")
+    if variadic:
+        return _witness(WITNESS_REFUSED, "variadic_callee")
     name = str(getattr(callee_fn, "name", "") or getattr(callee_fn, "raw_name", "") or "")
     if not _undecorated_name(name):
-        return None
+        return _witness(WITNESS_REFUSED, "decorated_name")
     arg_regs = _abi_arg_register_names(bv, callee_fn)
     if not arg_regs:
-        return None
+        return _witness(WITNESS_REFUSED, "no_abi_registers")
     try:
         positions = _arg_register_storage_positions(bv, arg_regs)
         if not positions:
-            return None
+            return _witness(WITNESS_REFUSED, "no_abi_registers")
         position = _callee_used_arg_position(callee_fn, positions)
     except Exception:  # noqa: BLE001 - a body we cannot walk witnesses nothing
-        return None
-    if position is None or position < 0:
-        return None
-    return position + 1, arg_regs[position]
+        return _witness(WITNESS_UNAVAILABLE, "no_body")
+    if position is None:
+        return _witness(WITNESS_UNAVAILABLE, "no_body")
+    if declared_count is None:
+        return _witness(WITNESS_REFUSED, "no_declared_arity")
+    used_arity = position + 1
+    observed: dict[str, Any] = {"declared_arity": declared_count, "witness_arity": used_arity}
+    if position >= 0:
+        observed["register"] = arg_regs[position]
+    status = WITNESS_CONTRADICTION if used_arity > declared_count else WITNESS_AGREEMENT
+    return _witness(status, **observed)
 
 
 def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
                              arguments: list[dict[str, Any]],
-                             *, read_cache: dict[int, tuple[int, str] | None] | None = None
+                             *, witness_cache: dict[int, dict[str, dict[str, Any]]] | None = None
                              ) -> dict[str, Any]:
     """Is the callee's ARITY known, or is HLIL enumerating ABI registers? (#648)
 
@@ -680,11 +748,10 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     live, and HLIL renders whatever happens to sit in them -- typically the NEXT
     call's argument staging, up to and including the stack canary. #549 separated
     canonical ``arguments`` from heuristic ``argument_candidates``; the residual was
-    that the canonical field still claimed ``authoritative`` when nothing was known
+    that the canonical field still claimed full confidence when nothing was known
     about the callee's arity. The distinguishing signal is available right here:
-    ``memset`` reports 3 declared parameters (a bundled library type, so its
-    ``authoritative`` stamp is EARNED), while an unprototyped vendor import reports
-    zero -- verified against a live BN view.
+    ``memset`` reports 3 declared parameters (a bundled library type), while an
+    unprototyped vendor import reports zero -- verified against a live BN view.
 
     ``indirect_call`` (#704) means exactly what its name says -- the call's
     destination could not be resolved to a constant at all (``dest_value is
@@ -704,36 +771,44 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     ``arity_mismatch`` is checked ONLY when ``arg_source == "hlil"`` (#704 round 3):
     ``arguments`` falls back to MLIL, then LLIL, whenever the HLIL roots are an
     ambiguous fold (``_call_arguments``); an mlil/llil-sourced list is already
-    surfaced as heuristic (never ``authoritative``) and is not even attempting to
+    surfaced as heuristic (never ``recovered``) and is not even attempting to
     describe the callee's operands the way HLIL does -- on the mapped-MLIL fallback
     it is literally the CALLER's ABI registers (#661). Comparing THAT count against
     the callee's declared arity and reporting the note as an "HLIL rendered N
     argument(s)" finding would attribute a provenance the tool never established,
     reintroducing #661's defect class in prose.
 
-    Returns ``{"arity_unknown": bool, ...}``; ``arity_unknown`` is False whenever the
-    callee cannot be resolved -- ``callee_unresolved`` carries that case instead.
+    Returns ``{"arity_unknown": bool, "arity_witnesses": {...}, ...}``;
+    ``arity_unknown`` is False whenever the callee cannot be resolved --
+    ``callee_unresolved`` carries that case instead.
 
-    ``callee_under_recovered``/``callee_read_arity``/``declared_arity``/
-    ``callee_arity_note`` (#882) is the callee-side witness, and it DOES move
-    confidence: the callee's body USES an argument register the prototype does not
-    declare -- as an incoming value, established by parameter def-use in SSA, so a
-    scratch reuse of the register and a write-then-read on another path are not
-    uses -- on an HLIL-sourced list whose length agrees with that prototype (where
-    ``arity_mismatch`` is silent by construction, so nothing else here would report
-    it). The row demotes to ``inferred`` and keeps the observation, because a
-    demotion that hides its reason is the silent demotion this module exists to
-    stop. See :func:`_callee_arg_use_witness`. ``read_cache`` memoizes the
-    per-CALLEE witness across the call sites of one function.
+    ``arity_witnesses`` (#865) reports each independent arity witness separately
+    -- ``library`` (:func:`_library_witness`) and ``callee_body``
+    (:func:`_callee_body_witness`) -- as agreement / contradiction / unavailable /
+    refused with the counts it observed. It is a per-CALLEE fact, so
+    ``witness_cache`` memoizes it across the call sites of one function. Only a
+    CONTRADICTION moves confidence, through the positive fields below; an
+    unavailable or refused witness is reported and nothing more.
+
+    ``prototype_unverified``/``library_arity``/``library_source`` (#759/#862) is a
+    library contradiction. ``callee_under_recovered``/``callee_read_arity``/
+    ``declared_arity``/``callee_arity_note`` (#882) is a callee-body
+    contradiction on an HLIL-sourced list whose length agrees with that prototype
+    (where ``arity_mismatch`` is silent by construction, so nothing else here
+    would report it). Either demotes the row to ``inferred`` and keeps the
+    observation, because a demotion that hides its reason is the silent demotion
+    this module exists to stop.
     """
     evidence: dict[str, Any] = {"arity_unknown": False}
     if dest_value is None:
         evidence["indirect_call"] = True
         evidence["callee_unresolved"] = True
+        evidence["arity_witnesses"] = _unresolved_witnesses()
         return evidence
     callee_fn = _callee_function_for_call(ctx, bv, dest_value, target)
     if callee_fn is None:
         evidence["callee_unresolved"] = True
+        evidence["arity_witnesses"] = _unresolved_witnesses()
         return evidence
     has_user_type = bool(getattr(callee_fn, "has_user_type", False))
     func_type = getattr(callee_fn, "type", None)
@@ -749,7 +824,7 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     # signature before either branch below trusts it. Both of them compare the
     # rendered list against `declared_count`, so an under-recovered callee agrees
     # with itself -- measured on a real target as `__popcountdi2()` rendering zero
-    # arguments with `authoritative` and no mismatch, against a library that
+    # arguments at full confidence and no mismatch, against a library that
     # declares one parameter. Recorded whenever the two disagree, including the
     # zero-vs-N case the "genuinely void callee" branch below would wave through.
     # Deliberately NOT suppressed for a user prototype. Round 1 of this review
@@ -766,64 +841,59 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
     # analyst's statement. That is met by DISCLOSURE, not by privilege: a pinned
     # prototype IS demoted like any other, and the row carries `declared_arity`,
     # `library_arity` and `library_source`, and the text line names the
-    # disagreement as the reason it withheld `authoritative` and warns that the
+    # disagreement as the reason it withheld `recovered` and warns that the
     # row may be contradicting a prototype the analyst pinned -- so the claim is
     # visible, checkable with `bn proto get`, and can be judged wrong for this
-    # binary. The renderer owns that wording; this comment does not quote it. Suppression bought the nuance
-    # at the price of the feature everywhere it matters.
-    library = _library_param_count(
-        bv, callee_fn, str(getattr(callee_fn, "name", "") or ""))
-    if (
-        library is not None
-        and declared_count is not None
-        and not is_variadic
-        and library[0] != declared_count
-    ):
+    # binary. The renderer owns that wording; this comment does not quote it.
+    # Suppression bought the nuance at the price of the feature everywhere it
+    # matters.
+    #
+    # #865/#882: the callee-body witness covers the shape #862 cannot reach --
+    # nothing OUTSIDE this binary settles the arity (no attached library names
+    # the callee, or it is an ordinary-named local definition), so the recovered
+    # prototype is compared against something inside it instead: the callee's own
+    # parameter variables. It takes the THREE-state varargs answer, not
+    # `is_variadic`: it contradicts the recovered prototype, so it may only speak
+    # where BN actually determined the callee is not variadic (#882 round 2).
+    key = int(getattr(callee_fn, "start", 0) or 0)
+    witnesses = witness_cache.get(key) if witness_cache is not None else None
+    if witnesses is None:
+        # A dispatch function calls the same few callees hundreds of times, and
+        # the witnesses are per CALLEE, not per call site -- pay them once (#865).
+        witnesses = {
+            "library": _library_witness(
+                bv, callee_fn, str(getattr(callee_fn, "name", "") or ""),
+                declared_count=declared_count, is_variadic=is_variadic),
+            "callee_body": _callee_body_witness(
+                bv, callee_fn, variadic=il_format._variadic_determination(callee_fn),
+                declared_count=declared_count),
+        }
+        if witness_cache is not None:
+            witness_cache[key] = witnesses
+    # Each row gets its own copy: a consumer mutating one row must not rewrite
+    # every other row that shares the callee.
+    evidence["arity_witnesses"] = {name: dict(verdict) for name, verdict in witnesses.items()}
+    library = witnesses["library"]
+    if library["status"] == WITNESS_CONTRADICTION:
         evidence["prototype_unverified"] = True
         evidence["declared_arity"] = declared_count
-        evidence["library_arity"] = library[0]
-        evidence["library_source"] = library[1]
-    # #865/#882: the witness for the shape #862 cannot reach -- nothing OUTSIDE
-    # this binary settles the arity (no attached library names the callee, the
-    # name is decorated, or it is an ordinary-named local definition), so the
-    # recovered prototype is compared against something inside it instead: the
-    # callee's own parameter variables. A body that USES an argument register the
-    # prototype does not declare takes more arguments than the recovery admits,
-    # which is a positive reason to distrust it -- not the absence of a reason to
-    # trust it, which is what demoting on `has_user_type`/`is_import` alone
-    # amounts to (#648's own precedent, where `memset`'s bundled 3-parameter
-    # prototype EARNS `authoritative`).
-    #
+        evidence["library_arity"] = library["witness_arity"]
+        evidence["library_source"] = library["source"]
+    body = witnesses["callee_body"]
     # Gated to the vacuous AGREEMENT the issue reports: the rendered list matches
     # the declared arity, so `arity_mismatch` is silent and the row would
-    # otherwise claim `authoritative` off a comparison of the recovery against
+    # otherwise claim `recovered` off a comparison of the recovery against
     # itself. Where the rendered list already disagrees, `arity_mismatch` demotes
     # and this adds nothing. Only an HLIL-sourced list is compared, for #704
     # round 3's reason: an MLIL/LLIL list is the CALLER's ABI registers (#661) and
     # its count is not a claim about the callee's operands.
-    #
-    # The witness takes the THREE-state varargs answer, not `is_variadic`: it
-    # contradicts the recovered prototype, so it may only speak where BN actually
-    # determined the callee is not variadic (#882 round 2).
-    variadic = il_format._variadic_determination(callee_fn)
-    callee_use: tuple[int, str] | None
-    if read_cache is None:
-        callee_use = _callee_arg_use_witness(bv, callee_fn, variadic=variadic)
-    else:
-        # A dispatch function calls the same few callees hundreds of times, and the
-        # witness is per CALLEE, not per call site -- pay it once per callee (#865).
-        key = int(getattr(callee_fn, "start", 0) or 0)
-        if key not in read_cache:
-            read_cache[key] = _callee_arg_use_witness(bv, callee_fn, variadic=variadic)
-        callee_use = read_cache[key]
+
     if (
         arg_source == "hlil"
-        and callee_use is not None
-        and declared_count is not None
-        and callee_use[0] > declared_count
+        and body["status"] == WITNESS_CONTRADICTION
         and len(arguments) == declared_count
     ):
-        used_arity, used_register = callee_use
+        used_arity, used_register = body["witness_arity"], body["register"]
         evidence["callee_under_recovered"] = True
         evidence["callee_read_arity"] = used_arity
         evidence["declared_arity"] = declared_count
@@ -835,7 +905,7 @@ def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
             f"writes before reading (a scratch reuse) and a value merged at a phi "
             f"are not uses. The rendered argument list may therefore be "
             f"under-recovered and this row's `arguments` confidence is withheld "
-            f"from `authoritative`: check `bn proto get` on the callee and "
+            f"from `recovered`: check `bn proto get` on the callee and "
             f"`bn disasm --linear` at the call before trusting the list"
         )
     if declared_count is not None and (declared_count > 0 or has_user_type):
@@ -1022,8 +1092,8 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
     }
     calls = []
-    # #865: memo for the callee-side read witness, keyed by callee entry address.
-    callee_read_cache: dict[int, tuple[int, str] | None] = {}
+    # #865: memo for the per-callee arity witnesses, keyed by callee entry address.
+    witness_cache: dict[int, dict[str, dict[str, Any]]] = {}
     for insn in il_format._iter_llil_instructions(func):
         op_name = il_format._il_op_name(insn)
         if op_name not in {
@@ -1058,20 +1128,28 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         # #549: `arguments` (from `argument_source`) is canonical only when it came
         # from HLIL/ABI recovery; an mlil/llil fallback is itself heuristic. Surface
         # that trust level so downstream automation traces the right field.
-        argument_confidence = "authoritative" if arg_source == "hlil" else "heuristic"
-        # #648: `authoritative` meant "HLIL produced a list", not "the list is right".
-        # On an unknown-arity callee HLIL invents ABI-register args (a neighbouring
-        # call's staging, the stack canary), so demote and flag it -- confirmed wrong
-        # against upstream source on a dogfood target. A call whose callee could
-        # not be resolved at all (genuinely indirect, or a resolved destination
-        # that matched no function) has no declared arity to check: it is NEVER
-        # `authoritative`, regardless of source (#704: keyed on `callee_unresolved`,
-        # not `indirect_call` -- the latter is purely a call-shape mirror of
-        # `direct` and does not by itself mean the arity is unknown).
+        #
+        # #865: the HLIL label is `recovered` -- "this is what HLIL recovered", the
+        # neutral claim the analysis can actually back. It used to be
+        # `authoritative`, which no witness earned: the #742 guard compares the
+        # list against the callee's own recovered prototype, so an under-recovered
+        # callee agrees with itself. What the independent witnesses DID say is in
+        # `arity_witnesses`, each one separately; only a contradiction moves this
+        # label, and an unavailable or refused witness never does.
+        argument_confidence = ARGUMENT_RECOVERED if arg_source == "hlil" else ARGUMENT_HEURISTIC
+        # #648: an unknown-arity callee makes HLIL invent ABI-register args (a
+        # neighbouring call's staging, the stack canary), so demote and flag it --
+        # confirmed wrong against upstream source on a dogfood target. A call
+        # whose callee could not be resolved at all (genuinely indirect, or a
+        # resolved destination that matched no function) has no declared arity to
+        # check: it is NEVER `recovered`, regardless of source (#704: keyed on
+        # `callee_unresolved`, not `indirect_call` -- the latter is purely a
+        # call-shape mirror of `direct` and does not by itself mean the arity is
+        # unknown).
         arity = _argument_arity_evidence(ctx, bv, dest_value, target, arg_source, arguments,
-                                         read_cache=callee_read_cache)
+                                         witness_cache=witness_cache)
         if arity.get("callee_unresolved"):
-            argument_confidence = "heuristic"
+            argument_confidence = ARGUMENT_HEURISTIC
         elif (
             arity["arity_unknown"]
             or arity.get("arity_mismatch")
@@ -1085,11 +1163,11 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
             # exists to stop.
             or arity.get("callee_under_recovered")
             # #759: a bundled library signature contradicting the recovered
-            # prototype is a positive reason to distrust it, so the row stops
-            # claiming authority and carries `library_arity` saying why.
+            # prototype is a positive reason to distrust it, so the row is demoted
+            # and carries `library_arity` saying why.
             or arity.get("prototype_unverified")
-        ) and argument_confidence == "authoritative":
-            argument_confidence = "inferred"
+        ) and argument_confidence == ARGUMENT_RECOVERED:
+            argument_confidence = ARGUMENT_INFERRED
         # #557: expose WHY the HLIL statement is null (reason code) rather than a bare null.
         hlil_statement, hlil_reason = il_format._hlil_statement_localization(insn)
         # #558: under-recovered imported variadic (scanf/printf-family) calls.
@@ -1275,6 +1353,17 @@ def _cpp_method_this_caveat(func, decompiled_text: str = "") -> str | None:
     )
 
 
+def _arity_witness_counts(calls: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    """Per witness, how many call rows it answered with each status (#865)."""
+    counts = {name: dict.fromkeys(WITNESS_STATUSES, 0) for name in ARITY_WITNESSES}
+    for call in calls:
+        for name, verdict in (call.get("arity_witnesses") or {}).items():
+            status = verdict.get("status") if isinstance(verdict, dict) else None
+            if name in counts and status in counts[name]:
+                counts[name][status] += 1
+    return counts
+
+
 def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 2,
                        offset: int = 0, limit: int | None = None,
                        address_window: tuple[int, int] | None = None):
@@ -1306,6 +1395,10 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
 
     calls = _function_call_evidence(ctx, bv, func, context=context)
     total_calls = len(calls)
+    # #865: how often each arity witness agreed, contradicted, was unavailable or
+    # refused, over the FULL call set (before slicing, like the hoisted warnings
+    # below), so a reader sees how much of the card any witness actually backs.
+    witness_counts = _arity_witness_counts(calls)
     # #558: hoist per-call variadic under-recovery warnings to the function level so
     # they're visible regardless of which page is requested. Computed from the full
     # call set (before slicing) and address-tagged so an agent can find the callsite.
@@ -1314,7 +1407,7 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         if isinstance(variadic, dict) and variadic.get("under_recovered") and variadic.get("warning"):
             warnings.append(f"{call.get('address', '?')}: {variadic['warning']}")
         # #882: TEXT-mode disclosure for the callee-side witness -- the reason the
-        # row's `arguments` confidence was withheld from `authoritative`, in the
+        # row's `arguments` confidence was withheld from `recovered`, in the
         # same words the row carries. Hoisted like the variadic warning above, and
         # for the same reason: computed from the full call set BEFORE slicing, so
         # the caveat is visible on whichever page is requested (an unsliced row
@@ -1374,6 +1467,7 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         "returned": returned,
         "has_more": offset + returned < matched,
         "warnings": warnings,
+        "arity_witness_counts": witness_counts,
         # #820: a --quick view answers here (the matrix marks this op `partial`),
         # so disclose that the ABI/argument recovery was read off a function BN
         # has not analyzed -- the call list is real, its fidelity is not.

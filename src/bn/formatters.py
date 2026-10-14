@@ -3099,6 +3099,10 @@ def _render_function_evidence_text(value: Any) -> str:
             else:
                 call_hdr += f" -- more: rerun with --offset {nxt}"
     lines.append(call_hdr)
+    witness_counts = _render_arity_witness_counts(_field_dict(value, "arity_witness_counts"),
+                                                  total_calls)
+    if witness_counts:
+        lines.append(witness_counts)
     if not calls:
         return "\n".join(lines)
 
@@ -3130,8 +3134,10 @@ def _render_function_evidence_text(value: Any) -> str:
         # Confidence and arity diagnostics also describe empty argument lists.
         if args or call.get("argument_confidence") or call.get("arity_mismatch"):
             source = call.get("argument_source")
-            # #549: mark whether `arguments` is canonical (authoritative HLIL/ABI) or a
-            # heuristic lower-IL fallback, so an agent traces the right field.
+            # #549/#865: mark whether `arguments` is what HLIL recovered for a
+            # resolved callee (`recovered`), an HLIL list with a positive reason to
+            # doubt its arity (`inferred`), or a heuristic lower-IL fallback, so an
+            # agent traces the right field.
             confidence = call.get("argument_confidence")
             # The tag is joined, so a non-string source or confidence cost the
             # WHOLE evidence card -- and it renders cleanly with the field
@@ -3211,6 +3217,9 @@ def _render_function_evidence_text(value: Any) -> str:
                 "statement -- BN cannot tell a pinned prototype from a recovered one "
                 "here, so decide which is right for this binary."
             )
+        witnesses = _render_arity_witnesses(_field_dict(call, "arity_witnesses"))
+        if witnesses:
+            lines.append(witnesses)
         variadic = _field_dict(call, "variadic")
         if variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
@@ -3219,21 +3228,22 @@ def _render_function_evidence_text(value: Any) -> str:
             # HEURISTIC -- `read_evidence` stamps the diagnostic
             # `confidence: heuristic` / `provenance: abi-format-heuristic` -- but
             # that stamp reached JSON only. A text reader saw "expected >= N
-            # argument(s)" in the same authoritative voice the recovered facts on
-            # this card use, with nothing saying the count came from counting
+            # argument(s)" in the same firm voice the recovered facts on this
+            # card use, with nothing saying the count came from counting
             # conversion specifiers in a string literal. Print the marker the
             # payload already carries rather than inventing a second vocabulary.
             #
-            # Spelled `count: <confidence>` because #886 asks for a marker that
-            # reads as "this COUNT is a heuristic". That spelling is also why
-            # there is NO omission rule: `[count: authoritative]` STATES the
-            # count is authoritative, so printing a firm word does not hedge it,
-            # where a bare `[authoritative]` beside `UNDER-RECOVERED` would have
-            # hedged the whole finding. An earlier cut omitted the marker for the
-            # firm word instead, and that made a payload CALLING the count firm
-            # render byte-identically to one that said nothing about it -- the
-            # silent absence this marker exists to close, on a branch no producer
-            # in this repo can even reach.
+            # This marker is the VARIADIC DIAGNOSTIC's own `confidence`, not
+            # `argument_confidence` (#865 retired `authoritative` there). The
+            # bridge only ever stamps it `heuristic`, so the only marker it
+            # produces is `[count: heuristic]`. The renderer still prints
+            # whatever word a payload carries: a firm word (a hypothetical
+            # `[count: firm]`) states the count is firm and does not hedge it,
+            # where a bare `[firm]` beside `UNDER-RECOVERED` would hedge the
+            # whole finding -- so there is NO omission rule. An earlier cut
+            # omitted the marker for a firm word, and that made a payload
+            # CALLING the count firm render byte-identically to one that said
+            # nothing about it, on a branch no producer in this repo reaches.
             #
             # Read through `_text_value`, not an inline isinstance: a bare shape
             # test DROPS a present-but-unreadable confidence with nothing
@@ -3254,6 +3264,95 @@ def _render_function_evidence_text(value: Any) -> str:
                     f"conversions={variadic.get('format_conversions')}"
                 )
     return "\n".join(lines)
+
+
+_WITNESS_STATUSES = ("agreement", "contradiction", "unavailable", "refused")
+# Rendered first, in this order, whatever order the payload's keys arrive in
+# (the wire sorts them); a witness this CLI does not know follows.
+_WITNESS_ORDER = ("library", "callee_body")
+
+
+def _witness_items(mapping: dict[str, Any]) -> list[tuple[str, Any]]:
+    known = [(name, mapping[name]) for name in _WITNESS_ORDER if name in mapping]
+    return known + [(str(name), value) for name, value in mapping.items()
+                    if name not in _WITNESS_ORDER]
+
+
+def _scoped_reads(read: Callable[[], str]) -> str:
+    """Run *read* inside its own skew capture, then re-record what it refused.
+
+    `_stated_count` answers `?` whenever `_field_skewed(key)` is true, and that
+    record covers the WHOLE render keyed by field name only -- so one malformed
+    `witness_arity` on one row would turn every later row's well-formed one into
+    `?`, and one witness's malformed `agreement` tally the other's (#865
+    review). The class listing's per-row `method_count` capture is the same
+    repair; re-recording keeps the card's disclosure naming the field."""
+    token = _SKEWED_FIELDS.set([])
+    try:
+        text = read()
+        unreadable = list(_SKEWED_FIELDS.get() or ())
+    finally:
+        _SKEWED_FIELDS.reset(token)
+    for key in unreadable:
+        _record_skew(key)
+    return text
+
+
+def _render_arity_witness(name: str, verdict: dict[str, Any]) -> str:
+    """One witness verdict as `name=status (detail)` (#865). Read through the
+    field choke points, so a skewed field is disclosed rather than dropped, and
+    inside its own capture, so it is disclosed for THIS verdict only."""
+    return _scoped_reads(lambda: _arity_witness_text(name, verdict))
+
+
+def _arity_witness_text(name: str, verdict: dict[str, Any]) -> str:
+    if not verdict:
+        return f"{name}=no verdict"
+    status = _text_value(verdict, "status")
+    detail = ""
+    if status in ("agreement", "contradiction"):
+        observed = _stated_count(verdict, "witness_arity")
+        declared = _stated_count(verdict, "declared_arity")
+        if name == "library":
+            who = _text_value(verdict, "source") or "library"
+            detail = f"{who} declares {observed}, prototype {declared}"
+        elif name == "callee_body":
+            register = _text_value(verdict, "register")
+            via = f" up to {register}" if register else ""
+            detail = f"body uses {observed}{via}, prototype {declared}"
+        else:
+            detail = f"witness {observed}, prototype {declared}"
+    else:
+        detail = _text_value(verdict, "reason") or ""
+    return f"{name}={status or 'unreadable'}" + (f" ({detail})" if detail else "")
+
+
+def _render_arity_witnesses(witnesses: dict[str, Any]) -> str:
+    """The per-row arity witness line (#865), or "" when the row carries none."""
+    if not witnesses:
+        return ""
+    return "  witnesses: " + "; ".join(
+        _render_arity_witness(name, _field_dict(witnesses, name))
+        for name, _ in _witness_items(witnesses))
+
+
+def _render_arity_witness_counts(counts: dict[str, Any], total_calls: Any) -> str:
+    """The function-level arity witness tally (#865), or "" when absent. The
+    trailing clause is the contract an agent most needs: an `unavailable` or
+    `refused` witness says nothing about the arguments either way."""
+    if not counts:
+        return ""
+    parts = []
+    for name, _ in _witness_items(counts):
+        tally = _field_dict(counts, name)
+        cells = _scoped_reads(lambda tally=tally: ", ".join(
+            f"{status} {_stated_count(tally, status)}"
+            for status in _WITNESS_STATUSES if status in tally))
+        parts.append(f"{name} {cells}" if cells else f"{name} no tally")
+    scope = f" over {total_calls} call(s)" if isinstance(total_calls, int) else ""
+    return (f"arity witnesses{scope}: " + "; ".join(parts)
+            + " -- only a contradiction is evidence against a row; unavailable/refused "
+            "is neither")
 
 
 def _render_resolved_arg(resolved: Any) -> str:
