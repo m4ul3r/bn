@@ -4535,10 +4535,19 @@ def _render_flow_line(f: dict[str, Any], *, mangled: bool = False) -> str:
                       display_key="rendered_display") or ""
     unresolved = "y" if m.get("traverses_unresolved") else "n"
     facts = f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} unresolved={unresolved}}}"
-    callee = _shown_name(sink, mangled=mangled, name_key="callee",
-                         display_key="callee_display_name") or "?"
+    callee = _sink_callee_text(sink, mangled=mangled) or "?"
     head = f"[{sink.get('class') or '?'}] {callee} @ {sink.get('address')}{arg}"
     return f"  {head}   {sig}   {facts}".rstrip()
+
+
+def _sink_callee_text(sink: dict[str, Any], *, mangled: bool = False) -> Any:
+    """A taint sink's callee as text prints it (#1001 item 4): the demangled
+    display name, or under ``--mangled`` the real raw symbol -- not the model
+    key, which drops a C++ symbol's leading underscore. Falls back to the key
+    (an older bridge, or no symbol by that name)."""
+    return _shown_name(sink, mangled=mangled,
+                       name_key="callee_symbol" if mangled and sink.get("callee_symbol") else "callee",
+                       display_key="callee_display_name")
 
 
 def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
@@ -4684,11 +4693,12 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                 # and the command that settles it, on the compact view.
                 _arity = _field_dict(_field_dict(f, "sink"), "arity_mismatch")
                 if _field_dict(f, "sink").get("via") == "abi_register" and _arity:
-                    _ref = _text_value(_arity, "callee_ref") or "<callee>"
+                    _ref = _text_value(_arity, "callee_ref")
                     lines.append(
                         f"      read from ABI register {_arity.get('register') or '?'}: "
-                        f"BN recovered {_arity.get('recovered', '?')} param(s) for this call "
-                        f"-- confirm with `bn proto get {_ref}`, then `bn proto set`")
+                        f"BN recovered {_arity.get('recovered', '?')} param(s) for this call"
+                        + (f" -- confirm with `bn proto get {_ref}`, then `bn proto set`"
+                           if _ref else " -- the call target did not resolve"))
                 # #980: a finding whose class differs from its catalog entry says
                 # so, and why, on the compact view -- `taint models` lists the
                 # call as `[overflow_len] memcpy`, and two names for one sink with
@@ -4736,13 +4746,13 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
             # per-(seed,sink,origin) call-site count. --full shows origin/crosses/steps.
             lines.append(
                 f"  [{sink.get('class') or sink.get('kind') or '?'}] "
-                f"{sink.get('callee') or sink.get('kind') or '?'} @ {sink.get('address')} "
+                f"{_sink_callee_text(sink, mangled=mangled) or sink.get('kind') or '?'} @ {sink.get('address')} "
                 f"(seed {sink.get('seed', '?')})   {sig}   "
                 f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} "
                 f"unresolved={unresolved}}}{xn}".rstrip())
             if full:
                 lines.append(
-                    f"  slice for {sink.get('callee') or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
+                    f"  slice for {_sink_callee_text(sink, mangled=mangled) or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
                 )
                 _ok = origin.get("kind")
                 if _ok == "constant" and origin.get("value") is not None:
@@ -4798,7 +4808,8 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
             bleaves = _field_list(br, "leaves")
             if bsinks:
                 desc = ", ".join(
-                    f"{_field_dict(s, 'sink').get('class', '?')} {_field_dict(s, 'sink').get('callee', '?')}"
+                    f"{_field_dict(s, 'sink').get('class', '?')} "
+                    f"{_sink_callee_text(_field_dict(s, 'sink'), mangled=mangled) or '?'}"
                     for s in bsinks)
             else:
                 desc = "no sinks"
@@ -7071,12 +7082,16 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
 
         if cross_fn:
             callee = step.get("callee", "")
-            lines.append(f"  ── enters {callee} ──")
+            shown = _shown_name(step, mangled=mangled, name_key="callee",
+                                display_key="callee_display_name") or callee
+            lines.append(f"  ── enters {shown} ──")
             current_fn = callee
             continue
 
         if fn_ctx and fn_ctx != current_fn:
-            lines.append(f"  ── in {fn_ctx} ──")
+            shown = _shown_name(step, mangled=mangled, name_key="function_context",
+                                display_key="function_context_display_name") or fn_ctx
+            lines.append(f"  ── in {shown} ──")
             current_fn = fn_ctx
 
         if terminates:
@@ -7085,7 +7100,7 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
             # Name the resolved callee at a call boundary so a library-call origin
             # reads as `call boundary (strlen)` not a bare PLT address (#193).
             if reason == "call_or_jump_boundary" and step.get("callee"):
-                line += f" ({step['callee']})"
+                line += f" ({_shown_name(step, mangled=mangled, name_key='callee', display_key='callee_display_name')})"
             if (reason in ("interprocedural_out_param_not_followed", "out_param_not_followed")
                     and step.get("out_param_callee")):
                 line += f" (via {step['out_param_callee']})"
@@ -7111,7 +7126,7 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
     # backward trace byte-identically to one whose frontier was genuinely empty,
     # so the terminal steps a reader uses to judge the slice went missing with
     # no note (#619).
-    lines.extend(_render_trace_frontiers(_field_list(value, "frontiers")))
+    lines.extend(_render_trace_frontiers(_field_list(value, "frontiers"), mangled=mangled))
     assumptions = [a for a in _field_list(value, "assumptions") if a]
     if assumptions:
         lines.append("")
@@ -7140,7 +7155,7 @@ def _trace_param_slot(step: Any) -> str:
     return ", ".join(parts)
 
 
-def _render_trace_frontiers(frontiers: Any) -> list[str]:
+def _render_trace_frontiers(frontiers: Any, *, mangled: bool = False) -> list[str]:
     """Concise top-level roll-up of where the slice stopped (#552): one line per
     reason group with its count and a couple of examples. A factual summary of
     stopping conditions, not a verdict."""
@@ -7163,7 +7178,8 @@ def _render_trace_frontiers(frontiers: Any) -> list[str]:
         for ex in (_field_list(g, "examples")):
             if not isinstance(ex, dict):
                 continue
-            nm = ex.get("callee") or ex.get("out_param_callee") or ex.get("local")
+            nm = ((ex.get("callee_display_name") if not mangled else None) or ex.get("callee")
+                  or ex.get("out_param_callee") or ex.get("local"))
             if not nm and reason == "function_parameter":
                 slot = _trace_param_slot(ex)
                 var = str(ex.get("ssa_label") or "").split("#", 1)[0]

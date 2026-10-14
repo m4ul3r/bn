@@ -171,15 +171,14 @@ def _make_signature(source: Any, chain: list[str], sink_class: str | None,
     }
     # #1001 item 4: the same signature with every function named as `decompile`
     # names it. `rendered` stays the raw, address-free grouping key; text shows
-    # this one unless --mangled. Present only when it differs.
+    # this one unless --mangled. Always present when a resolver was given, like
+    # every other display-name field (equal to `rendered` for C-only flows).
     if display is not None:
         def _shown(name: Any) -> str:
             return (display(str(name)) or str(name)) if name else str(name)
         shown_src = _shown(src) if not isinstance(source, dict) else src
-        shown = " → ".join([shown_src] + [_shown(c) for c in chain]
-                           + [f"{cls}{_shown(sink_callee)}"])
-        if shown != sig["rendered"]:
-            sig["rendered_display"] = shown
+        sig["rendered_display"] = " → ".join([shown_src] + [_shown(c) for c in chain]
+                                             + [f"{cls}{_shown(sink_callee)}"])
     return sig
 
 

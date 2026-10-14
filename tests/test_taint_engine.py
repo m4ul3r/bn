@@ -794,6 +794,28 @@ def test_forward_modeled_sink_arg_out_of_range_reports_abi_register_sink_1001(mo
     assert "`bn proto get 0x900`" in rendered
 
 
+def test_abi_register_sink_runs_the_in_range_classification_1001(models, monkeypatch):
+    # #1001 review blocker: `dst = malloc(n); memcpy(dst, src, n)` is a copy the
+    # engine proves bounded. When BN's prototype drops the length (and source)
+    # registers, the length is recovered through x2 -- and must be judged by the
+    # same classification, staying `bounded_len`, not headlined `overflow_len`.
+    n = FVar("n"); n0 = FSSA(n, 0)
+    func = _copy_func(n0, n0, param=n)
+    call = func.mlil.ssa_form.instructions[1]
+    src0 = call.params[1].vars_read[0]
+    call.params = call.params[:1]                       # BN recovered memcpy(void* d)
+    engine = te.TaintEngine(FBV({0x2000: "malloc", 0x2010: "memcpy"}), models)
+    regs = {1: ("x1", [(src0, call)]), 2: ("x2", [(n0, call)])}
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                        lambda f, sites, idx: regs.get(idx, (None, [])), raising=False)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sink = next(s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy")
+    assert (sink["class"], sink["catalog_class"], sink["via"]) == (
+        "bounded_len", "overflow_len", "abi_register")
+    assert "provably bounded" in sink["detail"] and "ABI register x2" in sink["detail"]
+    assert sink["arity_mismatch"]["recovered"] == 1
+
+
 def test_abi_register_sinks_counted_per_class_in_verdict_1001():
     # The verdict counts every reached sink and, per class, how many of them
     # rest on a dropped ABI register; a class with none carries no marker.
@@ -807,29 +829,30 @@ def test_abi_register_sinks_counted_per_class_in_verdict_1001():
         " · taint crossed 2 fn(s)")
 
 
-def test_display_for_name_restores_a_model_keys_stripped_underscore_1001(models):
+def test_symbol_names_restore_a_model_keys_stripped_underscore_1001(models):
     # #1001 item 4: a finding names its callee by MODEL key, which strips a C++
-    # symbol's leading underscore, so it neither reads nor demangles. The
-    # display name comes from the raw symbol with the underscore restored; a C
-    # symbol (short name == raw name) and an unknown name have none.
+    # symbol's leading underscore, so it is not a real symbol and neither reads
+    # nor demangles. The real symbol and its display name come from the raw
+    # symbol with the underscore restored; a C symbol keeps its model spelling
+    # as its display name, and an unknown name falls back to itself.
     syms = {"_ZN5store4openEPKc": types.SimpleNamespace(name="_ZN5store4openEPKc",
                                                          short_name="store::open"),
-            "memcpy": types.SimpleNamespace(name="memcpy", short_name="memcpy")}
+            "__strcpy_chk": types.SimpleNamespace(name="__strcpy_chk", short_name="__strcpy_chk")}
 
     class SymBV(FBV):
         def get_symbol_by_raw_name(self, name):
             return syms.get(name)
 
     engine = te.TaintEngine(SymBV({}), models)
-    assert engine._display_for_name("ZN5store4openEPKc") == "store::open"
-    assert engine._display_for_name("_ZN5store4openEPKc") == "store::open"
-    assert engine._display_for_name("memcpy") is None
-    assert engine._display_for_name("not_a_symbol") is None
+    assert engine._symbol_names("ZN5store4openEPKc") == ("_ZN5store4openEPKc", "store::open")
+    assert engine._symbol_names("_ZN5store4openEPKc") == ("_ZN5store4openEPKc", "store::open")
+    assert engine._symbol_names("strcpy_chk") == ("__strcpy_chk", "strcpy_chk")
+    assert engine._symbol_names("not_a_symbol") == ("not_a_symbol", "not_a_symbol")
 
 
 def test_flow_signature_display_keeps_the_raw_grouping_key_1001():
     # `rendered` is the address-free grouping key and stays raw; the display
-    # spelling rides beside it, and only when it differs.
+    # spelling always rides beside it (equal to it when nothing demangles).
     shown = {"_Z8read_keyPc": "read_key", "ZN5store4openEPKc": "store::open"}
     path = [{"address": "0x10", "callee": "_Z8read_keyPc"},
             {"address": "0x20", "callee": "ZN5store4openEPKc"}]
@@ -840,8 +863,31 @@ def test_flow_signature_display_keeps_the_raw_grouping_key_1001():
     assert sig["rendered_display"] == "arg:recv:1 → read_key → [path_injection] store::open"
     _, plain = te.derive_flow_facts(direction="forward", path=path, sink=sink,
                                     sources=["arg:recv:1"], display=lambda n: None)
-    assert "rendered_display" not in plain
+    assert plain["rendered_display"] == plain["rendered"]
 
+
+def test_unresolved_in_binary_thunk_is_not_called_external_1001(models):
+    # #1001 review nit: after `--force-analysis` BN can turn an oversized body
+    # into an in-binary tail-jump thunk whose target does not resolve. It is
+    # neither an import nor an external symbol, so it is not "external".
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    stub = FFunc("fetch_input", 0xB00, FSSAFunc([]), is_thunk=True)
+    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(p#0)", reads=[p0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0xB00", constant=0xB00),
+                  params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])])
+    func = FFunc("handle", 0x10, FSSAFunc([call]), params=[p])
+    result = te.TaintEngine(FBV({}, funcs={0xB00: stub}), models).forward(
+        func, [te.parse_locator("param:0")])
+    assert ("in-binary fetch_input was not analysed (Binary Ninja made it a thunk and its "
+            "target did not resolve) and has no model; return conservatively tainted -- "
+            "read it with `bn disasm 0xb00`") in result["assumptions"]
+    # An import stub is still external, even though BN also marks it a thunk.
+    plt = FFunc("fetch_input", 0xB00, FSSAFunc([]), is_thunk=True,
+                symbol_type="ImportedFunctionSymbol")
+    result = te.TaintEngine(FBV({}, funcs={0xB00: plt}), models).forward(
+        func, [te.parse_locator("param:0")])
+    assert "external fetch_input has no model; return conservatively tainted" in result["assumptions"]
 
 
 def test_forward_modeled_sink_arg_out_of_range_silent_when_untainted(models, monkeypatch):

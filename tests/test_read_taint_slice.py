@@ -598,7 +598,7 @@ def test_backward_slice_assumptions_nonempty_when_ip_depth_exhausted(monkeypatch
     assert result["frontiers"] == [
         {"reason": "call_or_jump_boundary", "count": 1,
          "examples": [{"ssa_label": "r0#3", "address": "0x1000c", "depth": 0,
-                       "callee": "callee_fn"}]},
+                       "callee": "callee_fn", "callee_display_name": "callee_fn"}]},
     ]
 
 
@@ -649,7 +649,7 @@ def test_build_backward_trace_call_depth_guard_marks_boundary_not_dangling_cross
     assert rts._summarize_frontiers(trace) == [
         {"reason": "call_or_jump_boundary", "count": 1,
          "examples": [{"ssa_label": "r0#3", "address": "0x1000c", "depth": 0,
-                       "callee": "callee_fn"}]},
+                       "callee": "callee_fn", "callee_display_name": "callee_fn"}]},
     ]
     assert rts._trace_assumptions(trace, truncated=False, max_depth=10) == [
         "interprocedural crossing stopped at the internal recursion-depth "
@@ -716,7 +716,8 @@ def test_output_pointer_hint_names_callee_not_param_name(monkeypatch):
     assert result["arg_label"]["name"] == "out"
     assert len(result["hints"]) == 1
     assert "if fill_record fills it instead" in result["hints"][0]
-    assert "--source call:fill_record`" in result["hints"][0]
+    # fill_record has no source model, so the runnable seed is the arg itself.
+    assert "--source arg:fill_record:0`" in result["hints"][0]
     assert "out fills" not in result["hints"][0]
 
 

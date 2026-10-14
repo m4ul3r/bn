@@ -72,6 +72,30 @@ from .il_format import _display_name, _variadic_determination
 from .taint_models import _model_copy_roles
 
 
+class _RegisterOperand:
+    """A call argument BN dropped from the MLIL call's parameter list, read as
+    the value its calling-convention register holds at the call (#1001 item 1).
+
+    Shaped like an ``MLIL_VAR_SSA`` read of that value (``operation.name``,
+    ``src``, ``vars_read``) so the sink classifiers that take a call operand
+    judge it exactly as they judge a recovered parameter. ``var`` is None when no
+    single reaching value is known: the operand then reads nothing, so no
+    classifier can resolve it -- it is never a guess."""
+
+    class _Op:
+        name = "MLIL_VAR_SSA"
+
+    operation = _Op
+
+    def __init__(self, var: Any, register: str | None) -> None:
+        self.src = var
+        self.vars_read = [var] if var is not None else []
+        self.register = register
+
+    def __str__(self) -> str:
+        return f"{self.src if self.src is not None else '?'} (via {self.register or '?'})"
+
+
 # Caller sites the backward ascent follows per function. Module-level (not a
 # local of ``_continue_into_callers``) because the cap is part of the result
 # contract: crossing it sets ``stats.truncated``/``truncation_cause`` and emits a
@@ -3858,20 +3882,22 @@ class TaintEngine:
     def _not_internal_reason(fn: Any) -> str | None:
         """Why a call target is NOT descended into, or None when it is.
 
-        ``no_function`` / ``thunk`` / ``import`` are the genuinely external
-        shapes. ``analysis_skipped:<BN reason>`` and ``no_mlil`` are IN-BINARY
+        ``no_function`` / ``import`` are the genuinely external shapes;
+        ``thunk`` is an in-binary stub the caller may still resolve to its
+        target. ``analysis_skipped:<BN reason>`` and ``no_mlil`` are IN-BINARY
         bodies Binary Ninja did not analyse (an oversized function past
         ``analysis.limits.maxFunctionSize``, a failed lift) -- the caveat for
-        those must not call the function "external" (#1001 item 3)."""
+        those must not call the function "external" (#1001 item 3). The import
+        check runs first: a PLT stub is a thunk AND an import symbol."""
         if fn is None:
             return "no_function"
-        if getattr(fn, "is_thunk", False):
-            return "thunk"
         sym = getattr(fn, "symbol", None)
         stype = str(getattr(getattr(sym, "type", None), "name", "") or "")
         if stype in {"ImportedFunctionSymbol", "LibraryFunctionSymbol",
                      "ImportAddressSymbol", "ExternalSymbol"}:
             return "import"
+        if getattr(fn, "is_thunk", False):
+            return "thunk"
         try:
             has_body = len(list(fn.mlil.instructions)) > 0
         except Exception:
@@ -3902,6 +3928,8 @@ class TaintEngine:
             return f"Binary Ninja skipped its analysis: {why}"
         if reason == "no_mlil":
             return "Binary Ninja produced no MLIL for it"
+        if reason == "thunk_unresolved":
+            return "Binary Ninja made it a thunk and its target did not resolve"
         return None
 
     def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int) -> dict[str, Any]:
@@ -4508,72 +4536,55 @@ class TaintEngine:
                 if leaf not in leaves:
                     leaves.append(leaf)
 
-            def _note_under_recovered_sink_arg(argidx: int, sink: dict[str, Any]) -> None:
-                # #577: a modeled sink's OWN declared arg index (e.g. memcpy's
-                # length at arg 2) sits beyond the params BN recovered for this
-                # call -- an under-recovered arity, the shape an ARM-Thumb
-                # `j_memcpy` typed `memcpy(int32_t)` produces by dropping the
-                # length register. The in-range sink loop below never inspects
-                # it, and the modeled branch's trailing `continue` bypasses every
-                # other honesty path, so a tainted value passed there would vanish
-                # and a zero-sink run falsely report all-clear.
-                # Recover the dropped arg through its calling-convention register
-                # (the #433 reg bridge) and, ONLY when it actually carries taint,
-                # report the sink. Gating on real taint keeps a merely-under-
-                # recovered but quiet sink from crying wolf on every function
-                # that calls it.
-                #
-                # #1001 item 1: this used to be an `arg_under_recovered` frontier
-                # LEAF, so a modeled sink the engine SAW reached stayed out of the
-                # verdict and `flows` and was filed with the "we lost track"
-                # leaves. It is a reached sink, reported as one -- with
-                # `via: abi_register` and the `arity_mismatch` that produced it,
-                # because the evidence is the register, not BN's prototype.
+            def _sink_arg_operands(argidx: int) -> tuple[list[Any] | None, list, dict | None]:
+                """``(operands, hit_nodes, abi)`` for a modeled sink's arg.
+
+                In range: the call's own params. Out of range (#577) -- the sink's
+                declared index sits beyond the params BN recovered for this call,
+                the shape an ARM-Thumb `j_memcpy` typed `memcpy(int32_t)` produces
+                by dropping the length register -- the arg is recovered through
+                its calling-convention register (the #433 reg bridge) and the
+                operand list is extended with register stand-ins, so the SAME
+                classification the in-range path runs (bounded copy, receive
+                bound, index-only, ...) judges it (#1001 item 1 review). Reported
+                only when the register value really carries taint, so a merely
+                under-recovered but quiet sink does not cry wolf; ``abi`` names
+                the register and the arity mismatch for the finding. This used to
+                be an `arg_under_recovered` frontier LEAF, which kept a modeled
+                sink the engine SAW reached out of the verdict and `flows`."""
+                if argidx < len(params):
+                    return params, arg_taint(params[argidx]), None
                 try:
                     reg, seeds = self._reaching_arg_seeds_via_reg(func, [ins], argidx)
                 except Exception:
-                    return
-                if not seeds:
-                    return
-
-                def _hit_node(v: Any) -> tuple | None:
-                    k = var_key(v); ver = getattr(v, "version", None)
-                    for node in ((k, ver), (k, None)):
-                        if node in tainted:
-                            return node
-                    node = self._pointee_tainted(ssaf, v, tainted)
-                    if node is not None:
-                        return node
-                    # A pointer reaching a tainted buffer the store/load keys do
-                    # not name (a PHI of allocations): the register itself is the
-                    # only node to cite.
-                    if self._var_buffer_tainted(ssaf, v, tainted, set(), 0):
-                        return (k, ver)
-                    return None
-
-                hit = [n for n in (_hit_node(v) for v, _site in seeds) if n is not None]
-                if not hit:
-                    return
-                sig = (addr, argidx) if site_taddr is None else (addr, argidx, site_taddr)
-                if sig in recorded_sinks:
-                    return
-                recorded_sinks.add(sig)
+                    return None, [], None
+                operand = hit = None
+                for v, _site in seeds:
+                    cand = _RegisterOperand(v, reg)
+                    nodes = arg_taint(cand)
+                    if not nodes and self._var_buffer_tainted(ssaf, v, tainted, set(), 0):
+                        # A pointer reaching a tainted buffer the store/load keys
+                        # do not name (a PHI of allocations): cite the register.
+                        nodes = [(var_key(v), getattr(v, "version", None))]
+                    if nodes:
+                        operand, hit = cand, nodes
+                        break
+                if operand is None:
+                    return None, [], None
+                operands: list[Any] = list(params)
+                for i in range(len(params), argidx):
+                    # Another dropped arg the classification may consult (a copy's
+                    # destination): its register's single reaching value, else an
+                    # operand no classifier can resolve (never a guess).
+                    try:
+                        r_i, s_i = self._reaching_arg_seeds_via_reg(func, [ins], i)
+                    except Exception:
+                        r_i, s_i = None, []
+                    operands.append(_RegisterOperand(s_i[0][0] if len(s_i) == 1 else None, r_i))
+                operands.append(operand)
                 taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
-                target_ref = hex(int(taddr)) if taddr is not None else (mkey or name or "<callee>")
-                abi_sink = {
-                    **sink,
-                    "via": "abi_register",
-                    "arity_mismatch": {"recovered": len(params), "dropped": [argidx],
-                                       "register": reg, "callee_ref": target_ref},
-                    "detail": (sink.get("detail") or "")
-                    + f" (reached through ABI register {reg}: Binary Ninja recovered only "
-                    f"{len(params)} parameter(s) for this call, so arg {argidx} is read "
-                    f"from the register rather than the call's parameter list -- confirm "
-                    f"the prototype with `bn proto get {target_ref}` and apply it with "
-                    f"`bn proto set {target_ref} \"<prototype>\"`)",
-                }
-                findings.append(_tag_unconditional_flow(
-                    self._make_finding(ins, mkey or name, argidx, abi_sink, hit, why), hit))
+                return operands, hit, {"register": reg, "recovered": len(params),
+                                       "callee_ref": hex(int(taddr)) if taddr is not None else None}
 
             sink = model.get("sink")
             # opt-in sinks (e.g. file_write) stay silent unless their gate was
@@ -4663,8 +4674,8 @@ class TaintEngine:
                 if sink.get("len_arg") is not None and sink["len_arg"] not in _sink_args:
                     _sink_args.append(int(sink["len_arg"]))
                 for argidx in _sink_args:
-                    if argidx < len(params):
-                        ht = arg_taint(params[argidx])
+                    aparams, ht, abi = _sink_arg_operands(argidx)
+                    if aparams is not None:
                         if ht:
                             sig = (addr, argidx) if site_taddr is None else (addr, argidx, site_taddr)
                             if sig not in recorded_sinks:
@@ -4718,7 +4729,7 @@ class TaintEngine:
                                     # `len_arg` without `buf_arg` took the branch above.
                                     _len_pair = (sink.get("buf_arg") is not None
                                                  and argidx == sink.get("len_arg"))
-                                    _bnd_reason = (self._bounded_copy_reason(ssaf, params, argidx, dest_idx=_dest_idx)
+                                    _bnd_reason = (self._bounded_copy_reason(ssaf, aparams, argidx, dest_idx=_dest_idx)
                                                    if (sink.get("class") == "overflow_len" or _len_pair) else None)
                                 if _bnd_reason is not None:
                                     eff_sink = {
@@ -4733,13 +4744,13 @@ class TaintEngine:
                                     # `overread_len` when it is a fixed-size object
                                     # the length is not provably within.
                                     eff_sink = self._source_side_verdict(
-                                        ssaf, params, argidx, mkey, model, eff_sink)
+                                        ssaf, aparams, argidx, mkey, model, eff_sink)
                                 elif sink.get("class") == "overflow_len":
                                     # Length is the return of a modeled receive
                                     # call bounded by a constant count arg
                                     # (n = read(fd, buf, MAX); memcpy(dst, buf, n)):
                                     # attacker-derived but provably <= MAX (#159).
-                                    _bnd = self._syscall_bound_for_length(ssaf, params[argidx])
+                                    _bnd = self._syscall_bound_for_length(ssaf, aparams[argidx])
                                     if _bnd is not None:
                                         eff_sink = {
                                             **sink,
@@ -4771,7 +4782,7 @@ class TaintEngine:
                                     or argidx in _model_buffer_source_args(model)
                                 if eff_sink.get("class") in _OVERFLOW_INDEX_CLASSES \
                                         and self._sink_taint_is_index_only(
-                                            ssaf, params[argidx], tainted, pointer_arg=_ptr_arg):
+                                            ssaf, aparams[argidx], tainted, pointer_arg=_ptr_arg):
                                     _prior = eff_sink.get("class")
                                     eff_sink = {
                                         **eff_sink,
@@ -4801,7 +4812,7 @@ class TaintEngine:
                                 # so those more-specific verdicts take precedence.
                                 if eff_sink.get("class") == "overflow_len" \
                                         and self._length_is_reused_aliased_slot(
-                                            ssaf, instrs, params[argidx], tainted):
+                                            ssaf, instrs, aparams[argidx], tainted):
                                     eff_sink = {
                                         **eff_sink,
                                         "class": "tainted_len",
@@ -4837,7 +4848,7 @@ class TaintEngine:
                                 # `total`. The class is untouched.
                                 if eff_sink.get("class") == "overflow_len":
                                     _resid = self._residual_chunk_length(
-                                        ssaf, params, argidx,
+                                        ssaf, aparams, argidx,
                                         int(eff_sink.get("buf_arg") or 0))
                                     if _resid is not None:
                                         _total, _cursor = _resid
@@ -4867,14 +4878,28 @@ class TaintEngine:
                                 # finding are visibly the same sink.
                                 if eff_sink.get("class") != sink.get("class"):
                                     eff_sink = {**eff_sink, "catalog_class": sink.get("class")}
+                                if abi is not None:
+                                    # #1001 item 1: the evidence is the register,
+                                    # not BN's prototype -- say so on the finding.
+                                    _ref = abi["callee_ref"]
+                                    eff_sink = {
+                                        **eff_sink,
+                                        "via": "abi_register",
+                                        "arity_mismatch": {"recovered": abi["recovered"],
+                                                           "dropped": [argidx],
+                                                           "register": abi["register"],
+                                                           "callee_ref": _ref},
+                                        "detail": (eff_sink.get("detail") or "")
+                                        + f" (reached through ABI register {abi['register']}: "
+                                        f"Binary Ninja recovered only {abi['recovered']} "
+                                        f"parameter(s) for this call, so arg {argidx} is read "
+                                        "from the register rather than the call's parameter "
+                                        "list"
+                                        + (f" -- confirm the prototype with `bn proto get {_ref}`"
+                                           if _ref else "") + ")",
+                                    }
                                 findings.append(_tag_unconditional_flow(
                                     self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
-                    else:
-                        # #577: the sink's OWN declared arg index is out of range
-                        # of the recovered params -- recover it through its ABI
-                        # register and report the sink when it carries taint
-                        # (#1001 item 1) instead of silently skipping it.
-                        _note_under_recovered_sink_arg(argidx, sink)
             co = model.get("continuation")
             if co is not None:
                 cidx = int(co.get("null_arg", 0))
@@ -5376,13 +5401,21 @@ class TaintEngine:
                             # "external". Name it as what it is, with the remedy,
                             # and record it as an unread body (#811). The phrase
                             # keeps "has no model": taint_result's gate keys on it.
-                            _unread = self._unanalysed_body_phrase(
-                                self._not_internal_reason(descend_fn))
+                            _reason = self._not_internal_reason(descend_fn)
+                            if _reason == "thunk" and self._follow_thunk_cached(descend_fn) is None:
+                                # In-binary, and not a stub onto an import either
+                                # (that one resolves): e.g. a body BN turned into a
+                                # tail-jump after `--force-analysis`.
+                                _reason = "thunk_unresolved"
+                            _unread = self._unanalysed_body_phrase(_reason)
                             _who = nm or hex(taddr)
-                            if _unread is not None:
+                            _at = hex(int(getattr(descend_fn, "start", taddr)))
+                            if _reason == "thunk_unresolved":
+                                _fix = f"read it with `bn disasm {_at}`"
+                            elif _unread is not None:
                                 self._analysis_incomplete.add(str(_who))
-                                _fix = (f"run `bn decompile {hex(int(getattr(descend_fn, 'start', taddr)))} "
-                                        "--force-analysis` (may be slow) and re-run this taint query")
+                                _fix = (f"run `bn decompile {_at} --force-analysis` (may be slow) "
+                                        "and re-run this taint query")
                             if self.unknown_call_policy != "stop":
                                 ret_tainted = True
                                 add_assumption(
@@ -6299,8 +6332,11 @@ class TaintEngine:
         return {
             "sink": {
                 "callee": callee,
-                **({"callee_display_name": _shown}
-                   if (_shown := self._display_for_name(callee)) else {}),
+                # #1001 item 4: `callee` is the MODEL key, which drops a C++
+                # symbol's leading underscore; the real symbol and its demangled
+                # display name ride beside it (always present, like #978's).
+                "callee_symbol": self._symbol_names(callee)[0],
+                "callee_display_name": self._display_for_name(callee),
                 "address": hex(int(getattr(ins, "address", 0))),
                 "tainted_arg_index": argidx,
                 "class": sink.get("class"),
@@ -6329,29 +6365,35 @@ class TaintEngine:
             "path": path,
         }
 
-    def _display_for_name(self, name: Any) -> str | None:
-        """The demangled display name for a symbol name a taint result prints
-        (#1001 item 4), or None when it has none (a C symbol, an unknown name).
+    def _symbol_names(self, name: Any) -> tuple[str, str]:
+        """``(raw symbol name, display name)`` for a name a taint result prints
+        (#1001 item 4); both fall back to *name* itself when no symbol has it.
 
         Models key a callee with its leading underscores stripped
-        (``ZNSt13basic_filebuf...``), which neither reads nor demangles, so the
-        raw spelling is tried with them restored. The display name is the
-        symbol's ``short_name`` -- the spelling ``decompile`` prints (#978)."""
-        if not name:
-            return None
-        name = str(name)
-        cache = self.__dict__.setdefault("_display_names", {})
+        (``ZNSt13basic_filebuf...``), which is not a real symbol, neither reads
+        nor demangles, and does not resolve in `bn proto get`; the raw spelling
+        is tried with them restored. The display name is the symbol's
+        ``short_name`` -- the spelling ``decompile`` prints (#978) -- when it
+        differs from the raw name, else the name asked for (a C symbol keeps
+        its model spelling, so `strcpy_chk` does not turn into `__strcpy_chk`)."""
+        name = str(name) if name else ""
+        cache = self.__dict__.setdefault("_symbol_name_cache", {})
         if name in cache:
             return cache[name]
-        shown = None
-        for cand in (name, "_" + name, "__" + name):
+        found = (name, name)
+        for cand in ((name, "_" + name, "__" + name) if name else ()):
             sym = _symbol_by_raw_name(self.bv, cand)
-            short = getattr(sym, "short_name", None) if sym is not None else None
-            if isinstance(short, str) and short and short != getattr(sym, "name", None):
-                shown = short
+            raw = getattr(sym, "name", None) if sym is not None else None
+            if isinstance(raw, str) and raw:
+                short = getattr(sym, "short_name", None)
+                found = (raw, short if isinstance(short, str) and short and short != raw else name)
                 break
-        cache[name] = shown
-        return shown
+        cache[name] = found
+        return found
+
+    def _display_for_name(self, name: Any) -> str:
+        """The demangled display name for *name* (see :meth:`_symbol_names`)."""
+        return self._symbol_names(name)[1]
 
     def _reconstruct_path(self, node, why) -> list[dict[str, Any]]:
         chain = []
@@ -6491,6 +6533,12 @@ class TaintEngine:
                 display=self._display_for_name)
             sl["metrics"] = sm
             sl["signature"] = ss
+            # #1001 item 4 review: the slice row names its sink callee as the
+            # forward flow row does -- demangled in text, raw beside it.
+            _sk = sl.get("sink")
+            if isinstance(_sk, dict) and _sk.get("callee"):
+                _sym, _shown = self._symbol_names(_sk["callee"])
+                sl["sink"] = {**_sk, "callee_symbol": _sym, "callee_display_name": _shown}
         return {
             "direction": "backward",
             "function": {"name": str(func.name), "display_name": _display_name(func),
