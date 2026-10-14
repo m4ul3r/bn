@@ -1,0 +1,11 @@
+{
+  "description": "Optimized do-while and conditional stashes retain unwritten paths; a stash after a finished loop does not make its earlier calls opaque. Analyze only.",
+  "lang": "c",
+  "cflags": ["-O1", "-fno-inline"],
+  "backward": [
+    {"function": "dowhile_stash", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "dowhile_stash_strcpy", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "branch_stash", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "escape_after_loop", "sink": "arg:popen:0", "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true}
+  ]
+}

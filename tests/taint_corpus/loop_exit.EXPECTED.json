@@ -1,0 +1,15 @@
+{
+  "description": "#950: both loop-exit orders retain the entry path without a buf writer; analyze only, never execute this intentionally unsafe target",
+  "lang": "c",
+  "cflags": ["-O1", "-fno-inline"],
+  "backward": [
+    {"function": "fill_first", "sink": "arg:popen:0",
+     "leaves": [{"kind": "address_of_local_unresolved"}],
+     "leaf_details_contain": ["on at least one path"],
+     "complete_slice": false},
+    {"function": "fill_second", "sink": "arg:popen:0",
+     "leaves": [{"kind": "address_of_local_unresolved"}],
+     "leaf_details_contain": ["on at least one path"],
+     "complete_slice": false}
+  ]
+}

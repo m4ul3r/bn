@@ -1,0 +1,9 @@
+{
+  "description": "Optimized explicit wrong-member STRUCT read stays unresolved; source forwarding remains parameter provenance. Matching constant sink may be bounded/unseeded, not pinned here.",
+  "lang": "c",
+  "cflags": ["-O1", "-fno-inline", "-fno-builtin"],
+  "backward": [
+    {"function": "external_wrong", "sink": "arg:malloc:0", "leaves": [{"kind": "field_load_unresolved"}], "complete_slice": false},
+    {"function": "external_source", "sink": "arg:malloc:0", "origin_kinds": ["parameter"], "forbid_leaves": [{"kind": "field_load_unresolved"}], "complete_slice": true}
+  ]
+}

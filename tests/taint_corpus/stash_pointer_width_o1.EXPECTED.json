@@ -1,0 +1,9 @@
+{
+  "description": "Optimized narrow/full pointer stash controls; copied_epoch's folded scalar sink is deliberately not pinned.",
+  "lang": "c",
+  "cflags": ["-O1", "-fno-inline", "-fno-builtin", "-fno-strict-aliasing"],
+  "backward": [
+    {"function": "truncated_stash", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "full_stash", "sink": "arg:popen:0", "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true}
+  ]
+}

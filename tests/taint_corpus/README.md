@@ -34,10 +34,144 @@ brittle across compilers/optimisation.
 | `bw_terminate_append.c` | `fill; buf[n] = 0; append; popen` at -O1: the aliased-field terminator (a memory def with no `src_memory`) must not break the writer chain -- the parameter / `read` source copied in by the OLDER writer is the origin, not the literal append; a nested `strcpy(cmd, tmp)` source buffer is walked to its `read` |
 | `bw_memory_paths.c`    | backward memory-path honesty: a conditional fill (memory phi with a writer-less arm) is an `address_of_local_unresolved` frontier; a source buffer overwritten AFTER it was copied is read at the copy's memory version; `&buf` escaping to a global makes a later unmodeled call an opaque writer and a later modeled call that reloads the stash (`strcpy(g_stash, host)`) a fill; a 1-byte terminator after a conditional `read` does not cover the bare arm; a `memset` arm is a literal fill that does |
 | `strtok_escape.c`      | strtok state left tainted at return is disclosed (`tokenizer_state_escapes`) and withholds `safe_to_report_all_clear`; a clean non-NULL `strtok` that lies on EVERY path from the tainted call to the `strtok(NULL)` resets the continuation (negative); one under `if (mode)`, or a priming call before a loop that the back-edge bypasses (`tok_prime_loop`), does not, so the continuation stays a real `system()` flow (positive). `strtok_escape_o1.c` rebuilds it at -O1 |
-| `bw_opt_shapes.c`      | -O1 optimiser shapes (`bw_opt_shapes_o2.c` rebuilds at -O2): a store through a phi'd / non-constant pointer is a writer whose value reaches the ascent (`buf[i] ^= key[i]`, `*p++ = *src++`), never a bare `source` with `complete_slice: true`; a byte-wise `*p++ = *src++` loop is a loop-only fill and stays a frontier leaf; `__builtin_memset` is a literal fill; `char buf[] = "lit"` lifted to `__builtin_strncpy` is modeled; a tainted `memcpy` length is a step and the fill outranks the terminator |
+| `bw_opt_shapes.c`      | -O1 optimiser shapes (`bw_opt_shapes_o2.c` rebuilds at -O2): a store through a phi'd / non-constant pointer retains its input and caller ascent; byte-wise cursor copies remain frontiers where loop initialization cannot be proved; `__builtin_memset` is a literal fill; `char buf[] = "lit"` lifted to `__builtin_strncpy` has concrete constant-data NUL evidence; a tainted `memcpy` length remains an input rather than being hidden by the terminator |
 | `bw_global_operand.c`  | a `CONST_PTR` fill operand is a literal only in read-only storage: `sprintf(cmd, "%s", g_host)` from a `.bss` array is a frontier leaf with origin `global` (`complete_slice: false`); the `.rodata` literal twin is complete |
 | `bw_offset_address.c`  | an address built on a buffer at a VARIABLE offset is that buffer: `popen(line + off)` and `strcpy(buf, &other[i])` walk the `read` that filled it beside the offset; `g_hosts[i]` (a `.bss` array element) is a `global` frontier leaf. `bw_offset_address_o1.c` rebuilds it at -O1 |
 | `bw_byte_coverage.c`   | coverage by bytes, not by writer kind: a `read` through a pointer that may point at another local, a one-byte indexed terminator, an escape of `&buf` and a copy at a constant offset each leave the bare path a frontier (`complete_slice: false`); a copy at offset 0 covers. `bw_byte_coverage_o1.c` rebuilds it at -O1 |
+| `bw_regions.c`        | #931/#933: zero/short/full-request reads, suffix/indexed rows and append-only buffers remain incomplete; initialized struct-member strings and exact byte ranges are covered without requiring unrelated fields. `bw_regions_o1.c` / `bw_regions_o2.c` rebuild at -O1/-O2 |
+| `strtok_fixpoint.c`   | #932: two-entry/two-back-edge tokenizer CFG with two unused-return initializers; the NULL continuation reaches `system` even when IL enumerates it first. O0/O1/O2 variants share the source |
+| `loop_exit.c`        | #950: exact synthetic -O1 loop with filled/unwritten exits in both source orders; cyclic memory-PHI memoization must retain an unresolved entry path |
+| `loop_escape_index.c` | loop-bottom address escape makes the next iteration's earlier helper an opaque writer; indexed scalar LOAD preserves parameter origin and caller ascent at O0. `loop_escape_index_o1.c` checks the escape at O1 |
+| `stash_must_paths.c` | do-while and conditional stash reloads must not certify the unwritten first/alternate path; a stash after a finished loop leaves it covered. O0 pointer-copy byte LOAD is covered; O1 variant checks stash paths |
+| `stash_pointer_width.c` | exact narrow/full pointer reload controls at O0/O1; partial reload plus zero-extension must not certify initialization. Copied LOAD epoch control is checked at O0; O1 may fold the scalar sink |
+| `nested_escape_paths.c` | #951: native O0 nested call/escape arrangements require an opaque helper leaf; no-escape nests stay covered. Includes single-loop and differing-offset cache controls |
+| `store_member_identity.c` | exact O0 direct-store lossy destination and STRUCT-stash member PHIs remain incomplete; matching-member full-pointer control stays complete |
+| `scalar_member_regions.c` | exact Opus O0 scalar STRUCT-read fixture: unwritten member/mirror/pointer-store variants remain incomplete; genuinely initialized consumed member stays covered |
+| `external_member_regions.c` | nonlocal matching STORE/LOAD members recover the real writer, unwritten members remain frontiers, and a disjoint later write preserves parameter source. O1 variant checks surviving wrong-member/source forms |
+
+The region-coverage cases deliberately distinguish a may-source from a proven
+initializer. Existing `read`-based offset/append/loop cases still require their
+source steps, but now require an incomplete slice: the request length does not
+prove the return count or NUL termination. A zero-filled branch cannot certify
+the alternative short/error-read branch.
+
+`bw_regions` keeps the modeled library-call boundary at every optimization
+level with `-fno-builtin` and an explicit `_FORTIFY_SOURCE=0`. Some compilers
+enable fortify by default; its header wrappers can still expand constant
+copies into vector loads/stores despite `-fno-builtin`. General vector-load
+provenance and multi-store interval unions are not claimed by this modeled-fill
+fixture. The separate `fortified` and `bw_opt_shapes` cases retain their own
+fortified/inlined-operation coverage.
+
+`bw_opt_shapes.literal_init` is a covered-local control, not an obsolete
+completion pin: C initializes all 64 bytes of `char buf[64] = "ping "`, and
+`strcat` preserves its string. Optimized IL may instead copy into `buf + 5`;
+that remains covered because the preceding five bytes were initialized.
+The caller's unresolved `argv` field still withholds whole-slice completeness.
+`read_or_memset` cannot claim the same proof: the `read` arm can leave a gap
+before `buf[63] = 0`. The `ptr_copy` loop requires an induction proof the
+walker does not provide, rather than whole-array initialization at loop entry.
+
+`origin_kinds` is optional when a case checks region coverage rather than the
+choice of one representative origin. A zero/disjoint write is not evidence for
+the consumed bytes, and an indexed address also depends on its selector;
+those cases retain explicit frontier and completeness assertions without
+pinning one path. Overlapping nonzero reads and copy/member cases still check
+their source/parameter origins. `string_not_full_bytes` must remain incomplete:
+`snprintf`'s capacity is not the number of bytes it initializes.
+
+`loop_exit` is compiled with `-O1 -fno-inline`, using the exact issue #950
+source. It is analyzed only: do not execute its intentionally uninitialized
+`popen` arguments. Compiler-dependent IL coverage is complemented by deterministic
+memory-SSA tests for both exit-arm orders, `memset`/`strcpy` writers, initialized
+entry controls, and shared-budget exhaustion. Cyclic results that consulted a
+neutral backedge are not cached for other exit arms; revisits remain bounded
+by the same proof allowance. This does not claim arbitrary loop induction.
+
+`loop_escape_index` retains the review's invented probe source. Analyze it
+only; its helper can copy an unbounded environment string. The O0 index case
+checks parameter origin and ascent without certifying unknown-offset bytes.
+At O1 the compiler can fold the LOAD away, so that variant checks only the
+loop-carried escape. Deterministic memory-SSA controls cover both PHI orders,
+unescaped initialized loops with unrelated unmodeled calls, and shared-budget
+exhaustion on escape-state revisits.
+
+`stash_must_paths` retains the round-two review's invented source and is
+analyzed only: the do-while and conditional-stash paths intentionally consume
+uninitialized bytes. O0/O1 cases distinguish must-reaching initialization from
+may-reaching provenance, including inlined `strcpy` stores. Deterministic
+tests cover both PHI orders, agreeing/disagreeing stash values, bare-entry,
+opaque-call, partial/unknown-width arms, initialized loop entries, and bounded
+must-query work. Retry evidence stays deduplicated and retains known parameter
+sources even when the shared allowance is exhausted. Copied pointer LOAD
+controls use nonzero offsets and preserve index origins without adding an
+unrelated unknown-region demand.
+
+`stash_pointer_width` retains the Sol review's exact invented source and
+compiler flags (`-fno-builtin -fno-strict-aliasing -fno-inline`). Analyze only:
+the narrow reload does not reconstruct the stack pointer. Full-width STORE/
+LOAD controls remain covered; deterministic 32/64-bit, subfield, extension,
+cast/operator and unknown-ABI controls require conservative pointer identity.
+The copied-base epoch defect was reproduced synthetically, not natively:
+O0 folds the base copy and O1 can make the scalar sink bounded/unseeded.
+The deterministic test excludes post-load writer provenance.
+
+`nested_escape_paths` retains the Opus review's exact invented source.
+Analyze only: helper copies may overflow. Both O0 inner-call/outer-escape and
+outer-call/inner-escape arrangements must name the opaque helper, while their
+no-escape controls stay covered. Both mocked PHI orders complement the native
+compiler shape. Overlapping cycles share escape state under the same allowance;
+sequential loops remain separate. Moving inline/SSA stash values stop as unknown
+without exhausting the allowance, and transient-operand cache tests check
+object lifetime rather than relying on nondeterministic allocator id reuse.
+
+`store_member_identity` retains the Opus O0 source exactly. Analyze only:
+the wrong-member and truncated-pointer paths intentionally leave `buf`
+uninitialized. It checks both STRUCT-member arrangements and the genuinely
+matching-member control. Deterministic byte, string and bounded-string cases
+retain possible-store provenance while requiring strict destination identity
+for coverage, including the keyed-store path. Slot-value SSA versions and
+possibly aliasing different pointer/stack keys stay conservative; a known
+same-base disjoint-member control is retained.
+
+The corresponding O1 address-size-override case is **not** an engine fix claim:
+BN may erase `0x67` and lift a truncated destination as a named local write
+([#954](https://github.com/m4ul3r/bn/issues/954)). These guarantees are scoped to
+the lifted model; disassembly is required for machine-level address-width
+claims. No opcode blacklist or weakened native regression is used to hide
+that upstream limit.
+
+`scalar_member_regions` retains the Opus scalar-member source exactly and
+uses its O0 flags (`-fno-inline -fno-builtin`). Analyze only: wrong-member reads
+are intentionally uninitialized. The initialized-member control checks that
+coverage is not blanket-disabled. Deterministic equivalent plain LOAD,
+LOAD_STRUCT and named aliased-field forms cover direct/copied bases, nonzero
+base plus member offsets exactly once, unknown geometry, read epochs and
+selector provenance.
+
+The scalar STRUCT root is corroborated natively by that O0 shape. The Sol
+O0 fixture instead lifts to named aliased-field reads; O1 can fold undefined
+reads away or produce non-memory SSA-field `entry` origins. Those separate
+representations are not credited as a STRUCT-path repair. The float-constant
+numeric-coercion defect is exercised synthetically with an integer-zero
+control; no native direct FLOAT_CONST reproduction is claimed. Integer
+bit-pattern and verified byte-data evidence remain supported without adding
+floating evaluation.
+
+`external_member_regions` retains the Sol nonlocal source exactly. At O0,
+the matching `p->b` writer/read is covered, `p->a` remains unresolved after only
+`p->b` was written, and the earlier `source` in `p->a` survives a later `p->b`
+literal. O1 keeps the wrong-member read but can forward the source directly
+and fold the matching constant to a bounded/unseeded sink; those cases are
+not miscredited as matching-memory proof. Inputs are analyzed only.
+
+The shared geometry audit also covers forward memory correlation, named
+writers/reads, descriptor-array field keys and indirect pointer slots.
+Deterministic direct/copied and mixed plain/STRUCT forms exercise positive,
+disjoint/overlapping and source-retention controls. The forward sibling was
+reported statically and is exercised behaviorally here, not claimed as a
+native forward vulnerability reproduction. May semantics and strict local
+coverage remain separate.
 
 ## `EXPECTED.json` schema
 

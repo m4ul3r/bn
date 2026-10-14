@@ -138,9 +138,10 @@ def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
 # "unmodeled external" fallback (`_comment_benign` in taint_models.json). An
 # entry whose only keys are `_comment*` annotations is that same marker.
 _MODEL_ROLE_KEYS = ("sink", "sources", "propagates", "varargs", "continuation",
-                    "writes", "return_bound", "arity_capped", "destinations_unmodeled")
-# The roles that move or fill bytes. The other three are ANNOTATIONS of a flow
-# model (a return bound, an arity cap, a destination disclosure): an overlay
+                    "writes", "return_bound", "arity_capped", "destinations_unmodeled",
+                    "initializes", "consumes", "write_bounds", "preserves_cstring", "return_alias")
+# The roles that move or fill bytes. The remaining roles annotate a flow
+# model (bounds, regions, aliases and disclosures): an overlay
 # entry made of annotations alone is merged INTO the existing model of the same
 # name, never a replacement for it -- `{"read": {"return_bound": ..}}` used to
 # replace the builtin `read` and drop it from every slice (round 4 P3).
@@ -266,8 +267,8 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
             _fail("`continuation.null_arg` must be a non-negative integer argument index")
     if "writes" in model:
         # A literal fill (`bzero`): the callee writes the pointee of `*arg:N`
-        # from no argument. The backward local-buffer walk counts it as a
-        # covering writer whose bytes come from the call itself.
+        # from no argument. This is a may-write, NOT an initialized extent;
+        # only `initializes` supplies that separate guarantee.
         ws = model["writes"]
         if not isinstance(ws, list) or not ws:
             _fail("`writes` must be a non-empty list of `*arg:N` tokens (the pointees "
@@ -278,10 +279,45 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
                 _fail(f"`writes` entry {t!r} must be a `*arg:N` token (a pointee the callee "
                       f"fills); a scalar `arg:N` is not written through -- fix the token or "
                       f"use {{}} to mark {name} benign")
-    # The three annotation roles: a falsy value (`{}`, `0`, `false`) declares
-    # nothing, yet passed as a role, counted as a model and replaced the
-    # builtin of the same name with nothing (round 3 P3) -- the residue of
-    # the empty-role rule above.
+    for key in ("initializes", "consumes", "write_bounds"):
+        if key not in model:
+            continue
+        rules = model[key]
+        if not isinstance(rules, list) or not rules or not all(isinstance(r, dict) for r in rules):
+            _fail(f"`{key}` must be a non-empty list of region objects")
+        consumed_args: set[int] = set()
+        for rule in rules:
+            allowed = {"arg", "kind", "len_arg"}
+            if key == "initializes":
+                allowed |= {"zero", "value_arg", "copy_arg"}
+            if set(rule) - allowed:
+                _fail(f"`{key}` has unknown region fields: {sorted(set(rule) - allowed)}")
+            if not _is_int(rule.get("arg")) or rule["arg"] < 0:
+                _fail(f"`{key}.arg` must be a non-negative argument index")
+            if key == "consumes":
+                if rule["arg"] in consumed_args:
+                    _fail(f"`consumes` declares argument {rule['arg']} more than once; "
+                          "each argument requires exactly one consumption contract")
+                consumed_args.add(rule["arg"])
+            kinds = ("bytes", "cstring", "bounded_cstring") if key == "consumes" else (
+                ("bytes",) if key == "write_bounds" else ("bytes", "cstring"))
+            if rule.get("kind") not in kinds:
+                _fail(f"`{key}.kind` must be one of {', '.join(kinds)}")
+            if rule["kind"] in ("bytes", "bounded_cstring") and "len_arg" not in rule:
+                _fail(f"`{key}` {rule['kind']} regions require `len_arg`")
+            for field in ("len_arg", "value_arg", "copy_arg"):
+                if field in rule and (not _is_int(rule[field]) or rule[field] < 0):
+                    _fail(f"`{key}.{field}` must be a non-negative argument index")
+            if "zero" in rule and rule["zero"] is not True:
+                _fail(f"`{key}.zero` must be true")
+            if sum(field in rule for field in ("zero", "value_arg", "copy_arg")) > 1:
+                _fail(f"`{key}` cannot combine `zero`, `value_arg` and `copy_arg`")
+            if rule["kind"] != "bytes" and any(f in rule for f in ("zero", "value_arg", "copy_arg")):
+                _fail(f"`{key}` fill/copy values apply only to byte regions")
+    if "return_alias" in model and (
+            not _is_int(model["return_alias"]) or model["return_alias"] < 0):
+        _fail("`return_alias` must be a non-negative argument index")
+    # Annotation roles must declare an actual contract, not an empty marker.
     if "return_bound" in model:
         rb = model["return_bound"]
         if not isinstance(rb, dict) or not _is_int(rb.get("max_from_arg")) or rb["max_from_arg"] < 0:
@@ -289,7 +325,7 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
                   "`max_from_arg` (the argument that bounds the return); an empty "
                   "`return_bound` declares nothing -- give it `max_from_arg` or use {} "
                   f"to mark {name} benign")
-    for flag in ("arity_capped", "destinations_unmodeled"):
+    for flag in ("arity_capped", "destinations_unmodeled", "preserves_cstring"):
         if flag in model and model[flag] is not True:
             _fail(f"`{flag}` must be `true` -- `{model[flag]!r}` declares nothing yet "
                   f"would count as an active model; drop the key or use {{}} to mark "

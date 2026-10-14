@@ -1,0 +1,11 @@
+{
+  "description": "Optimized loop-carried escape retains the opaque helper rather than certifying literal initialization. Analyze only.",
+  "lang": "c",
+  "cflags": ["-O1", "-fno-inline"],
+  "backward": [
+    {"function": "escape_loop", "sink": "arg:popen:0",
+     "leaves": [{"kind": "address_of_local_unresolved"}],
+     "leaf_details_contain": ["helper"],
+     "complete_slice": false}
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "description": "Exact Opus O0 direct-STORE and STRUCT-member boundaries: lossy terminator destination and wrong stash member remain incomplete; matching member PHI control stays complete. Analyze only.",
+  "lang": "c",
+  "cflags": ["-fno-inline", "-fno-builtin"],
+  "backward": [
+    {"function": "member_phi", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "member_phi_rev", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
+    {"function": "member_phi_ctl", "sink": "arg:popen:0", "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true},
+    {"function": "low_part_terminator", "sink": "arg:popen:0", "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false}
+  ]
+}
