@@ -3125,7 +3125,7 @@ def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
         return _render_fallback_text(value)
     function = _field_dict(value, "function")
     lines = [
-        f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}",
+        f"{_escape_control_chars(_shown_name(function, mangled=mangled) or '<unknown>')} @ {function.get('address', '<unknown>')}",
         f"prototype: {value.get('prototype', '<unknown>')}",
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
     ]
@@ -3730,6 +3730,9 @@ def _render_pointer_table_text(value: Any) -> str:
         f"pointer-size: {value.get('pointer_size', '<unknown>')}  stride: {value.get('stride', '<unknown>')}"
         f"  read-width: {value.get('read_width', value.get('pointer_size', '<unknown>'))}",
     ]
+    if value.get("decode") == "relative-int32":
+        lines[0] = f"relative-int32 table @ {value.get('address', '<unknown>')}"
+        lines.append(f"decode: signed int32 + base {value.get('base', '<unknown>')}")
     # Through the choke point, so a malformed `context` envelope discloses
     # instead of rendering the table byte-identically to one with no context.
     suffix = _context_suffix(_field_dict(value, "context"))
@@ -3747,7 +3750,10 @@ def _render_pointer_table_text(value: Any) -> str:
             lines.append(f"{prefix}  <unreadable>")
             continue
         plausibility = "" if item.get("plausible", True) else "  [implausible]"
-        lines.append(f"{prefix}  {item.get('value', '<unknown>')} -> "
+        raw = str(item.get("value", "<unknown>"))
+        if value.get("decode") == "relative-int32":
+            raw += f" (offset {item.get('offset', '<unknown>')})"
+        lines.append(f"{prefix}  {raw} -> "
                      f"{_render_target_line(_field_dict(item, 'target'))}{plausibility}")
     return "\n".join(lines)
 
@@ -4009,6 +4015,9 @@ def _render_orient_text(value: Any) -> str:
                 raw = s.get("value")
                 shown = raw if isinstance(raw, str) else ("" if raw is None else repr(raw))
                 lines.append(f"    {s.get('address', '?')}  {shown[:80]!r}")
+        total = ss.get("total")
+        if isinstance(total, int) and not isinstance(total, bool) and total > len(items):
+            lines.append(f"  more strings: bn evidence orient --strings-limit {total}")
     return "\n".join(lines)
 
 
@@ -6424,7 +6433,7 @@ def _build_mutation_summary(
         summary["kept_library_imports"] = list(kept_library_imports)
     if fallthrough_entries:
         # #997 item 2: a `function create` at an address the previous
-        # instruction runs straight into -- likely mid-function. Conditional
+        # instruction runs straight into -- may be mid-function. Conditional
         # like the keys above; the row's `note` carries the sentence.
         summary["fallthrough_entries"] = list(fallthrough_entries)
     if preview_skipped:
@@ -7004,9 +7013,9 @@ def _render_mutation_summary_text(value: Any) -> str:
                 f"{_text_value(m, 'name') or '<unnamed>'} @{_text_value(m, 'address') or '<unknown>'} "
                 f"({_text_value(m, 'reason') or 'unknown reason'})" for m in skipped)
     for entry in _row_list(value, "fallthrough_entries"):
-        line += (f"\nwarning: {_text_value(entry, 'address') or '<unknown>'} is reached by "
-                 f"fall-through from {_text_value(entry, 'fallthrough_from') or '<unknown>'}; "
-                 "likely mid-function, not an entry")
+        line += (f"\nwarning: {_text_value(entry, 'address') or '<unknown>'}: preceding word "
+                 f"decodes as a fall-through instruction at {_text_value(entry, 'fallthrough_from') or '<unknown>'}; "
+                 "may be mid-function")
     if _field_declared(value, "go_rename"):
         go = _field_dict(value, "go_rename")
         line += "\ngo rename: " + "  ".join(
