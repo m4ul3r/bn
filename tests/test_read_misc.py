@@ -205,7 +205,9 @@ def test_strings_with_xrefs_names_referencing_functions_968(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     log_fn = _FakeFunction(0x1100, "sub_1100")
-    init_fn = _FakeFunction(0x1000, "init_widget")
+    init_fn = _FakeFunction(0x1000, "_ZN6widget4initEv")
+    # #978: a C++ referencer carries its demangled display name beside the raw one.
+    init_fn.symbol = types.SimpleNamespace(short_name="widget::init")
     many = [_FakeFunction(0x3000 + i * 0x40, f"sub_{0x3000 + i * 0x40:x}") for i in range(10)]
     bv = _FakeBV(
         strings=[
@@ -227,8 +229,8 @@ def test_strings_with_xrefs_names_referencing_functions_968(monkeypatch):
     by_value = {row["value"]: row for row in rows}
 
     assert by_value["parse_config"]["xref_functions"] == [
-        {"address": "0x1000", "name": "init_widget"},
-        {"address": "0x1100", "name": "sub_1100"},
+        {"address": "0x1000", "name": "_ZN6widget4initEv", "display_name": "widget::init"},
+        {"address": "0x1100", "name": "sub_1100", "display_name": "sub_1100"},
     ]
     assert by_value["parse_config"]["code_ref_count"] == 3
     assert by_value["parse_config"]["xref_function_count"] == 2
@@ -261,7 +263,7 @@ def test_strings_with_xrefs_reports_unreadable_data_refs_as_unknown_987(monkeypa
     assert row["data_ref_count"] is None
     assert row["data_ref_note"] == "data refs could not be read: RuntimeError: data refs unavailable"
     # The code-ref half was measured and is still reported.
-    assert row["xref_functions"] == [{"address": "0x1000", "name": "main"}]
+    assert row["xref_functions"] == [{"address": "0x1000", "name": "main", "display_name": "main"}]
 
 
 

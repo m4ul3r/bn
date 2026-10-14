@@ -3478,6 +3478,104 @@ def test_function_list_carries_demangled_display_name(monkeypatch):
     assert item["display_name"] == "foo::bar::recv"
 
 
+def _cxx_function(start: int, mangled: str, demangled: str) -> _FakeFunction:
+    fn = _FakeFunction(start, mangled)
+    fn.symbol = _FakeSymbol("FunctionSymbol")
+    fn.symbol.short_name = demangled
+    return fn
+
+
+def test_function_search_matches_the_display_name_by_default_978(monkeypatch):
+    """#978: a short class-name query matched any function whose MANGLED name
+    happened to contain the letters. Default search matches the demangled
+    display name the text prints; `mangled` matches raw spellings instead, and
+    a default search reports what only a mangled spelling would have matched."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[
+        _cxx_function(0x401000, "_ZN4demo6Widget6handleEi", "demo::Widget::handle"),
+        _cxx_function(0x402000, "_ZN4demo5Gizmo3runEv", "demo::Gizmo::run"),
+        _FakeFunction(0x403000, "main"),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def names(result):
+        return [item["display_name"] for item in result["items"]]
+
+    shown = instance._search_functions(None, "Widget::handle")
+    assert names(shown) == ["demo::Widget::handle"]
+    assert "mangled_only_matches" not in shown
+    assert instance._search_functions(None, "Widget::handle", mangled=True)["items"] == []
+
+    # `6Widget` occurs only inside the mangled spelling.
+    raw_query = instance._search_functions(None, "6Widget")
+    assert raw_query["items"] == [] and raw_query["mangled_only_matches"] == 1
+    counted = instance._search_functions(None, "6Widget", count_only=True)
+    assert counted["count"] == 0 and counted["mangled_only_matches"] == 1
+    raw_hit = instance._search_functions(None, "6Widget", mangled=True)
+    assert [item["name"] for item in raw_hit["items"]] == ["_ZN4demo6Widget6handleEi"]
+    assert "mangled_only_matches" not in raw_hit
+
+    # An unmangled name is the same spelling either way.
+    for mangled in (False, True):
+        assert names(instance._search_functions(None, "main", mangled=mangled)) == ["main"]
+
+
+def _sort_population():
+    return [
+        _cxx_function(0x401000, "_Z10pump_queueiPc", "pump_queue"),
+        _cxx_function(0x402000, "_Z9copy_tailPcPKcim", "copy_tail"),
+        _FakeFunction(0x403000, "main"),
+    ]
+
+
+def test_sort_name_orders_by_the_name_the_text_shows_978(monkeypatch):
+    """#978 review: text shows display names, so `--sort name` sorting by the
+    mangled `fn.name` printed pump_queue before copy_tail. Sort by the display
+    name by default and by the raw name under `mangled`, on list and search."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=_sort_population())
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    for read in (lambda **k: instance._list_functions(None, **k),
+                 lambda **k: instance._search_functions(None, ".", regex=True, **k)):
+        shown = read(sort="name")["items"]
+        assert [item["name"] for item in shown] == [
+            "_Z9copy_tailPcPKcim", "main", "_Z10pump_queueiPc"]
+        raw = read(sort="name", mangled=True)["items"]
+        assert [item["name"] for item in raw] == [
+            "_Z10pump_queueiPc", "_Z9copy_tailPcPKcim", "main"]
+        assert [item["name"] for item in read(sort="name", reverse=True)["items"]] == [
+            "_Z10pump_queueiPc", "main", "_Z9copy_tailPcPKcim"]
+
+
+def test_implicit_callsite_scope_keeps_raw_names_across_overloads_978(monkeypatch):
+    """#986 review: with no --within the bridge fills `within_query` itself.
+    JSON keeps the RAW caller name there (#978's contract): three `ns::put`
+    overloads share one display name, which would merge three callers and
+    cannot be passed back as `--within`, while each raw name resolves to its
+    own function."""
+    bridge = _load_bridge(monkeypatch)
+    from bn_agent_bridge import read_listing
+    instance = bridge.BinaryNinjaBridge()
+    callers = [
+        _cxx_function(0x400a68, "_ZN2ns3putEPcPKci", "ns::put"),
+        _cxx_function(0x400aa0, "_ZN2ns3putEPci", "ns::put"),
+        _cxx_function(0x400acc, "_ZN2ns3putEPcl", "ns::put"),
+    ]
+    bv = _FakeBV(functions=callers)
+    bv.get_code_refs = lambda address: [types.SimpleNamespace(function=fn) for fn in callers]
+    scope = read_listing._all_caller_functions(bv, {0x400100})
+    queries = [query for query, _fn in scope]
+    assert queries == ["_ZN2ns3putEPcPKci", "_ZN2ns3putEPci", "_ZN2ns3putEPcl"]
+    for query, fn in scope:
+        [(_echo, resolved)] = instance.ctx._resolve_scope_functions(bv, [query])
+        assert resolved is fn
+    with pytest.raises(Exception, match="(?i)ambiguous"):
+        instance.ctx._resolve_scope_functions(bv, ["ns::put"])
+
+
 def test_backward_slice_constant_arg_reports_value_hint(monkeypatch):
     """A constant/immediate arg (e.g. read(fd, buf, 0x1fff)'s count) has no SSA
     definition to trace. Instead of a renderer-only "constant or immediate" line

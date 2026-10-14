@@ -655,9 +655,32 @@ def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
                             "format_arg_index": 1, "note": "..."},
     }], "total": 1, "has_more": False}
     out = _render_callsites_text(value)
-    assert "hlil: null (no_hlil_mapping)" in out
-    assert "variadic-callee: sscanf" in out
+    assert "hlil_statement: null (no_hlil_mapping)" in out
+    assert "callee_variadic: sscanf" in out
     assert "bn evidence function parse_line" in out
+
+
+def test_render_callsites_variadic_hint_runs_on_the_address_of_a_demangled_caller_978():
+    # #986 review: overloads share a demangled name (`ns::put` x3), so a hint
+    # naming the caller that way runs an ambiguous command. The text NAMES the
+    # caller by its shown name but the runnable commands take its address;
+    # under --mangled the raw name is unique and is used as-is.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [{
+        "callee": {"name": "__printf_chk", "address": "0x400700"},
+        "containing_function": {"name": "_ZN2ns3putEPci", "display_name": "ns::put",
+                                "address": "0x400aa0"},
+        "call_addr": "0x400ab0", "caller_static": "0x400ab4",
+        "call_instruction": {"address": "0x400ab0", "text": "bl __printf_chk"},
+        "previous_instructions": [], "next_instructions": [],
+        "callee_variadic": {"name": "printf_chk", "is_variadic": True},
+    }], "total": 1, "has_more": False}
+    out = _render_callsites_text(value)
+    assert "fixed args in ns::put;" in out
+    assert "`bn evidence function 0x400aa0`" in out
+    assert "`bn disasm 0x400aa0 --linear`" in out
+    raw = _render_callsites_text(value, mangled=True)
+    assert "`bn evidence function _ZN2ns3putEPci`" in raw
 
 
 def test_render_callsites_shows_missing_context_reason():
@@ -673,7 +696,7 @@ def test_render_callsites_shows_missing_context_reason():
         "previous_instructions": [], "next_instructions": [],
     }], "total": 1, "has_more": False}
     out = _render_callsites_text(value)
-    assert "call 0x4124a6 | caller_static 0x4124ab" in out
+    assert "call_addr 0x4124a6 | caller_static 0x4124ab" in out
     assert "> unavailable (no_structured_disasm_entry)" in out
     assert "<unknown>" not in out
 
@@ -701,7 +724,7 @@ def test_render_callsites_flags_an_incomplete_caller_scan():
         "callers_scanned": 1, "caller_total": None, "caller_scan_note": note,
     }
     out = _render_callsites_text(value)
-    assert "call 0x4124a6 | caller_static 0x4124ab" in out
+    assert "call_addr 0x4124a6 | caller_static 0x4124ab" in out
     assert "note: the caller scan was incomplete" in out
     assert note in out
 
@@ -4090,9 +4113,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # M-12 adds the strings `noise_strings` count read.
     # #968 adds the `strings --with-xrefs` row's `xref_function_count` and
     # `data_ref_count`; #969 the imports listing's `library_unattributed`.
-    assert len(sites) == 58, (
+    # #978 adds the `function search` mangled-only match count.
+    assert len(sites) == 59, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 58. A "
+        "count helper, not 59. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4156,6 +4180,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "renderer]",
         "_duplicate_starts_note(duplicate_starts_unresolved) [not a payload "
         "renderer]",
+        # #978: the `function search` mangled-only line is a fragment helper the
+        # list and `--count` renderers both append, like the line above.
+        "_mangled_only_note(mangled_only_matches) [not a payload renderer]",
         "_operation_row_text(count) [not a payload renderer]",
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",
@@ -9488,6 +9515,22 @@ def test_unreadable_data_refs_render_as_unknown_not_zero_987():
     }])
     assert out.endswith("[xrefs: main; data refs unknown (data refs could not be read: "
                         "RuntimeError: boom)]"), out
+
+
+def test_strings_with_xrefs_names_functions_by_display_name_978():
+    # Merge of #987 into #986: the `--with-xrefs` tail names referencing
+    # functions the way every other text surface does -- demangled -- while
+    # JSON keeps the raw `name` beside `display_name`.
+    from bn.formatters import _render_strings_rows
+
+    out = _render_strings_rows([{
+        "address": "0x2000", "length": 5, "chars": 5, "type": "ascii", "value": "hello",
+        "code_ref_count": 1, "data_ref_count": 0, "xref_function_count": 1,
+        "xref_functions": [{"address": "0x1000", "name": "_ZN6widget4initEv",
+                            "display_name": "widget::init"}],
+    }])
+    assert out.endswith("[xrefs: widget::init]"), out
+
 
 
 def test_dynamic_section_notes_reach_every_text_face_987():

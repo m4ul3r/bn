@@ -4946,6 +4946,8 @@ def _bind_list_functions(bridge, params, target):
         # only, matching `target info`'s buckets.
         named=(_validate_bool(params.get("named"), label="named", default=False)
                if params.get("named") is not None else None),
+        # #978: `--sort name` orders by the raw name instead of the display name.
+        mangled=_validate_bool(params.get("mangled"), label="mangled", default=False),
     )
 
 
@@ -4965,6 +4967,8 @@ def _bind_search_functions(bridge, params, target):
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
         sort=str(params.get("sort", "address")),
         reverse=_validate_bool(params.get("reverse"), label="reverse", default=False),
+        # #978: match raw (mangled) spellings instead of the demangled display name.
+        mangled=_validate_bool(params.get("mangled"), label="mangled", default=False),
     )
 
 

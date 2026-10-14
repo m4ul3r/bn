@@ -71,6 +71,19 @@ def _display_name(func) -> str:
     return str(getattr(func, "name", ""))
 
 
+def _function_identity(func) -> dict[str, str]:
+    """``{name, display_name, address}`` for a function a row points AT (an xref's
+    caller, a callsite's container or callee, a comment's owner). ``name`` stays
+    the raw ``fn.name`` (mangled for C++) and ``display_name`` is
+    :func:`_display_name`, so every text renderer can show one demangled spelling
+    while JSON keeps both (#978)."""
+    return {
+        "name": str(func.name),
+        "display_name": _display_name(func),
+        "address": hex(int(func.start)),
+    }
+
+
 def _unimplemented_instructions(func, *, cap: int = 64) -> dict[str, Any]:
     """Aggregate signal for instructions Binary Ninja's lifter could not model.
 

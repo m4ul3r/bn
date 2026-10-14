@@ -224,6 +224,10 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
     }
     callee_address = int(callee.start)
+    # #978: both ends carry the raw name AND the demangled display name, read
+    # once per function rather than per call row.
+    callee_identity = il_format._function_identity(callee)
+    container_identity = il_format._function_identity(func)
     # An exported function's intra-lib callers reach it through a same-name PLT
     # stub; treat a call to the stub as a call to the callee so `callsites
     # --within` sees through it (#286), mirroring the xrefs union.
@@ -300,14 +304,8 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         hlil_statement, hlil_reason = il_format._hlil_statement_localization(insn)
         rows.append(
             {
-                "callee": {
-                    "name": str(callee.name),
-                    "address": hex(callee_address),
-                },
-                "containing_function": {
-                    "name": str(func.name),
-                    "address": hex(int(func.start)),
-                },
+                "callee": dict(callee_identity),
+                "containing_function": dict(container_identity),
                 "call_addr": hex(call_addr),
                 "call_kind": call_kind,
                 "instruction_length": instruction_length,
@@ -368,6 +366,10 @@ def _all_caller_functions(
                 start = int(getattr(function, "start", -1))
                 if start >= 0:
                     callers.setdefault(start, function)
+    # With no --within there is no user query to echo, so each row's
+    # `within_query` holds its caller's raw name: unique even across overloads,
+    # so it can be passed back to `--within`. The CLI text leaves the line out in
+    # this case (#978/#979 review); the display name rides `containing_function`.
     return [
         (str(getattr(function, "name", "") or hex(start)), function)
         for start, function in sorted(callers.items())
@@ -1316,7 +1318,7 @@ def _disclose_collapsed_starts(result: dict[str, Any], collapsed: int,
     return result
 
 
-def _function_population_key(fn, sort: str, sizes: dict[int, Any]) -> Any:
+def _function_population_key(fn, sort: str, sizes: dict[int, Any], name: str = "") -> Any:
     """The order key for *sort* read off the LIVE Function (#814) -- the same
     keys ``--sort`` used on a materialized row before it (``size`` or 0 for
     ``size``, the lowercased name for ``name``, the address otherwise).
@@ -1327,7 +1329,8 @@ def _function_population_key(fn, sort: str, sizes: dict[int, Any]) -> Any:
     tie-break included. ``size`` is the one key that costs a per-function read
     (``il_format._function_size``: ``total_bytes`` or a basic-block walk); it is
     recorded in *sizes* so the page rows reuse it instead of paying twice, the
-    way the full build handed each row its size. ``address``/``name`` read a
+    way the full build handed each row its size. ``name`` is the spelling the
+    caller sorts by -- the one its text shows (#978) -- and ``address`` reads a
     field the filter pass already touched.
     """
     if sort == "size":
@@ -1335,7 +1338,7 @@ def _function_population_key(fn, sort: str, sizes: dict[int, Any]) -> Any:
         sizes[id(fn)] = size
         return size or 0
     if sort == "name":
-        return str(getattr(fn, "name", "")).lower()
+        return name.lower()
     return int(fn.start)
 
 
@@ -1344,6 +1347,9 @@ def _order_function_population(
     sort: str,
     reverse: bool = False,
     function_of=None,
+    *,
+    mangled: bool = False,
+    name_of=None,
 ) -> dict[int, Any]:
     """Order address, size, or name ascending unless ``reverse`` is set.
 
@@ -1352,7 +1358,12 @@ def _order_function_population(
     had to read (``{id(fn): size}``; empty unless *sort* is ``size``). #814:
     ordering the population instead of the rows is what lets the row build, the
     display projection and the xref enrichment happen for the returned page
-    only."""
+    only.
+
+    ``--sort name`` orders by the name the text SHOWS (#978): the demangled
+    display name by default, the raw ``fn.name`` under ``mangled``. *name_of*
+    supplies an already-computed display name per item (search keeps one per
+    match), so only ``function list --sort name`` pays a symbol read for it."""
     if sort not in _FUNCTION_SORTS:
         raise OperationFailure(
             "invalid_request",
@@ -1364,8 +1375,16 @@ def _order_function_population(
         # address order, tie-break included -- so this is not a skip.
         return sizes
     get_fn = function_of or (lambda item: item)
+
+    def name(item) -> str:
+        if sort != "name":
+            return ""
+        if mangled:
+            return str(getattr(get_fn(item), "name", ""))
+        return name_of(item) if name_of else il_format._display_name(get_fn(item))
+
     population.sort(
-        key=lambda item: _function_population_key(get_fn(item), sort, sizes),
+        key=lambda item: _function_population_key(get_fn(item), sort, sizes, name(item)),
         reverse=reverse,
     )
     return sizes
@@ -1420,6 +1439,7 @@ def _list_functions(
     sort: str = "address",
     reverse: bool = False,
     named: bool | None = None,
+    mangled: bool = False,
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -1464,7 +1484,7 @@ def _list_functions(
     # --limit 100` over a 50k-function target no longer materializes (and sorts)
     # 50k rows to hand back 100. `_fn` carries the live Function to the page
     # projection, then drops.
-    sizes = _order_function_population(functions, sort, reverse)
+    sizes = _order_function_population(functions, sort, reverse, mangled=mangled)
     start, stop = read_misc._page_window(len(functions), offset=offset, limit=limit)
     # Per-row labels for the collided records, built once for the page. Empty
     # dict on a clean view, so this costs nothing where nothing collided.
@@ -1582,6 +1602,7 @@ def _search_functions(
     count_only: bool = False,
     sort: str = "address",
     reverse: bool = False,
+    mangled: bool = False,
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -1640,19 +1661,27 @@ def _search_functions(
         list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
     )
     matched: list[tuple[Any, str]] = []
+    # Functions only a raw (mangled) spelling matched: not results by default,
+    # but counted so an empty or short answer can say `--mangled` finds more.
+    mangled_only: list[Any] = []
     for fn in population:
-        # Match across name forms (mangled fn.name, demangled display_name, raw)
-        # so a demangled C++ query finds a function BN named with the mangled
-        # symbol -- the same greppability `--demangle` gives the listing (#196).
+        # #978: match the spelling the text face SHOWS -- the demangled display
+        # name -- by default, so a short class-name query no longer hits every
+        # function whose MANGLED name happens to contain the letters. `mangled`
+        # matches the raw spellings (fn.name / raw_name) instead, for a query
+        # copied from a mangled symbol.
         display = il_format._display_name(fn)
-        raw = str(getattr(fn, "raw_name", fn.name))
-        if any(matches(str(form)) for form in (fn.name, display, raw) if form):
+        raw_forms = tuple(
+            form for form in (str(fn.name), str(getattr(fn, "raw_name", fn.name))) if form)
+        if any(matches(form) for form in (raw_forms if mangled else (display,)) if form):
             # #814: retain the live Function plus the display name this match
             # already computed -- NOT a row. The row (and the size/block/label
             # projections behind it) is built for the returned page only, so a
             # `function search --limit 20` over a 50k-function target no longer
             # sizes and materializes every match.
             matched.append((fn, display))
+        elif not mangled and any(matches(form) for form in raw_forms if form != display):
+            mangled_only.append(fn)
     if min_size is not None:
         # #446: drop tiny PLT/GOT thunk veneers so a `function search RFCOMM...`
         # doesn't return each export twice (16-byte veneer + real body). size IS
@@ -1662,6 +1691,9 @@ def _search_functions(
             (fn, display) for fn, display in matched
             if (il_format._function_size(fn) or 0) >= min_size
         ]
+        mangled_only = [fn for fn in mangled_only
+                        if (il_format._function_size(fn) or 0) >= min_size]
+    hint = {"mangled_only_matches": len(mangled_only)} if mangled_only else {}
     # After `--min-size`, for the same reason `_list_functions` recounts there.
     collapsed_starts, unresolved_starts = collapse.counts([fn for fn, _ in matched])
     if count_only:
@@ -1669,9 +1701,10 @@ def _search_functions(
         # key, `count` kept for back-compat (#252). (`_fn` is never serialized
         # here -- only the returned page is enriched/cleaned below.)
         result = {"kind": "functions", "count": len(matched), "total": len(matched),
-                  **_analysis_state_fields(bv)}
+                  **hint, **_analysis_state_fields(bv)}
         return _disclose_collapsed_starts(result, collapsed_starts, unresolved_starts)
-    sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0])
+    sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0],
+                                       mangled=mangled, name_of=lambda pair: pair[1])
     start, stop = read_misc._page_window(len(matched), offset=offset, limit=limit)
     # Same per-row labels as `function list`: one record of a collided start
     # must not read differently depending on which command returned it.
@@ -1688,5 +1721,6 @@ def _search_functions(
     result = read_misc._paged_envelope(
         kind="functions", items=items, total=len(matched), offset=offset, limit=limit,
     )
+    result.update(hint)
     result.update(_analysis_state_fields(bv))
     return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts, unresolved_starts))
