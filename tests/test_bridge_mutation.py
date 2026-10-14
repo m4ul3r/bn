@@ -559,7 +559,8 @@ def test_a_rename_landing_on_a_symbol_already_renamed_fails_the_batch_995(
     assert row["status"] == "invalid_request"
     assert row["requested"]["conflicting_op_indices"] == [first, failed_index]
     assert f"renames the symbol at {hex(landed[first][0])} again" in row["message"]
-    assert f"Rename it once, to {landed[failed_index][2]}" in row["message"]
+    assert (f"Rename the symbol at {hex(landed[first][0])} once, by that address, to "
+            f"{landed[failed_index][2]}") in row["message"]
     assert result["rolled_back"] is True and result["success"] is False
     assert all(r["status"] == "reverted" for r in result["results"][:failed_index])
     assert _has_event(bv, "revert")
@@ -4021,39 +4022,49 @@ def test_preview_misspelled_prototype_field_gets_the_field_hint_999(monkeypatch)
     assert not _has_event(bv, "begin")
 
 
-def test_preview_reports_an_unresolvable_prototype_beside_a_rename_999(monkeypatch):
-    """#999 review round 2: beside a rename the target is never PROVEN, but one
-    that does not resolve now and that no rename in the batch could name still
-    fails the live apply -- so the preview fails on it too."""
+@pytest.mark.parametrize("later", [
+    {"op": "rename_symbol", "identifier": "other", "new_name": "nosuchfn"},
+    {"op": "function_create", "address": "0x401300"},
+])
+def test_preview_fails_an_unresolvable_prototype_no_earlier_op_can_supply_999(
+        monkeypatch, later):
+    """#999 review rounds 2-3: an op AFTER the prototype cannot supply its target
+    -- even a rename to exactly that name -- so the miss fails the preview the
+    way it fails the live apply."""
     bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
 
     with pytest.raises(bridge.OperationFailure) as exc:
         instance._mutation("active", True, [
             {"op": "set_prototype", "identifier": "nosuchfn", "prototype": "int f(void)"},
-            {"op": "rename_symbol", "identifier": "other", "new_name": "other2"},
+            later,
         ])
 
     assert exc.value.message == "Function not found: nosuchfn"
     assert applied == []
 
 
-@pytest.mark.parametrize("supplier", [
-    {"op": "rename_symbol", "identifier": "other", "new_name": "NewFn"},   # case-folded
-    {"op": "rename_symbol", "identifier": "other", "new_name": "_ZN2ns5newfnEv"},  # mangled
+@pytest.mark.parametrize("earlier", [
+    {"op": "rename_symbol", "identifier": "other", "new_name": "unrelated"},
+    {"op": "function_create", "address": "0x401300"},
 ])
-def test_preview_skips_a_prototype_target_a_rename_may_supply_999(monkeypatch, supplier):
-    """The miss is only reported when no rename could make the name resolve; a
-    rename to it (in any case, or to a mangled name that may demangle to it) can,
-    so that prototype is skipped as unprovable instead."""
+def test_preview_leaves_out_an_unresolvable_prototype_after_a_resolution_op_999(
+        monkeypatch, earlier):
+    """#999 review round 3: whether an earlier op supplies the target is not
+    predicted (a follow-up). The prototype is left out with a reason that says
+    its target was NOT checked -- never reported as checked."""
     bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
 
     result = instance._mutation("active", True, [
+        earlier,
         {"op": "set_prototype", "identifier": "newfn", "prototype": "int f(void)"},
-        supplier,
     ])
 
-    assert [row["index"] for row in result["preview_skipped"]] == [0]
-    assert applied == [supplier]
+    (skip,) = result["preview_skipped"]
+    assert skip["index"] == 1
+    assert "does not resolve yet (Function not found: newfn)" in skip["reason"]
+    assert "only checked when the batch is applied" in skip["reason"]
+    assert result["results"][1]["status"] == "not_previewed"
+    assert applied == [earlier]
 
 
 @pytest.mark.parametrize("bn_column,typed_column", [
@@ -4081,6 +4092,25 @@ def test_a_prototype_parse_error_quotes_what_was_typed_999(monkeypatch, bn_colum
     assert exc.value.message.startswith(f"could not parse prototype {typed!r}")
     assert "`ns::Cls::run`" not in exc.value.message
     assert f"string.hpp:1:{typed_column} " in exc.value.message
+
+
+def test_a_parse_error_column_on_the_name_line_is_translated_999(monkeypatch):
+    """A prototype split over lines: only the name's own line moved."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def reject(text):
+        raise SyntaxError("error: string.hpp:2:19 expected ')' "
+                          "error: string.hpp:1:3 note")
+
+    monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
+    typed = "int\n ns::Cls::ref(int i"
+    with pytest.raises(bridge.OperationFailure) as exc:
+        bridge.mutation_engine._parse_prototype(
+            instance.ctx, bv, {"op": "set_prototype", "prototype": typed})
+    assert "string.hpp:2:17 " in exc.value.message
+    assert "string.hpp:1:3 " in exc.value.message
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -4331,7 +4361,10 @@ def test_preview_never_applies_a_prototype_beside_a_rename(monkeypatch, function
     proto_index = next(i for i, op in enumerate(ops) if op["op"] == "set_prototype")
     row = result["results"][proto_index]
     assert row["status"] == "not_previewed"
-    assert "rename_symbol" in row["message"]
+    # Either reason is honest: the rename is named, or the target was not
+    # checked because an earlier op may create it -- never "checked".
+    assert ("rename_symbol" in row["message"]
+            or "only checked when the batch is applied" in row["message"]), row["message"]
     assert [item["index"] for item in result["preview_skipped"]] == [proto_index]
     assert {fn.start: (fn.name, fn.has_user_type, str(fn.type)) for fn in fns} == before
     others = [r["status"] for i, r in enumerate(result["results"]) if i != proto_index]

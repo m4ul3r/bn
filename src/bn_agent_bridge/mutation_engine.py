@@ -1109,32 +1109,6 @@ def _resolve_prototype_target(ctx, bv, op: dict[str, Any]):
 _PROTOTYPE_DEPENDENT_OPS = frozenset({"local_rename", "local_retype"})
 
 
-def _batch_could_supply_function(identifier: Any, operations) -> bool:
-    """Whether some op in the batch could make *identifier* resolve to a function
-    when it does not resolve in the view the batch starts from.
-
-    Answered on the safe side, never by simulating the resolver: a function
-    create or an op off the resolution-safe whitelist could supply anything; an
-    address is supplied only by those (a rename never creates a function); a name
-    by any rename whose new name contains it, ignoring case (the resolver also
-    folds case and matches demangled spellings, which a mangled new name may
-    carry). Only a "no" is used, to fail a preview the live apply would fail."""
-    for op in operations:
-        kind = op.get("op") if isinstance(op, dict) else None
-        if kind not in _RESOLUTION_SAFE_OPS and kind != "rename_symbol":
-            return True
-    try:
-        _parse_address(identifier)
-    except (ValueError, TypeError):
-        wanted = str(identifier).casefold()
-        return any(
-            isinstance(op, dict) and op.get("op") == "rename_symbol"
-            and (wanted in str(op.get("new_name", "")).casefold()
-                 or str(op.get("new_name", "")).startswith(("_Z", "?")))
-            for op in operations)
-    return False
-
-
 def _unpreviewable_operations(ctx, bv, operations) -> dict[int, str]:
     """``{index: reason}`` for the ops a ``--preview`` must leave out (#999 item 5).
 
@@ -1154,8 +1128,10 @@ def _unpreviewable_operations(ctx, bv, operations) -> dict[int, str]:
                  else f"the operation {offending_op!r}, which may change how a symbol resolves")
         # The target cannot be PROVEN here, but two failures the live apply would
         # hit can still be shown (#999 review): a prototype string that does not
-        # parse, and a target that does not resolve now when nothing in the batch
-        # could make it resolve (`_batch_could_supply_function`).
+        # parse, and a target that does not resolve when no EARLIER op could
+        # change name resolution. When one could, whether it supplies the target
+        # is not predicted (that prediction is a follow-up): the op is left out
+        # and says plainly that its target was not checked.
         check_parse = not _declares_types(operations)
         for index, op in enumerate(operations):
             if isinstance(op, dict) and op.get("op") == "set_prototype":
@@ -1164,13 +1140,14 @@ def _unpreviewable_operations(ctx, bv, operations) -> dict[int, str]:
                 try:
                     _resolve_prototype_target(ctx, bv, op)
                 except OperationFailure as exc:
-                    # Only a plain miss: an ambiguous name may be made unique by a
-                    # rename that moves one of its holders away.
-                    missed = exc.message.startswith(("Function not found: ",
-                                                     "No function found at address "))
-                    if missed and not _batch_could_supply_function(op.get("identifier"),
-                                                                   operations):
+                    if _resolution_affecting_op(operations[:index]) is None:
                         raise
+                    skipped[index] = (
+                        "not previewed: its target does not resolve yet "
+                        f"({exc.message.splitlines()[0] if exc.message else 'not found'}); "
+                        "an earlier operation in this batch may create or rename it, so "
+                        "it is only checked when the batch is applied")
+                    continue
                 skipped[index] = (
                     f"not previewed: this batch also carries {cause}, so the function "
                     "this prototype lands on cannot be proven from the pre-mutation view, "
@@ -2502,8 +2479,9 @@ def _refuse_rename_chain(row: dict[str, Any], results: list[dict[str, Any]],
             f"{(row.get('requested') or {}).get('identifier')!r} resolved to that same "
             f"symbol, so it would be renamed again to {row.get('new_name')}. Every op is "
             f"verified against the batch's END state, so operation {first} could never "
-            f"verify. Rename it once, to {row.get('new_name')}, or split the renames "
-            f"across two batches.",
+            f"verify. Rename the symbol at {row['address']} once, by that address, to "
+            f"{row.get('new_name')} (by name it may be ambiguous mid-batch), or split "
+            f"the renames across two batches.",
             requested={
                 **(row.get("requested") or {}),
                 "conflicting_op_indices": [first, index],
@@ -3585,8 +3563,10 @@ def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: s
         if column_of is not None:
             # BN's `file:line:col` positions count the parsed text; translate
             # them to the text the error quotes.
-            detail = re.sub(r"(\S+:1:)(\d+)",
-                            lambda m: f"{m.group(1)}{column_of(int(m.group(2)))}", detail)
+            detail = re.sub(r"(\S+?:)(\d+):(\d+)",
+                            lambda m: (f"{m.group(1)}{m.group(2)}:"
+                                       f"{column_of(int(m.group(2)), int(m.group(3)))}"),
+                            detail)
         raise OperationFailure(
             "invalid_request",
             f"could not parse {label} {shown if shown is not None else str(type_text)!r}"
@@ -3665,11 +3645,18 @@ def _parse_prototype(ctx, bv, op: dict[str, Any]):
     column_of = None
     if span is not None:
         start, end = span
+        # The name never spans a newline, so both backticks land on its line;
+        # positions are taken relative to that line's start.
+        name_line = typed.count("\n", 0, start) + 1
+        line_start = typed.rfind("\n", 0, start) + 1
+        start, end = start - line_start, end - line_start
 
-        def column_of(column: int) -> int:
+        def column_of(line: int, column: int) -> int:
             # The rewrite adds one backtick before index `start` and one after
-            # index `end - 1` of the typed text.
+            # index `end - 1` of the name's line; other lines are unchanged.
             position = column - 1
+            if line != name_line:
+                return column
             if position > end + 1:
                 position -= 2
             elif position > start:
