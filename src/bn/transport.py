@@ -125,10 +125,12 @@ def _report_write_gate_wait(instance: BridgeInstance, request_id: str, op: str) 
         return
     holder = status.get("holder")
     if isinstance(holder, dict) and isinstance(holder.get("op"), str):
-        what = f"the running {holder['op']}"
+        # A read can wait on a writer that is only queued (writer priority).
+        queued = holder.get("queued") is True
+        what = f"the {'queued' if queued else 'running'} {holder['op']}"
         elapsed = holder.get("elapsed_seconds")
         if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
-            what += f" (started {elapsed:g}s ago)"
+            what += f" ({'queued' if queued else 'started'} {elapsed:g}s ago)"
     else:
         what = "another write operation"
     print(
@@ -1753,10 +1755,10 @@ class _SignalUnwind:
 
     Signals still at SIG_DFL are taken over, and so is a leftover of an earlier
     spawn's own handler (below); a host that installed its own handler (or a
-    `nohup` SIG_IGN) keeps it. Only on the main thread, the one place Python
-    lets a handler be installed. The handlers go in before
-    the child is started and only RECORD a signal until `arm()`, the first
-    statement after Popen inside the owner's try (it raises at once for a
+    `nohup` SIG_IGN) keeps it. Off the main thread nothing is taken over, since
+    Python lets only the main thread install a handler. The handlers go
+    in before the child is started and only RECORD a signal until `arm()`, the
+    first statement after Popen inside the owner's try (it raises at once for a
     signal recorded meanwhile); from `defer()`, where the reap begins, they
     record again, so a signal cannot cut the reap short. The first one caught
     is the one re-delivered.

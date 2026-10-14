@@ -1630,7 +1630,15 @@ def _scripted_bridge_sockets(monkeypatch, instance, answer):
     return sent
 
 
-def test_request_queued_on_write_gate_prints_waiting_notice(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("holder, expected", [
+    ({"op": "refresh", "elapsed_seconds": 12.0},
+     "py_exec is waiting for the running refresh (started 12s ago) to finish"),
+    # #992: a read can wait on a writer that is only queued (writer priority).
+    ({"op": "close_binary", "elapsed_seconds": 3.0, "queued": True},
+     "py_exec is waiting for the queued close_binary (queued 3s ago) to finish"),
+])
+def test_request_queued_on_write_gate_prints_waiting_notice(
+        tmp_path, monkeypatch, capsys, holder, expected):
     """#976: a write that sits behind a refresh said nothing for minutes. After a
     quiet interval the CLI asks the bridge, on a side connection, whether THIS
     request is queued on the write gate, and says so on stderr -- while the
@@ -1645,7 +1653,7 @@ def test_request_queued_on_write_gate_prints_waiting_notice(tmp_path, monkeypatc
     def answer(request):
         if request["op"] == "write_gate_status":
             result = {"kind": "write_gate_status", "request_id": request["params"]["request_id"],
-                      "waiting": True, "holder": {"op": "refresh", "elapsed_seconds": 12.0}}
+                      "waiting": True, "holder": holder}
             status_answered.set()
             return result
         # The queued write: answers only after the notice went out.
@@ -1662,7 +1670,7 @@ def test_request_queued_on_write_gate_prints_waiting_notice(tmp_path, monkeypatc
     assert sent[1]["params"] == {"request_id": sent[0]["id"]}
     assert sent[1].get("idle_probe") is True  # the question never asks itself
     err = capsys.readouterr().err
-    assert "py_exec is waiting for the running refresh (started 12s ago) to finish" in err
+    assert expected in err
     assert "BN_NO_WAIT=1" in err
 
 

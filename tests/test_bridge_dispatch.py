@@ -357,6 +357,130 @@ def test_no_wait_read_still_answers_during_a_gate_only_refresh(monkeypatch):
     assert response["ok"] is True, response
 
 
+def test_no_wait_refresh_that_ran_is_not_refused_at_its_reply(monkeypatch):
+    """#992 review round 2: refresh builds its reply under a read lock AFTER its
+    analysis. With a writer queued for the views at that moment, a `no_wait`
+    refresh answered `busy: ... refused instead of queued` although the
+    analysis had run and its flags were cleared. A request that already did
+    its work waits for the reply read instead."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    analyzed: list[bool] = []
+    bv.update_analysis_and_wait = lambda: analyzed.append(True)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_target_info", lambda selector: {"selector": "sample"})
+    writer_done = threading.Event()
+
+    def queued_load():
+        with bridge._gate_request_context("load_binary", "load-1", False), \
+                instance._target_lock.write():
+            time.sleep(0.05)
+        writer_done.set()
+
+    def count_inside_exclusive_phase(view):
+        # Runs while refresh holds the views exclusively: queue a writer so it
+        # is waiting the moment refresh moves on to its reply read.
+        threading.Thread(target=queued_load, daemon=True).start()
+        deadline = time.monotonic() + 5.0
+        while not instance._target_lock._queued_writers:
+            assert time.monotonic() < deadline, "the load never queued"
+            time.sleep(0.005)
+        return 1
+
+    monkeypatch.setattr(bridge, "_view_function_count", count_inside_exclusive_phase)
+
+    response = instance.dispatch(
+        {"op": "refresh", "params": {}, "target": "active", "id": "refresh-1", "no_wait": True})
+
+    assert response["ok"] is True, response
+    assert response["result"] == {"refreshed": True, "target": {"selector": "sample"}}
+    assert analyzed == [True]
+    assert writer_done.wait(5.0)
+
+
+def test_no_wait_read_names_a_writer_that_is_only_queued(monkeypatch):
+    """#992 review round 2: writer priority makes a new read wait while a
+    writer is merely QUEUED behind other readers; the refusal and the status
+    named nothing (`another write in progress`, holder None)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    lock = instance._target_lock
+    release_read = threading.Event()
+    reading = threading.Event()
+
+    def long_read():
+        with lock.read():
+            reading.set()
+            release_read.wait(10)
+
+    def queued_close():
+        with bridge._gate_request_context("close_binary", "close-1", False), lock.write():
+            pass
+
+    reader = threading.Thread(target=long_read, daemon=True)
+    writer = threading.Thread(target=queued_close, daemon=True)
+    try:
+        reader.start()
+        assert reading.wait(5.0)
+        writer.start()
+        deadline = time.monotonic() + 5.0
+        while not lock._queued_writers:
+            assert time.monotonic() < deadline, "the close never queued"
+            time.sleep(0.005)
+
+        refused = instance.dispatch(
+            {"op": "list_targets", "params": {}, "id": "read-0", "no_wait": True})
+        assert refused["ok"] is False
+        assert refused["error"].startswith("busy: close_binary queued for the open views (waiting ")
+        holder = lock.read_status("read-0")["holder"]
+        assert holder["op"] == "close_binary" and holder["queued"] is True
+    finally:
+        release_read.set()
+        reader.join(5.0)
+        writer.join(5.0)
+
+
+def test_exclusive_holder_is_cleared_on_release(monkeypatch):
+    """#992 review round 2: a holder left behind after release would name a
+    finished write in every later refusal and waiting notice."""
+    bridge = _load_bridge(monkeypatch)
+    lock = bridge.BinaryNinjaBridge()._target_lock
+    with bridge._gate_request_context("batch_apply", "w-1", False), lock.write():
+        assert lock.read_status("r-1")["holder"]["op"] == "batch_apply"
+    assert lock.read_status("r-1") == {"waiting": False, "holder": None}
+
+
+def test_detached_load_names_itself_as_the_holder(monkeypatch, tmp_path):
+    """#992 review round 2: the detached `load_binary_async` worker runs outside
+    any request, so a read refused behind its exclusive load said only
+    `another write in progress`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    sample = tmp_path / "sample"
+    sample.write_bytes(b"\x7fELF")
+    loading = threading.Event()
+    release = threading.Event()
+
+    def load(path, **kwargs):
+        with instance._target_lock.write():
+            loading.set()
+            release.wait(10)
+        return {"targets": []}
+
+    monkeypatch.setattr(instance, "_load_binary", load)
+    try:
+        instance._load_binary_async(str(sample))
+        assert loading.wait(5.0)
+        refused = instance.dispatch(
+            {"op": "list_targets", "params": {}, "id": "read-0", "no_wait": True})
+    finally:
+        release.set()
+        for thread in list(instance._load_job_threads.values()):
+            thread.join(5.0)
+    assert refused["ok"] is False
+    assert refused["error"].startswith("busy: load_binary_async in progress (started ")
+
 
 def test_mutation_reanalysis_runs_under_gate_not_exclusive_lock(monkeypatch):
     """#628: a mutation op is @op lock="none" and self-manages locking -- the write
@@ -1058,6 +1182,23 @@ def test_cancel_reaches_a_request_the_retired_gui_bridge_admitted(monkeypatch):
     assert foreign["ok"] is False
     assert "bridge identity mismatch" in foreign["error"]
 
+    # Routed by the identity it arrived with (round 2): a request id active on
+    # BOTH bridges is marked only on the one that identity names, and the
+    # successor's own identity no longer reaches a predecessor's request.
+    old._begin_request("req-shared")
+    new._begin_request("req-shared")
+    assert _cancel_through_handler(
+        bridge, new, "req-shared", old.bridge_identity)["result"]["cancelled"] is True
+    assert old._is_request_cancelled("req-shared") is True
+    assert new._is_request_cancelled("req-shared") is False
+    old._begin_request("req-old-2")
+    assert _cancel_through_handler(
+        bridge, new, "req-old-2", new.bridge_identity)["result"]["cancelled"] is False
+    assert old._is_request_cancelled("req-old-2") is False
+    for request_id in ("req-shared", "req-old-2"):
+        old._end_request(request_id)
+    new._end_request("req-shared")
+
     # The successor does not keep its predecessor alive once nothing it
     # admitted is running: a retired manager pins its views (#586).
     old._end_request("req-old")
@@ -1220,9 +1361,9 @@ def test_read_write_lock_waiting_writer_blocks_new_readers(monkeypatch):
     t_writer.start()
     # Wait until the writer is actually queued behind the active reader.
     deadline = time.monotonic() + 2
-    while lock._writers_waiting == 0 and time.monotonic() < deadline:
+    while not lock._queued_writers and time.monotonic() < deadline:
         time.sleep(0.005)
-    assert lock._writers_waiting == 1
+    assert len(lock._queued_writers) == 1
 
     t_second = threading.Thread(target=second_reader)
     t_second.start()
