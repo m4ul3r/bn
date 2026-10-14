@@ -660,6 +660,29 @@ def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
     assert "bn evidence function parse_line" in out
 
 
+def test_render_callsites_variadic_hint_runs_on_the_address_of_a_demangled_caller_978():
+    # #986 review: overloads share a demangled name (`ns::put` x3), so a hint
+    # naming the caller that way runs an ambiguous command. The text NAMES the
+    # caller by its shown name but the runnable commands take its address;
+    # under --mangled the raw name is unique and is used as-is.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [{
+        "callee": {"name": "__printf_chk", "address": "0x400700"},
+        "containing_function": {"name": "_ZN2ns3putEPci", "display_name": "ns::put",
+                                "address": "0x400aa0"},
+        "call_addr": "0x400ab0", "caller_static": "0x400ab4",
+        "call_instruction": {"address": "0x400ab0", "text": "bl __printf_chk"},
+        "previous_instructions": [], "next_instructions": [],
+        "callee_variadic": {"name": "printf_chk", "is_variadic": True},
+    }], "total": 1, "has_more": False}
+    out = _render_callsites_text(value)
+    assert "fixed args in ns::put;" in out
+    assert "`bn evidence function 0x400aa0`" in out
+    assert "`bn disasm 0x400aa0 --linear`" in out
+    raw = _render_callsites_text(value, mangled=True)
+    assert "`bn evidence function _ZN2ns3putEPci`" in raw
+
+
 def test_render_callsites_shows_missing_context_reason():
     # #816: a call whose address the disassembly sweep never decoded keeps its row
     # (identity fields intact) with a null context -- text mode must say WHY the

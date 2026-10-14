@@ -1289,7 +1289,9 @@ _WIDGET = {"name": "_ZN4demo6Widget6handleEi", "display_name": "demo::Widget::ha
           "caller_function": _WIDGET}], "total": 1}),
     (["callsites", "memcpy"], "callsites",
      {"items": [{"callee": {"name": "memcpy", "display_name": "memcpy", "address": "0x400100"},
-                 "containing_function": _WIDGET,
+                 # No --within: the bridge echoes the raw caller name, which
+                 # the text leaves out instead of printing a mangled name.
+                 "containing_function": _WIDGET, "within_query": _WIDGET["name"],
                  "call_addr": "0x402a60",
                  "caller_static": "0x402a64", "previous_instructions": [],
                  "next_instructions": []}], "total": 1}),

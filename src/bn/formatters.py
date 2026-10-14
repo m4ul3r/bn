@@ -3804,7 +3804,7 @@ def _render_init_arrays_text(value: Any) -> str:
 
 @_discloses
 def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
-                           mangled: bool = False) -> str:
+                           mangled: bool = False, scoped: bool = True) -> str:
     # callsites returns the {items,total,...} envelope (#131 / item 11). Keep the
     # paging metadata (#454: callsites now pages bridge-side like xrefs) so a
     # truncated high-fan-in survey states the true total + remainder in a footer.
@@ -3882,9 +3882,12 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         ]
         if call_index is not None:
             lines.append(f"call_index: {call_index}")
-        if row.get("within_query"):
+        if scoped and row.get("within_query"):
             # Verbatim, like every other labelled value: the text must carry
             # the JSON value a filter written from it will compare (#979).
+            # Unscoped (no --within), the bridge fills it with the caller's raw
+            # name, which the containing_function line already names, so the
+            # line is left out rather than reintroducing a mangled name (#978).
             lines.append(f"within_query: {row['within_query']}")
         if row.get("hlil_statement"):
             lines.append(f"hlil_statement: {row['hlil_statement']}")

@@ -868,6 +868,7 @@ def _callsites(args: argparse.Namespace) -> int:
             value,
             prefer_caller_static=bool(args.caller_static),
             mangled=bool(args.mangled),
+            scoped=bool(within_identifiers),
         ),
         paged_spill=True,
         stem="callsites",

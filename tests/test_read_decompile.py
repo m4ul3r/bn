@@ -3546,17 +3546,30 @@ def test_sort_name_orders_by_the_name_the_text_shows_978(monkeypatch):
             "_Z10pump_queueiPc", "main", "_Z9copy_tailPcPKcim"]
 
 
-def test_implicit_callsite_scope_echoes_the_display_name_978(monkeypatch):
-    """#979 review: with no --within the bridge fills `within_query` itself. It
-    echoes the caller's display name, the spelling the text prints, so a jq
-    filter written from the text matches the JSON value."""
-    _load_bridge(monkeypatch)
+def test_implicit_callsite_scope_keeps_raw_names_across_overloads_978(monkeypatch):
+    """#986 review: with no --within the bridge fills `within_query` itself.
+    JSON keeps the RAW caller name there (#978's contract): three `ns::put`
+    overloads share one display name, which would merge three callers and
+    cannot be passed back as `--within`, while each raw name resolves to its
+    own function."""
+    bridge = _load_bridge(monkeypatch)
     from bn_agent_bridge import read_listing
-    callers = _sort_population()
+    instance = bridge.BinaryNinjaBridge()
+    callers = [
+        _cxx_function(0x400a68, "_ZN2ns3putEPcPKci", "ns::put"),
+        _cxx_function(0x400aa0, "_ZN2ns3putEPci", "ns::put"),
+        _cxx_function(0x400acc, "_ZN2ns3putEPcl", "ns::put"),
+    ]
     bv = _FakeBV(functions=callers)
     bv.get_code_refs = lambda address: [types.SimpleNamespace(function=fn) for fn in callers]
     scope = read_listing._all_caller_functions(bv, {0x400100})
-    assert [query for query, _fn in scope] == ["pump_queue", "copy_tail", "main"]
+    queries = [query for query, _fn in scope]
+    assert queries == ["_ZN2ns3putEPcPKci", "_ZN2ns3putEPci", "_ZN2ns3putEPcl"]
+    for query, fn in scope:
+        [(_echo, resolved)] = instance.ctx._resolve_scope_functions(bv, [query])
+        assert resolved is fn
+    with pytest.raises(Exception, match="(?i)ambiguous"):
+        instance.ctx._resolve_scope_functions(bv, ["ns::put"])
 
 
 def test_backward_slice_constant_arg_reports_value_hint(monkeypatch):

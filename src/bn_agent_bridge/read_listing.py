@@ -356,12 +356,12 @@ def _all_caller_functions(
                 start = int(getattr(function, "start", -1))
                 if start >= 0:
                     callers.setdefault(start, function)
-    # #978/#979: with no --within there is no user query to echo, so each row's
-    # `within_query` names its caller by the display name -- the spelling the
-    # text prints, so text and JSON carry one value. The raw name stays on
-    # `containing_function.name`.
+    # With no --within there is no user query to echo, so each row's
+    # `within_query` holds its caller's raw name: unique even across overloads,
+    # so it can be passed back to `--within`. The CLI text leaves the line out in
+    # this case (#978/#979 review); the display name rides `containing_function`.
     return [
-        (il_format._display_name(function) or hex(start), function)
+        (str(getattr(function, "name", "") or hex(start)), function)
         for start, function in sorted(callers.items())
     ]
 
@@ -408,7 +408,7 @@ def _scan_caller_functions(
             if function is not None:
                 callers.setdefault(start, function)
     scope_functions = [
-        (il_format._display_name(function) or hex(start), function)
+        (str(getattr(function, "name", "") or hex(start)), function)
         for start, function in sorted(callers.items())
     ]
     return scope_functions, truncated, "; ".join(notes) if notes else None
