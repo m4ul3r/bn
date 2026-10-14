@@ -739,51 +739,23 @@ def _callsite_row(call_addr: str) -> dict:
     }
 
 
-def test_render_callsites_names_vtable_slots_even_with_no_rows_998():
-    """#998 item 1: a virtual method's callers dispatch through its slot, so an
-    empty direct-call list must say the method IS a slot, per slot and class."""
+def test_render_callsites_notes_data_refs_to_the_callee_998():
+    """#998 item 1: a function stored in data may be called through it (a
+    vtable slot, a function-pointer table), which no call instruction names.
+    The note states how many such refs there are and where -- nothing more --
+    and points at `xrefs`."""
     from bn.formatters import _render_callsites_text
-    slot = {"vtable": "0x41fc40", "address_point": "0x41fc50", "slot_address": "0x41fc68",
-            "offset_to_top": 0}
-    value = {
-        "items": [], "total": 0, "has_more": False, "scan_truncated": False,
-        "vtable_slots": [
-            {**slot, "class": "Dispatcher", "slot_index": 3, "slot_offset": "0x18"},
-            {**slot, "class": "VideoDisp", "slot_index": 3, "slot_offset": "0x18"},
-        ],
-    }
+    value = {"items": [], "total": 0, "has_more": False, "scan_truncated": False,
+             "callee_data_ref_count": 5,
+             "callee_data_refs": ["0x41fc68", "0x41fcc8", "0x41fd00", "0x41fd08", "0x41fd10"]}
     out = _render_callsites_text(value)
     assert out.startswith("(no callsites)")
-    assert ("note: the callee is a vtable slot -- slot 3 (+0x18) of Dispatcher, VideoDisp; "
-            "virtual calls through it are not direct callsites") in out
-    assert "vtable slot" not in _render_callsites_text({**value, "vtable_slots": []})
-
-
-def test_render_callsites_names_a_secondary_table_and_undecided_refs_998():
-    """#998 review: a secondary table's slot 2 is not the primary's slot 2, so
-    the note names the table; refs the slot reader could not decide are
-    disclosed per reason, with the full count, at most three addresses, and
-    the slot they would be when known."""
-    from bn.formatters import _render_callsites_text
-    candidate = {"class": "X", "slot_index": 0, "slot_offset": "0x0", "offset_to_top": 0}
-    value = {
-        "items": [], "total": 0, "has_more": False, "scan_truncated": False,
-        "vtable_slots": [{"class": "C", "slot_index": 2, "slot_offset": "0x10",
-                          "offset_to_top": -16, "vtable": "0x403d30"}],
-        "vtable_slots_undecided": [
-            {"address": "0x422160", "reason": "no_vtable_symbol", "candidate": candidate},
-            *({"address": hex(0x430000 + 8 * i), "reason": "walk_budget_exhausted"}
-              for i in range(5)),
-        ],
-        "vtable_slots_undecided_counts": {"no_vtable_symbol": 1, "walk_budget_exhausted": 900},
-    }
-    out = _render_callsites_text(value)
-    assert "slot 2 (+0x10) of the secondary vtable (offset-to-top -16) of C;" in out
-    assert ("note: 1 data ref(s) to the callee (0x422160) may be vtable slots, unconfirmed: "
-            "a vtable-shaped header precedes them, but no `_ZTV` symbol") in out
-    assert "the first would be slot 0 (+0x0) of X" in out
-    assert ("note: 900 data ref(s) to the callee (0x430000, 0x430008, 0x430010, +897 more) "
-            "may be vtable slots, unconfirmed: the slot walk's per-call budget ran out") in out
+    assert ("note: the callee's address is stored in 5 data location(s) (0x41fc68, 0x41fcc8, "
+            "0x41fd00, +2 more); they may be vtable slots or function-pointer tables, so it "
+            "may also be called indirectly -- see `bn xrefs` on the callee") in out
+    for count in (0, None):
+        assert "data location" not in _render_callsites_text(
+            {**value, "callee_data_ref_count": count, "callee_data_refs": []})
 
 
 def test_render_callsites_lists_the_other_containing_functions_998():
@@ -794,31 +766,6 @@ def test_render_callsites_lists_the_other_containing_functions_998():
     assert "also_in: f2 @ 0x4000f0" in out
     assert "also_in" not in _render_callsites_text(
         {"items": [{**row, "also_in": []}], "total": 1, "has_more": False})
-
-
-def test_render_xrefs_labels_a_vtable_slot_data_ref_998():
-    from bn.formatters import _render_xrefs_text
-    ctx = {"sections": [{"name": ".data.rel.ro"}]}
-    refs = [
-        {"address": "0x41fc68", "kind": "data", "function": None, "caller_function": None,
-         "context": ctx, "vtable_slot": {"class": "Dispatcher", "slot_index": 3}},
-        {"address": "0x41fcc8", "kind": "data", "function": None, "caller_function": None,
-         "context": ctx, "vtable_slot": {"class": "VideoDisp", "slot_index": 3}},
-        {"address": "0x41fd00", "kind": "data", "function": None, "caller_function": None,
-         "context": ctx},
-    ]
-    out = _render_xrefs_text({"address": "0x400db0", "items": refs})
-    assert "vtable for Dispatcher [slot 3]  (1 site: 0x41fc68)" in out
-    assert "vtable for VideoDisp [slot 3]  (1 site: 0x41fcc8)" in out
-    assert ".data.rel.ro  (1 site: 0x41fd00)" in out
-    secondary = {**refs[0], "vtable_slot": {"class": "C", "slot_index": 2, "offset_to_top": -16}}
-    undecided = {**refs[2], "vtable_slot_undecided": {"reason": "walk_budget_exhausted"}}
-    candidate = {**refs[1], "vtable_slot": None, "vtable_slot_undecided": {
-        "reason": "no_vtable_symbol", "candidate": {"class": "X", "slot_index": 0}}}
-    out = _render_xrefs_text({"address": "0x401200", "items": [secondary, undecided, candidate]})
-    assert "secondary vtable (offset-to-top -16) for C [slot 2]  (1 site: 0x41fc68)" in out
-    assert ".data.rel.ro [may be a vtable slot]  (1 site: 0x41fd00)" in out
-    assert ".data.rel.ro [may be slot 0 of X, unconfirmed]  (1 site: 0x41fcc8)" in out
 
 
 def test_render_class_card_shows_the_vtable_address_point_998():
@@ -845,30 +792,25 @@ def test_render_class_card_labels_an_allocation_as_an_allocation_998():
     assert "  size: unknown (allocation_upper_bound_only; at most 0x50)" in out
     assert "ctor-call @ 0x401465 (allocation 0x50) (in make_outer)" in out
     assert "size 0x50" not in out
-    partial = {"name": "std::istream", "confidence": "rtti", "methods": [], "size": None,
-               "size_reason": "bn_type_may_exclude_virtual_bases", "size_lower_bound": "0x10"}
-    assert "  size: unknown (bn_type_may_exclude_virtual_bases; at least 0x10)" in \
-        _render_one_class(partial)
 
 
-def test_render_class_list_says_sizes_were_not_computed_998():
+def test_render_class_list_sizes_rows_say_why_998():
+    """#998: a `--sizes` row says why its size is unknown, with the upper bound
+    when an allocation gives one; a default row (no `size_reason`) is unchanged."""
     from bn.formatters import _render_class_list_text
     rows = [{"name": "A", "method_count": 1, "has_vtable": True, "size": None,
-             "size_reason": "not_computed", "confidence": "rtti", "bases": [], "aliases": []},
-            {"name": "B", "method_count": 1, "has_vtable": True,
-             "size": {"value": "0x10", "source": "bn_type"}, "size_reason": None,
+             "size_reason": "allocation_upper_bound_only", "size_upper_bound": "0x50",
+             "confidence": "rtti", "bases": [], "aliases": []},
+            {"name": "B", "method_count": 1, "has_vtable": True, "size": None,
+             "size_reason": "no_size_evidence", "size_upper_bound": None,
+             "confidence": "rtti", "bases": [], "aliases": []},
+            {"name": "C", "method_count": 1, "has_vtable": True, "size": None,
              "confidence": "rtti", "bases": [], "aliases": []}]
-    out = _render_class_list_text({"kind": "classes", "items": rows, "total": 2,
-                                   "offset": 0, "returned": 2, "has_more": False})
-    assert "size=? on 1 row(s): not computed by default; `class list --sizes`" in out
-    computed = [{**rows[0], "size_reason": "allocation_upper_bound_only",
-                 "size_upper_bound": "0x50"}, rows[1]]
-    out = _render_class_list_text(
-        {"kind": "classes", "items": computed, "total": 2, "offset": 0, "returned": 2,
-         "has_more": False, "sizes": True})
-    assert "not computed" not in out
-    # #998 review round 2: a `--sizes` row says why, with its bound.
+    out = _render_class_list_text({"kind": "classes", "items": rows, "total": 3, "offset": 0,
+                                   "returned": 3, "has_more": False, "sizes": True})
     assert "  A  methods=1  vtable  size=? (allocation_upper_bound_only; at most 0x50)  [rtti]" in out
+    assert "  B  methods=1  vtable  size=? (no_size_evidence)  [rtti]" in out
+    assert "  C  methods=1  vtable  size=?  [rtti]" in out
 
 
 def test_render_callsites_footer_on_partial_last_page():

@@ -1,7 +1,7 @@
 // Synthetic C++ fixture for #998 item 4, built at -O2: the shapes where an
-// `operator new(N)` allocation is NOT one object of the class whose vptr or
-// constructor touches it first. The class lens may leave any of these sizes
-// unknown; it must never report a wrong one. Each real size is pinned below.
+// `operator new(N)` allocation is NOT one object of the class whose
+// constructor runs on it. The class lens reports no class size; the
+// allocation is only an upper bound, which must hold. Real sizes pinned below.
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -102,9 +102,8 @@ struct PD : PB {
     int s() override { return static_cast<int>(more[0]); }
 };
 
-// No vtable, so no deleting destructor; its ctor writes every byte of the
-// `operator new(0x18)` it runs on -- which still proves nothing (see below):
-// an allocation is only ever an upper bound.
+// No vtable; its ctor writes every byte of the `operator new(0x18)` it runs
+// on -- which still proves nothing: an allocation is only an upper bound.
 struct Rec {
     long a, b, c;
     NOINLINE Rec();
@@ -135,8 +134,7 @@ struct Storage {
 };
 Header::Header() : tag(3) { std::memset(reinterpret_cast<Storage *>(this)->payload, 0, 64); }
 
-// A virtual base: a BN type that covers only the non-virtual part (what a
-// type library gives `std::istream`) is not the class size.
+// A class with a virtual base, constructed out of line.
 struct VB0 {
     long x[20];
 };

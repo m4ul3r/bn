@@ -33,10 +33,10 @@ from ..formatters import _render_class_list_text, _render_class_show_text
                    help="Return just the class count (respects --no-stl/--no-vendor/--query/"
                         "--all), plus artifact_count -- fast class-lens scale characterization"),
                arg("--sizes", action="store_true", default=False, dest="sizes",
-                   help="Recover each listed class's size the way `class show` does (sized "
-                        "delete in the deleting destructor, operator new + constructor "
-                        "extent). Slower: it reads IL per row, so bound the page with "
-                        "--limit. Without it, size comes only from a BN type of that name")],
+                   help="Add each listed class's size evidence, as `class show` does: "
+                        "size_upper_bound (the smallest operator new(N) one of its "
+                        "constructors runs on) and size_reason. Never an exact size. "
+                        "Slower: it reads IL per row, so bound the page with --limit")],
          estimable=True)
 def _class_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}

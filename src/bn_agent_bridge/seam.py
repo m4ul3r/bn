@@ -1577,9 +1577,9 @@ class BridgeContext:
         """Where this class is constructed, with the ``operator new``
         allocation each site's object sits in when one is traced -- an upper
         bound on the class size, never the size (`read_class._construction_sites`,
-        #998 item 4).
-        Uncapped: the cap lives at the LISTING site (`read_class._instances`,
-        which slices and discloses `construction_sites_total`/`_truncated`, #822)."""
+        #998 item 4). Uncapped: the cap lives at the LISTING site
+        (`read_class._instances`, which slices and discloses
+        `construction_sites_total`/`_truncated`, #822)."""
         from . import read_class
         return read_class._construction_sites(self, bv, record)
 

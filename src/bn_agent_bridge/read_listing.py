@@ -336,9 +336,24 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
     return rows
 
 
-#: #998 review: how many undecided vtable-slot refs a `callsites` envelope
-#: lists; `vtable_slots_undecided_counts` counts them all, per reason.
-_UNDECIDED_SLOTS_LISTED = 64
+#: #998 item 1: how many data-ref addresses a `callsites` envelope lists;
+#: `callee_data_ref_count` counts them all.
+_CALLEE_DATA_REFS_LISTED = 8
+
+
+def _callee_data_refs(bv, address: int) -> dict[str, Any]:
+    """``callee_data_ref_count`` and the first ``_CALLEE_DATA_REFS_LISTED``
+    ``callee_data_refs`` (hex) of BN's data refs to *address*; the count is
+    None when BN cannot list them."""
+    getter = getattr(bv, "get_data_refs", None)
+    try:
+        refs = sorted({int(r) for r in getter(address)}) if callable(getter) else None
+    except Exception:
+        refs = None
+    if refs is None:
+        return {"callee_data_ref_count": None, "callee_data_refs": []}
+    return {"callee_data_ref_count": len(refs),
+            "callee_data_refs": [hex(r) for r in refs[:_CALLEE_DATA_REFS_LISTED]]}
 
 
 def _other_containing_functions(ctx, bv, call_addr: str, func) -> list[dict[str, str]]:
@@ -533,21 +548,12 @@ def _callsites(
             )
     # #558: an imported variadic (scanf/printf-family) callee's HLIL callsite text
     # can show only the fixed argument; attach a steer to the argument-recovery views.
-    # #998 item 1: a virtual method's real callers dispatch through a vtable
-    # slot, which no call instruction names; report the slots so a short (or
-    # empty) direct-call list is never read as "rarely called".
-    from . import read_class   # read_class imports this module; import lazily
-    slot_refs = (read_class._SlotRefs([], []) if callee_symbol_only
-                 else read_class._vtable_slots_referencing(ctx, bv, int(callee.start)))
-    # The undecided refs are LISTED up to a cap (a long pointer table in a
-    # stripped binary can hold thousands) and COUNTED per reason in full, so
-    # the envelope stays small without hiding how many there were.
-    undecided_counts: dict[str, int] = {}
-    for item in slot_refs.undecided:
-        undecided_counts[item["reason"]] = undecided_counts.get(item["reason"], 0) + 1
-    vtable_fields = {"vtable_slots": slot_refs.slots,
-                     "vtable_slots_undecided": slot_refs.undecided[:_UNDECIDED_SLOTS_LISTED],
-                     "vtable_slots_undecided_counts": undecided_counts}
+    # #998 item 1: a function whose address is stored in data (a vtable slot,
+    # a function-pointer table) can be called through it, and no call
+    # instruction names such a call. Report only the FACT -- how many data
+    # refs there are and where -- so a short (or empty) direct-call list is not
+    # read as "rarely called"; what those refs are is `xrefs`'s to show.
+    data_ref_fields = _callee_data_refs(bv, int(callee.start))
     variadic_hint = _callee_variadic_hint(callee)
 
     rows = []
@@ -613,7 +619,7 @@ def _callsites(
                 # stopped early that number is unknown, not `len(scope_functions)`.
                 "caller_total": None,
                 "callee_symbol_only": callee_symbol_only,
-                **vtable_fields,
+                **data_ref_fields,
             }
         )
         _attach_callsite_excerpts(bv, result["items"])
@@ -638,7 +644,7 @@ def _callsites(
             "callers_scanned": callers_scanned,
             "caller_total": len(scope_functions),
             "callee_symbol_only": callee_symbol_only,
-            **vtable_fields,
+            **data_ref_fields,
         }
 
     result = read_misc._paged_list_result(
@@ -652,7 +658,7 @@ def _callsites(
             "callers_scanned": callers_scanned,
             "caller_total": len(scope_functions),
             "callee_symbol_only": callee_symbol_only,
-            **vtable_fields,
+            **data_ref_fields,
         }
     )
     _attach_callsite_excerpts(bv, result["items"])

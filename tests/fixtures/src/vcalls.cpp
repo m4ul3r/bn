@@ -1,9 +1,8 @@
 // Synthetic C++ fixture for #998: a virtual method reached only through its
-// vtable slot (`callsites` must say so instead of "no callsites"), classes
-// constructed on the heap through an out-of-line constructor, a derived class
-// sharing the base's slot for a method it does not override, a class whose
-// vtable runs past the class lens's 64-slot window, and a multiple-inheritance
-// class whose second base's slots live in a secondary vtable.
+// vtable slot (`callsites` must not read as "never called"), classes
+// constructed on the heap through an out-of-line constructor (`class show`
+// bounds the size by the `operator new(N)`), and a derived class sharing the
+// base's slot for a method it does not override.
 #include <cstdio>
 
 namespace vc {
@@ -53,29 +52,6 @@ int pump(Dispatcher *d, int n) {
     return s;
 }
 
-// 70 virtuals: slots 0..69, so `m68` sits past the 64-slot layout window.
-#define VC_V(n) virtual int m##n() { return n; }
-#define VC_V10(t) VC_V(t##0) VC_V(t##1) VC_V(t##2) VC_V(t##3) VC_V(t##4) \
-                  VC_V(t##5) VC_V(t##6) VC_V(t##7) VC_V(t##8) VC_V(t##9)
-struct Big {
-    VC_V(0) VC_V(1) VC_V(2) VC_V(3) VC_V(4) VC_V(5) VC_V(6) VC_V(7) VC_V(8) VC_V(9)
-    VC_V10(1) VC_V10(2) VC_V10(3) VC_V10(4) VC_V10(5) VC_V10(6)
-};
-
-struct Left {
-    virtual int fa() { return 1; }
-};
-struct Right {
-    virtual int fb() { return 2; }
-};
-struct Both : Left, Right {
-    long tag = 3;
-    int fa() override { return 10; }
-    int fb() override { return static_cast<int>(tag); }
-};
-
-int poke(Big *big, Right *right) { return big->m3() + right->fb(); }
-
 } // namespace vc
 
 int main(int argc, char **) {
@@ -83,9 +59,6 @@ int main(int argc, char **) {
     vc::register_all(d);
     int r = vc::pump(d, argc * 4);
     std::printf("%d\n", r);
-    vc::Big big;
-    vc::Both both;
-    std::printf("%d %d\n", vc::poke(&big, &both), both.fa());
     delete d;
     return 0;
 }

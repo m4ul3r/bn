@@ -104,7 +104,7 @@ _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "xrefs": (
         "address", "kind", "function", "caller_function", "context",
-        "function_pointer", "thumb_pointer", "vtable_slot", "vtable_slot_undecided",
+        "function_pointer", "thumb_pointer",
     ),
     "callsites": (
         "callee", "containing_function", "call_addr", "call_kind",

@@ -11,11 +11,6 @@ import functools
 import re
 from typing import Any, NamedTuple
 
-try:
-    import binaryninja as bn
-except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
-    bn = None  # type: ignore[assignment]
-
 from . import il_format
 from ._shared import OperationFailure, _validate_count
 from .read_listing import _analysis_state_fields
@@ -1193,9 +1188,8 @@ def _class_list(
     # Populate RTTI bases for the RETURNED PAGE only: base decode is cheap (a few
     # typeinfo reads per class) and bounded to the page, so a single `class list`
     # recovers the inheritance graph without N `class show` calls. Vtable layout
-    # stays show-only (far costlier per class). The object size is the exact
-    # BN-type lookup by default; `sizes=True` runs the full readers of
-    # `_object_size` for the page (#998 item 4 and its review).
+    # stays show-only (far costlier per class); `sizes=True` runs the size
+    # reader (an upper bound only, #998 item 4) for the page.
     rows = []
     for rec in page:
         if rec["confidence"] == _DECLARED_CONFIDENCE:
@@ -1204,32 +1198,18 @@ def _class_list(
             type_obj = declared_types.get(rec["name"])
             if type_obj is not None:
                 rec["size"] = _declared_size(type_obj)
+            bound_fields = {"size_reason": None, "size_upper_bound": None} if sizes else {}
         elif sizes:
-            # `--sizes`: the same readers `class show` runs, for this page.
-            _apply_size(rec, ctx._object_size_for(bv, rec))
+            bound = ctx._object_size_for(bv, rec)
+            bound_fields = {"size_reason": bound.reason, "size_upper_bound": (
+                hex(bound.upper_bound) if bound.upper_bound else None)}
         else:
-            # Default listing: only the cheap BN-type lookup (plus the RTTI
-            # ancestry read that decides whether a type's width can be the
-            # whole class). Tracing destructors and construction sites for
-            # every row made a large listing minutes slower (#998 review).
-            exact_type, lower = _bn_type_size(ctx, bv, rec)
-            rec["size"] = exact_type
-            rec["size_reason"] = _SIZE_BN_TYPE_PARTIAL if lower else _SIZE_NOT_COMPUTED
-            rec["size_lower_bound"] = hex(lower) if lower else None
-            rec["size_upper_bound"] = None
-        is_declared = rec["confidence"] == _DECLARED_CONFIDENCE
+            bound_fields = {}
         try:
             rec["bases"] = ctx._bases_for(bv, rec)
         except Exception:
             rec["bases"] = []
-        rows.append({
-            **_list_row(rec),
-            # #998 review: a row whose size is unknown says why and what the
-            # evidence still bounds it by, as the `class show` card does.
-            "size_reason": None if is_declared or rec.get("size") else rec.get("size_reason"),
-            "size_upper_bound": None if is_declared else rec.get("size_upper_bound"),
-            "size_lower_bound": None if is_declared else rec.get("size_lower_bound"),
-        })
+        rows.append({**_list_row(rec), **bound_fields})
     returned = len(rows)
     result = {
         "kind": "classes",
@@ -1922,119 +1902,29 @@ def _infer_rtti_kind(ctx, bv, typeinfo_addr: int, ptr: int) -> str:
     return "base"
 
 
-class _SizeFinding(NamedTuple):
-    """What the size readers established about one class (#998 item 4).
+class _SizeBound(NamedTuple):
+    """What the evidence says about a class's size (#998 item 4): never the
+    size itself, only ``upper_bound`` -- the smallest ``operator new(N)`` a
+    constructor of the class ran on (the object sits at offset 0 of that
+    allocation, so it fits in N; the allocation may also hold a derived class,
+    an enclosing object or trailing storage) -- and ``reason``."""
 
-    ``size`` is an exact size with provenance, or None; ``reason`` says why it
-    is None (None on a hit). The bounds are what the evidence still allows
-    when it does not fix the size:
-
-    * ``upper_bound`` -- the smallest ``operator new(N)`` a constructor of the
-      class ran on. The object sits at offset 0 of that allocation, so it is at
-      most N; the allocation may also hold a derived class, an enclosing object
-      or trailing storage the constructor fills, so N is never the size;
-    * ``lower_bound`` -- the width of a BN type of that name when the class may
-      have virtual bases: such a type covers only the non-virtual part."""
-
-    size: dict[str, Any] | None
-    reason: str | None
+    reason: str
     upper_bound: int | None
-    lower_bound: int | None = None
 
 
-#: #998 item 4: why ``size`` is null.
-#:   * ``no_size_evidence`` -- no BN type of this name, no sized ``operator
-#:     delete`` in the class's deleting destructor, no allocation traced;
-#:   * ``allocation_upper_bound_only`` -- only ``operator new(N)`` allocations
-#:     a constructor ran on, which bound the size from above;
-#:   * ``bn_type_may_exclude_virtual_bases`` -- a BN type of this name exists,
-#:     but the class's RTTI ancestry is not proven free of virtual bases, and a
-#:     type for such a class covers only its non-virtual part (cmake's
-#:     ``std::istream`` type is 0x10 wide; the class is 0x118);
-#:   * ``size_evidence_disagrees`` -- two exact readers named different sizes.
-_SIZE_NO_EVIDENCE = "no_size_evidence"
+#: #998 item 4: why ``size`` is null (it always is):
+#:   * ``allocation_upper_bound_only`` -- an ``operator new(N)`` result reaches
+#:     a constructor of the class; ``size_upper_bound`` is the smallest N;
+#:   * ``no_size_evidence`` -- no such allocation was traced.
 _SIZE_UPPER_BOUND_ONLY = "allocation_upper_bound_only"
-_SIZE_BN_TYPE_PARTIAL = "bn_type_may_exclude_virtual_bases"
-_SIZE_DISAGREE = "size_evidence_disagrees"
-
-#: A `class list` row whose size readers did not run (the default listing
-#: runs only the BN-type lookup; `--sizes` runs them all).
-_SIZE_NOT_COMPUTED = "not_computed"
-
-
-def _apply_size(rec: dict[str, Any], finding: _SizeFinding) -> None:
-    """Write a :class:`_SizeFinding` onto a class record. #817: where the size
-    came from rides BESIDE the size (``size_source``), with ``size_reason`` on
-    a miss (null on a hit, mirroring ``hlil_statement_reason``) and the bounds
-    the evidence still allows (``size_upper_bound`` / ``size_lower_bound``)."""
-    rec["size"] = finding.size
-    rec["size_source"] = finding.size["source"] if finding.size else "unavailable"
-    rec["size_reason"] = finding.reason
-    rec["size_upper_bound"] = hex(finding.upper_bound) if finding.upper_bound else None
-    rec["size_lower_bound"] = hex(finding.lower_bound) if finding.lower_bound else None
-
+_SIZE_NO_EVIDENCE = "no_size_evidence"
 
 #: Raw-name prefix of SCALAR ``operator new`` in every overload (``_Znwm``,
 #: ``_Znwj``, the nothrow and aligned forms): its first argument is the size.
-#: ``operator new[]`` (``_Zna``) is excluded -- an array allocation is never
-#: one object.
+#: ``operator new[]`` (``_Zna``) is not traced: an array allocation may carry
+#: a cookie before its first element.
 _OPERATOR_NEW_PREFIX = "_Znw"
-
-#: Raw-name prefixes of SIZED scalar ``operator delete`` (``_ZdlPvm``,
-#: ``_ZdlPvj`` and their aligned forms): its second argument is the size of
-#: the object being deleted.
-_SIZED_DELETE_PREFIXES = ("_ZdlPvm", "_ZdlPvj")
-
-_CALL_OPS = frozenset({"MLIL_CALL_SSA", "MLIL_TAILCALL_SSA"})
-
-
-def _split_toplevel_scopes(name: str) -> list[str]:
-    """``a::b<c::d>::e`` -> ``["a", "b<c::d>", "e"]``: ``::`` inside template
-    arguments or a parameter list is not a scope separator."""
-    parts: list[str] = []
-    depth = 0
-    start = 0
-    i = 0
-    while i < len(name):
-        ch = name[i]
-        if ch in "<(":
-            depth += 1
-        elif ch in ">)":
-            depth = max(0, depth - 1)
-        elif ch == ":" and depth == 0 and name.startswith("::", i):
-            parts.append(name[start:i])
-            i += 2
-            start = i
-            continue
-        i += 1
-    parts.append(name[start:])
-    return [p for p in parts if p]
-
-
-def _bn_type_width(bv, name: str) -> int:
-    """Width of the BN type named exactly *name*, else 0.
-
-    A plain-string lookup misses a namespaced type (``a::B``): BN keys types by
-    ``QualifiedName`` components, so the components are tried too. One lookup,
-    shared by `class list` and `class show`, so the two never disagree about
-    whether a class has a BN type (#998 review)."""
-    getter = getattr(bv, "get_type_by_name", None)
-    if not callable(getter) or not name:
-        return 0
-    keys: list[Any] = [name]
-    parts = _split_toplevel_scopes(name)
-    qualified = getattr(bn, "QualifiedName", None) if bn is not None else None
-    if len(parts) > 1 and qualified is not None:
-        keys.append(qualified(parts))
-    for key in keys:
-        try:
-            type_obj = getter(key)
-        except Exception:
-            continue
-        width = int(getattr(type_obj, "width", 0) or 0) if type_obj is not None else 0
-        if width > 0:
-            return width
-    return 0
 
 
 def _symbol_names_at(bv, address: int) -> list[str]:
@@ -2049,22 +1939,11 @@ def _symbol_names_at(bv, address: int) -> list[str]:
     return names
 
 
-def _call_target(insn) -> int | None:
-    dest = getattr(insn, "dest", None)
-    value = getattr(dest, "constant", None)
-    return int(value) if isinstance(value, int) else None
-
-
-def _is_operator_new(bv, address: int | None) -> bool:
-    if address is None:
+def _is_operator_new(bv, dest) -> bool:
+    address = getattr(dest, "constant", None)
+    if not isinstance(address, int):
         return False
     return any(n.startswith(_OPERATOR_NEW_PREFIX) for n in _symbol_names_at(bv, address))
-
-
-def _is_sized_delete(bv, address: int | None) -> bool:
-    if address is None:
-        return False
-    return any(n.startswith(_SIZED_DELETE_PREFIXES) for n in _symbol_names_at(bv, address))
 
 
 def _mlil_const(expr) -> int | None:
@@ -2075,81 +1954,9 @@ def _mlil_const(expr) -> int | None:
     return int(value) if isinstance(value, int) else None
 
 
-def _arg_regs(bv, fn) -> list[str]:
-    cc = getattr(fn, "calling_convention", None)
-    if cc is None:
-        platform = getattr(bv, "platform", None)
-        cc = getattr(platform, "default_calling_convention", None)
-    return [str(r) for r in (getattr(cc, "int_arg_regs", None) or [])]
-
-
-def _reg_value(fn, address: int, reg: str) -> tuple[str, Any]:
-    """``(kind, value)`` of BN's dataflow for *reg* just before *address*:
-    ``("const", int)``, ``("entry", reg_name)`` or ``("other", None)``."""
-    try:
-        value = fn.get_reg_value_at(address, reg)
-    except Exception:
-        return "other", None
-    kind = str(getattr(getattr(value, "type", None), "name", ""))
-    if kind == "ConstantValue" and isinstance(getattr(value, "value", None), int):
-        return "const", int(value.value)
-    if kind == "EntryValue":
-        return "entry", str(getattr(value, "reg", "") or "")
-    return "other", None
-
-
-def _call_arg_const(fn, insn, index: int, regs: list[str]) -> int | None:
-    """Constant argument *index* of a call: from its MLIL parameter list, else
-    from the argument register's dataflow value at the call (BN's type for an
-    import such as ``operator delete(void*, unsigned long)`` can drop the size
-    parameter from the IL while the register still holds it)."""
-    params = list(getattr(insn, "params", None) or [])
-    if len(params) > index:
-        value = _mlil_const(params[index])
-        if value is not None:
-            return value
-    if len(regs) > index:
-        kind, value = _reg_value(fn, int(insn.address), regs[index])
-        if kind == "const":
-            return value
-    return None
-
-
-def _deleting_dtor_size(bv, fn) -> tuple[int, int] | None:
-    """``(N, call_addr)`` when deleting destructor *fn* ends in a sized
-    ``operator delete(this, N)``: the Itanium ABI's own statement of the
-    complete object's size. ``this`` must be the destructor's untouched first
-    argument (BN's entry value of that register), so a thunk that adjusts it
-    or a delete of some other pointer never counts. Two different sizes in one
-    body decide nothing."""
-    regs = _arg_regs(bv, fn)
-    if len(regs) < 2:
-        return None
-    try:
-        instructions = list(fn.mlil.ssa_form.instructions)
-    except Exception:
-        return None
-    found: dict[int, int] = {}
-    for insn in instructions:
-        if il_format._il_op_name(insn) not in _CALL_OPS:
-            continue
-        if not _is_sized_delete(bv, _call_target(insn)):
-            continue
-        kind, reg = _reg_value(fn, int(insn.address), regs[0])
-        if kind != "entry" or reg != regs[0]:
-            continue
-        size = _call_arg_const(fn, insn, 1, regs)
-        if size:
-            found.setdefault(size, int(insn.address))
-    if len(found) != 1:
-        return None
-    ((size, at),) = found.items()
-    return size, at
-
-
 def _new_allocation(bv, expr, *, depth: int = 0) -> tuple[int, int] | None:
-    """``(N, call_addr)`` when MLIL SSA *expr* is, through plain SSA copies,
-    the result of scalar ``operator new(<constant N>)``; else None."""
+    """``(N, call_addr)`` when MLIL SSA *expr* is, through plain SSA copies
+    (no offset), the result of scalar ``operator new(<constant N>)``."""
     if expr is None or il_format._il_op_name(expr) != "MLIL_VAR_SSA":
         return None
     definition = expr.function.get_ssa_var_definition(expr.src)
@@ -2158,11 +1965,10 @@ def _new_allocation(bv, expr, *, depth: int = 0) -> tuple[int, int] | None:
     op = il_format._il_op_name(definition)
     if op == "MLIL_SET_VAR_SSA" and depth < 8:
         return _new_allocation(bv, definition.src, depth=depth + 1)
-    if op != "MLIL_CALL_SSA" or not _is_operator_new(bv, _call_target(definition)):
+    if op != "MLIL_CALL_SSA" or not _is_operator_new(bv, definition.dest):
         return None
-    fn = getattr(expr.function, "source_function", None)
-    size = (_call_arg_const(fn, definition, 0, _arg_regs(bv, fn)) if fn is not None
-            else _mlil_const((list(definition.params or []) or [None])[0]))
+    params = list(definition.params or [])
+    size = _mlil_const(params[0]) if params else None
     if not size:
         return None
     return size, int(definition.address)
@@ -2170,9 +1976,8 @@ def _new_allocation(bv, expr, *, depth: int = 0) -> tuple[int, int] | None:
 
 def _operator_new_size_at(bv, call_addr: int) -> tuple[int, int] | None:
     """``(N, allocation_addr)`` when the constructor call at *call_addr* runs
-    on the result of scalar ``operator new(<constant N>)``, else None. N is the
-    ALLOCATION: the object sits at its offset 0, so N bounds its size from
-    above and says nothing more by itself."""
+    on ``this`` == the result of scalar ``operator new(<constant N>)``, else
+    None. N is the ALLOCATION, an upper bound on the object's size only."""
     try:
         functions = list(bv.get_functions_containing(call_addr) or [])
     except Exception:
@@ -2191,86 +1996,23 @@ def _operator_new_size_at(bv, call_addr: int) -> tuple[int, int] | None:
     return None
 
 
-_D0_SUFFIX = "D0Ev"
-
-
-def _bn_type_size(ctx, bv, record: dict[str, Any]) -> tuple[dict[str, Any] | None, int | None]:
-    """``(exact_size, lower_bound)`` from a BN type named exactly like the
-    class. The width is the class size only when the class has no virtual
-    bases: BN's type for such a class covers just its non-virtual part
-    (#998 review: cmake's ``std::istream`` type is 0x10, the class 0x118).
-    Freedom from virtual bases is PROVEN from local RTTI ancestry; a class
-    whose RTTI is imported or unreadable, or that has a vtable but no
-    typeinfo, gets the width only as a lower bound. A class with neither a
-    vtable nor a typeinfo has no vptr, and so no virtual base."""
-    width = _bn_type_width(bv, record["name"])
-    if width <= 0:
-        return None, None
-    typeinfo = record.get("typeinfo") if isinstance(record.get("typeinfo"), dict) else None
-    if typeinfo and typeinfo.get("address"):
-        whole = _has_nonvirtual_rtti_ancestry(
-            ctx, bv, int(str(typeinfo["address"]), 16), ctx._pointer_size(bv))
-    else:
-        whole = not record.get("vtable")
-    if whole:
-        return {"value": hex(width), "source": "bn_type"}, None
-    return None, width
-
-
-def _object_size(ctx, bv, record: dict[str, Any]) -> _SizeFinding:
-    """The class's size, only from evidence that IS ``sizeof`` by
-    construction (#998 item 4 and its reviews):
-
-    1. a BN type of exactly this name, when the class is proven free of
-       virtual bases (:func:`_bn_type_size`; otherwise a lower bound);
-    2. the sized ``operator delete(this, N)`` in the class's own deleting
-       destructor (``D0``), which the ABI emits with ``sizeof`` the class.
-
-    An ``operator new(N)`` a constructor runs on is never the size -- array
-    new, an enclosing object, a derived class built around the constructor,
-    placement new and trailing storage the constructor itself fills all hand
-    it a LARGER block, and no write the constructor makes can tell those
-    apart -- so it is reported only as ``upper_bound``."""
-    exact_type, lower = _bn_type_size(ctx, bv, record)
-    if exact_type is not None:
-        return _SizeFinding(exact_type, None, None)
-    exact: dict[int, dict[str, Any]] = {}
-    for method in record.get("methods", []):
-        mangled = str(method.get("mangled") or "")
-        if method.get("kind") != "dtor" or not mangled.endswith(_D0_SUFFIX) \
-                or mangled.startswith(("_ZTh", "_ZTv", "_ZTc")):
-            continue
-        fn = bv.get_function_at(int(method["address"], 16)) \
-            if hasattr(bv, "get_function_at") else None
-        found = _deleting_dtor_size(bv, fn) if fn is not None else None
-        if found is not None:
-            exact.setdefault(found[0], {"value": hex(found[0]),
-                                        "source": "deleting_destructor", "at": hex(found[1])})
+def _object_size(ctx, bv, record: dict[str, Any]) -> _SizeBound:
+    """The size evidence for a class: the smallest ``operator new(N)`` one of
+    its constructors runs on (#998 item 4), as an upper bound only."""
     upper: int | None = None
     for site in ctx._ctor_construction_sites(bv, record):
         if isinstance(site, dict) and site.get("allocation_size"):
             allocation = int(str(site["allocation_size"]), 16)
             upper = allocation if upper is None else min(upper, allocation)
-    if len(exact) == 1:
-        return _SizeFinding(next(iter(exact.values())), None, upper)
-    if exact:
-        reason = _SIZE_DISAGREE
-    elif lower is not None:
-        reason = _SIZE_BN_TYPE_PARTIAL
-    elif upper is not None:
-        reason = _SIZE_UPPER_BOUND_ONLY
-    else:
-        reason = _SIZE_NO_EVIDENCE
-    return _SizeFinding(None, reason, upper, lower)
+    return _SizeBound(_SIZE_UPPER_BOUND_ONLY if upper is not None else _SIZE_NO_EVIDENCE, upper)
 
 
 def _construction_sites(ctx, bv, record: dict[str, Any]) -> list[dict[str, Any]]:
     """Where this class is constructed: each ctor's inbound call sites, from
-    code xrefs (``kind: "ctor-call"``, ``ctor`` the constructor called). A site
-    whose object is the result of ``operator new(<constant N>)`` carries
-    ``allocation_size`` (N, hex) and ``allocation`` (the ``operator new``
-    call); otherwise both are None. N is the allocation, an upper bound on
-    the class size -- see :func:`_object_size` (#998 item 4)."""
+    code xrefs (``kind: "ctor-call"``). A site whose ``this`` is the result of
+    scalar ``operator new(<constant N>)`` carries ``allocation_size`` (N, hex)
+    and ``allocation`` (the ``operator new`` call); otherwise both are None.
+    N bounds the class size from above only (#998 item 4)."""
     get_refs = getattr(bv, "get_code_refs", None)
     if not callable(get_refs):
         return []
@@ -2297,7 +2039,6 @@ def _construction_sites(ctx, bv, record: dict[str, Any]) -> list[dict[str, Any]]
                 "address": hex(ra),
                 "function": str(cname) if cname else None,
                 "kind": "ctor-call",
-                "ctor": hex(addr),
                 "allocation_size": hex(traced[0]) if traced else None,
                 "allocation": hex(traced[1]) if traced else None,
             })
@@ -2414,7 +2155,17 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
                 # not the primary; the card keeps `vtable: null` and says why.
                 rec.setdefault("notes", []).append(_NO_PRIMARY_NOTE)
             _note_rejected_secondaries(rec, recovered["rejected"])
-    _apply_size(rec, ctx._object_size_for(bv, rec))
+    # #998 item 4: no reader here fixes a class's size -- every candidate the
+    # reviews tried (a BN type, the deleting destructor's sized delete, a
+    # constructor's writes) is wrong for a legal, common shape -- so `size`
+    # stays null. What IS sound is an upper bound: an `operator new(N)` result
+    # a constructor of this class runs on holds the object at offset 0, so the
+    # object fits in N. #817: the provenance rides beside the size.
+    bound = ctx._object_size_for(bv, rec)
+    rec["size"] = None
+    rec["size_source"] = "unavailable"
+    rec["size_reason"] = bound.reason
+    rec["size_upper_bound"] = hex(bound.upper_bound) if bound.upper_bound else None
     rec["bases"] = ctx._bases_for(bv, rec)
     rec["instances"] = ctx._instances_for(bv, rec)
     return rec
@@ -2645,255 +2396,6 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
     primary = zeros[0] if zeros else None
     secondary = [layout for ott, layout in groups if ott != 0]
     return {"primary": primary, "secondary": secondary, "rejected": rejected}
-
-
-class _SlotRefs(NamedTuple):
-    """:func:`_vtable_slots_referencing`'s answer: the confirmed ``slots``, and
-    the data refs it could not decide (``undecided``): each a dict with the
-    ref ``address``, a ``reason`` code and, when a header was found, the
-    ``candidate`` slot it would be."""
-
-    slots: list[dict[str, Any]]
-    undecided: list[dict[str, Any]]
-
-
-#: #998 review: word reads one `callsites`/`xrefs` call may spend walking data
-#: refs back to a vtable header. Walks share work (a ref's walk stops at the
-#: previous ref in the same run and reuses its answer), so a whole table costs
-#: its length once; past the budget a ref is `undecided`, never walked.
-_SLOT_WALK_BUDGET = 4096
-
-#: Table rows past `class show`'s 64-slot window one call may decode to
-#: confirm a slot there; each costs a full pointer-row classification.
-_SLOT_PROBE_BUDGET = 512
-
-#: How far before a header the `_ZTV` symbol owning it may start: a secondary
-#: table sits inside its complete class's vtable group.
-_VTABLE_GROUP_REACH = 0x4000
-
-#: `undecided` reason codes.
-_SLOT_BUDGET = "walk_budget_exhausted"
-_SLOT_NO_SYMBOL = "no_vtable_symbol"
-_SLOT_UNRESOLVED = "slot_unresolved"
-
-
-def _plausible_slot_word(bv, value: int | None) -> bool:
-    """Can *value* be a vtable entry: null (pure-virtual placeholder), code,
-    or an imported/external function? Anything else (unreadable, data) ends a
-    vtable, so a backward walk that meets it is not inside one."""
-    if value is None:
-        return False
-    if value == 0:
-        return True
-    get_function_at = getattr(bv, "get_function_at", None)
-    if callable(get_function_at) and get_function_at(value) is not None:
-        return True
-    get_segment_at = getattr(bv, "get_segment_at", None)
-    segment = get_segment_at(value) if callable(get_segment_at) else None
-    if segment is not None and getattr(segment, "executable", False):
-        return True
-    sym = bv.get_symbol_at(value) if hasattr(bv, "get_symbol_at") else None
-    sym_type = str(getattr(getattr(sym, "type", None), "name", "") or "")
-    return sym_type in {"ImportedFunctionSymbol", "ExternalSymbol", "ImportAddressSymbol"}
-
-
-def _real_symbols(bv, start: int, length: int) -> list[tuple[int, str, Any]]:
-    """``(address, raw_name, symbol)`` of the symbols in ``[start,
-    start+length)``, address-ordered, leaving out BN's own synthesized
-    ``_vtable_for_...`` names (its RTTI analysis also gives them to data that
-    only looks like a vtable)."""
-    get_symbols = getattr(bv, "get_symbols", None)
-    if not callable(get_symbols) or length <= 0:
-        return []
-    try:
-        symbols = list(get_symbols(start, length) or [])
-    except Exception:
-        return []
-    found = [(int(s.address), str(getattr(s, "raw_name", "") or ""), s) for s in symbols]
-    return sorted((item for item in found if not item[1].startswith("_vtable_for_")),
-                  key=lambda item: (item[0], item[1]))
-
-
-class _TableBounds:
-    """What the binary's own symbols say about refs past one vtable-shaped
-    header (#998 review). The header and its typeinfo word alone prove
-    nothing: a registry entry ``{0, &typeid(X), fn}`` has the same shape, and
-    the word after a table looks like one more slot -- BN's own RTTI analysis
-    is fooled by both and names them ``vtable for X``. So:
-
-    * a ref with another object's symbol starting between the table's start
-      and itself is in that object: ``"outside"``, not a slot;
-    * a ref is IN the table only when a linker-visible ``_ZTV<X>`` symbol, for
-      the class the header's typeinfo names, starts at or before the header (a
-      secondary table sits inside its group) -- otherwise ``no_vtable_symbol``
-      (a stripped binary, or data shaped like a vtable): undecided.
-
-    Symbols past the header are read incrementally, so a run of refs costs
-    one pass over its range."""
-
-    def __init__(self, bv, vt_addr: int, class_name: str):
-        self._bv = bv
-        start = max(0, vt_addr - _VTABLE_GROUP_REACH)
-        # BN renames a `_ZTI` symbol it analysed (`_typeinfo_for_X`), but keeps
-        # the `_ZTV` raw name, so the owner is matched by the class it names.
-        owners = [addr for addr, raw, sym in _real_symbols(bv, start, vt_addr + 1 - start)
-                  if raw.startswith("_ZTV")
-                  and _rtti_kind_and_class(sym) == ("vtable", class_name)]
-        self.owner = owners[-1] if owners else None
-        # Refs up to `_clear_through` have no other object's symbol before them.
-        self._clear_through = self.owner if self.owner is not None else vt_addr
-        self._boundary: int | None = None
-
-    def classify(self, ref: int) -> str | None:
-        if self._boundary is None and ref > self._clear_through:
-            later = [addr for addr, _raw, _sym in _real_symbols(
-                self._bv, self._clear_through + 1, ref - self._clear_through)]
-            if later:
-                self._boundary = later[0]
-            else:
-                self._clear_through = ref
-        if self._boundary is not None and ref >= self._boundary:
-            return "outside"
-        return None if self.owner is not None else _SLOT_NO_SYMBOL
-
-
-def _vtable_slots_referencing(ctx, bv, target: int, *, data_refs: Any = None) -> _SlotRefs:
-    """#998 item 1: every Itanium vtable slot that holds *target*.
-
-    Reads BN's data refs to *target*; for each, walks back word by word to the
-    nearest header whose word[1] is a typeinfo, over words that can be vtable
-    entries (:func:`_plausible_slot_word`) -- the first word that cannot ends
-    the walk: the ref is not in a vtable. A candidate slot must then
-
-    * be inside the table by the decoder `class show` uses (past its 64-slot
-      window, by the #822 slot probe) and hold *target*, with an
-      offset-to-top at word[0]; and
-    * lie inside the class's own ``_ZTV`` symbol (:class:`_TableBounds`).
-
-    A candidate the symbols cannot attest, a slot the probe cannot decide, and
-    a ref past the call's budgets (``_SLOT_WALK_BUDGET`` words walked,
-    ``_SLOT_PROBE_BUDGET`` rows probed) are ``undecided`` -- never dropped,
-    never confirmed. A ref inside another named object is not a slot.
-    ``data_refs`` are the refs when the caller already read them."""
-    if data_refs is None:
-        getter = getattr(bv, "get_data_refs", None)
-        if not callable(getter):
-            return _SlotRefs([], [])
-        try:
-            data_refs = getter(int(target))
-        except Exception:
-            return _SlotRefs([], [])
-    try:
-        refs = sorted({int(r) for r in data_refs or []})
-    except (TypeError, ValueError):
-        return _SlotRefs([], [])
-    ptr = ctx._pointer_size(bv)
-    out: list[dict[str, Any]] = []
-    undecided: list[dict[str, Any]] = []
-    budget = _SLOT_WALK_BUDGET
-    # ref -> its walk's answer: ("header", vt_addr, typeinfo, class) / ("out",)
-    # / ("budget",); a later ref in the same run stops at this ref and reuses it.
-    walked: dict[int, tuple] = {}
-    layouts: dict[int, dict[str, Any]] = {}
-    probed: dict[int, dict[str, Any]] = {}
-    bounds: dict[int, _TableBounds] = {}
-    probe_budget = _SLOT_PROBE_BUDGET
-    for ref in refs:
-        answer: tuple | None = None
-        steps = 0
-        while answer is None:
-            word_addr = ref - (steps + 1) * ptr
-            if word_addr in walked:
-                answer = walked[word_addr]
-                break
-            if budget <= 0:
-                answer = ("budget",)
-                break
-            budget -= 1
-            word = ctx._read_pointer_value(bv, word_addr, size=ptr)
-            class_name = ctx._typeinfo_name_at(bv, word) if word else None
-            if class_name is not None:
-                answer = ("header", word_addr - ptr, int(word), class_name)
-            elif not _plausible_slot_word(bv, word):
-                answer = ("out",)
-            steps += 1
-        walked[ref] = answer
-        if answer[0] == "out":
-            continue
-        if answer[0] == "budget":
-            undecided.append({"address": hex(ref), "reason": _SLOT_BUDGET})
-            continue
-        _kind, vt_addr, _typeinfo, class_name = answer
-        index = (ref - vt_addr) // ptr - 2
-        if vt_addr not in layouts:
-            layouts[vt_addr] = ctx._vtable_layout_for(bv, vt_addr) or {}
-            probed[vt_addr] = {"through": int(layouts[vt_addr].get("scanned") or 0),
-                               "state": "open"}
-            bounds[vt_addr] = _TableBounds(bv, vt_addr, class_name)
-        attested = bounds[vt_addr].classify(ref)
-        if attested == "outside":
-            continue   # inside another named object: not a slot
-        layout = layouts[vt_addr]
-        slots = {s.get("index"): s for s in layout.get("slots") or [] if isinstance(s, dict)}
-        slot = slots.get(index)
-        if slot is None and layout.get("truncated"):
-            if attested is not None:
-                # Unattested and past the 64-slot window: it could never be
-                # confirmed, so the costly probe is not run to name a candidate.
-                undecided.append({"address": hex(ref), "reason": attested})
-                continue
-            # Past the 64-slot window: one incremental #822 probe per table
-            # (refs arrive in address order, so each row is read once), and
-            # its rows count against the call's probe budget.
-            state = probed[vt_addr]
-            if state["state"] == "ended":
-                continue
-            if state["state"] in ("unknown", "budget"):
-                undecided.append({"address": hex(ref), "reason": (
-                    _SLOT_UNRESOLVED if state["state"] == "unknown" else _SLOT_BUDGET)})
-                continue
-            rows = index - state["through"] + 1
-            if rows > probe_budget:
-                state["state"] = "budget"
-                undecided.append({"address": hex(ref), "reason": _SLOT_BUDGET})
-                continue
-            probe_budget -= max(rows, 0)
-            probe = _vtable_slot_probe(ctx, bv, vt_addr, index,
-                                       scanned_through=state["through"])
-            if probe["status"] == "not_present":
-                state["state"] = "ended"
-                continue
-            if probe["status"] != "resolved":
-                state["state"] = "unknown"
-                undecided.append({"address": hex(ref), "reason": _SLOT_UNRESOLVED})
-                continue
-            state["through"] = index + 1
-            slot = probe["slot"]
-        try:
-            value = int(str(slot.get("address")), 16) if slot else None
-        except ValueError:
-            value = None
-        if value is None or value & ~1 != int(target) & ~1:
-            continue
-        raw = ctx._read_pointer_value(bv, vt_addr, size=ptr)
-        ott, rejected, _proof = _classify_backwalk_candidate(
-            ctx, bv, vt_addr, raw, ptr, layout, class_name)
-        if rejected is not None:
-            continue
-        candidate = {
-            "class": class_name,
-            "vtable": hex(vt_addr),
-            "address_point": hex(vt_addr + 2 * ptr),
-            "slot_index": index,
-            "slot_offset": hex(index * ptr),
-            "slot_address": hex(ref),
-            "offset_to_top": ott,
-        }
-        if attested is None:
-            out.append(candidate)
-        else:
-            undecided.append({"address": hex(ref), "reason": attested, "candidate": candidate})
-    return _SlotRefs(out, undecided)
 
 
 def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:

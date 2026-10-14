@@ -32,7 +32,6 @@ CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
 VCALLS_BINARY = FIXTURES_DIR / "vcalls_x86_64"
 SIZES_BINARY = FIXTURES_DIR / "sizes_x86_64"
-SLOTS_BINARY = FIXTURES_DIR / "slots_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -3889,55 +3888,33 @@ int main() { return global_b.b() + global_r.r(); }
 
 class TestVirtualMethodsAndClassSize998:
     """#998 on real g++ builds. `src/vcalls.cpp` (-O0): a virtual method reached
-    only through its vtable slot -- including past the 64-slot layout window
-    and in a secondary vtable -- and the vtable's address point.
+    only through its vtable slot, and the vtable's address point.
     `src/sizes.cpp` (-O2): the allocation shapes that are NOT one object of
-    the class whose constructor touches them first."""
+    the class whose constructor runs on them."""
 
     def _json(self, shared_bn, *args):
         res = shared_bn.run(*args, "--format", "json")
         assert res.returncode == 0, (res.stdout, res.stderr)
         return json.loads(res.stdout)
 
-    def test_virtual_only_method_names_its_vtable_slots(self, shared_bn):
+    def test_callsites_says_when_the_callee_is_stored_in_data(self, shared_bn):
+        # `reg` is never called directly; its address sits in the Dispatcher
+        # and AudioDisp vtables. `callsites` states that fact -- two data
+        # refs, where -- and claims nothing about what they are.
         shared_bn.load(VCALLS_BINARY)
-        # `reg` is never called directly; AudioDisp inherits it, so both
-        # tables hold it at slot 3 (after the two destructors and dispatch).
         out = self._json(shared_bn, "callsites", "vc::Dispatcher::reg")
         assert out["total"] == 0, out
-        assert sorted((s["class"], s["slot_index"], s["slot_offset"]) for s in out["vtable_slots"]) == [
-            ("vc::AudioDisp", 3, "0x18"), ("vc::Dispatcher", 3, "0x18")]
+        assert out["callee_data_ref_count"] == 2, out
+        xrefs = self._json(shared_bn, "xrefs", "vc::Dispatcher::reg")
+        assert out["callee_data_refs"] == sorted(
+            r["address"] for r in xrefs["items"] if r["kind"] == "data")
         text = shared_bn.run("callsites", "vc::Dispatcher::reg").stdout
-        assert "the callee is a vtable slot -- slot 3 (+0x18) of vc::AudioDisp, vc::Dispatcher" in text
-        # The override lives only in its own class's table.
-        out = self._json(shared_bn, "callsites", "vc::AudioDisp::dispatch")
-        assert [(s["class"], s["slot_index"]) for s in out["vtable_slots"]] == [("vc::AudioDisp", 2)]
-        # A plain function is in no vtable.
-        assert self._json(shared_bn, "callsites", "vc::run_table")["vtable_slots"] == []
-        # xrefs labels those data refs with the table and slot.
-        text = shared_bn.run("xrefs", "vc::Dispatcher::reg").stdout
-        assert "vtable for vc::Dispatcher [slot 3]" in text, text
-        assert "vtable for vc::AudioDisp [slot 3]" in text, text
-
-    def test_slot_past_the_layout_window_and_in_a_secondary_vtable(self, shared_bn):
-        # #998 review: slot 68 of a 70-slot table was dropped silently, and a
-        # secondary table's slot read as the primary's.
-        shared_bn.load(VCALLS_BINARY)
-        out = self._json(shared_bn, "callsites", "vc::Big::m68")
-        assert [(s["class"], s["slot_index"], s["slot_offset"]) for s in out["vtable_slots"]] == [
-            ("vc::Big", 68, "0x220")]
-        assert out["vtable_slots_undecided"] == []
-        assert "vtable for vc::Big [slot 68]" in shared_bn.run("xrefs", "vc::Big::m68").stdout
-        # The non-virtual thunk to `Both::fb` is slot 0 of Both's Right-in-Both
-        # table (offset-to-top -8); Both's PRIMARY slot 0 is `Both::fa`.
-        thunk = "_ZThn8_N2vc4Both2fbEv"
-        out = self._json(shared_bn, "callsites", thunk)
-        (slot,) = out["vtable_slots"]
-        assert (slot["class"], slot["slot_index"], slot["offset_to_top"]) == ("vc::Both", 0, -8)
-        text = shared_bn.run("callsites", thunk).stdout
-        assert "slot 0 (+0x0) of the secondary vtable (offset-to-top -8) of vc::Both" in text
-        assert "secondary vtable (offset-to-top -8) for vc::Both [slot 0]" in \
-            shared_bn.run("xrefs", thunk).stdout
+        assert "note: the callee's address is stored in 2 data location(s)" in text, text
+        assert "may be vtable slots or function-pointer tables" in text
+        # A function stored nowhere gets no note.
+        plain = self._json(shared_bn, "callsites", "vc::pump")
+        assert plain["callee_data_ref_count"] == 0
+        assert "data location" not in shared_bn.run("callsites", "vc::pump").stdout
 
     def test_vtable_address_point_is_what_objects_reference(self, shared_bn):
         shared_bn.load(VCALLS_BINARY)
@@ -3957,104 +3934,43 @@ class TestVirtualMethodsAndClassSize998:
                   "sz::PB": 0x10, "sz::PD": 0x50, "sz::Rec": 0x18, "sz::Trailing": 0x10,
                   "sz::Trail": 0x8, "sz::Header": 0x8, "sz::VD0": 0xb0}
 
-    def test_a_reported_size_is_never_an_allocation_that_is_not_the_class(self, shared_bn):
-        # #998 review blockers: array new, a polymorphic member at offset 0
-        # (ctor inlined or not), placement new, a derived ctor inlined around
-        # an out-of-line base ctor (polymorphic or not, the vptr store through
-        # an SSA copy), a final class's inlined destructor re-stamping the
-        # base vptr (round 1), and a ctor writing trailing storage or its
-        # enclosing object's payload (round 2) each reported an ALLOCATION as
-        # the class size.
+    def test_no_class_gets_a_size_and_every_upper_bound_holds(self, shared_bn):
+        # #998 reviews: every exact reader tried (allocation, constructor
+        # writes, deleting destructor, BN type) was wrong for some legal shape.
+        # What remains is sound by construction: the object sits at offset 0 of
+        # the `operator new(N)` its constructor runs on, so it fits in N.
         shared_bn.load(SIZES_BINARY)
         listing = self._json(shared_bn, "class", "list", "--query", "sz::", "--sizes")
         rows = {row["name"]: row for row in listing["items"]}
         assert set(self.REAL_SIZES) <= set(rows), sorted(rows)
         for name, real in self.REAL_SIZES.items():
             card = self._json(shared_bn, "class", "show", name)
-            for reported in (card["size"], rows[name]["size"]):
-                assert reported is None or int(reported["value"], 16) == real, (name, reported)
-        # What establishes a size: the sized delete in the deleting destructor
-        # of every class with a virtual destructor.
-        for name in ("sz::Plain", "sz::Base", "sz::Leaf", "sz::PB", "sz::PD"):
-            assert rows[name]["size"]["source"] == "deleting_destructor", rows[name]
-        # Everything else stays unknown, with its allocation as a disclosed upper
-        # bound -- including `Rec`, whose ctor fills its allocation exactly, and
-        # `Trailing`/`Trail`/`Header`, whose ctors fill past their own object.
+            assert card["size"] is None and rows[name]["size"] is None, (name, card["size"])
+            assert card["size_upper_bound"] == rows[name]["size_upper_bound"], name
+            bound = card["size_upper_bound"]
+            assert bound is None or int(bound, 16) >= real, (name, bound)
+            assert card["size_reason"] == (
+                "allocation_upper_bound_only" if bound else "no_size_evidence"), card
         for name, bound in (("sz::Inner", "0x50"), ("sz::Gadget", "0x100"),
                             ("sz::PBase", "0x58"), ("sz::Rec", "0x18"),
                             ("sz::Trailing", "0x50"), ("sz::Trail", "0x10"),
-                            ("sz::Header", "0x48")):
-            card = self._json(shared_bn, "class", "show", name)
-            assert (card["size"], card["size_reason"], card["size_upper_bound"]) == (
-                None, "allocation_upper_bound_only", bound), card
-            assert (rows[name]["size_reason"], rows[name]["size_upper_bound"]) == (
-                "allocation_upper_bound_only", bound), rows[name]
-        # The default listing reads only BN types and says so.
-        default = self._json(shared_bn, "class", "list", "--query", "sz::Plain")
-        assert default["items"][0]["size"] is None
-        assert default["items"][0]["size_reason"] == "not_computed"
+                            ("sz::Header", "0x48"), ("sz::Plain", "0x28")):
+            assert rows[name]["size_upper_bound"] == bound, rows[name]
+        text = shared_bn.run("class", "show", "sz::Trailing").stdout
+        assert "size: unknown (allocation_upper_bound_only; at most 0x50)" in text
+        # The default listing runs no size reader and carries no size fields.
+        (default,) = self._json(shared_bn, "class", "list", "--query", "sz::Plain")["items"]
+        assert default["size"] is None and "size_reason" not in default
 
-    def test_a_bn_type_of_a_class_with_virtual_bases_is_only_a_lower_bound(self, shared_bn):
-        # #998 review round 2: cmake's `std::istream` type (0x10) covers only
-        # the non-virtual part of a 0x118 class, and the default listing
-        # printed it as the size. `VD0 : virtual VB0` is 0xb0; a declared type
-        # of its non-virtual part is 0x10.
-        shared_bn.load(SIZES_BINARY)
-        declared = shared_bn.run("types", "declare", "struct `sz::VD0` { void* vptr; long d; };")
-        assert declared.returncode == 0, (declared.stdout, declared.stderr)
-        for args in (("class", "list", "--query", "sz::VD0"),
-                     ("class", "list", "--query", "sz::VD0", "--sizes")):
-            (row,) = self._json(shared_bn, *args)["items"]
-            assert (row["size"], row["size_reason"], row["size_lower_bound"]) == (
-                None, "bn_type_may_exclude_virtual_bases", "0x10"), row
-        card = self._json(shared_bn, "class", "show", "sz::VD0")
-        assert (card["size"], card["size_lower_bound"], card["size_upper_bound"]) == (
-            None, "0x10", "0xb0"), card
-        # A class proven free of virtual bases keeps its BN type as the size.
-        declared = shared_bn.run("types", "declare", "struct `sz::Rec` { long a; long b; long c; };")
-        assert declared.returncode == 0, (declared.stdout, declared.stderr)
-        (row,) = self._json(shared_bn, "class", "list", "--query", "sz::Rec")["items"]
-        assert row["size"] == {"value": "0x18", "source": "bn_type"}, row
-
-    def test_vcalls_sizes_come_from_exact_evidence(self, shared_bn):
+    def test_vcalls_construction_sites_carry_their_allocation(self, shared_bn):
         shared_bn.load(VCALLS_BINARY)
         disp = self._json(shared_bn, "class", "show", "vc::Dispatcher")
-        assert disp["size"]["value"] == "0x40", disp
+        assert (disp["size"], disp["size_upper_bound"]) == (None, "0x40"), disp
         sites = {s["function"]: s for s in disp["instances"]["construction_sites"]}
         assert sites["vc::make"]["allocation_size"] == "0x40"
         # AudioDisp's ctor calls the base ctor on its own `this`: a real
         # construction site with no allocation to read.
         assert sites["vc::AudioDisp::AudioDisp"]["allocation_size"] is None
-        assert self._json(shared_bn, "class", "show", "vc::AudioDisp")["size"]["value"] == "0x80"
-
-    def test_data_shaped_like_a_vtable_slot_is_never_confirmed(self, shared_bn):
-        # #998 review round 2 (`src/slots.cpp`, -O2): the word right after
-        # Short's 70 slots (`adjacent_table`) and a `{0, &typeid(X), fx}`
-        # registry were confirmed as slots 70 of Short and 0 of X.
-        shared_bn.load(SLOTS_BINARY)
-        adjacent = self._json(shared_bn, "callsites", "_Z8adjacenti")
-        assert adjacent["vtable_slots"] == [] and adjacent["vtable_slots_undecided"] == []
-        assert "adjacent_table" in shared_bn.run("xrefs", "_Z8adjacenti").stdout
-        registry = self._json(shared_bn, "callsites", "_Z2fxi")
-        assert registry["vtable_slots"] == [], registry["vtable_slots"]
-        assert [u["reason"] for u in registry["vtable_slots_undecided"]] == ["no_vtable_symbol"]
-        # The real table's slots are still confirmed, past the 64-slot window too.
-        for raw, index in (("_ZN5Short2m3Ev", 3), ("_ZN5Short3m69Ev", 69)):
-            out = self._json(shared_bn, "callsites", raw)
-            assert [(s["class"], s["slot_index"]) for s in out["vtable_slots"]] == [
-                ("Short", index)], out
-
-    def test_a_long_pointer_table_stays_fast(self, shared_bn):
-        # #998 review round 2: a 4865-entry table made `callsites` time out at
-        # 600 s (0.3 s on base); every ref walked back over the whole run.
-        shared_bn.load(SLOTS_BINARY)
-        for args in (("callsites", "_Z4hdefi", "--format", "json"), ("xrefs", "_Z4hdefi")):
-            started = time.monotonic()
-            res = shared_bn.run(*args)
-            assert res.returncode == 0, (res.stdout, res.stderr)
-            assert time.monotonic() - started < 30, args
-        out = self._json(shared_bn, "callsites", "_Z4hdefi")
-        assert out["vtable_slots"] == [] and out["vtable_slots_undecided"] == []
 
 
 class TestStructLayoutAssistance903:

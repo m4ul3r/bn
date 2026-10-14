@@ -918,156 +918,7 @@ def test_vtable_layout_skips_header_and_marks_slots():
     assert s2["pure_virtual"] is True
 
 
-_NO_SIZE = read_class._SizeFinding(None, "no_size_evidence", None)
-
-
-class _SlotRefCtx:
-    """Tables in fake memory: `Base` @ 0x9000 (slots at 0x9010) and `Derived`
-    @ 0x9100 (slots at 0x9110). Each table's word[1] is its typeinfo; slot
-    words are code pointers, which are not typeinfo. Counts word reads."""
-
-    def __init__(self, words, tables):
-        self._words = words
-        self._tables = tables          # vtable addr -> [slot values]
-        self.reads = 0
-
-    def _pointer_size(self, bv):
-        return 8
-
-    def _read_pointer_value(self, bv, addr, *, size=None):
-        self.reads += 1
-        return self._words.get(addr)
-
-    def _typeinfo_name_at(self, bv, addr):
-        return {0x9800: "Base", 0x9900: "Derived"}.get(addr)
-
-    def _vtable_layout_for(self, bv, addr):
-        slots = self._tables.get(addr)
-        if slots is None:
-            return {"address": hex(addr), "slots": [], "truncated_reason": "no_local_vtable_body"}
-        return {"address": hex(addr), "address_point": hex(addr + 16),
-                "slots": [{"index": i, "address": hex(v), "method": {"name": f"m{i}"}}
-                          for i, v in enumerate(slots)]}
-
-    def _sections_at(self, bv, addr):
-        return []
-
-    def _segment_at(self, bv, addr):
-        return None
-
-
-def _sym(address, raw, short=None):
-    return types.SimpleNamespace(address=address, raw_name=raw, short_name=short or raw)
-
-
-_BASE_ZTV = _sym(0x9000, "_ZTV4Base", "vtable for Base")
-_DERIVED_ZTV = _sym(0x9100, "_ZTV7Derived", "vtable for Derived")
-
-
-def _slot_bv(data_refs, symbols=()):
-    """A view whose code is 0x400000-0x403000 (what a vtable entry may hold),
-    with the given symbols."""
-    symbols = list(symbols)
-    return types.SimpleNamespace(
-        get_data_refs=lambda addr: data_refs.get(addr, []),
-        get_function_at=lambda addr: object() if 0x400000 <= addr < 0x403000 else None,
-        get_symbol_at=lambda addr: next((s for s in symbols if s.address == addr), None),
-        get_symbols=lambda start, length: [s for s in symbols
-                                           if start <= s.address < start + length])
-
-
-def test_vtable_slots_referencing_names_each_table_and_slot_998():
-    """#998 item 1: the data refs to a method that are vtable slots, each with
-    its class, slot index and byte offset from the address point."""
-    reg, other = 0x401000, 0x402000
-    words = {0x9000: 0, 0x9008: 0x9800, 0x9010: 0x400100, 0x9018: other, 0x9020: reg,
-             0x9100: 0, 0x9108: 0x9900, 0x9110: 0x400200, 0x9118: 0x402100, 0x9120: reg,
-             # A function-pointer array preceded by a data word, not a header.
-             0x94f8: 0x7777, 0x9500: reg}
-    ctx = _SlotRefCtx(words, {0x9000: [0x400100, other, reg],
-                              0x9100: [0x400200, 0x402100, reg]})
-    bv = _slot_bv({reg: [0x9020, 0x9120, 0x9500], other: [0x9018]}, [_BASE_ZTV, _DERIVED_ZTV])
-
-    found = read_class._vtable_slots_referencing(ctx, bv, reg)
-    assert found.slots == [
-        {"class": "Base", "vtable": "0x9000", "address_point": "0x9010", "slot_index": 2,
-         "slot_offset": "0x10", "slot_address": "0x9020", "offset_to_top": 0},
-        {"class": "Derived", "vtable": "0x9100", "address_point": "0x9110", "slot_index": 2,
-         "slot_offset": "0x10", "slot_address": "0x9120", "offset_to_top": 0},
-    ]
-    # The fn-pointer array's walk met a word no vtable can hold: decided, not a slot.
-    assert found.undecided == []
-    assert [s["slot_index"] for s in read_class._vtable_slots_referencing(ctx, bv, other).slots] == [1]
-
-
-def test_vtable_slots_referencing_requires_the_decoded_slot_to_hold_the_target_998():
-    """A data ref past the table's decoded end (the layout stopped before it)
-    is not a slot, even with a typeinfo header within reach."""
-    target = 0x401000
-    words = {0x9000: 0, 0x9008: 0x9800, 0x9010: 0x400100, 0x9018: 0x401100, 0x9020: target}
-    ctx = _SlotRefCtx(words, {0x9000: [0x400100]})
-    found = read_class._vtable_slots_referencing(
-        ctx, _slot_bv({target: [0x9020]}, [_BASE_ZTV]), target)
-    assert found == read_class._SlotRefs([], [])
-
-
-def test_data_shaped_like_a_vtable_is_never_a_confirmed_slot_998():
-    """#998 review round 2: a registry entry `{0, &typeid(X), fn}` has a
-    vtable header's shape, and the word right after a table looks like one
-    more slot. Only the class's own `_ZTV` symbol, with no other object's
-    symbol before the ref, confirms a slot."""
-    fn = 0x401000
-    # `regs` @ 0x9000 is {0, &typeid(Base), fn}; no `_ZTV4Base` precedes it.
-    words = {0x9000: 0, 0x9008: 0x9800, 0x9010: fn}
-    ctx = _SlotRefCtx(words, {0x9000: [fn]})
-    registry = read_class._vtable_slots_referencing(
-        ctx, _slot_bv({fn: [0x9010]}, [_sym(0x9000, "regs")]), fn)
-    assert registry.slots == []
-    assert [(u["reason"], u["candidate"]["class"], u["candidate"]["slot_index"])
-            for u in registry.undecided] == [("no_vtable_symbol", "Base", 0)]
-
-    # A real `_ZTV4Base` whose two slots end where `adjacent_table` begins: the
-    # decoder reads the adjacent word as a third slot, the symbols do not.
-    words = {0x9000: 0, 0x9008: 0x9800, 0x9010: 0x400100, 0x9018: 0x400200, 0x9020: fn}
-    ctx = _SlotRefCtx(words, {0x9000: [0x400100, 0x400200, fn]})
-    adjacent = read_class._vtable_slots_referencing(
-        ctx, _slot_bv({fn: [0x9020]}, [_BASE_ZTV, _sym(0x9020, "adjacent_table")]), fn)
-    assert adjacent == read_class._SlotRefs([], [])
-
-    # BN's own synthesized `_vtable_for_` name is not attestation (a stripped
-    # binary): the slot stays undecided, with the slot it would be.
-    stripped = read_class._vtable_slots_referencing(
-        ctx, _slot_bv({fn: [0x9020]}, [_sym(0x9010, "_vtable_for_Base", "vtable for Base")]), fn)
-    assert stripped.slots == []
-    assert [u["candidate"]["slot_index"] for u in stripped.undecided] == [2]
-
-
-def test_vtable_slot_walk_that_never_ends_is_disclosed_not_dropped_998():
-    """#998 review: a ref deep inside a long run of code pointers with no
-    header in reach is reported as undecided, with the budget as the reason."""
-    target = 0x401000
-    run_end = 0x100000
-    words = {run_end - 8 * k: 0x400100 for k in range(1, 5000)}
-    words[run_end] = target
-    ctx = _SlotRefCtx(words, {})
-    found = read_class._vtable_slots_referencing(ctx, _slot_bv({target: [run_end]}), target)
-    assert found == read_class._SlotRefs(
-        [], [{"address": hex(run_end), "reason": "walk_budget_exhausted"}])
-
-
-def test_a_long_pointer_table_costs_one_pass_998():
-    """#998 review round 2: every ref walked back on its own, so a 4865-entry
-    table cost refs x length word reads and `callsites` timed out. A ref's walk
-    stops at the previous ref in the run and reuses its answer."""
-    target = 0x401000
-    table = 0x200000
-    words = {table - 8: 0x7777}                       # the object before the table
-    words.update({table + 8 * i: target for i in range(5000)})
-    ctx = _SlotRefCtx(words, {})
-    refs = [table + 8 * i for i in range(5000)]
-    found = read_class._vtable_slots_referencing(ctx, _slot_bv({target: refs}), target)
-    assert found == read_class._SlotRefs([], [])
-    assert ctx.reads <= 2
+_NO_SIZE = read_class._SizeBound("no_size_evidence", None)
 
 
 def test_vtable_layout_reports_the_address_point_998():
@@ -1103,7 +954,7 @@ def test_vtable_layout_stops_at_unmapped_slot():
     assert [s["index"] for s in layout["slots"]] == [0]   # stopped at the gap
 
 
-# --- #998 item 4: fake MLIL SSA for the size readers ------------------------
+# --- #998 item 4: fake MLIL SSA for the allocation trace --------------------
 
 
 class _Il:
@@ -1114,72 +965,26 @@ class _Il:
         self.__dict__.update(operands)
 
 
-def _ssa(name, version=0):
-    return types.SimpleNamespace(var=name, version=version)
-
-
 def _var(name, version=0, function=None):
-    return _Il("MLIL_VAR_SSA", src=_ssa(name, version), function=function)
+    return _Il("MLIL_VAR_SSA", src=types.SimpleNamespace(var=name, version=version),
+               function=function)
 
 
-def _const(value):
-    return _Il("MLIL_CONST", constant=value)
+def _call(target, params, address):
+    return _Il("MLIL_CALL_SSA", dest=_Il("MLIL_CONST_PTR", constant=target),
+               params=params, address=address)
 
 
-def _add(left, right):
-    return _Il("MLIL_ADD", left=left, right=right)
-
-
-def _store(dest, size, address=0):
-    return _Il("MLIL_STORE_SSA", dest=dest, size=size, src=_const(0), address=address)
-
-
-def _copy(dest, src):
-    return _Il("MLIL_SET_VAR_SSA", dest=_ssa(*dest), src=src)
-
-
-def _call(target, params, address, op="MLIL_CALL_SSA"):
-    return _Il(op, dest=_Il("MLIL_CONST_PTR", constant=target), params=params, address=address)
-
-
-class _RegValue:
-    def __init__(self, kind, value=None, reg=None):
-        self.type = types.SimpleNamespace(name=kind)
-        self.value = value
-        self.reg = reg
-
-
-class _MlilFn:
-    """A function with an MLIL SSA body, a SysV-style argument list and BN's
-    per-address register dataflow (``regs``: {address: {reg: _RegValue}})."""
-
-    def __init__(self, start, name, instructions, *, regs=None, symbol=None):
-        self.start = start
-        self.name = name
-        self.symbol = symbol
-        self.parameter_vars = ["this"]
-        self.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi", "rdx"])
-        self._regs = regs or {}
-        self.mlil = types.SimpleNamespace(ssa_form=types.SimpleNamespace(
-            instructions=instructions, source_function=self))
-
-    def get_reg_value_at(self, address, reg):
-        return self._regs.get(address, {}).get(reg, _RegValue("UndeterminedValue"))
-
-
-_OP_NEW, _OP_NEW_ARRAY, _SIZED_DELETE, _DELETE, _MEMSET = (
-    0x400620, 0x400630, 0x4010c0, 0x4010d0, 0x4010e0)
+_OP_NEW, _OP_NEW_ARRAY = 0x400620, 0x400630
 
 
 class _MlilBV:
     """Imports by raw name, plus local functions by address."""
 
-    _IMPORTS = {_OP_NEW: "_Znwm", _OP_NEW_ARRAY: "_Znam", _SIZED_DELETE: "_ZdlPvm",
-                _DELETE: "_ZdlPv", _MEMSET: "memset"}
+    _IMPORTS = {_OP_NEW: "_Znwm", _OP_NEW_ARRAY: "_Znam"}
 
-    def __init__(self, functions=(), type_widths=None):
+    def __init__(self, functions=()):
         self._functions = {fn.start: fn for fn in functions}
-        self._type_widths = type_widths or {}
 
     def get_symbol_at(self, address):
         name = self._IMPORTS.get(address)
@@ -1191,55 +996,28 @@ class _MlilBV:
     def get_functions_containing(self, address):
         return [fn for fn in self._functions.values() if fn.start <= address < fn.start + 0x100]
 
-    def get_type_by_name(self, name):
-        width = self._type_widths.get(str(name))
-        return types.SimpleNamespace(width=width) if width else None
-
-
-def _d0(start, size, *, this_reg="rdi", delete=_SIZED_DELETE):
-    """`X::~X() [D0]`: `rsi = size; tailcall delete(this)` (BN's import type
-    drops the size parameter from the IL; the register still holds it)."""
-    call = start + 9
-    this_value = (_RegValue("EntryValue", reg=this_reg) if this_reg
-                  else _RegValue("UndeterminedValue"))
-    return _MlilFn(start, "_ZN1XD0Ev", [
-        _copy(("rsi", 1), _const(size)),
-        _call(delete, [_var("this")], call, op="MLIL_TAILCALL_SSA"),
-    ], regs={call: {"rdi": this_value, "rsi": _RegValue("ConstantValue", value=size)}})
-
-
-def test_deleting_destructor_names_the_object_size_998():
-    """The ABI's sized `operator delete(this, sizeof(X))` in X's own deleting
-    destructor is exact, whatever allocation the object came from."""
-    bv = _MlilBV()
-    assert read_class._deleting_dtor_size(bv, _d0(0x12b0, 0x28)) == (0x28, 0x12b9)
-    # `this` adjusted first (a thunk) or an unsized delete: no evidence.
-    assert read_class._deleting_dtor_size(bv, _d0(0x12b0, 0x28, this_reg=None)) is None
-    assert read_class._deleting_dtor_size(bv, _d0(0x12b0, 0x28, delete=_DELETE)) is None
-
 
 def _allocating_caller(start, new_target, size, *, via_copy=False):
     """`p = operator new(size); [q = p;] X::X(q)` with the ctor call at start+0x10."""
     ssa = types.SimpleNamespace()
-    new_call = _call(new_target, [_const(size)], start + 4)
+    new_call = _call(new_target, [_Il("MLIL_CONST", constant=size)], start + 4)
     definitions = {("result", 1): new_call}
     arg = _var("result", 1, function=ssa)
     if via_copy:
-        definitions[("x3", 1)] = _copy(("x3", 1), arg)
+        definitions[("x3", 1)] = _Il("MLIL_SET_VAR_SSA", src=arg)
         arg = _var("x3", 1, function=ssa)
-    fn = _MlilFn(start, "make", [])
     ssa.get_ssa_var_definition = lambda var: definitions.get((var.var, var.version))
-    ssa.source_function = fn
     ctor_call = types.SimpleNamespace(params=[arg])
-    fn.get_llil_at = lambda addr: types.SimpleNamespace(
-        mlil=types.SimpleNamespace(ssa_form=ctor_call))
-    return fn
+    return types.SimpleNamespace(
+        start=start,
+        get_llil_at=lambda addr: types.SimpleNamespace(
+            mlil=types.SimpleNamespace(ssa_form=ctor_call)))
 
 
 def test_operator_new_size_at_traces_scalar_new_only_998():
     caller = _allocating_caller(0x6000, _OP_NEW, 0x58, via_copy=True)
     assert read_class._operator_new_size_at(_MlilBV([caller]), 0x6010) == (0x58, 0x6004)
-    # `operator new[]` is an array: never one object.
+    # `operator new[]` is not traced.
     array = _allocating_caller(0x6000, _OP_NEW_ARRAY, 0x30)
     assert read_class._operator_new_size_at(_MlilBV([array]), 0x6010) is None
 
@@ -1251,91 +1029,25 @@ class _SizeCtx:
     def _ctor_construction_sites(self, bv, record):
         return [dict(site) for site in self._sites]
 
-    def _pointer_size(self, bv):
-        return 8
 
-
-def _site(allocation_size=None, ctor="0x4000", allocation="0x6004", address="0x6010"):
-    return {"address": address, "function": "make", "kind": "ctor-call", "ctor": ctor,
+def _site(allocation_size=None, allocation="0x6004", address="0x6010"):
+    return {"address": address, "function": "make", "kind": "ctor-call",
             "allocation_size": allocation_size, "allocation": allocation}
 
 
-def _record(*methods, **fields):
-    return {"name": "net::Session", "methods": list(methods), **fields}
-
-
-_D0_METHOD = {"address": "0x12b0", "mangled": "_ZN3net7SessionD0Ev", "kind": "dtor"}
-
-
-def test_size_prefers_bn_type_width():
-    bv = _MlilBV([_d0(0x12b0, 0x28)], type_widths={"net::Session": 0xD0})
-    finding = read_class._object_size(_SizeCtx(), bv, _record(_D0_METHOD))
-    assert finding == read_class._SizeFinding({"value": "0xd0", "source": "bn_type"}, None, None)
-
-
-def test_size_from_the_deleting_destructor_998():
-    """A class's D0 fixes its size even when every allocation is larger."""
-    bv = _MlilBV([_d0(0x12b0, 0x28)])
-    finding = read_class._object_size(_SizeCtx([_site("0x50")]), bv, _record(_D0_METHOD))
-    assert finding == read_class._SizeFinding(
-        {"value": "0x28", "source": "deleting_destructor", "at": "0x12b9"}, None, 0x50)
+def _record():
+    return {"name": "net::Session", "methods": []}
 
 
 def test_an_allocation_is_only_ever_an_upper_bound_998():
-    """#998 review rounds 1 and 2: array new, an enclosing object, a derived
-    class built around the ctor, placement new and trailing storage the ctor
-    itself fills (so its writes reach the end of the block) all hand the ctor
-    a LARGER block. No constructor write tells them apart, so even an
-    allocation the constructor fills to the last byte is not the size."""
-    fills = _MlilFn(0x4000, "_ZN1XC2Ev", [_store(_var("this"), 8),
-                                          _store(_add(_var("this"), _const(8)), 0x48)])
-    bv = _MlilBV([fills])
-    finding = read_class._object_size(_SizeCtx([_site("0x50"), _site(None)]), bv, _record())
-    assert finding == read_class._SizeFinding(None, "allocation_upper_bound_only", 0x50)
-
-
-def test_a_bn_type_is_a_lower_bound_when_virtual_bases_are_not_ruled_out_998(monkeypatch):
-    """#998 review round 2: BN's `std::istream` type is 0x10 wide while the
-    class is 0x118 -- a type for a class with virtual bases covers only the
-    non-virtual part. Its width is the size only once local RTTI proves the
-    ancestry free of virtual bases; else it is `size_lower_bound`."""
-    bv = _MlilBV(type_widths={"net::Session": 0x10})
-    proven: list[bool] = []
-    monkeypatch.setattr(read_class, "_has_nonvirtual_rtti_ancestry",
-                        lambda ctx, b, ti, ptr: proven[-1])
-    with_rtti = _record(typeinfo={"address": "0x9800"}, vtable={"address": "0x9000"})
-
-    proven.append(False)
-    assert read_class._object_size(_SizeCtx(), bv, with_rtti) == read_class._SizeFinding(
-        None, "bn_type_may_exclude_virtual_bases", None, 0x10)
-    proven.append(True)
-    assert read_class._object_size(_SizeCtx(), bv, with_rtti).size == {
-        "value": "0x10", "source": "bn_type"}
-    # A vtable but no typeinfo to read the ancestry from: not proven.
-    assert read_class._object_size(
-        _SizeCtx(), bv, _record(vtable={"address": "0x9000"})).reason == \
-        "bn_type_may_exclude_virtual_bases"
-    # No vptr at all: no virtual base.
-    assert read_class._object_size(_SizeCtx(), bv, _record()).size is not None
-    # The deleting destructor is the complete class's size either way.
-    bv = _MlilBV([_d0(0x12b0, 0x118)], type_widths={"net::Session": 0x10})
-    proven.append(False)
-    with_d0 = _record(_D0_METHOD, typeinfo={"address": "0x9800"}, vtable={"address": "0x9000"})
-    assert read_class._object_size(_SizeCtx(), bv, with_d0).size["value"] == "0x118"
-
-
-def test_exact_readers_that_disagree_report_no_size_998():
-    second = {"address": "0x12c0", "mangled": "_ZN3net7SessionD0Ev", "kind": "dtor"}
-    bv = _MlilBV([_d0(0x12b0, 0x28), _d0(0x12c0, 0x30)])
-    finding = read_class._object_size(_SizeCtx(), bv, _record(_D0_METHOD, second))
-    assert finding == read_class._SizeFinding(None, "size_evidence_disagrees", None)
-
-
-def test_size_miss_with_nothing_to_read_998():
-    """A miss stays a bare `None`, NOT a value-less envelope (#619: the card
-    renders any size dict as `size ?`); WHY it missed rides beside it."""
-    finding = read_class._object_size(_SizeCtx(), _MlilBV(), _record())
-    assert finding == _NO_SIZE
+    """#998 reviews: array new, an enclosing object, a derived class, placement
+    new and trailing storage all hand a constructor a LARGER block, so the
+    smallest allocation a constructor runs on bounds the size from above and
+    is never reported as the size."""
+    bound = read_class._object_size(_SizeCtx([_site("0x50"), _site(None), _site("0x60")]),
+                                    _MlilBV(), _record())
+    assert bound == read_class._SizeBound("allocation_upper_bound_only", 0x50)
+    assert read_class._object_size(_SizeCtx([_site(None)]), _MlilBV(), _record()) == _NO_SIZE
 
 
 class _EnrichCtx(_SizeCtx):
@@ -1358,7 +1070,7 @@ class _EnrichCtx(_SizeCtx):
 def test_class_card_for_a_sizeless_class_states_why_998():
     """The size-less card, composed end to end: the head keeps no size, and
     the reason `_object_size` produced is printed on its own line with the
-    largest size the evidence still allows."""
+    largest size the evidence allows."""
     formatters = importlib.import_module("bn.formatters")
     rec = {"name": "net::Session", "methods": [], "confidence": "rtti"}
     read_class._enrich(_EnrichCtx([_site("0x50")]), _MlilBV(), rec)
@@ -1369,23 +1081,11 @@ def test_class_card_for_a_sizeless_class_states_why_998():
 
 
 def test_class_record_states_where_the_size_came_from_817():
+    """#817 / #998: `size` is never set -- no reader fixes it -- and the miss
+    says why, beside it."""
     missed = read_class._enrich(_EnrichCtx(), _MlilBV(), _record())
-    assert missed["size"] is None
-    assert missed["size_source"] == "unavailable"
-    assert missed["size_reason"] == "no_size_evidence"
-    assert missed["size_upper_bound"] is None
-
-    hit = read_class._enrich(_EnrichCtx(), _MlilBV(type_widths={"net::Session": 0xD0}), _record())
-    assert hit["size"] == {"value": "0xd0", "source": "bn_type"}
-    assert hit["size_source"] == "bn_type" and hit["size_reason"] is None
-
-
-def test_namespaced_bn_type_is_found_by_its_components_998():
-    """#998 review: a plain-string lookup misses a namespaced BN type, so
-    `class list` and `class show` disagreed about the size source. The
-    components are tried as a `QualifiedName` when BN is present."""
-    assert read_class._split_toplevel_scopes("a::b<c::d, e::f>::g") == ["a", "b<c::d, e::f>", "g"]
-    assert read_class._split_toplevel_scopes("Plain") == ["Plain"]
+    assert (missed["size"], missed["size_source"], missed["size_reason"],
+            missed["size_upper_bound"]) == (None, "unavailable", "no_size_evidence", None)
 
 
 class _RttiCtx:
@@ -1516,8 +1216,7 @@ def test_class_show_assembles_full_record():
                 {"index": 0, "address": "0x40e8b0", "method": {"name": "onData"},
                  "pure_virtual": False, "unnamed": False}]}
         def _object_size_for(self, b, rec):
-            return read_class._SizeFinding(
-                {"value": "0xd0", "source": "operator_new", "at": "0x443abc"}, None, 0xd0)
+            return read_class._SizeBound("allocation_upper_bound_only", 0xd0)
         def _bases_for(self, b, rec):
             return [{"name": "net::Endpoint", "address": "0x9200", "kind": "public"}]
         def _instances_for(self, b, rec):
@@ -1525,7 +1224,7 @@ def test_class_show_assembles_full_record():
 
     out = read_class._class_show(_ShowCtx(), None, "net::Session")
     assert out["name"] == "net::Session"
-    assert out["size"]["value"] == "0xd0"
+    assert out["size"] is None and out["size_upper_bound"] == "0xd0"
     assert out["bases"][0]["name"] == "net::Endpoint"
     assert out["vtable"]["slots"][0]["method"]["name"] == "onData"
 
