@@ -65,7 +65,9 @@ from .paths import (
 from .proc_identity import identity_payload
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
-from .target_hint import LISTED_SELECTOR_LEAD, format_multi_target_hint, open_target_lines
+from .target_hint import (
+    LISTED_SELECTOR_LEAD, format_multi_target_hint, open_target_lines, target_row,
+)
 from .version import VERSION, build_id_for_file, build_id_for_package
 
 try:
@@ -1407,9 +1409,16 @@ class TargetManager:
                 selectors_by_view.get(record.view_id, record.target_id())
                 for record in matches
             )
-            raise RuntimeError(
-                f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})"
-            )
+            # #996 re-dogfood: the candidates as the shared `-t` rows too, so
+            # the refusal hands over selectors that each resolve to ONE target
+            # (a CLI command with a positional selector re-spells them).
+            matched = {record.view_id for record in matches}
+            rows = [target_row(t) for t in targets if t.get("view_id") in matched]
+            raise RuntimeError("\n".join([
+                f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})",
+                "Matching targets:",
+                *rows,
+            ]))
         return matches[0].view, targets
 
     def pin_destructive_target(self, op_name: str, selector: Any) -> str | None:

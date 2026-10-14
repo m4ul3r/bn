@@ -64,3 +64,27 @@ def format_multi_target_hint(
     """``headline`` (the condition, which differs per refusal site) followed by
     the shared instruction line and listing."""
     return "\n".join([headline, SELECT_HINT_LINE, *open_target_lines(targets, row=row)])
+
+
+def respell_for_positional(message: str, command: str) -> str:
+    """Rewrite a refusal's `-t` rows and instruction line for a command whose
+    selector is POSITIONAL (`bn target close <sel>`), where `-t` is rejected.
+
+    The bridge and the CLI both render this module's grammar, whatever command
+    the selector will go to; only the CLI knows that command. *command* is the
+    full prefix to print, e.g. ``bn -i demo target close`` (#996 re-dogfood).
+    Rows keep their quoting, columns and active marker; every other line is
+    left as it is.
+    """
+    out = []
+    for line in message.split("\n"):
+        if line == SELECT_HINT_LINE:
+            out.append(f"Run one of these to choose: {command} <selector>.")
+            continue
+        for marker in ("*", " "):
+            lead = f"  {marker} -t "
+            if line.startswith(lead):
+                line = f"  {marker} {command} {line[len(lead):]}"
+                break
+        out.append(line)
+    return "\n".join(out)

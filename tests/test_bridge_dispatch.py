@@ -7646,3 +7646,92 @@ def test_the_degraded_rehomed_save_also_discloses_a_collision_857(monkeypatch, t
     assert excinfo.value.status == "invalid_request"
     assert "already open as target" in excinfo.value.message
     assert sidecar.read_text() == "bndb"          # nothing written
+
+
+# --- #996 re-dogfood: every printed close suggestion runs as printed ---------
+
+
+def _close_suggestions(err: str) -> list[tuple[list[str], str | None]]:
+    """The commands a close refusal hands over, as CLI argv, with the filename
+    each row says it closes (None for a `close it with` line)."""
+    import re
+    import shlex
+
+    found: list[tuple[list[str], str | None]] = []
+    for line in err.splitlines():
+        row = re.match(r"^  [* ] (.*?)  view_id=\S*  target_id=\S*  (.*)$", line)
+        if row:
+            words = shlex.split(row.group(1))
+            argv = words[1:] if words[:1] == ["bn"] else ["close", *words]
+            found.append((argv, row.group(2)))
+        hint = re.search(r"close it with `([^`]*)`", line)
+        if hint:
+            found.append((shlex.split(hint.group(1))[1:], None))
+    return found
+
+
+@pytest.mark.parametrize("argv", [
+    ["close", "-t", "5"],                    # unknown selector
+    ["target", "close", "5"],
+    ["-i", "demo", "target", "close", "5"],
+    ["close", "-t", "x"],                    # ambiguous selector
+    ["target", "close", "x"],
+    ["close", "-t", "hello"],                # names hello.bndb only via the strip
+    ["target", "close", "hello"],
+    ["-i", "demo", "target", "close", "hello"],
+    ["close"],                               # several open, no selector
+    ["close", "-t", "active"],
+    ["target", "close", "active"],
+    ["close", "nosuch"],                     # bare name matching nothing
+    ["close", "x"],                          # bare name matching two targets
+])
+def test_every_close_refusal_suggestion_runs_as_printed_996(monkeypatch, tmp_path, capsys, argv):
+    """#996 re-dogfood: `bn target close 5` listed `-t <sel>` rows, which
+    `target close` rejects (`unrecognized arguments: -t`). Each refusal of
+    `bn close` / `bn target close` is run, then EVERY suggestion it printed is
+    run as printed against a fresh copy of the same views: each must succeed
+    and close exactly the target it names."""
+    import bn.cli
+
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    paths = ["/p/hello.bndb", "/p/hello2", "/p/a/x", "/p/b/x"]
+
+    def fresh():
+        instance = bridge.BinaryNinjaBridge()
+        _hermetic_registry(instance, tmp_path)
+        views = [_ClosableBV(p, session_id=str(i)) for i, p in enumerate(paths, 1)]
+        _register_views(bridge, *views)
+        instance.targets.refresh()
+
+        def send(op, *, params=None, target=None, **_kwargs):
+            request = {"op": op, "params": params or {}, "id": "r"}
+            if target is not None:
+                request["target"] = target
+            response = instance.dispatch(request)
+            if not response.get("ok"):
+                raise bn.cli.BridgeError(response["error"])
+            return response
+
+        monkeypatch.setattr(bn.cli, "send_request", send)
+        return views
+
+    try:
+        views = fresh()
+        assert bn.cli.main(argv) == 2
+        err = capsys.readouterr().err
+        assert not any(v.closed for v in views)
+        suggestions = _close_suggestions(err)
+        assert suggestions, err
+        if "target" in argv:
+            assert " -t " not in err.replace("`-t active`", ""), err
+        for suggested, filename in suggestions:
+            views = fresh()
+            rc = bn.cli.main(suggested)
+            out = capsys.readouterr()
+            assert rc == 0, (argv, suggested, out.err)
+            closed = [v.file.filename for v in views if v.closed]
+            assert closed == ([filename] if filename else ["/p/hello.bndb"]), (suggested, closed)
+    finally:
+        bridge._headless_views.clear()

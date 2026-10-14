@@ -8,7 +8,9 @@ from typing import Any
 from .. import cli
 from ..cli import _call, _pick, arg, command
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT
-from ..target_hint import LISTED_SELECTOR_LEAD, format_multi_target_hint
+from ..target_hint import (
+    LISTED_SELECTOR_LEAD, format_multi_target_hint, respell_for_positional,
+)
 from ..formatters import (
     _render_close_text,
     _render_load_text,
@@ -250,6 +252,13 @@ def _close(args: argparse.Namespace) -> int:
             params["pinned_target"] = True
         except cli.MultiTargetError as exc:
             if explicit_target == "active":
+                if getattr(args, "_close_spelling", None) == "target close":
+                    raise BridgeError(
+                        f"{exc}\nnote: `active` follows the GUI selection, "
+                        "which is not honored for close: pass a concrete "
+                        "selector from the list above (`bn close --all` closes "
+                        "every open target, including GUI tabs bn did not load)."
+                    ) from None
                 raise BridgeError(
                     f"{exc}\nnote: `-t active` follows the GUI selection, "
                     "which is not honored for close: pass a concrete "
@@ -281,12 +290,19 @@ def _close_hint_in_run_form(args: argparse.Namespace, exc: BridgeError) -> Bridg
     if LISTED_SELECTOR_LEAD not in message:
         return exc
     head, quoted = message.rsplit(LISTED_SELECTOR_LEAD, 1)
-    instance = getattr(args, "instance", None)
-    routing = f"-i {shlex.quote(str(instance))} " if instance else ""
-    command = (f"bn {routing}target close {quoted}"
+    command = (f"{_target_close_prefix(args)} {quoted}"
                if getattr(args, "_close_spelling", None) == "target close"
-               else f"bn {routing}close -t {quoted}")
+               else f"bn {_routing(args)}close -t {quoted}")
     return BridgeError(f"{head}close it with `{command}`.")
+
+
+def _routing(args: argparse.Namespace) -> str:
+    instance = getattr(args, "instance", None)
+    return f"-i {shlex.quote(str(instance))} " if instance else ""
+
+
+def _target_close_prefix(args: argparse.Namespace) -> str:
+    return f"bn {_routing(args)}target close"
 
 
 @command("target", "close", help="Close one open target by selector", fmt="text",
@@ -330,7 +346,16 @@ def _target_close(args: argparse.Namespace) -> int:
     args.all = False
     args._sticky_target = False
     args._close_spelling = "target close"
-    return _close(args)
+    try:
+        return _close(args)
+    except BridgeError as exc:
+        # #996 re-dogfood: every refusal listing (unknown, ambiguous, several
+        # open) renders `-t <sel>` rows, which this command rejects. Spell them
+        # as `bn [-i ID] target close <sel>`, the form that runs here.
+        respelled = respell_for_positional(str(exc), _target_close_prefix(args))
+        if respelled == str(exc):
+            raise
+        raise BridgeError(respelled) from None
 
 
 @command("save", help="Save the current analysis database (.bndb)", target=True,
