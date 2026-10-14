@@ -4315,7 +4315,9 @@ def _unrecorded_base_clauses(declaration: str) -> dict[str, str]:
         unrecorded[name] = (
             f"bn does not yet record C++ bases (see #965): declared without its base(s) "
             f"{', '.join(bases)}. Its own members keep the offsets the parser gave them, after "
-            f"the bases, but no base or inherited field is recorded"
+            f"the bases, but no base or inherited field is recorded. Those offsets can differ "
+            f"from the compiler's when a base is empty or non-POD (for `struct E {{}}; struct D "
+            f": E {{ int x; }}` the parser puts x at 0x4, g++ at 0x0), so check them"
         )
     return unrecorded
 
