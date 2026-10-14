@@ -1474,6 +1474,38 @@ def test_xrefs_any_marks_ambiguous_symbol_present(monkeypatch):
     assert res["present"] == 1
 
 
+def test_xrefs_any_marks_a_probed_string_address(monkeypatch):
+    """#1002: an `--any` row only COUNTS the functions referencing a string, so
+    a probed string start is marked for the renderer to point at
+    `strings --with-xrefs`; a function is not."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x1A000, "store_add")
+    caller.basic_blocks = [_FakeBasicBlock(0x1A000, 0x1A100)]
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x2A07C: [_FakeCodeRef(0x1A050, caller)]},
+        sections={
+            ".text": _FakeSection(".text", 0x10000, 0x20000),
+            ".rodata": _FakeSection(".rodata", 0x2A000, 0x2B000),
+        },
+        segments={
+            0x1A050: _FakeSegment(readable=True, executable=True),
+            0x2A07C: _FakeSegment(readable=True, executable=False),
+        },
+        memory={0x2A07C: b"Store::Add\x00"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._xrefs_any(None, ["0x2a07c", "store_add"])
+
+    rows = {row["symbol"]: row for row in res["items"]}
+    assert rows["0x2a07c"]["target_kind"] == "string"
+    assert rows["0x2a07c"]["caller_function_count"] == 1
+    assert rows["store_add"]["present"] is True
+    assert "target_kind" not in rows["store_add"]
+
+
 def test_xrefs_thunk_real_collision_surfaces_ambiguity_and_picks_hot(monkeypatch):
     """A bare name that resolves to a 16-byte thunk AND the real body must not
     silently pick the zero-caller member: surface both under `ambiguous_symbol`

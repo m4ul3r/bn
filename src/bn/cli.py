@@ -903,13 +903,16 @@ def _render_result(
             "or raise BN_SPILL_TOKENS.",
             file=sys.stderr,
         )
-    elif result.truncation_risk:
-        # Spill is opt-in, so this payload reaches stdout in full and the consuming
-        # agent's harness truncates it. Name this command's own slicing knob -- the
-        # one thing no harness can derive (#409).
+    elif result.truncation_risk and not _stdout_reaches_no_context():
+        # Spill is opt-in, so this payload reaches stdout in full; if stdout is an
+        # agent's tool capture, its harness truncates it. Name this command's own
+        # slicing knob -- the one thing no harness can derive (#409). Only a
+        # redirect to a regular file or /dev/null is known not to be that
+        # capture: an agent harness reads through a pipe too, so a pipe cannot be
+        # told apart from `| jq` and keeps the note (#1002).
         print(
-            f"note: output is {result.token_count} estimated tokens; a consuming agent "
-            f"truncates long tool output -- "
+            f"note: output is {result.token_count} estimated tokens; if it lands in an "
+            f"agent's context, the harness truncates long tool output -- "
             f"{_spill_next_step_hint(stem, paged=paged, text_format=(fmt == 'text'), slice_hint=slice_hint)}.",
             file=sys.stderr,
         )
@@ -1157,6 +1160,23 @@ def _stdout_is_pipe() -> bool:
     yields False, so the caution stays quiet rather than misfiring."""
     try:
         return stat.S_ISFIFO(os.fstat(sys.stdout.fileno()).st_mode)
+    except Exception:
+        return False
+
+
+def _stdout_reaches_no_context() -> bool:
+    """True when stdout is a regular file or the null device (``> out.json``,
+    ``> /dev/null``).
+
+    The destinations known not to be a consuming agent's context, so the
+    truncation-risk note (#409) stays quiet there (#1002). Defensive like
+    `_stdout_is_pipe`: an fd that cannot be inspected yields False, so the note
+    still fires rather than going silent."""
+    try:
+        st = os.fstat(sys.stdout.fileno())
+        if stat.S_ISREG(st.st_mode):
+            return True
+        return os.path.samestat(st, os.stat(os.devnull))
     except Exception:
         return False
 

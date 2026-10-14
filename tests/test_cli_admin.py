@@ -13,6 +13,14 @@ from _cli_helpers import *  # noqa: F401,F403
 
 @pytest.fixture(autouse=True)
 def _isolate_omp_skill_destination(monkeypatch, tmp_path):
+    # A throwaway HOME, with the variables that override it cleared, so no
+    # install test can reach the real skill or plugin roots through a default
+    # that was not monkeypatched (#1004 review).
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for var in ("CLAUDE_HOME", "CODEX_HOME", "BN_PLUGIN_DIR", "PI_CONFIG_DIR"):
+        monkeypatch.delenv(var, raising=False)
     config_root = tmp_path / "absent-omp-config"
     agent_dir = config_root / "agent"
     monkeypatch.setattr(bn.cli, "omp_config_root", lambda: config_root, raising=False)
@@ -73,6 +81,26 @@ def test_plugin_install_copy_mode(tmp_path):
     )
     assert rc == 0
     assert (destination / "bridge.py").exists()
+
+
+def test_plugin_install_accepts_its_own_install_and_names_a_stale_one(tmp_path, capsys):
+    # #1002: a link already pointing at this source is not an error; a link
+    # into another tree is refused with what it points at and --force named.
+    destination = tmp_path / "bn_agent_bridge"
+    destination.symlink_to(bn.cli.plugin_source_dir())
+
+    assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["installed"] is False
+    assert result["note"].startswith("already installed: symlink to ")
+
+    destination.unlink()
+    destination.symlink_to(tmp_path / "old-checkout")
+    assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 2
+    err = capsys.readouterr().err
+    assert f"dangling symlink to {tmp_path / 'old-checkout'}" in err
+    assert "--force" in err
+    assert os.readlink(destination) == str(tmp_path / "old-checkout")
 
 
 def test_skill_install_copy_mode(tmp_path):
@@ -150,24 +178,377 @@ def test_skill_install_defaults_to_claude_and_codex_when_codex_home_exists(tmp_p
     assert (codex_root / "bn-vr" / "SKILL.md").exists()
 
 
-def test_skill_install_defaults_skip_existing_destinations(tmp_path, monkeypatch):
+def test_skill_install_defaults_skip_up_to_date_destinations(tmp_path, monkeypatch):
     claude_root = tmp_path / "claude" / "skills"
     codex_home = tmp_path / "codex"
     codex_root = codex_home / "skills"
     codex_home.mkdir()
-    (claude_root / "bn").mkdir(parents=True)
-    (claude_root / "bn-re").mkdir()
-    (claude_root / "bn-vr").mkdir()
+    claude_root.mkdir(parents=True)
+    for name in ("bn", "bn-re", "bn-vr"):
+        (claude_root / name).symlink_to(bn.cli.skills_source_dir() / name)
     monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
     monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
     monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_root)
 
-    rc = bn.cli.main(["skill", "install", "--mode", "copy"])
+    rc = bn.cli.main(["skill", "install"])  # symlink mode, as the seeded links
 
     assert rc == 0
     assert (codex_root / "bn" / "SKILL.md").exists()
     assert (codex_root / "bn-re" / "SKILL.md").exists()
     assert (codex_root / "bn-vr" / "SKILL.md").exists()
+    assert (claude_root / "bn").is_symlink()  # left as it was
+
+
+def _one_skill_source(tmp_path, monkeypatch):
+    source_root = tmp_path / "bundled-skills"
+    skill = source_root / "sample"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: sample\n---\n")
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: source_root)
+    claude_root = tmp_path / "claude" / "skills"
+    claude_root.mkdir(parents=True)
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: tmp_path / "codex")
+    return skill, claude_root / "sample"
+
+
+def _seed_leftover(leftover, skill, dest, tmp_path):
+    """Put a non-current install of `skill` at `dest`; return the old link target."""
+    old_tree = tmp_path / "old-checkout" / "sample"
+    if leftover in ("other_tree", "dangling", "unwritable_parent"):
+        old_tree.mkdir(parents=True)
+        dest.symlink_to(old_tree)
+        if leftover != "other_tree":
+            old_tree.rmdir()
+        if leftover == "unwritable_parent":
+            dest.parent.chmod(0o555)
+        return old_tree
+    if leftover == "foreign_dir":
+        dest.mkdir()
+        (dest / "notes.txt").write_text("mine")
+    elif leftover == "empty_dir":
+        dest.mkdir()
+    elif leftover == "other_mode":
+        dest.symlink_to(skill)  # a link, where copy mode is requested below
+    elif leftover == "old_copy_with_removed_file":
+        # An old copy install, then an upgrade removed `old.md` from the source.
+        dest.mkdir()
+        (dest / "SKILL.md").write_text((skill / "SKILL.md").read_text())
+        (dest / "old.md").write_text("gone upstream")
+    elif leftover == "read_only_old_copy":
+        # A previous copy (its SKILL.md still matches), out of date because the
+        # source gained a file, and read-only: rmtree cannot empty it.
+        dest.mkdir()
+        (dest / "SKILL.md").write_text((skill / "SKILL.md").read_text())
+        (skill / "extra.md").write_text("new upstream")
+        dest.chmod(0o555)
+    elif leftover == "read_only_empty_dir":
+        # Removing an empty directory needs only a writable parent: base
+        # replaced it under --force, and so must this.
+        dest.mkdir()
+        dest.chmod(0o555)
+    return None
+
+
+_LEFTOVERS = {
+    # leftover: (state, words in detail, exit code of the --force run after it)
+    "other_tree": ("stale", "symlink to", 0),
+    "dangling": ("stale", "dangling symlink", 0),
+    "foreign_dir": ("existing", "does not match", 2),
+    "empty_dir": ("existing", "empty directory", 0),
+    "other_mode": ("other_mode", "not the requested copy", 0),
+    "old_copy_with_removed_file": ("existing", "does not match", 2),
+    "unwritable_parent": ("stale", "dangling symlink", 2),
+    "read_only_old_copy": ("existing", "does not match", 2),
+    "read_only_empty_dir": ("existing", "empty directory", 0),
+}
+_PERMISSION_LEFTOVERS = {"unwritable_parent", "read_only_old_copy", "read_only_empty_dir"}
+
+
+@pytest.mark.parametrize("leftover", sorted(_LEFTOVERS))
+def test_skill_install_reports_a_non_current_destination_and_fails(
+    tmp_path, monkeypatch, capsys, leftover
+):
+    # #1002: a default destination holding anything but this install -- most
+    # often a link into a previous checkout -- used to print "Skills already
+    # installed." with exit 0 while nothing was updated. It is listed with
+    # what it is, under one plain --force note, and the run exits 1. The
+    # forced run that follows answers with exit 0 or a refusal, never a
+    # traceback (read-only copy: rmtree used to crash).
+    if leftover in _PERMISSION_LEFTOVERS and os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses the permission this case denies; run as a user")
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    old_tree = _seed_leftover(leftover, skill, dest, tmp_path)
+    state, detail_words, forced_rc = _LEFTOVERS[leftover]
+    try:
+        rc = bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"])
+
+        assert rc == 1
+        result = json.loads(capsys.readouterr().out)
+        [row] = result["not_updated_destinations"]
+        assert row == {"destination": str(dest), "state": state, "detail": row["detail"]}
+        assert detail_words in row["detail"]
+        assert result["force_note"] == bn.commands.admin.FORCE_NOTE
+        if old_tree is not None:
+            assert os.readlink(dest) == str(old_tree)  # untouched without --force
+
+        assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 1
+        text = capsys.readouterr().out
+        assert "already installed" not in text
+        assert text.rstrip().endswith(bn.commands.admin.FORCE_NOTE)
+
+        forced = bn.cli.main(["skill", "install", "--mode", "copy", "--force"])
+        captured = capsys.readouterr()
+        assert forced == forced_rc, captured
+        assert "Traceback" not in captured.err
+        if forced_rc == 0:
+            assert (dest / "SKILL.md").read_text() == (skill / "SKILL.md").read_text()
+        if leftover == "read_only_old_copy":
+            assert "lacks write permission" in captured.err
+            assert "never an unrelated path" not in captured.err
+    finally:
+        dest.parent.chmod(0o755)
+        if dest.is_dir() and not dest.is_symlink():
+            dest.chmod(0o755)
+
+
+def test_a_refused_forced_skill_install_leaves_every_destination_alone(
+    tmp_path, monkeypatch, capsys
+):
+    # A forced run is all-or-nothing: a foreign directory in one root refuses
+    # the run before the stale link in the other is touched.
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    codex_home = tmp_path / "codex"
+    (codex_home / "skills" / "sample").mkdir(parents=True)
+    (codex_home / "skills" / "sample" / "notes.txt").write_text("mine")
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_home / "skills")
+    dest.symlink_to(tmp_path / "gone")
+
+    assert bn.cli.main(["skill", "install", "--force"]) == 2
+    assert os.readlink(dest) == str(tmp_path / "gone")
+    assert (codex_home / "skills" / "sample" / "notes.txt").read_text() == "mine"
+
+
+def test_install_maps_a_failing_rmtree_to_a_structured_error(tmp_path, monkeypatch, capsys):
+    # A race or a filesystem error during the replace is a BridgeError (exit 2,
+    # JSON refusal), not a traceback.
+    destination = tmp_path / "bn_agent_bridge"
+    assert bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(destination)]) == 0
+    capsys.readouterr()
+
+    def failing_rmtree(path, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(bn.commands.admin.shutil, "rmtree", failing_rmtree)
+    rc = bn.cli.main(["plugin", "install", "--dest", str(destination), "--force"])
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["error"].startswith(f"Cannot replace {destination}:")
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("kind", ["foreign_dir", "regular_file", "read_only_empty_dir"])
+def test_plugin_install_force_note_is_true_for_what_is_there(tmp_path, capsys, kind):
+    # Review round 4: the note said "--force replaces it" for destinations
+    # --force then refuses. It states the rule instead, so it holds for every
+    # state it is printed under -- and the forced run follows that rule.
+    if kind == "read_only_empty_dir" and os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses the permission this case denies; run as a user")
+    destination = tmp_path / "bn_agent_bridge"
+    if kind == "regular_file":
+        destination.write_text("not ours")
+    else:
+        destination.mkdir()
+        if kind == "foreign_dir":
+            (destination / "notes.txt").write_text("mine")
+        else:
+            destination.chmod(0o555)
+    try:
+        assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 2
+        err = capsys.readouterr().err
+        assert bn.commands.admin.FORCE_NOTE_ONE in err
+        assert "--force replaces it," not in err  # no unconditional promise
+
+        forced = bn.cli.main(["plugin", "install", "--dest", str(destination), "--force"])
+        captured = capsys.readouterr()
+        assert "Traceback" not in captured.err
+        if kind == "read_only_empty_dir":
+            assert forced == 0, captured  # an empty directory: replaced, as on base
+            assert destination.is_symlink()
+        else:
+            assert forced == 2, captured  # not provably ours: refused, unchanged
+            if kind == "foreign_dir":
+                assert (destination / "notes.txt").read_text() == "mine"
+            else:
+                assert destination.read_text() == "not ours"
+    finally:
+        if destination.is_dir() and not destination.is_symlink():
+            destination.chmod(0o755)
+
+
+def test_install_with_dest_equal_to_the_source_is_a_no_op(tmp_path, monkeypatch, capsys):
+    # Installing a source onto itself has nothing to do: it is reported as
+    # already installed, with or without --force, and nothing is written.
+    skill, _ = _one_skill_source(tmp_path, monkeypatch)
+    plugin = tmp_path / "plugin-src"
+    plugin.mkdir()
+    (plugin / "bridge.py").write_text("print('bridge')\n")
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: plugin)
+    skills = skill.parent
+
+    for argv in (["skill", "install", "--dest", str(skills), "--mode", "copy", "--force"],
+                 ["skill", "install", "--dest", str(skills)]):
+        assert bn.cli.main(argv) == 0, argv
+        assert capsys.readouterr().out.startswith("Skills already installed.\n")
+    for extra in ([], ["--mode", "copy", "--force"]):
+        assert bn.cli.main(["plugin", "install", "--dest", str(plugin), *extra]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["installed"] is False
+        assert "is the install source" in result["note"]
+    assert sorted(p.name for p in skills.iterdir()) == ["sample"]
+    assert sorted(p.name for p in skill.iterdir()) == ["SKILL.md"]
+    assert sorted(p.name for p in plugin.iterdir()) == ["bridge.py"]
+
+
+def test_skill_install_into_its_own_source_is_already_installed(tmp_path, monkeypatch, capsys):
+    # A skills root symlinked to the checkout's own skills/ holds the source
+    # itself: base said "already installed" (exit 0), and so does this, with
+    # or without --force.
+    skill, _ = _one_skill_source(tmp_path, monkeypatch)
+    root_link = tmp_path / "linked-root"
+    root_link.symlink_to(skill.parent)
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: root_link)
+
+    for argv in (["skill", "install"], ["skill", "install", "--mode", "copy"],
+                 ["skill", "install", "--force"]):
+        assert bn.cli.main(argv) == 0, argv
+        out = capsys.readouterr().out
+        assert out.startswith("Skills already installed.\n"), argv
+    assert (skill / "SKILL.md").is_file()
+
+
+def test_skill_install_dest_in_the_other_mode_names_a_force_that_converts(tmp_path, capsys):
+    destination = tmp_path / "store"
+    destination.mkdir()
+    (destination / "bn").symlink_to(bn.cli.skills_source_dir() / "bn")
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy", "--dest", str(destination)])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "not the requested copy" in err and "--force replaces it" in err
+    assert bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    ) == 0
+    assert not (destination / "bn").is_symlink()
+    assert (destination / "bn" / "SKILL.md").is_file()
+
+
+def test_plugin_install_symlink_over_a_copy_names_a_force_that_converts(tmp_path, capsys):
+    destination = tmp_path / "bn_agent_bridge"
+    assert bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(destination)]) == 0
+    capsys.readouterr()
+
+    rc = bn.cli.main(["plugin", "install", "--dest", str(destination)])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "not the requested symlink" in err and "--force replaces it" in err
+    assert bn.cli.main(["plugin", "install", "--dest", str(destination), "--force"]) == 0
+    assert destination.is_symlink()
+
+
+@pytest.mark.parametrize("mode", ["symlink", "copy"])
+def test_skill_install_treats_a_current_install_as_up_to_date(
+    tmp_path, monkeypatch, capsys, mode
+):
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    assert bn.cli.main(["skill", "install", "--mode", mode]) == 0
+    capsys.readouterr()
+
+    rc = bn.cli.main(["skill", "install", "--mode", mode])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Skills already installed.\n")
+    assert "- " + str(dest) in out
+    if mode == "copy":
+        # A copy that no longer matches the source is not current.
+        (skill / "SKILL.md").write_text("---\nname: sample\nversion: 2\n---\n")
+        assert bn.cli.main(["skill", "install", "--mode", mode]) == 1
+        assert "does not match" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("unreadable", ["a_first.py", "z_last.py"])
+def test_install_reports_an_unreadable_copy_as_structured_output(
+    tmp_path, monkeypatch, capsys, unreadable
+):
+    # Review of #1004: comparing a copy read every file, and a PermissionError
+    # escaped `main` as a traceback with no JSON. It is a destination state.
+    # Parametrized over which file is unreadable: whether --force replaces the
+    # copy must not depend on where that file sorts (the ownership proof used
+    # to raise on, or stop before, the unreadable file).
+    if os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses the mode-000 read this test needs; run as a user")
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    plugin = tmp_path / "plugin-src"
+    plugin.mkdir()
+    for name in ("a_first.py", "z_last.py"):
+        (plugin / name).write_text(f"# {name}\n")
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: plugin)
+    assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 0
+    (dest / "SKILL.md").chmod(0)
+    plugin_dest = tmp_path / "plugin-copy"
+    assert bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(plugin_dest)]) == 0
+    (plugin_dest / unreadable).chmod(0)
+    capsys.readouterr()
+    try:
+        rc = bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"])
+        assert rc == 1
+        [row] = json.loads(capsys.readouterr().out)["not_updated_destinations"]
+        assert "could not be read" in row["detail"]
+        # Only file, unreadable: nothing proves the copy is ours, so --force
+        # refuses, with a message rather than a traceback.
+        assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 2
+        assert "Traceback" not in capsys.readouterr().err
+
+        rc = bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(plugin_dest)])
+        assert rc == 2
+        captured = capsys.readouterr()
+        error = json.loads(captured.out)["error"]
+        assert "could not be read" in error
+        assert "Traceback" not in captured.err
+        # The other file still matches, so --force replaces the copy wherever
+        # the unreadable one sorts.
+        assert bn.cli.main(
+            ["plugin", "install", "--mode", "copy", "--dest", str(plugin_dest), "--force"]
+        ) == 0
+        assert (plugin_dest / unreadable).read_text() == f"# {unreadable}\n"
+    finally:
+        (dest / "SKILL.md").chmod(0o644)
+        if (plugin_dest / unreadable).exists():
+            (plugin_dest / unreadable).chmod(0o644)
+
+
+def test_plugin_install_up_to_date_check_respects_the_requested_mode(tmp_path, capsys):
+    # Review of #1004: `--mode copy` over a link to the source returned exit 0
+    # with "mode":"copy" and copied nothing.
+    destination = tmp_path / "bn_agent_bridge"
+    destination.symlink_to(bn.cli.plugin_source_dir())
+
+    rc = bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(destination)])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "not the requested copy" in err and "--force replaces it" in err
+    assert bn.cli.main(
+        ["plugin", "install", "--mode", "copy", "--dest", str(destination), "--force"]
+    ) == 0
+    assert not destination.is_symlink() and (destination / "bridge.py").is_file()
 
 
 def test_skill_install_default_output_is_text(tmp_path, monkeypatch, capsys):
@@ -200,28 +581,19 @@ def test_skill_install_json_output_remains_available(tmp_path, monkeypatch, caps
 
 
 def test_skill_install_all_skipped_reports_installed_false(tmp_path, monkeypatch, capsys):
-    # #620(b): when every destination already exists and is skipped, nothing
-    # was actually installed -- the result must say so instead of always
-    # claiming success.
-    source_root = tmp_path / "bundled-skills"
-    skill = source_root / "sample"
-    skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text("---\nname: sample\n---\n")
-    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: source_root)
+    # #620(b): when every destination is already installed and is skipped,
+    # nothing was actually installed -- the result must say so instead of
+    # always claiming success.
+    skill, dest = _one_skill_source(tmp_path, monkeypatch)
+    dest.symlink_to(skill)
 
-    claude_root = tmp_path / "claude" / "skills"
-    codex_home = tmp_path / "codex"
-    (claude_root / "sample").mkdir(parents=True)
-    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
-    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
-
-    rc = bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"])
+    rc = bn.cli.main(["skill", "install", "--format", "json"])
 
     assert rc == 0
     output = capsys.readouterr().out
     assert '"installed":false' in output
     assert '"installed_destinations":[]' in output
-    assert str(claude_root / "sample") in output  # skipped_destinations explains why
+    assert str(dest) in output  # skipped_destinations explains why
 
 
 def test_skill_install_custom_dest_still_fails_when_destination_exists(tmp_path):
