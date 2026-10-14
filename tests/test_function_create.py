@@ -714,3 +714,124 @@ def test_function_create_rejects_unmapped_address_with_no_memory_seeded_at_all(m
         instance._function_create(None, "0x1000", False)
 
     assert bv.added == []
+
+
+class _A64Arch:
+    """A fixed-width ISA: every word decodes as the instruction the table names,
+    with the branch kinds BN's InstructionInfo would report for it."""
+    instr_alignment = 4
+    max_instr_length = 4
+
+    def __init__(self, program):
+        self.program = program          # address -> (mnemonic, [branch kind names])
+
+    def get_instruction_info(self, data, address):
+        entry = self.program.get(int(address))
+        if entry is None:
+            return None
+        return types.SimpleNamespace(length=4, branches=[
+            types.SimpleNamespace(type=types.SimpleNamespace(name=kind)) for kind in entry[1]])
+
+    def get_instruction_text(self, data, address):
+        entry = self.program.get(int(address))
+        return ([entry[0]], 4) if entry else None
+
+
+@pytest.mark.parametrize(
+    ("previous", "expected"),
+    [
+        pytest.param(("add", []), 0x402ffc, id="straight-line-falls-through"),
+        pytest.param(("b.ne", ["TrueBranch", "FalseBranch"]), 0x402ffc,
+                     id="conditional-branch-not-taken-falls-through"),
+        pytest.param(("ret", ["FunctionReturn"]), None, id="after-ret-is-an-entry"),
+        pytest.param(("b", ["UnconditionalBranch"]), None, id="after-b-is-an-entry"),
+        pytest.param(("bl", ["CallDestination"]), None, id="after-a-call-may-be-noreturn"),
+        pytest.param(("nop", []), None, id="padding-is-not-a-body"),
+        pytest.param(None, None, id="undecodable-says-nothing"),
+    ],
+)
+def test_fallthrough_source_names_the_instruction_running_into_the_address_997(
+        monkeypatch, previous, expected):
+    """#997 item 2: `function create` accepted an `adrp` page base in the middle of
+    a loop body. On a fixed-width ISA the instruction before the address is known,
+    and if it neither returns nor branches away, execution runs straight in: the
+    address is mid-body. Anything the bytes do not settle answers None."""
+    bridge = _load_bridge(monkeypatch)
+    program = {0x402ffc: previous} if previous else {}
+    bv = types.SimpleNamespace(arch=_A64Arch(program), read=lambda a, n: b"\x00" * n)
+    assert bridge.create_comments._create_fallthrough_source(bv, 0x403000) == expected
+
+
+def test_fallthrough_source_is_silent_on_a_variable_length_isa(monkeypatch):
+    """x86: any byte before the address may start an instruction, so no single
+    predecessor exists to name."""
+    bridge = _load_bridge(monkeypatch)
+    arch = _A64Arch({0x402fff: ("add", [])})
+    arch.instr_alignment, arch.max_instr_length = 1, 15
+    bv = types.SimpleNamespace(arch=arch, read=lambda a, n: b"\x00" * n)
+    assert bridge.create_comments._create_fallthrough_source(bv, 0x403000) is None
+
+
+def test_fallthrough_create_is_disclosed_on_the_compact_status_997():
+    """The warning rides on the line every loop reads, not only the verbose row."""
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+    row = {"op": "function_create", "status": "verified", "address": "0x403000",
+           "fallthrough_from": "0x402ffc", "note": "..."}
+    summary = _mutation_summary({"success": True, "committed": False, "preview": True,
+                                 "rolled_back": True, "results": [row]})
+    assert summary["fallthrough_entries"] == [
+        {"address": "0x403000", "fallthrough_from": "0x402ffc"}]
+    assert ("warning: 0x403000 is reached by fall-through from 0x402ffc; likely "
+            "mid-function, not an entry") in _render_mutation_summary_text(summary)
+    plain = _mutation_summary({"success": True, "committed": True, "results": [
+        {"op": "function_create", "status": "verified", "address": "0x403110"}]})
+    assert "fallthrough_entries" not in plain
+
+
+def test_fallthrough_probe_ignores_literal_pools_and_mixed_arm_thumb_views_997(monkeypatch):
+    """#1006 review: an ARMv7 literal-pool word before a real entry decodes as
+    `andeq` with no branches and read as a fall-through. A word BN holds as a
+    data variable after a `ret` is a literal pool, not an instruction running
+    into the address -- but one that a straight-line instruction runs into is
+    code that something merely loads (round 2), and still warns. An ARM view
+    mixes ARM and Thumb code, so the instruction before an address is not
+    knowable from the view's architecture at all."""
+    bridge = _load_bridge(monkeypatch)
+    probe = bridge.create_comments._create_fallthrough_source
+    program = {0x402ffc: ("add", [])}
+
+    def view(arch, data_vars=()):
+        return types.SimpleNamespace(arch=arch, read=lambda a, n: b"\x00" * n,
+                                     get_data_var_at=lambda a: object() if a in data_vars else None)
+
+    assert probe(view(_A64Arch(program)), 0x403000) == 0x402ffc
+    after_ret = {0x402ff8: ("ret", ["FunctionReturn"]), **program}
+    assert probe(view(_A64Arch(after_ret), data_vars={0x402ffc}), 0x403000) is None
+    pool_run = {0x402ff8: ("add", []), **program}
+    assert probe(view(_A64Arch(pool_run), data_vars={0x402ff8, 0x402ffc}), 0x403000) is None
+    loaded_code = {0x402ff8: ("add", []), **program}
+    assert probe(view(_A64Arch(loaded_code), data_vars={0x402ffc}), 0x403000) == 0x402ffc
+    arm = _A64Arch(program)
+    arm.name = "armv7"
+    assert probe(view(arm), 0x403000) is None
+
+
+def test_fallthrough_probe_reads_a_wide_data_variable_from_its_start_997(monkeypatch):
+    """#1006 review round 3 (`adrp6`): BN held an 8-byte `int64_t` over the two
+    instruction words before the address because code loads them. The pool test
+    must look before the VARIABLE's start, not one word back -- which is still
+    inside it -- and still skip a wide pool that follows a `ret`."""
+    bridge = _load_bridge(monkeypatch)
+    probe = bridge.create_comments._create_fallthrough_source
+    var = types.SimpleNamespace(address=0x402ff8)
+
+    def view(program):
+        return types.SimpleNamespace(
+            arch=_A64Arch(program), read=lambda a, n: b"\x00" * n,
+            get_data_var_at=lambda a: var if 0x402ff8 <= a < 0x403000 else None)
+
+    loaded = {0x402ff4: ("add", []), 0x402ff8: ("add", []), 0x402ffc: ("add", [])}
+    assert probe(view(loaded), 0x403000) == 0x402ffc
+    pool = {0x402ff4: ("ret", ["FunctionReturn"]), 0x402ff8: ("add", []),
+            0x402ffc: ("add", [])}
+    assert probe(view(pool), 0x403000) is None

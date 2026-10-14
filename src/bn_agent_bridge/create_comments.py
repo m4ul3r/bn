@@ -304,6 +304,105 @@ def _with_overlap_note(row: dict, overlapped: list[dict[str, Any]]) -> dict:
     return row
 
 
+# Branch kinds after which execution still reaches the NEXT instruction: a
+# conditional branch's not-taken edge. A call is deliberately absent -- the
+# instruction after a call to a noreturn routine is a routine start often.
+_FALLTHROUGH_BRANCH_KINDS = frozenset({"FalseBranch"})
+
+
+def _create_fallthrough_source(bv, addr: int) -> int | None:
+    """The instruction that runs straight into *addr*, if one provably does.
+
+    #997 item 2: an address the previous instruction falls through into is
+    the middle of a body, not an entry -- the shape of an aarch64 `adrp` page
+    base nominated as a missing function. (Named apart from
+    `read_decompile._fallthrough_predecessor`, which asks about a FUNCTION's
+    neighbour by different rules.) Only a FIXED-WIDTH ISA can name the
+    previous instruction (on x86 any byte before *addr* might start one), so
+    every other ISA answers None, as does an ARM view: ARM and Thumb code
+    share it, and the instruction set of the bytes before *addr* is not known
+    there. Anything not decoded as a real instruction, or padding (`nop`),
+    answers None too. A DATA variable over the word(s) before *addr* is a
+    literal pool between two routines -- unless the instruction before the
+    variable's START itself runs into it, which a pool never has (it sits
+    after a `ret`/`b`): then the variable is code some other code merely loads
+    (its every word must decode and run on), and the fall-through stands. An
+    advisory probe: an unanswerable view yields None, never a refusal.
+    """
+    try:
+        arch = getattr(bv, "arch", None)
+        arch_name = str(getattr(arch, "name", "") or "").lower()
+        if ("arm" in arch_name or "thumb" in arch_name) and "aarch64" not in arch_name \
+                and "arm64" not in arch_name:
+            return None
+        width = int(getattr(arch, "instr_alignment", 0) or 0)
+        if width <= 0 or width != int(getattr(arch, "max_instr_length", 0) or 0):
+            return None
+        prev = addr - width
+        if not _falls_through(bv, arch, width, prev):
+            return None
+        var_start = _data_var_start(bv, prev)
+        if var_start is not None:
+            if var_start > prev or (prev - var_start) % width:
+                return None
+            if any(not _falls_through(bv, arch, width, word)
+                   for word in range(var_start, prev, width)):
+                return None
+            before = var_start - width
+            if _data_var_start(bv, before) is not None or not _falls_through(bv, arch, width, before):
+                return None
+        return prev
+    except Exception:  # noqa: BLE001 - advisory: no evidence means no warning
+        return None
+
+
+def _data_var_start(bv, address: int) -> int | None:
+    """Start of the data variable BN holds over *address*, or None."""
+    get_data_var_at = getattr(bv, "get_data_var_at", None)
+    var = get_data_var_at(address) if callable(get_data_var_at) else None
+    if var is None:
+        return None
+    start = getattr(var, "address", None)
+    return int(start) if start is not None else address
+
+
+def _falls_through(bv, arch, width: int, address: int) -> bool:
+    """Does the fixed-width instruction at *address* run into the next one?
+    No branch, or a conditional branch's not-taken edge; never padding or a
+    word that does not decode."""
+    data = bytes(bv.read(address, width) or b"")
+    if len(data) != width:
+        return False
+    info = arch.get_instruction_info(data, address)
+    if info is None or int(getattr(info, "length", 0) or 0) != width:
+        return False
+    tokens, _length = arch.get_instruction_text(data, address) or ([], 0)
+    mnemonic = str(tokens[0]).strip().lower() if tokens else ""
+    if not mnemonic or mnemonic in ("nop", "udf", "hlt", "brk"):
+        return False
+    kinds = {str(getattr(getattr(b, "type", None), "name", ""))
+             for b in (getattr(info, "branches", None) or ())}
+    return not kinds or bool(kinds & _FALLTHROUGH_BRANCH_KINDS)
+
+
+def _with_fallthrough_note(row: dict, predecessor: int | None) -> dict:
+    """Disclose a create at an address reached by fall-through (#997 item 2).
+
+    ONE builder for both create paths. The create still goes ahead -- BN's
+    own boundaries are not authoritative there, and the address may be an
+    entry of a routine laid out after a non-returning tail -- but the row
+    and the compact summary say what the bytes before it show.
+    """
+    if predecessor is None:
+        return row
+    row = dict(row)
+    row["fallthrough_from"] = hex(predecessor)
+    warning = (f"{row.get('address', '<unknown>')} is reached by fall-through from "
+               f"{hex(predecessor)}; likely mid-function, not an entry")
+    row["note"] = f"{row['note']}; {warning}" if row.get("note") else warning
+    return row
+
+
 def _function_ranges(fn) -> list:
     ranges = getattr(fn, "address_ranges", None)
     return list(ranges) if ranges is not None else []
@@ -703,6 +802,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *,
         # tail were left shortened behind `rolled_back: true`), so record
         # them now and verify them after every revert below.
         hosts = _snapshot_split_hosts(bv, overlapped) if overlapped else {"hosts": {}}
+        fallthrough_from = _create_fallthrough_source(bv, addr)
         state = bv.begin_undo_actions()
     try:
         with exclusive_scope():
@@ -848,13 +948,13 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *,
                 "committed": committed,
                 "message": message,
                 "results": [
-                    _with_overlap_note({
+                    _with_fallthrough_note(_with_overlap_note({
                         "op": "function_create",
                         "status": op_status,
                         "address": hex(addr),
                         "function": function_name,
                         "requested": requested,
-                    }, overlapped)
+                    }, overlapped), fallthrough_from)
                 ],
                 # The host(s) a deliberate split cut are affected functions
                 # too (#927 review): the compact face carries them under

@@ -159,7 +159,11 @@ def cache_home() -> Path:
     env = os.environ.get("BN_CACHE_DIR")
     if env:
         return Path(env).expanduser()
+    return default_cache_home()
 
+
+def default_cache_home() -> Path:
+    """The platform cache root ``cache_home()`` uses when BN_CACHE_DIR is unset."""
     system = platform.system()
     home = Path.home()
     if system == "Darwin":

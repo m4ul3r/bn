@@ -5607,6 +5607,7 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     # below can verify -- and repair -- them rather than assume removing the
     # created function put them back.
     hosts = create_comments._snapshot_split_hosts(bv, overlapped) if overlapped else {"hosts": {}}
+    fallthrough_from = create_comments._create_fallthrough_source(bv, addr)
     # create_user_function (FORCED), not add_function (an advisory auto hint that
     # declines exactly the auto-skipped data-table / missed-handler addresses this
     # op exists to recover -- #360). Mirrors the standalone create_comments path.
@@ -5694,7 +5695,8 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     # ONE builder for both create paths (the other is
     # `create_comments._function_create`), so the two cannot state the same
     # fact differently.
-    return create_comments._with_overlap_note(result, overlapped)
+    return create_comments._with_fallthrough_note(
+        create_comments._with_overlap_note(result, overlapped), fallthrough_from)
 
 
 def _verify_function_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
@@ -5739,8 +5741,12 @@ def _verify_function_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
         # analyzed: say which were truncated and which are intact, in the
         # same words the self-analyzing op and the standalone command use.
         from . import create_comments
+        fallthrough_from = item.get("fallthrough_from")
         item = create_comments._with_overlap_note(
             item, create_comments._observe_split(bv, addr, overlaps))
+        if isinstance(fallthrough_from, str):
+            # The overlap note is rebuilt whole; put #997's clause back on it.
+            item = create_comments._with_fallthrough_note(item, int(fallthrough_from, 16))
     return item
 
 

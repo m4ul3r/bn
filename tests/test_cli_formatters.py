@@ -396,6 +396,116 @@ def test_arg_under_recovered_leaves_group_per_callee():
                        "recovered_params": 1, "dropped_args": [1], "note": "n"}
     out = "\n".join(_render_grouped_leaves([mk("0x10"), mk("0x20")]))
     assert "[2 leaves]" in out                             # two call sites of f collapse
+
+
+# --- demangled names in taint / trace text (#1001 item 4) --------------------
+
+_CXX_TAINT = {
+    "direction": "forward",
+    "function": {"name": "_Z9load_userPK4Conn", "display_name": "load_user",
+                 "address": "0x402000"},
+    "sources": ["arg:recv:1"],
+    "reached_sinks": [{
+        "sink": {"class": "path_injection",
+                 "callee": "ZN5store4openEPKc", "callee_symbol": "_ZN5store4openEPKc",
+                 "callee_display_name": "store::open",
+                 "address": "0x402080", "tainted_arg_index": 1},
+        "path": [],
+        "metrics": {"steps": 4, "fns_spanned": 2, "traverses_unresolved": False},
+        "signature": {"rendered": "arg:recv:1 → _Z8read_keyPc → [path_injection] ZN5store4openEPKc",
+                      "rendered_display": "arg:recv:1 → read_key → [path_injection] store::open",
+                      "rendered_symbol": "arg:recv:1 → _Z8read_keyPc → [path_injection] _ZN5store4openEPKc"},
+    }],
+    "leaves": [{"kind": "unmodeled_callee", "address": "0x402040",
+                "callee": {"name": "_ZN5cache3getEi", "display_name": "cache::get",
+                           "address": "0x403000"},
+                "tainted_args": [0]}],
+}
+
+
+def test_taint_text_names_functions_demangled_unless_mangled_1001():
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text(_CXX_TAINT)
+    assert out.splitlines()[0] == "forward taint in load_user @ 0x402000"
+    assert ("[path_injection] store::open @ 0x402080 (arg 1)   "
+            "arg:recv:1 → read_key → [path_injection] store::open") in out
+    assert "unmodeled_callee @ 0x402040  -> cache::get @ 0x403000" in out
+    raw = _render_taint_text(_CXX_TAINT, mangled=True)
+    assert raw.splitlines()[0] == "forward taint in _Z9load_userPK4Conn @ 0x402000"
+    # --mangled prints the REAL symbol, not the model key (leading `_` restored),
+    # in the row head and its signature alike.
+    assert ("[path_injection] _ZN5store4openEPKc @ 0x402080 (arg 1)   "
+            "arg:recv:1 → _Z8read_keyPc → [path_injection] _ZN5store4openEPKc") in raw
+    assert "-> _ZN5cache3getEi @ 0x403000" in raw
+
+
+def test_trace_header_names_function_and_callee_demangled_unless_mangled_1001():
+    from bn.formatters import _render_trace_text
+    value = {"function": "_Z8run_toolPK3Req", "function_display_name": "run_tool",
+             "function_address": "0x401660", "target_address": "0x401804", "arg_index": 1,
+             "arg_label": {"index": 1, "register": "x1", "callee": "_ZN3app4execEPPc",
+                           "callee_display_name": "app::exec"},
+             "callee": "_ZN3app4execEPPc", "trace": [], "hints": []}
+    assert _render_trace_text(value).splitlines()[:2] == [
+        "backward trace of arg[1] of app::exec (x1) in run_tool @ 0x401804",
+        "  run_tool @ 0x401660  •  0 steps"]
+    assert _render_trace_text(value, mangled=True).splitlines()[0] == (
+        "backward trace of arg[1] of _ZN3app4execEPPc (x1) in _Z8run_toolPK3Req @ 0x401804")
+
+
+def test_trace_steps_and_frontiers_name_callees_demangled_unless_mangled_1001():
+    from bn.formatters import _render_trace_text
+    step = {"ssa_label": "x0#9", "address": "0x4016e4", "il_text": "x0#9 = 0x4011d0()",
+            "terminates": True, "reason": "call_or_jump_boundary",
+            "callee": "_ZN3app6appendEPKc", "callee_display_name": "app::append"}
+    value = {"function": "f", "function_address": "0x401660", "target_address": "0x401884",
+             "arg_index": 1, "trace": [step],
+             "frontiers": [{"reason": "call_or_jump_boundary", "count": 1,
+                            "examples": [{k: step[k] for k in ("callee", "callee_display_name")}]}]}
+    out = _render_trace_text(value)
+    assert "x0#9  —  call boundary (app::append)" in out
+    assert "call boundary  [1 step] (app::append)" in out
+    raw = _render_trace_text(value, mangled=True)
+    assert "call boundary (_ZN3app6appendEPKc)" in raw
+    assert "call boundary  [1 step] (_ZN3app6appendEPKc)" in raw
+
+
+def test_trace_out_param_fill_names_its_callee_demangled_unless_mangled_1001():
+    from bn.formatters import _render_trace_text
+    step = {"ssa_label": "n#0", "terminates": True, "reason": "out_param_not_followed",
+            "out_param_callee": "_ZN2ns4fillEPl", "out_param_callee_display_name": "ns::fill"}
+    value = {"function": "f", "function_address": "0x401660", "target_address": "0x401884",
+             "arg_index": 0, "trace": [step],
+             "frontiers": [{"reason": "out_param_not_followed", "count": 1,
+                            "examples": [{k: step[k] for k in ("out_param_callee",
+                                                               "out_param_callee_display_name")}]}]}
+    out = _render_trace_text(value)
+    assert "out-param fill not followed (via ns::fill)" in out
+    assert "out-param fill not followed  [1 step] (ns::fill)" in out
+    raw = _render_trace_text(value, mangled=True)
+    assert "(via _ZN2ns4fillEPl)" in raw and "[1 step] (_ZN2ns4fillEPl)" in raw
+
+
+def test_backward_slice_row_names_its_sink_demangled_unless_mangled_1001():
+    from bn.formatters import _render_taint_text
+    value = {"direction": "backward",
+             "function": {"name": "main", "display_name": "main", "address": "0x401380"},
+             "sinks": [], "slices": [{
+                 "sink": {"kind": "arg", "callee": "_Z8run_toolPK3Req",
+                          "callee_symbol": "_Z8run_toolPK3Req", "callee_display_name": "run_tool",
+                          "address": "0x4013d8", "seed": "x0#6"},
+                 "origin": {"kind": "call", "callee": "_Z12save_profilePK3Req"},
+                 "origin_callee_display_name": "save_profile",
+                 "metrics": {"steps": 4, "fns_spanned": 1},
+                 "signature": {"rendered": "_Z12save_profilePK3Req → _Z8run_toolPK3Req",
+                               "rendered_display": "save_profile → run_tool"}}]}
+    assert "[arg] run_tool @ 0x4013d8 (seed x0#6)   save_profile → run_tool" in _render_taint_text(value)
+    assert ("[arg] _Z8run_toolPK3Req @ 0x4013d8 (seed x0#6)   "
+            "_Z12save_profilePK3Req → _Z8run_toolPK3Req") in _render_taint_text(value, mangled=True)
+    assert "origin: call save_profile" in _render_taint_text(value, full=True)
+    assert "origin: call _Z12save_profilePK3Req" in _render_taint_text(value, full=True, mangled=True)
+
+
 # --- compact-default taint output (Thread C) ---------------------------------
 
 _FWD_FLOW = {
@@ -3974,6 +4084,9 @@ _GO_RENAME_NON_COUNT_READS = {
     "replaced_members", "class_apply_types",
     # #993 review round 2: the rolled-back declare's kept library imports.
     "kept_library_imports",
+    # #997 item 2: the paired renderer reads the fall-through create warnings
+    # back off the summary; a listing, not a count, and absent on every `go rename`.
+    "fallthrough_entries",
     # #999 item 5: the paired renderer reads the ops a --preview left out back
     # off the summary; a listing, not a count, and absent on every `go rename`.
     "preview_skipped",

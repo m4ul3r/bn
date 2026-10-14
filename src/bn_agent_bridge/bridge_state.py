@@ -17,6 +17,7 @@ imports ONLY stdlib -- never bridge.
 from __future__ import annotations
 
 import threading
+import time
 import weakref
 from typing import Any
 
@@ -57,6 +58,11 @@ _source_verified: dict[str, bool] = {}
 # this session -- and a save that re-homes the view -- never count as
 # inherited. Pruned with `_source_verified`.
 _opened_annotations: dict[str, dict[str, Any] | None] = {}
+# Views a `bn refresh` is analysing right now -> monotonic start time (#996).
+# The --quick marker stays set until that analysis returns, so without this a
+# gated read told the agent to "Run `bn refresh`" while one was already running
+# -- starting a second multi-minute analysis. Weak so a closed view drops out.
+_refreshing_views: "weakref.WeakKeyDictionary[Any, float]" = weakref.WeakKeyDictionary()
 
 
 def view_session_key(bv: Any) -> str:
@@ -69,6 +75,46 @@ def view_session_key(bv: Any) -> str:
         return str(id(bv))
 
 
+def _progress_fragment(bv: Any) -> str:
+    """`` (N/M)`` from BN's live analysis progress, or "" when it says nothing."""
+    try:
+        ap = bv.analysis_progress
+        count = int(getattr(ap, "count", 0) or 0)
+        total = int(getattr(ap, "total", 0) or 0)
+    except Exception:  # noqa: BLE001 - not all view types expose progress
+        return ""
+    return f" ({count}/{total})" if total else ""
+
+
+def analysis_unavailable(
+    bv: Any, what: str, directive: str, *, plural: bool = False
+) -> str | None:
+    """Why an analysis-dependent read cannot answer on *bv* yet, or None.
+
+    *directive* is the "Run `bn refresh` ..." sentence for a view nobody is
+    analysing. While a `bn refresh` is running on it the message says so and
+    tells the caller to retry instead -- never to start another (#996). Both
+    forms keep the literal "loaded with --quick" callers match on. *plural*
+    picks "are" for a plural *what* ("Strings are not available").
+    """
+    if bv not in _quick_loaded_views:
+        return None
+    verb = "are" if plural else "is"
+    started = _refreshing_views.get(bv)
+    if started is not None:
+        elapsed = max(0, int(time.monotonic() - started))
+        return (
+            f"{what} {verb} not available yet: this target was loaded with --quick and "
+            f"full analysis is in progress{_progress_fragment(bv)}, started "
+            f"{elapsed}s ago by `bn refresh`. Retry when it finishes -- do not "
+            "start another refresh."
+        )
+    return (
+        f"{what} {verb} not available: this target was loaded with --quick "
+        f"(no analysis). {directive}"
+    )
+
+
 def require_analysis(bv: Any, what: str = "This operation") -> None:
     """Refuse an analysis-dependent read on a ``--quick``-loaded (unanalyzed) view.
 
@@ -76,12 +122,12 @@ def require_analysis(bv: Any, what: str = "This operation") -> None:
     otherwise return a misleading empty/zero result -- or a wrong "not found" /
     "no call to <sink>" error that blames a typo -- on a view whose analysis has
     not run. Refuse with a directive pointing at ``bn refresh`` instead, so a cold
-    agent isn't silently led to the wrong conclusion. Message contains the literal
-    "loaded with --quick" so callers can match on it. No-op once analysis has run
-    (the view is discarded from ``_quick_loaded_views`` by ``bn refresh``).
+    agent isn't silently led to the wrong conclusion -- or, while a refresh is
+    already running, with "retry when it finishes" (#996). Message contains the
+    literal "loaded with --quick" so callers can match on it. No-op once analysis
+    has run (the view is discarded from ``_quick_loaded_views`` by ``bn refresh``).
     """
-    if bv in _quick_loaded_views:
-        raise RuntimeError(
-            f"{what} is not available: this target was loaded with --quick "
-            "(no analysis). Run `bn refresh` to run analysis first."
-        )
+    message = analysis_unavailable(
+        bv, what, "Run `bn refresh` to run analysis first.")
+    if message is not None:
+        raise RuntimeError(message)

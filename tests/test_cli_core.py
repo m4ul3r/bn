@@ -1781,6 +1781,43 @@ def test_session_start_text_prints_the_target_selector_653(monkeypatch, capsys):
     assert "4242:1:99" in out
 
 
+def test_session_start_prints_one_target_per_loaded_binary_996(monkeypatch, capsys):
+    """#996: each load returns every open target, so the second binary listed the
+    first one's selector under its own path too. The row the load names as its
+    own `target` is the one printed."""
+    class _Inst:
+        instance_id = "a1b2c3"
+        pid = 4242
+        socket_path = "/tmp/a1b2c3.sock"
+        meta = {"source_dir": "/src/checkout/bn_agent_bridge"}
+
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda iid: _Inst())
+    first = {"selector": "profile", "target_id": "4242:1:11", "view_id": "1"}
+    second = {"selector": "fetch", "target_id": "4242:2:22", "view_id": "2"}
+    opened: list[dict] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+                          spawn_missing_named=False):
+        if op == "associate_project_roots":
+            return {"ok": True, "result": {"instance_id": "a1b2c3", "associated": [],
+                                           "skipped": []}}
+        own = first if params["path"].endswith("profile") else second
+        opened.append(own)
+        return {"ok": True, "result": {
+            "path": params["path"], "loaded": True, "analyzed": True, "notes": [],
+            "targets": list(opened), "target": own}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    assert bn.cli.main(["session", "start", "/bin/profile", "/bin/fetch"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("target: profile") == 1
+    assert out.count("target: fetch") == 1
+    assert out.index("/bin/profile") < out.index("target: profile") < out.index("/bin/fetch")
+    assert out.index("/bin/fetch") < out.index("target: fetch")
+    assert "source: /src/checkout/bn_agent_bridge" in out
+
+
 # --- #694 item 8: one outer deadline across the literal + regex-fallback retry ---
 
 

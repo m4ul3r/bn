@@ -118,6 +118,21 @@ def _help_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _same_dir(left: str, right: str | Path) -> bool:
+    """Whether two directory spellings name one directory (symlinks resolved)."""
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return str(left) == str(right)
+
+
+def _instance_source_dir(instance: Any) -> str | None:
+    """The checkout a bridge's code came from, as its registry records it (#992)."""
+    meta = getattr(instance, "meta", None)
+    value = meta.get("source_dir") if isinstance(meta, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
 @command("doctor", help="Validate bridge discovery and installation")
 def _doctor(args: argparse.Namespace) -> int:
     install_dir = cli.plugin_install_dir()
@@ -141,8 +156,8 @@ def _doctor(args: argparse.Namespace) -> int:
         ]
         if not candidates:
             raise BridgeError(
-                f"No bridge instance found with id: {requested}. "
-                "See `bn session list` for running instances."
+                cli.instance_not_found_message(
+                    requested, "See `bn session list` for running instances.")
             )
     instances = []
     for instance in candidates:
@@ -174,6 +189,27 @@ def _doctor(args: argparse.Namespace) -> int:
         # could not tell a reachable instance from an unreachable one -- it had
         # to re-derive reachability from the absence of `doctor.error`. (L16)
         reachable = isinstance(ping, dict) and not ping.get("error")
+        meta = getattr(instance, "meta", None)
+        meta = meta if isinstance(meta, dict) else {}
+        # #992: which checkout this bridge's code came from, as it reports it
+        # (doctor ping, else its registry). None from an older bridge.
+        bridge_source = (ping.get("source_dir") if isinstance(ping, dict) else None) \
+            or meta.get("source_dir")
+        bridge_source = bridge_source if isinstance(bridge_source, str) and bridge_source else None
+        # #992: what this bridge SHOULD be running. A GUI bridge loads the
+        # installed plugin file, so that is its reference. A headless bridge
+        # runs the package of the interpreter that spawned it, so the reference
+        # is THIS CLI's own source: comparing it to the installed plugin called a
+        # worktree's own, current bridge stale (with a restart that loads the
+        # same code) and reported another checkout's bridge clean.
+        is_gui = bool(meta.get("gui")) or getattr(instance, "instance_id", None) is None
+        reference_build_id = install_build_id if is_gui else source_build_id
+        reference_engine_id = install_engine_id if is_gui else source_engine_id
+        other_checkout = (
+            not is_gui
+            and bridge_source is not None
+            and not _same_dir(bridge_source, source_dir)
+        )
         instances.append(
             {
                 "instance_id": getattr(instance, "instance_id", None),
@@ -185,26 +221,38 @@ def _doctor(args: argparse.Namespace) -> int:
                 "plugin_build_id": loaded_build_id,
                 "bn_version": bn_version,
                 "bn_build_id": bn_build_id,
+                "gui": is_gui,
+                "bridge_source_dir": bridge_source,
+                # A headless bridge started from another checkout than this
+                # CLI's: restarting it from here would not change its code
+                # unless this CLI's interpreter spawns it (#992).
+                "other_checkout": other_checkout,
                 "installed_plugin_build_id": install_build_id,
                 "source_plugin_build_id": source_build_id,
                 "stale_plugin_version": (
                     bool(loaded_version)
                     and str(loaded_version) != cli.VERSION
                 ),
+                # Against the reference above -- the installed plugin file for a
+                # GUI bridge, this CLI's source for a headless one; never set for
+                # a bridge from another checkout, which `other_checkout` names.
                 "stale_plugin_code": (
-                    bool(loaded_build_id)
-                    and install_build_id is not None
-                    and loaded_build_id != install_build_id
+                    not other_checkout
+                    and bool(loaded_build_id)
+                    and reference_build_id is not None
+                    and loaded_build_id != reference_build_id
                 ),
                 "engine_build_id": loaded_engine_id,
                 "installed_engine_build_id": install_engine_id,
-                # The loaded engine package diverges from on-disk: this live
-                # session is running stale logic (e.g. an edited taint_engine.py
-                # after a git pull). `bn session restart <id>` reloads it (#161).
+                # The loaded engine package diverges from its reference on disk:
+                # this live session is running stale logic (e.g. an edited
+                # taint_engine.py after a git pull). `bn session restart <id>`
+                # reloads it (#161).
                 "stale_engine": (
-                    bool(loaded_engine_id)
-                    and install_engine_id is not None
-                    and loaded_engine_id != install_engine_id
+                    not other_checkout
+                    and bool(loaded_engine_id)
+                    and reference_engine_id is not None
+                    and loaded_engine_id != reference_engine_id
                 ),
                 "started_at": instance.started_at,
                 "doctor": ping,
@@ -738,7 +786,10 @@ def _default_skill_install_roots() -> list[Path]:
     return roots
 
 
-@command("session", "start", help="Start a new headless bridge session",
+@command("session", "start",
+         help="Start a new headless bridge session. BN_CACHE_DIR also scopes the "
+              "instance registry and sticky session: a bridge started with it set is "
+              "only visible to bn commands run with the same value",
          args=[
              arg("binaries", nargs="*", help="Binary file paths to preload"),
              arg("--instance-id", help="Use a specific instance ID (default: random)"),
@@ -834,6 +885,9 @@ def _session_start(args: argparse.Namespace) -> int:
         "socket_path": str(instance.socket_path),
         "detached": detached,
     }
+    source_dir = _instance_source_dir(instance)
+    if source_dir is not None:
+        result["source_dir"] = source_dir
     if loaded:
         result["loaded"] = loaded
     if project_roots:
@@ -1005,7 +1059,8 @@ def _session_stop(args: argparse.Namespace) -> int:
         except BridgeError:
             # Fallback: signal the pinned process directly.
             if inst is None or signaller is None:
-                raise BridgeError(f"No bridge instance found with id: {target_id}")
+                raise BridgeError(cli.instance_not_found_message(
+                    target_id, "See `bn session list`.")) from None
             reason = signaller.send(signal.SIGTERM)
             if reason is not None:
                 print(f"error: {reason}", file=sys.stderr)
@@ -1078,7 +1133,7 @@ def _session_restart(args: argparse.Namespace) -> int:
     _require_headless_lifecycle(inst)
     if inst is None:
         raise BridgeError(
-            f"No bridge instance found with id: {target_id}. See `bn session list`."
+            cli.instance_not_found_message(target_id, "See `bn session list`.")
         )
     resolved_id = inst.instance_id
 
@@ -1463,6 +1518,9 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
             entry["project_roots"] = list(project_roots)
         if sticky_id and (inst.instance_id == sticky_id or selector == sticky_id):
             entry["sticky"] = True
+        source_dir = _instance_source_dir(inst)
+        if source_dir is not None:
+            entry["source_dir"] = source_dir
         entries.append(entry)
         if rss is not None:
             total_rss += rss
@@ -1596,7 +1654,10 @@ def _probe_unsaved_targets(snapshot: dict[str, Any]) -> None:
         list(pool.map(lambda entry: _probe_one_instance(entry, deadline), entries))
 
 
-@command("session", "list", help="List running bridge sessions")
+@command("session", "list",
+         help="List running bridge sessions (from $BN_CACHE_DIR/instances when "
+              "BN_CACHE_DIR is set: BN_CACHE_DIR also scopes the instance registry "
+              "and sticky session)")
 def _session_list(args: argparse.Namespace) -> int:
     # An explicit `-i ''` is an empty SELECTOR, not "no selector": the filter in
     # _running_instances_result is truthiness-based, so an empty string silently
@@ -1611,6 +1672,11 @@ def _session_list(args: argparse.Namespace) -> int:
         else None
     )
     result: Any = _running_instances_result(selector_filter)
+    # #996: an explicit -i that matches nothing is the "lost BN_CACHE_DIR"
+    # case -- say where the id IS registered rather than "(no sessions)".
+    if selector_filter and not result.get("items"):
+        raise BridgeError(cli.instance_not_found_message(
+            selector_filter, "Run `bn session list` without -i to see every running instance."))
     # #733 F1: "is it safe to stop these bridges?" answered on the read path.
     # A live probe, not registry meta: `_write_registry` runs on load/close
     # only, so a registry-sourced count would report "0 unsaved" for a bridge
@@ -1748,6 +1814,9 @@ def _target_list(args: argparse.Namespace) -> int:
     # Wrap the bare list in the {kind, items} envelope the rest of the CLI's
     # collection reads use, so an agent doesn't special-case target list (#358).
     envelope: Any = {"kind": "targets", "items": result if isinstance(result, list) else []}
+    # #996: name the bridge that answered -- a lone instance is used from any cwd.
+    if isinstance(response, dict) and isinstance(response.get("instance"), str):
+        envelope["instance"] = response["instance"]
     cli._emit_result(args, envelope, text_renderer=_render_target_list_text, stem="targets")
     return 0
 
