@@ -111,8 +111,8 @@ def _close_target_by_name(args: argparse.Namespace, name: str) -> str:
     basename or a full ``target_id`` counts -- never a view id (``close 5``
     must not close whichever view became view 5) and never a ``.bndb``-stripped
     alias (a second ``close hello`` must not go on to close ``hello.bndb``). It
-    must match exactly one target, and the close is sent PINNED to that
-    target's id, like every implicit close resolution (#690 R3).
+    must match exactly one target, and the close is sent with
+    ``pinned_target`` so the bridge resolves that id and nothing else.
     """
     response = cli.send_request(
         "list_targets", params={}, target=None,
@@ -129,6 +129,10 @@ def _close_target_by_name(args: argparse.Namespace, name: str) -> str:
                if name in (row.get("basename"), str(row.get("target_id") or ""))]
     if len(matches) == 1 and matches[0].get("target_id"):
         return str(matches[0]["target_id"])
+    if not rows:
+        raise BridgeError(
+            f"No targets are open, and no file {name!r} exists in this directory."
+        )
     headline = (
         f"{len(matches)} open targets are named {name!r}; close one by selector."
         if matches else
@@ -215,6 +219,10 @@ def _close(args: argparse.Namespace) -> int:
             # stays a path: what the operand has always meant.
             explicit_target = args.target = _close_target_by_name(args, name)
             explicit_path = None
+            # #996 review: the id came from a listing, so it is sent as a PIN --
+            # the bridge resolves it by exact target_id only and refuses if that
+            # target is gone, rather than falling back to a file NAMED like it.
+            params["pinned_target"] = True
     if args.all:
         params["all"] = True
     # #664: a bare `bn close` closes the single open target and refuses under
@@ -238,6 +246,7 @@ def _close(args: argparse.Namespace) -> int:
         try:
             # Looked up on ``bn.cli`` at call time so tests patch one seam.
             args.target = cli._implicit_target(args)
+            params["pinned_target"] = True
         except cli.MultiTargetError as exc:
             if explicit_target == "active":
                 raise BridgeError(

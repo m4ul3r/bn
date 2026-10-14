@@ -3020,31 +3020,57 @@ def test_opening_a_view_never_moves_an_advertised_selector_onto_it_996(monkeypat
     bridge._headless_views.clear()
 
 
-def test_saved_database_keeps_the_raw_views_selector_996(monkeypatch):
+def test_saved_database_keeps_the_raw_views_selector_996(monkeypatch, tmp_path):
     # #996: the one exception to "every alias counts equally". `bn save` of the
     # raw `foo` then `bn load foo.bndb`: the raw view's own name and path still
     # mean the raw view, the database answers to `foo.bndb`, and the listing
-    # advertises exactly those -- only because THIS bridge recorded the save.
+    # advertises exactly those -- only because THIS bridge recorded the save,
+    # and only while the `.bndb` is still the file it wrote (#996 review N2).
     bridge = _load_bridge(monkeypatch)
-    raw = _FakeFileBV("/x/foo", session_id="1")
+    raw_path, db_path = tmp_path / "foo", tmp_path / "foo.bndb"
+    raw_path.write_bytes(b"raw")
+    raw = _FakeFileBV(str(raw_path), session_id="1")
     _register_views(bridge, raw)
     manager = bridge.TargetManager()
     manager.refresh()
-    manager.note_database(raw, "/x/foo.bndb")
-    db = _FakeFileBV("/x/foo.bndb", session_id="2")
+    db_path.write_bytes(b"database written by this bridge")
+    manager.note_database(raw, str(db_path))
+    db = _FakeFileBV(str(db_path), session_id="2")
     _register_views(bridge, raw, db)
-    selectors = {row["filename"]: row["selector"] for row in manager.refresh()}
-    assert selectors == {"/x/foo": "foo", "/x/foo.bndb": "foo.bndb"}
-    assert manager.resolve("foo") is raw
-    assert manager.resolve("/x/foo") is raw
-    assert manager.resolve("x/foo") is raw
-    assert manager.resolve("foo.bndb") is db
-    assert manager.resolve("/x/foo.bndb") is db
-    # A third, unrelated `foo` is a real ambiguity again.
-    _register_views(bridge, raw, db, _FakeFileBV("/y/foo", session_id="3"))
-    with pytest.raises(Exception, match="mbiguous"):
-        manager.resolve("foo")
-    bridge._headless_views.clear()
+    try:
+        selectors = {row["filename"]: row["selector"] for row in manager.refresh()}
+        assert selectors == {str(raw_path): "foo", str(db_path): "foo.bndb"}
+        assert manager.resolve("foo") is raw
+        assert manager.resolve(str(raw_path)) is raw
+        assert manager.resolve(f"{tmp_path.name}/foo") is raw
+        assert manager.resolve("foo.bndb") is db
+        assert manager.resolve(str(db_path)) is db
+
+        # The database view loaded as UNVERIFIED against its raw bytes: no pair.
+        bridge._source_verified["2"] = False
+        with pytest.raises(Exception, match="mbiguous"):
+            manager.resolve("foo")
+        bridge._source_verified.pop("2")
+        assert manager.resolve("foo") is raw
+
+        # The file at that path was replaced since the save: no pair either.
+        replacement = tmp_path / "other.bndb"
+        replacement.write_bytes(b"another binary's database")
+        os.replace(replacement, db_path)
+        with pytest.raises(Exception, match="mbiguous"):
+            manager.resolve("foo")
+        assert manager.refresh()[0]["selector"] != "foo"
+
+        # A later save through this bridge re-pairs with what it wrote.
+        manager.note_database(raw, str(db_path))
+        assert manager.resolve("foo") is raw
+
+        # A third, unrelated `foo` is a real ambiguity again.
+        _register_views(bridge, raw, db, _FakeFileBV("/y/foo", session_id="3"))
+        with pytest.raises(Exception, match="mbiguous"):
+            manager.resolve("foo")
+    finally:
+        bridge._headless_views.clear()
 
 
 def test_resolve_stays_ambiguous_for_two_views_sharing_a_basename(monkeypatch):
@@ -5768,6 +5794,54 @@ def test_close_binary_pinned_target_id_errors_when_view_was_replaced(monkeypatch
         _close_on_watchdog(instance, target=pinned)
     assert "Unknown target selector" in str(exc.value)
     assert not newcomer.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_pinned_target_flag_never_falls_back_to_a_file_named_like_the_id(
+    monkeypatch, tmp_path
+):
+    # #996 review N1: the CLI read the id from a listing. If that target closes
+    # first and another open file is literally NAMED that id, a plain selector
+    # falls back to the basename and closes the other file. `pinned_target`
+    # resolves the id and nothing else.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    first = _ClosableBV("/proj/first.so", session_id="11")
+    _register_views(bridge, first)
+    pinned = instance.targets.refresh()[0]["target_id"]
+    _close_on_watchdog(instance, target=pinned)
+    namesake = _ClosableBV(f"/proj/{pinned}", session_id="33")
+    _register_views(bridge, namesake)
+
+    response = instance.dispatch({"op": "close_binary", "target": pinned,
+                                  "params": {"pinned_target": True}, "id": "r1"})
+    assert response["ok"] is False
+    assert "Unknown target selector" in response["error"]
+    assert not namesake.closed
+
+    # Without the flag the same request is a human selector, which is the hazard.
+    response = instance.dispatch({"op": "close_binary", "target": pinned,
+                                  "params": {}, "id": "r2"})
+    assert response["ok"] is True and namesake.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_refuses_a_target_named_only_by_its_bndb_stripped_alias(
+    monkeypatch, tmp_path
+):
+    # #996 review nit: once the raw `hello` is closed, `close -t hello` reached
+    # `hello.bndb` through the #312 strip. A destructive close names it.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    db = _ClosableBV("/proj/hello.bndb", session_id="11")
+    _register_views(bridge, db)
+    with pytest.raises(RuntimeError, match=r"pass `-t hello.bndb`"):
+        _close_on_watchdog(instance, target="hello")
+    assert not db.closed
+    _close_on_watchdog(instance, target="hello.bndb")
+    assert db.closed
     bridge._headless_views.clear()
 
 

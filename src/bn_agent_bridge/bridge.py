@@ -674,6 +674,11 @@ class TargetManager:
         # load-time sidecar/cache substitution OPENS the database, so `filename`
         # already names it.
         self._database_paths: dict[str, str] = {}
+        # Stable view_id -> (st_dev, st_ino, st_size, st_mtime_ns) of the file at
+        # `_database_paths[vid]` right after this bridge last wrote it. Pairs a
+        # database view with its raw view for selector resolution only while
+        # that file is still the one written (#996 review).
+        self._database_identities: dict[str, tuple[int, int, int, int] | None] = {}
         # Stable view_id -> the comments THIS bridge wrote and verified, keyed
         # (scope, address) -> body, scope "address" (a global address comment)
         # or "function_doc" (fn.comment, keyed at the function start). Decompile
@@ -783,6 +788,7 @@ class TargetManager:
         """
         if not path:
             return
+        identity = _file_identity(path)
         # Only when it DIVERGES from the live filename. A target loaded from a
         # `.bndb` and saved in place has `saved == filename`, and recording that
         # contradicted this field's own contract ("the database when it is not the
@@ -794,12 +800,18 @@ class TargetManager:
             live = str(getattr(getattr(bv, "file", None), "filename", "") or "")
         except Exception:  # noqa: BLE001 - an odd view must not break a save
             live = ""
-        if live and str(path) == live:
-            return
         with self._lock:
-            vid = self._stable_view_id(bv)
-            if vid is not None:
-                self._database_paths[vid] = str(path)
+            # A save rewrote *path*: every record pointing at that file now
+            # pairs with what this bridge just wrote -- including a save of the
+            # database view itself, which records nothing of its own below.
+            for other, recorded in self._database_paths.items():
+                if _same_file(recorded, path):
+                    self._database_identities[other] = identity
+            if not (live and str(path) == live):
+                vid = self._stable_view_id(bv)
+                if vid is not None:
+                    self._database_paths[vid] = str(path)
+                    self._database_identities[vid] = identity
             successor = self._successor
         if successor is not None:
             successor.note_database(bv, path)
@@ -872,6 +884,7 @@ class TargetManager:
             if vid is not None:
                 self._dirty_view_ids.discard(vid)
                 self._database_paths.pop(vid, None)
+                self._database_identities.pop(vid, None)
                 self._session_annotations.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
@@ -1024,18 +1037,41 @@ class TargetManager:
     def _saved_pairs(self, records: dict[str, TargetRecord]) -> dict[str, str]:
         """database view id -> the raw view id THIS bridge saved it from.
 
-        From the save ledger (`_database_paths`, written by a successful
-        `bn save`), never from filename spelling: two unrelated `foo` and
-        `foo.bndb` views form no pair.
+        From the save ledger, never from filename spelling: two unrelated `foo`
+        and `foo.bndb` views form no pair. The path alone is not enough either
+        (#996 review): the database view must still be the file this bridge
+        wrote -- same device, inode, size and mtime as recorded right after the
+        save -- and must not have loaded as unverified against its raw bytes.
+        A database replaced since, or one that failed that check, pairs with
+        nothing, so `-t foo` is ambiguous again exactly as without a save.
         """
         pairs: dict[str, str] = {}
         for raw_vid, path in self._database_paths.items():
-            if raw_vid not in records:
+            identity = self._database_identities.get(raw_vid)
+            if raw_vid not in records or identity is None:
                 continue
             for vid, record in records.items():
-                if vid != raw_vid and _same_file(record.filename, path):
+                if (
+                    vid != raw_vid
+                    and _same_file(record.filename, path)
+                    and _file_identity(record.filename) == identity
+                    and _source_verified.get(record.session_id) is not False
+                ):
                     pairs[vid] = raw_vid
         return pairs
+
+    def stripped_only_name(self, selector: str | None, bv) -> str | None:
+        """*bv*'s basename when *selector* names it ONLY through a `.bndb`-stripped
+        alias (`hello` for `hello.bndb`), else None. A destructive close refuses
+        that convenience (#996 review)."""
+        if selector is None or isinstance(selector, PinnedTarget):
+            return None
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            record = self._records.get(vid) if vid is not None else None
+            if record is None or self._match_kind(record, selector) != self._STRIPPED:
+                return None
+            return record.basename
 
     def _drop_saved_databases(
         self, kinds: dict[str, str], saved_pairs: dict[str, str]
@@ -1186,6 +1222,10 @@ class TargetManager:
                 # restart would then reopen its raw bytes (#753 review).
                 self._database_paths = {
                     vid: path for vid, path in self._database_paths.items()
+                    if vid in alive
+                }
+                self._database_identities = {
+                    vid: ident for vid, ident in self._database_identities.items()
                     if vid in alive
                 }
                 self._session_annotations = {
@@ -3051,6 +3091,16 @@ class BinaryNinjaBridge:
             target_bv = self._resolve_sole_target_for_close()
         else:
             target_bv = self.targets.resolve(target)
+            # #996 review: a destructive close does not take the `.bndb`-strip
+            # convenience (#312). Once the raw `hello` is closed, `-t hello`
+            # names `hello.bndb` only through that alias -- say so, rather than
+            # tear down the database the caller may not have meant.
+            stripped = self.targets.stripped_only_name(target, target_bv)
+            if stripped is not None:
+                raise RuntimeError(
+                    f"close_binary: {str(target)!r} names {stripped} only through "
+                    f"its `.bndb`-stripped name; to close it pass `-t {stripped}`."
+                )
 
         # Target-based close takes priority and must succeed even when
         # _headless_views is empty: GUI-opened views resolve fine but are not
@@ -5025,9 +5075,18 @@ def _bind_close_binary(bridge, params, target):
             "close_binary: pass \"target\" at the top level of the request, "
             "not inside params"
         )
+    # #996 review: `pinned_target` makes the selector an identity -- resolved
+    # by exact target_id and nothing else (`PinnedTarget`) -- for a CLI that
+    # read the id from a listing. Without it a target closed in between could
+    # hand the close to a file NAMED like that id. A flag, not a selector
+    # spelling, so no filename can ever carry pin semantics.
+    pinned = _validate_bool(params.get("pinned_target"), label="pinned_target",
+                            default=False)
+    if pinned and not (isinstance(target, str) and target.strip()):
+        raise ValueError("close_binary: pinned_target needs a target_id selector")
     return bridge._close_binary(
         params.get("path"),
-        target,
+        PinnedTarget(target) if pinned else target,
         _validate_bool(params.get("all"), label="all", default=False),
     )
 
@@ -5711,6 +5770,17 @@ def _bind_batch_apply(bridge, params, target):
 READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 
+
+
+def _file_identity(path: str | None) -> tuple[int, int, int, int] | None:
+    """(device, inode, size, mtime_ns) of *path*, or None when it cannot be read."""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def _same_file(a: str | None, b: str | None) -> bool:

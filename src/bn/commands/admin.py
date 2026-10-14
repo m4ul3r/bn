@@ -1501,7 +1501,7 @@ def _session_list(args: argparse.Namespace) -> int:
     # case -- say where the id IS registered rather than "(no sessions)".
     if selector_filter and not result.get("items"):
         raise BridgeError(cli.instance_not_found_message(
-            selector_filter, "See `bn session list` for running instances."))
+            selector_filter, "Run `bn session list` without -i to see every running instance."))
     # #733 F1: "is it safe to stop these bridges?" answered on the read path.
     # A live probe, not registry meta: `_write_registry` runs on load/close
     # only, so a registry-sourced count would report "0 unsaved" for a bridge

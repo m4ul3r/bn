@@ -579,7 +579,9 @@ def test_close_bare_single_target_pins_peeked_target_id(fake_transport, monkeypa
         assert rc == 0, argv
         assert [c["op"] for c in calls] == ["list_targets", "close_binary"], argv
         assert calls[-1]["target"] == "123:1:7", argv
-        assert calls[-1]["params"] == {}, argv
+        # ...and sends it with `pinned_target`, so the bridge resolves that id
+        # by identity only, never a file whose name spells it (#996 review N1).
+        assert calls[-1]["params"] == {"pinned_target": True}, argv
         assert "closed: /tmp/foo" in capsys.readouterr().out
 
 
@@ -935,7 +937,9 @@ def test_close_takes_a_bare_name_as_its_exact_file_name_996(
     assert bn.cli.main(["close", "5"]) == 0
     assert [c["op"] for c in calls] == ["list_targets", "close_binary"]
     assert calls[-1]["target"] == "123:4:1"          # the file `5`, not view id 5
-    assert calls[-1]["params"] == {}
+    # Sent as a PIN: the bridge resolves exactly that id, never a file named
+    # like it (#996 review N1).
+    assert calls[-1]["params"] == {"pinned_target": True}
 
     # `hello` is only a `.bndb`-stripped alias of `hello.bndb`: nothing closes.
     calls = fake_transport({"list_targets": _NAMED_TARGETS, "close_binary": closed})
@@ -973,6 +977,13 @@ def test_close_by_name_refuses_two_targets_with_that_file_name_996(
     err = capsys.readouterr().err
     assert "2 open targets are named 'foo'" in err
     assert "-t a/foo" in err and "-t b/foo" in err
+
+    # Nothing open at all: say so, without an empty "Open targets:" listing.
+    calls = fake_transport({"list_targets": {"ok": True, "result": []}})
+    assert bn.cli.main(["close", "foo"]) == 2
+    err = capsys.readouterr().err
+    assert "No targets are open" in err
+    assert "Open targets:" not in err
 
 
 def test_target_list_and_info_name_the_answering_instance_996(fake_transport, capsys):

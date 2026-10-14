@@ -1168,7 +1168,31 @@ def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
     )
 
 
-def _agent_cache_dirs_for(instance_id: str, proc: Path = Path("/proc")) -> list[Path]:
+# Where process facts are read from; a module constant so tests can point it
+# at a synthetic tree.
+_PROC_ROOT = Path("/proc")
+
+
+def _is_bn_agent_named(argv: list[str], instance_id: str) -> bool:
+    """Whether *argv* is a headless bridge launched as ``--instance-id <id>``,
+    under any of its three launch spellings (console script, ``bn.headless``,
+    ``bn_agent_bridge``)."""
+    return any(
+        os.path.basename(part) == "bn-agent" or part in ("bn.headless", "bn_agent_bridge")
+        for part in argv
+    ) and any(
+        part == "--instance-id" and argv[i + 1:i + 2] == [instance_id]
+        for i, part in enumerate(argv)
+    )
+
+
+def _proc_argv(entry: Path) -> list[str]:
+    """``/proc/<pid>/cmdline`` as decoded arguments (raises OSError)."""
+    return [os.fsdecode(part) for part in
+            entry.joinpath("cmdline").read_bytes().split(b"\0") if part]
+
+
+def _agent_cache_dirs_for(instance_id: str, proc: Path | None = None) -> list[Path]:
     """Cache roots of this user's running bridges named *instance_id*.
 
     Read from each `bn-agent` process's own argv and environment, so it needs no
@@ -1178,6 +1202,7 @@ def _agent_cache_dirs_for(instance_id: str, proc: Path = Path("/proc")) -> list[
     host without /proc answers nothing.
     """
     found: list[Path] = []
+    proc = _PROC_ROOT if proc is None else proc
     try:
         entries = list(proc.iterdir())
     except OSError:
@@ -1186,13 +1211,7 @@ def _agent_cache_dirs_for(instance_id: str, proc: Path = Path("/proc")) -> list[
         if not entry.name.isdigit():
             continue
         try:
-            argv = [os.fsdecode(part) for part in
-                    entry.joinpath("cmdline").read_bytes().split(b"\0") if part]
-            if not any(os.path.basename(part) == "bn-agent"
-                       or part in ("bn.headless", "bn_agent_bridge") for part in argv):
-                continue
-            if not any(part == "--instance-id" and argv[i + 1:i + 2] == [instance_id]
-                       for i, part in enumerate(argv)):
+            if not _is_bn_agent_named(_proc_argv(entry), instance_id):
                 continue
             environ = entry.joinpath("environ").read_bytes().split(b"\0")
         except OSError:
@@ -1219,7 +1238,10 @@ def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool:
 
     The "registered elsewhere" hint replaces the start advice, so a stale file
     (dead or recycled pid, an orphaned ``{}``, another id's payload) must not
-    produce it (#996 review).
+    produce it (#996 review) -- and neither may a live pid that is not that
+    bridge: the process must be a ``bn-agent`` launched with this
+    ``--instance-id`` (its own cmdline says so), and its recorded start
+    identity must not contradict the live process.
     """
     try:
         payload = json.loads(registry_path.read_text(encoding="utf-8"))
@@ -1230,10 +1252,17 @@ def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool:
     pid = payload.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
-    recorded_id = payload.get("instance_id")
-    if recorded_id is not None and recorded_id != instance_id:
+    if payload.get("instance_id") != instance_id:
         return False
-    return _process_alive(pid) and identity_verdict(payload, pid) != "mismatch"
+    try:
+        argv = _proc_argv(_PROC_ROOT / str(pid))
+    except OSError:
+        return False
+    return (
+        _is_bn_agent_named(argv, instance_id)
+        and _process_alive(pid)
+        and identity_verdict(payload, pid) != "mismatch"
+    )
 
 
 def _instance_registered_elsewhere(instance_id: str) -> Path | None:

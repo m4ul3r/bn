@@ -2311,6 +2311,13 @@ def test_missing_instance_points_at_the_registry_that_holds_it_996(tmp_path, mon
     (default_root / "instances").mkdir(parents=True)
     live = json.dumps({"pid": os.getpid(), "instance_id": "demo"})
     (default_root / "instances" / "demo.json").write_text(live)
+    # This test process stands in for the bridge: a synthetic /proc says it is
+    # `bn-agent --instance-id demo` (the registry check reads its cmdline).
+    proc = tmp_path / "proc"
+    (proc / str(os.getpid())).mkdir(parents=True)
+    cmdline = proc / str(os.getpid()) / "cmdline"
+    cmdline.write_bytes(b"/venv/bin/bn-agent\0--instance-id\0demo\0")
+    monkeypatch.setattr("bn.transport._PROC_ROOT", proc)
     monkeypatch.setattr("bn.transport.default_cache_home", lambda: default_root)
     monkeypatch.setattr("bn.transport._agent_cache_dirs_for", lambda instance_id: [])
     private = tmp_path / "private"
@@ -2335,6 +2342,17 @@ def test_missing_instance_points_at_the_registry_that_holds_it_996(tmp_path, mon
             choose_instance("demo")
         assert "export BN_CACHE_DIR" not in str(exc.value), stale
         assert "Start one with" in str(exc.value), stale
+
+    # A live pid that is NOT that bridge (any other process) is no evidence
+    # either (#996 review N3).
+    (default_root / "instances" / "demo.json").write_text(live)
+    for argv in (b"/usr/bin/python3\0-m\0pytest\0",
+                 b"/venv/bin/bn-agent\0--instance-id\0someone-else\0"):
+        cmdline.write_bytes(argv)
+        with pytest.raises(BridgeError) as exc:
+            choose_instance("demo")
+        assert "export BN_CACHE_DIR" not in str(exc.value), argv
+        assert "Start one with" in str(exc.value), argv
 
     # An id registered nowhere else keeps the start advice, and says the
     # variable scopes the registry.
@@ -2362,7 +2380,7 @@ def test_missing_instance_found_through_a_running_bridges_environment_996(
     (bridge_cwd / "rel" / "instances").mkdir(parents=True)
     proc = tmp_path / "proc"
     for pid, argv, env in (
-        ("4242", b"/venv/bin/bn-agent\0--instance-id\0demo\0",
+        (str(os.getpid()), b"/venv/bin/bn-agent\0--instance-id\0demo\0",
          b"HOME=/h\0BN_CACHE_DIR=" + str(elsewhere).encode() + b"\0"),
         ("4343", b"/usr/bin/python3\0other.py\0--instance-id\0demo\0",
          b"BN_CACHE_DIR=/nowhere\0"),
@@ -2376,6 +2394,7 @@ def test_missing_instance_found_through_a_running_bridges_environment_996(
     real_scan = transport._agent_cache_dirs_for
     monkeypatch.setattr(transport, "_agent_cache_dirs_for",
                         lambda instance_id: real_scan(instance_id, proc=proc))
+    monkeypatch.setattr(transport, "_PROC_ROOT", proc)
     monkeypatch.setattr(transport, "default_cache_home", lambda: default_root)
     monkeypatch.delenv("BN_CACHE_DIR", raising=False)
     monkeypatch.setattr(transport, "cache_home", lambda: default_root)
