@@ -706,6 +706,40 @@ def _slice_text_lines(
     return header + "\n" + "\n".join(sliced)
 
 
+@_discloses
+def _render_decompile_warnings(value: Any, *, explain: bool = False) -> str:
+    """One `warning[<code>]: <summary>` line per decompile warning (#1000 item 1).
+
+    The bridge sends `{code, summary, detail, ...}` rows. Text printed each
+    detail as a 450-870 character paragraph, mostly the same boilerplate on
+    every function, so agents filtered `^warning` wholesale and lost the
+    dropped-argument findings with it (and harnesses cut the longest ones off
+    before their advice). The summary is the finding; `--explain` adds the
+    detail -- what it means and what to do -- indented under it. A bare string
+    (a bridge older than the rows) prints as it always did."""
+    lines: list[str] = []
+    explained = False
+    for warning in _field_list(value, "warnings") or []:
+        if not isinstance(warning, dict):
+            lines.append(f"warning: {warning}")
+            continue
+        # Through the choke point: a non-string field is a skew to disclose,
+        # not a line to drop (#619). A row with neither text prints whole.
+        code = _text_value(warning, "code")
+        summary = _text_value(warning, "summary")
+        detail = _text_value(warning, "detail")
+        head = f"warning[{code}]: " if code else "warning: "
+        body = summary or detail or json.dumps(warning, sort_keys=True, default=str)
+        lines.append(head + body)
+        if detail and detail != body:
+            explained = True
+            if explain:
+                lines.append(f"  {detail}")
+    if explained and not explain:
+        lines.append("(--explain: what each warning means and what to do)")
+    return "\n".join(lines)
+
+
 # A BOUNDARY, not just a reader: every CLI caller concatenates this note ahead of
 # another render and none of them wraps it, so without one of its own the skew it
 # records below reaches no recorder and the note disappears in silence (#619).

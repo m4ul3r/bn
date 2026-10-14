@@ -35,12 +35,12 @@ def test_thunk_veneer_warning_names_target_and_is_quiet_for_non_thunks(monkeypat
                         lambda ctx, bv, func: {"is_candidate": True,
                                                "target": {"function": {"name": "memcpy", "address": "0x1000",
                                                                         "exact_start": True}}})
-    w = read_decompile._thunk_veneer_warning(None, None, None)
+    w = read_decompile._thunk_veneer_warning(None, None, None)["detail"]
     assert "thunk/veneer -> memcpy @ 0x1000" in w and "self-recursive" in w
 
     monkeypatch.setattr(read_evidence, "_function_thunk_summary",
                         lambda ctx, bv, func: {"is_candidate": True, "target": None})
-    w2 = read_decompile._thunk_veneer_warning(None, None, None)
+    w2 = read_decompile._thunk_veneer_warning(None, None, None)["detail"]
     assert "thunk/veneer" in w2 and "trampoline" in w2
 
     monkeypatch.setattr(read_evidence, "_function_thunk_summary",
@@ -61,7 +61,7 @@ def test_thunk_veneer_warning_mid_function_target_not_confirmed_704(monkeypatch)
             "target": {"function": {"name": "big_fn", "address": "0x405000",
                                      "exact_start": False, "offset": "0x10"}},
         })
-    w = read_decompile._thunk_veneer_warning(None, None, None)
+    w = read_decompile._thunk_veneer_warning(None, None, None)["detail"]
     assert "big_fn @ 0x405000" in w
     assert "not confirmed" in w
     assert "not a self-recursive function" not in w  # the confident wording only
@@ -91,10 +91,10 @@ def test_thunk_veneer_warning_names_resolved_exact_start_target_through_real_pro
     w = read_decompile._thunk_veneer_warning(instance.ctx, bv, veneer)
 
     assert w is not None
-    assert "log_write @ 0x461746" in w
-    assert "PLT/GOT trampoline" in w
-    assert "not resolved" not in w
-    assert "not confirmed" not in w
+    assert "log_write @ 0x461746" in w["detail"]
+    assert "PLT/GOT trampoline" in w["detail"]
+    assert "not resolved" not in w["detail"]
+    assert "not confirmed" not in w["detail"]
 
 
 def test_thunk_veneer_warning_mid_function_target_through_real_producer_704(monkeypatch):
@@ -117,9 +117,9 @@ def test_thunk_veneer_warning_mid_function_target_through_real_producer_704(monk
     w = read_decompile._thunk_veneer_warning(instance.ctx, bv, stub)
 
     assert w is not None
-    assert "big_fn" in w
-    assert "not confirmed" in w
-    assert "not a self-recursive function" not in w
+    assert "big_fn" in w["detail"]
+    assert "not confirmed" in w["detail"]
+    assert "not a self-recursive function" not in w["detail"]
 
 
 def test_thunk_veneer_warning_target_less_wording_states_only_what_is_known_704(monkeypatch):
@@ -137,7 +137,7 @@ def test_thunk_veneer_warning_target_less_wording_states_only_what_is_known_704(
             "reason": "small function rendered as a pseudo-C tailcall",
             "target": None,
         })
-    w = read_decompile._thunk_veneer_warning(None, None, None)
+    w = read_decompile._thunk_veneer_warning(None, None, None)["detail"]
     assert "small function rendered as a pseudo-C tailcall" in w
     assert "not resolved" in w
     assert "the apparent self-call is the resolved target" not in w
@@ -149,7 +149,7 @@ def test_thunk_veneer_warning_target_less_wording_states_only_what_is_known_704(
             "reason": "function starts in a PLT/import trampoline section",
             "target": None,
         })
-    w2 = read_decompile._thunk_veneer_warning(None, None, None)
+    w2 = read_decompile._thunk_veneer_warning(None, None, None)["detail"]
     assert "function starts in a PLT/import trampoline section" in w2
     assert "the apparent self-call is the resolved target" not in w2
 
@@ -1171,7 +1171,7 @@ def test_decompile_struct_assist_witness_and_no_mutation(monkeypatch):
     result = instance._decompile("active", "handle")
 
     assert len(result["warnings"]) == 1
-    hint = result["warnings"][0]
+    hint = result["warnings"][0]["detail"]
     # These are the actionable evidence, not a pin of the explanatory prose.
     for evidence in ("cfg", "c", "+0x28/8", "flags", "+0x30/4", "depth",
                      "bn struct show cfg", "bn proto get 0x401000",
@@ -1229,7 +1229,7 @@ def test_struct_assist_resolves_scalar_member_typedef_before_ambiguity(monkeypat
     # A whole-struct alias must not create another concrete candidate.
     bv.types["wrapped_alias"] = reference("wrapped_cfg", wrapped.width)
 
-    warnings = read_decompile._struct_layout_warnings(bv, fn)
+    warnings = [w["detail"] for w in read_decompile._struct_layout_warnings(bv, fn)]
     if other_layout:
         assert warnings == []
     else:
@@ -1292,7 +1292,7 @@ def test_struct_assist_bounds_member_typedef_lookups(
     if expected_hints:
         candidate = "cfg" if direct_layout else "wrapped_cfg"
         for witness in (f"struct {candidate} *", "+0x28/8", "flags", "+0x30/4", "depth"):
-            assert witness in result["warnings"][0]
+            assert witness in result["warnings"][0]["detail"]
     assert len(lookups) == expected_lookups
 
 
@@ -1334,7 +1334,7 @@ def test_decompile_struct_assist_opaque_members_do_not_hide_supported_layout(mon
 
     assert len(result["warnings"]) == 1
     for witness in ("struct cfg *", "+0x28/8", "flags", "+0x30/4", "depth"):
-        assert witness in result["warnings"][0]
+        assert witness in result["warnings"][0]["detail"]
 
 
 @pytest.mark.parametrize("case", [
@@ -1481,7 +1481,7 @@ def test_struct_assist_potentially_compatible_competitor_blocks_uniqueness(case,
         other = bv.types["cfg"]
         other.members.append(bitfield(0x34, "spare", 3))
     bv.types[str(other).removeprefix("struct ")] = other
-    warnings = read_decompile._struct_layout_warnings(bv, fn)
+    warnings = [w["detail"] for w in read_decompile._struct_layout_warnings(bv, fn)]
     assert len(warnings) == hints
     if hints:
         assert "struct cfg *" in warnings[0]
@@ -1517,7 +1517,7 @@ def test_struct_assist_resolves_only_observed_member_typedefs():
     bv.types["wrapped_cfg"] = wrapped
     del bv.types["cfg"]
 
-    warnings = read_decompile._struct_layout_warnings(bv, fn)
+    warnings = [w["detail"] for w in read_decompile._struct_layout_warnings(bv, fn)]
 
     assert len(warnings) == 1 and "struct wrapped_cfg *" in warnings[0]
     assert lookups == ["ref--1"]
@@ -1541,7 +1541,7 @@ def test_struct_assist_preserves_pointee_qualifiers_in_suggestion():
     bv, fn, var, _ = _struct_assist_case()
     var.type.target.const = True
     var.type.target.volatile = True
-    assert "const volatile struct cfg *" in read_decompile._struct_layout_warnings(bv, fn)[0]
+    assert "const volatile struct cfg *" in read_decompile._struct_layout_warnings(bv, fn)[0]["detail"]
 
 
 def test_decompile_renders_pseudo_c(monkeypatch):
@@ -1866,7 +1866,7 @@ def test_decompile_warns_on_skipped_analysis(monkeypatch):
     assert result["analysis_forced"] is False
     assert result["analysis_force_requested"] is False
     assert fn.reanalyzed is False  # warn-only must NOT reanalyze
-    assert any("big_fn" in w and "ExceedFunctionSize" in w and "--force-analysis" in w for w in result["warnings"])
+    assert any("big_fn" in w["detail"] and "ExceedFunctionSize" in w["detail"] and "--force-analysis" in w["detail"] for w in result["warnings"])
 
 
 def test_decompile_warns_on_placeholder_text_when_flag_clear(monkeypatch):
@@ -1890,7 +1890,7 @@ def test_decompile_warns_on_placeholder_text_when_flag_clear(monkeypatch):
     result = instance._decompile("active", "big_fn")
 
     assert result["analysis_skipped"] is False
-    assert any("incomplete stub" in w for w in result["warnings"])
+    assert any("incomplete stub" in w["detail"] for w in result["warnings"])
 
 
 def test_analysis_stub_warning_ignores_legitimate_phrase_in_program_text(monkeypatch):
@@ -1929,7 +1929,7 @@ def test_decompile_force_analysis_reanalyzes_and_clears_warning(monkeypatch):
     assert result["analysis_force_requested"] is True
     assert result["analysis_skipped"] is False
     assert result["text"] == "int32_t big_fn()\n{\n    return 1;\n}"
-    assert not any("stub" in w.lower() or "skipped analysis" in w for w in result["warnings"])
+    assert not any("stub" in w["detail"].lower() or "skipped analysis" in w["detail"] for w in result["warnings"])
 
 
 def test_decompile_force_analysis_warns_on_likely_data_region(monkeypatch):
@@ -1953,8 +1953,8 @@ def test_decompile_force_analysis_warns_on_likely_data_region(monkeypatch):
     result = instance._decompile("active", "sub_80586324", force_analysis=True)
 
     assert result["analysis_forced"] is True
-    assert any("data region" in w.lower() for w in result["warnings"])
-    assert any("0 inbound code refs" in w for w in result["warnings"])
+    assert any("data region" in w["detail"].lower() for w in result["warnings"])
+    assert any("0 inbound code refs" in w["detail"] for w in result["warnings"])
 
 
 def test_decompile_force_analysis_no_data_warning_when_referenced(monkeypatch):
@@ -1976,7 +1976,7 @@ def test_decompile_force_analysis_no_data_warning_when_referenced(monkeypatch):
     result = instance._decompile("active", "big_real_fn", force_analysis=True)
 
     assert result["analysis_forced"] is True
-    assert not any("data region" in w.lower() for w in result["warnings"])
+    assert not any("data region" in w["detail"].lower() for w in result["warnings"])
 
 
 def test_decompile_force_analysis_no_data_warning_for_init_array_initializer(monkeypatch):
@@ -2001,7 +2001,7 @@ def test_decompile_force_analysis_no_data_warning_for_init_array_initializer(mon
     result = instance._decompile("active", "init_array_ctor", force_analysis=True)
 
     assert result["analysis_forced"] is True
-    assert not any("data region" in w.lower() for w in result["warnings"])
+    assert not any("data region" in w["detail"].lower() for w in result["warnings"])
 
 
 def test_function_list_defers_display_projection_to_the_returned_page(monkeypatch):
@@ -4822,7 +4822,8 @@ def _guard_note(monkeypatch, mnemonics, span=None):
         ),
     )
     func = _GuardFunc(span if span is not None else 4 * len(listing))
-    return read_decompile._flattened_guard_warning(object(), func)
+    note = read_decompile._flattened_guard_warning(object(), func)
+    return None if note is None else note["detail"]
 
 
 def test_a_branch_free_select_is_named_in_the_output(monkeypatch):
@@ -5614,7 +5615,7 @@ def test_call_arity_names_a_call_rendering_fewer_arguments_than_its_signature_95
         rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
         signature=(["this", "", ""], False),
     )
-    warning = read_decompile._call_arity_warning(bv, func)
+    warning = read_decompile._call_arity_warning(bv, func)["detail"]
     assert warning is not None
     assert "0x401040" in warning and "renders 1 of 3 arguments" in warning
     assert "x0, x1, x2" in warning
@@ -5638,7 +5639,7 @@ def test_call_arity_does_not_count_the_stack_protector_scrub_955(monkeypatch):
         monkeypatch, [_set_reg("x1", _const(0)), _set_reg("x0", _reg("sp"))],
         rendered=1, raw_name="widget_init",
     )
-    assert "renders 1 of 2 arguments" in read_decompile._call_arity_warning(bv, func)
+    assert "renders 1 of 2 arguments" in read_decompile._call_arity_warning(bv, func)["detail"]
 
 
 def test_call_arity_scrub_lookback_stops_at_the_previous_call_955(monkeypatch):
@@ -5656,7 +5657,7 @@ def test_call_arity_scrub_lookback_stops_at_the_previous_call_955(monkeypatch):
          _set_reg("x1", _const(0)), _set_reg("x0", _reg("sp"))],
         rendered=1, raw_name="widget_init",
     )
-    assert "renders 1 of 2 arguments" in read_decompile._call_arity_warning(bv, func)
+    assert "renders 1 of 2 arguments" in read_decompile._call_arity_warning(bv, func)["detail"]
 
 
 def test_call_arity_skips_sized_operator_delete_955(monkeypatch):
@@ -5675,7 +5676,7 @@ def test_call_arity_groups_repeated_calls_and_sees_stack_adjusting_calls_955(mon
         monkeypatch, [], rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
         signature=(["this", "", ""], False), call_op="LLIL_CALL_STACK_ADJUST", calls=4,
     )
-    warning = read_decompile._call_arity_warning(bv, func)
+    warning = read_decompile._call_arity_warning(bv, func)["detail"]
     assert warning.startswith("call arity: 4 call(s)")
     assert "(4 calls at 0x401040, 0x401048, 0x401050 and 1 more) renders 1 of 3" in warning
     assert warning.count("renders 1 of 3") == 1
@@ -5709,7 +5710,7 @@ def test_call_arity_reports_an_argument_the_signature_does_not_take_955(monkeypa
         signature=(["this"], False),
     )
     assert "renders 3 arguments but the demangled signature takes only 1" in \
-        read_decompile._call_arity_warning(bv, func)
+        read_decompile._call_arity_warning(bv, func)["detail"]
     bv, func = _arity_case(
         monkeypatch, [], rendered=3, raw_name="_Z6logfmtPKcz",
         signature=([""], True),
@@ -5783,13 +5784,13 @@ def _split_view(*, tail_mnemonics, tail_returns=True, tail_refs=None, tail_data_
 
 def test_split_body_notes_name_the_fall_through_and_saved_register_params_966():
     bv, head, tail = _split_view(tail_mnemonics=["str"])
-    head_notes = read_decompile._split_body_notes(bv, head)
+    head_notes = [n["detail"] for n in read_decompile._split_body_notes(bv, head)]
     assert any("the block ending at 0x4000f4 runs straight into sub_4000f8 @ 0x4000f8" in n
                for n in head_notes)
     assert any("(arg3 @ x19, arg5 @ fp)" in n for n in head_notes)
     # The argument register x0 is never reported.
     assert not any("arg1 @ x0" in n for n in head_notes)
-    tail_notes = read_decompile._split_body_notes(bv, tail)
+    tail_notes = [n["detail"] for n in read_decompile._split_body_notes(bv, tail)]
     assert any("build_widget @ 0x4000dc runs straight into this function's entry" in n
                for n in tail_notes)
 
@@ -5828,12 +5829,12 @@ def test_eh_fragment_gets_one_note_and_no_proto_set_advice_966(tail_refs, tail_r
     # `proto set` would break the frame accesses (#985 review).
     bv, head, tail = _split_view(tail_mnemonics=["str"], tail_returns=tail_returns,
                                  tail_refs=tail_refs)
-    notes = read_decompile._split_body_notes(bv, tail)
+    notes = [n["detail"] for n in read_decompile._split_body_notes(bv, tail)]
     assert len(notes) == 1 and notes[0].startswith("EH/cold fragment:")
     assert "(arg1 @ x19)" in notes[0] and "proto set" not in notes[0]
     # Its parent running into it is not a shared-tail split either.
     assert read_decompile._fallthrough_successor(bv, head) is None
-    assert not any("runs straight into" in n for n in read_decompile._split_body_notes(bv, head))
+    assert not any("runs straight into" in n["detail"] for n in read_decompile._split_body_notes(bv, head))
 
 
 def test_callee_note_skips_an_eh_fragment_but_not_a_shared_tail_966():
@@ -5850,13 +5851,13 @@ def test_jump_only_tail_gets_no_proto_set_advice_966():
     # The tail is entered only by reset_widget's tail jump and build_widget's
     # fall-through: its x19 is live in that code, so `proto set` advice is wrong.
     bv, head, tail = _split_view(tail_mnemonics=["str"])
-    tail_notes = read_decompile._split_body_notes(bv, tail)
+    tail_notes = [n["detail"] for n in read_decompile._split_body_notes(bv, tail)]
     saved = [n for n in tail_notes if "callee-saved/link registers" in n]
     assert len(saved) == 1 and "nothing calls this function" in saved[0]
     assert "proto set" not in saved[0]
     # The head IS called (from main), so its stray parameters keep the advice.
-    head_saved = [n for n in read_decompile._split_body_notes(bv, head)
-                  if "callee-saved/link registers" in n]
+    head_saved = [n["detail"] for n in read_decompile._split_body_notes(bv, head)
+                  if "callee-saved/link registers" in n["detail"]]
     assert "drop them with `bn proto set`" in head_saved[0]
 
 
@@ -5893,7 +5894,7 @@ def test_an_address_taken_function_is_called_not_a_body_piece_966(returns, data_
     bv, _head, tail = _split_view(tail_mnemonics=["ret"], tail_returns=returns,
                                   tail_refs=[], tail_data_refs=[data_ref])
     assert not read_decompile._is_eh_fragment(bv, tail)
-    notes = read_decompile._split_body_notes(bv, tail)
+    notes = [n["detail"] for n in read_decompile._split_body_notes(bv, tail)]
     assert len(notes) == 1 and "drop them with `bn proto set`" in notes[0]
     assert "nothing calls this function" not in notes[0]
 
@@ -5912,7 +5913,7 @@ def test_call_arity_group_counts_each_kind_of_evidence_955(monkeypatch):
     second.address = 0x401080
     second.mlil = types.SimpleNamespace(params=[object()])
     func.llil.extend([second])
-    warning = read_decompile._call_arity_warning(bv, func)
+    warning = read_decompile._call_arity_warning(bv, func)["detail"]
     assert "(2 calls at 0x401040, 0x401080) renders 1 of 3 arguments (" in warning
     assert ("1 of 2: the demangled signature takes 3 with `this`; the call site writes "
             "x0, x1, x2 just before it / 1 of 2: the demangled signature takes 3 with "
@@ -5963,15 +5964,15 @@ def test_raw_string_pointer_note_names_an_undefined_short_literal_970():
     text = "    std::__ostream_insert<char>(x0, 0x402ae0);"
     note = read_decompile._raw_string_pointer_note(bv, func, text)
     assert note is not None
-    assert '0x402ae0 = " -n" (call at 0x4023dc)' in note
-    assert "bn data retype 0x402ae0 'char[4]'" in note
+    assert '0x402ae0 = " -n" (call at 0x4023dc)' in note["detail"]
+    assert "bn data retype 0x402ae0 'char[4]'" in note["detail"]
 
 
 @pytest.mark.parametrize("param_type", ["char const*", "const char*", "char*"])
 def test_raw_string_pointer_note_takes_a_short_run_passed_as_char_pointer_970(param_type):
     bv, func = _string_view(b"/\0\0\0", param_type=param_type)
     note = read_decompile._raw_string_pointer_note(bv, func, "    put(x0, 0x402ae0);")
-    assert note is not None and '0x402ae0 = "/"' in note
+    assert note is not None and '0x402ae0 = "/"' in note["detail"]
 
 
 @pytest.mark.parametrize("memory,kwargs,text", [
@@ -6058,3 +6059,287 @@ def test_session_comment_body_also_stored_elsewhere_stays_redacted_977():
         "    a();  // same words\n    b();  // same words", ["same words"], ["same words"])
     assert text.count("<annotation redacted>") == 2
     assert (hidden, shown) == (2, 0)
+
+
+# ---------------------------------------------------------------------------
+# #1000 decompile warnings: dropped arguments marked on the call line, an
+# unresolved virtual tail call, `__offset` base types; #994 item 2 short
+# literals passed to untyped C library imports.
+# ---------------------------------------------------------------------------
+
+
+class _Expr(types.SimpleNamespace):
+    """An IL expression that prints the way BN renders it."""
+
+    def __str__(self):
+        return self.text
+
+
+def _hop(name, text, **fields):
+    return _Expr(operation=types.SimpleNamespace(name=name), text=text,
+                 operands=list(fields.values()), **fields)
+
+
+class _Block(list):
+    def __init__(self, start, items, incoming=()):
+        super().__init__(items)
+        self.start = start
+        self.incoming_edges = [types.SimpleNamespace(source=b) for b in incoming]
+        self.outgoing_edges = []
+
+
+def _at(address, ins):
+    ins.address = address
+    return ins
+
+
+def _select_then_call_case(monkeypatch):
+    """`write(this, buf, n)` where `n = len > 0x100 ? 0x100 : len` is one `csel`
+    right before the call: BN lifts the csel into a diamond, so the call opens
+    its own LLIL block with nothing in it."""
+    head = _Block(0, [
+        _at(0x4015b8, _set_reg("w2", _op("LLIL_LOAD", src=_reg("x21")))),
+        _at(0x4015bc, _set_reg("w3", _const(0x100))),
+        _at(0x4015c0, _set_reg("x1", _reg("x21"))),
+        _at(0x4015c4, _set_reg("x0", _reg("x20"))),
+        _at(0x4015cc, _op("LLIL_IF", condition=_reg("w2"))),
+    ])
+    keep = _Block(5, [_at(0x4015cc, _set_reg("w2", _reg("w2"))),
+                      _at(0x4015cc, _op("LLIL_GOTO"))], [head])
+    clamp = _Block(7, [_at(0x4015cc, _set_reg("w2", _reg("w3"))),
+                       _at(0x4015cc, _op("LLIL_GOTO"))], [head])
+    call = _at(0x4015d0, _op("LLIL_CALL", dest=_op("LLIL_CONST_PTR", constant=0x400e00)))
+    call.mlil = types.SimpleNamespace(params=[object(), object()])
+    join = _Block(9, [call], [keep, clamp])
+    bv, func = _arity_case(monkeypatch, [], rendered=2, raw_name="_ZNSo5writeEPKcl",
+                           signature=(["this", "", ""], False))
+    func.llil = types.SimpleNamespace(basic_blocks=[head, keep, clamp, join])
+    bv.get_disassembly = lambda a: "csel    w2, w2, w3, ls" if a == 0x4015cc else "mov"
+    return bv, func
+
+
+def test_call_arity_sees_an_argument_a_select_computes_right_before_the_call_1000(monkeypatch):
+    bv, func = _select_then_call_case(monkeypatch)
+    [row] = read_decompile._call_arity_findings(bv, func)
+    assert (row["rendered"], row["expected"]) == (2, 3)
+    # Both arms are read: `w3` feeds the clamp arm, so it is no argument.
+    assert row["evidence"][-1] == "the call site writes x0, x1, x2 just before it"
+    assert row["missing"] == [("x2", "csel @ 0x4015cc")]
+    assert read_decompile._arity_line_note(row) == \
+        "/* bn: +1 arg not rendered: x2 = csel @ 0x4015cc */"
+
+
+def test_call_arity_note_names_each_dropped_register_and_its_value_1000(monkeypatch):
+    bv, func = _arity_case(
+        monkeypatch,
+        [_set_reg("w2", _hop("LLIL_CONST", "0x30", constant=0x30)),
+         _set_reg("x1", _hop("LLIL_LOAD", "[sp {__path}].q", src=_reg("sp"))),
+         _set_reg("x0", _reg("x27"))],
+        rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
+        signature=(["this", "", ""], False),
+    )
+    [row] = read_decompile._call_arity_findings(bv, func)
+    assert read_decompile._arity_line_note(row) == \
+        "/* bn: +2 args not rendered: x1 = [sp].q, x2 = 0x30 */"
+    # An excess names the counts instead: there is no register to point at.
+    bv, func = _arity_case(monkeypatch, [], rendered=3, raw_name="_ZN4demo6Widget5resetEv",
+                           signature=(["this"], False))
+    [row] = read_decompile._call_arity_findings(bv, func)
+    assert read_decompile._arity_line_note(row) == "/* bn: renders 3 args, signature takes 1 */"
+
+
+def test_call_arity_summary_says_which_calls_carry_the_inline_note_1000(monkeypatch):
+    bv, func = _arity_case(monkeypatch, [], rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
+                           signature=(["this", "", ""], False), calls=2)
+    findings = read_decompile._call_arity_findings(bv, func)
+    full = read_decompile._call_arity_warning(bv, func, findings, {0x401040, 0x401048})
+    assert full["code"] == "arity"
+    assert full["summary"] == ("2 call(s) render the wrong argument count, marked inline: "
+                               "N4demo7Archive4openEPKci 1/3 @ 0x401040, 0x401048")
+    assert [c["inline"] for c in full["calls"]] == [True, True]
+    assert [c["missing"] for c in full["calls"]] == [
+        [{"register": "x1", "value": None}, {"register": "x2", "value": None}]] * 2
+    # A note BN gave no line to attach to is not claimed as placed.
+    part = read_decompile._call_arity_warning(bv, func, findings, {0x401040})
+    assert ", 1 marked inline:" in part["summary"]
+    assert "1 of the 2 calls are marked inline" in part["detail"]
+    none = read_decompile._call_arity_warning(bv, func, findings)
+    assert "inline" not in none["summary"] and "inline" not in none["detail"]
+
+
+def test_pseudo_c_appends_a_note_to_the_first_statement_line_at_its_address_1000(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    func = _FakeFunction(0x401420, "save_record")
+    _install_fake_pseudo_c(monkeypatch, bridge, func, [[
+        (0x401420, "  void save_record()"),
+        (0x401420, "{"),
+        (0x401598, "    int64_t r;"),
+        (0x401598, "    int64_t r = open(&f);"),
+        (0x401598, "    if (r)"),
+        (0x401620, "}"),
+    ]])
+    placed: set[int] = set()
+    text = bridge.il_format._pseudo_c_text(
+        func, line_notes={0x401598: ["/* bn: +2 args not rendered: x1, x2 */"],
+                          0x401700: ["/* bn: never rendered */"]},
+        placed=placed)
+    assert text.splitlines()[3] == "    int64_t r = open(&f);  /* bn: +2 args not rendered: x1, x2 */"
+    assert text.count("/* bn:") == 1
+    assert placed == {0x401598}
+
+
+def _jump_case(*, exits=True, dest=None):
+    """`int Holder::forward(int msg, int a, int b) { return inner->dispatch(msg, b, a); }`
+    with `Dispatcher` untyped: a tail jump through vtable slot 2 of `this->inner`."""
+    arch = _aarch64_arch()
+    arch.get_reg_name = lambda storage: storage
+    obj = _hop("HLIL_DEREF", "*(this + 0x18)", src=_hop("HLIL_ADD", "this + 0x18"))
+    if dest is None:
+        dest = _hop("HLIL_DEREF", "*(**(this + 0x18) + 0x10)",
+                    src=_hop("HLIL_ADD", "**(this + 0x18) + 0x10",
+                             left=_hop("HLIL_DEREF", "**(this + 0x18)", src=obj),
+                             right=_hop("HLIL_CONST", "0x10", constant=0x10)))
+    jump = _at(0x40058c, _hop("HLIL_JUMP", "jump(...)", dest=dest))
+    setup = [
+        _set_reg("x0", _op("LLIL_LOAD", src=_reg("x0"))),
+        _set_reg("w4", _hop("LLIL_REG", "w2", src=types.SimpleNamespace(name="w2"))),
+        _set_reg("w2", _hop("LLIL_REG", "w3", src=types.SimpleNamespace(name="w3"))),
+        _set_reg("w3", _hop("LLIL_REG", "w4", src=types.SimpleNamespace(name="w4"))),
+        _set_reg("x4", _op("LLIL_LOAD", src=_reg("x0"))),
+        _set_reg("x16", _reg("x4")),
+        _op("LLIL_JUMP", dest=_reg("x16")),
+    ]
+    for index, ins in enumerate(setup):
+        ins.instr_index = index
+    block = _Block(0, setup)
+    if not exits:
+        block.outgoing_edges = [types.SimpleNamespace(target=None)]
+    setup[-1].il_basic_block = block
+    func = types.SimpleNamespace(
+        start=0x400570, hlil=types.SimpleNamespace(instructions=[jump]),
+        calling_convention=types.SimpleNamespace(int_arg_regs=_ARG_REGS),
+        parameter_vars=[_param_var(n, r) for n, r in
+                        (("this", "x0"), ("arg2", "x1"), ("arg3", "x2"), ("arg4", "x3"))],
+        get_llil_at=lambda a: setup[-1] if a == 0x40058c else None,
+    )
+    return types.SimpleNamespace(arch=arch, address_size=8), func
+
+
+def test_an_unresolved_virtual_tail_call_is_named_with_its_arguments_1000():
+    bv, func = _jump_case()
+    [row] = read_decompile._unresolved_jump_findings(bv, func)
+    assert row["slot"] == ("*(this + 0x18)", 2)
+    assert row["registers"] == ["x0", "x1", "x2", "x3"]
+    # The swap of `a` and `b` shows in what the jump site writes.
+    assert read_decompile._jump_line_note(row) == \
+        "/* bn: indirect tail call, args x0-x3 not rendered; set here: x2 = w3, x3 = w4 */"
+    warning = read_decompile._unresolved_jump_warning(func, row, True)
+    assert warning["code"] == "jump" and warning["vtable_slot"] == 2
+    assert warning["summary"] == ("indirect tail call at 0x40058c through vtable slot 2 of "
+                                  "*(this + 0x18): callee and args x0-x3 not rendered")
+    assert "❓" in warning["detail"] and "bn disasm 0x400570" in warning["detail"]
+
+
+def test_a_jump_with_successors_or_a_known_target_is_not_reported_1000():
+    # A jump BN resolved to targets is a switch, not a lost call.
+    assert read_decompile._unresolved_jump_findings(*_jump_case(exits=False)) == []
+    known = _hop("HLIL_CONST_PTR", "0x400800", constant=0x400800)
+    assert read_decompile._unresolved_jump_findings(*_jump_case(dest=known)) == []
+
+
+def _offset_func(this_type="demo::Store"):
+    target = _Expr(text=this_type)
+    this = types.SimpleNamespace(name="this", type=types.SimpleNamespace(target=target))
+    return types.SimpleNamespace(start=0x401964, parameter_vars=[this])
+
+
+_OFFSET_TEXT = ("    void* __offset(Req, 0x40) p = &r->body;\n"
+                "    *this = __offset(vtable_for_demo::Store, 0x10);")
+
+
+def test_offset_warning_says_which_base_types_have_no_definition_1000():
+    bv = types.SimpleNamespace(get_type_by_name=lambda name: None)
+    warning = read_decompile._offset_warning(bv, _offset_func(), _OFFSET_TEXT)
+    assert warning["code"] == "offset"
+    assert warning["types"] == {"defined": [],
+                                "missing": ["Req", "vtable_for_demo::Store", "demo::Store"]}
+    detail = warning["detail"]
+    # The old note sent the reader to `types show` for types that do not exist.
+    assert "authoritative" not in detail
+    assert "No definition: Req, demo::Store" in detail and "bn types declare" in detail
+    assert "vtable_for_demo::Store names a class's vtable OBJECT" in detail
+    assert "`this` points at demo::Store, which has no definition either." in detail
+    assert warning["summary"].endswith(
+        "no type defined for Req, vtable_for_demo::Store, demo::Store")
+
+
+def test_offset_warning_names_defined_types_and_the_vtable_route_1000():
+    known = {"Req": object(), "demo::Store::VTable": object()}
+    bv = types.SimpleNamespace(get_type_by_name=known.get)
+    warning = read_decompile._offset_warning(bv, _offset_func(), _OFFSET_TEXT)
+    assert warning["types"]["defined"] == ["Req"]
+    assert "Defined here: Req" in warning["detail"]
+    assert "bn struct show demo::Store" in warning["detail"]
+    assert read_decompile._offset_warning(bv, _offset_func(), "    return 0;") is None
+
+
+def _libc_string_view(memory, *, name, kind="ImportedFunctionSymbol", params=(), library=None):
+    """`if (!name(arg2, 0x661bd8))` where *name* is a callee at 0x401100 whose
+    prototype declares *params*, and 0x661bd8 holds *memory* in .rodata."""
+    section = types.SimpleNamespace(
+        semantics=types.SimpleNamespace(name="ReadOnlyDataSectionSemantics"))
+    callee = types.SimpleNamespace(type=types.SimpleNamespace(
+        parameters=[types.SimpleNamespace(type=t) for t in params]))
+    symbol = types.SimpleNamespace(raw_name=name, type=types.SimpleNamespace(name=kind))
+    libraries = [] if library is None else [types.SimpleNamespace(
+        get_named_object=lambda n: library if n == name else None)]
+    bv = types.SimpleNamespace(
+        get_string_at=lambda a: None,
+        get_data_var_at=lambda a: None,
+        get_sections_at=lambda a: [section],
+        read=lambda a, n: memory[:n],
+        get_function_at=lambda a: callee if a == 0x401100 else None,
+        get_symbol_at=lambda a: symbol if a == 0x401100 else None,
+        platform=types.SimpleNamespace(type_libraries=libraries),
+        type_libraries=[],
+    )
+    call = _op("MLIL_CALL", dest=_op("MLIL_CONST_PTR", constant=0x401100),
+               params=[_op("MLIL_VAR"), _op("MLIL_CONST_PTR", constant=0x661bd8)])
+    call.address = 0x51c884
+    func = types.SimpleNamespace(mlil=types.SimpleNamespace(instructions=[call]))
+    return bv, func
+
+
+_LIBC_TEXT = "    if (!strcmp(arg2, 0x661bd8))"
+
+
+@pytest.mark.parametrize("name", ["strcmp", "strcmp@plt", "__isoc99_sscanf"])
+def test_a_short_literal_to_an_untyped_libc_import_is_named_994(name):
+    # #994 item 2: `strcmp` with no prototype passed "C"; the typed import's
+    # rendering showed `strcmp(arg2, "C")`, the untyped one a bare address.
+    bv, func = _libc_string_view(b"C\0", name=name)
+    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
+    assert note is not None and '0x661bd8 = "C" (call at 0x51c884)' in note["detail"]
+    assert note["strings"] == [{"address": "0x661bd8", "value": "C", "call": "0x51c884"}]
+
+
+@pytest.mark.parametrize("kwargs", [
+    # Not a C library name: the three-character rule for unknown callees holds.
+    {"name": "frob_lookup"},
+    # A body here whose own prototype covers the argument: BN's type stands.
+    {"name": "strcmp", "kind": "FunctionSymbol", "params": ("char const*", "int64_t")},
+    # The platform type library's prototype wins over the built-in list.
+    {"name": "strcmp", "library": types.SimpleNamespace(parameters=[
+        types.SimpleNamespace(type="int32_t"), types.SimpleNamespace(type="int32_t")])},
+])
+def test_a_short_literal_needs_a_char_pointer_from_somewhere_994(kwargs):
+    bv, func = _libc_string_view(b"C\0", **kwargs)
+    assert read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT) is None
+
+
+def test_the_platform_type_library_types_an_untyped_import_994():
+    library = types.SimpleNamespace(parameters=[
+        types.SimpleNamespace(type="int32_t"), types.SimpleNamespace(type="char const*")])
+    bv, func = _libc_string_view(b"C\0", name="locale_hook", library=library)
+    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
+    assert note is not None and '"C"' in note["summary"]

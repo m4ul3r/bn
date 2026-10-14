@@ -3121,6 +3121,56 @@ def test_decompile_text_warns_when_quick_loaded(fake_transport, capsys):
     assert out.startswith("int32_t sub_401000()")
 
 
+_ARITY_ROW = {
+    "code": "arity",
+    "summary": "1 call(s) render the wrong argument count, marked inline: "
+               "demo::Archive::open 1/3 @ 0x401598",
+    "detail": "call arity: 1 call(s) render a different argument count than the call "
+              "site passes: demo::Archive::open @ 0x401160 (call at 0x401598) renders 1 "
+              "of 3 arguments. Read the real arguments with `bn callsites 0x401160 "
+              "--within 0x401420 --context 4`; fix the callee with `bn proto set`.",
+    "calls": [{"address": "0x401598", "rendered": 1, "expected": 3}],
+}
+
+
+def _decompile_with_warnings(fake_transport, warnings):
+    fake_transport({"decompile": {"ok": True, "result": {
+        "function": {"name": "save_record", "address": "0x401420"},
+        "text": "void save_record()\n{\n    open(&f);  /* bn: +2 args not rendered: x1, x2 */\n}",
+        "warnings": warnings, "analysis_skipped": False,
+        "analysis_state": "full", "partial": False,
+    }}})
+
+
+def test_decompile_text_prints_one_short_line_per_warning_1000(fake_transport, capsys):
+    # #1000 item 1: text printed each warning's whole paragraph, so agents
+    # filtered `^warning` and lost the dropped-argument findings with the
+    # boilerplate. One tagged summary line each; the detail waits for --explain.
+    _decompile_with_warnings(fake_transport, [_ARITY_ROW])
+    assert bn.cli.main(["decompile", "save_record", "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    assert f"warning[arity]: {_ARITY_ROW['summary']}" in out
+    assert "bn callsites" not in out
+    assert "(--explain: what each warning means and what to do)" in out
+
+    assert bn.cli.main(["decompile", "save_record", "--target", "active", "--explain"]) == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    head = lines.index(f"warning[arity]: {_ARITY_ROW['summary']}")
+    assert lines[head + 1] == f"  {_ARITY_ROW['detail']}"
+    assert "--explain:" not in out
+
+
+def test_decompile_text_keeps_a_bare_string_warning_from_an_older_bridge_1000(
+        fake_transport, capsys):
+    _decompile_with_warnings(fake_transport, ["call arity: 1 call(s) render ..."])
+    assert bn.cli.main(["decompile", "save_record", "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    assert "warning: call arity: 1 call(s) render ..." in out
+    # Nothing to explain: the line already is the whole warning.
+    assert "--explain" not in out
+
+
 # --- #768: --count refuses the ordering/paging flags it would ignore --------
 
 

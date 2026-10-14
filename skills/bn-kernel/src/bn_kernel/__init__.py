@@ -315,9 +315,13 @@ def _require_text(op: str, value: Any, payload: Any) -> str:
 def _require_decompile(value: Any, payload: Any) -> str:
     text = _require_text("decompile", value, payload)
     warnings_value = payload.get("warnings") if isinstance(payload, dict) else []
+    # Rows are `{code, summary, detail}` (#1000 item 1); a bare string is an
+    # older bridge's warning.
     warnings_text = " ".join(
-        str(warning).lower() for warning in (warnings_value or [])
-    )
+        " ".join(str(warning.get(key) or "") for key in ("code", "summary", "detail"))
+        if isinstance(warning, dict) else str(warning)
+        for warning in (warnings_value or [])
+    ).lower()
     incomplete = bool(payload.get("analysis_skipped")) or any(
         marker in warnings_text
         for marker in (
