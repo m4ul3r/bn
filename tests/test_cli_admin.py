@@ -242,6 +242,11 @@ def _seed_leftover(leftover, skill, dest, tmp_path):
         (dest / "SKILL.md").write_text((skill / "SKILL.md").read_text())
         (skill / "extra.md").write_text("new upstream")
         dest.chmod(0o555)
+    elif leftover == "read_only_empty_dir":
+        # Removing an empty directory needs only a writable parent: base
+        # replaced it under --force, and so must this.
+        dest.mkdir()
+        dest.chmod(0o555)
     return None
 
 
@@ -255,8 +260,9 @@ _LEFTOVERS = {
     "old_copy_with_removed_file": ("existing", "does not match", 2),
     "unwritable_parent": ("stale", "dangling symlink", 2),
     "read_only_old_copy": ("existing", "does not match", 2),
+    "read_only_empty_dir": ("existing", "empty directory", 0),
 }
-_PERMISSION_LEFTOVERS = {"unwritable_parent", "read_only_old_copy"}
+_PERMISSION_LEFTOVERS = {"unwritable_parent", "read_only_old_copy", "read_only_empty_dir"}
 
 
 @pytest.mark.parametrize("leftover", sorted(_LEFTOVERS))
@@ -341,6 +347,46 @@ def test_install_maps_a_failing_rmtree_to_a_structured_error(tmp_path, monkeypat
     captured = capsys.readouterr()
     assert json.loads(captured.out)["error"].startswith(f"Cannot replace {destination}:")
     assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("kind", ["foreign_dir", "regular_file", "read_only_empty_dir"])
+def test_plugin_install_force_note_is_true_for_what_is_there(tmp_path, capsys, kind):
+    # Review round 4: the note said "--force replaces it" for destinations
+    # --force then refuses. It states the rule instead, so it holds for every
+    # state it is printed under -- and the forced run follows that rule.
+    if kind == "read_only_empty_dir" and os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses the permission this case denies; run as a user")
+    destination = tmp_path / "bn_agent_bridge"
+    if kind == "regular_file":
+        destination.write_text("not ours")
+    else:
+        destination.mkdir()
+        if kind == "foreign_dir":
+            (destination / "notes.txt").write_text("mine")
+        else:
+            destination.chmod(0o555)
+    try:
+        assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 2
+        err = capsys.readouterr().err
+        assert bn.commands.admin.FORCE_NOTE_ONE in err
+        assert "--force replaces it," not in err  # no unconditional promise
+
+        forced = bn.cli.main(["plugin", "install", "--dest", str(destination), "--force"])
+        captured = capsys.readouterr()
+        assert "Traceback" not in captured.err
+        if kind == "read_only_empty_dir":
+            assert forced == 0, captured  # an empty directory: replaced, as on base
+            assert destination.is_symlink()
+        else:
+            assert forced == 2, captured  # not provably ours: refused, unchanged
+            if kind == "foreign_dir":
+                assert (destination / "notes.txt").read_text() == "mine"
+            else:
+                assert destination.read_text() == "not ours"
+    finally:
+        if destination.is_dir() and not destination.is_symlink():
+            destination.chmod(0o755)
 
 
 def test_install_with_dest_equal_to_the_source_is_a_no_op(tmp_path, monkeypatch, capsys):

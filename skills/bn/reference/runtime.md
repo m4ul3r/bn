@@ -98,7 +98,7 @@ bn plugin install
 bn skill install
 ```
 
-`bn capabilities` is the registry-derived command catalog. Use `bn doctor` when discovery, installation, or bridge connectivity is wrong; stale plugin code requires restarting the bridge or GUI. `bn plugin install` and `bn skill install` install the local bridge and skill links. After moving to a new checkout, a link into the old one is reported as not updated (`skill install` exits 1, `plugin install` refuses). `--force` replaces such destinations, including local edits in copied directories; check them first. `bn instance gc` removes dead registry residue, not live bridges.
+`bn capabilities` is the registry-derived command catalog. Use `bn doctor` when discovery, installation, or bridge connectivity is wrong; stale plugin code requires restarting the bridge or GUI. `bn plugin install` and `bn skill install` install the local bridge and skill links. After moving to a new checkout, a link into the old one is reported as not updated (`skill install` exits 1, `plugin install` refuses). `--force` replaces only what it can remove and proves is this install's own (a link, an empty directory, or a previous copy, losing any local edits in that copy); it refuses anything else and changes no destination. `bn instance gc` removes dead registry residue, not live bridges.
 
 ## Python escape hatch
 

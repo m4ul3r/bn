@@ -254,7 +254,7 @@ def _plugin_install(args: argparse.Namespace) -> int:
     )
     # An install of this source in the requested mode is not an error (#1002);
     # anything else at the destination is refused by `_plan_install`, which
-    # names what is there and whether --force would replace it.
+    # names what is there.
     up_to_date = state is not None and state[0] == "up_to_date"
     if not up_to_date:
         _install_tree(source, dest, mode=args.mode, force=args.force)
@@ -437,20 +437,25 @@ def _is_install_source(source: Path, dest: Path) -> bool:
 
 
 def _removal_blocker(dest: Path) -> str | None:
-    """Why `shutil.rmtree(dest)` would fail on permissions, or None. Emptying a
-    directory needs read, write and search on it and on every directory under
-    it; a read-only previous copy used to crash `--force` in rmtree."""
+    """Why `shutil.rmtree(dest)` would fail on permissions, or None. rmtree
+    lists every directory (read and search) and unlinks the entries of a
+    non-empty one (write); removing `dest` itself needs only its writable
+    parent, so a read-only EMPTY directory is replaceable, as on base. A
+    read-only previous copy used to crash `--force` in rmtree."""
     pending = [dest]
     while pending:
         directory = pending.pop()
         missing = [
-            name for flag, name in ((os.R_OK, "read"), (os.W_OK, "write"), (os.X_OK, "search"))
+            name for flag, name in ((os.R_OK, "read"), (os.X_OK, "search"))
             if not os.access(directory, flag)
         ]
         if missing:
             return (f"{directory} lacks {' and '.join(missing)} permission, so its "
-                    "contents cannot be removed")
-        for entry in directory.iterdir():
+                    "contents cannot be listed")
+        entries = list(directory.iterdir())
+        if entries and not os.access(directory, os.W_OK):
+            return f"{directory} lacks write permission, so its contents cannot be removed"
+        for entry in entries:
             if entry.is_dir() and not entry.is_symlink():
                 pending.append(entry)
     return None
@@ -470,12 +475,17 @@ def _force_refusal_reason(dest: Path, source: Path) -> str | None:
 
 
 # Printed under destinations an install left alone. One plain line rather than
-# a per-destination verdict on whether --force would succeed: that verdict is
-# split out of #1004 to its own follow-up.
-FORCE_NOTE = ("--force replaces these destinations, including any local edits "
-              "in copied directories; check them first.")
-FORCE_NOTE_ONE = ("--force replaces it, including any local edits in a copied "
-                  "directory; check it first.")
+# a per-destination verdict on whether --force would succeed (split out of
+# #1004 to its own follow-up), so it states the rule instead of a promise: it
+# must stay true for every state it is printed under.
+FORCE_NOTE = ("--force replaces only what it can remove and proves is this "
+              "install's own (a link, an empty directory, or a previous copy, "
+              "losing any local edits in that copy); it refuses anything else "
+              "and then changes no destination.")
+FORCE_NOTE_ONE = ("--force replaces it only if it can remove it and it is a link, "
+                  "an empty directory, or a previous copy of this install (losing "
+                  "any local edits in that copy); otherwise it refuses and "
+                  "changes nothing.")
 
 
 def _install_path(dest: Path) -> Path:
