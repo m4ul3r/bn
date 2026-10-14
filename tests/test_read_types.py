@@ -1599,3 +1599,23 @@ def test_named_type_references_finds_every_member_reference(monkeypatch):
             return [types.SimpleNamespace(name=f"f{i}", type=_Pointer(n)) for i, n in enumerate(names)]
 
     assert me._named_type_references(_Struct()) == names
+
+
+def test_preview_library_needs_names_library_tags_the_view_lacks(monkeypatch):
+    """#993 review round 3: a preview never models a library import; it is
+    refused when the declaration names a library tag the view lacks -- by
+    value or through a pointer -- but not for a tag it defines, one the view
+    already has, a lone forward declaration, or a tag spelled in a string."""
+    me = _load_bridge(monkeypatch).mutation_engine
+    bv = _FakeBV(functions=[], types_={"timeval": _FakeType("struct timeval", width=16)})
+
+    class _Library:
+        def get_named_type(self, name):
+            return _FakeType(f"struct {name}", width=16) if name in {"timespec", "tms", "timeval", "stat"} else None
+
+    bv.type_libraries = [_Library()]
+    assert me._preview_library_needs(bv, "struct S { struct timespec ts; struct tms* p; };") == ["timespec", "tms"]
+    assert me._preview_library_needs(bv, "struct S { struct timeval tv; };") == []
+    assert me._preview_library_needs(bv, "struct stat { int x; }; struct U { struct stat s; };") == []
+    assert me._preview_library_needs(bv, "struct timespec;") == []
+    assert me._preview_library_needs(bv, 'struct S { int a; }; const char* m = "struct tms";') == []

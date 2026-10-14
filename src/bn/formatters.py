@@ -6381,12 +6381,13 @@ def _mutation_summary(value: Any) -> Any:
         ],
         class_apply_types=(_field_dict(value, "class_apply_types")
                            if _field_declared(value, "class_apply_types") else None),
-        # A live declare row that did not land but whose imports stayed in the
-        # view; a preview imports nothing, so its would-imports are not kept.
+        # A declare row whose imports stayed in the view although the row did
+        # not land -- or any declare row of a preview, which imports nothing on
+        # purpose, so an import stamped there is one BN made and kept.
         kept_library_imports=list(dict.fromkeys(
             str(name) for r in results
-            if not value.get("preview") and r.get("op") == "types_declare"
-            and r.get("status") not in ("verified", "noop")
+            if r.get("op") == "types_declare"
+            and (value.get("preview") or r.get("status") not in ("verified", "noop"))
             for name in _field_list(r, "imported_from_library"))),
     )
 

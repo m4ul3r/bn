@@ -1157,44 +1157,57 @@ class TestTypeStringsAndInheritance:
         assert fresh["declared_types"]["created_by_reference"] == ["Leaf993"], fresh
         assert shared_bn.json("types", "show", "Leaf993")["layout"] == "struct Leaf993 // size=0x0"
 
-    def test_preview_leaves_no_library_import_behind(self, shared_bn):
-        """#993 item 2: parsing a declaration that uses a library type by value
-        makes BN import it, and BN's undo does not revert an import, so a
-        `--preview` left libc's `timespec` in the view. The preview now removes
-        it; the live declare after it still lands the type (BN keeps its
-        imported-record when the type is removed, so its own import no longer
-        fires) and names every type it imported."""
+    def test_preview_needing_a_library_type_is_refused_and_imports_nothing(self, tmp_path, shared_bn):
+        """#993 item 2 (round 3): parsing a declaration that uses a library type
+        makes BN import it, undo cannot revert that, and modelling the import
+        under a preview failed three reviews. A preview that would need a
+        library type the view lacks is refused, naming it, and the view's type
+        list is untouched -- a single declare, and a batch whose later op uses
+        the type. Once the type is in the view, the same batch previews."""
         shared_bn.load(HELLO_BINARY)
         probe = "print(sorted(str(n) for n in bv.type_names))"
         before = shared_bn.run("py", "exec", "--code", probe).stdout
-        preview = shared_bn.json("types", "declare", "struct Stamp993 { struct timespec ts; int y; };",
-                                 "--preview", "--summary")
-        assert preview["preview"] is True and preview["verified_count"] == 1, preview
-        assert "timespec" in preview["declared_types"]["imported_from_library"], preview
+        refused = shared_bn.run("types", "declare", "struct Stamp993 { struct timespec ts; int y; };", "--preview")
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        assert "Cannot --preview" in refused.stderr + refused.stdout
+        assert "timespec" in refused.stderr + refused.stdout
+        pointer = shared_bn.run("types", "declare", "struct Ptr993 { struct tms* p; };", "--preview")
+        assert pointer.returncode == 3 and "tms" in pointer.stderr + pointer.stdout, pointer.stderr
+        manifest = tmp_path / "batch.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "types_declare", "declaration": "struct Px993 { struct timeval tv; int64_t pad; };"},
+            {"op": "struct_field_set", "struct_name": "Px993", "offset": "0x18", "field_name": "t2",
+             "field_type": "struct timeval"}]}))
+        batch = shared_bn.run("batch", "apply", str(manifest), "--preview")
+        assert batch.returncode == 3 and "timeval" in batch.stderr + batch.stdout, batch.stderr
         assert shared_bn.run("py", "exec", "--code", probe).stdout == before
-        live = shared_bn.json("types", "declare", "struct Stamp993 { struct timespec ts; int y; };",
-                              "--summary")
-        assert live["committed"] is True, live
-        assert {"timespec", "__time_t"} <= set(live["declared_types"]["imported_from_library"]), live
-        shown = shared_bn.run("types", "show", "timespec").stdout
-        assert "__time_t tv_sec" in shown, shown
-        assert shared_bn.run("types", "show", "__time_t").returncode == 0
+        # A platform-only declaration still previews.
+        plain = shared_bn.json("types", "declare", "struct Plain993 { uint32_t a; size_t n; };",
+                               "--preview", "--summary")
+        assert plain["verified_count"] == 1, plain
 
-    def test_preview_leaves_later_imports_working(self, shared_bn):
-        """#993 review: removing a preview's imports kept BN's imported-record,
-        so a later declare landed the user's colliding `__time_t` inside libc's
-        `timespec`, and a later `proto set` no longer imported `passwd`. A
-        preview now imports nothing at all, so both behave as on a fresh view."""
+        live = shared_bn.json("types", "declare", "struct Stamp993 { struct timespec ts; struct timeval tv; };",
+                              "--summary")
+        assert {"timespec", "timeval", "__time_t"} <= set(live["declared_types"]["imported_from_library"]), live
+        assert "__time_t tv_sec" in shared_bn.run("types", "show", "timespec").stdout
+        again = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json", "--summary")
+        assert again.returncode == 0, again.stdout + again.stderr
+        assert json.loads(again.stdout)["verified_count"] == 2, again.stdout
+
+    def test_live_imports_rename_collisions_and_later_imports_still_work(self, shared_bn):
+        """#993 review rounds 1-2: the live path imports only through BN's own
+        import, so a dependency colliding with a user type is renamed, and a
+        refused preview leaves later imports working."""
         shared_bn.load(HELLO_BINARY)
         shared_bn.json("types", "declare", "typedef uint32_t __time_t;")
-        shared_bn.json("types", "declare", "struct Collide993 { struct timespec ts; };", "--preview")
+        assert shared_bn.run("types", "declare", "struct Collide993 { struct timespec ts; };",
+                             "--preview").returncode == 3
         live = shared_bn.json("types", "declare", "struct Collide993 { struct timespec ts; };", "--summary")
         assert live["committed"] is True, live
-        shown = shared_bn.run("struct", "show", "timespec").stdout
-        assert "__time_t_1 tv_sec" in shown, shown
+        assert "__time_t_1 tv_sec" in shared_bn.run("struct", "show", "timespec").stdout
         assert "int64_t" in shared_bn.run("types", "show", "__time_t_1").stdout
 
-        shared_bn.json("types", "declare", "struct Pw993 { struct passwd pw; };", "--preview")
+        assert shared_bn.run("types", "declare", "struct Pw993 { struct passwd pw; };", "--preview").returncode == 3
         shared_bn.json("proto", "set", "main", "int main(struct passwd* a, int b)")
         probe = shared_bn.run("py", "exec", "--code", "print(bv.get_type_by_name('passwd') is not None)")
         assert probe.stdout.strip().endswith("True"), probe.stdout
@@ -1203,38 +1216,24 @@ class TestTypeStringsAndInheritance:
         """#993 review round 2: only the first of several library types
         reached through pointers was imported (the reference walk lost
         members to reused `id()`s), the rest dangled and were listed as
-        referenced. Preview and live now name the same set, and live lands it."""
+        referenced."""
         shared_bn.load(HELLO_BINARY)
         decl = "struct Many993 { struct tms* a; struct passwd* b; struct group* c; struct tm* d; };"
-        preview = shared_bn.json("types", "declare", decl, "--preview", "--summary")["declared_types"]
         live = shared_bn.json("types", "declare", decl, "--summary")["declared_types"]
         wanted = {"tms", "passwd", "group", "tm"}
         assert wanted <= set(live["imported_from_library"]), live
-        assert preview["imported_from_library"] == live["imported_from_library"], (preview, live)
         assert not wanted & set(live.get("referenced_existing", [])), live
         probe = shared_bn.run("py", "exec", "--code",
                               "print(sorted(n for n in ('tms','passwd','group','tm') if bv.get_type_by_name(n) is None))")
         assert probe.stdout.strip().endswith("[]"), probe.stdout
 
-    def test_previewed_batch_can_use_a_library_type_its_declare_brings(self, tmp_path, shared_bn):
-        """#993 review round 2: a previewed batch whose `types_declare` embeds
-        `struct timeval` and whose next op uses it failed to parse (the name
-        had nothing behind it during the preview), while live committed. The
-        preview stands the library types in without importing, then removes
-        them. A rolled-back live batch names the imports it could not undo."""
+    def test_failed_live_declares_name_the_imports_they_kept(self, tmp_path, shared_bn):
+        """#993 review rounds 2-3: a rolled-back live batch, and a declare op
+        that is itself refused after BN's parse imported, keep those imports
+        (BN cannot un-import) and say so -- on the op's own row, not a
+        sibling's."""
         shared_bn.load(HELLO_BINARY)
-        probe = "print(sorted(str(n) for n in bv.type_names))"
-        before = shared_bn.run("py", "exec", "--code", probe).stdout
         manifest = tmp_path / "batch.json"
-        manifest.write_text(json.dumps({"ops": [
-            {"op": "types_declare", "declaration": "struct Px993 { struct timeval tv; int64_t pad; };"},
-            {"op": "struct_field_set", "struct_name": "Px993", "offset": "0x18", "field_name": "t2",
-             "field_type": "struct timeval"}]}))
-        preview = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json", "--summary")
-        assert preview.returncode == 0, preview.stdout + preview.stderr
-        assert json.loads(preview.stdout)["verified_count"] == 2, preview.stdout
-        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
-
         manifest.write_text(json.dumps({"ops": [
             {"op": "types_declare", "declaration": "struct Ru993 { struct rusage ru; };"},
             {"op": "struct_field_set", "struct_name": "NoSuchStruct993", "offset": "0x0",
@@ -1244,6 +1243,16 @@ class TestTypeStringsAndInheritance:
         summary = json.loads(failed.stdout)
         assert summary["rolled_back"] is True, summary
         assert "rusage" in summary["kept_library_imports"], summary
+
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "types_declare", "declaration": "struct S8_993 { int a; };"},
+            {"op": "types_declare",
+             "declaration": "struct D2_993 { struct sigaction sa; }; struct uint32_t { int x; };"}]}))
+        refused = shared_bn.run("batch", "apply", str(manifest), "--format", "json")
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        rows = json.loads(refused.stdout)["results"]
+        assert "imported_from_library" not in rows[0], rows[0]
+        assert "sigaction" in rows[1]["imported_from_library"], rows[1]
 
     def test_typed_vptr_keeps_bn_vtable_and_renders_named_virtual_call(self, shared_bn):
         """#963: BN's parser returns a type a declaration only references as an

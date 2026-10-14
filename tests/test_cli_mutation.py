@@ -188,8 +188,9 @@ def test_class_apply_types_summary_states_the_plan():
 
 def test_rolled_back_declare_names_the_library_imports_it_kept():
     """#993 review round 2: a rolled-back live declare keeps the library types
-    it imported, and the result said nothing. A preview imports nothing, so
-    its would-import list is never reported as kept."""
+    it imported, and the result said nothing. A committed declare's imports
+    are ordinary imports, not kept ones; a preview imports nothing on purpose,
+    so an import stamped on even a verified preview row is one BN kept."""
     from bn.formatters import _mutation_summary, _render_mutation_summary_text
     rows = [{"op": "types_declare", "status": "reverted", "defined_types": {"S7": "struct S7"},
              "imported_from_library": ["rusage", "timeval"]},
@@ -198,9 +199,12 @@ def test_rolled_back_declare_names_the_library_imports_it_kept():
     assert live["kept_library_imports"] == ["rusage", "timeval"]
     assert "\nkept library imports (a rollback cannot remove them): rusage, timeval" in \
         _render_mutation_summary_text(live)
-    preview = _mutation_summary({"success": False, "committed": False, "preview": True,
-                                 "rolled_back": True, "results": rows})
-    assert "kept_library_imports" not in preview
+    landed = [{**rows[0], "status": "verified"}]
+    committed = _mutation_summary({"success": True, "committed": True, "rolled_back": False, "results": landed})
+    assert "kept_library_imports" not in committed
+    preview = _mutation_summary({"success": True, "committed": False, "preview": True,
+                                 "rolled_back": True, "results": landed})
+    assert preview["kept_library_imports"] == ["rusage", "timeval"]
 
 
 
