@@ -1395,6 +1395,9 @@ def _render_session_start_text(value: Any) -> str:
         f"pid: {value.get('pid', '<unknown>')}",
         f"socket: {value.get('socket_path', '<unknown>')}",
     ]
+    # #992: which checkout this bridge runs.
+    if value.get("source_dir"):
+        lines.append(f"source: {value['source_dir']}")
     loaded = _field_list(value, "loaded")
     if loaded:
         lines.append("")
@@ -1423,7 +1426,13 @@ def _render_session_start_text(value: Any) -> str:
                 else:
                     mark = "  [not analyzed]" if item.get("analyzed") is False else ""
                     lines.append(f"- {item.get('path', '<unknown>')}{mark}")
-                    for tgt in _field_list(item, "targets"):
+                    # #996: the target THIS load opened. `targets` is every open
+                    # view, so listing it repeated earlier binaries' selectors
+                    # under later paths; an older bridge without `target` keeps
+                    # the full list.
+                    own = _field_dict(item, "target")
+                    rows = [own] if own else _field_list(item, "targets")
+                    for tgt in rows:
                         if isinstance(tgt, dict) and tgt.get("selector"):
                             lines.append(
                                 f"  target: {tgt['selector']}"
@@ -1547,6 +1556,9 @@ def _render_session_list_text(value: Any) -> str:
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
+        # #992: which checkout this bridge runs.
+        if item.get("source_dir"):
+            lines.append(f"  source: {item['source_dir']}")
         binaries = _field_list(item, "binaries")
         if binaries:
             lines.append(f"  open: {', '.join(str(b) for b in binaries)}")
@@ -1635,6 +1647,10 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         lines[0] += " [unsaved]"
 
     details = [
+        # #996: which bridge answered. `target info` stamps it on the one row;
+        # `target list` puts it on the envelope (one header line), so a row
+        # without the key renders as before.
+        ("instance", value.get("instance")),
         ("target", value.get("target_id")),
         ("view", value.get("view_id")),
         ("kind", value.get("view_name")),
@@ -1759,10 +1775,13 @@ def _render_target_list_text(value: Any) -> str:
         return _render_fallback_text(value)
     if not items:
         return _empty_result("targets")
-    return "\n\n".join(
+    body = "\n\n".join(
         _render_target_summary(item) if isinstance(item, dict) else _render_fallback_text(item)
         for item in items
     )
+    # #996: the answering instance, once, above the rows it owns.
+    instance = _text_value(value, "instance") if isinstance(value, dict) else None
+    return f"instance: {instance}\n{body}" if instance else body
 
 
 @_discloses
@@ -5575,13 +5594,27 @@ def _render_doctor_text(value: Any) -> str:
             bn_build = item.get("bn_build_id")
             suffix = f" (build {bn_build})" if bn_build else ""
             lines.append(f"  binary ninja: {bn_version}{suffix}")
+        # #992: the checkout this bridge's code came from.
+        if item.get("bridge_source_dir"):
+            lines.append(f"  source: {item['bridge_source_dir']}")
+        if item.get("other_checkout"):
+            lines.append(
+                "  note: bridge built from another checkout: "
+                f"{item.get('bridge_source_dir')} (this CLI runs "
+                f"{value.get('plugin_source_dir', '<unknown>')}); its build is not "
+                "compared with this CLI's. `bn session restart "
+                + str(item.get("instance_id") or "<id>")
+                + "` from this CLI would respawn it on this CLI's checkout")
         if item.get("stale_plugin_version"):
             lines.append("  stale: loaded plugin version differs from CLI version")
+        # The reference differs by kind (#992): a GUI bridge loads the installed
+        # plugin file, a headless one this CLI's own source.
+        reference = "installed plugin file" if item.get("gui", True) else "this CLI's source"
         if item.get("stale_plugin_code"):
-            lines.append("  stale: loaded plugin code does not match installed plugin file")
+            lines.append(f"  stale: loaded plugin code does not match {reference}")
         if item.get("stale_engine"):
             lines.append(
-                "  stale: loaded engine code (taint/IL modules) is out of date -- "
+                f"  stale: loaded engine code (taint/IL modules) does not match {reference} -- "
                 "run `bn session restart " + str(item.get("instance_id") or "<id>") + "`")
         if item.get("started_at"):
             lines.append(f"  started: {item['started_at']}")

@@ -53,6 +53,7 @@ from .transport import (  # noqa: F401
     _send_request_to_instance,
     find_lifecycle_instance,
     gc_instances,
+    instance_not_found_message,
     instance_selector,
     list_instances,
     send_request,
@@ -415,7 +416,9 @@ def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) 
         "-i",
         "--instance",
         default=os.environ.get("BN_INSTANCE") if is_root else argparse.SUPPRESS,
-        help="Target a specific bridge instance by ID (env: BN_INSTANCE)",
+        help="Target a specific bridge instance by ID (env: BN_INSTANCE). Instances "
+             "are looked up in $BN_CACHE_DIR/instances when BN_CACHE_DIR is set: "
+             "BN_CACHE_DIR also scopes the instance registry and sticky session",
     )
 
 
@@ -2166,6 +2169,9 @@ def _call(
     op_default_timeout: float | None = None,
     spill_status: Callable[[Any], Any] | None = None,
     spill_status_renderer: Callable[[Any], str] | None = None,
+    # #996: copy the answering instance (stamped by `send_request`) into a dict
+    # result, so the output names which bridge answered.
+    stamp_instance: bool = False,
 ) -> int:
     _require_nonempty_instance(args)
     # THE BOUNDARY (#101/#715/#716). Every transform a handler hands this call is
@@ -2241,6 +2247,10 @@ def _call(
         **timeout_kwargs,
     )
     result = unwrap_result(response, op)
+    if stamp_instance and isinstance(result, dict) and isinstance(response, dict):
+        answering = response.get("instance")
+        if isinstance(answering, str) and answering:
+            result["instance"] = answering
     # Auto-regex fallback (#291.3): a metacharacter query that matched nothing
     # literally is almost always meant as a pattern. Retry it once as a regex and
     # disclose the switch, instead of returning a confident literal `none`. Only

@@ -846,6 +846,63 @@ def test_doctor_flags_stale_engine(monkeypatch, tmp_path, capsys):
     assert payload["engine_install_build_id"]
 
 
+def test_doctor_judges_headless_bridges_against_this_cli_checkout_992(
+    monkeypatch, tmp_path, capsys
+):
+    """#992: a headless bridge runs the package of the interpreter that spawned
+    it. One from THIS checkout whose code matches this CLI's source is current
+    even when the installed GUI plugin differs; one from another checkout is
+    named as such -- not called stale with a restart line, and not clean."""
+    install_dir = tmp_path / "install"
+    source_dir = tmp_path / "worktree" / "src" / "bn_agent_bridge"
+    other_dir = tmp_path / "main" / "src" / "bn_agent_bridge"
+    for d, body in ((install_dir, "old"), (source_dir, "new"), (other_dir, "old")):
+        d.mkdir(parents=True)
+        (d / "bridge.py").write_text(f"print('{body}')\n", encoding="utf-8")
+
+    def fake_instance(iid, source):
+        return type("FakeInstance", (), {
+            "instance_id": iid, "pid": 1, "socket_path": tmp_path / f"{iid}.sock",
+            "plugin_version": bn.cli.VERSION, "started_at": None,
+            "meta": {"gui": False, "source_dir": str(source)},
+        })()
+
+    instances = [fake_instance("wt", source_dir), fake_instance("other", other_dir)]
+    builds = {
+        "wt": (bn.cli.build_id_for_file(source_dir / "bridge.py"),
+               bn.cli.build_id_for_package(source_dir)),
+        "other": (bn.cli.build_id_for_file(other_dir / "bridge.py"),
+                  bn.cli.build_id_for_package(other_dir)),
+    }
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: instances)
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: install_dir)
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda instance, op, params=None, target=None, **_kwargs: {"ok": True, "result": {
+            "plugin_version": bn.cli.VERSION,
+            "plugin_build_id": builds[instance.instance_id][0],
+            "engine_build_id": builds[instance.instance_id][1],
+            "source_dir": instance.meta["source_dir"],
+        }},
+    )
+
+    assert bn.cli.main(["doctor", "--format", "json"]) == 0
+    rows = {row["instance_id"]: row for row in json.loads(capsys.readouterr().out)["instances"]}
+    assert rows["wt"]["other_checkout"] is False
+    assert rows["wt"]["stale_plugin_code"] is False
+    assert rows["wt"]["stale_engine"] is False
+    assert rows["other"]["other_checkout"] is True
+    assert rows["other"]["bridge_source_dir"] == str(other_dir)
+    assert rows["other"]["stale_plugin_code"] is False
+
+    assert bn.cli.main(["doctor"]) == 0
+    text = capsys.readouterr().out
+    assert f"bridge built from another checkout: {other_dir}" in text
+    assert "stale" not in text
+    assert f"source: {source_dir}" in text
+
+
 def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
     from bn.transport import BridgeInstance
     old = type("FakeInstance", (), {

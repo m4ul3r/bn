@@ -879,6 +879,74 @@ def test_load_refuses_ambient_routing_with_multiple_instances(
     assert "explicit -i/--instance" in capsys.readouterr().err
 
 
+def test_load_routes_on_bn_instance_with_multiple_instances_992(
+    fake_transport, monkeypatch, tmp_path
+):
+    """#992: BN_INSTANCE names an instance for `load` exactly as for every other
+    command; only the sticky `bn instance use` pin stays ambient and refused."""
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [
+        types.SimpleNamespace(instance_id="one"), types.SimpleNamespace(instance_id="two"),
+    ])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    loaded = {"ok": True, "result": {"loaded": True, "path": str(raw), "targets": []}}
+
+    monkeypatch.setenv("BN_INSTANCE", "one")
+    calls = fake_transport({"load_binary": loaded})
+    assert bn.cli.main(["load", str(raw)]) == 0
+    assert [(c["op"], c["instance_id"]) for c in calls] == [("load_binary", "one")]
+
+    monkeypatch.delenv("BN_INSTANCE")
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"instance_id": "one"})
+    calls = fake_transport({"load_binary": loaded})
+    assert bn.cli.main(["load", str(raw)]) == 2
+    assert calls == []
+
+
+def test_close_takes_a_bare_name_as_a_selector_996(
+    fake_transport, monkeypatch, tmp_path, capsys
+):
+    """#996: every other command takes `hello` as a selector; `bn close hello`
+    from an unrelated cwd resolved it as `<cwd>/hello` and failed. A bare name
+    that is no file here is a selector; an existing file stays a path."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    calls = fake_transport({
+        "list_targets": _TWO_TARGETS,
+        "close_binary": {"ok": True, "result": {"closed": ["/elsewhere/alpha.so"]}},
+    })
+    assert bn.cli.main(["close", "alpha.so"]) == 0
+    assert calls[-1]["op"] == "close_binary"
+    assert calls[-1]["target"] == "alpha.so"
+    assert calls[-1]["params"] == {}
+
+    (tmp_path / "alpha.so").write_bytes(b"")
+    calls = fake_transport({
+        "close_binary": {"ok": True, "result": {"closed": []}},
+    })
+    assert bn.cli.main(["close", "alpha.so"]) == 0
+    assert calls[-1]["target"] is None
+    assert calls[-1]["params"] == {"path": str(tmp_path / "alpha.so")}
+
+
+def test_target_list_and_info_name_the_answering_instance_996(fake_transport, capsys):
+    """#996: a lone instance answers from any cwd, so the output names it."""
+    row = {"target_id": "123:1:7", "selector": "hello", "view_id": "1"}
+    fake_transport({
+        "list_targets": {"ok": True, "result": [row], "instance": "demo"},
+        "target_info": {"ok": True, "result": dict(row), "instance": "demo"},
+    })
+    assert bn.cli.main(["target", "list"]) == 0
+    assert capsys.readouterr().out.startswith("instance: demo\n")
+    assert bn.cli.main(["target", "list", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["instance"] == "demo"
+    assert bn.cli.main(["-t", "hello", "target", "info"]) == 0
+    assert "\tinstance: demo" in capsys.readouterr().out
+    assert bn.cli.main(["-t", "hello", "target", "info", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["instance"] == "demo"
+
+
 def test_load_quick_flag_sets_quick_param(monkeypatch, tmp_path):
     raw = tmp_path / "foo.so"; raw.write_bytes(b"")
     captured = _load_capture(monkeypatch, raw, analyzed=False)

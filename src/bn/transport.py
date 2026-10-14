@@ -32,8 +32,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from .paths import (
-    bridge_registry_path, bridge_socket_path, cache_home, ensure_private_dir,
-    instances_dir, project_root, validate_instance_id as _paths_validate_instance_id,
+    bridge_registry_path, bridge_socket_path, cache_home, default_cache_home,
+    ensure_private_dir, instances_dir, project_root,
+    validate_instance_id as _paths_validate_instance_id,
 )
 from .proc_identity import PinUnavailable, identity_verdict, pin_process
 from .socket_evidence import path_has_bound_socket
@@ -1166,6 +1167,99 @@ def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
     )
 
 
+def _agent_cache_dirs_for(instance_id: str, proc: Path = Path("/proc")) -> list[Path]:
+    """Cache roots of this user's running bridges named *instance_id*.
+
+    Read from each `bn-agent` process's own argv and environment, so it needs no
+    state written anywhere: a bridge launched with ``--instance-id <id>`` under
+    ``BN_CACHE_DIR=<dir>`` answers ``<dir>`` (an unset variable answers the
+    platform default). Another user's processes are unreadable and skipped; a
+    host without /proc answers nothing.
+    """
+    found: list[Path] = []
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = [os.fsdecode(part) for part in
+                    entry.joinpath("cmdline").read_bytes().split(b"\0") if part]
+            if not any(os.path.basename(part) == "bn-agent"
+                       or part in ("bn.headless", "bn_agent_bridge") for part in argv):
+                continue
+            if not any(part == "--instance-id" and argv[i + 1:i + 2] == [instance_id]
+                       for i, part in enumerate(argv)):
+                continue
+            environ = entry.joinpath("environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        cache_dir: Path = default_cache_home()
+        for var in environ:
+            if var.startswith(b"BN_CACHE_DIR=") and len(var) > len(b"BN_CACHE_DIR="):
+                cache_dir = Path(os.fsdecode(var[len(b"BN_CACHE_DIR="):])).expanduser()
+                break
+        found.append(cache_dir)
+    return found
+
+
+def _instance_registered_elsewhere(instance_id: str) -> Path | None:
+    """The cache root, other than the current one, where *instance_id* is registered.
+
+    BN_CACHE_DIR moves the instance registry along with the database cache, so
+    a shell that lost (or never had) the variable cannot see a bridge started
+    under it, and the reverse (#996). Candidates are the platform default root
+    when BN_CACHE_DIR is set, plus the root every running bridge of that name
+    was launched under; one counts only when it holds ``instances/<id>.json``.
+    """
+    try:
+        current = cache_home().resolve()
+    except OSError:
+        return None
+    candidates: list[Path] = []
+    if os.environ.get("BN_CACHE_DIR"):
+        candidates.append(default_cache_home())
+    candidates.extend(_agent_cache_dirs_for(instance_id))
+    for candidate in candidates:
+        try:
+            if candidate.resolve() == current:
+                continue
+            if (candidate / "instances" / f"{instance_id}.json").is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def instance_not_found_message(instance_id: str, advice: str) -> str:
+    """The "no such instance" refusal, naming the registry that was searched.
+
+    When the id IS registered under another cache root the advice is replaced by
+    the one export that reaches it -- never "start one", which would spawn a
+    duplicate bridge under the same name (#996).
+    """
+    searched = instances_dir()
+    head = f"No bridge instance found with id: {instance_id} (searched {searched})."
+    elsewhere = _instance_registered_elsewhere(instance_id)
+    if elsewhere is not None:
+        return (
+            f"{head} Instance {instance_id} is registered under {elsewhere}: "
+            f"export BN_CACHE_DIR={elsewhere} (BN_CACHE_DIR also moves the "
+            "instance registry and sticky session pins)."
+        )
+    scope = (
+        "BN_CACHE_DIR is set, and it scopes the instance registry"
+        if os.environ.get("BN_CACHE_DIR")
+        else "BN_CACHE_DIR moves the instance registry"
+    )
+    return (
+        f"{head} {advice} ({scope}: a bridge started under a different "
+        "BN_CACHE_DIR is only visible with that same value exported.)"
+    )
+
+
 @contextlib.contextmanager
 def _spawn_lock(timeout: float | None = SPAWN_LOCK_TIMEOUT):
     """Exclusive, bounded flock serializing all bridge spawns on this host."""
@@ -1278,6 +1372,13 @@ def choose_instance(
     spawn_missing_named: bool = False,
     timeout: float | None = None,
 ) -> BridgeInstance:
+    """Pick the bridge a request goes to.
+
+    A lone running instance is used when nothing names one, from any cwd. When
+    its registry does not list the caller's project root that is exactly the
+    case where a command silently answers from somebody else's bridge, so it
+    is disclosed on stderr (#996).
+    """
     if instance_id is not None:
         validate_instance_id(instance_id)
     deadline = time.monotonic() + timeout if timeout is not None else None
@@ -1297,11 +1398,13 @@ def choose_instance(
                     deadline, "starting the requested bridge instance"
                 ),
             )
-        raise BridgeError(
-            f"No bridge instance found with id: {instance_id}. "
-            f"Start one with: bn session start /path/to/binary --instance-id {instance_id}"
-        )
+        raise BridgeError(instance_not_found_message(
+            instance_id,
+            f"Start one with: bn session start /path/to/binary --instance-id {instance_id}",
+        ))
     if len(instances) == 1:
+        if instances[0].instance_id and _resolve_from_project_roots(instances) is None:
+            _note_unassociated_instance(instances[0])
         return instances[0]
     if instances:
         associated = _resolve_from_project_roots(instances)
@@ -2078,7 +2181,7 @@ def send_request(
                 f"Timed out selecting a bridge instance for op {op!r}; "
                 "the end-to-end request deadline expired before connecting"
             )
-    return _send_request_to_instance(
+    response = _send_request_to_instance(
         instance,
         op,
         params=params,
@@ -2089,4 +2192,34 @@ def send_request(
         connect_retries=connect_retries,
         resolved=True,
         idle_probe=idle_probe,
+    )
+    # Which bridge answered, for the caller to disclose (#996): a lone running
+    # instance is picked from any cwd, and nothing in a bridge's own result
+    # names the instance it is.
+    if isinstance(response, dict):
+        response.setdefault("instance", instance_selector(instance))
+    return response
+
+
+_unassociated_noted: set[str] = set()
+
+
+def _note_unassociated_instance(instance: BridgeInstance) -> None:
+    """Say on stderr, once per process, that a lone bridge was used implicitly.
+
+    Nothing named it and its registry does not list the caller's project root,
+    so it may be another agent's bridge (#996).
+    """
+    selector = instance_selector(instance)
+    if selector in _unassociated_noted:
+        return
+    _unassociated_noted.add(selector)
+    try:
+        root = str(project_root())
+    except OSError:
+        root = "this directory"
+    print(
+        f"note: using the only running instance {selector} (not associated with "
+        f"{root}); pass -i {selector} to make that explicit",
+        file=sys.stderr,
     )

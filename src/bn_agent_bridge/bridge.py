@@ -78,6 +78,11 @@ PLUGIN_BUILD_ID = build_id_for_file(Path(__file__).resolve())
 # is actually running. `doctor` compares it to the on-disk package so an edited
 # engine module (e.g. taint_engine.py) is flagged stale, not just bridge.py (#161).
 ENGINE_BUILD_ID = build_id_for_package(Path(__file__).resolve().parent)
+# The checkout this process's code came from (symlinks resolved, so a GUI
+# plugin symlinked into BN's plugins dir names its source tree). Published in
+# the registry and the doctor ping so `doctor`/`session list` can say which
+# checkout a bridge runs (#992).
+SOURCE_DIR = str(Path(__file__).resolve().parent)
 
 # Upper bound on a single newline-terminated JSON request. Anything larger is
 # rejected with a clean error instead of being buffered without limit.
@@ -885,32 +890,28 @@ class TargetManager:
         return type(bv).__name__
 
     def _compute_selectors(self, records: dict[str, TargetRecord]) -> dict[str, str]:
-        # Index the resolver's exact aliases and component suffixes once per
-        # snapshot. Candidate lookup must not re-split every other view's path.
-        exact: dict[str, set[str]] = {}
-        tails: dict[tuple[str, ...], set[str]] = {}
+        """The shortest path suffix that RESOLVES to each view, else its target_id.
+
+        Resolution is tiered (`_match_tier`), so a candidate counts when its best
+        non-empty tier is this view alone -- the same rule `_matching_records`
+        applies, which keeps every advertised selector resolvable, and keeps
+        the raw `hello` advertised as `hello` once its `hello.bndb` is open
+        (#996). The resolver's aliases and component suffixes are indexed once
+        per snapshot, per tier; candidate lookup must not re-split every other
+        view's path.
+        """
+        exact: dict[str, dict[int, set[str]]] = {}
+        tails: dict[tuple[str, ...], dict[int, set[str]]] = {}
         paths = {}
         identities = {}
         for vid, record in records.items():
             identities[record.target_id()] = vid
             parts = paths[vid] = _path_components(record.filename)
-            aliases = [record.view_id, record.filename, record.basename]
-            variants = [parts]
-            if record.basename.endswith(".bndb"):
-                core = record.basename[:-len(".bndb")]
-                aliases.append(core)
-                stem, dot, digest = core.rpartition(".")
-                if dot and len(digest) == 16 and all(
-                    c in "0123456789abcdef" for c in digest
-                ):
-                    aliases.append(stem)
-            if parts and parts[-1].endswith(".bndb"):
-                variants.append(parts[:-1] + (parts[-1][:-len(".bndb")],))
-            for alias in aliases:
-                exact.setdefault(alias, set()).add(vid)
-            for variant in variants:
+            for alias, tier in self._alias_tiers(record):
+                exact.setdefault(alias, {}).setdefault(tier, set()).add(vid)
+            for variant, tier in self._tail_variants(parts):
                 for depth in range(1, len(variant) + 1):
-                    tails.setdefault(variant[-depth:], set()).add(vid)
+                    tails.setdefault(variant[-depth:], {}).setdefault(tier, set()).add(vid)
 
         selectors: dict[str, str] = {}
         for vid, record in records.items():
@@ -924,18 +925,63 @@ class TargetManager:
                 if normalized in identities:
                     matches = {identities[normalized]}
                 else:
-                    matches = exact.get(normalized, set()) | tails.get(
-                        _path_components(normalized), set()
-                    )
+                    by_tier: dict[int, set[str]] = {}
+                    for source in (exact.get(normalized, {}),
+                                   tails.get(_path_components(normalized), {})):
+                        for tier, vids in source.items():
+                            by_tier.setdefault(tier, set()).update(vids)
+                    matches = by_tier[min(by_tier)] if by_tier else set()
                 if matches == {vid}:
                     chosen = candidate
                     break
             selectors[vid] = chosen
         return selectors
 
-    def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
+    # Match tiers, best first (#996). A selector resolves to the views in its
+    # best NON-EMPTY tier, so an exact name is never made ambiguous by a looser
+    # alias of another view: once `hello` is saved and `hello.bndb` opened,
+    # `hello` and `/abs/hello` still mean the raw view, `hello.bndb` the database.
+    _TIER_TARGET_ID = 0
+    _TIER_FILENAME = 1      # exact filename or view id
+    _TIER_BASENAME = 2      # exact basename
+    _TIER_BNDB_CORE = 3     # basename with `.bndb` (and a cache digest) stripped
+    _TIER_TAIL = 4          # path tail
+    _TIER_BNDB_TAIL = 5     # path tail with `.bndb` stripped
+
+    def _alias_tiers(self, record: TargetRecord) -> list[tuple[str, int]]:
+        """Every exact-string alias of *record* with its tier."""
+        aliases = [
+            (record.view_id, self._TIER_FILENAME),
+            (record.filename, self._TIER_FILENAME),
+            (record.basename, self._TIER_BASENAME),
+        ]
+        # A .bndb corpus loads <binary>.bndb, but the obvious selector is
+        # <binary>; `-t foo` resolves `foo.bndb` (#312).
+        if record.basename.endswith(".bndb"):
+            core = record.basename[: -len(".bndb")]
+            aliases.append((core, self._TIER_BNDB_CORE))
+            # Read-only-mount targets restore the GLOBAL cache DB, named
+            # `<stem>.<16-hex content digest>.bndb` by `_cache_bndb_path`; strip
+            # a trailing `.<16 hex>` so the cache name resolves by stem.
+            stem, dot, digest = core.rpartition(".")
+            if dot and len(digest) == 16 and all(
+                c in "0123456789abcdef" for c in digest
+            ):
+                aliases.append((stem, self._TIER_BNDB_CORE))
+        return [(alias, tier) for alias, tier in aliases if alias]
+
+    def _tail_variants(self, parts: tuple[str, ...]) -> list[tuple[tuple[str, ...], int]]:
+        """The component sequences whose suffixes a path-tail selector matches."""
+        variants = [(parts, self._TIER_TAIL)] if parts else []
+        if parts and parts[-1].endswith(".bndb"):
+            variants.append(
+                (parts[:-1] + (parts[-1][: -len(".bndb")],), self._TIER_BNDB_TAIL))
+        return variants
+
+    def _match_tier(self, record: TargetRecord, selector: str | None) -> int | None:
+        """The best tier at which *selector* names *record*, or None."""
         if selector is None:
-            return False
+            return None
         if isinstance(selector, PinnedTarget):
             # An identity the BRIDGE pinned (the destructive gate) resolves by
             # exact target_id and by nothing else. Every fallback below is a
@@ -944,67 +990,49 @@ class TargetManager:
             # DIFFERENT view whose filename happened to spell the pinned id,
             # which is exactly the wrong-target write the pin prevents (#736
             # review rounds 2 and 3).
-            return str(selector) == record.target_id()
+            return self._TIER_TARGET_ID if str(selector) == record.target_id() else None
         candidate = str(selector).strip()
         if candidate in ("", "active"):
-            return False
-        if candidate in (
-            record.target_id(),
-            record.view_id,
-            record.filename,
-            record.basename,
-        ):
-            return True
-        # A .bndb corpus loads <binary>.bndb, but the obvious selector is
-        # <binary>; match a candidate against the basename / path tail with a
-        # trailing .bndb stripped so `-t foo` resolves `foo.bndb` (#312).
-        if record.basename.endswith(".bndb"):
-            core = record.basename[: -len(".bndb")]
-            if candidate == core:
-                return True
-            # Read-only-mount targets restore the GLOBAL cache DB, named
-            # `<stem>.<16-hex content digest>.bndb` by `_cache_bndb_path`. Its core
-            # is `<stem>.<digest>`, so `-t <stem>` (e.g. `-t foo`, the obvious
-            # base name) would miss the exact/`.bndb`-strip cases above. Strip a
-            # trailing `.<16 hex>` so the cache name resolves by stem.
-            stem, dot, digest = core.rpartition(".")
-            if (
-                dot
-                and candidate == stem
-                and len(digest) == 16
-                and all(c in "0123456789abcdef" for c in digest)
-            ):
-                return True
+            return None
+        if candidate == record.target_id():
+            return self._TIER_TARGET_ID
+        best: int | None = None
+        for alias, tier in self._alias_tiers(record):
+            if candidate == alias and (best is None or tier < best):
+                best = tier
+        if best is not None:
+            return best
         suffix = _path_components(candidate)
         if suffix:
-            parts = _path_components(record.filename)
-            if len(parts) >= len(suffix) and parts[-len(suffix):] == suffix:
-                return True
-            if parts and parts[-1].endswith(".bndb"):
-                stripped = tuple(parts[:-1]) + (parts[-1][: -len(".bndb")],)
-                if len(stripped) >= len(suffix) and tuple(stripped[-len(suffix):]) == tuple(suffix):
-                    return True
-        return False
+            for variant, tier in self._tail_variants(_path_components(record.filename)):
+                if len(variant) >= len(suffix) and variant[-len(suffix):] == suffix:
+                    return tier
+        return None
+
+    def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
+        return self._match_tier(record, selector) is not None
 
     def _matching_records(
         self, records: dict[str, TargetRecord], selector: str | None
     ) -> list[TargetRecord]:
         """The matching relation shared by listings and resolution.
 
-        A live full target_id outranks filename aliases, so the last-resort
-        selector remains usable even with a file named after another view's ID.
-        PinnedTarget retains its stricter identity-only semantics, including
-        when its view has disappeared.
+        The records in the selector's best non-empty tier (`_match_tier`): a
+        live full target_id outranks filename aliases, an exact filename
+        outranks a basename, a basename outranks a `.bndb`-stripped alias, and
+        those outrank path tails (#996). PinnedTarget retains its stricter
+        identity-only semantics, including when its view has disappeared.
         """
-        candidate = str(selector).strip() if selector is not None else None
-        if not isinstance(selector, PinnedTarget):
-            for record in records.values():
-                if candidate == record.target_id():
-                    return [record]
-        return [
-            record for record in records.values()
-            if self._matches_record(record, selector)
-        ]
+        best: int | None = None
+        matches: list[TargetRecord] = []
+        for record in records.values():
+            tier = self._match_tier(record, selector)
+            if tier is None or (best is not None and tier > best):
+                continue
+            if best is None or tier < best:
+                best, matches = tier, []
+            matches.append(record)
+        return matches
 
     def matches_target(self, target_id: str, selector: str | None) -> bool:
         """Whether ``selector`` names the record with ``target_id``. Locked."""
@@ -2045,6 +2073,7 @@ class BinaryNinjaBridge:
             "plugin_name": PLUGIN_NAME,
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
+            "source_dir": SOURCE_DIR,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "gui": ui is not None,
         }
@@ -2340,6 +2369,7 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             # Whole-package fingerprint of the code this process loaded (#161).
             "engine_build_id": ENGINE_BUILD_ID,
+            "source_dir": SOURCE_DIR,
             # Which Binary Ninja this process is actually driving. Nothing else
             # in the tool's output names it: a major-version jump (5.x -> 6.x)
             # changes analysis and IL semantics, so "the same command behaved
@@ -2375,6 +2405,19 @@ class BinaryNinjaBridge:
                 continue
         return None
 
+    def _loaded_target_row(self, targets: list[dict[str, Any]], bv) -> dict[str, Any] | None:
+        """The row of *targets* that IS *bv*: the target this load opened.
+
+        `targets` lists every open view, so a reader that wants "the selector of
+        what I just loaded" -- `session start` printing one `target:` line per
+        binary -- needs it named rather than guessed from the list (#996).
+        """
+        with self.targets._lock:
+            view_id = self.targets._stable_view_id(bv)
+        if view_id is None:
+            return None
+        return next((row for row in targets if row.get("view_id") == view_id), None)
+
     def _load_existing_result(
         self,
         load_path: Path,
@@ -2406,6 +2449,7 @@ class BinaryNinjaBridge:
             "already_open": True,
             "notes": notes,
             "targets": targets,
+            "target": self._loaded_target_row(targets, existing),
         }
 
     def _load_binary_async(
@@ -2828,6 +2872,7 @@ class BinaryNinjaBridge:
                 ),
                 "notes": notes,
                 "targets": targets,
+                "target": self._loaded_target_row(targets, bv),
             }
         except BaseException:
             # #609: a view opened by binaryninja.load() above but not yet published
@@ -2999,7 +3044,10 @@ class BinaryNinjaBridge:
                     to_close.append(bv)
 
             if not to_close:
-                raise RuntimeError(f"No loaded binary matches path: {path}")
+                raise RuntimeError(
+                    f"No loaded binary matches path: {path}. To close by selector "
+                    f"(as `bn target list` shows it), use `bn close -t <selector>`."
+                )
 
         # Dedup by BN's handle-based equality, not id(). _collect_open_views()
         # already collapses wrappers per core view (#714), but this is the
@@ -3538,14 +3586,20 @@ class BinaryNinjaBridge:
         # against those writers before we ever touch the view.
         with self._write_gate:
             bv = self._resolve_view(selector)
-            bv.update_analysis_and_wait()
-            with self._target_lock.write():
-                _quick_loaded_views.discard(bv)
-                # Only clear the #458 unanalyzed flag if analysis actually produced
-                # functions -- a refresh on a raw-only container (no product view)
-                # is a no-op and must stay "unanalyzed", not be mislabeled "full".
-                if _view_function_count(bv) > 0:
-                    _unanalyzed_views.discard(bv)
+            # #996: gated reads on other connections see the refresh running and
+            # say "retry", instead of telling the agent to start another one.
+            _refreshing_views[bv] = time.monotonic()
+            try:
+                bv.update_analysis_and_wait()
+                with self._target_lock.write():
+                    _quick_loaded_views.discard(bv)
+                    # Only clear the #458 unanalyzed flag if analysis actually produced
+                    # functions -- a refresh on a raw-only container (no product view)
+                    # is a no-op and must stay "unanalyzed", not be mislabeled "full".
+                    if _view_function_count(bv) > 0:
+                        _unanalyzed_views.discard(bv)
+            finally:
+                _refreshing_views.pop(bv, None)
         # Build the response under the READ lock: the tail read touches live view
         # state (bv.functions / arch / analysis_progress), and the instant we drop
         # the write gate a queued mutation can begin writing the same view -- so
@@ -4800,6 +4854,7 @@ from .bridge_state import (  # noqa: E402
     _headless_views_lock,
     _quick_loaded_views,
     _opened_annotations,
+    _refreshing_views,
     _source_verified,
     _unanalyzed_views,
     view_session_key,

@@ -45,7 +45,10 @@ def _render_target_info_text_with_annotations(value: Any) -> str:
              arg("--no-bndb", action="store_true",
                  help="Open the raw bytes: skip both an adjacent <binary>.bndb and a "
                       "database saved to the cache. The cache is machine-wide; set "
-                      "BN_CACHE_DIR per agent or project to isolate them"),
+                      "BN_CACHE_DIR per agent or project to isolate them -- it also "
+                      "moves the instance registry and sticky session pins, so set it "
+                      "on EVERY bn command (an instance started under it is invisible "
+                      "without it)"),
              arg("--quick", "--no-analysis", action="store_true",
                  help="Load without full analysis (fast, ~1s): sections/imports/symbols are ready "
                       "immediately; strings and the full function set need `bn refresh`. Never "
@@ -59,15 +62,21 @@ def _load(args: argparse.Namespace) -> int:
     # same unset-shell-var doctrine as close/save (#690 r4).
     if not str(args.path).strip():
         raise BridgeError("path is empty: pass the binary or .bndb file to load")
+    # BN_INSTANCE NAMES an instance exactly as -i does (#992): it reaches
+    # args.instance as the root option's default. Only the sticky pin
+    # (`bn instance use`) is ambient and stays refused below.
     explicitly_routed = bool(
         getattr(args, "_explicit_instance", False)
         or getattr(args, "_explicit_instance_id", False)
+        or (getattr(args, "instance", None)
+            and not getattr(args, "_sticky_instance", False))
     )
     if not explicitly_routed and len(cli.list_instances()) > 1:
         raise BridgeError(
             "bn load refuses ambient instance routing while multiple bridges are "
-            "running. Pass an explicit -i/--instance for an existing bridge, or "
-            "--instance-id to create a named bridge."
+            "running. Pass an explicit -i/--instance (or export BN_INSTANCE) for an "
+            "existing bridge, or --instance-id to create a named bridge; the "
+            "`bn instance use` pin is not used to pick where a load lands."
         )
     return _call(
         args,
@@ -96,7 +105,10 @@ def _load(args: argparse.Namespace) -> int:
 
 @command("close", help="Close an open target (bn-loaded or a GUI tab)", target=True,
          args=[
-             arg("path", nargs="?", help="Path to close (omit to close the single open target)"),
+             arg("path", nargs="?",
+                 help="Path to close (omit to close the single open target). A name "
+                      "that is not an existing file is taken as a target selector, "
+                      "same as -t"),
              arg("--all", action="store_true", help="Close all open targets, including GUI tabs bn did not load"),
          ])
 def _close(args: argparse.Namespace) -> int:
@@ -156,7 +168,16 @@ def _close(args: argparse.Namespace) -> int:
         )
     params: dict[str, Any] = {}
     if explicit_path is not None:
-        params["path"] = str(Path(explicit_path).expanduser().resolve())
+        resolved = Path(explicit_path).expanduser().resolve()
+        if "/" in str(explicit_path) or resolved.exists():
+            params["path"] = str(resolved)
+        else:
+            # #996: every other command takes `hello` as a selector, so a bare
+            # name that is no file in the cwd is one too. Anything spelled as a
+            # path, or an existing file, stays a path: what the operand has
+            # always meant.
+            explicit_target = args.target = str(explicit_path)
+            explicit_path = None
     if args.all:
         params["all"] = True
     # #664: a bare `bn close` closes the single open target and refuses under
@@ -258,7 +279,8 @@ def _target_close(args: argparse.Namespace) -> int:
                       "request_sent: true, written: false}} -- exit 2, not the mutation exit 3, "
                       "because save is a file write, not a mutation). The cache is shared by every bn "
                       "instance using it: set BN_CACHE_DIR per agent or project to keep "
-                      "their saved analyses apart"),
+                      "their saved analyses apart -- it also moves the instance registry "
+                      "and sticky session pins, so set it on every bn command"),
              arg("--path", dest="path_flag", default=None,
                  help="Output path (alias for the positional)"),
          ])
@@ -324,4 +346,5 @@ def _target_info(args: argparse.Namespace) -> int:
         # text view carries the annotation counts/provenance block too.
         text_renderer=_render_target_info_text_with_annotations,
         stem="target-info",
+        stamp_instance=True,
     )
