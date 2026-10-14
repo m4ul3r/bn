@@ -402,6 +402,132 @@ def test_preview_restore_failure_is_not_success(monkeypatch):
     assert not _has_event(bv, "commit")
 
 
+@pytest.mark.parametrize("revert_fault,residue_text", [
+    (None, None),
+    ("values", "reverting a non-journaled change"),
+    ("hosts", "a function a create split is not back"),
+    ("proto", "has_user_type override could NOT be cleared"),
+])
+def test_preview_verification_failure_never_claims_verified_937(
+        monkeypatch, revert_fault, residue_text):
+    """#937: a preview whose readback FAILED kept its exit/status/rollback
+    contract but said "Preview verified and reverted." -- on the clean-revert
+    branch and on every incomplete-revert branch alike. The message must name
+    the failed verification, and still name which part of the revert did not
+    hold."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None, **kwargs):
+        restores.append(lambda: None)
+        return {"op": "local_rename", "requested": {}}
+
+    _mutation_with_stubs(
+        monkeypatch, bridge, instance, bv,
+        apply=apply,
+        verify=lambda bv_, result: {**result, "status": "verification_failed"},
+    )
+    monkeypatch.setattr(me, "_run_local_restores",
+                        lambda ctx, bv_, restores: revert_fault != "values")
+    monkeypatch.setattr(bridge.create_comments, "_split_hosts_at_baseline",
+                        lambda bv_, baseline, what: revert_fault != "hosts")
+    monkeypatch.setattr(me, "_prototype_user_type_residue",
+                        lambda ctx, bv_, results: revert_fault == "proto")
+
+    result = instance._mutation("active", True, [{"op": "local_rename"}])
+
+    assert result["preview"] is True
+    assert result["success"] is False
+    assert result["committed"] is False
+    assert result["rolled_back"] is (revert_fault is None)
+    assert result["results"][0]["status"] == "verification_failed"
+    assert "verified" not in result["message"].replace("verification failed", "")
+    if revert_fault is None:
+        assert result["message"] == "Preview verification failed; the change was reverted."
+    else:
+        assert result["message"].startswith("Preview verification failed, and ")
+        assert residue_text in result["message"]
+
+
+def test_a_name_renamed_earlier_in_the_batch_is_explained_975(monkeypatch):
+    """#975: a later op naming a function by the spelling an earlier op renamed
+    away failed with the resolver's lexically-close but unrelated suggestions.
+    The failure must name the rename (and follow a chained one). It must NOT
+    fire when the name still resolves -- a round trip gave it back, or a later
+    rename reused it for another function -- and the real failure is a different
+    one: there the hint would point the agent at the WRONG function."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    names: dict[str, int] = {}
+
+    def resolve(name):
+        if name not in names:
+            raise bridge.OperationFailure(
+                "unsupported", f"Function not found: {name}. Did you mean: sub_4025dc")
+        return names[name]
+
+    def apply(bv_, op, restores=None, **kwargs):
+        if op["op"] == "rename_symbol":
+            before = op["identifier"]
+            address = resolve(before)
+            del names[before]
+            names[op["new_name"]] = address
+            return {"op": "rename_symbol", "kind": "function", "address": hex(address),
+                    "before_name": before, "new_name": op["new_name"], "requested": {}}
+        resolve(op["function"])
+        if op["op"] == "local_rename":
+            raise bridge.OperationFailure(
+                "unsupported", f"Variable not found: {op['variable']}")
+        return {"op": op["op"], "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
+
+    def run(*ops):
+        names.clear()
+        names.update({"sub_401d10": 0x401d10, "sub_401e20": 0x401e20})
+        return instance._mutation("active", True, list(ops))
+
+    def rename(old, new):
+        return {"op": "rename_symbol", "identifier": old, "new_name": new}
+
+    comment = {"op": "set_comment", "function": "sub_401d10", "comment": "entry"}
+
+    row = run(rename("sub_401d10", "handle_request"), comment)["results"][1]
+    assert row["status"] == "unsupported"
+    assert "Did you mean" not in row["message"]
+    assert row["message"].startswith(
+        "sub_401d10 not found: operation 0 of this batch renamed sub_401d10 "
+        "(at 0x401d10) to handle_request.")
+
+    row = run(rename("sub_401d10", "handle_request"),
+              rename("handle_request", "handle_request_v2"), comment)["results"][2]
+    assert "to handle_request, then to handle_request_v2" in row["message"]
+    assert "refer to it as handle_request_v2" in row["message"]
+
+    # A miss on a name no rename touched keeps the resolver's message.
+    unrelated = {"op": "set_comment", "function": "sub_missing", "comment": "entry"}
+    row = run(rename("sub_401d10", "handle_request"), unrelated)["results"][1]
+    assert row["message"] == "Function not found: sub_missing. Did you mean: sub_4025dc"
+
+    # Round trip: the name was given back, so it resolves; the real failure is
+    # the variable, and that is what must be reported.
+    bad_local = {"op": "local_rename", "function": "sub_401d10",
+                 "variable": "no_such_var", "new_name": "x"}
+    row = run(rename("sub_401d10", "foo"), rename("foo", "sub_401d10"),
+              bad_local)["results"][2]
+    assert row["message"] == "Variable not found: no_such_var"
+
+    # Reuse: `alpha` moved off 0x401d10, then named 0x401e20. It resolves --
+    # to 0x401e20 -- so no hint may send the agent back to 0x401d10.
+    row = run(rename("sub_401d10", "alpha"), rename("alpha", "gamma"),
+              rename("sub_401e20", "alpha"),
+              {**bad_local, "function": "alpha"})["results"][3]
+    assert row["message"] == "Variable not found: no_such_var"
+
+
 def test_preview_drift_restore_failure_is_not_success(monkeypatch):
     """If reverting BN's propagation onto aliased siblings (the var-drift
     restore) fails, the preview left the view modified and must report
@@ -2279,6 +2405,44 @@ def test_struct_field_set_overwrite_minting_surviving_duplicate_refused(monkeypa
     assert "b" in str(exc.value)
     assert "0x8" in str(exc.value)             # names the surviving member's offset
     assert builder.added == []                 # never reached add_member_at_offset
+
+
+def test_struct_field_set_retype_under_own_name_succeeds_with_fresh_member_objects(monkeypatch):
+    """#961: BN hands out NEW member objects on every `.members` access, so a
+    guard that matched the members a write removes by `id()` across two reads
+    refused a same-name retype (`vtable` at 0x0 -> `void**`) as a duplicate of
+    itself. The type below mints fresh members per access, as BN does."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    builder = _AddableStructBuilder()
+
+    class _FreshMembersType:
+        @property
+        def members(self):
+            return [types.SimpleNamespace(offset=0, name="vtable", type=types.SimpleNamespace(width=8)),
+                    types.SimpleNamespace(offset=8, name="field", type=types.SimpleNamespace(width=4))]
+
+    class _BV:
+        def parse_type_string(self, s):
+            return types.SimpleNamespace(width=8), None
+
+        def get_type_by_name(self, n):
+            return _FreshMembersType()
+
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("Probe", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
+    res = instance._op_struct_field_set(_BV(), {
+        "struct_name": "Probe", "offset": "0x0", "field_name": "vtable",
+        "field_type": "int64_t", "overwrite_existing": True})
+    assert res["before_member"]["field_name"] == "vtable"
+    assert builder.added and builder.added[0] == ("vtable", 0, True)
+    # The surviving member still guards its name.
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_struct_field_set(_BV(), {
+            "struct_name": "Probe", "offset": "0x0", "field_name": "field",
+            "field_type": "int64_t", "overwrite_existing": True})
+    assert "0x8" in str(exc.value)
+
 
 
 def test_types_declare_rejects_bitfield(monkeypatch):

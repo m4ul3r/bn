@@ -744,6 +744,138 @@ def test_parse_type_or_hint_resolves_const_qualified_namespaced_pointer(monkeypa
     assert str(t3) == "struct std::vector<std::pair<int, long> >::iterator*"
 
 
+def test_parse_type_or_hint_accepts_tag_keyword_and_backticks_on_namespaced_type(monkeypatch):
+    """#962: BN spells a recovered C++ type `struct ns::demo::Foo`, and its
+    declaration grammar quotes it as struct `ns::demo::Foo`. The #200 fallback
+    stripped `*` and cv-qualifiers but not a leading tag keyword or backticks,
+    so both spellings an agent copies from BN failed to parse. A tag keyword
+    that disagrees with the type's kind must still fail closed."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    foo = _FakeType("struct ns::demo::Foo")
+
+    class _NsBV(_FakeBV):
+        def parse_type_string(self, decl):
+            raise SyntaxError("error: <unknown>:1:8 use of undeclared identifier 'ns'\n1 error generated.")
+
+        def get_type_by_name(self, name):
+            # As on real BN: a raw "ns::demo::Foo" string misses the type
+            # registered under its component tuple...
+            return None if isinstance(name, str) else super().get_type_by_name(name)
+
+    bv = _NsBV(functions=[], qualified_types_={("ns", "demo", "Foo"): foo})
+    # ...while `bv.types` lists it under its joined name.
+    bv.types["ns::demo::Foo"] = foo
+    for decl in ("struct ns::demo::Foo*", "struct `ns::demo::Foo`*", "`ns::demo::Foo`*",
+                 "class ns::demo::Foo *", "const struct ns::demo::Foo*"):
+        t, _ = me._parse_type_or_hint(instance.ctx, bv, {"op": "struct_field_set"}, decl, label="field type")
+        assert str(t) == "struct ns::demo::Foo*", decl
+
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        me._parse_type_or_hint(instance.ctx, bv, {"op": "struct_field_set"}, "union ns::demo::Foo*",
+                               label="field type")
+    assert excinfo.value.status == "invalid_request"
+    # ...and the refusal names the spelling that does resolve.
+    assert "struct `ns::demo::Foo`" in excinfo.value.message
+
+
+def test_type_parse_failure_names_the_existing_spelling(monkeypatch):
+    """#962: `unknown type name 'mtx_t'` on a view whose `mtx_t` is a UNION tag
+    (C does not make a tag a type name) and `undeclared identifier 'ns'` for a
+    qualified name both left the agent guessing the spelling. The error names
+    the existing type as a type string must spell it."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    union = _FakeType("union mtx_t")
+    union.type = "UnionStructureType"
+    bv = _FakeBV(functions=[], types_={
+        "mtx_t": union,
+        "ns::Widget::VTable": _FakeType("struct ns::Widget::VTable"),
+        "count_t": _FakeType("int32_t", type_class="IntegerTypeClass"),
+    })
+    detail = ("error: input:1:13 unknown type name 'mtx_t' error: input:1:22 use of "
+              "undeclared identifier 'ns' 2 errors generated")
+    hint = me._type_spelling_hint(bv, "struct P { mtx_t m; ns::Widget::VTable* v; };", detail)
+    assert "union mtx_t" in hint
+    assert "struct `ns::Widget::VTable`" in hint
+    assert "count_t" not in hint
+    # A diagnostic that names no type yields no hint (the generic advice stays).
+    assert me._type_spelling_hint(bv, "struct P { int x }", "error: expected ';'") == ""
+
+
+def test_declaration_references_to_existing_types_are_not_redefined(monkeypatch):
+    """#963: BN's parser hands back a type the declaration only REFERENCES
+    (`struct ns::W::VTable* vtable;`) as an empty named struct, and defining it
+    replaced the view's real type with a 0-byte stub. Only a type the
+    declaration gives a body may be (re)defined; a new forward name still is."""
+    me = _load_bridge(monkeypatch).mutation_engine
+    vtable = _FakeType("struct ns::W::VTable", width=0x20, members=[_FakeMember(0, "f", "void*")])
+    alpha = _FakeType("struct Alpha", width=8, members=[_FakeMember(0, "a", "long")])
+    bv = _FakeBV(functions=[], types_={"ns::W::VTable": vtable, "Alpha": alpha})
+
+    class _Library:
+        def get_named_type(self, name):
+            return _FakeType("struct timespec", width=16) if name == "timespec" else None
+
+    bv.type_libraries = [_Library()]
+
+    def stub(name):
+        return _FakeType(f"struct {name}", width=0, members=[])
+
+    holder = _FakeType("struct ns::W", width=8, members=[_FakeMember(0, "vtable", "void*")])
+    declaration = ("struct `ns::W` { struct `ns::W::VTable`* vtable; struct timespec* ts; "
+                   "struct `ns::W::VTabl`* typo; }; struct Fresh; struct Alpha { long a; long b; };")
+    parsed = [("ns::W", holder), ("ns::W::VTable", stub("ns::W::VTable")), ("timespec", stub("timespec")),
+              ("ns::W::VTabl", stub("ns::W::VTabl")), ("Fresh", stub("Fresh")), ("Alpha", stub("Alpha"))]
+    kept, referenced, by_mention = me._drop_references_to_existing_types(bv, declaration, parsed)
+    # The view's VTable and the type library's `timespec` are only referenced.
+    assert referenced == ["ns::W::VTable", "timespec"]
+    # `Fresh` is new (an intentional forward declaration); `Alpha` has a body
+    # here; the misspelled `ns::W::VTabl` is created but disclosed.
+    assert [name for name, _ in kept] == ["ns::W", "ns::W::VTabl", "Fresh", "Alpha"]
+    assert by_mention == ["ns::W::VTabl"]
+
+
+def test_every_base_clause_is_reported_never_dropped(monkeypatch):
+    """#965 split out of #989: bn records no C++ base, so it must name every
+    base clause it sees -- whatever sits around the name -- and fail loudly on
+    one it cannot read rather than drop it."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    found = me._unrecorded_base_clauses(
+        "struct A { int a; }; struct alignas(32) D1 : A { char e; };\n"
+        "struct __attribute__((packed)) D2 : public A, private B { char e; };\n"
+        "struct [[gnu::packed]] D3 final : virtual A {};\n"
+        "class `ns::D4` : ns::Base<int, char> { int x; };\n"
+        "struct Outer { struct Inner : A { int i; } in; struct A* p; };\n"
+        "enum class E : int { X }; struct Fwd; int f(struct A* a, struct B b);")
+    assert set(found) == {"D1", "D2", "D3", "ns::D4", "Inner"}
+    assert "A, B" in found["D2"] and "see #965" in found["D1"]
+    assert "ns::Base<int, char>" in found["ns::D4"]
+    assert me._unrecorded_base_clauses("struct P { int a; }; struct Q { struct P p; };") == {}
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        me._unrecorded_base_clauses("struct D : { int x; };")
+    assert excinfo.value.status == "invalid_request"
+    assert "#965" in excinfo.value.message
+
+
+def test_type_not_found_explains_class_vtable_types(monkeypatch):
+    """#963: `struct show <Class>` on a class BN only made vtable types for."""
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeBV(functions=[], types_={"app::Base::app::Widget::VTable": _FakeType("struct x"),
+                                       "app::Widget::app::Sub::VTable": _FakeType("struct y")})
+    with pytest.raises(RuntimeError) as own:
+        ctx._find_type(bv, "app::Widget")
+    assert "No struct named app::Widget is defined" in str(own.value)
+    assert "struct `app::Base::app::Widget::VTable`* vtable" in str(own.value)
+    with pytest.raises(RuntimeError) as unrelated:
+        ctx._find_type(bv, "app::Other")
+    assert "No struct named" not in str(unrelated.value)
+
+
 def test_resolve_type_field_accepts_offset_and_suggests_near_match(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

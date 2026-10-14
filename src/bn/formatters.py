@@ -944,6 +944,10 @@ def _render_proto_text(value: Any) -> str:
     # carried none, which is the exact skew #619 made a suite-wide invariant.
     raw_width_note = _text_value(value, "return_width_note")
     width_note = f"\n\nnote: {raw_width_note}" if raw_width_note else ""
+    # #966: a prototype with callee-saved/link-register parameters, or a body
+    # BN split at a shared tail, is disclosed the same way.
+    split_notes = _field_list(value, "split_body_notes") or []
+    width_note += "".join(f"\n\nnote: {n}" for n in split_notes)
     fn = value.get("function")
     name = fn.get("name") if isinstance(fn, dict) else None
     head, sep, rest = prototype.partition("(")
@@ -5650,6 +5654,7 @@ def _build_mutation_summary(
     unmeasured_cause: str = "this op reported no results[] rows",
     unusable: bool = False,
     overlapping_functions: Sequence[dict[str, Any]] = (),
+    declared_types: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -5784,7 +5789,60 @@ def _build_mutation_summary(
         # the residue key: an ordinary create must not grow an empty list for
         # every consumer to learn to ignore.
         summary["overlapping_functions"] = list(overlapping_functions)
+    if declared_types:
+        # #964: `types declare` is ONE op however many types it declares, so the
+        # op counts above said `changed=1 verified=1` for a header of eleven
+        # structs and the caller had to `struct show` each one to learn what
+        # landed. Conditional like the keys above: only a declare carries it.
+        summary["declared_types"] = declared_types
     return summary
+
+
+# How many declared type names the compact summary lists before it truncates;
+# the full set stays in the detailed result's `defined_types`.
+_DECLARED_TYPE_NAME_CAP = 10
+
+
+def _declared_types_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """#964: the types a `types_declare` row set actually landed (verified or
+    noop rows), counted per TYPE rather than per op, with the names capped, plus
+    any base clause the declare could not record (#965), the existing types it
+    only referenced and left unchanged, and the empty types it created only
+    because a member mentioned an unknown name (#963 / #989 review). None when
+    no declare row landed, so every other mutation's summary is unchanged."""
+    names: list[str] = []
+    unattached: dict[str, Any] = {}
+    referenced: list[str] = []
+    stubs: list[str] = []
+    landed = False
+    for row in results:
+        if row.get("op") != "types_declare" or row.get("status") not in ("verified", "noop"):
+            continue
+        landed = True
+        row_referenced = [str(name) for name in _field_list(row, "referenced_existing_types")]
+        row_stubs = [str(name) for name in _field_list(row, "created_by_reference")]
+        referenced.extend(row_referenced)
+        stubs.extend(row_stubs)
+        # Neither a referenced type nor an empty type created by a bare mention
+        # was DECLARED; both are listed on their own lines instead.
+        names.extend(str(name) for name in _field_dict(row, "defined_types")
+                     if str(name) not in row_referenced and str(name) not in row_stubs)
+        unattached.update(_field_dict(row, "unattached_bases"))
+    if not landed:
+        return None
+    unique = list(dict.fromkeys(names))
+    out: dict[str, Any] = {
+        "count": len(unique),
+        "names": unique[:_DECLARED_TYPE_NAME_CAP],
+        "truncated": len(unique) > _DECLARED_TYPE_NAME_CAP,
+    }
+    if unattached:
+        out["unattached_bases"] = unattached
+    if referenced:
+        out["referenced_existing"] = list(dict.fromkeys(referenced))
+    if stubs:
+        out["created_by_reference"] = list(dict.fromkeys(stubs))
+    return out
 
 
 @_discloses_in_summary
@@ -5906,6 +5964,7 @@ def _mutation_summary(value: Any) -> Any:
             o for r in results if r.get("status") in ("verified", "rollback_failed")
             for o in _row_list(r, "overlaps")
         ],
+        declared_types=_declared_types_summary(results),
     )
 
 
@@ -6212,6 +6271,26 @@ def _render_mutation_summary_text(value: Any) -> str:
     line = "  ".join(parts)
     if overlaps:
         line += "\noverlapping_functions: " + _overlap_listing(overlaps)
+    if _field_declared(value, "declared_types"):
+        declared = _field_dict(value, "declared_types")
+        names = [str(name) for name in _field_list(declared, "names")]
+        count = declared.get("count")
+        hidden = count - len(names) if isinstance(count, int) and count > len(names) else 0
+        shown = ", ".join(names) + (f", +{hidden} more" if hidden else "")
+        kept = [str(name) for name in _field_list(declared, "referenced_existing")]
+        stubs = [str(name) for name in _field_list(declared, "created_by_reference")]
+        # A declare that only referenced existing types declared nothing; its
+        # `referenced` line says all there is, so no "types: 0 declared".
+        if not (count == 0 and not names and (kept or stubs)):
+            line += f"\ntypes: {_fmt_count(count).strip()} declared" + (f" ({shown})" if shown else "")
+        bases = _field_dict(declared, "unattached_bases")
+        if bases:
+            line += "\nbases not recorded: " + "; ".join(f"{name}: {why}" for name, why in bases.items())
+        if kept:
+            line += "\nreferenced, left unchanged: " + ", ".join(kept)
+        if stubs:
+            line += ("\ncreated empty (only mentioned, never defined -- check the spelling): "
+                     + ", ".join(stubs))
     if _field_declared(value, "go_rename"):
         go = _field_dict(value, "go_rename")
         line += "\ngo rename: " + "  ".join(
@@ -6948,13 +7027,15 @@ def _render_one_class(rec: Any) -> str:
                 continue
             lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
     elif vt_addr:
-        # A vtable symbol exists but no slots resolved. Either the vtable is
-        # defined in another module (the local symbol is an import/GOT slot) or
-        # it is a PIE/.data.rel.ro vtable whose pointers are applied at load time
-        # via relocations (zero in the static image). In both cases there is no
-        # decodable local body; say so rather than render fake or empty virtuals.
-        lines.append("  vtable: symbol present but no slots resolved here "
-                     "(defined in another module, or applied at load time via relocations)")
+        # A vtable symbol exists but no slots resolved. The causes differ (an
+        # import/GOT slot for a vtable defined in another module, a PIE slot
+        # relocated to zero, a header whose typeinfo word did not decode), and
+        # naming one of them sent a reader after a shared library when the slots
+        # were in the image all along (#960). Say what is known -- the slots were
+        # not proven -- with the reason code and the next step.
+        reason = _text_value(vt, "truncated_reason") or "unknown"
+        lines.append(f"  vtable: symbol present, slots not proven ({reason}); "
+                     f"inspect the table with `bn evidence table {vt_addr}`")
     if vt.get("truncated"):
         # #822: the cap note now carries the bound instead of only the cap, so a
         # reader can see how much the cap hid -- the validated minimum, never a

@@ -19,8 +19,8 @@ def main(argv: list[str] | None = None):
         "--no-bndb",
         dest="no_bndb",
         action="store_true",
-        help="Open the raw binary even if an adjacent <binary>.bndb exists "
-        "(default: load the saved sidecar database, like `bn load`)",
+        help="Open the raw binary even if an adjacent <binary>.bndb or a cached database "
+        "exists (default: load the saved database, like `bn load`)",
     )
     args = parser.parse_args(argv)
 
