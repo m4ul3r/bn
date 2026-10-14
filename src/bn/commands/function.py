@@ -424,9 +424,10 @@ def _decompile_many(
                       "one-line `warning[<code>]:` summary (text mode; json carries "
                       "the sentences in `warnings` and `{code, summary, detail}` rows "
                       "in `warning_rows`). In the Pseudo C, a `❓` line is control "
-                      "flow BN could not resolve (an indirect jump with no known "
-                      "target), and a `/* bn: ... */` note is added by bn, not by "
-                      "Binary Ninja"),
+                      "flow BN could not resolve -- an indirect jump with no known "
+                      "target, which may be a tail call (its arguments are not "
+                      "rendered) or a computed goto / jump table -- and a "
+                      "`/* bn: ... */` note is added by bn, not by Binary Ninja"),
          ],
          estimable=True)
 def _decompile(args: argparse.Namespace) -> int:

@@ -1712,12 +1712,16 @@ def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
     memo: dict[str, Any] = {}
     # Every address the text renders raw, tokenised once rather than searched
     # per operand (#985 review: decompile cost on large functions).
-    # BN's placeholder name for untyped data counts as raw too: a library
-    # prototype that types the argument as a pointer (aarch64 libc's
-    # `setlocale(int32_t, int64_t*)`) renders it `&data_400b90`, not
-    # `0x400b90`, and the string there is just as undefined (#1000 review).
-    rendered = {int(token, 16) for token in re.findall(r"\b0x[0-9a-fA-F]+\b", text)}
-    rendered |= {int(token, 16) for token in re.findall(r"\bdata_([0-9a-fA-F]+)\b", text)}
+    # BN's placeholder name for untyped data counts too: a library prototype
+    # that types the argument as a pointer (aarch64 libc's `setlocale(int32_t,
+    # int64_t*)`) renders it `&data_400b90`, not `0x400b90` (#1000 review).
+    # But BN gave that address a data variable, which on a stripped binary is
+    # as often an `int[]` or a struct (`memcmp(p, &data_4008f0, 0x10)` read as
+    # "ABC"), so a placeholder is named only on the evidence the short-literal
+    # rule already demands: a callee that takes a narrow `char *` there.
+    raw = {int(token, 16) for token in re.findall(r"\b0x[0-9a-fA-F]+\b", text)}
+    placeholders = {int(token, 16)
+                    for token in re.findall(r"\bdata_([0-9a-fA-F]+)\b", text)} - raw
     for ins in instructions:
         if "CALL" not in il_format._il_op_name(ins):
             continue
@@ -1730,9 +1734,11 @@ def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
                 continue
             try:
                 address = int(param.constant)
-                if address in found or address not in rendered:
+                if address in found or (address not in raw and address not in placeholders):
                     continue
                 typed = _char_pointer_parameter(bv, target, index, memo)
+                if address in placeholders and not typed:
+                    continue
                 value = _undefined_c_string(
                     bv, address, min_length=1 if typed else _UNTYPED_STRING_MIN)
             except Exception:  # noqa: BLE001 - one odd operand must not hide the rest
@@ -1765,286 +1771,90 @@ def _c_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _hlil_constant(expr, bv=None) -> int | None:
-    """A displacement constant. An `HLIL_CONST_PTR` counts only when it is not
-    an address in the view: BN types `arg1 + 8` that way on x86-64 when arg1
-    is an integer, while `&tbl + *arg1` adds a real table address to a loaded
-    value, which is a table index, never a slot offset."""
-    op = il_format._il_op_name(expr)
-    if op not in ("HLIL_CONST", "HLIL_CONST_PTR"):
-        return None
-    try:
-        value = int(expr.constant)
-        if op == "HLIL_CONST_PTR" and (bv is None or bv.is_valid_offset(value)):
-            return None
-    except Exception:  # noqa: BLE001 - unknown is not a displacement
-        return None
-    return value
+_RESOLVED_JUMP_OPS = ("HLIL_CONST", "HLIL_CONST_PTR", "HLIL_IMPORT", "HLIL_EXTERN_PTR")
 
 
-_HLIL_DEF_DEPTH = 4
-_GLOBAL_POINTER_OPS = ("HLIL_CONST_PTR", "HLIL_IMPORT", "HLIL_EXTERN_PTR")
-_PASS_THROUGH_OPS = ("HLIL_ZX", "HLIL_SX", "HLIL_LOW_PART")
-
-
-def _hlil_resolved(hlil, expr, params: set, depth: int = 0):
-    """*expr* with a variable replaced by what its definitions assign
-    (`x6_1` -> `*(**(this + 0x18) + 0x10)`), up to a few hops, when every
-    definition assigns the same expression (patchelf's `rax = *arg1` on three
-    paths). A parameter, or anything else, comes back as itself."""
-    while depth < _HLIL_DEF_DEPTH and il_format._il_op_name(expr) == "HLIL_VAR":
-        var = getattr(expr, "var", None)
-        if str(getattr(var, "name", "")) in params:
-            return expr
-        try:
-            defs = list(hlil.get_var_definitions(var) or [])
-        except Exception:  # noqa: BLE001 - no def-use: stop at the variable
-            return expr
-        if not defs or any(il_format._il_op_name(d) not in ("HLIL_VAR_INIT", "HLIL_ASSIGN")
-                           for d in defs):
-            return expr
-        if len({str(d.src) for d in defs}) != 1:
-            return expr
-        expr, depth = defs[0].src, depth + 1
-    return expr
-
-
-def _pointer_root(hlil, expr, params: set, bv=None, depth: int = 0) -> tuple[str, str] | None:
-    """``("param", name)`` or ``("global", text)``: what an index-free pointer
-    expression is computed from, through loads, field offsets and constant
-    displacements only. None as soon as any term is computed from a value --
-    an index, a scaled register, a sum of two loads -- or from a stack
-    address: those are how a jump table or a computed goto's label array is
-    addressed (`*(&tables + (op & 1) * 8)`, `&tbl + *arg1`), and a slot read
-    from one is not a call (#1000 review round 2)."""
-    if depth > 3 * _HLIL_DEF_DEPTH:
-        return None
-    expr = _hlil_resolved(hlil, expr, params)
-    op = il_format._il_op_name(expr)
-    if op == "HLIL_VAR":
-        name = str(getattr(getattr(expr, "var", None), "name", ""))
-        return ("param", name) if name in params else None
-    if op in _GLOBAL_POINTER_OPS:
-        return ("global", str(expr)) if _hlil_constant(expr, bv) is None else None
-    if op in ("HLIL_DEREF", "HLIL_DEREF_FIELD", *_PASS_THROUGH_OPS):
-        return _pointer_root(hlil, getattr(expr, "src", None), params, bv, depth + 1)
-    if op in ("HLIL_ADD", "HLIL_SUB"):
-        left, right = getattr(expr, "left", None), getattr(expr, "right", None)
-        if _hlil_constant(right, bv) is not None:
-            return _pointer_root(hlil, left, params, bv, depth + 1)
-        if op == "HLIL_ADD" and _hlil_constant(left, bv) is not None:
-            return _pointer_root(hlil, right, params, bv, depth + 1)
-    return None
-
-
-def _split_displacement(expr, bv=None) -> tuple[Any, int] | None:
-    """``(base, k)`` for `base + k` with k a displacement constant, ``(expr,
-    0)`` for a bare base, None for a sum with no constant term."""
-    op = il_format._il_op_name(expr)
-    if op == "HLIL_DEREF_FIELD":
-        return getattr(expr, "src", None), int(getattr(expr, "offset", 0) or 0)
-    if op != "HLIL_ADD":
-        return expr, 0
-    left, right = getattr(expr, "left", None), getattr(expr, "right", None)
-    if _hlil_constant(right, bv) is not None:
-        return left, _hlil_constant(right, bv)
-    if _hlil_constant(left, bv) is not None:
-        return right, _hlil_constant(left, bv)
-    return None
-
-
-def _has_label_data_refs(bv, func) -> bool:
-    """Whether data refers to a block inside *func* other than its entry: a
-    computed goto's label array. Such a function's `*(arg1 + 8)` may be
-    `goto *lab[1]` rather than a function-pointer field call."""
+def _is_plt_stub(bv, func) -> bool:
+    """An import stub or the PLT header (`push [..]; jmp [GOT+16]`): its jump
+    is the dynamic linker's business, not code a reader needs explained."""
     try:
         start = int(func.start)
-        return any(int(block.start) != start and list(bv.get_data_refs(int(block.start)) or [])
-                   for block in list(func.basic_blocks))
-    except Exception:  # noqa: BLE001 - unknown is not evidence of labels
+        symbol = bv.get_symbol_at(start)
+        if str(getattr(getattr(symbol, "type", None), "name", "")) in _IMPORT_SYMBOL_KINDS:
+            return True
+        if bool(getattr(func, "is_thunk", False)):
+            return True
+        return any(".plt" in str(getattr(section, "name", ""))
+                   for section in list(bv.get_sections_at(start) or []))
+    except Exception:  # noqa: BLE001 - unknown: treat as ordinary code
         return False
 
 
-def _call_pointer_source(bv, func, hlil, dest, params: set,
-                         pointer_size: int) -> dict[str, Any] | None:
-    """Where an indirect jump's target comes from, when that is evidence of a
-    CALL, else None:
-
-      * ``param``: the target is a parameter (`return fn(x + 1)`);
-      * ``global``: a function pointer loaded from a global (`return gfp(x)`);
-      * ``table``: slot k of a function table whose pointer is itself loaded
-        from an object rooted at a parameter or a global (`*(*(obj) + 0x10)`,
-        a C++ vtable or a C ops struct);
-      * ``field``: a function pointer at a constant offset from a
-        parameter-rooted address (`*(arg1 + 8)`), unless the function has a
-        computed goto's label array, where that shape is `goto *lab[1]`.
-
-    Every pointer on the way must be index-free (`_pointer_root`): a target
-    read through an index -- a jump table, `goto *tables[i][0]`, `jmp
-    [rax + tbl]` -- is a switch BN did not resolve, not a call, and gets no
-    warning (#1000 review rounds 1 and 2)."""
-    if pointer_size <= 0:
-        return None
-    target = _hlil_resolved(hlil, dest, params)
-    op = il_format._il_op_name(target)
-    if op == "HLIL_VAR":
-        name = str(getattr(getattr(target, "var", None), "name", ""))
-        return {"kind": "param", "base": name} if name in params else None
-    if op not in ("HLIL_DEREF", "HLIL_DEREF_FIELD"):
-        return None
-    src = getattr(target, "src", None)
-    if (op == "HLIL_DEREF" and il_format._il_op_name(src) in _GLOBAL_POINTER_OPS
-            and _hlil_constant(src, bv) is None):
-        return {"kind": "global", "base": str(target)}
-    split = _split_displacement(target if op == "HLIL_DEREF_FIELD" else src, bv)
-    if split is None:
-        return None
-    base, offset = split
-    base = _hlil_resolved(hlil, base, params)
-    root = _pointer_root(hlil, base, params, bv)
-    if root is None:
-        return None
-    if il_format._il_op_name(base) in ("HLIL_DEREF", "HLIL_DEREF_FIELD"):
-        if offset % pointer_size:
-            return None
-        return {"kind": "table", "object": str(getattr(base, "src", "?")),
-                "slot": offset // pointer_size, "virtual": root == ("param", "this")}
-    if root[0] == "param" and not _has_label_data_refs(bv, func):
-        return {"kind": "field", "base": str(base), "offset": offset}
-    return None
-
-
 def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
-    """Indirect tail calls BN left as unresolved jumps (#1000 item 3).
+    """Indirect jumps that leave *func* with no target BN resolved (#1000 item 3).
 
-    BN renders one as `❓ /* jump -> <expr> */`: no callee, no arguments, and
-    no warning. A C++ virtual tail call (`return inner->dispatch(msg, b, a)`)
-    comes out that way while its type is unknown, hiding which arguments it
-    forwards and in what order. A jump is reported only when it leaves the
-    function (no successor block) AND its target is a code pointer loaded
-    from memory the way a call's is (`_call_pointer_source`): an unresolved
-    switch or computed goto also has no successor block, and calling it a
-    tail call -- with its index register as an "argument" -- was false. One
-    row per jump, with the argument registers it hands on: the ones the jump
-    site writes and nothing reads (`_argument_setup_count`) and this
-    function's own register parameters, which a tail call passes through,
-    minus the register holding the jump target. Never raises."""
+    BN renders one as `❓ /* jump -> <expr> */` with no warning. It is EITHER
+    a tail call through a pointer -- whose arguments sit unrendered in the
+    argument registers at the jump -- OR a computed goto / jump table BN
+    could not follow. Telling the two apart from the IL failed three review
+    rounds (a dispatch BN split into its own function, a label stored into a
+    global first, an object picked by an index), so this states both and
+    claims neither; the classification is a follow-up. A jump with a
+    successor block (one BN resolved), an import stub and the PLT header are
+    skipped. One row per jump. Never raises."""
+    if _is_plt_stub(bv, func):
+        return []
     try:
         hlil = getattr(func, "hlil", None) or getattr(func, "high_level_il", None)
         statements = list(hlil.instructions) if hlil is not None else []
-        cc = getattr(func, "calling_convention", None)
-        arg_regs = [_full_reg(bv.arch, str(r)) for r in (getattr(cc, "int_arg_regs", None) or [])]
-        pointer_size = int(getattr(bv, "address_size", 0) or getattr(bv.arch, "address_size", 8))
-        param_vars = list(getattr(func, "parameter_vars", None) or [])
     except Exception:  # noqa: BLE001 - no HLIL means nothing rendered to explain
         return []
-    params = {str(getattr(var, "name", "")) for var in param_vars}
     rows: list[dict[str, Any]] = []
     for ins in statements:
         if il_format._il_op_name(ins) != "HLIL_JUMP":
             continue
         try:
-            source = _call_pointer_source(bv, func, hlil, getattr(ins, "dest", None), params,
-                                          pointer_size)
-            if source is None:
+            dest = getattr(ins, "dest", None)
+            if il_format._il_op_name(dest) in _RESOLVED_JUMP_OPS:
                 continue
             address = int(ins.address)
-            llil = func.get_llil_at(address)
-            block = getattr(llil, "il_basic_block", None)
+            block = getattr(func.get_llil_at(address), "il_basic_block", None)
             if block is None or list(getattr(block, "outgoing_edges", None) or []):
                 continue
-            window: list = []
-            for item in block:
-                if int(getattr(item, "instr_index", -1)) == int(getattr(llil, "instr_index", -2)):
-                    break
-                op = il_format._il_op_name(item)
-                if "CALL" in op or op == "LLIL_SYSCALL":
-                    window.clear()
-                else:
-                    window.append(item)
-            jump_reg = getattr(getattr(llil, "dest", None), "src", None)
-            excluded = {_full_reg(bv.arch, str(getattr(jump_reg, "name", "")))}
-            _setup, writes = _argument_setup_count(bv.arch, window, arg_regs) if arg_regs else (0, {})
-            own = {_register_name(bv.arch, var) for var in param_vars}
-            passed = [reg for reg in arg_regs
-                      if (reg in writes or reg in own) and reg not in excluded]
-            count = arg_regs.index(passed[-1]) + 1 if passed else 0
-            values = _window_values(bv, func, window, set())
         except Exception:  # noqa: BLE001 - one odd jump must not hide the rest
             continue
-        rows.append({
-            "address": address,
-            "target": str(getattr(ins, "dest", "")),
-            "source": source,
-            "registers": [reg for reg in arg_regs[:count] if reg not in excluded],
-            "writes": [(reg, values.get(reg)) for reg in writes if reg not in excluded],
-        })
+        rows.append({"address": address, "target": str(dest)})
     return rows
 
 
-def _register_span(registers: list[str]) -> str:
-    return registers[0] if len(registers) == 1 else f"{registers[0]}-{registers[-1]}"
-
-
-def _jump_line_note(row: dict[str, Any]) -> str:
-    written = ", ".join(f"{reg} = {value}" if value else reg for reg, value in row["writes"])
-    args = (f", args {_register_span(row['registers'])} not rendered"
-            if row["registers"] else "")
-    return (f"/* bn: indirect tail call{args}"
-            + (f"; set here: {written}" if written else "") + " */")
-
-
-def _jump_through(source: dict[str, Any]) -> str:
-    kind = source["kind"]
-    if kind == "table":
-        if source["virtual"]:
-            return f"vtable slot {source['slot']} of {source['object']}"
-        return f"slot {source['slot']} of the function table loaded from {source['object']}"
-    if kind == "field":
-        return f"the function pointer at {source['base']} + {hex(source['offset'])}"
-    if kind == "param":
-        return f"the function pointer passed in {source['base']}"
-    return f"the function pointer in {source['base']}"
-
-
-_JUMP_EVIDENCE = {
-    "table": ("its target is a word at a constant offset in a table whose pointer is itself "
-              "loaded from an object -- a vtable, or a C struct of function pointers"),
-    "field": "its target is a code pointer loaded from a parameter's pointee",
-    "param": "its target is a parameter",
-    "global": "its target is a code pointer loaded from a global",
-}
+_JUMP_LINE_NOTE = "/* bn: unresolved jump: a tail call (args not rendered) or a computed goto */"
 
 
 def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[str, Any]:
+    """The neutral `jump` warning: what `❓` means, the target, and both
+    readings with how to check each. It never says which one this is."""
     where = hex(row["address"])
-    source = row["source"]
-    through = _jump_through(source)
-    written = ", ".join(f"{reg} = {value}" if value else reg for reg, value in row["writes"])
-    table = source["kind"] == "table"
+    try:
+        cc = getattr(func, "calling_convention", None)
+        arg_regs = [str(r) for r in (getattr(cc, "int_arg_regs", None) or [])]
+    except Exception:  # noqa: BLE001
+        arg_regs = []
+    regs = f" ({', '.join(arg_regs)})" if arg_regs else ""
     detail = (
-        f"unresolved indirect jump at {where}: BN renders it as `❓ /* jump -> ... */` "
-        "(the ❓ marks control flow it could not resolve), so neither the callee nor its "
-        f"arguments appear. It leaves the function and {_JUMP_EVIDENCE[source['kind']]}, "
-        "and no index went into it, so it is an indirect tail call through "
-        f"{through}. "
-        + (f"Argument registers {_register_span(row['registers'])} reach the callee "
-           "unrendered"
-           + (f"; the jump site sets {written} just before it, so their order can differ "
-              "from this function's parameters" if written else "")
-           + ". " if row["registers"] else "")
-        + ("The jump line carries a `/* bn: ... */` note. " if inline else "")
-        + f"Read the set-up in `bn disasm {hex(int(func.start))}`"
-        + ("; giving the object a type whose table is a struct of function pointers may "
-           "let BN render the call by name with its arguments." if table else ".")
+        f"unresolved indirect jump at {where} to `{row['target']}`: BN renders it as "
+        "`❓ /* jump -> ... */` -- the ❓ marks control flow it could not resolve -- and "
+        "the jump leaves the function. It is one of two things, and the IL alone does "
+        "not say which. A tail call through a pointer: the callee's arguments are then "
+        f"in the argument registers{regs} at the jump and are not rendered; read them "
+        f"in `bn disasm {where}`, and type the callee (`bn proto set`) or the object the "
+        "pointer is loaded from so BN can render the call. Or a computed goto or jump "
+        "table BN did not resolve: the code it reaches may be missing from this "
+        "decompile; read the targets in `bn disasm`."
+        + (" The jump line carries a `/* bn: ... */` note." if inline else "")
     )
-    unrendered = (f"callee and args {_register_span(row['registers'])} not rendered"
-                  if row["registers"] else "callee not rendered")
-    summary = (f"{'virtual' if table and source['virtual'] else 'indirect'} tail call at "
-               f"{where} through {through}: {unrendered}")
-    return _warning_row("jump", summary, detail, address=where,
-                        registers=row["registers"], target_kind=source["kind"],
-                        slot=source["slot"] if table else None)
+    summary = (f"unresolved jump at {where} (❓): a tail call whose args are not rendered, "
+               f"or a computed goto/jump table; read it in `bn disasm {where}`")
+    return _warning_row("jump", summary, detail, address=where, target=row["target"])
 
 
 _OFFSET_RE = re.compile(r"__offset\((.+?), (-?(?:0x[0-9a-fA-F]+|\d+))\)")
@@ -2216,7 +2026,7 @@ def _decompile(
     for row in arity:
         line_notes.setdefault(row["address"], []).append(_arity_line_note(row))
     for row in jumps:
-        line_notes.setdefault(row["address"], []).append(_jump_line_note(row))
+        line_notes.setdefault(row["address"], []).append(_JUMP_LINE_NOTE)
     placed: set[int] = set()
     text = il_format._decompile_text(bv, func, addresses=addresses,
                                      line_notes=line_notes, placed=placed)

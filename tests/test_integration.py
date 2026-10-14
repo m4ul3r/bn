@@ -4204,10 +4204,11 @@ class TestStringsReadImportsBurndownG:
         assert shared_bn.run("imports", "--count").returncode == 0
 
 
-# #1000 item 3 / #994 item 2 (review rounds 1-2): which unresolved jumps are
-# tail calls, and a short literal BN renders as `&data_<addr>`. Built at -O2
-# because the shapes only exist after the compiler forms tail calls; AArch64
-# for the type library whose `setlocale(int32_t, int64_t*)` hides the string.
+# #1000 item 3 / #994 item 2: unresolved jumps out of a function (pointer tail
+# calls and computed gotos), and a short literal BN renders as `&data_<addr>`.
+# Built at -O2 because the shapes only exist after the compiler forms tail
+# calls; AArch64 for the type library whose `setlocale(int32_t, int64_t*)`
+# hides the string.
 _TAIL_JUMPS_C = r"""
 #include <locale.h>
 typedef int (*fn_t)(int);
@@ -4277,39 +4278,34 @@ def tail_jump_binaries(tmp_path_factory) -> dict[str, Path]:
 
 
 @pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
-class TestDecompileTailJumps1000:
-    """A real tail call through a pointer is named; a jump read through an
-    indexed table base -- a computed goto, `jmp [rax + tbl]` -- never is."""
+class TestDecompileUnresolvedJumps1000:
+    """An unresolved jump out of a function -- a pointer tail call or a
+    computed goto alike -- gets one neutral `jump` row and one line note, and
+    neither ever claims which it is. Which fixtures the compiler leaves as
+    jumps varies by gcc version, so only the population is pinned, not which
+    function lands in it."""
 
-    def _jumps(self, shared_bn, function):
-        rows = shared_bn.json("decompile", function)["warning_rows"]
-        return [row for row in rows if row["code"] == "jump"]
-
-    def test_pointer_tail_calls_are_named(self, shared_bn, tail_jump_binaries, arch):
+    def test_every_jump_row_is_neutral_and_marks_its_line(self, shared_bn, tail_jump_binaries,
+                                                           arch):
         shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
-        kinds = {}
-        for function in ("tc_param", "tc_global", "tc_field", "tc_table"):
-            jumps = self._jumps(shared_bn, function)
-            if jumps:
-                kinds[function] = jumps[0]["target_kind"]
-                assert "virtual" not in jumps[0]["summary"], jumps  # plain C, no `this`
-        # The compiler may emit a real `call`/`b` for some of these (no `❓` to
-        # explain); every one it left as an unresolved jump must be named.
-        text = {f: shared_bn.json("decompile", f)["text"] for f in kinds.keys() | {
-            "tc_param", "tc_global", "tc_field", "tc_table"}}
-        unexplained = [f for f, body in text.items() if "jump ->" in body and f not in kinds]
-        assert not unexplained, (unexplained, text)
-        expected = {"tc_param": "param", "tc_global": "global", "tc_field": "field",
-                    "tc_table": "table"}
-        assert all(expected[f] == kind for f, kind in kinds.items()), kinds
-        # Measured: all four are tail jumps at -O2 on both architectures.
-        assert set(kinds) == set(expected), kinds
-
-    def test_indexed_jumps_are_not_called_tail_calls(self, shared_bn, tail_jump_binaries, arch):
-        shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
-        for function in ("labels2", "idxjump"):
-            assert self._jumps(shared_bn, function) == [], function
-            assert "bn: indirect tail call" not in shared_bn.json("decompile", function)["text"]
+        rows_seen = 0
+        for function in ("tc_param", "tc_global", "tc_field", "tc_table", "labels2",
+                         "idxjump"):
+            result = shared_bn.json("decompile", function)
+            jumps = [row for row in result["warning_rows"] if row["code"] == "jump"]
+            rows_seen += len(jumps)
+            for row in jumps:
+                assert "tail call" in row["summary"] and "computed goto" in row["summary"], row
+                for claim in ("virtual", "slot", "through the function pointer"):
+                    assert claim not in row["summary"] and claim not in row["detail"], row
+                assert row["target"] and f"`{row['target']}`" in row["detail"], row
+            noted = [line for line in result["text"].splitlines()
+                     if "/* bn: unresolved jump" in line]
+            assert len(noted) == len(jumps), (function, result["text"])
+            # Never on the signature line, always on BN's `jump ->` line.
+            assert all("jump ->" in line for line in noted), noted
+        # At -O2 at least the pointer tail calls are jumps on every gcc measured.
+        assert rows_seen >= 1
 
 
 class TestShortLiteralBehindDataName994:

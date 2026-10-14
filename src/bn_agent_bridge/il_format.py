@@ -995,7 +995,8 @@ def _pseudo_c_text(func, *, addresses: bool = False,
                 # not on the prefixed string).
                 out.append("")
                 continue
-            if not seen_content:
+            header = not seen_content
+            if header:
                 # BN indents the function-header (signature) line by two
                 # spaces; the braces and body don't share that indent, so
                 # left-justify the header to line up with them.
@@ -1003,7 +1004,9 @@ def _pseudo_c_text(func, *, addresses: bool = False,
                 seen_content = True
             addr = getattr(line.contents, "address", None)
             noted = None
-            if (line_notes and addr is not None
+            # Never on the signature: it carries the entry address too, so a
+            # jump at a function's first instruction put its note there (#1000).
+            if (line_notes and addr is not None and not header
                     and int(addr) in line_notes and int(addr) not in (placed or ())):
                 noted = _with_line_note(text, " ".join(line_notes[int(addr)]))
             if noted is not None:
