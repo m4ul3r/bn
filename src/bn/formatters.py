@@ -2695,9 +2695,14 @@ def _group_refs_by_caller(refs: list[Any], *, mangled: bool = False) -> list[dic
                          else "vtable for")
                 label = f"{table} {vslot['class']} [slot {vslot.get('slot_index', '?')}]"
             else:
-                # A run of code pointers the slot walk could not resolve.
-                maybe = (" [may be a vtable slot]"
-                         if ref.get("vtable_slot_undecided") is True else "")
+                # A ref the slot reader could not decide: say so, and name the
+                # slot it would be when a header was found (#998 review).
+                undecided_slot = _field_dict(ref, "vtable_slot_undecided")
+                candidate = _field_dict(undecided_slot, "candidate")
+                maybe = ("" if not undecided_slot
+                         else f" [may be slot {candidate.get('slot_index', '?')} of "
+                              f"{candidate.get('class', '?')}, unconfirmed]" if candidate.get("class")
+                         else " [may be a vtable slot]")
                 label = (_unknown_ref_label(_field_dict(ref, "context"))
                          or ("" if fn_label is None else str(fn_label))) + maybe
             if label:
@@ -3979,7 +3984,8 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         has_more = bool(value.get("has_more"))
         caller_scan_note = value.get("caller_scan_note")
         vtable_note = _callsites_vtable_note(value.get("vtable_slots"),
-                                             value.get("vtable_slots_undecided"))
+                                             value.get("vtable_slots_undecided"),
+                                             value.get("vtable_slots_undecided_counts"))
         value = _field_list(value, "items")
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -4148,14 +4154,21 @@ def _vtable_table_phrase(slot: dict[str, Any]) -> str:
     return "of"
 
 
-def _callsites_vtable_note(raw_slots: Any, raw_undecided: Any = None) -> str | None:
-    """#998 item 1: the callee sits in vtable slots, so its virtual callers --
-    which no call instruction names -- are absent from the rows above. One
-    phrase per (slot, offset, table), the classes whose tables hold it. Data
-    refs the slot walk could not decide are disclosed too. Read through the
-    choke point so a skewed field is disclosed, not dropped."""
+#: Why a data ref may be a vtable slot this read could not confirm (#998).
+_UNDECIDED_SLOT_REASONS = {
+    "walk_budget_exhausted": "the slot walk's per-call budget ran out before reaching them",
+    "no_vtable_symbol": ("a vtable-shaped header precedes them, but no `_ZTV` symbol of "
+                         "that class bounds the table (a stripped binary, or data shaped "
+                         "like a vtable)"),
+    "slot_unresolved": "an entry of the table before them could not be read",
+}
+
+
+def _vtable_slot_phrase(slots: list[Any]) -> str:
+    """``slot 3 (+0x18) of A, B; slot 2 (+0x10) of the secondary vtable ...``:
+    one phrase per (slot, offset, table), the classes whose tables hold it."""
     groups: dict[tuple[str, str, str], list[str]] = {}
-    for slot in _field_list({"vtable_slots": raw_slots}, "vtable_slots"):
+    for slot in slots:
         if not isinstance(slot, dict):
             continue
         key = (str(slot.get("slot_index", "?")), str(slot.get("slot_offset", "?")),
@@ -4165,18 +4178,47 @@ def _callsites_vtable_note(raw_slots: Any, raw_undecided: Any = None) -> str | N
             groups[key] = []
         if cls not in groups[key]:
             groups[key].append(cls)
+    return "; ".join(f"slot {index} (+{offset}) {table} {', '.join(classes)}"
+                     for (index, offset, table), classes in groups.items())
+
+
+def _callsites_vtable_note(raw_slots: Any, raw_undecided: Any = None,
+                           raw_counts: Any = None) -> str | None:
+    """#998 item 1: the callee sits in vtable slots, so its virtual callers --
+    which no call instruction names -- are absent from the rows above. Data
+    refs the slot reader could not decide are disclosed per reason: the full
+    count (``vtable_slots_undecided_counts``), at most three addresses, and
+    the slots the first three would be when known. Read through the choke
+    point so a skewed field is disclosed, not dropped."""
     notes = []
-    if groups:
-        where = "; ".join(f"slot {index} (+{offset}) {table} {', '.join(classes)}"
-                          for (index, offset, table), classes in groups.items())
+    where = _vtable_slot_phrase(_field_list({"vtable_slots": raw_slots}, "vtable_slots"))
+    if where:
         notes.append(f"note: the callee is a vtable slot -- {where}; virtual calls through "
                      "it are not direct callsites and are not listed above")
-    undecided = [str(a) for a in _field_list({"vtable_slots_undecided": raw_undecided},
-                                             "vtable_slots_undecided")]
-    if undecided:
-        notes.append(f"note: {len(undecided)} data ref(s) to the callee ({', '.join(undecided)}) "
-                     "sit in a run of code pointers too long to walk back to a vtable header; "
-                     "they may be vtable slots, so virtual callers are not ruled out")
+    counts = _field_dict({"vtable_slots_undecided_counts": raw_counts},
+                         "vtable_slots_undecided_counts")
+    by_reason: dict[str, list[dict[str, Any]]] = {}
+    for item in _field_list({"vtable_slots_undecided": raw_undecided}, "vtable_slots_undecided"):
+        if isinstance(item, dict):
+            reason = str(item.get("reason") or "?")
+            if reason not in by_reason:
+                by_reason[reason] = []
+            by_reason[reason].append(item)
+    for reason in counts:
+        if str(reason) not in by_reason:
+            by_reason[str(reason)] = []
+    for reason, items in by_reason.items():
+        stated = counts.get(reason)
+        total = stated if isinstance(stated, int) and stated >= len(items) else len(items)
+        shown = ", ".join(str(i.get("address", "?")) for i in items[:3])
+        more = f", +{total - min(len(items), 3)} more" if total > min(len(items), 3) else ""
+        candidates = _vtable_slot_phrase(
+            [c for c in (_field_dict(i, "candidate") for i in items[:3]) if c])
+        maybe = f"; the first would be {candidates}" if candidates else ""
+        why = _UNDECIDED_SLOT_REASONS.get(reason, reason)
+        notes.append(f"note: {total} data ref(s) to the callee ({shown}{more}) may be "
+                     f"vtable slots, unconfirmed: {why}{maybe}; virtual callers are not "
+                     "ruled out")
     return "\n".join(notes) if notes else None
 
 
@@ -7391,10 +7433,19 @@ def _render_class_list_text(value: Any) -> str:
         # who knows the class by the expanded template spelling finds the row.
         aliases = ", ".join(str(a) for a in _field_list(rec, "aliases") if a)
         aka_s = f"  (aka {aliases})" if aliases else ""
+        # #998 review: an unknown size computed by `--sizes` (or a BN type that
+        # may omit virtual bases) says why, with the bounds the evidence allows,
+        # as the `class show` card does. `not_computed` gets the footer below.
+        row_reason = _text_value(rec, "size_reason")
+        why_s = ""
+        if size_s is None and row_reason and row_reason != "not_computed":
+            bounds = [f"at least {lb}" for lb in [_text_value(rec, "size_lower_bound")] if lb]
+            bounds += [f"at most {ub}" for ub in [_text_value(rec, "size_upper_bound")] if ub]
+            why_s = f" ({'; '.join([row_reason, *bounds])})"
         lines.append(
             f"  {rec.get('name', '<unknown>')}  "
             f"methods={methods}  {vt}  "
-            f"size={size_s if size_s is not None else '?'}  "
+            f"size={size_s if size_s is not None else '?'}{why_s}  "
             f"[{rec.get('confidence', '?')}]{base_s}{art_s}{aka_s}"
         )
     uncomputed = sum(1 for rec in rows
@@ -7506,9 +7557,10 @@ def _render_one_class(rec: Any) -> str:
     size_reason = _text_value(rec, "size_reason")
     if size_s is None and size_reason:
         # #998 item 4: an unknown size says which recovery outcome it hit,
-        # and the largest size the evidence still allows.
-        bound = _text_value(rec, "size_upper_bound")
-        bound_s = f"; at most {bound}" if bound else ""
+        # and the bounds the evidence still allows.
+        lower = _text_value(rec, "size_lower_bound")
+        upper = _text_value(rec, "size_upper_bound")
+        bound_s = (f"; at least {lower}" if lower else "") + (f"; at most {upper}" if upper else "")
         lines.append(f"  size: unknown ({size_reason}{bound_s})")
     # #922 (d): one class, several demangled spellings -- the card is the merge.
     for alias in _field_list(rec, "aliases"):

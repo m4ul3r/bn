@@ -32,6 +32,7 @@ CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
 VCALLS_BINARY = FIXTURES_DIR / "vcalls_x86_64"
 SIZES_BINARY = FIXTURES_DIR / "sizes_x86_64"
+SLOTS_BINARY = FIXTURES_DIR / "slots_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -3953,14 +3954,17 @@ class TestVirtualMethodsAndClassSize998:
     #: `src/sizes.cpp`'s `static_assert`ed sizes.
     REAL_SIZES = {"sz::Plain": 0x28, "sz::Inl": 0x10, "sz::Elem": 0x10, "sz::Inner": 0x10,
                   "sz::Gadget": 0x10, "sz::PBase": 0x8, "sz::Base": 0x10, "sz::Leaf": 0x40,
-                  "sz::PB": 0x10, "sz::PD": 0x50, "sz::Rec": 0x18}
+                  "sz::PB": 0x10, "sz::PD": 0x50, "sz::Rec": 0x18, "sz::Trailing": 0x10,
+                  "sz::Trail": 0x8, "sz::Header": 0x8, "sz::VD0": 0xb0}
 
     def test_a_reported_size_is_never_an_allocation_that_is_not_the_class(self, shared_bn):
         # #998 review blockers: array new, a polymorphic member at offset 0
         # (ctor inlined or not), placement new, a derived ctor inlined around
         # an out-of-line base ctor (polymorphic or not, the vptr store through
-        # an SSA copy), and a final class's inlined destructor re-stamping the
-        # base vptr each reported the ALLOCATION as the class size.
+        # an SSA copy), a final class's inlined destructor re-stamping the
+        # base vptr (round 1), and a ctor writing trailing storage or its
+        # enclosing object's payload (round 2) each reported an ALLOCATION as
+        # the class size.
         shared_bn.load(SIZES_BINARY)
         listing = self._json(shared_bn, "class", "list", "--query", "sz::", "--sizes")
         rows = {row["name"]: row for row in listing["items"]}
@@ -3969,23 +3973,48 @@ class TestVirtualMethodsAndClassSize998:
             card = self._json(shared_bn, "class", "show", name)
             for reported in (card["size"], rows[name]["size"]):
                 assert reported is None or int(reported["value"], 16) == real, (name, reported)
-        # What the exact readers do establish: the deleting destructor's sized
-        # delete for every class with a virtual destructor, and a constructor
-        # that writes every byte of its allocation for one without.
+        # What establishes a size: the sized delete in the deleting destructor
+        # of every class with a virtual destructor.
         for name in ("sz::Plain", "sz::Base", "sz::Leaf", "sz::PB", "sz::PD"):
             assert rows[name]["size"]["source"] == "deleting_destructor", rows[name]
-        rec = self._json(shared_bn, "class", "show", "sz::Rec")
-        assert rec["size"] == {"value": "0x18", "source": "operator_new",
-                               "at": rec["instances"]["construction_sites"][0]["allocation"]}
-        # The rest stay unknown, with the allocation as a disclosed upper bound.
-        for name, bound in (("sz::Inner", "0x50"), ("sz::Gadget", "0x100"), ("sz::PBase", "0x58")):
+        # Everything else stays unknown, with its allocation as a disclosed upper
+        # bound -- including `Rec`, whose ctor fills its allocation exactly, and
+        # `Trailing`/`Trail`/`Header`, whose ctors fill past their own object.
+        for name, bound in (("sz::Inner", "0x50"), ("sz::Gadget", "0x100"),
+                            ("sz::PBase", "0x58"), ("sz::Rec", "0x18"),
+                            ("sz::Trailing", "0x50"), ("sz::Trail", "0x10"),
+                            ("sz::Header", "0x48")):
             card = self._json(shared_bn, "class", "show", name)
-            assert (card["size_reason"], card["size_upper_bound"]) == (
-                "allocation_upper_bound_only", bound), card
+            assert (card["size"], card["size_reason"], card["size_upper_bound"]) == (
+                None, "allocation_upper_bound_only", bound), card
+            assert (rows[name]["size_reason"], rows[name]["size_upper_bound"]) == (
+                "allocation_upper_bound_only", bound), rows[name]
         # The default listing reads only BN types and says so.
         default = self._json(shared_bn, "class", "list", "--query", "sz::Plain")
         assert default["items"][0]["size"] is None
         assert default["items"][0]["size_reason"] == "not_computed"
+
+    def test_a_bn_type_of_a_class_with_virtual_bases_is_only_a_lower_bound(self, shared_bn):
+        # #998 review round 2: cmake's `std::istream` type (0x10) covers only
+        # the non-virtual part of a 0x118 class, and the default listing
+        # printed it as the size. `VD0 : virtual VB0` is 0xb0; a declared type
+        # of its non-virtual part is 0x10.
+        shared_bn.load(SIZES_BINARY)
+        declared = shared_bn.run("types", "declare", "struct `sz::VD0` { void* vptr; long d; };")
+        assert declared.returncode == 0, (declared.stdout, declared.stderr)
+        for args in (("class", "list", "--query", "sz::VD0"),
+                     ("class", "list", "--query", "sz::VD0", "--sizes")):
+            (row,) = self._json(shared_bn, *args)["items"]
+            assert (row["size"], row["size_reason"], row["size_lower_bound"]) == (
+                None, "bn_type_may_exclude_virtual_bases", "0x10"), row
+        card = self._json(shared_bn, "class", "show", "sz::VD0")
+        assert (card["size"], card["size_lower_bound"], card["size_upper_bound"]) == (
+            None, "0x10", "0xb0"), card
+        # A class proven free of virtual bases keeps its BN type as the size.
+        declared = shared_bn.run("types", "declare", "struct `sz::Rec` { long a; long b; long c; };")
+        assert declared.returncode == 0, (declared.stdout, declared.stderr)
+        (row,) = self._json(shared_bn, "class", "list", "--query", "sz::Rec")["items"]
+        assert row["size"] == {"value": "0x18", "source": "bn_type"}, row
 
     def test_vcalls_sizes_come_from_exact_evidence(self, shared_bn):
         shared_bn.load(VCALLS_BINARY)
@@ -3997,6 +4026,35 @@ class TestVirtualMethodsAndClassSize998:
         # construction site with no allocation to read.
         assert sites["vc::AudioDisp::AudioDisp"]["allocation_size"] is None
         assert self._json(shared_bn, "class", "show", "vc::AudioDisp")["size"]["value"] == "0x80"
+
+    def test_data_shaped_like_a_vtable_slot_is_never_confirmed(self, shared_bn):
+        # #998 review round 2 (`src/slots.cpp`, -O2): the word right after
+        # Short's 70 slots (`adjacent_table`) and a `{0, &typeid(X), fx}`
+        # registry were confirmed as slots 70 of Short and 0 of X.
+        shared_bn.load(SLOTS_BINARY)
+        adjacent = self._json(shared_bn, "callsites", "_Z8adjacenti")
+        assert adjacent["vtable_slots"] == [] and adjacent["vtable_slots_undecided"] == []
+        assert "adjacent_table" in shared_bn.run("xrefs", "_Z8adjacenti").stdout
+        registry = self._json(shared_bn, "callsites", "_Z2fxi")
+        assert registry["vtable_slots"] == [], registry["vtable_slots"]
+        assert [u["reason"] for u in registry["vtable_slots_undecided"]] == ["no_vtable_symbol"]
+        # The real table's slots are still confirmed, past the 64-slot window too.
+        for raw, index in (("_ZN5Short2m3Ev", 3), ("_ZN5Short3m69Ev", 69)):
+            out = self._json(shared_bn, "callsites", raw)
+            assert [(s["class"], s["slot_index"]) for s in out["vtable_slots"]] == [
+                ("Short", index)], out
+
+    def test_a_long_pointer_table_stays_fast(self, shared_bn):
+        # #998 review round 2: a 4865-entry table made `callsites` time out at
+        # 600 s (0.3 s on base); every ref walked back over the whole run.
+        shared_bn.load(SLOTS_BINARY)
+        for args in (("callsites", "_Z4hdefi", "--format", "json"), ("xrefs", "_Z4hdefi")):
+            started = time.monotonic()
+            res = shared_bn.run(*args)
+            assert res.returncode == 0, (res.stdout, res.stderr)
+            assert time.monotonic() - started < 30, args
+        out = self._json(shared_bn, "callsites", "_Z4hdefi")
+        assert out["vtable_slots"] == [] and out["vtable_slots_undecided"] == []
 
 
 class TestStructLayoutAssistance903:

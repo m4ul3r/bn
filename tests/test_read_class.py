@@ -922,18 +922,20 @@ _NO_SIZE = read_class._SizeFinding(None, "no_size_evidence", None)
 
 
 class _SlotRefCtx:
-    """Two tables in fake memory: `Base` @ 0x9000 (slots at 0x9010) and
-    `Derived` @ 0x9100 (slots at 0x9110). Each table's word[1] is its typeinfo;
-    slot words are code pointers, which are not typeinfo."""
+    """Tables in fake memory: `Base` @ 0x9000 (slots at 0x9010) and `Derived`
+    @ 0x9100 (slots at 0x9110). Each table's word[1] is its typeinfo; slot
+    words are code pointers, which are not typeinfo. Counts word reads."""
 
     def __init__(self, words, tables):
         self._words = words
         self._tables = tables          # vtable addr -> [slot values]
+        self.reads = 0
 
     def _pointer_size(self, bv):
         return 8
 
     def _read_pointer_value(self, bv, addr, *, size=None):
+        self.reads += 1
         return self._words.get(addr)
 
     def _typeinfo_name_at(self, bv, addr):
@@ -954,11 +956,24 @@ class _SlotRefCtx:
         return None
 
 
-def _slot_bv(data_refs):
-    """A view whose code is 0x400000-0x403000 (what a vtable entry may hold)."""
+def _sym(address, raw, short=None):
+    return types.SimpleNamespace(address=address, raw_name=raw, short_name=short or raw)
+
+
+_BASE_ZTV = _sym(0x9000, "_ZTV4Base", "vtable for Base")
+_DERIVED_ZTV = _sym(0x9100, "_ZTV7Derived", "vtable for Derived")
+
+
+def _slot_bv(data_refs, symbols=()):
+    """A view whose code is 0x400000-0x403000 (what a vtable entry may hold),
+    with the given symbols."""
+    symbols = list(symbols)
     return types.SimpleNamespace(
         get_data_refs=lambda addr: data_refs.get(addr, []),
-        get_function_at=lambda addr: object() if 0x400000 <= addr < 0x403000 else None)
+        get_function_at=lambda addr: object() if 0x400000 <= addr < 0x403000 else None,
+        get_symbol_at=lambda addr: next((s for s in symbols if s.address == addr), None),
+        get_symbols=lambda start, length: [s for s in symbols
+                                           if start <= s.address < start + length])
 
 
 def test_vtable_slots_referencing_names_each_table_and_slot_998():
@@ -971,7 +986,7 @@ def test_vtable_slots_referencing_names_each_table_and_slot_998():
              0x94f8: 0x7777, 0x9500: reg}
     ctx = _SlotRefCtx(words, {0x9000: [0x400100, other, reg],
                               0x9100: [0x400200, 0x402100, reg]})
-    bv = _slot_bv({reg: [0x9020, 0x9120, 0x9500], other: [0x9018]})
+    bv = _slot_bv({reg: [0x9020, 0x9120, 0x9500], other: [0x9018]}, [_BASE_ZTV, _DERIVED_ZTV])
 
     found = read_class._vtable_slots_referencing(ctx, bv, reg)
     assert found.slots == [
@@ -991,20 +1006,68 @@ def test_vtable_slots_referencing_requires_the_decoded_slot_to_hold_the_target_9
     target = 0x401000
     words = {0x9000: 0, 0x9008: 0x9800, 0x9010: 0x400100, 0x9018: 0x401100, 0x9020: target}
     ctx = _SlotRefCtx(words, {0x9000: [0x400100]})
-    found = read_class._vtable_slots_referencing(ctx, _slot_bv({target: [0x9020]}), target)
+    found = read_class._vtable_slots_referencing(
+        ctx, _slot_bv({target: [0x9020]}, [_BASE_ZTV]), target)
     assert found == read_class._SlotRefs([], [])
+
+
+def test_data_shaped_like_a_vtable_is_never_a_confirmed_slot_998():
+    """#998 review round 2: a registry entry `{0, &typeid(X), fn}` has a
+    vtable header's shape, and the word right after a table looks like one
+    more slot. Only the class's own `_ZTV` symbol, with no other object's
+    symbol before the ref, confirms a slot."""
+    fn = 0x401000
+    # `regs` @ 0x9000 is {0, &typeid(Base), fn}; no `_ZTV4Base` precedes it.
+    words = {0x9000: 0, 0x9008: 0x9800, 0x9010: fn}
+    ctx = _SlotRefCtx(words, {0x9000: [fn]})
+    registry = read_class._vtable_slots_referencing(
+        ctx, _slot_bv({fn: [0x9010]}, [_sym(0x9000, "regs")]), fn)
+    assert registry.slots == []
+    assert [(u["reason"], u["candidate"]["class"], u["candidate"]["slot_index"])
+            for u in registry.undecided] == [("no_vtable_symbol", "Base", 0)]
+
+    # A real `_ZTV4Base` whose two slots end where `adjacent_table` begins: the
+    # decoder reads the adjacent word as a third slot, the symbols do not.
+    words = {0x9000: 0, 0x9008: 0x9800, 0x9010: 0x400100, 0x9018: 0x400200, 0x9020: fn}
+    ctx = _SlotRefCtx(words, {0x9000: [0x400100, 0x400200, fn]})
+    adjacent = read_class._vtable_slots_referencing(
+        ctx, _slot_bv({fn: [0x9020]}, [_BASE_ZTV, _sym(0x9020, "adjacent_table")]), fn)
+    assert adjacent == read_class._SlotRefs([], [])
+
+    # BN's own synthesized `_vtable_for_` name is not attestation (a stripped
+    # binary): the slot stays undecided, with the slot it would be.
+    stripped = read_class._vtable_slots_referencing(
+        ctx, _slot_bv({fn: [0x9020]}, [_sym(0x9010, "_vtable_for_Base", "vtable for Base")]), fn)
+    assert stripped.slots == []
+    assert [u["candidate"]["slot_index"] for u in stripped.undecided] == [2]
 
 
 def test_vtable_slot_walk_that_never_ends_is_disclosed_not_dropped_998():
     """#998 review: a ref deep inside a long run of code pointers with no
-    header in reach was dropped silently; it is reported as undecided."""
+    header in reach is reported as undecided, with the budget as the reason."""
     target = 0x401000
     run_end = 0x100000
     words = {run_end - 8 * k: 0x400100 for k in range(1, 5000)}
     words[run_end] = target
     ctx = _SlotRefCtx(words, {})
     found = read_class._vtable_slots_referencing(ctx, _slot_bv({target: [run_end]}), target)
-    assert found == read_class._SlotRefs([], [hex(run_end)])
+    assert found == read_class._SlotRefs(
+        [], [{"address": hex(run_end), "reason": "walk_budget_exhausted"}])
+
+
+def test_a_long_pointer_table_costs_one_pass_998():
+    """#998 review round 2: every ref walked back on its own, so a 4865-entry
+    table cost refs x length word reads and `callsites` timed out. A ref's walk
+    stops at the previous ref in the run and reuses its answer."""
+    target = 0x401000
+    table = 0x200000
+    words = {table - 8: 0x7777}                       # the object before the table
+    words.update({table + 8 * i: target for i in range(5000)})
+    ctx = _SlotRefCtx(words, {})
+    refs = [table + 8 * i for i in range(5000)]
+    found = read_class._vtable_slots_referencing(ctx, _slot_bv({target: refs}), target)
+    assert found == read_class._SlotRefs([], [])
+    assert ctx.reads <= 2
 
 
 def test_vtable_layout_reports_the_address_point_998():
@@ -1155,31 +1218,6 @@ def test_deleting_destructor_names_the_object_size_998():
     assert read_class._deleting_dtor_size(bv, _d0(0x12b0, 0x28, delete=_DELETE)) is None
 
 
-def _ctor(start, body):
-    return _MlilFn(start, "_ZN1XC2Ev", body,
-                   symbol=types.SimpleNamespace(short_name="X::X", name="X::X"))
-
-
-def test_ctor_write_extent_follows_copies_memset_and_member_ctors_998():
-    """The extent is the furthest byte the ctor writes through `this`, through
-    SSA copies, `memset(this + o, 0, n)` and a member ctor on `this + o`;
-    a store at a computed offset only lowers the bound."""
-    member = _MlilFn(0x5000, "_ZN1MC2Ev", [_store(_var("this"), 8)])
-    bv = _MlilBV([member])
-    # `_classify_function` decides "ctor" from the demangled name.
-    member.symbol = types.SimpleNamespace(short_name="M::M()", name="M::M()",
-                                          full_name="M::M()", raw_name="_ZN1MC2Ev")
-    ctor = _ctor(0x4000, [
-        _copy(("x19", 1), _var("this")),
-        _store(_add(_var("x19", 1), _const(0x10)), 8),
-        _call(_MEMSET, [_add(_var("this"), _const(0x18)), _const(0), _const(0x20)], 0x4010),
-        _store(_add(_var("this"), _var("idx", 1)), 8),
-    ])
-    assert read_class._ctor_write_extent(bv, ctor) == 0x38
-    with_member = _ctor(0x4100, [_call(0x5000, [_add(_var("this"), _const(0x40))], 0x4110)])
-    assert read_class._ctor_write_extent(bv, with_member) == 0x48
-
-
 def _allocating_caller(start, new_target, size, *, via_copy=False):
     """`p = operator new(size); [q = p;] X::X(q)` with the ctor call at start+0x10."""
     ssa = types.SimpleNamespace()
@@ -1213,14 +1251,17 @@ class _SizeCtx:
     def _ctor_construction_sites(self, bv, record):
         return [dict(site) for site in self._sites]
 
+    def _pointer_size(self, bv):
+        return 8
+
 
 def _site(allocation_size=None, ctor="0x4000", allocation="0x6004", address="0x6010"):
     return {"address": address, "function": "make", "kind": "ctor-call", "ctor": ctor,
             "allocation_size": allocation_size, "allocation": allocation}
 
 
-def _record(*methods):
-    return {"name": "net::Session", "methods": list(methods)}
+def _record(*methods, **fields):
+    return {"name": "net::Session", "methods": list(methods), **fields}
 
 
 _D0_METHOD = {"address": "0x12b0", "mangled": "_ZN3net7SessionD0Ev", "kind": "dtor"}
@@ -1234,33 +1275,60 @@ def test_size_prefers_bn_type_width():
 
 def test_size_from_the_deleting_destructor_998():
     """A class's D0 fixes its size even when every allocation is larger."""
-    bv = _MlilBV([_d0(0x12b0, 0x28), _ctor(0x4000, [_store(_var("this"), 8)])])
+    bv = _MlilBV([_d0(0x12b0, 0x28)])
     finding = read_class._object_size(_SizeCtx([_site("0x50")]), bv, _record(_D0_METHOD))
     assert finding == read_class._SizeFinding(
         {"value": "0x28", "source": "deleting_destructor", "at": "0x12b9"}, None, 0x50)
 
 
-def test_allocation_is_the_size_only_when_the_ctor_fills_it_998():
-    """#998 review: array new, an enclosing object, a derived class built
-    around this ctor and placement new all hand the ctor a LARGER block, so an
-    allocation is the size only when the ctor's own writes reach its end;
-    otherwise it is an upper bound."""
-    fills = _ctor(0x4000, [_store(_var("this"), 8),
-                           _store(_add(_var("this"), _const(8)), 0x10)])
+def test_an_allocation_is_only_ever_an_upper_bound_998():
+    """#998 review rounds 1 and 2: array new, an enclosing object, a derived
+    class built around the ctor, placement new and trailing storage the ctor
+    itself fills (so its writes reach the end of the block) all hand the ctor
+    a LARGER block. No constructor write tells them apart, so even an
+    allocation the constructor fills to the last byte is not the size."""
+    fills = _MlilFn(0x4000, "_ZN1XC2Ev", [_store(_var("this"), 8),
+                                          _store(_add(_var("this"), _const(8)), 0x48)])
     bv = _MlilBV([fills])
-    exact = read_class._object_size(_SizeCtx([_site("0x18")]), bv, _record())
-    assert exact == read_class._SizeFinding(
-        {"value": "0x18", "source": "operator_new", "at": "0x6004"}, None, 0x18)
+    finding = read_class._object_size(_SizeCtx([_site("0x50"), _site(None)]), bv, _record())
+    assert finding == read_class._SizeFinding(None, "allocation_upper_bound_only", 0x50)
 
-    larger = read_class._object_size(_SizeCtx([_site("0x50"), _site(None)]), bv, _record())
-    assert larger == read_class._SizeFinding(None, "allocation_upper_bound_only", 0x50)
+
+def test_a_bn_type_is_a_lower_bound_when_virtual_bases_are_not_ruled_out_998(monkeypatch):
+    """#998 review round 2: BN's `std::istream` type is 0x10 wide while the
+    class is 0x118 -- a type for a class with virtual bases covers only the
+    non-virtual part. Its width is the size only once local RTTI proves the
+    ancestry free of virtual bases; else it is `size_lower_bound`."""
+    bv = _MlilBV(type_widths={"net::Session": 0x10})
+    proven: list[bool] = []
+    monkeypatch.setattr(read_class, "_has_nonvirtual_rtti_ancestry",
+                        lambda ctx, b, ti, ptr: proven[-1])
+    with_rtti = _record(typeinfo={"address": "0x9800"}, vtable={"address": "0x9000"})
+
+    proven.append(False)
+    assert read_class._object_size(_SizeCtx(), bv, with_rtti) == read_class._SizeFinding(
+        None, "bn_type_may_exclude_virtual_bases", None, 0x10)
+    proven.append(True)
+    assert read_class._object_size(_SizeCtx(), bv, with_rtti).size == {
+        "value": "0x10", "source": "bn_type"}
+    # A vtable but no typeinfo to read the ancestry from: not proven.
+    assert read_class._object_size(
+        _SizeCtx(), bv, _record(vtable={"address": "0x9000"})).reason == \
+        "bn_type_may_exclude_virtual_bases"
+    # No vptr at all: no virtual base.
+    assert read_class._object_size(_SizeCtx(), bv, _record()).size is not None
+    # The deleting destructor is the complete class's size either way.
+    bv = _MlilBV([_d0(0x12b0, 0x118)], type_widths={"net::Session": 0x10})
+    proven.append(False)
+    with_d0 = _record(_D0_METHOD, typeinfo={"address": "0x9800"}, vtable={"address": "0x9000"})
+    assert read_class._object_size(_SizeCtx(), bv, with_d0).size["value"] == "0x118"
 
 
 def test_exact_readers_that_disagree_report_no_size_998():
-    fills = _ctor(0x4000, [_store(_add(_var("this"), _const(0x10)), 8)])
-    bv = _MlilBV([_d0(0x12b0, 0x28), fills])
-    finding = read_class._object_size(_SizeCtx([_site("0x18")]), bv, _record(_D0_METHOD))
-    assert finding == read_class._SizeFinding(None, "size_evidence_disagrees", 0x18)
+    second = {"address": "0x12c0", "mangled": "_ZN3net7SessionD0Ev", "kind": "dtor"}
+    bv = _MlilBV([_d0(0x12b0, 0x28), _d0(0x12c0, 0x30)])
+    finding = read_class._object_size(_SizeCtx(), bv, _record(_D0_METHOD, second))
+    assert finding == read_class._SizeFinding(None, "size_evidence_disagrees", None)
 
 
 def test_size_miss_with_nothing_to_read_998():
@@ -1418,14 +1486,16 @@ class _InstCtx:
 
 def test_instances_collects_construction_and_global_stores():
     sites = [
-        {"address": "0x443abc", "function": "net::open", "kind": "new", "size": "0xd0"},
-        {"address": "0x4500a0", "function": "main", "kind": "stack", "size": None},
+        {"address": "0x443abc", "function": "net::open", "kind": "ctor-call",
+         "allocation_size": "0xd0", "allocation": "0x443ab0"},
+        {"address": "0x4500a0", "function": "main", "kind": "ctor-call",
+         "allocation_size": None, "allocation": None},
     ]
     globals_ = [{"symbol": "g_session", "address": "0x4cabcd"}]
     ctx = _InstCtx(sites, globals_)
     rec = {"name": "net::Session", "vtable": {"address": "0x9000"}, "methods": []}
     out = read_class._instances(ctx, object(), rec)
-    assert out["construction_sites"][0]["kind"] == "new"
+    assert out["construction_sites"][0]["allocation_size"] == "0xd0"
     assert out["stored_globals"][0]["symbol"] == "g_session"
 
 
@@ -1688,7 +1758,7 @@ def test_render_construction_site_includes_function():
            "bases": [], "methods": [],
            "instances": {"construction_sites": [
                {"address": "0x443abc", "function": "AapGalifStart",
-                "kind": "ctor-call", "size": None}],
+                "kind": "ctor-call", "allocation_size": None, "allocation": None}],
                "stored_globals": []}}
     assert "ctor-call @ 0x443abc (in AapGalifStart)" in _render_class_show_text(rec)
 
@@ -2401,7 +2471,8 @@ def test_instances_reports_exact_totals_and_truncation_flag_at_cap():
     # exactly 128 with no total and no flag, so a capped scan was
     # indistinguishable from a complete one.
     sites = [{"address": hex(0x443000 + i * 16), "function": f"caller{i}",
-              "kind": "ctor-call", "size": None} for i in range(400)]
+              "kind": "ctor-call", "allocation_size": None, "allocation": None}
+             for i in range(400)]
     globals_ = [{"symbol": f"g_slot{i}", "address": hex(0x4c0000 + i * 8)}
                 for i in range(400)]
     ctx = _InstCtx(sites, globals_)
@@ -2419,7 +2490,7 @@ def test_instances_reports_exact_totals_and_truncation_flag_at_cap():
 def test_instances_reports_exact_totals_without_truncation():
     # The uncapped shape: real totals, no truncation claimed.
     ctx = _InstCtx([{"address": "0x443abc", "function": "main",
-                     "kind": "ctor-call", "size": None}],
+                     "kind": "ctor-call", "allocation_size": None, "allocation": None}],
                    [{"symbol": "g_session", "address": "0x4cabcd"}])
     rec = {"name": "net::Session", "vtable": {"address": "0x9000"}, "methods": []}
     out = read_class._instances(ctx, object(), rec)

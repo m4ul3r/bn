@@ -336,6 +336,11 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
     return rows
 
 
+#: #998 review: how many undecided vtable-slot refs a `callsites` envelope
+#: lists; `vtable_slots_undecided_counts` counts them all, per reason.
+_UNDECIDED_SLOTS_LISTED = 64
+
+
 def _other_containing_functions(ctx, bv, call_addr: str, func) -> list[dict[str, str]]:
     """#998 item 2: identities of the functions OTHER than *func* that BN puts
     the instruction at *call_addr* in (a block shared by several functions)."""
@@ -534,8 +539,15 @@ def _callsites(
     from . import read_class   # read_class imports this module; import lazily
     slot_refs = (read_class._SlotRefs([], []) if callee_symbol_only
                  else read_class._vtable_slots_referencing(ctx, bv, int(callee.start)))
+    # The undecided refs are LISTED up to a cap (a long pointer table in a
+    # stripped binary can hold thousands) and COUNTED per reason in full, so
+    # the envelope stays small without hiding how many there were.
+    undecided_counts: dict[str, int] = {}
+    for item in slot_refs.undecided:
+        undecided_counts[item["reason"]] = undecided_counts.get(item["reason"], 0) + 1
     vtable_fields = {"vtable_slots": slot_refs.slots,
-                     "vtable_slots_undecided": slot_refs.undecided}
+                     "vtable_slots_undecided": slot_refs.undecided[:_UNDECIDED_SLOTS_LISTED],
+                     "vtable_slots_undecided_counts": undecided_counts}
     variadic_hint = _callee_variadic_hint(callee)
 
     rows = []

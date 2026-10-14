@@ -27,7 +27,8 @@ make -C tests/fixtures clean
 | `classes_stripped_x86_64` | the same C++ PIE built with `-s`: synthesized slot-array vtable symbols must recover the same object heads and slot contents without phantom secondaries (#935) |
 | `canary_x86_64`        | a stack-protected buffer: frame-map canary evidence and slot-to-canary distances |
 | `vcalls_x86_64`        | a C++ binary whose virtual methods are reached only through vtable slots (one past the 64-slot layout window, one in a secondary vtable), and whose classes are heap-constructed by out-of-line ctors (`callsites` slot notes, `class` sizes, #998) |
-| `sizes_x86_64`         | a C++ binary built at -O2 whose `operator new` allocations are NOT one object of the class whose ctor or vptr touches them (array new, members at offset 0, placement new, inlined derived ctors and final dtors) -- class sizes must be exact or absent (#998) |
+| `sizes_x86_64`         | a C++ binary built at -O2 whose `operator new` allocations are NOT one object of the class whose ctor or vptr touches them (array new, members at offset 0, placement new, inlined derived ctors and final dtors, trailing storage, a header clearing its enclosing payload) and a class with a virtual base -- class sizes must be exact or absent (#998) |
+| `slots_x86_64`         | a C++ binary built at -O2 with data shaped like a vtable slot (the word after a 70-slot vtable, a `{0, &typeid(X), fn}` registry) and a 5000-entry function-pointer table -- never a confirmed slot, never slow (#998) |
 
 The paired class-lens regression checks slot addresses against each view's raw
 words. Across the symbolized/stripped views, local and null slots, object heads,

@@ -651,13 +651,13 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
     # table and which slot, instead of an anonymous `.data.rel.ro` word -- the
     # one hint that a function with no code callers is called virtually.
     vtable_slots: dict[str, dict[str, Any]] = {}
-    undecided: set[str] = set()
+    undecided: dict[str, dict[str, Any]] = {}
     if raw_data_refs:
         from . import read_class   # read_class imports read_listing -> this module
         slot_refs = read_class._vtable_slots_referencing(
             ctx, bv, int(address), data_refs=raw_data_refs)
         vtable_slots = {slot["slot_address"]: slot for slot in slot_refs.slots}
-        undecided = set(slot_refs.undecided)
+        undecided = {item["address"]: item for item in slot_refs.undecided}
     for ref_addr in sorted(raw_data_refs):
         ref_addr = int(ref_addr)
         functions = ctx._functions_containing(bv, ref_addr)
@@ -673,9 +673,11 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
         if hex(ref_addr) in vtable_slots:
             entry["vtable_slot"] = vtable_slots[hex(ref_addr)]
         elif hex(ref_addr) in undecided:
-            # A run of code pointers too long to walk back to a header: it may
-            # be a vtable slot, which this read could not decide (#998 review).
-            entry["vtable_slot_undecided"] = True
+            # It may be a vtable slot, which this read could not decide: the
+            # reason, and the slot it would be when a header was found (#998
+            # review).
+            entry["vtable_slot_undecided"] = {
+                key: value for key, value in undecided[hex(ref_addr)].items() if key != "address"}
         data_refs.append(entry)
     fn_pointer_truncated = False
     if fn_pointer_scan:
