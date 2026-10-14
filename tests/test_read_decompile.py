@@ -5632,7 +5632,7 @@ def _ref(owner_op, start):
     return types.SimpleNamespace(function=owner, address=start + 0x10)
 
 
-def _split_view(*, tail_mnemonics, tail_returns=True, tail_refs=None):
+def _split_view(*, tail_mnemonics, tail_returns=True, tail_refs=None, tail_data_refs=()):
     """build_widget @ 0x4000dc ends at 0x4000f8, where sub_4000f8 begins. Its
     last instructions are *tail_mnemonics* (4 bytes each). By default the tail
     returns and reset_widget tail-jumps into it -- an ordinary shared tail."""
@@ -5678,7 +5678,7 @@ def _split_view(*, tail_mnemonics, tail_returns=True, tail_refs=None):
         get_function_at=lambda a: {0x4000f8: tail, 0x4000dc: head}.get(a),
         get_basic_blocks_at=lambda a: [block] if first <= a < 0x4000f8 else [],
         get_code_refs=lambda a: refs.get(a, []),
-        get_data_refs=lambda a: [],
+        get_data_refs=lambda a: list(tail_data_refs) if a == 0x4000f8 else [],
     )
     return bv, head, tail
 
@@ -5780,6 +5780,45 @@ def test_eh_fragment_chain_longer_than_three_links_966():
     chain[0].can_return = True
     refs[chain[0].start] = [_ref("LLIL_CALL", 0x400100)]
     assert not read_decompile._is_eh_fragment(bv, chain[-1])
+
+
+@pytest.mark.parametrize("returns", [True, False])
+@pytest.mark.parametrize("data_ref", [
+    0x43b488,  # a vtable slot in .data.rel.ro
+    0x44f010,  # a callback table entry
+])
+def test_an_address_taken_function_is_called_not_a_body_piece_966(returns, data_ref):
+    # Reached only through a vtable or a function pointer: no direct call site
+    # and no jump, yet an ordinary function. Its callee-saved "parameter" is a
+    # register it saves itself, so the `proto set` advice is right, and it is
+    # neither a fragment nor "a piece of another function's body" (#985 re-review).
+    bv, _head, tail = _split_view(tail_mnemonics=["ret"], tail_returns=returns,
+                                  tail_refs=[], tail_data_refs=[data_ref])
+    assert not read_decompile._is_eh_fragment(bv, tail)
+    notes = read_decompile._split_body_notes(bv, tail)
+    assert len(notes) == 1 and "drop them with `bn proto set`" in notes[0]
+    assert "nothing calls this function" not in notes[0]
+
+
+def test_call_arity_group_counts_each_kind_of_evidence_955(monkeypatch):
+    # Two calls to one callee: the first has its set-up registers in view; the
+    # second follows it directly, so the first call ends its set-up window. The
+    # group must not describe both by the first.
+    bv, func = _arity_case(
+        monkeypatch,
+        [_set_reg("x2", _const(1)), _set_reg("x1", _const(2)), _set_reg("x0", _reg("sp"))],
+        rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
+        signature=(["this", "", ""], False), calls=1,
+    )
+    second = _op("LLIL_CALL", dest=_op("LLIL_CONST_PTR", constant=0x400e00))
+    second.address = 0x401080
+    second.mlil = types.SimpleNamespace(params=[object()])
+    func.llil.extend([second])
+    warning = read_decompile._call_arity_warning(bv, func)
+    assert "(2 calls at 0x401040, 0x401080) renders 1 of 3 arguments (" in warning
+    assert ("1 of 2: the demangled signature takes 3 with `this`; the call site writes "
+            "x0, x1, x2 just before it / 1 of 2: the demangled signature takes 3 with "
+            "`this`") in warning
 
 
 def test_a_named_unreferenced_function_is_not_an_eh_fragment_966():

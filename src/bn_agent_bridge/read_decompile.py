@@ -762,9 +762,14 @@ def _call_arity_warning(bv, func) -> str | None:
         # rarer finding past the listing cap (#985 review).
         group = groups.setdefault((target, rendered, expected), {
             "label": _callee_label(symbol, callee, target),
-            "addresses": [], "evidence": evidence,
+            "addresses": [], "evidence": {},
         })
         group["addresses"].append(address)
+        # Every call's evidence, counted: calls to one callee can differ (the
+        # signature alone at one, signature plus register writes at another),
+        # and the first call's text must not stand for all (#985 re-review).
+        key = tuple(evidence)
+        group["evidence"][key] = group["evidence"].get(key, 0) + 1
     if not groups:
         return None
     findings = []
@@ -773,12 +778,18 @@ def _call_arity_warning(bv, func) -> str | None:
         where = ", ".join(hex(a) for a in addrs[:3]) + (
             f" and {len(addrs) - 3} more" if len(addrs) > 3 else "")
         noun = "call" if len(addrs) == 1 else f"{len(addrs)} calls"
+        variants = group["evidence"]
+        if len(variants) == 1:
+            evidence = "; ".join(next(iter(variants)))
+        else:
+            evidence = " / ".join(f"{n} of {len(addrs)}: {'; '.join(ev)}"
+                                  for ev, n in variants.items())
         if rendered > expected:
             findings.append(f"{group['label']} ({noun} at {where}) renders {rendered} "
-                            f"arguments but {group['evidence'][0]}")
+                            f"arguments but {evidence}")
         else:
             findings.append(f"{group['label']} ({noun} at {where}) renders {rendered} of "
-                            f"{expected} arguments ({'; '.join(group['evidence'])})")
+                            f"{expected} arguments ({evidence})")
     calls = sum(len(g["addresses"]) for g in groups.values())
     listed = findings[:_ARITY_LISTED_MAX]
     more = len(findings) - len(listed)
@@ -982,9 +993,11 @@ def _is_eh_fragment(bv, func, memo: dict[int, bool] | None = None, _depth: int =
     (#985 review). Recognised by any of:
       * a `.cold` name, or a parameter typed `_Unwind_Exception` (BN's own
         landing-pad reading of the exception object);
-      * nothing CALLS it -- it is reached only by jumps, falls, or the unwinder
-        -- and it never returns, or nothing references it at all (an LSDA
-        landing pad has no code or data reference);
+      * nothing CALLS it and nothing takes its address -- it is reached only by
+        jumps, falls, or the unwinder -- and it never returns, or nothing
+        references it at all (an LSDA landing pad has no code or data
+        reference; a vtable or callback-table entry makes it an ordinary
+        function called indirectly);
       * it never returns and every function calling it is itself a fragment
         (BN chains a long cleanup through synthetic calls).
     A shared tail split off a normal function returns, so it is not matched.
@@ -1016,7 +1029,10 @@ def _is_eh_fragment(bv, func, memo: dict[int, bool] | None = None, _depth: int =
             refs, callers = _direct_call_refs(bv, start)
             returns = bool(getattr(func, "can_return", True))
             if not callers:
-                verdict = not returns or (not refs and not list(bv.get_data_refs(start) or []))
+                # An address-taken function (vtable slot, callback table) is
+                # called indirectly; a landing pad is never address-taken (the
+                # LSDA locates it by offset), so any data reference vetoes it.
+                verdict = not list(bv.get_data_refs(start) or []) and (not returns or not refs)
             elif returns or _depth >= _FRAGMENT_DEPTH:
                 verdict = False
             else:
@@ -1028,6 +1044,17 @@ def _is_eh_fragment(bv, func, memo: dict[int, bool] | None = None, _depth: int =
         verdict = False
     memo[start] = verdict
     return verdict
+
+
+def _has_callers(bv, start: int) -> bool:
+    """Whether anything can call the function at *start*: a direct call site,
+    or a data reference -- a vtable slot, a `.data.rel.ro` entry, a callback
+    table. An address-taken function is an ordinary function reached
+    indirectly, not a piece of another body (#985 re-review), the same test
+    `_is_eh_fragment` applies before calling anything a landing pad."""
+    if _direct_call_refs(bv, start)[1]:
+        return True
+    return bool(list(bv.get_data_refs(start) or []))
 
 
 def _split_body_notes(bv, func) -> list[str]:
@@ -1057,7 +1084,7 @@ def _split_body_notes(bv, func) -> list[str]:
                 "registers, not arguments and not a split to repair. Read it together with "
                 f"the code that jumps here (`bn xrefs {hex(int(func.start))}`)."
             )]
-        called = bool(params) and bool(_direct_call_refs(bv, int(func.start))[1])
+        called = bool(params) and _has_callers(bv, int(func.start))
         successor = _fallthrough_successor(bv, func)
         predecessor = _fallthrough_predecessor(bv, func)
     except Exception:  # noqa: BLE001 - a read-only nudge never sinks the read
