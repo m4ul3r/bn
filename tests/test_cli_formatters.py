@@ -4088,9 +4088,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #795 adds eleven further CLI count reads to this combined population.
     # #889 adds the data-symbol total read; its offset read was already covered.
     # M-12 adds the strings `noise_strings` count read.
-    assert len(sites) == 55, (
+    # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
+    assert len(sites) == 57, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 55. A "
+        "count helper, not 57. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4158,6 +4159,12 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",
         "_paging_footer(total) [not a payload renderer]",
+        # #865: a fragment helper for ONE witness verdict nested under a call
+        # row's `arity_witnesses`. Covered by name in
+        # `test_render_evidence_states_each_arity_witness_and_the_function_tally_865`,
+        # which drives the nested payload and asserts the `?` refusal.
+        "_render_arity_witness(declared_arity) [not a payload renderer]",
+        "_render_arity_witness(witness_arity) [not a payload renderer]",
         # #795 round-6 review: the class lens states these two on its
         # COUNT-ONLY branch, which this differential's context never takes --
         # it fills every harvested key, so the listing branch always wins.
@@ -5257,7 +5264,7 @@ def test_render_evidence_shows_argument_confidence_and_variadic():
         "calls": [{
             "address": "0x500010", "operation": "LLIL_CALL", "direct": True,
             "hlil_statement": None, "hlil_statement_reason": "hlil_not_call_shaped",
-            "argument_source": "hlil", "argument_confidence": "authoritative",
+            "argument_source": "hlil", "argument_confidence": "recovered",
             "arguments": [{"text": "input"}],
             "argument_candidates": [{"source": "llil", "index": 0, "text": "r0", "confidence": "low"}],
             "variadic": {"is_variadic": True, "family": "scanf", "callee": "sscanf",
@@ -5267,8 +5274,70 @@ def test_render_evidence_shows_argument_confidence_and_variadic():
     }
     out = _render_function_evidence_text(value)
     assert "hlil: null (hlil_not_call_shaped)" in out
-    assert "arguments: (hlil authoritative)" in out
+    assert "arguments: (hlil recovered)" in out
     assert "variadic: UNDER-RECOVERED" in out
+
+
+def test_render_evidence_states_each_arity_witness_and_the_function_tally_865():
+    """#865: each witness is stated separately on the row, in its own words --
+    a contradiction with the counts it observed, an unavailable or refused one
+    with its reason -- and the function-level tally says outright that only a
+    contradiction is evidence against a row."""
+    from bn.formatters import _render_function_evidence_text
+    value = {
+        "function": {"name": "probe_device", "address": "0x401400"},
+        "thunk": {"is_candidate": False},
+        "total_calls": 2, "matched_calls": 2, "offset": 0, "limit": None,
+        "arity_witness_counts": {
+            "library": {"agreement": 0, "contradiction": 1, "unavailable": 1, "refused": 0},
+            "callee_body": {"agreement": 1, "contradiction": 0, "unavailable": 1, "refused": 0},
+        },
+        "calls": [
+            {"address": "0x401400", "operation": "LLIL_CALL", "direct": True,
+             "argument_source": "hlil", "argument_confidence": "inferred",
+             "arguments": [], "prototype_unverified": True, "declared_arity": 0,
+             "library_arity": 1, "library_source": "libgcc",
+             "arity_witnesses": {
+                 "library": {"status": "contradiction", "reason": None,
+                             "declared_arity": 0, "witness_arity": 1, "source": "libgcc"},
+                 "callee_body": {"status": "unavailable", "reason": "imported_callee"}}},
+            {"address": "0x401404", "operation": "LLIL_CALL", "direct": True,
+             "argument_source": "hlil", "argument_confidence": "recovered",
+             "arguments": [{"text": "a"}, {"text": "b"}],
+             "arity_witnesses": {
+                 "library": {"status": "unavailable", "reason": "no_library_entry"},
+                 "callee_body": {"status": "agreement", "reason": None, "declared_arity": 2,
+                                 "witness_arity": 2, "register": "x1"}}},
+        ],
+    }
+    out = _render_function_evidence_text(value)
+    assert ("arity witnesses over 2 call(s): library agreement 0, contradiction 1, "
+            "unavailable 1, refused 0; callee_body agreement 1, contradiction 0, "
+            "unavailable 1, refused 0 -- only a contradiction is evidence against a row"
+            in out)
+    assert ("  witnesses: library=contradiction (libgcc declares 1, prototype 0); "
+            "callee_body=unavailable (imported_callee)") in out
+    assert ("  witnesses: library=unavailable (no_library_entry); "
+            "callee_body=agreement (body uses 2 up to x1, prototype 2)") in out
+    assert "arguments: (hlil recovered)" in out
+
+    # A skewed count is stated as unknown and disclosed, never a fabricated 0.
+    skewed = {**value, "arity_witness_counts": {"library": {"agreement": "many"}}}
+    out = _render_function_evidence_text(skewed)
+    assert "library agreement ?" in out
+    assert "malformed agreement field" in out
+    # The wire sorts keys (`callee_body` before `library`); the card does not.
+    reordered = copy.deepcopy(value)
+    reordered["arity_witness_counts"] = dict(reversed(value["arity_witness_counts"].items()))
+    for call in reordered["calls"]:
+        call["arity_witnesses"] = dict(reversed(call["arity_witnesses"].items()))
+    assert _render_function_evidence_text(reordered) == _render_function_evidence_text(value)
+    # The same for a witness's own observed count: `?`, not a number.
+    row = copy.deepcopy(value["calls"][1])
+    row["arity_witnesses"]["callee_body"]["witness_arity"] = "many"
+    out = _render_function_evidence_text({**value, "calls": [row]})
+    assert "callee_body=agreement (body uses ? up to x1, prototype 2)" in out
+    assert "malformed witness_arity field" in out
 
 
 def test_render_evidence_function_shows_recorded_local_tailcall_target_704():

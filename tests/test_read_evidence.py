@@ -4248,14 +4248,14 @@ def test_callsites_null_hlil_carries_reason_code(monkeypatch):
     assert rows[0]["hlil_statement_reason"] == "no_hlil_mapping"
 
 
-# --- #549: authoritative arguments vs low-confidence candidates ------------
+# --- #549: recovered arguments vs low-confidence candidates ----------------
 
 
 def test_function_evidence_marks_argument_confidence(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     callee = _FakeFunction(0x461746, "send_message")
-    # A recovered 2-parameter prototype: what EARNS the `authoritative` stamp. Without
+    # A recovered 2-parameter prototype: what keeps the `recovered` label. Without
     # it the callee's arity is unknown and #648 correctly demotes to `inferred`.
     callee.parameter_vars = [
         _FakeVariable(name="code", storage=0, var_type="int32_t", identifier=1),
@@ -4276,9 +4276,9 @@ def test_function_evidence_marks_argument_confidence(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     call = instance._function_evidence("active", "build_response", context=0)["calls"][0]
-    # canonical HLIL args -> authoritative; the reason code is null (statement present)
+    # canonical HLIL args -> recovered; the reason code is null (statement present)
     assert call["argument_source"] == "hlil"
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert call["hlil_statement_reason"] is None
     # every candidate is explicitly low-confidence with a provenance source
     assert call["argument_candidates"]
@@ -4372,7 +4372,8 @@ def _arity_bv(monkeypatch, instance, *, callee_params, arg_texts, arg_regs=8,
 def test_argument_confidence_demoted_on_unknown_arity_callee_648(monkeypatch):
     """#648: with no recovered prototype BN assumes every argument register is live,
     so HLIL renders the NEIGHBOURING call's staging -- a log string and the stack
-    canary -- as arguments 2..5 of a 1-parameter vendor API. `authoritative` meant
+    canary -- as arguments 2..5 of a 1-parameter vendor API. `authoritative` (the old
+    label, now `recovered`) meant
     "HLIL produced a list", not "the list is right"; #549 left this residual on the
     canonical field. Confirmed wrong against upstream source on a second target."""
     bridge = _load_bridge(monkeypatch)
@@ -4383,7 +4384,7 @@ def test_argument_confidence_demoted_on_unknown_arity_callee_648(monkeypatch):
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["argument_source"] == "hlil"
-    assert call["argument_confidence"] != "authoritative"
+    assert call["argument_confidence"] != "recovered"
     assert call["argument_confidence"] == "inferred"
     assert call["arity_unknown"] is True
     # 6 recovered args on a 6-register ABI: BN is enumerating registers.
@@ -4393,7 +4394,7 @@ def test_argument_confidence_demoted_on_unknown_arity_callee_648(monkeypatch):
 def test_argument_confidence_kept_for_known_prototype_648(monkeypatch):
     """#648 negative control -- the assertion that keeps the fix from blanket-demoting
     everything. `memset` has a bundled 3-parameter prototype, so its arguments really
-    ARE authoritative (verified live: BN reports 3 declared params for memset and 0
+    keep `recovered` (verified live: BN reports 3 declared params for memset and 0
     for an unprototyped stub)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -4401,7 +4402,7 @@ def test_argument_confidence_kept_for_known_prototype_648(monkeypatch):
               arg_texts=["&buf", "0", "0x100"])
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert call["arity_unknown"] is False
     assert "abi_register_saturated" not in call
 
@@ -4445,10 +4446,11 @@ def test_argument_confidence_demoted_when_a_library_contradicts_the_prototype_75
 ):
     """#759: the #742 guard compares the rendered list against the callee's own
     RECOVERED prototype, so an under-recovered callee agrees with itself and keeps
-    `authoritative` -- vacuous by construction.
+    `recovered` -- vacuous by construction.
 
     Measured on a real target: `__popcountdi2()` rendered ZERO arguments with
-    `argument_confidence: authoritative` and `arity_mismatch` absent, while the
+    `argument_confidence: authoritative` (the old label, now `recovered`) and
+    `arity_mismatch` absent, while the
     attached type library declares one parameter. The library is an INDEPENDENT
     witness, so the row must stop asserting authority and say why."""
     bridge = _load_bridge(monkeypatch)
@@ -4467,7 +4469,7 @@ def test_argument_confidence_demoted_when_a_library_contradicts_the_prototype_75
 
 def test_argument_confidence_kept_when_the_library_agrees_759(monkeypatch):
     """Negative control: an agreeing library must not disturb an earned
-    `authoritative` (the #648 `memset` precedent)."""
+    `recovered` (the #648 `memset` precedent)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=3,
@@ -4477,7 +4479,7 @@ def test_argument_confidence_kept_when_the_library_agrees_759(monkeypatch):
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "prototype_unverified" not in call
 
 
@@ -4496,7 +4498,7 @@ def test_library_cross_check_skips_mangled_cxx_names_759(monkeypatch):
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
     assert "prototype_unverified" not in call
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
 
 
 def test_library_cross_check_makes_no_claim_for_a_variadic_signature_759(monkeypatch):
@@ -4512,12 +4514,12 @@ def test_library_cross_check_makes_no_claim_for_a_variadic_signature_759(monkeyp
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
     assert "prototype_unverified" not in call
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
 
 
 # --- #865/#882: the callee-side argument-use witness ------------------------
 #
-# Where no library names the callee, `_library_param_count` refuses (#862) and
+# Where no library names the callee, the library witness is unavailable (#862) and
 # `arity_mismatch` is silent -- the rendered list and the recovered prototype are
 # the SAME under-recovery, so `declared_count == len(arguments)` compares the
 # recovery against itself. The witness these tests drive settles that shape from
@@ -4649,7 +4651,7 @@ def test_argument_confidence_demoted_when_the_callee_body_uses_past_its_prototyp
 
     assert call["argument_source"] == "hlil"
     # The demotion is the direction the evidence supports, and only one step: the
-    # list is not `authoritative`, it is not thrown away either.
+    # list does not keep `recovered`, but it is not thrown away either.
     assert call["argument_confidence"] == "inferred"
     assert call["callee_under_recovered"] is True
     assert call["callee_read_arity"] == 3
@@ -4673,7 +4675,7 @@ def test_argument_confidence_kept_when_the_callee_body_uses_only_its_declared_ar
     monkeypatch,
 ):
     """#865 AC4, matching arity: using exactly the argument registers the prototype
-    declares is what a CORRECT recovery looks like and must stay authoritative."""
+    declares is what a CORRECT recovery looks like and must keep `recovered`."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=["a", "b", "c"])
@@ -4685,7 +4687,7 @@ def test_argument_confidence_kept_when_the_callee_body_uses_only_its_declared_ar
     )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "callee_under_recovered" not in call
     assert "callee_arity_note" not in call
 
@@ -4695,7 +4697,7 @@ def test_argument_confidence_kept_for_a_void_callee_reading_no_argument_register
 ):
     """#865 AC4, the genuinely-void callee: a body that reads no incoming argument
     register agrees with its recovered 0-parameter prototype, so it keeps
-    `authoritative` -- demoting here would flag every `f()` call in a stripped
+    `recovered` -- demoting here would flag every `f()` call in a stripped
     binary for nothing. A register the body WRITES (its own defined version) and
     then reads is not an incoming argument."""
     bridge = _load_bridge(monkeypatch)
@@ -4708,7 +4710,7 @@ def test_argument_confidence_kept_for_a_void_callee_reading_no_argument_register
     )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "callee_under_recovered" not in call
     assert "callee_arity_note" not in call
 
@@ -4727,7 +4729,7 @@ def test_argument_confidence_kept_for_a_variadic_callee_reading_every_register_8
     _with_ssa(bv, *[_SSARead(0x401100 + i * 4, _ssa_var(i)) for i in range(6)])
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "callee_arity_note" not in call
 
 
@@ -4809,7 +4811,7 @@ def test_the_witness_speaks_only_where_bn_determined_the_varargs_flag_882(
         assert call["callee_read_arity"] == 6
         assert call["declared_arity"] == 1
     else:
-        assert call["argument_confidence"] == "authoritative"
+        assert call["argument_confidence"] == "recovered"
         assert "callee_under_recovered" not in call
         assert "callee_read_arity" not in call
         assert "callee_arity_note" not in call
@@ -4838,13 +4840,13 @@ def test_the_callee_witness_is_paid_once_per_callee_not_once_per_row_882(monkeyp
     _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)), _SSARead(0x401104, _ssa_var(2)))
 
     seen: list[int] = []
-    real = mod._callee_arg_use_witness
+    real = mod._callee_body_witness
 
     def counting(view, callee_fn, **kwargs):
         seen.append(int(getattr(callee_fn, "start", 0) or 0))
         return real(view, callee_fn, **kwargs)
 
-    monkeypatch.setattr(mod, "_callee_arg_use_witness", counting)
+    monkeypatch.setattr(mod, "_callee_body_witness", counting)
 
     card = instance._function_evidence("active", "probe_device", context=0)
 
@@ -4875,7 +4877,7 @@ def test_argument_confidence_kept_when_the_callee_body_reads_after_writing_865(m
     )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "callee_arity_note" not in call
 
 
@@ -4890,7 +4892,7 @@ def test_argument_confidence_undemoted_when_the_callee_has_no_body_to_read_865(m
     _as_import(bv)   # an imported symbol, no body in this image
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "callee_arity_note" not in call
 
 
@@ -4929,7 +4931,7 @@ def test_argument_confidence_kept_for_a_decorated_callee_865(monkeypatch):
     carry IMPLICIT parameters -- a method's `this`, a by-value class return's sret
     slot -- which are argument REGISTERS the body legitimately reads and the
     parameter count never mentions, so a body-vs-count comparison is meaningless
-    there. Same refusal `_library_param_count` makes, same measured reason (3 of 4
+    there. Same refusal `_library_witness` makes, same measured reason (3 of 4
     raw #862 firings on a C++-heavy target were exactly this). Here the callee's
     body uses three registers against a 2-parameter prototype --
     indistinguishable from the true positive above except for the name, which is
@@ -4948,12 +4950,12 @@ def test_argument_confidence_kept_for_a_decorated_callee_865(monkeypatch):
     )
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "callee_arity_note" not in call
 
 
 def test_undecorated_name_refusal_is_shared_with_the_library_cross_check_865(monkeypatch):
-    """One rule, two callers: the witness and `_library_param_count` must agree
+    """One rule, two callers: the witness and `_library_witness` must agree
     about which names are trustworthy, or a name could be refused by one and
     trusted by the other."""
     bridge = _load_bridge(monkeypatch)
@@ -4979,7 +4981,7 @@ def test_argument_confidence_not_demoted_when_a_read_precedes_its_write_in_layou
     and called it an argument (every natural firing on an unmutated corpus image was
     an artifact of this shape -- 16 of 16). In SSA the read is of the version the
     loop defined, and the incoming value appears only as a phi INPUT: a merge, not a
-    use. The row keeps `authoritative` and carries no caveat, because there is
+    use. The row keeps `recovered` and carries no caveat, because there is
     nothing to caveat."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -4999,7 +5001,7 @@ def test_argument_confidence_not_demoted_when_a_read_precedes_its_write_in_layou
     card = instance._function_evidence("active", "probe_device", context=0)
     call = card["calls"][0]
 
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "callee_under_recovered" not in call
     assert "callee_read_arity" not in call
     assert "callee_arity_note" not in call
@@ -5031,7 +5033,7 @@ def test_argument_confidence_not_demoted_for_a_scratch_register_touch_865(monkey
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "callee_under_recovered" not in call
     assert "callee_arity_note" not in call
 
@@ -5053,20 +5055,165 @@ def test_callee_arity_note_survives_a_sliced_read_882(monkeypatch):
              _SSARead(0x401504, _ssa_var(3)))               # rcx: the fourth argument
 
     full = instance._function_evidence("active", "probe_device", context=0)
-    assert [c["argument_confidence"] for c in full["calls"]] == ["authoritative", "inferred"]
+    assert [c["argument_confidence"] for c in full["calls"]] == ["recovered", "inferred"]
     assert full["calls"][1]["callee_read_arity"] == 4
     assert any("hw_set_mode" in w and "rcx" in w for w in full["warnings"])
 
     page = instance._function_evidence("active", "probe_device", context=1, limit=1)
     assert [c["address"] for c in page["calls"]] == ["0x401400"]
-    assert page["calls"][0]["argument_confidence"] == "authoritative"
+    assert page["calls"][0]["argument_confidence"] == "recovered"
     assert page["returned"] == 1 and page["matched_calls"] == 2
     # The demoted row is not on this page; its reason still is.
     assert any("NOTE" in w and "hw_set_mode" in w and "rcx" in w for w in page["warnings"])
 
+# --- #865: per-witness results replace the old full-confidence label ---------
+#
+# `argument_confidence` no longer claims more than the analysis backs: an HLIL
+# list for a resolved callee is `recovered`, whatever the witnesses say, unless
+# one of them CONTRADICTS the prototype. Each witness reports separately in
+# `arity_witnesses`, and `arity_witness_counts` tallies them per function.
+
+
+def _witness_call(monkeypatch, *, callee_params=2, arg_texts=("a", "b"), setup=None):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=callee_params,
+                   arg_texts=list(arg_texts))
+    if setup is not None:
+        setup(bv)
+    card = instance._function_evidence("active", "probe_device", context=0)
+    return card, card["calls"][0]
+
+
+def _callee(bv):
+    return bv.get_function_at(0x401100)
+
+
+@pytest.mark.parametrize(
+    ("setup", "library", "body", "confidence"),
+    [
+        pytest.param(
+            None,
+            {"status": "unavailable", "reason": "no_library_entry"},
+            {"status": "unavailable", "reason": "no_body"},
+            "recovered", id="no-witness-is-no-accusation"),
+        pytest.param(
+            lambda bv: _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)),
+                                 _SSARead(0x401104, _ssa_var(1))),
+            {"status": "unavailable", "reason": "no_library_entry"},
+            {"status": "agreement", "reason": None, "declared_arity": 2,
+             "witness_arity": 2, "register": "x1"},
+            "recovered", id="body-agrees"),
+        pytest.param(
+            lambda bv: _with_ssa(bv, _SSARead(0x401100, _ssa_var(0))),
+            {"status": "unavailable", "reason": "no_library_entry"},
+            {"status": "agreement", "reason": None, "declared_arity": 2,
+             "witness_arity": 1, "register": "x0"},
+            "recovered", id="body-reads-fewer-is-not-a-contradiction"),
+        pytest.param(
+            lambda bv: _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)),
+                                 _SSARead(0x401104, _ssa_var(2))),
+            {"status": "unavailable", "reason": "no_library_entry"},
+            {"status": "contradiction", "reason": None, "declared_arity": 2,
+             "witness_arity": 3, "register": "x2"},
+            "inferred", id="body-contradicts"),
+        pytest.param(
+            lambda bv: (_with_type_library(bv, symbol="hw_get_version", params=2),
+                        _as_import(bv)),
+            {"status": "agreement", "reason": None, "declared_arity": 2,
+             "witness_arity": 2, "source": "libc_x86_64.so.6"},
+            {"status": "unavailable", "reason": "imported_callee"},
+            "recovered", id="library-agrees-import-has-no-body"),
+        pytest.param(
+            lambda bv: (_with_type_library(bv, symbol="hw_get_version", params=3),
+                        _as_import(bv)),
+            {"status": "contradiction", "reason": None, "declared_arity": 2,
+             "witness_arity": 3, "source": "libc_x86_64.so.6"},
+            {"status": "unavailable", "reason": "imported_callee"},
+            "inferred", id="library-contradicts"),
+        pytest.param(
+            lambda bv: _with_type_library(bv, symbol="hw_get_version", params=3),
+            {"status": "refused", "reason": "not_library_provenance"},
+            {"status": "unavailable", "reason": "no_body"},
+            "recovered", id="library-names-a-local-definition"),
+        pytest.param(
+            lambda bv: (_with_type_library(bv, symbol="hw_get_version", params=1,
+                                           variadic=True), _as_import(bv)),
+            {"status": "refused", "reason": "variadic_signature"},
+            {"status": "unavailable", "reason": "imported_callee"},
+            "recovered", id="library-variadic-signature"),
+        pytest.param(
+            lambda bv: (setattr(_callee(bv), "name", "_ZN4Impl7combineEii"),
+                        _with_type_library(bv, symbol="_ZN4Impl7combineEii", params=3),
+                        _with_ssa(bv, *[_SSARead(0x401100 + 4 * i, _ssa_var(i))
+                                        for i in range(3)])),
+            {"status": "refused", "reason": "decorated_name"},
+            {"status": "refused", "reason": "decorated_name"},
+            "recovered", id="decorated-callee-refused-by-both"),
+        pytest.param(
+            lambda bv: (_with_varargs_flag(bv, _VarargsFlag(False, 0)),
+                        _with_ssa(bv, *[_SSARead(0x401100 + 4 * i, _ssa_var(i))
+                                        for i in range(6)])),
+            {"status": "unavailable", "reason": "no_library_entry"},
+            {"status": "refused", "reason": "variadic_undetermined"},
+            "recovered", id="varargs-never-determined"),
+        pytest.param(
+            lambda bv: _with_varargs_flag(bv, _VarargsFlag(True, _MAX_CONFIDENCE)),
+            {"status": "unavailable", "reason": "no_library_entry"},
+            {"status": "refused", "reason": "variadic_callee"},
+            "recovered", id="varargs-determined-variadic"),
+    ],
+)
+def test_each_arity_witness_reports_its_own_verdict_865(
+    monkeypatch, setup, library, body, confidence,
+):
+    """#865: the two witnesses are reported separately, each as agreement /
+    contradiction / unavailable / refused with the counts it observed. Only a
+    contradiction moves `argument_confidence`; a row no witness could check keeps
+    the neutral `recovered` -- absence of a witness is neither an under-recovery
+    accusation nor proof of correctness, and `recovered` claims neither."""
+    _, call = _witness_call(monkeypatch, setup=setup)
+    assert call["arity_witnesses"] == {"library": library, "callee_body": body}
+    assert call["argument_confidence"] == confidence
+
+
+def test_arity_witness_counts_tally_the_full_call_set_not_the_page_865(monkeypatch):
+    """#865: the function-level tally is over EVERY call row, like the hoisted
+    warnings, so a paged reader still sees how much of the card any witness backs."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=1, arg_texts=["a"],
+                   second=("hw_set_mode", 1, ["b"]))
+    _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)))                 # agrees
+    _set_ssa(bv.get_function_at(0x401500), _SSARead(0x401500, _ssa_var(0)),
+             _SSARead(0x401504, _ssa_var(3)))                      # contradicts
+
+    page = instance._function_evidence("active", "probe_device", context=0, limit=1)
+
+    assert page["returned"] == 1
+    assert page["arity_witness_counts"] == {
+        "library": {"agreement": 0, "contradiction": 0, "unavailable": 2, "refused": 0},
+        "callee_body": {"agreement": 1, "contradiction": 1, "unavailable": 0, "refused": 0},
+    }
+
+
+def test_no_row_claims_authoritative_any_more_865(monkeypatch):
+    """#865 changed the enum: `authoritative` is not emitted anywhere, including
+    where every available witness agrees -- agreement lives in `arity_witnesses`."""
+    _, call = _witness_call(
+        monkeypatch,
+        setup=lambda bv: (_with_type_library(bv, symbol="__hw_get_version", params=2),
+                          setattr(_callee(bv), "name", "__hw_get_version"),
+                          _with_ssa(bv, _SSARead(0x401100, _ssa_var(0)),
+                                    _SSARead(0x401104, _ssa_var(1)))))
+    assert call["arity_witnesses"]["library"]["status"] == "agreement"
+    assert call["arity_witnesses"]["callee_body"]["status"] == "agreement"
+    assert call["argument_confidence"] == "recovered"
+
+
 def test_argument_confidence_zero_args_on_unknown_arity_not_demoted_648(monkeypatch):
     """#648: a genuinely void callee rendering NO arguments agrees with its recovered
-    prototype -- nothing was invented, so it keeps `authoritative`. Demoting here
+    prototype -- nothing was invented, so it keeps `recovered`. Demoting here
     would flag every `f()` call in a stripped binary for no gain."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -5074,7 +5221,7 @@ def test_argument_confidence_zero_args_on_unknown_arity_not_demoted_648(monkeypa
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["arity_unknown"] is False
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
 
 
 def test_argument_confidence_unknown_arity_below_abi_width_648(monkeypatch):
@@ -5097,9 +5244,9 @@ def test_argument_confidence_unknown_arity_below_abi_width_648(monkeypatch):
     [
         pytest.param(3, ["1"], "inferred", True, id="under-recovered"),
         pytest.param(3, ["1", "2", "3", "4"], "inferred", True, id="extra"),
-        pytest.param(3, ["1", "2", "3"], "authoritative", False, id="matching"),
+        pytest.param(3, ["1", "2", "3"], "recovered", False, id="matching"),
         pytest.param(3, [], "inferred", True, id="zero-rendered"),
-        pytest.param(0, [], "authoritative", False, id="user-void"),
+        pytest.param(0, [], "recovered", False, id="user-void"),
         pytest.param(0, ["1"], "inferred", True, id="user-void-extra"),
     ],
 )
@@ -5151,7 +5298,7 @@ def test_argument_confidence_user_variadic_has_no_exact_count_742(monkeypatch, f
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["arity_unknown"] is False
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "arity_mismatch" not in call
 
 
@@ -5187,16 +5334,16 @@ def test_argument_confidence_arity_mismatch_fewer_args_than_declared_648(monkeyp
     assert call["arity_unknown"] is False
 
 
-def test_argument_confidence_negative_control_matching_arity_stays_authoritative_648(monkeypatch):
+def test_argument_confidence_negative_control_matching_arity_stays_recovered_648(monkeypatch):
     """#648 negative control (like a `memcpy`-shaped prototype): 3 declared params
-    and exactly 3 rendered arguments -- nothing invented, stays `authoritative`
+    and exactly 3 rendered arguments -- nothing invented, stays `recovered`
     and carries neither `arity_mismatch` nor `arity_unknown`."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=["&dst", "&src", "0x40"])
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "arity_mismatch" not in call
     assert call["arity_unknown"] is False
 
@@ -5372,10 +5519,10 @@ def test_argument_confidence_unavailable_argument_lists_are_heuristic_742(monkey
     assert "arity_mismatch" not in call
 
 
-def test_argument_confidence_indirect_call_never_authoritative_648(monkeypatch):
+def test_argument_confidence_indirect_call_never_recovered_648(monkeypatch):
     """#648: an indirect call has no resolvable callee, so its arity is
     unknowable even when HLIL produced a clean-looking argument list. The
-    canonical field must never report `authoritative` for it."""
+    canonical field must never report `recovered` for it."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     caller = _FakeFunction(0x401800, "dispatch")
@@ -5395,6 +5542,10 @@ def test_argument_confidence_indirect_call_never_authoritative_648(monkeypatch):
     assert call["indirect_call"] is True
     assert call["callee_unresolved"] is True
     assert call["argument_confidence"] == "heuristic"
+    # #865: no callee, so neither witness has anything to ask -- stated, not omitted.
+    assert call["arity_witnesses"] == {
+        name: {"status": "unavailable", "reason": "callee_unresolved"}
+        for name in ("library", "callee_body")}
 
 
 def test_argument_confidence_direct_call_to_unresolved_target_not_marked_indirect_704(monkeypatch):
@@ -5403,7 +5554,7 @@ def test_argument_confidence_direct_call_to_unresolved_target_not_marked_indirec
     with no covering function) must NOT be marked `indirect_call` -- that
     would contradict the sibling `direct: true` in the same record. It is
     still `callee_unresolved` (the callee's arity is unknowable either way),
-    so `argument_confidence` is demoted off `authoritative` regardless."""
+    so `argument_confidence` is demoted off `recovered` regardless."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     caller = _FakeFunction(0x401800, "dispatch")
@@ -5424,7 +5575,7 @@ def test_argument_confidence_direct_call_to_unresolved_target_not_marked_indirec
     assert call["direct"] is True
     assert call.get("indirect_call") is not True
     assert call["callee_unresolved"] is True
-    assert call["argument_confidence"] != "authoritative"
+    assert call["argument_confidence"] != "recovered"
 
 
 # --- #661: mlil: line / MLIL candidates come from the TRUE per-instruction MLIL --
@@ -6599,7 +6750,7 @@ def test_library_cross_check_refuses_a_locally_defined_name_collision_759(monkey
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
     assert "prototype_unverified" not in call
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
 
 
 def test_library_cross_check_applies_to_a_reserved_identifier_759(monkeypatch):
@@ -6676,7 +6827,7 @@ def test_an_agreeing_library_leaves_a_user_prototype_alone_759(monkeypatch):
 
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
     assert "prototype_unverified" not in call
 
 
@@ -6714,7 +6865,7 @@ def test_library_cross_check_refuses_every_decorated_scheme_759(monkeypatch, man
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
     assert "prototype_unverified" not in call
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
 
 
 def test_reserved_identifier_arm_requires_a_double_underscore_759(monkeypatch):
@@ -6736,7 +6887,7 @@ def test_reserved_identifier_arm_requires_a_double_underscore_759(monkeypatch):
     # shape, statically linked from libgcc and not an import).
     assert confidence("__popcountdi2") == "inferred"
     # A local `_X` name is not, so no demotion.
-    assert confidence("_Exit") == "authoritative"
+    assert confidence("_Exit") == "recovered"
 
 
 def test_library_cross_check_refuses_when_two_libraries_disagree_759(monkeypatch):
@@ -6765,7 +6916,7 @@ def test_library_cross_check_refuses_when_two_libraries_disagree_759(monkeypatch
     bv.type_libraries = [lib("libfirst.so", 1), lib("libsecond.so", 3)]
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert "prototype_unverified" not in call
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
 
     # Reversed order, same answer -- the point of the fix.
     bv.type_libraries = [lib("libsecond.so", 3), lib("libfirst.so", 1)]
@@ -6785,13 +6936,14 @@ def test_library_cross_check_refuses_punctuation_decorated_names_759(monkeypatch
     """#862 review round 6 MAJOR: the IDENTIFIER half of the refusal had no test
     anywhere. Deleting `or not _C_IDENTIFIER_RE.match(name)` left every changed
     test file green while IMPORTED punctuation-decorated callees flipped from
-    `authoritative` to `inferred` + `prototype_unverified` -- the measured
+    `authoritative` (the old label, now `recovered`) to `inferred` +
+    `prototype_unverified` -- the measured
     false-demotion class the agent-facing paragraph claims that rule excludes.
 
     These are the schemes the prefix tuple does NOT catch, because they are not
     valid C identifiers at all: MSVC `?name@@...`, current Swift `$s...`, a GCC
     clone suffix, and a versioned symbol. Import provenance is deliberately
-    granted here, so the row can only stay authoritative because the NAME was
+    granted here, so the row can only keep `recovered` because the NAME was
     refused -- which is what makes this fail when the identifier clause goes."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -6803,7 +6955,7 @@ def test_library_cross_check_refuses_punctuation_decorated_names_759(monkeypatch
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
 
     assert "prototype_unverified" not in call
-    assert call["argument_confidence"] == "authoritative"
+    assert call["argument_confidence"] == "recovered"
 
 
 def test_a_plain_c_identifier_is_still_admitted_759(monkeypatch):

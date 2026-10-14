@@ -3084,14 +3084,15 @@ class TestBareVoidCallHlilStatement:
 
 
 class TestArgumentArityConfidence:
-    """Regression for #648: `argument_confidence: authoritative` meant "HLIL
-    produced a list", not "the list is right" -- on an unknown-arity callee BN
-    assumes every argument register is live and HLIL renders whatever sits in them
-    (a neighbouring call's staging, the stack canary). This is the negative
-    control that keeps the fix from blanket-demoting everything: `memcpy` has a
-    bundled 3-parameter prototype, so its arguments really ARE authoritative."""
+    """Regression for #648: the HLIL label (`authoritative` then, `recovered` since
+    #865) meant "HLIL produced a list", not "the list is right" -- on an
+    unknown-arity callee BN assumes every argument register is live and HLIL
+    renders whatever sits in them (a neighbouring call's staging, the stack
+    canary). This is the negative control that keeps the fix from
+    blanket-demoting everything: `memcpy` has a bundled 3-parameter prototype, so
+    its arguments keep `recovered`."""
 
-    def test_known_prototype_callee_stays_authoritative(self, shared_bn):
+    def test_known_prototype_callee_stays_recovered(self, shared_bn):
         shared_bn.load(PARSER_BINARY)
         ev = json.loads(shared_bn.run("evidence", "function", "parse_record",
                                       "--format", "json").stdout)
@@ -3101,7 +3102,15 @@ class TestArgumentArityConfidence:
         ]
         assert memcpy_calls
         for c in memcpy_calls:
-            assert c["argument_confidence"] == "authoritative", c
+            assert c["argument_confidence"] == "recovered", c
+            # #865: the bundled libc signature is a real, independent witness
+            # and it AGREES; the import's body is not in this image, so the
+            # callee-body witness has nothing to read and says so.
+            library = c["arity_witnesses"]["library"]
+            assert library["status"] == "agreement", c
+            assert library["witness_arity"] == library["declared_arity"] == 3, c
+            assert c["arity_witnesses"]["callee_body"] == {
+                "status": "unavailable", "reason": "imported_callee"}, c
             assert c["arity_unknown"] is False, c
             assert "abi_register_saturated" not in c, c
 
@@ -3126,7 +3135,7 @@ class TestArgumentArityConfidence:
         "vendor" import BN's bundled type library has no signature for (unlike
         memcpy/printf, which are covered) analyzes with zero declared
         parameters, so its `argument_confidence` must demote off
-        `authoritative` and flag `arity_unknown`. Needs real BN + a C compiler
+        `recovered` and flag `arity_unknown`. Needs real BN + a C compiler
         that can build a small shared library."""
         import shutil
         cc = shutil.which("cc") or shutil.which("gcc")
@@ -3164,7 +3173,7 @@ class TestArgumentArityConfidence:
         assert vendor_calls, "expected a call to the unprototyped vendor import"
         for c in vendor_calls:
             assert c["arity_unknown"] is True, c
-            assert c["argument_confidence"] != "authoritative", c
+            assert c["argument_confidence"] != "recovered", c
 
 
 class TestUserPrototypeArityConfidence742:
@@ -3253,7 +3262,17 @@ class TestUserPrototypeArityConfidence742:
                 assert call["argument_confidence"] == "inferred", call
             else:
                 assert "arity_mismatch" not in call, call
-                assert call["argument_confidence"] == "authoritative", call
+                assert call["argument_confidence"] == "recovered", call
+            # #865: per-witness results on a real view. No attached library
+            # names a local `arity_sink`, and its -O0 body spills all three
+            # incoming argument registers, which agrees with the pinned
+            # 3-parameter prototype -- whatever the call-site adjustment did.
+            witnesses = call["arity_witnesses"]
+            assert witnesses["library"] == {
+                "status": "unavailable", "reason": "no_library_entry"}, call
+            assert witnesses["callee_body"]["status"] == "agreement", call
+            assert witnesses["callee_body"]["witness_arity"] == 3, call
+            assert witnesses["callee_body"]["declared_arity"] == 3, call
 
         indirect = shared_bn.json("evidence", "function", "arity_dispatch", "-t", target)
         assert len(indirect["calls"]) == 1, indirect
@@ -3263,6 +3282,9 @@ class TestUserPrototypeArityConfidence742:
         assert call["callee_unresolved"] is True, call
         assert call["argument_confidence"] == "heuristic", call
         assert "arity_mismatch" not in call, call
+        assert call["arity_witnesses"] == {
+            name: {"status": "unavailable", "reason": "callee_unresolved"}
+            for name in ("library", "callee_body")}, call
 
 
 class TestDataRetypeRoundtrip:
