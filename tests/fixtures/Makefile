@@ -23,7 +23,7 @@ SRCDIR  := src
 # integration lane reads); tests that only exercise the *build* pass a tmp dir
 # so a unit-only run leaves no working-tree side effects.
 OUTDIR  ?= .
-NAMES   := hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64 dispatch_table_x86_64 classes_x86_64 classes_stripped_x86_64 canary_x86_64
+NAMES   := hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64 dispatch_table_x86_64 classes_x86_64 classes_stripped_x86_64 canary_x86_64 vcalls_x86_64
 BINS    := $(addprefix $(OUTDIR)/,$(NAMES))
 # The bridge prefers an adjacent <binary>.bndb over the binary it caches, so a
 # sidecar left behind by an earlier build silently shadows the fresh one.

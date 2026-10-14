@@ -30,6 +30,7 @@ PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
 CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
 CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
+VCALLS_BINARY = FIXTURES_DIR / "vcalls_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -4186,6 +4187,47 @@ int main() { return global_b.b() + global_r.r(); }
         assert cards[0]["vtable"] == cards[1]["vtable"]
         assert cards[0]["instances"]["stored_globals"][0]["symbol"] == "global_r"
         assert cards[1]["instances"]["stored_globals"][0]["symbol"] is None
+
+
+class TestVirtualMethods998:
+    """#998 on a real g++ build (`src/vcalls.cpp`, -O0): a virtual method
+    reached only through its vtable slot, and the vtable's address point."""
+
+    def _json(self, shared_bn, *args):
+        res = shared_bn.run(*args, "--format", "json")
+        assert res.returncode == 0, (res.stdout, res.stderr)
+        return json.loads(res.stdout)
+
+    def test_callsites_says_when_the_callee_is_stored_in_data(self, shared_bn):
+        # `reg` is never called directly; its address sits in the Dispatcher
+        # and AudioDisp vtables. `callsites` states that fact -- two data
+        # refs, where -- and claims nothing about what they are.
+        shared_bn.load(VCALLS_BINARY)
+        out = self._json(shared_bn, "callsites", "vc::Dispatcher::reg")
+        assert out["total"] == 0, out
+        assert out["callee_data_ref_count"] == 2, out
+        xrefs = self._json(shared_bn, "xrefs", "vc::Dispatcher::reg")
+        assert out["callee_data_refs"] == sorted(
+            r["address"] for r in xrefs["items"] if r["kind"] == "data")
+        text = shared_bn.run("callsites", "vc::Dispatcher::reg").stdout
+        assert "note: the callee's address is stored in 2 data location(s)" in text, text
+        assert "may be vtable slots or function-pointer tables" in text
+        # A function stored nowhere gets no note.
+        plain = self._json(shared_bn, "callsites", "vc::pump")
+        assert plain["callee_data_ref_count"] == 0
+        assert "data location" not in shared_bn.run("callsites", "vc::pump").stdout
+
+    def test_vtable_address_point_is_what_objects_reference(self, shared_bn):
+        shared_bn.load(VCALLS_BINARY)
+        card = self._json(shared_bn, "class", "show", "vc::Dispatcher")
+        vt = card["vtable"]
+        assert int(vt["address_point"], 16) == int(vt["address"], 16) + 16, vt
+        # The ctor stores the address point, so xrefs on it finds code and on
+        # the object start (what the card printed alone before) finds none.
+        assert self._json(shared_bn, "xrefs", vt["address_point"])["code_ref_count"] >= 1
+        assert self._json(shared_bn, "xrefs", vt["address"])["code_ref_count"] == 0
+        text = shared_bn.run("class", "show", "vc::Dispatcher").stdout
+        assert f"vtable @ {vt['address']}, address point {vt['address_point']}" in text
 
 
 class TestStructLayoutAssistance903:

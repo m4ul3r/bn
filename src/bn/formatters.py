@@ -4004,6 +4004,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
     scan_truncated = False
     has_more = False
     caller_scan_note = None
+    data_ref_note = None
     if _field_declared(value, "items"):
         total = value.get("total")
         offset = value.get("offset")
@@ -4013,6 +4014,8 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         scan_truncated = bool(value.get("scan_truncated"))
         has_more = bool(value.get("has_more"))
         caller_scan_note = value.get("caller_scan_note")
+        data_ref_note = _callsites_data_ref_note(value.get("callee_data_ref_count"),
+                                                 value.get("callee_data_refs"))
         value = _field_list(value, "items")
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -4070,6 +4073,13 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         ]
         if call_index is not None:
             lines.append(f"call_index: {call_index}")
+        also_in = [f for f in _field_list(row, "also_in") if isinstance(f, dict)]
+        if also_in:
+            # #998 item 2: one call instruction in a block BN gives to several
+            # functions is one call site; the other containers ride on it.
+            lines.append("also_in: " + ", ".join(
+                f"{_shown_name(f, mangled=mangled) or '<unknown>'} @ {f.get('address', '<unknown>')}"
+                for f in also_in))
         if scoped and row.get("within_query"):
             # Verbatim, like every other labelled value: the text must carry
             # the JSON value a filter written from it will compare (#979).
@@ -4159,7 +4169,25 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         body = f"{body}\n\n{note}" if body else note
     if not blocks and not body:
         body = _empty_result("callsites")
+    if data_ref_note:
+        body = f"{body}\n\n{data_ref_note}" if body else data_ref_note
     return body
+
+
+def _callsites_data_ref_note(raw_count: Any, raw_refs: Any) -> str | None:
+    """#998 item 1: the callee's address is stored in data, so it may also be
+    called through a vtable slot or a function-pointer table -- calls no call
+    instruction names, absent from the rows above. States the fact (how many,
+    where) and nothing more; `xrefs` shows what those locations are."""
+    if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count <= 0:
+        return None
+    refs = [str(r) for r in _field_list({"callee_data_refs": raw_refs}, "callee_data_refs")]
+    shown = ", ".join(refs[:3])
+    more = f", +{raw_count - len(refs[:3])} more" if raw_count > len(refs[:3]) else ""
+    where = f" ({shown}{more})" if shown else ""
+    return (f"note: the callee's address is stored in {raw_count} data location(s){where}; "
+            "they may be vtable slots or function-pointer tables, so it may also be called "
+            "indirectly -- see `bn xrefs` on the callee")
 
 
 @_discloses
@@ -7704,7 +7732,12 @@ def _render_one_class(rec: Any) -> str:
     if size_s is not None:
         bits.append(f"size {size_s}")
     if vt_addr:
+        # #998 item 3: `address` is the object start the `_ZTV` symbol names;
+        # objects (and so xrefs) hold the address point two words in.
+        vt_ap = _text_value(vt, "address_point")
         bits.append(f"vtable @ {vt_addr}")
+        if vt_ap:
+            bits.append(f"address point {vt_ap}")
     if bases:
         bits.append(f"base: {bases}")
     if bits:
@@ -7776,7 +7809,9 @@ def _render_one_class(rec: Any) -> str:
         # fact; say so on the line an analyst would quote.
         conf = _text_value(sec, "confidence")
         conf_s = f" [{conf}]" if conf else ""
-        lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}{conf_s}:")
+        sec_ap = _text_value(sec, "address_point")
+        ap_s = f" (address point {sec_ap})" if sec_ap else ""
+        lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ap_s}{ott_s}{conf_s}:")
         for s in _field_list(sec, "slots"):
             if not isinstance(s, dict):
                 lines.append(f"    {s!r}")

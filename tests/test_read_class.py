@@ -918,6 +918,13 @@ def test_vtable_layout_skips_header_and_marks_slots():
     assert s2["pure_virtual"] is True
 
 
+def test_vtable_layout_reports_the_address_point_998():
+    """#998 item 3: objects hold the slot array's address, not the `_ZTV`
+    object start the layout is keyed by."""
+    layout = read_class._vtable_layout(_VtableCtx([(0x40e8b0, "onData")]), object(), 0x9000)
+    assert layout["address"] == "0x9000" and layout["address_point"] == "0x9010"
+
+
 def test_vtable_layout_stops_at_unmapped_slot():
     # The scan must terminate at the first non-function/unreadable slot (the next
     # object / padding), not skip it and keep collecting later rows.
@@ -1858,6 +1865,8 @@ def test_vtable_layout_early_return_carries_truncation_keys():
         "scan_truncated": False,
         "truncated_reason": "no_local_vtable_body",
         "bn_vtable_slots": None,
+        # #998 item 3: no decoded header, so no proven address point.
+        "address_point": None,
     }
 
 

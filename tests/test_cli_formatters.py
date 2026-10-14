@@ -849,6 +849,46 @@ def _callsite_row(call_addr: str) -> dict:
     }
 
 
+def test_render_callsites_notes_data_refs_to_the_callee_998():
+    """#998 item 1: a function stored in data may be called through it (a
+    vtable slot, a function-pointer table), which no call instruction names.
+    The note states how many such refs there are and where -- nothing more --
+    and points at `xrefs`."""
+    from bn.formatters import _render_callsites_text
+    value = {"items": [], "total": 0, "has_more": False, "scan_truncated": False,
+             "callee_data_ref_count": 5,
+             "callee_data_refs": ["0x41fc68", "0x41fcc8", "0x41fd00", "0x41fd08", "0x41fd10"]}
+    out = _render_callsites_text(value)
+    assert out.startswith("(no callsites)")
+    assert ("note: the callee's address is stored in 5 data location(s) (0x41fc68, 0x41fcc8, "
+            "0x41fd00, +2 more); they may be vtable slots or function-pointer tables, so it "
+            "may also be called indirectly -- see `bn xrefs` on the callee") in out
+    for count in (0, None):
+        assert "data location" not in _render_callsites_text(
+            {**value, "callee_data_ref_count": count, "callee_data_refs": []})
+
+
+def test_render_callsites_lists_the_other_containing_functions_998():
+    from bn.formatters import _render_callsites_text
+    row = {**_callsite_row("0x4000e0"),
+           "also_in": [{"name": "f2", "display_name": "f2", "address": "0x4000f0"}]}
+    out = _render_callsites_text({"items": [row], "total": 1, "has_more": False})
+    assert "also_in: f2 @ 0x4000f0" in out
+    assert "also_in" not in _render_callsites_text(
+        {"items": [{**row, "also_in": []}], "total": 1, "has_more": False})
+
+
+def test_render_class_card_shows_the_vtable_address_point_998():
+    from bn.formatters import _render_one_class
+    rec = {"name": "Dispatcher", "confidence": "rtti", "methods": [],
+           "vtable": {"address": "0x41fc40", "address_point": "0x41fc50", "slots": []},
+           "secondary_vtables": [{"address": "0x41fd00", "address_point": "0x41fd10",
+                                  "offset_to_top": -8, "slots": []}]}
+    out = _render_one_class(rec)
+    assert out.splitlines()[0] == "class Dispatcher  (vtable @ 0x41fc40, address point 0x41fc50)"
+    assert "  secondary vtable @ 0x41fd00 (address point 0x41fd10) (offset-to-top -8):" in out
+
+
 def test_render_callsites_footer_on_partial_last_page():
     # #611: a partial LAST page (offset > 0, has_more False, fewer rows than the
     # total) must still say so -- it used to read as the complete result.

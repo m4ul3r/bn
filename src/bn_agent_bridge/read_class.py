@@ -1507,6 +1507,7 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
             "scan_truncated": False,
             "truncated_reason": "no_local_vtable_body",
             "bn_vtable_slots": None,
+            "address_point": None,
         }
     start = vtable_addr + 2 * ptr
     # #922 (b) review: BN's own `<Class>::VTable` struct at the slot array is
@@ -1631,6 +1632,10 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
         # (None when BN defined none) -- informational, never a bound (see the
         # note at `start`).
         "bn_vtable_slots": bn_slots,
+        # #998 item 3: the vptr value objects of this class carry (the slot
+        # array, start + 2 words). `address` is the OBJECT start the `_ZTV`
+        # symbol names (#935); xrefs and stored vptrs point here instead.
+        "address_point": hex(int(start)),
     }
 
 
