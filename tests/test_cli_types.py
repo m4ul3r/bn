@@ -93,6 +93,23 @@ def test_proto_get_renders_prototype_text(fake_transport, capsys):
     assert capsys.readouterr().out == "int32_t sub_401000(int32_t arg1)\n"
 
 
+def test_proto_get_renders_split_body_notes_966(fake_transport, capsys):
+    fake_transport({"get_prototype": {"ok": True, "result": {
+        "function": {"name": "build_widget", "address": "0x4000dc"},
+        "prototype": "int64_t (int64_t* arg1, int64_t arg3 @ x19)",
+        "split_body_notes": ["prototype takes parameters in callee-saved/link "
+                             "registers (arg3 @ x19): ..."],
+    }}})
+
+    rc = bn.cli.main(["proto", "get", "--target", "active", "build_widget"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The first line stays a copy-pasteable declaration (#222).
+    assert out.splitlines()[0] == "int64_t build_widget(int64_t* arg1, int64_t arg3 @ x19)"
+    assert "note: prototype takes parameters in callee-saved/link registers (arg3 @ x19)" in out
+
+
 def test_types_declare_rejects_multiple_sources(fake_transport, capsys, tmp_path):
     # #94 Problem B: --file + positional must not silently pick one.
     f = tmp_path / "d.h"

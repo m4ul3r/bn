@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, _pick, arg, command, mutation_output_args, preview_arg
+from ..cli import _call, _effective_limit, _mutate, _mutation_preflight, _pick, arg, command, mangled_arg, mutation_output_args, preview_arg
 from ..formatters import (
     _render_comment_list_text,
     _render_comment_text,
@@ -56,7 +56,8 @@ def _symbol_rename(args: argparse.Namespace) -> int:
                # address-only behaviour stays expressible.
                arg("--scope", choices=["all", "address", "function"], default="all",
                    help="Which comment store to list: address comments, function "
-                        "documentation comments (fn.comment), or both (default: all)")],
+                        "documentation comments (fn.comment), or both (default: all)"),
+               mangled_arg()],
          estimable=True)
 def _comment_list(args: argparse.Namespace) -> int:
     return _call(
@@ -65,7 +66,7 @@ def _comment_list(args: argparse.Namespace) -> int:
         {"query": args.query, "offset": args.offset, "limit": _effective_limit(args),
          "scope": args.scope},
         require_target=True,
-        text_renderer=_render_comment_list_text,
+        text_renderer=lambda v: _render_comment_list_text(v, mangled=args.mangled),
         # Bridge returns the {items,total,...} envelope and applies the page, so
         # forward the real limit/offset (above) and keep the spill hint -- no
         # client-side limit+1 probe (#131, mirrors strings/imports/#130).

@@ -8,7 +8,7 @@ from typing import Any
 from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
                    _mutation_exit_code, _mutation_preflight, _non_negative_int, _out_path_is_process_local, _pick,
                    _positive_int, _refuse_count_only_slices, arg, blank_selector, command,
-                   decode_json_input, mutex, mutation_output_args, preview_arg,
+                   decode_json_input, mangled_arg, mutex, mutation_output_args, preview_arg,
                    read_text_input)
 from ..formatters import (
     _discloses,
@@ -22,11 +22,15 @@ from ..formatters import (
     _render_go_rename_text,
     _go_rename_summary,
     _render_imports_summary_text,
+    _render_mangled_name_address_list_text,
     _render_name_address_list_text,
     _render_py_exec_text,
+    _render_read_escaped_text,
     _render_read_text,
     _render_sections_text,
+    _render_strings_narrowed_mangled_text,
     _render_strings_narrowed_text,
+    _render_strings_mangled_text,
     _render_strings_text,
     _stated_count,
 )
@@ -73,12 +77,17 @@ def _strings_count_text(value: Any) -> str:
          fanout=True,
          args=[
              arg("--query"),
+             mangled_arg("Name `--with-xrefs` functions by their raw (mangled) C++ "
+                         "symbol names instead of demangled display names; JSON "
+                         "always carries both"),
              arg("--regex", action="store_true", default=False,
                  help="Interpret --query as a case-insensitive regular expression"),
              arg("--min-length", type=_non_negative_int, default=None,
-                 help="Exclude strings shorter than N characters"),
+                 help="Exclude strings shorter than N characters (decoded code points, "
+                      "not storage bytes: a UTF-16/UTF-32 string counts its characters)"),
              arg("--max-length", type=_non_negative_int, default=None,
-                 help="Exclude strings longer than N characters (drops long resource/blob data)"),
+                 help="Exclude strings longer than N characters (decoded code points; "
+                      "drops long resource/blob data)"),
              arg("--section",
                  help="Only include strings in this section (e.g. .rodata, .rdata)"),
              arg("--no-crt", action="store_true", default=False,
@@ -91,6 +100,10 @@ def _strings_count_text(value: Any) -> str:
                       "assert a format-string vulnerability."),
              arg("--count", action="store_true", default=False,
                  help="Show the matching string count instead of listing"),
+             arg("--with-xrefs", action="store_true", default=False,
+                 help="Annotate each listed string with the functions that reference "
+                      "it (code refs; first 8 per row plus the total), so a filtered "
+                      "string set maps to its users in one call"),
          ],
          estimable=True)
 def _strings(args: argparse.Namespace) -> int:
@@ -135,9 +148,13 @@ def _strings(args: argparse.Namespace) -> int:
             **common,
             "offset": args.offset,
             "limit": _effective_limit(args),
+            "with_xrefs": bool(args.with_xrefs),
         },
         require_target=True,
-        text_renderer=_render_strings_narrowed_text if narrowed else _render_strings_text,
+        text_renderer=(
+            (_render_strings_narrowed_mangled_text if args.mangled
+             else _render_strings_narrowed_text) if narrowed
+            else (_render_strings_mangled_text if args.mangled else _render_strings_text)),
         page_label="strings",
         paged_spill=True,
         stem="strings",
@@ -266,7 +283,8 @@ _EXPORT_ARGS = [
         action="store_true",
         default=False,
         help="Count global/weak definitions from any symbol table, not loader-visible exports",
-    )
+    ),
+    mangled_arg(),
 ]
 
 
@@ -307,7 +325,8 @@ def _exports(args: argparse.Namespace) -> int:
         "list_exports",
         params,
         require_target=True,
-        text_renderer=_render_name_address_list_text,
+        text_renderer=(_render_mangled_name_address_list_text if args.mangled
+                       else _render_name_address_list_text),
         page_label="exports",
         paged_spill=True,
         stem="exports",
@@ -567,16 +586,28 @@ def _bundle_function(args: argparse.Namespace) -> int:
          args=[
              arg("address", nargs="?",
                  help="Address to read from (hex 0x.. or decimal)"),
+             arg("length_pos", nargs="?", metavar="length", type=_int_or_hex,
+                 help="Number of bytes to read (same as --length: `bn read ADDR LEN`)"),
              arg("--address", dest="address_flag", default=None,
                  help="Address to read from (alias for the positional)"),
-             arg("--length", "--size", dest="length", default=16, type=_int_or_hex,
+             arg("--length", "--size", dest="length", default=None, type=_int_or_hex,
                  help="Number of bytes to read (decimal or hex 0x..; --size is an alias; default 16)"),
-             arg("--encoding", choices=("hex", "bytes"), default="hex",
-                 help="Byte payload encoding: hex hexdump (default) or raw bytes"),
+             arg("--encoding", choices=("hex", "escaped", "bytes"), default="hex",
+                 help="Byte payload encoding: hex hexdump (default); escaped, the bytes "
+                      "as a quoted C-escaped string (\\0, \\n, \\xHH; one unambiguous "
+                      "escape per byte, octal before a digit), so the NULs between short "
+                      "strings stay visible; or raw "
+                      "bytes, for redirection or --out (NULs are invisible on a terminal)"),
          ],
          estimable=True)
 def _read(args: argparse.Namespace) -> int:
+    # #972: `bn read ADDR LEN` -- the second positional is the length. It is
+    # only ever the SECOND slot: `bn read --address A N` keeps reading N as a
+    # (conflicting) address, so a typo'd address is never silently turned into
+    # a byte count.
     address = _pick(args.address, args.address_flag, "read address")
+    length = _pick(args.length_pos, args.length, "read length", required=False)
+    args.length = 16 if length is None else length
     if args.encoding == "bytes":
         return _read_raw_bytes(args, address)
     return _call(
@@ -584,7 +615,10 @@ def _read(args: argparse.Namespace) -> int:
         "read",
         {"address": address, "length": args.length},
         require_target=True,
-        text_renderer=_render_read_text,
+        # #971: a text face only; `--format json` already carries the exact
+        # bytes in `hex`.
+        text_renderer=(_render_read_escaped_text if args.encoding == "escaped"
+                       else _render_read_text),
         stem="read",
     )
 

@@ -1082,11 +1082,11 @@ def test_mutating_reference_documents_the_output_flags(mutation_engine):
 
 
 def test_reading_reference_documents_the_function_list_flags():
-    """#650: `--sort` / `--reverse` / `--min-size` / `--demangle` all ship, and all
+    """#650: `--sort` / `--reverse` / `--min-size` / `--mangled` all ship, and all
     were absent from `reading.md` -- so two agents wrote the same python to sort
     functions by size."""
     text = READING.read_text(encoding="utf-8")
-    for flag in ("--sort", "--reverse", "--min-size", "--demangle", "--named", "--unnamed"):
+    for flag in ("--sort", "--reverse", "--min-size", "--mangled", "--named", "--unnamed"):
         assert flag in text, f"`function list` flag {flag!r} undocumented in reading.md"
 
 

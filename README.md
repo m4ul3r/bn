@@ -101,7 +101,7 @@ Ready immediately after `--quick`:
 
 - `bn sections`
 - `bn imports`
-- the symbol table (and `bn rename` against named symbols)
+- the symbol table
 - `bn target list` / `bn target info` (the view is flagged `[not analyzed]`)
 
 Need `bn refresh` first — these depend on the analysis pass:
@@ -109,6 +109,7 @@ Need `bn refresh` first — these depend on the analysis pass:
 - `bn strings` **errors** until you refresh — it refuses with "Strings are not available: this target was loaded with --quick (no analysis). Run bn refresh …" rather than return an empty list that looks like "this binary has no strings".
 - `bn function list` / `bn function search` return a **partial** set — only entry-point and symbol functions exist before analysis; the count grows once the analysis pass recovers the rest.
 - `bn decompile` / `bn il` / `bn disasm` / `bn xrefs` across the binary are partial for the same reason (functions BN hasn't discovered yet aren't there to read).
+- Every mutation, `bn go rename` included, **refuses** with `invalid_request` (exit 3) until you refresh: mutations reanalyze under the write lock, and `go rename` would only see the few functions a quick view defines.
 
 Run `bn refresh` once to promote a quick view to full analysis:
 
@@ -126,7 +127,7 @@ Single-function escape hatch — analyze just one function without a full refres
 bn decompile handle_request --force-analysis
 ```
 
-Loading a `.bndb` ignores `--quick`: a database already carries its saved analysis, so the flag is a no-op there.
+Loading a `.bndb` ignores `--quick`: a database already carries its saved analysis, so the flag is a no-op there. That includes an adjacent `<binary>.bndb`, which `bn load <binary>` prefers (pass `--no-bndb` for the raw bytes). A database `bn save` wrote to the cache (`<cache>/bndb/`, used when the binary's own directory is read-only) is different: the cache is shared by every bn instance using the same `BN_CACHE_DIR` (by default, every one on the machine), so `--quick` never restores it — the raw bytes load quickly and the note names the skipped entry with the `bn load <entry>` that restores it. On a read-only mount, a target that did not load an existing cache entry (`--quick`, `--no-bndb`) cannot `bn save` over it: the save is refused and points at `bn save <path>`. Give each agent or project its own `BN_CACHE_DIR` to keep their caches apart.
 
 ### Detecting a quick view programmatically
 
@@ -253,7 +254,7 @@ bn imports
 Each callsite row also includes:
 
 - `call_index`: zero-based ordinal for matching callsites in the containing function, ordered by `call_addr`
-- `within_query`: the original unresolved scope token from `--within` or `--within-file`
+- `within_query`: the scope token from `--within` or `--within-file`, as given; with no `--within`, the containing function's raw (mangled for C++) name, unique across overloads so it can be passed back as `--within`. Text prints it only when `--within`/`--within-file` was given
 - `hlil_statement`: the smallest recoverable HLIL expression or statement containing the call, or `null` when Binary Ninja only exposes a coarse enclosing region
 - `pre_branch_condition`: the nearest enclosing pre-call HLIL condition when it can be recovered confidently, otherwise `null`
 

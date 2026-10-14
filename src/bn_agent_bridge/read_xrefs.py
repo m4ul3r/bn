@@ -633,11 +633,7 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
     genuine_code_refs, stub_starts = _union_stub_code_refs(ctx, bv, address, genuine_code_refs)
     for ref in sorted(genuine_code_refs, key=lambda item: int(item.address)):
         fn = getattr(ref, "function", None)
-        caller = (
-            {"address": hex(int(fn.start)), "name": str(fn.name)}
-            if fn is not None
-            else None
-        )
+        caller = il_format._function_identity(fn) if fn is not None else None
         ref_addr = int(ref.address)
         ref_arch = getattr(ref, "arch", None) or getattr(fn, "arch", None)
         code_refs.append(
@@ -655,11 +651,7 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
         ref_addr = int(ref_addr)
         functions = ctx._functions_containing(bv, ref_addr)
         fn = functions[0] if functions else None
-        caller = (
-            {"address": hex(int(fn.start)), "name": str(fn.name)}
-            if fn is not None
-            else None
-        )
+        caller = il_format._function_identity(fn) if fn is not None else None
         data_refs.append(
             {
                 "function": fn.name if fn is not None else None,
@@ -679,11 +671,7 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
         for slot, _section_name, thumb in fp_refs:
             functions = ctx._functions_containing(bv, slot)
             fn = functions[0] if functions else None
-            caller = (
-                {"address": hex(int(fn.start)), "name": str(fn.name)}
-                if fn is not None
-                else None
-            )
+            caller = il_format._function_identity(fn) if fn is not None else None
             entry = {
                 "function": fn.name if fn is not None else None,
                 "address": hex(slot),
@@ -993,10 +981,7 @@ def _scan_for_calls_to(
             code_refs.append({
                 "function": str(fn.name),
                 "address": hex(ref_addr),
-                "caller_function": {
-                    "address": hex(int(fn.start)),
-                    "name": str(fn.name),
-                },
+                "caller_function": il_format._function_identity(fn),
                 "kind": "code",
                 "context": ctx._address_context(
                     bv, ref_addr, include_disasm=True, arch=fn_arch, assume_code=True
@@ -1107,6 +1092,9 @@ def _field_xrefs(ctx, selector: str | None, field_spec: str,
         code_refs.append(
             {
                 "function": func.name if func is not None else None,
+                # #978: the demangled spelling the text face shows.
+                "function_display_name": (
+                    il_format._display_name(func) if func is not None else None),
                 "address": hex(address),
                 "size": int(getattr(ref, "size", 0)),
                 "incoming_type": str(getattr(ref, "incomingType", "")) or None,

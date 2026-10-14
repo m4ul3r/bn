@@ -160,36 +160,67 @@ _COMMENT_SPAN_RE = re.compile(
 )
 
 
-def _redact_rendered_annotations(text: str, annotation_bodies: list[str]) -> str:
+_SESSION_ANNOTATION_MARK = "[this session] "
+
+
+def _body_lines(bodies) -> set[str]:
+    return {
+        line.strip()
+        for body in bodies
+        for line in str(body).splitlines()
+        if line.strip()
+    }
+
+
+def _redact_rendered_annotations(
+    text: str, annotation_bodies: list[str], session_bodies: list[str] = (),
+) -> tuple[str, int, int]:
     """Redact matching standalone or trailing ``//`` annotation bodies.
 
     Match complete stored body lines, not substrings in code or literals.
     Block comments are consumed unchanged; BN renders inherited notes as ``//``.
+
+    A line of *session_bodies* -- a comment this bridge wrote -- stays visible,
+    marked ``[this session]`` (#977). A line stored BOTH ways is redacted:
+    the rendered text cannot say which store it came from, so the inherited
+    reading wins. Returns ``(text, hidden, session_shown)``, counting the
+    rendered comment spans each rule rewrote, so a caller can tell the reader
+    something was hidden rather than leave ``<annotation redacted>`` looking
+    like a write that did not land.
     """
-    bodies = {
-        line.strip()
-        for body in annotation_bodies
-        for line in str(body).splitlines()
-        if line.strip()
-    }
-    if not bodies:
-        return text
+    bodies = _body_lines(annotation_bodies)
+    session = _body_lines(session_bodies) - bodies
+    if not bodies and not session:
+        return text, 0, 0
+    counts = {"hidden": 0, "session": 0}
 
     def redact(match: re.Match[str]) -> str:
         body = match.group("body")
-        if body is None or body.strip() not in bodies:
+        if body is None:
             return match.group(0)
+        stripped = body.strip()
         leading = body[:len(body) - len(body.lstrip())]
         trailing = body[len(body.rstrip()):]
-        return f"//{leading}<annotation redacted>{trailing}"
+        if stripped in bodies:
+            counts["hidden"] += 1
+            return f"//{leading}<annotation redacted>{trailing}"
+        if stripped in session:
+            counts["session"] += 1
+            return f"//{leading}{_SESSION_ANNOTATION_MARK}{stripped}{trailing}"
+        return match.group(0)
 
-    return _COMMENT_SPAN_RE.sub(redact, text)
+    redacted = _COMMENT_SPAN_RE.sub(redact, text)
+    return redacted, counts["hidden"], counts["session"]
 
 
-def _annotation_bodies(func, comments: dict) -> list[str]:
-    """Every stored annotation body that can surface in this function's rendered
-    text: the global comment map (passed in, already computed by the caller), the
-    function-local map, and the function's own documentation comment.
+def _annotation_entries(func, comments: dict) -> list[tuple[tuple[str, int], str]]:
+    """Every stored annotation that can surface in this function's rendered
+    text, keyed by where it is stored: ``("address", addr)`` for the global
+    comment map (passed in, already computed by the caller), ``("local", addr)``
+    for the function-local map, and ``("function_doc", start)`` for the
+    function's own documentation comment. The keys are the ones
+    ``TargetManager.note_session_annotations`` records, so a session-written
+    comment is recognised by location AND body (#977).
 
     Shared with ``bridge._bundle_function``, which renders the same text through
     its own call path: #752 was precisely those two paths disagreeing about what
@@ -209,13 +240,35 @@ def _annotation_bodies(func, comments: dict) -> list[str]:
     # live, that view iterates it and a parallel text decompile dies of
     # "dictionary changed size during iteration".
     local_comments = dict(getattr(func, "comments", {}) or {})
-    return [
-        *comments.values(),
-        # Local and global bodies can differ at the same address; do not merge
-        # their maps and silently discard one of the two annotations.
-        *local_comments.values(),
-        *([function_comment] if function_comment else []),
-    ]
+    # Local and global bodies can differ at the same address; do not merge
+    # their maps and silently discard one of the two annotations.
+    entries = [(("address", int(str(addr), 16)), body) for addr, body in comments.items()]
+    entries.extend((("local", int(addr)), body) for addr, body in local_comments.items())
+    if function_comment:
+        entries.append((("function_doc", int(func.start)), function_comment))
+    return entries
+
+
+def _redact_function_annotations(ctx, bv, func, comments: dict, text: str
+                                 ) -> tuple[str, dict[str, Any]]:
+    """The default (#740) decompile redaction for *func*, exempting the
+    comments this bridge wrote (#977). Returns the text and the
+    ``annotation_summary`` counts. Shared by ``decompile`` and ``bundle
+    function`` so the two renderings cannot disagree (#752)."""
+    entries = _annotation_entries(func, comments)
+    try:
+        ledger = ctx.targets.session_annotations(bv)
+    except Exception:  # noqa: BLE001 - no ledger means nothing is exempt
+        ledger = {}
+    inherited = [body for key, body in entries if ledger.get(key) != body]
+    session = [body for key, body in entries if ledger.get(key) == body]
+    text, hidden, shown = _redact_rendered_annotations(text, inherited, session)
+    return text, {
+        "comment_count": len(entries),
+        "redacted": True,
+        "hidden": hidden,
+        "session_shown": shown,
+    }
 
 
 
@@ -504,6 +557,744 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[str]:
     return warnings
 
 
+# Symbol kinds whose body is not in this binary: an import's PLT stub, its GOT
+# slot, or an extern. A call to one of these cannot be IPRA-optimized (#955), so
+# an argument register written right before it is an argument.
+_IMPORT_SYMBOL_KINDS = {
+    "ImportedFunctionSymbol", "ImportAddressSymbol", "ExternalSymbol",
+    "LibraryFunctionSymbol",
+}
+_ARITY_LISTED_MAX = 6
+
+
+def _full_reg(arch, name: str) -> str:
+    """The full-width register *name* is part of (`w2` -> `x2`, `esi` -> `rsi`)."""
+    try:
+        return str(arch.regs[name].full_width_reg)
+    except Exception:  # noqa: BLE001 - an unknown register stands for itself
+        return str(name)
+
+
+def _llil_regs_read(arch, expr, acc: set[str]) -> None:
+    if expr is None or not hasattr(expr, "operation"):
+        return
+    if il_format._il_op_name(expr) in ("LLIL_REG", "LLIL_REG_SSA", "LLIL_REG_SSA_PARTIAL"):
+        src = getattr(expr, "src", None)
+        name = getattr(src, "name", None)
+        if name:
+            acc.add(_full_reg(arch, str(name)))
+    for operand in getattr(expr, "operands", None) or []:
+        for item in operand if isinstance(operand, list) else [operand]:
+            _llil_regs_read(arch, item, acc)
+
+
+def _argument_setup_count(arch, window: list, arg_regs: list[str]) -> tuple[int, list[str]]:
+    """How many leading argument registers *window* writes for the call after it.
+
+    *window* is the LLIL between the previous call (or the block start) and the
+    call, in order. LLIL blocks do NOT end at calls, so that bound is the
+    caller's job, and it bounds everything here: nothing before an earlier call
+    can set up this one, nor explain one of its writes (#985 review).
+
+    A write to an argument register counts only when nothing reads that register
+    between the write and the call: such a value has no consumer but the callee,
+    since every argument register is caller-saved. Two writes are never counted:
+    one that is read before the call (a temporary), and GCC's stack-protector
+    scrub -- `ldr xN, [guard]; str xN, [sp, ..]; mov xN, #0` -- which zeroes a
+    register it just stored, and is where the issue's invented `__stack_chk_guard`
+    argument came from (#955). Returns (count, written register names): the count
+    is the highest written argument register's position + 1, because the ABI
+    passes every lower register too.
+    """
+    read_after: set[str] = set()
+    written: dict[str, Any] = {}
+    stored_before: list[set[str]] = []
+    stored: set[str] = set()
+    for ins in window:
+        stored_before.append(set(stored))
+        if il_format._il_op_name(ins) == "LLIL_STORE":
+            src = getattr(ins, "src", None)
+            if il_format._il_op_name(src) == "LLIL_REG":
+                stored.add(_full_reg(arch, str(getattr(src.src, "name", ""))))
+    for pos in range(len(window) - 1, -1, -1):
+        ins = window[pos]
+        if il_format._il_op_name(ins) == "LLIL_SET_REG":
+            name = _full_reg(arch, str(getattr(getattr(ins, "dest", None), "name", "")))
+            if name in arg_regs and name not in written and name not in read_after:
+                scrub = (il_format._llil_constant_value(getattr(ins, "src", None)) == 0
+                         and name in stored_before[pos])
+                if not scrub:
+                    written[name] = ins
+            _llil_regs_read(arch, getattr(ins, "src", None), read_after)
+        else:
+            _llil_regs_read(arch, ins, read_after)
+    if not written:
+        return 0, []
+    names = sorted(written, key=arg_regs.index)
+    return arg_regs.index(names[-1]) + 1, names
+
+
+_CALL_OPS = ("LLIL_CALL", "LLIL_TAILCALL", "LLIL_CALL_STACK_ADJUST")
+
+
+def _calls_with_setup_windows(llil):
+    """Yield ``(call, window)`` for each LLIL call, *window* being the
+    instructions since the previous call or the start of the call's block.
+    One linear pass, so the cost is the function's LLIL size, not its square."""
+    for block in list(getattr(llil, "basic_blocks", None) or []):
+        window: list = []
+        for ins in block:
+            op = il_format._il_op_name(ins)
+            if op in _CALL_OPS:
+                yield ins, window
+                window = []
+            elif "CALL" in op or op == "LLIL_SYSCALL":
+                window = []
+            else:
+                window.append(ins)
+
+
+# Sized deallocation (`operator delete(void*, size_t)` and the array / aligned
+# forms). BN's type library declares only the pointer, so every sized delete in
+# a C++ binary renders one argument short -- 370 of 383 findings on one stock
+# binary (#985 review). The dropped value is the object size the allocator is
+# told, not data any analysis follows, so reporting it buried the findings that
+# matter.
+_SIZED_DELETE_RE = re.compile(r"^_Zd[la]Pv[mj]")
+
+
+def _demangled_arity(bv, raw_name: str) -> tuple[int, int, bool] | None:
+    """(total, explicit, variadic) parameter counts from a mangled name, or None.
+
+    BN's GNU3 demangler includes `this` for every nested name -- including a
+    static member or a namespaced free function, which have none -- so *total*
+    may overcount by one; *explicit* excludes a `this` parameter and never does.
+    """
+    demangle = getattr(bn, "demangle_gnu3", None)
+    if demangle is None or not raw_name.startswith("_Z"):
+        return None
+    try:
+        demangled_type, _ = demangle(bv.arch, raw_name)
+        params = list(getattr(demangled_type, "parameters", None) or [])
+    except Exception:  # noqa: BLE001 - an undemanglable name gives no signature
+        return None
+    if demangled_type is None:
+        return None
+    has_this = bool(params) and str(getattr(params[0], "name", "")) == "this"
+    variadic = bool(getattr(demangled_type, "has_variable_arguments", False))
+    return len(params), len(params) - int(has_this), variadic
+
+
+def _call_arity_warning(bv, func) -> str | None:
+    """Name calls whose rendered argument list is shorter than the call site's
+    (#955), or -- for a mangled callee -- longer than its signature.
+
+    HLIL renders exactly the callee prototype's parameter count. When that
+    prototype is short -- BN's bundled C++ type libraries declare many library
+    methods without `this` and drop trailing parameters -- the extra arguments
+    vanish from the output with no trace: `std::filebuf::open(&f)` for a call
+    whose disassembly sets up `this`, the path and the open mode.
+
+    Two witnesses, so neither can fire alone where it is known to be wrong:
+      * the demangled signature of a mangled callee. It counts `this` for a
+        static member too, so a shortfall against it is only reported when the
+        explicit parameters alone already exceed the rendered count, or when
+        the call site itself writes a register past the rendered arguments;
+      * the argument registers the call's block writes and nothing else reads
+        (`_argument_setup_count`). Used alone only for a callee with no body
+        here -- an import cannot be IPRA-compiled, so a register it is handed
+        cannot be a value the caller keeps across the call.
+    An excess (more rendered than the signature takes, the invented argument
+    the issue saw) is reported against the mangled signature only, and never
+    for a variadic one. Returns None when every call agrees, and never raises.
+    """
+    try:
+        llil = getattr(func, "llil", None) or getattr(func, "low_level_il", None)
+        calls = list(_calls_with_setup_windows(llil)) if llil is not None else []
+        cc = getattr(func, "calling_convention", None)
+        arg_regs = [_full_reg(bv.arch, str(r)) for r in (getattr(cc, "int_arg_regs", None) or [])]
+    except Exception:  # noqa: BLE001 - no IL means nothing to compare
+        return None
+    groups: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for call, window in calls:
+        try:
+            target = il_format._llil_constant_value(getattr(call, "dest", None))
+            address = int(getattr(call, "address", 0))
+            if target is None:
+                continue
+            mlil = getattr(call, "mlil", None)
+            params = getattr(mlil, "params", None)
+            if params is None:
+                continue
+            rendered = len(list(params))
+            symbol = bv.get_symbol_at(target)
+            callee = bv.get_function_at(target)
+            kind = str(getattr(getattr(symbol, "type", None), "name", ""))
+            raw_name = str(getattr(symbol, "raw_name", "") or getattr(callee, "name", "") or "")
+            if _SIZED_DELETE_RE.match(raw_name):
+                continue
+            no_body = kind in _IMPORT_SYMBOL_KINDS or bool(getattr(callee, "is_thunk", False))
+            signature = _demangled_arity(bv, raw_name)
+            setup, regs = _argument_setup_count(bv.arch, window, arg_regs) if arg_regs else (0, [])
+        except Exception:  # noqa: BLE001 - one odd call must not hide the rest
+            continue
+        setup_text = f"the call site writes {', '.join(regs)} just before it"
+        if signature is not None:
+            # The demangled signature is the arity whenever there is one: the
+            # register witness only corroborates it, never overrides it.
+            total, explicit, variadic = signature
+            if rendered > total and not variadic:
+                expected = total
+                evidence = [f"the demangled signature takes only {total}"]
+            elif rendered >= total or not (explicit > rendered or setup > rendered):
+                continue
+            else:
+                expected = total
+                evidence = [f"the demangled signature takes {total}"
+                            + (" with `this`" if total != explicit else "")]
+                if setup > rendered:
+                    evidence.append(setup_text)
+        elif no_body and setup > rendered:
+            expected, evidence = setup, [setup_text]
+        else:
+            continue
+        # One entry per callee and shape, so ten identical calls cannot push a
+        # rarer finding past the listing cap (#985 review).
+        group = groups.setdefault((target, rendered, expected), {
+            "label": _callee_label(symbol, callee, target),
+            "addresses": [], "evidence": {},
+        })
+        group["addresses"].append(address)
+        # Every call's evidence, counted: calls to one callee can differ (the
+        # signature alone at one, signature plus register writes at another),
+        # and the first call's text must not stand for all (#985 re-review).
+        key = tuple(evidence)
+        group["evidence"][key] = group["evidence"].get(key, 0) + 1
+    if not groups:
+        return None
+    findings = []
+    for (_target, rendered, expected), group in groups.items():
+        addrs = group["addresses"]
+        where = ", ".join(hex(a) for a in addrs[:3]) + (
+            f" and {len(addrs) - 3} more" if len(addrs) > 3 else "")
+        noun = "call" if len(addrs) == 1 else f"{len(addrs)} calls"
+        variants = group["evidence"]
+        if len(variants) == 1:
+            evidence = "; ".join(next(iter(variants)))
+        else:
+            evidence = " / ".join(f"{n} of {len(addrs)}: {'; '.join(ev)}"
+                                  for ev, n in variants.items())
+        if rendered > expected:
+            findings.append(f"{group['label']} ({noun} at {where}) renders {rendered} "
+                            f"arguments but {evidence}")
+        else:
+            findings.append(f"{group['label']} ({noun} at {where}) renders {rendered} of "
+                            f"{expected} arguments ({evidence})")
+    calls = sum(len(g["addresses"]) for g in groups.values())
+    listed = findings[:_ARITY_LISTED_MAX]
+    more = len(findings) - len(listed)
+    return (
+        f"call arity: {calls} call(s) render a different argument count than "
+        f"the call site passes: {'; '.join(listed)}"
+        + (f"; and {more} more callee(s)" if more > 0 else "")
+        + ". The callee's prototype (often from a type library) has the wrong arity, so "
+        "the decompiled call silently drops or invents arguments. Read the real "
+        f"arguments with `bn callsites <callee address> --within {hex(int(func.start))} "
+        "--context 4`; fix the callee with `bn proto set`."
+    )
+
+
+def _callee_label(symbol, callee, target: int) -> str:
+    name = str(getattr(symbol, "short_name", "") or "") if symbol is not None else ""
+    if not name and callee is not None:
+        name = il_format._display_name(callee)
+    name = name.split("(", 1)[0] if name else ""
+    return f"{name} @ {hex(target)}" if name else hex(target)
+
+
+def _register_name(arch, var) -> str | None:
+    """The register *var* lives in, or None for a stack/flag variable."""
+    source = getattr(getattr(var, "source_type", None), "name", "")
+    if source != "RegisterVariableSourceType":
+        return None
+    try:
+        return _full_reg(arch, str(arch.get_reg_name(var.storage)))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _callee_saved_parameters(bv, func) -> list[str]:
+    """`argN @ reg` for each parameter BN placed in a register no calling
+    convention passes arguments in: a callee-saved register or the link
+    register (#966). A register the function's own convention lists as an
+    argument register is never reported, so a custom convention that really
+    passes values there stays silent."""
+    cc = getattr(func, "calling_convention", None)
+    arch = bv.arch
+    try:
+        saved = {_full_reg(arch, str(r)) for r in (getattr(cc, "callee_saved_regs", None) or [])}
+        args = {_full_reg(arch, str(r))
+                for r in [*(getattr(cc, "int_arg_regs", None) or []),
+                          *(getattr(cc, "float_arg_regs", None) or [])]}
+        link = getattr(arch, "link_reg", None)
+        if link:
+            saved.add(_full_reg(arch, str(link)))
+        params = list(getattr(func, "parameter_vars", None) or [])
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for var in params:
+        reg = _register_name(arch, var)
+        if reg and reg in saved and reg not in args:
+            out.append(f"{getattr(var, 'name', '?')} @ {reg}")
+    return out
+
+
+def _falls_through(bv, address: int) -> bool:
+    """True when the instruction at *address* can continue into the next one:
+    no branch at all, a conditional branch (its not-taken side), or a call to
+    a callee that returns."""
+    try:
+        data = bv.read(address, bv.arch.max_instr_length)
+        info = bv.arch.get_instruction_info(data, address)
+        branches = list(getattr(info, "branches", None) or [])
+    except Exception:  # noqa: BLE001 - undecodable: claim nothing
+        return False
+    kinds = {str(getattr(getattr(b, "type", None), "name", "")) for b in branches}
+    if not kinds or "FalseBranch" in kinds:
+        return True
+    if kinds <= {"CallDestination"}:
+        for branch in branches:
+            callee = bv.get_function_at(int(getattr(branch, "target", 0) or 0))
+            if callee is not None and not bool(getattr(callee, "can_return", True)):
+                return False
+        return True
+    return False
+
+
+def _block_instructions(bv, block) -> list[int]:
+    start, end = int(block.start), int(block.end)
+    addresses = []
+    address = start
+    while address < end:
+        addresses.append(address)
+        length = bv.get_instruction_length(address)
+        if not length:
+            return []
+        address += length
+    return addresses
+
+
+def _llil_op_at(func, address: int) -> str:
+    try:
+        return il_format._il_op_name(func.get_llil_at(address))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# Mnemonics compilers emit as alignment padding. Matched on the decoded text:
+# BN lifts the padding before a function it ended early as a synthetic
+# `tailcall`, so the IL cannot tell padding from code.
+_PADDING_MNEMONICS = {"nop", "int3", "hlt", "udf"}
+
+
+def _is_padding(bv, address: int) -> bool:
+    try:
+        text = str(bv.get_disassembly(address) or "")
+    except Exception:  # noqa: BLE001
+        return False
+    words = text.split()
+    return bool(words) and words[0].lower() in _PADDING_MNEMONICS
+
+
+def _runs_into_next(bv, func, block) -> int | None:
+    """The address of *block*'s last real instruction when the block (of
+    *func*) ends by executing into the next address, else None.
+
+    Trailing alignment padding is not code: compilers pad after a call that
+    never returns (`call [rax]; nop ...`, an abort through a pointer BN cannot
+    see is noreturn), so a block whose real last instruction is a call followed
+    only by padding is a function end, not a split."""
+    addresses = _block_instructions(bv, block)
+    padded = False
+    while addresses and _is_padding(bv, addresses[-1]):
+        addresses.pop()
+        padded = True
+    if not addresses:
+        return None
+    if padded and "CALL" in _llil_op_at(func, addresses[-1]):
+        return None
+    return addresses[-1] if _falls_through(bv, addresses[-1]) else None
+
+
+def _split_pair(bv, head, tail) -> bool:
+    """Whether *head* running into *tail* reads as a shared-tail split. Not
+    when either is an EH/cold fragment (`_is_eh_fragment`), and not when the
+    tail never returns: BN outlines a bare `call __stack_chk_fail` or abort
+    path that way, and no return path of the head is hidden behind it."""
+    return bool(getattr(tail, "can_return", True)) \
+        and not _is_eh_fragment(bv, tail) and not _is_eh_fragment(bv, head)
+
+
+def _fallthrough_successor(bv, func) -> tuple[Any, int] | None:
+    """``(function, source)``: the function whose entry *func*'s body runs
+    straight into, and the address of the instruction that runs into it.
+    The source is usually NOT the end of the listing: any block can end at
+    another function's entry (#985 review)."""
+    for block in list(getattr(func, "basic_blocks", None) or []):
+        other = bv.get_function_at(int(block.end))
+        if other is None or int(other.start) == int(func.start):
+            continue
+        source = _runs_into_next(bv, func, block)
+        if source is not None and _split_pair(bv, func, other):
+            return other, source
+    return None
+
+
+def _fallthrough_predecessor(bv, func):
+    """The function whose body runs straight into *func*'s entry, or None."""
+    start = int(func.start)
+    try:
+        blocks = list(bv.get_basic_blocks_at(start - 1) or [])
+    except Exception:  # noqa: BLE001
+        return None
+    for block in blocks:
+        owner = getattr(block, "function", None)
+        if owner is None or int(owner.start) == start or int(block.end) != start:
+            continue
+        if _runs_into_next(bv, owner, block) is not None and _split_pair(bv, owner, func):
+            return owner
+    return None
+
+
+_DIRECT_CALL_OPS = ("LLIL_CALL", "LLIL_CALL_STACK_ADJUST")
+# BN chains a long cleanup through synthetic calls, one fragment per object
+# destroyed; a stock C++ binary had chains well past three links.
+_FRAGMENT_DEPTH = 32
+# BN's placeholder name for a function no symbol names. Fragments are never named.
+_DEFAULT_NAME_RE = re.compile(r"^sub_[0-9a-fA-F]+$")
+
+
+def _direct_call_refs(bv, start: int) -> tuple[list, list]:
+    """(every code reference to *start*, the ones that are real calls)."""
+    refs = list(bv.get_code_refs(start) or [])
+    return refs, [r for r in refs
+                  if _llil_op_at(r.function, int(r.address)) in _DIRECT_CALL_OPS]
+
+
+def _is_eh_fragment(bv, func, memo: dict[int, bool] | None = None, _depth: int = 0) -> bool:
+    """True when *func* is exception-cleanup or cold-path code BN carved out
+    of a parent function: a landing pad, a `.cold` part, or a chain of them.
+
+    Such a fragment runs inside its parent's frame, so BN reads the parent's
+    live callee-saved registers (`rbp`, `rbx`, ...) as its "parameters". On a
+    C++ binary with exceptions these were ~98% of the #966 notes, and their
+    `proto set` advice was wrong: dropping `rbp` breaks the frame accesses
+    (#985 review). Recognised by any of:
+      * a `.cold` name, or a parameter typed `_Unwind_Exception` (BN's own
+        landing-pad reading of the exception object);
+      * nothing CALLS it and nothing takes its address -- it is reached only by
+        jumps, falls, or the unwinder -- and it never returns, or nothing
+        references it at all (an LSDA landing pad has no code or data
+        reference; a vtable or callback-table entry makes it an ordinary
+        function called indirectly);
+      * it never returns and every function calling it is itself a fragment
+        (BN chains a long cleanup through synthetic calls).
+    A shared tail split off a normal function returns, so it is not matched.
+    A function with a real name (`.cold` aside) is never a fragment: an
+    exported method that nothing in the binary calls looks unreferenced too.
+    *memo* caches verdicts by start address across one read's lookups.
+    """
+    memo = {} if memo is None else memo
+    try:
+        start = int(func.start)
+    except Exception:  # noqa: BLE001
+        return False
+    if start in memo:
+        return memo[start]
+    memo[start] = False  # a cycle of callers proves nothing
+    try:
+        name = str(getattr(func, "name", "") or "")
+        params = list(getattr(getattr(func, "type", None), "parameters", None) or [])
+        if ".cold" in name:
+            verdict = True
+        elif not _DEFAULT_NAME_RE.match(name):
+            # A named function -- exported, or from the symbol table -- is an
+            # entry point in its own right: an exported method nothing in the
+            # binary calls has no references either, and is no landing pad.
+            verdict = False
+        elif any("_Unwind_Exception" in str(getattr(p, "type", "")) for p in params):
+            verdict = True
+        else:
+            refs, callers = _direct_call_refs(bv, start)
+            returns = bool(getattr(func, "can_return", True))
+            if not callers:
+                # An address-taken function (vtable slot, callback table) is
+                # called indirectly; a landing pad is never address-taken (the
+                # LSDA locates it by offset), so any data reference vetoes it.
+                verdict = not list(bv.get_data_refs(start) or []) and (not returns or not refs)
+            elif returns or _depth >= _FRAGMENT_DEPTH:
+                verdict = False
+            else:
+                verdict = all(
+                    r.function is not None
+                    and _is_eh_fragment(bv, r.function, memo, _depth + 1)
+                    for r in callers)
+    except Exception:  # noqa: BLE001 - unknown: treat as an ordinary function
+        verdict = False
+    memo[start] = verdict
+    return verdict
+
+
+def _has_callers(bv, start: int) -> bool:
+    """Whether anything can call the function at *start*: a direct call site,
+    or a data reference -- a vtable slot, a `.data.rel.ro` entry, a callback
+    table. An address-taken function is an ordinary function reached
+    indirectly, not a piece of another body (#985 re-review), the same test
+    `_is_eh_fragment` applies before calling anything a landing pad."""
+    if _direct_call_refs(bv, start)[1]:
+        return True
+    return bool(list(bv.get_data_refs(start) or []))
+
+
+def _split_body_notes(bv, func) -> list[str]:
+    """Disclose a function body BN split at a shared tail (#966).
+
+    When another function branches into the tail of this one, BN can make the
+    tail a function of its own and end this one early. The damage is quiet:
+    the head's prototype gains "parameters" in callee-saved registers and the
+    frame pointer (values the tail only restores), and every caller passes
+    stray arguments for them. Two read-only signals name it: parameters in
+    registers no convention passes arguments in, and a body that runs
+    straight into another function's entry (or is run into by one).
+
+    An EH/cold fragment gets one note of its own instead: its register
+    parameters are its parent's live registers, which nothing should drop.
+    So do they on any piece entered only by jumps or fall-through: the
+    `proto set` advice is only for a function something actually calls."""
+    notes: list[str] = []
+    memo: dict[int, bool] = {}
+    try:
+        params = _callee_saved_parameters(bv, func)
+        if params and _is_eh_fragment(bv, func, memo):
+            return [(
+                "EH/cold fragment: BN made this exception-cleanup (landing pad) or "
+                "cold-path code a function of its own. It runs inside its parent's frame, "
+                f"so its register parameters ({', '.join(params)}) are the parent's live "
+                "registers, not arguments and not a split to repair. Read it together with "
+                f"the code that jumps here (`bn xrefs {hex(int(func.start))}`)."
+            )]
+        called = bool(params) and _has_callers(bv, int(func.start))
+        successor = _fallthrough_successor(bv, func)
+        predecessor = _fallthrough_predecessor(bv, func)
+    except Exception:  # noqa: BLE001 - a read-only nudge never sinks the read
+        return notes
+    if successor is not None:
+        other, source = successor
+        notes.append(
+            f"split body: the block ending at {hex(source)} runs straight into "
+            f"{_function_label(other)} without a branch or return -- BN likely split "
+            "this function at a shared tail, so part of its code is listed under that "
+            "one. Read both (`bn disasm`) before trusting either decompile."
+        )
+    if predecessor is not None:
+        notes.append(
+            f"split body: {_function_label(predecessor)} runs straight into this "
+            "function's entry -- this may be the shared tail of that function, not a "
+            "function of its own; its parameters are likely that function's saved registers."
+        )
+    if params and called:
+        notes.append(
+            f"prototype takes parameters in callee-saved/link registers ({', '.join(params)}): "
+            "no calling convention passes arguments there, so BN is reading a value the "
+            "body only saves or restores -- typically because it split the body at a "
+            "shared tail, or a path reads the register before setting it. Callers render "
+            "stray arguments for them; drop them with `bn proto set`."
+        )
+    elif params:
+        notes.append(
+            f"prototype takes parameters in callee-saved/link registers ({', '.join(params)}), "
+            "and nothing calls this function -- it is entered only by jumps or fall-through, "
+            "so it is a piece of another function's body and these are registers live in "
+            "the code that jumps here, not arguments. Do not drop them; read it with the "
+            f"code that jumps here (`bn xrefs {hex(int(func.start))}`)."
+        )
+    return notes
+
+
+def _function_label(func) -> str:
+    return f"{il_format._display_name(func)} @ {hex(int(func.start))}"
+
+
+def _callee_split_notes(bv, func) -> list[str]:
+    """#966 from the CALLER's side, where the symptom is read: a direct callee
+    whose prototype takes callee-saved/link-register parameters gets stray
+    arguments rendered at every call."""
+    try:
+        llil = getattr(func, "llil", None) or getattr(func, "low_level_il", None)
+        instructions = list(llil.instructions) if llil is not None else []
+    except Exception:  # noqa: BLE001
+        return []
+    checked: set[int] = {int(func.start)}
+    notes = []
+    for call in instructions:
+        if il_format._il_op_name(call) not in _CALL_OPS:
+            continue
+        target = il_format._llil_constant_value(getattr(call, "dest", None))
+        if target is None or target in checked:
+            continue
+        checked.add(target)
+        callee = bv.get_function_at(target)
+        if callee is None:
+            continue
+        params = _callee_saved_parameters(bv, callee)
+        if params and not _is_eh_fragment(bv, callee):
+            notes.append(
+                f"callee {_function_label(callee)} takes parameters in callee-saved/link "
+                f"registers ({', '.join(params)}), so the arguments rendered for them here "
+                "are not real arguments -- its body is likely split at a shared tail "
+                f"(`bn decompile {hex(target)}` names the split)."
+            )
+    return notes
+
+
+_SHORT_STRING_MAX = 64
+_STRING_NOTE_LISTED_MAX = 8
+# Without a `char *` parameter to say so, a run this short is as likely a small
+# integer, a UTF-16 code unit or a struct field as a string: `{0x41, 0, 0, 0}`
+# reads as "A" (#985 review). Three printable bytes is the issue's own `" -n"`.
+_UNTYPED_STRING_MIN = 3
+_CHAR_POINTER_RE = re.compile(r"^(?:const\s+)?(?:(?:un)?signed\s+)?char\b[^*]*\*(?:\s*const)?$")
+
+
+def _read_only_data(bv, address: int) -> bool:
+    """True when *address* is in read-only, non-code data."""
+    try:
+        sections = list(bv.get_sections_at(address) or [])
+    except Exception:  # noqa: BLE001
+        sections = []
+    if sections:
+        return any(
+            str(getattr(getattr(s, "semantics", None), "name", "")) == "ReadOnlyDataSectionSemantics"
+            for s in sections
+        )
+    segment = bv.get_segment_at(address)
+    return bool(segment is not None and getattr(segment, "readable", False)
+                and not getattr(segment, "writable", True)
+                and not getattr(segment, "executable", True))
+
+
+def _undefined_c_string(bv, address: int, *, min_length: int) -> str | None:
+    """The printable NUL-terminated string at *address*, when BN defined none
+    and it is at least *min_length* characters long."""
+    if bv.get_string_at(address) is not None:
+        return None
+    var = bv.get_data_var_at(address)
+    if var is not None and "char" in str(getattr(var, "type", "")):
+        return None
+    if not _read_only_data(bv, address):
+        return None
+    data = bytes(bv.read(address, _SHORT_STRING_MAX) or b"")
+    end = data.find(b"\0")
+    if end < max(1, min_length):
+        return None
+    body = data[:end]
+    if not all(0x20 <= c < 0x7f or c in (0x09, 0x0a, 0x0d) for c in body):
+        return None
+    return body.decode("ascii")
+
+
+def _char_pointer_parameter(bv, target: int | None, index: int) -> bool:
+    """True when the callee at *target* declares parameter *index* as a narrow
+    `char *`, by its prototype or by its demangled signature. Either may be off
+    by `this` (#955), so agreement from either is enough."""
+    if target is None:
+        return False
+    spellings: list[str] = []
+    callee = bv.get_function_at(target)
+    params = list(getattr(getattr(callee, "type", None), "parameters", None) or [])
+    if index < len(params):
+        spellings.append(str(getattr(params[index], "type", "")))
+    symbol = bv.get_symbol_at(target)
+    raw_name = str(getattr(symbol, "raw_name", "") or "")
+    demangle = getattr(bn, "demangle_gnu3", None)
+    if demangle is not None and raw_name.startswith("_Z"):
+        try:
+            demangled_type, _ = demangle(bv.arch, raw_name)
+            dparams = list(getattr(demangled_type, "parameters", None) or [])
+            if index < len(dparams):
+                spellings.append(str(getattr(dparams[index], "type", "")))
+        except Exception:  # noqa: BLE001
+            pass
+    return any(_CHAR_POINTER_RE.match(s.strip()) for s in spellings)
+
+
+def _raw_string_pointer_note(bv, func, text: str) -> str | None:
+    """Name call arguments rendered as a raw address that point at a short C
+    string BN never defined (#970).
+
+    BN's string scan has a minimum length, so `" -n"` in `s << "cat " << f <<
+    " -n"` stays an untyped address: decompile prints `0x402ae0` and `strings`
+    lists nothing. Only a constant argument whose hex spelling actually appears
+    in the rendered text is reported, and only into read-only data, so a
+    pointer BN already renders as a literal or a writable buffer never is.
+
+    Printable bytes before a NUL are weak evidence on their own: an `int[]`, a
+    UTF-16 string and a struct all start that way (#985 review). So a run is
+    reported at any length only when the callee takes a `char *` there, and
+    otherwise only from `_UNTYPED_STRING_MIN` characters.
+    Read-only: defining the string is the caller's choice (`bn data retype`)."""
+    try:
+        mlil = getattr(func, "mlil", None) or getattr(func, "medium_level_il", None)
+        instructions = list(mlil.instructions) if mlil is not None else []
+    except Exception:  # noqa: BLE001
+        return None
+    found: dict[int, tuple[str, int]] = {}
+    # Every address the text renders raw, tokenised once rather than searched
+    # per operand (#985 review: decompile cost on large functions).
+    rendered = {int(token, 16) for token in re.findall(r"\b0x[0-9a-fA-F]+\b", text)}
+    for ins in instructions:
+        if "CALL" not in il_format._il_op_name(ins):
+            continue
+        dest = getattr(ins, "dest", None)
+        target = getattr(dest, "constant", None) \
+            if il_format._il_op_name(dest) in ("MLIL_CONST_PTR", "MLIL_CONST", "MLIL_IMPORT") \
+            else None
+        for index, param in enumerate(list(getattr(ins, "params", None) or [])):
+            if il_format._il_op_name(param) not in ("MLIL_CONST_PTR", "MLIL_CONST"):
+                continue
+            try:
+                address = int(param.constant)
+                if address in found or address not in rendered:
+                    continue
+                typed = _char_pointer_parameter(bv, target, index)
+                value = _undefined_c_string(
+                    bv, address, min_length=1 if typed else _UNTYPED_STRING_MIN)
+            except Exception:  # noqa: BLE001 - one odd operand must not hide the rest
+                continue
+            if value is not None:
+                found[address] = (value, int(getattr(ins, "address", 0)))
+    if not found:
+        return None
+    rows = [f"{hex(a)} = {_c_quote(v)} (call at {hex(c)})"
+            for a, (v, c) in list(found.items())[:_STRING_NOTE_LISTED_MAX]]
+    more = len(found) - len(rows)
+    first, (value, _) = next(iter(found.items()))
+    return (
+        f"raw string pointer(s): {len(found)} call argument(s) render as an address "
+        f"that holds a NUL-terminated string BN did not define (so `bn strings` does not "
+        f"list it either): {'; '.join(rows)}" + (f"; and {more} more" if more > 0 else "")
+        + f". To render it inline, define it: `bn data retype {hex(first)} "
+        f"'char[{len(value) + 1}]'`."
+    )
+
+
+def _c_quote(value: str) -> str:
+    escaped = (value.replace("\\", "\\\\").replace('"', '\\"')
+               .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+    return f'"{escaped}"'
+
+
 def _decompile_batch(
     ctx,
     selector: str | None,
@@ -571,10 +1362,18 @@ def _decompile(
         forced = True
 
     comments = il_format._comment_map(bv, func)
-    annotation_bodies = _annotation_bodies(func, comments)
     text = il_format._decompile_text(bv, func, addresses=addresses)
-    if not include_annotations:
-        text = _redact_rendered_annotations(text, annotation_bodies)
+    if include_annotations:
+        annotation_summary = {
+            "comment_count": len(_annotation_entries(func, comments)),
+            "redacted": False,
+            "hidden": 0,
+            "session_shown": 0,
+        }
+    else:
+        text, annotation_summary = _redact_function_annotations(
+            ctx, bv, func, comments, text
+        )
 
     warnings = il_format._render_warnings(text)
     stub = il_format._analysis_stub_warning(func, text, forced=forced)
@@ -592,14 +1391,19 @@ def _decompile(
     if guard_warn:
         warnings.append(guard_warn)
     warnings.extend(_struct_layout_warnings(bv, func))
+    arity_warn = _call_arity_warning(bv, func)
+    if arity_warn:
+        warnings.append(arity_warn)
+    warnings.extend(_split_body_notes(bv, func))
+    warnings.extend(_callee_split_notes(bv, func))
+    string_note = _raw_string_pointer_note(bv, func, text)
+    if string_note:
+        warnings.append(string_note)
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": text,
         "comments": comments if include_annotations else {},
-        "annotation_summary": {
-            "comment_count": len(annotation_bodies),
-            "redacted": not include_annotations,
-        },
+        "annotation_summary": annotation_summary,
         "warnings": warnings,
         "analysis_skipped": bool(getattr(func, "analysis_skipped", False)),
         "analysis_force_requested": bool(force_analysis),
@@ -767,6 +1571,9 @@ def _get_prototype(ctx, selector: str | None, identifier):
     note = _return_width_inference_note(bv, func)
     if note:
         result["return_width_note"] = note
+    split_notes = _split_body_notes(bv, func)
+    if split_notes:
+        result["split_body_notes"] = split_notes
     _annotate_containment(ctx, result, identifier, func)
     return result
 
@@ -1016,6 +1823,26 @@ def _disasm(ctx, selector: str | None, identifier, linear=None, mode=None,
         "returned_lines": len(returned_text.splitlines()) if returned_text else 0,
         "line_range": selected_range,
     }
+    # #966: a listing that stops where BN split the body read as a function that
+    # simply ended. Say where execution actually continues -- and from WHICH
+    # instruction: the block that runs into the other entry is often mid-listing
+    # (#985 review), so `from` is what a renderer anchors the note to.
+    try:
+        successor = _fallthrough_successor(bv, func)
+    except Exception:  # noqa: BLE001 - a read-only nudge never sinks the read
+        successor = None
+    if successor is not None:
+        other, source = successor
+        result["continues_into"] = {
+            "name": other.name,
+            "address": hex(int(other.start)),
+            "from": hex(source),
+            "note": (
+                f"falls through into {_function_label(other)}: BN made the code after "
+                f"{hex(source)} a separate function (likely a shared tail split); "
+                f"continue with `bn disasm {hex(int(other.start))}`"
+            ),
+        }
     _annotate_containment(ctx, result, identifier, func)
     return result
 

@@ -568,9 +568,12 @@ def _default_skill_install_roots() -> list[Path]:
              arg("binaries", nargs="*", help="Binary file paths to preload"),
              arg("--instance-id", help="Use a specific instance ID (default: random)"),
              arg("--no-bndb", action="store_true",
-                 help="Don't auto-prefer a sibling .bndb file"),
+                 help="Open the raw bytes: skip both an adjacent <binary>.bndb and a "
+                      "database saved to the cache"),
              arg("--quick", "--no-analysis", action="store_true",
-                 help="Preload without full analysis (fast); run `bn refresh` for full analysis"),
+                 help="Preload without full analysis (fast); run `bn refresh` for full analysis. "
+                      "Never restores a cached database; an adjacent <binary>.bndb is still "
+                      "preferred unless --no-bndb"),
              arg("--detach", action="store_true", default=False,
                  help="Queue BNDB loading in the bridge and return immediately; "
                       "poll with `bn -i ID session status`"),
