@@ -829,13 +829,50 @@ def test_declaration_references_to_existing_types_are_not_redefined(monkeypatch)
                    "struct `ns::W::VTabl`* typo; }; struct Fresh; struct Alpha { long a; long b; };")
     parsed = [("ns::W", holder), ("ns::W::VTable", stub("ns::W::VTable")), ("timespec", stub("timespec")),
               ("ns::W::VTabl", stub("ns::W::VTabl")), ("Fresh", stub("Fresh")), ("Alpha", stub("Alpha"))]
-    kept, referenced, by_mention = me._drop_references_to_existing_types(bv, declaration, parsed)
+    kept, referenced, by_mention = me._drop_references_to_existing_types(None, bv, declaration, parsed)
     # The view's VTable and the type library's `timespec` are only referenced.
     assert referenced == ["ns::W::VTable", "timespec"]
     # `Fresh` is new (an intentional forward declaration); `Alpha` has a body
     # here; the misspelled `ns::W::VTabl` is created but disclosed.
     assert [name for name, _ in kept] == ["ns::W", "ns::W::VTabl", "Fresh", "Alpha"]
     assert by_mention == ["ns::W::VTabl"]
+
+
+def test_function_pointer_parameter_tags_are_references_not_void_types(monkeypatch):
+    """#993 item 1: a tag mentioned only in a function-pointer parameter list
+    comes back from BN's parser as a named `void`. Defining it redefined an
+    existing `struct Node` as `void` (rolled back as verification_failed); for
+    a new name it defined a `void` typedef where the forward declaration's
+    empty struct belongs."""
+    me = _load_bridge(monkeypatch).mutation_engine
+    node = _FakeType("struct Node", width=0x10, members=[_FakeMember(0, "next", "struct Node*")])
+    bv = _FakeBV(functions=[], types_={"Node": node})
+    forward_stub = _FakeType("struct", width=0, members=[])
+    parses = []
+
+    def parse_types_from_string(text):
+        parses.append(text)
+        return types.SimpleNamespace(types={"Leaf": forward_stub}, variables={}, functions={})
+
+    bv.parse_types_from_string = parse_types_from_string
+    cb = _FakeType("void (*)(Node*, Leaf*)", width=8, type_class="PointerTypeClass")
+    void = _FakeType("void", type_class="VoidTypeClass")
+    declaration = "typedef void (*visit_cb)(struct Node* n, struct Leaf* l);"
+    parsed = [("visit_cb", cb), ("Node", void), ("Leaf", void)]
+    kept, referenced, by_mention = me._drop_references_to_existing_types(None, bv, declaration, parsed)
+    assert referenced == ["Node"]
+    assert kept == [("visit_cb", cb), ("Leaf", forward_stub)]
+    assert parses == ["struct Leaf;"]
+    assert by_mention == ["Leaf"]
+    # A `void` the declaration never spells as a tag is a real typedef and stays.
+    plain = [("Node", void)]
+    assert me._drop_references_to_existing_types(None, bv, "typedef void Node;", plain)[0] == plain
+    # Nor does a tag spelled only inside a string literal or an attribute
+    # argument: that is not code (#993 review).
+    for text in ('typedef void Marker; const char* tag = "struct Marker";',
+                 'typedef void Marker __attribute__((annotate("struct Marker")));'):
+        typedef = [("Marker", void)]
+        assert me._drop_references_to_existing_types(None, bv, text, typedef)[0] == typedef, text
 
 
 def test_every_base_clause_is_reported_never_dropped(monkeypatch):
@@ -871,6 +908,10 @@ def test_type_not_found_explains_class_vtable_types(monkeypatch):
         ctx._find_type(bv, "app::Widget")
     assert "No struct named app::Widget is defined" in str(own.value)
     assert "struct `app::Base::app::Widget::VTable`* vtable" in str(own.value)
+    # #999 item 2: `this` cannot be named in a `proto set`, so the hint types it
+    # through the command that can.
+    assert ("bn local retype <function> this 'struct `app::Widget`*'"
+            in str(own.value))
     with pytest.raises(RuntimeError) as unrelated:
         ctx._find_type(bv, "app::Other")
     assert "No struct named" not in str(unrelated.value)
@@ -1528,3 +1569,60 @@ def test_the_guard_reads_parsed_names_not_the_source_text_675():
     # differently-named type, so the guard sees no offending tag.
     me._refuse_reserved_keyword_tags(None, {"op": "types_declare"},
                                      [("holder", object())])
+
+
+def test_named_type_references_finds_every_member_reference(monkeypatch):
+    """#993 review round 2: BN hands out a fresh, temporary wrapper for every
+    member and pointer target, so a walk that remembered visited wrappers by
+    `id()` saw reused ids and skipped all but the first of several pointer
+    members -- importing only the first of twelve library types reached."""
+    me = _load_bridge(monkeypatch).mutation_engine
+    names = [f"lib_type_{i}" for i in range(12)]
+
+    class _Ref:
+        type_class = "NamedTypeReferenceClass"
+
+        def __init__(self, name):
+            self.name = name
+
+    class _Pointer:
+        type_class = "PointerTypeClass"
+
+        def __init__(self, name):
+            self._name = name
+
+        @property
+        def target(self):
+            return _Ref(self._name)          # a new wrapper on every read
+
+    class _Struct:
+        type_class = "StructureTypeClass"
+
+        @property
+        def members(self):                   # new member objects on every read
+            return [types.SimpleNamespace(name=f"f{i}", type=_Pointer(n)) for i, n in enumerate(names)]
+
+    assert me._named_type_references(_Struct()) == names
+
+
+def test_preview_library_needs_names_library_tags_the_view_lacks(monkeypatch):
+    """#993 review round 3: a preview never models a library import; it is
+    refused when the declaration names a library tag the view lacks -- by
+    value or through a pointer -- but not for a tag it defines, one the view
+    already has, a lone forward declaration, or a tag spelled in a string."""
+    me = _load_bridge(monkeypatch).mutation_engine
+    bv = _FakeBV(functions=[], types_={"timeval": _FakeType("struct timeval", width=16)})
+
+    class _Library:
+        def get_named_type(self, name):
+            return _FakeType(f"struct {name}", width=16) if name in {"timespec", "tms", "timeval", "stat"} else None
+
+    bv.type_libraries = [_Library()]
+    assert me._preview_library_needs(bv, "struct S { struct timespec ts; struct tms* p; };") == ["timespec", "tms"]
+    assert me._preview_library_needs(bv, "struct S { struct timeval tv; };") == []
+    assert me._preview_library_needs(bv, "struct stat { int x; }; struct U { struct stat s; };") == []
+    assert me._preview_library_needs(bv, "struct timespec;") == []
+    assert me._preview_library_needs(bv, 'struct S { int a; }; const char* m = "struct tms";') == []
+    # Untagged identifiers are never treated as type uses up front: a member
+    # named like a library type imports nothing (#993 review round 4).
+    assert me._preview_library_needs(bv, "struct S { int tms; int stat; struct S* timespec; };") == []

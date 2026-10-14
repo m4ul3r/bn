@@ -1757,8 +1757,17 @@ class _CodeRefScan:
                     self.code_ref_failures += 1
                     continue
                 sites: list[tuple[int, str]] = []
+                page_aligned = not (addr & 0xFFF)
                 for ref in refs:
                     if _code_ref_site_kind(ref, addr) in _NON_NOMINATING_SITE_KINDS:
+                        continue
+                    # #997 item 2: an aarch64 `adrp` that only materialises the
+                    # PAGE this address starts (every consumer adds a nonzero
+                    # page offset) is not a reference to it. `bn xrefs` drops
+                    # exactly these sites (#284); the scan uses the same
+                    # predicate so the two commands agree about one address --
+                    # measured as 40 of 86 `code-likely` leads, all mid-body.
+                    if page_aligned and read_xrefs._is_spurious_adrp_pagebase(bv, ref, addr):
                         continue
                     func = getattr(ref, "function", None)
                     sites.append((int(getattr(ref, "address", 0) or 0),

@@ -95,6 +95,12 @@ def test_types_declare_summary_counts_types_not_ops():
         {"op": "types_declare", "status": "noop", "defined_types": {"Alpha": "struct Alpha"},
          "referenced_existing_types": ["Alpha"]}]})
     assert noop["declared_types"]["count"] == 0 and noop["declared_types"]["names"] == []
+    # #993 item 2: library types a declare brought into the view are named.
+    imported = _mutation_summary({"success": True, "committed": True, "rolled_back": False, "results": [
+        {"op": "types_declare", "status": "verified", "defined_types": {"Sample": "struct Sample"},
+         "imported_from_library": ["__time_t", "timespec"]}]})
+    assert imported["declared_types"]["imported_from_library"] == ["__time_t", "timespec"]
+    assert "\nimported from a type library: __time_t, timespec" in _render_mutation_summary_text(imported)
 
     failed = _mutation_summary({"success": False, "committed": False, "rolled_back": True,
                                 "results": [{"op": "types_declare", "status": "invalid_request",
@@ -103,6 +109,102 @@ def test_types_declare_summary_counts_types_not_ops():
     rename = _mutation_summary({"success": True, "committed": True, "rolled_back": False,
                                 "results": [{"op": "rename_symbol", "status": "verified"}]})
     assert "declared_types" not in rename
+
+
+def test_struct_field_set_summary_names_replaced_members():
+    """#999 item 4: a field set that overwrote overlapped members said only
+    `changed=1 verified=1`. The compact status counts them on the line and
+    names each one; a reverted row's replacement did not happen, and a field
+    set that replaced nothing grows no key."""
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+    row = {"op": "struct_field_set", "status": "verified", "struct_name": "Pad",
+           "replaced_members": [{"field_name": "_unk78", "field_type": "uint8_t[0x1e0]",
+                                 "offset": "0x78"}]}
+    summary = _mutation_summary({"success": True, "committed": True, "rolled_back": False,
+                                 "results": [row]})
+    assert summary["replaced_members"] == [
+        {"struct_name": "Pad", "field_name": "_unk78", "field_type": "uint8_t[0x1e0]", "offset": "0x78"}]
+    text = _render_mutation_summary_text(summary)
+    assert text.splitlines()[0].endswith("  replaced=1")
+    assert "\nreplaced: Pad::_unk78 (uint8_t[0x1e0] @0x78)" in text
+    reverted = _mutation_summary({"success": False, "committed": False, "rolled_back": True,
+                                  "results": [{**row, "status": "reverted"},
+                                              {"op": "set_comment", "status": "verification_failed"}]})
+    assert "replaced_members" not in reverted
+    plain = _mutation_summary({"success": True, "committed": True, "rolled_back": False,
+                               "results": [{"op": "struct_field_set", "status": "verified",
+                                            "struct_name": "Pad"}]})
+    assert "replaced_members" not in plain
+    assert "replaced" not in _render_mutation_summary_text(plain)
+
+
+def test_class_apply_types_summary_states_the_plan():
+    """#993 item 3: `class apply-types` reports what it planned beside the op
+    counts -- the vptr's table type, the instance struct's fate, and every
+    method it did not retype with why -- so a skipped method is never silent."""
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+    plan = {"class": "demo::Widget", "vtable_type": "demo::Base::demo::Widget::VTable",
+            "instance_struct": "declared", "size": None, "size_source": "unavailable",
+            "retyped_methods": [{"address": "0x401200", "name": "demo::Widget::run", "status": "verified"}],
+            "skipped_methods": [{"address": "0x401260", "name": "demo::Widget::make",
+                                 "reason": "no parameter named `this`"}]}
+    summary = _mutation_summary({"success": True, "committed": True, "rolled_back": False,
+                                 "class_apply_types": plan,
+                                 "results": [{"op": "types_declare", "status": "verified",
+                                              "defined_types": {"demo::Widget": "struct demo::Widget"}},
+                                             {"op": "local_retype", "status": "verified"}]})
+    assert summary["class_apply_types"] == plan
+    text = _render_mutation_summary_text(summary)
+    assert ("\nclass: demo::Widget  vptr: struct `demo::Base::demo::Widget::VTable`*  "
+            "instance struct: declared (size unknown: only the vptr is declared)") in text
+    assert "\nthis retyped: 1 method(s)" in text
+    assert "\nskipped: demo::Widget::make @0x401260 (no parameter named `this`)" in text
+    sized = _render_mutation_summary_text(_mutation_summary({
+        "success": True, "committed": True, "rolled_back": False,
+        "class_apply_types": {**plan, "size": "0x20", "skipped_methods": []},
+        "results": [{"op": "types_declare", "status": "verified"}]}))
+    assert "instance struct: declared (size 0x20)" in sized and "\nskipped:" not in sized
+    # The count is what each retype's row says happened: an already-typed
+    # `this` is `noop`, not "retyped".
+    rerun = _render_mutation_summary_text(_mutation_summary({
+        "success": True, "committed": True, "rolled_back": False,
+        "class_apply_types": {**plan, "instance_struct": "vptr_retyped",
+                              "vptr_member_before": {"field_name": "vptr", "field_type": "void*"},
+                              "retyped_methods": [{"address": "0x401200", "name": "a", "status": "noop"},
+                                                  {"address": "0x401220", "name": "b", "status": "verified"}]},
+        "results": [{"op": "struct_field_set", "status": "verified"},
+                    {"op": "local_retype", "status": "noop"}, {"op": "local_retype", "status": "verified"}]}))
+    assert "instance struct: vptr_retyped (was void* vptr)" in rerun
+    assert "\nthis retyped: 1 method(s), already typed: 1" in rerun
+    # A rolled-back run's retypes are `reverted`: none of them is "retyped".
+    reverted = _render_mutation_summary_text(_mutation_summary({
+        "success": False, "committed": False, "rolled_back": True,
+        "class_apply_types": {**plan, "retyped_methods": [
+            {"address": "0x401200", "name": "a", "status": "reverted"}]},
+        "results": [{"op": "local_retype", "status": "reverted"},
+                    {"op": "local_retype", "status": "invalid_request", "message": "bad"}]}))
+    assert "\nthis retyped: 0 method(s), not applied: 1" in reverted
+
+
+def test_rolled_back_declare_names_the_library_imports_it_kept():
+    """#993 review round 2: a rolled-back live declare keeps the library types
+    it imported, and the result said nothing. A committed declare's imports
+    are ordinary imports, not kept ones; a preview imports nothing on purpose,
+    so an import stamped on even a verified preview row is one BN kept."""
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+    rows = [{"op": "types_declare", "status": "reverted", "defined_types": {"S7": "struct S7"},
+             "imported_from_library": ["rusage", "timeval"]},
+            {"op": "struct_field_set", "status": "invalid_request", "message": "no struct"}]
+    live = _mutation_summary({"success": False, "committed": False, "rolled_back": True, "results": rows})
+    assert live["kept_library_imports"] == ["rusage", "timeval"]
+    assert "\nkept library imports (a rollback cannot remove them): rusage, timeval" in \
+        _render_mutation_summary_text(live)
+    landed = [{**rows[0], "status": "verified"}]
+    committed = _mutation_summary({"success": True, "committed": True, "rolled_back": False, "results": landed})
+    assert "kept_library_imports" not in committed
+    preview = _mutation_summary({"success": True, "committed": False, "preview": True,
+                                 "rolled_back": True, "results": landed})
+    assert preview["kept_library_imports"] == ["rusage", "timeval"]
 
 
 
@@ -2738,6 +2840,7 @@ _CALL_DATA_PARAMS = frozenset({
     "page_label", "paged_spill", "stem",
     "bridge_writes_output", "spawn_missing_named", "regex_hint_query",
     "regex_fallback_query", "offset_hint_identifier", "op_default_timeout",
+    "stamp_instance",
 })
 
 

@@ -516,10 +516,10 @@ class TestBatchManifestTarget:
         address. Stripped, so the name is BN's synthesized one: a named ELF
         symbol would keep resolving after the rename and hide the defect.
 
-        The hint must stay silent when the name still resolves -- a round trip
-        gave it back, or a later rename reused it for another function -- and
-        the op failed for its own reason; otherwise it buries that reason and
-        points at the function the name used to denote."""
+        The hint must stay silent when the name still resolves -- a later rename
+        reused it for another function -- and the op failed for its own reason;
+        otherwise it buries that reason and points at the function the name used
+        to denote. A chain through the name (#995) is refused before apply."""
         stripped = tmp_path / "add_stripped"
         build = subprocess.run(["strip", "-o", str(stripped), str(ADD_BINARY)],
                                capture_output=True, text=True)
@@ -553,16 +553,64 @@ class TestBatchManifestTarget:
             return {"op": "local_rename", "function": fn, "variable": "no_such_var",
                     "new_name": "unused"}
 
-        for ops in (
-            # Round trip: the name is back, so it resolves.
-            (rename(old, "foo"), rename("foo", old), bad_local(old)),
-            # Reuse: `alpha` now names the OTHER function.
-            (rename(old, "alpha"), rename("alpha", "gamma"), rename(other, "alpha"),
-             bad_local("alpha")),
-        ):
-            failed = failed_row(*ops)
-            assert "no_such_var" in failed["message"], failed["message"]
-            assert "of this batch renamed" not in failed["message"], failed["message"]
+        # Reuse: `old` now names the OTHER function, so it resolves.
+        failed = failed_row(rename(old, "alpha"), rename(other, old), bad_local(old))
+        assert "no_such_var" in failed["message"], failed["message"]
+        assert "of this batch renamed" not in failed["message"], failed["message"]
+
+        # #995: renaming one function twice fails at the second rename, by name
+        # or by address, naming both operations; the batch is rolled back.
+        for second in (rename("foo", "bar"), rename(address, "bar")):
+            failed = failed_row(rename(old, "foo"), second)
+            assert failed["status"] == "invalid_request", failed
+            assert f"renames the symbol at {address} again" in failed["message"], failed
+            assert (f'Drop operation 0 and make operation 1 rename the symbol by its '
+                    f'address: {{"op": "rename_symbol", "identifier": "{address}", '
+                    f'"new_name": "bar"}}') in failed["message"], failed
+
+    def test_rename_chains_are_judged_by_where_the_rename_lands_995(self, shared_bn, tmp_path):
+        """#995 review rounds 1-2, on BN's own resolver: a chain is refused only
+        when a later rename LANDS on a symbol an earlier one renamed -- through a
+        case variant, an address, a data rename at the function's address, or past
+        an unrelated rename to the same name -- and batches whose renames land on
+        different symbols (a case-folded function beside a data symbol, a data
+        symbol holding a name a function rename took) apply."""
+        shared_bn.load(ADD_BINARY)
+        address = next(f["address"] for f in
+                       shared_bn.json("function", "list", "--limit", "500")["items"]
+                       if f["name"] == "add")
+
+        def preview(*ops):
+            manifest = tmp_path / "chain.json"
+            manifest.write_text(json.dumps({"ops": list(ops)}), encoding="utf-8")
+            result = shared_bn.run("batch", "apply", str(manifest), "--preview",
+                                   "--format", "json")
+            return result.returncode, json.loads(result.stdout)
+
+        def rename(src, dst, kind="auto"):
+            return {"op": "rename_symbol", "identifier": src, "new_name": dst, "kind": kind}
+
+        chains = [
+            ([rename("add", "Q1"), rename("q1", "zz")], 1),
+            ([rename(address, "alias", "data"), rename("alias", "q2", "function")], 1),
+            ([rename("add", "q1", "function"), rename(address, "q2", "data")], 1),
+            ([rename("add", "both", "function"), rename("__dso_handle", "both", "data"),
+              rename("both", "lastadd", "function")], 2),
+        ]
+        for ops, failed_index in chains:
+            code, payload = preview(*ops)
+            assert code == 3, (ops, payload)
+            row = payload["results"][failed_index]
+            assert row["status"] == "invalid_request", (ops, row)
+            assert f"renames the symbol at {address} again" in row["message"], (ops, row)
+            assert payload["rolled_back"] is True, (ops, payload)
+
+        for ops in ([rename("__dso_handle", "ADD", "data"), rename("ADD", "newadd")],
+                    [rename("add", "__dso_handle", "function"),
+                     rename("__dso_handle", "marker", "data")]):
+            code, payload = preview(*ops)
+            assert code == 0, (ops, payload)
+            assert [r["status"] for r in payload["results"]] == ["verified", "verified"], payload
 
 
 class TestProtoSetUnnamedParams:
@@ -1125,15 +1173,180 @@ class TestTypeStringsAndInheritance:
         # The bare-mention stub is not counted as declared.
         assert summary["declared_types"]["names"] == ["Use989"], summary
         # A type only a loaded type library defines is not shadowed by an empty
-        # user stub (libc's `struct timespec` on this dynamically linked fixture).
+        # user stub (libc's `struct timespec` on this dynamically linked fixture);
+        # the library's own type is imported instead, with its dependencies, and
+        # named (#993 item 2).
         lib = shared_bn.json("types", "declare", "struct Lib989 { struct timespec* ts; };", "--summary")
-        assert lib["declared_types"]["referenced_existing"] == ["timespec"], lib
-        assert shared_bn.run("types", "show", "timespec").returncode == 2
-        # A header of only forward declarations of library types is a noop too.
-        fwd = shared_bn.run("types", "declare", "struct timespec;", "--format", "json")
+        # Imported, so not also listed as an existing type left unchanged.
+        assert "timespec" not in lib["declared_types"].get("referenced_existing", []), lib
+        assert "timespec" in lib["declared_types"]["imported_from_library"], lib
+        assert shared_bn.json("types", "show", "timespec")["layout"].startswith("struct timespec // size=0x10")
+        # A header of only forward declarations of library types is a noop.
+        fwd = shared_bn.run("types", "declare", "struct timeval;", "--format", "json")
         assert fwd.returncode == 0, fwd.stdout
         assert json.loads(fwd.stdout)["results"][0]["status"] == "noop"
-        assert shared_bn.run("types", "show", "timespec").returncode == 2
+        assert shared_bn.run("types", "show", "timeval").returncode == 2
+
+    def test_function_pointer_typedef_references_existing_struct(self, shared_bn):
+        """#993 item 1: a struct mentioned only in a function-pointer parameter
+        list came back from BN's parser as a named `void`; defining it redefined
+        the existing struct as `void` and verification rolled the typedef back."""
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct Node993 { int a; };")
+        res = shared_bn.run("types", "declare", "typedef void (*visit993_cb)(struct Node993*);",
+                            "--format", "json", "--summary")
+        assert res.returncode == 0, res.stdout + res.stderr
+        summary = json.loads(res.stdout)
+        assert summary["declared_types"]["names"] == ["visit993_cb"], summary
+        assert summary["declared_types"]["referenced_existing"] == ["Node993"], summary
+        assert "int32_t a" in shared_bn.run("struct", "show", "Node993").stdout
+        assert shared_bn.json("types", "show", "visit993_cb")["decl"] == "void (*)(struct Node993*)"
+        # A NEW name mentioned there becomes an empty struct, not a `void` typedef.
+        fresh = shared_bn.json("types", "declare", "typedef void (*leaf993_cb)(struct Leaf993*);", "--summary")
+        assert fresh["declared_types"]["created_by_reference"] == ["Leaf993"], fresh
+        assert shared_bn.json("types", "show", "Leaf993")["layout"] == "struct Leaf993 // size=0x0"
+
+    def test_preview_needing_a_library_type_is_refused_and_imports_nothing(self, tmp_path, shared_bn):
+        """#993 item 2 (round 3): parsing a declaration that uses a library type
+        makes BN import it, undo cannot revert that, and modelling the import
+        under a preview failed three reviews. A preview that would need a
+        library type the view lacks is refused, naming it, and the view's type
+        list is untouched -- a single declare, and a batch whose later op uses
+        the type. Once the type is in the view, the same batch previews."""
+        shared_bn.load(HELLO_BINARY)
+        probe = "print(sorted(str(n) for n in bv.type_names))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
+        refused = shared_bn.run("types", "declare", "struct Stamp993 { struct timespec ts; int y; };", "--preview")
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        assert "Cannot --preview" in refused.stderr + refused.stdout
+        assert "timespec" in refused.stderr + refused.stdout
+        pointer = shared_bn.run("types", "declare", "struct Ptr993 { struct tms* p; };", "--preview")
+        assert pointer.returncode == 3 and "tms" in pointer.stderr + pointer.stdout, pointer.stderr
+        manifest = tmp_path / "batch.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "types_declare", "declaration": "struct Px993 { struct timeval tv; int64_t pad; };"},
+            {"op": "struct_field_set", "struct_name": "Px993", "offset": "0x18", "field_name": "t2",
+             "field_type": "struct timeval"}]}))
+        batch = shared_bn.run("batch", "apply", str(manifest), "--preview")
+        assert batch.returncode == 3 and "timeval" in batch.stderr + batch.stdout, batch.stderr
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
+        # A platform-only declaration still previews.
+        plain = shared_bn.json("types", "declare", "struct Plain993 { uint32_t a; size_t n; };",
+                               "--preview", "--summary")
+        assert plain["verified_count"] == 1, plain
+
+        live = shared_bn.json("types", "declare", "struct Stamp993 { struct timespec ts; struct timeval tv; };",
+                              "--summary")
+        assert {"timespec", "timeval", "__time_t"} <= set(live["declared_types"]["imported_from_library"]), live
+        assert "__time_t tv_sec" in shared_bn.run("types", "show", "timespec").stdout
+        again = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json", "--summary")
+        assert again.returncode == 0, again.stdout + again.stderr
+        assert json.loads(again.stdout)["verified_count"] == 2, again.stdout
+
+    def test_preview_that_imported_fails_and_names_every_import(self, shared_bn):
+        """#993 review round 4: untagged library names, a macro hiding the
+        tag, and a user typedef standing in for a library name are not caught
+        up front, and BN imported while the preview reported `verified`, exit
+        0. The preview now judges by what BN did -- new type ids, so a renamed
+        import is counted too -- and fails (`unsupported`, exit 3) listing
+        every import as kept. A preview that verifies changed no type id."""
+        shared_bn.load(HELLO_BINARY)
+        ids = "print(sorted(bv.type_container.type_ids))"
+        shapes = [
+            ("struct U1_993 { rusage r; };", "rusage"),
+            ("struct U2_993 { timespec* p; };", "timespec"),
+            ("struct U3_993 { pthread_mutex_t m; };", "pthread_mutex_t"),
+            ("#define TAGGED(x) struct x\nstruct U4_993 { TAGGED(tms) t; };", "tms"),
+        ]
+        for declaration, library_type in shapes:
+            res = shared_bn.run("types", "declare", declaration, "--preview", "--format", "json", "--summary")
+            assert res.returncode == 3, (declaration, res.stdout, res.stderr)
+            summary = json.loads(res.stdout)
+            assert summary["ok"] is False and summary["verified_count"] == 0, summary
+            assert library_type in summary["kept_library_imports"], summary
+            assert "Run the declare without --preview" in summary["first_error"], summary
+        # The reviewed shape as ONE declaration: the user typedef and its use
+        # parse together, and BN imports libc's `sigset_t` (and `__sigset_t`)
+        # while parsing -- the preview must fail and name both (review round 5).
+        before = shared_bn.run("py", "exec", "--code", ids).stdout
+        local = shared_bn.run("types", "declare", "typedef int sigset_t; struct Local993 { sigset_t s; };",
+                              "--preview", "--format", "json", "--summary")
+        summary = json.loads(local.stdout)
+        assert before != shared_bn.run("py", "exec", "--code", ids).stdout, "BN imported nothing"
+        assert local.returncode == 3 and summary["verified_count"] == 0, summary
+        assert {"sigset_t", "__sigset_t"} <= set(summary["kept_library_imports"]), summary
+
+    def test_member_names_like_library_types_preview_normally(self, shared_bn):
+        """#993 review round 4: the bare-identifier pre-check treated member
+        names as type uses and refused previews that import nothing."""
+        shared_bn.load(HELLO_BINARY)
+        ids = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", ids).stdout
+        res = shared_bn.json("types", "declare",
+                             "struct Names993 { int node; int FILE; int clock_t; int pid_t; int sigset_t; };",
+                             "--preview", "--summary")
+        assert res["ok"] is True and res["verified_count"] == 1, res
+        assert shared_bn.run("py", "exec", "--code", ids).stdout == before
+
+    def test_live_imports_rename_collisions_and_later_imports_still_work(self, shared_bn):
+        """#993 review rounds 1-2: the live path imports only through BN's own
+        import, so a dependency colliding with a user type is renamed, and a
+        refused preview leaves later imports working."""
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "typedef uint32_t __time_t;")
+        assert shared_bn.run("types", "declare", "struct Collide993 { struct timespec ts; };",
+                             "--preview").returncode == 3
+        live = shared_bn.json("types", "declare", "struct Collide993 { struct timespec ts; };", "--summary")
+        assert live["committed"] is True, live
+        assert "__time_t_1 tv_sec" in shared_bn.run("struct", "show", "timespec").stdout
+        assert "int64_t" in shared_bn.run("types", "show", "__time_t_1").stdout
+
+        assert shared_bn.run("types", "declare", "struct Pw993 { struct passwd pw; };", "--preview").returncode == 3
+        shared_bn.json("proto", "set", "main", "int main(struct passwd* a, int b)")
+        probe = shared_bn.run("py", "exec", "--code", "print(bv.get_type_by_name('passwd') is not None)")
+        assert probe.stdout.strip().endswith("True"), probe.stdout
+
+    def test_every_pointer_reached_library_type_is_imported(self, shared_bn):
+        """#993 review round 2: only the first of several library types
+        reached through pointers was imported (the reference walk lost
+        members to reused `id()`s), the rest dangled and were listed as
+        referenced."""
+        shared_bn.load(HELLO_BINARY)
+        decl = "struct Many993 { struct tms* a; struct passwd* b; struct group* c; struct tm* d; };"
+        live = shared_bn.json("types", "declare", decl, "--summary")["declared_types"]
+        wanted = {"tms", "passwd", "group", "tm"}
+        assert wanted <= set(live["imported_from_library"]), live
+        assert not wanted & set(live.get("referenced_existing", [])), live
+        probe = shared_bn.run("py", "exec", "--code",
+                              "print(sorted(n for n in ('tms','passwd','group','tm') if bv.get_type_by_name(n) is None))")
+        assert probe.stdout.strip().endswith("[]"), probe.stdout
+
+    def test_failed_live_declares_name_the_imports_they_kept(self, tmp_path, shared_bn):
+        """#993 review rounds 2-3: a rolled-back live batch, and a declare op
+        that is itself refused after BN's parse imported, keep those imports
+        (BN cannot un-import) and say so -- on the op's own row, not a
+        sibling's."""
+        shared_bn.load(HELLO_BINARY)
+        manifest = tmp_path / "batch.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "types_declare", "declaration": "struct Ru993 { struct rusage ru; };"},
+            {"op": "struct_field_set", "struct_name": "NoSuchStruct993", "offset": "0x0",
+             "field_name": "x", "field_type": "int"}]}))
+        failed = shared_bn.run("batch", "apply", str(manifest), "--format", "json", "--summary")
+        assert failed.returncode == 3, failed.stdout + failed.stderr
+        summary = json.loads(failed.stdout)
+        assert summary["rolled_back"] is True, summary
+        assert "rusage" in summary["kept_library_imports"], summary
+
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "types_declare", "declaration": "struct S8_993 { int a; };"},
+            {"op": "types_declare",
+             "declaration": "struct D2_993 { struct sigaction sa; }; struct uint32_t { int x; };"}]}))
+        refused = shared_bn.run("batch", "apply", str(manifest), "--format", "json")
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        rows = json.loads(refused.stdout)["results"]
+        assert "imported_from_library" not in rows[0], rows[0]
+        assert "sigaction" in rows[1]["imported_from_library"], rows[1]
 
     def test_typed_vptr_keeps_bn_vtable_and_renders_named_virtual_call(self, shared_bn):
         """#963: BN's parser returns a type a declaration only references as an
@@ -1158,6 +1371,97 @@ class TestTypeStringsAndInheritance:
         shared_bn.json("local", "retype", "svc::dispatch", this["local_id"], "struct `svc::Handler`*")
         text = shared_bn.json("decompile", "svc::dispatch")["text"]
         assert "this->vtable->handle(" in text, text
+
+    def test_class_apply_types_types_the_vptr_and_this_as_one_mutation(self, shared_bn):
+        """#993 item 3: `class apply-types` declares the instance struct with a
+        vptr typed as BN's own `<Base>::<Class>::VTable*` and retypes `this` on
+        the class's methods, previewable and verified as one mutation; a class
+        BN made no table of its own for is refused, naming the derived tables."""
+        shared_bn.load(CLASSES_BINARY)
+        vtable = "svc::Handler::svc::EchoHandler::VTable"
+        before = shared_bn.json("types", "show", vtable)["layout"]
+        preview = shared_bn.json("class", "apply-types", "svc::EchoHandler", "--preview", "--summary")
+        plan = preview["class_apply_types"]
+        assert preview["preview"] is True and preview["failed_count"] == 0, preview
+        assert plan["vtable_type"] == vtable and plan["instance_struct"] == "declared", plan
+        assert {m["name"] for m in plan["retyped_methods"]} >= {
+            "svc::EchoHandler::handle", "svc::EchoHandler::name"}, plan
+        assert shared_bn.run("types", "show", "svc::EchoHandler").returncode == 2
+
+        live = shared_bn.json("class", "apply-types", "svc::EchoHandler", "--summary")
+        assert live["committed"] is True and live["failed_count"] == 0, live
+        assert shared_bn.run("struct", "show", "svc::EchoHandler").stdout.splitlines() == [
+            "struct svc::EchoHandler // size=0x8",
+            f"0x0000: struct {vtable}* vtable",
+        ]
+        assert shared_bn.json("types", "show", vtable)["layout"] == before
+        handle = shared_bn.json("local", "list", "svc::EchoHandler::handle")["items"]
+        this = next(v for v in handle if v["is_parameter"] and v["name"] == "this")
+        assert this["type"] == "struct svc::EchoHandler*", this
+
+        again = shared_bn.json("class", "apply-types", "svc::EchoHandler", "--summary")
+        assert again["class_apply_types"]["instance_struct"] == "unchanged", again
+        assert again["changed_count"] == 0 and again["dirty_after"] is False, again
+
+        refused = shared_bn.run("class", "apply-types", "svc::Handler")
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        assert "no table type of its own" in refused.stderr + refused.stdout
+        assert vtable in refused.stderr + refused.stdout
+
+    def test_class_apply_types_refuses_layout_at_offset_zero(self, shared_bn):
+        """#993 review: an embedded base at offset 0 was overwritten by the
+        8-byte vptr and reported `verified`; it is refused and left intact."""
+        shared_bn.load(CLASSES_BINARY)
+        shared_bn.json("types", "declare", "struct `svc::Handler` { void* vtable; int64_t id; int64_t flags; };")
+        shared_bn.json("types", "declare", "struct `svc::EchoHandler` { struct `svc::Handler` base; int64_t extra; };")
+        before = shared_bn.run("struct", "show", "svc::EchoHandler").stdout
+        refused = shared_bn.run("class", "apply-types", "svc::EchoHandler")
+        assert refused.returncode == 3, refused.stdout + refused.stderr
+        assert "would replace it" in refused.stdout + refused.stderr
+        assert shared_bn.run("struct", "show", "svc::EchoHandler").stdout == before
+
+    def test_class_apply_types_stripped_rerun_is_a_noop(self, shared_bn):
+        """#993 review: a re-run on a stripped build, where nothing is left to
+        write, is a clean noop rather than an exit-3 refusal, and the vtable's
+        slot functions are listed as skipped."""
+        shared_bn.load(CLASSES_STRIPPED_BINARY)
+        first = shared_bn.json("class", "apply-types", "svc::Codec", "--summary")
+        assert first["committed"] is True and first["failed_count"] == 0, first
+        assert first["class_apply_types"]["skipped_methods"], first
+        again = shared_bn.run("class", "apply-types", "svc::Codec", "--format", "json", "--summary")
+        assert again.returncode == 0, again.stdout + again.stderr
+        summary = json.loads(again.stdout)
+        assert summary["noop_count"] == 1 and summary["dirty_after"] is False, summary
+        assert summary["class_apply_types"]["instance_struct"] == "unchanged", summary
+
+    def test_qualified_prototype_preview_and_display_name_999(self, shared_bn, tmp_path):
+        """#999 on BN's real parser: a `::`-qualified type in backticks and a
+        `::`-qualified function name both land (items 1-2), `proto get` names the
+        demangled function (item 3), and a batch preview with an AUTO-prototype op
+        previews the comment beside it instead of refusing (item 5)."""
+        shared_bn.load(CLASSES_BINARY)
+        shared_bn.json("types", "declare", "struct `svc::Probe999` { int a; };")
+        prototype = "void svc::dispatch(struct `svc::Probe999`* self)"
+
+        manifest = tmp_path / "b.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "set_prototype", "identifier": "svc::dispatch", "prototype": prototype},
+            {"op": "set_comment", "function": "svc::dispatch", "comment": "probe"},
+        ]}), encoding="utf-8")
+        preview = shared_bn.run("batch", "apply", str(manifest), "--preview",
+                                "--format", "json", "--summary")
+        assert preview.returncode == 0, (preview.stdout, preview.stderr)
+        summary = json.loads(preview.stdout)
+        assert summary["verified_count"] == 1, summary
+        assert [row["index"] for row in summary["preview_skipped"]] == [0], summary
+
+        committed = shared_bn.json("proto", "set", "svc::dispatch", prototype)
+        assert committed["results"][0]["status"] == "verified", committed
+        got = shared_bn.json("proto", "get", "svc::dispatch")
+        assert got["function"]["display_name"] == "svc::dispatch", got
+        assert "svc::Probe999" in got["prototype"], got
+        text = shared_bn.run("proto", "get", "svc::dispatch").stdout
+        assert text.startswith("// svc::dispatch\n"), text
 
 
 class TestDisasmLinear:

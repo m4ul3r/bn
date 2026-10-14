@@ -12,9 +12,10 @@ Outbound calls resolve through:
   * ``ctx`` -- resolution helpers relocated to the seam (``_resolve_view``);
   * ``read_xrefs`` -- ``_import_symbol_name`` (the preferred display name for an
     import symbol, used by the imports op);
-  * ``bridge_state`` -- the ``_quick_loaded_views`` WeakSet (the strings op
-    consults it to refuse with a directive when analysis hasn't run); imported
-    as the SAME shared object so ``bv in _quick_loaded_views`` stays correct;
+  * ``bridge_state`` -- ``analysis_unavailable``, which reads the shared
+    ``_quick_loaded_views`` / ``_refreshing_views`` state (the strings op
+    refuses with a directive when analysis hasn't run, or says "retry" while a
+    ``bn refresh`` is running, #996);
   * ``_shared`` -- module-free helpers (``_parse_address``, ``_validate_count``,
     ``OperationFailure``).
 
@@ -35,7 +36,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 
 from . import il_format
 from . import read_xrefs
-from .bridge_state import _quick_loaded_views
+from .bridge_state import analysis_unavailable
 from ._shared import OperationFailure, _parse_address, _validate_count
 from .elf_dynamic import ElfDynamicInfo, parse_elf_dynamic
 
@@ -359,14 +360,15 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     # means "no limit", so a raw-socket / py exec caller can fetch every string.
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
-    if bv in _quick_loaded_views:
-        # In --quick mode string analysis hasn't run, so bv.strings is empty
-        # and `[]` would be indistinguishable from "this binary has none".
-        # Refuse with a directive instead of misleading the caller.
-        raise RuntimeError(
-            "Strings are not available: this target was loaded with --quick (no analysis). "
-            "Run `bn refresh` to build the full string set first."
-        )
+    # In --quick mode string analysis hasn't run, so bv.strings is empty and `[]`
+    # would be indistinguishable from "this binary has none". Refuse with a
+    # directive instead of misleading the caller -- "retry" while a refresh is
+    # already building them (#996).
+    unavailable = analysis_unavailable(
+        bv, "Strings", "Run `bn refresh` to build the full string set first.",
+        plural=True)
+    if unavailable is not None:
+        raise RuntimeError(unavailable)
     needle = str(query) if query else None
     pattern = None
     if needle and regex:
