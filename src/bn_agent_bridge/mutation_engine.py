@@ -788,17 +788,14 @@ def _explain_renamed_reference(op: Any, results: list[dict[str, Any]],
             continue
         address = row.get("address")
         renamed_to = row.get("new_name")
-        current = renamed_to
-        for later in results[index + 1:]:
-            if later.get("op") == "rename_symbol" and later.get("address") == address:
-                current = later.get("new_name")
-        now = "" if current == renamed_to else f", then to {current}"
+        # A second rename of the same symbol never reaches here: a rename chain
+        # is refused before apply (`_reject_rename_chains`, #995).
         return OperationFailure(
             exc.status,
             f"{before} not found: operation {index} of this batch renamed {before} "
-            f"(at {address}) to {renamed_to}{now}. Each operation resolves "
+            f"(at {address}) to {renamed_to}. Each operation resolves "
             f"names against the state the earlier operations left, so refer to it "
-            f"as {current} or by its address {address}.",
+            f"as {renamed_to} or by its address {address}.",
             requested=exc.requested,
             observed=exc.observed,
         )
@@ -843,6 +840,47 @@ def _unattempted_results(ctx, operations: list[dict[str, Any]]) -> list[dict[str
     return rows
 
 
+# #999 item 5: an op a --preview left out because it cannot be previewed
+# reversibly, or depends on one that cannot. Like `not_attempted` it is NOT in
+# `FAILED_MUTATION_STATUSES`: the op never ran, and the preview of the rest of
+# the batch is still a real one.
+NOT_PREVIEWED = "not_previewed"
+
+
+def _not_previewed_result(ctx, op: Any, reason: str) -> dict[str, Any]:
+    """The row for an op the preview skipped. It carries no `address`, so the
+    has_user_type residue scan (`_prototype_user_type_residue`) never reads a
+    skipped set_prototype as one that ran."""
+    return {
+        "op": str(op.get("op") or "<missing>") if isinstance(op, dict) else "<non-object>",
+        "status": NOT_PREVIEWED,
+        "message": reason,
+        "requested": _operation_requested(ctx, op),
+    }
+
+
+def _disclose_not_previewed(result: dict[str, Any], skipped: dict[int, str],
+                            operations: list) -> dict[str, Any]:
+    """Say on the batch result itself that a preview did not cover every op:
+    `preview_skipped` lists them by index, and the message leads with the gap so
+    a reader of the message alone cannot take the preview for the whole batch."""
+    if not skipped:
+        return result
+    result["preview_skipped"] = [
+        {"index": index,
+         "op": str(operations[index].get("op") or "<missing>")
+         if isinstance(operations[index], dict) else "<non-object>",
+         "reason": reason}
+        for index, reason in sorted(skipped.items())
+    ]
+    result["message"] = (
+        f"{len(skipped)} of {len(operations)} operations were not previewed (see "
+        f"preview_skipped); the preview covers the rest only. {result.get('message') or ''}"
+    ).rstrip()
+    return result
+
+
+
 def _mark_unverified_results(
     ctx, results: list[dict[str, Any]], message: str, status: str = "reverted"
 ) -> list[dict[str, Any]]:
@@ -856,11 +894,12 @@ def _mark_unverified_results(
 
     A genuine ``noop`` op (its requested state was already satisfied) changed
     nothing, so a rollback leaves it exactly as observed -- keep it ``noop`` (#630)
-    rather than restamping it as reverted/rollback_failed and corrupting counts."""
+    rather than restamping it as reverted/rollback_failed and corrupting counts.
+    A ``not_previewed`` op never ran, so it keeps its status too (#999 item 5)."""
     annotated = []
     for result in results:
         item = dict(result)
-        if item.get("status") != "noop":
+        if item.get("status") not in ("noop", NOT_PREVIEWED):
             item["status"] = status
             item["message"] = message
         annotated.append(item)
@@ -983,8 +1022,8 @@ def _batch_changes_symbol_resolution(operations) -> bool:
     return _resolution_affecting_op(operations) is not None
 
 
-def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[str]:
-    """Names/identifiers of functions a ``--preview`` set_prototype would
+def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[tuple[int, str]]:
+    """``(index, function label)`` of each ``--preview`` set_prototype that would
     irreversibly pin ``has_user_type`` on (#630), for a batch that does NOT change
     symbol resolution.
 
@@ -1013,15 +1052,15 @@ def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[str]:
     prototype would DIFFER is flagged; so is one that is ambiguous or unresolvable
     (we cannot PROVE it lands on a non-AUTO function). Over-flagging is safe; an
     irreversible AUTO-prototype pin under ``--preview`` is not."""
-    proto_ops = [
-        op for op in operations
-        if isinstance(op, dict) and op.get("op") == "set_prototype"
-    ]
-    if not proto_ops:
-        return []
-
-    flagged: list[str] = []
-    for op in proto_ops:
+    # A prototype that fails to parse is reported as a parse error (#999 item 1),
+    # not as "cannot preview": every attempt was otherwise live. The one case it
+    # cannot be judged yet is a batch that declares types the prototype may use.
+    declares_types = any(isinstance(op, dict) and op.get("op") == "types_declare"
+                         for op in operations)
+    flagged: list[tuple[int, str]] = []
+    for index, op in enumerate(operations):
+        if not (isinstance(op, dict) and op.get("op") == "set_prototype"):
+            continue
         identifier = op.get("identifier")
         if identifier is None:
             continue
@@ -1031,24 +1070,94 @@ def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[str]:
             # Ambiguous or unresolvable under BN's REAL lookup: we cannot prove
             # the target is a non-AUTO function, so an irreversible AUTO pin can't
             # be ruled out -> refuse (over-refusal is safe).
-            flagged.append(str(identifier))
+            flagged.append((index, str(identifier)))
             continue
         if fn is None:
-            flagged.append(str(identifier))
+            flagged.append((index, str(identifier)))
             continue
         if bool(getattr(fn, "has_user_type", False)):
             # A genuine prior user type: re-asserting it on revert is correct.
             continue
+        label = str(il_format._display_name(fn) or identifier)
         try:
-            expected_type, _ = _parse_type_or_hint(ctx, bv, op, op["prototype"], label="prototype")
-        except Exception:
+            expected_type = _parse_prototype(ctx, bv, op)
+        except OperationFailure:
+            if not declares_types:
+                raise
             # Cannot determine whether the prototype differs from this AUTO
             # function's current type, so cannot prove it is a no-op -> refuse.
-            flagged.append(str(getattr(fn, "name", None) or identifier))
+            flagged.append((index, label))
             continue
         if str(fn.type) != str(expected_type):
-            flagged.append(str(getattr(fn, "name", None) or identifier))
+            flagged.append((index, label))
     return flagged
+
+
+# The ops whose meaning depends on a function's prototype: a parameter is a
+# local, so renaming or retyping one means nothing until the prototype lands.
+_PROTOTYPE_DEPENDENT_OPS = frozenset({"local_rename", "local_retype"})
+
+
+def _unpreviewable_operations(ctx, bv, operations) -> dict[int, str]:
+    """``{index: reason}`` for the ops a ``--preview`` must leave out (#999 item 5).
+
+    A set_prototype on a function with no user prototype cannot be previewed
+    (it pins has_user_type, #630), and neither can any set_prototype in a batch
+    that may move name resolution, since its target cannot be proven from the
+    pre-mutation view. Refusing the whole batch for it meant the comments and
+    renames beside it could not be previewed either, so the preview skips those
+    ops plus every op that depends on them -- a local op on the same function,
+    or one whose function cannot be resolved here and so cannot be proven
+    elsewhere -- and previews the rest."""
+    skipped: dict[int, str] = {}
+    offending = _resolution_affecting_op(operations)
+    if offending is not None:
+        offending_op, is_known = offending
+        cause = (f"a rename or a symbol/function create ({offending_op})" if is_known
+                 else f"the operation {offending_op!r}, which may change how a symbol resolves")
+        for index, op in enumerate(operations):
+            if isinstance(op, dict) and op.get("op") == "set_prototype":
+                skipped[index] = (
+                    f"not previewed: this batch also carries {cause}, so the function "
+                    "this prototype lands on cannot be proven from the pre-mutation view, "
+                    "and a prototype set on a function with no user prototype pins its "
+                    "has_user_type flag, which Binary Ninja cannot clear")
+    else:
+        for index, label in _unrevertible_preview_prototypes(ctx, bv, operations):
+            skipped[index] = (
+                f"not previewed: {label} has no user prototype yet, and setting one pins "
+                "its has_user_type flag, which Binary Ninja exposes no API to clear, so "
+                "the preview could not be cleanly reverted")
+    if not skipped:
+        return skipped
+    first = min(skipped)
+    starts: dict[int, int] = {}
+    names: dict[str, int] = {}
+    for index in list(skipped):
+        identifier = operations[index].get("identifier")
+        names.setdefault(str(identifier), index)
+        try:
+            starts.setdefault(int(ctx._find_function(bv, identifier).start), index)
+        except Exception:
+            continue
+    for index, op in enumerate(operations):
+        if not (isinstance(op, dict) and op.get("op") in _PROTOTYPE_DEPENDENT_OPS):
+            continue
+        function = op.get("function")
+        source = names.get(str(function))
+        if source is None and offending is not None:
+            # Names may move under this batch, so no local op can be proven to
+            # sit outside the functions whose prototype is left out.
+            source = first
+        if source is None:
+            try:
+                source = starts.get(int(ctx._find_function(bv, function).start))
+            except Exception:
+                source = first
+        if source is not None:
+            skipped[index] = (f"not previewed: depends on operation {source}, a prototype "
+                              "change this preview leaves out")
+    return skipped
 
 
 def _prototype_user_type_residue(ctx, bv, results: list[dict[str, Any]]) -> bool:
@@ -1476,7 +1585,12 @@ def _verify_set_prototype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             # ...and it auto-names unnamed parameters on readback, so a prototype
             # requested without parameter names reads back with arg1/arg2/...; accept
             # when the return type and all parameter TYPES still match (#254).
-            if not _prototype_matches_ignoring_param_names(bv, fn.type, expected):
+            # #999 item 1: parse the REQUESTED text, not `expected` -- `str(Type)`
+            # drops the backticks a `::`-qualified type needs, so it never parses.
+            requested_text = (item.get("requested") or {}).get("prototype")
+            source = (_quote_qualified_declarator(str(requested_text))
+                      if requested_text is not None else expected)
+            if not _prototype_matches_ignoring_param_names(bv, fn.type, source):
                 raise OperationFailure(
                     "verification_failed",
                     f"Live prototype verification failed at {item['address']}",
@@ -2299,6 +2413,63 @@ def _reject_duplicate_write_keys(ctx, operations: list[dict[str, Any]]) -> None:
         )
 
 
+def _reject_rename_chains(ctx, bv, operations: list[dict[str, Any]]) -> None:
+    """Refuse a manifest that renames one symbol twice, up front (#995).
+
+    `_reject_duplicate_write_keys` keys a rename on its identifier STRING, so a
+    chain (`add -> foo`, then `foo -> bar`, or the second rename naming the same
+    symbol by address) slipped past it, and the first rename then failed
+    verification against the end state (`bar` at the address it expected `foo`)
+    -- a rollback that read as a BN problem at an address, not as a manifest
+    that renames one function twice. Key on the address the rename resolves to
+    instead: a name an earlier rename in this batch assigned resolves to THAT
+    rename's target; any other identifier resolves against the view the batch
+    starts from, and one that does not resolve there is keyed by its spelling,
+    so a chain through it is still caught while a lone miss is left to fail at
+    apply, where the #975 hint explains a name an earlier rename replaced."""
+    renamed: dict[tuple, tuple[int, Any, str]] = {}
+    assigned: dict[str, tuple] = {}
+    for index, op in enumerate(operations):
+        if not isinstance(op, dict) or op.get("op") != "rename_symbol":
+            continue
+        identifier = op.get("identifier")
+        new_name = op.get("new_name")
+        if not isinstance(new_name, str):
+            continue
+        before_name: Any = identifier
+        if isinstance(identifier, str) and identifier in assigned:
+            key = assigned[identifier]
+        else:
+            try:
+                target = ctx._resolve_rename_target(bv, identifier, str(op.get("kind", "auto")))
+                key = ("addr", int(target["address"]))
+                before_name = target.get("before_name") or identifier
+            except Exception:
+                key = ("name", str(identifier))
+        previous = renamed.get(key)
+        if previous is not None:
+            first, first_before, first_new = previous
+            where = hex(key[1]) if key[0] == "addr" else str(first_before)
+            at = f"at {where}: " if key[0] == "addr" else ""
+            raise OperationFailure(
+                "invalid_request",
+                f"operation {index} renames the symbol operation {first} already renamed "
+                f"({at}{first_before} -> {first_new}, then -> {new_name}). "
+                f"Every op is verified against the batch's END state, so operation "
+                f"{first} would be judged against operation {index}'s name, fail "
+                f"verification, and roll the whole batch back. Rename it once, to "
+                f"{new_name}, or split the renames across two batches.",
+                requested={
+                    "op": "rename_symbol",
+                    "conflicting_op_indices": [first, index],
+                    "conflict_key": where,
+                },
+            )
+        renamed[key] = (index, before_name, new_name)
+        assigned[new_name] = key
+
+
+
 def _later_create_needs_ranges(operations: list, index: int) -> bool:
     """Whether op *index* is a `function_create` with another one after it.
 
@@ -2389,72 +2560,32 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         # generalizes the per-op function_create guard to bn type/comment/rename/proto/
         # struct-field/batch-apply on a quick view.
         refuse_quick_view(bv, requested={"op": "mutation", "operations": len(operations)})
+        # #995: a rename chain (one symbol renamed twice) can never verify.
+        _reject_rename_chains(ctx, bv, operations)
         # #630: a --preview of a prototype set on a function with no user type would
         # pin has_user_type, which BN cannot clear -- so the preview could not honor
-        # its non-destructive contract. Refuse BEFORE touching the view (pristine, no
-        # residue) rather than apply and report a false clean rollback. Non-preview
-        # applies are unaffected: committing a prototype SHOULD leave it a user type.
-        if preview:
-            proto_ops = [
-                op for op in operations
-                if isinstance(op, dict) and op.get("op") == "set_prototype"
-            ]
-            # Round-5 conservative rule: if the same --preview batch also carries any
-            # op that could move function/symbol name-or-address resolution (a rename,
-            # a symbol/function create, or an unknown op), the target a set_prototype
-            # will hit at apply time cannot be PROVEN from the pre-mutation view, so
-            # reversibility of an AUTO-prototype pin can't be guaranteed. Refuse the
-            # whole preview up front rather than simulate BN's resolver (which four
-            # review rounds proved unsound). Over-refusal is acceptable here.
-            offending = _resolution_affecting_op(operations) if proto_ops else None
-            if offending is not None:
-                offending_op, is_known = offending
-                if is_known:
-                    # A recognized rename / symbol-or-function create.
-                    cause = (
-                        f"a rename or a symbol/function create ({offending_op})"
-                    )
-                else:
-                    # An unknown/future (or malformed) op: NOT a rename/create, but not
-                    # on the resolution-safe whitelist either, so we cannot prove it
-                    # leaves resolution untouched. Name it as such rather than falsely
-                    # blaming a rename (#630 follow-up).
-                    cause = (
-                        f"the operation {offending_op!r}, which is not on the "
-                        "resolution-safe whitelist and so may change how a symbol "
-                        "resolves"
-                    )
-                raise OperationFailure(
-                    "unsupported",
-                    f"Cannot --preview a prototype change together with {cause} in "
-                    "the same batch: it can change how the prototype target resolves "
-                    "at apply time, so a clean, reversible preview cannot be proven "
-                    "from the pre-mutation view (setting a prototype pins the "
-                    "function's has_user_type flag, which Binary Ninja exposes no API "
-                    "to clear). Apply the other change(s) and the prototype change in "
-                    "separate previews, or re-run without --preview to commit.",
-                    requested={
-                        "op": "set_prototype",
-                        "reason": "batch_changes_symbol_resolution",
-                        "offending_op": offending_op,
-                    },
-                )
-            # No resolution-affecting op: current-view resolution == apply-time
-            # resolution, so resolve each proto target with BN's REAL lookup and
-            # refuse the ones that would irreversibly pin has_user_type.
-            unrevertible = _unrevertible_preview_prototypes(ctx, bv, operations)
-            if unrevertible:
-                names = ", ".join(unrevertible)
-                raise OperationFailure(
-                    "unsupported",
-                    f"Cannot --preview a prototype change on {names}: setting a "
-                    "prototype pins the function's has_user_type flag and Binary "
-                    "Ninja exposes no API to clear it, so the preview could not be "
-                    "cleanly reverted (it would leave the view modified). Re-run "
-                    "without --preview to apply the change, or preview a function "
-                    "that already has a user-defined prototype.",
-                    requested={"op": "set_prototype", "functions": unrevertible},
-                )
+        # its non-destructive contract, and neither can a prototype set whose target
+        # a rename in the same batch may move (round-5 conservative rule: we do not
+        # simulate BN's resolver). #999 item 5: such ops, and the ops that depend on
+        # them, are left out of the preview and listed, and the rest is previewed;
+        # only a batch with nothing left to preview is still refused, BEFORE
+        # touching the view. Non-preview applies are unaffected: committing a
+        # prototype SHOULD leave it a user type.
+        skipped = _unpreviewable_operations(ctx, bv, operations) if preview else {}
+        if skipped and len(skipped) == len(operations):
+            unrevertible = [label for _, label in
+                            _unrevertible_preview_prototypes(ctx, bv, operations)]
+            names = ", ".join(unrevertible)
+            raise OperationFailure(
+                "unsupported",
+                f"Cannot --preview a prototype change on {names}: setting a "
+                "prototype pins the function's has_user_type flag and Binary "
+                "Ninja exposes no API to clear it, so the preview could not be "
+                "cleanly reverted (it would leave the view modified). Re-run "
+                "without --preview to apply the change, or preview a function "
+                "that already has a user-defined prototype.",
+                requested={"op": "set_prototype", "functions": unrevertible},
+            )
         # #650: validate EVERY op's shape before applying ANY. The batch is atomic, so a
         # guessed op or field name in op 13 previously rolled back 12 good ops -- and with
         # no argparse layer on this path, guessing is the norm, not the exception. Placed
@@ -2507,6 +2638,9 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             # every concurrent read. Defer it -- the same #628 deferral -- and
             # _verify_function_create does the post-analysis readback + #386
             # code guard afterwards.
+            if index in skipped:
+                results.append(_not_previewed_result(ctx, op, skipped[index]))
+                continue
             with exclusive_scope():
                 results.append(_apply_operation(ctx, bv, op, restores, defer_reanalysis=True))
             if _later_create_needs_ranges(operations, index):
@@ -2569,7 +2703,10 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 "message": message,
                 "results": _mark_unverified_results(ctx, results, result_note, status=result_status)
                 + [_operation_failure_result(ctx, operations[len(results)], exc)]
-                + _unattempted_results(ctx, operations[len(results) + 1:]),
+                + [_not_previewed_result(ctx, op, skipped[index]) if index in skipped
+                   else _unattempted_results(ctx, [op])[0]
+                   for index, op in enumerate(operations)
+                   if index > len(results)],
                 "affected_functions": [],
                 "affected_types": [],
                 "affected_summary": {
@@ -2579,7 +2716,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             }
             if proto_residue:
                 result["prototype_user_type_residue"] = True
-            return result
+            return _disclose_not_previewed(result, skipped, operations)
 
     # #628: the reanalysis after a successful apply is the long pole on a large
     # target and changes nothing we snapshot here -- it runs under the write gate
@@ -2594,7 +2731,8 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             type_after = _capture_type_snapshots(ctx, bv, operations)
             diffs = _diff_snapshots(ctx, before, after)
             type_diffs = _diff_type_snapshots(ctx, type_before, type_after)
-            verified_results = [_verify_operation(ctx, bv, result) for result in results]
+            verified_results = [result if result.get("status") == NOT_PREVIEWED
+                                else _verify_operation(ctx, bv, result) for result in results]
             annotated_results = _annotate_operation_results(ctx, verified_results, type_diffs)
             failed = _has_failed_results(ctx, annotated_results)
             # Origin tag: a direct op (rename/prototype/comment) targets a specific
@@ -2742,7 +2880,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 # Structured disclosure of the unclearable has_user_type override, in
                 # addition to success:false / rolled_back:false (#630).
                 result["prototype_user_type_residue"] = True
-            return result
+            return _disclose_not_previewed(result, skipped, operations)
     except Exception as exc:
         with exclusive_scope():
             undo_ok = _revert_undo_safely(ctx, bv, state)
@@ -3403,11 +3541,65 @@ def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: s
             f"could not parse {label} {str(type_text)!r}"
             + (f": {detail}" if detail else "")
             + "."
-            + (_type_spelling_hint(bv, str(type_text), detail)
-               or " If it references a struct or type that isn't defined yet, "
-               "declare it first (e.g. with `bn types declare`), then retry."),
+            + _parse_failure_hint(bv, str(type_text), detail),
             requested=_operation_requested(ctx, op),
         ) from exc
+
+
+def _parse_failure_hint(bv, text: str, detail: str) -> str:
+    """The next step for a type string BN's parser refused, most specific first.
+
+    #999 item 2: two failures are about the spelling, not a missing type, and
+    the generic "declare it first" sent agents re-declaring types they already
+    had: ``this`` is a C++ keyword BN's parser rejects as a parameter name, and a
+    ``::``-qualified function name outside backticks reads as an out-of-line
+    member definition (one the declarator quoting cannot reach, such as a
+    partly backticked name).
+    The #962 existing-type spelling still wins over the generic ``::`` advice
+    when it can name the type the string meant."""
+    if "'this' is a keyword" in detail:
+        return (" `this` is a keyword the parser rejects as a parameter name: name "
+                "the parameter something else (e.g. self), or keep the existing "
+                "`this` and set its type with `bn local retype <function> this "
+                "'<type>'`.")
+    spelling = _type_spelling_hint(bv, text, detail)
+    if spelling:
+        return spelling
+    if "out-of-line declaration" in detail:
+        return (" A `::`-qualified function name must be quoted with backticks as "
+                "a whole (int `ns::Foo::run`(int x)); the name in a prototype is "
+                "ignored, so it can also be omitted.")
+    return (" If it references a struct or type that isn't defined yet, "
+            "declare it first (e.g. with `bn types declare`), then retry.")
+
+
+# The declarator name of a prototype: the identifier right before its first `(`,
+# with something (the return type) in front of it.
+_PROTOTYPE_DECLARATOR = re.compile(r"^(?P<head>.*\S)\s+(?P<name>[A-Za-z_~][\w~]*(?:::[A-Za-z_~][\w~]*)+)\s*$",
+                                   re.DOTALL)
+
+
+def _quote_qualified_declarator(text: str) -> str:
+    """#999 item 2: backtick-quote a ``::``-qualified function name in a
+    prototype (``int ns::Cls::run(int x)``). BN's parser reads it as an
+    out-of-line member definition and refuses it, yet the name is ignored --
+    ``set_user_type`` sets a type, never a symbol -- so quoting it changes nothing
+    but whether the string parses. A name already in backticks, or a prototype
+    with no return type in front of the qualified token, is left alone."""
+    head, sep, rest = text.partition("(")
+    if not sep:
+        return text
+    match = _PROTOTYPE_DECLARATOR.match(head)
+    if match is None or match.group("head").endswith(("::", "`")):
+        return text
+    return f"{match.group('head')} `{match.group('name')}`{sep}{rest}"
+
+
+def _parse_prototype(ctx, bv, op: dict[str, Any]):
+    """The prototype a ``set_prototype`` op requests, parsed to a ``Type``."""
+    expected_type, _ = _parse_type_or_hint(
+        ctx, bv, op, _quote_qualified_declarator(str(op["prototype"])), label="prototype")
+    return expected_type
 
 
 def _parse_concrete_type(ctx, bv, op: dict[str, Any], type_text: Any, *, label: str):
@@ -3448,7 +3640,7 @@ def _parse_concrete_type(ctx, bv, op: dict[str, Any], type_text: Any, *, label: 
 
 def _op_set_prototype(ctx, bv, op: dict[str, Any], restores: list | None = None):
     fn = ctx._find_function(bv, op["identifier"])
-    expected_type, _ = _parse_type_or_hint(ctx, bv, op, op["prototype"], label="prototype")
+    expected_type = _parse_prototype(ctx, bv, op)
     before_prototype = str(fn.type)
     before_type_obj = fn.type
     # #582: whether the function ALREADY carried a user prototype before we
@@ -3467,10 +3659,10 @@ def _op_set_prototype(ctx, bv, op: dict[str, Any], restores: list | None = None)
             before_prototype=before_prototype, before_type_obj=before_type_obj,
             had_user_type=before_has_user_type,
         )
-        try:
-            fn.set_user_type(expected_prototype)
-        except TypeError:
-            fn.set_user_type(expected_type)
+        # #999 item 1: hand BN the parsed Type, never its string. `str(Type)`
+        # drops the backticks a `::`-qualified type needs (`struct ns::Cls*`),
+        # so re-parsing it failed on a prototype that had just parsed fine.
+        fn.set_user_type(expected_type)
     return {
         "op": "set_prototype",
         "function": fn.name,
