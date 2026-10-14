@@ -253,7 +253,10 @@ def _target_close(args: argparse.Namespace) -> int:
                       "<cache> is $BN_CACHE_DIR, else the user cache dir (~/.cache/bn on "
                       "Linux) -- which a later `bn load` of the same bytes restores; an "
                       "explicit path never falls back, and the fallback refuses to "
-                      "overwrite an existing entry this target was not loaded from. The cache is shared by every bn "
+                      "overwrite an existing entry this target was not loaded from (exit 2; JSON "
+                      "{ok: false, status: invalid_request, observed: {cache_entry_exists, "
+                      "request_sent: true, written: false}} -- exit 2, not the mutation exit 3, "
+                      "because save is a file write, not a mutation). The cache is shared by every bn "
                       "instance using it: set BN_CACHE_DIR per agent or project to keep "
                       "their saved analyses apart"),
              arg("--path", dest="path_flag", default=None,

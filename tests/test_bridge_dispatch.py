@@ -2002,7 +2002,7 @@ def test_load_binary_restores_content_keyed_cache(monkeypatch, tmp_path):
     # The note names the entry, why it matched, and the cache dir it lives in.
     assert f"restored cached database {cache_bndb}" in notes
     assert "content hash of parse_record" in notes
-    assert str(cache_bndb.parent) in notes
+    assert f"{cache_bndb.parent} is shared" in notes
     assert "unverified" not in notes
     # What the substituted database already held is stated at load (#956).
     assert "0 comment(s), 0 function doc(s) and 0 analyst symbol(s)" in notes
