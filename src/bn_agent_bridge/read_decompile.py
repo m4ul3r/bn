@@ -1437,20 +1437,28 @@ def _split_body_notes(bv, func) -> list[dict[str, Any]]:
         notes.append(_warning_row(
             "split",
             f"block ending at {hex(source)} runs into {_function_label(other)}: "
-            "part of this body is listed under that function",
+            "part of this body is listed under that function. If erroneous: "
+            f"`bn function delete {hex(int(other.start))}` (no clean undo; --preview refuses)",
             f"split body: the block ending at {hex(source)} runs straight into "
             f"{_function_label(other)} without a branch or return -- BN likely split "
             "this function at a shared tail, so part of its code is listed under that "
-            "one. Read both (`bn disasm`) before trusting either decompile.",
+            "one. Read both (`bn disasm`) before trusting either decompile. "
+            f"If this is an erroneous tail entry, repair with `bn function delete {hex(int(other.start))}`. "
+            "There is no clean undo; --preview refuses without changes. Inspect the "
+            "reported containing bodies and decompile again; deletion does not guarantee a full merge.",
         ))
     if predecessor is not None:
         notes.append(_warning_row(
             "split",
             f"{_function_label(predecessor)} runs into this entry: this may be its "
-            "shared tail, not a function of its own",
+            "shared tail, not a function of its own. If erroneous: "
+            f"`bn function delete {hex(int(func.start))}` (no clean undo; --preview refuses)",
             f"split body: {_function_label(predecessor)} runs straight into this "
             "function's entry -- this may be the shared tail of that function, not a "
-            "function of its own; its parameters are likely that function's saved registers.",
+            "function of its own; its parameters are likely that function's saved registers. "
+            f"If this is an erroneous tail entry, repair with `bn function delete {hex(int(func.start))}`. "
+            "There is no clean undo; --preview refuses without changes. Inspect the "
+            "reported containing bodies and decompile again; deletion does not guarantee a full merge.",
         ))
     if params and called:
         notes.append(_warning_row(

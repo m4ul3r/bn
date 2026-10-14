@@ -4130,6 +4130,8 @@ _GO_RENAME_NON_COUNT_READS = {
     # #999 item 5: the paired renderer reads the ops a --preview left out back
     # off the summary; a listing, not a count, and absent on every `go rename`.
     "preview_skipped",
+    # #966: deletion outcomes are a listing, not a go-rename count.
+    "function_deletions",
 }
 
 

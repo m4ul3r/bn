@@ -49,6 +49,88 @@ from ._shared import (
 )
 
 
+def _function_delete(ctx, bv, address, *, exclusive=None):
+    """Journal an irreversible deletion and report only post-analysis facts.
+
+    The caller holds the write gate. Analysis runs outside the exclusive read
+    lock; a suppression override cannot be rolled back, even if analysis fails.
+    """
+    scope = exclusive or contextlib.nullcontext
+    addr = _parse_address(address)
+    requested = {"op": "function_delete", "address": hex(addr)}
+    warning = "No clean undo: BN retains a user override suppressing function creation here."
+    apply_error = None
+    with scope():
+        fn = bv.get_function_at(addr)
+        if fn is None:
+            raise OperationFailure("invalid_request", "No function starts at this address.",
+                                   requested=requested, observed={"request_applied": False})
+        name = str(fn.name)
+        predecessors = {ref.function.start for ref in bv.get_code_refs(addr)
+                        if ref.function is not None and ref.function.start != addr}
+        # Fall-through edges across function boundaries need not have a code ref.
+        for candidate in bv.functions:
+            if candidate.start != addr and any(block.end == addr for block in candidate.basic_blocks):
+                predecessors.add(candidate.start)
+        state = bv.begin_undo_actions()
+        try:
+            bv.remove_user_function(fn)
+        except Exception as exc:
+            apply_error = str(exc)
+        finally:
+            # Closing the journal is not an undo promise. Even an API exception
+            # may follow a write; never claim an unobserved clean rollback.
+            bv.commit_undo_actions(state)
+            ctx.targets.mark_dirty(bv)
+        try:
+            for start in predecessors:
+                parent = bv.get_function_at(start)
+                if parent is not None:
+                    parent.reanalyze()
+        except Exception as exc:
+            apply_error = str(exc)
+    error = None
+    try:
+        bv.update_analysis_and_wait()
+    except Exception as exc:
+        error = str(exc)
+    with scope():
+        remaining = bv.get_function_at(addr)
+        containing = [{"address": hex(parent.start), "name": str(parent.name)}
+                      for parent in bv.get_functions_containing(addr)
+                      if parent.start != addr]
+        removed = remaining is None
+        observed = {
+            "function_removed": removed,
+            "function_at_entry": str(remaining.name) if remaining is not None else None,
+            "bodies_containing_deleted_entry": containing,
+            "reanalysis_completed": error is None,
+            "clean_undo_available": False,
+        }
+        if apply_error is not None:
+            observed["apply_error"] = apply_error
+        if error is not None:
+            observed["analysis_error"] = error
+        outcome = ("Function is absent at the entry." if removed else
+                   "A function still starts at the deleted entry.")
+        if error is not None or apply_error is not None:
+            outcome += " Mutation or reanalysis failed; this is not a verified repair."
+        outcome += (" Entry is now inside: " + ", ".join(row["name"] for row in containing) + "."
+                    if containing else " No other analyzed body contains the deleted entry.")
+        success = removed and error is None and apply_error is None
+        return {
+            "preview": False, "success": success, "committed": True,
+            "rolled_back": False, "message": outcome + " " + warning,
+            "results": [{
+                "op": "function_delete", "address": hex(addr), "function": name,
+                "status": "verified" if success else "verification_failed",
+                "requested": requested, "observed": observed,
+                "message": outcome + " " + warning,
+            }],
+            "affected_functions": [], "affected_types": [],
+        }
+
+
 def _remove_created_function(ctx, bv, addr: int) -> bool:
     """Remove a just-created function and confirm it is gone.
 

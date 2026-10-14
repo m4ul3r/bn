@@ -2957,6 +2957,59 @@ def _shared_tail_snapshot_code(base: int) -> str:
     )
 
 
+class TestFunctionDeleteRepair966:
+    def test_shared_tail_deletion_reports_real_observed_containment(self, shared_bn, tmp_path):
+        cc = shutil.which("aarch64-linux-gnu-gcc")
+        if cc is None:
+            refuse_silent_skip("Install gcc-aarch64-linux-gnu for the shared-tail repair lane")
+        source = tmp_path / "split.s"
+        source.write_text(
+            ".text\n.global _start, build_widget, shared_tail, other_user\n"
+            ".type _start,%function\n_start:\n"
+            " bl build_widget\n bl other_user\n mov x8,#93\n svc #0\n"
+            ".type build_widget,%function\nbuild_widget:\n"
+            " stp x29,x30,[sp,#-16]!\n mov x29,sp\n mov x19,x0\n mov x20,x1\n"
+            ".type shared_tail,%function\nshared_tail:\n"
+            " add x0,x19,x20\n ldp x29,x30,[sp],#16\n ret\n"
+            ".type other_user,%function\nother_user:\n"
+            " stp x29,x30,[sp,#-16]!\n b shared_tail\n"
+        )
+        binary = tmp_path / "split"
+        build = subprocess.run([cc, "-nostdlib", "-static", str(source), "-o", str(binary)],
+                               capture_output=True, text=True, timeout=120)
+        assert build.returncode == 0, build.stderr
+        shared_bn.load(binary)
+        split = int(_py_line(shared_bn,
+                            "print('TAIL=' + hex(bv.get_functions_by_name('shared_tail')[0].start))",
+                            "TAIL"), 16)
+        warning = shared_bn.run("decompile", "build_widget")
+        assert warning.returncode == 0, f"{warning.stdout}\n{warning.stderr}"
+        repair_command = f"bn function delete {hex(split)}"
+        assert f"`{repair_command}`" in warning.stdout
+        assert "no clean undo; --preview refuses" in warning.stdout
+
+        preview = shared_bn.run("function", "delete", hex(split), "--preview", "--format", "json")
+        assert preview.returncode == 3, f"{preview.stdout}\n{preview.stderr}"
+        assert _py_line(shared_bn, f"print('ENTRY=' + str(bv.get_function_at({split}) is not None))", "ENTRY") == "True"
+
+        deleted = shared_bn.run(*repair_command.split()[1:], "--format", "json")
+        assert deleted.returncode == 0, f"{deleted.stdout}\n{deleted.stderr}"
+        result = json.loads(deleted.stdout)
+        observed = result["results"][0]["observed"]
+        assert result["success"] is True and result["rolled_back"] is False, result
+        assert observed["function_removed"] is True
+        assert observed["function_at_entry"] is None
+        assert observed["reanalysis_completed"] is True
+        assert observed["clean_undo_available"] is False
+        actual = json.loads(_py_line(shared_bn, (
+            "import json\n"
+            f"print('BODIES=' + json.dumps([{{'address': hex(f.start), 'name': f.name}} "
+            f"for f in bv.get_functions_containing({split}) if f.start != {split}]))"
+        ), "BODIES"))
+        assert observed["bodies_containing_deleted_entry"] == actual
+        assert {row["name"] for row in actual} == {"build_widget", "other_user"}
+
+
 class TestFunctionCreateSplitRestore:
     """#927 P1 on real BN: `--allow-overlap --preview` inside two hosts that
     share a tail reported `rolled_back: true` while both hosts stayed

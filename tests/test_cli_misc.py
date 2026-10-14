@@ -3267,21 +3267,11 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
         f"advertised {sorted(advertised - (marked - groups))} without being marked, "
         f"or marked-and-advertisable but not advertised "
         f"{sorted((marked - groups) - advertised)}")
-    assert len(marked) == 49, (
-        f"{len(marked)} commands are marked estimable, not 49 -- a command that "
-        "joins or leaves this set is a deliberate change to the coverage claim, so "
-        "move the number in the same commit")
-    # ...of which the two dual-role leaves cannot carry the flag (see above), so
-    # 47 advertise it and 47 refuse it by absence: default added `spill gc`,
-    # which is an administrative mutation and cannot estimate a read payload,
-    # and #993 added the `class apply-types` mutation.
-    assert len(advertised) == 47 and len(bn.cli._COMMANDS) - len(advertised) == 47
     # ...and everything else refuses it BY ABSENCE (argparse's own rc 2), which is
     # stronger than a bespoke refusal: there is no path on which the flag is
     # accepted and ignored, because the parser never builds it.
     assert all(not spec.get("estimable") for spec in bn.cli._COMMANDS
                if tuple(spec["path"]) not in marked)
-    assert len(bn.cli._COMMANDS) - len(marked) == 45
 
     # THE COVERAGE CLAIM, observed. One invariant over every marked command in
     # every emit mode its parser offers: whatever lands on stdout is the

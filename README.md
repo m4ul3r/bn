@@ -333,9 +333,9 @@ bn types declare "typedef struct Player { int hp; } Player;" --preview
 bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
 ```
 
-Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
+Supported preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation. `function delete` is deliberately not previewable: `--preview` refuses before writes, without changes.
 
-Non-preview writes only report success after reading the live BN session back and verifying that the requested post-state actually landed. If verification fails, the CLI returns a nonzero exit code and reverts the whole mutation or batch.
+Non-preview writes only report success after reading the live BN session back and verifying that the requested post-state actually landed. If verification fails, the CLI returns a nonzero exit code and attempts to revert reversible mutations or batches. Function deletion has no clean undo and cannot promise restoration.
 
 After any live type or prototype mutation, do an explicit readback:
 
@@ -370,6 +370,12 @@ If a declaration parses no named types to persist (including function/extern-var
 
 `bn local list` and `bn function info` return stable `local_id` values for parameters and locals. Prefer those IDs for `bn local rename`, `bn local retype`, and batch manifests; legacy name-based targeting still works for compatibility.
 
+### Function-entry repair (Refs #966)
+
+Use `bn function delete <address>` to remove an erroneous function entry, for example `bn function delete 0x402000` for a shared-tail entry at `0x402000` named by a split-body warning. Inspect the head and tail disassembly first. The command uses `remove_user_function`, journals the mutation, and waits for reanalysis, but has **no clean undo**; recreating the entry cannot restore all prior analysis or annotations. `--preview` refuses without changes. Save a durable baseline before applying if recovery is needed.
+
+The mutation result's `observed` fields are `function_removed`, `function_at_entry`, `bodies_containing_deleted_entry` (rows of `{address, name}`), `reanalysis_completed`, and `clean_undo_available: false`. Verification requires the entry to be absent and reanalysis complete. A containing body is only an observed containment outcome, not proof that deletion merged the entire tail. Decompile and inspect the reported bodies afterward. A `can_return` mutation API is deferred because its user-override, preview, and rollback contract remains unsettled; effective-value readback alone cannot restore prior override provenance.
+
 ## Batch Manifests
 
 `bn batch apply` accepts a JSON manifest:
@@ -400,7 +406,7 @@ Apply it with:
 bn batch apply manifest.json
 ```
 
-Batch apply verifies the live session by default. If any op fails to apply or fails post-state verification, the entire batch is reverted.
+Batch apply verifies the live session by default. If any reversible op fails to apply or fails post-state verification, rollback of the batch is attempted. A `function_delete` batch is the exception: it must contain exactly one operation and no siblings, for example `{"ops":[{"op":"function_delete","address":"0x402000"}]}`. Mixed batches and multiple deletes are refused before writes. A singleton delete's preview is also refused before writes, because deletion has no clean undo.
 
 ## Security / Trust Boundary
 

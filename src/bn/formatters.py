@@ -6266,6 +6266,7 @@ def _build_mutation_summary(
     kept_library_imports: Sequence[str] = (),
     fallthrough_entries: Sequence[dict[str, Any]] = (),
     preview_skipped: Sequence[dict[str, Any]] = (),
+    function_deletions: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -6427,6 +6428,8 @@ def _build_mutation_summary(
         # instruction runs straight into -- likely mid-function. Conditional
         # like the keys above; the row's `note` carries the sentence.
         summary["fallthrough_entries"] = list(fallthrough_entries)
+    if function_deletions:
+        summary["function_deletions"] = list(function_deletions)
     if preview_skipped:
         # #999 item 5: a --preview that left ops out (a prototype it cannot
         # revert, and the ops that depend on it) previewed only the rest, and
@@ -6630,6 +6633,12 @@ def _mutation_summary(value: Any) -> Any:
              "fallthrough_from": _text_value(r, "fallthrough_from")}
             for r in results if r.get("status") in ("verified", "rollback_failed")
             and _text_value(r, "fallthrough_from")
+        ],
+        function_deletions=[
+            {"address": _text_value(row, "address"),
+             "message": _text_value(row, "message"),
+             "observed": _field_dict(row, "observed")}
+            for row in results if row.get("op") == "function_delete"
         ],
         preview_skipped=[row for row in _row_list(value, "preview_skipped")
                          if isinstance(row, dict)],
@@ -7007,6 +7016,9 @@ def _render_mutation_summary_text(value: Any) -> str:
         line += (f"\nwarning: {_text_value(entry, 'address') or '<unknown>'} is reached by "
                  f"fall-through from {_text_value(entry, 'fallthrough_from') or '<unknown>'}; "
                  "likely mid-function, not an entry")
+    for deletion in _row_list(value, "function_deletions"):
+        line += (f"\nfunction delete {_text_value(deletion, 'address')}: "
+                 f"{_text_value(deletion, 'message')}")
     if _field_declared(value, "go_rename"):
         go = _field_dict(value, "go_rename")
         line += "\ngo rename: " + "  ".join(

@@ -74,6 +74,7 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "struct_field_delete": ("struct_name", "field_name"),
     "types_declare": ("declaration",),
     "function_create": ("address",),
+    "function_delete": ("address",),
     "tag_add": ("type",),
     "tag_remove": (),
     "tag_type_create": ("name", "icon"),
@@ -142,7 +143,7 @@ _VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
 _BATCH_OP_NAMES = (
     "rename_symbol", "set_comment", "delete_comment", "set_prototype",
     "local_rename", "local_retype", "data_retype", "struct_field_set", "struct_field_rename",
-    "struct_field_delete", "types_declare", "function_create", "tag_add", "tag_remove",
+    "struct_field_delete", "types_declare", "function_create", "function_delete", "tag_add", "tag_remove",
     "tag_type_create", "tag_type_remove",
 )
 
@@ -2665,6 +2666,26 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
     operations = [_normalize_struct_alias(op) for op in operations]
     # #652: reject a same-key-twice manifest BEFORE touching the view.
     _reject_duplicate_write_keys(ctx, operations)
+    deletions = [op for op in operations
+                 if isinstance(op, dict) and op.get("op") == "function_delete"]
+    if deletions:
+        with exclusive_scope():
+            bv = ctx._resolve_view(selector)
+            refuse_quick_view(bv, requested={"op": "function_delete"})
+            if preview or len(operations) != 1:
+                raise OperationFailure(
+                    "unsupported",
+                    "function delete has no clean undo: remove_user_function leaves a "
+                    "persistent suppression override. --preview and combining deletion "
+                    "with other batch operations are refused before writing. Apply one "
+                    "function_delete operation without --preview, then read back the outcome.",
+                    requested={"op": "function_delete"},
+                    observed={"request_applied": False},
+                )
+            _validate_operation_request(ctx, deletions[0], index=0)
+        return create_comments._function_delete(
+            ctx, bv, deletions[0]["address"], exclusive=exclusive_scope)
+
 
     with exclusive_scope():
         bv = ctx._resolve_view(selector)

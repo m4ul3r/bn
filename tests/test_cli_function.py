@@ -3549,3 +3549,29 @@ def test_the_reading_reference_documents_the_multi_identifier_decompile_676():
     for name in (envelope["kind"], container, *counters):
         assert f"`{name}`" in doc or f'"{name}"' in doc, (
             f"reading.md never names the batch envelope's {name!r}")
+
+
+@pytest.mark.parametrize("flags", [[], ["--format", "json", "--summary"]])
+def test_function_delete_compact_output_retains_observed_outcome(fake_transport, capsys, flags):
+    message = ("Function is absent at the entry. Entry is now inside: host. "
+               "No clean undo: BN retains a user override suppressing function creation here.")
+    observed = {"function_removed": True, "function_at_entry": None,
+                "bodies_containing_deleted_entry": [{"address": "0x1000", "name": "host"}],
+                "reanalysis_completed": True, "clean_undo_available": False}
+    calls = fake_transport({"function_delete": {"ok": True, "result": {
+        "success": True, "committed": True, "preview": False, "rolled_back": False,
+        "message": message, "affected_functions": [], "affected_types": [],
+        "results": [{"op": "function_delete", "address": "0x1010", "status": "verified",
+                     "message": message, "observed": observed}],
+    }}})
+    assert bn.cli.main(["function", "delete", "0x1010", "--target", "active", *flags]) == 0
+    stdout, stderr = capsys.readouterr()
+    assert calls[-1]["op"] == "function_delete"
+    assert calls[-1]["params"] == {"address": "0x1010", "preview": False}
+    assert stderr == ""
+    if flags:
+        assert json.loads(stdout)["function_deletions"] == [
+            {"address": "0x1010", "message": message, "observed": observed}]
+    else:
+        assert message in stdout
+        assert "function delete 0x1010" in stdout
