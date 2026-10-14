@@ -2419,109 +2419,212 @@ def test_choose_instance_spawn_missing_named_spawns_new(tmp_path, monkeypatch):
     assert "No bridge instance found with id: brandnew" in str(exc.value)
 
 
-def test_missing_instance_points_at_the_registry_that_holds_it_996(tmp_path, monkeypatch):
-    """#996: BN_CACHE_DIR moves the instance registry too. An id missing from
-    the searched registry but registered under the other root must be answered
-    with the export that reaches it -- never "start one", which spawns a
-    duplicate bridge under the same name."""
-    import shlex
+@contextlib.contextmanager
+def _registered_hint_bridge(cache_root, socket_path):
+    """A real socket with an independently supplied bridge identity."""
+    registry = cache_root / "instances" / "demo.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(), "instance_id": "demo",
+        "socket_path": str(socket_path), "instance_token": "hint-token",
+    }
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+    server = _Server(str(socket_path), _Handler)
+    server.bridge_identity = {
+        "instance_id": "demo", "pid": os.getpid(), "token": "hint-token",
+    }
+    threading.Thread(
+        target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True,
+    ).start()
+    try:
+        yield server, registry, payload
+    finally:
+        server.shutdown()
+        server.server_close()
 
-    default_root = tmp_path / "default root"          # a space: the export is quoted
-    (default_root / "instances").mkdir(parents=True)
-    live = json.dumps({"pid": os.getpid(), "instance_id": "demo"})
-    (default_root / "instances" / "demo.json").write_text(live)
-    # This test process stands in for the bridge: a synthetic /proc says it is
-    # `bn-agent --instance-id demo` (the registry check reads its cmdline).
-    proc = tmp_path / "proc"
-    (proc / str(os.getpid())).mkdir(parents=True)
-    cmdline = proc / str(os.getpid()) / "cmdline"
-    cmdline.write_bytes(b"/venv/bin/bn-agent\0--instance-id\0demo\0")
-    monkeypatch.setattr("bn.transport._PROC_ROOT", proc)
-    monkeypatch.setattr("bn.transport.default_cache_home", lambda: default_root)
-    monkeypatch.setattr("bn.transport._agent_cache_dirs_for", lambda instance_id: [])
+
+@pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="Requires kernel peer pid")
+def test_missing_instance_points_at_the_registry_that_holds_it_996(tmp_path, monkeypatch):
+    """The export is backed by a live socket, not a file or process argv."""
+    import shlex
+    from bn import transport
+
+    default_root = tmp_path / "default root"  # export must quote the space
     private = tmp_path / "private"
+    monkeypatch.setattr(transport, "default_cache_home", lambda: default_root)
+    monkeypatch.setattr(transport, "_agent_cache_dirs_for", lambda instance_id: [])
     monkeypatch.setenv("BN_CACHE_DIR", str(private))
 
-    with pytest.raises(BridgeError) as exc:
-        choose_instance("demo")
-    message = str(exc.value)
-    assert message.startswith("No bridge instance found with id: demo")
-    assert f"searched {private / 'instances'}" in message
-    assert f"export BN_CACHE_DIR={shlex.quote(str(default_root))} " in message
-    assert "Start one with" not in message
-
-    # A stale registry there is no evidence: a dead pid, an orphaned `{}`,
-    # garbage, or another id's payload keep the start advice (#996 review).
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
-    for stale in (json.dumps({"pid": dead.pid, "instance_id": "demo"}), "{}",
-                  "not json", json.dumps({"pid": os.getpid(), "instance_id": "other"})):
-        (default_root / "instances" / "demo.json").write_text(stale)
+    with _registered_hint_bridge(default_root, tmp_path / _PROBE_SOCK) as (
+        server, registry, payload,
+    ):
         with pytest.raises(BridgeError) as exc:
             choose_instance("demo")
-        assert "export BN_CACHE_DIR" not in str(exc.value), stale
-        assert "Start one with" in str(exc.value), stale
+        message = str(exc.value)
+        assert message.startswith("No bridge instance found with id: demo")
+        assert f"searched {private / 'instances'}" in message
+        assert f"export BN_CACHE_DIR={shlex.quote(str(default_root))} " in message
+        assert "Start one with" not in message
+        assert len(server.requests) == 1
+        probe = server.requests[0]
+        assert probe["op"] == "write_gate_status"
+        assert probe["idle_probe"] is True
+        assert "target" not in probe
 
-    # A live pid that is NOT that bridge (any other process) is no evidence
-    # either (#996 review N3).
-    (default_root / "instances" / "demo.json").write_text(live)
-    for argv in (b"/usr/bin/python3\0-m\0pytest\0",
-                 b"/venv/bin/bn-agent\0--instance-id\0someone-else\0"):
-        cmdline.write_bytes(argv)
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        for stale in (
+            json.dumps({**payload, "pid": dead.pid}), "{}", "not json",
+            json.dumps({**payload, "instance_id": "other"}),
+            json.dumps({**payload, "pid": True}),
+            json.dumps({**payload, "pid": 2**80}),
+            json.dumps({**payload, "socket_path": None}),
+            json.dumps({**payload, "socket_path": str(tmp_path / "absent.sock")}),
+            json.dumps({**payload, "instance_token": None}),
+            json.dumps({**payload, "instance_token": "retired-token"}),
+            json.dumps({**payload, **_identity(ticks_delta=1)}),
+        ):
+            registry.write_text(stale, encoding="utf-8")
+            with pytest.raises(BridgeError) as exc:
+                choose_instance("demo")
+            assert "export BN_CACHE_DIR" not in str(exc.value), stale
+            assert "Start one with" in str(exc.value), stale
+            assert registry.read_text(encoding="utf-8") == stale
+            assert server.socket.fileno() != -1
+
         with pytest.raises(BridgeError) as exc:
-            choose_instance("demo")
-        assert "export BN_CACHE_DIR" not in str(exc.value), argv
-        assert "Start one with" in str(exc.value), argv
-
-    # An id registered nowhere else keeps the start advice, and says the
-    # variable scopes the registry.
-    with pytest.raises(BridgeError) as exc:
-        choose_instance("other")
-    assert "Start one with" in str(exc.value)
-    assert "BN_CACHE_DIR is set, and it scopes the instance registry" in str(exc.value)
+            choose_instance("other")
+        assert "Start one with" in str(exc.value)
+        assert "BN_CACHE_DIR is set, and it scopes the instance registry" in str(exc.value)
 
 
+@pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="Requires kernel peer pid")
+@pytest.mark.parametrize("argv", [
+    b"/venv/bin/bn-agent\0--instance-id\0demo\0",
+    b"/venv/bin/bn-agent\0--instance-id=demo\0",
+    b"/usr/bin/python3\0/public/headless.py\0--instance-id=demo\0",
+])
+@pytest.mark.parametrize("relative", [False, True])
 def test_missing_instance_found_through_a_running_bridges_environment_996(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, argv, relative,
 ):
-    """The reverse direction: the shell lost BN_CACHE_DIR, the bridge still has
-    it. The running `bn-agent` process's own argv/environment name the root."""
+    """Hand-launched bridges work too; a relative cache uses the process cwd."""
     from bn import transport
 
     default_root = tmp_path / "default"
-    elsewhere = tmp_path / "elsewhere"
-    (elsewhere / "instances").mkdir(parents=True)
-    (elsewhere / "instances" / "demo.json").write_text(
-        json.dumps({"pid": os.getpid(), "instance_id": "demo"}))
-    # A bridge started with a RELATIVE BN_CACHE_DIR: it is relative to the
-    # bridge's own cwd, read from /proc/<pid>/cwd, not the caller's.
     bridge_cwd = tmp_path / "bridge-cwd"
-    (bridge_cwd / "rel" / "instances").mkdir(parents=True)
+    elsewhere = bridge_cwd / "rel" if relative else tmp_path / "elsewhere"
+    bridge_cwd.mkdir()
     proc = tmp_path / "proc"
-    for pid, argv, env in (
-        (str(os.getpid()), b"/venv/bin/bn-agent\0--instance-id\0demo\0",
-         b"HOME=/h\0BN_CACHE_DIR=" + str(elsewhere).encode() + b"\0"),
-        ("4343", b"/usr/bin/python3\0other.py\0--instance-id\0demo\0",
-         b"BN_CACHE_DIR=/nowhere\0"),
-        ("4444", b"/venv/bin/bn-agent\0--instance-id\0demo\0",
-         b"BN_CACHE_DIR=rel\0"),
-    ):
-        (proc / pid).mkdir(parents=True)
-        (proc / pid / "cmdline").write_bytes(argv)
-        (proc / pid / "environ").write_bytes(env)
-    (proc / "4444" / "cwd").symlink_to(bridge_cwd)
-    real_scan = transport._agent_cache_dirs_for
-    monkeypatch.setattr(transport, "_agent_cache_dirs_for",
-                        lambda instance_id: real_scan(instance_id, proc=proc))
+    entry = proc / str(os.getpid())
+    entry.mkdir(parents=True)
+    entry.joinpath("cmdline").write_bytes(argv)
+    cache_value = b"rel" if relative else os.fsencode(elsewhere)
+    entry.joinpath("environ").write_bytes(b"HOME=/h\0BN_CACHE_DIR=" + cache_value + b"\0")
+    entry.joinpath("cwd").symlink_to(bridge_cwd)
+    # An unrelated process can locate a candidate root; it cannot prove a bridge.
+    decoy = proc / "4343"
+    decoy.mkdir()
+    decoy.joinpath("environ").write_bytes(b"BN_CACHE_DIR=/nowhere\0")
     monkeypatch.setattr(transport, "_PROC_ROOT", proc)
     monkeypatch.setattr(transport, "default_cache_home", lambda: default_root)
     monkeypatch.delenv("BN_CACHE_DIR", raising=False)
     monkeypatch.setattr(transport, "cache_home", lambda: default_root)
     monkeypatch.setattr(transport, "instances_dir", lambda: default_root / "instances")
 
-    assert sorted(real_scan("demo", proc=proc)) == sorted([elsewhere, bridge_cwd / "rel"])
-    message = transport.instance_not_found_message("demo", "Start one.")
-    assert f"export BN_CACHE_DIR={elsewhere}" in message
+    with _registered_hint_bridge(elsewhere, tmp_path / _PROBE_SOCK):
+        assert set(transport._agent_cache_dirs_for("demo")) == {elsewhere, Path("/nowhere")}
+        message = transport.instance_not_found_message("demo", "Start one.")
+        assert f"export BN_CACHE_DIR={elsewhere}" in message
+        assert "Start one." not in message
+        # Cmdline is not evidence, nor is it needed to locate the registry.
+        entry.joinpath("cmdline").unlink()
+        assert f"export BN_CACHE_DIR={elsewhere}" in transport.instance_not_found_message(
+            "demo", "Start one.",
+        )
+
+
+@pytest.mark.parametrize("endpoint", ["absent", "bound", "unresponsive", "foreign"])
+def test_registry_export_rejects_decoy_argv_1020(tmp_path, monkeypatch, endpoint):
+    """Even real decoy argv cannot vouch for an absent, inert or foreign socket."""
+    from bn import transport
+
+    elsewhere = tmp_path / "elsewhere"
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(transport, "default_cache_home", lambda: elsewhere)
+    monkeypatch.setattr(transport, "_agent_cache_dirs_for", lambda instance_id: [])
+    registry = elsewhere / "instances" / "demo.json"
+    registry.parent.mkdir(parents=True)
+    socket_path = tmp_path / _PROBE_SOCK
+    decoy = subprocess.Popen([
+        sys.executable, "-c", "import time; time.sleep(60)",
+        "bn-agent", "--instance-id", "demo",
+    ])
+    payload = {
+        "pid": decoy.pid, "instance_id": "demo",
+        "socket_path": str(socket_path), "instance_token": "hint-token",
+    }
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+    try:
+        with contextlib.ExitStack() as stack:
+            if endpoint == "foreign":
+                server, registry, _ = stack.enter_context(
+                    _registered_hint_bridge(elsewhere, socket_path),
+                )
+                registry.write_text(json.dumps(payload), encoding="utf-8")
+            elif endpoint != "absent":
+                listener = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+                listener.bind(str(socket_path))
+                if endpoint == "unresponsive":
+                    listener.listen()
+                    # The right pid without a protocol reply is also insufficient.
+                    payload["pid"] = os.getpid()
+                    registry.write_text(json.dumps(payload), encoding="utf-8")
+            message = transport.instance_not_found_message("demo", "Start one.")
+            assert "export BN_CACHE_DIR" not in message
+            assert "Start one." in message
+            assert json.loads(registry.read_text(encoding="utf-8")) == payload
+            if endpoint == "foreign":
+                assert server.requests == []  # kernel peer mismatch: no request sent
+    finally:
+        decoy.terminate()
+        decoy.wait(timeout=5)
+        socket_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("evidence", ["unavailable", "unreadable", "malformed", "wrong_identity"])
+def test_registry_export_requires_peer_and_response_identity_1020(
+    tmp_path, monkeypatch, evidence,
+):
+    from bn import transport
+
+    elsewhere = tmp_path / "elsewhere"
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(transport, "default_cache_home", lambda: elsewhere)
+    monkeypatch.setattr(transport, "_agent_cache_dirs_for", lambda instance_id: [])
+    with _registered_hint_bridge(elsewhere, tmp_path / _PROBE_SOCK) as (server, _, _):
+        if evidence == "unavailable":
+            monkeypatch.delattr(socket, "SO_PEERCRED", raising=False)
+        elif evidence in {"unreadable", "malformed"}:
+            real_verify = transport._verify_socket_peer_pid
+
+            class UnreadablePeer:
+                def getsockopt(self, *args):
+                    if evidence == "unreadable":
+                        raise OSError("Synthetic peer credentials unavailable")
+                    return b"short"
+
+            monkeypatch.setattr(
+                transport, "_verify_socket_peer_pid",
+                lambda sock, instance, **kwargs: real_verify(UnreadablePeer(), instance, **kwargs),
+            )
+        else:
+            server.bridge_identity = {**server.bridge_identity, "instance_id": "other"}
+        message = transport.instance_not_found_message("demo", "Start one.")
+        assert "export BN_CACHE_DIR" not in message
+        assert "Start one." in message
+        if evidence != "wrong_identity":
+            assert server.requests == []
 
 
 def test_lone_unassociated_instance_is_named_on_stderr_996(tmp_path, monkeypatch, capsys):

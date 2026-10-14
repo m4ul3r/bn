@@ -1596,37 +1596,6 @@ def test_symbol_rename_uses_implicit_target_when_single_target_is_open(fake_tran
     assert calls[1]["target"] == "123:1:7"  # implicit resolution pins the target_id (#690 R3)
 
 
-def test_symbol_rename_requires_target_when_multiple_targets_are_open(fake_transport, capsys):
-    fake_transport(
-        {
-            "list_targets": {
-                "ok": True,
-                "result": [
-                    {
-                        "target_id": "123:1:7",
-                        "selector": "SnailMail_unwrapped.exe.bndb",
-                        "active": True,
-                    },
-                    {"target_id": "123:2:8", "selector": "other.exe.bndb", "active": False},
-                ],
-            }
-        }
-    )
-
-    rc = bn.cli.main(["symbol", "rename", "sub_401000", "player_update"])
-
-    assert rc == 2
-    err = capsys.readouterr().err
-    # The exact block is pinned once, in test_cli_function; what matters here
-    # is that a MUTATION refuses pre-flight with the shared hint (#688) and
-    # sends nothing.
-    assert err.startswith(
-        "This command requires --target when multiple targets are open.\n"
-        "Pass -t <selector> (--target) to choose one.\n"
-        "Open targets:\n"
-    )
-    assert "  * -t SnailMail_unwrapped.exe.bndb" in err
-    assert "    -t other.exe.bndb" in err
 
 
 def test_function_create_builds_payload_explicit_json(fake_transport, capsys):

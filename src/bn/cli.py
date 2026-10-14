@@ -3036,6 +3036,22 @@ def main(argv: list[str] | None = None) -> int:
         return handler(args)
     except BridgeError as exc:
         msg = str(exc)
+        if tuple(getattr(args, "_command_path", ())) != ("target", "close"):
+            from .target_hint import respell_for_option
+            hint_argv = parse_argv
+            if tuple(getattr(args, "_command_path", ())) == ("close",):
+                hint_argv = ["close"]
+                if getattr(args, "instance", None):
+                    hint_argv.insert(0, f"--instance={args.instance}")
+            selected = _selected_parser_for_argv(parser, parse_argv)
+            value_options = {
+                option for option, action in selected._option_string_actions.items()
+                if action.nargs != 0
+            }
+            if (getattr(args, "instance", None) and not args._explicit_instance
+                    and tuple(getattr(args, "_command_path", ())) != ("close",)):
+                hint_argv = [f"--instance={args.instance}", *hint_argv]
+            msg = respell_for_option(msg, hint_argv, value_options)
         if getattr(args, "_sticky_instance", False) and _looks_like_dead_bridge(msg):
             msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
         status = getattr(exc, "status", None)

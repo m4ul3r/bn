@@ -257,7 +257,7 @@ def _close(args: argparse.Namespace) -> int:
                     raise BridgeError(
                         f"{exc}\nnote: `active` follows the GUI selection, "
                         "which is not honored for close: pass a concrete "
-                        "selector from the list above (`bn close --all` closes "
+                        f"selector from the list above (`bn {_routing(args)}close --all` closes "
                         "every open target, including GUI tabs bn did not load)."
                     ) from None
                 raise BridgeError(
@@ -303,7 +303,11 @@ def _close_hint_in_run_form(args: argparse.Namespace, exc: BridgeError) -> Bridg
 
 def _routing(args: argparse.Namespace) -> str:
     instance = getattr(args, "instance", None)
-    return f"-i {shlex.quote(str(instance))} " if instance else ""
+    if not instance:
+        return ""
+    value = str(instance)
+    return (f"--instance={shlex.quote(value)} " if value.startswith("-")
+            else f"-i {shlex.quote(value)} ")
 
 
 def _target_close_prefix(args: argparse.Namespace) -> str:
