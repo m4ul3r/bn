@@ -1391,6 +1391,52 @@ def test_refresh_clears_quick_state_and_enables_strings(monkeypatch):
     assert result["items"] == [] and result["total"] == 0
 
 
+def test_gated_reads_say_retry_while_a_refresh_is_running_996(monkeypatch):
+    """#996: while `bn refresh` analyses a --quick view, a gated read must not
+    tell the agent to run `bn refresh` -- that starts a second analysis. It says
+    one is in progress (with progress) and to retry; afterwards the reads work,
+    and a quick view nobody is refreshing keeps the original directive."""
+    bridge = _load_bridge(monkeypatch)
+    # The bridge_state THIS loaded bridge shares (the loader may load a fresh
+    # package copy), reached through the globals of a name it imports from there.
+    bridge_state = types.SimpleNamespace(**bridge.view_session_key.__globals__)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(strings=[])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
+                        lambda selector: (bv, []), raising=False)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    bridge._quick_loaded_views.add(bv)
+
+    with pytest.raises(RuntimeError, match=r"Run `bn refresh`"):
+        bridge_state.require_analysis(bv, "Callsites")
+
+    seen: dict[str, str] = {}
+
+    def analyse():
+        bv.analysis_progress = types.SimpleNamespace(count=1592, total=3209)
+        for what, call in (
+            ("callsites", lambda: bridge_state.require_analysis(bv, "Callsites")),
+            ("strings", lambda: instance._strings(None, query=None, offset=0, limit=10)),
+        ):
+            with pytest.raises(RuntimeError) as exc:
+                call()
+            seen[what] = str(exc.value)
+
+    bv.update_analysis_and_wait = analyse
+    instance._refresh(None)
+
+    for message in seen.values():
+        assert "full analysis is in progress (1592/3209)" in message
+        assert "do not start another refresh" in message
+        assert "loaded with --quick" in message
+        assert "Run `bn refresh`" not in message
+    assert bv not in bridge._quick_loaded_views
+    assert bv not in bridge_state._refreshing_views
+    bridge_state.require_analysis(bv, "Callsites")  # analysed: no refusal
+
+
 def test_sections_rejects_negative_count(monkeypatch):
     # #100: _sections re-enforces the count contract for raw callers.
     bridge = _load_bridge(monkeypatch)

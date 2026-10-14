@@ -962,6 +962,12 @@ def _render_proto_text(value: Any) -> str:
     width_note += "".join(f"\n\nnote: {n}" for n in split_notes)
     fn = value.get("function")
     name = fn.get("name") if isinstance(fn, dict) else None
+    # #999 item 3: the declaration splices the SYMBOL name (a mangled C++ name
+    # is a valid C declarator; `ns::Cls::run(` is not), so the demangled name
+    # `decompile` shows goes on a comment line above it instead.
+    display = _text_value(fn, "display_name") if isinstance(fn, dict) else None
+    if display and display != name:
+        note += f"// {display}\n"
     head, sep, rest = prototype.partition("(")
     if name and sep:
         head = head.rstrip()
@@ -1395,6 +1401,9 @@ def _render_session_start_text(value: Any) -> str:
         f"pid: {value.get('pid', '<unknown>')}",
         f"socket: {value.get('socket_path', '<unknown>')}",
     ]
+    # #992: which checkout this bridge runs.
+    if value.get("source_dir"):
+        lines.append(f"source: {value['source_dir']}")
     loaded = _field_list(value, "loaded")
     if loaded:
         lines.append("")
@@ -1423,7 +1432,13 @@ def _render_session_start_text(value: Any) -> str:
                 else:
                     mark = "  [not analyzed]" if item.get("analyzed") is False else ""
                     lines.append(f"- {item.get('path', '<unknown>')}{mark}")
-                    for tgt in _field_list(item, "targets"):
+                    # #996: the target THIS load opened. `targets` is every open
+                    # view, so listing it repeated earlier binaries' selectors
+                    # under later paths; an older bridge without `target` keeps
+                    # the full list.
+                    own = _field_dict(item, "target")
+                    rows = [own] if own else _field_list(item, "targets")
+                    for tgt in rows:
                         if isinstance(tgt, dict) and tgt.get("selector"):
                             lines.append(
                                 f"  target: {tgt['selector']}"
@@ -1547,6 +1562,9 @@ def _render_session_list_text(value: Any) -> str:
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
+        # #992: which checkout this bridge runs.
+        if item.get("source_dir"):
+            lines.append(f"  source: {item['source_dir']}")
         binaries = _field_list(item, "binaries")
         if binaries:
             lines.append(f"  open: {', '.join(str(b) for b in binaries)}")
@@ -1635,6 +1653,10 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         lines[0] += " [unsaved]"
 
     details = [
+        # #996: which bridge answered. `target info` stamps it on the one row;
+        # `target list` puts it on the envelope (one header line), so a row
+        # without the key renders as before.
+        ("instance", value.get("instance")),
         ("target", value.get("target_id")),
         ("view", value.get("view_id")),
         ("kind", value.get("view_name")),
@@ -1757,12 +1779,14 @@ def _render_target_list_text(value: Any) -> str:
         items = value
     if not isinstance(items, list):
         return _render_fallback_text(value)
-    if not items:
-        return _empty_result("targets")
-    return "\n\n".join(
+    body = "\n\n".join(
         _render_target_summary(item) if isinstance(item, dict) else _render_fallback_text(item)
         for item in items
-    )
+    ) if items else _empty_result("targets")
+    # #996: the answering instance, once, above the rows it owns -- an empty
+    # listing included, since "which bridge has nothing open" is the question.
+    instance = _text_value(value, "instance") if isinstance(value, dict) else None
+    return f"instance: {instance}\n{body}" if instance else body
 
 
 @_discloses
@@ -2754,11 +2778,15 @@ def _xref_buckets(value: dict[str, Any]) -> tuple[list[Any], list[Any], int, int
 @_discloses
 def _render_xrefs_any_text(value: Any) -> str:
     """Render the multi-symbol sink-sweep (`xrefs --any`): one line per symbol,
-    present (with counts) or absent (#218)."""
+    present (with counts) or absent (#218). When a probed symbol is a string
+    address, close with a pointer to `strings --with-xrefs`: these rows only
+    count the referencing functions, and agents mapping strings to functions
+    otherwise loop `xrefs` once per address (#1002)."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     syms = _field_list(value, "items")  # #275: was `symbols`
     lines = [f"xrefs --any: {value.get('present', 0)}/{value.get('count', len(syms))} symbol(s) present"]
+    string_targets = 0
     for s in syms:
         if not isinstance(s, dict):
             continue
@@ -2766,8 +2794,15 @@ def _render_xrefs_any_text(value: Any) -> str:
             lines.append(
                 f"  {s.get('symbol')}: {s.get('code_ref_count', 0)} code refs across "
                 f"{s.get('caller_function_count', 0)} fn(s)  @ {s.get('address', '?')}")
+            if s.get("target_kind") == "string":
+                string_targets += 1
         else:
             lines.append(f"  {s.get('symbol')}: absent")
+    if string_targets:
+        lines.append(
+            f"tip: {string_targets} probed address(es) point into strings; "
+            "`bn strings --query <text> --with-xrefs` names the functions "
+            "referencing every matching string in one call")
     return "\n".join(lines)
 
 
@@ -5648,13 +5683,27 @@ def _render_doctor_text(value: Any) -> str:
             bn_build = item.get("bn_build_id")
             suffix = f" (build {bn_build})" if bn_build else ""
             lines.append(f"  binary ninja: {bn_version}{suffix}")
+        # #992: the checkout this bridge's code came from.
+        if item.get("bridge_source_dir"):
+            lines.append(f"  source: {item['bridge_source_dir']}")
+        if item.get("other_checkout"):
+            lines.append(
+                "  note: bridge built from another checkout: "
+                f"{item.get('bridge_source_dir')} (this CLI runs "
+                f"{value.get('plugin_source_dir', '<unknown>')}); its build is not "
+                "compared with this CLI's. `bn session restart "
+                + str(item.get("instance_id") or "<id>")
+                + "` from this CLI would respawn it on this CLI's checkout")
         if item.get("stale_plugin_version"):
             lines.append("  stale: loaded plugin version differs from CLI version")
+        # The reference differs by kind (#992): a GUI bridge loads the installed
+        # plugin file, a headless one this CLI's own source.
+        reference = "installed plugin file" if item.get("gui", True) else "this CLI's source"
         if item.get("stale_plugin_code"):
-            lines.append("  stale: loaded plugin code does not match installed plugin file")
+            lines.append(f"  stale: loaded plugin code does not match {reference}")
         if item.get("stale_engine"):
             lines.append(
-                "  stale: loaded engine code (taint/IL modules) is out of date -- "
+                f"  stale: loaded engine code (taint/IL modules) does not match {reference} -- "
                 "run `bn session restart " + str(item.get("instance_id") or "<id>") + "`")
         if item.get("started_at"):
             lines.append(f"  started: {item['started_at']}")
@@ -6111,6 +6160,7 @@ def _build_mutation_summary(
     unusable: bool = False,
     overlapping_functions: Sequence[dict[str, Any]] = (),
     declared_types: dict[str, Any] | None = None,
+    preview_skipped: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -6251,6 +6301,12 @@ def _build_mutation_summary(
         # structs and the caller had to `struct show` each one to learn what
         # landed. Conditional like the keys above: only a declare carries it.
         summary["declared_types"] = declared_types
+    if preview_skipped:
+        # #999 item 5: a --preview that left ops out (a prototype it cannot
+        # revert, and the ops that depend on it) previewed only the rest, and
+        # the counts above say nothing about the ops it skipped. Conditional
+        # like the keys above: a preview that covered every op has none.
+        summary["preview_skipped"] = list(preview_skipped)
     return summary
 
 
@@ -6421,6 +6477,8 @@ def _mutation_summary(value: Any) -> Any:
             for o in _row_list(r, "overlaps")
         ],
         declared_types=_declared_types_summary(results),
+        preview_skipped=[row for row in _row_list(value, "preview_skipped")
+                         if isinstance(row, dict)],
     )
 
 
@@ -6755,6 +6813,16 @@ def _render_mutation_summary_text(value: Any) -> str:
                 "skipped_interior_pc", "skipped_changed_during_apply",
             )
         )
+    if _field_declared(value, "preview_skipped"):
+        # #999 item 5: one line per op the preview left out, so the line above
+        # is never read as covering the whole batch.
+        for row in _field_list(value, "preview_skipped"):
+            if not isinstance(row, dict):
+                continue
+            reason = _text_value(row, "reason") or ""
+            reason = reason.removeprefix("not previewed: ")
+            line += (f"\nnot previewed: op {row.get('index')} {_text_value(row, 'op') or '?'}"
+                     + (f" -- {reason}" if reason else ""))
     if value.get("measured") is False:
         # #684 review: `dirty_after` is no longer "UNKNOWN" here -- it is a
         # fail-safe True (see _mutation_summary) precisely so a naive
@@ -6958,17 +7026,33 @@ def _render_skill_install_text(value: Any) -> str:
 
     installed = _field_list(value, "installed_destinations")
     skipped = _field_list(value, "skipped_destinations")
+    not_updated = [row for row in _field_list(value, "not_updated_destinations")
+                   if isinstance(row, dict)]
+    # A list, not a set: membership must not hash wire values (#619).
+    not_updated_paths = [row.get("destination") for row in not_updated]
+    up_to_date = [dest for dest in skipped if dest not in not_updated_paths]
     lines = []
 
     if installed:
         lines.append(f"Installed skills ({value.get('mode', 'unknown')}):")
         lines.extend(f"- {dest}" for dest in installed)
-    else:
+    elif not not_updated:
         lines.append("Skills already installed.")
 
-    if skipped:
-        lines.append("Skipped existing destinations:")
-        lines.extend(f"- {dest}" for dest in skipped)
+    if up_to_date:
+        lines.append("Already up to date:")
+        lines.extend(f"- {dest}" for dest in up_to_date)
+
+    # #1002: these were left alone and are NOT this install -- a link into a
+    # previous checkout, dangling, another mode, or a foreign directory. Never
+    # "installed". One closing note about --force, not a per-row verdict.
+    if not_updated:
+        lines.append("Not updated, existing destination differs from the requested install:")
+        lines.extend(f"- {row.get('destination')} ({row.get('detail')})"
+                     for row in not_updated)
+        force_note = _text_value(value, "force_note")
+        if force_note:
+            lines.append(force_note)
 
     return "\n".join(lines) + "\n"
 

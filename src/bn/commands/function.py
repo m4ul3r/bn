@@ -703,7 +703,9 @@ def _function_cfg(args: argparse.Namespace) -> int:
                  help="Struct field xref spec (e.g., TrackRowCell.tile_type)"),
              arg("--any", nargs="+", dest="any_symbols", metavar="SYMBOL",
                  help="Batch-probe several symbols (a sink sweep); absent symbols are "
-                      "reported, not errors"),
+                      "reported, not errors. Rows carry counts only: for string "
+                      "addresses, `bn strings --with-xrefs` lists the referencing "
+                      "functions"),
              arg("--fn-pointer-scan", action="store_true",
                  help="Also scan stored function pointers for references"),
              mangled_arg(),

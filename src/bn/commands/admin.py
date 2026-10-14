@@ -118,6 +118,21 @@ def _help_index(args: argparse.Namespace) -> int:
     return 0
 
 
+def _same_dir(left: str, right: str | Path) -> bool:
+    """Whether two directory spellings name one directory (symlinks resolved)."""
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return str(left) == str(right)
+
+
+def _instance_source_dir(instance: Any) -> str | None:
+    """The checkout a bridge's code came from, as its registry records it (#992)."""
+    meta = getattr(instance, "meta", None)
+    value = meta.get("source_dir") if isinstance(meta, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
 @command("doctor", help="Validate bridge discovery and installation")
 def _doctor(args: argparse.Namespace) -> int:
     install_dir = cli.plugin_install_dir()
@@ -141,8 +156,8 @@ def _doctor(args: argparse.Namespace) -> int:
         ]
         if not candidates:
             raise BridgeError(
-                f"No bridge instance found with id: {requested}. "
-                "See `bn session list` for running instances."
+                cli.instance_not_found_message(
+                    requested, "See `bn session list` for running instances.")
             )
     instances = []
     for instance in candidates:
@@ -174,6 +189,27 @@ def _doctor(args: argparse.Namespace) -> int:
         # could not tell a reachable instance from an unreachable one -- it had
         # to re-derive reachability from the absence of `doctor.error`. (L16)
         reachable = isinstance(ping, dict) and not ping.get("error")
+        meta = getattr(instance, "meta", None)
+        meta = meta if isinstance(meta, dict) else {}
+        # #992: which checkout this bridge's code came from, as it reports it
+        # (doctor ping, else its registry). None from an older bridge.
+        bridge_source = (ping.get("source_dir") if isinstance(ping, dict) else None) \
+            or meta.get("source_dir")
+        bridge_source = bridge_source if isinstance(bridge_source, str) and bridge_source else None
+        # #992: what this bridge SHOULD be running. A GUI bridge loads the
+        # installed plugin file, so that is its reference. A headless bridge
+        # runs the package of the interpreter that spawned it, so the reference
+        # is THIS CLI's own source: comparing it to the installed plugin called a
+        # worktree's own, current bridge stale (with a restart that loads the
+        # same code) and reported another checkout's bridge clean.
+        is_gui = bool(meta.get("gui")) or getattr(instance, "instance_id", None) is None
+        reference_build_id = install_build_id if is_gui else source_build_id
+        reference_engine_id = install_engine_id if is_gui else source_engine_id
+        other_checkout = (
+            not is_gui
+            and bridge_source is not None
+            and not _same_dir(bridge_source, source_dir)
+        )
         instances.append(
             {
                 "instance_id": getattr(instance, "instance_id", None),
@@ -185,26 +221,38 @@ def _doctor(args: argparse.Namespace) -> int:
                 "plugin_build_id": loaded_build_id,
                 "bn_version": bn_version,
                 "bn_build_id": bn_build_id,
+                "gui": is_gui,
+                "bridge_source_dir": bridge_source,
+                # A headless bridge started from another checkout than this
+                # CLI's: restarting it from here would not change its code
+                # unless this CLI's interpreter spawns it (#992).
+                "other_checkout": other_checkout,
                 "installed_plugin_build_id": install_build_id,
                 "source_plugin_build_id": source_build_id,
                 "stale_plugin_version": (
                     bool(loaded_version)
                     and str(loaded_version) != cli.VERSION
                 ),
+                # Against the reference above -- the installed plugin file for a
+                # GUI bridge, this CLI's source for a headless one; never set for
+                # a bridge from another checkout, which `other_checkout` names.
                 "stale_plugin_code": (
-                    bool(loaded_build_id)
-                    and install_build_id is not None
-                    and loaded_build_id != install_build_id
+                    not other_checkout
+                    and bool(loaded_build_id)
+                    and reference_build_id is not None
+                    and loaded_build_id != reference_build_id
                 ),
                 "engine_build_id": loaded_engine_id,
                 "installed_engine_build_id": install_engine_id,
-                # The loaded engine package diverges from on-disk: this live
-                # session is running stale logic (e.g. an edited taint_engine.py
-                # after a git pull). `bn session restart <id>` reloads it (#161).
+                # The loaded engine package diverges from its reference on disk:
+                # this live session is running stale logic (e.g. an edited
+                # taint_engine.py after a git pull). `bn session restart <id>`
+                # reloads it (#161).
                 "stale_engine": (
-                    bool(loaded_engine_id)
-                    and install_engine_id is not None
-                    and loaded_engine_id != install_engine_id
+                    not other_checkout
+                    and bool(loaded_engine_id)
+                    and reference_engine_id is not None
+                    and loaded_engine_id != reference_engine_id
                 ),
                 "started_at": instance.started_at,
                 "doctor": ping,
@@ -240,23 +288,34 @@ def _doctor(args: argparse.Namespace) -> int:
          args=[
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
-             arg("--force", action="store_true"),
+             arg("--force", action="store_true",
+                 help="Replace an existing destination: a link to another tree, or a "
+                      "previous install of this plugin"),
          ])
 def _plugin_install(args: argparse.Namespace) -> int:
     source = cli.plugin_source_dir()
     dest = args.dest or cli.plugin_install_dir()
-    _install_tree(source, dest, mode=args.mode, force=args.force)
-
-    cli._emit_result(
-        args,
-        {
-            "installed": True,
-            "mode": args.mode,
-            "source": str(source),
-            "destination": str(dest),
-        },
-        stem="plugin-install",
+    state = (
+        _existing_install_state(source, dest, mode=args.mode)
+        if source.exists() and (not args.force or _is_install_source(source, dest))
+        else None
     )
+    # An install of this source in the requested mode is not an error (#1002);
+    # anything else at the destination is refused by `_plan_install`, which
+    # names what is there.
+    up_to_date = state is not None and state[0] == "up_to_date"
+    if not up_to_date:
+        _install_tree(source, dest, mode=args.mode, force=args.force)
+
+    result: dict[str, Any] = {
+        "installed": not up_to_date,
+        "mode": args.mode,
+        "source": str(source),
+        "destination": str(dest),
+    }
+    if up_to_date:
+        result["note"] = f"already installed: {state[1]}"
+    cli._emit_result(args, result, stem="plugin-install")
     return 0
 
 
@@ -296,12 +355,18 @@ def _foreign_install_entry(dest: Path, source: Path) -> str | None:
 
 
 def _any_file_matches_source(dest: Path, source: Path) -> bool:
-    """Whether one file under `dest` is still byte-identical to its source
-    counterpart. That is the content proof this tree is an install of `source`
-    rather than a directory that merely reuses its entry names -- a user's own
-    `plugin.json` sitting where ours sits is not ours (#766).
+    """Whether one readable file under `dest` is still byte-identical to its
+    source counterpart. That is the content proof this tree is an install of
+    `source` rather than a directory that merely reuses its entry names -- a
+    user's own `plugin.json` sitting where ours sits is not ours (#766).
+    An entry that cannot be read is skipped rather than raised, so the answer
+    depends on what the tree holds, not on where an unreadable file sorts.
     """
-    for entry in sorted(dest.iterdir()):
+    try:
+        entries = sorted(dest.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
         if _is_install_bytecode(entry.name):
             continue
         counterpart = source / entry.name
@@ -310,8 +375,12 @@ def _any_file_matches_source(dest: Path, source: Path) -> bool:
         if entry.is_dir():
             if counterpart.is_dir() and _any_file_matches_source(entry, counterpart):
                 return True
-        elif counterpart.is_file() and entry.read_bytes() == counterpart.read_bytes():
-            return True
+        elif counterpart.is_file():
+            try:
+                if entry.read_bytes() == counterpart.read_bytes():
+                    return True
+            except OSError:
+                continue
     return False
 
 
@@ -346,6 +415,125 @@ def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
             "still matches the source tree)"
         )
     return None
+
+
+def _copy_matches_source(dest: Path, source: Path) -> bool:
+    """Whether directory `dest` is exactly what a copy-mode install of `source`
+    writes: the same entries, every file byte-identical. Bytecode is ignored on
+    both sides, as the copy omits it and importing in place regenerates it.
+    An unreadable entry raises `OSError`; the caller reports it."""
+    if _foreign_install_entry(dest, source) is not None:
+        return False
+    for entry in source.iterdir():
+        if _is_install_bytecode(entry.name):
+            continue
+        counterpart = dest / entry.name
+        if entry.is_dir():
+            if not counterpart.is_dir() or not _copy_matches_source(counterpart, entry):
+                return False
+        elif not counterpart.is_file() or counterpart.read_bytes() != entry.read_bytes():
+            return False
+    return True
+
+
+def _existing_install_state(source: Path, dest: Path, *, mode: str) -> tuple[str, str] | None:
+    """How whatever sits at `dest` relates to a `mode` install of `source`.
+
+    None when nothing is there. Otherwise `(state, detail)`, where `state` is
+    `up_to_date` (a symlink to `source` under symlink mode, or a matching copy
+    under copy mode), `other_mode` (this source, installed in the other mode),
+    `stale` (a symlink to anything else, dangling included: the usual leftover
+    of a reinstall onto a new checkout) or `existing` (any other directory or
+    file, including one that cannot be read). Only `up_to_date` is an install
+    that needs nothing; reporting the others as "already installed" left every
+    link pointing at the previous tree with exit 0 (#1002).
+    """
+    if _is_install_source(source, dest):
+        return "up_to_date", f"is the install source {source} itself"
+    if dest.is_symlink():
+        link = Path(os.readlink(dest))
+        target = link if link.is_absolute() else dest.parent / link
+        if not target.exists():
+            return "stale", f"dangling symlink to {link}"
+        if target.resolve() != source.resolve():
+            return "stale", f"symlink to {target.resolve()}, not {source}"
+        if mode == "symlink":
+            return "up_to_date", f"symlink to {source}"
+        return "other_mode", f"symlink to {source}, not the requested copy"
+    if not dest.exists():
+        return None
+    if not dest.is_dir():
+        return "existing", "not a directory"
+    try:
+        if not any(dest.iterdir()):
+            return "existing", "empty directory"
+        matches = _copy_matches_source(dest, source)
+    except OSError as exc:
+        return "existing", f"directory that could not be read ({exc})"
+    if not matches:
+        return "existing", f"directory that does not match {source}"
+    if mode == "copy":
+        return "up_to_date", f"copy matching {source}"
+    return "other_mode", f"copy of {source}, not the requested symlink"
+
+
+def _is_install_source(source: Path, dest: Path) -> bool:
+    """Whether `dest` is the install source itself, reached through a symlinked
+    ancestor -- a skills root linked to the checkout's own `skills/`. Nothing
+    can be installed there and nothing needs to be, `--force` included."""
+    return not dest.is_symlink() and dest.exists() and dest.resolve() == source.resolve()
+
+
+def _removal_blocker(dest: Path) -> str | None:
+    """Why `shutil.rmtree(dest)` would fail on permissions, or None. rmtree
+    lists every directory (read and search) and unlinks the entries of a
+    non-empty one (write); removing `dest` itself needs only its writable
+    parent, so a read-only EMPTY directory is replaceable, as on base. A
+    read-only previous copy used to crash `--force` in rmtree."""
+    pending = [dest]
+    while pending:
+        directory = pending.pop()
+        missing = [
+            name for flag, name in ((os.R_OK, "read"), (os.X_OK, "search"))
+            if not os.access(directory, flag)
+        ]
+        if missing:
+            return (f"{directory} lacks {' and '.join(missing)} permission, so its "
+                    "contents cannot be listed")
+        entries = list(directory.iterdir())
+        if entries and not os.access(directory, os.W_OK):
+            return f"{directory} lacks write permission, so its contents cannot be removed"
+        for entry in entries:
+            if entry.is_dir() and not entry.is_symlink():
+                pending.append(entry)
+    return None
+
+
+def _force_refusal_reason(dest: Path, source: Path) -> str | None:
+    """Why `--force` must not replace what sits at `dest` (already
+    `_install_path`'d) because it may not be this install's own, or None."""
+    if dest.is_symlink() or not dest.exists():
+        return None
+    if not dest.is_dir():
+        return "it is not a directory"
+    try:
+        return _unsafe_replace_reason(dest, source)
+    except OSError as exc:
+        return f"it could not be read ({exc})"
+
+
+# Printed under destinations an install left alone. One plain line rather than
+# a per-destination verdict on whether --force would succeed (split out of
+# #1004 to its own follow-up), so it states the rule instead of a promise: it
+# must stay true for every state it is printed under.
+FORCE_NOTE = ("--force replaces only what it can remove and proves is this "
+              "install's own (a link, an empty directory, or a previous copy, "
+              "losing any local edits in that copy); it refuses anything else "
+              "and then changes no destination.")
+FORCE_NOTE_ONE = ("--force replaces it only if it can remove it and it is a link, "
+                  "an empty directory, or a previous copy of this install (losing "
+                  "any local edits in that copy); otherwise it refuses and "
+                  "changes nothing.")
 
 
 def _install_path(dest: Path) -> Path:
@@ -420,7 +608,7 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
     if not source.exists():
         raise BridgeError(f"Source directory is missing: {source}")
 
-    dest = _plan_install(source, dest, force=force)
+    dest = _plan_install(source, dest, mode=mode, force=force)
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -428,10 +616,13 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
             f"Cannot create the parent directory of {dest}: {exc}"
         ) from exc
 
-    if dest.is_symlink():
-        dest.unlink()
-    elif dest.is_dir():
-        shutil.rmtree(dest)
+    try:
+        if dest.is_symlink():
+            dest.unlink()
+        elif dest.is_dir():
+            shutil.rmtree(dest)
+    except OSError as exc:
+        raise BridgeError(f"Cannot replace {dest}: {exc}") from exc
 
     if mode == "copy":
         shutil.copytree(source, dest, ignore=_IGNORED_INSTALL_ENTRIES)
@@ -442,13 +633,13 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
 def _refuse_replacement(dest: Path, reason: str) -> NoReturn:
     raise BridgeError(
         f"Refusing to replace {dest} with --force: {reason}. "
-        "--force replaces this install's own destination (an empty directory, "
-        "or a previous install of the same artifact), never an unrelated path. "
-        "Move it aside by hand and re-run if that is what you want."
+        "--force replaces only what it can prove is an install of this "
+        "artifact (a link, an empty directory, or a previous copy), never an "
+        "unrelated path. Move it aside by hand and re-run if that is what you want."
     )
 
 
-def _plan_install(source: Path, dest: Path, *, force: bool) -> Path:
+def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
     """The path this install will write to, or a refusal raised.
 
     Both `plugin install` and the `skill install` pre-pass call this, on the
@@ -459,10 +650,10 @@ def _plan_install(source: Path, dest: Path, *, force: bool) -> Path:
 
     The pure path rules come first and hold for a destination that does not
     exist yet (`_never_an_install_destination`). Without `--force` any existing
-    destination is an error. With it, only a symlink (removed as a link, never
-    recursed into), an empty directory, or a previous install of `source` may
-    be replaced; a regular file under `--dest` is somebody else's and is refused
-    instead of unlinked.
+    destination is an error, naming what is there. With it, only a symlink
+    (removed as a link, never recursed into), an empty directory, or a previous
+    install of `source` that rmtree can empty may be replaced; a regular file
+    under `--dest` is somebody else's and is refused instead of unlinked.
     """
     dest = _install_path(dest)
     forbidden = _never_an_install_destination(dest, source)
@@ -476,16 +667,25 @@ def _plan_install(source: Path, dest: Path, *, force: bool) -> Path:
     if unusable is not None:
         raise BridgeError(f"Cannot install into {dest}: {unusable}.")
     if not force:
-        if dest.exists() or dest.is_symlink():
-            raise BridgeError(f"Destination already exists: {dest}")
+        state = _existing_install_state(source, dest, mode=mode)
+        if state is not None:
+            raise BridgeError(
+                f"Destination already exists: {dest} ({state[1]}). {FORCE_NOTE_ONE}"
+            )
         return dest
-    if dest.is_symlink() or not dest.exists():
-        return dest
-    if not dest.is_dir():
-        _refuse_replacement(dest, "it is not a directory")
-    refusal = _unsafe_replace_reason(dest, source)
-    if refusal is not None:
-        _refuse_replacement(dest, refusal)
+    reason = _force_refusal_reason(dest, source)
+    if reason is not None:
+        _refuse_replacement(dest, reason)
+    if dest.is_dir() and not dest.is_symlink():
+        try:
+            blocker = _removal_blocker(dest)
+        except OSError as exc:
+            blocker = f"it could not be read ({exc})"
+        if blocker is not None:
+            raise BridgeError(
+                f"Cannot replace {dest} with --force: {blocker}. Fix the "
+                "permissions, or move it aside by hand, and re-run."
+            )
     return dest
 
 
@@ -493,7 +693,9 @@ def _plan_install(source: Path, dest: Path, *, force: bool) -> Path:
          args=[
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
-             arg("--force", action="store_true"),
+             arg("--force", action="store_true",
+                 help="Replace existing destinations: links to another tree, or "
+                      "previous installs of these skills"),
          ])
 def _skill_install(args: argparse.Namespace) -> int:
     skills_root = cli.skills_source_dir()
@@ -520,10 +722,26 @@ def _skill_install(args: argparse.Namespace) -> int:
 
     pending_installs = []
     skipped_destinations = []
+    not_updated_destinations = []
     for source, dest in install_plan:
-        if not explicit_dest and not args.force and (dest.exists() or dest.is_symlink()):
+        if args.force and _is_install_source(source, dest):
             skipped_destinations.append(str(dest))
             continue
+        if not args.force:
+            state = _existing_install_state(source, dest, mode=args.mode)
+            if state is not None and state[0] == "up_to_date":
+                skipped_destinations.append(str(dest))
+                continue
+            if state is not None and not explicit_dest:
+                # A default root holds something else -- most often a link into
+                # a previous checkout. Leave it, but say so and fail the run:
+                # "already installed" here kept every link on the old tree with
+                # exit 0 (#1002). An explicit --dest is refused by the plan.
+                skipped_destinations.append(str(dest))
+                not_updated_destinations.append(
+                    {"destination": str(dest), "state": state[0], "detail": state[1]}
+                )
+                continue
         # Planned, not just checked: the path validated here is the path the
         # install writes to, and every destination is refused before the first
         # one is written -- so no refusal can leave half a store installed. An
@@ -532,7 +750,7 @@ def _skill_install(args: argparse.Namespace) -> int:
         # Two target roots can name one directory (a symlinked skills root, or
         # an equal CLAUDE_HOME and CODEX_HOME), and installing there twice would
         # write the same skills over the copy the first entry just made.
-        planned = _plan_install(source, dest, force=args.force)
+        planned = _plan_install(source, dest, mode=args.mode, force=args.force)
         if any(queued == planned for _, queued in pending_installs):
             continue
         pending_installs.append((source, planned))
@@ -547,11 +765,16 @@ def _skill_install(args: argparse.Namespace) -> int:
         "installed": bool(pending_installs),
         "mode": args.mode,
         "installed_destinations": [str(dest) for _, dest in pending_installs],
+        # Every destination left as it was; the ones that are not a current
+        # install of this source are also in not_updated_destinations.
         "skipped_destinations": skipped_destinations,
+        "not_updated_destinations": not_updated_destinations,
         "skills": results,
     }
+    if not_updated_destinations:
+        result["force_note"] = FORCE_NOTE
     cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
-    return 0
+    return 1 if not_updated_destinations else 0
 
 
 def _default_skill_install_roots() -> list[Path]:
@@ -563,7 +786,10 @@ def _default_skill_install_roots() -> list[Path]:
     return roots
 
 
-@command("session", "start", help="Start a new headless bridge session",
+@command("session", "start",
+         help="Start a new headless bridge session. BN_CACHE_DIR also scopes the "
+              "instance registry and sticky session: a bridge started with it set is "
+              "only visible to bn commands run with the same value",
          args=[
              arg("binaries", nargs="*", help="Binary file paths to preload"),
              arg("--instance-id", help="Use a specific instance ID (default: random)"),
@@ -659,6 +885,9 @@ def _session_start(args: argparse.Namespace) -> int:
         "socket_path": str(instance.socket_path),
         "detached": detached,
     }
+    source_dir = _instance_source_dir(instance)
+    if source_dir is not None:
+        result["source_dir"] = source_dir
     if loaded:
         result["loaded"] = loaded
     if project_roots:
@@ -830,7 +1059,8 @@ def _session_stop(args: argparse.Namespace) -> int:
         except BridgeError:
             # Fallback: signal the pinned process directly.
             if inst is None or signaller is None:
-                raise BridgeError(f"No bridge instance found with id: {target_id}")
+                raise BridgeError(cli.instance_not_found_message(
+                    target_id, "See `bn session list`.")) from None
             reason = signaller.send(signal.SIGTERM)
             if reason is not None:
                 print(f"error: {reason}", file=sys.stderr)
@@ -903,7 +1133,7 @@ def _session_restart(args: argparse.Namespace) -> int:
     _require_headless_lifecycle(inst)
     if inst is None:
         raise BridgeError(
-            f"No bridge instance found with id: {target_id}. See `bn session list`."
+            cli.instance_not_found_message(target_id, "See `bn session list`.")
         )
     resolved_id = inst.instance_id
 
@@ -1288,6 +1518,9 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
             entry["project_roots"] = list(project_roots)
         if sticky_id and (inst.instance_id == sticky_id or selector == sticky_id):
             entry["sticky"] = True
+        source_dir = _instance_source_dir(inst)
+        if source_dir is not None:
+            entry["source_dir"] = source_dir
         entries.append(entry)
         if rss is not None:
             total_rss += rss
@@ -1421,7 +1654,10 @@ def _probe_unsaved_targets(snapshot: dict[str, Any]) -> None:
         list(pool.map(lambda entry: _probe_one_instance(entry, deadline), entries))
 
 
-@command("session", "list", help="List running bridge sessions")
+@command("session", "list",
+         help="List running bridge sessions (from $BN_CACHE_DIR/instances when "
+              "BN_CACHE_DIR is set: BN_CACHE_DIR also scopes the instance registry "
+              "and sticky session)")
 def _session_list(args: argparse.Namespace) -> int:
     # An explicit `-i ''` is an empty SELECTOR, not "no selector": the filter in
     # _running_instances_result is truthiness-based, so an empty string silently
@@ -1436,6 +1672,11 @@ def _session_list(args: argparse.Namespace) -> int:
         else None
     )
     result: Any = _running_instances_result(selector_filter)
+    # #996: an explicit -i that matches nothing is the "lost BN_CACHE_DIR"
+    # case -- say where the id IS registered rather than "(no sessions)".
+    if selector_filter and not result.get("items"):
+        raise BridgeError(cli.instance_not_found_message(
+            selector_filter, "Run `bn session list` without -i to see every running instance."))
     # #733 F1: "is it safe to stop these bridges?" answered on the read path.
     # A live probe, not registry meta: `_write_registry` runs on load/close
     # only, so a registry-sourced count would report "0 unsaved" for a bridge
@@ -1573,6 +1814,9 @@ def _target_list(args: argparse.Namespace) -> int:
     # Wrap the bare list in the {kind, items} envelope the rest of the CLI's
     # collection reads use, so an agent doesn't special-case target list (#358).
     envelope: Any = {"kind": "targets", "items": result if isinstance(result, list) else []}
+    # #996: name the bridge that answered -- a lone instance is used from any cwd.
+    if isinstance(response, dict) and isinstance(response.get("instance"), str):
+        envelope["instance"] = response["instance"]
     cli._emit_result(args, envelope, text_renderer=_render_target_list_text, stem="targets")
     return 0
 

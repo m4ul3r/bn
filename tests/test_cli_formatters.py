@@ -4078,6 +4078,9 @@ _GO_RENAME_NON_COUNT_READS = {
     # #964: the paired renderer reads the per-type `types declare` disclosure
     # back off the summary; a listing, not a count, and absent on every `go rename`.
     "declared_types",
+    # #999 item 5: the paired renderer reads the ops a --preview left out back
+    # off the summary; a listing, not a count, and absent on every `go rename`.
+    "preview_skipped",
 }
 
 

@@ -515,10 +515,10 @@ class TestBatchManifestTarget:
         address. Stripped, so the name is BN's synthesized one: a named ELF
         symbol would keep resolving after the rename and hide the defect.
 
-        The hint must stay silent when the name still resolves -- a round trip
-        gave it back, or a later rename reused it for another function -- and
-        the op failed for its own reason; otherwise it buries that reason and
-        points at the function the name used to denote."""
+        The hint must stay silent when the name still resolves -- a later rename
+        reused it for another function -- and the op failed for its own reason;
+        otherwise it buries that reason and points at the function the name used
+        to denote. A chain through the name (#995) is refused before apply."""
         stripped = tmp_path / "add_stripped"
         build = subprocess.run(["strip", "-o", str(stripped), str(ADD_BINARY)],
                                capture_output=True, text=True)
@@ -552,16 +552,64 @@ class TestBatchManifestTarget:
             return {"op": "local_rename", "function": fn, "variable": "no_such_var",
                     "new_name": "unused"}
 
-        for ops in (
-            # Round trip: the name is back, so it resolves.
-            (rename(old, "foo"), rename("foo", old), bad_local(old)),
-            # Reuse: `alpha` now names the OTHER function.
-            (rename(old, "alpha"), rename("alpha", "gamma"), rename(other, "alpha"),
-             bad_local("alpha")),
-        ):
-            failed = failed_row(*ops)
-            assert "no_such_var" in failed["message"], failed["message"]
-            assert "of this batch renamed" not in failed["message"], failed["message"]
+        # Reuse: `old` now names the OTHER function, so it resolves.
+        failed = failed_row(rename(old, "alpha"), rename(other, old), bad_local(old))
+        assert "no_such_var" in failed["message"], failed["message"]
+        assert "of this batch renamed" not in failed["message"], failed["message"]
+
+        # #995: renaming one function twice fails at the second rename, by name
+        # or by address, naming both operations; the batch is rolled back.
+        for second in (rename("foo", "bar"), rename(address, "bar")):
+            failed = failed_row(rename(old, "foo"), second)
+            assert failed["status"] == "invalid_request", failed
+            assert f"renames the symbol at {address} again" in failed["message"], failed
+            assert (f'Drop operation 0 and make operation 1 rename the symbol by its '
+                    f'address: {{"op": "rename_symbol", "identifier": "{address}", '
+                    f'"new_name": "bar"}}') in failed["message"], failed
+
+    def test_rename_chains_are_judged_by_where_the_rename_lands_995(self, shared_bn, tmp_path):
+        """#995 review rounds 1-2, on BN's own resolver: a chain is refused only
+        when a later rename LANDS on a symbol an earlier one renamed -- through a
+        case variant, an address, a data rename at the function's address, or past
+        an unrelated rename to the same name -- and batches whose renames land on
+        different symbols (a case-folded function beside a data symbol, a data
+        symbol holding a name a function rename took) apply."""
+        shared_bn.load(ADD_BINARY)
+        address = next(f["address"] for f in
+                       shared_bn.json("function", "list", "--limit", "500")["items"]
+                       if f["name"] == "add")
+
+        def preview(*ops):
+            manifest = tmp_path / "chain.json"
+            manifest.write_text(json.dumps({"ops": list(ops)}), encoding="utf-8")
+            result = shared_bn.run("batch", "apply", str(manifest), "--preview",
+                                   "--format", "json")
+            return result.returncode, json.loads(result.stdout)
+
+        def rename(src, dst, kind="auto"):
+            return {"op": "rename_symbol", "identifier": src, "new_name": dst, "kind": kind}
+
+        chains = [
+            ([rename("add", "Q1"), rename("q1", "zz")], 1),
+            ([rename(address, "alias", "data"), rename("alias", "q2", "function")], 1),
+            ([rename("add", "q1", "function"), rename(address, "q2", "data")], 1),
+            ([rename("add", "both", "function"), rename("__dso_handle", "both", "data"),
+              rename("both", "lastadd", "function")], 2),
+        ]
+        for ops, failed_index in chains:
+            code, payload = preview(*ops)
+            assert code == 3, (ops, payload)
+            row = payload["results"][failed_index]
+            assert row["status"] == "invalid_request", (ops, row)
+            assert f"renames the symbol at {address} again" in row["message"], (ops, row)
+            assert payload["rolled_back"] is True, (ops, payload)
+
+        for ops in ([rename("__dso_handle", "ADD", "data"), rename("ADD", "newadd")],
+                    [rename("add", "__dso_handle", "function"),
+                     rename("__dso_handle", "marker", "data")]):
+            code, payload = preview(*ops)
+            assert code == 0, (ops, payload)
+            assert [r["status"] for r in payload["results"]] == ["verified", "verified"], payload
 
 
 class TestProtoSetUnnamedParams:
@@ -1157,6 +1205,35 @@ class TestTypeStringsAndInheritance:
         shared_bn.json("local", "retype", "svc::dispatch", this["local_id"], "struct `svc::Handler`*")
         text = shared_bn.json("decompile", "svc::dispatch")["text"]
         assert "this->vtable->handle(" in text, text
+
+    def test_qualified_prototype_preview_and_display_name_999(self, shared_bn, tmp_path):
+        """#999 on BN's real parser: a `::`-qualified type in backticks and a
+        `::`-qualified function name both land (items 1-2), `proto get` names the
+        demangled function (item 3), and a batch preview with an AUTO-prototype op
+        previews the comment beside it instead of refusing (item 5)."""
+        shared_bn.load(CLASSES_BINARY)
+        shared_bn.json("types", "declare", "struct `svc::Probe999` { int a; };")
+        prototype = "void svc::dispatch(struct `svc::Probe999`* self)"
+
+        manifest = tmp_path / "b.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "set_prototype", "identifier": "svc::dispatch", "prototype": prototype},
+            {"op": "set_comment", "function": "svc::dispatch", "comment": "probe"},
+        ]}), encoding="utf-8")
+        preview = shared_bn.run("batch", "apply", str(manifest), "--preview",
+                                "--format", "json", "--summary")
+        assert preview.returncode == 0, (preview.stdout, preview.stderr)
+        summary = json.loads(preview.stdout)
+        assert summary["verified_count"] == 1, summary
+        assert [row["index"] for row in summary["preview_skipped"]] == [0], summary
+
+        committed = shared_bn.json("proto", "set", "svc::dispatch", prototype)
+        assert committed["results"][0]["status"] == "verified", committed
+        got = shared_bn.json("proto", "get", "svc::dispatch")
+        assert got["function"]["display_name"] == "svc::dispatch", got
+        assert "svc::Probe999" in got["prototype"], got
+        text = shared_bn.run("proto", "get", "svc::dispatch").stdout
+        assert text.startswith("// svc::dispatch\n"), text
 
 
 class TestDisasmLinear:

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import shlex
 from pathlib import Path
 from typing import Any
 
 from .. import cli
 from ..cli import _call, _pick, arg, command
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT
+from ..target_hint import (
+    LISTED_SELECTOR_LEAD, format_multi_target_hint, positional_selector,
+    respell_for_positional, target_option,
+)
 from ..formatters import (
     _render_close_text,
     _render_load_text,
@@ -45,7 +50,10 @@ def _render_target_info_text_with_annotations(value: Any) -> str:
              arg("--no-bndb", action="store_true",
                  help="Open the raw bytes: skip both an adjacent <binary>.bndb and a "
                       "database saved to the cache. The cache is machine-wide; set "
-                      "BN_CACHE_DIR per agent or project to isolate them"),
+                      "BN_CACHE_DIR per agent or project to isolate them -- it also "
+                      "moves the instance registry and sticky session pins, so set it "
+                      "on EVERY bn command (an instance started under it is invisible "
+                      "without it)"),
              arg("--quick", "--no-analysis", action="store_true",
                  help="Load without full analysis (fast, ~1s): sections/imports/symbols are ready "
                       "immediately; strings and the full function set need `bn refresh`. Never "
@@ -59,15 +67,21 @@ def _load(args: argparse.Namespace) -> int:
     # same unset-shell-var doctrine as close/save (#690 r4).
     if not str(args.path).strip():
         raise BridgeError("path is empty: pass the binary or .bndb file to load")
+    # BN_INSTANCE NAMES an instance exactly as -i does (#992): it reaches
+    # args.instance as the root option's default. Only the sticky pin
+    # (`bn instance use`) is ambient and stays refused below.
     explicitly_routed = bool(
         getattr(args, "_explicit_instance", False)
         or getattr(args, "_explicit_instance_id", False)
+        or (getattr(args, "instance", None)
+            and not getattr(args, "_sticky_instance", False))
     )
     if not explicitly_routed and len(cli.list_instances()) > 1:
         raise BridgeError(
             "bn load refuses ambient instance routing while multiple bridges are "
-            "running. Pass an explicit -i/--instance for an existing bridge, or "
-            "--instance-id to create a named bridge."
+            "running. Pass an explicit -i/--instance (or export BN_INSTANCE) for an "
+            "existing bridge, or --instance-id to create a named bridge; the "
+            "`bn instance use` pin is not used to pick where a load lands."
         )
     return _call(
         args,
@@ -94,9 +108,51 @@ def _load(args: argparse.Namespace) -> int:
     )
 
 
+def _close_target_by_name(args: argparse.Namespace, name: str) -> str:
+    """The ``target_id`` of the ONE open target a bare ``bn close <name>`` names.
+
+    Deliberately narrower than the ``-t`` resolver (#996 review): only an exact
+    basename or a full ``target_id`` counts -- never a view id (``close 5``
+    must not close whichever view became view 5) and never a ``.bndb``-stripped
+    alias (a second ``close hello`` must not go on to close ``hello.bndb``). It
+    must match exactly one target, and the close is sent with
+    ``pinned_target`` so the bridge resolves that id and nothing else.
+    """
+    response = cli.send_request(
+        "list_targets", params={}, target=None,
+        instance_id=getattr(args, "instance", None),
+    )
+    result = cli.unwrap_result(response, "list_targets")
+    if not isinstance(result, list):
+        raise BridgeError(
+            "malformed bridge reply to list_targets (no target list); the "
+            "bridge may be stale -- restart it or pass an explicit --target"
+        )
+    rows = [row for row in result if isinstance(row, dict)]
+    matches = [row for row in rows
+               if name in (row.get("basename"), str(row.get("target_id") or ""))]
+    if len(matches) == 1 and matches[0].get("target_id"):
+        return str(matches[0]["target_id"])
+    if not rows:
+        raise BridgeError(
+            f"No targets are open, and no file {name!r} exists in this directory."
+        )
+    headline = (
+        f"{len(matches)} open targets are named {name!r}; close one by selector."
+        if matches else
+        f"No open target is named {name!r}, and no file {name!r} exists in this "
+        "directory. A bare name closes the open target with exactly that file "
+        "name; to close by any selector use `bn close -t <selector>`."
+    )
+    raise BridgeError(format_multi_target_hint(headline, matches or rows))
+
+
 @command("close", help="Close an open target (bn-loaded or a GUI tab)", target=True,
          args=[
-             arg("path", nargs="?", help="Path to close (omit to close the single open target)"),
+             arg("path", nargs="?",
+                 help="Path to close (omit to close the single open target). A bare "
+                      "name (no `/`) that is no file here closes the one open target "
+                      "with exactly that file name; any other selector needs -t"),
              arg("--all", action="store_true", help="Close all open targets, including GUI tabs bn did not load"),
          ])
 def _close(args: argparse.Namespace) -> int:
@@ -156,7 +212,21 @@ def _close(args: argparse.Namespace) -> int:
         )
     params: dict[str, Any] = {}
     if explicit_path is not None:
-        params["path"] = str(Path(explicit_path).expanduser().resolve())
+        resolved = Path(explicit_path).expanduser().resolve()
+        name = str(explicit_path)
+        if "/" in name or name.strip() == "active" or resolved.exists():
+            params["path"] = str(resolved)
+        else:
+            # #996: every other command takes `hello` as a selector, so a bare
+            # name that is no file in the cwd names an open target. Anything
+            # spelled as a path, an existing file, or the volatile `active`
+            # stays a path: what the operand has always meant.
+            explicit_target = args.target = _close_target_by_name(args, name)
+            explicit_path = None
+            # #996 review: the id came from a listing, so it is sent as a PIN --
+            # the bridge resolves it by exact target_id only and refuses if that
+            # target is gone, rather than falling back to a file NAMED like it.
+            params["pinned_target"] = True
     if args.all:
         params["all"] = True
     # #664: a bare `bn close` closes the single open target and refuses under
@@ -180,8 +250,16 @@ def _close(args: argparse.Namespace) -> int:
         try:
             # Looked up on ``bn.cli`` at call time so tests patch one seam.
             args.target = cli._implicit_target(args)
+            params["pinned_target"] = True
         except cli.MultiTargetError as exc:
             if explicit_target == "active":
+                if getattr(args, "_close_spelling", None) == "target close":
+                    raise BridgeError(
+                        f"{exc}\nnote: `active` follows the GUI selection, "
+                        "which is not honored for close: pass a concrete "
+                        "selector from the list above (`bn close --all` closes "
+                        "every open target, including GUI tabs bn did not load)."
+                    ) from None
                 raise BridgeError(
                     f"{exc}\nnote: `-t active` follows the GUI selection, "
                     "which is not honored for close: pass a concrete "
@@ -189,14 +267,47 @@ def _close(args: argparse.Namespace) -> int:
                     "including GUI tabs bn did not load)."
                 ) from None
             raise
-    return _call(
-        args,
-        "close_binary",
-        params,
-        require_target=False,
-        text_renderer=_render_close_text,
-        stem="close",
-    )
+    try:
+        return _call(
+            args,
+            "close_binary",
+            params,
+            require_target=False,
+            text_renderer=_render_close_text,
+            stem="close",
+        )
+    except BridgeError as exc:
+        raise _close_hint_in_run_form(args, exc) from None
+
+
+def _close_hint_in_run_form(args: argparse.Namespace, exc: BridgeError) -> BridgeError:
+    """Spell the bridge's "listed selector" refusal as the command that was run.
+
+    The bridge names the selector `target list` advertises for the target (one
+    that resolves to exactly it); only the CLI knows whether that goes after
+    `bn close -t` or as `bn target close`'s positional (#996 review).
+    """
+    message = str(exc)
+    if LISTED_SELECTOR_LEAD not in message:
+        return exc
+    head, quoted = message.rsplit(LISTED_SELECTOR_LEAD, 1)
+    try:
+        [selector] = shlex.split(quoted)
+    except ValueError:
+        return exc
+    command = (f"{_target_close_prefix(args)} {positional_selector(selector)}"
+               if getattr(args, "_close_spelling", None) == "target close"
+               else f"bn {_routing(args)}close {target_option(selector)}")
+    return BridgeError(f"{head}close it with `{command}`.")
+
+
+def _routing(args: argparse.Namespace) -> str:
+    instance = getattr(args, "instance", None)
+    return f"-i {shlex.quote(str(instance))} " if instance else ""
+
+
+def _target_close_prefix(args: argparse.Namespace) -> str:
+    return f"bn {_routing(args)}target close"
 
 
 @command("target", "close", help="Close one open target by selector", fmt="text",
@@ -239,7 +350,17 @@ def _target_close(args: argparse.Namespace) -> int:
     args.path = None
     args.all = False
     args._sticky_target = False
-    return _close(args)
+    args._close_spelling = "target close"
+    try:
+        return _close(args)
+    except BridgeError as exc:
+        # #996 re-dogfood: every refusal listing (unknown, ambiguous, several
+        # open) renders `-t <sel>` rows, which this command rejects. Spell them
+        # as `bn [-i ID] target close <sel>`, the form that runs here.
+        respelled = respell_for_positional(str(exc), _target_close_prefix(args))
+        if respelled == str(exc):
+            raise
+        raise BridgeError(respelled) from None
 
 
 @command("save", help="Save the current analysis database (.bndb)", target=True,
@@ -258,7 +379,8 @@ def _target_close(args: argparse.Namespace) -> int:
                       "request_sent: true, written: false}} -- exit 2, not the mutation exit 3, "
                       "because save is a file write, not a mutation). The cache is shared by every bn "
                       "instance using it: set BN_CACHE_DIR per agent or project to keep "
-                      "their saved analyses apart"),
+                      "their saved analyses apart -- it also moves the instance registry "
+                      "and sticky session pins, so set it on every bn command"),
              arg("--path", dest="path_flag", default=None,
                  help="Output path (alias for the positional)"),
          ])
@@ -324,4 +446,5 @@ def _target_info(args: argparse.Namespace) -> int:
         # text view carries the annotation counts/provenance block too.
         text_renderer=_render_target_info_text_with_annotations,
         stem="target-info",
+        stamp_instance=True,
     )
