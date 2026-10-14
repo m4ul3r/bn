@@ -61,6 +61,8 @@ A saved `.bndb` may be preferred over adjacent raw bytes, but only if it describ
 
 `existing_annotations.provenance_hint` (in `target info` and `evidence orient`) flags inherited work only. A target this bridge opened from raw bytes gets no hint, however much you annotate or save; one opened from a database is judged by what it held when opened (`present_at_open`), never by your own later renames. The counts beside it are always current.
 
+While `bn refresh` runs, reads answer at once, but writes queue behind it: `py exec`, every mutation, `save`, `close` and `decompile --force-analysis` wait until the refresh finishes. After about two seconds of waiting the CLI prints `bn: <op> is waiting for the running refresh (started Ns ago) to finish` on stderr, so a queue is not a hang. Set `BN_NO_WAIT=1` to make a queued write fail fast with `busy: refresh in progress ...` (exit 2) instead.
+
 ```bash
 bn session start /path/to/sample.bin --instance-id triage-1 --quick
 bn -i triage-1 target info

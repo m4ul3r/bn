@@ -47,7 +47,7 @@ EXPECTED_WRITE = {
 # of truth (`REGISTRY.read_locked_ops()`/`write_locked_ops()`).
 EXPECTED_SELF_MANAGED = {
     "cancel_request", "load_binary", "load_binary_async", "load_status",
-    "go_rename", "shutdown", "refresh",
+    "go_rename", "shutdown", "refresh", "write_gate_status",
     # #628: every binder that routes through bridge._mutation() -- all of them
     # reanalyze inside their own body -- plus the standalone function_create.
     "function_create", "rename_symbol", "set_comment", "delete_comment",
