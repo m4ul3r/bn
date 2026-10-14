@@ -6380,11 +6380,12 @@ def _load(src):
 
 
 def _jump_case(*, exits=True, dest=None, symbol_kind="FunctionSymbol", section=".text",
-               thunk=False):
-    """One HLIL jump at 0x40058c, the last instruction of *func*'s only block."""
+               thunk=False, copies=1):
+    """One machine jump at 0x40058c, the last instruction of *func*'s only
+    block, that HLIL shows *copies* times (BN repeats it per switch case)."""
     if dest is None:
         dest = _load(_plus(_load(_load(_plus(_var("this"), _hconst(0x18)))), _hconst(0x10)))
-    jump = _at(0x40058c, _hop("HLIL_JUMP", "jump(...)", dest=dest))
+    jumps = [_at(0x40058c, _hop("HLIL_JUMP", "jump(...)", dest=dest)) for _ in range(copies)]
     llil_jump = _op("LLIL_JUMP", dest=_reg("x16"))
     block = _Block(0, [llil_jump])
     if not exits:
@@ -6392,7 +6393,7 @@ def _jump_case(*, exits=True, dest=None, symbol_kind="FunctionSymbol", section="
     llil_jump.il_basic_block = block
     func = types.SimpleNamespace(
         start=0x400570, is_thunk=thunk,
-        hlil=types.SimpleNamespace(instructions=[jump]),
+        hlil=types.SimpleNamespace(instructions=jumps),
         calling_convention=types.SimpleNamespace(int_arg_regs=["x0", "x1", "x2"]),
         get_llil_at=lambda a: llil_jump if a == 0x40058c else None,
     )
@@ -6432,8 +6433,40 @@ def test_every_unresolved_exit_jump_gets_one_neutral_warning_1000(dest):
     assert "computed goto or jump table" in detail
     for claim in ("virtual", "slot", "through the function pointer", "is an indirect tail call"):
         assert claim not in detail and claim not in warning["summary"]
-    assert read_decompile._JUMP_LINE_NOTE == (
-        "/* bn: unresolved jump: a tail call (args not rendered) or a computed goto */")
+    # Neither reading is stated as fact: leaving the function is the tail
+    # call's, staying in it the jump table's.
+    assert "leaving the function" in detail and "staying in this function" in detail
+    assert "bn disasm 0x40058c --linear" in detail
+    note = read_decompile._JUMP_LINE_NOTE
+    assert note.startswith("/* bn:") and note.endswith("*/")
+    assert "tail call" in note and "computed goto" in note and "virtual" not in note
+
+
+def test_a_jump_bn_repeats_in_switch_cases_is_one_row_with_a_note_on_every_copy_1000(
+        monkeypatch):
+    # `sw_then_cb`: BN rendered one `br` in two switch cases; it got two rows,
+    # both notes on the first copy, and none on the second.
+    bv, func = _jump_case(copies=2)
+    assert [row["address"] for row in read_decompile._unresolved_jump_findings(bv, func)] \
+        == [0x40058c]
+    bridge = _load_bridge(monkeypatch)
+    fake = _FakeFunction(0x400570, "sw_then_cb")
+    _install_fake_pseudo_c(monkeypatch, bridge, fake, [[
+        (0x400570, "  int64_t sw_then_cb(int64_t arg1, int32_t arg2)"),
+        (0x400570, "{"),
+        (0x400580, "    case 4:"),
+        (0x40058c, "❓        /* jump -> *(uint64_t*)(arg1 + 8) */"),
+        (0x400584, "    case 5:"),
+        (0x40058c, "❓        /* jump -> *(uint64_t*)(arg1 + 8) */  // shared exit"),
+        (0x400590, "}"),
+    ]])
+    placed: set[int] = set()
+    text = bridge.il_format._pseudo_c_text(
+        fake, jump_notes={0x40058c: "/* bn: J */"}, placed=placed)
+    lines = text.splitlines()
+    assert lines[3] == "❓        /* jump -> *(uint64_t*)(arg1 + 8) */  /* bn: J */"
+    assert lines[5] == "❓        /* jump -> *(uint64_t*)(arg1 + 8) */  /* bn: J */  // shared exit"
+    assert text.count("/* bn: J */") == 2 and placed == {0x40058c}
 
 
 @pytest.mark.parametrize("kwargs", [

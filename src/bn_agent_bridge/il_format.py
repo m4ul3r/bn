@@ -957,7 +957,8 @@ def _with_line_note(text: str, note: str) -> str | None:
 
 def _pseudo_c_text(func, *, addresses: bool = False,
                    line_notes: dict[int, list[str]] | None = None,
-                   placed: set[int] | None = None) -> str:
+                   placed: set[int] | None = None,
+                   jump_notes: dict[int, str] | None = None) -> str:
     """Render Binary Ninja's Pseudo C for one function (GUI-equivalent).
 
     Walks the language-representation linear view a batch of lines at a
@@ -966,8 +967,11 @@ def _pseudo_c_text(func, *, addresses: bool = False,
 
     *line_notes* maps an instruction address to notes added to the first
     statement line BN renders at that address (`_with_line_note`), ahead of
-    any trailing `//` comment. Each address placed is added to *placed*, so
-    the caller can say which notes it could not attach.
+    any trailing `//` comment. *jump_notes* maps a jump's address to one note
+    added to EVERY `jump ->` line at that address: BN repeats one machine
+    jump in several switch cases, and each copy reads the same. Each address
+    placed is added to *placed*, so the caller can say which notes it could
+    not attach.
     """
     settings = bn.DisassemblySettings()
     # Suppress BN's built-in address column so `--addresses` controls the
@@ -1006,9 +1010,13 @@ def _pseudo_c_text(func, *, addresses: bool = False,
             noted = None
             # Never on the signature: it carries the entry address too, so a
             # jump at a function's first instruction put its note there (#1000).
-            if (line_notes and addr is not None and not header
-                    and int(addr) in line_notes and int(addr) not in (placed or ())):
-                noted = _with_line_note(text, " ".join(line_notes[int(addr)]))
+            if addr is not None and not header:
+                if jump_notes and int(addr) in jump_notes \
+                        and "jump ->" in _code_and_comment(text)[0]:
+                    noted = _with_line_note(text, jump_notes[int(addr)])
+                elif (line_notes and int(addr) in line_notes
+                        and int(addr) not in (placed or ())):
+                    noted = _with_line_note(text, " ".join(line_notes[int(addr)]))
             if noted is not None:
                 text = noted
                 if placed is not None:
@@ -1029,12 +1037,15 @@ def _pseudo_c_text(func, *, addresses: bool = False,
 
 def _decompile_text(bv, func, *, addresses: bool = False,
                     line_notes: dict[int, list[str]] | None = None,
-                    placed: set[int] | None = None) -> str:
+                    placed: set[int] | None = None,
+                    jump_notes: dict[int, str] | None = None) -> str:
     """Pseudo C for a function, degrading to wrapped HLIL if it is unavailable.
-    *line_notes*/*placed* are `_pseudo_c_text`'s; the HLIL fallback places none."""
+    *line_notes*/*placed*/*jump_notes* are `_pseudo_c_text`'s; the HLIL
+    fallback places none."""
     marker = ""
     try:
-        text = _pseudo_c_text(func, addresses=addresses, line_notes=line_notes, placed=placed)
+        text = _pseudo_c_text(func, addresses=addresses, line_notes=line_notes, placed=placed,
+                              jump_notes=jump_notes)
     except Exception as exc:
         # Make the failure visible instead of silently returning the HLIL
         # fallback (or worse, an empty body) with ok:true.

@@ -1809,7 +1809,9 @@ def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
         statements = list(hlil.instructions) if hlil is not None else []
     except Exception:  # noqa: BLE001 - no HLIL means nothing rendered to explain
         return []
-    rows: list[dict[str, Any]] = []
+    # Keyed by address: BN repeats one machine jump in several switch cases,
+    # and each HLIL copy is the same jump -- one row, not one per copy.
+    rows: dict[int, dict[str, Any]] = {}
     for ins in statements:
         if il_format._il_op_name(ins) != "HLIL_JUMP":
             continue
@@ -1818,13 +1820,15 @@ def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
             if il_format._il_op_name(dest) in _RESOLVED_JUMP_OPS:
                 continue
             address = int(ins.address)
+            if address in rows:
+                continue
             block = getattr(func.get_llil_at(address), "il_basic_block", None)
             if block is None or list(getattr(block, "outgoing_edges", None) or []):
                 continue
         except Exception:  # noqa: BLE001 - one odd jump must not hide the rest
             continue
-        rows.append({"address": address, "target": str(dest)})
-    return rows
+        rows[address] = {"address": address, "target": str(dest)}
+    return list(rows.values())
 
 
 _JUMP_LINE_NOTE = "/* bn: unresolved jump: a tail call (args not rendered) or a computed goto */"
@@ -1843,14 +1847,15 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
     detail = (
         f"unresolved indirect jump at {where} to `{row['target']}`: BN renders it as "
         "`❓ /* jump -> ... */` -- the ❓ marks control flow it could not resolve -- and "
-        "the jump leaves the function. It is one of two things, and the IL alone does "
-        "not say which. A tail call through a pointer: the callee's arguments are then "
-        f"in the argument registers{regs} at the jump and are not rendered; read them "
-        f"in `bn disasm {where}`, and type the callee (`bn proto set`) or the object the "
-        "pointer is loaded from so BN can render the call. Or a computed goto or jump "
-        "table BN did not resolve: the code it reaches may be missing from this "
-        "decompile; read the targets in `bn disasm`."
-        + (" The jump line carries a `/* bn: ... */` note." if inline else "")
+        "found no target for it. It is one of two things, and the IL alone does not say "
+        "which. A tail call through a pointer, leaving the function: the callee's "
+        f"arguments are then in the argument registers{regs} at the jump and are not "
+        f"rendered; read them in `bn disasm {where}`, and type the callee (`bn proto "
+        "set`) or the object the pointer is loaded from so BN can render the call. Or a "
+        "computed goto or jump table BN did not resolve, staying in this function: the "
+        "code it reaches may be missing from this decompile; read the table and its "
+        f"targets with `bn disasm {where} --linear 16`."
+        + (" Every line that shows this jump carries a `/* bn: ... */` note." if inline else "")
     )
     summary = (f"unresolved jump at {where} (❓): a tail call whose args are not rendered, "
                f"or a computed goto/jump table; read it in `bn disasm {where}`")
@@ -2025,11 +2030,11 @@ def _decompile(
     line_notes: dict[int, list[str]] = {}
     for row in arity:
         line_notes.setdefault(row["address"], []).append(_arity_line_note(row))
-    for row in jumps:
-        line_notes.setdefault(row["address"], []).append(_JUMP_LINE_NOTE)
+    jump_notes = {row["address"]: _JUMP_LINE_NOTE for row in jumps}
     placed: set[int] = set()
     text = il_format._decompile_text(bv, func, addresses=addresses,
-                                     line_notes=line_notes, placed=placed)
+                                     line_notes=line_notes, placed=placed,
+                                     jump_notes=jump_notes)
     if include_annotations:
         annotation_summary = {
             "comment_count": len(_annotation_entries(func, comments)),

@@ -4280,32 +4280,41 @@ def tail_jump_binaries(tmp_path_factory) -> dict[str, Path]:
 @pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
 class TestDecompileUnresolvedJumps1000:
     """An unresolved jump out of a function -- a pointer tail call or a
-    computed goto alike -- gets one neutral `jump` row and one line note, and
-    neither ever claims which it is. Which fixtures the compiler leaves as
-    jumps varies by gcc version, so only the population is pinned, not which
-    function lands in it."""
+    computed goto alike -- gets exactly one neutral `jump` row and a note on
+    every line that shows it, and neither ever claims which it is. The
+    expected rows come from the disassembly, not from a list of fixtures:
+    which ones the compiler leaves as jumps varies by gcc version, but every
+    indirect branch it emits here is one BN cannot resolve."""
 
-    def test_every_jump_row_is_neutral_and_marks_its_line(self, shared_bn, tail_jump_binaries,
-                                                           arch):
+    _INDIRECT_BRANCH = re.compile(
+        r"^(0x[0-9a-f]+)\s+(?:[0-9a-f]{2} )+\s*(?:notrack\s+)?(?:br|jmp)\s+(?!0x)\S")
+
+    def test_one_neutral_row_per_indirect_branch_and_a_note_on_each_copy(
+            self, shared_bn, tail_jump_binaries, arch):
         shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
-        rows_seen = 0
         for function in ("tc_param", "tc_global", "tc_field", "tc_table", "labels2",
                          "idxjump"):
-            result = shared_bn.json("decompile", function)
+            disasm = shared_bn.run("disasm", function)
+            assert disasm.returncode == 0, disasm.stderr
+            expected = {int(m.group(1), 16) for line in disasm.stdout.splitlines()
+                        if (m := self._INDIRECT_BRANCH.match(line))}
+            if function == "idxjump":
+                assert len(expected) == 1, disasm.stdout  # hand-written `br`/`jmp`
+            result = shared_bn.json("decompile", function, "--addresses")
             jumps = [row for row in result["warning_rows"] if row["code"] == "jump"]
-            rows_seen += len(jumps)
+            addresses = [int(row["address"], 16) for row in jumps]
+            assert sorted(addresses) == sorted(expected), (function, jumps, disasm.stdout)
             for row in jumps:
                 assert "tail call" in row["summary"] and "computed goto" in row["summary"], row
                 for claim in ("virtual", "slot", "through the function pointer"):
                     assert claim not in row["summary"] and claim not in row["detail"], row
                 assert row["target"] and f"`{row['target']}`" in row["detail"], row
-            noted = [line for line in result["text"].splitlines()
-                     if "/* bn: unresolved jump" in line]
-            assert len(noted) == len(jumps), (function, result["text"])
-            # Never on the signature line, always on BN's `jump ->` line.
-            assert all("jump ->" in line for line in noted), noted
-        # At -O2 at least the pointer tail calls are jumps on every gcc measured.
-        assert rows_seen >= 1
+            # Every line BN renders for one of those jumps carries the note,
+            # and no other line does.
+            for line in result["text"].splitlines():
+                address = int(line.split()[0], 16) if line.startswith("0x") else None
+                shows_jump = "jump ->" in line and address in expected
+                assert ("/* bn: unresolved jump" in line) == shows_jump, (function, line)
 
 
 class TestShortLiteralBehindDataName994:
