@@ -956,6 +956,10 @@ def _render_proto_text(value: Any) -> str:
     # carried none, which is the exact skew #619 made a suite-wide invariant.
     raw_width_note = _text_value(value, "return_width_note")
     width_note = f"\n\nnote: {raw_width_note}" if raw_width_note else ""
+    # #966: a prototype with callee-saved/link-register parameters, or a body
+    # BN split at a shared tail, is disclosed the same way.
+    split_notes = _field_list(value, "split_body_notes") or []
+    width_note += "".join(f"\n\nnote: {n}" for n in split_notes)
     fn = value.get("function")
     name = fn.get("name") if isinstance(fn, dict) else None
     head, sep, rest = prototype.partition("(")
@@ -1604,6 +1608,14 @@ def _yes_no(flag: Any) -> str:
     return "yes" if flag is True else "no" if flag is False else ""
 
 
+def _dynamic_section_notes(value: Any) -> list[str]:
+    """The `dynamic_section_notes` a target info / imports payload carries: why
+    part of the ELF dynamic section was out of range and skipped (#987 review),
+    escaped for one text line each."""
+    return [_escape_control_chars(str(note))
+            for note in _field_list(value, "dynamic_section_notes")]
+
+
 def _render_target_summary(value: dict[str, Any]) -> str:
     view_id = value.get("view_id")
     label = value.get("selector") or value.get("target_id") or "<unknown>"
@@ -1701,6 +1713,19 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         lines.append(
             f"\timports: {import_symbols} symbols{callable_suffix}"
         )
+    # #969: the dependency list, on `target info` (target list rows carry no
+    # such key and render nothing). Declared-but-empty is a real answer -- a
+    # static or non-ELF target has no DT_NEEDED -- so it prints as a zero.
+    if _field_declared(value, "needed_libraries"):
+        needed = [_escape_control_chars(str(lib)) for lib in _field_list(value, "needed_libraries")]
+        listed = ", ".join(needed) if needed else "0 (no DT_NEEDED entries)"
+        lines.append(f"\tneeded libraries: {listed}")
+    for key in ("soname", "rpath", "runpath"):
+        text = _text_value(value, key)
+        if text:
+            lines.append(f"\t{key}: {_escape_control_chars(text)}")
+    for note in _dynamic_section_notes(value):
+        lines.append(f"\t! dynamic section: {note}")
     # Segment-level detail only when present -- target info --verbose adds it;
     # target list rows do not, so this stays out of the list view. (F21)
     segments = _field_list(value, "segments")
@@ -2050,6 +2075,19 @@ def _render_name_address_list_text(value: Any, *, mangled: bool = False) -> str:
         # fabricated zero the choke point exists to stop (#619/#683).
         note = ("// the payload's self-defined-excluded count is not a number "
                 "that can be read (use --format json)")
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    # #969: `library: null` rows are imports no ELF symbol version binds to a
+    # library; name the DT_NEEDED list they can come from, so the null points at
+    # the answer rather than reading as "no dependency".
+    unattributed = _nonnegative_count(value, "library_unattributed")
+    if unattributed:
+        needed = ", ".join(_escape_control_chars(str(lib))
+                           for lib in _field_list(value, "needed_libraries"))
+        note = (f"// {unattributed} import(s) carry no library (no symbol version names one); "
+                f"this target needs: {needed or '?'} (also in `bn target info`)")
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    for dynamic_note in _dynamic_section_notes(value):
+        note = f"// dynamic section: {dynamic_note}"
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     return body
 
@@ -3286,8 +3324,8 @@ def _render_surface_text(value: Any) -> str:
         code_likely = [c for c in cands if isinstance(c, dict) and c.get("code_likely")]
         lines.append("")
         lines.append(
-            f"missing-function candidates (executable, data-referenced, no BN function): "
-            f"{len(code_likely)} code-likely of {len(cands)}")
+            f"missing-function candidates (executable, data- or code-referenced, "
+            f"no BN function): {len(code_likely)} code-likely of {len(cands)}")
         # Show the high-confidence subset first; then the rest, marked with why.
         ordered = code_likely + [c for c in cands if isinstance(c, dict) and not c.get("code_likely")]
         for c in ordered:
@@ -3308,9 +3346,12 @@ def _render_surface_text(value: Any) -> str:
                 suffix = "  -> " + _render_string_literal(clipped, truncated=len(text) > 48)
             else:
                 suffix = ""
+            sites_total = c.get("referenced_from_total")
+            more = (f" (+{sites_total - 1} more site(s))"
+                    if isinstance(sites_total, int) and sites_total > 1 else "")
             lines.append(
                 f"  {c.get('address', '?')}  [{c.get('section') or '?'}]  "
-                f"via {c.get('provenance', '?')}  [{tag}: {', '.join(why)}]{suffix}")
+                f"via {c.get('provenance', '?')}{more}  [{tag}: {', '.join(why)}]{suffix}")
         lines.append("")
         lines.append("(candidates -- NOT confirmed functions. `decode` = clean instructions "
                      "before an undefined one; a low decode reliably means data. Start with the "
@@ -4850,6 +4891,19 @@ def _render_imports_summary_text(value: Any) -> str:
         lines.append("needed libraries (DT_NEEDED):")
         for lib in needed:
             lines.append(f"  {lib}")
+    # #969: per-import library attribution (ELF symbol versioning), aggregated.
+    # Shown only when at least one import IS attributed: a lone
+    # "(unattributed)" row restates the total and says nothing.
+    by_library = _field_dict(value, "by_library")
+    if any(lib != "(unattributed)" for lib in by_library):
+        lines.append("")
+        lines.append("by library (symbol version requirements):")
+        for lib, count in sorted(by_library.items(), key=lambda x: -_int_or_default(x[1])):
+            lines.append(f"  {_fmt_count(count):>5}  {_escape_control_chars(lib)}")
+    notes = _dynamic_section_notes(value)
+    if notes:
+        lines.append("")
+        lines.extend(f"! dynamic section: {note}" for note in notes)
     # Skip the breakdown sections entirely when empty (e.g. a 0-import target),
     # rather than printing dangling "by namespace:"/"by kind:" headers.
     namespaces = _field_dict(value, "namespaces")
@@ -4902,8 +4956,34 @@ def _render_strings_rows(value: Any) -> str:
                 suffix += f"; code_refs={refs}"
             suffix += "]"
             row += suffix
+        # #968 --with-xrefs: the functions that reference this string, capped
+        # by the bridge; the stated total names how many the cap left out.
+        if _field_declared(item, "xref_functions"):
+            row += _string_xref_suffix(item)
         lines.append(row)
     return "\n".join(lines)
+
+
+def _string_xref_suffix(item: dict[str, Any]) -> str:
+    """The `[xrefs: ...]` tail of one `strings --with-xrefs` row (#968)."""
+    functions = [fn for fn in _field_list(item, "xref_functions") if isinstance(fn, dict)]
+    # #978: the demangled display name, as every other function-name surface.
+    names = [_escape_control_chars(_text_value(fn, "display_name") or _text_value(fn, "name")
+                                   or _text_value(fn, "address") or "?")
+             for fn in functions]
+    total = _nonnegative_count(item, "xref_function_count")
+    text = ", ".join(names) if names else "0 functions"
+    if total > len(names):
+        text += f" (+{total - len(names)} more)"
+    # An unmeasured count arrives as null with a note: say so, never a zero.
+    unmeasured = _text_value(item, "data_ref_note")
+    if unmeasured:
+        text += f"; data refs unknown ({_escape_control_chars(unmeasured)})"
+    else:
+        data_refs = _nonnegative_count(item, "data_ref_count")
+        if data_refs:
+            text += f"; {data_refs} data ref(s)"
+    return f"  [xrefs: {text}]"
 
 
 def _strings_listing_text(value: Any, *, narrowed: bool) -> str:
@@ -5200,6 +5280,74 @@ def _render_read_text(value: Any) -> str:
         lines.append(f"note: {note}")
 
     return "\n".join(lines)
+
+
+# #971: the C escapes `read --encoding escaped` writes. Every escape stands for
+# exactly one byte AND reads back as that byte in C: a C octal escape takes up
+# to three digits and `\x` takes every hex digit that follows, so `\0` before
+# an octal digit is written `\000`, and `\xHH` before a hex digit is written
+# as three-digit octal -- `b"a\x00" b"123"` is `a\000123`, never the `a\0123`
+# that reads back as `a`, `\012`, `3` (#987 review).
+_C_ESCAPES = {0x07: "\\a", 0x08: "\\b", 0x09: "\\t", 0x0A: "\\n",
+              0x0B: "\\v", 0x0C: "\\f", 0x0D: "\\r", 0x22: '\\"', 0x5C: "\\\\"}
+_OCTAL_DIGITS = frozenset(b"01234567")
+_HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
+
+
+def _c_escape_bytes(data: bytes) -> str:
+    """*data* as the body of one C string literal: printable ASCII verbatim,
+    every other byte as exactly one unambiguous escape."""
+    out: list[str] = []
+    for index, byte in enumerate(data):
+        following = data[index + 1] if index + 1 < len(data) else None
+        if byte in _C_ESCAPES:
+            out.append(_C_ESCAPES[byte])
+        elif 0x20 <= byte < 0x7F:
+            out.append(chr(byte))
+        elif byte == 0:
+            out.append("\\000" if following in _OCTAL_DIGITS else "\\0")
+        elif following in _HEX_DIGITS:
+            out.append(f"\\{byte:03o}")
+        else:
+            out.append(f"\\x{byte:02x}")
+    return "".join(out)
+
+
+# Source bytes per `read --encoding escaped` text line: short enough that a
+# harness's line truncation cannot hide the tail of a string table.
+_READ_ESCAPED_LINE_BYTES = 64
+
+
+@_discloses
+def _render_read_escaped_text(value: Any) -> str:
+    """`read --encoding escaped`: each line an address and a quoted C-escaped
+    run, so the NULs separating adjacent short strings stay visible on a
+    terminal and in an agent harness, where raw bytes drop them (#971)."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    hex_str = value.get("hex")
+    if not isinstance(hex_str, str):
+        return _render_fallback_text(value)
+    try:
+        data = bytes.fromhex(hex_str)
+    except ValueError:
+        return _render_fallback_text(value)
+    address = value.get("address", "0x0")
+    try:
+        base = int(str(address), 16) if str(address).lower().startswith("0x") else int(address)
+    except (TypeError, ValueError):
+        base = 0
+    width = _READ_ESCAPED_LINE_BYTES
+    lines = [f'{base + offset:08x}: "{_c_escape_bytes(data[offset:offset + width])}"'
+             for offset in range(0, len(data), width)]
+    if not lines:
+        lines.append(f"{base:08x}: (no bytes)")
+    note = _text_value(value, "note")
+    if note:
+        lines.append("")
+        lines.append(f"note: {note}")
+    return "\n".join(lines)
+
 
 
 @_discloses
@@ -5706,6 +5854,7 @@ def _build_mutation_summary(
     unmeasured_cause: str = "this op reported no results[] rows",
     unusable: bool = False,
     overlapping_functions: Sequence[dict[str, Any]] = (),
+    declared_types: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -5840,7 +5989,60 @@ def _build_mutation_summary(
         # the residue key: an ordinary create must not grow an empty list for
         # every consumer to learn to ignore.
         summary["overlapping_functions"] = list(overlapping_functions)
+    if declared_types:
+        # #964: `types declare` is ONE op however many types it declares, so the
+        # op counts above said `changed=1 verified=1` for a header of eleven
+        # structs and the caller had to `struct show` each one to learn what
+        # landed. Conditional like the keys above: only a declare carries it.
+        summary["declared_types"] = declared_types
     return summary
+
+
+# How many declared type names the compact summary lists before it truncates;
+# the full set stays in the detailed result's `defined_types`.
+_DECLARED_TYPE_NAME_CAP = 10
+
+
+def _declared_types_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """#964: the types a `types_declare` row set actually landed (verified or
+    noop rows), counted per TYPE rather than per op, with the names capped, plus
+    any base clause the declare could not record (#965), the existing types it
+    only referenced and left unchanged, and the empty types it created only
+    because a member mentioned an unknown name (#963 / #989 review). None when
+    no declare row landed, so every other mutation's summary is unchanged."""
+    names: list[str] = []
+    unattached: dict[str, Any] = {}
+    referenced: list[str] = []
+    stubs: list[str] = []
+    landed = False
+    for row in results:
+        if row.get("op") != "types_declare" or row.get("status") not in ("verified", "noop"):
+            continue
+        landed = True
+        row_referenced = [str(name) for name in _field_list(row, "referenced_existing_types")]
+        row_stubs = [str(name) for name in _field_list(row, "created_by_reference")]
+        referenced.extend(row_referenced)
+        stubs.extend(row_stubs)
+        # Neither a referenced type nor an empty type created by a bare mention
+        # was DECLARED; both are listed on their own lines instead.
+        names.extend(str(name) for name in _field_dict(row, "defined_types")
+                     if str(name) not in row_referenced and str(name) not in row_stubs)
+        unattached.update(_field_dict(row, "unattached_bases"))
+    if not landed:
+        return None
+    unique = list(dict.fromkeys(names))
+    out: dict[str, Any] = {
+        "count": len(unique),
+        "names": unique[:_DECLARED_TYPE_NAME_CAP],
+        "truncated": len(unique) > _DECLARED_TYPE_NAME_CAP,
+    }
+    if unattached:
+        out["unattached_bases"] = unattached
+    if referenced:
+        out["referenced_existing"] = list(dict.fromkeys(referenced))
+    if stubs:
+        out["created_by_reference"] = list(dict.fromkeys(stubs))
+    return out
 
 
 @_discloses_in_summary
@@ -5962,6 +6164,7 @@ def _mutation_summary(value: Any) -> Any:
             o for r in results if r.get("status") in ("verified", "rollback_failed")
             for o in _row_list(r, "overlaps")
         ],
+        declared_types=_declared_types_summary(results),
     )
 
 
@@ -6268,6 +6471,26 @@ def _render_mutation_summary_text(value: Any) -> str:
     line = "  ".join(parts)
     if overlaps:
         line += "\noverlapping_functions: " + _overlap_listing(overlaps)
+    if _field_declared(value, "declared_types"):
+        declared = _field_dict(value, "declared_types")
+        names = [str(name) for name in _field_list(declared, "names")]
+        count = declared.get("count")
+        hidden = count - len(names) if isinstance(count, int) and count > len(names) else 0
+        shown = ", ".join(names) + (f", +{hidden} more" if hidden else "")
+        kept = [str(name) for name in _field_list(declared, "referenced_existing")]
+        stubs = [str(name) for name in _field_list(declared, "created_by_reference")]
+        # A declare that only referenced existing types declared nothing; its
+        # `referenced` line says all there is, so no "types: 0 declared".
+        if not (count == 0 and not names and (kept or stubs)):
+            line += f"\ntypes: {_fmt_count(count).strip()} declared" + (f" ({shown})" if shown else "")
+        bases = _field_dict(declared, "unattached_bases")
+        if bases:
+            line += "\nbases not recorded: " + "; ".join(f"{name}: {why}" for name, why in bases.items())
+        if kept:
+            line += "\nreferenced, left unchanged: " + ", ".join(kept)
+        if stubs:
+            line += ("\ncreated empty (only mentioned, never defined -- check the spelling): "
+                     + ", ".join(stubs))
     if _field_declared(value, "go_rename"):
         go = _field_dict(value, "go_rename")
         line += "\ngo rename: " + "  ".join(
@@ -7004,13 +7227,15 @@ def _render_one_class(rec: Any) -> str:
                 continue
             lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
     elif vt_addr:
-        # A vtable symbol exists but no slots resolved. Either the vtable is
-        # defined in another module (the local symbol is an import/GOT slot) or
-        # it is a PIE/.data.rel.ro vtable whose pointers are applied at load time
-        # via relocations (zero in the static image). In both cases there is no
-        # decodable local body; say so rather than render fake or empty virtuals.
-        lines.append("  vtable: symbol present but no slots resolved here "
-                     "(defined in another module, or applied at load time via relocations)")
+        # A vtable symbol exists but no slots resolved. The causes differ (an
+        # import/GOT slot for a vtable defined in another module, a PIE slot
+        # relocated to zero, a header whose typeinfo word did not decode), and
+        # naming one of them sent a reader after a shared library when the slots
+        # were in the image all along (#960). Say what is known -- the slots were
+        # not proven -- with the reason code and the next step.
+        reason = _text_value(vt, "truncated_reason") or "unknown"
+        lines.append(f"  vtable: symbol present, slots not proven ({reason}); "
+                     f"inspect the table with `bn evidence table {vt_addr}`")
     if vt.get("truncated"):
         # #822: the cap note now carries the bound instead of only the cap, so a
         # reader can see how much the cap hid -- the validated minimum, never a

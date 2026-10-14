@@ -1483,6 +1483,87 @@ def test_read_conflicting_address_errors(fake_transport, capsys):
     assert "given twice with different values" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("argv, length", [
+    (["0x1000", "0x10"], 16),
+    (["0x1000", "24"], 24),
+    (["0x1000", "0x10", "--length", "16"], 16),  # both, agreeing
+])
+def test_read_accepts_positional_length_972(fake_transport, argv, length):
+    # #972: `bn read ADDR LEN` is the xxd/dd/debugger form agents try first.
+    calls = fake_transport({
+        "read": {"ok": True, "result": {"address": "0x1000", "length": length,
+                                        "hex": "00" * length, "ascii": "." * length}},
+    })
+    rc = bn.cli.main(["read", "--target", "active", *argv])
+    assert rc == 0
+    assert calls[-1]["params"] == {"address": "0x1000", "length": length}
+
+
+def test_read_positional_length_conflicting_with_flag_errors_972(fake_transport, capsys):
+    fake_transport()
+    rc = bn.cli.main(["read", "--target", "active", "0x1000", "0x10", "--length", "8"])
+    assert rc == 2
+    assert "read length given twice with different values" in capsys.readouterr().err
+
+
+def test_read_escaped_encoding_keeps_nuls_visible_971(fake_transport, capsys):
+    # #971: adjacent short strings separated by NUL padding. Raw bytes lose the
+    # NULs on a terminal; the escaped form shows each one, one escape per byte.
+    data = b"cat \x00\x00\x00\x00 -n\x00\x00\x00\x00\x00[demo] w\t\"\\\x7f\xff"
+    fake_transport({"read": {"ok": True, "result": {
+        "address": "0x402ad8", "length": len(data), "hex": data.hex(), "ascii": ""}}})
+    rc = bn.cli.main(["read", "--target", "active", "0x402ad8", str(len(data)),
+                      "--encoding", "escaped"])
+    assert rc == 0
+    assert capsys.readouterr().out == (
+        '00402ad8: "cat \\0\\0\\0\\0 -n\\0\\0\\0\\0\\0[demo] w\\t\\"\\\\\\x7f\\xff"\n')
+
+
+def test_read_escaped_encoding_wraps_long_reads_and_keeps_note_971(fake_transport, capsys):
+    data = bytes(range(0x41, 0x41 + 26)) * 3  # 78 bytes: two lines
+    fake_transport({"read": {"ok": True, "result": {
+        "address": "0x1000", "length": len(data), "hex": data.hex(), "ascii": "",
+        "short_read": True, "requested_length": 100,
+        "note": "short read: requested 100 bytes, only 78 mapped from 0x1000"}}})
+    rc = bn.cli.main(["read", "--target", "active", "0x1000", "100", "--encoding", "escaped"])
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == f'00001000: "{data[:64].decode()}"'
+    assert lines[1] == f'00001040: "{data[64:].decode()}"'
+    assert lines[-1].startswith("note: short read")
+
+
+def test_strings_with_xrefs_forwards_flag_and_renders_functions_968(fake_transport, capsys):
+    calls = fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "total": 2, "offset": 0, "limit": 100, "returned": 2,
+        "has_more": False, "filtered": 0,
+        "items": [
+            {"address": "0x2000", "length": 12, "chars": 12, "type": "ascii",
+             "value": "parse_config", "code_ref_count": 12, "data_ref_count": 0,
+             "xref_function_count": 10,
+             "xref_functions": [{"address": hex(0x1000 + i * 0x40), "name": f"sub_{0x1000 + i * 0x40:x}"}
+                                for i in range(8)]},
+            {"address": "0x2010", "length": 9, "chars": 9, "type": "ascii",
+             "value": "vtable_ns", "code_ref_count": 0, "data_ref_count": 1,
+             "xref_function_count": 0, "xref_functions": []},
+        ]}}})
+    rc = bn.cli.main(["strings", "--target", "active", "--query", "_", "--with-xrefs"])
+    assert rc == 0
+    assert calls[-1]["params"]["with_xrefs"] is True
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].endswith("[xrefs: sub_1000, sub_1040, sub_1080, sub_10c0, sub_1100, "
+                           "sub_1140, sub_1180, sub_11c0 (+2 more)]")
+    assert out[1].endswith("[xrefs: 0 functions; 1 data ref(s)]")
+
+
+def test_strings_with_xrefs_refused_beside_count_968(fake_transport, capsys):
+    calls = fake_transport()
+    rc = bn.cli.main(["strings", "--target", "active", "--count", "--with-xrefs"])
+    assert rc == 2
+    assert "--with-xrefs would be silently ignored" in capsys.readouterr().err
+    assert not [c for c in calls if c["op"] == "strings"]
+
+
 def test_read_missing_address_errors(monkeypatch, capsys):
     monkeypatch.setattr(bn.cli, "send_request", lambda *a, **k: None)
 
@@ -2547,6 +2628,7 @@ _MISC_TEXT_RENDERERS: dict[str, tuple[tuple[str, ...], ...] | str] = {
     "_render_mangled_name_address_list_text": _COVERED_IN_FORMATTERS,
     "_render_name_address_list_text": _COVERED_IN_FORMATTERS,
     "_render_py_exec_text": _COVERED_IN_FORMATTERS,
+    "_render_read_escaped_text": _COVERED_IN_FORMATTERS,
     "_render_read_text": _COVERED_IN_FORMATTERS,
     "_render_sections_text": _COVERED_IN_FORMATTERS,
     "_render_strings_narrowed_text": _COVERED_IN_FORMATTERS,
@@ -3010,6 +3092,7 @@ _ESTIMATE_ARG_VALUES = {
     "type_name": "int32_t", "struct_name": "hdr",
     "at": "0x401000", "var": "x#1", "start": "0x401000", "end": "0x402000",
     "arg_index": "1", "sinks": "arg:memcpy:0", "sources": "call:recv",
+    "length_pos": "4",
 }
 # One permissive reply for every op. The sweep is about which EMIT PATH a
 # handler takes, not about any single op's payload shape.

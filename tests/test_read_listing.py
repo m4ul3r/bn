@@ -548,6 +548,60 @@ def test_annotation_summary_degrades_instead_of_fabricating_zero_comments_793(mo
     assert "comments" not in block and "analyst_symbols" not in block
 
 
+def test_annotation_summary_excludes_a_user_symbol_that_echoes_an_auto_symbol_973(monkeypatch):
+    """BN promotes some names the binary itself carries to user (`auto=False`)
+    symbols: glibc's AArch64 `_start` stub `__wrap_main`, a local NOTYPE symtab
+    entry, comes back as a non-auto function symbol beside auto symbols of the
+    SAME name at the SAME address. A raw load with no annotations at all then
+    reported one analyst symbol. An analyst rename never echoes the auto name it
+    shadows, so it must still count -- including one at an address that also
+    carries an auto symbol."""
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    symbols = [
+        SimpleNamespace(auto=True, name="__wrap_main", address=0x401ff4),
+        SimpleNamespace(auto=False, name="__wrap_main", address=0x401ff4),
+        SimpleNamespace(auto=True, name="widget_poll", address=0x40276c),
+        SimpleNamespace(auto=False, name="widget_dispatch", address=0x40276c),
+        # Same name as an auto symbol, but at ANOTHER address: analyst work.
+        SimpleNamespace(auto=False, name="widget_poll", address=0x402800),
+    ]
+    bv = _FakeBV(functions=[], symbols=symbols)
+
+    summary = bridge.read_listing._annotation_summary(None, bv)
+
+    assert summary["user_symbols"] == 3
+    assert summary["analyst_symbols"] == 2
+    assert summary["placeholder_symbols"] == 1
+    assert summary["symbol_exclusions"] == [
+        {"name": "__wrap_main", "address": "0x401ff4", "reason": "auto_alias"},
+    ]
+    assert [row["name"] for row in summary["analyst_symbol_locations"]] == [
+        "widget_dispatch", "widget_poll",
+    ]
+
+
+def test_auto_alias_keeps_a_rename_to_one_of_several_alias_names_973(monkeypatch):
+    """#973 review: an address with several automatic names (a C alias) lets an
+    analyst rename the function to one of them. That is a real choice, so the
+    rename stays analyst work -- otherwise a view carrying it passes the
+    `assert_unannotated` gate as clean."""
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    bv = _FakeBV(functions=[], symbols=[
+        SimpleNamespace(auto=True, name="real_worker", address=0x401129),
+        SimpleNamespace(auto=True, name="worker_alias", address=0x401129),
+        SimpleNamespace(auto=False, name="worker_alias", address=0x401129),
+    ])
+
+    summary = bridge.read_listing._annotation_summary(None, bv)
+
+    assert summary["analyst_symbols"] == 1
+    assert summary["symbol_exclusions"] == []
+
+
 def test_function_search_scopes_duplicate_starts_to_the_rows_it_returns_757(monkeypatch):
     """The two listing commands must give `duplicate_starts_collapsed` ONE meaning.
 

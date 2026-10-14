@@ -1040,10 +1040,11 @@ _NONE_LOCK_OP = re.compile(r'@op\(\s*"([^"]+)"\s*,\s*lock="none"')
 # test_the_lock_model_counterexample_is_a_really_stateful_none_op. What is worth
 # keeping is the claim-deletion tripwire, over the whole paragraph.
 #
-# The two `none` ops that really are pure signals: they set an event and must
-# stay deliverable while a write op holds the lock. Everything else declared
-# `none` runs real work on the view and takes whatever lock it needs itself.
-SIGNAL_ONLY_NONE_OPS = frozenset({"shutdown", "cancel_request"})
+# The `none` ops that really are pure signals: they set an event or report
+# bridge-side bookkeeping, and must stay deliverable while a write op holds the
+# lock. Everything else declared `none` runs real work on the view and takes
+# whatever lock it needs itself.
+SIGNAL_ONLY_NONE_OPS = frozenset({"shutdown", "cancel_request", "write_gate_status"})
 
 LOCK_MODEL_SENTENCE_PREFIX = "`op_registry.py` is the single source of truth"
 

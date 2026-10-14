@@ -3032,6 +3032,149 @@ def test_hidden_surface_cap_warnings_disclose_totals_653(monkeypatch):
     assert not any("capped at" in w for w in full["warnings"])
 
 
+# --- #967: code-referenced addresses with no function -----------------------
+
+
+def _il(opname, **kw):
+    operands = [v for v in kw.values() if hasattr(v, "operation")]
+    return types.SimpleNamespace(operation=types.SimpleNamespace(name=opname),
+                                 operands=operands, **kw)
+
+
+class _CodeRefFunc:
+    """A referencing function: per-site LLIL (with its MLIL) and basic blocks."""
+
+    def __init__(self, name, sites, blocks):
+        self.name = name
+        self._sites = sites          # site -> (llil, mlil)
+        self._blocks = blocks        # [(start, end, edge type names)]
+        self.unresolved_indirect_branches = []
+
+    def get_llils_at(self, addr):
+        llil, mlil = self._sites[int(addr)]
+        llil.mlil = mlil
+        return [llil]
+
+    def get_basic_block_at(self, addr):
+        for start, end, edges in self._blocks:
+            if start <= int(addr) < end:
+                return types.SimpleNamespace(start=start, end=end, outgoing_edges=[
+                    types.SimpleNamespace(type=types.SimpleNamespace(name=e)) for e in edges])
+        return None
+
+
+class _CodeRefSurfBV(_SurfBV):
+    """`.text` holds five function-less data variables, each referenced from code:
+
+    * 0x2020 -- `sa.sa_handler = on_signal`: the adrp/add site's IL carries nothing,
+      the store site's MLIL carries the address as a constant (the measured aarch64
+      shape), so the address is TAKEN;
+    * 0x2040 -- a literal-pool slot: its only site LOADS from it;
+    * 0x2060 -- a jump-table base: `adr` in a block that leaves by an indirect branch;
+    * 0x2080 -- a function already covers it;
+    * 0x3000 -- an `adrp` page anchor: its address is taken, but it decodes to nothing.
+    `.rodata` holds a sixth, 0x1100, referenced from code but not in a code region."""
+    _VALS = [0]
+    _DATA_VARS = [0x1100, 0x2020, 0x2040, 0x2060, 0x2080, 0x3000]
+
+    def __init__(self):
+        super().__init__()
+        self.sections[".rodata"] = _SurfSection(".rodata", 0x1100, 0x1200,
+                                                "ReadOnlyDataSectionSemantics")
+        self._fns = {0x2080}
+        install = _CodeRefFunc("install", {
+            0x2104: (_il("LLIL_SET_REG", src=_il("LLIL_ADD")), None),
+            0x2110: (_il("LLIL_STORE"), _il("MLIL_SET_VAR_FIELD", src=_il("MLIL_CONST_PTR", constant=0x2020))),
+            0x2120: (_il("LLIL_SET_REG", src=_il("LLIL_LOAD", src=_il("LLIL_CONST_PTR", constant=0x2040))), None),
+            0x2130: (_il("LLIL_SET_REG", src=_il("LLIL_CONST_PTR", constant=0x2060)), None),
+            0x2140: (_il("LLIL_SET_REG", src=_il("LLIL_CONST_PTR", constant=0x1100)), None),
+            0x2144: (_il("LLIL_SET_REG", src=_il("LLIL_CONST_PTR", constant=0x3000)), None),
+        }, [(0x2100, 0x2128, ["UnconditionalBranch"]),
+            (0x2128, 0x2138, ["IndirectBranch", "IndirectBranch"]),
+            (0x2138, 0x2150, [])])
+        self._refs = {
+            0x2020: [(0x2104, install), (0x2110, install)],
+            0x2040: [(0x2120, install)],
+            0x2060: [(0x2130, install)],
+            0x2080: [(0x2104, install)],
+            0x1100: [(0x2140, install)],
+            0x3000: [(0x2144, install)],
+        }
+
+    def get_segment_at(self, a):
+        return _SurfSeg(0x1000, 0x6000) if 0x1000 <= int(a) < 0x6000 else None
+
+    def get_next_data_var_start_after(self, addr):
+        return next((a for a in self._DATA_VARS if a > int(addr)), self.end)
+
+    def get_code_refs(self, addr):
+        return [types.SimpleNamespace(address=site, function=fn)
+                for site, fn in self._refs.get(int(addr), [])]
+
+
+def test_hidden_surface_code_referenced_handler_is_a_candidate_967(monkeypatch):
+    """#967: a handler whose address code stores (`sa.sa_handler = on_signal`) and
+    that BN never functionized is a missing-function candidate carrying its
+    referencing sites; a literal-pool slot, a jump-table base, an address a
+    function already covers, and a code-referenced address in DATA are not."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    out = re._hidden_surface(_pie_ctx(_CodeRefSurfBV()), None)
+    cands = {c["address"]: c for c in out["missing_function_candidates"]}
+    assert set(cands) == {"0x2020"}
+    handler = cands["0x2020"]
+    assert handler["provenance"] == "code_ref:install@0x2104"
+    assert handler["referenced_from"] == [{"address": "0x2104", "function": "install"},
+                                          {"address": "0x2110", "function": "install"}]
+    assert handler["referenced_from_total"] == 2
+    assert handler["code_likely"] is True
+    assert out["summary"]["missing_function_candidates"] == 1
+
+
+def test_hidden_surface_code_ref_probe_cap_is_disclosed_967(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    full = re._hidden_surface(_pie_ctx(_CodeRefSurfBV()), None)
+    assert not any("code-referenced address scan stopped" in w for w in full["warnings"])
+    # One probe reaches the handler, then the walk stops -- and says so.
+    monkeypatch.setattr(re, "_MAX_CODE_REF_PROBES", 1)
+    out = re._hidden_surface(_pie_ctx(_CodeRefSurfBV()), None)
+    assert [c["address"] for c in out["missing_function_candidates"]] == ["0x2020"]
+    assert any("code-referenced address scan stopped" in w for w in out["warnings"])
+
+
+class _FailingCodeRefSurfBV(_CodeRefSurfBV):
+    """`get_code_refs` raises for the handler; the data-variable walk raises after it."""
+
+    def get_code_refs(self, addr):
+        if int(addr) == 0x2020:
+            raise RuntimeError("code refs unavailable")
+        return super().get_code_refs(addr)
+
+    def get_next_data_var_start_after(self, addr):
+        if int(addr) >= 0x2020:
+            raise RuntimeError("data variable walk failed")
+        return super().get_next_data_var_start_after(addr)
+
+
+def test_hidden_surface_code_ref_scan_failures_are_disclosed_967(monkeypatch):
+    """A BN error that skips an address or ends a region's walk must not leave the
+    scan reading as complete: the handler goes unreported, and the output says why."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    clean = re._hidden_surface(_pie_ctx(_CodeRefSurfBV()), None)
+    assert not any("PARTIAL" in w for w in clean["warnings"])
+    out = re._hidden_surface(_pie_ctx(_FailingCodeRefSurfBV()), None)
+    assert out["missing_function_candidates"] == []
+    partial = [w for w in out["warnings"] if "PARTIAL" in w]
+    assert len(partial) == 1
+    assert "1 code region(s)" in partial[0] and "1 address(es)" in partial[0]
+
+
+
 # --- #466 cross-target virtual-call slot extraction --------------------------
 
 def _vc_expr(opname, **kw):
@@ -5549,17 +5692,27 @@ def test_variadic_format_helpers(monkeypatch):
     assert il_format._count_format_conversions("%[^,],%d", is_scanf=True) == 2
 
 
-def _variadic_caller_bv(monkeypatch, instance, *, params):
-    callee = _FakeFunction(0x461746, "sscanf")
+def _variadic_caller_bv(monkeypatch, instance, *, params, name="sscanf", symbol_kind=None,
+                        varargs_fixed=None):
+    """A call from `parse_line` to *name*. `varargs_fixed=N` gives the callee a
+    recovered `(N fixed formals, ...)` prototype -- the generic variadic shape
+    with no format-family entry; `symbol_kind` its BN symbol kind."""
+    callee = _FakeFunction(0x461746, name)
+    if symbol_kind is not None:
+        callee.symbol = _FakeSymbol(symbol_kind)
+    if varargs_fixed is not None:
+        callee.set_auto_type(types.SimpleNamespace(
+            parameters=[types.SimpleNamespace(name=f"a{i}") for i in range(varargs_fixed)],
+            has_variable_arguments=True))
     caller = _FakeFunction(0x412470, "parse_line")
-    call_expr = _FakeHLILInstruction("sscanf(...)", class_name="HighLevelILCall",
+    call_expr = _FakeHLILInstruction(f"{name}(...)", class_name="HighLevelILCall",
                                      address=0x4124A0, expr_index=30, instr_index=30)
     call_expr.params = params
     call_insn = _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746), hlils=[call_expr])
     caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A4)]
     caller.low_level_il = [[call_insn]]
     bv = _FakeBV(functions=[callee, caller], instruction_lengths={0x4124A0: 4},
-                 disassembly={0x4124A0: "bl sscanf"})
+                 disassembly={0x4124A0: f"bl {name}"})
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     return bv
 
@@ -5621,6 +5774,113 @@ def test_callsites_no_variadic_hint_for_ordinary_callee(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     rows = _callsites_items(instance, "active", "memcpy", within_identifiers=["caller"], context=1)
     assert "callee_variadic" not in rows[0]
+
+
+# --- #949: a variadic prototype alone is not a format contract or a shortfall ---
+
+
+def _variadic_row(monkeypatch, **kw):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _variadic_caller_bv(monkeypatch, instance, **kw)
+    result = instance._function_evidence("active", "parse_line", context=0)
+    return result, result["calls"][0]["variadic"]
+
+
+def test_local_variadic_literal_only_call_is_not_under_recovered_949(monkeypatch):
+    """`app_log("[board]")` to a LOCAL `void app_log(const char *fmt, ...)`: its one
+    fixed formal is satisfied and nothing says how many varargs it needs. It used
+    to be flagged under-recovered and called an import."""
+    result, variadic = _variadic_row(monkeypatch, name="app_log", params=['"[board]"'],
+                                     symbol_kind="FunctionSymbol", varargs_fixed=1)
+    assert variadic["is_variadic"] is True
+    assert variadic["callee_imported"] is False
+    assert variadic["arity_status"] == "unknown"
+    assert variadic["under_recovered"] is False
+    # No invented requirement: neither a format position nor an expected count.
+    assert variadic["format_arg_index"] is None
+    assert variadic["expected_min_arg_count"] is None
+    assert "warning" not in variadic
+    assert not any("under-recovered" in w for w in result["warnings"])
+
+
+def test_generic_variadic_fixed_formal_shortfall_is_reported_949(monkeypatch):
+    """A shortfall against the prototype's own fixed formals IS demonstrated, so it
+    still warns -- without claiming a local callee is an import."""
+    result, variadic = _variadic_row(monkeypatch, name="app_log_at", params=["level"],
+                                     symbol_kind="FunctionSymbol", varargs_fixed=2)
+    assert variadic["arity_status"] == "under_recovered" and variadic["under_recovered"] is True
+    assert variadic["fixed_arg_count"] == 2 and variadic["expected_min_arg_count"] == 2
+    assert "imported" not in variadic["warning"]
+    assert any("under-recovered" in w for w in result["warnings"])
+
+
+@pytest.mark.parametrize(("symbol_kind", "imported"), [
+    ("ImportedFunctionSymbol", True),
+    ("FunctionSymbol", False),
+    (None, None),
+])
+def test_variadic_import_provenance_follows_the_symbol_kind_949(monkeypatch, symbol_kind,
+                                                                imported):
+    """The import claim reads BN's symbol kind; with no symbol it is unknown, and
+    only a callee BN calls an import is worded as one."""
+    _, variadic = _variadic_row(monkeypatch, params=["input"], symbol_kind=symbol_kind)
+    assert variadic["callee_imported"] is imported
+    assert variadic["under_recovered"] is True
+    assert ("imported" in variadic["warning"]) is bool(imported)
+
+
+@pytest.mark.parametrize(("name", "params", "status"), [
+    # a known format family whose literal has no conversions is complete
+    ("printf", ['"[board]\\n"'], "complete"),
+    # a known family whose format is not a literal says nothing about its varargs
+    ("printf", ["buf"], "unknown"),
+    # the format argument itself is missing: a demonstrated fixed shortfall
+    ("snprintf", ["dst", "n"], "under_recovered"),
+    # the parsed literal needs more than were recovered
+    ("sscanf", ["input", '"%d %d"', "&a"], "under_recovered"),
+])
+def test_known_format_family_arity_status_949(monkeypatch, name, params, status):
+    _, variadic = _variadic_row(monkeypatch, name=name, params=params)
+    assert variadic["arity_status"] == status
+    assert variadic["under_recovered"] is (status == "under_recovered")
+
+
+@pytest.mark.parametrize("kw", [
+    # the shape that used to print `variadic variadic value(s)`
+    {"name": "app_log_at", "params": ["level"], "varargs_fixed": 2},
+    {"name": "printf", "params": ['"%d %s"']},
+])
+def test_variadic_warning_names_the_role_once_949(monkeypatch, kw):
+    _, variadic = _variadic_row(monkeypatch, **kw)
+    assert variadic["under_recovered"] is True
+    assert "variadic variadic" not in variadic["warning"]
+
+
+@pytest.mark.parametrize(("symbol_kind", "imported"), [
+    ("ImportedFunctionSymbol", True),
+    ("FunctionSymbol", False),
+])
+def test_callsites_variadic_hint_provenance_949(monkeypatch, symbol_kind, imported):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "app_log")
+    callee.symbol = _FakeSymbol(symbol_kind)
+    callee.set_auto_type(types.SimpleNamespace(
+        parameters=[types.SimpleNamespace(name="fmt")], has_variable_arguments=True))
+    fn = _FakeFunction(0x500000, "caller")
+    fn.basic_blocks = [_FakeBasicBlock(0x500010, 0x500015)]
+    fn.low_level_il = [[_FakeLLILInstruction(0x500010, _FakeConstPtr(0x461746))]]
+    bv = _FakeBV(functions=[callee, fn], instruction_lengths={0x500010: 5},
+                 disassembly={0x500010: "bl app_log"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    rows = _callsites_items(instance, "active", "app_log", within_identifiers=["caller"], context=1)
+    hint = rows[0]["callee_variadic"]
+    assert hint["is_variadic"] is True and hint["family"] is None
+    assert hint["callee_imported"] is imported
+    assert ("imported" in hint["note"]) is imported
+    assert "format string" not in hint["note"]
+
 
 
 # --- #561: existing-annotation counts in the orient digest -----------------

@@ -1642,6 +1642,8 @@ def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
     assert redacted["annotation_summary"] == {
         "comment_count": 3,
         "redacted": True,
+        "hidden": 3,
+        "session_shown": 0,
     }
     assert included["text"] == text
     # The legacy map stays global-only; local bodies are collected independently.
@@ -1787,7 +1789,9 @@ def test_redact_rendered_annotations_preserves_address_gutter():
         "0x401000        // secret note\n"
         "0x401004            value = 1;"
     )
-    redacted = read_decompile._redact_rendered_annotations(text, ["secret note"])
+    redacted, _hidden, _shown = read_decompile._redact_rendered_annotations(
+        text, ["secret note"]
+    )
     assert redacted == (
         "0x401000        // <annotation redacted>\n"
         "0x401004            value = 1;"
@@ -1816,7 +1820,7 @@ def test_redact_rendered_annotations_preserves_literals_and_noncomment_spans():
         "0x401024    // <annotation redacted>\t",
     ])
 
-    assert read_decompile._redact_rendered_annotations(text, ["buf"]) == expected
+    assert read_decompile._redact_rendered_annotations(text, ["buf"])[0] == expected
 
 
 def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):
@@ -4649,10 +4653,10 @@ def test_comment_map_tolerates_dict_mutation_during_iteration_850():
     assert il_format._comment_map(_FakeBV(store), _FakeFunc()) == {"0x1000": "a comment"}
 
 
-def test_annotation_bodies_tolerate_dict_mutation_during_iteration_861():
+def test_annotation_entries_tolerate_dict_mutation_during_iteration_861():
     # #861: the SAME live-collection shape #850 fixed in `_comment_map`, at the
-    # two sites that fix did not reach. Here it is `_annotation_bodies`, which
-    # unpacked `func.comments.values()` -- a view of BN's per-function map, which
+    # two sites that fix did not reach. Here it is `_annotation_entries` (formerly
+    # `_annotation_bodies`), which unpacked `func.comments` -- a view of BN's per-function map, which
     # the analysis threads can add to while the walk is in flight. The store
     # below mutates DURING that walk (the #850 store's mechanism, walked through
     # `values()` because this site unpacked the value view), so the pre-fix code
@@ -4692,8 +4696,8 @@ def test_annotation_bodies_tolerate_dict_mutation_during_iteration_861():
 
     store = _LiveFunctionCommentStore({0x1000: "a local note"})
     # Pre-fix: RuntimeError: dictionary changed size during iteration.
-    bodies = read_decompile._annotation_bodies(_FakeFunc(store), {})
-    assert bodies == ["a local note"]
+    entries = read_decompile._annotation_entries(_FakeFunc(store), {})
+    assert [body for _key, body in entries] == ["a local note"]
 
 # ---------------------------------------------------------------------------
 # #675 item 5: return width inferred from the full register, disclosed
@@ -5514,3 +5518,543 @@ def test_defuse_discloses_only_the_calls_the_variable_feeds_797(monkeypatch):
     feeding = instance._defuse("active", "0x401000", "arg1#0")
     assert len(feeding["hints"]) == 1, feeding["hints"]
     assert "call 0x401030" in feeding["hints"][0]
+
+
+# ---------------------------------------------------------------------------
+# #955 call arity, #966 split bodies, #970 raw string pointers, #977 session
+# annotations. Small SimpleNamespace IL fakes: these detectors read only the
+# LLIL/MLIL fields named below.
+# ---------------------------------------------------------------------------
+
+
+def _op(name, **fields):
+    return types.SimpleNamespace(operation=types.SimpleNamespace(name=name),
+                                 operands=list(fields.values()), **fields)
+
+
+def _reg(name):
+    return _op("LLIL_REG", src=types.SimpleNamespace(name=name))
+
+
+def _const(value):
+    return _op("LLIL_CONST", constant=value)
+
+
+def _set_reg(name, src):
+    return _op("LLIL_SET_REG", dest=types.SimpleNamespace(name=name), src=src)
+
+
+class _Llil(list):
+    """One LLIL basic block holding every instruction, in order."""
+
+    @property
+    def instructions(self):
+        return list(self)
+
+    @property
+    def basic_blocks(self):
+        return [list(self)]
+
+
+def _aarch64_arch():
+    regs = {f"x{i}": types.SimpleNamespace(full_width_reg=f"x{i}") for i in range(31)}
+    regs.update({f"w{i}": types.SimpleNamespace(full_width_reg=f"x{i}") for i in range(31)})
+    regs["fp"] = types.SimpleNamespace(full_width_reg="fp")
+    regs["lr"] = types.SimpleNamespace(full_width_reg="lr")
+    return types.SimpleNamespace(regs=regs, link_reg="lr")
+
+
+_ARG_REGS = [f"x{i}" for i in range(8)]
+
+
+def _arity_case(monkeypatch, setup, *, rendered, raw_name, kind="ImportedFunctionSymbol",
+                signature=None, call_op="LLIL_CALL", calls=1):
+    """*calls* identical calls at 0x401040.. to an import at 0x400e00, the first
+    preceded in its block by *setup* LLIL instructions. *signature* is the
+    demangled (params, variadic)."""
+    llil = _Llil(setup)
+    for n in range(calls):
+        call = _op(call_op, dest=_op("LLIL_CONST_PTR", constant=0x400e00))
+        call.address = 0x401040 + 8 * n
+        call.mlil = types.SimpleNamespace(params=[object()] * rendered)
+        llil.append(call)
+    func = types.SimpleNamespace(
+        start=0x401000, llil=llil,
+        calling_convention=types.SimpleNamespace(int_arg_regs=_ARG_REGS),
+    )
+    symbol = types.SimpleNamespace(type=types.SimpleNamespace(name=kind),
+                                   raw_name=raw_name,
+                                   short_name=raw_name.removeprefix("_Z") + "(...)")
+    bv = types.SimpleNamespace(
+        arch=_aarch64_arch(),
+        get_symbol_at=lambda a: symbol if a == 0x400e00 else None,
+        get_function_at=lambda a: types.SimpleNamespace(name=raw_name, is_thunk=True,
+                                                        start=a),
+    )
+
+    def demangle(arch, name):
+        if signature is None:
+            raise ValueError("not mangled")
+        params, variadic = signature
+        return (types.SimpleNamespace(
+            parameters=[types.SimpleNamespace(name=p) for p in params],
+            has_variable_arguments=variadic), [name])
+
+    monkeypatch.setattr(read_decompile, "bn", types.SimpleNamespace(demangle_gnu3=demangle))
+    return bv, func
+
+
+def test_call_arity_names_a_call_rendering_fewer_arguments_than_its_signature_955(monkeypatch):
+    # f.open(path, mode): `this`, the path and the mode are all set up, but the
+    # type library's prototype for the import declares one parameter.
+    bv, func = _arity_case(
+        monkeypatch,
+        [_set_reg("w2", _const(0x11)), _set_reg("x1", _reg("x23")),
+         _set_reg("x0", _reg("sp"))],
+        rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
+        signature=(["this", "", ""], False),
+    )
+    warning = read_decompile._call_arity_warning(bv, func)
+    assert warning is not None
+    assert "0x401040" in warning and "renders 1 of 3 arguments" in warning
+    assert "x0, x1, x2" in warning
+    assert "--within 0x401000" in warning
+
+
+def test_call_arity_does_not_count_the_stack_protector_scrub_955(monkeypatch):
+    # GCC loads the canary into x1, stores it, then zeroes x1: that write is not
+    # an argument. An untyped import with one rendered argument stays silent
+    # instead of reporting the invented extra argument the issue saw.
+    store = _op("LLIL_STORE", dest=_reg("sp"), src=_reg("x1"))
+    bv, func = _arity_case(
+        monkeypatch,
+        [_set_reg("x1", _op("LLIL_LOAD", src=_reg("x0"))), store,
+         _set_reg("x1", _const(0)), _set_reg("x0", _reg("sp"))],
+        rendered=1, raw_name="widget_init",
+    )
+    assert read_decompile._call_arity_warning(bv, func) is None
+    # ...whereas the same zero WITHOUT the store before it is a real NULL argument.
+    bv, func = _arity_case(
+        monkeypatch, [_set_reg("x1", _const(0)), _set_reg("x0", _reg("sp"))],
+        rendered=1, raw_name="widget_init",
+    )
+    assert "renders 1 of 2 arguments" in read_decompile._call_arity_warning(bv, func)
+
+
+def test_call_arity_scrub_lookback_stops_at_the_previous_call_955(monkeypatch):
+    # The canary store sits before an EARLIER call in the same LLIL block (LLIL
+    # blocks do not end at calls). It cannot explain the `x1 = 0` set up for the
+    # later call: that is a real NULL argument (`basic_ios::init(nullptr)`).
+    earlier = _op("LLIL_CALL", dest=_op("LLIL_CONST_PTR", constant=0x400f00))
+    earlier.address = 0x401020
+    earlier.mlil = None
+    bv, func = _arity_case(
+        monkeypatch,
+        [_set_reg("x1", _op("LLIL_LOAD", src=_reg("x0"))),
+         _op("LLIL_STORE", dest=_reg("sp"), src=_reg("x1")),
+         _set_reg("x1", _const(0)), _set_reg("x0", _reg("sp")), earlier,
+         _set_reg("x1", _const(0)), _set_reg("x0", _reg("sp"))],
+        rendered=1, raw_name="widget_init",
+    )
+    assert "renders 1 of 2 arguments" in read_decompile._call_arity_warning(bv, func)
+
+
+def test_call_arity_skips_sized_operator_delete_955(monkeypatch):
+    # BN's type library declares `operator delete(void*)`; the size every sized
+    # delete also passes is allocator bookkeeping, not data, and it flooded the
+    # warning on ordinary C++.
+    bv, func = _arity_case(
+        monkeypatch, [_set_reg("x1", _const(0x18)), _set_reg("x0", _reg("x19"))],
+        rendered=1, raw_name="_ZdlPvm", signature=(["", ""], False),
+    )
+    assert read_decompile._call_arity_warning(bv, func) is None
+
+
+def test_call_arity_groups_repeated_calls_and_sees_stack_adjusting_calls_955(monkeypatch):
+    bv, func = _arity_case(
+        monkeypatch, [], rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
+        signature=(["this", "", ""], False), call_op="LLIL_CALL_STACK_ADJUST", calls=4,
+    )
+    warning = read_decompile._call_arity_warning(bv, func)
+    assert warning.startswith("call arity: 4 call(s)")
+    assert "(4 calls at 0x401040, 0x401048, 0x401050 and 1 more) renders 1 of 3" in warning
+    assert warning.count("renders 1 of 3") == 1
+
+
+def test_call_arity_ignores_a_register_read_before_the_call_955(monkeypatch):
+    # x1 is a temporary consumed by the x0 computation, not an argument.
+    bv, func = _arity_case(
+        monkeypatch,
+        [_set_reg("x1", _reg("x20")), _set_reg("x0", _op("LLIL_ADD", left=_reg("x1"),
+                                                          right=_const(8)))],
+        rendered=1, raw_name="widget_free",
+    )
+    assert read_decompile._call_arity_warning(bv, func) is None
+
+
+def test_call_arity_trusts_the_signature_over_a_static_members_assumed_this_955(monkeypatch):
+    # BN's demangler adds `this` to every nested name, static members included.
+    # One explicit parameter, rendered once, nothing else set up: silent.
+    bv, func = _arity_case(
+        monkeypatch, [_set_reg("x0", _const(5))],
+        rendered=1, raw_name="_ZN4demo5Clock5ticksEi",
+        signature=(["this", ""], False),
+    )
+    assert read_decompile._call_arity_warning(bv, func) is None
+
+
+def test_call_arity_reports_an_argument_the_signature_does_not_take_955(monkeypatch):
+    bv, func = _arity_case(
+        monkeypatch, [], rendered=3, raw_name="_ZN4demo6Widget5resetEv",
+        signature=(["this"], False),
+    )
+    assert "renders 3 arguments but the demangled signature takes only 1" in \
+        read_decompile._call_arity_warning(bv, func)
+    bv, func = _arity_case(
+        monkeypatch, [], rendered=3, raw_name="_Z6logfmtPKcz",
+        signature=([""], True),
+    )
+    assert read_decompile._call_arity_warning(bv, func) is None
+
+
+def _param_var(name, reg):
+    return types.SimpleNamespace(
+        name=name, storage=reg,
+        source_type=types.SimpleNamespace(name="RegisterVariableSourceType"))
+
+
+def _ref(owner_op, start):
+    """A code reference from a function at *start* whose instruction there lifts
+    as *owner_op*."""
+    owner = types.SimpleNamespace(start=start, get_llil_at=lambda a: _op(owner_op))
+    return types.SimpleNamespace(function=owner, address=start + 0x10)
+
+
+def _split_view(*, tail_mnemonics, tail_returns=True, tail_refs=None, tail_data_refs=()):
+    """build_widget @ 0x4000dc ends at 0x4000f8, where sub_4000f8 begins. Its
+    last instructions are *tail_mnemonics* (4 bytes each). By default the tail
+    returns and reset_widget tail-jumps into it -- an ordinary shared tail."""
+    arch = _aarch64_arch()
+    arch.get_reg_name = lambda storage: storage
+    arch.max_instr_length = 4
+    cc = types.SimpleNamespace(int_arg_regs=_ARG_REGS, float_arg_regs=[],
+                               callee_saved_regs=[f"x{i}" for i in range(19, 29)] + ["fp"])
+    tail = types.SimpleNamespace(start=0x4000f8, name="sub_4000f8",
+                                 symbol=None, calling_convention=cc,
+                                 parameter_vars=[_param_var("arg1", "x19")],
+                                 type=types.SimpleNamespace(parameters=[]),
+                                 can_return=tail_returns, basic_blocks=[])
+    first = 0x4000f8 - 4 * len(tail_mnemonics)
+    mnemonics = {first + 4 * i: m for i, m in enumerate(tail_mnemonics)}
+    block = types.SimpleNamespace(start=first, end=0x4000f8)
+    head = types.SimpleNamespace(
+        start=0x4000dc, name="build_widget", symbol=None, calling_convention=cc,
+        parameter_vars=[_param_var("arg1", "x0"), _param_var("arg3", "x19"),
+                        _param_var("arg5", "fp")],
+        type=types.SimpleNamespace(parameters=[]), can_return=True,
+        basic_blocks=[block],
+        get_llil_at=lambda a: _op("LLIL_CALL" if mnemonics.get(a) == "blr" else "LLIL_STORE"),
+    )
+    block.function = head
+    branches = {"ret": "FunctionReturn", "b": "UnconditionalBranch"}
+
+    def info(data, address):
+        kind = branches.get(mnemonics.get(address))
+        return types.SimpleNamespace(branches=[types.SimpleNamespace(
+            type=types.SimpleNamespace(name=kind), target=0)] if kind else [])
+
+    refs = {
+        0x4000f8: [_ref("LLIL_TAILCALL", 0x400108)] if tail_refs is None else tail_refs,
+        0x4000dc: [_ref("LLIL_CALL", 0x400120)],
+    }
+    arch.get_instruction_info = info
+    bv = types.SimpleNamespace(
+        arch=arch,
+        read=lambda a, n: b"\0" * n,
+        get_instruction_length=lambda a: 4,
+        get_disassembly=lambda a: f"{mnemonics.get(a, 'mov')}  x0, x1",
+        get_function_at=lambda a: {0x4000f8: tail, 0x4000dc: head}.get(a),
+        get_basic_blocks_at=lambda a: [block] if first <= a < 0x4000f8 else [],
+        get_code_refs=lambda a: refs.get(a, []),
+        get_data_refs=lambda a: list(tail_data_refs) if a == 0x4000f8 else [],
+    )
+    return bv, head, tail
+
+
+def test_split_body_notes_name_the_fall_through_and_saved_register_params_966():
+    bv, head, tail = _split_view(tail_mnemonics=["str"])
+    head_notes = read_decompile._split_body_notes(bv, head)
+    assert any("the block ending at 0x4000f4 runs straight into sub_4000f8 @ 0x4000f8" in n
+               for n in head_notes)
+    assert any("(arg3 @ x19, arg5 @ fp)" in n for n in head_notes)
+    # The argument register x0 is never reported.
+    assert not any("arg1 @ x0" in n for n in head_notes)
+    tail_notes = read_decompile._split_body_notes(bv, tail)
+    assert any("build_widget @ 0x4000dc runs straight into this function's entry" in n
+               for n in tail_notes)
+
+
+@pytest.mark.parametrize("tail", [["ret"], ["b"], ["blr", "nop", "nop"]])
+def test_split_body_notes_are_silent_on_an_ordinary_function_end_966(tail):
+    # A return, a branch away, or a (noreturn) call followed only by alignment
+    # padding ends the function: the next function's entry is not reached.
+    bv, head, _ = _split_view(tail_mnemonics=tail)
+    head.parameter_vars = []
+    assert read_decompile._split_body_notes(bv, head) == []
+    assert read_decompile._fallthrough_successor(bv, head) is None
+
+
+def test_disasm_discloses_where_execution_continues_966(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, head, _ = _split_view(tail_mnemonics=["str"])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda *a, **k: head)
+    monkeypatch.setattr(bridge.il_format, "_disasm_text", lambda *a, **k: "0x4000f4  str")
+    result = instance._disasm("active", "build_widget")
+    assert result["continues_into"]["address"] == "0x4000f8"
+    assert result["continues_into"]["from"] == "0x4000f4"
+    assert "bn disasm 0x4000f8" in result["continues_into"]["note"]
+
+
+@pytest.mark.parametrize("tail_refs,tail_returns", [
+    # A landing pad: nothing references it (the unwinder enters it via the LSDA).
+    ([], True),
+    # Cleanup reached only by a jump from its parent, and it never returns.
+    ([_ref("LLIL_GOTO", 0x400200)], False),
+])
+def test_eh_fragment_gets_one_note_and_no_proto_set_advice_966(tail_refs, tail_returns):
+    # The fragment's x19 is its parent's live register: dropping it with
+    # `proto set` would break the frame accesses (#985 review).
+    bv, head, tail = _split_view(tail_mnemonics=["str"], tail_returns=tail_returns,
+                                 tail_refs=tail_refs)
+    notes = read_decompile._split_body_notes(bv, tail)
+    assert len(notes) == 1 and notes[0].startswith("EH/cold fragment:")
+    assert "(arg1 @ x19)" in notes[0] and "proto set" not in notes[0]
+    # Its parent running into it is not a shared-tail split either.
+    assert read_decompile._fallthrough_successor(bv, head) is None
+    assert not any("runs straight into" in n for n in read_decompile._split_body_notes(bv, head))
+
+
+def test_callee_note_skips_an_eh_fragment_but_not_a_shared_tail_966():
+    bv, _head, tail = _split_view(tail_mnemonics=["ret"])
+    call = _op("LLIL_CALL", dest=_op("LLIL_CONST_PTR", constant=0x4000f8))
+    caller = types.SimpleNamespace(start=0x400300, llil=_Llil([call]))
+    assert len(read_decompile._callee_split_notes(bv, caller)) == 1
+    tail.type = types.SimpleNamespace(parameters=[types.SimpleNamespace(
+        type="struct _Unwind_Exception*")])
+    assert read_decompile._callee_split_notes(bv, caller) == []
+
+
+def test_jump_only_tail_gets_no_proto_set_advice_966():
+    # The tail is entered only by reset_widget's tail jump and build_widget's
+    # fall-through: its x19 is live in that code, so `proto set` advice is wrong.
+    bv, head, tail = _split_view(tail_mnemonics=["str"])
+    tail_notes = read_decompile._split_body_notes(bv, tail)
+    saved = [n for n in tail_notes if "callee-saved/link registers" in n]
+    assert len(saved) == 1 and "nothing calls this function" in saved[0]
+    assert "proto set" not in saved[0]
+    # The head IS called (from main), so its stray parameters keep the advice.
+    head_saved = [n for n in read_decompile._split_body_notes(bv, head)
+                  if "callee-saved/link registers" in n]
+    assert "drop them with `bn proto set`" in head_saved[0]
+
+
+def test_eh_fragment_chain_longer_than_three_links_966():
+    # BN chains cleanup fragments through synthetic calls; each never returns,
+    # and the chain's root is entered only by a jump.
+    chain = [types.SimpleNamespace(start=0x405600 + 0xc * i, name=f"sub_{i}",
+                                   type=types.SimpleNamespace(parameters=[]),
+                                   can_return=False) for i in range(8)]
+    for fn in chain:
+        fn.get_llil_at = lambda a: _op("LLIL_CALL")
+    refs = {chain[0].start: [_ref("LLIL_GOTO", 0x414f00)]}
+    for prev, nxt in itertools.pairwise(chain):
+        refs[nxt.start] = [types.SimpleNamespace(function=prev, address=prev.start + 4)]
+    bv = types.SimpleNamespace(get_code_refs=lambda a: refs.get(a, []),
+                               get_data_refs=lambda a: [])
+    assert read_decompile._is_eh_fragment(bv, chain[-1])
+    # ...while the same chain under a root that returns is ordinary code.
+    chain[0].can_return = True
+    refs[chain[0].start] = [_ref("LLIL_CALL", 0x400100)]
+    assert not read_decompile._is_eh_fragment(bv, chain[-1])
+
+
+@pytest.mark.parametrize("returns", [True, False])
+@pytest.mark.parametrize("data_ref", [
+    0x43b488,  # a vtable slot in .data.rel.ro
+    0x44f010,  # a callback table entry
+])
+def test_an_address_taken_function_is_called_not_a_body_piece_966(returns, data_ref):
+    # Reached only through a vtable or a function pointer: no direct call site
+    # and no jump, yet an ordinary function. Its callee-saved "parameter" is a
+    # register it saves itself, so the `proto set` advice is right, and it is
+    # neither a fragment nor "a piece of another function's body" (#985 re-review).
+    bv, _head, tail = _split_view(tail_mnemonics=["ret"], tail_returns=returns,
+                                  tail_refs=[], tail_data_refs=[data_ref])
+    assert not read_decompile._is_eh_fragment(bv, tail)
+    notes = read_decompile._split_body_notes(bv, tail)
+    assert len(notes) == 1 and "drop them with `bn proto set`" in notes[0]
+    assert "nothing calls this function" not in notes[0]
+
+
+def test_call_arity_group_counts_each_kind_of_evidence_955(monkeypatch):
+    # Two calls to one callee: the first has its set-up registers in view; the
+    # second follows it directly, so the first call ends its set-up window. The
+    # group must not describe both by the first.
+    bv, func = _arity_case(
+        monkeypatch,
+        [_set_reg("x2", _const(1)), _set_reg("x1", _const(2)), _set_reg("x0", _reg("sp"))],
+        rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
+        signature=(["this", "", ""], False), calls=1,
+    )
+    second = _op("LLIL_CALL", dest=_op("LLIL_CONST_PTR", constant=0x400e00))
+    second.address = 0x401080
+    second.mlil = types.SimpleNamespace(params=[object()])
+    func.llil.extend([second])
+    warning = read_decompile._call_arity_warning(bv, func)
+    assert "(2 calls at 0x401040, 0x401080) renders 1 of 3 arguments (" in warning
+    assert ("1 of 2: the demangled signature takes 3 with `this`; the call site writes "
+            "x0, x1, x2 just before it / 1 of 2: the demangled signature takes 3 with "
+            "`this`") in warning
+
+
+def test_a_named_unreferenced_function_is_not_an_eh_fragment_966():
+    # An exported method nothing in the binary calls has no references either;
+    # only BN's placeholder `sub_` name can be a carved-out fragment.
+    bv, _head, tail = _split_view(tail_mnemonics=["ret"], tail_refs=[])
+    assert read_decompile._is_eh_fragment(bv, tail)
+    tail.name = "_ZNSi8readsomeEPcl"
+    assert not read_decompile._is_eh_fragment(bv, tail)
+
+
+def test_running_into_a_noreturn_piece_is_not_a_split_966():
+    # BN outlines a bare `call __stack_chk_fail` as a noreturn function of its
+    # own; the block that falls into it hides no return path.
+    bv, head, _ = _split_view(tail_mnemonics=["str"], tail_returns=False,
+                              tail_refs=[_ref("LLIL_CALL", 0x400400)])
+    assert read_decompile._fallthrough_successor(bv, head) is None
+
+
+def _string_view(memory: bytes, *, semantics="ReadOnlyDataSectionSemantics", string=None,
+                 param_type="void*"):
+    """A call `put(x0, 0x402ae0)` to a callee at 0x401100 whose second
+    parameter is declared *param_type*, with *memory* at 0x402ae0."""
+    section = types.SimpleNamespace(semantics=types.SimpleNamespace(name=semantics))
+    callee = types.SimpleNamespace(type=types.SimpleNamespace(parameters=[
+        types.SimpleNamespace(type="void*"), types.SimpleNamespace(type=param_type)]))
+    bv = types.SimpleNamespace(
+        get_string_at=lambda a: string,
+        get_data_var_at=lambda a: None,
+        get_sections_at=lambda a: [section],
+        read=lambda a, n: memory[:n],
+        get_function_at=lambda a: callee if a == 0x401100 else None,
+        get_symbol_at=lambda a: None,
+    )
+    call = _op("MLIL_CALL", dest=_op("MLIL_CONST_PTR", constant=0x401100),
+               params=[_op("MLIL_VAR"), _op("MLIL_CONST_PTR", constant=0x402ae0)])
+    call.address = 0x4023dc
+    func = types.SimpleNamespace(mlil=types.SimpleNamespace(instructions=[call]))
+    return bv, func
+
+
+def test_raw_string_pointer_note_names_an_undefined_short_literal_970():
+    bv, func = _string_view(b" -n\0\x01\x02")
+    text = "    std::__ostream_insert<char>(x0, 0x402ae0);"
+    note = read_decompile._raw_string_pointer_note(bv, func, text)
+    assert note is not None
+    assert '0x402ae0 = " -n" (call at 0x4023dc)' in note
+    assert "bn data retype 0x402ae0 'char[4]'" in note
+
+
+@pytest.mark.parametrize("param_type", ["char const*", "const char*", "char*"])
+def test_raw_string_pointer_note_takes_a_short_run_passed_as_char_pointer_970(param_type):
+    bv, func = _string_view(b"/\0\0\0", param_type=param_type)
+    note = read_decompile._raw_string_pointer_note(bv, func, "    put(x0, 0x402ae0);")
+    assert note is not None and '0x402ae0 = "/"' in note
+
+
+@pytest.mark.parametrize("memory,kwargs,text", [
+    # Already rendered as a literal: the address is not in the text.
+    (b" -n\0", {}, '    std::__ostream_insert<char>(x0, " -n");'),
+    # BN defined a string there.
+    (b" -n\0", {"string": object()}, "    f(x0, 0x402ae0);"),
+    # Writable data is a buffer, not a literal.
+    (b" -n\0", {"semantics": "ReadWriteDataSectionSemantics"}, "    f(x0, 0x402ae0);"),
+    # Not printable, or not terminated within the window.
+    (b"\x01\x02\0", {}, "    f(x0, 0x402ae0);"),
+    (b"A" * 80, {}, "    f(x0, 0x402ae0);"),
+    # Printable-then-NUL data that is not a string, passed where the callee does
+    # not take a `char *` (#985 review): an int[] {0x41, ...}, a UTF-16 "hi", a
+    # struct {0x2a, 0}, and a two-byte run.
+    (b"A\0\0\0B\0\0\0", {}, "    sum_ints(0x402ae0);"),
+    (b"h\0i\0\0\0", {"param_type": "uint16_t const*"}, "    wlen(0x402ae0);"),
+    (b"*\0\0\0\0\0\0\0", {"param_type": "void const*"}, "    cfg_id(0x402ae0);"),
+    (b"ok\0", {}, "    f(x0, 0x402ae0);"),
+    # A wide or double-pointer parameter is not narrow-string evidence.
+    (b"h\0i\0\0\0", {"param_type": "wchar_t const*"}, "    f(x0, 0x402ae0);"),
+    (b"A\0", {"param_type": "char**"}, "    f(x0, 0x402ae0);"),
+])
+def test_raw_string_pointer_note_is_silent_without_an_undefined_literal_970(memory, kwargs, text):
+    bv, func = _string_view(memory, **kwargs)
+    assert read_decompile._raw_string_pointer_note(bv, func, text) is None
+
+
+def test_decompile_shows_this_sessions_comments_and_counts_hidden_ones_977(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x401000, "parse_record")
+    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401010)]
+    function.comment = "parses one record"
+    bv = _FakeBV(
+        functions=[function],
+        comments={0x401004: "dispatch on message type", 0x401008: "planted note"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    text = (
+        "void parse_record() {  // parses one record\n"
+        "    dispatch();  // dispatch on message type\n"
+        "    // planted note\n"
+        "}"
+    )
+    monkeypatch.setattr(bridge.il_format, "_decompile_text", lambda *a, **k: text)
+    instance.targets._ids_by_object[bv] = "v1"
+    instance.targets.note_session_annotations(bv, [
+        {"op": "set_comment", "status": "verified", "address": "0x401004",
+         "requested": {"comment": "dispatch on message type"}},
+        {"op": "set_comment", "status": "verified", "scope": "function_doc",
+         "address": "0x401000", "requested": {"comment": "parses one record"}},
+        # A noop set means the body was already stored: not this session's.
+        {"op": "set_comment", "status": "noop", "address": "0x401008",
+         "requested": {"comment": "planted note"}},
+    ])
+
+    result = instance._decompile("active", "parse_record")
+
+    assert result["text"] == (
+        "void parse_record() {  // [this session] parses one record\n"
+        "    dispatch();  // [this session] dispatch on message type\n"
+        "    // <annotation redacted>\n"
+        "}"
+    )
+    assert result["annotation_summary"] == {
+        "comment_count": 3, "redacted": True, "hidden": 1, "session_shown": 2,
+    }
+
+    # A verified delete forgets the location; a later inherited body there is
+    # redacted again.
+    instance.targets.note_session_annotations(bv, [
+        {"op": "delete_comment", "status": "verified", "address": "0x401004"},
+    ])
+    again = instance._decompile("active", "parse_record")
+    assert "// <annotation redacted>" in again["text"].splitlines()[1]
+    assert again["annotation_summary"]["hidden"] == 2
+
+
+def test_session_comment_body_also_stored_elsewhere_stays_redacted_977():
+    # The rendered line cannot say which store it came from, so a body that is
+    # BOTH this session's and inherited elsewhere is treated as inherited.
+    text, hidden, shown = read_decompile._redact_rendered_annotations(
+        "    a();  // same words\n    b();  // same words", ["same words"], ["same words"])
+    assert text.count("<annotation redacted>") == 2
+    assert (hidden, shown) == (2, 0)

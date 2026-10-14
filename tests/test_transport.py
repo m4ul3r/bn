@@ -1573,6 +1573,139 @@ def test_timeout_message_shows_subsecond_value(tmp_path, monkeypatch):
         send_request("ping", timeout=0.01)
 
 
+def _gate_test_instance(tmp_path):
+    from bn.transport import BridgeInstance
+
+    return BridgeInstance(
+        pid=999,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+        instance_token="test-token",
+    )
+
+
+def _scripted_bridge_sockets(monkeypatch, instance, answer):
+    """Fake sockets, one per connection, whose replies come from *answer*."""
+    import bn.transport as transport
+
+    identity = transport._instance_identity(instance)
+    sent: list[dict] = []
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, data):
+            self.request = json.loads(data.decode("utf-8"))
+            sent.append(self.request)
+            self.reply = None
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            if self.reply is None:
+                result = answer(self.request)
+                self.reply = json.dumps(
+                    {"ok": True, "result": result, "bridge_identity": identity}
+                ).encode("utf-8")
+                return self.reply
+            return b""
+
+    monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda sock, inst: None)
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: _FakeSocket())
+    return sent
+
+
+def test_request_queued_on_write_gate_prints_waiting_notice(tmp_path, monkeypatch, capsys):
+    """#976: a write that sits behind a refresh said nothing for minutes. After a
+    quiet interval the CLI asks the bridge, on a side connection, whether THIS
+    request is queued on the write gate, and says so on stderr -- while the
+    request itself keeps waiting and still returns its own result."""
+    import bn.transport as transport
+
+    instance = _gate_test_instance(tmp_path)
+    monkeypatch.setattr(transport, "choose_instance", lambda instance_id=None, **kw: instance)
+    monkeypatch.setattr(transport, "WRITE_GATE_NOTICE_AFTER", 0.05)
+    status_answered = threading.Event()
+
+    def answer(request):
+        if request["op"] == "write_gate_status":
+            result = {"kind": "write_gate_status", "request_id": request["params"]["request_id"],
+                      "waiting": True, "holder": {"op": "refresh", "elapsed_seconds": 12.0}}
+            status_answered.set()
+            return result
+        # The queued write: answers only after the notice went out.
+        assert status_answered.wait(timeout=5.0), "no write_gate_status question was asked"
+        time.sleep(0.05)
+        return {"stdout": "1\n"}
+
+    sent = _scripted_bridge_sockets(monkeypatch, instance, answer)
+
+    response = send_request("py_exec", params={"code": "print(1)"}, timeout=30)
+
+    assert response["result"] == {"stdout": "1\n"}
+    assert [p["op"] for p in sent] == ["py_exec", "write_gate_status"]
+    assert sent[1]["params"] == {"request_id": sent[0]["id"]}
+    assert sent[1].get("idle_probe") is True  # the question never asks itself
+    err = capsys.readouterr().err
+    assert "py_exec is waiting for the running refresh (started 12s ago) to finish" in err
+    assert "BN_NO_WAIT=1" in err
+
+
+def test_quick_answer_or_unqueued_request_prints_no_notice(tmp_path, monkeypatch, capsys):
+    import bn.transport as transport
+
+    instance = _gate_test_instance(tmp_path)
+    monkeypatch.setattr(transport, "choose_instance", lambda instance_id=None, **kw: instance)
+    monkeypatch.setattr(transport, "WRITE_GATE_NOTICE_AFTER", 0.05)
+
+    def answer(request):
+        if request["op"] == "write_gate_status":
+            # A slow READ is not queued on the gate: nothing to report.
+            return {"kind": "write_gate_status", "request_id": request["params"]["request_id"],
+                    "waiting": False, "holder": {"op": "refresh", "elapsed_seconds": 3.0}}
+        time.sleep(0.2)
+        return {"text": "ok"}
+
+    sent = _scripted_bridge_sockets(monkeypatch, instance, answer)
+    send_request("decompile", params={"identifier": "main"}, timeout=30)
+
+    assert [p["op"] for p in sent] == ["decompile", "write_gate_status"]
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("value, expected", [("1", True), ("yes", True), ("0", False), ("", False)])
+def test_bn_no_wait_marks_the_envelope(tmp_path, monkeypatch, value, expected):
+    """#976: BN_NO_WAIT=1 asks the bridge to refuse a write with `busy:` rather
+    than queue it; unset, the envelope carries no `no_wait` key at all."""
+    import bn.transport as transport
+
+    instance = _gate_test_instance(tmp_path)
+    monkeypatch.setattr(transport, "choose_instance", lambda instance_id=None, **kw: instance)
+    monkeypatch.setenv("BN_NO_WAIT", value)
+    sent = _scripted_bridge_sockets(monkeypatch, instance, lambda request: {})
+
+    send_request("py_exec", params={"code": "1"}, timeout=30)
+
+    assert ("no_wait" in sent[0]) is expected
+    if expected:
+        assert sent[0]["no_wait"] is True
+
+
 def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     registry_path = bridge_registry_path()
@@ -1927,6 +2060,219 @@ def test_spawn_instance_terminates_child_on_registration_timeout(monkeypatch, tm
         spawn_instance("slowkid", timeout=0.05, poll_interval=0.01)
 
     assert lifecycle[:2] == ["terminate", "wait"]
+
+
+@pytest.mark.parametrize("failure", ["deadline", "observer", "interrupt"])
+def test_spawn_instance_reaps_child_when_registration_wait_raises(monkeypatch, tmp_path, failure):
+    # #916: every exception escaping the registration wait used to bypass the
+    # reap, leaving a real child that never registered alive in its own session,
+    # invisible to `instance list/find/gc` and `session stop`. Spawn a REAL
+    # child so "reaped" is the kernel's answer, not a fake's bookkeeping.
+    import subprocess as real_subprocess
+
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(transport, "list_instances", lambda **kwargs: [])
+    monkeypatch.setattr(
+        transport,
+        "_find_bn_agent",
+        lambda: [sys.executable, "-c", "import time; time.sleep(60)"],
+    )
+    spawned: list[real_subprocess.Popen] = []
+    real_popen = real_subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(transport.subprocess, "Popen", recording_popen)
+    # A registry file under the id makes the wait consult the observer.
+    instances_dir().mkdir(parents=True, exist_ok=True)
+    bridge_registry_path("sample-1").write_text("{}", encoding="utf-8")
+
+    def observer(*args, **kwargs):
+        if failure == "deadline":
+            time.sleep(0.3)  # outlive the deadline; the NEXT check raises
+            return
+        if failure == "observer":
+            raise OSError("registry read failed")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(transport, "_load_instance", observer)
+    expected = {
+        "deadline": (BridgeError, "Timed out waiting for bridge registration"),
+        "observer": (OSError, "registry read failed"),
+        "interrupt": (KeyboardInterrupt, None),
+    }[failure]
+
+    try:
+        with pytest.raises(expected[0], match=expected[1]):
+            spawn_instance("sample-1", timeout=0.2, poll_interval=0.01)
+        assert len(spawned) == 1
+        # Reaped by the spawner itself: poll() answers without us waiting.
+        assert spawned[0].poll() is not None
+    finally:
+        for proc in spawned:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+_SPAWN_WAIT_DRIVER = """
+import inspect, os, signal, sys, time
+import bn.transport as transport
+
+pidfile, mode, signum = sys.argv[1], sys.argv[2], int(sys.argv[3])
+before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+transport.list_instances = lambda **kwargs: []
+transport._find_bn_agent = lambda: [sys.executable, "-c", "import time; time.sleep(60)"]
+real_popen = transport.subprocess.Popen
+
+def recording_popen(*args, **kwargs):
+    proc = real_popen(*args, **kwargs)
+    with open(pidfile, "w") as stream:
+        stream.write(str(proc.pid))
+    if mode == "popen":
+        # The child is running and Popen has not returned: the CLI's owner
+        # has not been entered yet.
+        os.kill(os.getpid(), signum)
+    return proc
+
+transport.subprocess.Popen = recording_popen
+
+# Act exactly on one statement of `_spawn_instance_unlocked`: deliver the
+# signal, or raise the KeyboardInterrupt a REAL SIGINT would raise there.
+triggers = {
+    "defer": ("unwind.defer()", "signal"),
+    "close-ki": ("log_file.close()", "interrupt"),
+    "restore-ki": ("unwind.restore()", "interrupt"),
+}
+if mode in triggers:
+    statement, action = triggers[mode]
+    code = transport._spawn_instance_unlocked.__code__
+    lines, first = inspect.getsourcelines(transport._spawn_instance_unlocked)
+    target = first + max(i for i, text in enumerate(lines) if text.strip() == statement)
+
+    def local(frame, event, arg):
+        if event == "line" and frame.f_lineno == target:
+            if action == "interrupt":
+                raise KeyboardInterrupt
+            os.kill(os.getpid(), signum)
+        return local
+
+    def tracer(frame, event, arg):
+        return local if frame.f_code is code else None
+
+    sys.settrace(tracer)
+
+timeout = 1.0 if mode in ("defer", "restore-ki") else 60
+try:
+    transport.spawn_instance("sample-1", timeout=timeout, poll_interval=0.05)
+except transport.BridgeError as exc:
+    print("spawn failed:", exc)
+except KeyboardInterrupt:
+    # A host that survives the interrupt (a REPL, a Client user) must still
+    # die of its own SIGTERM afterwards.
+    after = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+    print("restored:", after == before, flush=True)
+    os.kill(os.getpid(), signum)
+    time.sleep(5)
+    print("survived its own signal", flush=True)
+"""
+
+
+@pytest.mark.parametrize("mode, signum", [
+    ("external", signal.SIGTERM),  # during the registration wait
+    ("external", signal.SIGHUP),
+    ("popen", signal.SIGTERM),     # child started, owner not yet entered
+    ("defer", signal.SIGTERM),     # at the top of the reaping finally
+    ("close-ki", signal.SIGTERM),  # KeyboardInterrupt at the log close after Popen
+    ("restore-ki", signal.SIGTERM),  # KeyboardInterrupt before restore() runs
+])
+def test_signal_during_spawn_reaps_child_and_still_kills_cli(tmp_path, mode, signum):
+    # #916 review: Python's default SIGTERM/SIGHUP action runs no `finally`, so
+    # a harness timeout or a closed terminal while the CLI waited for its child
+    # to register left that never-registering child alive in its own session.
+    # The same orphan followed from a signal in either edge of the owner: while
+    # Popen was returning, or on entry to the finally's `unwind.defer()`, which
+    # let the exception skip the reap. In every window the CLI must reap the
+    # child and then still die OF the signal, as it would have without the fix.
+    # A KeyboardInterrupt in a host that catches it must not leave the host
+    # deaf to its own SIGTERM: at the log close the dispositions are restored,
+    # and handlers left behind by one that skips restore() hand the signal on.
+    pidfile = tmp_path / "child.pid"
+    env = {**os.environ, "BN_CACHE_DIR": str(tmp_path / "cache")}
+    cli = subprocess.Popen(
+        [sys.executable, "-c", _SPAWN_WAIT_DRIVER, str(pidfile), mode, str(int(signum))],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 30
+        while not (pidfile.exists() and pidfile.read_text()):
+            assert time.monotonic() < deadline, "the driver never spawned its child"
+            time.sleep(0.02)
+        child_pid = int(pidfile.read_text())
+        if mode == "external":
+            time.sleep(0.3)  # well inside the registration wait
+            cli.send_signal(signum)
+        cli.wait(timeout=15)
+
+        output = cli.stdout.read().decode(errors="replace")
+        assert cli.returncode == -signum, output
+        if mode == "close-ki":
+            assert "restored: True" in output, output
+        if mode == "restore-ki":
+            # restore() never ran, so the host died through the leftover
+            # handler handing its SIGTERM to the default action.
+            assert "restored: False" in output, output
+        # The CLI waited on its own child before re-raising the signal, so the
+        # pid is gone rather than a zombie or a reparented orphan.
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+        child_pid = None
+    finally:
+        if cli.poll() is None:
+            cli.kill()
+            cli.wait(timeout=5)
+        if child_pid is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
+
+
+def test_named_spawn_refuses_live_owner_missed_by_initial_discovery(monkeypatch, tmp_path):
+    # #916: `bn -i sample-1 load` first looks with NORMAL discovery, which hides
+    # a live bridge whose socket is not reachable yet. The spawn path must look
+    # again with include_unreachable under the spawn lock and refuse the id,
+    # never start a second bridge under it.
+    from bn.transport import BridgeInstance
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    live_owner = BridgeInstance(
+        pid=os.getpid(),
+        socket_path=tmp_path / "sample-1.sock",
+        registry_path=tmp_path / "sample-1.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0",
+        started_at=None,
+        meta={},
+        instance_id="sample-1",
+        unreachable=True,
+    )
+    monkeypatch.setattr(
+        "bn.transport.list_instances",
+        lambda **kwargs: [live_owner] if kwargs.get("include_unreachable") else [],
+    )
+
+    def no_spawn(*args, **kwargs):  # pragma: no cover - reached only on regression
+        raise AssertionError("spawned a second bridge under an occupied id")
+
+    monkeypatch.setattr("bn.transport.subprocess.Popen", no_spawn)
+
+    with pytest.raises(BridgeError, match="already exists with id: sample-1"):
+        choose_instance("sample-1", spawn_missing_named=True)
 
 
 def test_choose_instance_spawn_missing_named_spawns_new(tmp_path, monkeypatch):
