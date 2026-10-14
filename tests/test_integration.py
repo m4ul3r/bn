@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import struct
@@ -507,6 +508,61 @@ class TestBatchManifestTarget:
         assert payload["preview"] is True
         assert payload["results"][0]["status"] == "verified"
 
+    def test_a_name_an_earlier_op_renamed_names_the_rename_975(self, shared_bn, tmp_path):
+        """#975: a later op that names a function by the `sub_<addr>` spelling an
+        earlier op in the same batch replaced must say so -- not offer
+        close-but-unrelated "Did you mean" functions, which reads as a wrong
+        address. Stripped, so the name is BN's synthesized one: a named ELF
+        symbol would keep resolving after the rename and hide the defect.
+
+        The hint must stay silent when the name still resolves -- a round trip
+        gave it back, or a later rename reused it for another function -- and
+        the op failed for its own reason; otherwise it buries that reason and
+        points at the function the name used to denote."""
+        stripped = tmp_path / "add_stripped"
+        build = subprocess.run(["strip", "-o", str(stripped), str(ADD_BINARY)],
+                               capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        shared_bn.load(stripped, copy=False)
+        autos = [f for f in shared_bn.json("function", "list", "--limit", "500")["items"]
+                 if f["name"].startswith("sub_")]
+        (old, address), (other, _) = [(f["name"], f["address"]) for f in autos[:2]]
+
+        def failed_row(*ops):
+            manifest = tmp_path / "batch.json"
+            manifest.write_text(json.dumps({"ops": list(ops)}), encoding="utf-8")
+            result = shared_bn.run("batch", "apply", str(manifest), "--preview",
+                                   "--format", "json")
+            assert result.returncode == 3, (result.stdout, result.stderr)
+            payload = json.loads(result.stdout)
+            assert payload["rolled_back"] is True
+            return payload["results"][len(ops) - 1]
+
+        def rename(src, dst):
+            return {"op": "rename_symbol", "identifier": src, "new_name": dst}
+
+        failed = failed_row(rename(old, "handle_request"),
+                            {"op": "set_comment", "function": old, "comment": "entry"})
+        assert failed["status"] == "unsupported"
+        assert "Did you mean" not in failed["message"]
+        assert (f"operation 0 of this batch renamed {old} (at {address}) to "
+                "handle_request") in failed["message"], failed["message"]
+
+        def bad_local(fn):
+            return {"op": "local_rename", "function": fn, "variable": "no_such_var",
+                    "new_name": "unused"}
+
+        for ops in (
+            # Round trip: the name is back, so it resolves.
+            (rename(old, "foo"), rename("foo", old), bad_local(old)),
+            # Reuse: `alpha` now names the OTHER function.
+            (rename(old, "alpha"), rename("alpha", "gamma"), rename(other, "alpha"),
+             bad_local("alpha")),
+        ):
+            failed = failed_row(*ops)
+            assert "no_such_var" in failed["message"], failed["message"]
+            assert "of this batch renamed" not in failed["message"], failed["message"]
+
 
 class TestProtoSetUnnamedParams:
     """Regression for #254: a `proto set` whose prototype omits parameter names
@@ -898,6 +954,209 @@ class TestTypesDeclareBitfield:
         assert res.returncode == 0, f"unexpected rejection: {res.stdout}\n{res.stderr}"
         parsed = json.loads(res.stdout)
         assert parsed["results"][0]["status"] == "verified", parsed["results"]
+
+
+class TestTypeStringsAndInheritance:
+    """#961 / #962 / #964 / #965 against BN's real type system: member objects
+    that are fresh on every access, a `::`-qualified type registered under its
+    component list, a parser that drops C++ base clauses, and the per-type
+    declare summary. None of these can be modelled faithfully by the fakes."""
+
+    def test_retype_field_under_its_own_name(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct Probe961 { void* vtable; int field; };")
+        res = shared_bn.run("struct", "field", "set", "Probe961", "0", "vtable", "void**",
+                            "--format", "json")
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        assert json.loads(res.stdout)["results"][0]["status"] == "verified"
+        assert "void** vtable" in shared_bn.run("struct", "show", "Probe961").stdout
+
+    def test_tagged_and_backticked_qualified_field_types_resolve(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct Probe962 { void* vtable; int field; };")
+        # Registered the way a recovered C++ type is: under its component list.
+        shared_bn.json("py", "exec", "--code",
+                       "import binaryninja as bn\n"
+                       "s = bn.StructureBuilder.create()\n"
+                       "s.append(bn.Type.pointer(bv.arch, bn.Type.void()), 'slot0')\n"
+                       "bv.define_user_type(bn.QualifiedName(['demo', 'Widget', 'VTable']),"
+                       " bn.Type.structure_type(s))\n")
+        for spelling in ("struct demo::Widget::VTable*", "struct `demo::Widget::VTable`*",
+                         "demo::Widget::VTable*"):
+            res = shared_bn.run("struct", "field", "set", "Probe962", "0", "vtable", spelling,
+                                "--format", "json")
+            assert res.returncode == 0, f"{spelling}: {res.stdout}\n{res.stderr}"
+        assert "struct demo::Widget::VTable* vtable" in shared_bn.run(
+            "struct", "show", "Probe962").stdout
+        # A tag keyword that contradicts the type's kind fails, naming the spelling.
+        bad = shared_bn.run("struct", "field", "set", "Probe962", "0", "vtable",
+                            "union demo::Widget::VTable*", "--format", "json")
+        assert bad.returncode == 3, bad.stdout
+        assert "struct `demo::Widget::VTable`" in bad.stdout, bad.stdout
+        # An unquoted qualified name in a declaration body gets its spelling.
+        res = shared_bn.run("types", "declare", "struct Holder962 { demo::Widget::VTable* v; };",
+                            "--format", "json")
+        assert res.returncode == 3, res.stdout
+        assert "struct `demo::Widget::VTable`" in res.stdout, res.stdout
+
+    # The base shapes from the third #989 review's matrix (every shape but the
+    # bit-field ones, which the bitfield guard refuses outright), each as the
+    # `types declare` steps it was declared in. Bases from the same declaration
+    # and from earlier ones, empty, virtual, `final`, `alignas`/`__attribute__`
+    # heads, private/protected members, multiple inheritance.
+    _BASE_SHAPES = [
+        ['struct e02_A { long long a; long long b; };', 'struct e02_D : e02_A { char e; };'],
+        ['struct e03_A { long long a; char c; };', 'struct e03_D : e03_A { char e; };'],
+        ['struct e04_E { };', 'struct e04_D : e04_E { int x; };'],
+        ['struct e05_A { long long a; }; struct e05_B { long long b; };', 'struct e05_D : e05_A, e05_B { char e; };'],
+        ['struct e05b_A { long long a; };', 'struct e05b_B { long long b; }; struct e05b_D : e05b_A, e05b_B { char e; };'],
+        ['struct e17_A { long long a; }; struct e17_B : e17_A { long long b; };', 'struct e17_C : e17_B { long long c; };', 'struct e17_D : e17_C { char e; };'],
+        ['struct alignas(16) e18_A { long long a; };', 'struct e18_D : e18_A { char e; };'],
+        ['struct alignas(16) e18b_A { long long a; long long b; };', 'struct e18b_D : e18b_A { char e; };'],
+        ['struct e19_A { long long a; long long b; };', 'struct alignas(32) e19_D : e19_A { char e; };'],
+        ['struct e20_A { long long a; long long b; };', 'struct __attribute__((packed)) e20_D : e20_A { char e; int f; };'],
+        ['struct e22_B { int b; };', 'struct e22_D : virtual e22_B { int x; };'],
+        ['class e25_K { long long a; long long b; };', 'struct e25_D : e25_K { char e; };'],
+        ['class e37_Z { long long a; char c; };', 'struct e37_A : e37_Z { char d[8]; };', 'struct e37_D : e37_A { char e; };'],
+        ['class e43r_Z { long long a; char c; };', 'struct alignas(8) e43r_A : e43r_Z { char d[8]; };', 'struct e43r_D : e43r_A { char e; };'],
+        ['struct e44_Z { long long z; }; struct e44_A : e44_Z { char c; }; struct e44_B : e44_A { char d; };', 'struct e44_D : e44_B { char e; };'],
+        ['struct e45_Z { long long z; }; struct e45_A : e45_Z { char c; }; struct e45_B : e45_A { };', 'struct e45_D : e45_B { char e; };'],
+        ['struct r2fd_F1 {}; struct r2fd_F2 {};', 'struct r2fd_FD2 : r2fd_F1, r2fd_F2 { int x; };'],
+        ['struct r2fdx_F1 {}; struct r2fdx_F2 {};', 'struct r2fdx_FD2 : r2fdx_F1, r2fdx_F2 { int x; };'],
+        ['class r2ke_KP { long long a; char c; };', 'struct r2ke_KX { char x; }; struct r2ke_KE : r2ke_KP, r2ke_KX { char e; };'],
+        ['class r2kex_KP { long long a; char c; };', 'struct r2kex_KX { char x; }; struct r2kex_KE : r2kex_KP, r2kex_KX { char e; };'],
+        ['struct r2oe_OA { long long a; char c; }; struct r2oe_OB : r2oe_OA { char d; }; struct r2oe_OM { r2oe_OB m; char z; };', 'struct r2oe_OX { char x; }; struct r2oe_OE : r2oe_OM, r2oe_OX { char e; };'],
+        ['struct r2oex_OA { long long a; char c; }; struct r2oex_OB : r2oex_OA { char d; }; struct r2oex_OM { r2oex_OB m; char z; };', 'struct r2oex_OX { char x; }; struct r2oex_OE : r2oex_OM, r2oex_OX { char e; };'],
+        ['struct r2qc_MA { long long a; char c; }; struct r2qc_MB : r2qc_MA { char d; };', 'struct r2qc_QC : r2qc_MB { char e; };'],
+        ['struct r2qcx_MA { long long a; char c; }; struct r2qcx_MB : r2qcx_MA { char d; };', 'struct r2qcx_QC : r2qcx_MB { char e; };'],
+        ['struct r2t5_A5 { long long a; char c; }; struct r2t5_B5 : r2t5_A5 { char d; };', 'struct r2t5_X5 { char x; }; struct r2t5_Y5 { short y; }; struct r2t5_T5 : r2t5_X5, r2t5_Y5, r2t5_B5 { char e; };'],
+        ['struct r2t5x_A5 { long long a; char c; }; struct r2t5x_B5 : r2t5x_A5 { char d; };', 'struct r2t5x_X5 { char x; }; struct r2t5x_Y5 { short y; }; struct r2t5x_T5 : r2t5x_X5, r2t5x_Y5, r2t5x_B5 { char e; };'],
+        ['struct s01_A { int a; }; struct s01_D : s01_A { char e; };'],
+        ['struct s06_A { long long a; char c; }; struct s06_B : s06_A { char d; }; struct s06_X { char x; }; struct s06_D : s06_B, s06_X { char e; };'],
+        ['struct s07_E { }; struct s07_D : s07_E { int x; };'],
+        ['struct s08_N { int a; }; struct s08_E { }; struct s08_D : s08_N, s08_E { int x; };'],
+        ['struct s08b_E { }; struct s08b_D : s08b_E { };'],
+        ['class s09_K { long long a; char c; }; struct s09_D : s09_K { char e; };'],
+        ['struct s10_K { protected: long long a; char c; }; struct s10_D : s10_K { char e; };'],
+        ['struct s10b_K { long long a; private: char c; }; struct s10b_D : s10b_K { char e; };'],
+        ['struct s11_A { long long a; char c = 1; }; struct s11_D : s11_A { char e; };'],
+        ['struct s12_A { long long& r; char c; }; struct s12_D : s12_A { char e; };'],
+        ['struct s13_A { long long a; const char c; }; struct s13_D : s13_A { char e; };'],
+        ['struct s18c_A { char c; alignas(16) char d; }; struct s18c_D : s18c_A { char e; };'],
+        ['struct s21_B { int b; }; struct s21_D : virtual s21_B { int x; };'],
+        ['struct s23_A { long long a; long long b; }; struct s23_D : s23_A { virtual void f(); int y; };'],
+        ['struct s24_A { long long a; long long b; }; struct s24_D : s24_A { int get(); int y; };'],
+        ['struct s35_E { }; struct s35_F : s35_E { int x; }; struct s35_D : s35_E, s35_F { int y; };'],
+        ['struct s35r_E { }; struct s35r_F : s35r_E { int x; }; struct s35r_D : s35r_E, s35r_F { int y; };'],
+        ['struct s38_A { long long a; char c; }; class s38_B : public s38_A { char d; }; struct s38_D : s38_B { char e; };'],
+        ['struct s38r_A { long long a; char c; }; class s38r_B : public s38r_A { char d; }; struct s38r_D : s38r_B { char e; };'],
+        ['struct s39_A { int a; }; struct s39_B { int b; }; struct s39_D : public s39_A, private s39_B { int x; };'],
+        ['struct s39r_A { int a; }; struct s39r_B { int b; }; struct s39r_D : public s39r_A, private s39r_B { int x; };'],
+        ['struct s40_A { long long a; char c; }; struct s40_B : s40_A { }; struct s40_D : s40_B { char e; };'],
+        ['struct s41_A { char c; }; struct s41_B { long double ld; }; struct s41_D : s41_A, s41_B { char e; };'],
+        ['struct s42_A { int a; }; struct s42_D final : s42_A { char e; };'],
+        ['struct s46_Z { long long z; }; struct s46_A : s46_Z { char c; }; struct s46_B : s46_A { char d; }; struct s46_D : s46_B { char e; };'],
+        ['struct t00_A { long long a; long long b; };', 'struct t00_D : t00_A { char e; };'],
+    ]
+
+    _DERIVED_HEAD_RE = re.compile(
+        r"\b(?:struct|class)\s+(?:alignas\(\d+\)\s*|__attribute__\(\(\w+\)\)\s*)*"
+        r"(\w+)(?:\s+final)?\s*:(?!:)")
+
+    def test_declared_bases_are_never_recorded_and_always_listed(self, shared_bn):
+        """#965 is split out of #989: three reviews found base layouts bn
+        reconstructed wrong. Until it lands, bn records NO C++ base -- and must
+        not drop one silently either. For every shape of the third review's
+        matrix: no struct carries `bases`, and every struct with a base clause
+        is named in that step's `unattached_bases` with the #965 reason; the
+        derived struct itself is still declared (counted per type, #964)."""
+        shared_bn.load(HELLO_BINARY)
+        for steps in self._BASE_SHAPES:
+            for step in steps:
+                expected = set(self._DERIVED_HEAD_RE.findall(step))
+                summary = shared_bn.json("types", "declare", step, "--summary")
+                declared = summary["declared_types"]
+                unattached = declared.get("unattached_bases") or {}
+                assert set(unattached) == expected, (step, unattached)
+                assert all("see #965" in why for why in unattached.values()), unattached
+                for name in expected:
+                    assert name in declared["names"], (step, declared)
+                    assert "bases" not in shared_bn.json("types", "show", name), (step, name)
+
+    def test_struct_show_renders_bases_binary_ninja_records(self, shared_bn):
+        """`struct show` still renders the bases a type ALREADY carries in BN
+        (debug info, a plugin, the API) -- only bn's own reconstruction is gone."""
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct Base965 { void* vtable; int x; };")
+        shared_bn.json("py", "exec", "--code",
+                       "import binaryninja as bn\n"
+                       "s = bn.StructureBuilder.create(width=0x18)\n"
+                       "s.insert(0x10, bn.Type.int(4), 'y')\n"
+                       "s.base_structures = [bn.BaseStructure(bn.NamedTypeReferenceType.create("
+                       "bn.NamedTypeReferenceClass.StructNamedTypeClass, None, 'Base965'), 0, 0x10)]\n"
+                       "bv.define_user_type('Derived965', bn.Type.structure_type(s))\n")
+        shown = shared_bn.run("struct", "show", "Derived965").stdout
+        assert shown.splitlines() == [
+            "struct Derived965 : Base965 // size=0x18",
+            "0x0000: void* vtable  [from Base965]",
+            "0x0008: int32_t x  [from Base965]",
+            "0x0010: int32_t y",
+        ], shown
+        card = shared_bn.json("struct", "show", "Derived965")
+        assert card["bases"] == [{"name": "Base965", "offset": "0x0", "width": "0x10"}], card
+        assert [(m["offset"], m["name"]) for m in card["inherited_members"]] == [
+            ("0x0", "vtable"), ("0x8", "x")], card
+
+    def test_reference_only_declarations(self, shared_bn):
+        """#989 review: a forward declaration of an existing type is a no-op (it
+        used to apply the clobbering stub, then briefly exited 3); a misspelled
+        mention is created but disclosed as `created_by_reference`."""
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct Fwd989 { long a; };")
+        res = shared_bn.run("types", "declare", "struct Fwd989;", "--format", "json")
+        assert res.returncode == 0, res.stdout
+        assert json.loads(res.stdout)["results"][0]["status"] == "noop"
+        assert "int64_t a" in shared_bn.run("struct", "show", "Fwd989").stdout
+        summary = shared_bn.json("types", "declare",
+                                 "struct Use989 { struct Fwd989* f; struct Fwdd989* typo; };", "--summary")
+        assert summary["declared_types"]["referenced_existing"] == ["Fwd989"], summary
+        assert summary["declared_types"]["created_by_reference"] == ["Fwdd989"], summary
+        # The bare-mention stub is not counted as declared.
+        assert summary["declared_types"]["names"] == ["Use989"], summary
+        # A type only a loaded type library defines is not shadowed by an empty
+        # user stub (libc's `struct timespec` on this dynamically linked fixture).
+        lib = shared_bn.json("types", "declare", "struct Lib989 { struct timespec* ts; };", "--summary")
+        assert lib["declared_types"]["referenced_existing"] == ["timespec"], lib
+        assert shared_bn.run("types", "show", "timespec").returncode == 2
+        # A header of only forward declarations of library types is a noop too.
+        fwd = shared_bn.run("types", "declare", "struct timespec;", "--format", "json")
+        assert fwd.returncode == 0, fwd.stdout
+        assert json.loads(fwd.stdout)["results"][0]["status"] == "noop"
+        assert shared_bn.run("types", "show", "timespec").returncode == 2
+
+    def test_typed_vptr_keeps_bn_vtable_and_renders_named_virtual_call(self, shared_bn):
+        """#963: BN's parser returns a type a declaration only references as an
+        EMPTY named struct; defining it overwrote BN's own `...::VTable` with a
+        0-byte stub, so the typed vptr led nowhere and the virtual call in
+        `svc::dispatch` stayed a raw `*(this + 0x10)`."""
+        shared_bn.load(CLASSES_BINARY)
+        vtable = "svc::Handler::svc::EchoHandler::VTable"
+        miss = shared_bn.run("struct", "show", "svc::Handler")
+        assert miss.returncode == 2
+        assert "No struct named svc::Handler is defined" in miss.stderr + miss.stdout
+        before = shared_bn.json("types", "show", vtable)
+        declared = shared_bn.json(
+            "types", "declare", f"struct `svc::Handler` {{ struct `{vtable}`* vtable; }};")
+        row = declared["results"][0]
+        assert list(row["defined_types"]) == ["svc::Handler"], row
+        assert row["referenced_existing_types"] == [vtable], row
+        assert shared_bn.json("types", "show", vtable)["layout"] == before["layout"]
+
+        locals_ = shared_bn.json("local", "list", "svc::dispatch")
+        this = next(v for v in locals_["items"] if v["is_parameter"] and v["name"] == "this")
+        shared_bn.json("local", "retype", "svc::dispatch", this["local_id"], "struct `svc::Handler`*")
+        text = shared_bn.json("decompile", "svc::dispatch")["text"]
+        assert "this->vtable->handle(" in text, text
 
 
 class TestDisasmLinear:

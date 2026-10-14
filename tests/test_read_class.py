@@ -1371,7 +1371,7 @@ def test_render_class_show_lists_non_virtual_methods_and_empty_vtable_note():
     from bn.formatters import _render_class_show_text
     rec = {
         "name": "Controller", "confidence": "rtti", "size": None,
-        "vtable": {"address": "0x4b6270", "slots": []},
+        "vtable": {"address": "0x4b6270", "slots": [], "truncated_reason": "no_local_vtable_body"},
         "bases": [], "instances": {"construction_sites": [], "stored_globals": []},
         "methods": [
             {"kind": "method", "address": "0x401000", "demangled": "Controller::setAudioFocus(int)"},
@@ -1381,7 +1381,11 @@ def test_render_class_show_lists_non_virtual_methods_and_empty_vtable_note():
     text = _render_class_show_text(rec)
     assert "methods (2):" in text
     assert "0x401000  Controller::setAudioFocus(int)" in text
-    assert "vtable: symbol present but no slots resolved here" in text
+    # #960: the note states what is known -- slots not proven, with the reason
+    # code and next step -- and no longer guesses "another module".
+    assert ("vtable: symbol present, slots not proven (no_local_vtable_body); "
+            "inspect the table with `bn evidence table 0x4b6270`") in text
+    assert "another module" not in text
 
 
 def test_render_class_show_no_vtable_note_when_no_vtable():
@@ -1389,7 +1393,7 @@ def test_render_class_show_no_vtable_note_when_no_vtable():
     rec = {"name": "GalMutex", "confidence": "ctor", "size": None,
            "vtable": None, "bases": [], "methods": [],
            "instances": {"construction_sites": [], "stored_globals": []}}
-    assert "no slots resolved" not in _render_class_show_text(rec)
+    assert "slots not proven" not in _render_class_show_text(rec)
 
 
 def test_render_construction_site_includes_function():
@@ -1536,6 +1540,49 @@ def test_is_type_expression_name_481():
     assert not f("std::vector<int>")           # template args stripped
     assert not f("std::__cxx11::basic_string<char, std::char_traits<char> >")
     assert not f("Outer<Foo, Bar>::Inner")     # template with comma inside <>
+
+
+def test_fundamental_and_enum_typeinfo_rows_are_non_class_artifacts_960():
+    """#960: BN demangles `_ZTIi` as `typeinfo for int32_t`, which the keyword set
+    of #481 did not know, so the row listed as a class -- and with a vtable a
+    neighbouring object lent it, the no-vtable condition kept it untagged too. An
+    enum's typeinfo is named like a class; only its ABI selector says otherwise."""
+    def rec(name, *, vtable=None, abi=None, methods=()):
+        return {"name": name, "confidence": "rtti", "vtable": vtable,
+                "methods": list(methods), "typeinfo_abi": abi}
+    f = read_class._is_non_class_rtti_artifact
+    for name in ("int32_t", "uint8_t", "uint64_t", "int128_t", "float128", "std::nullptr_t"):
+        assert f(rec(name)), name
+    assert f(rec("int32_t", vtable={"address": "0x41fd08"}))   # a lent vtable doesn't make a class
+    assert f(rec("example::example_err_t", abi="nonclass"))    # enum: the selector decides
+    assert not f(rec("example::Session", vtable={"address": "0x401100"}, abi="si"))
+    assert not f(rec("example::Plain"))                          # typeinfo-only real class
+    assert not f({**rec("int32_t"), "confidence": "declared"})   # a user's declaration
+
+
+def test_rtti_bases_trusts_the_typeinfo_selector_960():
+    """#960: a fundamental/enum typeinfo is two words long, so structural layout
+    inference read the NEXT object as an `si` base. The ABI selector the vptr
+    names must be consulted first: a non-class typeinfo has no bases."""
+    ptr = 8
+    vtables = {0x5000: "vtable for __cxxabiv1::__enum_type_info",
+               0x6000: "vtable for __cxxabiv1::__si_class_type_info"}
+    # typeinfo @0x1000 (enum): vptr -> 0x5010; the next object's typeinfo ptr
+    # sits where an si base would be. typeinfo @0x2000 (si class): base 0x3000.
+    words = {0x1000: 0x5010, 0x1010: 0x3000, 0x2000: 0x6010, 0x2010: 0x3000}
+    names = {0x3000: "std::basic_ios<char>", 0x1000: "example::example_err_t",
+             0x2000: "example::Session"}
+    ctx = types.SimpleNamespace(
+        _pointer_size=lambda bv: ptr,
+        _read_pointer_value=lambda bv, addr, size=8: words.get(addr, 0),
+        _typeinfo_name_at=lambda bv, addr: names.get(addr),
+        _read_u32=lambda bv, addr: 0,
+    )
+    bv = types.SimpleNamespace(get_symbol_at=lambda a: (
+        types.SimpleNamespace(short_name=vtables[a], raw_name="") if a in vtables else None))
+    assert read_class._typeinfo_abi_kind(ctx, bv, 0x1000, ptr) == "nonclass"
+    assert read_class._rtti_bases(ctx, bv, 0x1000) == []
+    assert [b["name"] for b in read_class._rtti_bases(ctx, bv, 0x2000)] == ["std::basic_ios<char>"]
 
 
 def test_rtti_symbol_maps_prefers_local_definition_over_alias_529():

@@ -133,4 +133,4 @@ def _type_info(ctx, selector: str | None, type_name: str, *, require_struct: boo
             )
         if getattr(type_obj, "members", None) is None:
             raise RuntimeError(f"Type is not a struct-like type: {resolved_name}")
-    return ctx._type_entry(resolved_name, type_obj)
+    return ctx._type_entry(resolved_name, type_obj, bv)
