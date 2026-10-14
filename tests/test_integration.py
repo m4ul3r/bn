@@ -974,6 +974,85 @@ class TestTypeStringsAndInheritance:
             ("0x0", "vtable"), ("0x8", "x"), ("0x10", "vtable"), ("0x18", "x"), ("0x20", "m")]
         assert two["members"] == [{"name": "c", "offset": "0x24", "type": "char"}], two
 
+    _LAYOUT_PROBE = r"""
+#include <cstdio>
+#include <cstddef>
+struct MA { long long a; char c; };
+struct MB : MA { char d; };
+struct PX { char x; };
+struct PC : MB, PX { char e; };
+struct QC : MB { char e; };
+#define BASE(D, B) (long)((char*)static_cast<B*>((D*)0x1000) - (char*)0x1000)
+int main() {
+    std::printf("PC.MB=%ld PC.PX=%ld PC.e=%ld PC.size=%zu\n", BASE(PC, MB), BASE(PC, PX),
+                (long)offsetof(PC, e), sizeof(PC));
+    std::printf("QC.MB=%ld QC.e=%ld\n", BASE(QC, MB), (long)offsetof(QC, e));
+}
+"""
+
+    def test_bases_match_the_cxx_abi_or_are_not_recorded(self, shared_bn, tmp_path):
+        """#989 review blocker: with `MB : MA` declared FIRST, `PC : MB, PX`
+        recorded `PX` at 0x11 while BN's parser had laid the struct out with
+        `PX` at 0x18 (it treats a view base as a plain C struct), reported
+        `verified`. Every base offset that is recorded must be the one g++
+        gives; a struct whose parsed layout matches neither is declared without
+        bases and named in `unattached_bases`."""
+        cxx = shutil.which("c++") or shutil.which("g++")
+        assert cxx is not None, "a C++ compiler is required for the base-layout regression"
+        source = tmp_path / "layout.cpp"
+        source.write_text(self._LAYOUT_PROBE)
+        probe = tmp_path / "layout"
+        built = subprocess.run([cxx, "-Wno-invalid-offsetof", "-o", str(probe), str(source)],
+                               capture_output=True, text=True, timeout=120)
+        assert built.returncode == 0, built.stderr
+        gxx = dict(kv.split("=") for kv in subprocess.run(
+            [str(probe)], capture_output=True, text=True, check=True).stdout.split())
+
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct MA { long long a; char c; }; struct MB : MA { char d; };")
+        summary = shared_bn.json(
+            "types", "declare",
+            "struct PX { char x; }; struct PC : MB, PX { char e; }; struct QC : MB { char e; };",
+            "--summary")
+        assert list(summary["declared_types"]["unattached_bases"]) == ["PC"], summary
+        assert "bases" not in shared_bn.json("types", "show", "PC")
+        qc = shared_bn.json("types", "show", "QC")
+        assert [(b["name"], int(b["offset"], 16)) for b in qc["bases"]] == [("MB", int(gxx["QC.MB"]))]
+        # PX would have to sit where g++ puts it for any record to be honest.
+        assert int(gxx["PC.PX"]) == 0x11
+
+        # Declared together, the parser knows MB derives from MA, lays the
+        # struct out as g++ does, and every recorded offset matches g++.
+        shared_bn.json(
+            "types", "declare",
+            "struct SA { long long a; char c; }; struct SB : SA { char d; }; struct SX { char x; }; "
+            "struct SC : SB, SX { char e; };")
+        sc = shared_bn.json("types", "show", "SC")
+        assert [(b["name"], int(b["offset"], 16)) for b in sc["bases"]] == [
+            ("SB", int(gxx["PC.MB"])), ("SX", int(gxx["PC.PX"]))]
+        assert [(m["name"], int(m["offset"], 16)) for m in sc["members"]] == [("e", int(gxx["PC.e"]))]
+        assert int(sc["layout"].split("size=")[1].split()[0], 16) == int(gxx["PC.size"])
+
+    def test_reference_only_declarations(self, shared_bn):
+        """#989 review: a forward declaration of an existing type is a no-op (it
+        used to apply the clobbering stub, then briefly exited 3); a misspelled
+        mention is created but disclosed as `created_by_reference`."""
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct Fwd989 { long a; };")
+        res = shared_bn.run("types", "declare", "struct Fwd989;", "--format", "json")
+        assert res.returncode == 0, res.stdout
+        assert json.loads(res.stdout)["results"][0]["status"] == "noop"
+        assert "int64_t a" in shared_bn.run("struct", "show", "Fwd989").stdout
+        summary = shared_bn.json("types", "declare",
+                                 "struct Use989 { struct Fwd989* f; struct Fwdd989* typo; };", "--summary")
+        assert summary["declared_types"]["referenced_existing"] == ["Fwd989"], summary
+        assert summary["declared_types"]["created_by_reference"] == ["Fwdd989"], summary
+        # A type only a loaded type library defines is not shadowed by an empty
+        # user stub (libc's `struct timespec` on this dynamically linked fixture).
+        lib = shared_bn.json("types", "declare", "struct Lib989 { struct timespec* ts; };", "--summary")
+        assert lib["declared_types"]["referenced_existing"] == ["timespec"], lib
+        assert shared_bn.run("types", "show", "timespec").returncode == 2
+
     def test_typed_vptr_keeps_bn_vtable_and_renders_named_virtual_call(self, shared_bn):
         """#963: BN's parser returns a type a declaration only references as an
         EMPTY named struct; defining it overwrote BN's own `...::VTable` with a

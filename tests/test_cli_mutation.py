@@ -79,6 +79,23 @@ def test_types_declare_summary_counts_types_not_ops():
     assert "\ntypes: 12 declared (T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, +2 more)" in text
     assert "\nbases not recorded: T3: virtual base" in text
 
+    # Referenced-only types are not counted as declared; they and the empty
+    # types created by a bare mention are listed separately.
+    refs = _mutation_summary({"success": True, "committed": True, "rolled_back": False, "results": [
+        {"op": "types_declare", "status": "verified",
+         "defined_types": {"Holder": "struct Holder", "Alpah": "struct Alpah"},
+         "referenced_existing_types": ["Alpha"], "created_by_reference": ["Alpah"]}]})
+    assert refs["declared_types"]["count"] == 2
+    assert refs["declared_types"]["referenced_existing"] == ["Alpha"]
+    assert refs["declared_types"]["created_by_reference"] == ["Alpah"]
+    refs_text = _render_mutation_summary_text(refs)
+    assert "\nreferenced, left unchanged: Alpha" in refs_text
+    assert "\ncreated empty (only mentioned, never defined -- check the spelling): Alpah" in refs_text
+    noop = _mutation_summary({"success": True, "committed": True, "rolled_back": False, "results": [
+        {"op": "types_declare", "status": "noop", "defined_types": {"Alpha": "struct Alpha"},
+         "referenced_existing_types": ["Alpha"]}]})
+    assert noop["declared_types"]["count"] == 0 and noop["declared_types"]["names"] == []
+
     failed = _mutation_summary({"success": False, "committed": False, "rolled_back": True,
                                 "results": [{"op": "types_declare", "status": "invalid_request",
                                              "message": "could not parse declaration"}]})

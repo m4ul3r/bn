@@ -815,18 +815,27 @@ def test_declaration_references_to_existing_types_are_not_redefined(monkeypatch)
     alpha = _FakeType("struct Alpha", width=8, members=[_FakeMember(0, "a", "long")])
     bv = _FakeBV(functions=[], types_={"ns::W::VTable": vtable, "Alpha": alpha})
 
+    class _Library:
+        def get_named_type(self, name):
+            return _FakeType("struct timespec", width=16) if name == "timespec" else None
+
+    bv.type_libraries = [_Library()]
+
     def stub(name):
         return _FakeType(f"struct {name}", width=0, members=[])
 
     holder = _FakeType("struct ns::W", width=8, members=[_FakeMember(0, "vtable", "void*")])
-    declaration = ("struct `ns::W` { struct `ns::W::VTable`* vtable; }; struct Fresh; "
-                   "struct Alpha { long a; long b; };")
-    parsed = [("ns::W", holder), ("ns::W::VTable", stub("ns::W::VTable")), ("Fresh", stub("Fresh")),
-              ("Alpha", stub("Alpha"))]
-    kept, referenced = me._drop_references_to_existing_types(bv, declaration, parsed)
-    assert referenced == ["ns::W::VTable"]
-    # `Fresh` is new (an intentional forward declaration); `Alpha` has a body here.
-    assert [name for name, _ in kept] == ["ns::W", "Fresh", "Alpha"]
+    declaration = ("struct `ns::W` { struct `ns::W::VTable`* vtable; struct timespec* ts; "
+                   "struct `ns::W::VTabl`* typo; }; struct Fresh; struct Alpha { long a; long b; };")
+    parsed = [("ns::W", holder), ("ns::W::VTable", stub("ns::W::VTable")), ("timespec", stub("timespec")),
+              ("ns::W::VTabl", stub("ns::W::VTabl")), ("Fresh", stub("Fresh")), ("Alpha", stub("Alpha"))]
+    kept, referenced, by_mention = me._drop_references_to_existing_types(bv, declaration, parsed)
+    # The view's VTable and the type library's `timespec` are only referenced.
+    assert referenced == ["ns::W::VTable", "timespec"]
+    # `Fresh` is new (an intentional forward declaration); `Alpha` has a body
+    # here; the misspelled `ns::W::VTabl` is created but disclosed.
+    assert [name for name, _ in kept] == ["ns::W", "ns::W::VTabl", "Fresh", "Alpha"]
+    assert by_mention == ["ns::W::VTabl"]
 
 
 def test_type_not_found_explains_class_vtable_types(monkeypatch):

@@ -4107,7 +4107,33 @@ def _declares_body_for(declaration: str, name: str) -> bool:
     return re.search(pattern, _strip_c_comments(declaration)) is not None
 
 
-def _drop_references_to_existing_types(bv, declaration: str, named_types: list) -> tuple[list, list[str]]:
+def _library_has_type(bv, name: str) -> bool:
+    """Whether a type library loaded on the view defines *name* (e.g. libc's
+    `struct timespec`) although the view itself has not imported it yet."""
+    try:
+        libraries = list(getattr(bv, "type_libraries", None) or [])
+    except Exception:
+        return False
+    for library in libraries:
+        try:
+            if library.get_named_type(name) is not None:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _declares_forward(declaration: str, name: str) -> bool:
+    """Whether *declaration* forward-declares *name* as a statement of its own
+    (`struct name;`), as opposed to only mentioning it in a member type."""
+    quoted = re.escape(name)
+    pattern = (r"(?:^|[;{}])\s*(?:struct|class|union|enum)\s+(?:`" + quoted + r"`|" + quoted
+               + r"(?![\w:]))\s*;")
+    return re.search(pattern, _strip_c_comments(declaration)) is not None
+
+
+def _drop_references_to_existing_types(bv, declaration: str,
+                                       named_types: list) -> tuple[list, list[str], list[str]]:
     """#963: BN's declaration parser does not see the view's types, so a member
     such as ``struct `ns::Widget::VTable`* vtable;`` or ``struct Alpha* a;``
     comes back as a NAMED, EMPTY forward-declared struct -- and defining every
@@ -4119,20 +4145,29 @@ def _drop_references_to_existing_types(bv, declaration: str, named_types: list) 
 
     A parsed type is a mere reference -- and is NOT applied -- when it is an
     empty aggregate (no members, zero width), the declaration gives it no body,
-    and the view already defines a type of that name. A forward declaration of
-    a NEW name still creates its opaque type, as before. Returns the types to
-    apply and the names left untouched."""
-    kept, referenced = [], []
+    and the view already defines a type of that name, or a type library loaded
+    on the view does (a 0-byte user `timespec` would shadow libc's). A forward
+    declaration of a NEW name still creates its opaque type, as before.
+
+    Returns the types to apply, the names left untouched, and the new empty
+    types created only because a member MENTIONED them (no body, no forward
+    declaration of their own) -- typically a misspelled name -- so the result
+    can say so instead of passing them off as declared."""
+    kept, referenced, by_mention = [], [], []
     for name, type_obj in named_types:
         empty = (not list(getattr(type_obj, "members", None) or [])
                  and int(getattr(type_obj, "width", 0) or 0) == 0
                  and _type_tag_kind(type_obj) is not None)
-        if (empty and not _declares_body_for(declaration, str(name))
-                and _lookup_named_type(bv, str(name)) is not None):
+        if not empty or _declares_body_for(declaration, str(name)):
+            kept.append((name, type_obj))
+            continue
+        if _lookup_named_type(bv, str(name)) is not None or _library_has_type(bv, str(name)):
             referenced.append(str(name))
             continue
+        if not _declares_forward(declaration, str(name)):
+            by_mention.append(str(name))
         kept.append((name, type_obj))
-    return kept, referenced
+    return kept, referenced, by_mention
 
 
 # A C++ base clause on a struct/class definition: `struct D : public B, C {`.
@@ -4173,12 +4208,23 @@ def _attach_declared_bases(bv, declaration: str, named_types: list) -> tuple[lis
     ABI: bases in order, each aligned to its own alignment; the next base or
     member starts after a base's full size when that base is a plain C struct,
     but may reuse its tail padding -- start at the end of its last member --
-    when the base itself derives from something, i.e. is not POD). They are
-    only attached when consistent with the parsed layout -- every own member
-    starts at or after the last base's end. A virtual base, an unknown base, or
-    an inconsistent layout is NOT guessed at: the type is declared exactly as
-    parsed and the reason is returned so the result can say the bases were not
-    recorded.
+    when the base derives from something, i.e. is not POD). The parser knows a
+    base is non-POD only when THIS declaration gives it a base clause: a base
+    taken from the view is laid out at its full size even when it records bases
+    of its own, which is not where the C++ ABI would put what follows it (#989
+    review). So the layout is computed twice -- as the parser did, and as the
+    ABI does -- and the bases are attached only when:
+
+    * both computations place every base at the same offset (otherwise the
+      parsed struct matches neither the ABI nor any honest base list), and
+    * the struct's own layout continues exactly where the parser's bases end:
+      its first own member sits at the next offset aligned for that member (or,
+      with no own members, its size is the bases' end rounded to its alignment).
+      A base placed too EARLY fails this as surely as one placed too late.
+
+    A virtual base, an unknown base, or anything failing those checks is NOT
+    guessed at: the type is declared exactly as parsed and the reason is
+    returned so the result can say the bases were not recorded.
 
     Returns the (possibly updated) ``(name, type)`` list and ``{derived name:
     reason}`` for every base clause left unattached."""
@@ -4196,7 +4242,8 @@ def _attach_declared_bases(bv, declaration: str, named_types: list) -> tuple[lis
             updated.append((name, type_obj))
             continue
         bases: list[tuple[Any, int, int, str]] = []
-        cursor = 0
+        cursor = 0          # where the parser continues after the bases so far
+        abi_cursor = 0      # where the C++ ABI would
         reason = None
         for spec in specs:
             words = spec.split()
@@ -4211,20 +4258,25 @@ def _attach_declared_bases(bv, declaration: str, named_types: list) -> tuple[lis
                 break
             width = int(getattr(base_type, "width", 0) or 0)
             align = max(int(getattr(base_type, "alignment", 1) or 1), 1)
-            offset = -(-cursor // align) * align
+            offset = _align_up(cursor, align)
+            abi_offset = _align_up(abi_cursor, align)
+            if offset != abi_offset:
+                reason = (f"BN's parser placed base {base_name!r} at {hex(offset)}, but the C++ "
+                          f"ABI places it at {hex(abi_offset)}: an earlier base declared outside "
+                          f"this declaration derives from another class, and the parser laid it "
+                          f"out as a plain C struct, so the parsed layout is not the class's")
+                break
             # Reference the base by the name it is REGISTERED under (a recovered
             # C++ type is keyed by its component list, not the `::` string); a
             # base declared in this same declaration is not registered yet and
             # is referenced by the name it is about to be defined under.
             registered = getattr(getattr(base_type, "registered_name", None), "name", None)
             bases.append((registered or base_name, offset, width, kind))
-            cursor = offset + (_data_size(base_type) if _is_non_pod_base(base_name, base_type, clauses)
-                               else width)
+            dsize = _data_size(base_type)
+            cursor = offset + (dsize if clauses.get(base_name) else width)
+            abi_cursor = offset + (dsize if _is_non_pod_base(base_name, base_type, clauses) else width)
         if reason is None:
-            own_starts = [int(getattr(m, "offset", 0)) for m in list(getattr(type_obj, "members", None) or [])]
-            if (own_starts and min(own_starts) < cursor) or int(getattr(type_obj, "width", 0) or 0) < cursor:
-                reason = (f"the parsed layout does not leave room for the bases at their "
-                          f"natural offsets (bases end at {hex(cursor)})")
+            reason = _parsed_layout_mismatch(type_obj, cursor)
         if reason is not None:
             unattached[str(name)] = reason
             updated.append((name, type_obj))
@@ -4243,11 +4295,38 @@ def _attach_declared_bases(bv, declaration: str, named_types: list) -> tuple[lis
     return updated, unattached
 
 
+def _align_up(value: int, align: int) -> int:
+    return -(-int(value) // max(int(align), 1)) * max(int(align), 1)
+
+
+def _parsed_layout_mismatch(type_obj, bases_end: int) -> str | None:
+    """Why the parsed struct does not continue exactly where its bases end, or
+    None when it does: the first own member must sit at the next offset aligned
+    for it, or -- with no own members -- the size must be the bases' end rounded
+    up to the struct's alignment. Checking only "at or after" let a base placed
+    too early pass with an unexplained gap after it (#989 review)."""
+    members = list(getattr(type_obj, "members", None) or [])
+    if members:
+        first = min(members, key=lambda m: int(getattr(m, "offset", 0)))
+        start = int(getattr(first, "offset", 0))
+        align = int(getattr(getattr(first, "type", None), "alignment", 1) or 1)
+        expected = _align_up(bases_end, align)
+        if start != expected:
+            return (f"the parsed layout puts the first own member at {hex(start)}, but the "
+                    f"bases end at {hex(bases_end)} (next aligned offset {hex(expected)})")
+        return None
+    width = int(getattr(type_obj, "width", 0) or 0)
+    expected = _align_up(bases_end, int(getattr(type_obj, "alignment", 1) or 1))
+    if width != expected:
+        return f"the parsed size {hex(width)} does not match bases ending at {hex(bases_end)}"
+    return None
+
+
 def _is_non_pod_base(base_name: str, base_type, clauses: dict[str, list[str]]) -> bool:
-    """Whether a base is non-POD for layout, so a derived class may reuse its
-    tail padding. Declared structs carry no virtuals, so having a base of its
-    own (in this declaration, or recorded on an existing type) is what makes one
-    non-POD here."""
+    """Whether the C++ ABI treats a base as non-POD for layout, so a derived
+    class may reuse its tail padding. Declared structs carry no virtuals, so
+    having a base of its own (in this declaration, or recorded on an existing
+    type) is what makes one non-POD here."""
     return bool(clauses.get(base_name)) or bool(list(getattr(base_type, "base_structures", None) or []))
 
 
@@ -4481,15 +4560,26 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
                 f"The parser produced an inconsistent struct; refusing to apply it.",
                 requested=_operation_requested(ctx, op),
             )
-    named_types, referenced_existing = _drop_references_to_existing_types(bv, declaration, named_types)
-    if not named_types:
-        raise OperationFailure(
-            "invalid_request",
-            "the declaration only references existing types ("
-            + ", ".join(referenced_existing)
-            + ") without defining them; nothing to declare. Give a type a body to redefine it.",
-            requested=_operation_requested(ctx, op),
-        )
+    parsed_type_count = len(named_types)
+    named_types, referenced_existing, created_by_mention = _drop_references_to_existing_types(
+        bv, declaration, named_types)
+    reference_only = not named_types
+    if reference_only:
+        # #989 review: `struct Alpha;` against an existing Alpha used to apply
+        # (as the clobbering stub) and exit 0; a header of forward declarations
+        # must stay a success. It is now the no-op it always should have been:
+        # report each view type as declared-and-unchanged so verification
+        # observes it and stamps `noop`.
+        in_view = [name for name in referenced_existing if bv.get_type_by_name(name) is not None]
+        if not in_view:
+            raise OperationFailure(
+                "invalid_request",
+                "the declaration only references types that a loaded type library defines ("
+                + ", ".join(referenced_existing)
+                + ") without defining them; nothing to declare.",
+                requested=_operation_requested(ctx, op),
+            )
+        named_types = [(name, bv.get_type_by_name(name)) for name in in_view]
     named_types, unattached_bases = _attach_declared_bases(bv, declaration, named_types)
     defined_types = {}
     defined_type_layouts = {}
@@ -4497,7 +4587,8 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
     for name, type_obj in named_types:
         existing = ctx._current_type_entry(bv, str(name))
         before_defined_types[str(name)] = existing["decl"] if existing is not None else None
-        bv.define_user_type(name, type_obj)
+        if not reference_only:
+            bv.define_user_type(name, type_obj)
         current = ctx._current_type_entry(bv, str(name))
         defined_types[str(name)] = current["decl"] if current is not None else str(type_obj)
         defined_type_layouts[str(name)] = current["layout"] if current is not None else ctx._render_type_layout(type_obj)
@@ -4506,10 +4597,13 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         "defined_types": defined_types,
         "defined_type_layouts": defined_type_layouts,
         "before_defined_types": before_defined_types,
-        "count": len(defined_types),
+        "count": 0 if reference_only else len(defined_types),
         "parsed_functions": [name for name, _ in parsed["functions"]],
         "parsed_variables": [name for name, _ in parsed["variables"]],
-        "parsed_type_count": len(named_types),
+        # What the parser returned, before references to existing types were
+        # set aside (#989 review): `count` is what was applied, and
+        # `referenced_existing_types` names the rest.
+        "parsed_type_count": parsed_type_count,
         "parsed_function_count": len(parsed["functions"]),
         "parsed_variable_count": len(parsed["variables"]),
         # #965: a base clause the parser dropped and this op could not re-attach
@@ -4519,6 +4613,12 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         # #963: existing types the declaration only REFERENCED (left as they
         # were rather than overwritten by the parser's empty forward stub).
         **({"referenced_existing_types": referenced_existing} if referenced_existing else {}),
+        # #989 review: NEW empty types created only because a member mentioned
+        # an unknown name (no body, no forward declaration of their own) --
+        # usually a misspelling, e.g. ``struct `ns::W::VTabl`*``.
+        **({"created_by_reference": created_by_mention} if created_by_mention else {}),
+        **({"note": "the declaration only forward-declares existing types; nothing was changed"}
+           if reference_only else {}),
         # #825 item 3: a `--file` declaration parses with the header's PARENT
         # DIRECTORY as an implicit include root, so `#include "sibling.h"`
         # resolves. The root was derivable from `requested.source_path` but

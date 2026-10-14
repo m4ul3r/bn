@@ -5799,16 +5799,24 @@ _DECLARED_TYPE_NAME_CAP = 10
 def _declared_types_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
     """#964: the types a `types_declare` row set actually landed (verified or
     noop rows), counted per TYPE rather than per op, with the names capped, plus
-    any base clause the declare could not record (#965). None when no
-    declare row landed, so every other mutation's summary is unchanged."""
+    any base clause the declare could not record (#965), the existing types it
+    only referenced and left unchanged, and the empty types it created only
+    because a member mentioned an unknown name (#963 / #989 review). None when
+    no declare row landed, so every other mutation's summary is unchanged."""
     names: list[str] = []
     unattached: dict[str, Any] = {}
+    referenced: list[str] = []
+    stubs: list[str] = []
     landed = False
     for row in results:
         if row.get("op") != "types_declare" or row.get("status") not in ("verified", "noop"):
             continue
         landed = True
-        names.extend(str(name) for name in _field_dict(row, "defined_types"))
+        row_referenced = [str(name) for name in _field_list(row, "referenced_existing_types")]
+        referenced.extend(row_referenced)
+        stubs.extend(str(name) for name in _field_list(row, "created_by_reference"))
+        names.extend(str(name) for name in _field_dict(row, "defined_types")
+                     if str(name) not in row_referenced)
         unattached.update(_field_dict(row, "unattached_bases"))
     if not landed:
         return None
@@ -5820,6 +5828,10 @@ def _declared_types_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]
     }
     if unattached:
         out["unattached_bases"] = unattached
+    if referenced:
+        out["referenced_existing"] = list(dict.fromkeys(referenced))
+    if stubs:
+        out["created_by_reference"] = list(dict.fromkeys(stubs))
     return out
 
 
@@ -6259,6 +6271,13 @@ def _render_mutation_summary_text(value: Any) -> str:
         bases = _field_dict(declared, "unattached_bases")
         if bases:
             line += "\nbases not recorded: " + "; ".join(f"{name}: {why}" for name, why in bases.items())
+        kept = [str(name) for name in _field_list(declared, "referenced_existing")]
+        if kept:
+            line += "\nreferenced, left unchanged: " + ", ".join(kept)
+        stubs = [str(name) for name in _field_list(declared, "created_by_reference")]
+        if stubs:
+            line += ("\ncreated empty (only mentioned, never defined -- check the spelling): "
+                     + ", ".join(stubs))
     if _field_declared(value, "go_rename"):
         go = _field_dict(value, "go_rename")
         line += "\ngo rename: " + "  ".join(

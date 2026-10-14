@@ -1690,14 +1690,23 @@ class BridgeContext:
             return ""
         if own:
             listed = f"BN's RTTI analysis created only its vtable type ({', '.join(own[:3])})"
+            caveat = ""
         else:
             listed = (f"BN created no vtable type for {name} itself, only for classes derived "
                       f"from it ({', '.join(derived[:3])})")
+            # #989 review: the example below then borrows a DERIVED class's
+            # table, whose leading slots are this class's virtuals but whose
+            # slot types name the derived class -- say so instead of offering
+            # it as this class's own.
+            caveat = (" (that is a derived class's table: its leading slots are "
+                      f"{name}'s virtuals in order, but their `this` types and any later "
+                      "slots belong to the derived class; declare your own VTable struct "
+                      "for an exact fit)")
         vt = (own or derived)[0]
         return (f" No struct named {name} is defined: {listed}; BN names a derived class's "
                 f"vtable type `<Base>::<Class>::VTable`. Declare the instance struct with a typed "
-                f"vptr, e.g. bn types declare 'struct `{name}` {{ struct `{vt}`* vtable; }};', "
-                f"then type `this` as struct `{name}`* so virtual calls render as "
+                f"vptr, e.g. bn types declare 'struct `{name}` {{ struct `{vt}`* vtable; }};'"
+                f"{caveat}, then type `this` as struct `{name}`* so virtual calls render as "
                 f"this->vtable-><method>().")
 
     @staticmethod
