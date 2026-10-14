@@ -3972,6 +3972,8 @@ _GO_RENAME_NON_COUNT_READS = {
     # set` replaced-member listing and the `class apply-types` plan back off the
     # summary; listings, not counts, and absent on every `go rename`.
     "replaced_members", "class_apply_types",
+    # #993 review round 2: the rolled-back declare's kept library imports.
+    "kept_library_imports",
 }
 
 

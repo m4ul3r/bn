@@ -6545,6 +6545,21 @@ def test_class_apply_types_plan_builds_the_typing_batch(monkeypatch):
     operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
     assert plan["instance_struct"] == "vptr_retyped"
 
+    # #993 review round 2: a pointer-width TYPEDEF at 0x0 is retyped like the
+    # pointer it names, and a union instance is refused as not a struct.
+    bv.types["opaque_ptr"] = _FakeType("void*", width=8, type_class="PointerTypeClass")
+    opaque = _FakeType("opaque_ptr", width=8, type_class="NamedTypeReferenceClass")
+    opaque.name = "opaque_ptr"
+    struct_with(types.SimpleNamespace(offset=0, name="vptr", type=opaque))
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert plan["instance_struct"] == "vptr_retyped", plan
+    union = _FakeType("union demo::Widget", width=8, members=[member(0, "p", "void*", 8, "PointerTypeClass")])
+    union.type = "UnionStructureType"
+    bv.types["demo::Widget"] = union
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert "not a struct" in excinfo.value.message
+
     # A stripped card: no methods, slots only. Nothing is left to write once
     # the struct is typed -- an empty plan, not a refusal -- and every slot
     # function is listed as skipped.

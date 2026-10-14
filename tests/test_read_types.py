@@ -1565,3 +1565,37 @@ def test_the_guard_reads_parsed_names_not_the_source_text_675():
     # differently-named type, so the guard sees no offending tag.
     me._refuse_reserved_keyword_tags(None, {"op": "types_declare"},
                                      [("holder", object())])
+
+
+def test_named_type_references_finds_every_member_reference(monkeypatch):
+    """#993 review round 2: BN hands out a fresh, temporary wrapper for every
+    member and pointer target, so a walk that remembered visited wrappers by
+    `id()` saw reused ids and skipped all but the first of several pointer
+    members -- importing only the first of twelve library types reached."""
+    me = _load_bridge(monkeypatch).mutation_engine
+    names = [f"lib_type_{i}" for i in range(12)]
+
+    class _Ref:
+        type_class = "NamedTypeReferenceClass"
+
+        def __init__(self, name):
+            self.name = name
+
+    class _Pointer:
+        type_class = "PointerTypeClass"
+
+        def __init__(self, name):
+            self._name = name
+
+        @property
+        def target(self):
+            return _Ref(self._name)          # a new wrapper on every read
+
+    class _Struct:
+        type_class = "StructureTypeClass"
+
+        @property
+        def members(self):                   # new member objects on every read
+            return [types.SimpleNamespace(name=f"f{i}", type=_Pointer(n)) for i, n in enumerate(names)]
+
+    assert me._named_type_references(_Struct()) == names

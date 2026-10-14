@@ -1199,6 +1199,52 @@ class TestTypeStringsAndInheritance:
         probe = shared_bn.run("py", "exec", "--code", "print(bv.get_type_by_name('passwd') is not None)")
         assert probe.stdout.strip().endswith("True"), probe.stdout
 
+    def test_every_pointer_reached_library_type_is_imported(self, shared_bn):
+        """#993 review round 2: only the first of several library types
+        reached through pointers was imported (the reference walk lost
+        members to reused `id()`s), the rest dangled and were listed as
+        referenced. Preview and live now name the same set, and live lands it."""
+        shared_bn.load(HELLO_BINARY)
+        decl = "struct Many993 { struct tms* a; struct passwd* b; struct group* c; struct tm* d; };"
+        preview = shared_bn.json("types", "declare", decl, "--preview", "--summary")["declared_types"]
+        live = shared_bn.json("types", "declare", decl, "--summary")["declared_types"]
+        wanted = {"tms", "passwd", "group", "tm"}
+        assert wanted <= set(live["imported_from_library"]), live
+        assert preview["imported_from_library"] == live["imported_from_library"], (preview, live)
+        assert not wanted & set(live.get("referenced_existing", [])), live
+        probe = shared_bn.run("py", "exec", "--code",
+                              "print(sorted(n for n in ('tms','passwd','group','tm') if bv.get_type_by_name(n) is None))")
+        assert probe.stdout.strip().endswith("[]"), probe.stdout
+
+    def test_previewed_batch_can_use_a_library_type_its_declare_brings(self, tmp_path, shared_bn):
+        """#993 review round 2: a previewed batch whose `types_declare` embeds
+        `struct timeval` and whose next op uses it failed to parse (the name
+        had nothing behind it during the preview), while live committed. The
+        preview stands the library types in without importing, then removes
+        them. A rolled-back live batch names the imports it could not undo."""
+        shared_bn.load(HELLO_BINARY)
+        probe = "print(sorted(str(n) for n in bv.type_names))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
+        manifest = tmp_path / "batch.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "types_declare", "declaration": "struct Px993 { struct timeval tv; int64_t pad; };"},
+            {"op": "struct_field_set", "struct_name": "Px993", "offset": "0x18", "field_name": "t2",
+             "field_type": "struct timeval"}]}))
+        preview = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json", "--summary")
+        assert preview.returncode == 0, preview.stdout + preview.stderr
+        assert json.loads(preview.stdout)["verified_count"] == 2, preview.stdout
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
+
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "types_declare", "declaration": "struct Ru993 { struct rusage ru; };"},
+            {"op": "struct_field_set", "struct_name": "NoSuchStruct993", "offset": "0x0",
+             "field_name": "x", "field_type": "int"}]}))
+        failed = shared_bn.run("batch", "apply", str(manifest), "--format", "json", "--summary")
+        assert failed.returncode == 3, failed.stdout + failed.stderr
+        summary = json.loads(failed.stdout)
+        assert summary["rolled_back"] is True, summary
+        assert "rusage" in summary["kept_library_imports"], summary
+
     def test_typed_vptr_keeps_bn_vtable_and_renders_named_virtual_call(self, shared_bn):
         """#963: BN's parser returns a type a declaration only references as an
         EMPTY named struct; defining it overwrote BN's own `...::VTable` with a

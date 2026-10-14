@@ -6040,6 +6040,7 @@ def _build_mutation_summary(
     declared_types: dict[str, Any] | None = None,
     replaced_members: Sequence[dict[str, Any]] = (),
     class_apply_types: dict[str, Any] | None = None,
+    kept_library_imports: Sequence[str] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -6191,6 +6192,11 @@ def _build_mutation_summary(
         # the vptr's table type, what happened to the instance struct, and the
         # methods whose `this` it did NOT retype, with why.
         summary["class_apply_types"] = class_apply_types
+    if kept_library_imports:
+        # #993 review round 2: a rolled-back live declare keeps the library
+        # types it imported (Binary Ninja cannot un-import one without
+        # refusing to import it again), so the compact status names them.
+        summary["kept_library_imports"] = list(kept_library_imports)
     return summary
 
 
@@ -6375,6 +6381,13 @@ def _mutation_summary(value: Any) -> Any:
         ],
         class_apply_types=(_field_dict(value, "class_apply_types")
                            if _field_declared(value, "class_apply_types") else None),
+        # A live declare row that did not land but whose imports stayed in the
+        # view; a preview imports nothing, so its would-imports are not kept.
+        kept_library_imports=list(dict.fromkeys(
+            str(name) for r in results
+            if not value.get("preview") and r.get("op") == "types_declare"
+            and r.get("status") not in ("verified", "noop")
+            for name in _field_list(r, "imported_from_library"))),
     )
 
 
@@ -6712,6 +6725,9 @@ def _render_mutation_summary_text(value: Any) -> str:
         imported = [str(name) for name in _field_list(declared, "imported_from_library")]
         if imported:
             line += "\nimported from a type library: " + ", ".join(imported)
+    kept = [str(name) for name in _field_list(value, "kept_library_imports")]
+    if kept:
+        line += "\nkept library imports (a rollback cannot remove them): " + ", ".join(kept)
     if _field_declared(value, "class_apply_types"):
         plan = _field_dict(value, "class_apply_types")
         action = _text_value(plan, "instance_struct") or "<unknown>"
@@ -6727,12 +6743,16 @@ def _render_mutation_summary_text(value: Any) -> str:
                  f"vptr: struct `{_text_value(plan, 'vtable_type') or '<unknown>'}`*  "
                  f"instance struct: {action}{size_note}")
         # #993 review: count what each retype's own row says happened, not the
-        # plan; a method whose `this` already had the type is `noop`.
+        # plan: `verified` retyped, `noop` already had the type, anything else
+        # (a rolled-back run's `reverted`) did not land.
         methods = _row_list(plan, "retyped_methods")
-        already = sum(1 for m in methods if _text_value(m, "status") == "noop")
-        line += f"\nthis retyped: {len(methods) - already} method(s)"
+        statuses = [_text_value(m, "status") for m in methods]
+        retyped, already = statuses.count("verified"), statuses.count("noop")
+        line += f"\nthis retyped: {retyped} method(s)"
         if already:
             line += f", already typed: {already}"
+        if len(methods) - retyped - already:
+            line += f", not applied: {len(methods) - retyped - already}"
         skipped = _row_list(plan, "skipped_methods")
         if skipped:
             line += "\nskipped: " + ", ".join(

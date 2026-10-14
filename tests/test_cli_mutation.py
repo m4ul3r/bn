@@ -145,7 +145,7 @@ def test_class_apply_types_summary_states_the_plan():
     from bn.formatters import _mutation_summary, _render_mutation_summary_text
     plan = {"class": "demo::Widget", "vtable_type": "demo::Base::demo::Widget::VTable",
             "instance_struct": "declared", "size": None, "size_source": "unavailable",
-            "retyped_methods": [{"address": "0x401200", "name": "demo::Widget::run"}],
+            "retyped_methods": [{"address": "0x401200", "name": "demo::Widget::run", "status": "verified"}],
             "skipped_methods": [{"address": "0x401260", "name": "demo::Widget::make",
                                  "reason": "no parameter named `this`"}]}
     summary = _mutation_summary({"success": True, "committed": True, "rolled_back": False,
@@ -176,6 +176,31 @@ def test_class_apply_types_summary_states_the_plan():
                     {"op": "local_retype", "status": "noop"}, {"op": "local_retype", "status": "verified"}]}))
     assert "instance struct: vptr_retyped (was void* vptr)" in rerun
     assert "\nthis retyped: 1 method(s), already typed: 1" in rerun
+    # A rolled-back run's retypes are `reverted`: none of them is "retyped".
+    reverted = _render_mutation_summary_text(_mutation_summary({
+        "success": False, "committed": False, "rolled_back": True,
+        "class_apply_types": {**plan, "retyped_methods": [
+            {"address": "0x401200", "name": "a", "status": "reverted"}]},
+        "results": [{"op": "local_retype", "status": "reverted"},
+                    {"op": "local_retype", "status": "invalid_request", "message": "bad"}]}))
+    assert "\nthis retyped: 0 method(s), not applied: 1" in reverted
+
+
+def test_rolled_back_declare_names_the_library_imports_it_kept():
+    """#993 review round 2: a rolled-back live declare keeps the library types
+    it imported, and the result said nothing. A preview imports nothing, so
+    its would-import list is never reported as kept."""
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+    rows = [{"op": "types_declare", "status": "reverted", "defined_types": {"S7": "struct S7"},
+             "imported_from_library": ["rusage", "timeval"]},
+            {"op": "struct_field_set", "status": "invalid_request", "message": "no struct"}]
+    live = _mutation_summary({"success": False, "committed": False, "rolled_back": True, "results": rows})
+    assert live["kept_library_imports"] == ["rusage", "timeval"]
+    assert "\nkept library imports (a rollback cannot remove them): rusage, timeval" in \
+        _render_mutation_summary_text(live)
+    preview = _mutation_summary({"success": False, "committed": False, "preview": True,
+                                 "rolled_back": True, "results": rows})
+    assert "kept_library_imports" not in preview
 
 
 

@@ -2018,7 +2018,7 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None, 
         if kind == "struct_field_delete":
             return _op_struct_field_delete(ctx, bv, op)
         if kind == "types_declare":
-            return _op_types_declare(ctx, bv, op)
+            return _op_types_declare(ctx, bv, op, restores)
         if kind == "function_create":
             return _op_function_create(ctx, bv, op, restores,
                                        defer_reanalysis=defer_reanalysis)
@@ -2619,6 +2619,10 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
     except OperationFailure as exc:
         exc = _explain_renamed_reference(operations[len(results)], results, exc)
         with exclusive_scope():
+            # #993 review round 2: the revert below keeps a live declare's
+            # library imports (BN cannot un-import), so the rows must say so.
+            if not preview:
+                _report_library_imports(bv, library_baseline, results)
             # Run BOTH revert steps unconditionally: an `and` would short-circuit
             # past the explicit restores when the undo revert fails, leaving
             # non-journaled local/prototype changes applied.
@@ -4348,14 +4352,19 @@ def _library_type(bv, name: str):
 def _named_type_references(type_obj) -> list[str]:
     """Names of the named types *type_obj* refers to (through pointers, arrays,
     members, parameters and return values), in first-seen order. A reference is
-    a leaf: the referenced type's own references are not followed."""
+    a leaf: the referenced type's own references are not followed.
+
+    No visited set: a type tree can only loop back through a named reference,
+    which is a leaf here, so the walk is finite without one. The first version
+    tracked visited wrappers by `id()`; BN hands out temporary wrappers whose
+    ids Python reuses, so later members were skipped and only the first of
+    several pointer-reached library types was found (#993 review round 2)."""
     names: list[str] = []
-    stack, seen = [type_obj], set()
+    stack = [type_obj]
     while stack:
         current = stack.pop()
-        if current is None or id(current) in seen:
+        if current is None:
             continue
-        seen.add(id(current))
         if "NamedTypeReference" in _type_class_name(current):
             name = str(getattr(current, "name", "") or "")
             if name and name not in names:
@@ -4394,7 +4403,8 @@ def _is_library_import(bv, name: str) -> bool:
         return False
 
 
-def _import_referenced_library_types(bv, type_objs, *, apply: bool = True) -> list[str]:
+def _import_referenced_library_types(bv, type_objs, *, apply: bool = True,
+                                     stand_ins: list | None = None) -> list[str]:
     """#993 item 2: every type a loaded type library defines that *type_objs*
     reference, transitively, and that the view lacks -- imported through BN's
     own ``import_library_type`` when *apply* (so a declaration that points at
@@ -4405,7 +4415,13 @@ def _import_referenced_library_types(bv, type_objs, *, apply: bool = True) -> li
 
     BN's import is the only path: bn never removes an imported type (BN would
     keep its imported-record and refuse to import it again), so the record and
-    the view always agree and the import does what BN's parser would."""
+    the view always agree and the import does what BN's parser would.
+
+    *stand_ins* (preview only): define each missing type as a plain auto type
+    -- NOT an import, so BN records nothing -- and append its ``(name, id)``,
+    so a later op in the same previewed batch (`struct field set S 0x10 t
+    'struct timespec'`) resolves the name as it would live; the preview's
+    revert removes them (`_remove_stand_ins`)."""
     pending = [name for type_obj in type_objs for name in _named_type_references(type_obj)]
     seen: set[str] = set()
     missing: list[str] = []
@@ -4424,8 +4440,37 @@ def _import_referenced_library_types(bv, type_objs, *, apply: bool = True) -> li
                 bv.import_library_type(name, library)
             except Exception as exc:
                 bn.log_error(f"BN Agent Bridge: importing library type {name!r} failed: {exc!r}")
+        elif stand_ins is not None:
+            qualified = bn.QualifiedName(_split_qualified_name(name)) if "::" in name else name
+            try:
+                # The id a dangling entry already holds, so the entry is filled
+                # rather than shadowed (a second id is not found by name).
+                type_id = str(bv.get_type_id(qualified) or "") or bn.Type.generate_auto_type_id(
+                    "bn-preview", name)
+                bv.define_type(type_id, qualified, library_type)
+                stand_ins.append((name, type_id))
+            except Exception as exc:
+                bn.log_error(f"BN Agent Bridge: preview stand-in for {name!r} failed: {exc!r}")
         pending.extend(_named_type_references(library_type))
     return missing
+
+
+def _remove_stand_ins(bv, stand_ins: list) -> None:
+    """Revert step for a previewed declare: remove the stand-in types
+    `_import_referenced_library_types` defined, and the name entries they
+    leave. Raises when one stays, so the revert reports itself incomplete."""
+    leftover = []
+    for name, type_id in reversed(stand_ins):
+        bv.undefine_type(type_id)
+        if name in (_view_type_names(bv) or set()):
+            # `undefine_type` can leave the name entry; a void placeholder
+            # under the id, undefined again, drops it (see _clear_dangling_type_names).
+            bv.define_type(type_id, name, bn.Type.void())
+            bv.undefine_type(type_id)
+        if _lookup_named_type(bv, name) is not None:
+            leftover.append(name)
+    if leftover:
+        raise RuntimeError(f"could not remove preview stand-in type(s): {', '.join(leftover)}")
 
 
 def _declare_batch_type_names(bv, operations) -> set[str] | None:
@@ -4869,7 +4914,7 @@ def _refuse_reserved_keyword_tags(ctx, op: dict[str, Any], named_types) -> None:
     )
 
 
-def _op_types_declare(ctx, bv, op: dict[str, Any]):
+def _op_types_declare(ctx, bv, op: dict[str, Any], restores: list | None = None):
     declaration = str(op["declaration"])
     # Reject C bitfield syntax up front: BN's parser corrupts it (see
     # _BITFIELD_MEMBER_RE) and would otherwise return a malformed, overlapping
@@ -5026,8 +5071,13 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         # leaves one only pointed at dangling; import both on purpose (the
         # batch reports what came in). A preview parsed without importing and
         # imports nothing here either; it names what the live run would import.
+        previewing = _PREVIEW_PARSE.get()
+        stand_ins: list = []
         would_import = _import_referenced_library_types(
-            bv, [type_obj for _, type_obj in named_types], apply=not _PREVIEW_PARSE.get())
+            bv, [type_obj for _, type_obj in named_types], apply=not previewing,
+            stand_ins=stand_ins if previewing and restores is not None else None)
+        if stand_ins:
+            restores.append(lambda: _remove_stand_ins(bv, stand_ins))
     # Read back only once everything is defined: a type rendered while a name it
     # uses was still missing (`void (*)(Leaf*)` before `struct Leaf` lands) reads
     # differently afterwards, and verification compares against the final view.
@@ -5444,7 +5494,9 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
         operations.append({"op": "types_declare", "declaration": f"struct `{cls}` {{ {body} }};"})
         struct_action = "declared"
     else:
-        if "Structure" not in _type_class_name(instance):
+        if _type_tag_kind(instance) not in ("struct", "class"):
+            # #993 review round 2: a union also has a Structure type class, and
+            # passed this check only to fail later in `local retype`.
             raise OperationFailure(
                 "invalid_request",
                 f"{cls} names a {str(instance)!r} type, not a struct, so it cannot carry a vptr.",
@@ -5459,18 +5511,23 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
         first = occupying[0] if len(occupying) == 1 and int(getattr(occupying[0], "offset", -1)) == 0 else None
         if first is not None and _is_pointer_to(getattr(first, "type", None), vtable_type):
             struct_action = "unchanged"
-        elif occupying and (first is None or not _replaceable_vptr_slot(getattr(first, "type", None), ptr)):
+        elif occupying and (first is None or not _replaceable_vptr_slot(bv, getattr(first, "type", None), ptr)):
             listed = ", ".join(
                 f"{getattr(m, 'name', '') or '<unnamed>'} ({getattr(m, 'type', '')} @{hex(int(getattr(m, 'offset', 0)))})"
                 for m in occupying)
+            # An embedded base is typed with ITS class's own table, not this
+            # class's (that is the borrowing the abstract-base refusal warns of).
+            first_type = getattr(first, "type", None) if first is not None else None
+            base = (str(getattr(first_type, "name", "") or "")
+                    if first_type is not None and "NamedTypeReference" in _type_class_name(first_type) else "")
+            base_hint = (f"If {first.name} is an embedded base, type its vptr with `bn class apply-types {base}`. "
+                         if base and "Structure" in _type_class_name(_lookup_named_type(bv, base) or object()) else "")
             raise OperationFailure(
                 "invalid_request",
                 f"struct {cls} holds {listed} where the {ptr}-byte vptr goes, and writing the vptr "
-                f"would replace it; only a single pointer-width pointer or integer member at 0x0 is "
-                f"retyped. If it is an embedded base whose own first member is the vptr, type that "
-                f"member in the base's struct (`bn struct field set <base> 0x0 <member> "
-                f"'{vptr_type}'`); to replace it anyway, which removes it, run "
-                f"`bn struct field set {cls} 0x0 vtable '{vptr_type}'`.",
+                f"would replace it; only a single pointer-width pointer or integer member at 0x0 "
+                f"(typedefs of one included) is retyped. {base_hint}To replace it anyway, which "
+                f"removes it, run `bn struct field set {cls} 0x0 vtable '{vptr_type}'`.",
                 requested=requested,
             )
         else:
@@ -5549,9 +5606,14 @@ def _is_pointer_to(type_obj, name: str) -> bool:
     return registered is not None and str(getattr(registered, "name", "") or "") == name
 
 
-def _replaceable_vptr_slot(type_obj, ptr: int) -> bool:
+def _replaceable_vptr_slot(bv, type_obj, ptr: int) -> bool:
     """Whether an offset-0 member of this type may be retyped as the vptr: a
-    pointer or integer exactly one pointer wide."""
+    pointer or integer exactly one pointer wide, through any typedefs (a
+    `typedef void* opaque_ptr` member counts, #993 review round 2)."""
+    for _ in range(8):   # a typedef chain, bounded against a cycle
+        if type_obj is None or "NamedTypeReference" not in _type_class_name(type_obj):
+            break
+        type_obj = _lookup_named_type(bv, str(getattr(type_obj, "name", "") or ""))
     try:
         width = int(getattr(type_obj, "width", 0) or 0)
     except (TypeError, ValueError):
