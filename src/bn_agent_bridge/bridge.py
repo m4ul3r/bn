@@ -276,6 +276,104 @@ class _ReadWriteLock:
                 self._condition.notify_all()
 
 
+# The request the current thread is serving, as far as the write gate is
+# concerned: set by `dispatch` for the whole request, read when that request
+# reaches the gate -- directly (lock="write" ops) or from inside a self-locking
+# handler (refresh, mutations, function create, go rename).
+_gate_request = threading.local()
+
+
+class _WriteGate:
+    """The writer gate, plus WHO holds it and WHO is queued behind it (#976).
+
+    A write-gated request used to block silently for as long as the holder ran:
+    `py exec` behind a two-minute `refresh` answered nothing for two minutes,
+    while reads in the same window returned at once, so an agent could not tell
+    a queue from a hang. Recording the holder and the waiting request ids lets a
+    side-channel `write_gate_status` answer "request X is waiting for refresh,
+    started N s ago", and lets a request that declared `no_wait` refuse with
+    that same answer instead of queueing.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state = threading.Lock()
+        self._holder: dict[str, Any] | None = None
+        self._waiters: set[str] = set()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def __enter__(self) -> None:
+        op = getattr(_gate_request, "op", None)
+        request_id = getattr(_gate_request, "request_id", None)
+        if not self._lock.acquire(blocking=False):
+            if getattr(_gate_request, "no_wait", False):
+                raise RuntimeError(self._busy_message(op))
+            if request_id:
+                with self._state:
+                    self._waiters.add(request_id)
+            try:
+                self._lock.acquire()
+            finally:
+                if request_id:
+                    with self._state:
+                        self._waiters.discard(request_id)
+        with self._state:
+            self._holder = {"op": op, "since": time.monotonic()}
+
+    def __exit__(self, *exc_info: object) -> None:
+        with self._state:
+            self._holder = None
+        self._lock.release()
+
+    def holder(self) -> dict[str, Any] | None:
+        with self._state:
+            if self._holder is None:
+                return None
+            return {
+                "op": self._holder["op"],
+                "elapsed_seconds": round(time.monotonic() - self._holder["since"], 1),
+            }
+
+    def status(self, request_id: str) -> dict[str, Any]:
+        with self._state:
+            waiting = request_id in self._waiters
+        return {
+            "kind": "write_gate_status",
+            "request_id": request_id,
+            "waiting": waiting,
+            "holder": self.holder(),
+        }
+
+    def _busy_message(self, op: str | None) -> str:
+        holder = self.holder()
+        what = (
+            f"{holder['op'] or 'another write'} in progress "
+            f"(started {holder['elapsed_seconds']:g}s ago)"
+            if holder is not None
+            else "another write in progress"
+        )
+        return (
+            f"busy: {what}; {op or 'this request'} needs the write gate and "
+            "BN_NO_WAIT is set, so it was refused instead of queued. Retry when "
+            "that operation finishes, or unset BN_NO_WAIT to wait for it."
+        )
+
+
+@contextlib.contextmanager
+def _gate_request_context(op: Any, request_id: Any, no_wait: bool):
+    previous = dict(vars(_gate_request))
+    _gate_request.op = op if isinstance(op, str) else None
+    _gate_request.request_id = request_id if isinstance(request_id, str) and request_id else None
+    _gate_request.no_wait = no_wait
+    try:
+        yield
+    finally:
+        vars(_gate_request).clear()
+        vars(_gate_request).update(previous)
+
+
 class PinnedTarget(str):
     """A target identity the BRIDGE pinned, not a selector a client sent.
 
@@ -571,6 +669,43 @@ class TargetManager:
         # load-time sidecar/cache substitution OPENS the database, so `filename`
         # already names it.
         self._database_paths: dict[str, str] = {}
+        # Stable view_id -> the comments THIS bridge wrote and verified, keyed
+        # (scope, address) -> body, scope "address" (a global address comment)
+        # or "function_doc" (fn.comment, keyed at the function start). Decompile
+        # redacts stored comment bodies so a planted or stale database note is
+        # not read as fact (#740); a body the analyst wrote through this bridge
+        # is neither, so the redaction exempts it and marks it instead (#977).
+        # Keyed by location as well as body, so an inherited note that merely
+        # shares a location or a spelling with one is never credited to this
+        # session.
+        self._session_annotations: dict[str, dict[tuple[str, int], str]] = {}
+        # The manager that took this one's ledger over in a GUI bridge restart
+        # (`succeed`). A request the old bridge admitted can still commit -- or
+        # save, or close -- after the handover; its ledger change is forwarded
+        # so the successor does not lose it (#953).
+        self._successor: TargetManager | None = None
+
+    def succeed(self, predecessor: TargetManager) -> None:
+        """Take over *predecessor*'s per-view ledger before serving anything.
+
+        A GUI "Restart Bridge" replaces the bridge -- and with it the
+        TargetManager -- inside the same BN process, while every tab stays
+        open. A fresh manager started with no view ids and an empty dirty set,
+        so a tab holding a committed-but-unsaved mutation was listed
+        `unsaved=false` the moment the new bridge answered, with nothing saved
+        (#953). Carrying the handle-keyed id map over (not a filename or a
+        selector, which another view can share) keeps each RETAINED view's
+        stable id, and with it its unsaved marker and backing-database path. A
+        view that closed meanwhile is pruned by the first complete `refresh()`
+        exactly as it would have been in the old manager: the carried map holds
+        strong references, so no other view can arrive under its handle.
+        """
+        with predecessor._lock, self._lock:
+            self._ids_by_object = dict(predecessor._ids_by_object)
+            self._next_id = max(self._next_id, predecessor._next_id)
+            self._dirty_view_ids = set(predecessor._dirty_view_ids)
+            self._database_paths = dict(predecessor._database_paths)
+            predecessor._successor = self
 
     def _stable_view_id(self, bv) -> str | None:
         return self._ids_by_object.get(bv)
@@ -581,12 +716,59 @@ class TargetManager:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 self._dirty_view_ids.add(vid)
+            successor = self._successor
+        if successor is not None:
+            successor.mark_dirty(bv)
 
     def clear_dirty(self, bv) -> None:
         with self._lock:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 self._dirty_view_ids.discard(vid)
+            successor = self._successor
+        if successor is not None:
+            successor.clear_dirty(bv)
+
+    def note_session_annotations(self, bv, results) -> None:
+        """Record the comments a committed mutation verified on *bv* (#977).
+
+        Only ``verified`` rows count: a ``noop`` set means the body was already
+        stored, which is exactly the inherited case the redaction exists for.
+        A verified delete forgets the location."""
+        entries: list[tuple[tuple[str, int], str | None]] = []
+        for row in results or []:
+            if not isinstance(row, dict) or row.get("status") != "verified":
+                continue
+            op_name = row.get("op")
+            if op_name not in ("set_comment", "delete_comment"):
+                continue
+            try:
+                address = int(str(row.get("address")), 16)
+            except (TypeError, ValueError):
+                continue
+            scope = "function_doc" if row.get("scope") == "function_doc" else "address"
+            body = None
+            if op_name == "set_comment":
+                body = str((row.get("requested") or {}).get("comment") or "")
+            entries.append(((scope, address), body or None))
+        if not entries:
+            return
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            if vid is None:
+                return
+            ledger = self._session_annotations.setdefault(vid, {})
+            for key, body in entries:
+                if body is None:
+                    ledger.pop(key, None)
+                else:
+                    ledger[key] = body
+
+    def session_annotations(self, bv) -> dict[tuple[str, int], str]:
+        """The comments this bridge wrote on *bv*, keyed by (scope, address)."""
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            return dict(self._session_annotations.get(vid, {})) if vid is not None else {}
 
     def note_database(self, bv, path: str) -> None:
         """Record that *path* is the database backing *bv*'s analysis.
@@ -613,6 +795,15 @@ class TargetManager:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 self._database_paths[vid] = str(path)
+            successor = self._successor
+        if successor is not None:
+            successor.note_database(bv, path)
+
+    def recorded_database(self, bv) -> str | None:
+        """The database `note_database` recorded for *bv*, or None."""
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            return self._database_paths.get(vid) if vid is not None else None
 
     def open_target_for_path(self, path: str, *, exclude) -> dict[str, Any] | None:
         """The open target whose file IS *path*, other than *exclude*, or None.
@@ -676,8 +867,12 @@ class TargetManager:
             if vid is not None:
                 self._dirty_view_ids.discard(vid)
                 self._database_paths.pop(vid, None)
+                self._session_annotations.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
+            successor = self._successor
+        if successor is not None:
+            successor.forget(bv)
 
     def _view_name(self, bv) -> str:
         for attr in ("view_type", "name"):
@@ -913,13 +1108,18 @@ class TargetManager:
                     vid: path for vid, path in self._database_paths.items()
                     if vid in alive
                 }
-                # The provenance verdicts, keyed on the file session id so a
-                # GUI tab's transient wrapper cannot lose one; pruned here
-                # (same complete-snapshot rule) since nothing else drops a
-                # closed view's entry.
+                self._session_annotations = {
+                    vid: ledger for vid, ledger in self._session_annotations.items()
+                    if vid in alive
+                }
+                # The provenance verdicts and open-time annotation records,
+                # keyed on the file session id so a GUI tab's transient wrapper
+                # cannot lose one; pruned here (same complete-snapshot rule)
+                # since nothing else drops a closed view's entry.
                 open_sessions = {record.session_id for record in alive.values()}
-                for key in [k for k in _source_verified if k not in open_sessions]:
-                    del _source_verified[key]
+                for verdicts in (_source_verified, _opened_annotations):
+                    for key in [k for k in verdicts if k not in open_sessions]:
+                        del verdicts[key]
             active = focused
             if active is None and len(self._records) == 1:
                 active = next(iter(self._records.values())).view
@@ -1442,7 +1642,9 @@ class BinaryNinjaBridge:
         self._target_lock = _ReadWriteLock()
         # Serializes write operations. Long chunked writers can hold this gate
         # while releasing _target_lock between chunks so reads stay responsive.
-        self._write_gate = threading.Lock()
+        # It records its holder and waiters so a queued writer is observable
+        # (`write_gate_status`) and refusable (`no_wait`) rather than silent (#976).
+        self._write_gate = _WriteGate()
         self._request_state_lock = threading.Lock()
         self._requests_drained = threading.Condition(self._request_state_lock)
         self._request_threads: dict[threading.Thread, int] = {}
@@ -1933,7 +2135,10 @@ class BinaryNinjaBridge:
                     lock = self._write_operation_lock()
                 elif lock_class == "read":
                     lock = self._target_lock.read()
-            with lock:
+            # The gate reads which request reached it from this context, so a
+            # self-locking handler (refresh, mutations) reports and honours
+            # `no_wait` exactly like a lock="write" op does (#976).
+            with _gate_request_context(op, payload.get("id"), payload.get("no_wait") is True), lock:
                 if spec is not None and spec.destructive:
                     # The selector the HANDLER will resolve, which is not
                     # always the request's top-level one (batch_apply prefers
@@ -2374,10 +2579,11 @@ class BinaryNinjaBridge:
         # a save then certifies the bytes the view loaded, whatever sits at
         # the path by then. The same identity judges a preferred database.
         identity = _load_identity(resolved)
-        substitute = _resolve_bndb_sidecar(resolved, prefer_bndb, identity)
+        substitute, sidecar_note = _choose_sidecar(resolved, prefer_bndb, quick, identity)
         if substitute is not None:
             load_path = substitute.path
-            notes.append(_sidecar_note(substitute, resolved))
+        if sidecar_note:
+            notes.append(sidecar_note)
         # A preferred database `_database_provenance` refused: its note's first
         # sentence, awaiting the tail that says what happened instead.
         refused: str | None = None
@@ -2579,6 +2785,14 @@ class BinaryNinjaBridge:
             # analysis_state="unanalyzed" (not "full"), matching the WARNING note.
             if bndb_unanalyzed:
                 _unanalyzed_views.add(bv)
+            # #973: what the view carried BEFORE this session could touch it
+            # (it is still unpublished), so the provenance hint never counts
+            # the session's own annotations -- or a save's re-home -- as
+            # inherited. Measured outside the lock; recorded inside it below.
+            opened_known, opened_record = _opened_annotation_record(
+                bv, load_path if load_path.suffix == ".bndb" else None)
+            if substitute is not None and opened_record is not None:
+                notes.append(_opened_annotation_note(opened_record))
             # The load note is one-shot; the target row keeps the verdict so a
             # later `target info` can still answer whether the restored
             # database was verified against the raw file.
@@ -2595,6 +2809,8 @@ class BinaryNinjaBridge:
                     published = True  # latched: view now owned by _headless_views
                 if verified is not None:
                     _source_verified[view_session_key(bv)] = verified
+                if opened_known:
+                    _opened_annotations[view_session_key(bv)] = opened_record
                 targets = self.targets.refresh()
 
             self._record_project_root(workdir)
@@ -2628,6 +2844,7 @@ class BinaryNinjaBridge:
                 _quick_loaded_views.discard(bv)
                 _unanalyzed_views.discard(bv)
                 _source_verified.pop(view_session_key(bv), None)
+                _opened_annotations.pop(view_session_key(bv), None)
             raise
         finally:
             with _load_in_progress_lock:
@@ -3079,6 +3296,30 @@ class BinaryNinjaBridge:
             # of the same binary finds this copy and restores the annotations (#318).
             if cache_path is None:
                 raise exc
+            # The cache is shared by every instance using this BN_CACHE_DIR, and
+            # a view opened from the raw bytes (`--no-bndb`, or `--quick`, which
+            # never restores a cache entry, #956) did not load the entry that
+            # may already sit at this name. Overwriting it silently replaced
+            # another run's saved analysis with this one. Write it only when it
+            # is new, or is this view's own: opened from it, or written by an
+            # earlier save of this view.
+            if Path(cache_path).exists() and not (
+                _same_file(cache_path, filename)
+                or _same_file(self.targets.recorded_database(bv), cache_path)
+            ):
+                _restore_filename()
+                raise OperationFailure(
+                    "invalid_request",
+                    f"save refused: {out} is not writable, and the cache fallback "
+                    f"{cache_path} already holds a database this target was not "
+                    "loaded from (another run's saved analysis of these bytes); "
+                    "overwriting it would discard that work. Save elsewhere with "
+                    "`bn save <path>`, or close this target and `bn load "
+                    f"{shlex.quote(cache_path)}` to continue from that database.",
+                    requested={"path": out},
+                    observed={"cache_entry_exists": cache_path,
+                              "request_sent": True, "written": False},
+                )
             try:
                 saved = _attempt(cache_path, make_parent=True)
             except Exception:
@@ -3787,9 +4028,20 @@ class BinaryNinjaBridge:
         """
         with self._write_gate:
             with self._target_lock.read():
+                bv = self._resolve_view(selector)
+                # #952: this op bypasses the generic engine, so it must apply the
+                # engine's quick-view policy itself -- before the walk and before
+                # any write. A quick view defines a sliver of the pcln entries, and
+                # renaming that sliver reported a measured zero-candidate success
+                # over a target whose functions were simply never discovered.
+                mutation_engine.refuse_quick_view(
+                    bv,
+                    requested={"op": "go_rename", "preview": preview},
+                    why=("Go rename only renames functions analysis has defined, so "
+                         "it would skip almost every recovered pcln entry."),
+                )
                 recovered = read_go._go_functions(self.ctx, selector)
                 items = recovered.get("items") or []
-                bv = self._resolve_view(selector)
                 candidates: list[dict[str, Any]] = []
                 skipped_user_named = 0
                 # #818 review: the DEFECT this closes was an envelope stating two
@@ -4078,8 +4330,8 @@ class BinaryNinjaBridge:
             # For the same reason the op's `annotation_summary` is not copied
             # here -- `redacted: true` beside a populated `comments` map would
             # be a false claim about the artifact.
-            decompile = read_decompile._redact_rendered_annotations(
-                decompile, read_decompile._annotation_bodies(func, comments)
+            decompile, _summary = read_decompile._redact_function_annotations(
+                self.ctx, bv, func, comments, decompile
             )
         bundle_warnings = self._render_warnings(decompile)
         stub = self._analysis_stub_warning(func, decompile)
@@ -4470,7 +4722,13 @@ class BinaryNinjaBridge:
             if committed_change or rollback_left_state or residue_left_state:
                 try:
                     selector = a[0] if a else k.get("selector")
-                    self.targets.mark_dirty(self.targets.resolve(selector))
+                    view = self.targets.resolve(selector)
+                    self.targets.mark_dirty(view)
+                    # #977: only a COMMITTED write is the analyst's annotation; a
+                    # failed rollback's leftovers are stamped `rollback_failed`,
+                    # never `verified`, so they cannot enter the ledger here.
+                    if committed_change:
+                        self.targets.note_session_annotations(view, result.get("results"))
                 except Exception:
                     pass
             return result
@@ -4541,6 +4799,7 @@ from .bridge_state import (  # noqa: E402
     _headless_views,
     _headless_views_lock,
     _quick_loaded_views,
+    _opened_annotations,
     _source_verified,
     _unanalyzed_views,
     view_session_key,
@@ -4604,6 +4863,15 @@ def _bind_associate_project_roots(bridge, params, target):
 @op("cancel_request", lock="none")
 def _bind_cancel_request(bridge, params, target):
     return bridge._cancel_request(params.get("request_id"))
+
+
+@op("write_gate_status", lock="none")
+def _bind_write_gate_status(bridge, params, target):
+    # lock="none": it must answer while the gate it describes is held (#976).
+    request_id = params.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("write_gate_status requires params.request_id")
+    return bridge._write_gate.status(request_id)
 
 
 @op("load_binary", lock="none")
@@ -5721,6 +5989,10 @@ class _SidecarChoice:
 
     path: Path
     source: str  # "adjacent" | "cache"
+    # For a cache entry: found under the name keyed on the content sha256 of
+    # the bytes being loaded (True), or under the legacy PATH-keyed name a
+    # save wrote before content keying (False). Always False for "adjacent".
+    content_keyed: bool = False
 
 
 def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool,
@@ -5729,14 +6001,14 @@ def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool,
     path as given.
 
     Shared by the runtime ``bn load`` path (`_load_binary`) and the headless
-    preload path (`_preload_binary`) so both honor a saved database -- otherwise
-    `bn-agent foo` silently re-analyzes from scratch and drops the saved work that
-    `bn load foo` would have picked up (#178). Prefers an adjacent
-    ``<path>.bndb``; if none (e.g. the binary is on a read-only mount), falls back
-    to the writable-cache copy `_save_database` wrote there (#318): the
-    content-keyed name first, then the legacy path-keyed name. A request that
-    already points at a ``.bndb`` (or prefer_bndb=False, or a raw file whose
-    *identity* could not be taken) resolves to None.
+    preload path (`_preload_binary`), through `_choose_sidecar`, so both honor a
+    saved database -- otherwise `bn-agent foo` silently re-analyzes from scratch
+    and drops the saved work that `bn load foo` would have picked up (#178).
+    Prefers an adjacent ``<path>.bndb``; if none (e.g. the binary is on a
+    read-only mount), falls back to the writable-cache copy `_save_database`
+    wrote there (#318): the content-keyed name first, then the legacy path-keyed
+    name. A request that already points at a ``.bndb`` (or prefer_bndb=False,
+    or a raw file whose *identity* could not be taken) resolves to None.
 
     The choice is by path; whether the database actually describes the bytes
     now at ``resolved`` is decided AFTER it is opened (`_database_provenance`),
@@ -5747,11 +6019,64 @@ def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool,
     sibling = Path(str(resolved) + ".bndb")
     if sibling.exists():
         return _SidecarChoice(sibling, "adjacent")
-    for cached in (_cache_bndb_path(str(resolved), identity.sha256),
-                   _cache_bndb_path(str(resolved))):
+    for cached, content_keyed in ((_cache_bndb_path(str(resolved), identity.sha256), True),
+                                  (_cache_bndb_path(str(resolved)), False)):
         if cached.exists():
-            return _SidecarChoice(cached, "cache")
+            return _SidecarChoice(cached, "cache", content_keyed)
     return None
+
+
+def _choose_sidecar(resolved: Path, prefer_bndb: bool, quick: bool,
+                    identity: _SourceIdentity | None) -> tuple[_SidecarChoice | None, str | None]:
+    """`_resolve_bndb_sidecar` plus the load's own policy on it, for both load
+    paths: ``(database to open instead, note)``, either may be None.
+
+    ``--quick`` never restores a CACHE entry (#956). The cache is one directory
+    for every bn instance sharing a BN_CACHE_DIR, so the entry a quick look found was
+    written by whichever earlier run saved these bytes: restoring it replaced
+    the ~1s raw load the flag promises with a full database load (54s measured
+    on a firmware binary) and started a "fresh" look with that run's renames.
+    The quick load opens the raw bytes and the note names the entry it left
+    alone and how to restore it. An adjacent ``<binary>.bndb`` is still
+    preferred: it sits beside the file, where someone put it on purpose, and
+    the "--quick ignored" note says so.
+    """
+    choice = _resolve_bndb_sidecar(resolved, prefer_bndb, identity)
+    if choice is None:
+        return None, None
+    if quick and choice.source == "cache":
+        return None, (
+            f"--quick: did not restore the cached database {choice.path} "
+            f"({_cache_entry_description(choice, resolved)}); loaded the raw "
+            f"bytes without analysis. To restore that analysis instead: "
+            f"`bn load {shlex.quote(str(choice.path))}`"
+        )
+    return choice, _sidecar_note(choice, resolved)
+
+
+def _cache_entry_description(choice: _SidecarChoice, resolved: Path) -> str:
+    """Why a cache entry was picked for *resolved*, and when it was written --
+    the two facts an agent needs to judge whose analysis it is about to get."""
+    why = (
+        f"its name matches the content hash of {resolved.name}"
+        if choice.content_keyed else
+        f"legacy entry named for the path {resolved}, saved before content keying"
+    )
+    try:
+        mtime = choice.path.stat().st_mtime
+    except OSError:
+        return f"{why}; save time unknown"
+    saved = datetime.fromtimestamp(mtime, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return f"{why}; saved {saved}, {_age_text(time.time() - mtime)} ago"
+
+
+def _age_text(seconds: float) -> str:
+    """A coarse human age: ``45s``, ``12m``, ``5h``, ``3d``."""
+    seconds = max(0, int(seconds))
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
 
 
 def _sidecar_note(choice: _SidecarChoice, resolved: Path) -> str:
@@ -5760,13 +6085,44 @@ def _sidecar_note(choice: _SidecarChoice, resolved: Path) -> str:
         # The binary's own mount had no writable adjacent .bndb (a read-only
         # firmware image), so the annotations were saved to the writable cache.
         # Restore them instead of silently re-analyzing blank, which looked
-        # like total annotation loss (#318).
+        # like total annotation loss (#318) -- and say which entry and whose:
+        # the cache is shared by every bn instance using that cache dir (#956).
         return (
-            f"restored cached database {choice.path} (saved when "
-            f"{resolved.name}'s mount had no writable adjacent .bndb -- "
-            f"annotations preserved); pass --no-bndb to load the raw bytes"
+            f"restored cached database {choice.path} "
+            f"({_cache_entry_description(choice, resolved)}; {choice.path.parent} is "
+            "shared by every bn instance using that cache dir (BN_CACHE_DIR), so "
+            "its annotations may be another run's); pass --no-bndb to load the raw bytes"
         )
     return f"loaded {choice.path} instead of {resolved} (use --no-bndb to skip)"
+
+
+def _opened_annotation_record(bv, database: Path | None) -> tuple[bool, dict[str, Any] | None]:
+    """What *bv* carried as the bridge opened it, for `_opened_annotations`
+    (#973): ``(known, record)``. A raw open inherits nothing -- ``(True,
+    None)``; a database open records its counts and path; ``(False, None)``
+    when those counts cannot be read, so the hint falls back to the current
+    counts rather than claim a clean inheritance it never measured."""
+    if database is None:
+        return True, None
+    try:
+        summary = read_listing._annotation_summary(None, bv)
+    except Exception:  # noqa: BLE001 - unmeasured is "unknown", never zero
+        return False, None
+    return True, {
+        "path": str(database),
+        **{key: summary[key] for key in (
+            "comments", "function_comments", "analyst_symbols", "placeholder_symbols")},
+    }
+
+
+def _opened_annotation_note(record: dict[str, Any]) -> str:
+    """The load note stating what a substituted database already held."""
+    return (
+        f"{Path(record['path']).name} already held {record['comments']} comment(s), "
+        f"{record['function_comments']} function doc(s) and "
+        f"{record['analyst_symbols']} analyst symbol(s) when opened -- not this "
+        "run's work (`bn target info` keeps reporting them as existing_annotations)"
+    )
 
 
 def _view_function_count(bv) -> int:
@@ -5910,10 +6266,10 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
 
     resolved = Path(path).expanduser().resolve()
     identity = _load_identity(resolved)
-    substitute = _resolve_bndb_sidecar(resolved, prefer_bndb, identity)
+    substitute, sidecar_note = _choose_sidecar(resolved, prefer_bndb, quick, identity)
     load_path = substitute.path if substitute is not None else resolved
-    if substitute is not None:
-        bn.log_info(_sidecar_note(substitute, resolved))
+    if sidecar_note:
+        bn.log_info(sidecar_note)
     bv = binaryninja.load(str(load_path), update_analysis=False)
     if bv is None:
         bn.log_warn(f"Failed to open binary: {load_path}")
@@ -5965,8 +6321,14 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
             _quick_loaded_views.discard(bv)
         if bndb_unanalyzed:
             _unanalyzed_views.add(bv)
+        opened_known, opened_record = _opened_annotation_record(
+            bv, load_path if load_path.suffix == ".bndb" else None)
+        if substitute is not None and opened_record is not None:
+            bn.log_info(_opened_annotation_note(opened_record))
         if verified is not None:
             _source_verified[view_session_key(bv)] = verified
+        if opened_known:
+            _opened_annotations[view_session_key(bv)] = opened_record
         with _headless_views_lock:
             _headless_views.append(bv)
             published = True  # latched: view now owned by _headless_views
@@ -5983,18 +6345,23 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
             _quick_loaded_views.discard(bv)
             _unanalyzed_views.discard(bv)
             _source_verified.pop(view_session_key(bv), None)
+            _opened_annotations.pop(view_session_key(bv), None)
         raise
     bn.log_info(f"Loaded {load_path}{' (no analysis)' if quick_effective else ''}")
     return bv
 
 
-def start_bridge():  # pragma: no cover - GUI runtime
+def start_bridge(predecessor: TargetManager | None = None):  # pragma: no cover - GUI runtime
     global _bridge
     if ui is None:
         return
     if _bridge is not None:
         return
     bridge = BinaryNinjaBridge()
+    if predecessor is not None:
+        # Before start(): the first request the new bridge answers must already
+        # see the retained tabs' unsaved state (#953).
+        bridge.targets.succeed(predecessor)
     bridge.start()
     _bridge = bridge
 
@@ -6076,6 +6443,12 @@ def _restart_bridge_command(_):  # pragma: no cover - GUI runtime
     restart_bridge()
 
 
+# The TargetManager of a GUI bridge that Restart Bridge stopped and no successor
+# has replaced yet: its per-view ledger (unsaved markers, backing databases)
+# belongs to tabs that are still open (#953).
+_retired_targets: TargetManager | None = None
+
+
 def restart_bridge():  # pragma: no cover - GUI runtime
     """Stop-then-start the bridge, unlike start_bridge()'s start-once no-op.
 
@@ -6084,17 +6457,21 @@ def restart_bridge():  # pragma: no cover - GUI runtime
     running (#585). This tears the live bridge down first so a fresh instance
     always gets constructed and started.
     """
-    global _bridge
+    global _bridge, _retired_targets
     if ui is None:
         return
     if _bridge is not None:
+        # Kept until a successor actually starts, so a failed start followed by
+        # another Restart still carries the retained tabs' ledger (#953).
+        _retired_targets = _bridge.targets
         _stop_bridge()
     try:
-        start_bridge()
+        start_bridge(_retired_targets)
     except Exception as exc:
         bn.log_error(f"BN Agent Bridge restart failed: {exc}")
         return
     if _bridge is not None:
+        _retired_targets = None
         bn.log_info("BN Agent Bridge restarted")
     else:
         bn.log_error("BN Agent Bridge restart failed: bridge did not start")

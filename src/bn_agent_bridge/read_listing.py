@@ -45,30 +45,40 @@ from ._shared import (
     is_imported_function,
     is_placeholder_symbol_name,
 )
-from .bridge_state import require_analysis, _quick_loaded_views
+from .bridge_state import (
+    _opened_annotations,
+    _quick_loaded_views,
+    require_analysis,
+    view_session_key,
+)
 
 
 def _callee_variadic_hint(callee) -> dict[str, Any] | None:
-    """A provenance-labeled hint when the callee is an imported variadic
-    (printf/scanf-family) function (#558): HLIL callsite text can show only the
-    fixed argument, so point at the argument-recovery views. Returns None for a
-    non-variadic callee. Never asserts a finding -- it steers, it does not judge."""
+    """A provenance-labeled hint when the callee is variadic (#558): HLIL callsite
+    text can show only the fixed argument(s), so point at the argument-recovery
+    views. Returns None for a non-variadic callee. Never asserts a finding -- it
+    steers, it does not judge. ``callee_imported`` is BN's symbol kind (#949), and
+    only a known printf/scanf-family callee is said to take a format string."""
     name = str(getattr(callee, "name", "") or "")
     family = il_format._variadic_format_family(name)
     if family is None and not il_format._function_is_variadic(callee):
         return None
     fmt_index = family[0] if family is not None else None
     is_scanf = bool(family[1]) if family is not None else False
+    imported = is_imported_function(callee)
+    kind = "an imported variadic function" if imported else "a variadic function"
+    supplied = ("a format string and additional arguments" if family is not None
+                else "variadic arguments")
     return {
         "name": il_format._normalize_libc_name(name),
+        "callee_imported": imported,
         "is_variadic": True,
         "family": "scanf" if is_scanf else ("printf" if family is not None else None),
         "format_arg_index": fmt_index,
         "note": (
-            "callee is an imported variadic function; the HLIL statement may show only "
-            "the fixed argument(s) even when ABI setup supplied a format string and "
-            "additional arguments. Run `bn evidence function <caller>` for the format "
-            "string, destination pointers, and raw ABI argument candidates, or inspect "
+            f"callee is {kind}; the HLIL statement may show only the fixed argument(s) "
+            f"even when ABI setup supplied {supplied}. Run `bn evidence function <caller>` "
+            "for the recovered arguments and raw ABI argument candidates, or inspect "
             "`bn disasm <caller> --linear`."
         ),
     }
@@ -687,6 +697,46 @@ def _symbol_address_text(symbol) -> str | None:
         return None
 
 
+def _mirrors_auto_symbol(bv, address: str, name: str) -> bool:
+    """Do the AUTOMATIC symbols at *address* all carry exactly *name* (#973)?
+
+    Binary Ninja marks some names it took from the binary itself as user
+    (``auto=False``) symbols: a local ``NOTYPE`` symtab entry it promotes to a
+    function -- glibc's AArch64 ``_start`` stub ``__wrap_main`` is the case
+    measured, a non-auto ``FunctionSymbol`` beside the auto data and library
+    symbols of the same name -- so a raw load with no annotations at all
+    reported one analyst symbol. When the address has ONE automatic name and
+    the user symbol repeats it, there is nothing an analyst could have chosen:
+    renaming to the current name is a no-op. An address with SEVERAL automatic
+    names (C aliases) is different -- renaming the function to one of its
+    alias names is a real choice -- so any disagreeing auto symbol keeps the
+    user symbol counted. Unreadable means no: an exclusion this cannot prove
+    would hide analyst work from the gate.
+    """
+    if not name:
+        return False
+    try:
+        start = int(address, 16)
+        others = list(bv.get_symbols(start, 1) or [])
+    except Exception:
+        return False
+    matched = False
+    for other in others:
+        try:
+            if getattr(other, "auto", None) is not True:
+                continue
+            if int(getattr(other, "address", -1)) != start:
+                continue
+            other_name = str(getattr(other, "raw_name", "")
+                             or getattr(other, "name", "") or "")
+        except Exception:
+            return False
+        if other_name != name:
+            return False
+        matched = True
+    return matched
+
+
 # ONE bound for every sample array `_annotation_summary` publishes (#733 F2/#793
 # review). The counts beside them stay EXACT: `bn_kernel.assert_unannotated`
 # refuses on `comments` / `function_comments` / `user_symbols` (+`analyst_symbols`),
@@ -829,6 +879,8 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
             exclusion_reason = "debug_info"
         elif is_placeholder_symbol_name(name):
             exclusion_reason = "name_shape"
+        elif address is not None and _mirrors_auto_symbol(bv, address, name):
+            exclusion_reason = "auto_alias"
         if (len(user_symbol_locations) < _ANNOTATION_SAMPLE_LIMIT
                 and address is not None):
             user_symbol_locations.append({"name": name, "address": address})
@@ -840,8 +892,8 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
             # dominated by one placeholder family on a 2900-function target) and
             # tripped the tool's own token guard on the command every agent runs
             # first -- while `placeholder_symbols` above already states the full
-            # number the rows were enumerating, and the two reasons
-            # (`name_shape`/`debug_info`) are visible in a 20-row sample.
+            # number the rows were enumerating, and the reasons
+            # (`name_shape`/`debug_info`/`auto_alias`) are visible in a 20-row sample.
             if len(symbol_exclusions) < _ANNOTATION_SAMPLE_LIMIT:
                 symbol_exclusions.append(
                     {"name": name, "address": address, "reason": exclusion_reason}
@@ -881,7 +933,9 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
             "name_shape is a heuristic, not provenance: analyst renames matching "
             "excluded name families may remain undetected. Internal symbol "
             "namespaces also occur on user renames and are not proof of origin. "
-            "debug_info requires the imported name and address to match."
+            "debug_info requires the imported name and address to match. "
+            "auto_alias requires every automatic symbol at that address to carry "
+            "the same name."
         ),
         # No fourth pair: `analyst_symbols <= user_symbols` and both samples cap
         # at `_ANNOTATION_SAMPLE_LIMIT`, so whenever the analyst pair could
@@ -932,29 +986,50 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
     The caller resolves *bv* itself, the way its own read path resolves it (the
     digest through the bridge shim its unit doubles patch, `target info` from the
     view it already holds); a resolution failure degrades to
-    ``_annotations_unavailable`` in the caller. ``analysis_cache_restored`` is
-    derived from *filename*: a ``.bndb`` carries the analysis cache, which is
-    where inherited comments/names come from. *source_verified* is the load's
+    ``_annotations_unavailable`` in the caller. *source_verified* is the load's
     verdict on the database (preferred over the raw path, or named explicitly
     and judged against its sibling raw file) -- checked against the file's
     content (True), restored unverified or naming other bytes (False), or no
     database was judged (None) -- published beside the flag and spelled out in the hint,
-    so a later reader is not left with the one-shot load note. ``provenance_hint``
-    is keyed on ANALYST work, not the raw non-auto count -- the loader's own
-    placeholders made a pristine view hint that its entirely-current-run
-    analysis may predate the run (#733 F2).
+    so a later reader is not left with the one-shot load note. The COUNTS are
+    always the view's current ones: ``bn_kernel.assert_unannotated`` gates on
+    them.
+
+    The hint is about INHERITANCE, so for a view this bridge opened it is
+    judged from what the view held at open (`_opened_annotations`, #973): a
+    raw open inherited nothing and gets no hint, however much this session has
+    annotated since; a database open gets one naming the counts the database
+    held when opened (also published as ``present_at_open``), never this
+    session's own renames -- before or after a ``save`` re-homes the view. For
+    a view the bridge did not open (a GUI tab), ``analysis_cache_restored`` is
+    derived from *filename* and the hint from the current ANALYST counts (not
+    the raw non-auto count -- the loader's own placeholders made a pristine view
+    hint that its entirely-current-run analysis may predate the run, #733 F2).
     """
-    analysis_cache_restored = str(filename or "").endswith(".bndb")
+    opened_key = view_session_key(bv)
+    opened_known = opened_key in _opened_annotations
+    opened = _opened_annotations.get(opened_key)
+    analysis_cache_restored = (
+        opened is not None if opened_known else str(filename or "").endswith(".bndb")
+    )
     try:
         annotations = _annotation_summary(ctx, bv)
     except Exception as exc:
-        return _annotations_unavailable(exc, filename=filename)
-    total_annotations = (
-        annotations["comments"] + annotations["function_comments"]
-        + annotations["analyst_symbols"]
-    )
+        unavailable = _annotations_unavailable(exc, filename=filename)
+        if opened_known:
+            unavailable["analysis_cache_restored"] = analysis_cache_restored
+        return unavailable
+    if opened_known:
+        inherited = opened or {}
+        present = opened is not None
+    else:
+        inherited = annotations
+        present = analysis_cache_restored or bool(
+            annotations["comments"] + annotations["function_comments"]
+            + annotations["analyst_symbols"]
+        )
     hint = None
-    if analysis_cache_restored or total_annotations:
+    if present:
         if source_verified is True:
             restored = " (analysis cache restored from a .bndb verified against the raw file's content)"
         elif source_verified is False:
@@ -966,10 +1041,12 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
             restored = " (analysis cache restored from a .bndb)"
         hint = (
             f"existing BNDB annotations may predate this run: "
-            f"{annotations['comments']} comment(s), "
-            f"{annotations['function_comments']} function doc(s), "
-            f"{annotations['analyst_symbols']} analyst symbol(s) already present "
-            f"({annotations['placeholder_symbols']} loader placeholder(s) excluded)"
+            f"{inherited['comments']} comment(s), "
+            f"{inherited['function_comments']} function doc(s), "
+            f"{inherited['analyst_symbols']} analyst symbol(s) "
+            + ("present when the database was opened "
+               if opened_known else "already present ")
+            + f"({inherited['placeholder_symbols']} loader placeholder(s) excluded)"
             + (restored if analysis_cache_restored else "")
             + " -- do not over-credit current-run analysis"
         )
@@ -977,6 +1054,8 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
         **annotations,
         "analysis_cache_restored": analysis_cache_restored,
         "source_verified": source_verified,
+        **({"present_at_open": {k: v for k, v in opened.items() if k != "path"}}
+           if opened is not None else {}),
         "provenance_hint": hint,
     }
 

@@ -1055,6 +1055,20 @@ def test_render_surface_non_dict_summary_degrades():
     assert out != _render_surface_text({})
 
 
+def test_render_surface_code_ref_candidate_names_its_site_and_count_967():
+    from bn.formatters import _render_surface_text
+    row = {"address": "0x401158", "section": ".text", "aligned": True, "decode_depth": 16,
+           "code_likely": True, "provenance": "code_ref:install@0x401204",
+           "referenced_from": [{"address": "0x401204", "function": "install"},
+                               {"address": "0x401210", "function": "install"}],
+           "referenced_from_total": 3}
+    out = _render_surface_text({"summary": {"missing_function_candidates": 1},
+                                "missing_function_candidates": [row]})
+    line = next(ln for ln in out.splitlines() if "0x401158" in ln)
+    assert "code_ref:install@0x401204" in line
+    assert "+2 more site(s)" in line
+
+
 def test_render_orient_non_dict_target_and_kind_breakdown_degrade():
     from bn.formatters import _render_orient_text
     out = _render_orient_text({"target": "bad",
@@ -3928,6 +3942,9 @@ _GO_RENAME_NON_COUNT_READS = {
     "overlapping_functions",
     # Command-specific disclosure container, built from the captured counters.
     "go_rename",
+    # #964: the paired renderer reads the per-type `types declare` disclosure
+    # back off the summary; a listing, not a count, and absent on every `go rename`.
+    "declared_types",
 }
 
 
@@ -4862,7 +4879,7 @@ def test_class_show_skewed_primary_vtable_slots_say_more_than_the_empty_case():
     base = {"name": "Widget", "confidence": "rtti", "vtable": {"address": "0x10"}}
     skewed = _render_class_show_text({**base, "vtable": {"address": "0x10", "slots": "bad"}})
     empty = _render_class_show_text({**base, "vtable": {"address": "0x10", "slots": []}})
-    assert "no slots resolved here" in skewed        # the empty case's explanation
+    assert "slots not proven" in skewed              # the empty case's explanation
     assert "malformed slots field" in skewed         # plus what the empty case cannot say
     assert all(line in skewed for line in empty.splitlines())
     assert skewed != empty
