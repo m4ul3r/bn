@@ -5795,17 +5795,31 @@ def _render_doctor_text(value: Any) -> str:
                 "compared with this CLI's. `bn session restart "
                 + str(item.get("instance_id") or "<id>")
                 + "` from this CLI would respawn it on this CLI's checkout")
+        elif not item.get("gui", True) and item.get("bridge_source_unknown"):
+            lines.append(
+                "  note: bridge source is unknown (not reported by this bridge); "
+                "`bn session restart " + str(item.get("instance_id") or "<id>")
+                + "` from this CLI would respawn it on this CLI's checkout: "
+                + str(value.get("plugin_source_dir", "<unknown>")))
         if item.get("stale_plugin_version"):
             lines.append("  stale: loaded plugin version differs from CLI version")
-        # The reference differs by kind (#992): a GUI bridge loads the installed
-        # plugin file, a headless one this CLI's own source.
-        reference = "installed plugin file" if item.get("gui", True) else "this CLI's source"
+        # GUI comparisons use its actual reported package, not a guessed install.
+        is_gui = item.get("gui", True)
+        reference = (
+            "reported plugin source on disk" if item.get("bridge_source_dir")
+            else "installed plugin file"
+        ) if is_gui else "this CLI's source"
         if item.get("stale_plugin_code"):
             lines.append(f"  stale: loaded plugin code does not match {reference}")
         if item.get("stale_engine"):
+            remedy = (
+                "reload Binary Ninja plugins or restart Binary Ninja"
+                if is_gui else "run `bn session restart "
+                + str(item.get("instance_id") or "<id>") + "`"
+            )
             lines.append(
                 f"  stale: loaded engine code (taint/IL modules) does not match {reference} -- "
-                "run `bn session restart " + str(item.get("instance_id") or "<id>") + "`")
+                + remedy)
         if item.get("started_at"):
             lines.append(f"  started: {item['started_at']}")
         if item.get("socket_path"):

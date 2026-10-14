@@ -869,8 +869,8 @@ def test_load_refuses_ambient_routing_with_multiple_instances(
         bn.cli,
         "list_instances",
         lambda: [
-            types.SimpleNamespace(instance_id="one"),
-            types.SimpleNamespace(instance_id="two"),
+            types.SimpleNamespace(instance_id="one", pid=11, socket_path="/tmp/one.sock", started_at=None),
+            types.SimpleNamespace(instance_id="two", pid=22, socket_path="/tmp/two.sock", started_at=None),
         ],
     )
 
@@ -878,7 +878,10 @@ def test_load_refuses_ambient_routing_with_multiple_instances(
 
     assert rc == 2
     assert calls == []
-    assert "explicit -i/--instance" in capsys.readouterr().err
+    message = capsys.readouterr().err
+    assert "explicit -i/--instance" in message
+    assert "- one (pid=11" in message
+    assert "- two (pid=22" in message
 
 
 def test_load_routes_on_bn_instance_with_multiple_instances_992(
@@ -889,7 +892,8 @@ def test_load_routes_on_bn_instance_with_multiple_instances_992(
     raw = tmp_path / "foo.so"
     raw.write_bytes(b"")
     monkeypatch.setattr(bn.cli, "list_instances", lambda: [
-        types.SimpleNamespace(instance_id="one"), types.SimpleNamespace(instance_id="two"),
+        types.SimpleNamespace(instance_id="one", pid=11, socket_path="/tmp/one.sock", started_at=None),
+        types.SimpleNamespace(instance_id="two", pid=22, socket_path="/tmp/two.sock", started_at=None),
     ])
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
     loaded = {"ok": True, "result": {"loaded": True, "path": str(raw), "targets": []}}

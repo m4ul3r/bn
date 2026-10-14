@@ -1532,7 +1532,8 @@ def _verify_response_identity(
             f"expected {expected!r}, received {actual!r}; "
             "refusing data from a different or stale bridge"
         )
-def _send_cancel_request(instance: BridgeInstance, request_id: str) -> None:
+def _send_cancel_request(instance: BridgeInstance, request_id: str) -> bool:
+    """Return whether the cancellation request was sent, not whether it took effect."""
     payload = {
         "id": str(uuid.uuid4()),
         "op": "cancel_request",
@@ -1551,8 +1552,9 @@ def _send_cancel_request(instance: BridgeInstance, request_id: str) -> None:
             with contextlib.suppress(OSError):
                 while sock.recv(65536):
                     pass
+        return True
     except (OSError, BridgeError):
-        pass
+        return False
 
 
 def _send_request_to_instance(
@@ -1657,6 +1659,7 @@ def _send_request_to_instance(
     # reached the bridge; one after it is the bridge's own (see
     # BridgeUnreachableError).
     reached = False
+    cancel_sent = False
     for attempt in range(connect_retries):
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -1704,7 +1707,7 @@ def _send_request_to_instance(
         except OSError as exc:
             last_error = exc
             if isinstance(exc, TimeoutError):
-                _send_cancel_request(instance, str(payload["id"]))
+                cancel_sent = _send_cancel_request(instance, str(payload["id"]))
             if exc.errno not in TRANSIENT_SOCKET_ERRNOS or attempt == connect_retries - 1:
                 break
             delay = 0.05 * (attempt + 1)
@@ -1719,6 +1722,12 @@ def _send_request_to_instance(
                     break
             time.sleep(delay)
 
+    cancellation = (
+        "A cancel request was sent; the operation may keep running until "
+        "it checks for cancellation. "
+        if cancel_sent else
+        "A cancel request could not be sent; the operation may still be running. "
+    )
     if last_error is not None and chunks:
         # Bytes arrived and then the connection failed: a timeout or reset
         # mid-response. Don't fall through to json.loads on the truncated
@@ -1726,6 +1735,7 @@ def _send_request_to_instance(
         raise BridgeError(
             f"Connection to Binary Ninja bridge pid {instance.pid} failed mid-response for op '{op}' "
             f"after {len(b''.join(chunks))} bytes ({type(last_error).__name__}: {last_error})"
+            + (f". {cancellation}" if isinstance(last_error, TimeoutError) else "")
         ) from last_error
     if last_error is not None:
         if isinstance(last_error, TimeoutError):
@@ -1740,9 +1750,8 @@ def _send_request_to_instance(
             )
             raise BridgeError(
                 f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path}"
-                f"{timeout_suffix} (op '{op}'). The bridge may be busy with analysis; "
-                f"inspect progress with `bn -i {instance_selector(instance)} target info`, "
-                "then raise or disable the limit with "
+                f"{timeout_suffix} (op '{op}'). {cancellation}"
+                "Raise or disable the limit with "
                 "BN_REQUEST_TIMEOUT=<seconds|0> if the operation is intentionally long."
             ) from last_error
         # A failure before connect() ever succeeded (socket gone, nothing

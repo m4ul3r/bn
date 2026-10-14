@@ -7,7 +7,7 @@ from typing import Any
 
 from .. import cli
 from ..cli import _call, _pick, arg, command
-from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT
+from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT, _format_instance_choices
 from ..target_hint import (
     LISTED_SELECTOR_LEAD, format_multi_target_hint, positional_selector,
     respell_for_positional, target_option,
@@ -76,12 +76,14 @@ def _load(args: argparse.Namespace) -> int:
         or (getattr(args, "instance", None)
             and not getattr(args, "_sticky_instance", False))
     )
-    if not explicitly_routed and len(cli.list_instances()) > 1:
+    instances = cli.list_instances() if not explicitly_routed else []
+    if len(instances) > 1:
         raise BridgeError(
             "bn load refuses ambient instance routing while multiple bridges are "
             "running. Pass an explicit -i/--instance (or export BN_INSTANCE) for an "
             "existing bridge, or --instance-id to create a named bridge; the "
-            "`bn instance use` pin is not used to pick where a load lands."
+            "`bn instance use` pin is not used to pick where a load lands.\n"
+            "Running instances:\n" + _format_instance_choices(instances)
         )
     return _call(
         args,

@@ -2517,6 +2517,8 @@ class TestRestartReopensAStaleDatabaseLoudly:
     had changed with `notes: []`. A private session: the restart IS the subject."""
 
     def test_restart_reports_the_database_whose_raw_file_changed(self, tmp_path):
+        from bn.commands.admin import _SHUTDOWN_TEARDOWN_TIMEOUT
+
         prog = tmp_path / "prog"
         hello = Path(HELLO_BINARY).read_bytes()
         prog.write_bytes(hello)
@@ -2524,15 +2526,24 @@ class TestRestartReopensAStaleDatabaseLoudly:
         sidecar = prog.with_name("prog.bndb")
         inst = None
         try:
-            inst = _session_start(str(prog))["instance_id"]
-            saved = json.loads(_bn("--instance", inst, "save", "--format", "json").stdout)
+            started = _session_start(str(prog))
+            inst = started["instance_id"]
+            saving = _bn("--instance", inst, "-t", str(prog), "save", "--format", "json")
+            assert saving.returncode == 0, f"{saving.stdout}\n{saving.stderr}"
+            saved = json.loads(saving.stdout)
             assert saved["path"] == str(sidecar), saved
             prog.write_bytes(Path(ADD_BINARY).read_bytes())
 
-            restarted = _bn("session", "restart", inst, "--format", "json",
-                            timeout=_SESSION_START_TIMEOUT)
+            # Restart includes old-process teardown AND a full new session start;
+            # don't make those phases compete for one startup-only outer budget.
+            restarted = _bn(
+                "session", "restart", inst, "--format", "json",
+                timeout=_SHUTDOWN_TEARDOWN_TIMEOUT + 2.0 + _SESSION_START_TIMEOUT,
+            )
             assert restarted.returncode == 0, f"{restarted.stdout}\n{restarted.stderr}"
             result = json.loads(restarted.stdout)
+            assert result["instance_id"] == inst, result
+            assert result["pid"] != started["pid"], result
             reloaded = result["loaded"][0]
             assert reloaded["path"] == str(sidecar), reloaded
             note = next((n for n in reloaded["notes"] if "requested explicitly" in n), None)
