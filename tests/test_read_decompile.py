@@ -6439,7 +6439,11 @@ def test_every_unresolved_exit_jump_gets_one_neutral_warning_1000(dest):
     # The jump-table half promises nothing: no table here, so only the
     # decompile's own stores are offered, as a "may".
     assert "None of these steps is sure to find the targets" in detail
-    assert "may name the targets" in detail and "bn xrefs" not in detail
+    assert "may name the targets" in detail and "`bn xrefs 0x" not in detail
+    # A table a store names (`&a.1`) is read through its address, which
+    # `bn xrefs <name>` prints.
+    assert "`bn xrefs <name>` prints its address" in detail
+    assert "`bn evidence table <address>` reads it" in detail
     note = read_decompile._JUMP_LINE_NOTE
     assert note.startswith("/* bn:") and note.endswith("*/")
     assert "tail call" in note and "computed goto" in note and "virtual" not in note
@@ -6457,6 +6461,7 @@ def test_a_jump_reading_a_data_table_names_the_steps_and_their_limits_1000():
     assert row["table"] == 0x420010
     # xrefs: the writes of a table filled at run time.
     assert "`bn xrefs 0x420010`" in detail and "filled at run time" in detail
+    assert "base address only" in detail
     # evidence table: only a static table, and it says what relative entries mean.
     assert "`bn evidence table 0x420010`" in detail
     assert "added to the table base 0x420010" in detail and "reads as zeros" in detail

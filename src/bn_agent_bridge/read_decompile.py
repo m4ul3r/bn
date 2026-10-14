@@ -1826,9 +1826,10 @@ def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
             if block is None or list(getattr(block, "outgoing_edges", None) or []):
                 continue
             table = _jump_data_address(bv, dest)
+            target = str(dest)
         except Exception:  # noqa: BLE001 - one odd jump must not hide the rest
             continue
-        rows[address] = {"address": address, "target": str(dest), "table": table}
+        rows[address] = {"address": address, "target": target, "table": table}
     return list(rows.values())
 
 
@@ -1882,8 +1883,9 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
     if table is not None:
         steps.append(
             f"`bn xrefs {hex(table)}` lists the code that reads and writes the data the "
-            "jump reads from; when it is filled at run time (a `.bss` table) its writes "
-            "are where the target addresses are stored")
+            "jump reads from -- references to its base address only, so a store to a later "
+            "entry may be missing; when it is filled at run time (a `.bss` table) its "
+            "writes are where the target addresses are stored")
         steps.append(
             f"`bn evidence table {hex(table)}` reads that data's current bytes, which name "
             "targets only for a static table (absolute pointers; with `--stride 4 --width "
@@ -1891,7 +1893,9 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
             "table filled at run time reads as zeros")
     steps.append(
         "stores in this decompile that write code or table addresses into what the jump "
-        "reads (`tbl = &data_...`, `var_10 = &a.1`) may name the targets or their table")
+        "reads (`tbl = &data_...`, `var_10 = &a.1`) may name the targets or their table; "
+        "for a table a store names, `bn xrefs <name>` prints its address (`resolved 'a.1' "
+        "as a data symbol @ <address>`), and `bn evidence table <address>` reads it")
     detail = (
         f"unresolved indirect jump at {where} to `{row['target']}`: BN renders it as "
         "`❓ /* jump -> ... */` -- the ❓ marks control flow it could not resolve -- and "
@@ -1901,7 +1905,7 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
         f"rendered; read them in `bn disasm {where}`, and type the callee (`bn proto "
         "set`) or the object the pointer is loaded from so BN can render the call. Or a "
         "computed goto or jump table BN did not resolve, staying in this function: the "
-        "code it reaches is not part of this function's decompile or disassembly. None "
+        "code it reaches may not be part of this function's decompile or disassembly. None "
         "of these steps is sure to find the targets: " + "; ".join(steps) + ". Read a "
         "target address's code with `bn disasm <target> --linear 16`."
         + (" Every line that shows this jump carries a `/* bn: ... */` note." if inline else "")
