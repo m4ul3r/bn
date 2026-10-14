@@ -1497,6 +1497,14 @@ class BridgeContext:
             self, bv, start, entries=entries, stride_size=stride
         )
 
+    def _operator_new_size_at_ctor(self, bv, record):
+        """(size, addr) of the operator-new allocation feeding a ctor's ``this``,
+        else None. TODO(#205 Task 9): implement against live BN — backward-slice
+        the ctor call's arg0 to its ``operator new(N)`` allocation and read N.
+        Returns None for now (honest "unknown"); the BN-type-width path in
+        _object_size still yields real sizes when a type is defined."""
+        return None
+
     def _read_u32(self, bv, address):
         try:
             data = bytes(bv.read(address, 4))
@@ -1573,15 +1581,47 @@ class BridgeContext:
                 notes.append(note)
         return out
 
-    def _ctor_construction_sites(self, bv, record):
-        """Where this class is constructed, with the ``operator new``
-        allocation each site's object sits in when one is traced -- an upper
-        bound on the class size, never the size (`read_class._construction_sites`,
-        #998 item 4). Uncapped: the cap lives at the LISTING site
-        (`read_class._instances`, which slices and discloses
-        `construction_sites_total`/`_truncated`, #822)."""
-        from . import read_class
-        return read_class._construction_sites(self, bv, record)
+    def _ctor_construction_sites(self, bv, record, *, cap=None):
+        """Where this class is constructed: each ctor's inbound call sites, from
+        code xrefs. This is sound (no arg recovery needed). Classifying the
+        `this` storage (new/stack/global) and recovering the operator-new size
+        needs MLIL arg recovery that BN often does not expose at these sites, so
+        it is left as a best-effort gap: kind is "ctor-call" and size is None.
+
+        ``cap`` is OPTIONAL and no longer used by `_instances` (#822): a reader
+        that caps its own scan cannot report the exact total of what it hid, so
+        the cap now lives at the LISTING site (`read_class._instances`, which
+        slices and discloses `construction_sites_total`/`_truncated`)."""
+        get_refs = getattr(bv, "get_code_refs", None)
+        if not callable(get_refs):
+            return []
+        sites: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for m in record.get("methods", []):
+            if m.get("kind") != "ctor":
+                continue
+            try:
+                addr = int(m["address"], 16)
+            except (KeyError, ValueError, TypeError):
+                continue
+            for ref in get_refs(addr):
+                ra = int(getattr(ref, "address", 0) or 0)
+                if ra == 0 or ra in seen:
+                    continue
+                seen.add(ra)
+                caller = getattr(ref, "function", None)
+                csym = getattr(caller, "symbol", None) if caller is not None else None
+                cname = (getattr(csym, "short_name", None) or getattr(caller, "name", None)) \
+                    if caller is not None else None
+                sites.append({
+                    "address": hex(ra),
+                    "function": str(cname) if cname else None,
+                    "kind": "ctor-call",
+                    "size": None,
+                })
+                if cap is not None and len(sites) >= cap:
+                    return sites
+        return sites
 
     def _vtable_layout_for(self, bv, addr):
         from . import read_class

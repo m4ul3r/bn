@@ -67,8 +67,7 @@ REQUIRED_INTEGRATION_FIXTURES = (
     "classes_x86_64",   # C++ (src/classes.cpp): the class lens's RTTI shapes (#922)
     "classes_stripped_x86_64",  # same PIE with BN-synthesized vtable symbols (#935)
     "canary_x86_64",
-    "vcalls_x86_64",    # C++ (src/vcalls.cpp): vtable-slot callers, operator-new sizes (#998)
-    "sizes_x86_64",     # C++ -O2 (src/sizes.cpp): allocations that are not the class (#998)
+    "vcalls_x86_64",    # C++ (src/vcalls.cpp): vtable-slot callers, address points (#998)
 )
 
 _BUILD_LOCK_NAME = ".build.lock"

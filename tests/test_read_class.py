@@ -494,7 +494,7 @@ def test_enrich_backwalks_vtable_for_stripped_class():
     # primary + secondary vtables recovered via the typeinfo backwalk in _enrich.
     class _EnrichCtx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return _NO_SIZE
+            return None
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -525,7 +525,7 @@ def test_enrich_recovers_secondary_for_symbolized_primary_class():
     # symbolized primary layout.
     class _EnrichCtx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return _NO_SIZE
+            return None
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -918,9 +918,6 @@ def test_vtable_layout_skips_header_and_marks_slots():
     assert s2["pure_virtual"] is True
 
 
-_NO_SIZE = read_class._SizeBound("no_size_evidence", None)
-
-
 def test_vtable_layout_reports_the_address_point_998():
     """#998 item 3: objects hold the slot array's address, not the `_ZTV`
     object start the layout is keyed by."""
@@ -954,100 +951,33 @@ def test_vtable_layout_stops_at_unmapped_slot():
     assert [s["index"] for s in layout["slots"]] == [0]   # stopped at the gap
 
 
-# --- #998 item 4: fake MLIL SSA for the allocation trace --------------------
-
-
-class _Il:
-    """One MLIL SSA expression/instruction: `operation.name` plus operands."""
-
-    def __init__(self, op, **operands):
-        self.operation = types.SimpleNamespace(name=op)
-        self.__dict__.update(operands)
-
-
-def _var(name, version=0, function=None):
-    return _Il("MLIL_VAR_SSA", src=types.SimpleNamespace(var=name, version=version),
-               function=function)
-
-
-def _call(target, params, address):
-    return _Il("MLIL_CALL_SSA", dest=_Il("MLIL_CONST_PTR", constant=target),
-               params=params, address=address)
-
-
-_OP_NEW, _OP_NEW_ARRAY = 0x400620, 0x400630
-
-
-class _MlilBV:
-    """Imports by raw name, plus local functions by address."""
-
-    _IMPORTS = {_OP_NEW: "_Znwm", _OP_NEW_ARRAY: "_Znam"}
-
-    def __init__(self, functions=()):
-        self._functions = {fn.start: fn for fn in functions}
-
-    def get_symbol_at(self, address):
-        name = self._IMPORTS.get(address)
-        return types.SimpleNamespace(raw_name=name, name=name) if name else None
-
-    def get_function_at(self, address):
-        return self._functions.get(address)
-
-    def get_functions_containing(self, address):
-        return [fn for fn in self._functions.values() if fn.start <= address < fn.start + 0x100]
-
-
-def _allocating_caller(start, new_target, size, *, via_copy=False):
-    """`p = operator new(size); [q = p;] X::X(q)` with the ctor call at start+0x10."""
-    ssa = types.SimpleNamespace()
-    new_call = _call(new_target, [_Il("MLIL_CONST", constant=size)], start + 4)
-    definitions = {("result", 1): new_call}
-    arg = _var("result", 1, function=ssa)
-    if via_copy:
-        definitions[("x3", 1)] = _Il("MLIL_SET_VAR_SSA", src=arg)
-        arg = _var("x3", 1, function=ssa)
-    ssa.get_ssa_var_definition = lambda var: definitions.get((var.var, var.version))
-    ctor_call = types.SimpleNamespace(params=[arg])
-    return types.SimpleNamespace(
-        start=start,
-        get_llil_at=lambda addr: types.SimpleNamespace(
-            mlil=types.SimpleNamespace(ssa_form=ctor_call)))
-
-
-def test_operator_new_size_at_traces_scalar_new_only_998():
-    caller = _allocating_caller(0x6000, _OP_NEW, 0x58, via_copy=True)
-    assert read_class._operator_new_size_at(_MlilBV([caller]), 0x6010) == (0x58, 0x6004)
-    # `operator new[]` is not traced.
-    array = _allocating_caller(0x6000, _OP_NEW_ARRAY, 0x30)
-    assert read_class._operator_new_size_at(_MlilBV([array]), 0x6010) is None
-
-
 class _SizeCtx:
-    def __init__(self, sites=()):
-        self._sites = list(sites)
+    def __init__(self, type_width=None, new_size=None):
+        self._type_width = type_width
+        self._new_size = new_size
 
-    def _ctor_construction_sites(self, bv, record):
-        return [dict(site) for site in self._sites]
+    def _find_type(self, bv, name):
+        if self._type_width is None:
+            return None
+        class _T:
+            width = self._type_width
+        return name, _T()
+
+    def _operator_new_size_at_ctor(self, bv, record):
+        return self._new_size  # (size, addr) or None
 
 
-def _site(allocation_size=None, allocation="0x6004", address="0x6010"):
-    return {"address": address, "function": "make", "kind": "ctor-call",
-            "allocation_size": allocation_size, "allocation": allocation}
+def test_size_prefers_bn_type_width():
+    rec = {"name": "net::Session", "methods": [], "vtable": None}
+    out = read_class._object_size(_SizeCtx(type_width=0xD0), object(), rec)
+    assert out == {"value": "0xd0", "source": "bn_type"}
 
 
-def _record():
-    return {"name": "net::Session", "methods": []}
-
-
-def test_an_allocation_is_only_ever_an_upper_bound_998():
-    """#998 reviews: array new, an enclosing object, a derived class, placement
-    new and trailing storage all hand a constructor a LARGER block, so the
-    smallest allocation a constructor runs on bounds the size from above and
-    is never reported as the size."""
-    bound = read_class._object_size(_SizeCtx([_site("0x50"), _site(None), _site("0x60")]),
-                                    _MlilBV(), _record())
-    assert bound == read_class._SizeBound("allocation_upper_bound_only", 0x50)
-    assert read_class._object_size(_SizeCtx([_site(None)]), _MlilBV(), _record()) == _NO_SIZE
+def test_size_from_operator_new_when_no_type():
+    rec = {"name": "net::Session", "methods": []}
+    out = read_class._object_size(_SizeCtx(new_size=(0xD0, 0x443abc)), object(), rec)
+    assert out["value"] == "0xd0" and out["source"] == "operator_new"
+    assert out["at"] == "0x443abc"
 
 
 class _EnrichCtx(_SizeCtx):
@@ -1067,25 +997,50 @@ class _EnrichCtx(_SizeCtx):
         return []
 
 
-def test_class_card_for_a_sizeless_class_states_why_998():
-    """The size-less card, composed end to end: the head keeps no size, and
-    the reason `_object_size` produced is printed on its own line with the
-    largest size the evidence allows."""
+def test_size_none_when_nothing_resolves():
+    """A miss stays a bare `None`, NOT a value-less envelope: `_render_one_class`
+    renders any `size` dict as `size ?` on purpose (#619 -- an envelope that
+    carries no value still CLAIMED a size), so an envelope per miss would change
+    the default card of every size-less class and make that #619 distinction
+    vacuous. #817's provenance lives beside the size instead."""
+    rec = {"name": "net::Session", "methods": []}
+    assert read_class._object_size(_SizeCtx(), object(), rec) is None
+
+
+def test_class_card_for_a_sizeless_class_is_unchanged_817():
+    """The size-less default card, composed end to end: what `_object_size`
+    produces, rendered by the real text formatter."""
     formatters = importlib.import_module("bn.formatters")
     rec = {"name": "net::Session", "methods": [], "confidence": "rtti"}
-    read_class._enrich(_EnrichCtx([_site("0x50")]), _MlilBV(), rec)
+    read_class._enrich(_EnrichCtx(), object(), rec)
 
-    lines = formatters._render_one_class(rec).splitlines()
-    assert lines[0] == "class net::Session"
-    assert "  size: unknown (allocation_upper_bound_only; at most 0x50)" in lines
+    assert formatters._render_one_class(rec).splitlines()[0] == "class net::Session"
 
 
 def test_class_record_states_where_the_size_came_from_817():
-    """#817 / #998: `size` is never set -- no reader fixes it -- and the miss
-    says why, beside it."""
-    missed = read_class._enrich(_EnrichCtx(), _MlilBV(), _record())
-    assert (missed["size"], missed["size_source"], missed["size_reason"],
-            missed["size_upper_bound"]) == (None, "unavailable", "no_size_evidence", None)
+    """#817: `class show` reported `size: null` with no `size_source` and no note
+    that the ctor-new path is a permanent stub, so a miss was indistinguishable
+    from a search that tried both paths. Provenance is now always readable in one
+    place, and the miss names the stub."""
+    missed = read_class._enrich(_EnrichCtx(), object(), {"name": "net::Session", "methods": []})
+    assert missed["size"] is None
+    assert missed["size_source"] == "unavailable"
+    assert missed["size_reason"] == "operator_new_recovery_unimplemented"
+
+    hit = read_class._enrich(_EnrichCtx(type_width=0xD0), object(),
+                             {"name": "net::Session", "methods": []})
+    assert hit["size"] == {"value": "0xd0", "source": "bn_type"}
+    assert hit["size_source"] == "bn_type" and hit["size_reason"] is None
+
+
+def test_size_survives_find_type_raising():
+    # Real ctx._find_type RAISES on a missing type; _object_size must treat that
+    # as "no type" and fall through, not propagate the exception.
+    class _RaisingCtx(_SizeCtx):
+        def _find_type(self, bv, name):
+            raise RuntimeError("Type not found: " + name)
+    out = read_class._object_size(_RaisingCtx(new_size=(0x40, 0x1000)), object(), {"name": "X", "methods": []})
+    assert out["value"] == "0x40" and out["source"] == "operator_new"
 
 
 class _RttiCtx:
@@ -1186,16 +1141,14 @@ class _InstCtx:
 
 def test_instances_collects_construction_and_global_stores():
     sites = [
-        {"address": "0x443abc", "function": "net::open", "kind": "ctor-call",
-         "allocation_size": "0xd0", "allocation": "0x443ab0"},
-        {"address": "0x4500a0", "function": "main", "kind": "ctor-call",
-         "allocation_size": None, "allocation": None},
+        {"address": "0x443abc", "function": "net::open", "kind": "new", "size": "0xd0"},
+        {"address": "0x4500a0", "function": "main", "kind": "stack", "size": None},
     ]
     globals_ = [{"symbol": "g_session", "address": "0x4cabcd"}]
     ctx = _InstCtx(sites, globals_)
     rec = {"name": "net::Session", "vtable": {"address": "0x9000"}, "methods": []}
     out = read_class._instances(ctx, object(), rec)
-    assert out["construction_sites"][0]["allocation_size"] == "0xd0"
+    assert out["construction_sites"][0]["kind"] == "new"
     assert out["stored_globals"][0]["symbol"] == "g_session"
 
 
@@ -1216,7 +1169,7 @@ def test_class_show_assembles_full_record():
                 {"index": 0, "address": "0x40e8b0", "method": {"name": "onData"},
                  "pure_virtual": False, "unnamed": False}]}
         def _object_size_for(self, b, rec):
-            return read_class._SizeBound("allocation_upper_bound_only", 0xd0)
+            return {"value": "0xd0", "source": "operator_new", "at": "0x443abc"}
         def _bases_for(self, b, rec):
             return [{"name": "net::Endpoint", "address": "0x9200", "kind": "public"}]
         def _instances_for(self, b, rec):
@@ -1224,7 +1177,7 @@ def test_class_show_assembles_full_record():
 
     out = read_class._class_show(_ShowCtx(), None, "net::Session")
     assert out["name"] == "net::Session"
-    assert out["size"] is None and out["size_upper_bound"] == "0xd0"
+    assert out["size"]["value"] == "0xd0"
     assert out["bases"][0]["name"] == "net::Endpoint"
     assert out["vtable"]["slots"][0]["method"]["name"] == "onData"
 
@@ -1232,7 +1185,7 @@ def test_class_show_assembles_full_record():
 @pytest.fixture
 def class_method_ctx(monkeypatch):
     ctx = seam.BridgeContext(None)
-    monkeypatch.setattr(ctx, "_object_size_for", lambda bv, rec: _NO_SIZE)
+    monkeypatch.setattr(ctx, "_object_size_for", lambda bv, rec: None)
     monkeypatch.setattr(ctx, "_bases_for", lambda bv, rec: [])
     monkeypatch.setattr(ctx, "_instances_for", lambda bv, rec: {
         "construction_sites": [], "stored_globals": []})
@@ -1387,7 +1340,7 @@ def test_class_show_ambiguous_returns_all_matches():
         def _vtable_layout_for(self, b, a):
             return None
         def _object_size_for(self, b, r):
-            return _NO_SIZE
+            return None
         def _bases_for(self, b, r):
             return []
         def _instances_for(self, b, r):
@@ -1408,15 +1361,14 @@ def test_render_class_show_text_matches_mock_shape():
             {"index": 1, "address": "0x0", "method": None, "pure_virtual": True, "unnamed": False}]},
         "bases": [{"name": "net::Endpoint"}],
         "methods": [{"kind": "ctor", "address": "0x40abc0", "demangled": "net::Session::Session()"}],
-        "instances": {"construction_sites": [{"kind": "ctor-call", "address": "0x443abc",
-                                              "allocation_size": "0xd0"}],
+        "instances": {"construction_sites": [{"kind": "new", "address": "0x443abc", "size": "0xd0"}],
                       "stored_globals": [{"symbol": "g_session", "address": "0x4cabcd"}]},
     }
     text = _render_class_show_text(rec)
     assert "class net::Session" in text and "size 0xd0" in text and "base: net::Endpoint" in text
     assert "vtable [0] 0x40e8b0  onData" in text
     assert "vtable [1] 0x0  __cxa_pure_virtual" in text
-    assert "instances: ctor-call @ 0x443abc (allocation 0xd0) ; stored -> g_session @ 0x4cabcd" in text
+    assert "instances: new @ 0x443abc (size 0xd0) ; stored -> g_session @ 0x4cabcd" in text
 
 
 def test_render_class_show_lists_non_virtual_methods_and_empty_vtable_note():
@@ -1457,7 +1409,7 @@ def test_render_construction_site_includes_function():
            "bases": [], "methods": [],
            "instances": {"construction_sites": [
                {"address": "0x443abc", "function": "AapGalifStart",
-                "kind": "ctor-call", "allocation_size": None, "allocation": None}],
+                "kind": "ctor-call", "size": None}],
                "stored_globals": []}}
     assert "ctor-call @ 0x443abc (in AapGalifStart)" in _render_class_show_text(rec)
 
@@ -2170,8 +2122,7 @@ def test_instances_reports_exact_totals_and_truncation_flag_at_cap():
     # exactly 128 with no total and no flag, so a capped scan was
     # indistinguishable from a complete one.
     sites = [{"address": hex(0x443000 + i * 16), "function": f"caller{i}",
-              "kind": "ctor-call", "allocation_size": None, "allocation": None}
-             for i in range(400)]
+              "kind": "ctor-call", "size": None} for i in range(400)]
     globals_ = [{"symbol": f"g_slot{i}", "address": hex(0x4c0000 + i * 8)}
                 for i in range(400)]
     ctx = _InstCtx(sites, globals_)
@@ -2189,7 +2140,7 @@ def test_instances_reports_exact_totals_and_truncation_flag_at_cap():
 def test_instances_reports_exact_totals_without_truncation():
     # The uncapped shape: real totals, no truncation claimed.
     ctx = _InstCtx([{"address": "0x443abc", "function": "main",
-                     "kind": "ctor-call", "allocation_size": None, "allocation": None}],
+                     "kind": "ctor-call", "size": None}],
                    [{"symbol": "g_session", "address": "0x4cabcd"}])
     rec = {"name": "net::Session", "vtable": {"address": "0x9000"}, "methods": []}
     out = read_class._instances(ctx, object(), rec)
@@ -2729,7 +2680,7 @@ def _declared_ctx(monkeypatch, bv):
     seam's own builder, so the test reads the shape a live call produces."""
     ctx = seam.BridgeContext(None)
     monkeypatch.setattr(ctx, "_resolve_view", lambda sel: bv)
-    monkeypatch.setattr(ctx, "_object_size_for", lambda b, r: _NO_SIZE)
+    monkeypatch.setattr(ctx, "_object_size_for", lambda b, r: None)
     monkeypatch.setattr(ctx, "_bases_for", lambda b, r: [])
     monkeypatch.setattr(ctx, "_instances_for", lambda b, r: {
         "construction_sites": [], "stored_globals": []})
@@ -3906,7 +3857,7 @@ def test_enrich_skips_the_backwalk_for_an_import_slot_typeinfo_922():
     # record as this class's vtable (and listed it as a secondary of itself).
     class _Ctx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return _NO_SIZE
+            return None
         def _bases_for(self, bv, rec):
             return read_class._bases_for_record(self, bv, rec)
         def _instances_for(self, bv, rec):
@@ -4096,7 +4047,7 @@ def test_recover_rejects_an_rtti_record_as_a_secondary_vtable_922():
 def test_enrich_discloses_rejected_secondary_candidates_922():
     class _Ctx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return _NO_SIZE
+            return None
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -4383,7 +4334,7 @@ def test_sole_nonzero_candidate_is_never_promoted_to_primary_922():
 
     class _Ctx(_RecoverCtx):
         def _object_size_for(self, bv, rec):
-            return _NO_SIZE
+            return None
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):
@@ -4413,7 +4364,7 @@ def test_sole_nonzero_candidate_is_never_promoted_to_primary_922():
 def test_enrich_notes_rtti_secondaries_as_such_922():
     class _Ctx(_MappedRecoverCtx):
         def _object_size_for(self, bv, rec):
-            return _NO_SIZE
+            return None
         def _bases_for(self, bv, rec):
             return []
         def _instances_for(self, bv, rec):

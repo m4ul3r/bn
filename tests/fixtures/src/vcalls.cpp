@@ -1,8 +1,7 @@
 // Synthetic C++ fixture for #998: a virtual method reached only through its
 // vtable slot (`callsites` must not read as "never called"), classes
-// constructed on the heap through an out-of-line constructor (`class show`
-// bounds the size by the `operator new(N)`), and a derived class sharing the
-// base's slot for a method it does not override.
+// constructed on the heap through an out-of-line constructor, and a derived
+// class sharing the base's slot for a method it does not override.
 #include <cstdio>
 
 namespace vc {

@@ -779,40 +779,6 @@ def test_render_class_card_shows_the_vtable_address_point_998():
     assert "  secondary vtable @ 0x41fd00 (address point 0x41fd10) (offset-to-top -8):" in out
 
 
-def test_render_class_card_labels_an_allocation_as_an_allocation_998():
-    """#998 review: the `operator new(N)` a constructor ran on bounds the size
-    from above; the card must not present it as the size."""
-    from bn.formatters import _render_one_class
-    rec = {"name": "Inner", "confidence": "rtti", "methods": [], "size": None,
-           "size_reason": "allocation_upper_bound_only", "size_upper_bound": "0x50",
-           "instances": {"construction_sites": [
-               {"address": "0x401465", "function": "make_outer", "kind": "ctor-call",
-                "allocation_size": "0x50", "allocation": "0x401450"}]}}
-    out = _render_one_class(rec)
-    assert "  size: unknown (allocation_upper_bound_only; at most 0x50)" in out
-    assert "ctor-call @ 0x401465 (allocation 0x50) (in make_outer)" in out
-    assert "size 0x50" not in out
-
-
-def test_render_class_list_sizes_rows_say_why_998():
-    """#998: a `--sizes` row says why its size is unknown, with the upper bound
-    when an allocation gives one; a default row (no `size_reason`) is unchanged."""
-    from bn.formatters import _render_class_list_text
-    rows = [{"name": "A", "method_count": 1, "has_vtable": True, "size": None,
-             "size_reason": "allocation_upper_bound_only", "size_upper_bound": "0x50",
-             "confidence": "rtti", "bases": [], "aliases": []},
-            {"name": "B", "method_count": 1, "has_vtable": True, "size": None,
-             "size_reason": "no_size_evidence", "size_upper_bound": None,
-             "confidence": "rtti", "bases": [], "aliases": []},
-            {"name": "C", "method_count": 1, "has_vtable": True, "size": None,
-             "confidence": "rtti", "bases": [], "aliases": []}]
-    out = _render_class_list_text({"kind": "classes", "items": rows, "total": 3, "offset": 0,
-                                   "returned": 3, "has_more": False, "sizes": True})
-    assert "  A  methods=1  vtable  size=? (allocation_upper_bound_only; at most 0x50)  [rtti]" in out
-    assert "  B  methods=1  vtable  size=? (no_size_evidence)  [rtti]" in out
-    assert "  C  methods=1  vtable  size=?  [rtti]" in out
-
-
 def test_render_callsites_footer_on_partial_last_page():
     # #611: a partial LAST page (offset > 0, has_more False, fewer rows than the
     # total) must still say so -- it used to read as the complete result.

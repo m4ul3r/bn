@@ -31,12 +31,7 @@ from ..formatters import _render_class_list_text, _render_class_show_text
                arg("--query", help="Filter classes by name substring"),
                arg("--count", action="store_true", default=False, dest="count_only",
                    help="Return just the class count (respects --no-stl/--no-vendor/--query/"
-                        "--all), plus artifact_count -- fast class-lens scale characterization"),
-               arg("--sizes", action="store_true", default=False, dest="sizes",
-                   help="Add each listed class's size evidence, as `class show` does: "
-                        "size_upper_bound (the smallest operator new(N) one of its "
-                        "constructors runs on) and size_reason. Never an exact size. "
-                        "Slower: it reads IL per row, so bound the page with --limit")],
+                        "--all), plus artifact_count -- fast class-lens scale characterization")],
          estimable=True)
 def _class_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
@@ -48,8 +43,6 @@ def _class_list(args: argparse.Namespace) -> int:
         params["no_stl"] = True
     if args.no_vendor:
         params["no_vendor"] = True
-    if args.sizes:
-        params["sizes"] = True
     if args.count_only:
         # #872: `class list --count` used to FORWARD --limit alongside
         # count_only, so the bridge received a page size it cannot apply to a

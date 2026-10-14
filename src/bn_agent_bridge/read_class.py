@@ -1069,7 +1069,6 @@ def _class_list(
     offset: int = 0,
     limit: int | None = None,
     count_only: bool = False,
-    sizes: bool = False,
 ) -> dict[str, Any]:
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -1188,8 +1187,7 @@ def _class_list(
     # Populate RTTI bases for the RETURNED PAGE only: base decode is cheap (a few
     # typeinfo reads per class) and bounded to the page, so a single `class list`
     # recovers the inheritance graph without N `class show` calls. Vtable layout
-    # stays show-only (far costlier per class); `sizes=True` runs the size
-    # reader (an upper bound only, #998 item 4) for the page.
+    # and object size stay show-only -- they are far costlier per class. (#205 review)
     rows = []
     for rec in page:
         if rec["confidence"] == _DECLARED_CONFIDENCE:
@@ -1198,18 +1196,11 @@ def _class_list(
             type_obj = declared_types.get(rec["name"])
             if type_obj is not None:
                 rec["size"] = _declared_size(type_obj)
-            bound_fields = {"size_reason": None, "size_upper_bound": None} if sizes else {}
-        elif sizes:
-            bound = ctx._object_size_for(bv, rec)
-            bound_fields = {"size_reason": bound.reason, "size_upper_bound": (
-                hex(bound.upper_bound) if bound.upper_bound else None)}
-        else:
-            bound_fields = {}
         try:
             rec["bases"] = ctx._bases_for(bv, rec)
         except Exception:
             rec["bases"] = []
-        rows.append({**_list_row(rec), **bound_fields})
+        rows.append(_list_row(rec))
     returned = len(rows)
     result = {
         "kind": "classes",
@@ -1222,7 +1213,6 @@ def _class_list(
         "include_all": include_all,
         "no_stl": no_stl,
         "no_vendor": no_vendor,
-        "sizes": sizes,
         "library_suppressed": library_suppressed,
         "vendor_suppressed": vendor_suppressed,
         "construction_vtables_suppressed": construction_vtables_suppressed,
@@ -1902,147 +1892,41 @@ def _infer_rtti_kind(ctx, bv, typeinfo_addr: int, ptr: int) -> str:
     return "base"
 
 
-class _SizeBound(NamedTuple):
-    """What the evidence says about a class's size (#998 item 4): never the
-    size itself, only ``upper_bound`` -- the smallest ``operator new(N)`` a
-    constructor of the class ran on (the object sits at offset 0 of that
-    allocation, so it fits in N; the allocation may also hold a derived class,
-    an enclosing object or trailing storage) -- and ``reason``."""
-
-    reason: str
-    upper_bound: int | None
+#: #817: the ctor-new path cannot search at all -- the seam's
+#: ``_operator_new_size_at_ctor`` is still an unconditional ``return None`` stub
+#: (the #205 its TODO defers to is CLOSED). A size miss therefore means "one path
+#: was exhausted and the other was never tried", which is what this reason code
+#: says; a bare null said only "unknown".
+_SIZE_UNAVAILABLE_REASON = "operator_new_recovery_unimplemented"
 
 
-#: #998 item 4: why ``size`` is null (it always is):
-#:   * ``allocation_upper_bound_only`` -- an ``operator new(N)`` result reaches
-#:     a constructor of the class; ``size_upper_bound`` is the smallest N;
-#:   * ``no_size_evidence`` -- no such allocation was traced.
-_SIZE_UPPER_BOUND_ONLY = "allocation_upper_bound_only"
-_SIZE_NO_EVIDENCE = "no_size_evidence"
+def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
+    """Object size with provenance. A defined BN type's width wins (authoritative
+    when present); else the operator-new size at a construction site; else None
+    (never fabricated). ``ctx._find_type`` raises on a miss, so the lookup is
+    guarded.
 
-#: Raw-name prefix of SCALAR ``operator new`` in every overload (``_Znwm``,
-#: ``_Znwj``, the nothrow and aligned forms): its first argument is the size.
-#: ``operator new[]`` (``_Zna``) is not traced: an array allocation may carry
-#: a cookie before its first element.
-_OPERATOR_NEW_PREFIX = "_Znw"
-
-
-def _symbol_names_at(bv, address: int) -> list[str]:
-    names: list[str] = []
-    sym = bv.get_symbol_at(address) if hasattr(bv, "get_symbol_at") else None
-    fn = bv.get_function_at(address) if hasattr(bv, "get_function_at") else None
-    for obj in (sym, getattr(fn, "symbol", None)):
-        for attr in ("raw_name", "name", "short_name"):
-            value = getattr(obj, attr, None)
-            if value:
-                names.append(str(value))
-    return names
-
-
-def _is_operator_new(bv, dest) -> bool:
-    address = getattr(dest, "constant", None)
-    if not isinstance(address, int):
-        return False
-    return any(n.startswith(_OPERATOR_NEW_PREFIX) for n in _symbol_names_at(bv, address))
-
-
-def _mlil_const(expr) -> int | None:
-    if expr is None or il_format._il_op_name(expr) not in {
-            "MLIL_CONST", "MLIL_CONST_PTR"}:
-        return None
-    value = getattr(expr, "constant", None)
-    return int(value) if isinstance(value, int) else None
-
-
-def _new_allocation(bv, expr, *, depth: int = 0) -> tuple[int, int] | None:
-    """``(N, call_addr)`` when MLIL SSA *expr* is, through plain SSA copies
-    (no offset), the result of scalar ``operator new(<constant N>)``."""
-    if expr is None or il_format._il_op_name(expr) != "MLIL_VAR_SSA":
-        return None
-    definition = expr.function.get_ssa_var_definition(expr.src)
-    if definition is None:
-        return None
-    op = il_format._il_op_name(definition)
-    if op == "MLIL_SET_VAR_SSA" and depth < 8:
-        return _new_allocation(bv, definition.src, depth=depth + 1)
-    if op != "MLIL_CALL_SSA" or not _is_operator_new(bv, definition.dest):
-        return None
-    params = list(definition.params or [])
-    size = _mlil_const(params[0]) if params else None
-    if not size:
-        return None
-    return size, int(definition.address)
-
-
-def _operator_new_size_at(bv, call_addr: int) -> tuple[int, int] | None:
-    """``(N, allocation_addr)`` when the constructor call at *call_addr* runs
-    on ``this`` == the result of scalar ``operator new(<constant N>)``, else
-    None. N is the ALLOCATION, an upper bound on the object's size only."""
+    A miss stays ``None`` rather than becoming a value-less envelope: the class
+    card renders any ``size`` DICT as ``size ?`` because #619 requires that "an
+    envelope that carries no value still CLAIMED a size" be visible, so returning
+    one for every miss would both change the default card of every class whose
+    size is unrecoverable and make that distinction vacuous. The provenance of a
+    miss travels beside the size instead -- see ``_enrich``'s ``size_source`` /
+    ``size_reason`` (#817)."""
     try:
-        functions = list(bv.get_functions_containing(call_addr) or [])
+        found = ctx._find_type(bv, record["name"])
     except Exception:
-        return None
-    for fn in functions:
-        try:
-            llil = fn.get_llil_at(call_addr)
-            mlil = getattr(llil, "mlil", None) if llil is not None else None
-            call = mlil.ssa_form if mlil is not None else None
-            params = list(getattr(call, "params", None) or [])
-            traced = _new_allocation(bv, params[0]) if params else None
-        except Exception:
-            continue
-        if traced is not None:
-            return traced
+        found = None
+    if found is not None:
+        _, type_obj = found
+        width = int(getattr(type_obj, "width", 0) or 0)
+        if width > 0:
+            return {"value": hex(width), "source": "bn_type"}
+    new = ctx._operator_new_size_at_ctor(bv, record)
+    if new is not None:
+        size, at = new
+        return {"value": hex(int(size)), "source": "operator_new", "at": hex(int(at))}
     return None
-
-
-def _object_size(ctx, bv, record: dict[str, Any]) -> _SizeBound:
-    """The size evidence for a class: the smallest ``operator new(N)`` one of
-    its constructors runs on (#998 item 4), as an upper bound only."""
-    upper: int | None = None
-    for site in ctx._ctor_construction_sites(bv, record):
-        if isinstance(site, dict) and site.get("allocation_size"):
-            allocation = int(str(site["allocation_size"]), 16)
-            upper = allocation if upper is None else min(upper, allocation)
-    return _SizeBound(_SIZE_UPPER_BOUND_ONLY if upper is not None else _SIZE_NO_EVIDENCE, upper)
-
-
-def _construction_sites(ctx, bv, record: dict[str, Any]) -> list[dict[str, Any]]:
-    """Where this class is constructed: each ctor's inbound call sites, from
-    code xrefs (``kind: "ctor-call"``). A site whose ``this`` is the result of
-    scalar ``operator new(<constant N>)`` carries ``allocation_size`` (N, hex)
-    and ``allocation`` (the ``operator new`` call); otherwise both are None.
-    N bounds the class size from above only (#998 item 4)."""
-    get_refs = getattr(bv, "get_code_refs", None)
-    if not callable(get_refs):
-        return []
-    sites: list[dict[str, Any]] = []
-    seen: set[int] = set()
-    for m in record.get("methods", []):
-        if m.get("kind") != "ctor":
-            continue
-        try:
-            addr = int(m["address"], 16)
-        except (KeyError, ValueError, TypeError):
-            continue
-        for ref in get_refs(addr):
-            ra = int(getattr(ref, "address", 0) or 0)
-            if ra == 0 or ra in seen:
-                continue
-            seen.add(ra)
-            caller = getattr(ref, "function", None)
-            csym = getattr(caller, "symbol", None) if caller is not None else None
-            cname = (getattr(csym, "short_name", None) or getattr(caller, "name", None)) \
-                if caller is not None else None
-            traced = _operator_new_size_at(bv, ra)
-            sites.append({
-                "address": hex(ra),
-                "function": str(cname) if cname else None,
-                "kind": "ctor-call",
-                "allocation_size": hex(traced[0]) if traced else None,
-                "allocation": hex(traced[1]) if traced else None,
-            })
-    return sites
 
 
 def _instances(ctx, bv, record: dict[str, Any], *, cap: int = 128) -> dict[str, Any]:
@@ -2155,17 +2039,17 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
                 # not the primary; the card keeps `vtable: null` and says why.
                 rec.setdefault("notes", []).append(_NO_PRIMARY_NOTE)
             _note_rejected_secondaries(rec, recovered["rejected"])
-    # #998 item 4: no reader here fixes a class's size -- every candidate the
-    # reviews tried (a BN type, the deleting destructor's sized delete, a
-    # constructor's writes) is wrong for a legal, common shape -- so `size`
-    # stays null. What IS sound is an upper bound: an `operator new(N)` result
-    # a constructor of this class runs on holds the object at offset 0, so the
-    # object fits in N. #817: the provenance rides beside the size.
-    bound = ctx._object_size_for(bv, rec)
-    rec["size"] = None
-    rec["size_source"] = "unavailable"
-    rec["size_reason"] = bound.reason
-    rec["size_upper_bound"] = hex(bound.upper_bound) if bound.upper_bound else None
+    size = ctx._object_size_for(bv, rec)
+    rec["size"] = size
+    # #817: where the size came from is a JSON-surface fact of its own, so it
+    # rides BESIDE the size instead of inside it -- one place to read the
+    # provenance whether or not a size was recovered, and the default text card
+    # (which renders only `size`) is unchanged for a class that has none. The
+    # `size_reason` code then distinguishes "both paths searched, nothing found"
+    # from what actually happens today: the ctor-new path is a stub and was
+    # never tried. Null on a hit, mirroring `hlil_statement_reason`.
+    rec["size_source"] = size["source"] if size else "unavailable"
+    rec["size_reason"] = None if size else _SIZE_UNAVAILABLE_REASON
     rec["bases"] = ctx._bases_for(bv, rec)
     rec["instances"] = ctx._instances_for(bv, rec)
     return rec

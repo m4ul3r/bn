@@ -5068,7 +5068,6 @@ def _bind_class_list(bridge, params, target):
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
-        sizes=_validate_bool(params.get("sizes"), label="sizes", default=False),
     )
 
 

@@ -7353,18 +7353,10 @@ def _render_class_list_text(value: Any) -> str:
         # who knows the class by the expanded template spelling finds the row.
         aliases = ", ".join(str(a) for a in _field_list(rec, "aliases") if a)
         aka_s = f"  (aka {aliases})" if aliases else ""
-        # #998 item 4: a `--sizes` row says why its size is unknown, with the
-        # upper bound when there is one, as the `class show` card does.
-        # `not_computed` gets the footer below.
-        row_reason = _text_value(rec, "size_reason")
-        why_s = ""
-        if size_s is None and row_reason and row_reason != "not_computed":
-            upper = _text_value(rec, "size_upper_bound")
-            why_s = f" ({row_reason}; at most {upper})" if upper else f" ({row_reason})"
         lines.append(
             f"  {rec.get('name', '<unknown>')}  "
             f"methods={methods}  {vt}  "
-            f"size={size_s if size_s is not None else '?'}{why_s}  "
+            f"size={size_s if size_s is not None else '?'}  "
             f"[{rec.get('confidence', '?')}]{base_s}{art_s}{aka_s}"
         )
     footer = _paging_footer(value, rows, page_unreadable)
@@ -7465,13 +7457,6 @@ def _render_one_class(rec: Any) -> str:
     if bits:
         head += "  (" + ", ".join(bits) + ")"
     lines = [head, f"  [{rec.get('confidence', '?')}]"]
-    size_reason = _text_value(rec, "size_reason")
-    if size_s is None and size_reason:
-        # #998 item 4: an unknown size says why, and the largest size the
-        # evidence allows (an allocation a constructor ran on).
-        upper = _text_value(rec, "size_upper_bound")
-        bound_s = f"; at most {upper}" if upper else ""
-        lines.append(f"  size: unknown ({size_reason}{bound_s})")
     # #922 (d): one class, several demangled spellings -- the card is the merge.
     for alias in _field_list(rec, "aliases"):
         lines.append(f"  aka: {alias}")
@@ -7578,10 +7563,7 @@ def _render_one_class(rec: Any) -> str:
         if not isinstance(site, dict):
             parts.append(repr(site))
             continue
-        # #998 review: the allocation a constructor ran on is an upper bound on
-        # the class size (it may hold a derived or enclosing object), so it is
-        # labelled as the allocation, never as the size.
-        sz = f" (allocation {site['allocation_size']})" if site.get("allocation_size") else ""
+        sz = f" (size {site['size']})" if site.get("size") else ""
         fn = f" (in {site['function']})" if site.get("function") else ""
         parts.append(f"{site.get('kind', '?')} @ {site.get('address', '?')}{sz}{fn}")
     for g in _field_list(inst, "stored_globals"):

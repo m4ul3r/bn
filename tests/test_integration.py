@@ -31,7 +31,6 @@ CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
 CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
 VCALLS_BINARY = FIXTURES_DIR / "vcalls_x86_64"
-SIZES_BINARY = FIXTURES_DIR / "sizes_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -3886,11 +3885,9 @@ int main() { return global_b.b() + global_r.r(); }
         assert cards[1]["instances"]["stored_globals"][0]["symbol"] is None
 
 
-class TestVirtualMethodsAndClassSize998:
-    """#998 on real g++ builds. `src/vcalls.cpp` (-O0): a virtual method reached
-    only through its vtable slot, and the vtable's address point.
-    `src/sizes.cpp` (-O2): the allocation shapes that are NOT one object of
-    the class whose constructor runs on them."""
+class TestVirtualMethods998:
+    """#998 on a real g++ build (`src/vcalls.cpp`, -O0): a virtual method
+    reached only through its vtable slot, and the vtable's address point."""
 
     def _json(self, shared_bn, *args):
         res = shared_bn.run(*args, "--format", "json")
@@ -3927,50 +3924,6 @@ class TestVirtualMethodsAndClassSize998:
         assert self._json(shared_bn, "xrefs", vt["address"])["code_ref_count"] == 0
         text = shared_bn.run("class", "show", "vc::Dispatcher").stdout
         assert f"vtable @ {vt['address']}, address point {vt['address_point']}" in text
-
-    #: `src/sizes.cpp`'s `static_assert`ed sizes.
-    REAL_SIZES = {"sz::Plain": 0x28, "sz::Inl": 0x10, "sz::Elem": 0x10, "sz::Inner": 0x10,
-                  "sz::Gadget": 0x10, "sz::PBase": 0x8, "sz::Base": 0x10, "sz::Leaf": 0x40,
-                  "sz::PB": 0x10, "sz::PD": 0x50, "sz::Rec": 0x18, "sz::Trailing": 0x10,
-                  "sz::Trail": 0x8, "sz::Header": 0x8, "sz::VD0": 0xb0}
-
-    def test_no_class_gets_a_size_and_every_upper_bound_holds(self, shared_bn):
-        # #998 reviews: every exact reader tried (allocation, constructor
-        # writes, deleting destructor, BN type) was wrong for some legal shape.
-        # What remains is sound by construction: the object sits at offset 0 of
-        # the `operator new(N)` its constructor runs on, so it fits in N.
-        shared_bn.load(SIZES_BINARY)
-        listing = self._json(shared_bn, "class", "list", "--query", "sz::", "--sizes")
-        rows = {row["name"]: row for row in listing["items"]}
-        assert set(self.REAL_SIZES) <= set(rows), sorted(rows)
-        for name, real in self.REAL_SIZES.items():
-            card = self._json(shared_bn, "class", "show", name)
-            assert card["size"] is None and rows[name]["size"] is None, (name, card["size"])
-            assert card["size_upper_bound"] == rows[name]["size_upper_bound"], name
-            bound = card["size_upper_bound"]
-            assert bound is None or int(bound, 16) >= real, (name, bound)
-            assert card["size_reason"] == (
-                "allocation_upper_bound_only" if bound else "no_size_evidence"), card
-        for name, bound in (("sz::Inner", "0x50"), ("sz::Gadget", "0x100"),
-                            ("sz::PBase", "0x58"), ("sz::Rec", "0x18"),
-                            ("sz::Trailing", "0x50"), ("sz::Trail", "0x10"),
-                            ("sz::Header", "0x48"), ("sz::Plain", "0x28")):
-            assert rows[name]["size_upper_bound"] == bound, rows[name]
-        text = shared_bn.run("class", "show", "sz::Trailing").stdout
-        assert "size: unknown (allocation_upper_bound_only; at most 0x50)" in text
-        # The default listing runs no size reader and carries no size fields.
-        (default,) = self._json(shared_bn, "class", "list", "--query", "sz::Plain")["items"]
-        assert default["size"] is None and "size_reason" not in default
-
-    def test_vcalls_construction_sites_carry_their_allocation(self, shared_bn):
-        shared_bn.load(VCALLS_BINARY)
-        disp = self._json(shared_bn, "class", "show", "vc::Dispatcher")
-        assert (disp["size"], disp["size_upper_bound"]) == (None, "0x40"), disp
-        sites = {s["function"]: s for s in disp["instances"]["construction_sites"]}
-        assert sites["vc::make"]["allocation_size"] == "0x40"
-        # AudioDisp's ctor calls the base ctor on its own `this`: a real
-        # construction site with no allocation to read.
-        assert sites["vc::AudioDisp::AudioDisp"]["allocation_size"] is None
 
 
 class TestStructLayoutAssistance903:
