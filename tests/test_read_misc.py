@@ -166,6 +166,105 @@ def test_strings_max_length_excludes_long_strings(monkeypatch):
     assert [item["value"] for item in result["items"]] == ["abcd"]
 
 
+def _wide_strings_bv():
+    # #946: storage bytes and decoded characters disagree for wide strings.
+    return _FakeBV(strings=[
+        _FakeStringRef(0x1000, 16, "abcd", string_type=2),       # UTF-32: 4 chars
+        _FakeStringRef(0x2000, 12, "abcdef", string_type=1),     # UTF-16: 6 chars
+        _FakeStringRef(0x3000, 9, "abcdefghi"),                  # ASCII: 9 chars
+        _FakeStringRef(0x4000, 10, "abcde", string_type=1),      # UTF-16 at min 5
+        _FakeStringRef(0x5000, 32, "abcdefgh", string_type=2),   # UTF-32 at max 8
+    ])
+
+
+@pytest.mark.parametrize("bounds, expected", [
+    ({"min_length": 5}, ["abcdef", "abcdefghi", "abcde", "abcdefgh"]),
+    ({"max_length": 8}, ["abcd", "abcdef", "abcde", "abcdefgh"]),
+    ({"min_length": 5, "max_length": 8}, ["abcdef", "abcde", "abcdefgh"]),
+])
+def test_strings_length_filters_count_decoded_characters_946(monkeypatch, bounds, expected):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _wide_strings_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._strings(None, query=None, offset=0, limit=100, **bounds)
+    counted = instance._strings(None, query=None, offset=0, limit=100, count_only=True, **bounds)
+    paged = instance._strings(None, query=None, offset=1, limit=1, **bounds)
+
+    assert [item["value"] for item in listed["items"]] == expected
+    assert listed["total"] == counted["count"] == len(expected)
+    assert paged["total"] == len(expected) and paged["items"][0]["value"] == expected[1]
+    # The byte span stays the row's `length`, distinct from `chars`.
+    by_value = {item["value"]: item for item in listed["items"]}
+    if "abcdefgh" in by_value:
+        assert (by_value["abcdefgh"]["length"], by_value["abcdefgh"]["chars"]) == (32, 8)
+
+
+def test_strings_with_xrefs_names_referencing_functions_968(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    log_fn = _FakeFunction(0x1100, "sub_1100")
+    init_fn = _FakeFunction(0x1000, "init_widget")
+    many = [_FakeFunction(0x3000 + i * 0x40, f"sub_{0x3000 + i * 0x40:x}") for i in range(10)]
+    bv = _FakeBV(
+        strings=[
+            _FakeStringRef(0x2000, 12, "parse_config"),
+            _FakeStringRef(0x2010, 6, "common"),
+            _FakeStringRef(0x2020, 6, "tabled"),
+        ],
+        code_refs={
+            # Two refs from one function count once in the function list.
+            0x2000: [_FakeCodeRef(0x1120, log_fn), _FakeCodeRef(0x1104, log_fn),
+                     _FakeCodeRef(0x1010, init_fn)],
+            0x2010: [_FakeCodeRef(fn.start + 4, fn) for fn in many],
+        },
+        data_refs={0x2020: [0x5000]},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    rows = instance._strings(None, query=None, offset=0, limit=100, with_xrefs=True)["items"]
+    by_value = {row["value"]: row for row in rows}
+
+    assert by_value["parse_config"]["xref_functions"] == [
+        {"address": "0x1000", "name": "init_widget"},
+        {"address": "0x1100", "name": "sub_1100"},
+    ]
+    assert by_value["parse_config"]["code_ref_count"] == 3
+    assert by_value["parse_config"]["xref_function_count"] == 2
+    common = by_value["common"]
+    assert common["xref_function_count"] == 10
+    assert [fn["name"] for fn in common["xref_functions"]] == [fn.name for fn in many[:8]]
+    assert by_value["tabled"]["xref_functions"] == []
+    assert by_value["tabled"]["data_ref_count"] == 1
+    # Without the flag a row carries none of it.
+    plain = instance._strings(None, query=None, offset=0, limit=100)["items"][0]
+    assert "xref_functions" not in plain
+
+
+def test_strings_with_xrefs_reports_unreadable_data_refs_as_unknown_987(monkeypatch):
+    # #987 review: an unreadable data-ref list is unmeasured, not a zero.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x1000, "main")
+    bv = _FakeBV(strings=[_FakeStringRef(0x2000, 5, "hello")],
+                 code_refs={0x2000: [_FakeCodeRef(0x1004, fn)]})
+
+    def broken(address):
+        raise RuntimeError("data refs unavailable")
+
+    bv.get_data_refs = broken
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    row = instance._strings(None, query=None, offset=0, limit=10, with_xrefs=True)["items"][0]
+
+    assert row["data_ref_count"] is None
+    assert row["data_ref_note"] == "data refs could not be read: RuntimeError: data refs unavailable"
+    # The code-ref half was measured and is still reported.
+    assert row["xref_functions"] == [{"address": "0x1000", "name": "main"}]
+
+
+
 def test_strings_probable_format_rejects_blob_noise_keeps_real_format(monkeypatch):
     # The whole point (#554): a raw `%s|%d` regex matches accidental
     # percent-substrings in resource/font/blob data. The directive-grammar mode
@@ -865,6 +964,61 @@ def test_imports_summary_includes_needed_libraries(monkeypatch):
     assert result["needed_libraries"] == ["libc.so.6", "libssl.so.1.1"]
     # namespace grouping still reflects the raw BN namespace.
     assert result["namespaces"] == {"BNEXTERNALNAMESPACE": 1}
+
+
+def _versioned_import_bv(fake_bn, *, image):
+    syms = []
+    for address, name in ((0x1000, "printf"), (0x1010, "_ZNSo3putEc"), (0x1020, "__gmon_start__")):
+        sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, address, name)
+        sym.short_name = name
+        sym.namespace = "BNINTERNALNAMESPACE"
+        syms.append(sym)
+    bv = _FakeBV(symbols=syms)
+    bv.libraries = ["libc.so.6", "libstdc++.so.6"]
+    bv.parent_view = types.SimpleNamespace(
+        start=0, length=len(image), read=lambda offset, size: image[offset:offset + size])
+    return bv
+
+
+def test_imports_attribute_library_from_symbol_versions_969(monkeypatch):
+    from test_elf_dynamic import _build_elf
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    image = _build_elf(needed=("libc.so.6", "libstdc++.so.6"), symbols=(
+        ("printf", "libc.so.6"), ("_ZNSo3putEc", "libstdc++.so.6"), ("__gmon_start__", None)))
+    bv = _versioned_import_bv(fake_bn, image=image)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._imports(None)
+    libraries = {item["name"]: item["library"] for item in listed["items"]}
+    assert libraries == {"printf": "libc.so.6", "_ZNSo3putEc": "libstdc++.so.6",
+                         "__gmon_start__": None}
+    # The unattributed row is disclosed with the DT_NEEDED list beside it.
+    assert listed["library_unattributed"] == 1
+    assert listed["needed_libraries"] == ["libc.so.6", "libstdc++.so.6"]
+    # A library name is a query field like any other.
+    assert [i["name"] for i in instance._imports(None, query="libstdc")["items"]] == ["_ZNSo3putEc"]
+
+    summary = instance._imports(None, summary=True)
+    assert summary["by_library"] == {"(unattributed)": 1, "libc.so.6": 1, "libstdc++.so.6": 1}
+
+
+def test_imports_without_raw_parent_keep_null_library_969(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "memcpy")
+    sym.short_name = "memcpy"
+    sym.namespace = "BNINTERNALNAMESPACE"
+    bv = _FakeBV(symbols=[sym])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._imports(None)
+    assert listed["items"][0]["library"] is None
+    # No DT_NEEDED to point at: nothing to disclose.
+    assert "library_unattributed" not in listed
 
 
 # --- read: raw bytes at an address ---

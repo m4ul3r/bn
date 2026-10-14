@@ -702,6 +702,91 @@ def test_target_info_surfaces_image_base(monkeypatch):
     assert info["path"] == str(bv.file.filename)
 
 
+def test_target_info_surfaces_dynamic_link_info_969(monkeypatch):
+    """#969: DT_NEEDED / DT_SONAME / DT_RPATH / DT_RUNPATH on `target info`,
+    the command an agent asks "which libraries does this need?" first."""
+    from test_elf_dynamic import _build_elf
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    image = _build_elf(needed=("libz.so.1", "libc.so.6"), soname="libwidget.so.2",
+                       runpath="$ORIGIN/../lib", symbols=(("printf", "libc.so.6"),))
+    bv = _FakeBV()
+    bv.file = types.SimpleNamespace(filename="/tmp/libwidget.so.2")
+    bv.libraries = ["libz.so.1", "libc.so.6"]
+    bv.parent_view = types.SimpleNamespace(start=0, length=len(image),
+                                           read=lambda off, size: image[off:off + size])
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot", lambda selector: (bv, []))
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    info = instance._target_info("active")
+
+    assert info["needed_libraries"] == ["libc.so.6", "libz.so.1"]
+    assert info["soname"] == "libwidget.so.2"
+    assert info["rpath"] is None
+    assert info["runpath"] == "$ORIGIN/../lib"
+    assert info["dynamic_section_notes"] == []
+
+    # A view with no raw ELF parent still states every key.
+    bare = _FakeBV()
+    bare.file = types.SimpleNamespace(filename="/tmp/firmware.bin")
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot", lambda selector: (bare, []))
+    info = instance._target_info("active")
+    assert (info["needed_libraries"], info["soname"], info["rpath"], info["runpath"],
+            info["dynamic_section_notes"]) == ([], None, None, None, [])
+
+
+def test_target_info_survives_a_hostile_dt_syment_987(monkeypatch):
+    """#987 review blocker: a DT_SYMENT of 1 << 56 (the loader ignores it, so
+    the file still runs) became a read size, and BN's `read()` segfaulted the
+    bridge. The fake raw view REFUSES any out-of-file window the way the test
+    must: by failing, not by returning short."""
+    from test_elf_dynamic import _build_elf, _set_dynamic_tag
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    image = _set_dynamic_tag(
+        _build_elf(needed=("libc.so.6",), symbols=(("printf", "libc.so.6"),)), 11, 1 << 56)
+
+    def read(offset, size):
+        assert offset + size <= len(image), f"read of {size} bytes at {offset}"
+        return image[offset:offset + size]
+
+    bv = _FakeBV()
+    bv.file = types.SimpleNamespace(filename="/tmp/widgetd")
+    bv.libraries = ["libc.so.6"]
+    bv.parent_view = types.SimpleNamespace(start=0, length=len(image), read=read)
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot", lambda selector: (bv, []))
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    info = instance._target_info("active")
+
+    assert info["needed_libraries"] == ["libc.so.6"]
+    assert any("DT_SYMENT" in note for note in info["dynamic_section_notes"]), info
+
+
+def test_target_info_surfaces_a_parser_failure_instead_of_hiding_it_987(monkeypatch):
+    """#987 review nit: a parser bug must not read as "no dynamic section"."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    read_misc = sys.modules[bridge.read_misc.__name__]
+
+    def broken(read, size):
+        raise IndexError("synthetic parser bug")
+
+    monkeypatch.setattr(read_misc, "parse_elf_dynamic", broken)
+    bv = _FakeBV()
+    bv.file = types.SimpleNamespace(filename="/tmp/widgetd")
+    bv.parent_view = types.SimpleNamespace(start=0, length=64, read=lambda off, size: b"")
+    monkeypatch.setattr(instance.targets, "resolve_with_snapshot", lambda selector: (bv, []))
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    notes = instance._target_info("active")["dynamic_section_notes"]
+
+    assert notes == ["the ELF dynamic section could not be parsed: "
+                     "IndexError: synthetic parser bug"]
+
+
 class _Endianness(enum.IntEnum):
     """BN's ``Endianness`` verbatim: an ``IntEnum`` with these two members.
 
@@ -3831,7 +3916,7 @@ def test_dispatch_forwards_strings_max_length_and_probable_format(monkeypatch):
     # no-op through the real RPC path. Drive them through the dispatch seam.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    seen: list[tuple[object, bool]] = []
+    seen: list[tuple[object, bool, bool]] = []
 
     def fake_strings(
         target,
@@ -3846,8 +3931,9 @@ def test_dispatch_forwards_strings_max_length_and_probable_format(monkeypatch):
         regex=False,
         probable_format_strings=False,
         count_only=False,
+        with_xrefs=False,
     ):
-        seen.append((max_length, probable_format_strings))
+        seen.append((max_length, probable_format_strings, with_xrefs))
         return {"target": target, "items": []}
 
     monkeypatch.setattr(instance, "_strings", fake_strings)
@@ -3856,8 +3942,10 @@ def test_dispatch_forwards_strings_max_length_and_probable_format(monkeypatch):
     instance._dispatch_on_main(
         "strings", {"max_length": 12, "probable_format_strings": True}, None
     )
+    # #968: --with-xrefs reaches `_strings` through the same seam.
+    instance._dispatch_on_main("strings", {"with_xrefs": True}, None)
 
-    assert seen == [(None, False), (12, True)]
+    assert seen == [(None, False, False), (12, True, False), (None, False, True)]
 
 
 def test_dispatch_rejects_non_boolean_probable_format_strings(monkeypatch):
