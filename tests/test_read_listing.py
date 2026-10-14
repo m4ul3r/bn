@@ -1952,3 +1952,111 @@ def _rendered_lines(bridge, monkeypatch, batches):
     func = _FakeFunction(0x500000, "handle_reply")
     _install_fake_pseudo_c(monkeypatch, bridge, func, [batches])
     return bridge.read_listing._callsite_decompile_render(_FakeBV(), func)
+
+
+@pytest.mark.parametrize("is64,endian", [(True, "<"), (True, ">"), (False, "<"), (False, ">")])
+@pytest.mark.parametrize("extent,symbol_address", [(24, 0x4000), (0, 0x4000), (24, 0x8000)])
+@pytest.mark.parametrize("symbol_type", ["DataSymbol", "ImportAddressSymbol", "ExternalSymbol"])
+@pytest.mark.parametrize("image_base", [0, 0x400000])
+def test_callee_data_refs_require_actual_elf_vtable_extent(monkeypatch, is64, endian, extent, symbol_address, symbol_type, image_base):
+    import struct
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    ptr = 8 if is64 else 4
+    data = bytearray(1024)
+    data[:16] = b"\x7fELF" + bytes([2 if is64 else 1, 1 if endian == "<" else 2]) + bytes(10)
+    struct.pack_into(endian + ("Q" if is64 else "I"), data, 40 if is64 else 32, 64)
+    stride = 64 if is64 else 40
+    struct.pack_into(endian + "HH", data, 58 if is64 else 46, stride, 4)
+    shfmt = endian + ("IIQQQQIIQQ" if is64 else "IIIIIIIIII")
+    sections = [
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (0, 1, 2, 0x4000, 512, 64, 0, 0, ptr, 0),
+        (0, 3, 0, 0, 640, 9, 0, 0, 1, 0),
+        (0, 2, 0, 0, 704, 24 if is64 else 16, 2, 0, ptr, 24 if is64 else 16),
+    ]
+    for i, section in enumerate(sections):
+        struct.pack_into(shfmt, data, 64 + i * stride, *section)
+    data[640:649] = b"\0_ZTV1X\0\0"
+    if is64:
+        struct.pack_into(endian + "IBBHQQ", data, 704, 1, 1, 0, 1, 0x4000, extent)
+    else:
+        struct.pack_into(endian + "IIIBBH", data, 704, 1, 0x4000, extent, 1, 0, 1)
+    reads = []
+
+    def read(off, size):
+        reads.append((off, size))
+        assert 0 <= off <= off + size <= len(data)
+        return data[off:off + size]
+
+    sym = SimpleNamespace(address=symbol_address + image_base, short_name="vtable for X", type=symbol_type)
+    inside, adjacent = image_base + 0x4000 + 2 * ptr, image_base + 0x4000 + max(extent, 24)
+    bv = SimpleNamespace(
+        image_base=image_base, original_image_base=0,
+        parent_view=SimpleNamespace(start=0, length=len(data), read=read),
+        get_symbol_by_raw_name=lambda name: sym if name == "_ZTV1X" else None,
+        get_data_refs=lambda address: [adjacent, inside])
+    result = bridge.read_listing._callee_data_refs(bv, 0x5000)
+    assert result["callee_data_refs"] == [hex(inside), hex(adjacent)]
+    expected = [hex(inside)] if extent == 24 and symbol_address == 0x4000 and symbol_type == "DataSymbol" else []
+    assert [row["address"] for row in result["callee_data_ref_vtables"]] == expected
+    assert sum(size for _, size in reads) < 1024
+
+
+def test_callee_vtable_hint_rejects_hostile_section_count_without_large_reads(monkeypatch):
+    import struct
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    data = bytearray(64)
+    data[:16] = b"\x7fELF\x02\x01" + bytes(10)
+    struct.pack_into("<Q", data, 40, 64)
+    struct.pack_into("<HH", data, 58, 64, 65535)
+    reads = []
+
+    def read(off, size):
+        reads.append(size)
+        assert size <= 16
+        return data[off:off + size]
+
+    bv = SimpleNamespace(parent_view=SimpleNamespace(start=0, length=1 << 40, read=read),
+                         get_symbol_by_raw_name=lambda name: None,
+                         get_data_refs=lambda address: [0x401018])
+    result = bridge.read_listing._callee_data_refs(bv, 0x5000)
+    assert result["callee_data_refs"] == ["0x401018"]
+    assert result["callee_data_ref_vtables"] == []
+    assert reads == [16, 8, 4]
+
+
+@pytest.mark.parametrize("ptr,endian", [(8, "<"), (8, ">"), (4, "<"), (4, ">")])
+@pytest.mark.parametrize("prefix_words", [0, 3, 65])
+def test_callee_address_point_reads_header_after_virtual_offsets(monkeypatch, ptr, endian, prefix_words):
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    order = "little" if endian == "<" else "big"
+    words = [0] * prefix_words + [0, 0x9000, 0x5000]
+    data = b"".join(word.to_bytes(ptr, order) for word in words)
+    reads = []
+
+    def read(address, size):
+        reads.append((address, size))
+        return data[:size]
+
+    typeinfo = SimpleNamespace(short_name="_typeinfo_for_X", type="DataSymbol")
+    bv = SimpleNamespace(read=read, get_symbol_at=lambda address: typeinfo if address == 0x9000 else None)
+    point = bridge.read_listing._callee_vtable_address_point(bv, 0x4000, len(data), "X", ptr, endian)
+    assert point == (hex(0x4000 + (prefix_words + 2) * ptr) if prefix_words < 64 else None)
+    assert reads == [(0x4000, min(len(data), 64 * ptr))]
+
+
+def test_callee_address_point_refuses_ambiguous_primary_headers(monkeypatch):
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    data = b"".join(word.to_bytes(8, "little") for word in [0, 0x9000, 0x5000, 0, 0x9000, 0x5100])
+    typeinfo = SimpleNamespace(short_name="typeinfo for X", type="DataSymbol")
+    bv = SimpleNamespace(read=lambda address, size: data[:size],
+                         get_symbol_at=lambda address: typeinfo if address == 0x9000 else None)
+    assert bridge.read_listing._callee_vtable_address_point(bv, 0x4000, len(data), "X", 8, "<") is None

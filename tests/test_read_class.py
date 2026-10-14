@@ -874,6 +874,242 @@ def test_class_list_populates_bases_for_shown_rows():
     assert row["bases"] == ["net::Endpoint"]
 
 
+
+@pytest.fixture
+def rtti_only_list_ctx(view_memo_live, monkeypatch):
+    """Public-data stand-in: two stripped classes and one checked table miss."""
+    # Control the deadline explicitly; these transitions do not pin the default.
+    monkeypatch.setattr(read_class, "_CLASS_LIST_VTABLE_BUDGET_SECONDS", 0.1)
+    names = {0xb000: "Alpha", 0xb100: "Beta", 0xb200: "NoTable"}
+
+    class _BV(_NotifyingRegistryBV):
+        def __init__(self):
+            super().__init__(
+                [_Fn(0x1000, "sub_1000", "sub_1000")],
+                [_Sym(f"_typeinfo_for_{name}", f"typeinfo for {name}", addr)
+                 for addr, name in names.items()],
+            )
+            self.refs = {0xb000: [0x9008], 0xb100: [0xa008], 0xb200: []}
+            self.ref_reads = []
+
+        def get_data_refs(self, addr):
+            self.ref_reads.append(addr)
+            return self.refs.get(addr, [])
+
+    bv = _BV()
+
+    class _Ctx(seam.BridgeContext):
+        def __init__(self):
+            super().__init__(None)
+            self.clock = 0.0
+            self.row_cost = 0.0
+            self.table_reads = []
+            self.size_reads = 0
+            self.instance_reads = 0
+
+        def _resolve_view(self, selector):
+            return bv
+
+        def _pointer_size(self, bv):
+            return 8
+
+        def _read_pointer_value(self, bv, addr, *, size=None):
+            return {0x9008: 0xb000, 0xa008: 0xb100}.get(addr, 0)
+
+        def _typeinfo_name_at(self, bv, addr):
+            return names.get(addr)
+
+        def _pointer_table_layout(self, bv, start, *, entries, stride):
+            self.clock += self.row_cost
+            self.table_reads.append((start, entries))
+            rows = []
+            for index in range(entries):
+                addr = start + index * stride
+                code = addr in (0x9010, 0x9018, 0xa010, 0xa018)
+                rows.append({
+                    "index": index, "entry_address": hex(addr), "readable": True,
+                    "value": "0x1000" if code else "0x7000",
+                    "target": ({"status": "function", "normalized": "0x1000",
+                                "function": {"name": "sub_1000"}}
+                               if code else {"status": "mapped",
+                                             "context": {"kind": "data"}}),
+                })
+            return {"items": rows}
+
+        def _bases_for(self, bv, rec):
+            return []
+
+        def _object_size_for(self, bv, rec):
+            self.size_reads += 1
+            return None
+
+        def _instances_for(self, bv, rec):
+            self.instance_reads += 1
+            return {"construction_sites": [], "stored_globals": []}
+
+    return _Ctx(), bv
+
+
+def test_class_list_recovers_rtti_only_primary_like_show(rtti_only_list_ctx):
+    ctx, bv = rtti_only_list_ctx
+    listed = read_class._class_list(ctx, None, query="Alpha")
+    row, = listed["items"]
+    assert row["has_vtable"] is True
+    assert row["vtable_status"] == "recovered"
+    assert bv.ref_reads == [0xb000]  # only the returned page is backwalked
+    assert ctx.size_reads == ctx.instance_reads == 0
+    shown = read_class._class_show(ctx, None, "Alpha")
+    assert row["method_count"] == len(shown["methods"]) == 0
+    # The two entries intentionally point at one function: slots are not methods.
+    assert row["vtable_slot_count"] == shown["vtable"]["total"] == 2
+    assert shown["vtable"]["address"] == "0x9000"
+    assert read_class._build_class_registry(ctx, bv)["Alpha"]["vtable"] is None
+    from bn.formatters import _render_class_list_text
+    text = _render_class_list_text(listed)
+    assert "methods=0  vtable  slots=2" in text
+
+
+def test_class_list_budget_stops_inside_slot_scan_and_discloses_unknown(
+        monkeypatch, rtti_only_list_ctx):
+    ctx, bv = rtti_only_list_ctx
+    monkeypatch.setattr(read_class.time, "monotonic", lambda: ctx.clock)
+    ctx.row_cost = 0.06
+    listed = read_class._class_list(ctx, None)
+    assert listed["vtable_recovery_budget_seconds"] == 0.1
+    assert listed["vtable_recovery_budget_exhausted"] is True
+    assert len(ctx.table_reads) == 2
+    assert all(entries == 1 for _, entries in ctx.table_reads)
+    assert bv.ref_reads == [0xb000]
+    for row in listed["items"]:
+        assert row["has_vtable"] is None
+        assert row["vtable_slot_count"] is None
+        assert row["vtable_status"] == "budget_exhausted"
+        assert row["method_count"] == 0
+    from bn.formatters import _render_class_list_text
+    text = _render_class_list_text(listed)
+    assert "vtable recovery budget exhausted" in text
+    assert text.count("vtable=? (unchecked)") == 3
+    assert "no-vtable" not in text
+    assert "malformed" not in text
+    # Neither the interrupted class nor later untouched rows become cache misses.
+    assert read_class._class_show(ctx, None, "Alpha")["vtable"]["total"] == 2
+    assert read_class._class_show(ctx, None, "Beta")["vtable"]["total"] == 2
+    ctx.row_cost = 0.0
+    repeated = read_class._class_list(ctx, None, query="Alpha")
+    assert repeated["items"][0]["has_vtable"] is True
+    assert repeated["vtable_recovery_budget_exhausted"] is False
+
+
+def test_class_list_budget_stops_inside_typeinfo_ref_scan(
+        monkeypatch, rtti_only_list_ctx):
+    ctx, bv = rtti_only_list_ctx
+    monkeypatch.setattr(read_class.time, "monotonic", lambda: ctx.clock)
+    seen = []
+
+    def refs():
+        for index in range(1000):
+            ctx.clock += 0.03
+            seen.append(index)
+            yield 0x5008  # invalid header: no slot scan, but refs still cost time
+
+    bv.refs[0xb000] = refs()
+    listed = read_class._class_list(ctx, None, query="Alpha")
+    assert len(seen) == 4
+    assert listed["vtable_recovery_budget_exhausted"] is True
+    assert listed["items"][0]["has_vtable"] is None
+    assert ctx.table_reads == []
+
+
+def test_class_list_checked_no_vtable_is_not_unknown(rtti_only_list_ctx):
+    ctx, bv = rtti_only_list_ctx
+    listed = read_class._class_list(ctx, None, query="NoTable")
+    row, = listed["items"]
+    assert bv.ref_reads == [0xb200]
+    assert row["has_vtable"] is False
+    assert row["vtable_status"] == "not_found"
+    assert row["vtable_slot_count"] == 0
+    assert row["method_count"] == len(read_class._class_show(ctx, None, "NoTable")["methods"])
+    assert listed["vtable_recovery_budget_exhausted"] is False
+    from bn.formatters import _render_class_list_text
+    text = _render_class_list_text(listed)
+    assert "no-vtable (checked)" in text
+    assert "unchecked" not in text and "budget exhausted" not in text
+
+
+def test_class_list_count_only_skips_vtable_recovery(rtti_only_list_ctx):
+    ctx, bv = rtti_only_list_ctx
+    counted = read_class._class_list(ctx, None, count_only=True)
+    assert counted["count"] == 3
+    assert bv.ref_reads == ctx.table_reads == []
+    assert "vtable_recovery_budget_exhausted" not in counted
+
+
+@pytest.mark.parametrize("slots", [True, [], "not-a-number"])
+def test_class_list_malformed_slot_count_is_disclosed_per_row(slots):
+    from bn.formatters import _render_class_list_text
+    row = {"name": "Bad", "method_count": 0, "has_vtable": True,
+           "vtable_status": "recovered", "vtable_slot_count": slots}
+    valid = {**row, "name": "Valid", "vtable_slot_count": 2}
+    unknown = {**row, "name": "Capped", "vtable_slot_count": None}
+    text = _render_class_list_text({"items": [row, valid, unknown]})
+    assert "Bad  methods=0  vtable  slots=?" in text
+    assert "Valid  methods=0  vtable  slots=2" in text
+    assert "Capped  methods=0  vtable  slots=?" in text
+    assert "malformed vtable_slot_count field" in text
+    clean = _render_class_list_text({"items": [valid, unknown]})
+    assert "malformed" not in clean
+
+
+def test_class_list_keeps_completed_rows_when_later_recovery_expires(
+        monkeypatch, rtti_only_list_ctx):
+    ctx, bv = rtti_only_list_ctx
+    monkeypatch.setattr(read_class.time, "monotonic", lambda: ctx.clock)
+    read_table = ctx._pointer_table_layout
+
+    def slow_beta(bv, start, *, entries, stride):
+        if start >= 0xa010:
+            ctx.clock += 0.06
+        return read_table(bv, start, entries=entries, stride=stride)
+
+    monkeypatch.setattr(ctx, "_pointer_table_layout", slow_beta)
+    listed = read_class._class_list(ctx, None)
+    alpha, beta, no_table = listed["items"]
+    assert alpha["has_vtable"] is True and alpha["vtable_slot_count"] == 2
+    assert beta["has_vtable"] is no_table["has_vtable"] is None
+    assert listed["vtable_recovery_budget_exhausted"] is True
+    assert bv.ref_reads == [0xb000, 0xb100]
+
+
+def test_class_list_does_not_promote_a_secondary_to_primary(
+        monkeypatch, rtti_only_list_ctx):
+    ctx, bv = rtti_only_list_ctx
+    read_pointer = ctx._read_pointer_value
+    monkeypatch.setattr(
+        ctx, "_read_pointer_value",
+        lambda bv, addr, size=None: ((1 << 64) - 8 if addr == 0x9000
+                                    else read_pointer(bv, addr, size=size)),
+    )
+    row, = read_class._class_list(ctx, None, query="Alpha")["items"]
+    assert row["has_vtable"] is False and row["vtable_status"] == "not_found"
+    shown = read_class._class_show(ctx, None, "Alpha")
+    assert shown["vtable"] is None
+    assert len(shown["secondary_vtables"]) == 1
+    assert row["method_count"] == len(shown["methods"]) == 0
+
+
+def test_class_list_unavailable_refs_are_unknown(monkeypatch, rtti_only_list_ctx):
+    ctx, bv = rtti_only_list_ctx
+    monkeypatch.setattr(bv, "get_data_refs", None)
+    listing = read_class._class_list(ctx, None, query="Alpha")
+    row, = listing["items"]
+    assert row["has_vtable"] is row["vtable_slot_count"] is None
+    assert row["vtable_status"] == "unavailable"
+    from bn.formatters import _render_class_list_text
+    text = _render_class_list_text(listing)
+    assert "vtable=? (unavailable)" in text and "no-vtable" not in text
+    assert "malformed" not in text
+
+
 class _VtableCtx:
     """Minimal ctx exposing the pointer-table reader over a fake slot map."""
     def __init__(self, slots, pure_addr=0xDEAD):
@@ -1151,6 +1387,20 @@ def test_instances_collects_construction_and_global_stores():
     assert out["construction_sites"][0]["kind"] == "new"
     assert out["stored_globals"][0]["symbol"] == "g_session"
 
+
+
+def test_construction_sites_have_stable_numeric_order_before_capping():
+    sites = [
+        {"address": address, "function": "factory", "kind": "ctor-call", "size": None}
+        for address in ("0x100", "0x20", "0x8")
+    ]
+    rec = {"name": "Widget", "vtable": None, "methods": []}
+    forward = read_class._instances(_InstCtx(sites, []), object(), rec, cap=2)
+    backward = read_class._instances(_InstCtx(list(reversed(sites)), []), object(), rec, cap=2)
+    assert forward["construction_sites"] == backward["construction_sites"]
+    assert [row["address"] for row in forward["construction_sites"]] == ["0x8", "0x20"]
+    assert forward["construction_sites_total"] == backward["construction_sites_total"] == 3
+    assert forward["construction_sites_truncated"] is True
 
 def test_class_show_assembles_full_record():
     bv = _make_registry_bv()

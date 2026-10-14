@@ -3967,6 +3967,28 @@ class TestClassLensRttiGuards922:
             "class", "list", "--no-stl", "--query", "basic_string", "--count", "--format", "json").stdout)
         assert counted["count"] == 1, counted
 
+    def test_stripped_rtti_only_list_recovers_the_same_primary_as_show_1018(self, shared_bn):
+        target = shared_bn.load(CLASSES_STRIPPED_BINARY)
+        listing = shared_bn.json(
+            "class", "list", "--query", "svc::EchoHandler", "-t", target)
+        row, = listing["items"]
+        assert row["has_vtable"] is True, row
+        assert row["vtable_status"] == "recovered", row
+        assert listing["vtable_recovery_budget_exhausted"] is False
+        card = shared_bn.json("class", "show", "svc::EchoHandler", "-t", target)
+        assert card["vtable"]["typeinfo_backwalk"] is True
+        assert row["method_count"] == len(card["methods"]) == 0
+        assert row["vtable_slot_count"] == card["vtable"]["total"] == 4
+        text = shared_bn.run(
+            "class", "list", "--query", "svc::EchoHandler", "-t", target)
+        assert text.returncode == 0, (text.stdout, text.stderr)
+        assert "methods=0  vtable  slots=4" in text.stdout
+        assert "no-vtable" not in text.stdout
+        count = shared_bn.json(
+            "class", "list", "--query", "svc::EchoHandler", "--count", "-t", target)
+        assert count["count"] == 1
+        assert "vtable_recovery_budget_exhausted" not in count
+
     def test_stripped_slot_array_symbols_preserve_vtable_contents_935(self, shared_bn):
         # Both builds use the same source/options except -s. Compare raw slot
         # words within each view; across views only proven external symbols use
@@ -4200,9 +4222,8 @@ class TestVirtualMethods998:
         return json.loads(res.stdout)
 
     def test_callsites_says_when_the_callee_is_stored_in_data(self, shared_bn):
-        # `reg` is never called directly; its address sits in the Dispatcher
-        # and AudioDisp vtables. `callsites` states that fact -- two data
-        # refs, where -- and claims nothing about what they are.
+        # `reg` is never called directly; its address sits in two named vtable
+        # objects. Execute the printed class-layout hints, not callee xrefs.
         shared_bn.load(VCALLS_BINARY)
         out = self._json(shared_bn, "callsites", "vc::Dispatcher::reg")
         assert out["total"] == 0, out
@@ -4212,11 +4233,50 @@ class TestVirtualMethods998:
             r["address"] for r in xrefs["items"] if r["kind"] == "data")
         text = shared_bn.run("callsites", "vc::Dispatcher::reg").stdout
         assert "note: the callee's address is stored in 2 data location(s)" in text, text
-        assert "may be vtable slots or function-pointer tables" in text
+        import re
+        import shlex
+        commands = re.findall(r"`(bn class show [^`]+)`", text)
+        assert len(commands) == 2, text
+        assert {shlex.split(command)[-1] for command in commands} == {"vc::Dispatcher", "vc::AudioDisp"}
+        for command in commands:
+            result = shared_bn.run(*shlex.split(command)[1:])
+            assert result.returncode == 0, (command, result.stderr)
+            row = next(row for row in out["callee_data_ref_vtables"]
+                       if row["class_name"] == shlex.split(command)[-1])
+            assert result.stdout.startswith(f"class {row['class_name']} ")
+            assert f"address point {row['address_point']}" in result.stdout.splitlines()[0]
         # A function stored nowhere gets no note.
         plain = self._json(shared_bn, "callsites", "vc::pump")
         assert plain["callee_data_ref_count"] == 0
         assert "data location" not in shared_bn.run("callsites", "vc::pump").stdout
+
+    def test_callsite_address_point_accounts_for_virtual_base_offsets(self, shared_bn, tmp_path):
+        import re
+        import shlex
+
+        source = tmp_path / "virtual.cpp"
+        source.write_text(
+            "struct Root { virtual void f() {} virtual ~Root() {} };\n"
+            "struct Leaf : virtual Root { void f() override {} };\n"
+            "int main() { Leaf value; Root* root = &value; root->f(); }\n")
+        binary = tmp_path / "virtual"
+        build = subprocess.run(["c++", "-O0", "-o", str(binary), str(source)],
+                               capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        shared_bn.load(binary)
+        out = self._json(shared_bn, "callsites", "Leaf::f")
+        row = next(row for row in out["callee_data_ref_vtables"] if row["class_name"] == "Leaf")
+        assert row["address_point"] == row["address"]
+        assert int(row["address_point"], 16) > int(row["vtable_address"], 16) + 16
+        refs = self._json(shared_bn, "xrefs", row["address_point"])
+        assert any(ref["kind"] == "code" for ref in refs["items"])
+        text = shared_bn.run("callsites", "Leaf::f").stdout
+        commands = re.findall(r"`(bn class show [^`]+)`", text)
+        assert len(commands) == 1, text
+        for command in commands:
+            result = shared_bn.run(*shlex.split(command)[1:])
+            assert result.returncode == 0, (command, result.stderr)
+            assert result.stdout.startswith("class Leaf")
 
     def test_vtable_address_point_is_what_objects_reference(self, shared_bn):
         shared_bn.load(VCALLS_BINARY)
@@ -4229,6 +4289,24 @@ class TestVirtualMethods998:
         assert self._json(shared_bn, "xrefs", vt["address"])["code_ref_count"] == 0
         text = shared_bn.run("class", "show", "vc::Dispatcher").stdout
         assert f"vtable @ {vt['address']}, address point {vt['address_point']}" in text
+
+    def test_unknown_table_hints_execute_xrefs_on_the_data_location(self, shared_bn):
+        import re
+        import shlex
+
+        shared_bn.load(CLASSES_STRIPPED_BINARY)
+        card = self._json(shared_bn, "class", "show", "svc::EchoHandler")
+        callee = card["vtable"]["slots"][0]["address"]
+        out = self._json(shared_bn, "callsites", callee)
+        assert out["callee_data_ref_vtables"] == []
+        text = shared_bn.run("callsites", callee).stdout
+        commands = re.findall(r"`(bn xrefs [^`]+)`", text)
+        assert {shlex.split(command)[-1] for command in commands} == set(out["callee_data_refs"])
+        assert card["vtable"]["address_point"] in out["callee_data_refs"]
+        for command in commands:
+            result = shared_bn.run(*shlex.split(command)[1:])
+            assert result.returncode == 0, (command, result.stderr)
+            assert result.stdout.startswith(f"xrefs to {shlex.split(command)[-1]} ")
 
 
 class TestStructLayoutAssistance903:
