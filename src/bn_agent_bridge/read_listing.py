@@ -336,6 +336,38 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
     return rows
 
 
+#: #998 item 1: how many data-ref addresses a `callsites` envelope lists;
+#: `callee_data_ref_count` counts them all.
+_CALLEE_DATA_REFS_LISTED = 8
+
+
+def _callee_data_refs(bv, address: int) -> dict[str, Any]:
+    """``callee_data_ref_count`` and the first ``_CALLEE_DATA_REFS_LISTED``
+    ``callee_data_refs`` (hex) of BN's data refs to *address*; the count is
+    None when BN cannot list them."""
+    getter = getattr(bv, "get_data_refs", None)
+    try:
+        refs = sorted({int(r) for r in getter(address)}) if callable(getter) else None
+    except Exception:
+        refs = None
+    if refs is None:
+        return {"callee_data_ref_count": None, "callee_data_refs": []}
+    return {"callee_data_ref_count": len(refs),
+            "callee_data_refs": [hex(r) for r in refs[:_CALLEE_DATA_REFS_LISTED]]}
+
+
+def _other_containing_functions(ctx, bv, call_addr: str, func) -> list[dict[str, str]]:
+    """#998 item 2: identities of the functions OTHER than *func* that BN puts
+    the instruction at *call_addr* in (a block shared by several functions)."""
+    start = int(getattr(func, "start", -1))
+    return [
+        il_format._function_identity(other)
+        for other in sorted(ctx._functions_containing(bv, int(call_addr, 16)),
+                            key=lambda fn: int(getattr(fn, "start", 0)))
+        if int(getattr(other, "start", -1)) != start
+    ]
+
+
 def _all_caller_functions(
     bv,
     callee_addresses: set[int],
@@ -516,9 +548,23 @@ def _callsites(
             )
     # #558: an imported variadic (scanf/printf-family) callee's HLIL callsite text
     # can show only the fixed argument; attach a steer to the argument-recovery views.
+    # #998 item 1: a function whose address is stored in data (a vtable slot,
+    # a function-pointer table) can be called through it, and no call
+    # instruction names such a call. Report only the FACT -- how many data
+    # refs there are and where -- so a short (or empty) direct-call list is not
+    # read as "rarely called"; what those refs are is `xrefs`'s to show.
+    data_ref_fields = _callee_data_refs(bv, int(callee.start))
     variadic_hint = _callee_variadic_hint(callee)
 
     rows = []
+    # #998 item 2: BN puts a block shared by two functions (a tail one jumps
+    # into) in BOTH, so the per-function scan below returns that block's call
+    # instructions once per containing function. A call site is an
+    # INSTRUCTION: keep the first row for each `call_addr`, so `total` counts
+    # call sites. `also_in` names the OTHER functions BN puts the instruction
+    # in, read from BN for the row itself -- not from the callers this page's
+    # scan happened to reach (a capped scan, or `--within`, sees only some).
+    rows_by_call: dict[Any, dict[str, Any]] = {}
     callers_scanned = 0
     scan_truncated = False
     row_scan_target = offset + limit + 1 if limit is not None else None
@@ -528,9 +574,13 @@ def _callsites(
             variadic_hint=variadic_hint)
         callers_scanned += 1
         for call_index, row in enumerate(function_rows):
+            if row["call_addr"] in rows_by_call:
+                continue
             row["call_index"] = call_index
             row["within_query"] = str(within_query)
-        rows.extend(function_rows)
+            row["also_in"] = _other_containing_functions(ctx, bv, row["call_addr"], func)
+            rows_by_call[row["call_addr"]] = row
+            rows.append(row)
         if (
             row_scan_target is not None
             and len(rows) >= row_scan_target
@@ -569,6 +619,7 @@ def _callsites(
                 # stopped early that number is unknown, not `len(scope_functions)`.
                 "caller_total": None,
                 "callee_symbol_only": callee_symbol_only,
+                **data_ref_fields,
             }
         )
         _attach_callsite_excerpts(bv, result["items"])
@@ -593,6 +644,7 @@ def _callsites(
             "callers_scanned": callers_scanned,
             "caller_total": len(scope_functions),
             "callee_symbol_only": callee_symbol_only,
+            **data_ref_fields,
         }
 
     result = read_misc._paged_list_result(
@@ -606,6 +658,7 @@ def _callsites(
             "callers_scanned": callers_scanned,
             "caller_total": len(scope_functions),
             "callee_symbol_only": callee_symbol_only,
+            **data_ref_fields,
         }
     )
     _attach_callsite_excerpts(bv, result["items"])

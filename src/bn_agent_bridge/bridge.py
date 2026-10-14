@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,7 +65,9 @@ from .paths import (
 from .proc_identity import identity_payload
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
-from .target_hint import format_multi_target_hint, open_target_lines
+from .target_hint import (
+    LISTED_SELECTOR_LEAD, format_multi_target_hint, open_target_lines, target_row,
+)
 from .version import VERSION, build_id_for_file, build_id_for_package
 
 try:
@@ -78,6 +81,11 @@ PLUGIN_BUILD_ID = build_id_for_file(Path(__file__).resolve())
 # is actually running. `doctor` compares it to the on-disk package so an edited
 # engine module (e.g. taint_engine.py) is flagged stale, not just bridge.py (#161).
 ENGINE_BUILD_ID = build_id_for_package(Path(__file__).resolve().parent)
+# The checkout this process's code came from (symlinks resolved, so a GUI
+# plugin symlinked into BN's plugins dir names its source tree). Published in
+# the registry and the doctor ping so `doctor`/`session list` can say which
+# checkout a bridge runs (#992).
+SOURCE_DIR = str(Path(__file__).resolve().parent)
 
 # Upper bound on a single newline-terminated JSON request. Anything larger is
 # rejected with a clean error instead of being buffered without limit.
@@ -236,19 +244,50 @@ def _format_no_active_target_error(targets: list[dict[str, Any]]) -> str:
 
 
 class _ReadWriteLock:
+    """Writer-priority reader/writer lock over the open views.
+
+    Like `_WriteGate`, it records WHO holds it exclusively and which request ids
+    are reading-queued behind that holder, so a read stuck behind an exclusive
+    phase is observable through `write_gate_status` and refusable with
+    `no_wait` instead of waiting silently (#976, #992). A GUI "Restart Bridge"
+    hands the lock to the successor, so the holder can be a write the RETIRED
+    bridge is still running -- which the new bridge's reads would otherwise wait
+    on with nothing able to say why. A writer that is only QUEUED blocks new
+    reads too (writer priority), so it is named when nothing holds the lock.
+    """
+
     def __init__(self):
         self._condition = threading.Condition()
         self._readers = 0
         self._writer = False
-        self._writers_waiting = 0
+        self._holder: dict[str, Any] | None = None
+        # One entry per writer waiting for the lock, oldest first; its length
+        # is the writer-priority count new readers wait on.
+        self._queued_writers: list[dict[str, Any]] = []
+        self._read_waiters: set[str] = set()
 
     @contextlib.contextmanager
-    def read(self):
+    def read(self, *, may_refuse: bool = True):
+        """Shared access. *may_refuse* False for a read a request takes after it
+        has already done its work (refresh's reply): `no_wait` is a promise to
+        refuse BEFORE doing anything, so such a read waits instead (#992)."""
         with self._condition:
             # Also wait while writers are queued, otherwise a steady stream of
             # readers starves a waiting writer forever.
-            while self._writer or self._writers_waiting:
-                self._condition.wait()
+            if self._writer or self._queued_writers:
+                if may_refuse and getattr(_gate_request, "no_wait", False):
+                    raise RuntimeError(_busy_message(
+                        self._blocking_holder(), getattr(_gate_request, "op", None),
+                        "needs to read the open views"))
+                request_id = getattr(_gate_request, "request_id", None)
+                if request_id:
+                    self._read_waiters.add(request_id)
+                try:
+                    while self._writer or self._queued_writers:
+                        self._condition.wait()
+                finally:
+                    if request_id:
+                        self._read_waiters.discard(request_id)
             self._readers += 1
         try:
             yield
@@ -260,20 +299,67 @@ class _ReadWriteLock:
 
     @contextlib.contextmanager
     def write(self):
+        entry = {"op": getattr(_gate_request, "op", None), "since": time.monotonic()}
         with self._condition:
-            self._writers_waiting += 1
+            self._queued_writers.append(entry)
             try:
                 while self._writer or self._readers:
                     self._condition.wait()
             finally:
-                self._writers_waiting -= 1
+                self._queued_writers.remove(entry)
             self._writer = True
+            self._holder = {"op": entry["op"], "since": time.monotonic()}
         try:
             yield
         finally:
             with self._condition:
                 self._writer = False
+                self._holder = None
                 self._condition.notify_all()
+
+    def _blocking_holder(self) -> dict[str, Any] | None:
+        """What a new read waits on: the holder, else the oldest queued writer.
+        Caller holds `_condition`."""
+        if self._holder is not None:
+            return _holder_view(self._holder)
+        if self._queued_writers:
+            return {**_holder_view(self._queued_writers[0]), "queued": True}
+        return None
+
+    def read_status(self, request_id: str) -> dict[str, Any]:
+        """Whether *request_id* is a read queued here, and what it waits on."""
+        with self._condition:
+            return {
+                "waiting": request_id in self._read_waiters,
+                "holder": self._blocking_holder(),
+            }
+
+
+def _holder_view(holder: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A lock holder as `write_gate_status` reports it: op and elapsed seconds."""
+    if holder is None:
+        return None
+    return {
+        "op": holder["op"],
+        "elapsed_seconds": round(time.monotonic() - holder["since"], 1),
+    }
+
+
+def _busy_message(holder: dict[str, Any] | None, op: str | None, need: str) -> str:
+    """The `no_wait` refusal: what holds the lock, and what this request needed."""
+    if holder is None:
+        what = "another write in progress"
+    elif holder.get("queued"):
+        what = (f"{holder['op'] or 'another write'} queued for the open views "
+                f"(waiting {holder['elapsed_seconds']:g}s)")
+    else:
+        what = (f"{holder['op'] or 'another write'} in progress "
+                f"(started {holder['elapsed_seconds']:g}s ago)")
+    return (
+        f"busy: {what}; {op or 'this request'} {need} and "
+        "BN_NO_WAIT is set, so it was refused instead of queued. Retry when "
+        "that operation finishes, or unset BN_NO_WAIT to wait for it."
+    )
 
 
 # The request the current thread is serving, as far as the write gate is
@@ -309,7 +395,7 @@ class _WriteGate:
         request_id = getattr(_gate_request, "request_id", None)
         if not self._lock.acquire(blocking=False):
             if getattr(_gate_request, "no_wait", False):
-                raise RuntimeError(self._busy_message(op))
+                raise RuntimeError(_busy_message(self.holder(), op, "needs the write gate"))
             if request_id:
                 with self._state:
                     self._waiters.add(request_id)
@@ -329,12 +415,7 @@ class _WriteGate:
 
     def holder(self) -> dict[str, Any] | None:
         with self._state:
-            if self._holder is None:
-                return None
-            return {
-                "op": self._holder["op"],
-                "elapsed_seconds": round(time.monotonic() - self._holder["since"], 1),
-            }
+            return _holder_view(self._holder)
 
     def status(self, request_id: str) -> dict[str, Any]:
         with self._state:
@@ -345,20 +426,6 @@ class _WriteGate:
             "waiting": waiting,
             "holder": self.holder(),
         }
-
-    def _busy_message(self, op: str | None) -> str:
-        holder = self.holder()
-        what = (
-            f"{holder['op'] or 'another write'} in progress "
-            f"(started {holder['elapsed_seconds']:g}s ago)"
-            if holder is not None
-            else "another write in progress"
-        )
-        return (
-            f"busy: {what}; {op or 'this request'} needs the write gate and "
-            "BN_NO_WAIT is set, so it was refused instead of queued. Retry when "
-            "that operation finishes, or unset BN_NO_WAIT to wait for it."
-        )
 
 
 @contextlib.contextmanager
@@ -669,6 +736,11 @@ class TargetManager:
         # load-time sidecar/cache substitution OPENS the database, so `filename`
         # already names it.
         self._database_paths: dict[str, str] = {}
+        # Stable view_id -> (st_dev, st_ino, st_size, st_mtime_ns) of the file at
+        # `_database_paths[vid]` right after this bridge last wrote it. Pairs a
+        # database view with its raw view for selector resolution only while
+        # that file is still the one written (#996 review).
+        self._database_identities: dict[str, tuple[int, int, int, int] | None] = {}
         # Stable view_id -> the comments THIS bridge wrote and verified, keyed
         # (scope, address) -> body, scope "address" (a global address comment)
         # or "function_doc" (fn.comment, keyed at the function start). Decompile
@@ -695,16 +767,21 @@ class TargetManager:
         `unsaved=false` the moment the new bridge answered, with nothing saved
         (#953). Carrying the handle-keyed id map over (not a filename or a
         selector, which another view can share) keeps each RETAINED view's
-        stable id, and with it its unsaved marker and backing-database path. A
-        view that closed meanwhile is pruned by the first complete `refresh()`
-        exactly as it would have been in the old manager: the carried map holds
-        strong references, so no other view can arrive under its handle.
+        stable id, and with it its unsaved marker, backing-database path and
+        session-comment ledger (#992). A view that closed meanwhile is pruned
+        by the first complete `refresh()` exactly as it would have been in the
+        old manager: the carried map holds strong references, so no other view
+        can arrive under its handle.
         """
         with predecessor._lock, self._lock:
             self._ids_by_object = dict(predecessor._ids_by_object)
             self._next_id = max(self._next_id, predecessor._next_id)
             self._dirty_view_ids = set(predecessor._dirty_view_ids)
             self._database_paths = dict(predecessor._database_paths)
+            self._session_annotations = {
+                vid: dict(ledger)
+                for vid, ledger in predecessor._session_annotations.items()
+            }
             predecessor._successor = self
 
     def _stable_view_id(self, bv) -> str | None:
@@ -755,14 +832,16 @@ class TargetManager:
             return
         with self._lock:
             vid = self._stable_view_id(bv)
-            if vid is None:
-                return
-            ledger = self._session_annotations.setdefault(vid, {})
-            for key, body in entries:
-                if body is None:
-                    ledger.pop(key, None)
-                else:
-                    ledger[key] = body
+            if vid is not None:
+                ledger = self._session_annotations.setdefault(vid, {})
+                for key, body in entries:
+                    if body is None:
+                        ledger.pop(key, None)
+                    else:
+                        ledger[key] = body
+            successor = self._successor
+        if successor is not None:
+            successor.note_session_annotations(bv, results)
 
     def session_annotations(self, bv) -> dict[tuple[str, int], str]:
         """The comments this bridge wrote on *bv*, keyed by (scope, address)."""
@@ -778,6 +857,7 @@ class TargetManager:
         """
         if not path:
             return
+        identity = _file_identity(path)
         # Only when it DIVERGES from the live filename. A target loaded from a
         # `.bndb` and saved in place has `saved == filename`, and recording that
         # contradicted this field's own contract ("the database when it is not the
@@ -789,12 +869,18 @@ class TargetManager:
             live = str(getattr(getattr(bv, "file", None), "filename", "") or "")
         except Exception:  # noqa: BLE001 - an odd view must not break a save
             live = ""
-        if live and str(path) == live:
-            return
         with self._lock:
-            vid = self._stable_view_id(bv)
-            if vid is not None:
-                self._database_paths[vid] = str(path)
+            # A save rewrote *path*: every record pointing at that file now
+            # pairs with what this bridge just wrote -- including a save of the
+            # database view itself, which records nothing of its own below.
+            for other, recorded in self._database_paths.items():
+                if _same_file(recorded, path):
+                    self._database_identities[other] = identity
+            if not (live and str(path) == live):
+                vid = self._stable_view_id(bv)
+                if vid is not None:
+                    self._database_paths[vid] = str(path)
+                    self._database_identities[vid] = identity
             successor = self._successor
         if successor is not None:
             successor.note_database(bv, path)
@@ -867,6 +953,7 @@ class TargetManager:
             if vid is not None:
                 self._dirty_view_ids.discard(vid)
                 self._database_paths.pop(vid, None)
+                self._database_identities.pop(vid, None)
                 self._session_annotations.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
@@ -885,32 +972,34 @@ class TargetManager:
         return type(bv).__name__
 
     def _compute_selectors(self, records: dict[str, TargetRecord]) -> dict[str, str]:
-        # Index the resolver's exact aliases and component suffixes once per
-        # snapshot. Candidate lookup must not re-split every other view's path.
-        exact: dict[str, set[str]] = {}
-        tails: dict[tuple[str, ...], set[str]] = {}
+        """The shortest path suffix that RESOLVES to each view, else its target_id.
+
+        A candidate counts when `_matching_records` would return this view
+        alone for it -- the same relation, including the saved-database pair
+        rule (`_drop_saved_databases`), so every advertised selector resolves and
+        the raw `hello` stays `hello` once the `hello.bndb` it saved is open
+        (#996). The resolver's aliases and component suffixes are indexed once
+        per snapshot; candidate lookup must not re-split every other view's path.
+        """
+        exact: dict[str, dict[str, str]] = {}
+        tails: dict[tuple[str, ...], dict[str, str]] = {}
         paths = {}
         identities = {}
+
+        def _index(table: dict, key, vid: str, kind: str) -> None:
+            kinds = table.setdefault(key, {})
+            if kinds.get(vid) != self._STRONG:
+                kinds[vid] = kind
+
         for vid, record in records.items():
             identities[record.target_id()] = vid
             parts = paths[vid] = _path_components(record.filename)
-            aliases = [record.view_id, record.filename, record.basename]
-            variants = [parts]
-            if record.basename.endswith(".bndb"):
-                core = record.basename[:-len(".bndb")]
-                aliases.append(core)
-                stem, dot, digest = core.rpartition(".")
-                if dot and len(digest) == 16 and all(
-                    c in "0123456789abcdef" for c in digest
-                ):
-                    aliases.append(stem)
-            if parts and parts[-1].endswith(".bndb"):
-                variants.append(parts[:-1] + (parts[-1][:-len(".bndb")],))
-            for alias in aliases:
-                exact.setdefault(alias, set()).add(vid)
-            for variant in variants:
+            for alias, kind in self._aliases(record):
+                _index(exact, alias, vid, kind)
+            for variant, kind in self._tail_variants(parts):
                 for depth in range(1, len(variant) + 1):
-                    tails.setdefault(variant[-depth:], set()).add(vid)
+                    _index(tails, variant[-depth:], vid, kind)
+        saved_pairs = self._saved_pairs(records)
 
         selectors: dict[str, str] = {}
         for vid, record in records.items():
@@ -924,18 +1013,64 @@ class TargetManager:
                 if normalized in identities:
                     matches = {identities[normalized]}
                 else:
-                    matches = exact.get(normalized, set()) | tails.get(
-                        _path_components(normalized), set()
-                    )
+                    kinds: dict[str, str] = {}
+                    for source in (exact.get(normalized, {}),
+                                   tails.get(_path_components(normalized), {})):
+                        for other, kind in source.items():
+                            if kinds.get(other) != self._STRONG:
+                                kinds[other] = kind
+                    matches = set(self._drop_saved_databases(kinds, saved_pairs))
                 if matches == {vid}:
                     chosen = candidate
                     break
             selectors[vid] = chosen
         return selectors
 
-    def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
+    # How a human selector names a record. Every alias counts equally -- view
+    # id, filename, basename, path tail and the `.bndb`-stripped forms -- so a
+    # selector matching two views is refused as ambiguous, whichever view
+    # opened first. A ranking between aliases was tried and rejected: opening
+    # a view could then silently MOVE a selector that used to be refused onto
+    # the new view (`close 5` closing the view whose id became 5, #996 review).
+    # The kind is kept only for the one narrow exception `_drop_saved_databases`
+    # makes.
+    _STRONG = "strong"        # view id, filename, basename, path tail
+    _STRIPPED = "stripped"    # only through a `.bndb`-stripped alias
+
+    def _aliases(self, record: TargetRecord) -> list[tuple[str, str]]:
+        """Every exact-string alias of *record* with its kind."""
+        aliases = [
+            (record.view_id, self._STRONG),
+            (record.filename, self._STRONG),
+            (record.basename, self._STRONG),
+        ]
+        # A .bndb corpus loads <binary>.bndb, but the obvious selector is
+        # <binary>; `-t foo` resolves `foo.bndb` (#312).
+        if record.basename.endswith(".bndb"):
+            core = record.basename[: -len(".bndb")]
+            aliases.append((core, self._STRIPPED))
+            # Read-only-mount targets restore the GLOBAL cache DB, named
+            # `<stem>.<16-hex content digest>.bndb` by `_cache_bndb_path`; strip
+            # a trailing `.<16 hex>` so the cache name resolves by stem.
+            stem, dot, digest = core.rpartition(".")
+            if dot and len(digest) == 16 and all(
+                c in "0123456789abcdef" for c in digest
+            ):
+                aliases.append((stem, self._STRIPPED))
+        return [(alias, kind) for alias, kind in aliases if alias]
+
+    def _tail_variants(self, parts: tuple[str, ...]) -> list[tuple[tuple[str, ...], str]]:
+        """The component sequences whose suffixes a path-tail selector matches."""
+        variants = [(parts, self._STRONG)] if parts else []
+        if parts and parts[-1].endswith(".bndb"):
+            variants.append(
+                (parts[:-1] + (parts[-1][: -len(".bndb")],), self._STRIPPED))
+        return variants
+
+    def _match_kind(self, record: TargetRecord, selector: str | None) -> str | None:
+        """How *selector* names *record* (strong over stripped), or None."""
         if selector is None:
-            return False
+            return None
         if isinstance(selector, PinnedTarget):
             # An identity the BRIDGE pinned (the destructive gate) resolves by
             # exact target_id and by nothing else. Every fallback below is a
@@ -944,47 +1079,95 @@ class TargetManager:
             # DIFFERENT view whose filename happened to spell the pinned id,
             # which is exactly the wrong-target write the pin prevents (#736
             # review rounds 2 and 3).
-            return str(selector) == record.target_id()
+            return self._STRONG if str(selector) == record.target_id() else None
         candidate = str(selector).strip()
         if candidate in ("", "active"):
-            return False
-        if candidate in (
-            record.target_id(),
-            record.view_id,
-            record.filename,
-            record.basename,
-        ):
-            return True
-        # A .bndb corpus loads <binary>.bndb, but the obvious selector is
-        # <binary>; match a candidate against the basename / path tail with a
-        # trailing .bndb stripped so `-t foo` resolves `foo.bndb` (#312).
-        if record.basename.endswith(".bndb"):
-            core = record.basename[: -len(".bndb")]
-            if candidate == core:
-                return True
-            # Read-only-mount targets restore the GLOBAL cache DB, named
-            # `<stem>.<16-hex content digest>.bndb` by `_cache_bndb_path`. Its core
-            # is `<stem>.<digest>`, so `-t <stem>` (e.g. `-t foo`, the obvious
-            # base name) would miss the exact/`.bndb`-strip cases above. Strip a
-            # trailing `.<16 hex>` so the cache name resolves by stem.
-            stem, dot, digest = core.rpartition(".")
-            if (
-                dot
-                and candidate == stem
-                and len(digest) == 16
-                and all(c in "0123456789abcdef" for c in digest)
-            ):
-                return True
+            return None
+        if candidate == record.target_id():
+            return self._STRONG
+        found: str | None = None
+        for alias, kind in self._aliases(record):
+            if candidate == alias:
+                if kind == self._STRONG:
+                    return kind
+                found = kind
         suffix = _path_components(candidate)
         if suffix:
-            parts = _path_components(record.filename)
-            if len(parts) >= len(suffix) and parts[-len(suffix):] == suffix:
-                return True
-            if parts and parts[-1].endswith(".bndb"):
-                stripped = tuple(parts[:-1]) + (parts[-1][: -len(".bndb")],)
-                if len(stripped) >= len(suffix) and tuple(stripped[-len(suffix):]) == tuple(suffix):
-                    return True
-        return False
+            for variant, kind in self._tail_variants(_path_components(record.filename)):
+                if len(variant) >= len(suffix) and variant[-len(suffix):] == suffix:
+                    if kind == self._STRONG:
+                        return kind
+                    found = kind
+        return found
+
+    def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
+        return self._match_kind(record, selector) is not None
+
+    def _saved_pairs(self, records: dict[str, TargetRecord]) -> dict[str, str]:
+        """database view id -> the raw view id THIS bridge saved it from.
+
+        From the save ledger, never from filename spelling: two unrelated `foo`
+        and `foo.bndb` views form no pair. The path alone is not enough either
+        (#996 review): the database view must still be the file this bridge
+        wrote -- same device, inode, size and mtime as recorded right after the
+        save -- and must not have loaded as unverified against its raw bytes.
+        A database replaced since, or one that failed that check, pairs with
+        nothing, so `-t foo` is ambiguous again exactly as without a save.
+        """
+        pairs: dict[str, str] = {}
+        for raw_vid, path in self._database_paths.items():
+            identity = self._database_identities.get(raw_vid)
+            if raw_vid not in records or identity is None:
+                continue
+            for vid, record in records.items():
+                if (
+                    vid != raw_vid
+                    and _same_file(record.filename, path)
+                    and _file_identity(record.filename) == identity
+                    and _source_verified.get(record.session_id) is not False
+                ):
+                    pairs[vid] = raw_vid
+        return pairs
+
+    def stripped_only_match(self, selector: str | None, bv) -> tuple[str, str] | None:
+        """``(filename, listed selector)`` of *bv* when *selector* names it ONLY
+        through a `.bndb`-stripped alias (`hello` for `hello.bndb`), else None.
+        A destructive close refuses that convenience (#996 review). The listed
+        selector is the one `target list` advertises, which resolves to exactly
+        this view -- unlike its basename, which another open view may share."""
+        if selector is None or isinstance(selector, PinnedTarget):
+            return None
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            record = self._records.get(vid) if vid is not None else None
+            if record is None or self._match_kind(record, selector) != self._STRIPPED:
+                return None
+        row = next((r for r in self.refresh() if r.get("view_id") == vid), None)
+        listed = str(row.get("selector") or "") if row else ""
+        return record.filename, listed or record.target_id()
+
+    def _drop_saved_databases(
+        self, kinds: dict[str, str], saved_pairs: dict[str, str]
+    ) -> list[str]:
+        """The matched view ids, minus a database its own raw view outranks.
+
+        The one exception to "every alias counts equally" (#996): `bn save` on
+        the raw `hello` then `bn load hello.bndb` -- the round trip the skills
+        recommend -- must not break the `hello` selector `session start`
+        printed. A database view is dropped only when it matched solely through
+        a `.bndb`-stripped alias AND the raw view this bridge saved it from
+        matched strongly. Stable whichever order they opened in, so no
+        selector moves onto a newly opened view; anything else that matches
+        twice stays ambiguous.
+        """
+        return [
+            vid for vid, kind in kinds.items()
+            if not (
+                kind == self._STRIPPED
+                and saved_pairs.get(vid) is not None
+                and kinds.get(saved_pairs[vid]) == self._STRONG
+            )
+        ]
 
     def _matching_records(
         self, records: dict[str, TargetRecord], selector: str | None
@@ -993,6 +1176,8 @@ class TargetManager:
 
         A live full target_id outranks filename aliases, so the last-resort
         selector remains usable even with a file named after another view's ID.
+        Every other alias counts equally (see `_STRONG`), less only a database
+        whose own saved-from raw view also matched (`_drop_saved_databases`).
         PinnedTarget retains its stricter identity-only semantics, including
         when its view has disappeared.
         """
@@ -1001,10 +1186,14 @@ class TargetManager:
             for record in records.values():
                 if candidate == record.target_id():
                     return [record]
-        return [
-            record for record in records.values()
-            if self._matches_record(record, selector)
-        ]
+        kinds = {
+            vid: kind for vid, record in records.items()
+            if (kind := self._match_kind(record, selector)) is not None
+        }
+        if len(kinds) > 1:
+            return [records[vid] for vid in
+                    self._drop_saved_databases(kinds, self._saved_pairs(records))]
+        return [records[vid] for vid in kinds]
 
     def matches_target(self, target_id: str, selector: str | None) -> bool:
         """Whether ``selector`` names the record with ``target_id``. Locked."""
@@ -1106,6 +1295,10 @@ class TargetManager:
                 # restart would then reopen its raw bytes (#753 review).
                 self._database_paths = {
                     vid: path for vid, path in self._database_paths.items()
+                    if vid in alive
+                }
+                self._database_identities = {
+                    vid: ident for vid, ident in self._database_identities.items()
                     if vid in alive
                 }
                 self._session_annotations = {
@@ -1216,9 +1409,16 @@ class TargetManager:
                 selectors_by_view.get(record.view_id, record.target_id())
                 for record in matches
             )
-            raise RuntimeError(
-                f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})"
-            )
+            # #996 re-dogfood: the candidates as the shared `-t` rows too, so
+            # the refusal hands over selectors that each resolve to ONE target
+            # (a CLI command with a positional selector re-spells them).
+            matched = {record.view_id for record in matches}
+            rows = [target_row(t) for t in targets if t.get("view_id") in matched]
+            raise RuntimeError("\n".join([
+                f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})",
+                "Matching targets:",
+                *rows,
+            ]))
         return matches[0].view, targets
 
     def pin_destructive_target(self, op_name: str, selector: Any) -> str | None:
@@ -1428,13 +1628,22 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                         idle_probe = payload.get("idle_probe") is True
                         expected_identity = getattr(bridge, "bridge_identity", None)
                         actual_identity = payload.get("_bridge_identity")
-                        if not admitted:
-                            response = _json_response(
-                                ok=False, error="bridge is shutting down")
-                        elif (
+                        # #992: a cancel stamped with a retired predecessor's
+                        # identity is dispatched to THAT predecessor, the only
+                        # bridge whose requests it may mark.
+                        dispatcher = bridge
+                        if (
                             expected_identity is not None
                             and actual_identity != expected_identity
                         ):
+                            route = getattr(bridge, "_predecessor_for_cancel", None)
+                            dispatcher = (
+                                route(op, actual_identity) if route is not None else None
+                            )
+                        if not admitted:
+                            response = _json_response(
+                                ok=False, error="bridge is shutting down")
+                        elif dispatcher is None:
                             response = _json_response(
                                 ok=False,
                                 error=(
@@ -1461,7 +1670,7 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                                 with _request_cancel_context(
                                     lambda: is_cancelled(request_id)
                                 ):
-                                    response = bridge.dispatch(payload)
+                                    response = dispatcher.dispatch(payload)
                             finally:
                                 end_request(request_id)
             encoded = self._encode_response(response, op=op, request_id=request_id)
@@ -1661,6 +1870,53 @@ class BinaryNinjaBridge:
         self._inflight: int = 0
         self._shutting_down: bool = False
         self._last_activity: float = time.monotonic()
+        # Retired GUI bridges this one succeeded (`succeed`), held weakly: a
+        # request one of them admitted may still be running, and a cancel for it
+        # now arrives HERE, on the socket path it used to own (#992). Weak, so a
+        # retired bridge -- and the views its manager pins -- is released once
+        # its last request has finished.
+        self._predecessors: list[weakref.ref[BinaryNinjaBridge]] = []
+
+    def succeed(self, predecessor: BinaryNinjaBridge) -> None:
+        """Take over a retired GUI bridge's per-view state before serving.
+
+        The tabs outlive a "Restart Bridge", and so can the old bridge's
+        requests: `stop()`'s drain is bounded, so a write it admitted can still
+        be running -- and commit -- after this bridge answers. The ledger moves
+        with `TargetManager.succeed`. The write gate and the target lock move as
+        the SAME objects, because what they serialize is access to those views,
+        not to a bridge: two bridges each holding their own let a late write
+        from the old one run alongside a write -- or a read -- on the new one
+        against the same view (#992). A write still holding them delays this
+        bridge's writes and reads exactly as it would have delayed the old
+        bridge's; `write_gate_status` and BN_NO_WAIT name it as the holder, and
+        a cancel for it reaches it through this bridge's socket
+        (`_predecessor_for_cancel`).
+        """
+        self.targets.succeed(predecessor.targets)
+        self._write_gate = predecessor._write_gate
+        self._target_lock = predecessor._target_lock
+        self._predecessors = [weakref.ref(predecessor)] + [
+            ref for ref in predecessor._predecessors if ref() is not None
+        ]
+
+    def _predecessor_for_cancel(self, op: Any, identity: Any) -> BinaryNinjaBridge | None:
+        """The live predecessor a `cancel_request` stamped with *identity* is for.
+
+        A client whose request outlived a GUI "Restart Bridge" cancels it with
+        the identity it sent the request under, to the socket path the
+        successor now listens on (#992). The cancel is dispatched to that
+        predecessor alone, so it can mark only the requests that bridge
+        admitted -- never a same-id request on this bridge or another
+        predecessor. Any other op under a predecessor's identity is refused.
+        """
+        if op != "cancel_request":
+            return None
+        for ref in self._predecessors:
+            bridge = ref()
+            if bridge is not None and identity == bridge.bridge_identity:
+                return bridge
+        return None
 
     @property
     def bridge_identity(self) -> dict[str, Any]:
@@ -2045,6 +2301,7 @@ class BinaryNinjaBridge:
             "plugin_name": PLUGIN_NAME,
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
+            "source_dir": SOURCE_DIR,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "gui": ui is not None,
         }
@@ -2318,6 +2575,8 @@ class BinaryNinjaBridge:
     def _cancel_request(self, request_id: Any) -> dict[str, Any]:
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("cancel_request requires params.request_id")
+        # Only this bridge's own requests: a cancel for a retired predecessor's
+        # is dispatched to that predecessor by `handle` (#992).
         with self._request_state_lock:
             active = request_id in self._active_requests
             if active:
@@ -2340,6 +2599,7 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             # Whole-package fingerprint of the code this process loaded (#161).
             "engine_build_id": ENGINE_BUILD_ID,
+            "source_dir": SOURCE_DIR,
             # Which Binary Ninja this process is actually driving. Nothing else
             # in the tool's output names it: a major-version jump (5.x -> 6.x)
             # changes analysis and IL semantics, so "the same command behaved
@@ -2375,6 +2635,19 @@ class BinaryNinjaBridge:
                 continue
         return None
 
+    def _loaded_target_row(self, targets: list[dict[str, Any]], bv) -> dict[str, Any] | None:
+        """The row of *targets* that IS *bv*: the target this load opened.
+
+        `targets` lists every open view, so a reader that wants "the selector of
+        what I just loaded" -- `session start` printing one `target:` line per
+        binary -- needs it named rather than guessed from the list (#996).
+        """
+        with self.targets._lock:
+            view_id = self.targets._stable_view_id(bv)
+        if view_id is None:
+            return None
+        return next((row for row in targets if row.get("view_id") == view_id), None)
+
     def _load_existing_result(
         self,
         load_path: Path,
@@ -2406,6 +2679,7 @@ class BinaryNinjaBridge:
             "already_open": True,
             "notes": notes,
             "targets": targets,
+            "target": self._loaded_target_row(targets, existing),
         }
 
     def _load_binary_async(
@@ -2459,12 +2733,16 @@ class BinaryNinjaBridge:
                     job["state"] = "running"
                     job["started_at"] = now
             try:
-                result = self._load_binary(
-                    str(resolved),
-                    prefer_bndb=prefer_bndb,
-                    quick=quick,
-                    workdir=workdir,
-                )
+                # Not a request thread, so name it for the locks it takes: a
+                # read it blocks then reports `load_binary_async`, not an
+                # anonymous write (#992).
+                with _gate_request_context("load_binary_async", None, False):
+                    result = self._load_binary(
+                        str(resolved),
+                        prefer_bndb=prefer_bndb,
+                        quick=quick,
+                        workdir=workdir,
+                    )
             except BaseException as exc:
                 with self._load_jobs_lock:
                     job["state"] = "failed"
@@ -2828,6 +3106,7 @@ class BinaryNinjaBridge:
                 ),
                 "notes": notes,
                 "targets": targets,
+                "target": self._loaded_target_row(targets, bv),
             }
         except BaseException:
             # #609: a view opened by binaryninja.load() above but not yet published
@@ -2954,6 +3233,18 @@ class BinaryNinjaBridge:
             target_bv = self._resolve_sole_target_for_close()
         else:
             target_bv = self.targets.resolve(target)
+            # #996 review: a destructive close does not take the `.bndb`-strip
+            # convenience (#312). Once the raw `hello` is closed, `-t hello`
+            # names `hello.bndb` only through that alias -- say so, rather than
+            # tear down the database the caller may not have meant.
+            stripped = self.targets.stripped_only_match(target, target_bv)
+            if stripped is not None:
+                filename, listed = stripped
+                raise RuntimeError(
+                    f"close_binary: {str(target)!r} names {filename} only through "
+                    f"its `.bndb`-stripped name; {LISTED_SELECTOR_LEAD}"
+                    f"{shlex.quote(listed)}"
+                )
 
         # Target-based close takes priority and must succeed even when
         # _headless_views is empty: GUI-opened views resolve fine but are not
@@ -2999,7 +3290,10 @@ class BinaryNinjaBridge:
                     to_close.append(bv)
 
             if not to_close:
-                raise RuntimeError(f"No loaded binary matches path: {path}")
+                raise RuntimeError(
+                    f"No loaded binary matches path: {path}. To close by selector "
+                    f"(as `bn target list` shows it), use `bn close -t <selector>`."
+                )
 
         # Dedup by BN's handle-based equality, not id(). _collect_open_views()
         # already collapses wrappers per core view (#714), but this is the
@@ -3538,19 +3832,27 @@ class BinaryNinjaBridge:
         # against those writers before we ever touch the view.
         with self._write_gate:
             bv = self._resolve_view(selector)
-            bv.update_analysis_and_wait()
-            with self._target_lock.write():
-                _quick_loaded_views.discard(bv)
-                # Only clear the #458 unanalyzed flag if analysis actually produced
-                # functions -- a refresh on a raw-only container (no product view)
-                # is a no-op and must stay "unanalyzed", not be mislabeled "full".
-                if _view_function_count(bv) > 0:
-                    _unanalyzed_views.discard(bv)
+            # #996: gated reads on other connections see the refresh running and
+            # say "retry", instead of telling the agent to start another one.
+            _refreshing_views[bv] = time.monotonic()
+            try:
+                bv.update_analysis_and_wait()
+                with self._target_lock.write():
+                    _quick_loaded_views.discard(bv)
+                    # Only clear the #458 unanalyzed flag if analysis actually produced
+                    # functions -- a refresh on a raw-only container (no product view)
+                    # is a no-op and must stay "unanalyzed", not be mislabeled "full".
+                    if _view_function_count(bv) > 0:
+                        _unanalyzed_views.discard(bv)
+            finally:
+                _refreshing_views.pop(bv, None)
         # Build the response under the READ lock: the tail read touches live view
         # state (bv.functions / arch / analysis_progress), and the instant we drop
         # the write gate a queued mutation can begin writing the same view -- so
         # serialize this read against writers like every other read op does.
-        with self._target_lock.read():
+        # It waits even under `no_wait`: the analysis already ran, so answering
+        # "refused instead of queued" now would be false (#992).
+        with self._target_lock.read(may_refuse=False):
             target = self._target_info(selector)
         return {"refreshed": True, "target": target}
 
@@ -4633,7 +4935,7 @@ class BinaryNinjaBridge:
     def _run_local_restores(self, *a, **k):
         return mutation_engine._run_local_restores(self.ctx, *a, **k)
 
-    def _mutation(self, *a, **k):
+    def _mutation(self, *a, gate_held: bool = False, **k):
         # #628: mutation ops are @op lock="none" -- they reanalyze inside their
         # own body, so holding the exclusive target lock for the whole op starved
         # every concurrent read for the length of update_analysis_and_wait(). Lock
@@ -4649,7 +4951,10 @@ class BinaryNinjaBridge:
         #     alone so concurrent reads stay live.
         # Revert/settle stays exclusive on purpose: a reader must never observe a
         # half-reverted view. The #479 quick-load refusal is unchanged.
-        with self._write_gate:
+        # `gate_held`: the caller already holds the write gate (which is not
+        # reentrant) because it planned the batch under it -- `class apply-types`
+        # reads the class card and applies the ops it built as one writer.
+        with contextlib.nullcontext() if gate_held else self._write_gate:
             try:
                 result = mutation_engine._mutation(
                     self.ctx, *a, exclusive=self._target_lock.write, **k
@@ -4733,6 +5038,18 @@ class BinaryNinjaBridge:
                     pass
             return result
 
+    def _class_apply_types(self, selector, name: str, *, preview: bool = False):
+        """#993 item 3: plan the class's typing ops (read_class's card, under the
+        read lock) and apply them as ONE mutation, holding the write gate across
+        both so no other writer can change the class between plan and apply."""
+        with self._write_gate:
+            with self._target_lock.read():
+                operations, plan = mutation_engine._class_apply_types_plan(self.ctx, selector, name)
+            if not operations:
+                return mutation_engine._class_apply_types_noop(plan, preview=preview)
+            result = self._mutation(selector, preview, operations, gate_held=True)
+        return mutation_engine._with_class_apply_types_plan(result, plan)
+
     def _op_rename_symbol(self, *a, **k):
         return mutation_engine._op_rename_symbol(self.ctx, *a, **k)
 
@@ -4800,6 +5117,7 @@ from .bridge_state import (  # noqa: E402
     _headless_views_lock,
     _quick_loaded_views,
     _opened_annotations,
+    _refreshing_views,
     _source_verified,
     _unanalyzed_views,
     view_session_key,
@@ -4871,7 +5189,14 @@ def _bind_write_gate_status(bridge, params, target):
     request_id = params.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         raise ValueError("write_gate_status requires params.request_id")
-    return bridge._write_gate.status(request_id)
+    status = bridge._write_gate.status(request_id)
+    if not status["waiting"]:
+        # A read queues on the target lock, not the gate; the same question has
+        # the same answer for it, naming the exclusive holder (#992).
+        read = bridge._target_lock.read_status(request_id)
+        if read["waiting"]:
+            status = {**status, "waiting": True, "holder": read["holder"]}
+    return status
 
 
 @op("load_binary", lock="none")
@@ -4918,9 +5243,18 @@ def _bind_close_binary(bridge, params, target):
             "close_binary: pass \"target\" at the top level of the request, "
             "not inside params"
         )
+    # #996 review: `pinned_target` makes the selector an identity -- resolved
+    # by exact target_id and nothing else (`PinnedTarget`) -- for a CLI that
+    # read the id from a listing. Without it a target closed in between could
+    # hand the close to a file NAMED like that id. A flag, not a selector
+    # spelling, so no filename can ever carry pin semantics.
+    pinned = _validate_bool(params.get("pinned_target"), label="pinned_target",
+                            default=False)
+    if pinned and not (isinstance(target, str) and target.strip()):
+        raise ValueError("close_binary: pinned_target needs a target_id selector")
     return bridge._close_binary(
         params.get("path"),
-        target,
+        PinnedTarget(target) if pinned else target,
         _validate_bool(params.get("all"), label="all", default=False),
     )
 
@@ -5074,6 +5408,16 @@ def _bind_class_list(bridge, params, target):
 @op("class_show", lock="read")
 def _bind_class_show(bridge, params, target):
     return bridge._class_show(target, str(params["name"]))
+
+
+# lock="none": it takes the write gate itself and the read lock only while it
+# plans, then applies through the ordinary mutation engine (#993 item 3).
+@op("class_apply_types", lock="none")
+def _bind_class_apply_types(bridge, params, target):
+    return bridge._class_apply_types(
+        target, str(params["name"]),
+        preview=_validate_bool(params.get("preview"), label="preview", default=False),
+    )
 
 
 @op("defuse", lock="read")
@@ -5604,6 +5948,17 @@ def _bind_batch_apply(bridge, params, target):
 READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 
+
+
+def _file_identity(path: str | None) -> tuple[int, int, int, int] | None:
+    """(device, inode, size, mtime_ns) of *path*, or None when it cannot be read."""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def _same_file(a: str | None, b: str | None) -> bool:
@@ -6355,7 +6710,7 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     return bv
 
 
-def start_bridge(predecessor: TargetManager | None = None):  # pragma: no cover - GUI runtime
+def start_bridge(predecessor: BinaryNinjaBridge | None = None):  # pragma: no cover - GUI runtime
     global _bridge
     if ui is None:
         return
@@ -6364,8 +6719,9 @@ def start_bridge(predecessor: TargetManager | None = None):  # pragma: no cover 
     bridge = BinaryNinjaBridge()
     if predecessor is not None:
         # Before start(): the first request the new bridge answers must already
-        # see the retained tabs' unsaved state (#953).
-        bridge.targets.succeed(predecessor)
+        # see the retained tabs' unsaved state (#953) and session comments, and
+        # queue behind a write the old bridge is still running (#992).
+        bridge.succeed(predecessor)
     bridge.start()
     _bridge = bridge
 
@@ -6447,10 +6803,11 @@ def _restart_bridge_command(_):  # pragma: no cover - GUI runtime
     restart_bridge()
 
 
-# The TargetManager of a GUI bridge that Restart Bridge stopped and no successor
-# has replaced yet: its per-view ledger (unsaved markers, backing databases)
-# belongs to tabs that are still open (#953).
-_retired_targets: TargetManager | None = None
+# The GUI bridge that Restart Bridge stopped and no successor has replaced yet:
+# its per-view ledger (unsaved markers, backing databases, session comments)
+# belongs to tabs that are still open (#953), and its write gate and target
+# lock may still be held by a write it admitted (#992).
+_retired_bridge: BinaryNinjaBridge | None = None
 
 
 def restart_bridge():  # pragma: no cover - GUI runtime
@@ -6461,21 +6818,21 @@ def restart_bridge():  # pragma: no cover - GUI runtime
     running (#585). This tears the live bridge down first so a fresh instance
     always gets constructed and started.
     """
-    global _bridge, _retired_targets
+    global _bridge, _retired_bridge
     if ui is None:
         return
     if _bridge is not None:
         # Kept until a successor actually starts, so a failed start followed by
-        # another Restart still carries the retained tabs' ledger (#953).
-        _retired_targets = _bridge.targets
+        # another Restart still carries the retained tabs' state (#953).
+        _retired_bridge = _bridge
         _stop_bridge()
     try:
-        start_bridge(_retired_targets)
+        start_bridge(_retired_bridge)
     except Exception as exc:
         bn.log_error(f"BN Agent Bridge restart failed: {exc}")
         return
     if _bridge is not None:
-        _retired_targets = None
+        _retired_bridge = None
         bn.log_info("BN Agent Bridge restarted")
     else:
         bn.log_error("BN Agent Bridge restart failed: bridge did not start")

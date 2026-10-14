@@ -1507,6 +1507,7 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
             "scan_truncated": False,
             "truncated_reason": "no_local_vtable_body",
             "bn_vtable_slots": None,
+            "address_point": None,
         }
     start = vtable_addr + 2 * ptr
     # #922 (b) review: BN's own `<Class>::VTable` struct at the slot array is
@@ -1631,17 +1632,18 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
         # (None when BN defined none) -- informational, never a bound (see the
         # note at `start`).
         "bn_vtable_slots": bn_slots,
+        # #998 item 3: the vptr value objects of this class carry (the slot
+        # array, start + 2 words). `address` is the OBJECT start the `_ZTV`
+        # symbol names (#935); xrefs and stored vptrs point here instead.
+        "address_point": hex(int(start)),
     }
 
 
-def _bn_vtable_slot_count(bv, slot_start: int, ptr: int) -> int | None:
-    """#922 (b): the slot count of BN's own ``<Class>::VTable`` struct when one
-    starts exactly at *slot_start* (the word the constructor stores as the
-    vptr), else None. Reported for the reader; it is NOT where the table ends
-    (BN stops the struct at the first null word, which an abstract class's
-    zeroed destructor entries put in the middle of a real table). Only a
-    structure whose name carries BN's ``VTable`` convention counts -- a user's
-    own pointer slot type says nothing about the table."""
+def _bn_vtable_type_at(bv, slot_start: int):
+    """BN's own ``<Class>::VTable`` type on the data variable that starts
+    exactly at *slot_start* (the word the constructor stores as the vptr), else
+    None. Only a type whose name carries BN's ``VTable`` convention counts -- a
+    user's own pointer slot type says nothing about the table."""
     getter = getattr(bv, "get_data_var_at", None)
     try:
         var = getter(slot_start) if callable(getter) else None
@@ -1651,6 +1653,33 @@ def _bn_vtable_slot_count(bv, slot_start: int, ptr: int) -> int | None:
         return None
     type_obj = getattr(var, "type", None)
     if type_obj is None or "VTable" not in str(getattr(type_obj, "registered_name", None) or type_obj):
+        return None
+    return type_obj
+
+
+def _bn_vtable_type_name(bv, slot_start: int) -> str | None:
+    """#993 item 3: the NAME of BN's ``<Class>::VTable`` type at *slot_start*
+    (``svc::Handler::svc::EchoHandler::VTable`` for a derived class), the type
+    a typed vptr must point at, or None when BN defined none there."""
+    type_obj = _bn_vtable_type_at(bv, slot_start)
+    if type_obj is None:
+        return None
+    registered = getattr(type_obj, "registered_name", None)
+    name = getattr(registered, "name", None) if registered is not None else getattr(type_obj, "name", None)
+    text = str(name or "").strip()
+    if not text:
+        text = re.sub(r"^(?:struct|class)\s+", "", str(type_obj).strip())
+    return text or None
+
+
+def _bn_vtable_slot_count(bv, slot_start: int, ptr: int) -> int | None:
+    """#922 (b): the slot count of BN's own ``<Class>::VTable`` struct when one
+    starts exactly at *slot_start*, else None. Reported for the reader; it is
+    NOT where the table ends (BN stops the struct at the first null word, which
+    an abstract class's zeroed destructor entries put in the middle of a real
+    table)."""
+    type_obj = _bn_vtable_type_at(bv, slot_start)
+    if type_obj is None:
         return None
     try:
         width = int(getattr(type_obj, "width", 0) or 0)

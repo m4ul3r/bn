@@ -19,6 +19,7 @@ import json
 import math
 import os
 import secrets
+import shlex
 import signal
 import socket
 import struct
@@ -32,8 +33,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from .paths import (
-    bridge_registry_path, bridge_socket_path, cache_home, ensure_private_dir,
-    instances_dir, project_root, validate_instance_id as _paths_validate_instance_id,
+    bridge_registry_path, bridge_socket_path, cache_home, default_cache_home,
+    ensure_private_dir, instances_dir, project_root,
+    validate_instance_id as _paths_validate_instance_id,
 )
 from .proc_identity import PinUnavailable, identity_verdict, pin_process
 from .socket_evidence import path_has_bound_socket
@@ -87,8 +89,8 @@ CANCEL_REQUEST_TIMEOUT = 0.25
 # is queued behind another writer, and the budget for that one question (#976).
 WRITE_GATE_NOTICE_AFTER = 2.0
 WRITE_GATE_STATUS_TIMEOUT = 1.0
-# Set to 1/true/yes to make a write-gated request fail fast with `busy: ...`
-# instead of queueing behind the writer that holds the gate (#976).
+# Set to 1/true/yes to make a request fail fast with `busy: ...` instead of
+# queueing behind the write that holds the gate (#976) or the views (#992).
 NO_WAIT_ENV = "BN_NO_WAIT"
 
 
@@ -104,7 +106,9 @@ def _report_write_gate_wait(instance: BridgeInstance, request_id: str, op: str) 
     hold it for minutes -- while reads in the same window answer at once, so a
     queue looked exactly like a hang (#976). One side-channel question, asked
     only after the request has already gone unanswered for a while; a bridge
-    that predates `write_gate_status`, or any failure to ask, prints nothing.
+    that predates `write_gate_status`, or any failure to ask, prints nothing. A
+    read queued behind a write that holds the views exclusively is reported the
+    same way (#992).
     """
     try:
         response = _send_request_to_instance(
@@ -123,10 +127,12 @@ def _report_write_gate_wait(instance: BridgeInstance, request_id: str, op: str) 
         return
     holder = status.get("holder")
     if isinstance(holder, dict) and isinstance(holder.get("op"), str):
-        what = f"the running {holder['op']}"
+        # A read can wait on a writer that is only queued (writer priority).
+        queued = holder.get("queued") is True
+        what = f"the {'queued' if queued else 'running'} {holder['op']}"
         elapsed = holder.get("elapsed_seconds")
         if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
-            what += f" (started {elapsed:g}s ago)"
+            what += f" ({'queued' if queued else 'started'} {elapsed:g}s ago)"
     else:
         what = "another write operation"
     print(
@@ -1166,6 +1172,160 @@ def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
     )
 
 
+# Where process facts are read from; a module constant so tests can point it
+# at a synthetic tree.
+_PROC_ROOT = Path("/proc")
+
+
+def _is_bn_agent_named(argv: list[str], instance_id: str) -> bool:
+    """Whether *argv* is a headless bridge launched as ``--instance-id <id>``,
+    under any of its three launch spellings (console script, ``bn.headless``,
+    ``bn_agent_bridge``)."""
+    return any(
+        os.path.basename(part) == "bn-agent" or part in ("bn.headless", "bn_agent_bridge")
+        for part in argv
+    ) and any(
+        part == "--instance-id" and argv[i + 1:i + 2] == [instance_id]
+        for i, part in enumerate(argv)
+    )
+
+
+def _proc_argv(entry: Path) -> list[str]:
+    """``/proc/<pid>/cmdline`` as decoded arguments (raises OSError)."""
+    return [os.fsdecode(part) for part in
+            entry.joinpath("cmdline").read_bytes().split(b"\0") if part]
+
+
+def _agent_cache_dirs_for(instance_id: str, proc: Path | None = None) -> list[Path]:
+    """Cache roots of this user's running bridges named *instance_id*.
+
+    Read from each `bn-agent` process's own argv and environment, so it needs no
+    state written anywhere: a bridge launched with ``--instance-id <id>`` under
+    ``BN_CACHE_DIR=<dir>`` answers ``<dir>`` (an unset variable answers the
+    platform default). Another user's processes are unreadable and skipped; a
+    host without /proc answers nothing.
+    """
+    found: list[Path] = []
+    proc = _PROC_ROOT if proc is None else proc
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            if not _is_bn_agent_named(_proc_argv(entry), instance_id):
+                continue
+            environ = entry.joinpath("environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        cache_dir: Path = default_cache_home()
+        for var in environ:
+            if var.startswith(b"BN_CACHE_DIR=") and len(var) > len(b"BN_CACHE_DIR="):
+                cache_dir = Path(os.fsdecode(var[len(b"BN_CACHE_DIR="):])).expanduser()
+                if not cache_dir.is_absolute():
+                    # A relative value is relative to the BRIDGE's cwd, not
+                    # ours; unreadable -> no answer rather than a wrong one.
+                    try:
+                        cache_dir = Path(os.readlink(entry / "cwd")) / cache_dir
+                    except OSError:
+                        cache_dir = None  # type: ignore[assignment]
+                break
+        if cache_dir is not None:
+            found.append(cache_dir)
+    return found
+
+
+def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool:
+    """Whether *registry_path* is a parseable registry of a still-running bridge.
+
+    The "registered elsewhere" hint replaces the start advice, so a stale file
+    (dead or recycled pid, an orphaned ``{}``, another id's payload) must not
+    produce it (#996 review) -- and neither may a live pid that is not that
+    bridge: the process must be a ``bn-agent`` launched with this
+    ``--instance-id`` (its own cmdline says so), and its recorded start
+    identity must not contradict the live process.
+    """
+    try:
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    pid = payload.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if payload.get("instance_id") != instance_id:
+        return False
+    try:
+        argv = _proc_argv(_PROC_ROOT / str(pid))
+    except OSError:
+        return False
+    return (
+        _is_bn_agent_named(argv, instance_id)
+        and _process_alive(pid)
+        and identity_verdict(payload, pid) != "mismatch"
+    )
+
+
+def _instance_registered_elsewhere(instance_id: str) -> Path | None:
+    """The cache root, other than the current one, where *instance_id* is registered.
+
+    BN_CACHE_DIR moves the instance registry along with the database cache, so
+    a shell that lost (or never had) the variable cannot see a bridge started
+    under it, and the reverse (#996). Candidates are the platform default root
+    when BN_CACHE_DIR is set, plus the root every running bridge of that name
+    was launched under; one counts only when its ``instances/<id>.json`` names
+    a live bridge.
+    """
+    try:
+        current = cache_home().resolve()
+    except OSError:
+        return None
+    candidates: list[Path] = []
+    if os.environ.get("BN_CACHE_DIR"):
+        candidates.append(default_cache_home())
+    candidates.extend(_agent_cache_dirs_for(instance_id))
+    for candidate in candidates:
+        try:
+            if candidate.resolve() == current:
+                continue
+            if _registry_names_live_bridge(
+                    candidate / "instances" / f"{instance_id}.json", instance_id):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def instance_not_found_message(instance_id: str, advice: str) -> str:
+    """The "no such instance" refusal, naming the registry that was searched.
+
+    When the id IS registered under another cache root the advice is replaced by
+    the one export that reaches it -- never "start one", which would spawn a
+    duplicate bridge under the same name (#996).
+    """
+    searched = instances_dir()
+    head = f"No bridge instance found with id: {instance_id} (searched {searched})."
+    elsewhere = _instance_registered_elsewhere(instance_id)
+    if elsewhere is not None:
+        return (
+            f"{head} Instance {instance_id} is registered under {elsewhere}: "
+            f"export BN_CACHE_DIR={shlex.quote(str(elsewhere))} (BN_CACHE_DIR also moves the "
+            "instance registry and sticky session pins)."
+        )
+    scope = (
+        "BN_CACHE_DIR is set, and it scopes the instance registry"
+        if os.environ.get("BN_CACHE_DIR")
+        else "BN_CACHE_DIR moves the instance registry"
+    )
+    return (
+        f"{head} {advice} ({scope}: a bridge started under a different "
+        "BN_CACHE_DIR is only visible with that same value exported.)"
+    )
+
+
 @contextlib.contextmanager
 def _spawn_lock(timeout: float | None = SPAWN_LOCK_TIMEOUT):
     """Exclusive, bounded flock serializing all bridge spawns on this host."""
@@ -1278,6 +1438,13 @@ def choose_instance(
     spawn_missing_named: bool = False,
     timeout: float | None = None,
 ) -> BridgeInstance:
+    """Pick the bridge a request goes to.
+
+    A lone running instance is used when nothing names one, from any cwd. When
+    its registry does not list the caller's project root that is exactly the
+    case where a command silently answers from somebody else's bridge, so it
+    is disclosed on stderr (#996).
+    """
     if instance_id is not None:
         validate_instance_id(instance_id)
     deadline = time.monotonic() + timeout if timeout is not None else None
@@ -1297,11 +1464,13 @@ def choose_instance(
                     deadline, "starting the requested bridge instance"
                 ),
             )
-        raise BridgeError(
-            f"No bridge instance found with id: {instance_id}. "
-            f"Start one with: bn session start /path/to/binary --instance-id {instance_id}"
-        )
+        raise BridgeError(instance_not_found_message(
+            instance_id,
+            f"Start one with: bn session start /path/to/binary --instance-id {instance_id}",
+        ))
     if len(instances) == 1:
+        if instances[0].instance_id and _resolve_from_project_roots(instances) is None:
+            _note_unassociated_instance(instances[0])
         return instances[0]
     if instances:
         associated = _resolve_from_project_roots(instances)
@@ -1749,11 +1918,12 @@ class _SignalUnwind:
     raises instead, the owner reaps the child, and `restore()` puts the default
     disposition back and re-delivers the signal so the CLI still dies of it.
 
-    Only signals still at SIG_DFL are taken over -- a host that installed its
-    own handler (or a `nohup` SIG_IGN) keeps it -- and only on the main thread,
-    the one place Python lets a handler be installed. The handlers go in before
-    the child is started and only RECORD a signal until `arm()`, the first
-    statement after Popen inside the owner's try (it raises at once for a
+    Signals still at SIG_DFL are taken over, and so is a leftover of an earlier
+    spawn's own handler (below); a host that installed its own handler (or a
+    `nohup` SIG_IGN) keeps it. Off the main thread nothing is taken over, since
+    Python lets only the main thread install a handler. The handlers go
+    in before the child is started and only RECORD a signal until `arm()`, the
+    first statement after Popen inside the owner's try (it raises at once for a
     signal recorded meanwhile); from `defer()`, where the reap begins, they
     record again, so a signal cannot cut the reap short. The first one caught
     is the one re-delivered.
@@ -1762,7 +1932,13 @@ class _SignalUnwind:
     installed because a KeyboardInterrupt unwound the owner before `restore()`
     ran, which a host that catches it (a REPL, a `Client` user) survives --
     restores the dispositions and re-delivers, so such a host still dies of its
-    SIGTERM/SIGHUP instead of silently ignoring it.
+    SIGTERM/SIGHUP instead of silently ignoring it. The next spawn in that host
+    ADOPTS such a leftover rather than reading it as the host's own handler:
+    left in place it would re-deliver a signal from that spawn's wait at once,
+    killing the host before the new child is reaped (#992). A leftover that had
+    already recorded a signal it never re-delivered is not adopted but
+    restored, which delivers that signal before anything is spawned: the host
+    dies of it, as the leftover would have made it on the next signal.
     """
 
     _SIGNALS = (signal.SIGTERM, signal.SIGHUP)
@@ -1778,10 +1954,33 @@ class _SignalUnwind:
             return
         for signum in self._SIGNALS:
             try:
-                if signal.getsignal(signum) is signal.SIG_DFL:
+                current = signal.getsignal(signum)
+                stale = self._stale_unwind(current)
+                if stale is not None and stale._caught is not None:
+                    # Ends the process under the SIG_DFL it puts back; if the
+                    # signal is blocked, the disposition is now SIG_DFL anyway.
+                    stale.restore()
+                    current = signal.getsignal(signum)
+                    stale = None
+                if stale is not None:
+                    # The leftover only ever replaced SIG_DFL, which is the
+                    # disposition to restore; dropping its entry keeps it from
+                    # undoing this install should it ever run `restore()`.
+                    signal.signal(signum, self._handle)
+                    self._previous[signum] = stale._previous.pop(signum, signal.SIG_DFL)
+                elif current is signal.SIG_DFL:
                     self._previous[signum] = signal.signal(signum, self._handle)
             except (ValueError, OSError):
                 continue
+
+    def _stale_unwind(self, handler: Any) -> _SignalUnwind | None:
+        """The `_SignalUnwind` whose `_handle` *handler* is, if its owner is gone."""
+        unwind = getattr(handler, "__self__", None)
+        if not isinstance(unwind, _SignalUnwind) or unwind is self:
+            return None
+        if getattr(handler, "__func__", None) is not _SignalUnwind._handle:
+            return None
+        return None if unwind._owner_running(self._owner) else unwind
 
     def _owner_running(self, frame: Any) -> bool:
         while frame is not None:
@@ -1910,7 +2109,9 @@ def _spawn_instance_unlocked(
     # the cleanup below before `_reap_child` runs, which leaves the child
     # running. Handlers that any KeyboardInterrupt leaves installed (there, or
     # mid-install) hand the next SIGTERM/SIGHUP to the default action rather
-    # than swallowing it; see `_SignalUnwind`.
+    # than swallowing it, and the next spawn takes them over as its own -- or,
+    # when one had recorded a signal, delivers that signal first (#992); see
+    # `_SignalUnwind`.
     unwind = _SignalUnwind()
     proc: subprocess.Popen | None = None
     owned = True
@@ -2078,7 +2279,7 @@ def send_request(
                 f"Timed out selecting a bridge instance for op {op!r}; "
                 "the end-to-end request deadline expired before connecting"
             )
-    return _send_request_to_instance(
+    response = _send_request_to_instance(
         instance,
         op,
         params=params,
@@ -2089,4 +2290,34 @@ def send_request(
         connect_retries=connect_retries,
         resolved=True,
         idle_probe=idle_probe,
+    )
+    # Which bridge answered, for the caller to disclose (#996): a lone running
+    # instance is picked from any cwd, and nothing in a bridge's own result
+    # names the instance it is.
+    if isinstance(response, dict):
+        response.setdefault("instance", instance_selector(instance))
+    return response
+
+
+_unassociated_noted: set[str] = set()
+
+
+def _note_unassociated_instance(instance: BridgeInstance) -> None:
+    """Say on stderr, once per process, that a lone bridge was used implicitly.
+
+    Nothing named it and its registry does not list the caller's project root,
+    so it may be another agent's bridge (#996).
+    """
+    selector = instance_selector(instance)
+    if selector in _unassociated_noted:
+        return
+    _unassociated_noted.add(selector)
+    try:
+        root = str(project_root())
+    except OSError:
+        root = "this directory"
+    print(
+        f"note: using the only running instance {selector} (not associated with "
+        f"{root}); pass -i {selector} to make that explicit",
+        file=sys.stderr,
     )

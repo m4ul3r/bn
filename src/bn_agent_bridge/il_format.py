@@ -521,6 +521,18 @@ _VARIADIC_FORMAT_FAMILY: dict[str, tuple[int, bool]] = {
     "snprintf": (2, False),
     "dprintf": (1, False),
     "syslog": (1, False),
+    # #994 item 1: the FORTIFY spellings every default Ubuntu/Debian/Fedora
+    # build calls instead. A leading flag (and destlen/maxlen for the buffer
+    # writers) shifts the format right; keyed after `_normalize_libc_name`,
+    # so `__printf_chk` resolves here. The v* twins take a va_list and are
+    # not variadic. Where `taint_models.json` models the same callee, its
+    # format sink index must agree (pinned by a test).
+    "printf_chk": (1, False),
+    "fprintf_chk": (2, False),
+    "dprintf_chk": (2, False),
+    "sprintf_chk": (3, False),
+    "snprintf_chk": (4, False),
+    "syslog_chk": (2, False),
 }
 
 # Scanf/printf length modifiers to skip before the conversion specifier.

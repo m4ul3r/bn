@@ -93,6 +93,27 @@ def test_proto_get_renders_prototype_text(fake_transport, capsys):
     assert capsys.readouterr().out == "int32_t sub_401000(int32_t arg1)\n"
 
 
+@pytest.mark.parametrize("display,expected", [
+    ("ns::Cls::run", "// ns::Cls::run\nint32_t _ZN2ns3Cls3runEi(int32_t x)\n"),
+    ("_ZN2ns3Cls3runEi", "int32_t _ZN2ns3Cls3runEi(int32_t x)\n"),   # nothing to add
+])
+def test_proto_get_names_the_demangled_function_above_the_declaration_999(
+        fake_transport, capsys, display, expected):
+    """#999 item 3: the declaration keeps the symbol name (a mangled name is a
+    pasteable C declarator; `ns::Cls::run(` is not), and the demangled name
+    `decompile` shows rides on a comment line above it."""
+    fake_transport({"get_prototype": {"ok": True, "result": {
+        "function": {"name": "_ZN2ns3Cls3runEi", "raw_name": "_ZN2ns3Cls3runEi",
+                     "display_name": display, "address": "0x401198"},
+        "prototype": "int32_t (int32_t x)",
+    }}})
+
+    rc = bn.cli.main(["proto", "get", "--format", "text", "--target", "active", "0x401198"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == expected
+
+
 def test_proto_get_renders_split_body_notes_966(fake_transport, capsys):
     fake_transport({"get_prototype": {"ok": True, "result": {
         "function": {"name": "build_widget", "address": "0x4000dc"},

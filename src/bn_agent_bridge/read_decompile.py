@@ -2333,6 +2333,9 @@ def _get_prototype(ctx, selector: str | None, identifier):
             "name": func.name,
             "address": hex(func.start),
             "raw_name": getattr(func, "raw_name", func.name),
+            # #999 item 3: the demangled name `decompile` shows; `name` stays
+            # the symbol name the text splices into a pasteable C declaration.
+            "display_name": il_format._display_name(func),
         },
         **il_format._function_metadata(func),
     }

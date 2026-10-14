@@ -2194,6 +2194,31 @@ def test_render_orient_text_card(monkeypatch):
     assert "--quick" in out2 and "unavailable" in out2
 
 
+def test_render_orient_text_prints_every_returned_row_997():
+    """#997 item 1: the card printed 15 strings and 12 section names whatever the
+    header said (`sample 39 of 39`, `sections: 25`), so a default call dropped
+    5 rows silently. Every returned row is printed, and `filtered` -- the
+    strings the min-length / data-section filter dropped -- is named in the
+    header so the total reconciles."""
+    from bn.formatters import _render_orient_text
+    strings = [{"address": hex(0x401000 + 0x20 * i), "value": f"message {i:02d}"}
+               for i in range(39)]
+    sections = [{"name": f".sec{i}"} for i in range(25)]
+    out = _render_orient_text({
+        "kind": "orient_digest", "target": {"basename": "demo"}, "analyzed": True,
+        "sections": {"items": sections, "total": 25}, "strings_min_length": 6,
+        "strings_sample": {"items": strings, "total": 39, "filtered": 52,
+                           "sample_sections": [".rodata"]}})
+    assert "sections: 25  " + " ".join(s["name"] for s in sections) in out
+    assert ("strings (min-length 6; sample 39 of 39; from .rodata; "
+            "52 dropped by min-length / non-data-section filter):") in out
+    assert all(f"'{s['value']}'" in out for s in strings)
+    # Nothing filtered, nothing said.
+    quiet = _render_orient_text({"strings_sample": {"items": strings[:1], "total": 1,
+                                                    "filtered": 0}})
+    assert "dropped" not in quiet
+
+
 def test_orient_digest_discloses_the_duplicate_start_collapse_757(monkeypatch):
     """The digest's function count is the LISTING's post-collapse total, so it
     carries the same disclosure obligation `target info` does.
@@ -3173,6 +3198,61 @@ def test_hidden_surface_code_ref_scan_failures_are_disclosed_967(monkeypatch):
     assert len(partial) == 1
     assert "1 code region(s)" in partial[0] and "1 address(es)" in partial[0]
 
+
+def _adrp_llil(page, offset, idx=0):
+    """`adrp x2, page` then `add x3, x2, #offset` as LLIL, in one block."""
+    def node(op, **kw):
+        ops = [v for v in kw.values() if hasattr(v, "operation")]
+        return types.SimpleNamespace(operation=types.SimpleNamespace(name=op), operands=ops, **kw)
+    adrp = node("LLIL_SET_REG", dest=types.SimpleNamespace(name="x2"),
+                src=node("LLIL_CONST_PTR", constant=page), instr_index=idx)
+    add = node("LLIL_SET_REG", dest=types.SimpleNamespace(name="x3"),
+               src=node("LLIL_ADD", left=node("LLIL_REG", name="x2"),
+                        right=node("LLIL_CONST", constant=offset)),
+               instr_index=idx + 1)
+    adrp.il_basic_block = add.il_basic_block = [adrp, add]
+    return adrp
+
+
+class _AdrpSurfBV(_CodeRefSurfBV):
+    """Two page-aligned, function-less `.text` addresses that decode cleanly, each
+    only materialised by an `adrp`: 0x4000's consumer adds #0x60 (the page base of
+    a handler further into the page -- the #997 shape), 0x5000's adds #0 (the
+    address itself is taken)."""
+    _DATA_VARS = (0x4000, 0x5000)
+
+    def __init__(self):
+        super().__init__()
+        install = _CodeRefFunc("_start", {}, [(0x2100, 0x2200, [])])
+        llil = {0x2148: _adrp_llil(0x4000, 0x60), 0x2158: _adrp_llil(0x5000, 0)}
+        for site, il in llil.items():
+            install._sites[site] = (il, None)
+        install.get_low_level_il_at = lambda a: llil.get(int(a))
+        self._refs = {0x4000: [(0x2148, install)], 0x5000: [(0x2158, install)]}
+        self._adrp_sites = {0x2148: 0x4000, 0x2158: 0x5000}
+
+    def get_disassembly(self, a):
+        a = int(a)
+        if a in self._adrp_sites:
+            return f"adrp x2, {hex(self._adrp_sites[a])}"
+        return "add x1, x1, #0x7" if 0x4000 <= a < 0x6000 else super().get_disassembly(a)
+
+
+def test_hidden_surface_drops_adrp_page_bases_like_xrefs_997(monkeypatch):
+    """#997 item 2: an `adrp` whose every consumer adds a nonzero page offset
+    references the page's CONTENTS, not its base. `bn xrefs` already drops it
+    (#284); `evidence surface` nominated the base as a `code-likely` missing
+    function -- measured 40 of 86 candidates, all mid-body. The same predicate
+    now applies, and a zero-offset take (a real `&fn`) still nominates."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _AdrpSurfBV()
+    out = re._hidden_surface(_pie_ctx(bv), None)
+    assert [c["address"] for c in out["missing_function_candidates"]] == ["0x5000"]
+    # The two commands agree about both addresses.
+    assert bridge.read_xrefs._genuine_code_refs(bv, 0x4000) == []
+    assert len(bridge.read_xrefs._genuine_code_refs(bv, 0x5000)) == 1
 
 
 # --- #466 cross-target virtual-call slot extraction --------------------------
@@ -5917,6 +5997,40 @@ def test_variadic_format_helpers(monkeypatch):
     assert il_format._count_format_conversions("%[^,],%d", is_scanf=True) == 2
 
 
+def test_fortified_printf_family_shares_the_taint_models_format_index_994(monkeypatch):
+    """#994 item 1: on a default FORTIFY build every printf-family call is a
+    `__*printf_chk`, and the leading flag (plus destlen/maxlen) shifts the format
+    right -- unrecognised, every such row took the generic `unknown` path. The
+    taint models already state those shifts; where both tables name a callee
+    they must agree, or one of them is wrong."""
+    import pathlib
+    bridge = _load_bridge(monkeypatch)
+    family = bridge.il_format._variadic_format_family
+    assert family("__printf_chk") == (1, False)
+    assert family("__fprintf_chk@plt") == (2, False)
+    assert family("__snprintf_chk") == (4, False)
+    assert family("__vsnprintf_chk") is None        # a va_list, not varargs
+
+    def find(node):
+        if isinstance(node, dict):
+            if "printf_chk" in node:
+                return node
+            for child in node.values():
+                if (found := find(child)) is not None:
+                    return found
+        return None
+
+    path = pathlib.Path(bridge.il_format.__file__).with_name("taint_models.json")
+    models = find(json.loads(path.read_text()))
+    checked = 0
+    for name, (fmt_index, _is_scanf) in bridge.il_format._VARIADIC_FORMAT_FAMILY.items():
+        sink = (models.get(name) or {}).get("sink") or {}
+        if "tainted_args" in sink:
+            assert sink["tainted_args"][0] == fmt_index, name
+            checked += 1
+    assert checked >= 4
+
+
 def _variadic_caller_bv(monkeypatch, instance, *, params, name="sscanf", symbol_kind=None,
                         varargs_fixed=None):
     """A call from `parse_line` to *name*. `varargs_fixed=N` gives the callee a
@@ -7049,3 +7163,59 @@ def test_a_plain_c_identifier_is_still_admitted_759(monkeypatch):
 
     assert call["prototype_unverified"] is True
     assert call["argument_confidence"] == "inferred"
+
+
+def test_evidence_card_target_line_follows_the_978_naming_rule_994(monkeypatch):
+    """#994 comment: the card's `target:` line printed `_ZdlPvm` where `callsites`
+    prints `operator delete`. The card's call target now carries `display_name`
+    beside the raw name (always, like `_function_identity`); text shows it,
+    `--mangled` the raw one -- on the tail-branch line too -- and JSON keeps
+    `name` raw. The shared function entry `evidence table` / `evidence init`
+    render (no `--mangled` there, and D1/D0 destructors would collide) stays raw."""
+    from bn.formatters import _render_function_evidence_text
+    bridge = _load_bridge(monkeypatch)
+    fn = types.SimpleNamespace(start=0x401030, name="_ZdlPvm",
+                               symbol=types.SimpleNamespace(short_name="operator delete"))
+    bv = types.SimpleNamespace(get_function_at=lambda a: {0x401030: fn}.get(a))
+    raw_entry = {"name": "_ZdlPvm", "address": "0x401030", "exact_start": True}
+    ctx = types.SimpleNamespace(_normalize_code_pointer=lambda b, v: {
+        "raw": hex(v), "normalized": hex(v), "function": dict(raw_entry)})
+    target = bridge.read_evidence._target_entry_for_call(ctx, bv, 0x401030, display_name=True)
+    assert target["function"] == {**raw_entry, "display_name": "operator delete"}
+    assert bridge.read_evidence._target_entry_for_call(ctx, bv, 0x401030)["function"] == raw_entry
+    assert "display_name" not in bridge.BinaryNinjaBridge().ctx._function_entry_for_address(
+        bv, 0x401030)
+
+    card = {"function": {"name": "main", "address": "0x401100"},
+            "thunk": {"is_candidate": False, "target": target},
+            "calls": [{"address": "0x401120", "operation": "MLIL_CALL", "direct": True,
+                       "target": target}]}
+    text = _render_function_evidence_text(card)
+    assert "  target: operator delete @ 0x401030" in text
+    assert "  tail branch -> operator delete @ 0x401030" in text
+    raw = _render_function_evidence_text(card, mangled=True)
+    assert "  target: _ZdlPvm @ 0x401030" in raw
+    assert "  tail branch -> _ZdlPvm @ 0x401030" in raw
+
+
+def test_only_the_evidence_card_demangles_its_thunk_target_994(monkeypatch):
+    """#1006 review round 2: `class show` builds each method's thunk label through
+    the same thunk summary as the card, so adding `display_name` there demangled
+    the class card's labels and grew its JSON. The card asks for the display name;
+    every other caller (`class show`, `decompile`'s veneer note) keeps the raw entry."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    helper = _FakeFunction(0x461746, "_ZN4Impl4initEv")
+    helper.symbol = _FakeSymbol("FunctionSymbol")
+    helper.symbol.short_name = "Impl::init"
+    ctor = _FakeFunction(0x500000, "init_array_0")
+    ctor.basic_blocks = [_FakeBasicBlock(0x500000, 0x500004)]
+    ctor.low_level_il = [[_FakeLLILInstruction(0x500000, _FakeConstPtr(0x461746), operation="LLIL_TAILCALL")]]
+    bv = _FakeBV(functions=[helper, ctor], disassembly={0x500000: "b _ZN4Impl4initEv"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    card = instance._function_evidence("active", "init_array_0", context=0)
+    assert card["thunk"]["target"]["function"]["display_name"] == "Impl::init"
+    shared = bridge.read_evidence._function_thunk_summary(instance.ctx, bv, ctor)
+    assert shared["target"]["function"]["name"] == "_ZN4Impl4initEv"
+    assert "display_name" not in shared["target"]["function"]
