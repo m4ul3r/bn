@@ -4921,8 +4921,9 @@ def _render_imports_summary_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_strings_rows(value: Any) -> str:
-    """Render a BARE list of string rows."""
+def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
+    """Render a BARE list of string rows. ``mangled`` names `--with-xrefs`
+    functions by their raw names instead of display names (#978)."""
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -4959,18 +4960,29 @@ def _render_strings_rows(value: Any) -> str:
         # #968 --with-xrefs: the functions that reference this string, capped
         # by the bridge; the stated total names how many the cap left out.
         if _field_declared(item, "xref_functions"):
-            row += _string_xref_suffix(item)
+            row += _string_xref_suffix(item, mangled=mangled)
         lines.append(row)
     return "\n".join(lines)
 
 
-def _string_xref_suffix(item: dict[str, Any]) -> str:
+def _string_xref_suffix(item: dict[str, Any], *, mangled: bool = False) -> str:
     """The `[xrefs: ...]` tail of one `strings --with-xrefs` row (#968)."""
     functions = [fn for fn in _field_list(item, "xref_functions") if isinstance(fn, dict)]
-    # #978: the demangled display name, as every other function-name surface.
-    names = [_escape_control_chars(_text_value(fn, "display_name") or _text_value(fn, "name")
-                                   or _text_value(fn, "address") or "?")
-             for fn in functions]
+    # #978: the demangled display name, as every other function-name surface,
+    # unless --mangled. Overloads share a display name, so a name that repeats
+    # in this list gets its address -- copying it back must name ONE function.
+    # Every read goes through the text choke point, so a non-text name is
+    # disclosed rather than silently dropped.
+    shown = [((None if mangled else _text_value(fn, "display_name"))
+              or _text_value(fn, "name")) for fn in functions]
+    repeated = {name for name in shown if name and shown.count(name) > 1}
+    names = []
+    for fn, name in zip(functions, shown):
+        if not name:
+            names.append(_escape_control_chars(_text_value(fn, "address") or "?"))
+            continue
+        label = f"{name} @ {fn.get('address', '?')}" if name in repeated else name
+        names.append(_escape_control_chars(label))
     total = _nonnegative_count(item, "xref_function_count")
     text = ", ".join(names) if names else "0 functions"
     if total > len(names):
@@ -4986,7 +4998,7 @@ def _string_xref_suffix(item: dict[str, Any]) -> str:
     return f"  [xrefs: {text}]"
 
 
-def _strings_listing_text(value: Any, *, narrowed: bool) -> str:
+def _strings_listing_text(value: Any, *, narrowed: bool, mangled: bool = False) -> str:
     """The body of the two `strings` listing faces below: the paged {items,
     total, ...} envelope (with a footer), or a bare list for back-compat /
     internal callers (#122). *narrowed* is whether the caller's own filters
@@ -4994,7 +5006,8 @@ def _strings_listing_text(value: Any, *, narrowed: bool) -> str:
     noise tip then states where the matches sit instead of recommending a
     flag the caller is already using. The faces are the `@_discloses`
     boundaries; this records through them."""
-    body = _render_paged_list_text(value, "items", _render_strings_rows)
+    body = _render_paged_list_text(
+        value, "items", lambda items: _render_strings_rows(items, mangled=mangled))
     # #795: state how many strings the ACTIVE filter chain dropped, so the
     # denominator does not need a second unfiltered invocation (`strings --count`
     # reported 1359 where `--probable-format-strings --count` reported 30, and
@@ -5060,6 +5073,20 @@ def _render_strings_narrowed_text(value: Any) -> str:
     shaped: the noise note states where the matches sit instead of
     recommending a flag in use (M-12)."""
     return _strings_listing_text(value, narrowed=True)
+
+
+@_discloses
+def _render_strings_mangled_text(value: Any) -> str:
+    """``strings --mangled``: :func:`_render_strings_text` naming `--with-xrefs`
+    functions by their raw (mangled) names (#978)."""
+    return _strings_listing_text(value, narrowed=False, mangled=True)
+
+
+@_discloses
+def _render_strings_narrowed_mangled_text(value: Any) -> str:
+    """``strings --mangled`` with the caller's own filters: the narrowed face
+    naming `--with-xrefs` functions by their raw names (#978)."""
+    return _strings_listing_text(value, narrowed=True, mangled=True)
 
 
 def _render_sections_rows(value: Any) -> str:

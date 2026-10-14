@@ -28,7 +28,9 @@ from ..formatters import (
     _render_read_escaped_text,
     _render_read_text,
     _render_sections_text,
+    _render_strings_narrowed_mangled_text,
     _render_strings_narrowed_text,
+    _render_strings_mangled_text,
     _render_strings_text,
     _stated_count,
 )
@@ -75,6 +77,9 @@ def _strings_count_text(value: Any) -> str:
          fanout=True,
          args=[
              arg("--query"),
+             mangled_arg("Name `--with-xrefs` functions by their raw (mangled) C++ "
+                         "symbol names instead of demangled display names; JSON "
+                         "always carries both"),
              arg("--regex", action="store_true", default=False,
                  help="Interpret --query as a case-insensitive regular expression"),
              arg("--min-length", type=_non_negative_int, default=None,
@@ -146,7 +151,10 @@ def _strings(args: argparse.Namespace) -> int:
             "with_xrefs": bool(args.with_xrefs),
         },
         require_target=True,
-        text_renderer=_render_strings_narrowed_text if narrowed else _render_strings_text,
+        text_renderer=(
+            (_render_strings_narrowed_mangled_text if args.mangled
+             else _render_strings_narrowed_text) if narrowed
+            else (_render_strings_mangled_text if args.mangled else _render_strings_text)),
         page_label="strings",
         paged_spill=True,
         stem="strings",

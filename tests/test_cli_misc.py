@@ -1556,6 +1556,38 @@ def test_strings_with_xrefs_forwards_flag_and_renders_functions_968(fake_transpo
     assert out[1].endswith("[xrefs: 0 functions; 1 data ref(s)]")
 
 
+@pytest.mark.parametrize("query", [None, "tag"])   # unfiltered and narrowed faces
+def test_strings_with_xrefs_disambiguates_overloads_and_honours_mangled_978(
+        fake_transport, capsys, query):
+    # #986 re-check: two `ns::tag` overloads share one string. Demangled names
+    # collide, so each repeated name carries its address (copying `ns::tag`
+    # back would be ambiguous); a unique name stays bare. `--mangled` names
+    # them by their raw, unique symbols, like every other command in #978.
+    calls = fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "total": 1, "offset": 0, "limit": 100, "returned": 1,
+        "has_more": False, "filtered": 0,
+        "items": [{
+            "address": "0x2000", "length": 4, "chars": 4, "type": "ascii", "value": "tag:",
+            "code_ref_count": 3, "data_ref_count": 0, "xref_function_count": 3,
+            "xref_functions": [
+                {"address": "0x400a68", "name": "_ZN2ns3tagEPci", "display_name": "ns::tag"},
+                {"address": "0x400aa0", "name": "_ZN2ns3tagEPcl", "display_name": "ns::tag"},
+                {"address": "0x400b00", "name": "main", "display_name": "main"},
+            ]}]}}})
+    argv = ["strings", "--target", "active", "--with-xrefs"]
+    if query:
+        argv += ["--query", query]
+    assert bn.cli.main(argv) == 0
+    assert capsys.readouterr().out.splitlines()[0].endswith(
+        "[xrefs: ns::tag @ 0x400a68, ns::tag @ 0x400aa0, main]")
+
+    assert bn.cli.main([*argv, "--mangled"]) == 0
+    assert capsys.readouterr().out.splitlines()[0].endswith(
+        "[xrefs: _ZN2ns3tagEPci, _ZN2ns3tagEPcl, main]")
+    # The flag shapes text only; the request is the same.
+    assert calls[0]["params"] == calls[1]["params"]
+
+
 def test_strings_with_xrefs_refused_beside_count_968(fake_transport, capsys):
     calls = fake_transport()
     rc = bn.cli.main(["strings", "--target", "active", "--count", "--with-xrefs"])
@@ -2631,6 +2663,8 @@ _MISC_TEXT_RENDERERS: dict[str, tuple[tuple[str, ...], ...] | str] = {
     "_render_read_escaped_text": _COVERED_IN_FORMATTERS,
     "_render_read_text": _COVERED_IN_FORMATTERS,
     "_render_sections_text": _COVERED_IN_FORMATTERS,
+    "_render_strings_mangled_text": _COVERED_IN_FORMATTERS,
+    "_render_strings_narrowed_mangled_text": _COVERED_IN_FORMATTERS,
     "_render_strings_narrowed_text": _COVERED_IN_FORMATTERS,
     "_render_strings_text": _COVERED_IN_FORMATTERS,
 }
