@@ -5560,11 +5560,13 @@ class _Llil(list):
 
 
 def _aarch64_arch():
-    regs = {f"x{i}": types.SimpleNamespace(full_width_reg=f"x{i}") for i in range(31)}
-    regs.update({f"w{i}": types.SimpleNamespace(full_width_reg=f"x{i}") for i in range(31)})
-    regs["fp"] = types.SimpleNamespace(full_width_reg="fp")
-    regs["lr"] = types.SimpleNamespace(full_width_reg="lr")
-    return types.SimpleNamespace(regs=regs, link_reg="lr")
+    regs = {f"x{i}": types.SimpleNamespace(full_width_reg=f"x{i}", size=8) for i in range(31)}
+    regs.update({f"w{i}": types.SimpleNamespace(full_width_reg=f"x{i}", size=4)
+                 for i in range(31)})
+    regs["fp"] = types.SimpleNamespace(full_width_reg="fp", size=8)
+    regs["lr"] = types.SimpleNamespace(full_width_reg="lr", size=8)
+    regs["sp"] = types.SimpleNamespace(full_width_reg="sp", size=8)
+    return types.SimpleNamespace(regs=regs, link_reg="lr", name="aarch64")
 
 
 _ARG_REGS = [f"x{i}" for i in range(8)]
@@ -5720,9 +5722,9 @@ def test_call_arity_reports_an_argument_the_signature_does_not_take_955(monkeypa
     assert read_decompile._call_arity_warning(bv, func) is None
 
 
-def _param_var(name, reg):
+def _param_var(name, reg, width=None):
     return types.SimpleNamespace(
-        name=name, storage=reg,
+        name=name, storage=reg, type=types.SimpleNamespace(width=width),
         source_type=types.SimpleNamespace(name="RegisterVariableSourceType"))
 
 
@@ -6207,7 +6209,7 @@ def test_window_values_follow_copies_and_name_parameters_1000():
 
     func = types.SimpleNamespace(
         get_reg_value_at=reg_value,
-        parameter_vars=[_param_var(n, r) for n, r in (("arg3", "x2"), ("arg4", "x3"))])
+        parameter_vars=[_param_var(n, r, 4) for n, r in (("arg3", "x2"), ("arg4", "x3"))])
     bv = types.SimpleNamespace(arch=arch)
     values = read_decompile._window_values(bv, func, window, set())
     assert (values["x2"], values["x3"]) == ("arg4", "arg3")
@@ -6215,6 +6217,60 @@ def test_window_values_follow_copies_and_name_parameters_1000():
     func.get_reg_value_at = lambda address, reg: None
     values = read_decompile._window_values(bv, func, window, set())
     assert (values["x2"], values["x3"]) == (None, None)
+
+
+def _entry_func(entry, params):
+    """A function whose dataflow says each register in *entry* still holds the
+    entry value of the named register; everything else is undetermined."""
+    def reg_value(address, reg):
+        if reg in entry:
+            return types.SimpleNamespace(type=types.SimpleNamespace(name="EntryValue"),
+                                         reg=entry[reg])
+        return types.SimpleNamespace(type=types.SimpleNamespace(name="UndeterminedValue"))
+    return types.SimpleNamespace(get_reg_value_at=reg_value, parameter_vars=params)
+
+
+def test_window_values_keep_the_width_a_narrow_copy_reads_1000():
+    # `return o->cb((unsigned int)v)` with v a 64-bit arg2: `mov w0, w1`
+    # hands over only the low 32 bits.
+    arch = _aarch64_arch()
+    arch.get_reg_name = lambda storage: storage
+    window = [_set_reg("w0", _reg("w1")), _set_reg("x2", _reg("x1"))]
+    window[0].address = 0x400850
+    func = _entry_func({"x1": "x1"}, [_param_var("arg2", "x1", 8)])
+    bv = types.SimpleNamespace(arch=arch)
+    values = read_decompile._window_values(bv, func, window, set())
+    assert values["x0"] == "(uint32_t)arg2"
+    assert values["x2"] == "arg2"
+    # A 32-bit parameter read through w1 is the whole value.
+    func = _entry_func({"x1": "x1"}, [_param_var("arg2", "x1", 4)])
+    assert read_decompile._window_values(bv, func, window, set())["x0"] == "arg2"
+
+
+def test_window_values_treat_split_and_intrinsic_writes_as_clobbers_1000():
+    # aarch64 `mov x1, x5; mrs x5, tpidr_el0; mrs x0, tpidr_el0; mov x2, x0`
+    # and x86 `mul rsi` (rdx:rax): neither write is a SET_REG, and a note
+    # that missed them named a value the register no longer held.
+    arch = _aarch64_arch()
+    arch.get_reg_name = lambda storage: storage
+    window = [
+        _set_reg("x1", _reg("x5")),
+        _op("LLIL_INTRINSIC", output=[types.SimpleNamespace(name="x5")]),
+        _op("LLIL_INTRINSIC", output=[types.SimpleNamespace(name="x0")]),
+        _set_reg("x2", _reg("x0")),
+        _set_reg("x3", _reg("x4")),
+        _op("LLIL_SET_REG_SPLIT", hi=types.SimpleNamespace(name="x4"),
+            lo=types.SimpleNamespace(name="x6"), src=_reg("x7")),
+    ]
+    window[0].address = 0x400900
+    bv = types.SimpleNamespace(arch=arch)
+    func = _entry_func({"x0": "x0"}, [_param_var("arg1", "x0", 8)])
+    values = read_decompile._window_values(bv, func, window, set())
+    # x5 has no name and is rewritten later: unknown, not `x5`.
+    assert values["x1"] is None
+    assert values["x2"] is None  # x0 holds the intrinsic's result, not arg1
+    assert values["x3"] is None  # x4 is the split's high half by the jump
+    assert values["x4"] is None and values["x6"] is None
 
 
 def test_call_arity_summary_says_which_calls_carry_the_inline_note_1000(monkeypatch):
@@ -6307,18 +6363,35 @@ def test_a_note_leaves_stored_comments_redacted_and_session_ones_marked_1000(mon
     assert result["warnings"] == [result["warning_rows"][0]["detail"]]
 
 
-def _jump_case(*, exits=True, dest=None, defs=None):
+def _var(name):
+    return _hop("HLIL_VAR", name, var=types.SimpleNamespace(name=name))
+
+
+def _hconst(value, text=None):
+    return _hop("HLIL_CONST", text or hex(value), constant=value)
+
+
+def _plus(left, right):
+    return _hop("HLIL_ADD", f"{left} + {right}", left=left, right=right)
+
+
+def _load(src):
+    return _hop("HLIL_DEREF", f"*({src})", src=src)
+
+
+def _vtable_target(root="this"):
+    """`*(*(*(root + 0x18)) + 0x10)`: slot 2 of the vtable of `root->inner`."""
+    return _load(_plus(_load(_load(_plus(_var(root), _hconst(0x18)))), _hconst(0x10)))
+
+
+def _jump_case(*, exits=True, dest=None, defs=None, label_refs=False):
     """`int Holder::forward(int msg, int a, int b) { return inner->dispatch(msg, b, a); }`
     with `Dispatcher` untyped: a tail jump through vtable slot 2 of `this->inner`.
-    *defs* maps an HLIL variable name to the expression its one definition assigns."""
+    *defs* maps an HLIL variable name to the expressions its definitions assign."""
     arch = _aarch64_arch()
     arch.get_reg_name = lambda storage: storage
-    obj = _hop("HLIL_DEREF", "*(this + 0x18)", src=_hop("HLIL_ADD", "this + 0x18"))
     if dest is None:
-        dest = _hop("HLIL_DEREF", "*(**(this + 0x18) + 0x10)",
-                    src=_hop("HLIL_ADD", "**(this + 0x18) + 0x10",
-                             left=_hop("HLIL_DEREF", "**(this + 0x18)", src=obj),
-                             right=_hop("HLIL_CONST", "0x10", constant=0x10)))
+        dest = _vtable_target()
     jump = _at(0x40058c, _hop("HLIL_JUMP", "jump(...)", dest=dest))
     setup = [
         _set_reg("x0", _op("LLIL_LOAD", src=_reg("x0"))),
@@ -6344,42 +6417,36 @@ def _jump_case(*, exits=True, dest=None, defs=None):
     definitions = defs or {}
     hlil = types.SimpleNamespace(
         instructions=[jump],
-        get_var_definitions=lambda var: (
-            [_hop("HLIL_VAR_INIT", "init", src=definitions[var.name])]
-            if var.name in definitions else []))
+        get_var_definitions=lambda var: [_hop("HLIL_VAR_INIT", "init", src=src)
+                                         for src in definitions.get(var.name, [])])
+    blocks = [types.SimpleNamespace(start=0x400570), types.SimpleNamespace(start=0x400590)]
     func = types.SimpleNamespace(
-        start=0x400570, hlil=hlil,
+        start=0x400570, hlil=hlil, basic_blocks=blocks,
         calling_convention=types.SimpleNamespace(int_arg_regs=_ARG_REGS),
-        parameter_vars=[_param_var(n, r) for n, r in
-                        (("this", "x0"), ("arg2", "x1"), ("arg3", "x2"), ("arg4", "x3"))],
+        parameter_vars=[_param_var(n, r, w) for n, r, w in
+                        (("this", "x0", 8), ("arg2", "x1", 4), ("arg3", "x2", 4),
+                         ("arg4", "x3", 4))],
         get_llil_at=lambda a: setup[-1] if a == 0x40058c else None,
         get_reg_value_at=reg_value,
     )
-    return types.SimpleNamespace(arch=arch, address_size=8), func
-
-
-def _vtable_target():
-    obj = _hop("HLIL_DEREF", "*(this + 0x18)", src=_hop("HLIL_ADD", "this + 0x18"))
-    return _hop("HLIL_DEREF", "*(**(this + 0x18) + 0x10)",
-                src=_hop("HLIL_ADD", "**(this + 0x18) + 0x10",
-                         left=_hop("HLIL_DEREF", "**(this + 0x18)", src=obj),
-                         right=_hop("HLIL_CONST", "0x10", constant=0x10)))
-
-
-def _var(name):
-    return _hop("HLIL_VAR", name, var=types.SimpleNamespace(name=name))
+    bv = types.SimpleNamespace(
+        arch=arch, address_size=8,
+        get_data_refs=lambda a: [0x420000] if label_refs and a == 0x400590 else [])
+    return bv, func
 
 
 def test_an_unresolved_virtual_tail_call_is_named_with_its_arguments_1000():
     bv, func = _jump_case()
     [row] = read_decompile._unresolved_jump_findings(bv, func)
-    assert row["source"] == {"kind": "vtable", "object": "*(this + 0x18)", "slot": 2}
+    assert row["source"] == {"kind": "table", "object": "*(this + 0x18)", "slot": 2,
+                             "virtual": True}
     assert row["registers"] == ["x0", "x1", "x2", "x3"]
     # The swap of `a` and `b`, named by the parameters the registers held.
     assert read_decompile._jump_line_note(row) == \
         "/* bn: indirect tail call, args x0-x3 not rendered; set here: x2 = arg4, x3 = arg3 */"
     warning = read_decompile._unresolved_jump_warning(func, row, True)
-    assert warning["code"] == "jump" and warning["vtable_slot"] == 2
+    assert warning["code"] == "jump" and warning["slot"] == 2
+    assert warning["target_kind"] == "table"
     assert warning["summary"] == ("virtual tail call at 0x40058c through vtable slot 2 of "
                                   "*(this + 0x18): callee and args x0-x3 not rendered")
     assert "❓" in warning["detail"] and "bn disasm 0x400570" in warning["detail"]
@@ -6388,44 +6455,96 @@ def test_an_unresolved_virtual_tail_call_is_named_with_its_arguments_1000():
 def test_a_tail_call_target_held_in_a_variable_is_followed_to_its_load_1000():
     # Plain -O2 with speculative devirtualisation: `int64_t x6_1 = <slot load>;
     # if (x6_1 != Dispatcher::dispatch) jump(x6_1)` renders `jump -> x6_1`.
-    bv, func = _jump_case(dest=_var("x6_1"), defs={"x6_1": _vtable_target()})
+    bv, func = _jump_case(dest=_var("x6_1"), defs={"x6_1": [_vtable_target()]})
     [row] = read_decompile._unresolved_jump_findings(bv, func)
     assert row["source"]["slot"] == 2
-
-
-def test_a_function_pointer_field_jump_is_an_indirect_tail_call_1000():
-    field = _hop("HLIL_DEREF", "*(arg2 + 8)",
-                 src=_hop("HLIL_ADD", "arg2 + 8", left=_var("arg2"),
-                          right=_hop("HLIL_CONST", "8", constant=8)))
-    bv, func = _jump_case(dest=field)
+    # Several definitions that all assign the same load (patchelf's
+    # `rax = *arg1` on three paths) still name one object.
+    table = _load(_plus(_var("rax"), _hconst(0x18)))
+    loaded = _load(_var("arg2"))
+    bv, func = _jump_case(dest=_var("rax_1"),
+                          defs={"rax_1": [table], "rax": [loaded, loaded, loaded]})
     [row] = read_decompile._unresolved_jump_findings(bv, func)
-    assert row["source"] == {"kind": "pointer", "base": "arg2", "offset": 8}
+    assert row["source"] == {"kind": "table", "object": "arg2", "slot": 3, "virtual": False}
+    # ...but definitions that disagree name nothing.
+    bv, func = _jump_case(dest=_var("rax_1"),
+                          defs={"rax_1": [table], "rax": [loaded, _load(_var("arg3"))]})
+    assert read_decompile._unresolved_jump_findings(bv, func) == []
+
+
+def test_a_c_function_table_is_not_called_virtual_1000():
+    # `o->ops->f(x)` in plain C has the vtable shape; without a `this` it is
+    # "a function table", not a C++ virtual call.
+    bv, func = _jump_case(dest=_load(_load(_plus(_var("arg2"), _hconst(8)))))
+    [row] = read_decompile._unresolved_jump_findings(bv, func)
     warning = read_decompile._unresolved_jump_warning(func, row, False)
     assert warning["summary"].startswith(
-        "indirect tail call at 0x40058c through the function pointer at arg2 + 0x8")
-    assert warning["vtable_slot"] is None
+        "indirect tail call at 0x40058c through slot 0 of the function table loaded from "
+        "arg2 + 0x8")
+    assert "virtual" not in warning["summary"]
 
 
-@pytest.mark.parametrize("dest", [
+@pytest.mark.parametrize("dest,kind,through", [
+    (_load(_plus(_var("arg2"), _hconst(8))), "field", "the function pointer at arg2 + 0x8"),
+    # `return fn(x + 1)`: the target IS a parameter.
+    (_var("arg2"), "param", "the function pointer passed in arg2"),
+    # `return gfp(x * 2)`: a function pointer read from a global, no index.
+    (_load(_hop("HLIL_CONST_PTR", "&gfp", constant=0x420040)), "global",
+     "the function pointer in *(&gfp)"),
+], ids=["field", "param", "global"])
+def test_pointer_tail_calls_are_named_1000(dest, kind, through):
+    bv, func = _jump_case(dest=dest)
+    [row] = read_decompile._unresolved_jump_findings(bv, func)
+    assert row["source"]["kind"] == kind
+    warning = read_decompile._unresolved_jump_warning(func, row, False)
+    assert warning["summary"].startswith(f"indirect tail call at 0x40058c through {through}")
+    assert warning["slot"] is None
+
+
+def test_a_jump_with_no_argument_registers_says_so_plainly_1000():
+    # `ldr x0, [x0, 8]; br x0` with no other parameters: no "args none".
+    bv, func = _jump_case(dest=_load(_plus(_var("this"), _hconst(8))))
+    func.parameter_vars = func.parameter_vars[:1]
+    [row] = read_decompile._unresolved_jump_findings(bv, func)
+    row["registers"], row["writes"] = [], []
+    assert read_decompile._jump_line_note(row) == "/* bn: indirect tail call */"
+    assert read_decompile._unresolved_jump_warning(func, row, False)["summary"].endswith(
+        ": callee not rendered")
+
+
+_TABLE = _hop("HLIL_CONST_PTR", "&tbl", constant=0x420010)
+_INDEX = _hop("HLIL_LSL", "(arg2 & 1) << 3")
+
+
+@pytest.mark.parametrize("dest,defs", [
     # A relative jump table: `tbl + *(int32_t*)(tbl + (i << 2))`.
-    _hop("HLIL_ADD", "tbl + *(tbl + (i << 2))",
-         left=_hop("HLIL_DEREF", "*(tbl + (i << 2))",
-                   src=_hop("HLIL_ADD", "tbl + (i << 2)",
-                            left=_hop("HLIL_CONST_PTR", "tbl", constant=0x435ea0),
-                            right=_hop("HLIL_LSL", "i << 2"))),
-         right=_hop("HLIL_CONST_PTR", "tbl", constant=0x435ea0)),
+    (_plus(_load(_plus(_TABLE, _hop("HLIL_LSL", "i << 2"))), _TABLE), None),
     # A computed goto: `goto *tbl[op & 3]`.
-    _hop("HLIL_DEREF", "*(tbl + ((op & 3) << 3))",
-         src=_hop("HLIL_ADD", "tbl + ((op & 3) << 3)",
-                  left=_hop("HLIL_CONST_PTR", "tbl", constant=0x420010),
-                  right=_hop("HLIL_LSL", "(op & 3) << 3"))),
+    (_load(_plus(_TABLE, _INDEX)), None),
+    # `goto *tables[op & 1][0]`: slot 0 of a table picked by an index from a
+    # stack array -- "vtable slot 0" in round 2.
+    (_load(_load(_plus(_hop("HLIL_ADDRESS_OF", "&var_28"), _INDEX))), None),
+    # `jmp qword [rax + tbl]` with rax = *arg1: a loaded value plus a table
+    # address is a table index, not "vtable slot 525313".
+    (_load(_plus(_load(_var("arg2")), _TABLE)), None),
+    (_load(_plus(_TABLE, _load(_var("arg2")))), None),
+    # The same, through a variable.
+    (_var("x7"), {"x7": [_load(_plus(_load(_var("arg2")), _TABLE))]}),
     # A pointer from nowhere this can see.
-    _var("x7"),
+    (_var("x7"), None),
     # BN resolved the target.
-    _hop("HLIL_CONST_PTR", "0x400800", constant=0x400800),
-], ids=["relative-table", "computed-goto", "opaque", "known"])
-def test_an_unresolved_switch_is_not_called_a_tail_call_1000(dest):
-    assert read_decompile._unresolved_jump_findings(*_jump_case(dest=dest)) == []
+    (_hop("HLIL_CONST_PTR", "0x400800", constant=0x400800), None),
+], ids=["relative-table", "computed-goto", "nested-goto", "table-plus-load",
+        "load-plus-table", "via-variable", "opaque", "known"])
+def test_an_unresolved_switch_is_not_called_a_tail_call_1000(dest, defs):
+    assert read_decompile._unresolved_jump_findings(*_jump_case(dest=dest, defs=defs)) == []
+
+
+def test_a_label_array_parameter_is_not_a_function_pointer_field_1000():
+    # `goto *lab[1]` with `lab` a parameter reads exactly like `o->cb`; a
+    # function whose blocks data refers to (a label array) gets no claim.
+    field = _load(_plus(_var("arg2"), _hconst(8)))
+    assert read_decompile._unresolved_jump_findings(*_jump_case(dest=field, label_refs=True)) == []
 
 
 def test_a_jump_with_successors_is_not_reported_1000():
@@ -6543,3 +6662,27 @@ def test_the_platform_type_library_types_an_untyped_import_994():
     bv, func = _libc_string_view(b"C\0", name="locale_hook", library=library)
     note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
     assert note is not None and '"C"' in note["summary"]
+
+
+def test_a_literal_bn_renders_as_a_data_placeholder_is_named_994():
+    # BN's aarch64 libc types `setlocale(int32_t, int64_t*)`, so the argument
+    # renders `&data_661bd8`, not `0x661bd8`; the string there is just as
+    # undefined.
+    bv, func = _libc_string_view(b"C\0", name="setlocale", params=("int32_t", "int64_t*"))
+    note = read_decompile._raw_string_pointer_note(
+        bv, func, "    return setlocale(6, &data_661bd8);")
+    assert note is not None and note["strings"][0]["value"] == "C"
+
+
+def test_an_unmapped_pointer_constant_is_a_displacement_but_a_mapped_one_is_a_table_1000():
+    # x86-64 BN types `arg1 + 8` as `HLIL_CONST_PTR 8` when arg1 is an
+    # integer (`jmp qword [rdi + 8]`); `&tbl + *arg1` adds a real address.
+    small = _hop("HLIL_CONST_PTR", "8", constant=8)
+    bv, func = _jump_case(dest=_load(_plus(_var("arg2"), small)))
+    bv.is_valid_offset = lambda value: value >= 0x400000
+    [row] = read_decompile._unresolved_jump_findings(bv, func)
+    assert row["source"] == {"kind": "field", "base": "arg2", "offset": 8}
+    table = _hop("HLIL_CONST_PTR", "&tbl", constant=0x420010)
+    bv, func = _jump_case(dest=_load(_plus(_load(_var("arg2")), table)))
+    bv.is_valid_offset = lambda value: value >= 0x400000
+    assert read_decompile._unresolved_jump_findings(bv, func) == []

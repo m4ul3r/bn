@@ -4202,3 +4202,122 @@ class TestStringsReadImportsBurndownG:
         assert any("DT_SYMENT" in note for note in summary["dynamic_section_notes"]), summary
         # The bridge is still alive for the next command.
         assert shared_bn.run("imports", "--count").returncode == 0
+
+
+# #1000 item 3 / #994 item 2 (review rounds 1-2): which unresolved jumps are
+# tail calls, and a short literal BN renders as `&data_<addr>`. Built at -O2
+# because the shapes only exist after the compiler forms tail calls; AArch64
+# for the type library whose `setlocale(int32_t, int64_t*)` hides the string.
+_TAIL_JUMPS_C = r"""
+#include <locale.h>
+typedef int (*fn_t)(int);
+struct ops { long pad; fn_t cb; };
+struct vtbl { fn_t f; fn_t g; };
+struct obj { const struct vtbl *ops; };
+fn_t gfp;
+__attribute__((noinline)) int tc_param(fn_t fn, int x) { return fn(x + 1); }
+__attribute__((noinline)) int tc_global(int x) { return gfp(x * 2); }
+__attribute__((noinline)) int tc_field(struct ops *o, int v) { return o->cb(v + 1); }
+__attribute__((noinline)) int tc_table(struct obj *o, int x) { return o->ops->g(x + 3); }
+__attribute__((noinline)) int labels2(int op, int v) {
+  static void *const a[] = { &&l0, &&l1 };
+  static void *const b[] = { &&l1, &&l0 };
+  void *const *tables[] = { a, b };
+  __asm__ volatile("" : : "r"(tables) : "memory");
+  goto *tables[op & 1][0];
+l0: return v + 1;
+l1: return v * 3;
+}
+int idxjump(long *p);
+__asm__(IDXJUMP);
+__attribute__((noinline)) char *use_c_locale(void) { return setlocale(LC_ALL, "C"); }
+static int inc(int v) { return v + 1; }
+static const struct vtbl vt = { inc, inc };
+int main(int argc, char **argv) {
+  struct ops o = { 0, inc }; struct obj ob = { &vt }; long z = 0;
+  gfp = inc;
+  return tc_param(inc, argc) + tc_global(argc) + tc_field(&o, argc) + tc_table(&ob, argc)
+       + labels2(argc, 2) + idxjump(&z) + !!use_c_locale();
+}
+"""
+# A jump through a label table indexed by a loaded value: `jmp [rax + tbl]`.
+_IDXJUMP_ASM = {
+    "aarch64": (
+        r'".text\n.globl idxjump\n.type idxjump, %function\nidxjump:\n'
+        r'  ldr x1, [x0]\n  adrp x2, tbl\n  add x2, x2, :lo12:tbl\n  ldr x3, [x2, x1]\n'
+        r'  br x3\n1: mov w0, #1\n  ret\n2: mov w0, #2\n  ret\n.size idxjump, .-idxjump\n'
+        r'.section .rodata\n.p2align 3\ntbl: .quad 1b, 2b\n.text\n"'),
+    "x86_64": (
+        r'".text\n.globl idxjump\n.type idxjump, @function\nidxjump:\n'
+        r'  mov (%rdi), %rax\n  jmp *tbl(%rax)\n1: mov $1, %eax\n  ret\n2: mov $2, %eax\n'
+        r'  ret\n.size idxjump, .-idxjump\n.section .rodata\n.p2align 3\n'
+        r'tbl: .quad 1b, 2b\n.text\n"'),
+}
+
+
+@pytest.fixture(scope="session")
+def tail_jump_binaries(tmp_path_factory) -> dict[str, Path]:
+    workdir = tmp_path_factory.mktemp("tail-jumps")
+    built: dict[str, Path] = {}
+    for arch, compiler in (("aarch64", "aarch64-linux-gnu-gcc"), ("x86_64", "cc")):
+        cc = shutil.which(compiler)
+        if cc is None:
+            refuse_silent_skip(f"{compiler} not available, so the #1000 tail-jump lane did not run")
+        src = workdir / f"tail_jumps_{arch}.c"
+        src.write_text(_TAIL_JUMPS_C.replace("IDXJUMP", _IDXJUMP_ASM[arch]))
+        out = workdir / f"tail_jumps_{arch}"
+        build = subprocess.run(
+            [cc, "-O2", "-fno-stack-protector", "-no-pie", str(src), "-o", str(out)],
+            capture_output=True, text=True, timeout=120)
+        if build.returncode != 0:
+            refuse_silent_skip(f"{compiler} failed to build the #1000 tail-jump fixture: "
+                               f"{build.stderr.strip()}")
+        built[arch] = out
+    return built
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+class TestDecompileTailJumps1000:
+    """A real tail call through a pointer is named; a jump read through an
+    indexed table base -- a computed goto, `jmp [rax + tbl]` -- never is."""
+
+    def _jumps(self, shared_bn, function):
+        rows = shared_bn.json("decompile", function)["warning_rows"]
+        return [row for row in rows if row["code"] == "jump"]
+
+    def test_pointer_tail_calls_are_named(self, shared_bn, tail_jump_binaries, arch):
+        shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        kinds = {}
+        for function in ("tc_param", "tc_global", "tc_field", "tc_table"):
+            jumps = self._jumps(shared_bn, function)
+            if jumps:
+                kinds[function] = jumps[0]["target_kind"]
+                assert "virtual" not in jumps[0]["summary"], jumps  # plain C, no `this`
+        # The compiler may emit a real `call`/`b` for some of these (no `❓` to
+        # explain); every one it left as an unresolved jump must be named.
+        text = {f: shared_bn.json("decompile", f)["text"] for f in kinds.keys() | {
+            "tc_param", "tc_global", "tc_field", "tc_table"}}
+        unexplained = [f for f, body in text.items() if "jump ->" in body and f not in kinds]
+        assert not unexplained, (unexplained, text)
+        expected = {"tc_param": "param", "tc_global": "global", "tc_field": "field",
+                    "tc_table": "table"}
+        assert all(expected[f] == kind for f, kind in kinds.items()), kinds
+        # Measured: all four are tail jumps at -O2 on both architectures.
+        assert set(kinds) == set(expected), kinds
+
+    def test_indexed_jumps_are_not_called_tail_calls(self, shared_bn, tail_jump_binaries, arch):
+        shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        for function in ("labels2", "idxjump"):
+            assert self._jumps(shared_bn, function) == [], function
+            assert "bn: indirect tail call" not in shared_bn.json("decompile", function)["text"]
+
+
+class TestShortLiteralBehindDataName994:
+    def test_setlocale_literal_rendered_as_data_name_is_named(self, shared_bn, tail_jump_binaries):
+        shared_bn.load(tail_jump_binaries["aarch64"], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        result = shared_bn.json("decompile", "use_c_locale")
+        match = re.search(r"setlocale\(6, &data_([0-9a-f]+)\)", result["text"])
+        assert match, result["text"]  # the premise: BN hides the literal as data
+        strings = [row for row in result["warning_rows"] if row["code"] == "string"]
+        assert strings and strings[0]["strings"][0]["value"] == "C", result["warning_rows"]
+        assert strings[0]["strings"][0]["address"] == hex(int(match.group(1), 16))

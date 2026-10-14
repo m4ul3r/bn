@@ -879,25 +879,66 @@ _WRITE_TEXT_MAX = 40
 _IL_VAR_ANNOTATION_RE = re.compile(r"\s*\{[^{}]*\}")
 
 
-def _entry_name(bv, func, address: int | None, reg: str) -> str | None:
-    """What *reg* holds at *address* by BN's own dataflow: a constant, or the
-    function's parameter when it still holds its entry value. None otherwise."""
+def _reg_bits(arch, name: str) -> int | None:
+    try:
+        size = int(arch.regs[name].size)
+    except Exception:  # noqa: BLE001 - an unknown register has no known width
+        return None
+    return size * 8 if size > 0 else None
+
+
+def _narrowed(arch, spelled: str, text: str, bits: int | None) -> tuple[str, int | None]:
+    """*text*, a value *bits* wide (None: as wide as the full register), as
+    read through the register spelling *spelled*, with the width it then
+    has: `mov w0, w1` copies only the low 32 bits of a 64-bit `arg2`, which
+    is `(uint32_t)arg2`, not `arg2`."""
+    narrow = _reg_bits(arch, spelled)
+    full = _reg_bits(arch, _full_reg(arch, spelled))
+    if narrow is None or full is None or narrow >= full or (bits is not None and bits <= narrow):
+        return text, bits
+    if re.fullmatch(r"0x[0-9a-fA-F]+", text):
+        return hex(int(text, 16) & ((1 << narrow) - 1)), narrow
+    cast = f"(uint{narrow}_t){text}" if re.fullmatch(r"\w+", text) else f"(uint{narrow}_t)({text})"
+    return cast, narrow
+
+
+def _entry_name(bv, func, address: int | None, reg: str) -> tuple[str, int | None] | None:
+    """What *reg* holds at *address* by BN's own dataflow, as (text, bits): a
+    constant, or the function's parameter (with its width) when the register
+    still holds its entry value. None otherwise."""
     if address is None:
         return None
     try:
         value = func.get_reg_value_at(address, reg)
         kind = str(getattr(getattr(value, "type", None), "name", ""))
         if kind in ("ConstantValue", "ConstantPointerValue"):
-            return hex(int(value.value))
+            return hex(int(value.value)), None
         if kind != "EntryValue":
             return None
         entry = _full_reg(bv.arch, str(getattr(value, "reg", "") or ""))
         for var in list(getattr(func, "parameter_vars", None) or []):
             if _register_name(bv.arch, var) == entry:
-                return str(var.name)
+                width = getattr(getattr(var, "type", None), "width", None)
+                return str(var.name), int(width) * 8 if isinstance(width, int) and width > 0 else None
     except Exception:  # noqa: BLE001 - no dataflow: say nothing rather than guess
         return None
     return None
+
+
+def _llil_writes(arch, ins) -> list[str]:
+    """Every register *ins* writes, full width: a plain set, a split pair
+    (`mul`'s rdx:rax), any other `LLIL_SET_REG*` form, and an intrinsic's
+    outputs (`mrs x5, tpidr_el0`). A write this misses would let a note name
+    a value the register no longer holds."""
+    op = il_format._il_op_name(ins)
+    if op == "LLIL_INTRINSIC":
+        targets = list(getattr(ins, "output", None) or [])
+    elif op.startswith("LLIL_SET_REG"):
+        targets = [getattr(ins, key, None) for key in ("dest", "hi", "lo")]
+    else:
+        return []
+    names = [str(getattr(t, "name", "")) for t in targets if getattr(t, "name", None)]
+    return [_full_reg(arch, name) for name in names]
 
 
 def _window_values(bv, func, window: list, select_ids: set[int]) -> dict[str, str | None]:
@@ -913,29 +954,40 @@ def _window_values(bv, func, window: list, select_ids: set[int]) -> dict[str, st
     writes it. Any other source is shown with the same naming applied to each
     register it reads (`w1 + 1` -> `arg2 + 1` when x1 is overwritten later),
     and not at all when one it reads was already rewritten in the window or
-    cannot be named. A lifted select arm is its mnemonic and address
+    cannot be named. A value read through a narrower register keeps that
+    width (`(uint32_t)arg2`), a write narrower than 32 bits (or any partial
+    write on an architecture that does not zero-extend) leaves the value
+    unknown, and a write this does not model (a split pair, an intrinsic)
+    clobbers the register. A lifted select arm is its mnemonic and address
     (`csel @ 0x4015cc`): one arm is not the value. None means unknown, never
     a guess."""
     arch = bv.arch
-    written = {_full_reg(arch, str(getattr(getattr(ins, "dest", None), "name", "")))
-               for ins in window if il_format._il_op_name(ins) == "LLIL_SET_REG"}
+    written = {reg for ins in window for reg in _llil_writes(arch, ins)}
     start = None
     if window:
         try:
             start = int(window[0].address)
         except Exception:  # noqa: BLE001
             start = None
-    values: dict[str, str | None] = {}
+    # Each value is (text, bits): bits is how wide the value is when narrower
+    # than its register, so a later copy through a narrower spelling knows
+    # whether it truncates.
+    values: dict[str, tuple[str, int | None] | None] = {}
     written_so_far: set[str] = set()
     regs = getattr(arch, "regs", None) or {}
+    zero_extends = str(getattr(arch, "name", "")) in _ZERO_EXTENDING_RETURN_ARCHS
 
-    def at_start(reg: str, spelled: str) -> str | None:
+    def spelled_bits(spelled: str) -> int | None:
+        narrow, full = _reg_bits(arch, spelled), _reg_bits(arch, _full_reg(arch, spelled))
+        return narrow if narrow is not None and full is not None and narrow < full else None
+
+    def at_start(reg: str, spelled: str) -> tuple[str, int | None] | None:
         named = _entry_name(bv, func, start, reg)
         if named is not None:
-            return named
-        return spelled if reg not in written else None
+            return _narrowed(arch, spelled, *named)
+        return (spelled, spelled_bits(spelled)) if reg not in written else None
 
-    def named_source(src) -> str | None:
+    def named_source(src, bits: int | None) -> tuple[str, int | None] | None:
         read: set[str] = set()
         _llil_regs_read(arch, src, read)
         if read & written_so_far:
@@ -948,37 +1000,48 @@ def _window_values(bv, func, window: list, select_ids: set[int]) -> dict[str, st
             token = match.group(0)
             if token not in regs:
                 return token
-            full = _full_reg(arch, token)
-            if full not in written:
-                return token
-            named = _entry_name(bv, func, start, full)
-            if named is None:
+            named = _entry_name(bv, func, start, _full_reg(arch, token))
+            if named is not None:
+                return _narrowed(arch, token, *named)[0]
+            if _full_reg(arch, token) in written:
                 unknown = True
-                return token
-            return named
+            return token
 
         text = re.sub(r"\b[A-Za-z_][A-Za-z0-9_]*\b", rename, text)
-        return None if unknown or not text or len(text) > _WRITE_TEXT_MAX else text
+        if unknown or not text or len(text) > _WRITE_TEXT_MAX:
+            return None
+        return text, bits
 
     for ins in window:
         if il_format._il_op_name(ins) != "LLIL_SET_REG":
+            for reg in _llil_writes(arch, ins):
+                values[reg] = None
+                written_so_far.add(reg)
             continue
-        dest = _full_reg(arch, str(getattr(getattr(ins, "dest", None), "name", "")))
+        spelled_dest = str(getattr(getattr(ins, "dest", None), "name", ""))
+        dest = _full_reg(arch, spelled_dest)
         src = getattr(ins, "src", None)
         try:
-            if id(ins) in select_ids:
+            dest_bits = spelled_bits(spelled_dest)
+            if dest_bits is not None and not (dest_bits == 32 and zero_extends):
+                values[dest] = None  # the rest of the register keeps an older value
+            elif id(ins) in select_ids:
                 words = str(bv.get_disassembly(int(ins.address)) or "").split()
-                values[dest] = f"{words[0]} @ {hex(int(ins.address))}" if words else None
+                values[dest] = (f"{words[0]} @ {hex(int(ins.address))}", dest_bits) if words else None
             elif il_format._il_op_name(src) == "LLIL_REG":
                 name = str(getattr(getattr(src, "src", None), "name", ""))
                 full = _full_reg(arch, name)
-                values[dest] = values[full] if full in values else at_start(full, name)
+                if full in values:
+                    held = values[full]
+                    values[dest] = None if held is None else _narrowed(arch, name, *held)
+                else:
+                    values[dest] = at_start(full, name)
             else:
-                values[dest] = named_source(src)
+                values[dest] = named_source(src, dest_bits)
         except Exception:  # noqa: BLE001 - a value is a nicety; the register stands alone
             values[dest] = None
         written_so_far.add(dest)
-    return values
+    return {reg: (value[0] if value is not None else None) for reg, value in values.items()}
 
 
 def _arity_line_note(row: dict[str, Any]) -> str:
@@ -1649,7 +1712,12 @@ def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
     memo: dict[str, Any] = {}
     # Every address the text renders raw, tokenised once rather than searched
     # per operand (#985 review: decompile cost on large functions).
+    # BN's placeholder name for untyped data counts as raw too: a library
+    # prototype that types the argument as a pointer (aarch64 libc's
+    # `setlocale(int32_t, int64_t*)`) renders it `&data_400b90`, not
+    # `0x400b90`, and the string there is just as undefined (#1000 review).
     rendered = {int(token, 16) for token in re.findall(r"\b0x[0-9a-fA-F]+\b", text)}
+    rendered |= {int(token, 16) for token in re.findall(r"\bdata_([0-9a-fA-F]+)\b", text)}
     for ins in instructions:
         if "CALL" not in il_format._il_op_name(ins):
             continue
@@ -1697,22 +1765,33 @@ def _c_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _hlil_constant(expr) -> int | None:
-    if il_format._il_op_name(expr) in ("HLIL_CONST", "HLIL_CONST_PTR"):
-        try:
-            return int(expr.constant)
-        except Exception:  # noqa: BLE001
+def _hlil_constant(expr, bv=None) -> int | None:
+    """A displacement constant. An `HLIL_CONST_PTR` counts only when it is not
+    an address in the view: BN types `arg1 + 8` that way on x86-64 when arg1
+    is an integer, while `&tbl + *arg1` adds a real table address to a loaded
+    value, which is a table index, never a slot offset."""
+    op = il_format._il_op_name(expr)
+    if op not in ("HLIL_CONST", "HLIL_CONST_PTR"):
+        return None
+    try:
+        value = int(expr.constant)
+        if op == "HLIL_CONST_PTR" and (bv is None or bv.is_valid_offset(value)):
             return None
-    return None
+    except Exception:  # noqa: BLE001 - unknown is not a displacement
+        return None
+    return value
 
 
 _HLIL_DEF_DEPTH = 4
+_GLOBAL_POINTER_OPS = ("HLIL_CONST_PTR", "HLIL_IMPORT", "HLIL_EXTERN_PTR")
+_PASS_THROUGH_OPS = ("HLIL_ZX", "HLIL_SX", "HLIL_LOW_PART")
 
 
 def _hlil_resolved(hlil, expr, params: set, depth: int = 0):
-    """*expr* with a variable that has exactly one definition replaced by what
-    that definition assigns (`x6_1` -> `*(**(this + 0x18) + 0x10)`), up to a
-    few hops. A parameter, or anything else, comes back as itself."""
+    """*expr* with a variable replaced by what its definitions assign
+    (`x6_1` -> `*(**(this + 0x18) + 0x10)`), up to a few hops, when every
+    definition assigns the same expression (patchelf's `rax = *arg1` on three
+    paths). A parameter, or anything else, comes back as itself."""
     while depth < _HLIL_DEF_DEPTH and il_format._il_op_name(expr) == "HLIL_VAR":
         var = getattr(expr, "var", None)
         if str(getattr(var, "name", "")) in params:
@@ -1721,39 +1800,117 @@ def _hlil_resolved(hlil, expr, params: set, depth: int = 0):
             defs = list(hlil.get_var_definitions(var) or [])
         except Exception:  # noqa: BLE001 - no def-use: stop at the variable
             return expr
-        if len(defs) != 1 or il_format._il_op_name(defs[0]) not in ("HLIL_VAR_INIT", "HLIL_ASSIGN"):
+        if not defs or any(il_format._il_op_name(d) not in ("HLIL_VAR_INIT", "HLIL_ASSIGN")
+                           for d in defs):
+            return expr
+        if len({str(d.src) for d in defs}) != 1:
             return expr
         expr, depth = defs[0].src, depth + 1
     return expr
 
 
-def _call_pointer_source(hlil, dest, params: set, pointer_size: int) -> dict[str, Any] | None:
-    """Where an indirect jump's target comes from, when that is evidence of a
-    CALL: a word loaded at a constant offset from either a loaded pointer (a
-    vtable slot: `*(*(obj) + 0x10)`) or a parameter (a function pointer field:
-    `*(arg1 + 8)`). None for anything else -- notably a jump table, whose
-    target is computed from an index (`*(tbl + (i << 3))`,
-    `tbl + *(int32_t*)(tbl + (i << 2))`), which is a switch BN did not
-    resolve, not a call (#1000 review)."""
-    target = _hlil_resolved(hlil, dest, params)
-    if il_format._il_op_name(target) != "HLIL_DEREF" or pointer_size <= 0:
+def _pointer_root(hlil, expr, params: set, bv=None, depth: int = 0) -> tuple[str, str] | None:
+    """``("param", name)`` or ``("global", text)``: what an index-free pointer
+    expression is computed from, through loads, field offsets and constant
+    displacements only. None as soon as any term is computed from a value --
+    an index, a scaled register, a sum of two loads -- or from a stack
+    address: those are how a jump table or a computed goto's label array is
+    addressed (`*(&tables + (op & 1) * 8)`, `&tbl + *arg1`), and a slot read
+    from one is not a call (#1000 review round 2)."""
+    if depth > 3 * _HLIL_DEF_DEPTH:
         return None
-    inner, offset = getattr(target, "src", None), 0
-    if il_format._il_op_name(inner) == "HLIL_ADD":
-        left, right = getattr(inner, "left", None), getattr(inner, "right", None)
-        if _hlil_constant(right) is not None:
-            inner, offset = left, _hlil_constant(right)
-        elif _hlil_constant(left) is not None:
-            inner, offset = right, _hlil_constant(left)
-        else:
+    expr = _hlil_resolved(hlil, expr, params)
+    op = il_format._il_op_name(expr)
+    if op == "HLIL_VAR":
+        name = str(getattr(getattr(expr, "var", None), "name", ""))
+        return ("param", name) if name in params else None
+    if op in _GLOBAL_POINTER_OPS:
+        return ("global", str(expr)) if _hlil_constant(expr, bv) is None else None
+    if op in ("HLIL_DEREF", "HLIL_DEREF_FIELD", *_PASS_THROUGH_OPS):
+        return _pointer_root(hlil, getattr(expr, "src", None), params, bv, depth + 1)
+    if op in ("HLIL_ADD", "HLIL_SUB"):
+        left, right = getattr(expr, "left", None), getattr(expr, "right", None)
+        if _hlil_constant(right, bv) is not None:
+            return _pointer_root(hlil, left, params, bv, depth + 1)
+        if op == "HLIL_ADD" and _hlil_constant(left, bv) is not None:
+            return _pointer_root(hlil, right, params, bv, depth + 1)
+    return None
+
+
+def _split_displacement(expr, bv=None) -> tuple[Any, int] | None:
+    """``(base, k)`` for `base + k` with k a displacement constant, ``(expr,
+    0)`` for a bare base, None for a sum with no constant term."""
+    op = il_format._il_op_name(expr)
+    if op == "HLIL_DEREF_FIELD":
+        return getattr(expr, "src", None), int(getattr(expr, "offset", 0) or 0)
+    if op != "HLIL_ADD":
+        return expr, 0
+    left, right = getattr(expr, "left", None), getattr(expr, "right", None)
+    if _hlil_constant(right, bv) is not None:
+        return left, _hlil_constant(right, bv)
+    if _hlil_constant(left, bv) is not None:
+        return right, _hlil_constant(left, bv)
+    return None
+
+
+def _has_label_data_refs(bv, func) -> bool:
+    """Whether data refers to a block inside *func* other than its entry: a
+    computed goto's label array. Such a function's `*(arg1 + 8)` may be
+    `goto *lab[1]` rather than a function-pointer field call."""
+    try:
+        start = int(func.start)
+        return any(int(block.start) != start and list(bv.get_data_refs(int(block.start)) or [])
+                   for block in list(func.basic_blocks))
+    except Exception:  # noqa: BLE001 - unknown is not evidence of labels
+        return False
+
+
+def _call_pointer_source(bv, func, hlil, dest, params: set,
+                         pointer_size: int) -> dict[str, Any] | None:
+    """Where an indirect jump's target comes from, when that is evidence of a
+    CALL, else None:
+
+      * ``param``: the target is a parameter (`return fn(x + 1)`);
+      * ``global``: a function pointer loaded from a global (`return gfp(x)`);
+      * ``table``: slot k of a function table whose pointer is itself loaded
+        from an object rooted at a parameter or a global (`*(*(obj) + 0x10)`,
+        a C++ vtable or a C ops struct);
+      * ``field``: a function pointer at a constant offset from a
+        parameter-rooted address (`*(arg1 + 8)`), unless the function has a
+        computed goto's label array, where that shape is `goto *lab[1]`.
+
+    Every pointer on the way must be index-free (`_pointer_root`): a target
+    read through an index -- a jump table, `goto *tables[i][0]`, `jmp
+    [rax + tbl]` -- is a switch BN did not resolve, not a call, and gets no
+    warning (#1000 review rounds 1 and 2)."""
+    if pointer_size <= 0:
+        return None
+    target = _hlil_resolved(hlil, dest, params)
+    op = il_format._il_op_name(target)
+    if op == "HLIL_VAR":
+        name = str(getattr(getattr(target, "var", None), "name", ""))
+        return {"kind": "param", "base": name} if name in params else None
+    if op not in ("HLIL_DEREF", "HLIL_DEREF_FIELD"):
+        return None
+    src = getattr(target, "src", None)
+    if (op == "HLIL_DEREF" and il_format._il_op_name(src) in _GLOBAL_POINTER_OPS
+            and _hlil_constant(src, bv) is None):
+        return {"kind": "global", "base": str(target)}
+    split = _split_displacement(target if op == "HLIL_DEREF_FIELD" else src, bv)
+    if split is None:
+        return None
+    base, offset = split
+    base = _hlil_resolved(hlil, base, params)
+    root = _pointer_root(hlil, base, params, bv)
+    if root is None:
+        return None
+    if il_format._il_op_name(base) in ("HLIL_DEREF", "HLIL_DEREF_FIELD"):
+        if offset % pointer_size:
             return None
-    base = _hlil_resolved(hlil, inner, params)
-    if il_format._il_op_name(base) == "HLIL_DEREF" and offset % pointer_size == 0:
-        return {"kind": "vtable", "object": str(getattr(base, "src", "?")),
-                "slot": offset // pointer_size}
-    if (il_format._il_op_name(base) == "HLIL_VAR"
-            and str(getattr(getattr(base, "var", None), "name", "")) in params):
-        return {"kind": "pointer", "base": str(base), "offset": offset}
+        return {"kind": "table", "object": str(getattr(base, "src", "?")),
+                "slot": offset // pointer_size, "virtual": root == ("param", "this")}
+    if root[0] == "param" and not _has_label_data_refs(bv, func):
+        return {"kind": "field", "base": str(base), "offset": offset}
     return None
 
 
@@ -1787,7 +1944,8 @@ def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
         if il_format._il_op_name(ins) != "HLIL_JUMP":
             continue
         try:
-            source = _call_pointer_source(hlil, getattr(ins, "dest", None), params, pointer_size)
+            source = _call_pointer_source(bv, func, hlil, getattr(ins, "dest", None), params,
+                                          pointer_size)
             if source is None:
                 continue
             address = int(ins.address)
@@ -1825,54 +1983,68 @@ def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
 
 
 def _register_span(registers: list[str]) -> str:
-    if not registers:
-        return "none"
     return registers[0] if len(registers) == 1 else f"{registers[0]}-{registers[-1]}"
 
 
 def _jump_line_note(row: dict[str, Any]) -> str:
     written = ", ".join(f"{reg} = {value}" if value else reg for reg, value in row["writes"])
-    return (f"/* bn: indirect tail call, args {_register_span(row['registers'])} not rendered"
+    args = (f", args {_register_span(row['registers'])} not rendered"
+            if row["registers"] else "")
+    return (f"/* bn: indirect tail call{args}"
             + (f"; set here: {written}" if written else "") + " */")
 
 
 def _jump_through(source: dict[str, Any]) -> str:
-    if source["kind"] == "vtable":
-        return f"vtable slot {source['slot']} of {source['object']}"
-    return f"the function pointer at {source['base']} + {hex(source['offset'])}"
+    kind = source["kind"]
+    if kind == "table":
+        if source["virtual"]:
+            return f"vtable slot {source['slot']} of {source['object']}"
+        return f"slot {source['slot']} of the function table loaded from {source['object']}"
+    if kind == "field":
+        return f"the function pointer at {source['base']} + {hex(source['offset'])}"
+    if kind == "param":
+        return f"the function pointer passed in {source['base']}"
+    return f"the function pointer in {source['base']}"
+
+
+_JUMP_EVIDENCE = {
+    "table": ("its target is a word at a constant offset in a table whose pointer is itself "
+              "loaded from an object -- a vtable, or a C struct of function pointers"),
+    "field": "its target is a code pointer loaded from a parameter's pointee",
+    "param": "its target is a parameter",
+    "global": "its target is a code pointer loaded from a global",
+}
 
 
 def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[str, Any]:
     where = hex(row["address"])
     source = row["source"]
     through = _jump_through(source)
-    span = _register_span(row["registers"])
     written = ", ".join(f"{reg} = {value}" if value else reg for reg, value in row["writes"])
-    evidence = ("its target is loaded from a vtable slot -- the object's vptr, then the "
-                "word at the slot's offset -- which is a virtual call's shape"
-                if source["kind"] == "vtable" else
-                "its target is a code pointer loaded from a parameter's pointee, which is "
-                "a function-pointer call's shape")
+    table = source["kind"] == "table"
     detail = (
         f"unresolved indirect jump at {where}: BN renders it as `❓ /* jump -> ... */` "
         "(the ❓ marks control flow it could not resolve), so neither the callee nor its "
-        f"arguments appear. It leaves the function and {evidence}, so it is an indirect "
-        f"tail call through {through}. "
-        + (f"Argument registers {span} reach the callee unrendered"
+        f"arguments appear. It leaves the function and {_JUMP_EVIDENCE[source['kind']]}, "
+        "and no index went into it, so it is an indirect tail call through "
+        f"{through}. "
+        + (f"Argument registers {_register_span(row['registers'])} reach the callee "
+           "unrendered"
            + (f"; the jump site sets {written} just before it, so their order can differ "
               "from this function's parameters" if written else "")
            + ". " if row["registers"] else "")
         + ("The jump line carries a `/* bn: ... */` note. " if inline else "")
         + f"Read the set-up in `bn disasm {hex(int(func.start))}`"
-        + ("; giving the object a type whose vtable is a struct of function pointers may "
-           "let BN render the call by name with its arguments." if source["kind"] == "vtable"
-           else ".")
+        + ("; giving the object a type whose table is a struct of function pointers may "
+           "let BN render the call by name with its arguments." if table else ".")
     )
-    summary = (f"{'virtual' if source['kind'] == 'vtable' else 'indirect'} tail call at "
-               f"{where} through {through}: callee and args {span} not rendered")
+    unrendered = (f"callee and args {_register_span(row['registers'])} not rendered"
+                  if row["registers"] else "callee not rendered")
+    summary = (f"{'virtual' if table and source['virtual'] else 'indirect'} tail call at "
+               f"{where} through {through}: {unrendered}")
     return _warning_row("jump", summary, detail, address=where,
-                        registers=row["registers"],
-                        vtable_slot=source["slot"] if source["kind"] == "vtable" else None)
+                        registers=row["registers"], target_kind=source["kind"],
+                        slot=source["slot"] if table else None)
 
 
 _OFFSET_RE = re.compile(r"__offset\((.+?), (-?(?:0x[0-9a-fA-F]+|\d+))\)")

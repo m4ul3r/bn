@@ -421,11 +421,12 @@ def _decompile_many(
                  help="Include inherited comment bodies in text/JSON (default: redact)"),
              arg("--explain", action="store_true", default=False,
                  help="Print each warning's full explanation and next step under its "
-                      "one-line `warning[<code>]:` summary (text mode; json always "
-                      "carries `code`, `summary` and `detail`). In the Pseudo C, a "
-                      "`❓` line is control flow BN could not resolve (an indirect "
-                      "jump with no known target), and a `/* bn: ... */` note is "
-                      "added by bn, not by Binary Ninja"),
+                      "one-line `warning[<code>]:` summary (text mode; json carries "
+                      "the sentences in `warnings` and `{code, summary, detail}` rows "
+                      "in `warning_rows`). In the Pseudo C, a `❓` line is control "
+                      "flow BN could not resolve (an indirect jump with no known "
+                      "target), and a `/* bn: ... */` note is added by bn, not by "
+                      "Binary Ninja"),
          ],
          estimable=True)
 def _decompile(args: argparse.Namespace) -> int:
