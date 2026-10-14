@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -236,19 +237,44 @@ def _format_no_active_target_error(targets: list[dict[str, Any]]) -> str:
 
 
 class _ReadWriteLock:
+    """Writer-priority reader/writer lock over the open views.
+
+    Like `_WriteGate`, it records WHO holds it exclusively and which request ids
+    are reading-queued behind that holder, so a read stuck behind an exclusive
+    phase is observable through `write_gate_status` and refusable with
+    `no_wait` instead of waiting silently (#976, #992). A GUI "Restart Bridge"
+    hands the lock to the successor, so the holder can be a write the RETIRED
+    bridge is still running -- which the new bridge's reads would otherwise wait
+    on with nothing able to say why.
+    """
+
     def __init__(self):
         self._condition = threading.Condition()
         self._readers = 0
         self._writer = False
         self._writers_waiting = 0
+        self._holder: dict[str, Any] | None = None
+        self._read_waiters: set[str] = set()
 
     @contextlib.contextmanager
     def read(self):
         with self._condition:
             # Also wait while writers are queued, otherwise a steady stream of
             # readers starves a waiting writer forever.
-            while self._writer or self._writers_waiting:
-                self._condition.wait()
+            if self._writer or self._writers_waiting:
+                if getattr(_gate_request, "no_wait", False):
+                    raise RuntimeError(_busy_message(
+                        _holder_view(self._holder), getattr(_gate_request, "op", None),
+                        "needs to read the open views"))
+                request_id = getattr(_gate_request, "request_id", None)
+                if request_id:
+                    self._read_waiters.add(request_id)
+                try:
+                    while self._writer or self._writers_waiting:
+                        self._condition.wait()
+                finally:
+                    if request_id:
+                        self._read_waiters.discard(request_id)
             self._readers += 1
         try:
             yield
@@ -268,12 +294,47 @@ class _ReadWriteLock:
             finally:
                 self._writers_waiting -= 1
             self._writer = True
+            self._holder = {"op": getattr(_gate_request, "op", None), "since": time.monotonic()}
         try:
             yield
         finally:
             with self._condition:
                 self._writer = False
+                self._holder = None
                 self._condition.notify_all()
+
+    def read_status(self, request_id: str) -> dict[str, Any]:
+        """Whether *request_id* is a read queued here, and the exclusive holder."""
+        with self._condition:
+            return {
+                "waiting": request_id in self._read_waiters,
+                "holder": _holder_view(self._holder),
+            }
+
+
+def _holder_view(holder: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A lock holder as `write_gate_status` reports it: op and elapsed seconds."""
+    if holder is None:
+        return None
+    return {
+        "op": holder["op"],
+        "elapsed_seconds": round(time.monotonic() - holder["since"], 1),
+    }
+
+
+def _busy_message(holder: dict[str, Any] | None, op: str | None, need: str) -> str:
+    """The `no_wait` refusal: what holds the lock, and what this request needed."""
+    what = (
+        f"{holder['op'] or 'another write'} in progress "
+        f"(started {holder['elapsed_seconds']:g}s ago)"
+        if holder is not None
+        else "another write in progress"
+    )
+    return (
+        f"busy: {what}; {op or 'this request'} {need} and "
+        "BN_NO_WAIT is set, so it was refused instead of queued. Retry when "
+        "that operation finishes, or unset BN_NO_WAIT to wait for it."
+    )
 
 
 # The request the current thread is serving, as far as the write gate is
@@ -309,7 +370,7 @@ class _WriteGate:
         request_id = getattr(_gate_request, "request_id", None)
         if not self._lock.acquire(blocking=False):
             if getattr(_gate_request, "no_wait", False):
-                raise RuntimeError(self._busy_message(op))
+                raise RuntimeError(_busy_message(self.holder(), op, "needs the write gate"))
             if request_id:
                 with self._state:
                     self._waiters.add(request_id)
@@ -329,12 +390,7 @@ class _WriteGate:
 
     def holder(self) -> dict[str, Any] | None:
         with self._state:
-            if self._holder is None:
-                return None
-            return {
-                "op": self._holder["op"],
-                "elapsed_seconds": round(time.monotonic() - self._holder["since"], 1),
-            }
+            return _holder_view(self._holder)
 
     def status(self, request_id: str) -> dict[str, Any]:
         with self._state:
@@ -345,20 +401,6 @@ class _WriteGate:
             "waiting": waiting,
             "holder": self.holder(),
         }
-
-    def _busy_message(self, op: str | None) -> str:
-        holder = self.holder()
-        what = (
-            f"{holder['op'] or 'another write'} in progress "
-            f"(started {holder['elapsed_seconds']:g}s ago)"
-            if holder is not None
-            else "another write in progress"
-        )
-        return (
-            f"busy: {what}; {op or 'this request'} needs the write gate and "
-            "BN_NO_WAIT is set, so it was refused instead of queued. Retry when "
-            "that operation finishes, or unset BN_NO_WAIT to wait for it."
-        )
 
 
 @contextlib.contextmanager
@@ -1435,12 +1477,16 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                         idle_probe = payload.get("idle_probe") is True
                         expected_identity = getattr(bridge, "bridge_identity", None)
                         actual_identity = payload.get("_bridge_identity")
+                        # #992: a cancel may carry a retired predecessor's identity.
+                        accepts_identity = getattr(bridge, "_accepts_identity", None)
                         if not admitted:
                             response = _json_response(
                                 ok=False, error="bridge is shutting down")
                         elif (
                             expected_identity is not None
                             and actual_identity != expected_identity
+                            and not (accepts_identity is not None
+                                     and accepts_identity(op, actual_identity))
                         ):
                             response = _json_response(
                                 ok=False,
@@ -1668,6 +1714,12 @@ class BinaryNinjaBridge:
         self._inflight: int = 0
         self._shutting_down: bool = False
         self._last_activity: float = time.monotonic()
+        # Retired GUI bridges this one succeeded (`succeed`), held weakly: a
+        # request one of them admitted may still be running, and a cancel for it
+        # now arrives HERE, on the socket path it used to own (#992). Weak, so a
+        # retired bridge -- and the views its manager pins -- is released once
+        # its last request has finished.
+        self._predecessors: list[weakref.ref[BinaryNinjaBridge]] = []
 
     def succeed(self, predecessor: BinaryNinjaBridge) -> None:
         """Take over a retired GUI bridge's per-view state before serving.
@@ -1681,11 +1733,32 @@ class BinaryNinjaBridge:
         from the old one run alongside a write -- or a read -- on the new one
         against the same view (#992). A write still holding them delays this
         bridge's writes and reads exactly as it would have delayed the old
-        bridge's, and `write_gate_status` / BN_NO_WAIT name it as the holder.
+        bridge's; `write_gate_status` and BN_NO_WAIT name it as the holder, and
+        a cancel for it reaches it through this bridge (`_cancel_request`).
         """
         self.targets.succeed(predecessor.targets)
         self._write_gate = predecessor._write_gate
         self._target_lock = predecessor._target_lock
+        self._predecessors = [weakref.ref(predecessor)] + [
+            ref for ref in predecessor._predecessors if ref() is not None
+        ]
+
+    def _live_predecessors(self) -> list[BinaryNinjaBridge]:
+        return [bridge for bridge in (ref() for ref in self._predecessors) if bridge is not None]
+
+    def _accepts_identity(self, op: Any, identity: Any) -> bool:
+        """Whether a request stamped with *identity* may be dispatched here.
+
+        This bridge's own identity, and -- for `cancel_request` only -- a
+        predecessor's: a client whose request outlived a GUI "Restart Bridge"
+        cancels it with the identity it sent the request under, to the socket
+        path the successor now listens on (#992).
+        """
+        if identity == self.bridge_identity:
+            return True
+        return op == "cancel_request" and any(
+            identity == bridge.bridge_identity for bridge in self._live_predecessors()
+        )
 
     @property
     def bridge_identity(self) -> dict[str, Any]:
@@ -2343,11 +2416,14 @@ class BinaryNinjaBridge:
     def _cancel_request(self, request_id: Any) -> dict[str, Any]:
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("cancel_request requires params.request_id")
-        with self._request_state_lock:
-            active = request_id in self._active_requests
-            if active:
-                self._cancelled_requests.add(request_id)
-        return {"kind": "cancel_request", "request_id": request_id, "cancelled": active}
+        # A request a retired GUI bridge admitted is still that bridge's to
+        # cancel: its handler polls the predecessor's own cancelled set (#992).
+        for owner in (self, *self._live_predecessors()):
+            with owner._request_state_lock:
+                if request_id in owner._active_requests:
+                    owner._cancelled_requests.add(request_id)
+                    return {"kind": "cancel_request", "request_id": request_id, "cancelled": True}
+        return {"kind": "cancel_request", "request_id": request_id, "cancelled": False}
 
     def _dispatch_on_main(self, op: str, params: dict[str, Any], target: str | None):
         spec = REGISTRY.spec(op)
@@ -4896,7 +4972,14 @@ def _bind_write_gate_status(bridge, params, target):
     request_id = params.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         raise ValueError("write_gate_status requires params.request_id")
-    return bridge._write_gate.status(request_id)
+    status = bridge._write_gate.status(request_id)
+    if not status["waiting"]:
+        # A read queues on the target lock, not the gate; the same question has
+        # the same answer for it, naming the exclusive holder (#992).
+        read = bridge._target_lock.read_status(request_id)
+        if read["waiting"]:
+            status = {**status, "waiting": True, "holder": read["holder"]}
+    return status
 
 
 @op("load_binary", lock="none")

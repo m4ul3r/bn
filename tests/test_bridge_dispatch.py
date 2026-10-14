@@ -277,6 +277,87 @@ def test_no_wait_write_refuses_busy_instead_of_queueing_behind_refresh(monkeypat
     assert instance._write_gate.locked() is False
 
 
+def _exclusive_write_parked(bridge, instance, op="batch_apply"):
+    """Hold the write gate AND the exclusive target lock as request *op* would."""
+    holding = threading.Event()
+    release = threading.Event()
+
+    def write():
+        with bridge._gate_request_context(op, "write-1", False), \
+                instance._write_operation_lock():
+            holding.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=write, daemon=True)
+    thread.start()
+    assert holding.wait(5)
+    return release, thread
+
+
+def test_read_queued_behind_an_exclusive_write_is_reported_and_refusable(monkeypatch):
+    """#992 review: a read waiting on the exclusive target lock got no notice
+    and ignored BN_NO_WAIT, which only the write gate honoured. After Restart
+    Bridge the holder can be a write the OLD bridge is still running, so the
+    read would wait with nothing able to say why. `no_wait` must refuse it
+    naming the holder, and `write_gate_status` must report a queued read."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    release, writer = _exclusive_write_parked(bridge, instance)
+
+    def status(request_id):
+        response = instance.dispatch(
+            {"op": "write_gate_status", "params": {"request_id": request_id}})
+        assert response["ok"] is True, response
+        return response["result"]
+
+    reads: dict = {}
+    reader = threading.Thread(
+        target=lambda: reads.update(r=instance.dispatch(
+            {"op": "list_targets", "params": {}, "id": "read-1"})),
+        daemon=True,
+    )
+    try:
+        started = time.monotonic()
+        refused = instance.dispatch(
+            {"op": "list_targets", "params": {}, "id": "read-0", "no_wait": True})
+        assert time.monotonic() - started < 1.0
+        assert refused["ok"] is False
+        assert refused["error"].startswith("busy: batch_apply in progress (started ")
+        assert "list_targets needs to read the open views" in refused["error"]
+
+        reader.start()
+        deadline = time.monotonic() + 5.0
+        while not status("read-1")["waiting"]:
+            assert time.monotonic() < deadline, "queued read never reported as waiting"
+            time.sleep(0.01)
+        assert status("read-1")["holder"]["op"] == "batch_apply"
+        assert "r" not in reads
+    finally:
+        release.set()
+        writer.join(timeout=5.0)
+        if reader.ident is not None:
+            reader.join(timeout=5.0)
+
+    assert reads["r"]["ok"] is True, reads
+    assert status("read-1")["waiting"] is False
+
+
+def test_no_wait_read_still_answers_during_a_gate_only_refresh(monkeypatch):
+    """#992 review: reads answer while `refresh` analyses under the write gate
+    alone (#321); `no_wait` refuses a read only when it would actually wait."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    release, refresh = _refresh_parked_on_gate(monkeypatch, bridge, instance)
+    try:
+        response = instance.dispatch(
+            {"op": "list_targets", "params": {}, "id": "read-0", "no_wait": True})
+    finally:
+        release.set()
+        refresh.join(timeout=5.0)
+    assert response["ok"] is True, response
+
+
+
 def test_mutation_reanalysis_runs_under_gate_not_exclusive_lock(monkeypatch):
     """#628: a mutation op is @op lock="none" and self-manages locking -- the write
     gate serializes writers for the WHOLE op, while the exclusive target lock covers
@@ -932,6 +1013,62 @@ def test_cancel_request_marks_only_active_requests(monkeypatch):
 
     instance._end_request("req-1")
     assert instance._is_request_cancelled("req-1") is False
+
+
+def _cancel_through_handler(bridge, inst, request_id, identity, op="cancel_request"):
+    line = json.dumps({
+        "id": "cancel-1", "op": op, "params": {"request_id": request_id},
+        "_bridge_identity": identity,
+    }).encode() + b"\n"
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.connection = _same_uid_conn()
+    handler.rfile = io.BytesIO(line)
+    handler.server = types.SimpleNamespace(bridge=inst)
+    inst._server = handler.server
+    handler.wfile = _RecordingWriter()
+    handler.handle()
+    return json.loads(handler.wfile.data.decode("utf-8"))
+
+
+def test_cancel_reaches_a_request_the_retired_gui_bridge_admitted(monkeypatch):
+    """#992 review: after Restart Bridge a request the old bridge admitted keeps
+    running -- holding the write locks the successor now shares -- but a timed-
+    out client's cancel lands on the successor, stamped with the OLD identity,
+    and was refused, so a cancellable op (go rename) could not be stopped. The
+    successor must accept that cancel and mark the request on the bridge whose
+    handler polls for it; any other op under the old identity stays refused."""
+    import gc
+    import weakref
+
+    bridge = _load_bridge(monkeypatch)
+    old = bridge.BinaryNinjaBridge()
+    new = bridge.BinaryNinjaBridge()
+    new.succeed(old)
+    old._begin_request("req-old")
+
+    response = _cancel_through_handler(bridge, new, "req-old", old.bridge_identity)
+    assert response["ok"] is True, response
+    assert response["result"]["cancelled"] is True
+    assert old._is_request_cancelled("req-old") is True
+    assert _cancel_through_handler(
+        bridge, new, "req-unknown", old.bridge_identity)["result"]["cancelled"] is False
+
+    foreign = _cancel_through_handler(
+        bridge, new, "req-old", old.bridge_identity, op="write_gate_status")
+    assert foreign["ok"] is False
+    assert "bridge identity mismatch" in foreign["error"]
+
+    # The successor does not keep its predecessor alive once nothing it
+    # admitted is running: a retired manager pins its views (#586).
+    old._end_request("req-old")
+    old_identity = old.bridge_identity
+    retired = weakref.ref(old)
+    del old
+    gc.collect()
+    assert retired() is None
+    stale = _cancel_through_handler(bridge, new, "req-old", old_identity)
+    assert "bridge identity mismatch" in stale["error"]
+
 
 
 def test_py_exec_non_serializable_result_falls_back_to_repr(monkeypatch):

@@ -1788,7 +1788,8 @@ def test_gui_restart_hands_the_write_locks_to_the_successor(monkeypatch):
     write the old bridge admitted before Restart Bridge and a write on the new
     bridge held different locks and ran together on the same view. A write
     still running on the old bridge must hold off the new bridge's writes and
-    reads, and a BN_NO_WAIT write must be refused naming it."""
+    reads, and BN_NO_WAIT requests -- writes and reads -- must be refused
+    naming it."""
     module = _load_bridge(monkeypatch)
     old_bridge = _restartable_gui_bridge(module, monkeypatch, module.TargetManager())
 
@@ -1813,6 +1814,11 @@ def test_gui_restart_hands_the_write_locks_to_the_successor(monkeypatch):
                 pytest.raises(RuntimeError, match="busy: batch_apply in progress"), \
                 new_bridge._write_gate:
             pass
+
+        refused = new_bridge.dispatch(
+            {"op": "list_targets", "params": {}, "id": "req-read", "no_wait": True})
+        assert refused["ok"] is False
+        assert refused["error"].startswith("busy: batch_apply in progress")
 
         read_done = threading.Event()
 
