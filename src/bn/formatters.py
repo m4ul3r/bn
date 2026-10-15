@@ -7253,10 +7253,13 @@ def _render_skill_install_text(value: Any) -> str:
         return f"; --force: {row.get('detail')}"
 
     lines = []
+    error = _text_value(value, "error")
+    if error:
+        lines.append(error)
 
     if installed:
         lines.append(f"Installed skills ({value.get('mode', 'unknown')}):")
-        lines.extend(f"- {dest}" for dest in installed)
+        lines.extend(f"- {dest}{force_detail(dest)}" for dest in installed)
     elif not not_updated:
         lines.append("Skills already installed.")
 
@@ -7267,20 +7270,27 @@ def _render_skill_install_text(value: Any) -> str:
     # Existing destinations are not claimed as installed. The force verdicts
     # come from the forced run's own no-write preflight, including current rows.
     if not_updated:
-        lines.append("Not updated, existing destination differs from the requested install:")
+        lines.append("Not updated, destination differs or is blocked:")
         lines.extend(
             f"- {row.get('destination')} ({row.get('detail')})"
             f"{force_detail(row.get('destination'))}" for row in not_updated
         )
-        if force_plan:
-            ready = "ready" if value.get("force_ready") else "refused; fix every blocker first"
-            lines.append(
-                f"--force preflight: {ready}. Checked without writes; "
-                "filesystem races or write errors can still fail the install."
-            )
-        force_note = _text_value(value, "force_note")
-        if force_note:
-            lines.append(force_note)
+    listed = installed + skipped
+    other = [row for row in force_plan if row.get("destination") not in listed]
+    if other:
+        lines.append("Other destinations (--force dry run):")
+        lines.extend(
+            f"- {row.get('destination')}{force_detail(row.get('destination'))}" for row in other
+        )
+    if force_plan:
+        ready = "ready" if value.get("force_ready") else "refused; fix every blocker first"
+        lines.append(
+            f"--force preflight: {ready}. Checked without writes; "
+            "filesystem races or write errors can still fail the install."
+        )
+    force_note = _text_value(value, "force_note")
+    if force_note:
+        lines.append(force_note)
 
     return "\n".join(lines) + "\n"
 

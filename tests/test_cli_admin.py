@@ -5221,3 +5221,194 @@ def test_plugin_default_refusal_is_one_text_diagnostic_and_json_is_explicit(
     assert bn.cli.main(argv + ["--format", "json"]) == 2
     captured = capsys.readouterr()
     assert json.loads(captured.out)["ok"] is False
+
+
+@pytest.mark.parametrize("installer", ["plugin", "skill"])
+@pytest.mark.parametrize("upgrade", [False, True])
+def test_copy_install_preserves_read_only_source_mode_and_writes_marker(
+    tmp_path, monkeypatch, capsys, installer, upgrade
+):
+    if os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses source directory write permissions")
+    source, skill_dest = _one_skill_source(tmp_path, monkeypatch)
+    if installer == "plugin":
+        dest = tmp_path / "plugin-copy"
+        monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source)
+        argv = ["plugin", "install", "--mode", "copy", "--dest", str(dest)]
+    else:
+        dest = skill_dest
+        argv = ["skill", "install", "--mode", "copy"]
+    if upgrade:
+        assert bn.cli.main(argv) == 0
+        (source / "SKILL.md").write_text("upgraded contents")
+    source.chmod(0o555)
+    capsys.readouterr()
+    before = _install_disk_snapshot(source)
+    try:
+        if upgrade and installer == "skill":
+            assert bn.cli.main(argv + ["--format", "json"]) == 1
+            assert json.loads(capsys.readouterr().out)["force_ready"] is True
+        assert bn.cli.main(argv + (["--force"] if upgrade else [])) == 0
+        capsys.readouterr()
+        assert _install_disk_snapshot(source) == before
+        assert dest.stat().st_mode & 0o777 == 0o555
+        assert (dest / "SKILL.md").read_bytes() == (source / "SKILL.md").read_bytes()
+        identity = json.loads((dest / ".bn-copy-install.json").read_text())
+        assert identity == {"format": "bn-copy-install-v1", "artifact": source.name}
+        assert bn.cli.main(argv + ["--format", "json"]) == 0
+        current = json.loads(capsys.readouterr().out)
+        assert current["installed"] is False
+        if installer == "skill":
+            # The freshly installed source mode now blocks the next force run.
+            assert current["force_ready"] is False
+    finally:
+        source.chmod(0o755)
+        if dest.exists():
+            dest.chmod(0o755)
+
+
+@pytest.mark.parametrize("upgrade", [False, True])
+def test_failed_marker_write_removes_prepared_copy_and_preserves_previous_install(
+    tmp_path, monkeypatch, capsys, upgrade
+):
+    from pathlib import Path
+    from bn.commands.admin import _install_tree
+
+    source, dest = _one_skill_source(tmp_path, monkeypatch)
+    if upgrade:
+        assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 0
+        (source / "SKILL.md").write_text("next version")
+    before = _install_disk_snapshot(dest) if upgrade else None
+    siblings = set(dest.parent.iterdir())
+    original_write = Path.write_text
+
+    def fail_marker(path, data, *args, **kwargs):
+        if path.name == ".bn-copy-install.json":
+            original_write(path, "partial marker")
+            raise PermissionError("injected marker write failure")
+        return original_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_marker)
+    # This is a write-time failure, not a preflight refusal: preparing and
+    # cleaning a temporary copy can change parent mtimes. Check cleanup and
+    # preservation of the live destination, including all of its metadata.
+    with pytest.raises(bn.cli.BridgeError, match="injected marker write failure"):
+        _install_tree(source, dest, mode="copy", force=upgrade)
+    assert set(dest.parent.iterdir()) == siblings
+    if upgrade:
+        assert _install_disk_snapshot(dest) == before
+    else:
+        assert not dest.exists()
+
+
+def test_all_current_skills_publish_every_force_blocker(tmp_path, monkeypatch, capsys):
+    if os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses read-only copy permissions")
+    source, dest = _one_skill_source(tmp_path, monkeypatch)
+    for name in ("second", "third"):
+        skill = source.parent / name
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(name)
+    assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 0
+    destinations = [dest.parent / skill.name for skill in source.parent.iterdir()]
+    for copy in destinations:
+        copy.chmod(0o555)
+    capsys.readouterr()
+    try:
+        before = _install_disk_snapshot(tmp_path)
+        assert bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["installed"] is False
+        assert result["force_ready"] is False
+        assert {row["destination"] for row in result["force_plan"]} == {
+            str(copy) for copy in destinations
+        }
+        assert all(not row["allowed"] for row in result["force_plan"])
+        assert _install_disk_snapshot(tmp_path) == before
+        assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 0
+        text = capsys.readouterr().out
+        for copy in destinations:
+            assert str(copy) in text
+        assert bn.cli.main(["skill", "install", "--mode", "copy", "--force"]) == 2
+        err = capsys.readouterr().err
+        for copy in destinations:
+            assert str(copy) in err
+    finally:
+        for copy in destinations:
+            copy.chmod(0o755)
+
+
+@pytest.mark.parametrize("parent_file", [False, True])
+def test_explicit_skill_refusal_publishes_whole_force_plan_without_installing(
+    tmp_path, monkeypatch, capsys, parent_file
+):
+    sources = tmp_path / "sources"
+    store = tmp_path / "store"
+    for name in ("bn", "bn-re", "bn-vr"):
+        source = sources / name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(name)
+    if parent_file:
+        store.write_text("preserve parent file")
+    else:
+        (store / "bn").mkdir(parents=True)
+        (store / "bn-re").mkdir()
+        (store / "bn-re" / "mine.txt").write_text("preserve")
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: sources)
+    argv = ["skill", "install", "--dest", str(store)]
+    before = _install_disk_snapshot(tmp_path)
+    assert bn.cli.main(argv + ["--format", "json", "--out", str(tmp_path / "refusal.json")]) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is False
+    assert result["force_ready"] is False
+    assert result["installed_destinations"] == []
+    verdicts = {row["destination"]: row["allowed"] for row in result["force_plan"]}
+    assert verdicts == {
+        str(store / "bn"): not parent_file,
+        str(store / "bn-re"): False,
+        str(store / "bn-vr"): not parent_file,
+    }
+    assert _install_disk_snapshot(tmp_path) == before
+    assert bn.cli.main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    for name in ("bn", "bn-re", "bn-vr"):
+        assert str(store / name) in captured.err
+    assert bn.cli.main(argv + ["--force"]) == 2
+    assert _install_disk_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_printed_root_link_recovery_preserves_checkout_and_reinstalls_outside_it(
+    tmp_path, monkeypatch, capsys, explicit
+):
+    import shutil
+    import subprocess
+
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    old = tmp_path / "old checkout" / "skills"
+    shutil.copytree(source.parent, old)
+    (old / source.name / "SKILL.md").write_text("local edits in old checkout")
+    root = tmp_path / "linked root's skills"
+    root.symlink_to(old)
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: root)
+    argv = ["skill", "install", "--mode", "copy", "--force"]
+    if explicit:
+        argv += ["--dest", str(root)]
+    before = _install_disk_snapshot(old)
+    assert bn.cli.main(argv) == 2
+    refusal = capsys.readouterr().err
+    commands = {
+        line.removeprefix("Recovery command: ")
+        for line in refusal.splitlines() if line.startswith("Recovery command: ")
+    }
+    [command] = commands
+    subprocess.run(command, shell=True, check=True, env=os.environ.copy())
+    # The printed advice says to rerun the same install command; execute its
+    # original argv through the real CLI, not a mock or rewritten destination.
+    assert bn.cli.main(argv) == 0
+    assert not root.is_symlink()
+    assert (root / source.name / "SKILL.md").read_bytes() == (source / "SKILL.md").read_bytes()
+    assert _install_disk_snapshot(old) == before

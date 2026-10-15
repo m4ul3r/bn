@@ -16,6 +16,7 @@ import shlex
 import shutil
 import signal
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -572,6 +573,16 @@ def _unusable_parent_reason(dest: Path) -> str | None:
     return None
 
 
+def _remove_install_destination(dest: Path) -> None:
+    try:
+        if dest.is_symlink():
+            dest.unlink()
+        elif dest.is_dir():
+            shutil.rmtree(dest)
+    except OSError as exc:
+        raise BridgeError(f"Cannot replace {dest}: {exc}") from exc
+
+
 def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
     dest = _plan_install(source, dest, mode=mode, force=force)
     try:
@@ -581,33 +592,51 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
             f"Cannot create the parent directory of {dest}: {exc}"
         ) from exc
 
-    try:
-        if dest.is_symlink():
-            dest.unlink()
-        elif dest.is_dir():
-            shutil.rmtree(dest)
-    except OSError as exc:
-        raise BridgeError(f"Cannot replace {dest}: {exc}") from exc
 
     try:
         if mode == "copy":
-            shutil.copytree(source, dest, ignore=_IGNORED_INSTALL_ENTRIES)
-            (dest / _COPY_INSTALL_MARKER).write_text(
-                json.dumps(_copy_install_identity(source), separators=(",", ":")) + "\n"
-            )
+            # Write ownership before copytree finalizes directory metadata.
+            # Prepare the complete copy before removing a previous install,
+            # so marker/copy failures leave no unmarked destination behind.
+            with tempfile.TemporaryDirectory(prefix=f".{dest.name}-", dir=dest.parent) as temporary:
+                prepared = Path(temporary)
+                (prepared / _COPY_INSTALL_MARKER).write_text(
+                    json.dumps(_copy_install_identity(source), separators=(",", ":")) + "\n"
+                )
+                shutil.copytree(
+                    source, prepared, dirs_exist_ok=True, ignore=_IGNORED_INSTALL_ENTRIES
+                )
+                _remove_install_destination(dest)
+                prepared.replace(dest)
         else:
+            _remove_install_destination(dest)
             os.symlink(source, dest, target_is_directory=True)
     except OSError as exc:
         raise BridgeError(f"Cannot install into {dest}: {exc}") from exc
 
 
-def _refuse_replacement(dest: Path, reason: str) -> NoReturn:
+def _install_recovery_advice(linked_root: Path | None) -> str:
+    if linked_root is None:
+        return (
+            "Move this destination aside by hand, then re-run the "
+            "same install command without --force to create a fresh install."
+        )
+    root = shlex.quote(str(linked_root.absolute()))
+    return (
+        f"The destination is reached through root link {linked_root}. "
+        "Do not move or replace directories inside its target. Replace only "
+        "the root link with a new directory:\n"
+        f"Recovery command: unlink -- {root} && mkdir -- {root}\n"
+        "Then re-run the same install command."
+    )
+
+
+def _refuse_replacement(dest: Path, reason: str, *, linked_root: Path | None) -> NoReturn:
     raise BridgeError(
         f"Refusing to replace {dest} with --force: {reason}. "
         "--force replaces only what it can prove is an install of this "
         "artifact (a link, an empty directory, or a marked copy), never an "
-        "unrelated path. Move this destination aside by hand, then re-run the "
-        "same install command without --force to create a fresh install."
+        f"unrelated path. {_install_recovery_advice(linked_root)}"
     )
 
 
@@ -629,6 +658,8 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
     """
     if not source.exists():
         raise BridgeError(f"Source directory is missing: {source}")
+    requested_dest = dest
+    linked_root = next((parent for parent in dest.parents if parent.is_symlink()), None)
     dest = _install_path(dest)
     forbidden = _never_an_install_destination(dest, source)
     if forbidden is not None:
@@ -639,12 +670,13 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
         )
     unusable = _unusable_parent_reason(dest)
     if unusable is not None:
-        raise BridgeError(f"Cannot install into {dest}: {unusable}.")
+        recovery = f" {_install_recovery_advice(linked_root)}" if linked_root else ""
+        raise BridgeError(f"Cannot install into {dest}: {unusable}.{recovery}")
     if not force:
         state = _existing_install_state(source, dest, mode=mode)
         if state is not None:
             try:
-                _plan_install(source, dest, mode=mode, force=True)
+                _plan_install(source, requested_dest, mode=mode, force=True)
             except BridgeError as exc:
                 force_detail = f"--force preflight refuses: {exc}"
             else:
@@ -656,7 +688,7 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
         return dest
     reason = _force_refusal_reason(dest, source)
     if reason is not None:
-        _refuse_replacement(dest, reason)
+        _refuse_replacement(dest, reason, linked_root=linked_root)
     if dest.is_dir() and not dest.is_symlink():
         try:
             blocker = _removal_blocker(dest)
@@ -664,8 +696,9 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
             blocker = f"it could not be read ({exc})"
         if blocker is not None:
             raise BridgeError(
-                f"Cannot replace {dest} with --force: {blocker}. Fix the "
-                "permissions, or move it aside by hand, and re-run."
+                f"Cannot replace {dest} with --force: {blocker}. "
+                + (_install_recovery_advice(linked_root) if linked_root else
+                   "Fix the permissions, or move it aside by hand, and re-run.")
             )
     return dest
 
@@ -750,18 +783,37 @@ def _skill_install(args: argparse.Namespace) -> int:
             if state is not None and state[0] == "up_to_date":
                 skipped_destinations.append(str(dest))
                 continue
-            if state is not None and not explicit_dest:
+            if state is not None:
                 skipped_destinations.append(str(dest))
                 not_updated_destinations.append(
                     {"destination": str(dest), "state": state[0], "detail": state[1]}
                 )
                 continue
-            planned = _plan_install(source, dest, mode=args.mode, force=False)
+            try:
+                planned = _plan_install(source, dest, mode=args.mode, force=False)
+            except BridgeError as exc:
+                if not explicit_dest:
+                    raise
+                skipped_destinations.append(str(dest))
+                not_updated_destinations.append(
+                    {"destination": str(dest), "state": "blocked", "detail": str(exc)}
+                )
+                continue
             if not any(queued == planned for _, queued in pending_installs):
                 pending_installs.append((source, planned))
 
+    # An explicit destination collision is a refusal, not a partial install.
+    # Gather every row first, then publish the complete dry run without writes.
+    explicit_refusal = explicit_dest and bool(not_updated_destinations) and not args.force
+    if explicit_refusal:
+        pending_installs = []
+
     for source, dest in pending_installs:
         _install_tree(source, dest, mode=args.mode, force=args.force)
+    if pending_installs:
+        # Report a future forced run against the disk as it now stands, not
+        # against destinations that this normal run just replaced/created.
+        _, force_plan = _plan_forced_installs(install_plan, mode=args.mode)
 
     result = {
         # #620(b): report installed=false when every destination was skipped,
@@ -775,11 +827,18 @@ def _skill_install(args: argparse.Namespace) -> int:
         "skipped_destinations": skipped_destinations,
         "not_updated_destinations": not_updated_destinations,
         "skills": results,
+        "force_note": FORCE_NOTE,
+        "force_plan": force_plan,
+        "force_ready": all(row["allowed"] for row in force_plan),
     }
-    if not_updated_destinations:
-        result["force_note"] = FORCE_NOTE
-        result["force_plan"] = force_plan
-        result["force_ready"] = all(row["allowed"] for row in force_plan)
+    if explicit_refusal:
+        result.update(ok=False, error="Skill install refused; no destinations changed.")
+        if args.format != "text":
+            # Like other errors, a refusal does not create a requested artifact.
+            refusal_args = argparse.Namespace(**{**vars(args), "out": None})
+            cli._emit_result(refusal_args, result, stem="skill-install")
+        print(_render_skill_install_text(result), file=sys.stderr, end="")
+        return 2
     cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
     return 1 if not_updated_destinations else 0
 
