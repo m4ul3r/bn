@@ -1630,7 +1630,15 @@ def _char_pointer_parameter(bv, target: int | None, index: int) -> bool:
         params = list(getattr(getattr(callee, "type", None), "parameters", None) or [])
         return index < len(params) and bool(
             _CHAR_POINTER_RE.match(str(getattr(params[index], "type", "")).strip()))
+    parameters = list(getattr(callee, "parameter_vars", None) or [])
+    if index < len(parameters):
+        var = parameters[index]
+        if callee.is_var_user_defined(var):
+            return bool(_CHAR_POINTER_RE.match(str(var.type).strip()))
     symbol = bv.get_symbol_at(target)
+    kind = str(getattr(getattr(symbol, "type", None), "name", ""))
+    if kind not in {"ImportedFunctionSymbol", "ImportAddressSymbol", "ExternalSymbol"}:
+        return False
     name = str(getattr(symbol, "raw_name", "") or "").split("@", 1)[0]
     key = il_format._normalize_libc_name(name)
     family = il_format._variadic_format_family(name)
@@ -1645,6 +1653,13 @@ def _character_array_capacity(bv: Any, address: int) -> int:
         r"(?:const\s+)?(?:(?:un)?signed\s+)?char(?:\s+const)?\s*"
         r"\[\s*(0x[0-9a-fA-F]+|\d+)\s*\]", str(getattr(var, "type", "")).strip())
     return int(match[1], 16 if match[1].startswith("0x") else 10) if match else 0
+
+
+def _may_advise_character_array(bv: Any, address: int, size: int) -> bool:
+    var = bv.get_data_var_at(address)
+    if var is not None and not bool(getattr(var, "auto_discovered", False)):
+        return False
+    return _character_array_capacity(bv, address) < size
 
 
 def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
@@ -1702,8 +1717,8 @@ def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
                 for a, (v, c, typed) in found.items() if not typed]
     advice = ""
     undeclared = [row for row in strings
-                  if _character_array_capacity(bv, int(row["address"], 16))
-                  < len(row["value"].encode("utf-8")) + 1]
+                  if _may_advise_character_array(
+                      bv, int(row["address"], 16), len(row["value"].encode("utf-8")) + 1)]
     if undeclared:
         first = undeclared[0]
         size = len(first["value"].encode("utf-8")) + 1

@@ -6938,6 +6938,38 @@ def test_inferred_char_pointer_is_not_string_evidence(user_typed):
         assert "bn data retype" not in note["detail"] + note["summary"]
 
 
+@pytest.mark.parametrize("kind", ["FunctionSymbol", "ImportedFunctionSymbol", "ExternalSymbol"])
+def test_string_api_identity_requires_external_provenance(kind):
+    bv, func = _libc_string_view(
+        b"\xe2\x80\x99\0" + b"\1\0\0\0" * 3, name="strcmp", kind=kind)
+    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
+    assert note["code"] == ("bytes" if kind == "FunctionSymbol" else "string")
+    if kind == "FunctionSymbol":
+        assert "bn data retype" not in note["detail"]
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_per_parameter_user_type_is_string_evidence(explicit):
+    bv, func = _libc_string_view(
+        "’".encode() + b"\0", name="consume_void", kind="FunctionSymbol")
+    callee = bv.get_function_at(0x401100)
+    var = types.SimpleNamespace(type="char const*")
+    callee.parameter_vars = [types.SimpleNamespace(type="int"), var]
+    callee.is_var_user_defined = lambda candidate: explicit and candidate is var
+    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
+    assert note["code"] == ("string" if explicit else "bytes")
+
+
+@pytest.mark.parametrize("data_type", ["int32_t[4]", "char[1]", "struct Record"])
+def test_user_data_type_is_never_advised_over(data_type):
+    bv, func = _libc_string_view("’".encode() + b"\0", name="strcmp")
+    bv.get_data_var_at = lambda address: types.SimpleNamespace(
+        type=data_type, auto_discovered=False)
+    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
+    assert note["strings"][0]["value"] == "’"
+    assert "bn data retype" not in note["summary"] + note["detail"]
+
+
 @pytest.mark.parametrize("value", [" ", "’", "٬", "é", "😀"])
 @pytest.mark.parametrize("argument", ["0x661bd8", "&data_661bd8"])
 def test_strcmp_names_short_utf8_with_byte_sized_retype_1017(value, argument):

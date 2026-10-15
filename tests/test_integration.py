@@ -4794,6 +4794,12 @@ __attribute__((noinline)) unsigned opaque_hash(const char *p) {
     for (unsigned i = 0; i < 4; ++i) h = h * 33 + (unsigned char)p[i];
     return h;
 }
+__attribute__((noinline)) int consume_void(const void *p) {
+    return ((const unsigned char *)p)[0] + ((const unsigned char *)p)[1];
+}
+__attribute__((noinline)) int call_consume(void) {
+    return consume_void("\xe2\x80\x99");
+}
 const int opaque_words[] = {0x44434241, 0};
 __attribute__((noinline)) unsigned hash_words(void) {
     return opaque_hash((const char *)opaque_words);
@@ -4830,7 +4836,7 @@ class TestLiteralRetypeAdvice1023:
             "    assert blob.count(needle) == 1, (value, blob)\n"
             "    address = sec.start + blob.index(needle)\n"
             "    addresses.append(address)\n"
-            "    bv.define_user_data_var(address, bn.Type.int(1))\n"
+            "    bv.define_data_var(address, bn.Type.int(1))\n"
             + ("bv.define_user_data_var(addresses[0], "
                "bv.parse_type_string('char[0x3]')[0])\n" if pretyped else "")
             + "bv.update_analysis_and_wait()\n"
@@ -4872,6 +4878,22 @@ class TestLiteralRetypeAdvice1023:
         result = shared_bn.json("decompile", "hash_words")
         assert not any(row["code"] == "string" for row in result["warning_rows"]), result
         assert "bn data retype" not in shared_bn.run("decompile", "hash_words").stdout
+
+    def test_local_retype_parameter_counts_without_whole_prototype(
+            self, shared_bn, unicode_literal_binary):
+        shared_bn.load(unicode_literal_binary)
+        parameter = shared_bn.json("py", "exec", "--code",
+            "f = bv.get_functions_by_name('consume_void')[0]\n"
+            "result = f.parameter_vars[0].name\n")["result"]
+        mutation = shared_bn.json("local", "retype", "consume_void", parameter, "char const*")
+        assert mutation["results"][0]["status"] == "verified", mutation
+        evidence = shared_bn.json("py", "exec", "--code",
+            "f = bv.get_functions_by_name('consume_void')[0]\n"
+            "result = [f.has_user_type, f.is_var_user_defined(f.parameter_vars[0])]\n")["result"]
+        assert evidence == [False, True], evidence
+        result = shared_bn.json("decompile", "call_consume")
+        strings = [s for row in result["warning_rows"] for s in row.get("strings", [])]
+        assert [s["value"] for s in strings] == ["’"], result
 
 
 class TestOffsetTypeLookup1000:
