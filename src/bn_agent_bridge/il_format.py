@@ -11,7 +11,7 @@ binaryninja + ``._shared`` + the ``vars`` module. It must NOT import ``bridge``,
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 try:
     import binaryninja as bn
@@ -628,12 +628,27 @@ def _extract_format_literal(text: str) -> str | None:
     return None
 
 
-def _count_format_conversions(fmt: str, *, is_scanf: bool) -> int:
-    """Count the argument-consuming conversion specifiers in a printf/scanf format
-    string. ``%%`` is skipped; a scanf ``%*`` (assignment suppression) consumes no
-    pointer. Heuristic (width ``%*`` in printf and exotic specifiers are not modeled)
-    -- used only to estimate an expected argument count, never asserted as fact."""
-    count = 0
+class FormatSpec(NamedTuple):
+    """One ``%`` conversion of a printf/scanf format string.
+
+    ``width`` is the literal maximum field width, or None when none is written
+    (a scanf ``%s``/``%[`` with no width reads an unbounded token);
+    ``allocates`` is the scanf ``m`` modifier (the callee allocates the
+    destination, so no width is needed); ``positional`` is a POSIX ``%n$``
+    spec, whose argument is not the next one in order."""
+    conv: str
+    width: int | None
+    suppressed: bool
+    allocates: bool
+    positional: bool
+
+
+def _format_specs(fmt: str, *, is_scanf: bool) -> list[FormatSpec]:
+    """Tokenize the conversion specifiers of a printf/scanf format string.
+    ``%%`` is skipped; a scanf ``%*`` (assignment suppression) is reported with
+    ``suppressed``. Heuristic (width ``%*`` in printf and exotic specifiers are
+    not modeled)."""
+    specs: list[FormatSpec] = []
     i, n = 0, len(fmt)
     while i < n:
         if fmt[i] != "%":
@@ -645,8 +660,23 @@ def _count_format_conversions(fmt: str, *, is_scanf: bool) -> int:
         if fmt[i] == "%":          # literal %%
             i += 1
             continue
-        suppressed = is_scanf and fmt[i] == "*"
+        positional = False
+        start = i
+        while i < n and fmt[i].isdigit():
+            i += 1
+        if is_scanf and i < n and fmt[i] == "$" and i > start:
+            positional = True
+            i += 1
+            start = i
+        suppressed = is_scanf and i < n and fmt[i] == "*"
         if suppressed:
+            i += 1
+            start = i
+        while i < n and fmt[i].isdigit():
+            i += 1
+        width = int(fmt[start:i]) if i > start and fmt[start:i].isdigit() else None
+        allocates = is_scanf and i < n and fmt[i] == "m"
+        if allocates:
             i += 1
         while i < n and (fmt[i].isdigit() or fmt[i] in _FORMAT_LENGTH_MODS):
             i += 1
@@ -664,9 +694,36 @@ def _count_format_conversions(fmt: str, *, is_scanf: bool) -> int:
             i += 1
         else:
             i += 1
-        if not suppressed:
-            count += 1
-    return count
+        specs.append(FormatSpec(conv, width, suppressed, allocates, positional))
+    return specs
+
+
+def _count_format_conversions(fmt: str, *, is_scanf: bool) -> int:
+    """Count the argument-consuming conversion specifiers in a printf/scanf format
+    string -- used only to estimate an expected argument count, never asserted
+    as fact."""
+    return sum(1 for spec in _format_specs(fmt, is_scanf=is_scanf) if not spec.suppressed)
+
+
+def unbounded_scanf_strings(fmt: str) -> list[tuple[int, str]] | None:
+    """The scanf conversions in *fmt* that write an input token of unbounded
+    length (#1041 item 4): ``%s`` / ``%[...]`` with no field width and no ``m``
+    allocation modifier. Returns ``(k, spec_text)`` per such conversion, ``k``
+    being its 0-based position among the assigning conversions -- the offset of
+    its destination from the first destination argument. None when the format
+    uses POSIX ``%n$`` positions, which do not consume arguments in order."""
+    specs = _format_specs(fmt, is_scanf=True)
+    if any(spec.positional for spec in specs):
+        return None
+    out: list[tuple[int, str]] = []
+    k = 0
+    for spec in specs:
+        if spec.suppressed:
+            continue
+        if spec.conv in ("s", "[") and spec.width is None and not spec.allocates:
+            out.append((k, "%s" if spec.conv == "s" else "%["))
+        k += 1
+    return out
 
 
 def _format_hlil_tree(ins, indent=0, *, _else_prefix=False, addresses: bool = True):

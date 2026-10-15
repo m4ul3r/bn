@@ -1,0 +1,17 @@
+{
+  "description": "#1041 item 4: a scanf-family %s / %[ conversion with no field width is an overflow_unbounded sink. fscanf's input is a stream, so it fires unconditionally like gets() (no --source attribution); sscanf fires only while its input string (arg 0) is tainted. A width (%63[^\\n]) or an untainted constant input string is never a sink. Built with glibc's default C99 spellings (__isoc99_*).",
+  "lang": "c",
+  "forward": [
+    {"function": "load_line", "source": "param:0",
+     "sinks": [{"callee": "__isoc99_fscanf", "class": "overflow_unbounded", "arg": null}],
+     "assumptions_contain": ["unconditional overflow_unbounded sink", "%[ into arg2"]},
+    {"function": "parse_reply", "source": "call:read",
+     "sinks": [{"callee": "__isoc99_sscanf", "class": "overflow_unbounded", "arg": 0}]}
+  ],
+  "negative": [
+    {"function": "load_line_bounded", "source": "param:0",
+     "forbid_sink_classes": ["overflow_unbounded"]},
+    {"function": "parse_constant", "source": "call:read",
+     "forbid_sink_classes": ["overflow_unbounded"]}
+  ]
+}

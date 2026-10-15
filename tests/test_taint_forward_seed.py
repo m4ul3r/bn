@@ -14,8 +14,11 @@ import shlex
 import pytest
 
 from test_taint_engine import (  # noqa: F401 -- `models` is a fixture
-    FBV, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar, _slot_recv_func, models, te,
+    FBV, FBVStr, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar, _slot_recv_func, models, te,
 )
+from bn_agent_bridge import il_format
+from bn_agent_bridge.read_taint_models import build_catalog
+from bn_agent_bridge.taint_models import _validate_model_interior
 
 
 def _var(ssa, text=None):
@@ -175,3 +178,88 @@ def test_resolve_map_name_without_a_resolver_is_refused_not_guessed_1041(models)
     _dispatch, bv = _dispatch_program()
     with pytest.raises(te.TaintError, match="must be addresses"):
         te.TaintEngine(bv, models, resolve_map={"0x70c": ["run_sys"]})
+
+
+# --------------------------------------------------------------------------
+# #1041 item 4: width-less scanf string conversions are sinks
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("fmt", "unbounded"), [
+    ("%[^\n]", [(0, "%[")]),
+    ("%63[^\n]", []),               # a width bounds the token
+    ("%d %s", [(1, "%s")]),         # the offset counts the %d destination
+    ("%*s %s", [(0, "%s")]),        # a suppressed conversion has no destination
+    ("%ms", []),                    # the callee allocates the destination
+    ("%%s %c %s", [(1, "%s")]),     # %% is literal; %c is not a string read
+    ("%1$s", None),                 # positions do not consume in order
+])
+def test_unbounded_scanf_strings_names_the_destination_offset_1041(fmt, unbounded):
+    assert il_format.unbounded_scanf_strings(fmt) == unbounded
+
+
+def _sscanf_program(fmt, *, input_tainted=True):
+    """`n = read(fd, &msg, ..)` (or not), then `sscanf(&msg, fmt, &code, &name)`."""
+    fd, msg, code, name, n = (FVar(s) for s in ("fd", "msg", "code", "name", "n"))
+    n1 = FSSA(n, 1)
+    fmt_arg = (FExpr("MLIL_CONST_PTR", repr(fmt), constant=0x5000) if fmt is not None
+               else FExpr("MLIL_VAR_SSA", "fmt#0", reads=[FSSA(FVar("fmt"), 0)]))
+    instrs = [
+        FInstr(0, 0x100, "MLIL_CALL_SSA", "n#1 = read(fd#0, &msg, 0x40)", writes=[n1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[_var(FSSA(fd, 0)), FExpr("MLIL_ADDRESS_OF", "&msg", src=msg),
+                       _const(0x40)]),
+        FInstr(1, 0x104, "MLIL_CALL_SSA", "sscanf(&msg, fmt, &code, &name)",
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_ADDRESS_OF", "&msg", src=msg if input_tainted else FVar("other")),
+                       fmt_arg,
+                       FExpr("MLIL_ADDRESS_OF", "&code", src=code),
+                       FExpr("MLIL_ADDRESS_OF", "&name", src=name)]),
+    ]
+    bv = FBVStr({0x900: "read", 0x901: "sscanf"}, strings={0x5000: fmt} if fmt else {})
+    return FFunc("parse_reply", 0x100, FSSAFunc(instrs), params=[fd]), bv
+
+
+def _format_sinks(result):
+    return [s["sink"] for s in result["reached_sinks"] if s["sink"].get("format_conversions")]
+
+
+def test_sscanf_width_less_string_into_a_tainted_input_is_a_sink_1041(models):
+    func, bv = _sscanf_program("%d %s")
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:read")])
+
+    [sink] = _format_sinks(result)
+    assert (sink["class"], sink["tainted_arg_index"]) == ("overflow_unbounded", 0)
+    assert sink["format_conversions"] == [{"conversion": "%s", "dest_arg": 3}]
+
+
+@pytest.mark.parametrize(("fmt", "input_tainted"), [
+    ("%d %15s", True),     # bounded by a width
+    ("%d %s", False),      # the input string is not the tainted buffer
+])
+def test_sscanf_bounded_or_untainted_is_not_a_sink_1041(models, fmt, input_tainted):
+    func, bv = _sscanf_program(fmt, input_tainted=input_tainted)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:read")])
+
+    assert _format_sinks(result) == []
+
+
+def test_sscanf_unreadable_format_is_disclosed_not_guessed_1041(models):
+    func, bv = _sscanf_program(None)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:read")])
+
+    assert _format_sinks(result) == []
+    assert any("is not a constant string" in a and "width-less" in a
+               for a in result["assumptions"]), result["assumptions"]
+
+
+def test_format_gated_sink_is_listed_with_its_condition_1041():
+    [entry] = [e for e in build_catalog(te.load_models(), role="sink")["sinks_by_class"]
+               ["overflow_unbounded"] if e["symbol"] == "sscanf"]
+    assert "constant format (argument 1)" in entry["model_description"]
+    assert "argument 0 is tainted" in entry["model_description"]
+
+
+def test_format_arg_without_first_dest_is_refused_1041():
+    with pytest.raises(te.TaintError, match="first_dest"):
+        _validate_model_interior("my_scanf", {"sink": {"class": "overflow_unbounded",
+                                                       "format_arg": 0}}, "--models x.json")

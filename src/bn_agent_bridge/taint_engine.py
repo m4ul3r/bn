@@ -69,7 +69,7 @@ from . import taint_il as _taint_il_mod  # noqa: F401
 from . import taint_locators as _taint_locators_mod  # noqa: F401
 from . import taint_models as _taint_models_mod  # noqa: F401
 from . import taint_result as _taint_result_mod  # noqa: F401
-from .il_format import _display_name, _variadic_determination
+from .il_format import _display_name, _variadic_determination, unbounded_scanf_strings
 from .taint_models import _model_copy_roles
 
 
@@ -4204,7 +4204,8 @@ class TaintEngine:
                 f"va_list (e.g. a v*printf call), or seed `bn taint forward` inside it.")
 
     def _descend(self, ins: Any, callee_fn: Any, tainted_args: dict, why: dict,
-                 depth: int, max_depth: int, *, via: str | None = None) -> dict[str, Any]:
+                 depth: int, max_depth: int, *, via: str | None = None,
+                 caller_instrs: list | None = None) -> dict[str, Any]:
         """Recurse into a (direct or resolved-indirect) internal callee and return
         its findings with a caller-side path prefix prepended, plus whether it
         propagates taint to its return.
@@ -4296,7 +4297,57 @@ class TaintEngine:
         out["reached_return"] = sub["reached_return"]
         out["out_params"] = sub.get("out_params", frozenset())
         out["out_param_elems"] = sub.get("out_param_elems", frozenset())
+        if not sub["reached_return"]:
+            lost = self._valueless_return_leaf(ins, callee_fn, tainted_args, caller_instrs)
+            if lost is not None:
+                out["leaves"].append(lost)
         return out
+
+    def _valueless_return_leaf(self, ins: Any, callee_fn: Any, tainted_args: dict,
+                               caller_instrs: list | None) -> dict[str, Any] | None:
+        """#1034 item 5: a frontier where BN's recovered IL cannot say whether a
+        tainted argument reaches the callee's return.
+
+        On AArch64 `long ident(long v) { return v; }` is a bare `ret` that leaves
+        x0 unchanged, and BN recovers it as `return` with no operand. Taint then
+        found no tainted return and the caller's flow vanished into a confident
+        all-clear, though the x86-64 build of the same source reports the sinks.
+        No guess about the register is made here; two facts BN itself reports
+        are compared after the walk: every return of the callee carries no value,
+        while the call site consumes one -- BN gave the call an output, or it is
+        a tail call from a function whose own returns carry a value. Then the
+        flow is unknown, and a frontier says so instead of a clean result."""
+        try:
+            callee_instrs = self._instrs(self._ssa_func(callee_fn))
+        except TaintError:
+            return None
+        rets = [i for i in callee_instrs if op_name(i) == "MLIL_RET"]
+
+        def operands(ret: Any) -> list:
+            srcs = getattr(ret, "src", None)
+            if not isinstance(srcs, (list, tuple)):
+                srcs = [] if srcs is None else [srcs]
+            return list(srcs)
+
+        if not rets or any(operands(r) for r in rets):
+            return None
+        if ssa_writes(ins):
+            consumer = "the call's result is used"
+        elif "TAILCALL" in op_name(ins) and any(
+                op_name(i) == "MLIL_RET" and operands(i) for i in caller_instrs or []):
+            consumer = "it is tail-called by a function that returns a value"
+        else:
+            return None
+        at = hex(int(getattr(callee_fn, "start", 0)))
+        leaf = self._frontier_leaf(
+            ins, callee_fn, tainted_args,
+            f"tainted arg(s) {sorted(tainted_args)} passed to "
+            f"{self._prose_function(callee_fn)}, whose returns Binary Ninja recovered "
+            f"with no value, while {consumer}: whether the arguments reach that value "
+            f"is unknown (a register the body leaves unchanged is not modeled) -- read "
+            f"the body with `bn disasm {at}`")
+        leaf["cause"] = "return_value_unrecovered"
+        return leaf
 
     def _unrecovered_arg_frontier(self, ins: Any, tainted: set) -> dict[str, Any] | None:
         """Honest frontier for the #381 silent drop. When a tainted value sits in
@@ -4756,6 +4807,81 @@ class TaintEngine:
                              "callee_variadic": variadic, "recovery_advice": advice,
                              "class_from": "recovered_args" if argidx < len(params) else "model"}
 
+            def format_gated_sink(sink: dict[str, Any]) -> bool:
+                """#1041 item 4: a scanf-family `%s`/`%[` conversion with no
+                width writes an input token of any length into its destination.
+                Armed only by what the CONSTANT format says -- never guessed
+                from a format the engine cannot read, which is disclosed instead
+                -- and, when the model names `tainted_args` (sscanf's input
+                string), only while that input is tainted. Without them the
+                input is a stream or stdin and the sink is unconditional, like
+                gets(): each named destination is injected as an unconditional
+                root, so flows out of it are not attributed to --source."""
+                fa, first = int(sink["format_arg"]), int(sink["first_dest"])
+                prose = self._prose_name(mkey or name or "?")
+                gate_hit: list = []
+                gate_idx = None
+                for gi in sink.get("tainted_args") or []:
+                    if gi < len(params):
+                        gate_hit = arg_taint(params[gi])
+                        if gate_hit:
+                            gate_idx = gi
+                            break
+                if sink.get("tainted_args") and not gate_hit:
+                    return False
+                if fa >= len(params):
+                    return False
+                usig = (addr, "format") if site_taddr is None else (addr, "format", site_taddr)
+                if usig in recorded_sinks:
+                    return False
+                fmt = self._const_format_string(ssaf, params[fa])
+                convs = unbounded_scanf_strings(fmt) if fmt is not None else None
+                if convs is None:
+                    recorded_sinks.add(usig)
+                    why_not = ("is not a constant string" if fmt is None
+                               else "uses POSIX %n$ positions")
+                    add_assumption(
+                        f"{prose}() at {hex(addr)}: its format (arg{fa}) {why_not}, so "
+                        f"its conversions were not checked for a width-less %s/%[")
+                    return False
+                if not convs:
+                    recorded_sinks.add(usig)
+                    return False
+                recorded_sinks.add(usig)
+                dests = [{"conversion": spec, "dest_arg": first + k} for k, spec in convs]
+                listed = ", ".join(f"{d['conversion']} into arg{d['dest_arg']}" for d in dests)
+                eff = {**sink, "format_conversions": dests,
+                       "detail": (f"width-less conversion(s) in the constant format write an "
+                                  f"input token of unbounded length: {listed}")}
+                if gate_idx is not None:
+                    findings.append(_tag_unconditional_flow(
+                        self._make_finding(ins, mkey or name, gate_idx, eff, gate_hit, why),
+                        gate_hit))
+                    return False
+                hit_nodes = []
+                grew = False
+                for d in dests:
+                    di = d["dest_arg"]
+                    dest = (self._buffer_target(ssaf, params[di]) if di < len(params) else None)
+                    if dest is not None:
+                        node, lbl = (dest[0], None), dest[1]
+                    else:
+                        node = (("name", f"{mkey or name}_arg{di}@{hex(addr)}"), None)
+                        lbl = var_label_of(node)
+                    if taint_node(node, lbl, ins,
+                                  f"{mkey or name}(): width-less {d['conversion']} reads an "
+                                  f"unbounded token", []):
+                        grew = True
+                    unconditional_roots.add(node)
+                    hit_nodes.append(node)
+                add_assumption(
+                    f"{prose}(): unconditional {sink.get('class') or '?'} sink at {hex(addr)} "
+                    f"independently of --source ({listed}; the finding does not require any "
+                    f"tracked taint to reach this call)")
+                findings.append(_tag_unconditional_flow(
+                    self._make_finding(ins, mkey or name, None, eff, hit_nodes, why), hit_nodes))
+                return grew
+
             sink = model.get("sink")
             # opt-in sinks (e.g. file_write) stay silent unless their gate was
             # enabled for this run; still a "modeled" call, so no fallback noise.
@@ -4767,6 +4893,10 @@ class TaintEngine:
                 _gate = sink.get("gate") or sink.get("class")
                 if _gate not in self._enabled_sink_classes:
                     sink = None
+            if sink is not None and sink.get("format_arg") is not None:
+                if format_gated_sink(sink):
+                    changed = True
+                sink = None
             if sink is not None:
                 # #615/review F3: an unconditional sink is one whose arming fields
                 # are BOTH empty -- no `tainted_args` and no `len_arg` -- independent
@@ -5548,7 +5678,8 @@ class TaintEngine:
                             if mchanged:
                                 changed = True
                         if descend_internal:
-                            d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth, via=via)
+                            d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth,
+                                              via=via, caller_instrs=instrs)
                             # Round-3 blocker: `_descend`'s rebuild strips per-finding
                             # taint-graph context, so a finding's provenance can only be
                             # re-checked HERE, against the CALLER's own why-chain, using
@@ -6569,6 +6700,7 @@ class TaintEngine:
                 "class": sink.get("class"),
                 "detail": sink.get("detail"),
                 **({"format_constant": sink["format_constant"]} if sink.get("format_constant") is not None else {}),
+                **({"format_conversions": sink["format_conversions"]} if sink.get("format_conversions") else {}),
                 **({"source_bound": sink["source_bound"]} if sink.get("source_bound") else {}),
                 **({"via": sink["via"]} if sink.get("via") else {}),
                 # A model-declared argument was dropped, whether the tainted

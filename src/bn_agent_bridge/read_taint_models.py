@@ -49,6 +49,14 @@ def _sink_model_description(cls: str, sink: dict[str, Any]) -> str:
     if _la is not None and _la not in _args:
         _args.insert(0, f"{_la} (length)")
     phrase = _arg_phrase(_args)
+    if sink.get("format_arg") is not None:
+        # #1041 item 4: armed by the constant format, not by an argument alone.
+        cond = (f"the constant format (argument {sink['format_arg']}) has a %s/%[ "
+                f"conversion with no field width")
+        if phrase is not None:
+            verb = "is" if " or " not in phrase else "are"
+            cond += f" and {phrase} {verb} tainted"
+        return f"{cls} sink -- flagged as a finding ONLY IF {cond} at a callsite"
     if phrase is None:
         # No tainted-arg condition (e.g. gets()): still a catalog entry, not a finding.
         return f"{cls} sink -- catalog entry (always-unsafe API); not a finding by itself"
