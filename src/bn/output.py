@@ -543,12 +543,6 @@ def _artifact_payload(
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "summary": _summary(value),
     }
-    # Writing the payload to an artifact does not turn its operation into a
-    # success. Preserve explicit failure status and its cause on the envelope.
-    if isinstance(value, dict) and value.get("ok") is False:
-        payload["ok"] = False
-        if "error" in value:
-            payload["error"] = value["error"]
     # #653.8: WHICH target/instance produced this artifact. Two agents sharing a
     # scratchpad both wrote `fns.json`; one silently read the other's list -- a
     # different target, a different binary -- and concluded its own name recovery
@@ -580,8 +574,6 @@ def render_artifact_envelope(payload: dict[str, Any]) -> str:
     lines = []
     if "ok" in payload:
         lines.append(f"ok: {str(bool(payload.get('ok'))).lower()}")
-    if "error" in payload:
-        lines.append(f"error: {_format_envelope_value(payload['error'])}")
     # #796: a preflight ESTIMATE is not an artifact. It reuses this envelope
     # (bytes/tokens/tokenizer/rerun/summary all mean the same thing) but wrote
     # nothing, so it says so instead of carrying a path that does not exist --

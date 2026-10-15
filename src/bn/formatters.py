@@ -7251,14 +7251,30 @@ def _render_skill_install_text(value: Any) -> str:
     not_updated_paths = [identity(row.get("destination")) for row in not_updated]
     up_to_date = [dest for dest in skipped if identity(dest) not in not_updated_paths]
 
+    def advice_row(dest: Any) -> dict[str, Any] | None:
+        exact = next((row for row in force_plan if row.get("destination") == dest), None)
+        if exact is not None:
+            return exact
+        matches = [row for row in force_plan
+                   if _text_value(row, "destination_id") == identity(dest)]
+        if matches and all(row.get("detail") == matches[0].get("detail") for row in matches):
+            return matches[0]
+        return None
+
     def force_detail(dest: Any) -> str:
-        key = identity(dest)
-        row = next(
-            (row for row in force_plan if _text_value(row, "destination_id") == key), None
-        )
-        if row is None:
-            return ""
-        return f"; --force: {row.get('detail')}"
+        row = advice_row(dest)
+        return f"; --force: {row.get('detail')}" if row is not None else ""
+
+    # A normalized installed path can name several displayed roots. If their
+    # advice differs, keep those roots separate instead of choosing one remedy.
+    installed_display = []
+    for dest in installed:
+        matches = [row for row in force_plan
+                   if _text_value(row, "destination_id") == identity(dest)]
+        if matches and advice_row(dest) is None:
+            installed_display.extend(row.get("destination") for row in matches)
+        else:
+            installed_display.append(dest)
 
     lines = []
     error = _text_value(value, "error")
@@ -7267,7 +7283,7 @@ def _render_skill_install_text(value: Any) -> str:
 
     if installed:
         lines.append(f"Installed skills ({value.get('mode', 'unknown')}):")
-        lines.extend(f"- {dest}{force_detail(dest)}" for dest in installed)
+        lines.extend(f"- {dest}{force_detail(dest)}" for dest in installed_display)
     elif not not_updated:
         lines.append("Skills already installed.")
 
@@ -7283,8 +7299,15 @@ def _render_skill_install_text(value: Any) -> str:
             f"- {row.get('destination')} ({row.get('detail')})"
             f"{force_detail(row.get('destination'))}" for row in not_updated
         )
-    listed = [identity(dest) for dest in installed + skipped]
-    other = [row for row in force_plan if _text_value(row, "destination_id") not in listed]
+    listed = [
+        (identity(dest), row.get("detail"))
+        for dest in installed_display + skipped
+        if (row := advice_row(dest)) is not None
+    ]
+    other = [
+        row for row in force_plan
+        if (_text_value(row, "destination_id"), row.get("detail")) not in listed
+    ]
     if other:
         lines.append("Other destinations (--force dry run):")
         lines.extend(

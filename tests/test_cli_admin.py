@@ -5444,8 +5444,9 @@ def test_skill_recovery_never_unlinks_a_configuration_ancestor(
     assert (skills_root / source.name / "SKILL.md").read_text() == "legacy copy with local edits"
 
 
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
 def test_spilled_explicit_skill_refusal_preserves_error_status(
-    tmp_path, tmp_path_factory, monkeypatch, capsys
+    tmp_path, tmp_path_factory, monkeypatch, capsys, fmt
 ):
     from pathlib import Path
 
@@ -5465,7 +5466,7 @@ def test_spilled_explicit_skill_refusal_preserves_error_status(
     monkeypatch.setenv("BN_CACHE_DIR", str(cache))
     monkeypatch.setenv("BN_SPILL_TOKENS", "100")
     assert bn.cli.main([
-        "skill", "install", "--dest", str(store), "--format", "json",
+        "skill", "install", "--dest", str(store), "--format", fmt,
         "--out", str(requested),
     ]) == 2
     envelope = json.loads(capsys.readouterr().out)
@@ -5512,3 +5513,84 @@ def test_skill_install_text_joins_destination_spellings_once(
     assert len(rows) == 1
     assert f"store/{source.name}" in rows[0]
     assert "; --force:" in rows[0]
+
+
+@pytest.mark.parametrize("state", ["edited", "read_only"])
+@pytest.mark.parametrize("relative", [False, True])
+def test_aliased_skill_roots_keep_their_own_recovery_advice(
+    tmp_path, monkeypatch, capsys, state, relative
+):
+    from pathlib import Path
+    import subprocess
+
+    if state == "read_only" and os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses the permission this case denies")
+    source, destination = _one_skill_source(tmp_path, monkeypatch)
+    claude_root = destination.parent
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    codex_root = codex_home / "skills"
+    codex_root.symlink_to(claude_root)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_root)
+    claude_display = claude_root
+    if relative:
+        monkeypatch.chdir(tmp_path)
+        claude_display = Path("claude/skills")
+        monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_display)
+    if state == "edited":
+        destination.mkdir()
+        (destination / "SKILL.md").write_text("local edits in ordinary root")
+    else:
+        source.chmod(0o555)
+    try:
+        argv = ["skill", "install", "--mode", "copy"]
+        expected_rc = 1 if state == "edited" else 0
+        assert bn.cli.main(argv) == expected_rc
+        text = capsys.readouterr().out
+        assert bn.cli.main(argv + ["--format", "json"]) == expected_rc
+        plan = json.loads(capsys.readouterr().out)["force_plan"]
+        first, second = plan
+        assert first["destination_id"] == second["destination_id"]
+        assert first["detail"] != second["detail"]
+        expected = {row["destination"]: row["detail"] for row in plan}
+        assert str(claude_display / source.name) in expected
+        assert str(codex_root / source.name) in expected
+        assert len([line for line in text.splitlines() if line.startswith("- ")]) == 2
+        positions = sorted((text.index(f"- {dest}"), dest) for dest in expected)
+        blocks = {}
+        for index, (start, dest) in enumerate(positions):
+            end = positions[index + 1][0] if index + 1 < len(positions) else len(text)
+            blocks[dest] = text[start:end]
+            assert expected[dest] in blocks[dest]
+        ordinary = blocks[str(claude_display / source.name)]
+        linked = blocks[str(codex_root / source.name)]
+        assert "Recovery command:" not in ordinary
+        [command] = [
+            line.removeprefix("Recovery command: ")
+            for line in linked.splitlines() if line.startswith("Recovery command: ")
+        ]
+        before = _install_disk_snapshot(claude_root)
+        subprocess.run(command, shell=True, check=True, env=os.environ.copy())
+        assert not codex_root.is_symlink()
+        assert _install_disk_snapshot(claude_root) == before
+    finally:
+        source.chmod(0o755)
+        if destination.exists():
+            destination.chmod(0o755)
+
+
+@pytest.mark.parametrize("mode", ["symlink", "copy"])
+def test_canceled_missing_component_keeps_destination_entry_identity(
+    tmp_path, monkeypatch, capsys, mode
+):
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    assert bn.cli.main(["skill", "install", "--dest", "store", "--mode", mode]) == 0
+    capsys.readouterr()
+    assert bn.cli.main([
+        "skill", "install", "--dest", "store/missing/..", "--mode", mode, "--format", "json",
+    ]) == 2
+    [row] = json.loads(capsys.readouterr().out)["force_plan"]
+    assert row["destination_id"] == str(tmp_path / "store" / source.name)
+    assert row["destination_id"] != str(source)
