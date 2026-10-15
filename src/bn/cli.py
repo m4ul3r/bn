@@ -2297,14 +2297,22 @@ def _call(
         default=op_default_timeout if op_default_timeout is not None else DEFAULT_REQUEST_TIMEOUT,
     )
     deadline = time.monotonic() + budget if budget is not None else None
-    response = send_request(
-        op,
-        params=request_params,
-        target=target,
-        instance_id=getattr(args, "instance", None),
-        spawn_missing_named=spawn_missing_named,
-        **timeout_kwargs,
-    )
+    try:
+        response = send_request(
+            op,
+            params=request_params,
+            target=target,
+            instance_id=getattr(args, "instance", None),
+            spawn_missing_named=spawn_missing_named,
+            **timeout_kwargs,
+        )
+    except BridgeError as exc:
+        if contextual_hints:
+            routed = _contextualize_diagnostic_hints(
+                {"error": str(exc)}, target=target,
+                instance=getattr(args, "instance", None))
+            exc.args = (routed["error"],)
+        raise
     if contextual_hints:
         response = _contextualize_diagnostic_hints(
             response, target=target, instance=getattr(args, "instance", None))

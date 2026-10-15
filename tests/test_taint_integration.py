@@ -376,3 +376,5 @@ int main(int argc, char **argv) {
         and s["sink"]["tainted_arg_index"] == 2
         for s in result["reached_sinks"]
     ), result
+    assert result["stats"]["functions_visited"] == 3, result
+    assert not any("has no model" in a for a in result["assumptions"]), result
