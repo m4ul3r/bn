@@ -1525,20 +1525,15 @@ def _callee_split_notes(bv, func) -> list[dict[str, Any]]:
 
 _SHORT_STRING_MAX = 64
 _STRING_NOTE_LISTED_MAX = 8
-# Below three characters, untyped byte previews are too noisy (#985).
+# Below three bytes, untyped byte previews are too noisy (#985).
 # This is only a display threshold, never evidence that bytes are a string.
 _UNTYPED_STRING_MIN = 3
 _CHAR_POINTER_RE = re.compile(r"^(?:const\s+)?(?:(?:un)?signed\s+)?char\b[^*]*\*(?:\s*const)?$")
 
 # Narrow `char *` parameter positions of C library functions, keyed by the
 # `il_format._normalize_libc_name` spelling (`__isoc99_sscanf`, `strcmp@plt`
-# and `_strcmp` all land on one key). The fallback for an import BN has no
-# type for (#994 item 2): BN's aarch64 libc type library has no `strcmp`, so
-# `strcmp(arg2, "C")` rendered `0x661bd8` with no note while the identical
-# call on a typed import rendered the literal. A curated list rather than a
-# heuristic because the name is the whole witness: only a callee that IS this
-# libc function (an import, or a body whose prototype stops short of the
-# argument) consults it; unknown callees provide no string-type evidence.
+# and `_strcmp` all land on one key). These known APIs provide string intent
+# by name; inferred prototypes and arbitrary type-library signatures do not.
 # The printf/scanf format positions are NOT repeated here: they are
 # `il_format._VARIADIC_FORMAT_FAMILY`'s, read through `_variadic_format_family`,
 # so the two tables cannot disagree.
@@ -1619,90 +1614,44 @@ def _undefined_c_string(bv, address: int, *, min_length: int) -> str | None:
         value = data[:end].decode("utf-8")
     except UnicodeDecodeError:
         return None
-    if len(value) < min_length or not all(
+    if not all(
             c.isprintable() or c in "\t\n\r" or unicodedata.category(c) == "Zs"
             for c in value):
         return None
     return value
 
 
-def _char_pointer_parameter(bv, target: int | None, index: int,
-                            memo: dict[str, Any] | None = None) -> bool:
-    """True when the callee at *target* declares parameter *index* as a narrow
-    `char *`, by its prototype or by its demangled signature. Either may be off
-    by `this` (#955), so agreement from either is enough.
-
-    A callee BN has no prototype for at *index* -- an import (its body is not
-    here, so BN's parameters are a guess) or a prototype that stops short --
-    is looked up by its C library name instead (#994 item 2; see
-    `_libc_char_pointer`). A prototype the analyst applied (`bn proto set`)
-    is never second-guessed by that lookup. *memo* caches the type-library
-    lookups across one read."""
+def _char_pointer_parameter(bv, target: int | None, index: int) -> bool:
+    """String evidence is a user-set parameter type or a known string API."""
     if target is None:
         return False
-    spellings: list[str] = []
     callee = bv.get_function_at(target)
-    params = list(getattr(getattr(callee, "type", None), "parameters", None) or [])
-    if index < len(params):
-        spellings.append(str(getattr(params[index], "type", "")))
+    if bool(getattr(callee, "has_user_type", False)):
+        params = list(getattr(getattr(callee, "type", None), "parameters", None) or [])
+        return index < len(params) and bool(
+            _CHAR_POINTER_RE.match(str(getattr(params[index], "type", "")).strip()))
     symbol = bv.get_symbol_at(target)
-    raw_name = str(getattr(symbol, "raw_name", "") or "")
-    demangle = getattr(bn, "demangle_gnu3", None)
-    if demangle is not None and raw_name.startswith("_Z"):
-        try:
-            demangled_type, _ = demangle(bv.arch, raw_name)
-            dparams = list(getattr(demangled_type, "parameters", None) or [])
-            if index < len(dparams):
-                spellings.append(str(getattr(dparams[index], "type", "")))
-        except Exception:  # noqa: BLE001
-            pass
-    if any(_CHAR_POINTER_RE.match(s.strip()) for s in spellings):
-        return True
-    kind = str(getattr(getattr(symbol, "type", None), "name", ""))
-    untyped = (index >= len(params) or kind in _IMPORT_SYMBOL_KINDS
-               or bool(getattr(callee, "is_thunk", False)))
-    user_typed = bool(getattr(callee, "has_user_type", False))
-    if not untyped or user_typed or not raw_name or raw_name.startswith("_Z"):
-        return False
-    return _libc_char_pointer(bv, raw_name, index, {} if memo is None else memo)
-
-
-def _libc_char_pointer(bv, raw_name: str, index: int, memo: dict[str, Any]) -> bool:
-    """Whether the C library function *raw_name* takes a narrow `char *` at
-    *index*: by `_LIBC_CHAR_POINTER_PARAMS` or the format family's format
-    argument for a name either lists -- both checked against glibc's
-    prototypes, which BN's type library does not always match (its aarch64
-    `setlocale` takes an `int64_t*`) -- else by the platform type library."""
-    name = raw_name.split("@", 1)[0]
+    name = str(getattr(symbol, "raw_name", "") or "").split("@", 1)[0]
     key = il_format._normalize_libc_name(name)
     family = il_format._variadic_format_family(name)
-    if key in _LIBC_CHAR_POINTER_PARAMS or family is not None:
-        return (index in _LIBC_CHAR_POINTER_PARAMS.get(key, ())
-                or (family is not None and family[0] == index))
-    if name not in memo:
-        found = None
-        try:
-            platform = getattr(bv, "platform", None)
-            libraries = list(getattr(platform, "type_libraries", None) or [])
-            libraries += list(getattr(bv, "type_libraries", None) or [])
-            for library in libraries:
-                found = library.get_named_object(name)
-                if found is not None:
-                    break
-        except Exception:  # noqa: BLE001 - no library is not evidence either way
-            found = None
-        memo[name] = list(getattr(found, "parameters", None) or []) if found is not None else None
-    library_params = memo[name]
-    return bool(library_params is not None and index < len(library_params)
-                and _CHAR_POINTER_RE.match(str(getattr(library_params[index], "type", "")).strip()))
+    return (index in _LIBC_CHAR_POINTER_PARAMS.get(key, ())
+            or (family is not None and family[0] == index))
+
+
+def _character_array_capacity(bv: Any, address: int) -> int:
+    """Existing character-array capacity, independent of string evidence."""
+    var = bv.get_data_var_at(address)
+    match = re.fullmatch(
+        r"(?:const\s+)?(?:(?:un)?signed\s+)?char(?:\s+const)?\s*"
+        r"\[\s*(0x[0-9a-fA-F]+|\d+)\s*\]", str(getattr(var, "type", "")).strip())
+    return int(match[1], 16 if match[1].startswith("0x") else 10) if match else 0
 
 
 def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
     """Describe raw call arguments using type facts, never byte length alone.
 
-    A narrow character array data variable or a callee's character-pointer
-    parameter supports naming a string. Otherwise printable NUL-terminated
-    bytes are only a byte preview, even when there are three or more (#1019).
+    Only known string-consuming APIs or user-set character-pointer parameters
+    support string naming. Inferred types and printable bytes do not.
     """
     try:
         mlil = getattr(func, "mlil", None) or getattr(func, "medium_level_il", None)
@@ -1710,7 +1659,6 @@ def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
     except Exception:  # noqa: BLE001
         return None
     found: dict[int, tuple[str, int, bool]] = {}
-    memo: dict[str, Any] = {}
     # Every address the text renders raw, tokenised once rather than searched
     # per operand (#985 review: decompile cost on large functions).
     # BN's placeholder name for untyped data counts too: a library prototype
@@ -1734,11 +1682,7 @@ def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
                 address = int(param.constant)
                 if address in found or (address not in raw and address not in placeholders):
                     continue
-                var = bv.get_data_var_at(address)
-                array_type = str(getattr(var, "type", "")).strip()
-                typed = bool(re.fullmatch(
-                    r"(?:const\s+)?(?:(?:un)?signed\s+)?char(?:\s+const)?\s*\[\s*\d+\s*\]",
-                    array_type)) or _char_pointer_parameter(bv, target, index, memo)
+                typed = _char_pointer_parameter(bv, target, index)
                 value = _undefined_c_string(
                     bv, address, min_length=1 if typed else _UNTYPED_STRING_MIN)
             except Exception:  # noqa: BLE001 - one odd operand must not hide the rest
@@ -1757,8 +1701,11 @@ def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
     previews = [{"address": hex(a), "value": v, "call": hex(c)}
                 for a, (v, c, typed) in found.items() if not typed]
     advice = ""
-    if strings:
-        first = strings[0]
+    undeclared = [row for row in strings
+                  if _character_array_capacity(bv, int(row["address"], 16))
+                  < len(row["value"].encode("utf-8")) + 1]
+    if undeclared:
+        first = undeclared[0]
         size = len(first["value"].encode("utf-8")) + 1
         retype = f"bn data retype {first['address']} 'char[{size}]'"
         advice = f" To declare a character array, use `{retype}`; BN may still render an address."

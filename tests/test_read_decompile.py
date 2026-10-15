@@ -6181,7 +6181,7 @@ def _string_view(memory: bytes, *, semantics="ReadOnlyDataSectionSemantics", str
     """A call `put(x0, 0x402ae0)` to a callee at 0x401100 whose second
     parameter is declared *param_type*, with *memory* at 0x402ae0."""
     section = types.SimpleNamespace(semantics=types.SimpleNamespace(name=semantics))
-    callee = types.SimpleNamespace(type=types.SimpleNamespace(parameters=[
+    callee = types.SimpleNamespace(has_user_type=True, type=types.SimpleNamespace(parameters=[
         types.SimpleNamespace(type="void*"), types.SimpleNamespace(type=param_type)]))
     bv = types.SimpleNamespace(
         get_string_at=lambda a: string,
@@ -6867,7 +6867,8 @@ def test_a_short_literal_to_an_untyped_libc_import_is_named_994(kwargs):
     # Not a C library name: no type evidence for a short literal.
     {"name": "frob_lookup"},
     # A body here whose own prototype covers the argument: BN's type stands.
-    {"name": "strcmp", "kind": "FunctionSymbol", "params": ("char const*", "int64_t")},
+    {"name": "strcmp", "kind": "FunctionSymbol", "params": ("char const*", "int64_t"),
+     "user_typed": True},
     # A prototype the analyst set on the import (`bn proto set`) wins.
     {"name": "strcmp", "params": ("int64_t", "int64_t"), "user_typed": True},
     # A name only a type library knows, typed there as no `char *`.
@@ -6878,12 +6879,12 @@ def test_a_short_literal_needs_a_char_pointer_from_somewhere_994(kwargs):
     assert read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT) is None
 
 
-def test_the_platform_type_library_types_an_untyped_import_994():
+def test_library_character_parameter_alone_is_not_string_evidence():
     library = types.SimpleNamespace(parameters=[
         types.SimpleNamespace(type="int32_t"), types.SimpleNamespace(type="char const*")])
     bv, func = _libc_string_view(b"C\0", name="locale_hook", library=library)
     note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
-    assert note is not None and '"C"' in note["summary"]
+    assert note is None
 
 
 def test_a_literal_bn_renders_as_a_data_placeholder_is_named_994():
@@ -6914,16 +6915,27 @@ def test_memcmp_bytes_are_not_claimed_as_strings_1019(argument, data_type):
     assert "bn data retype" not in note["summary"] + note["detail"]
 
 
-@pytest.mark.parametrize("data_type", ["char[2]", "char const[2]", "const char[2]"])
-@pytest.mark.parametrize("argument", ["0x402ae0", "&data_402ae0"])
-def test_character_array_type_names_a_short_literal_1019(data_type, argument):
-    bv, func = _string_view(b"C\0")
+@pytest.mark.parametrize("data_type", ["char[3]", "char[0x3]", "const char[0x3]"])
+def test_declared_character_array_suppresses_retype_advice(data_type):
+    bv, func = _libc_string_view("٬".encode() + b"\0", name="strcmp")
     bv.get_data_var_at = lambda a: types.SimpleNamespace(type=data_type)
-    note = read_decompile._raw_string_pointer_note(bv, func, f"put(x0, {argument});")
-    assert note is not None and note["code"] == "string"
-    assert note["address"] == "0x4023dc"
-    assert note["strings"] == [{"address": "0x402ae0", "value": "C", "call": "0x4023dc"}]
-    assert note["bytes"] == []
+    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
+    assert note["strings"][0]["value"] == "٬"
+    assert "bn data retype" not in note["detail"] + note["summary"]
+
+
+@pytest.mark.parametrize("user_typed", [False, True])
+def test_inferred_char_pointer_is_not_string_evidence(user_typed):
+    bv, func = _libc_string_view(
+        b"\xe2\x80\x99\0" + b"\1\0\0\0\2\0\0\0\3\0\0\0",
+        name="opaque_hash", kind="FunctionSymbol",
+        params=("int32_t", "char*"), user_typed=user_typed)
+    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
+    assert note["code"] == ("string" if user_typed else "bytes")
+    if not user_typed:
+        assert note["strings"] == []
+        assert note["bytes"][0]["value"] == "’"
+        assert "bn data retype" not in note["detail"] + note["summary"]
 
 
 @pytest.mark.parametrize("value", [" ", "’", "٬", "é", "😀"])
