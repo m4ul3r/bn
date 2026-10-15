@@ -28,6 +28,7 @@ reader for an out-of-range window.
 """
 from __future__ import annotations
 
+import os
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -75,6 +76,14 @@ class ElfDynamicInfo:
     # Dynamic symbol name -> the verneed library its version binds it to. Only
     # names with ONE library: a name versioned against two is not attributed.
     import_libraries: dict[str, str] = field(default_factory=dict)
+    # ELF e_machine, so a library read for attribution can be checked against
+    # the binary it is read for.
+    machine: int | None = None
+    # Names this file's dynamic symbol table DEFINES and exports to other
+    # modules (global/weak/unique binding, default/protected visibility). Only
+    # filled when `parse_elf_dynamic(..., with_exports=True)`; None when the
+    # table could not be read, so "exports nothing" is never a guess.
+    exports: frozenset[str] | None = None
     # Why part of the dynamic section was not parsed: a value out of range for
     # this file, so that part is skipped rather than guessed. Empty when the
     # whole answer was read.
@@ -128,24 +137,29 @@ class _Elf:
         return data[:end].decode("utf-8", errors="replace")
 
 
-def parse_elf_dynamic(read: Reader, file_size: int) -> ElfDynamicInfo | None:
+def parse_elf_dynamic(read: Reader, file_size: int, *,
+                      with_exports: bool = False) -> ElfDynamicInfo | None:
     """The dynamic-section facts of the ELF file *read* serves (*file_size*
     bytes long), or ``None`` when it is not an ELF, carries no PT_DYNAMIC (a
-    static binary), or its headers are out of range for the file."""
+    static binary), or its headers are out of range for the file.
+    *with_exports* also reads the names the file defines for other modules
+    (``ElfDynamicInfo.exports``), which a shared library read for import
+    attribution needs (#1037 item 6)."""
     if file_size <= 0:
         return None
     try:
-        return _parse(read, int(file_size))
+        return _parse(read, int(file_size), with_exports=with_exports)
     except (struct.error, ValueError, OverflowError):
         return None
 
 
-def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
+def _parse(read: Reader, file_size: int, *, with_exports: bool = False) -> ElfDynamicInfo | None:
     probe = _Elf(read, file_size, False, "<")
     ident = probe.bytes_at(0, 16)
     if ident is None or ident[:4] != b"\x7fELF" or ident[4] not in (1, 2) or ident[5] not in (1, 2):
         return None
     elf = _Elf(read, file_size, ident[4] == 2, "<" if ident[5] == 1 else ">")
+    machine = elf.unpack("H", 0x12)
     # e_phoff, then (past e_shoff/e_flags/e_ehsize) e_phentsize and e_phnum.
     phoff = elf.unpack("Q" if elf.is64 else "I", 0x20 if elf.is64 else 0x1C)
     counts = elf.unpack("HH", 0x36 if elf.is64 else 0x2A)
@@ -188,7 +202,7 @@ def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
             needed_offsets.append(value)
         else:
             tags.setdefault(tag, value)
-    info = ElfDynamicInfo(notes=elf.notes)
+    info = ElfDynamicInfo(notes=elf.notes, machine=machine[0] if machine else None)
     strtab = elf.file_offset(tags[_DT_STRTAB]) if _DT_STRTAB in tags else None
     if strtab is None:
         if _DT_STRTAB in tags:
@@ -213,6 +227,8 @@ def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
     info.rpath = dynstr(tags[_DT_RPATH]) if _DT_RPATH in tags else None
     info.runpath = dynstr(tags[_DT_RUNPATH]) if _DT_RUNPATH in tags else None
     info.import_libraries = _versioned_import_libraries(elf, tags, dynstr)
+    if with_exports:
+        info.exports = _defined_exports(elf, tags, dynstr)
     return info
 
 
@@ -338,12 +354,12 @@ def _verneed_files(elf: _Elf, tags: dict[int, int], dynstr) -> dict[int, str]:
     return files
 
 
-def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr) -> dict[str, str]:
-    if _DT_VERSYM not in tags or _DT_SYMTAB not in tags:
-        return {}
-    files = _verneed_files(elf, tags, dynstr)
-    if not files:
-        return {}
+def _dynamic_symbols(elf: _Elf, tags: dict[int, int], purpose: str) -> tuple[bytes, int, int] | None:
+    """The raw dynamic symbol table as ``(bytes, count, entry size)``, or None
+    when it cannot be read. Every bound is checked here, once, for both readers
+    below; *purpose* names what a refusal skipped."""
+    if _DT_SYMTAB not in tags:
+        return None
     # DT_SYMENT is fixed by the ABI (sizeof(ElfN_Sym)); the loader ignores it,
     # so a file can carry any value and still run. Any other value is refused,
     # never used as a stride or a read size.
@@ -351,21 +367,37 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr) -> dict
     syment = tags.get(_DT_SYMENT, expected)
     if syment != expected:
         elf.notes.append(f"DT_SYMENT {syment} is not the ABI symbol size {expected}; "
-                         "per-import library attribution was skipped")
-        return {}
+                         f"{purpose} was skipped")
+        return None
     count = _symbol_count(elf, tags)
     symtab = elf.file_offset(tags[_DT_SYMTAB])
-    versym = elf.file_offset(tags[_DT_VERSYM])
-    if not count or symtab is None or versym is None:
+    if not count or symtab is None:
+        return None
+    if count > _MAX_SYMBOLS or not elf.fits(symtab, count * syment):
+        elf.notes.append(f"the dynamic symbol table ({count} symbols) does not fit in "
+                         f"the file; {purpose} was skipped")
+        return None
+    symbols = elf.bytes_at(symtab, count * syment)
+    return (symbols, count, syment) if symbols is not None else None
+
+
+def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr) -> dict[str, str]:
+    if _DT_VERSYM not in tags or _DT_SYMTAB not in tags:
         return {}
-    if count > _MAX_SYMBOLS or not elf.fits(symtab, count * syment) \
-            or not elf.fits(versym, count * 2):
+    files = _verneed_files(elf, tags, dynstr)
+    if not files:
+        return {}
+    table = _dynamic_symbols(elf, tags, "per-import library attribution")
+    versym = elf.file_offset(tags[_DT_VERSYM])
+    if table is None or versym is None:
+        return {}
+    symbols, count, syment = table
+    if not elf.fits(versym, count * 2):
         elf.notes.append(f"the dynamic symbol table ({count} symbols) does not fit in "
                          "the file; per-import library attribution was skipped")
         return {}
-    symbols = elf.bytes_at(symtab, count * syment)
     versions = elf.bytes_at(versym, count * 2)
-    if symbols is None or versions is None:
+    if versions is None:
         return {}
     version_of = struct.unpack(f"{elf.endian}{count}H", versions)
     # st_name is the first field of both Elf32_Sym and Elf64_Sym. Definedness
@@ -388,3 +420,158 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr) -> dict
             del attributed[name]
             conflicted.add(name)
     return attributed
+
+
+_STB_GLOBAL, _STB_WEAK, _STB_GNU_UNIQUE = 1, 2, 10
+_STT_SECTION, _STT_FILE = 3, 4
+_STV_DEFAULT, _STV_PROTECTED = 0, 3
+_SHN_UNDEF = 0
+
+
+def _defined_exports(elf: _Elf, tags: dict[int, int], dynstr) -> frozenset[str] | None:
+    """Names the dynamic symbol table defines for other modules to bind to:
+    a defined (``st_shndx != SHN_UNDEF``) symbol with global, weak or unique
+    binding and default or protected visibility -- the symbols the dynamic
+    linker can resolve another module's undefined reference against. None when
+    the table could not be read."""
+    table = _dynamic_symbols(elf, tags, "reading the exported symbols")
+    if table is None:
+        return None
+    symbols, count, syment = table
+    # Elf64_Sym: name I, info B, other B, shndx H, value Q, size Q.
+    # Elf32_Sym: name I, value I, size I, info B, other B, shndx H.
+    fmt = elf.endian + ("IBBH" if elf.is64 else "IIIBBH")
+    names: set[str] = set()
+    for index in range(1, count):
+        fields = struct.unpack_from(fmt, symbols, index * syment)
+        if elf.is64:
+            name_index, info, other, shndx = fields
+        else:
+            name_index, _value, _size, info, other, shndx = fields
+        binding, kind = info >> 4, info & 0xF
+        if shndx == _SHN_UNDEF or binding not in (_STB_GLOBAL, _STB_WEAK, _STB_GNU_UNIQUE):
+            continue
+        if kind in (_STT_SECTION, _STT_FILE) or (other & 3) not in (_STV_DEFAULT, _STV_PROTECTED):
+            continue
+        name = dynstr(name_index)
+        if name:
+            names.add(name)
+    return frozenset(names)
+
+
+# ---------------------------------------------------------------------------
+# #1037 item 6: attributing UNVERSIONED imports from the needed libraries'
+# own export tables. A symbol version names its library (above); an import
+# with no version names nothing, and on a C++ binary linked against its own
+# libraries that was every symbol from them. The loader's answer is the first
+# library in DT_NEEDED order that defines the name, so this reads the files
+# bn can find -- never a guess from the name -- and refuses to attribute past
+# a needed library it could NOT read, since that one might define the name.
+
+
+@dataclass
+class NeededExports:
+    # Each DT_NEEDED entry, in load order, with the file read for it (None when
+    # no readable ELF of the binary's machine was found in the search dirs).
+    files: list[tuple[str, str | None]] = field(default_factory=list)
+    # Import name -> the needed library the loader would bind it to.
+    libraries: dict[str, str] = field(default_factory=dict)
+
+
+def read_elf_file(path: str, *, with_exports: bool = True) -> ElfDynamicInfo | None:
+    """`parse_elf_dynamic` over a file on disk; None when it cannot be opened."""
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+
+            def read(offset: int, length: int) -> bytes:
+                handle.seek(offset)
+                return handle.read(length)
+
+            return parse_elf_dynamic(read, size, with_exports=with_exports)
+    except OSError:
+        return None
+
+
+def library_search_dirs(*, binary_path: str | None, runpath: str | None,
+                        rpath: str | None, sysroot: str | None) -> list[str]:
+    """The directories searched for a needed library, in order: the binary's
+    DT_RUNPATH (else DT_RPATH) entries, the binary's own directory, then the
+    sysroot's library directories.
+
+    `$ORIGIN` is the binary's directory. An absolute entry names a path on the
+    TARGET's filesystem, so it is read under *sysroot* and skipped without one:
+    the same path on this machine is a host library, not the target's. A
+    relative entry depends on the loader's working directory and is skipped."""
+    origin = os.path.dirname(os.path.abspath(binary_path)) if binary_path else None
+    dirs: list[str] = []
+    for entry in (runpath if runpath is not None else rpath or "").split(":"):
+        if not entry:
+            continue
+        if "$ORIGIN" in entry or "${ORIGIN}" in entry:
+            if origin is None:
+                continue
+            dirs.append(entry.replace("${ORIGIN}", origin).replace("$ORIGIN", origin))
+        elif entry.startswith("/") and sysroot:
+            dirs.append(os.path.join(sysroot, entry.lstrip("/")))
+    if origin is not None:
+        dirs.append(origin)
+    if sysroot:
+        for base in ("lib", "lib64", "usr/lib", "usr/lib64"):
+            root = os.path.join(sysroot, base)
+            dirs.append(root)
+            try:
+                children = sorted(os.listdir(root))
+            except OSError:
+                continue
+            dirs.extend(os.path.join(root, child) for child in children
+                        if "-linux-" in child and os.path.isdir(os.path.join(root, child)))
+    seen: set[str] = set()
+    return [d for d in (os.path.normpath(d) for d in dirs) if not (d in seen or seen.add(d))]
+
+
+def needed_export_libraries(needed: list[str], search_dirs: list[str], *,
+                            machine: int | None, sysroot: str | None = None,
+                            reader: Callable[[str], ElfDynamicInfo | None] = read_elf_file,
+                            ) -> NeededExports:
+    """Attribute import names to the needed library that defines them.
+
+    Each DT_NEEDED name is looked up in *search_dirs*; the first file there that
+    is an ELF of *machine* with a readable export table is the one read (the
+    loader also skips a file of the wrong machine). A name goes to the FIRST
+    library in DT_NEEDED order that exports it, and only while every library
+    before it was read: past an unread one, a name stays unattributed."""
+    result = NeededExports()
+    blocked = False
+    for library in needed:
+        path, info = _find_library(library, search_dirs, machine=machine,
+                                   sysroot=sysroot, reader=reader)
+        if info is None or info.exports is None:
+            result.files.append((library, None))
+            blocked = True
+            continue
+        result.files.append((library, path))
+        if blocked:
+            continue
+        for name in info.exports:
+            result.libraries.setdefault(name, library)
+    return result
+
+
+def _find_library(library: str, search_dirs: list[str], *, machine: int | None,
+                  sysroot: str | None, reader) -> tuple[str | None, ElfDynamicInfo | None]:
+    if "/" in library:
+        # The loader uses a DT_NEEDED with a slash as a path. Only an absolute
+        # one under a sysroot names a file this machine can read for the target.
+        candidates = [os.path.join(sysroot, library.lstrip("/"))] \
+            if sysroot and library.startswith("/") else []
+    else:
+        candidates = [os.path.join(d, library) for d in search_dirs]
+    for candidate in candidates:
+        if not os.path.isfile(candidate):
+            continue
+        info = reader(candidate)
+        if info is None or (machine is not None and info.machine != machine):
+            continue
+        return candidate, info
+    return None, None

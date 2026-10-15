@@ -1638,6 +1638,8 @@ _COUNT_SLICE_FLAGS: tuple[tuple[str, str, Any], ...] = (
     ("summary", "--summary", False),
     # #968: a per-row enrichment; a count has no rows to enrich.
     ("with_xrefs", "--with-xrefs", False),
+    # #1037 item 5: the same per-row enrichment for imports.
+    ("with_callers", "--with-callers", False),
 )
 
 

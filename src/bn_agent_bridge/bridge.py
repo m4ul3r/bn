@@ -5753,6 +5753,8 @@ def _bind_strings(bridge, params, target):
         ),
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
         with_xrefs=_validate_bool(params.get("with_xrefs"), label="with_xrefs", default=False),
+        include_noise=_validate_bool(params.get("include_noise"), label="include_noise",
+                                     default=False),
     )
 
 
@@ -5767,7 +5769,22 @@ def _bind_imports(bridge, params, target):
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
         include_got=_validate_bool(params.get("include_got"), label="include_got", default=False),
+        with_callers=_validate_bool(params.get("with_callers"), label="with_callers", default=False),
+        sysroot=_validate_sysroot(params.get("sysroot")),
     )
+
+
+def _validate_sysroot(value: Any) -> str | None:
+    """`imports --sysroot`: an absolute path to a directory on the bridge's
+    machine (the CLI resolves it), or absent."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not os.path.isabs(value) or not os.path.isdir(value):
+        raise OperationFailure(
+            "invalid_request",
+            f"sysroot must be an absolute path to an existing directory (got {value!r})",
+        )
+    return value
 
 
 @op("list_exports", lock="read")

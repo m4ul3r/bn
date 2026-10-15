@@ -309,7 +309,7 @@ def test_strings_probable_format_annotates_directives_and_code_refs(monkeypatch)
     # excluded from the directive list.
     assert entry["format_directives"] == ["%s", "%d"]
     assert entry["directive_count"] == 2
-    assert entry["code_refs"] == 2
+    assert entry["code_ref_count"] == 2
 
 
 def test_strings_probable_format_recovers_flags_width_precision_length(monkeypatch):
@@ -341,7 +341,7 @@ def test_strings_probable_format_keeps_indirect_zero_xref_candidate(monkeypatch)
 
     entry = result["items"][0]
     assert entry["format_directives"] == ["%d"]
-    assert entry["code_refs"] == 0
+    assert entry["code_ref_count"] == 0
 
 
 # --- #814: strings paging builds rows for the returned page only ---
@@ -422,7 +422,7 @@ def test_strings_probable_format_counts_code_refs_for_the_page_only(monkeypatch)
     assert result["returned"] == 15 and result["has_more"] is True
     # ...the page still carries its enrichment (directives + code_refs)...
     assert [item["format_directives"] for item in result["items"]] == [["%d", "%d"]] * 15
-    assert [item["code_refs"] for item in result["items"]] == [1] * 15
+    assert [item["code_ref_count"] for item in result["items"]] == [1] * 15
     # ...and the xref helper ran for the page only.
     assert len(calls) <= 16, (
         f"_code_ref_count ran {len(calls)}x for a 15-row page of 2000 survivors"
@@ -451,7 +451,8 @@ def test_strings_query_filter_pages_without_building_the_rest(monkeypatch):
     counted = instance._strings(None, query="err", offset=0, limit=10, count_only=True)
     # #795: the count envelope also states how many candidates the filter dropped
     # (1000 scanned - 500 kept), so the denominator needs no second invocation.
-    assert counted == {"kind": "strings", "count": 500, "total": 500, "filtered": 500}
+    assert counted == {"kind": "strings", "count": 500, "total": 500, "filtered": 500,
+                       "noise_dropped": 0}
     # ...and the LIST envelope carries the same disclosed number.
     assert result["filtered"] == 500
 
@@ -500,7 +501,7 @@ def test_strings_page_rows_keep_their_parsed_fields(monkeypatch):
     result = instance._strings(None, query=None, offset=0, limit=1)
 
     assert result["items"] == [{"address": hex(0x1000), "length": 12, "chars": 2,
-                               "type": "utf16", "value": "hi"}]
+                               "type": "utf16", "value": "hi", "section": None}]
     assert [i["type"] for i in instance._strings(None, query=None, offset=0, limit=10)["items"]] == \
         ["utf16", "ascii"]
 
@@ -1021,6 +1022,74 @@ def test_imports_without_raw_parent_keep_null_library_969(monkeypatch):
     assert listed["items"][0]["library"] is None
     # No DT_NEEDED to point at: nothing to disclose.
     assert "library_unattributed" not in listed
+
+
+def test_imports_attribute_unversioned_from_needed_library_exports_1037(monkeypatch, tmp_path):
+    """#1037 item 6: an unversioned import gets the first needed library, in
+    load order, whose file bn READ defines it -- here `libreg.so` beside the
+    binary -- marked `needed-exports`; nothing is guessed from the name."""
+    from test_elf_dynamic import _build_elf, _library
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    image = _build_elf(needed=("libreg.so", "libc.so.6", "libstdc++.so.6"), symbols=(
+        ("printf", "libc.so.6"), ("_ZNSo3putEc", None), ("__gmon_start__", None)))
+    binary = tmp_path / "regd"
+    binary.write_bytes(image)
+    # `_ZNSo3putEc` is exported by libstdc++, which is NOT on disk: it stays
+    # null. libreg.so does not define it, so nothing names it.
+    (tmp_path / "libreg.so").write_bytes(_library(["_ZNSo3putEc_not", "printf"]))
+    bv = _versioned_import_bv(fake_bn, image=image)
+    bv.file = types.SimpleNamespace(original_filename=str(binary), filename=str(binary))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    rows = {i["name"]: i for i in instance._imports(None)["items"]}
+    assert (rows["printf"]["library"], rows["printf"]["library_source"]) == (
+        "libc.so.6", "symbol-version")
+    assert rows["_ZNSo3putEc"]["library"] is None and "library_source" not in rows["_ZNSo3putEc"]
+
+    (tmp_path / "libreg.so").write_bytes(_library(["_ZNSo3putEc"]))
+    listed = instance._imports(None)
+    rows = {i["name"]: i for i in listed["items"]}
+    assert (rows["_ZNSo3putEc"]["library"], rows["_ZNSo3putEc"]["library_source"]) == (
+        "libreg.so", "needed-exports")
+    assert rows["__gmon_start__"]["library"] is None
+    assert listed["needed_library_files"] == [
+        {"library": "libreg.so", "path": str(tmp_path / "libreg.so")},
+        {"library": "libc.so.6", "path": None},
+        {"library": "libstdc++.so.6", "path": None},
+    ]
+
+
+def test_imports_with_callers_names_capped_calling_functions_1037(monkeypatch):
+    """#1037 item 5: one call maps every listed import to its callers, capped
+    per row with the full count beside it, like `strings --with-xrefs`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    syms = []
+    for address, name in ((0x1000, "recv"), (0x1010, "accept")):
+        sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, address, name)
+        sym.short_name = name
+        sym.namespace = ""
+        syms.append(sym)
+    callers = [_FakeFunction(0x3000 + i * 0x40, f"handler_{i}") for i in range(10)]
+    bv = _FakeBV(symbols=syms, code_refs={
+        0x1000: [_FakeCodeRef(fn.start + 4, fn) for fn in callers]
+        + [_FakeCodeRef(callers[0].start + 8, callers[0])],
+    })
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._imports(None, with_callers=True)
+    rows = {i["name"]: i for i in listed["items"]}
+    assert rows["recv"]["code_ref_count"] == 11
+    assert rows["recv"]["caller_count"] == 10
+    assert [fn["name"] for fn in rows["recv"]["callers"]] == [fn.name for fn in callers[:8]]
+    assert (rows["accept"]["caller_count"], rows["accept"]["callers"]) == (0, [])
+    assert listed["callers_unrecorded"] == 1
+    assert "callers" not in instance._imports(None)["items"][0]
+
 
 
 # --- read: raw bytes at an address ---

@@ -4628,8 +4628,9 @@ def test_dispatch_forwards_strings_max_length_and_probable_format(monkeypatch):
         probable_format_strings=False,
         count_only=False,
         with_xrefs=False,
+        include_noise=False,
     ):
-        seen.append((max_length, probable_format_strings, with_xrefs))
+        seen.append((max_length, probable_format_strings, with_xrefs, include_noise))
         return {"target": target, "items": []}
 
     monkeypatch.setattr(instance, "_strings", fake_strings)
@@ -4640,8 +4641,11 @@ def test_dispatch_forwards_strings_max_length_and_probable_format(monkeypatch):
     )
     # #968: --with-xrefs reaches `_strings` through the same seam.
     instance._dispatch_on_main("strings", {"with_xrefs": True}, None)
+    # #1037 item 2: so does --include-noise.
+    instance._dispatch_on_main("strings", {"include_noise": True}, None)
 
-    assert seen == [(None, False, False), (12, True, False), (None, False, True)]
+    assert seen == [(None, False, False, False), (12, True, False, False),
+                    (None, False, True, False), (None, False, False, True)]
 
 
 def test_dispatch_rejects_non_boolean_probable_format_strings(monkeypatch):
@@ -7352,10 +7356,13 @@ def test_collection_payloads_declare_their_row_fields(monkeypatch, op, params, e
     assert isinstance(row_fields, list)
     missing = [key for key in expected if key not in row_fields]
     assert not missing, f"{op} row_fields missing {missing}: {row_fields}"
-    # Every key the hint advertises must be readable off a real row when the
-    # page has one, or the hint is worse than nothing.
+    # Every key a row carries is advertised, and every key `row_fields` names
+    # is on EVERY row (#1037 item 3): the rest are in `row_fields_optional`.
+    optional = result.get("row_fields_optional", {})
     for row in result["items"]:
-        assert set(row) <= set(row_fields), f"{op} row key not advertised: {set(row) - set(row_fields)}"
+        advertised = set(row_fields) | set(optional)
+        assert set(row) <= advertised, f"{op} row key not advertised: {set(row) - advertised}"
+        assert set(row_fields) <= set(row), f"{op} row lacks {set(row_fields) - set(row)}"
 
 
 @pytest.mark.parametrize("op,params,expected", ROW_FIELD_OPS, ids=[o[0] for o in ROW_FIELD_OPS])
@@ -7521,9 +7528,11 @@ _PREVIOUSLY_MISSING_ROW_FIELDS: dict[str, tuple[str, ...]] = {
 @pytest.mark.parametrize("kind", sorted(_PREVIOUSLY_MISSING_ROW_FIELDS))
 def test_empty_page_row_fields_include_previously_missing_optional_keys(monkeypatch, kind):
     # #694 item 9: a zero-hit page is exactly when there is no row to infer the
-    # schema from, so `row_fields` falls back to `_DECLARED_ROW_FIELDS` alone
+    # schema from, so the hint falls back to `_DECLARED_ROW_FIELDS` alone
     # (`_annotate_row_fields`). It must still advertise every optional key a
     # POPULATED page of this kind could carry -- omitting them here is the bug.
+    # Since #1037 item 3 they are advertised in `row_fields_optional`, with the
+    # condition that sets them, and never promised in `row_fields`.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     op = "list_functions" if kind == "functions" else kind
@@ -7546,8 +7555,39 @@ def test_empty_page_row_fields_include_previously_missing_optional_keys(monkeypa
     result = instance._dispatch_on_main(op, dict(op_params), "active")
 
     assert result["items"] == []
-    missing = [key for key in _PREVIOUSLY_MISSING_ROW_FIELDS[kind] if key not in result["row_fields"]]
-    assert not missing, f"{kind}: empty-page row_fields missing {missing}"
+    optional = result.get("row_fields_optional", {})
+    missing = [key for key in _PREVIOUSLY_MISSING_ROW_FIELDS[kind] if key not in optional]
+    assert not missing, f"{kind}: empty-page row_fields_optional missing {missing}"
+    promised = [key for key in _PREVIOUSLY_MISSING_ROW_FIELDS[kind] if key in result["row_fields"]]
+    assert not promised, f"{kind}: conditional keys promised on every row: {promised}"
+
+
+def test_row_fields_promise_only_keys_every_row_carries_1037():
+    """#1037 item 3: `row_fields` named `code_refs`/`format_directives` on a
+    plain `strings` pull and `provenance` on imports, so agents read `None`
+    everywhere or hit `KeyError`. Now it names only keys every row carries;
+    a declared conditional key stays optional even when the one probed row
+    happens to carry it, and an undeclared key on some rows is optional too."""
+    from bn_agent_bridge._shared import _annotate_row_fields
+
+    base = {"address": "0x1", "name": "f", "raw_name": "f", "kind": "function",
+            "library": None, "namespace": ""}
+    probe = _annotate_row_fields({"kind": "imports", "items": [
+        dict(base, provenance="relocation")]})
+    assert "provenance" not in probe["row_fields"]
+    assert probe["row_fields_optional"]["provenance"].startswith("imports recovered")
+
+    page = _annotate_row_fields({"kind": "imports", "items": [
+        dict(base, extra=1), dict(base)]})
+    assert page["row_fields"] == ["address", "name", "raw_name", "kind", "library", "namespace"]
+    assert page["row_fields_optional"]["extra"] == "present on some rows of this page only"
+
+    plain = _annotate_row_fields({"kind": "strings", "items": [
+        {"address": "0x1", "value": "a", "chars": 1, "length": 1, "type": "ascii",
+         "section": ".rodata"}]})
+    assert "code_ref_count" not in plain["row_fields"]
+    assert plain["row_fields_optional"]["code_ref_count"] == (
+        "--with-xrefs or --probable-format-strings")
 
 
 def test_save_records_the_backing_database_for_restart_857(monkeypatch, tmp_path):

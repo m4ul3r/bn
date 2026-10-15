@@ -671,7 +671,9 @@ def _require_row_fields(op: str, payload: dict[str, Any]) -> None:
     the schema, not the rows" request is a one-row PROBE at the wire level.
     The probed row proves the schema; without a well-formed `row_fields` the
     caller has no way to know what columns to expect once it does ask for
-    real rows.
+    real rows. `row_fields` names the keys every row carries; the conditional
+    ones are in `row_fields_optional` (`{field: condition}`, #1037 item 3),
+    which is optional but must be well-formed when present.
     """
     row_fields = payload.get("row_fields")
     if not isinstance(row_fields, list) or not all(
@@ -683,6 +685,58 @@ def _require_row_fields(op: str, payload: dict[str, Any]) -> None:
             returncode=0,
             argv=(op,),
         )
+    optional = payload.get("row_fields_optional")
+    if "row_fields_optional" in payload and not (
+        isinstance(optional, dict)
+        and all(isinstance(k, str) and isinstance(v, str) for k, v in optional.items())
+    ):
+        raise BnError(
+            f"malformed {op} page: row_fields_optional must map field names to "
+            f"condition strings (got {optional!r})",
+            returncode=0,
+            argv=(op,),
+        )
+
+
+# Condition named for a key some collected rows carry and others do not, when
+# no page declared why (mirrors the bridge's `_OBSERVED_OPTIONAL`).
+_OBSERVED_OPTIONAL = "present on some rows of this page only"
+
+
+def _restate_row_fields(aggregate: dict[str, Any], pages: list[dict[str, Any]],
+                        items: list[Any]) -> None:
+    """Make the collected envelope's `row_fields` true of EVERY collected row.
+
+    Each page's `row_fields` is checked against that page only, so the first
+    page's list -- which the aggregate copies -- can name a key a later page's
+    rows lack (#1037 item 3). Union what the pages declared, keep in
+    `row_fields` only the keys every collected row carries and no page called
+    conditional, and move the rest to `row_fields_optional`. Mirrors
+    `bn.client._restate_row_fields`."""
+    if "row_fields" not in aggregate:
+        return
+    ordered: list[str] = []
+    optional: dict[str, str] = {}
+    for page in pages:
+        for field in page.get("row_fields") or []:
+            if isinstance(field, str) and field not in ordered:
+                ordered.append(field)
+        declared = page.get("row_fields_optional")
+        if isinstance(declared, dict):
+            for field, condition in declared.items():
+                if isinstance(field, str):
+                    optional.setdefault(field, str(condition))
+    rows = [row for row in items if isinstance(row, dict)]
+    fields = [field for field in ordered
+              if field not in optional and all(field in row for row in rows)]
+    for field in ordered:
+        if field not in fields and field not in optional and any(field in row for row in rows):
+            optional[field] = _OBSERVED_OPTIONAL
+    aggregate["row_fields"] = fields
+    if optional:
+        aggregate["row_fields_optional"] = optional
+    else:
+        aggregate.pop("row_fields_optional", None)
 
 
 def _unbounded_collection_error(op: str) -> BnError:
@@ -872,13 +926,15 @@ class Result:
 
     @property
     def row_fields(self) -> list[str] | None:
-        """The read's own row-key declaration, or None when it published none.
+        """The keys EVERY row carries, or None when the read published none.
 
         Read straight off the payload the bridge returned, so there is no second
         catalog here to drift from the rows: collection schemas differ on purpose
         (functions key on address/size, sections on start/end/length, callsites
         nest callee/containing_function) and this is how to learn which one you
         are holding without a failed `brief()` or a trip through the source.
+        `row[field]` cannot raise for a field listed here; keys only some rows
+        carry are in `row_fields_optional`.
         """
         if not isinstance(self.payload, Mapping):
             return None
@@ -888,6 +944,19 @@ class Result:
         ):
             return None
         return list(fields)
+
+    @property
+    def row_fields_optional(self) -> dict[str, str]:
+        """Keys only some rows carry, each with the condition that sets it
+        (`{"code_ref_count": "--with-xrefs or --probable-format-strings"}`);
+        empty when the read published none (#1037 item 3). Read them with
+        `row.get(field)`."""
+        if not isinstance(self.payload, Mapping):
+            return {}
+        optional = self.payload.get("row_fields_optional")
+        if not isinstance(optional, dict):
+            return {}
+        return {str(k): str(v) for k, v in optional.items() if isinstance(k, str)}
 
 
 def _unwrap(payload: Any) -> Any:
@@ -1385,6 +1454,7 @@ class Session:
         notes = []
         bridge_has_more = False
         seen_total: Any = _UNSEEN
+        pages: list[dict[str, Any]] = []
 
         while True:
             remaining = None if limit is None else limit - len(items)
@@ -1445,6 +1515,7 @@ class Session:
                 raise
             if aggregate is None:
                 aggregate = dict(payload)
+            pages.append(payload)
 
             items.extend(page_items)
             offset += len(page_items)
@@ -1458,6 +1529,7 @@ class Session:
         aggregate["offset"] = initial_offset
         aggregate["returned"] = len(items)
         aggregate["total"] = seen_total
+        _restate_row_fields(aggregate, pages, items)
         # Match Client.collect: callsite coverage on the final page describes a
         # cumulative scan from row zero, not just that page's rows. In particular,
         # has_more=False does NOT prove caller enumeration completed. Replace
@@ -2360,9 +2432,10 @@ def brief(
 ) -> str:
     """One bounded line per row for the named columns (dotted paths allowed).
 
-    A column this row omits renders `-` -- the bridge MUST declare columns that
-    only some rows carry (`function_pointer`, `callee_variadic`, `provenance`), so
-    `brief(rows, *last.row_fields)` is the documented in-band idiom and a sparse
+    A column this row omits renders `-` -- the bridge declares the columns that
+    only some rows carry (`function_pointer`, `callee_variadic`, `provenance`) in
+    `row_fields_optional`, so `brief(rows, *last.row_fields,
+    *last.row_fields_optional)` is the documented in-band idiom and a sparse
     column is normal, not an error. A request naming no column the rows have at
     all still raises, because that is a wrong collection or a typo.
 

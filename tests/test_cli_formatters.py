@@ -4308,9 +4308,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
     # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
-    assert len(sites) == 63, (
+    # #1037 adds the strings listing's `noise_dropped` and `unreferenced_strings`,
+    # and the imports listing's `callers_unrecorded` and per-row `caller_count`.
+    assert len(sites) == 67, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 63. A "
+        "count helper, not 67. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4453,11 +4455,19 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # `test_imports_text_points_unattributed_rows_at_needed_libraries_969`.
         "_render_name_address_list_text(library_unattributed) [count not "
         "stated in this context]",
+        # #1037 item 5: the same harness cut. The note's wording is pinned in
+        # `tests/test_cli_misc.py::test_imports_text_names_callers_and_export_attribution_1037`.
+        "_render_name_address_list_text(callers_unrecorded) [count not "
+        "stated in this context]",
         # #968: a ROW fragment of `strings --with-xrefs`, reached only through
         # `_render_strings_rows`; pinned by
         # `tests/test_cli_misc.py::test_strings_with_xrefs_forwards_flag_and_renders_functions_968`.
         "_string_xref_suffix(data_ref_count) [not a payload renderer]",
         "_string_xref_suffix(xref_function_count) [not a payload renderer]",
+        # #1037 item 5: the `imports --with-callers` row fragment, reached only
+        # through `_render_name_address_rows`; pinned by
+        # `tests/test_cli_misc.py::test_imports_text_names_callers_and_export_attribution_1037`.
+        "_import_callers_suffix(caller_count) [not a payload renderer]",
         # Both live NESTED under `existing_annotations`, so a top-level probe
         # cannot open the presence gate that states them. Covered by name in
         # `test_render_orient_states_the_analyst_split_without_fabricating_it`,
@@ -4499,6 +4509,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # and dedicated string-count / noise-tip tests cover both output contexts.
         "_strings_listing_text(filtered) [not a payload renderer]",
         "_strings_listing_text(noise_strings) [not a payload renderer]",
+        # #1037 items 2 and 11, the same listing body; pinned by
+        # `tests/test_cli_misc.py::test_strings_query_text_counts_dropped_metadata_noise_1037`
+        # and `test_strings_text_states_the_landing_pad_note_1037`.
+        "_strings_listing_text(noise_dropped) [not a payload renderer]",
+        "_strings_listing_text(unreferenced_strings) [not a payload renderer]",
     ]), sorted(not_stated)
 
 
@@ -6922,6 +6937,9 @@ _STRING_SHAPE_GUARDS = {
     ("_render_read_escaped_text", "hex_str", 0): "reaches_the_output",
     ("_render_read_text", "hex_str", 0): "reaches_the_output",
     ("_render_sections_text", "n", 0): "reaches_the_output",
+    # #1037 item 1: the clip only shortens a string value; any other shape is
+    # rendered whole by the json.dumps that follows.
+    ("_render_strings_rows", "text", 0): "reaches_the_output",
     ("_render_trace_frontiers", "reason", 0): "reaches_the_output",
     ("_render_type_info_text", "decl", 0): "reaches_the_output",
     ("_render_type_info_text", "layout", 0): "reaches_the_output",

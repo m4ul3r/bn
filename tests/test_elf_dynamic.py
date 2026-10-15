@@ -11,16 +11,22 @@ import struct
 
 import pytest
 
-from bn_agent_bridge.elf_dynamic import parse_elf_dynamic
+from bn_agent_bridge.elf_dynamic import (
+    library_search_dirs,
+    needed_export_libraries,
+    parse_elf_dynamic,
+)
 
 _BASE = 0x400000
 
 
 def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, runpath=None,
-               symbols=(), count_source="hash"):
+               symbols=(), count_source="hash", defined=(), machine=None):
     """An ELF image whose dynamic symbols are ``symbols``: ``(name, library)``
     pairs, ``library`` None for an unversioned symbol. ``count_source`` is
-    ``"hash"`` (DT_HASH), ``"section"`` (a SHT_DYNSYM header) or ``"none"``."""
+    ``"hash"`` (DT_HASH), ``"section"`` (a SHT_DYNSYM header) or ``"none"``.
+    ``defined`` adds DEFINED symbols as ``(name, st_info, st_other)`` triples
+    (unversioned); ``machine`` overrides e_machine."""
     e = endian
     strtab = bytearray(b"\x00")
 
@@ -39,6 +45,7 @@ def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, run
     lib_file = {lib: intern(lib) for lib in libraries}
     lib_ver = {lib: intern(f"V_{i}") for i, lib in enumerate(libraries)}
     sym_names = [intern(name) for name, _ in symbols]
+    defined_names = [(intern(name), info, other) for name, info, other in defined]
 
     syment = 24 if is64 else 16
     dynsym = bytearray(syment)  # index 0: the null symbol
@@ -47,14 +54,20 @@ def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, run
             dynsym += struct.pack(e + "IBBHQQ", name_off, 0x12, 0, 0, 0, 0)
         else:
             dynsym += struct.pack(e + "IIIBBH", name_off, 0, 0, 0x12, 0, 0)
+    for name_off, info, other in defined_names:
+        if is64:
+            dynsym += struct.pack(e + "IBBHQQ", name_off, info, other, 1, 0x1000, 8)
+        else:
+            dynsym += struct.pack(e + "IIIBBH", name_off, 0x1000, 8, info, other, 1)
     versym = struct.pack(e + "H", 0) + b"".join(
-        struct.pack(e + "H", version_index[lib] if lib else 1) for _, lib in symbols)
+        struct.pack(e + "H", version_index[lib] if lib else 1) for _, lib in symbols) + b"".join(
+        struct.pack(e + "H", 1) for _ in defined)
     verneed = bytearray()
     for i, lib in enumerate(libraries):
         next_need = 32 if i + 1 < len(libraries) else 0
         verneed += struct.pack(e + "HHIII", 1, 1, lib_file[lib], 16, next_need)
         verneed += struct.pack(e + "IHHII", 0, 0, version_index[lib], lib_ver[lib], 0)
-    nsyms = len(symbols) + 1
+    nsyms = len(symbols) + len(defined) + 1
     hashtab = struct.pack(e + "II", 1, nsyms) + struct.pack(e + "I", 0) + bytes(4 * nsyms)
 
     ehsize, phentsize = (64, 56) if is64 else (52, 32)
@@ -105,14 +118,14 @@ def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, run
     image = bytearray(total)
     ident = b"\x7fELF" + bytes([2 if is64 else 1, 1 if e == "<" else 2, 1]) + bytes(9)
     if is64:
-        header = struct.pack(e + "HHIQQQIHHHHHH", 3, 183, 1, 0, ehsize, shoff, 0,
-                             ehsize, phentsize, 2, shentsize, shnum, 0)
+        header = struct.pack(e + "HHIQQQIHHHHHH", 3, 183 if machine is None else machine, 1, 0,
+                             ehsize, shoff, 0, ehsize, phentsize, 2, shentsize, shnum, 0)
         load = struct.pack(e + "IIQQQQQQ", 1, 5, 0, _BASE, _BASE, total, total, 0x1000)
         dyn_ph = struct.pack(e + "IIQQQQQQ", 2, 6, blobs["dynamic"][0],
                              _BASE + blobs["dynamic"][0], 0, len(dyn), len(dyn), 8)
     else:
-        header = struct.pack(e + "HHIIIIIHHHHHH", 3, 8, 1, 0, ehsize, shoff, 0,
-                             ehsize, phentsize, 2, shentsize, shnum, 0)
+        header = struct.pack(e + "HHIIIIIHHHHHH", 3, 8 if machine is None else machine, 1, 0,
+                             ehsize, shoff, 0, ehsize, phentsize, 2, shentsize, shnum, 0)
         load = struct.pack(e + "IIIIIIII", 1, 0, _BASE, _BASE, total, total, 5, 0x1000)
         dyn_ph = struct.pack(e + "IIIIIIII", 2, blobs["dynamic"][0],
                              _BASE + blobs["dynamic"][0], 0, len(dyn), len(dyn), 6, 4)
@@ -324,3 +337,90 @@ def test_file_size_bounds_reads_even_when_the_reader_could_serve_more():
     image = _build_elf(needed=("libc.so.6",), symbols=_SYMBOLS)
     info = _parse(image, file_size=200)
     assert info is None or info.import_libraries == {}
+
+
+# --- #1037 item 6: attributing unversioned imports from needed libraries ----
+
+_GLOBAL_FUNC, _WEAK_FUNC, _LOCAL_FUNC = 0x12, 0x22, 0x02
+_HIDDEN = 2
+
+
+def _library(names, *, is64=True, endian="<", machine=None, hidden=(), local=(),
+             needed=()):
+    """A shared library image exporting *names* (global functions), plus
+    defined-but-not-exported *hidden* and *local* symbols, and one undefined
+    import of its own (`malloc`)."""
+    defined = [(n, _GLOBAL_FUNC, 0) for n in names]
+    defined += [(n, _GLOBAL_FUNC, _HIDDEN) for n in hidden]
+    defined += [(n, _LOCAL_FUNC, 0) for n in local]
+    return _build_elf(is64=is64, endian=endian, machine=machine, needed=needed,
+                      symbols=(("malloc", None),), defined=defined)
+
+
+@pytest.mark.parametrize("is64, endian", [(True, "<"), (False, ">")])
+def test_exports_are_the_defined_symbols_other_modules_can_bind(is64, endian):
+    image = _library(["_ZN8Registry3getEv"], is64=is64, endian=endian,
+                     hidden=["internal_helper"], local=["static_helper"])
+    size = len(image)
+    info = parse_elf_dynamic(lambda o, n: image[o:o + n], size, with_exports=True)
+    # The undefined import, the hidden definition and the local one are not
+    # symbols the loader resolves another module's reference against.
+    assert info.exports == frozenset({"_ZN8Registry3getEv"})
+    assert parse_elf_dynamic(lambda o, n: image[o:o + n], size).exports is None
+
+
+def _write(path, image):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(image)
+    return str(path)
+
+
+def test_first_needed_library_in_load_order_wins(tmp_path):
+    # Both define `shared_name`: the loader binds the first in DT_NEEDED
+    # order, whatever the alphabetical or directory order.
+    _write(tmp_path / "libz_first.so", _library(["shared_name", "only_first"]))
+    _write(tmp_path / "liba_second.so", _library(["shared_name", "only_second"]))
+    found = needed_export_libraries(["libz_first.so", "liba_second.so"], [str(tmp_path)],
+                                    machine=183)
+    assert found.libraries["shared_name"] == "libz_first.so"
+    assert found.libraries["only_second"] == "liba_second.so"
+    assert found.files == [("libz_first.so", str(tmp_path / "libz_first.so")),
+                           ("liba_second.so", str(tmp_path / "liba_second.so"))]
+
+
+def test_no_attribution_past_a_needed_library_that_was_not_read(tmp_path):
+    # libmissing.so comes first and could define `only_second`: naming
+    # liba_second.so for it would be a guess, so it stays unattributed.
+    _write(tmp_path / "libz_first.so", _library(["only_first"]))
+    _write(tmp_path / "liba_second.so", _library(["only_second"]))
+    found = needed_export_libraries(
+        ["libz_first.so", "libmissing.so", "liba_second.so"], [str(tmp_path)], machine=183)
+    assert found.libraries == {"only_first": "libz_first.so"}
+    assert ("libmissing.so", None) in found.files
+
+
+def test_a_library_of_another_machine_is_skipped_like_the_loader_does(tmp_path):
+    host = tmp_path / "host"
+    target = tmp_path / "target"
+    _write(host / "libreg.so", _library(["wrong_arch_name"], machine=62))
+    _write(target / "libreg.so", _library(["right_arch_name"]))
+    found = needed_export_libraries(["libreg.so"], [str(host), str(target)], machine=183)
+    assert found.libraries == {"right_arch_name": "libreg.so"}
+    assert found.files == [("libreg.so", str(target / "libreg.so"))]
+
+
+def test_search_dirs_expand_origin_and_read_absolute_entries_only_under_a_sysroot(tmp_path):
+    binary = _write(tmp_path / "app" / "bin" / "regd", b"")
+    without = library_search_dirs(binary_path=binary, runpath="$ORIGIN/../lib:/opt/vendor/lib",
+                                  rpath=None, sysroot=None)
+    origin = str(tmp_path / "app" / "bin")
+    # `/opt/vendor/lib` on THIS machine is a host directory, not the target's.
+    assert without == [str(tmp_path / "app" / "lib"), origin]
+    sysroot = tmp_path / "rootfs"
+    (sysroot / "usr" / "lib" / "aarch64-linux-gnu").mkdir(parents=True)
+    with_root = library_search_dirs(binary_path=binary, runpath="$ORIGIN/../lib:/opt/vendor/lib",
+                                    rpath="/ignored/when/runpath", sysroot=str(sysroot))
+    assert with_root[:3] == [str(tmp_path / "app" / "lib"),
+                             str(sysroot / "opt" / "vendor" / "lib"), origin]
+    assert str(sysroot / "usr" / "lib" / "aarch64-linux-gnu") in with_root
+    assert "/ignored/when/runpath" not in " ".join(with_root)

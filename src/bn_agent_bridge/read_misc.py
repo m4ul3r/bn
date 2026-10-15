@@ -25,6 +25,7 @@ Import direction is one-way: this module imports ``read_xrefs``,
 """
 from __future__ import annotations
 
+import os
 import re
 from bisect import bisect_right
 from typing import Any
@@ -38,7 +39,13 @@ from . import il_format
 from . import read_xrefs
 from .bridge_state import analysis_unavailable
 from ._shared import OperationFailure, _parse_address, _validate_count
-from .elf_dynamic import ElfDynamicInfo, parse_elf_dynamic
+from .elf_dynamic import (
+    ElfDynamicInfo,
+    NeededExports,
+    library_search_dirs,
+    needed_export_libraries,
+    parse_elf_dynamic,
+)
 
 _STRING_TYPE_NAMES: dict[int, str] = {
     0: "ascii",
@@ -354,7 +361,8 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
              min_length: int | None = None, max_length: int | None = None,
              section: str | None = None, no_crt: bool = False, regex: bool = False,
              probable_format_strings: bool = False, count_only: bool = False,
-             domain_sections_only: bool = False, with_xrefs: bool = False):
+             domain_sections_only: bool = False, with_xrefs: bool = False,
+             include_noise: bool = False):
     offset = _validate_count(offset, label="offset", minimum=0)
     # allow_none mirrors the sibling list ops (imports/sections): limit=None
     # means "no limit", so a raw-socket / py exec caller can fetch every string.
@@ -387,7 +395,7 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     # --probable-format-strings mode -- the per-survivor code-xref count deferred
     # to `_string_entry`, which runs for the returned page only. Before #814 a
     # `strings --limit 20` paid both for every survivor of a 50k-string scan.
-    survivors: list[tuple[int, int, str, int, Any, list[str] | None]] = []
+    survivors: list[tuple[int, int, str, int, Any, list[str] | None, str]] = []
     # M-12: every survivor is ranked by the tier of its section, computed once
     # per read. The default dump orders `.rodata`-like strings first and the
     # instruction-byte / linker-metadata "strings" last. `--section` pins the
@@ -396,6 +404,14 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     # the pinned one), so the rank every survivor sorts by is a constant there.
     ranges = _string_section_ranges(bv)
     noise_by_section: dict[str, int] = {}
+    # #1037 item 2: a `--query` is a search for domain literals, and the
+    # linker-metadata / code-byte tier answered it with import names and
+    # mangled symbols (`--query sock` listed `socket` from `.dynstr`; one regex
+    # sweep grew to 1066 rows). Under a query those rows are dropped unless the
+    # caller pinned a `--section` or asked for them with `--include-noise`, and
+    # the drop is COUNTED per section so the listing says what it left out.
+    drop_noise = bool(needle) and not section and not include_noise
+    noise_dropped: dict[str, int] = {}
     data_by_section: dict[str, tuple[int, int]] = {}  # name -> (tier, strings)
     # #795: the candidate list is materialized so the read can disclose HOW MUCH
     # the active filters dropped. Without it the only way to the denominator was a
@@ -433,6 +449,7 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
         # head sample carries domain literals instead of the ELF preamble.
         if domain_sections_only and tier == _STRING_TIER_NOISE:
             continue
+        noise_match = drop_noise and tier == _STRING_TIER_NOISE
         if no_crt:
             if _NO_CRT_PATTERNS.match(value):
                 continue
@@ -447,6 +464,11 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             directives = _probable_format_directives(value)
             if directives is None:
                 continue
+        if noise_match:
+            # Counted after every other filter, so the number is "rows this
+            # query would have listed", not "noise strings the query touched".
+            noise_dropped[section_name] = noise_dropped.get(section_name, 0) + 1
+            continue
 
         if not section:
             if tier == _STRING_TIER_NOISE:
@@ -454,16 +476,21 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             elif section_name != _STRING_NO_SECTION:
                 seen = data_by_section.get(section_name, (tier, 0))
                 data_by_section[section_name] = (tier, seen[1] + 1)
-        survivors.append((0 if section else tier, address, value, length, item, directives))
+        survivors.append((0 if section else tier, address, value, length, item, directives,
+                          section_name))
     # #795: how many candidates the ACTIVE filters dropped. An int on EVERY
     # result (0 when nothing filtered), so `jq '.filtered'` is a stable read
     # rather than a key that appears only sometimes -- the same reason `total`
     # and `has_more` are always present.
     filtered = len(candidates) - len(survivors)
+    noise_dropped_total = sum(noise_dropped.values())
     if count_only:
         # `total` mirrors the list envelope key for the same number (#165).
-        return {"kind": "strings", "count": len(survivors), "total": len(survivors),
-                "filtered": filtered}
+        result = {"kind": "strings", "count": len(survivors), "total": len(survivors),
+                  "filtered": filtered}
+        if drop_noise:
+            result["noise_dropped"] = noise_dropped_total
+        return result
     # Preferred tier first, then the pre-#814 (address, value) order within a
     # tier, stable against the scan order for ties.
     survivors.sort(key=lambda row: (row[0], row[1], row[2]))
@@ -487,10 +514,18 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
     page["noise_sections"] = sorted(noise_by_section, key=lambda n: (-noise_by_section[n], n))
     page["data_sections"] = sorted(
         data_by_section, key=lambda n: (data_by_section[n][0], -data_by_section[n][1], n))
+    if drop_noise:
+        # Present whenever the drop was ACTIVE (0 when it removed nothing), so a
+        # reader can tell "nothing matched in metadata" from "not dropped".
+        page["noise_dropped"] = noise_dropped_total
+        page["noise_dropped_sections"] = sorted(
+            noise_dropped, key=lambda n: (-noise_dropped[n], n))
+    if with_xrefs:
+        _note_unreferenced_strings(page, bv)
     return page
 
 
-def _string_entry(row: tuple[int, int, str, int, Any, list[str] | None], bv, *,
+def _string_entry(row: tuple[int, int, str, int, Any, list[str] | None, str], bv, *,
                   with_xrefs: bool = False) -> dict[str, Any]:
     """Build ONE `strings` row from a retained survivor tuple (#814).
 
@@ -500,7 +535,7 @@ def _string_entry(row: tuple[int, int, str, int, Any, list[str] | None], bv, *,
     filtered population. (The directives themselves were already computed as the
     mode's FILTER and are handed through, so this cannot disagree with the
     filter that admitted the string.)"""
-    _tier, address, value, length, item, directives = row
+    _tier, address, value, length, item, directives, section_name = row
     raw_type = getattr(item, "type", "")
     try:
         string_type = _STRING_TYPE_NAMES.get(int(raw_type), str(raw_type))
@@ -512,6 +547,10 @@ def _string_entry(row: tuple[int, int, str, int, Any, list[str] | None], bv, *,
         "chars": len(value),
         "type": string_type,
         "value": value,
+        # #1037 item 2: the section the ranking already resolved for this row
+        # (null when no section claims the address), so a JSON reader can
+        # filter by it instead of joining against `bn sections` by hand.
+        "section": None if section_name == _STRING_NO_SECTION else section_name,
     }
     if directives is not None:
         # Provenance for the model: WHICH printf directives the candidate
@@ -519,15 +558,34 @@ def _string_entry(row: tuple[int, int, str, int, Any, list[str] | None], bv, *,
         # the code-xref count -- a plausible format string is usually
         # referenced by code. Reuse the existing xref helper rather than
         # recompute, and only for the returned page so the mode stays cheap.
-        # code_refs stays enrichment, NOT a hard filter: a format
+        # The count stays enrichment, NOT a hard filter: a format
         # string reached indirectly can have zero direct xrefs, and dropping
-        # it would be a false negative.
+        # it would be a false negative. It carries the same name as the
+        # `--with-xrefs` count it equals (#1037 item 3).
         entry["format_directives"] = directives
         entry["directive_count"] = len(directives)
-        entry["code_refs"] = read_xrefs._code_ref_count(bv, address)
+        entry["code_ref_count"] = read_xrefs._code_ref_count(bv, address)
     if with_xrefs:
         entry.update(_string_xref_functions(bv, address))
     return entry
+
+
+def _note_unreferenced_strings(page: dict[str, Any], bv) -> None:
+    """#1037 item 11: say why `0 functions` may not mean "unused".
+
+    A string used only from a C++ catch block is reached through a landing pad
+    that `.gcc_except_table` alone points at; BN makes no function for such a
+    pad, so the string shows no reference at all. When a returned row has no
+    code and no data reference and the binary carries that table, the page
+    counts those rows and states the limit. It claims nothing about any one
+    string: it does not look for landing pads."""
+    unreferenced = sum(
+        1 for row in page.get("items") or []
+        if row.get("code_ref_count") == 0 and row.get("data_ref_count") == 0)
+    note = read_xrefs._landing_pad_note(bv) if unreferenced else None
+    if note:
+        page["unreferenced_strings"] = unreferenced
+        page["unreferenced_note"] = note
 
 
 # #968: the most referencing functions one `strings --with-xrefs` row names. The
@@ -733,7 +791,8 @@ def _callable_import_slot_names(bv) -> set[str]:
 def _imports(ctx, selector: str | None, *, summary: bool = False,
              query: str | None = None, regex: bool = False,
              offset: int = 0, limit: int | None = None, count_only: bool = False,
-             include_got: bool = False):
+             include_got: bool = False, with_callers: bool = False,
+             sysroot: str | None = None):
     # Guard paging the same way the sibling list ops do, so a raw-socket /
     # py exec caller passing a negative offset/limit gets a clean
     # invalid_request instead of a silent Python negative-index slice (#68).
@@ -871,6 +930,10 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         )
         emitted_names.add(raw_name)
         relocation_recovered += 1
+    # #1037 item 6: say where every attributed library came from, and give an
+    # unversioned import the library the loader would bind it to when the
+    # needed libraries can be read from disk.
+    needed_exports = _attribute_from_needed_exports(bv, items, elf_info, sysroot)
     # #450: filter the survey to matching imports so a sink/source sweep
     # (`--query 'system|execve|popen' --regex`) doesn't need full paging + external
     # jq. Matches name / raw_name / library / namespace, mirroring strings/sections.
@@ -943,11 +1006,110 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     if unattributed and needed_libraries:
         result["library_unattributed"] = unattributed
         result["needed_libraries"] = needed_libraries
+    if needed_exports is not None:
+        # Which file each needed library was read from (null: not found or not
+        # readable), so an attribution, or the lack of one, can be checked.
+        result["needed_library_files"] = [
+            {"library": library, "path": path} for library, path in needed_exports.files]
     # Why attribution may be partial: a dynamic-section structure that was out
     # of range for the file and skipped rather than read (#987 review).
     if elf_info is not None and elf_info.notes:
         result["dynamic_section_notes"] = list(elf_info.notes)
+    if with_callers:
+        _attach_import_callers(bv, result)
     return result
+
+
+def _view_binary_path(bv) -> str | None:
+    """The on-disk path of the binary *bv* was loaded from, or None. A view
+    opened from a database names the `.bndb`; its original file is what the
+    loader's `$ORIGIN` means."""
+    file = getattr(bv, "file", None)
+    for attr in ("original_filename", "filename"):
+        try:
+            path = getattr(file, attr, None)
+        except Exception:  # noqa: BLE001 - an unreadable attribute is no path
+            path = None
+        if isinstance(path, str) and path and not path.endswith(".bndb") \
+                and os.path.isfile(path):
+            return path
+    return None
+
+
+def _attribute_from_needed_exports(bv, items: list[dict[str, Any]],
+                                   elf_info: ElfDynamicInfo | None,
+                                   sysroot: str | None) -> NeededExports | None:
+    """Stamp `library_source` on attributed rows, and attribute the rest from
+    the needed libraries' export tables (#1037 item 6).
+
+    Sources: `namespace` (BN's own per-library namespace), `symbol-version`
+    (the verneed entry the symbol's version names, #969) and `needed-exports`
+    (the first needed library, in load order, whose file was read and defines
+    the name; see `elf_dynamic.needed_export_libraries`). Returns what was read,
+    or None when no row needed it or the target has no DT_NEEDED list."""
+    unattributed = []
+    for item in items:
+        namespace = item.get("namespace") or ""
+        if item.get("library"):
+            item["library_source"] = ("namespace" if namespace
+                                      and namespace not in _BN_SENTINEL_NAMESPACES
+                                      else "symbol-version")
+        else:
+            unattributed.append(item)
+    if not unattributed or elf_info is None or not elf_info.needed:
+        return None
+    search_dirs = library_search_dirs(
+        binary_path=_view_binary_path(bv), runpath=elf_info.runpath,
+        rpath=elf_info.rpath, sysroot=sysroot)
+    found = needed_export_libraries(elf_info.needed, search_dirs,
+                                    machine=elf_info.machine, sysroot=sysroot)
+    for item in unattributed:
+        raw_name = str(item.get("raw_name") or "")
+        library = found.libraries.get(raw_name) or found.libraries.get(raw_name.split("@", 1)[0])
+        if library:
+            item["library"] = library
+            item["library_source"] = "needed-exports"
+    return found
+
+
+# #1037 item 5: the most calling functions one `imports --with-callers` row
+# names, as for `strings --with-xrefs` (#968); the row states the full count.
+_IMPORT_CALLER_CAP = 8
+
+
+def _attach_import_callers(bv, page: dict[str, Any]) -> None:
+    """Name the functions that call each import on the returned page.
+
+    One call instead of one `xrefs` per import. Counts BN's recorded code
+    references to the import's address (the #284-filtered population `xrefs`
+    renders); a row with none is counted on the envelope, because `bn xrefs
+    <import>` also scans function LLIL for calls BN did not record and this
+    sweep does not."""
+    unrecorded = 0
+    for item in page.get("items") or []:
+        try:
+            address = int(item["address"], 16)
+            refs = read_xrefs._genuine_code_refs(bv, address)
+        except Exception as exc:  # noqa: BLE001 - one unreadable row must not fail the page
+            item["code_ref_count"] = None
+            item["caller_count"] = None
+            item["callers"] = []
+            item["callers_note"] = f"code refs could not be read: {type(exc).__name__}: {exc}"
+            continue
+        functions: dict[int, Any] = {}
+        for ref in refs:
+            fn = getattr(ref, "function", None)
+            if fn is not None:
+                functions.setdefault(int(fn.start), fn)
+        ordered = sorted(functions.items())
+        item["code_ref_count"] = len(refs)
+        item["caller_count"] = len(ordered)
+        item["callers"] = [il_format._function_identity(fn)
+                           for _start, fn in ordered[:_IMPORT_CALLER_CAP]]
+        if not refs:
+            unrecorded += 1
+    page["callers_cap"] = _IMPORT_CALLER_CAP
+    page["callers_unrecorded"] = unrecorded
 
 
 def _exports(ctx, selector: str | None, *, offset: int = 0, limit: int | None = None,

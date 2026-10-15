@@ -64,7 +64,13 @@ def _strings_count_text(value: Any) -> str:
     line = f"Total strings: {_stated_count(value, 'count')}"
     dropped = _nonnegative_count(value, "filtered")
     if dropped:
-        line += f" ({dropped} filtered out by the active filters)"
+        line += f" ({dropped} filtered out by the active filters"
+        # #1037 item 2: how many of those a --query dropped as metadata noise.
+        noise = _nonnegative_count(value, "noise_dropped")
+        if noise:
+            line += (f"; {noise} of them in code bytes or linker metadata, "
+                     f"listed with --include-noise")
+        line += ")"
     elif _field_skewed("filtered"):
         # The same wording the listing surface uses, so one payload cannot be
         # described two ways depending on which flag the caller passed.
@@ -104,6 +110,10 @@ def _strings_count_text(value: Any) -> str:
                  help="Annotate each listed string with the functions that reference "
                       "it (code refs; first 8 per row plus the total), so a filtered "
                       "string set maps to its users in one call"),
+             arg("--include-noise", action="store_true", default=False,
+                 help="With --query, keep matches in code bytes and linker metadata "
+                      "(.dynstr import names, .symtab, .text, ...); they are dropped "
+                      "from a --query by default, and the listing counts them"),
          ],
          estimable=True)
 def _strings(args: argparse.Namespace) -> int:
@@ -115,6 +125,7 @@ def _strings(args: argparse.Namespace) -> int:
         "no_crt": args.no_crt,
         "regex": bool(args.regex),
         "probable_format_strings": bool(args.probable_format_strings),
+        "include_noise": bool(args.include_noise),
     }
     if args.count:
         _refuse_count_only_slices(args, command="strings")
@@ -230,11 +241,24 @@ def _go_functions_count_text(value: Any) -> str:
                    help="Treat --query as a case-insensitive regex (alternation for sink families)"),
                arg("--include-got", action="store_true", default=False,
                    help="Include GOT-slot (address) entries that duplicate a PLT import "
-                        "(collapsed by default)")],
+                        "(collapsed by default)"),
+               arg("--with-callers", action="store_true", default=False,
+                   help="Annotate each listed import with the functions that call it "
+                        "(BN's recorded code refs; first 8 per row plus the total), so "
+                        "an import set maps to its callers in one call"),
+               arg("--sysroot", default=None,
+                   help="Directory holding the target's root filesystem: needed "
+                        "libraries are also looked up under it (DT_RUNPATH entries, "
+                        "lib, usr/lib, ...) to attribute unversioned imports")],
          estimable=True)
 def _imports(args: argparse.Namespace) -> int:
     query = getattr(args, "query", None)
     regex = bool(getattr(args, "regex", False))
+    # Resolved here: the bridge reads it, and a relative path means the
+    # invoking shell's cwd, not the bridge's.
+    sysroot = str(Path(args.sysroot).resolve()) if args.sysroot else None
+    if sysroot is not None and not Path(sysroot).is_dir():
+        raise BridgeError(f"--sysroot {args.sysroot!r} is not a directory")
     if args.count:
         # #767: --summary and the paging flags vanished silently here while
         # `go functions` refused the same combination at the parser; refuse by
@@ -244,7 +268,7 @@ def _imports(args: argparse.Namespace) -> int:
             args,
             "imports",
             {"count_only": True, "include_got": bool(args.include_got),
-             "query": query, "regex": regex},
+             "query": query, "regex": regex, "sysroot": sysroot},
             require_target=True,
             text_renderer=_imports_count_text,
             stem="imports-count",
@@ -259,10 +283,11 @@ def _imports(args: argparse.Namespace) -> int:
     # full list (often 500+ entries on firmware libs) pages bridge-side like
     # strings/function list, returning a {items, total, ...} envelope (#122).
     params = {"summary": summary_mode, "include_got": bool(args.include_got),
-              "query": query, "regex": regex}
+              "query": query, "regex": regex, "sysroot": sysroot}
     if not summary_mode:
         params["offset"] = args.offset
         params["limit"] = _effective_limit(args)
+        params["with_callers"] = bool(args.with_callers)
     return _call(
         args,
         "imports",
