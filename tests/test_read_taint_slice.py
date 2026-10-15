@@ -1,6 +1,7 @@
 """#489: proactive call-model-truncation disclosure helpers in read_taint_slice."""
 from __future__ import annotations
 
+import shlex
 import types
 
 from _bridge_fakes import _load_bridge
@@ -84,8 +85,7 @@ _FMT_STR = {0x5000: b"%d %d %d %d %d\x00"}   # a genuine format string in rodata
 
 
 def test_truncation_note_fires_on_format_string_variadic(monkeypatch):
-    # A recovered format-string arg (positive variadic signal) + contiguous stack
-    # stores -> genuine variadic-auto-typed-fixed truncation; note fires (#489).
+    # A format-shaped literal and adjacent stores remain candidates, not proof.
     rts = _load_bridge(monkeypatch).read_taint_slice
     call_addr = 0x1c
     block = [_store(_reg("sp"), 0x10),
@@ -95,7 +95,7 @@ def test_truncation_note_fires_on_format_string_variadic(monkeypatch):
         _BV(_FMT_STR), _func(block), None, call_addr, [_fmt_ptr(0x5000)], "my_logger")
     assert note is not None
     assert "call-model truncation" in note and "my_logger" in note
-    assert "sp+0x0" in note and "sp+0x4" in note and "proto set" in note
+    assert "sp+0x0" in note and "sp+0x4" in note and "proto set" not in note
 
 
 def test_truncation_note_silent_without_format_string_arg(monkeypatch):
@@ -209,9 +209,8 @@ class _BVFn(_BV):
         return self._funcs.get(int(addr))
 
 
-def test_truncation_note_named_callee_renders_runnable_command(monkeypatch):
-    # #534: a NAMED callee still emits the runnable `bn proto set <name> ...`
-    # command verbatim -- unchanged behavior.
+def test_truncation_note_named_unknown_callee_does_not_prescribe_repair(monkeypatch):
+    # A name is a selector, not evidence of a prototype discrepancy.
     rts = _load_bridge(monkeypatch).read_taint_slice
     call_addr = 0x1c
     block = [_store(_reg("sp"), 0x10),
@@ -219,7 +218,7 @@ def test_truncation_note_named_callee_renders_runnable_command(monkeypatch):
              _call(call_addr)]
     note = rts._call_model_truncation_note(
         _BV(_FMT_STR), _func(block), None, call_addr, [_fmt_ptr(0x5000)], "my_logger")
-    assert 'bn proto set my_logger "<ret> my_logger(<fixed args>, ...)"' in note
+    assert "my_logger" in note and "proto set" not in note
 
 
 def test_truncation_note_prose_when_no_identifier(monkeypatch):
@@ -237,13 +236,11 @@ def test_truncation_note_prose_when_no_identifier(monkeypatch):
     assert "call-model truncation" in note
     # The broken literal command must be gone.
     assert "proto set the callee" not in note
-    # Still guidance pointing at proto set on the resolved callee.
-    assert "proto set" in note
+    assert "prototype" in note and "proto set" not in note
 
 
-def test_truncation_note_uses_address_selector_when_name_unknown(monkeypatch):
-    # #534: no name, but the direct call resolves to a callee entry address -->
-    # use the ADDRESS as a runnable `bn proto set 0x... ...` selector.
+def test_truncation_note_address_only_callee_keeps_unknown_advice(monkeypatch):
+    # Resolving an address alone does not establish variadic status.
     rts = _load_bridge(monkeypatch).read_taint_slice
     call_addr = 0x1c
     block = [_store(_reg("sp"), 0x10),
@@ -255,7 +252,7 @@ def test_truncation_note_uses_address_selector_when_name_unknown(monkeypatch):
     note = rts._call_model_truncation_note(
         bv, _func(block), call_insn, call_addr, [_fmt_ptr(0x5000)], None)
     assert note is not None
-    assert "bn proto set 0x1000" in note
+    assert "undetermined" in note and "proto set" not in note
     assert "proto set the callee" not in note
 
 
@@ -289,6 +286,18 @@ def test_out_of_range_message_for_a_declared_variadic_callee_948(monkeypatch):
     assert "already declared variadic" not in rts._out_of_range_arg_msg(func, 1, 1)
 
 
+def test_out_of_range_hints_quote_function_locators(monkeypatch):
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    name = "handle space$'symbol"
+    func = _func([], arg_regs=("x0", "x1", "x2", "x3"), name=name)
+    for arg in (1, 4):
+        msg = rts._out_of_range_arg_msg(func, arg, 1)
+        command = msg.split("`bn ", 1)[1].split("`", 1)[0]
+        assert shlex.split("bn " + command) == [
+            "bn", "il", name, "--view", "llil", "--ssa",
+        ]
+
+
 def test_truncation_note_prose_when_indirect_call_unresolvable(monkeypatch):
     # #534: a real indirect call_insn (register-indirect dest, no constant and no
     # symbol name) resolves to `.address is None` -- exercise the prose branch via
@@ -307,7 +316,7 @@ def test_truncation_note_prose_when_indirect_call_unresolvable(monkeypatch):
     assert note is not None
     assert "call-model truncation" in note
     assert "proto set the callee" not in note
-    assert "proto set" in note
+    assert "undetermined" in note and "proto set" not in note
 
 
 def test_truncation_note_silent_when_arch_unknown(monkeypatch):
@@ -656,18 +665,6 @@ def test_build_backward_trace_call_depth_guard_marks_boundary_not_dangling_cross
         "safety limit (not adjustable via --ip-depth); the slice may be "
         "incomplete beyond that boundary"
     ]
-
-
-def test_out_param_caveat_keeps_the_raw_callee_name_1001(monkeypatch):
-    # #1001 review round 3: free-text caveats keep raw names, so `--mangled`
-    # and the default print the same caveat; the demangled name rides on the
-    # step (`out_param_callee_display_name`) for the step line and roll-up.
-    rts = _load_bridge(monkeypatch).read_taint_slice
-    trace = [{"reason": "out_param_not_followed", "terminates": True,
-              "out_param_callee": "_ZN2ns4fillEPl", "out_param_callee_display_name": "ns::fill"}]
-    assert rts._trace_assumptions(trace, truncated=False, max_depth=10) == [
-        "value crosses an out-parameter fill by _ZN2ns4fillEPl that this trace did not "
-        "follow; the true origin may be inside it"]
 
 
 def test_build_backward_trace_records_step_for_unsupported_ssa_form(monkeypatch):

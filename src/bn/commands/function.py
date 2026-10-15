@@ -422,7 +422,7 @@ def _decompile_many(
              arg("--explain", action="store_true", default=False,
                  help="Print each warning's full explanation and next step under its "
                       "one-line `warning[<code>]:` summary (text mode; json carries "
-                      "the sentences in `warnings` and `{code, summary, detail}` rows "
+                      "the sentences in `warnings` and `{code, summary, detail, address}` rows "
                       "in `warning_rows`). In the Pseudo C, a `❓` line is control "
                       "flow BN could not resolve -- an indirect jump with no known "
                       "target, which may be a tail call (its arguments are not "
@@ -1011,6 +1011,11 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
              arg("--width", default=None,
                  help="Bytes read per entry (default: min(stride, pointer size); "
                       "use 4 for a uint32[] table at --stride 4)"),
+             arg("--decode", choices=("absolute", "relative-int32"), default="absolute",
+                 help="Explicit entry format (never inferred): absolute pointers or signed "
+                      "32-bit offsets added to --base; relative mode defaults to stride/width 4"),
+             arg("--base", default=None,
+                 help="Base address added to every signed offset under --decode relative-int32"),
              arg("--record-size", dest="record_size", default=None,
                  help="Record-aware mode: byte size of each MIXED record (scalar + pointer "
                       "fields), e.g. a dispatch descriptor. Requires --ptr-fields and/or --field"),
@@ -1036,6 +1041,8 @@ def _evidence_table(args: argparse.Namespace) -> int:
             "entries": args.entries,
             "stride": args.stride,
             "width": args.width,
+            "decode": args.decode,
+            "base": args.base,
             "record_size": getattr(args, "record_size", None),
             "ptr_fields": ptr_fields,
             "fields": getattr(args, "field_specs", None),
@@ -1254,8 +1261,10 @@ def _trace(args: argparse.Namespace) -> int:
             "max_depth": args.max_depth,
             "interprocedural": args.interprocedural,
             "ip_depth": args.ip_depth,
+            "mangled": args.mangled,
         },
         require_target=True,
+        contextual_hints=True,
         text_renderer=lambda v: _render_trace_text(v, mangled=args.mangled),
         stem="trace",
     )

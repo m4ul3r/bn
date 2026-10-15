@@ -473,6 +473,122 @@ def test_render_values_text_constant():
     assert "0x40" in text
 
 
+@pytest.mark.parametrize("fmt", ["text", "json"])
+def test_dataflow_values_exposes_separate_call_destination(monkeypatch, capsys, fmt):
+    result = {
+        "function": {"name": "dispatch_request", "address": "0x401000"},
+        "at": "0x401120", "expression": "handler#2(request#0)",
+        "value_basis": "instruction", "source_expression": None,
+        "possible_values": {"type": "UndeterminedValue", "raw": "<undetermined>"},
+        "call_destination": {
+            "expression": "handler#2", "value_basis": "destination_expression",
+            "possible_values": {"type": "InSetOfValues", "values": [0x402000, 0x403000],
+                                "raw": "<in set: 0x402000, 0x403000>"},
+        },
+    }
+    fake, calls = _fake({"possible_values": result})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["dataflow", "values", "dispatch_request", "--at", "0x401120",
+                      "--target", "active", "--format", fmt])
+    assert rc == 0
+    assert [c for c in calls if c["op"] == "possible_values"][0]["params"] == {
+        "identifier": "dispatch_request", "at": "0x401120"}
+    out = capsys.readouterr().out
+    if fmt == "json":
+        payload = json.loads(out)
+        assert payload["possible_values"]["type"] == "UndeterminedValue"
+        assert payload["value_basis"] == "instruction"
+        assert payload["call_destination"]["value_basis"] == "destination_expression"
+        assert payload["call_destination"]["possible_values"]["values"] == [0x402000, 0x403000]
+    else:
+        assert "possible values: UndeterminedValue\n" in out
+        assert "of instruction" in out
+        assert "call destination: handler#2" in out
+        assert "call destination possible values: InSetOfValues" in out
+        assert "of destination expression: handler#2" in out
+
+
+@pytest.mark.parametrize("instruction_type", ["ConstantValue", "UndeterminedValue"])
+def test_render_values_text_unknown_destination_does_not_impersonate_result(instruction_type):
+    value = {
+        "function": {"name": "dispatch_request", "address": "0x401000"},
+        "at": "0x401120", "expression": "handler#2(request#0)", "value_basis": "instruction",
+        "possible_values": {"type": instruction_type, "raw": "<instruction>"},
+        "call_destination": {
+            "expression": "handler#2", "value_basis": "destination_expression",
+            "possible_values": {"type": "UndeterminedValue", "raw": "<undetermined>"},
+        },
+    }
+    text = _render_values_text(value)
+    assert f"possible values: {instruction_type}\n" in text
+    assert "call destination possible values: UndeterminedValue\n" in text
+    assert "of destination expression: handler#2" in text
+    assert "values=[" not in text
+
+
+@pytest.mark.parametrize("instruction_pvs", [None, "bad"])
+def test_render_values_text_unavailable_instruction_still_shows_destination(instruction_pvs):
+    value = {
+        "function": {"name": "dispatch_request", "address": "0x401000"},
+        "possible_values": instruction_pvs,
+        "call_destination": {
+            "expression": "handler#2", "value_basis": "destination_expression",
+            "possible_values": {"type": "ConstantPointerValue", "value": 0x402000},
+        },
+    }
+    text = _render_values_text(value)
+    assert ("possible values: <unavailable>" if instruction_pvs is None
+            else "possible values: <malformed: 'bad'>") in text
+    assert "call destination possible values: ConstantPointerValue  value=0x402000" in text
+
+
+@pytest.mark.parametrize("destination_pvs", [None, "bad"])
+def test_render_values_text_unavailable_destination_stays_separate(destination_pvs):
+    value = {
+        "function": {"name": "dispatch_request", "address": "0x401000"},
+        "possible_values": {"type": "UndeterminedValue"},
+        "call_destination": {
+            "expression": "handler#2", "value_basis": "destination_expression",
+            "possible_values": destination_pvs,
+        },
+    }
+    text = _render_values_text(value)
+    assert "possible values: UndeterminedValue\n" in text
+    assert ("call destination possible values: <unavailable>" if destination_pvs is None
+            else "call destination possible values: <malformed: 'bad'>") in text
+    assert "values=[" not in text
+
+
+def test_render_values_text_malformed_destination_is_disclosed():
+    text = _render_values_text({
+        "function": {"name": "dispatch_request", "address": "0x401000"},
+        "possible_values": {"type": "UndeterminedValue"}, "call_destination": "bad",
+    })
+    assert "possible values: UndeterminedValue\n" in text
+    assert "malformed call_destination field" in text
+
+
+def test_render_values_text_assignment_source_provenance_is_preserved():
+    value = {
+        "function": {"name": "f", "address": "0x401000"},
+        "at": "0x401120", "expression": "size#1 = 7", "value_basis": "source_expression",
+        "source_expression": "7", "possible_values": {"type": "ConstantValue", "value": 7},
+    }
+    text = _render_values_text(value)
+    assert "possible values: ConstantValue  value=0x7" in text
+    assert "of source expression: 7" in text
+    assert "call destination" not in text
+
+
+def test_dataflow_values_help_distinguishes_destinations_from_return_values(capsys):
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["dataflow", "values", "--help"])
+    assert exc.value.code == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "call-destination value-set" in out
+    assert "not as return values" in out
+
+
 def test_taint_forward_verdict_sinks():
     v = {"reached_sinks": [{"sink": {"class": "overflow_len"}}],
          "leaves": [], "stats": {"functions_visited": 8, "truncated": True, "max_depth": 8}}

@@ -1268,6 +1268,110 @@ def test_doctor_judges_headless_bridges_against_this_cli_checkout_992(
     assert f"source: {source_dir}" in text
 
 
+@pytest.mark.parametrize("source_report", ["ping", "registry"])
+@pytest.mark.parametrize("changed_on_disk", [False, True])
+def test_doctor_gui_uses_reported_plugin_source_1020(
+    monkeypatch, tmp_path, capsys, source_report, changed_on_disk
+):
+    install_dir = tmp_path / "default-plugins" / "bn_agent_bridge"
+    source_dir = tmp_path / "cli" / "bn_agent_bridge"
+    user_dir = tmp_path / "private-bn"
+    actual_dir = user_dir / "plugins" / "bn_agent_bridge"
+    for directory, body in (
+        (install_dir, "default"), (source_dir, "cli"), (actual_dir, "gui")
+    ):
+        directory.mkdir(parents=True)
+        (directory / "bridge.py").write_text(f"BUILD = '{body}'\n")
+    monkeypatch.setenv("BN_USER_DIRECTORY", str(user_dir))
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    instance = types.SimpleNamespace(
+        instance_id="gui-test", pid=123, socket_path=tmp_path / "gui.sock",
+        plugin_version=bn.cli.VERSION, started_at=None, meta={"gui": True},
+    )
+    ping = {
+        "plugin_version": bn.cli.VERSION,
+        "plugin_build_id": bn.cli.build_id_for_file(actual_dir / "bridge.py"),
+        "engine_build_id": bn.cli.build_id_for_package(actual_dir),
+    }
+    if source_report == "ping":
+        # The live report wins over an outdated registry.
+        ping["source_dir"] = str(actual_dir)
+        instance.meta["source_dir"] = str(install_dir)
+    else:
+        instance.meta["source_dir"] = str(actual_dir)
+    if changed_on_disk:
+        (actual_dir / "bridge.py").write_text("BUILD = 'updated-gui'\n")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [instance])
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: install_dir)
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda *args, **kwargs: {"ok": True, "result": ping},
+    )
+
+    assert bn.cli.main(["doctor", "--format", "json"]) == 0
+    row = json.loads(capsys.readouterr().out)["instances"][0]
+    assert row["gui"] is True
+    assert row["bridge_source_dir"] == str(actual_dir)
+    assert row["reference_plugin_dir"] == str(actual_dir)
+    assert row["reference_plugin_build_id"] == bn.cli.build_id_for_file(actual_dir / "bridge.py")
+    assert row["reference_engine_build_id"] == bn.cli.build_id_for_package(actual_dir)
+    assert row["other_checkout"] is False
+    assert row["stale_plugin_code"] is changed_on_disk
+    assert row["stale_engine"] is changed_on_disk
+
+    assert bn.cli.main(["doctor"]) == 0
+    text = capsys.readouterr().out
+    assert f"source: {actual_dir}" in text
+    assert "bn session restart" not in text
+    if changed_on_disk:
+        assert "does not match reported plugin source on disk" in text
+        assert "reload Binary Ninja plugins or restart Binary Ninja" in text
+    else:
+        assert "stale:" not in text
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_doctor_legacy_headless_discloses_restart_checkout_1020(
+    monkeypatch, tmp_path, capsys, stale
+):
+    source_dir = tmp_path / "cli" / "bn_agent_bridge"
+    source_dir.mkdir(parents=True)
+    (source_dir / "bridge.py").write_text("BUILD = 'cli'\n")
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    instance = types.SimpleNamespace(
+        instance_id="legacy", pid=123, socket_path=tmp_path / "legacy.sock",
+        plugin_version=bn.cli.VERSION, started_at=None, meta={"gui": False},
+    )
+    ping = {
+        "plugin_version": bn.cli.VERSION,
+        "plugin_build_id": "old-build" if stale else bn.cli.build_id_for_file(source_dir / "bridge.py"),
+        "engine_build_id": "old-engine" if stale else bn.cli.build_id_for_package(source_dir),
+    }
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [instance])
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: tmp_path / "not-installed")
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda *args, **kwargs: {"ok": True, "result": ping},
+    )
+
+    assert bn.cli.main(["doctor", "--format", "json"]) == 0
+    row = json.loads(capsys.readouterr().out)["instances"][0]
+    assert row["bridge_source_dir"] is None
+    assert row["bridge_source_unknown"] is True
+    assert row["other_checkout"] is False
+    assert row["stale_plugin_code"] is stale
+    assert row["stale_engine"] is stale
+    assert bn.cli.main(["doctor"]) == 0
+    text = capsys.readouterr().out
+    assert "bridge source is unknown (not reported by this bridge)" in text
+    assert (
+        "`bn session restart legacy` from this CLI would respawn it on this CLI's checkout: "
+        + str(source_dir)
+    ) in text
+
+
 def test_session_list_and_stop_name_the_registry_for_a_missing_id_996(
     monkeypatch, tmp_path, capsys
 ):
@@ -3422,7 +3526,7 @@ def test_session_stop_reports_a_refused_sigterm_and_signals_nothing(monkeypatch,
     assert "reused" in err
 
 
-def test_session_stop_reports_a_refused_sigkill_escalation(monkeypatch, capsys):
+def test_session_stop_reports_a_plain_timeout_without_a_verified_pin(monkeypatch, capsys):
     monkeypatch.setattr(
         bn.cli,
         "send_request",
@@ -3442,8 +3546,36 @@ def test_session_stop_reports_a_refused_sigkill_escalation(monkeypatch, capsys):
     assert signallers[0].sent == []
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["stopped"] is False
-    assert "did not fully tear down" in parsed["error"]
-    assert "no verifiable process identity" in parsed["error"]
+    assert "timed out waiting for bridge instance abc123" in parsed["error"]
+    assert "refusing to signal" not in parsed["error"]
+
+
+@pytest.mark.parametrize("verified_pin", [False, True])
+def test_session_stop_default_text_reports_unconfirmed_teardown(
+    monkeypatch, capsys, verified_pin
+):
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda op, **kwargs: {"ok": True, "result": {"shutting_down": True}},
+    )
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _fake_bridge_instance("abc123")  # noqa: F405
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: False)
+    _fake_signaller(
+        monkeypatch,
+        refusal=None if verified_pin else "no verifiable process identity",
+    )
+
+    rc = bn.cli.main(["session", "stop", "abc123"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "stop failed: abc123" in out
+    assert "timed out waiting for bridge instance abc123" in out
+    assert "process may still be running" in out
+    assert "stopped:" not in out
+    assert "[unsaved changes discarded]" not in out
 
 
 def test_session_stop_resolves_an_unreachable_bridge(monkeypatch, capsys):
@@ -3617,6 +3749,37 @@ def test_session_start_cleanup_reports_a_refused_signal(monkeypatch, capsys, tmp
     assert "no verifiable process identity" in errors
 
 
+def test_session_start_default_text_discloses_cleanup_timeout(
+    monkeypatch, capsys, tmp_path
+):
+    from bn.transport import BridgeError
+
+    monkeypatch.setattr(
+        bn.cli, "spawn_instance", lambda instance_id=None: _failing_start_instance()
+    )
+
+    def send_request(op, **kwargs):
+        if op == "associate_project_roots":
+            return {"ok": True, "result": {"associated": [str(tmp_path)]}}
+        if op == "shutdown":
+            return {"ok": True, "result": {"shutting_down": True}}
+        raise BridgeError("load failed")
+
+    monkeypatch.setattr(bn.cli, "send_request", send_request)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: False)
+    _fake_signaller(monkeypatch)
+
+    rc = bn.cli.main(["session", "start", str(tmp_path / "app.bin")])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "load failed" in out
+    assert "cleanup error:" in out
+    assert "timed out waiting for teardown" in out
+    assert "process may still be running" in out
+    assert "session stopped:" not in out
+
+
 # --------------------------------------------------------------------------
 # #694: restart preserves private project associations
 # --------------------------------------------------------------------------
@@ -3687,6 +3850,130 @@ def _restart_bridge_stubs(
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
     monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
     return calls
+
+
+@pytest.mark.parametrize("verb", ["stop", "restart"])
+@pytest.mark.parametrize("no_pidfd", [False, True])
+def test_acknowledged_slow_shutdown_waits_without_signalling(
+    monkeypatch, capsys, verb, no_pidfd,
+):
+    import bn.transport as transport
+    from bn.proc_identity import PinUnavailable
+
+    calls = _restart_bridge_stubs(monkeypatch, [])
+    clock = [0.0]
+    monkeypatch.setattr(transport, "time", types.SimpleNamespace(
+        monotonic=lambda: clock[0],
+        sleep=lambda delay: clock.__setitem__(0, clock[0] + delay),
+    ))
+    # Exercise the real convergence loop, with BN teardown completing after the
+    # old five-second grace period, without depending on wall-clock scheduling.
+    monkeypatch.setattr(transport, "bridge_process_alive", lambda inst: clock[0] < 8.0)
+    monkeypatch.setattr(transport, "_load_instance", lambda *a, **kw: None)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", transport.wait_for_teardown)
+    monkeypatch.setattr(os, "kill", lambda *a: pytest.fail("no unpinned signal"))
+    pins = []
+    if no_pidfd:
+        def unavailable(pid):
+            pins.append(pid)
+            raise PinUnavailable("this platform provides no pidfd")
+
+        monkeypatch.setattr(transport, "pin_process", unavailable)
+        monkeypatch.setattr(
+            transport, "identity_verdict",
+            lambda *a: pytest.fail("no identity fallback for signalling"),
+        )
+        monkeypatch.setattr(bn.cli, "BridgeProcessSignal", transport.BridgeProcessSignal)
+    else:
+        signallers = _fake_signaller(monkeypatch)
+
+    rc = bn.cli.main(["session", verb, "keep1", "--format", "json"])
+
+    assert rc == 0
+    assert 8.0 <= clock[0] < 9.0
+    result = json.loads(capsys.readouterr().out)
+    assert result["stopped" if verb == "stop" else "restarted"] is True
+    assert [op for op, _ in calls].count("shutdown") == 1
+    if no_pidfd:
+        assert pins == [4242]
+    else:
+        assert signallers[0].sent == []
+        assert signallers[0].closed is True
+
+
+@pytest.mark.parametrize("verb", ["stop", "restart"])
+def test_acknowledged_shutdown_timeout_without_pidfd_never_respawns_or_signals(
+    monkeypatch, capsys, verb,
+):
+    import bn.transport as transport
+    from bn.commands.admin import _SHUTDOWN_TEARDOWN_TIMEOUT
+    from bn.proc_identity import PinUnavailable
+
+    _restart_bridge_stubs(monkeypatch, [])
+    budgets = []
+    monkeypatch.setattr(
+        bn.cli, "wait_for_teardown",
+        lambda inst, **kw: budgets.append(kw["timeout"]) or False,
+    )
+    monkeypatch.setattr(
+        bn.cli, "spawn_instance", lambda *a, **kw: pytest.fail("old process still alive"),
+    )
+    monkeypatch.setattr(os, "kill", lambda *a: pytest.fail("no unpinned signal"))
+
+    def unavailable(pid):
+        raise PinUnavailable("this platform provides no pidfd")
+
+    monkeypatch.setattr(transport, "pin_process", unavailable)
+    monkeypatch.setattr(bn.cli, "BridgeProcessSignal", transport.BridgeProcessSignal)
+    monkeypatch.setattr(
+        transport.BridgeProcessSignal, "send",
+        lambda *a: pytest.fail("unavailable pin must not be used for escalation"),
+    )
+
+    rc = bn.cli.main(["session", verb, "keep1", "--format", "json"])
+
+    assert rc == (1 if verb == "stop" else 2)
+    assert budgets == [_SHUTDOWN_TEARDOWN_TIMEOUT]
+    captured = capsys.readouterr()
+    assert "timed out waiting for bridge instance keep1" in captured.out
+    assert "refusing to signal" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("converges", [False, True])
+def test_failed_start_cleanup_gives_acknowledged_shutdown_its_grace_period(
+    monkeypatch, capsys, tmp_path, converges,
+):
+    from bn.commands.admin import _SHUTDOWN_TEARDOWN_TIMEOUT
+    from bn.transport import BridgeError
+
+    binary = tmp_path / "app.bin"
+    binary.write_bytes(b"\x7fELF")
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: _failing_start_instance())
+
+    def request(op, **kwargs):
+        if op == "shutdown":
+            return {"ok": True, "result": {"shutting_down": True}}
+        raise BridgeError("load failed")
+
+    monkeypatch.setattr(bn.cli, "send_request", request)
+    budgets = []
+    monkeypatch.setattr(
+        bn.cli, "wait_for_teardown",
+        lambda inst, **kw: budgets.append(kw["timeout"]) or converges,
+    )
+    signallers = _fake_signaller(
+        monkeypatch, refusal="refusing to signal pid 7777: this platform provides no pidfd",
+    )
+
+    assert bn.cli.main(["session", "start", str(binary), "--format", "json"]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["stopped"] is converges
+    assert budgets == [_SHUTDOWN_TEARDOWN_TIMEOUT]
+    assert signallers[0].sent == []
+    assert signallers[0].closed is True
+    assert "cleanup_errors" not in result
+    if not converges:
+        assert "timed out waiting for teardown" in result["cleanup_error"]
 
 
 def test_session_restart_restores_original_project_roots(

@@ -101,6 +101,14 @@ bn instance clear
 
 Spawn naming is separate from routing: `bn session start /path/to/bin --instance-id myid` names the new bridge; subsequent commands use `bn -i myid …` to talk to it.
 
+With multiple bridges running, `bn load` requires explicit instance routing and lists the running IDs when it refuses. A sticky `bn instance use` pin does not choose where a load lands. Use `session start` to preload several paths into a new bridge.
+
+The registry's `started_at` (shown by `session list` and `doctor`) is fixed for the bridge's lifetime; loads, closes and project-association updates do not reset it.
+
+After an acknowledged headless shutdown, `session stop` and `session restart` allow up to 30 seconds for process teardown before considering escalation. Signals still require a verified pidfd; platforms without that primitive get a plain timeout, never a `/proc` or bare-PID fallback. If `session stop` cannot confirm teardown, it exits 1 and default text reports the timeout and warns that the bridge process may still be running, rather than claiming it stopped. The same warning appears when cleanup after an entirely failed `session start` cannot confirm teardown.
+
+When a request times out, the error reports whether a cancel request was sent. Cancellation is cooperative: an operation can continue until it checks for cancellation. Once transmission has been attempted, even a timeout during `sendall` leaves delivery uncertain: the bridge may accept complete JSON at EOF without its final newline. The client attempts cancellation and retains the warning that the operation may keep running. Only a timeout before any transmission attempt says the request was not sent. A timeout does not establish that analysis is the cause.
+
 `BN_CACHE_DIR` moves more than the database cache: the instance registry (`instances/`) and the sticky `instance use` / `target use` pins live under it too. A bridge started with it set is only visible to bn commands run with the same value, so set it on every command (in a harness where each shell call is fresh, export it per call or wrap `bn`). When an id is missing from the searched registry but registered under another root, the error names that root and the `export BN_CACHE_DIR=…` that reaches it. With exactly one bridge running and no `-i`, commands use it from any directory; `target list` / `target info` name the answering instance, and stderr notes when that bridge is not associated with the current project.
 
 `bn load` and `bn close` are available for dynamic binary management (useful in headless, but also work with the GUI bridge). All commands work identically in GUI and headless mode.
@@ -121,7 +129,7 @@ Ready immediately after `--quick`:
 Need `bn refresh` first — these depend on the analysis pass:
 
 - `bn strings` **errors** until you refresh — it refuses with "Strings are not available: this target was loaded with --quick (no analysis). Run bn refresh …" rather than return an empty list that looks like "this binary has no strings".
-  While a `bn refresh` is already analysing that target, the refusal says `… full analysis is in progress (N/M), started Ns ago by bn refresh. Retry when it finishes -- do not start another refresh.` instead; wait rather than start a second refresh.
+  While a `bn refresh` is already analysing that target, the refusal reports the elapsed time and, when available, BN's current `count` and `total`, then says to retry when it finishes rather than start another refresh. Those counters may reset or change during one analysis: they are not overall completion or a time-remaining estimate.
 - `bn function list` / `bn function search` return a **partial** set — only entry-point and symbol functions exist before analysis; the count grows once the analysis pass recovers the rest.
 - `bn decompile` / `bn il` / `bn disasm` / `bn xrefs` across the binary are partial for the same reason (functions BN hasn't discovered yet aren't there to read).
 - Every mutation, `bn go rename` included, **refuses** with `invalid_request` (exit 3) until you refresh: mutations reanalyze under the write lock, and `go rename` would only see the few functions a quick view defines.
@@ -136,6 +144,8 @@ bn refresh                              # runs update_analysis_and_wait()
 bn strings                              # now returns the full string set
 ```
 
+A second `bn refresh` on a current bridge refuses immediately while the first is running, with its age and available counters; it does not queue another full analysis behind the first. This includes bare `bn refresh` without `-t` when the selected bridge advertises `capabilities.refresh_target_gate: true` in its registry: target resolution happens inside the reserved write gate, not through a preliminary target-list request that could block behind another writer. A bare first refresh still requires exactly one open target and refuses a broken empty ambient target default. For older bridges without that capability, the CLI retains its target-list preflight: multiple open targets are refused before refresh, and a sole target is pinned by its stable `target_id` on the same selected bridge. That legacy preflight can wait behind an exclusive writer; update the GUI bridge to get prompt bare duplicate refusal. The current bridge's duplicate refusal also applies across different targets and a GUI bridge restart, since the writer gate is shared. If the first refresh is still waiting for the write gate or resolving its target, the refusal says it is pending rather than analysing.
+
 Single-function escape hatch — analyze just one function without a full refresh:
 
 ```bash
@@ -143,6 +153,8 @@ bn decompile handle_request --force-analysis
 ```
 
 Loading a `.bndb` ignores `--quick`: a database already carries its saved analysis, so the flag is a no-op there. That includes an adjacent `<binary>.bndb`, which `bn load <binary>` prefers (pass `--no-bndb` for the raw bytes). A database `bn save` wrote to the cache (`<cache>/bndb/`, used when the binary's own directory is read-only) is different: the cache is shared by every bn instance using the same `BN_CACHE_DIR` (by default, every one on the machine), so `--quick` never restores it — the raw bytes load quickly and the note names the skipped entry with the `bn load <entry>` that restores it. On a read-only mount, a target that did not load an existing cache entry (`--quick`, `--no-bndb`) cannot `bn save` over it: the save is refused and points at `bn save <path>`. Give each agent or project its own `BN_CACHE_DIR` to keep their caches apart.
+
+Loading a saved database still reports inherited comments, function documentation and analyst symbols when any of those counts is nonzero. A measured all-zero record does not add an annotation note; current counts remain available through `target info`.
 
 ### Detecting a quick view programmatically
 
@@ -427,6 +439,13 @@ Check bridge state:
 ```bash
 bn doctor
 ```
+`doctor` compares GUI bridge code with the plugin source that the bridge reports,
+including private `BN_USER_DIRECTORY` installs, rather than assuming the default
+plugin directory. Reload Binary Ninja plugins or restart Binary Ninja to update
+a stale GUI bridge; `bn session restart` is for headless sessions. For older
+headless bridges that do not report their source, doctor discloses that restarting
+from this CLI moves the session onto this CLI's checkout.
+
 
 If `bn target list` is empty:
 

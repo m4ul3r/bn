@@ -42,6 +42,11 @@ from ..formatters import (
 )
 from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, unwrap_result
 
+# An ACK starts teardown, not process exit: BN still releases views and native
+# workers. Give that work room on a loaded host before considering pinned signals.
+_SHUTDOWN_TEARDOWN_TIMEOUT = 30.0
+_SIGNAL_TEARDOWN_TIMEOUT = 5.0
+
 
 @command("capabilities",
          help="Index of every command, what it's for, and when to pick it over a neighbor "
@@ -199,15 +204,22 @@ def _doctor(args: argparse.Namespace) -> int:
         bridge_source = (ping.get("source_dir") if isinstance(ping, dict) else None) \
             or meta.get("source_dir")
         bridge_source = bridge_source if isinstance(bridge_source, str) and bridge_source else None
-        # #992: what this bridge SHOULD be running. A GUI bridge loads the
-        # installed plugin file, so that is its reference. A headless bridge
-        # runs the package of the interpreter that spawned it, so the reference
-        # is THIS CLI's own source: comparing it to the installed plugin called a
-        # worktree's own, current bridge stale (with a restart that loads the
-        # same code) and reported another checkout's bridge clean.
+        # The GUI's reported source is the package it actually loaded, including
+        # private BN_USER_DIRECTORY installs and resolved plugin symlinks.
+        # Older GUI bridges have no source metadata: retain the install fallback.
+        # Headless bridges are compared with this CLI's checkout (#992).
         is_gui = bool(meta.get("gui")) or getattr(instance, "instance_id", None) is None
-        reference_build_id = install_build_id if is_gui else source_build_id
-        reference_engine_id = install_engine_id if is_gui else source_engine_id
+        reference_dir = Path(bridge_source) if is_gui and bridge_source else (
+            install_dir if is_gui else source_dir
+        )
+        reference_build_id = (
+            cli.build_id_for_file(reference_dir / "bridge.py") if is_gui and bridge_source
+            else install_build_id if is_gui else source_build_id
+        )
+        reference_engine_id = (
+            cli.build_id_for_package(reference_dir) if is_gui and bridge_source
+            else install_engine_id if is_gui else source_engine_id
+        )
         other_checkout = (
             not is_gui
             and bridge_source is not None
@@ -226,6 +238,10 @@ def _doctor(args: argparse.Namespace) -> int:
                 "bn_build_id": bn_build_id,
                 "gui": is_gui,
                 "bridge_source_dir": bridge_source,
+                "bridge_source_unknown": bridge_source is None,
+                "reference_plugin_dir": str(reference_dir),
+                "reference_plugin_build_id": reference_build_id,
+                "reference_engine_build_id": reference_engine_id,
                 # A headless bridge started from another checkout than this
                 # CLI's: restarting it from here would not change its code
                 # unless this CLI's interpreter spawns it (#992).
@@ -236,9 +252,8 @@ def _doctor(args: argparse.Namespace) -> int:
                     bool(loaded_version)
                     and str(loaded_version) != cli.VERSION
                 ),
-                # Against the reference above -- the installed plugin file for a
-                # GUI bridge, this CLI's source for a headless one; never set for
-                # a bridge from another checkout, which `other_checkout` names.
+                # GUI: its reported package on disk (install fallback for old
+                # bridges). Headless: this CLI's checkout, except known others.
                 "stale_plugin_code": (
                     not other_checkout
                     and bool(loaded_build_id)
@@ -247,10 +262,7 @@ def _doctor(args: argparse.Namespace) -> int:
                 ),
                 "engine_build_id": loaded_engine_id,
                 "installed_engine_build_id": install_engine_id,
-                # The loaded engine package diverges from its reference on disk:
-                # this live session is running stale logic (e.g. an edited
-                # taint_engine.py after a git pull). `bn session restart <id>`
-                # reloads it (#161).
+                # The loaded engine package diverges from its reference on disk.
                 "stale_engine": (
                     not other_checkout
                     and bool(loaded_engine_id)
@@ -1001,15 +1013,23 @@ def _session_start(args: argparse.Namespace) -> int:
         # go through that same pin, so cleanup can never terminate an unrelated
         # process that recycled this pid.
         with cli.BridgeProcessSignal(instance) as signaller:
+            acknowledged = False
             try:
                 cli.send_request("shutdown", instance_id=instance.instance_id)
+                acknowledged = True
             except BridgeError as exc:
                 cleanup_errors.append(f"shutdown request failed: {exc}")
                 reason = signaller.send(signal.SIGTERM)
                 if reason is not None:
                     cleanup_errors.append(f"SIGTERM not sent: {reason}")
-            stopped = cli.wait_for_teardown(instance, timeout=5.0)
-            if not stopped:
+            stopped = cli.wait_for_teardown(
+                instance,
+                timeout=(
+                    _SHUTDOWN_TEARDOWN_TIMEOUT
+                    if acknowledged else _SIGNAL_TEARDOWN_TIMEOUT
+                ),
+            )
+            if not stopped and (not acknowledged or signaller.refusal is None):
                 reason = signaller.send(signal.SIGKILL)
                 if reason is not None:
                     cleanup_errors.append(f"SIGKILL not sent: {reason}")
@@ -1020,7 +1040,7 @@ def _session_start(args: argparse.Namespace) -> int:
         if not stopped:
             result["cleanup_error"] = (
                 f"bridge instance {instance.instance_id} (pid {instance.pid}) "
-                "did not fully tear down"
+                "timed out waiting for teardown; no clean stop was confirmed"
             )
 
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-start")
@@ -1172,22 +1192,26 @@ def _session_stop(args: argparse.Namespace) -> int:
         # instance and fail as a duplicate (#92 Problem B). Escalate to SIGKILL if
         # graceful teardown stalls, and report failure if it never converges.
         if inst is not None and signaller is not None:
-            if not cli.wait_for_teardown(inst, timeout=5.0):
-                # Escalate through the SAME verified pin: SIGKILL against an
-                # unproven or recycled pid is the most destructive form of the bug
-                # (#694), so an unproven pin sends nothing and reports instead.
-                reason = signaller.send(signal.SIGKILL)
-                converged = (
-                    cli.wait_for_teardown(inst, timeout=2.0)
-                    if reason is None
-                    else False
-                )
+            teardown_timeout = (
+                _SHUTDOWN_TEARDOWN_TIMEOUT
+                if method == "shutdown" else _SIGNAL_TEARDOWN_TIMEOUT
+            )
+            if not cli.wait_for_teardown(inst, timeout=teardown_timeout):
+                # An acknowledged shutdown without a verified pin is just a
+                # timeout, not a reason to attempt an unsafe signal.
+                reason = None
+                converged = False
+                if signaller.refusal is None:
+                    reason = signaller.send(signal.SIGKILL)
+                    if reason is None:
+                        converged = cli.wait_for_teardown(inst, timeout=2.0)
                 if not converged:
                     result["stopped"] = False
                     detail = f" {reason}." if reason is not None else ""
                     result["error"] = (
-                        f"bridge instance {target_id} (pid {inst.pid}) did not fully "
-                        f"tear down; registry/socket may be stale.{detail}"
+                        f"timed out waiting for bridge instance {target_id} "
+                        f"(pid {inst.pid}) to fully tear down; "
+                        f"registry/socket may be stale.{detail}"
                     )
                     cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
                     return 1
@@ -1294,16 +1318,26 @@ def _session_restart(args: argparse.Namespace) -> int:
     # Both signals are gated on durable process identity: a restart must never
     # terminate an unrelated process that recycled the recorded pid (#694).
     with cli.BridgeProcessSignal(inst) as signaller:
+        acknowledged = False
         try:
             cli.send_request("shutdown", instance_id=resolved_id)
+            acknowledged = True
         except BridgeError:
             _require_signal_delivered(signaller.send(signal.SIGTERM), target_id)
-        if not cli.wait_for_teardown(inst, timeout=5.0):
-            _require_signal_delivered(signaller.send(signal.SIGKILL), target_id)
-            if not cli.wait_for_teardown(inst, timeout=2.0):
+        teardown_timeout = (
+            _SHUTDOWN_TEARDOWN_TIMEOUT
+            if acknowledged else _SIGNAL_TEARDOWN_TIMEOUT
+        )
+        if not cli.wait_for_teardown(inst, timeout=teardown_timeout):
+            converged = False
+            if signaller.refusal is None:
+                _require_signal_delivered(signaller.send(signal.SIGKILL), target_id)
+                converged = cli.wait_for_teardown(inst, timeout=2.0)
+            if not converged:
                 raise BridgeError(
-                    f"bridge instance {target_id} (pid {inst.pid}) did not tear down; "
-                    "cannot restart cleanly. Stop it manually and re-spawn."
+                    f"timed out waiting for bridge instance {target_id} "
+                    f"(pid {inst.pid}) to tear down; cannot restart cleanly. "
+                    "Stop it manually and re-spawn."
                 )
 
     instance = cli.spawn_instance(resolved_id)
