@@ -1809,18 +1809,20 @@ class TaintEngine:
                            escaped: bool, escape_addrs: dict[int, frozenset[int]],
                            visited: set | None = None,
                            depth: int = 0) -> str:
-        """Does the pointer *expr* point INTO local buffer *base_key*?
-        ``"yes"`` when it is provably built on ``&base`` (a constant or
-        non-constant offset, through SSA copies, every arm of a ``VAR_PHI``,
-        the return of a modeled call that derives it from ``&base``, or a
-        reload of a slot reached by an escape at that LOAD's memory epoch);
-        ``"no"`` when it provably is not (another local's address, a constant, a parameter / loaded /
-        callee-returned pointer while ``&base`` has NOT escaped -- a stack
-        address that was never stored can only be reached through ``&base``);
-        ``"maybe"`` otherwise -- a loaded or parameter pointer after the
-        address escaped, the return of an unmodeled call that was handed the
-        buffer, or a chain past the depth cap. ``"maybe"`` is the answer the
-        walk MUST disclose, never drop (PR-928 review round 3)."""
+        """Classify possible aliases of local buffer *base_key*.
+
+        ``"yes"`` includes address-derived pointers and reloads whose input
+        memory version has a remembered stash slot. Those slot sets are
+        monotone may-alias evidence, NOT reaching pointer values: definite
+        overwrites do not kill them, and the later ``escaped`` fallback can
+        promote a held old LOAD copied through a second slot. These cases
+        can fabricate a writer/source even in a complete slice, as on base
+        5aba57ee; epoch-keyed sets only repair the direct one-slot future-stash
+        repro, not general flow-sensitive pointer provenance.
+
+        ``"no"`` excludes known unrelated addresses and values fixed before
+        this frame existed; ``"maybe"`` retains unresolved aliases after an
+        escape or a depth cut. The walk must disclose those, never drop them."""
         if expr is None:
             return "no"
         if depth > 12:
@@ -2000,8 +2002,10 @@ class TaintEngine:
         # ever published. Coverage descends from top, escape ascends from bottom.
         memo: dict[int, tuple[bool, bool]] = {}
         truncated = False
-        # Reaching stash slots at EACH memory epoch, not a function-wide union:
-        # a future `stash = &buf` must not reclassify an earlier LOAD of stash.
+        # Remembered may-alias stash slots keyed by memory version. Consulting
+        # a LOAD's version fixes the direct one-slot future-stash repro only.
+        # No overwrite kills or held-LOAD provenance through another slot:
+        # both can still invent sources, including on base 5aba57ee.
         escape_addrs: dict[int, frozenset[int]] = {}
 
         def _alias(expr: Any, escaped: bool) -> str:
@@ -2237,9 +2241,10 @@ class TaintEngine:
                     break
             if truncated:
                 break
-        # One bounded frontier-collection pass also carries already-discovered
-        # escape facts forward when the proof allowance was exhausted. It cannot
-        # certify coverage, but must retain a nearby known escaped-call leaf.
+        # One bounded collection pass retains the nearby escaped-call frontier
+        # in a discovered straight-line suffix after a proof cut. It cannot
+        # certify coverage or solve loop backedges: discovery-cut loops can
+        # still lose the named loop-carried call (also on base 5aba57ee).
         for v in reversed(graph):
             cov, esc, addrs = transfer(v)
             memo[v] = (memo[v][0] and cov, memo[v][1] or esc)
