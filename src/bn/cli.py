@@ -2180,7 +2180,7 @@ def _contextualize_diagnostic_hints(
     if not flags:
         return value
     prefix = "`bn " + " ".join(flags) + " "
-    prose_keys = {"hints", "assumptions", "note", "detail", "next_action", "recovery_advice"}
+    prose_keys = {"error", "hints", "assumptions", "note", "detail", "next_action", "recovery_advice"}
 
     def visit(item: Any, *, prose: bool = False) -> None:
         if isinstance(item, dict):
@@ -2305,10 +2305,10 @@ def _call(
         spawn_missing_named=spawn_missing_named,
         **timeout_kwargs,
     )
-    result = unwrap_result(response, op)
     if contextual_hints:
-        result = _contextualize_diagnostic_hints(
-            result, target=target, instance=getattr(args, "instance", None))
+        response = _contextualize_diagnostic_hints(
+            response, target=target, instance=getattr(args, "instance", None))
+    result = unwrap_result(response, op)
     if stamp_instance and isinstance(result, dict) and isinstance(response, dict):
         answering = response.get("instance")
         if isinstance(answering, str) and answering:

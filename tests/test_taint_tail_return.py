@@ -26,7 +26,8 @@ def _program(kind, *, tail=True, late=False):
         instructions.append(FInstr(1, 0x2014, "MLIL_SET_VAR_SSA", "temporary = p",
                                    reads=[ps], writes=[ts], src=_value(ps), dest=ts))
     if not tail:
-        instructions.append(FInstr(2, 0x2018, "MLIL_RET", "return temporary", reads=[ts]))
+        instructions.append(FInstr(2, 0x2018, "MLIL_RET", "return temporary",
+                                   reads=[], src=[_value(ts)]))
     wrapper = FFunc("wrap", 0x2000, FSSAFunc(instructions), params=[p])
     main = FFunc("main", 0x1000, FSSAFunc([
         FInstr(0, 0x1010, "MLIL_CALL_SSA", "result = wrap(n)", reads=[ns], writes=[rs],
@@ -40,7 +41,8 @@ def _program(kind, *, tail=True, late=False):
         q = FVar("q")
         funcs[0x3000] = FFunc("callee", 0x3000, FSSAFunc([
             FInstr(0, 0x3010, "MLIL_RET", "return q" if kind == "tainted" else "return 0",
-                   reads=[FSSA(q, 0)] if kind == "tainted" else [])]), params=[q])
+                   reads=[], src=[_value(FSSA(q, 0))] if kind == "tainted"
+                   else [FExpr("MLIL_CONST", "0", constant=0)])]), params=[q])
     elif kind == "skipped":
         funcs[0x3000] = FFunc("callee", 0x3000, FSSAFunc([]), params=[FVar("q")])
         funcs[0x3000].analysis_skipped = True

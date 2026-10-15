@@ -279,6 +279,13 @@ int main(void) { handle(); return 0; }
     outputs = _run_diagnostic_commands(shared_bn, " ".join(trace["hints"]))
     assert {out.split()[0] for out in outputs} == {"backward", "forward"}
     assert all(f"handle @ {trace['function_address']}" in out for out in outputs)
+    for fmt in ("text", "json"):
+        refused = shared_bn.run("-t", target, "trace", "handle", site,
+                                "--arg", "6", "--format", fmt)
+        assert refused.returncode == 2
+        error_commands = _run_diagnostic_commands(
+            shared_bn, refused.stderr + refused.stdout)
+        assert all(re.search(r"\b\w+#\d+", output) for output in error_commands)
 
 
 def test_aarch64_oversized_big_preserves_flow_after_force_analysis(tmp_path, shared_bn):
@@ -335,3 +342,37 @@ int main(void) {
     force_hint = next(a for a in before["assumptions"] if "--force-analysis" in a)
     _run_diagnostic_commands(shared_bn, force_hint)
     assert_flow()
+
+
+def test_native_scalar_return_through_conditional_tail_wrapper(tmp_path, shared_bn):
+    """Descend into ident's native RET rather than relying on call models."""
+    src = tmp_path / "scalar_tail_return.c"
+    src.write_text("""
+extern long read(int, void *, unsigned long);
+extern void *__memcpy_chk(void *, const void *, unsigned long, unsigned long);
+__attribute__((noinline, noipa)) long ident(long v) { return v; }
+__attribute__((noinline, noipa)) long conditional_tail(long v, int take) {
+    if (take)
+        return ident(v);
+    return 0;
+}
+int main(int argc, char **argv) {
+    char input[32], output[16];
+    long n = read(0, input, sizeof(input));
+    n = conditional_tail(n, argc & 1);
+    __memcpy_chk(output, input, (unsigned long)n, sizeof(output));
+    return output[0];
+}
+""")
+    binary = tmp_path / "scalar_tail_return"
+    _compile(src, binary, ["-O2", "-fno-builtin", "-foptimize-sibling-calls"])
+    target = shared_bn.load(binary, copy=False)
+    main_addr = _resolve_addr(shared_bn, "main")
+    result = _bn_json(
+        shared_bn, "-t", target, "taint", "forward", "-f", main_addr,
+        "--source", "call:read")
+    assert any(
+        s["sink"]["class"] == "fortified_overflow"
+        and s["sink"]["tainted_arg_index"] == 2
+        for s in result["reached_sinks"]
+    ), result

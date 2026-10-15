@@ -5259,7 +5259,12 @@ class TaintEngine:
                                 leaves.append(_ul)
 
                 if opn == "MLIL_RET":
-                    if read_taint(ins) or self._return_buffer_tainted(ssaf, ins, tainted):
+                    # Native RET operands live in src even when vars_read is empty.
+                    srcs = getattr(ins, "src", None)
+                    if not isinstance(srcs, (list, tuple)):
+                        srcs = [] if srcs is None else [srcs]
+                    if (read_taint(ins) or any(arg_taint(src) for src in srcs)
+                            or self._return_buffer_tainted(ssaf, ins, tainted)):
                         reached_return = True
                     continue
 
@@ -6001,22 +6006,32 @@ class TaintEngine:
         return False
 
     def _param_not_found_error(self, func: Any, idx: int) -> "TaintError":
-        """#464: seeding/slicing a param index past a function's recovered arity is
-        often BN under-recovering its signature -- e.g. a vtable method whose
-        data/args parameter was DROPPED uniformly across the call chain, so the
-        per-callsite ``arg_under_recovered`` frontier (which needs an arity
-        *mismatch*) can't catch it. Disclose the proto-set remedy rather than a
-        bare not-found, so the disclose -> proto set -> re-run loop still applies."""
+        """Explain an unavailable named parameter without assuming a bad prototype."""
         try:
             n = len(list(getattr(func, "parameter_vars", []) or []))
             have = f" (BN recovered {n} parameter(s))"
         except Exception:
             have = ""
+        variadic = _variadic_determination(func)
+        if variadic is True:
+            advice = (
+                "the function is already declared variadic; param:N selects recovered "
+                "named parameters, not the variadic tail. Tracking that tail is a "
+                "varargs limitation; inspect how the function consumes its va_list "
+                "and seed a recovered variable inside it")
+        elif variadic is False:
+            advice = (
+                "the function is determined nonvariadic; inspect its prototype and "
+                "argument provenance. Only if independent argument evidence demonstrates "
+                "a declaration discrepancy, apply "
+                f"`bn proto set {hex(int(func.start))} \"<prototype>\"` and re-run")
+        else:
+            advice = (
+                "variadic status is undetermined; inspect the function's prototype "
+                "and argument consumption before diagnosing a declaration discrepancy "
+                "or a tracking limitation")
         return TaintError(
-            f"parameter {idx} not found on {func.name}{have}. If BN under-recovered "
-            f"this function's signature (a dropped parameter is a common vtable / "
-            f"stripped-proto shape), apply `bn proto set {func.name} \"<prototype>\"` "
-            f"and re-run this taint query")
+            f"parameter {idx} not found on {self._prose_function(func)}{have}: {advice}")
 
     def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption,
                       buffer_slots=None, leaves=None) -> bool:
@@ -7408,7 +7423,7 @@ class TaintEngine:
             idx = int(sink["index"])
             pv = self._param_var(func, idx)
             if pv is None:
-                raise TaintError(f"parameter {idx} not found on {func.name}")
+                raise self._param_not_found_error(func, idx)
             # seed from the earliest SSA read of the parameter (its entry value);
             # the walk bottoms out at the parameter and continues into callers
             for ins in instrs:

@@ -481,12 +481,28 @@ def backward_diagnostics(
         # to `bn proto set` for a walk that simply ran out of budget (round 3).
         next_action = _truncation_hint(truncation_cause)
     elif unresolved_n:
+        unresolved_leaves = [lf for lf in leaves or [] if lf.get("kind") in UNRESOLVED]
         next_action = (
-            "the walk bottomed out at an unresolved def (an indirect call, a "
-            "field load the engine could not key, or a local buffer whose "
-            "contents it could not account for); recover the callee prototype "
-            "with `bn proto set`, seed inside the producing function, or "
-            "re-run `bn taint forward --source var:<buf>` on the buffer")
+            "the walk bottomed out at an unresolved definition; inspect the frontier "
+            "leaves and argument consumption, seed inside the producing function, "
+            "or re-run `bn taint forward --source var:<buf>` on the buffer")
+        if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
+               for lf in unresolved_leaves):
+            next_action += (
+                ". A known call may have written the local buffer; inspect and model "
+                "that call's buffer writes and input propagation, or seed inside it")
+        elif unresolved_leaves and not unresolved_origins and all(
+                lf.get("cause") == "varargs_not_followed" for lf in unresolved_leaves):
+            next_action += (
+                ". The callee is already declared variadic; the engine does not follow "
+                "its variadic tail. Inspect its va_list consumption rather than "
+                "redeclaring the prototype")
+        elif unresolved_leaves and not unresolved_origins and all(
+                lf.get("cause") == "signature_under_recovered" for lf in unresolved_leaves):
+            next_action += (
+                ". The callee is determined nonvariadic; apply `bn proto set` only "
+                "where independent argument evidence demonstrates a declaration "
+                "discrepancy, then re-run")
     elif coarse_n:
         next_action = (
             "the walk crossed a coarse-memory frontier (a pointer/store not "

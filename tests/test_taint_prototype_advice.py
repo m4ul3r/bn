@@ -117,3 +117,82 @@ def test_unsettled_variadic_flag_keeps_unknown_forward_advice(models, value):
     assert leaf["cause"] == "prototype_status_unknown"
     assert "proto set" not in leaf["note"]
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize("direction", ["forward", "backward"])
+@pytest.mark.parametrize("variadic", [True, False, None])
+def test_missing_named_parameter_confidence_advice(models, direction, variadic):
+    _, bv, callee, _ = _variadic_logger_program(variadic)
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as error:
+        getattr(engine, direction)(callee, [te.parse_locator("param:4")])
+    text = str(error.value)
+    assert "parameter 4 not found" in text
+    assert "1 parameter(s)" in text
+    assert ("proto set" in text) is (variadic is False)
+    if variadic is True:
+        assert "already declared variadic" in text
+        assert "varargs limitation" in text
+    elif variadic is False:
+        assert "Only if independent argument evidence" in text
+        assert "declaration discrepancy" in text
+    else:
+        assert "undetermined" in text and "inspect" in text
+
+
+@pytest.mark.parametrize("cause", [
+    "varargs_not_followed", "signature_under_recovered", "prototype_status_unknown",
+])
+def test_backward_aggregate_preserves_prototype_confidence(cause):
+    from bn_agent_bridge import taint_result as tr
+
+    diagnostics = tr.backward_diagnostics(
+        [{"kind": "arg_under_recovered", "cause": cause}], [],
+        sinks_seeded=1, slices=1)
+    assert diagnostics["safe_to_report_complete_slice"] is False
+    assert diagnostics["frontier"]["unresolved"] == 1
+    text = diagnostics["next_action"]
+    assert ("proto set" in text) is (cause == "signature_under_recovered")
+    if cause == "varargs_not_followed":
+        assert "already declared variadic" in text
+        assert "does not follow" in text
+    elif cause == "signature_under_recovered":
+        assert "only where independent argument evidence" in text
+    else:
+        assert "inspect" in text
+
+
+def test_backward_known_buffer_writer_aggregate_recommends_model():
+    from bn_agent_bridge import taint_result as tr
+
+    diagnostics = tr.backward_diagnostics(
+        [{"kind": "address_of_local_unresolved", "callee": "fill_buffer",
+          "buffer": "local_buf", "note": "model the call or seed inside it"}],
+        [], sinks_seeded=1, slices=1, unresolved_origins=1)
+    assert diagnostics["safe_to_report_complete_slice"] is False
+    assert "model" in diagnostics["next_action"]
+    assert "proto set" not in diagnostics["next_action"]
+
+
+def test_backward_mixed_and_unknown_frontiers_keep_neutral_advice():
+    from bn_agent_bridge import taint_result as tr
+
+    for leaves in (
+        [{"kind": "field_load_unresolved"}],
+        [{"kind": "arg_under_recovered", "cause": "varargs_not_followed"},
+         {"kind": "unmodeled_callee", "cause": "prototype_status_unknown"}],
+    ):
+        diagnostics = tr.backward_diagnostics(
+            leaves, [], sinks_seeded=1, slices=1)
+        assert diagnostics["safe_to_report_complete_slice"] is False
+        assert "inspect" in diagnostics["next_action"]
+        assert "proto set" not in diagnostics["next_action"]
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_unsettled_variadic_flag_keeps_missing_parameter_advice_neutral(models, value):
+    _, bv, callee, _ = _variadic_logger_program(
+        types.SimpleNamespace(value=value, confidence=0))
+    text = str(te.TaintEngine(bv, models)._param_not_found_error(callee, 4))
+    assert "undetermined" in text
+    assert "proto set" not in text
