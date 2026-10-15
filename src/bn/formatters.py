@@ -3129,7 +3129,8 @@ def _render_target_line(target: Any, *, mangled: bool = False) -> str:
 
 
 @_discloses
-def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
+def _render_function_evidence_text(value: Any, *, mangled: bool = False,
+                                   verbose: bool = False, compact: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     function = _field_dict(value, "function")
@@ -3183,39 +3184,65 @@ def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
     # #471: show the slice window when the call set was paged/windowed.
     total_calls = value.get("total_calls")
     matched = value.get("matched_calls")
+    # #1037: a callee filter always states what it kept out of how many.
+    callee_filter = _field_dict(value, "callee_filter")
     call_hdr = f"calls: {len(calls)}"
-    if isinstance(total_calls, int) and (
-        value.get("offset") or value.get("limit") is not None or matched != total_calls
-    ):
-        call_hdr += f" of {matched if matched is not None else total_calls}"
-        if matched is not None and matched != total_calls:
-            call_hdr += f" in window (of {total_calls} total)"
-        if value.get("has_more"):
-            # Through the count choke point, like every other arithmetic read of
-            # a paging counter (see the paged-listing footer): `int(x or 0)`
-            # RAISED on a string and on a container, and it cost the WHOLE
-            # evidence card where the same payload with `offset` absent rendered
-            # cleanly (#619). The choke point answers 0 and discloses instead.
-            nxt = _count_field(value, "offset") + len(calls)
-            if _field_skewed("offset"):
-                # An ACTIONABLE number, not a descriptive one: a fabricated
-                # resume offset sends an agent paging from a window the payload
-                # never stated, which is the invented-offset harm the paging
-                # footer was fixed for (#722). Refuse the hint instead.
-                call_hdr += " -- more: page position unreadable, re-read with --format json"
-            else:
-                call_hdr += f" -- more: rerun with --offset {nxt}"
+    if callee_filter:
+        call_hdr = _callee_filter_call_header(callee_filter, len(calls), total_calls, matched)
+        paged = True
+    else:
+        paged = isinstance(total_calls, int) and (
+            value.get("offset") or value.get("limit") is not None or matched != total_calls
+        )
+        if paged:
+            call_hdr += f" of {matched if matched is not None else total_calls}"
+            if matched is not None and matched != total_calls:
+                call_hdr += f" in window (of {total_calls} total)"
+    if paged and value.get("has_more"):
+        # Through the count choke point, like every other arithmetic read of
+        # a paging counter (see the paged-listing footer): `int(x or 0)`
+        # RAISED on a string and on a container, and it cost the WHOLE
+        # evidence card where the same payload with `offset` absent rendered
+        # cleanly (#619). The choke point answers 0 and discloses instead.
+        nxt = _count_field(value, "offset") + len(calls)
+        if _field_skewed("offset"):
+            # An ACTIONABLE number, not a descriptive one: a fabricated
+            # resume offset sends an agent paging from a window the payload
+            # never stated, which is the invented-offset harm the paging
+            # footer was fixed for (#722). Refuse the hint instead.
+            call_hdr += " -- more: page position unreadable, re-read with --format json"
+        else:
+            call_hdr += f" -- more: rerun with --offset {nxt}"
     lines.append(call_hdr)
+    # #1037: a row's witness line is printed by default only when one of its
+    # verdicts is a contradiction -- the only status that is evidence against
+    # the row -- so a card of agreeing/unavailable witnesses is not one line per
+    # call of noise. Decided once per row here, because the tally line above the
+    # rows discloses how many were hidden.
+    row_witnesses: list[tuple[dict[str, Any], bool]] = []
+    for call in calls:
+        witnesses = _field_dict(call, "arity_witnesses") if isinstance(call, dict) else {}
+        row_witnesses.append((witnesses, _witnesses_contradict(witnesses)))
+    hidden = 0 if (verbose or compact) else sum(
+        1 for witnesses, contradicts in row_witnesses if witnesses and not contradicts)
+    hidden_clause = (f"per-row witness lines shown only for contradictions "
+                     f"({hidden} hidden; --verbose shows all)") if hidden else ""
     witness_counts = _render_arity_witness_counts(_field_dict(value, "arity_witness_counts"),
                                                   total_calls)
     if witness_counts:
-        lines.append(witness_counts)
+        lines.append(witness_counts + (f"; {hidden_clause}" if hidden_clause else ""))
+    elif hidden_clause:
+        lines.append(hidden_clause)
     if not calls:
         return "\n".join(lines)
 
-    for call in calls:
+    for call, (witnesses, contradicts) in zip(calls, row_witnesses):
         if not isinstance(call, dict):
             lines.append("- " + _render_fallback_text(call))
+            continue
+        if compact:
+            lines.append(_render_compact_call_row(call, mangled=mangled,
+                                                  contradicts=contradicts))
             continue
         call_addr = call.get("address", "<unknown>")
         operation = call.get("operation", "<unknown>")
@@ -3324,9 +3351,8 @@ def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
                 "statement -- BN cannot tell a pinned prototype from a recovered one "
                 "here, so decide which is right for this binary."
             )
-        witnesses = _render_arity_witnesses(_field_dict(call, "arity_witnesses"))
-        if witnesses:
-            lines.append(witnesses)
+        if witnesses and (verbose or contradicts):
+            lines.append(_render_arity_witnesses(witnesses))
         variadic = _field_dict(call, "variadic")
         if variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
@@ -3462,6 +3488,61 @@ def _render_arity_witness_counts(counts: dict[str, Any], total_calls: Any) -> st
             "is neither")
 
 
+def _witnesses_contradict(witnesses: dict[str, Any]) -> bool:
+    """Does any verdict on this row state `contradiction` (#1037)?"""
+    return any(_text_value(_field_dict(witnesses, name), "status") == "contradiction"
+               for name, _ in _witness_items(witnesses))
+
+
+def _callee_filter_call_header(callee_filter: dict[str, Any], shown: int,
+                               total_calls: Any, matched: Any) -> str:
+    """The `calls:` header when `evidence function --callee/--exclude-callee`
+    narrowed the set (#1037): how many matched out of the full count, and how
+    many the filter removed. Zero matches is stated as such, so the card never
+    reads like a function that makes no calls."""
+    total = str(total_calls) if isinstance(total_calls, int) else "?"
+    excluded = _stated_count(callee_filter, "excluded") if "excluded" in callee_filter else None
+    # A window applied on top of the filter shrinks `matched` below what the
+    # filter alone kept; name it so the count is not blamed on the filter.
+    scope = "the callee filter"
+    if (isinstance(total_calls, int) and isinstance(matched, int)
+            and excluded is not None and excluded.isdigit()
+            and matched < total_calls - int(excluded)):
+        scope = "the callee filter and address window"
+    tail = f"of {total} total" + (f"; {excluded} excluded" if excluded is not None else "")
+    if matched == 0:
+        return f"calls: 0 -- no call matched {scope} ({tail})"
+    of = str(matched) if isinstance(matched, int) else "?"
+    return f"calls: {shown} of {of} matching {scope} ({tail})"
+
+
+def _render_compact_call_row(call: dict[str, Any], *, mangled: bool,
+                             contradicts: bool) -> str:
+    """`evidence function --compact` (#1037): one line per call -- address,
+    direct/indirect, target, argument texts -- plus a short tag for each
+    diagnostic the full row would explain in its own line."""
+    target = _field_dict(call, "target")
+    shown_target = _render_target_line(target, mangled=mangled) if target else "?"
+    direct = "direct" if call.get("direct") else "indirect"
+    args = [arg for arg in _field_list(call, "arguments") if isinstance(arg, dict)]
+    arg_text = ", ".join(_text_value(arg, "text") or "" for arg in args)
+    tags = []
+    if call.get("arity_unknown"):
+        tags.append("[arity: unknown]")
+    if call.get("arity_mismatch"):
+        tags.append("[arity: mismatch]")
+    if call.get("prototype_unverified"):
+        tags.append("[arity: unverified]")
+    if call.get("callee_unresolved"):
+        tags.append("[target unresolved]")
+    if _field_dict(call, "variadic").get("under_recovered"):
+        tags.append("[variadic: under-recovered]")
+    if contradicts:
+        tags.append("[witness: contradiction]")
+    row = f"- {call.get('address', '<unknown>')}  {direct}  {shown_target}  ({arg_text})"
+    return row + "".join(f" {tag}" for tag in tags)
+
+
 def _render_resolved_arg(resolved: Any) -> str:
     if not isinstance(resolved, dict):
         return ""
@@ -3514,16 +3595,25 @@ def _render_surface_text(value: Any) -> str:
                 f"fn={sec.get('resolved_functions', 0)}  missing={sec.get('missing_functions', 0)}")
 
     tables = _field_list(value, "candidate_tables")
-    if tables:
+    hidden = s.get("vtable_tables_hidden")
+    if tables or (isinstance(hidden, int) and hidden):
         lines.append("")
         lines.append("candidate vtable / dispatch tables (runs of pointers-to-code):")
+        labels_note = _surface_vtable_census_note(_field_dict(s, "vtable_labels"))
+        if labels_note:
+            lines.append(f"  {labels_note}")
+        if isinstance(hidden, int) and hidden:
+            lines.append(f"  {hidden} table(s) lying wholly inside ELF vtable objects hidden "
+                         "(--hide-vtables); their missing slots stay listed as candidates")
         for t in tables:
             if not isinstance(t, dict):
                 continue
             lines.append(
                 f"  {t.get('address', '?')} [{t.get('section', '?')}]  "
-                f"entries={t.get('entries', '?')}  fn={t.get('resolved_functions', 0)}  "
+                f"entries={t.get('entries', '?')}  fn={t.get('resolved_functions', 0)}"
+                f"{_surface_interior_note(t)}  "
                 f"missing={t.get('missing_functions', 0)}")
+            lines.extend(_surface_vtable_lines(t))
 
     cands = _field_list(value, "missing_function_candidates")
     if cands:
@@ -3558,11 +3648,85 @@ def _render_surface_text(value: Any) -> str:
             lines.append(
                 f"  {c.get('address', '?')}  [{c.get('section') or '?'}]  "
                 f"via {c.get('provenance', '?')}{more}  [{tag}: {', '.join(why)}]{suffix}")
+            # #1017 comment: where the referencing code stores the address, as
+            # BN's MLIL writes the store. A fact about the store, no role guess.
+            for store in _field_list(c, "stored_to"):
+                if isinstance(store, dict):
+                    lines.append(
+                        f"    stored to {_escape_control_chars(str(store.get('destination', '?')))} "
+                        f"in {_escape_control_chars(str(store.get('function', '?')))} "
+                        f"@ {store.get('address', '?')}")
+        first = _text_value(ordered[0], "address") if ordered else None
+        verify = (f"`bn disasm {shlex.quote(first)} --linear 16` (the first candidate; "
+                  "use the same form for the others -- a candidate lies outside every "
+                  "function, so plain `disasm <addr>` refuses it)"
+                  if first else "`disasm <addr> --linear 16`")
         lines.append("")
         lines.append("(candidates -- NOT confirmed functions. `decode` = clean instructions "
                      "before an undefined one; a low decode reliably means data. Start with the "
-                     "code-likely subset; verify with `disasm`, then `function create`.)")
+                     f"code-likely subset; verify with {verify}, then `function create`.)")
     return "\n".join(lines)
+
+
+def _surface_interior_note(table: dict[str, Any]) -> str:
+    """#1017 item 3: ` (N inside 1 function body, not entries: name @ addr)` when
+    resolved slots point inside a function rather than at its entry."""
+    interior = table.get("resolved_interior")
+    if isinstance(interior, bool) or not isinstance(interior, int) or interior <= 0:
+        return ""
+    names = [f"{_escape_control_chars(str(fn.get('name', '?')))} @ {fn.get('address', '?')}"
+             for fn in _field_list(table, "interior_functions") if isinstance(fn, dict)]
+    total = table.get("interior_functions_total")
+    count = total if isinstance(total, int) and not isinstance(total, bool) else len(names)
+    more = f", +{count - len(names)} more" if count > len(names) else ""
+    return (f" ({interior} inside {count} function bod{'y' if count == 1 else 'ies'}, "
+            f"not entries: {', '.join(names)}{more})")
+
+
+def _surface_vtable_census_note(census: dict[str, Any]) -> str | None:
+    """Why `evidence surface` tables carry no (or only some) vtable labels. A
+    complete `.symtab` read with no vtable objects needs no note: the binary
+    simply defines none."""
+    if not census:
+        return None
+    reason = _text_value(census, "reason")
+    if not reason or (census.get("status") == "ok" and census.get("symtab") is True):
+        return None
+    if census.get("status") == "ok" and census.get("objects"):
+        return f"vtable labels: partial -- {_escape_control_chars(reason)}"
+    return f"vtable labels: none -- {_escape_control_chars(reason)}"
+
+
+def _surface_vtable_lines(table: dict[str, Any]) -> list[str]:
+    """#1017 item 1: the ELF `_ZTV`/`_ZTC` objects a candidate table lies in,
+    by symbol size, and the entries that lie outside every one of them."""
+    lines = []
+    for obj in _field_list(table, "elf_vtables"):
+        if not isinstance(obj, dict):
+            continue
+        label = _escape_control_chars(str(obj.get("label") or obj.get("object") or "?"))
+        raw = _escape_control_chars(str(obj.get("object", "?")))
+        where = f"{raw} @ {obj.get('object_address', '?')}, {obj.get('size', '?')} bytes"
+        inside = obj.get("entries_inside", "?")
+        slot = obj.get("slot")
+        if isinstance(slot, int) and not isinstance(slot, bool):
+            ott = obj.get("offset_to_top")
+            point = obj.get("slot_address_point", "?")
+            table_note = (f" of the secondary table at address point {point} "
+                          f"(offset-to-top {ott})"
+                          if isinstance(ott, int) and ott else "")
+            slots = f"{inside} entr{'y' if inside == 1 else 'ies'} from slot {slot}{table_note}"
+        else:
+            slots = (f"{inside} entr{'y' if inside == 1 else 'ies'} (no slot number: no "
+                     "typeinfo header precedes them in the object)")
+        lines.append(f"    in {label} ({where}): {slots}")
+    outside = table.get("entries_outside_elf_vtables")
+    if lines and isinstance(outside, int) and not isinstance(outside, bool) and outside > 0:
+        past = (" -- the run continues past the object's st_size into data that is not "
+                "part of it" if table.get("extends_past_elf_vtable") else "")
+        lines.append(f"    {outside} entr{'y' if outside == 1 else 'ies'} outside every ELF "
+                     f"vtable object{past}")
+    return lines
 
 
 @_discloses
@@ -4094,7 +4258,9 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         caller_scan_note = value.get("caller_scan_note")
         data_ref_note = _callsites_data_ref_note(value.get("callee_data_ref_count"),
                                                  value.get("callee_data_refs"),
-                                                 value.get("callee_data_ref_vtables"))
+                                                 value.get("callee_data_ref_vtables"),
+                                                 value.get("callee_data_ref_objects"),
+                                                 value.get("callee_data_ref_census"))
         value = _field_list(value, "items")
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -4253,7 +4419,21 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
     return body
 
 
-def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = None) -> str | None:
+def _vtable_slot_phrase(row: dict[str, Any]) -> str | None:
+    """`slot N` (of a secondary table when its offset-to-top is nonzero), from the
+    slot the bridge counted off a decoded typeinfo header; None when it had none."""
+    slot = row.get("slot")
+    if isinstance(slot, bool) or not isinstance(slot, int):
+        return None
+    ott = row.get("offset_to_top")
+    if isinstance(ott, int) and not isinstance(ott, bool) and ott:
+        return (f"slot {slot} of the secondary table at address point "
+                f"{row.get('slot_address_point', '?')} (offset-to-top {ott})")
+    return f"slot {slot}"
+
+
+def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = None,
+                             raw_objects: Any = None, raw_census: Any = None) -> str | None:
     """Data storage is not a recovered indirect caller; offer bounded next reads."""
     if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count <= 0:
         return None
@@ -4266,23 +4446,56 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
         class_name = _text_value(row, "class_name")
         address_point = _text_value(row, "address_point")
         if address and class_name and (address_point or row.get("address_point") is None):
-            known[address] = {"class_name": class_name, "address_point": address_point}
+            known[address] = {"class_name": class_name, "address_point": address_point,
+                              "slot": _vtable_slot_phrase(row)}
+    # #1018 item 1: sized ELF `_ZTV`/`_ZTC` objects holding a location whose
+    # class navigation is not proven -- a label from the symbol extent only.
+    objects: dict[str, list[str]] = {}
+    for row in _field_list({"callee_data_ref_objects": raw_objects}, "callee_data_ref_objects"):
+        if not isinstance(row, dict) or row.get("evidence") != "elf_symbol_size":
+            continue
+        address = _text_value(row, "address")
+        labels = []
+        for obj in _field_list(row, "objects"):
+            if not isinstance(obj, dict):
+                continue
+            label = _escape_control_chars(str(obj.get("label") or obj.get("object") or "?"))
+            raw = _escape_control_chars(str(obj.get("object", "?")))
+            slot = _vtable_slot_phrase(obj)
+            labels.append(f"{label} ({raw} @ {obj.get('object_address', '?')}, "
+                          f"{obj.get('size', '?')} bytes{'; ' + slot if slot else ''})")
+        if address and labels:
+            objects[address] = labels
     lines = [f"note: the callee's address is stored in {raw_count} data location(s); "
              "data refs do not identify indirect callers."]
+    unknown = False
     for ref in refs:
         row = known.get(ref)
         if row is not None:
             cls = str(row["class_name"])
             point = row["address_point"]
             point_note = f"primary address point {point}" if point else "primary address point not decoded"
-            lines.append(f"  {ref}: inside the named vtable for {_escape_control_chars(cls)} "
+            where = f"{row['slot']} of the named vtable" if row["slot"] else "inside the named vtable"
+            lines.append(f"  {ref}: {where} for {_escape_control_chars(cls)} "
                          f"({point_note}); "
                          f"inspect its class layout with `bn class show -- {shlex.quote(cls)}`")
+        elif ref in objects:
+            inside = objects[ref]
+            what = (f"inside {inside[0]}" if len(inside) == 1
+                    else f"inside overlapping ELF objects {', '.join(inside)}")
+            lines.append(f"  {ref}: {what} by ELF symbol size; class navigation is not proven, "
+                         f"so inspect references to this data location with "
+                         f"`bn xrefs {shlex.quote(ref)}` (not a virtual-caller list)")
         else:
+            unknown = True
             lines.append(f"  {ref}: table identity unknown; inspect references to this data "
                          f"location with `bn xrefs {shlex.quote(ref)}` (not a virtual-caller list)")
     if raw_count > len(refs):
         lines.append(f"  +{raw_count - len(refs)} unlisted data location(s)")
+    census = raw_census if isinstance(raw_census, dict) else {}
+    reason = _text_value(census, "reason") if census else None
+    if unknown and reason and not (census.get("status") == "ok" and census.get("symtab") is True):
+        lines.append(f"  (vtable extents: {_escape_control_chars(reason)})")
     return "\n".join(lines)
 
 

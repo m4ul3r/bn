@@ -2139,7 +2139,8 @@ def test_callee_vtable_plural_symbols_keep_local_alias_in_either_order(monkeypat
     result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
     assert result["callee_data_ref_vtables"] == [{
         "address": "0x4010", "class_name": "X", "vtable_address": "0x4000",
-        "address_point": None, "evidence": "elf_symbol_size",
+        "address_point": None, "slot": None, "slot_address_point": None,
+        "offset_to_top": None, "evidence": "elf_symbol_size",
     }]
 
 
@@ -2373,3 +2374,161 @@ def test_callee_vtable_actual_registry_must_resolve_exact_canonical_object(monke
     result = bridge.read_listing._callee_data_refs(ctx, bv, 0x5000)
     assert result["callee_data_refs"] == ["0x4010", "0x900000"]
     assert result["callee_data_ref_vtables"] == []
+
+
+def _elf_vtable_image(symbols, *, symtab=True, data_words=(), endian="<"):
+    """A 64-bit ELF whose one PROGBITS section maps 0x4000..0x4200 and holds
+    *data_words*, with *symbols* ``(name, value, size, info, shndx)`` in a
+    ``.symtab`` (or, with ``symtab=False``, only a ``.dynsym``)."""
+    import struct
+    from types import SimpleNamespace
+
+    strings = b"\0"
+    rows = [(0, 0, 0, 0, 0, 0)]
+    for name, value, size, info, shndx in symbols:
+        rows.append((len(strings), info, 0, shndx, value, size))
+        strings += name.encode() + b"\0"
+    data = bytearray(512)
+
+    def append(blob):
+        off = len(data)
+        data.extend(blob)
+        return off, len(blob)
+
+    body = append(b"".join(word.to_bytes(8, "little" if endian == "<" else "big", signed=word < 0)
+                           for word in data_words).ljust(0x200, b"\0"))
+    strtab = append(strings)
+    symbol_bytes = append(b"".join(struct.pack(endian + "IBBHQQ", *row) for row in rows))
+    data[:16] = b"\x7fELF\x02" + (b"\x01" if endian == "<" else b"\x02") + bytes(10)
+    struct.pack_into(endian + "Q", data, 40, 64)
+    struct.pack_into(endian + "HH", data, 58, 64, 4)
+    sections = [
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (0, 1, 2, 0x4000, body[0], 0x200, 0, 0, 8, 0),
+        (0, 3, 0, 0, *strtab, 0, 0, 1, 0),
+        (0, 2 if symtab else 11, 0, 0, *symbol_bytes, 2, 0, 8, 24),
+    ]
+    for i, section in enumerate(sections):
+        struct.pack_into(endian + "IIQQQQIIQQ", data, 64 + i * 64, *section)
+    memory = bytes(data[body[0]:body[0] + 0x200])
+
+    def read(address, size):
+        if 0x4000 <= address and address + size <= 0x4200:
+            return memory[address - 0x4000:address - 0x4000 + size]
+        return b""
+
+    return SimpleNamespace(
+        parent_view=SimpleNamespace(start=0, length=len(data),
+                                    read=lambda off, size: bytes(data[off:off + size])),
+        image_base=0, original_image_base=0, address_size=8, read=read)
+
+
+_OBJECT = 0x11  # STB_GLOBAL | STT_OBJECT
+
+
+def test_elf_vtable_census_reports_vtable_and_construction_objects_1018(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    rl = bridge.read_listing
+    bv = _elf_vtable_image([
+        ("_ZTV1D", 0x4000, 0x48, _OBJECT, 1),
+        ("_ZTC1D0_1B", 0x4048, 0x30, _OBJECT, 1),
+        ("_ZTI1D", 0x4100, 0x10, _OBJECT, 1),
+        ("_ZTV5Alias", 0x4000, 0, 0x10, 1),         # a NOTYPE size-0 linker alias
+        ("_ZTV6Import", 0, 0, _OBJECT, 0),          # undefined: not a definition
+    ])
+    census = rl._elf_vtable_census(bv)
+    assert census["status"] == "ok" and census["symtab"] is True
+    assert census["typeinfo"] == {0x4100}
+    rows = {(o["raw_name"], o["kind"], o["supported"]) for o in census["objects"]}
+    assert rows == {("_ZTV1D", "vtable", True),
+                    ("_ZTC1D0_1B", "construction_vtable", True),
+                    ("_ZTV5Alias", "vtable", False)}
+    assert [o["raw_name"] for o in rl._supported_vtable_objects(census)] == ["_ZTV1D", "_ZTC1D0_1B"]
+    assert rl._census_summary(census) == {"status": "ok", "symtab": True, "objects": 2,
+                                          "reason": None}
+
+
+@pytest.mark.parametrize("shape,status,reason", [
+    ("dynsym_only", "ok", "no .symtab (stripped)"),
+    ("not_elf", "not_elf", "not ELF"),
+    ("no_sections", "no_sections", "no section headers"),
+    ("no_parent", "unavailable", "no raw file view"),
+])
+def test_elf_vtable_census_says_why_nothing_is_labelled_1017(monkeypatch, shape, status, reason):
+    bridge = _load_bridge(monkeypatch)
+    rl = bridge.read_listing
+    bv = _elf_vtable_image([("main", 0x4000, 8, 0x12, 1)], symtab=shape != "dynsym_only")
+    if shape == "not_elf":
+        bv.parent_view.read = lambda off, size: b"MZ" + bytes(size)
+    elif shape == "no_sections":
+        image = bytearray(bv.parent_view.read(0, bv.parent_view.length))
+        image[60:62] = b"\0\0"   # e_shnum = 0, as after `sstrip`
+        bv.parent_view.read = lambda off, size: bytes(image[off:off + size])
+    elif shape == "no_parent":
+        bv.parent_view = None
+    summary = rl._census_summary(rl._elf_vtable_census(bv))
+    assert summary["status"] == status and summary["objects"] == 0
+    assert reason in summary["reason"]
+
+
+@pytest.mark.parametrize("address,expected", [
+    # The first table: words [0, &_ZTI1D, f, f, f]; the address point is 0x4010.
+    (0x4010, (0, "0x4010", 0)),
+    (0x4020, (2, "0x4010", 0)),
+    # The secondary table: [-16, &_ZTI1D, g, g] after the primary's slots.
+    (0x4038, (0, "0x4038", -16)),
+    (0x4040, (1, "0x4038", -16)),
+    # The header words themselves, an unaligned entry and one outside the object.
+    (0x4000, (None, None, None)),
+    (0x4008, (None, None, None)),
+    (0x4021, (None, None, None)),
+    (0x4048, (None, None, None)),
+])
+@pytest.mark.parametrize("endian", ["<", ">"])
+def test_vtable_slot_counts_from_the_governing_typeinfo_header_1018(monkeypatch, address,
+                                                                    expected, endian):
+    bridge = _load_bridge(monkeypatch)
+    rl = bridge.read_listing
+    words = [0, 0x4100, 0x5000, 0x5010, 0x5020, -16, 0x4100, 0x5030, 0x5040]
+    bv = _elf_vtable_image([("_ZTV1D", 0x4000, 0x48, _OBJECT, 1),
+                            ("_ZTI1D", 0x4100, 0x10, _OBJECT, 1)], data_words=words,
+                           endian=endian)
+    census = rl._elf_vtable_census(bv)
+    slot = rl._vtable_slot(bv, census, 0x4000, 0x48, address)
+    assert (slot["slot"], slot["slot_address_point"], slot["offset_to_top"]) == expected
+
+
+def test_vtable_slot_needs_a_typeinfo_header_not_the_object_start_1018(monkeypatch):
+    """With no `_ZTI` symbol in the tables (-fno-rtti, or typeinfo defined
+    elsewhere) the slot is unknown rather than counted from the object head."""
+    bridge = _load_bridge(monkeypatch)
+    rl = bridge.read_listing
+    bv = _elf_vtable_image([("_ZTV1D", 0x4000, 0x28, _OBJECT, 1)],
+                           data_words=[0, 0, 0x5000, 0x5010, 0x5020])
+    census = rl._elf_vtable_census(bv)
+    assert rl._vtable_slot(bv, census, 0x4000, 0x28, 0x4018)["slot"] is None
+
+
+def test_callee_data_refs_label_construction_vtable_slots_1018(monkeypatch):
+    """A `_ZTC` construction vtable has no class-navigation proof, so it is
+    reported beside the navigable rows with its symbol, extent and slot."""
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    words = [0x28, 0, 0x4100, 0x5000, 0x5010]
+    bv = _elf_vtable_image([("_ZTC1D0_1B", 0x4000, 0x28, _OBJECT, 1),
+                            ("_ZTI1B", 0x4100, 0x10, _OBJECT, 1)], data_words=words)
+    marker = SimpleNamespace(address=0x4000, short_name="construction_vtable_for_B-in-D",
+                             raw_name="_ZTC1D0_1B", type="DataSymbol")
+    bv.get_symbols_by_raw_name = lambda name: [marker] if name == "_ZTC1D0_1B" else []
+    bv.get_symbols = lambda: [marker]
+    bv.functions = []
+    bv.get_data_refs = lambda address: [0x4020, 0x900000]
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5010)
+    assert result["callee_data_ref_vtables"] == []
+    assert result["callee_data_ref_objects"] == [{
+        "address": "0x4020", "evidence": "elf_symbol_size", "objects": [{
+            "object": "_ZTC1D0_1B", "label": "construction vtable for B-in-D",
+            "kind": "construction_vtable", "object_address": "0x4000", "size": 0x28,
+            "slot": 1, "slot_address_point": "0x4018", "offset_to_top": 0}]}]
+    assert result["callee_data_ref_census"]["status"] == "ok"

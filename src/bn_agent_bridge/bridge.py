@@ -5595,6 +5595,9 @@ def _bind_function_evidence(bridge, params, target):
         if window[1] <= window[0]:
             raise OperationFailure("invalid_request",
                                    f"--address-window end must exceed start: {aw!r}")
+    callees = _validate_callee_selectors(params.get("callee"), label="callee")
+    exclude_callees = _validate_callee_selectors(params.get("exclude_callee"),
+                                                 label="exclude_callee")
     return bridge._function_evidence(
         target,
         params["identifier"],
@@ -5602,7 +5605,22 @@ def _bind_function_evidence(bridge, params, target):
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         address_window=window,
+        callees=callees,
+        exclude_callees=exclude_callees,
     )
+
+
+def _validate_callee_selectors(value, *, label: str) -> list[str] | None:
+    """#1037: `evidence function --callee/--exclude-callee`: absent or null means
+    no filter; otherwise a list of non-empty selector strings."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise OperationFailure(
+            "invalid_request",
+            f"{label} must be a list of non-empty function names or addresses, got {value!r}",
+        )
+    return list(value)
 
 
 @op("xrefs", lock="read")
@@ -5676,6 +5694,8 @@ def _bind_hidden_surface(bridge, params, target):
         max_tables=int(params.get("max_tables", 64)),
         max_candidates=int(params.get("max_candidates", 128)),
         max_scan_bytes=int(params.get("max_scan_bytes", 16_000_000)),
+        hide_vtables=_validate_bool(params.get("hide_vtables"), label="hide_vtables",
+                                    default=False),
     )
 
 

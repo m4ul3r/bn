@@ -952,6 +952,17 @@ def _callsites(args: argparse.Namespace) -> int:
                  help="Skip the first OFFSET call-evidence records (pagination, with --limit)"),
              arg("--address-window", dest="address_window", default=None, metavar="A:B",
                  help="Only calls whose address is in [A, B) (hex 0x.. or decimal), e.g. 0x402000:0x402200"),
+             arg("--callee", dest="callee", action="append", default=None, metavar="NAME|ADDR",
+                 help="Only calls whose resolved callee matches: exact raw or display name, or "
+                      "the callee's address (repeatable; unresolved/indirect calls never match)"),
+             arg("--exclude-callee", dest="exclude_callee", action="append", default=None,
+                 metavar="NAME|ADDR",
+                 help="Drop calls whose resolved callee matches (same rule as --callee; "
+                      "repeatable; unresolved/indirect calls are kept)"),
+             arg("--compact", action="store_true", default=False,
+                 help="One line per call: address, kind, target, arguments, and short tags"),
+             arg("--verbose", "-v", action="store_true", default=False,
+                 help="Print every per-row arity witness line (default: contradictions only)"),
              mangled_arg(),
          ],
          estimable=True)
@@ -963,13 +974,18 @@ def _evidence_function(args: argparse.Namespace) -> int:
     params["offset"] = args.offset
     if args.address_window:
         params["address_window"] = args.address_window
+    # #1037: forwarded only when given, so an unfiltered request is unchanged.
+    if args.callee:
+        params["callee"] = list(args.callee)
+    if args.exclude_callee:
+        params["exclude_callee"] = list(args.exclude_callee)
     return _call(
         args,
         "function_evidence",
         params,
         require_target=True,
         text_renderer=lambda value: _resolution_note(value) + _render_function_evidence_text(
-            value, mangled=args.mangled),
+            value, mangled=args.mangled, verbose=args.verbose, compact=args.compact),
         stem="function-evidence",
     )
 
@@ -1145,18 +1161,25 @@ def _evidence_virtual_call(args: argparse.Namespace) -> int:
                  help="Cap on reported missing-function candidates (disclosed when hit)"),
              arg("--max-scan-bytes", dest="max_scan_bytes", type=_positive_int, default=16_000_000,
                  help="Cap on total data bytes scanned for pointer tables (disclosed when hit)"),
+             arg("--hide-vtables", dest="hide_vtables", action="store_true", default=False,
+                 help="Hide candidate tables whose every entry lies inside a defined ELF "
+                      "_ZTV/_ZTC vtable object (by its symbol size); their missing slots "
+                      "stay listed as candidates"),
          ],
          estimable=True)
 def _evidence_surface(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {
+        "table_min_run": args.table_min_run,
+        "max_tables": args.max_tables,
+        "max_candidates": args.max_candidates,
+        "max_scan_bytes": args.max_scan_bytes,
+    }
+    if args.hide_vtables:
+        params["hide_vtables"] = True
     return _call(
         args,
         "hidden_surface",
-        {
-            "table_min_run": args.table_min_run,
-            "max_tables": args.max_tables,
-            "max_candidates": args.max_candidates,
-            "max_scan_bytes": args.max_scan_bytes,
-        },
+        params,
         require_target=True,
         text_renderer=_render_surface_text,
         stem="evidence-surface",

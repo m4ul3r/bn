@@ -1266,6 +1266,155 @@ def test_render_surface_code_ref_candidate_names_its_site_and_count_967():
     assert "+2 more site(s)" in line
 
 
+def _surface_value(**table_fields):
+    table = {"address": "0x403d20", "section": ".data.rel.ro", "entries": 5,
+             "resolved_functions": 5, "missing_functions": 0, **table_fields}
+    return {"summary": {"init_sections": 0, "candidate_tables": 1,
+                        "missing_function_candidates": 0,
+                        "vtable_labels": {"status": "ok", "symtab": True, "objects": 1,
+                                          "reason": None}},
+            "candidate_tables": [table], "missing_function_candidates": []}
+
+
+def test_render_surface_labels_a_table_by_elf_vtable_extent_1017():
+    from bn.formatters import _render_surface_text
+    out = _render_surface_text(_surface_value(
+        elf_vtables=[{"object": "_ZTV5Short", "label": "vtable for Short",
+                      "kind": "vtable", "object_address": "0x403d10", "size": 32,
+                      "first_entry": "0x403d20", "entries_inside": 2, "slot": 0,
+                      "slot_address_point": "0x403d20", "offset_to_top": 0}],
+        entries_outside_elf_vtables=3, extends_past_elf_vtable=True))
+    lines = out.splitlines()
+    row = lines.index(next(ln for ln in lines if ln.startswith("  0x403d20 ")))
+    assert lines[row + 1] == ("    in vtable for Short (_ZTV5Short @ 0x403d10, 32 bytes): "
+                              "2 entries from slot 0")
+    assert lines[row + 2].startswith("    3 entries outside every ELF vtable object -- "
+                                     "the run continues past the object's st_size")
+    # A complete .symtab read needs no census note.
+    assert "vtable labels:" not in out
+
+
+def test_render_surface_names_a_secondary_table_and_an_undecoded_slot_1017():
+    from bn.formatters import _render_surface_text
+    obj = {"object": "_ZTV1D", "label": "vtable for D", "kind": "vtable",
+           "object_address": "0x404940", "size": 168, "entries_inside": 3}
+    secondary = _render_surface_text(_surface_value(
+        elf_vtables=[{**obj, "slot": 0, "slot_address_point": "0x404998",
+                      "offset_to_top": -16}], entries_outside_elf_vtables=0))
+    assert ("3 entries from slot 0 of the secondary table at address point 0x404998 "
+            "(offset-to-top -16)") in secondary
+    assert "outside every ELF vtable object" not in secondary
+    undecoded = _render_surface_text(_surface_value(
+        elf_vtables=[{**obj, "slot": None, "slot_address_point": None,
+                      "offset_to_top": None}], entries_outside_elf_vtables=0))
+    assert "3 entries (no slot number: no typeinfo header precedes them" in undecoded
+
+
+@pytest.mark.parametrize("census,expected", [
+    ({"status": "ok", "symtab": False, "objects": 0, "reason": "no .symtab (stripped): x"},
+     "vtable labels: none -- no .symtab (stripped): x"),
+    ({"status": "ok", "symtab": False, "objects": 2, "reason": "no .symtab (stripped): x"},
+     "vtable labels: partial -- no .symtab (stripped): x"),
+    ({"status": "over_budget", "symtab": False, "objects": 0, "reason": "too many"},
+     "vtable labels: none -- too many"),
+    ({"status": "ok", "symtab": True, "objects": 0, "reason": "defines none"}, None),
+])
+def test_render_surface_says_why_tables_are_unlabelled_1017(census, expected):
+    from bn.formatters import _render_surface_text
+    value = _surface_value()
+    value["summary"]["vtable_labels"] = census
+    lines = [ln.strip() for ln in _render_surface_text(value).splitlines()]
+    notes = [ln for ln in lines if ln.startswith("vtable labels:")]
+    assert notes == ([expected] if expected else [])
+
+
+def test_render_surface_discloses_hidden_vtable_tables_1017():
+    from bn.formatters import _render_surface_text
+    value = _surface_value()
+    value["candidate_tables"] = []
+    value["summary"].update(candidate_tables=0, vtable_tables_hidden=2)
+    out = _render_surface_text(value)
+    assert ("2 table(s) lying wholly inside ELF vtable objects hidden (--hide-vtables); "
+            "their missing slots stay listed as candidates") in out
+
+
+def test_render_surface_says_resolved_slots_are_inside_a_function_body_1017():
+    from bn.formatters import _render_surface_text
+    out = _render_surface_text(_surface_value(
+        entries=4, resolved_functions=4, resolved_entries=0, resolved_interior=4,
+        interior_functions=[{"address": "0x401130", "name": "dispatch"}],
+        interior_functions_total=1))
+    assert ("fn=4 (4 inside 1 function body, not entries: dispatch @ 0x401130)  missing=0"
+            in out)
+    entries = _render_surface_text(_surface_value(resolved_entries=5, resolved_interior=0))
+    assert "inside" not in entries
+
+
+def test_render_surface_store_lines_and_runnable_verify_command():
+    import shlex
+
+    from bn.formatters import _render_surface_text
+    row = {"address": "0x4008e0", "section": ".text", "aligned": True, "decode_depth": 16,
+           "code_likely": True, "provenance": "code_ref:init_steps@0x400950",
+           "stored_to": [{"function": "init_steps", "address": "0x400958",
+                          "destination": "[arg1 + 0x10]"}]}
+    out = _render_surface_text({"summary": {"missing_function_candidates": 1},
+                                "missing_function_candidates": [row]})
+    assert "    stored to [arg1 + 0x10] in init_steps @ 0x400958" in out.splitlines()
+    # #1033: the footer prints a command that runs on a function-less address.
+    command, = re.findall(r"verify with `(bn [^`]+)`", out)
+    assert shlex.split(command) == ["bn", "disasm", "0x4008e0", "--linear", "16"]
+    assert "member" not in out
+
+
+def test_callsites_note_states_slots_and_construction_vtables_1018():
+    from bn.formatters import _callsites_data_ref_note
+    named = {"address": "0x404ba8", "class_name": "Square", "vtable_address": "0x404b88",
+             "address_point": "0x404b98", "slot": 2, "slot_address_point": "0x404b98",
+             "offset_to_top": 0, "evidence": "elf_symbol_size"}
+    secondary = {**named, "address": "0x404bb0", "slot": 1,
+                 "slot_address_point": "0x404ba8", "offset_to_top": -8}
+    ztc = {"address": "0x404a38", "evidence": "elf_symbol_size", "objects": [
+        {"object": "_ZTC1D0_1B", "label": "construction vtable for B-in-D",
+         "kind": "construction_vtable", "object_address": "0x404a20", "size": 112,
+         "slot": 0, "slot_address_point": "0x404a38", "offset_to_top": 0}]}
+    overlap = {"address": "0x404c00", "evidence": "elf_symbol_size", "objects": [
+        {**ztc["objects"][0], "slot": None},
+        {"object": "_ZTV5Alias", "label": "vtable for Alias", "kind": "vtable",
+         "object_address": "0x404a20", "size": 512, "slot": None}]}
+    note = _callsites_data_ref_note(
+        5, ["0x404ba8", "0x404bb0", "0x404a38", "0x404c00", "0x405000"],
+        [named, secondary], [ztc, overlap],
+        {"status": "ok", "symtab": True, "objects": 3, "reason": None})
+    lines = note.splitlines()
+    assert lines[1] == ("  0x404ba8: slot 2 of the named vtable for Square (primary address "
+                        "point 0x404b98); inspect its class layout with `bn class show -- Square`")
+    assert lines[2].startswith("  0x404bb0: slot 1 of the secondary table at address point "
+                               "0x404ba8 (offset-to-top -8) of the named vtable for Square")
+    assert lines[3] == ("  0x404a38: inside construction vtable for B-in-D (_ZTC1D0_1B @ "
+                        "0x404a20, 112 bytes; slot 0) by ELF symbol size; class navigation is "
+                        "not proven, so inspect references to this data location with "
+                        "`bn xrefs 0x404a38` (not a virtual-caller list)")
+    assert lines[4].startswith("  0x404c00: inside overlapping ELF objects construction vtable "
+                               "for B-in-D (_ZTC1D0_1B @ 0x404a20, 112 bytes), vtable for Alias")
+    assert lines[5].startswith("  0x405000: table identity unknown")
+    assert len(lines) == 6
+    # Every printed command is one of the two runnable forms.
+    assert {cmd.split()[1] for cmd in re.findall(r"`(bn [^`]+)`", note)} == {"class", "xrefs"}
+
+
+@pytest.mark.parametrize("census,shown", [
+    ({"status": "ok", "symtab": False, "objects": 0, "reason": "no .symtab (stripped): x"}, True),
+    ({"status": "unavailable", "symtab": False, "objects": 0, "reason": "raised"}, True),
+    ({"status": "ok", "symtab": True, "objects": 0, "reason": "defines none"}, False),
+])
+def test_callsites_note_discloses_why_extents_are_unknown_1018(census, shown):
+    from bn.formatters import _callsites_data_ref_note
+    note = _callsites_data_ref_note(1, ["0x404978"], [], [], census)
+    assert note.splitlines()[1].startswith("  0x404978: table identity unknown")
+    assert (f"  (vtable extents: {census['reason']})" in note.splitlines()) is shown
+
+
 def test_render_orient_non_dict_target_and_kind_breakdown_degrade():
     from bn.formatters import _render_orient_text
     out = _render_orient_text({"target": "bad",
@@ -4308,9 +4457,13 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
     # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
-    assert len(sites) == 63, (
+    # #1037 adds the `evidence function --callee` header's `excluded` count; the
+    # recorded context carries a `callee_filter`, whose header always states the
+    # paging, so `_render_function_evidence_text(offset)` is now checked below
+    # instead of skipped as unstated.
+    assert len(sites) == 64, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 63. A "
+        "count helper, not 64. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4387,6 +4540,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # which drives the nested payload and asserts the `?` refusal.
         "_arity_witness_text(declared_arity) [not a payload renderer]",
         "_arity_witness_text(witness_arity) [not a payload renderer]",
+        # #1037: the callee-filter `calls:` header is a fragment helper reading
+        # the nested `callee_filter.excluded`. Covered by name in
+        # `test_render_evidence_function_callee_filter_header_1037`, which
+        # asserts the `?` refusal for an unreadable count.
+        "_callee_filter_call_header(excluded) [not a payload renderer]",
         # #795 round-6 review: the class lens states these two on its
         # COUNT-ONLY branch, which this differential's context never takes --
         # it fills every harvested key, so the listing branch always wins.
@@ -4418,7 +4576,6 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "this context]",
         "_render_backward_diagnostics(unresolved) [count not stated in this "
         "context]",
-        "_render_function_evidence_text(offset) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
         # The same branch for the #818 skip buckets: the recorded context opens
         # the detail branch (`go_renamed_candidates` readable and non-zero), and
@@ -5546,7 +5703,7 @@ def test_render_evidence_states_each_arity_witness_and_the_function_tally_865():
                                  "witness_arity": 2, "register": "x1"}}},
         ],
     }
-    out = _render_function_evidence_text(value)
+    out = _render_function_evidence_text(value, verbose=True)
     assert ("arity witnesses over 2 call(s): library agreement 0, contradiction 1, "
             "unavailable 1, refused 0; callee_body agreement 1, contradiction 0, "
             "unavailable 1, refused 0 -- only a contradiction is evidence against a row"
@@ -5556,6 +5713,17 @@ def test_render_evidence_states_each_arity_witness_and_the_function_tally_865():
     assert ("  witnesses: library=unavailable (no_library_entry); "
             "callee_body=agreement (body uses 2 up to x1, prototype 2)") in out
     assert "arguments: (hlil recovered)" in out
+    assert "hidden" not in out
+
+    # #1037: by default only a row with a contradiction prints its witness
+    # line; the tally discloses how many rows' lines were hidden.
+    default = _render_function_evidence_text(value)
+    assert ("  witnesses: library=contradiction (libgcc declares 1, prototype 0); "
+            "callee_body=unavailable (imported_callee)") in default
+    assert "library=unavailable (no_library_entry)" not in default
+    assert default.count("  witnesses: ") == 1
+    assert ("unavailable/refused is neither; per-row witness lines shown only for "
+            "contradictions (1 hidden; --verbose shows all)") in default
 
     # A skewed count is stated as unknown and disclosed, never a fabricated 0.
     skewed = {**value, "arity_witness_counts": {"library": {"agreement": "many"}}}
@@ -5571,7 +5739,7 @@ def test_render_evidence_states_each_arity_witness_and_the_function_tally_865():
     # The same for a witness's own observed count: `?`, not a number.
     row = copy.deepcopy(value["calls"][1])
     row["arity_witnesses"]["callee_body"]["witness_arity"] = "many"
-    out = _render_function_evidence_text({**value, "calls": [row]})
+    out = _render_function_evidence_text({**value, "calls": [row]}, verbose=True)
     assert "callee_body=agreement (body uses ? up to x1, prototype 2)" in out
     assert "malformed witness_arity field" in out
 
@@ -5589,7 +5757,7 @@ def test_render_evidence_states_each_arity_witness_and_the_function_tally_865():
         },
         "calls": [bad, good],
     }
-    out = _render_function_evidence_text(two_rows)
+    out = _render_function_evidence_text(two_rows, verbose=True)
     rows = out.split("- 0x")
     assert "body uses ? up to x1" in rows[1]
     assert "callee_body=agreement (body uses 2 up to x1, prototype 2)" in rows[2]
@@ -5598,6 +5766,120 @@ def test_render_evidence_states_each_arity_witness_and_the_function_tally_865():
     # Both refusals are still disclosed by name on the card.
     note = out.split("\n! malformed ", 1)[1]
     assert "witness_arity" in note and "agreement" in note
+
+
+def _evidence_card_1037(**extra):
+    """A small `evidence function` payload: one resolved call to a free routine
+    with a contradicting witness, one resolved call with agreeing witnesses, one
+    indirect unresolved call."""
+    return {
+        "function": {"name": "session_close", "address": "0x402000"},
+        "thunk": {"is_candidate": False},
+        "total_calls": 44, "matched_calls": 3, "offset": 0, "limit": None,
+        "calls": [
+            {"address": "0x402010", "operation": "LLIL_CALL", "direct": True,
+             "target": {"raw": "0x401030", "normalized": "0x401030", "status": "function",
+                        "function": {"name": "_ZdlPv", "display_name": "operator delete",
+                                     "address": "0x401030"}},
+             "call_instruction": {"address": "0x402010", "text": "call 0x401030"},
+             "hlil_statement": "operator delete(ctx)", "llil": "call(0x401030)",
+             "argument_source": "hlil", "argument_confidence": "inferred",
+             "arguments": [{"text": "ctx"}, {"text": "0x18"}],
+             "arity_mismatch": True, "declared_arity": 1,
+             "arity_witnesses": {
+                 "library": {"status": "contradiction", "declared_arity": 1,
+                             "witness_arity": 2, "source": "libstdc++"}}},
+            {"address": "0x402020", "operation": "LLIL_CALL", "direct": True,
+             "target": {"raw": "0x401040", "normalized": "0x401040", "status": "function",
+                        "function": {"name": "log_line", "address": "0x401040"}},
+             "argument_source": "hlil", "argument_confidence": "recovered",
+             "arguments": [{"text": "\"closing\""}],
+             "variadic": {"is_variadic": True, "under_recovered": True,
+                          "warning": "under-recovered"},
+             "arity_witnesses": {
+                 "library": {"status": "unavailable", "reason": "no_library_entry"}}},
+            {"address": "0x402030", "operation": "LLIL_CALL", "direct": False,
+             "callee_unresolved": True, "arity_unknown": True, "arguments": []},
+        ],
+        **extra,
+    }
+
+
+def test_render_evidence_function_callee_filter_header_1037():
+    """#1037: a callee-filtered card states what matched out of the full call
+    count and how many the filter removed; zero matches is said outright."""
+    from bn.formatters import _render_function_evidence_text
+    flt = {"callee": [], "exclude_callee": ["operator delete"], "excluded": 41}
+    out = _render_function_evidence_text(_evidence_card_1037(callee_filter=flt))
+    assert ("calls: 3 of 3 matching the callee filter (of 44 total; 41 excluded)"
+            in out.splitlines())
+
+    # Paging still offers the resume offset.
+    paged = _render_function_evidence_text(_evidence_card_1037(
+        callee_filter=flt, limit=3, matched_calls=5, has_more=True))
+    assert ("calls: 3 of 5 matching the callee filter (of 44 total; 41 excluded) "
+            "-- more: rerun with --offset 3") in paged
+
+    # A window on top of the filter is named, not blamed on the filter.
+    windowed = _render_function_evidence_text(_evidence_card_1037(
+        callee_filter={**flt, "excluded": 30}))
+    assert "matching the callee filter and address window (of 44 total; 30 excluded)" in windowed
+
+    # Zero matches never reads like a function with no calls.
+    none = _render_function_evidence_text(_evidence_card_1037(
+        callee_filter={"callee": ["missing_fn"], "exclude_callee": [], "excluded": 44},
+        matched_calls=0, calls=[]))
+    assert "calls: 0 -- no call matched the callee filter (of 44 total; 44 excluded)" in none
+
+    # An unreadable `excluded` is stated as `?` and disclosed, never a number.
+    skewed = _render_function_evidence_text(_evidence_card_1037(
+        callee_filter={**flt, "excluded": "many"}))
+    assert "(of 44 total; ? excluded)" in skewed
+    assert "malformed excluded field" in skewed
+
+    # No filter: the unfiltered header is unchanged.
+    plain = _render_function_evidence_text(_evidence_card_1037(matched_calls=44, total_calls=44))
+    assert "calls: 3" in plain.splitlines()
+    assert "callee filter" not in plain
+
+
+def test_render_evidence_function_compact_rows_1037():
+    """#1037: `--compact` prints one line per call with short tags, and keeps
+    everything above the call list byte-identical."""
+    from bn.formatters import _render_function_evidence_text
+    card = _evidence_card_1037(arity_witness_counts={
+        "library": {"agreement": 0, "contradiction": 1, "unavailable": 1, "refused": 0}})
+    out = _render_function_evidence_text(card, compact=True)
+    rows = [line for line in out.splitlines() if line.startswith("- ")]
+    assert rows == [
+        "- 0x402010  direct  operator delete @ 0x401030  (ctx, 0x18) "
+        "[arity: mismatch] [witness: contradiction]",
+        "- 0x402020  direct  log_line @ 0x401040  (\"closing\") [variadic: under-recovered]",
+        "- 0x402030  indirect  ?  () [arity: unknown] [target unresolved]",
+    ]
+    for noisy in ("instruction:", "hlil:", "llil:", "witnesses:", "arguments:"):
+        assert noisy not in out
+    head = out.split("\n- ", 1)[0]
+    full_head = _render_function_evidence_text(card, verbose=True).split("\n- ", 1)[0]
+    assert head == full_head
+    # --mangled reaches the compact target too.
+    raw = _render_function_evidence_text(card, compact=True, mangled=True)
+    assert "- 0x402010  direct  _ZdlPv @ 0x401030  (ctx, 0x18)" in raw
+
+
+def test_render_evidence_function_witness_lines_default_to_contradictions_1037():
+    """#1037: the per-row witness line is printed by default only for a row with
+    a contradiction; the hidden count is disclosed even without a tally."""
+    from bn.formatters import _render_function_evidence_text
+    out = _render_function_evidence_text(_evidence_card_1037())
+    assert "  witnesses: library=contradiction (libstdc++ declares 2, prototype 1)" in out
+    assert "no_library_entry" not in out
+    assert ("per-row witness lines shown only for contradictions "
+            "(1 hidden; --verbose shows all)") in out.splitlines()
+    verbose = _render_function_evidence_text(_evidence_card_1037(), verbose=True)
+    assert "  witnesses: library=unavailable (no_library_entry)" in verbose
+    assert "hidden" not in verbose
+
 
 
 def test_render_evidence_function_shows_recorded_local_tailcall_target_704():

@@ -6418,3 +6418,272 @@ def test_diagnostic_recovery_and_target_commands_run_as_printed(tmp_path):
         assert instance_id not in {row["instance_id"] for row in stopped}
     finally:
         _session_stop(instance_id)
+
+
+_VTABLE_LAYOUT_ASM = r"""
+.text
+.macro fn name, value
+.globl \name
+.type \name,@function
+\name:
+ mov $\value,%eax
+ ret
+.size \name,.-\name
+.endm
+fn short_a, 1
+fn short_b, 2
+fn op_c, 3
+fn op_d, 4
+fn op_e, 5
+fn rec_a, 6
+fn rec_b, 7
+fn rec_c, 8
+fn impl_d1, 9
+fn impl_d0, 10
+fn impl_a, 11
+fn impl_b, 12
+.globl main
+.type main,@function
+main:
+ xor %eax,%eax
+ ret
+.size main,.-main
+.section .data.rel.ro,"aw",@progbits
+.p2align 3
+/* A vtable whose symbol covers two slots, then an anonymous function table
+   with no header between them: the pointer run merges the two. */
+.globl _ZTV5Short
+.type _ZTV5Short,@object
+_ZTV5Short:
+ .quad 0,_ZTI5Short,short_a,short_b
+.size _ZTV5Short,32
+ops:
+ .quad op_c,op_d,op_e
+ .quad 0
+/* A registry record with the Itanium header shape and no _ZTV symbol. */
+.globl registry
+.type registry,@object
+registry:
+ .quad 0,_ZTI5Short,rec_a,rec_b,rec_c
+.size registry,40
+ .quad 0
+/* An all-pure abstract class's vtable, all filler, right before Impl's. */
+.globl _ZTV8Abstract
+.type _ZTV8Abstract,@object
+_ZTV8Abstract:
+ .quad 0,_ZTI8Abstract,0,0
+.size _ZTV8Abstract,32
+.globl _ZTV4Impl
+.type _ZTV4Impl,@object
+_ZTV4Impl:
+ .quad 0,_ZTI4Impl,impl_d1,impl_d0,impl_a,impl_b
+.size _ZTV4Impl,48
+.globl _ZTI5Short
+.type _ZTI5Short,@object
+_ZTI5Short:
+ .quad 0,_ZTS5Short
+.size _ZTI5Short,16
+.globl _ZTI8Abstract
+.type _ZTI8Abstract,@object
+_ZTI8Abstract:
+ .quad 0,_ZTS8Abstract
+.size _ZTI8Abstract,16
+.globl _ZTI4Impl
+.type _ZTI4Impl,@object
+_ZTI4Impl:
+ .quad 0,_ZTS4Impl
+.size _ZTI4Impl,16
+.section .rodata
+_ZTS5Short: .asciz "5Short"
+_ZTS8Abstract: .asciz "8Abstract"
+_ZTS4Impl: .asciz "4Impl"
+.section .note.GNU-stack,"",@progbits
+"""
+
+_VIRTUAL_BASES_CPP = """
+struct V { long v = 1; virtual ~V() {} virtual int vf() { return 1; } };
+struct B : virtual V { long b = 2; virtual int bf() { return 2; } int vf() override { return 3; } };
+struct C : virtual V { long c = 3; virtual int cf() { return 4; } };
+struct D : B, C { long d = 4; int bf() override { return 5; } int cf() override { return 6; } };
+int main(int argc, char **) { B *b = new D; C *c = new D; return b->bf() + c->cf() + argc; }
+"""
+
+_HANDLER_STORE_C = """
+#include <stdio.h>
+#include <stdlib.h>
+struct steps { long id; void (*on_open)(int); void (*on_close)(int); };
+static void open_step(int x) { printf("open %d\\n", x); }
+static void close_step(int x) { printf("close %d\\n", x); }
+__attribute__((noinline)) void steps_init(struct steps *s) {
+  s->id = 7; s->on_open = open_step; s->on_close = close_step;
+}
+int main(int argc, char **argv) {
+  struct steps *s = malloc(sizeof *s);
+  steps_init(s);
+  if (argc > 3) s->on_open(argc);
+  return (int)s->id;
+}
+"""
+
+
+class TestEvidenceVtableLabels1017:
+    """#1017 items 1 and 3, the #1017 `code_ref` store comment, #1018 item 1 and
+    the #1033 surface footer, on real builds: vtable labels and slots come only
+    from a defined ELF `_ZTV`/`_ZTC` object's `st_size`, so every #1006
+    counterexample (a merged following table, a registry record, all-pure
+    filler before a real vtable) is labelled by what the symbols say."""
+
+    def _json(self, shared_bn, *args):
+        res = shared_bn.run(*args, "--format", "json")
+        assert res.returncode == 0, (res.stdout, res.stderr)
+        return json.loads(res.stdout)
+
+    def _build(self, tmp_path, name, source, *flags, compiler="cc", suffix=".s"):
+        src = tmp_path / f"{name}{suffix}"
+        src.write_text(source)
+        binary = tmp_path / name
+        build = subprocess.run([compiler, *flags, "-o", str(binary), str(src)],
+                               capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        return binary
+
+    def _symbols(self, shared_bn, *names):
+        return shared_bn.json(
+            "py", "exec",
+            f"names = {list(names)!r}\n"
+            "result = {n: next(s.address for s in bv.get_symbols_by_raw_name(n)\n"
+            "                  if s.type.name == 'DataSymbol') for n in names}\n")["result"]
+
+    def test_surface_labels_come_from_symbol_extents_only(self, shared_bn, tmp_path):
+        binary = self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM)
+        shared_bn.load(binary)
+        sym = self._symbols(shared_bn, "_ZTV5Short", "registry", "_ZTV4Impl")
+        out = self._json(shared_bn, "evidence", "surface")
+        tables = {t["address"]: t for t in out["candidate_tables"]}
+        short = tables[hex(sym["_ZTV5Short"] + 16)]
+        assert short["entries"] == 5
+        label, = short["elf_vtables"]
+        assert (label["object"], label["entries_inside"], label["slot"]) == ("_ZTV5Short", 2, 0)
+        assert label["slot_address_point"] == hex(sym["_ZTV5Short"] + 16)
+        assert short["entries_outside_elf_vtables"] == 3
+        assert short["extends_past_elf_vtable"] is True
+        record = tables[hex(sym["registry"] + 16)]
+        assert record["elf_vtables"] == [] and record["entries_outside_elf_vtables"] == 3
+        impl = tables[hex(sym["_ZTV4Impl"] + 16)]
+        label, = impl["elf_vtables"]
+        assert (label["label"], label["entries_inside"], label["slot"]) == ("vtable for Impl", 4, 0)
+        assert impl["entries_outside_elf_vtables"] == 0
+        text = shared_bn.run("evidence", "surface").stdout
+        assert "    in vtable for Short (_ZTV5Short @ " in text
+        assert "3 entries outside every ELF vtable object -- the run continues past" in text
+
+        hidden = self._json(shared_bn, "evidence", "surface", "--hide-vtables")
+        assert hidden["summary"]["vtable_tables_hidden"] == 1
+        assert {t["address"] for t in hidden["candidate_tables"]} == set(tables) - {
+            hex(sym["_ZTV4Impl"] + 16)}
+
+    def test_stripped_surface_has_no_labels_and_says_why(self, shared_bn, tmp_path):
+        binary = self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM)
+        stripped = tmp_path / "layout-stripped"
+        result = subprocess.run(["strip", "-o", str(stripped), str(binary)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        shared_bn.load(stripped)
+        out = self._json(shared_bn, "evidence", "surface", "--hide-vtables")
+        assert out["candidate_tables"]
+        assert all(t["elf_vtables"] == [] for t in out["candidate_tables"])
+        assert out["summary"]["vtable_tables_hidden"] == 0
+        assert "no .symtab (stripped)" in out["summary"]["vtable_labels"]["reason"]
+        assert any(w.startswith("--hide-vtables hid nothing: no .symtab") for w in out["warnings"])
+        text = shared_bn.run("evidence", "surface").stdout
+        assert "vtable labels: none -- no .symtab (stripped)" in text
+
+    def test_secondary_and_construction_tables_get_slots(self, shared_bn, tmp_path):
+        import shlex
+
+        binary = self._build(tmp_path, "vbases", _VIRTUAL_BASES_CPP, "-O0",
+                             compiler="c++", suffix=".cpp")
+        shared_bn.load(binary)
+        out = self._json(shared_bn, "evidence", "surface")
+        secondaries = [obj for t in out["candidate_tables"] for obj in t["elf_vtables"]
+                       if obj["object"] == "_ZTV1D" and obj["offset_to_top"]]
+        assert secondaries, out["candidate_tables"]
+        assert all(obj["offset_to_top"] < 0 and obj["slot"] == 0 for obj in secondaries)
+        # A function stored in B-in-D's construction vtable: its callsites note
+        # names the _ZTC object and slot, and keeps a runnable xrefs command.
+        ztc = self._symbols(shared_bn, "_ZTC1D0_1B")["_ZTC1D0_1B"]
+        found = shared_bn.json(
+            "py", "exec",
+            f"start = {ztc}\n"
+            "words = [bv.read_int(start + i * 8, 8, False) for i in range(8)]\n"
+            "result = [(hex(start + i * 8), hex(w)) for i, w in enumerate(words)\n"
+            "          if bv.get_function_at(w) is not None]\n")["result"]
+        slot_address, callee = found[0]
+        callsites = self._json(shared_bn, "callsites", callee)
+        row = next(r for r in callsites["callee_data_ref_objects"] if r["address"] == slot_address)
+        obj, = row["objects"]
+        assert obj["kind"] == "construction_vtable" and obj["object"] == "_ZTC1D0_1B"
+        assert obj["label"] == "construction vtable for B-in-D"
+        assert isinstance(obj["slot"], int)
+        text = shared_bn.run("callsites", callee).stdout
+        line = next(ln for ln in text.splitlines() if ln.startswith(f"  {slot_address}:"))
+        assert "construction vtable for B-in-D (_ZTC1D0_1B @ " in line
+        command, = re.findall(r"`(bn [^`]+)`", line)
+        result = shared_bn.run(*shlex.split(command)[1:])
+        assert result.returncode == 0, (command, result.stderr)
+
+    def test_code_ref_store_and_footer_command_run_as_printed(self, shared_bn, tmp_path):
+        import shlex
+
+        binary = self._build(tmp_path, "steps", _HANDLER_STORE_C, "-O1",
+                             compiler="cc", suffix=".c")
+        shared_bn.load(binary)
+        # BN made functions of both handlers; remove them so they are the
+        # function-less, code-referenced addresses the surface reports.
+        starts = shared_bn.json(
+            "py", "exec",
+            "fs = [f for f in bv.functions if f.name in ('open_step', 'close_step')]\n"
+            "result = {f.name: f.start for f in fs}\n"
+            "for f in fs:\n"
+            "    bv.remove_user_function(f)\n"
+            "bv.update_analysis_and_wait()\n")["result"]
+        assert set(starts) == {"open_step", "close_step"}
+        out = self._json(shared_bn, "evidence", "surface")
+        rows = {int(c["address"], 16): c for c in out["missing_function_candidates"]}
+        for name, offset in (("open_step", "8"), ("close_step", "0x10")):
+            stored = rows[starts[name]]["stored_to"]
+            assert {(s["function"], s["destination"]) for s in stored} == {
+                ("steps_init", f"[arg1 + {offset}]")}, stored
+        text = shared_bn.run("evidence", "surface").stdout
+        assert "    stored to [arg1 + 0x10] in steps_init @ " in text
+        command, = re.findall(r"verify with `(bn [^`]+)`", text)
+        args = shlex.split(command)
+        assert args[1:2] == ["disasm"] and args[3:] == ["--linear", "16"]
+        result = shared_bn.run(*args[1:])
+        assert result.returncode == 0, (command, result.stderr)
+        assert result.stdout.startswith("// bn: linear disassembly of 16 units from ")
+
+    def test_evidence_function_callee_filter_1037(self, shared_bn, tmp_path):
+        """#1037 item 7: `operator new` names every `_Znwm` call by its display
+        name; excluding it leaves exactly the other calls, and paging follows."""
+        binary = self._build(tmp_path, "vbases", _VIRTUAL_BASES_CPP, "-O0",
+                             compiler="c++", suffix=".cpp")
+        shared_bn.load(binary)
+        full = self._json(shared_bn, "evidence", "function", "main")
+        names = [((c.get("target") or {}).get("function") or {}).get("name") for c in full["calls"]]
+        news = sum(1 for n in names if n == "_Znwm")
+        assert news == 2, names
+        kept = self._json(shared_bn, "evidence", "function", "main",
+                          "--exclude-callee", "operator new")
+        assert kept["total_calls"] == full["total_calls"]
+        assert kept["matched_calls"] == full["total_calls"] - news
+        assert kept["callee_filter"]["excluded"] == news
+        assert all(((c.get("target") or {}).get("function") or {}).get("name") != "_Znwm"
+                   for c in kept["calls"])
+        only = self._json(shared_bn, "evidence", "function", "main", "--callee", "_Znwm",
+                          "--limit", "1")
+        assert only["matched_calls"] == news and only["returned"] == 1 and only["has_more"]
+        text = shared_bn.run("evidence", "function", "main", "--callee", "operator new",
+                             "--compact").stdout
+        rows = [ln for ln in text.splitlines() if ln.startswith("- ")]
+        assert len(rows) == news and all("operator new @ " in row for row in rows)
