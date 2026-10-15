@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 
 from _bridge_fakes import (
@@ -105,8 +107,11 @@ def test_delete_failure_never_claims_verified_or_clean_rollback(monkeypatch, fai
     assert row["status"] == "verification_failed"
     observed = row["observed"]
     assert observed["clean_undo_available"] is False
-    assert observed["function_removed"] is (failure_mode == "analysis")
+    assert observed["function_removed"] is (None if failure_mode == "analysis" else False)
     assert observed["function_at_entry"] == (None if failure_mode == "analysis" else "false_tail")
+    if failure_mode == "analysis":
+        assert observed["bodies_containing_deleted_entry"] is None
+        assert bv.get_function_at(0x1010) is None
     assert observed["reanalysis_completed"] is (failure_mode != "analysis")
     if failure_mode == "raised":
         assert observed["apply_error"] == "removal failed"
@@ -134,6 +139,177 @@ def test_delete_analysis_failure_compact_summary_reports_dirty_commit(monkeypatc
     assert summary["success"] is False
     assert summary["committed"] is True
     assert summary["rolled_back"] is False
+    assert summary["changed_count"] == 1
+    assert summary["dirty_after"] is True
+    assert summary["failed_count"] == 1
+    assert summary["verified_count"] == 0
+    assert _mutation_exit_code(result, _mutation_summary) == 3
+    rendered = _render_mutation_summary_text(summary)
+    for field in ("changed=1", "dirty_after=True", "failed=1", "verified=0"):
+        assert field in rendered, rendered
+
+
+@pytest.mark.parametrize("failure_point", [
+    "mark_dirty",
+    "commit_before",
+    "commit_after",
+    "predecessor_lookup",
+    "reanalyze",
+    "analysis",
+    "entry_readback",
+    "entry_name",
+    "containing_lookup",
+    "containing_iteration",
+    "containing_start",
+    "containing_name",
+    "scope_exit",
+])
+def test_delete_post_removal_exceptions_preserve_irreversible_result(monkeypatch, failure_point):
+    from bn.cli import _mutation_exit_code
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+
+    _, instance, bv, host, _ = _setup(monkeypatch)
+    error = f"injected post-removal failure: {failure_point}"
+    removed = False
+    marks = []
+    commits = []
+    targets = instance.ctx.targets
+    view_id = "post-removal-test-view"
+    targets._ids_by_object[bv] = view_id
+    original_remove = bv.remove_user_function
+    original_mark = targets.mark_dirty
+    original_commit = bv.commit_undo_actions
+    original_lookup = bv.get_function_at
+    original_containing = bv.get_functions_containing
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(error)
+
+    def remove(fn):
+        nonlocal removed
+        original_remove(fn)
+        removed = True
+
+    def mark(view):
+        assert removed, "dirty tracking must follow the irreversible write"
+        marks.append(view)
+        if failure_point == "mark_dirty":
+            fail()
+        original_mark(view)
+
+    def commit(state):
+        commits.append(state)
+        assert marks == [bv], "dirty tracking must precede even a failing commit"
+        assert view_id in targets._dirty_view_ids
+        if failure_point == "commit_before":
+            fail()
+        original_commit(state)
+        if failure_point == "commit_after":
+            fail()
+
+    class BrokenReadback:
+        @property
+        def start(self):
+            if failure_point == "containing_start":
+                fail()
+            return host.start
+
+        @property
+        def name(self):
+            fail()
+
+    def lookup(address):
+        if removed:
+            if failure_point == "predecessor_lookup" and address == host.start:
+                fail()
+            if address == 0x1010:
+                if failure_point == "entry_readback":
+                    fail()
+                if failure_point == "entry_name":
+                    return BrokenReadback()
+        return original_lookup(address)
+
+    def broken_iteration():
+        # A partial observation must not become a complete containing-body list.
+        yield host
+        fail()
+
+    def containing(address):
+        if failure_point == "containing_lookup":
+            fail()
+        if failure_point == "containing_iteration":
+            return broken_iteration()
+        if failure_point in {"containing_start", "containing_name"}:
+            return [BrokenReadback()]
+        return original_containing(address)
+
+    monkeypatch.setattr(bv, "remove_user_function", remove)
+    monkeypatch.setattr(targets, "mark_dirty", mark)
+    monkeypatch.setattr(bv, "commit_undo_actions", commit)
+    monkeypatch.setattr(bv, "get_function_at", lookup)
+    monkeypatch.setattr(bv, "get_functions_containing", containing)
+    if failure_point == "reanalyze":
+        monkeypatch.setattr(host, "reanalyze", fail)
+    if failure_point == "analysis":
+        monkeypatch.setattr(bv, "update_analysis_and_wait", fail)
+    if failure_point == "scope_exit":
+        original_write = instance._target_lock.write
+        scope_failed = False
+
+        @contextmanager
+        def write_scope():
+            nonlocal scope_failed
+            with original_write():
+                yield
+            if removed and not scope_failed:
+                scope_failed = True
+                fail()
+
+        monkeypatch.setattr(instance._target_lock, "write", write_scope)
+
+    result = instance._mutation(None, False, [{"op": "function_delete", "address": "0x1010"}])
+
+    assert removed
+    assert marks == [bv]
+    if failure_point != "mark_dirty":
+        assert commits
+        assert view_id in targets._dirty_view_ids
+    if failure_point == "commit_before":
+        assert not _has_event(bv, "commit")
+    if failure_point == "commit_after":
+        assert _has_event(bv, "commit")
+    assert not _has_event(bv, "revert")
+    assert 0x1010 in bv._suppressed
+    row = result["results"][0]
+    assert row["status"] == "verification_failed"
+    assert row["irreversible_change"] is True
+    observed = row["observed"]
+    assert observed["error"] == error
+    assert isinstance(observed["error_stage"], str) and observed["error_stage"]
+    assert observed["clean_undo_available"] is False
+    if failure_point in {"entry_readback", "entry_name"}:
+        assert observed["function_at_entry"] is None
+    if failure_point == "entry_readback":
+        assert observed["function_removed"] is None
+    if failure_point.startswith("containing_"):
+        assert observed["bodies_containing_deleted_entry"] is None
+    if failure_point in {"mark_dirty", "commit_before", "commit_after"}:
+        assert observed["function_removed"] is None
+        assert observed["function_at_entry"] is None
+        assert observed["bodies_containing_deleted_entry"] is None
+        assert observed["reanalysis_completed"] is False
+    if failure_point in {"predecessor_lookup", "reanalyze", "analysis"}:
+        assert observed["function_removed"] is None
+        assert observed["function_at_entry"] is None
+        assert observed["bodies_containing_deleted_entry"] is None
+    if failure_point == "analysis":
+        assert observed["analysis_error"] == error
+
+    summary = _mutation_summary(result)
+    for payload in (result, summary):
+        assert payload["success"] is False
+        assert payload["committed"] is True
+        assert payload["rolled_back"] is False
     assert summary["changed_count"] == 1
     assert summary["dirty_after"] is True
     assert summary["failed_count"] == 1

@@ -59,80 +59,110 @@ def _function_delete(ctx, bv, address, *, exclusive=None):
     addr = _parse_address(address)
     requested = {"op": "function_delete", "address": hex(addr)}
     warning = "No clean undo: BN retains a user override suppressing function creation here."
-    apply_error = None
-    with scope():
-        fn = bv.get_function_at(addr)
-        if fn is None:
-            raise OperationFailure("invalid_request", "No function starts at this address.",
-                                   requested=requested, observed={"request_applied": False})
-        name = str(fn.name)
-        predecessors = {ref.function.start for ref in bv.get_code_refs(addr)
-                        if ref.function is not None and ref.function.start != addr}
-        # Fall-through edges across function boundaries need not have a code ref.
-        for candidate in bv.functions:
-            if candidate.start != addr and any(block.end == addr for block in candidate.basic_blocks):
-                predecessors.add(candidate.start)
-        state = bv.begin_undo_actions()
-        try:
-            bv.remove_user_function(fn)
-        except Exception as exc:
-            apply_error = str(exc)
-        finally:
-            # Closing the journal is not an undo promise. Even an API exception
-            # may follow a write; never claim an unobserved clean rollback.
-            bv.commit_undo_actions(state)
+    result = None
+    phase = "preflight"
+    try:
+        with scope():
+            fn = bv.get_function_at(addr)
+            if fn is None:
+                raise OperationFailure("invalid_request", "No function starts at this address.",
+                                       requested=requested, observed={"request_applied": False})
+            name = str(fn.name)
+            predecessors = {ref.function.start for ref in bv.get_code_refs(addr)
+                            if ref.function is not None and ref.function.start != addr}
+            # Cross-function fall-through need not have a code reference.
+            for candidate in bv.functions:
+                if candidate.start != addr and any(block.end == addr for block in candidate.basic_blocks):
+                    predecessors.add(candidate.start)
+            state = bv.begin_undo_actions()
+            # Establish the response BEFORE entering the irreversible API. All
+            # observations start unknown; failed readback must not invent state.
+            observed = {
+                "function_removed": None,
+                "function_at_entry": None,
+                "bodies_containing_deleted_entry": None,
+                "reanalysis_completed": False,
+                "clean_undo_available": False,
+            }
+            row = {
+                "op": "function_delete", "address": hex(addr), "function": name,
+                "status": "verification_failed", "irreversible_change": True,
+                "requested": requested, "observed": observed,
+            }
+            result = {
+                "preview": False, "success": False, "committed": True,
+                "rolled_back": False, "results": [row],
+                "affected_functions": [], "affected_types": [],
+            }
+            phase = "remove_user_function"
+            try:
+                bv.remove_user_function(fn)
+            except Exception as exc:
+                # The API itself can raise after writing. Retain that error
+                # while still closing its journal and marking the view dirty.
+                observed["apply_error"] = str(exc)
+                observed["error"] = str(exc)
+                observed["error_stage"] = phase
+            phase = "mark_dirty"
             ctx.targets.mark_dirty(bv)
-        try:
+            phase = "commit_undo_actions"
+            bv.commit_undo_actions(state)
             for start in predecessors:
+                phase = "predecessor_lookup"
                 parent = bv.get_function_at(start)
                 if parent is not None:
+                    phase = "reanalyze"
                     parent.reanalyze()
-        except Exception as exc:
-            apply_error = str(exc)
-    error = None
-    try:
+        phase = "update_analysis_and_wait"
         bv.update_analysis_and_wait()
+        observed["reanalysis_completed"] = True
+        with scope():
+            phase = "get_function_at"
+            remaining = bv.get_function_at(addr)
+            # Publish each observation only after its entire read succeeds.
+            entry_name = str(remaining.name) if remaining is not None else None
+            observed["function_removed"] = remaining is None
+            observed["function_at_entry"] = entry_name
+            phase = "get_functions_containing"
+            observed["bodies_containing_deleted_entry"] = [
+                {"address": hex(parent.start), "name": str(parent.name)}
+                for parent in bv.get_functions_containing(addr) if parent.start != addr
+            ]
     except Exception as exc:
-        error = str(exc)
-    with scope():
-        remaining = bv.get_function_at(addr)
-        containing = [{"address": hex(parent.start), "name": str(parent.name)}
-                      for parent in bv.get_functions_containing(addr)
-                      if parent.start != addr]
-        removed = remaining is None
-        observed = {
-            "function_removed": removed,
-            "function_at_entry": str(remaining.name) if remaining is not None else None,
-            "bodies_containing_deleted_entry": containing,
-            "reanalysis_completed": error is None,
-            "clean_undo_available": False,
-        }
-        if apply_error is not None:
-            observed["apply_error"] = apply_error
-        if error is not None:
-            observed["analysis_error"] = error
-        outcome = ("Function is absent at the entry." if removed else
-                   "A function still starts at the deleted entry.")
-        if error is not None or apply_error is not None:
-            outcome += " Mutation or reanalysis failed; this is not a verified repair."
-        outcome += (" Entry is now inside: " + ", ".join(row["name"] for row in containing) + "."
-                    if containing else " No other analyzed body contains the deleted entry.")
-        success = removed and error is None and apply_error is None
-        return {
-            "preview": False, "success": success, "committed": True,
-            "rolled_back": False, "message": outcome + " " + warning,
-            "results": [{
-                "op": "function_delete", "address": hex(addr), "function": name,
-                "status": "verified" if success else "verification_failed",
-                # A failed readback does not undo the suppression write. Even
-                # an API exception can follow a partial write; preserve that
-                # possibly-changed state independently of verification.
-                "irreversible_change": True,
-                "requested": requested, "observed": observed,
-                "message": outcome + " " + warning,
-            }],
-            "affected_functions": [], "affected_types": [],
-        }
+        if result is None:
+            raise  # Preflight never entered the irreversible mutation.
+        # One boundary covers EVERY later phase, including context-manager
+        # exit, journal closing, reanalysis, and lazy readback iteration.
+        observed.setdefault("error", str(exc))
+        observed.setdefault("error_stage", phase)
+        if phase == "update_analysis_and_wait":
+            observed["analysis_error"] = str(exc)
+        elif phase in ("predecessor_lookup", "reanalyze"):
+            observed["apply_error"] = str(exc)
+        if observed["error"] != str(exc):
+            observed["later_error"] = str(exc)
+            observed["later_error_stage"] = phase
+
+    removed = observed["function_removed"]
+    containing = observed["bodies_containing_deleted_entry"]
+    outcome = ("Function is absent at the entry." if removed is True else
+               "A function still starts at the deleted entry." if removed is False else
+               "Function entry readback is unavailable.")
+    if containing is None:
+        outcome += " Containing-body readback is unavailable."
+    elif containing:
+        outcome += " Entry is now inside: " + ", ".join(parent["name"] for parent in containing) + "."
+    else:
+        outcome += " No other analyzed body contains the deleted entry."
+    if "error" in observed:
+        outcome += f" Failed at {observed['error_stage']}: {observed['error']}."
+        if "later_error" in observed:
+            outcome += f" Failed at {observed['later_error_stage']}: {observed['later_error']}."
+    success = removed is True and "error" not in observed
+    result["success"] = success
+    row["status"] = "verified" if success else "verification_failed"
+    result["message"] = row["message"] = outcome + " " + warning
+    return result
 
 
 def _remove_created_function(ctx, bv, addr: int) -> bool:

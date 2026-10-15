@@ -66,6 +66,8 @@ The mutation's `observed` state reports `function_removed`, `function_at_entry`,
 
 An attempted live deletion carries `irreversible_change: true` even if removal or reanalysis raises: a partial write cannot be ruled out or cleanly undone. Its compact summary therefore counts that operation as changed/possibly changed and reports `dirty_after: true`, independently of `verified_count`. A failed verification still reports failure (exit 3); changed does not imply verified.
 
+The irreversible result is established before removal, and the view is marked dirty before journal commit or analysis. Any subsequent exception, including journal or readback failure, returns that failed result with the original `observed.error` and `observed.error_stage` rather than a generic read error. Post-state observations not obtained are `null`, not invented absence or empty ownership; `function_at_entry: null` proves absence only when `function_removed: true`. Errors also appear in the mutation's default text and compact `first_error`.
+
 For `go rename`, `--verbose` (alias `--diffs`) requests detail and `--summary` (alias `--quiet`) forces the compact summary. It takes the standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`, `--out`) and nothing else.
 
 Per-op statuses:

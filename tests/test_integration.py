@@ -3009,46 +3009,122 @@ class TestFunctionDeleteRepair966:
         assert observed["bodies_containing_deleted_entry"] == actual
         assert {row["name"] for row in actual} == {"build_widget", "other_user"}
 
-    @pytest.mark.parametrize("output_args", [(), ("--format", "json", "--summary")],
-                             ids=["default", "compact-json"])
-    def test_analysis_failure_reports_committed_deletion(self, shared_bn, output_args):
+    @pytest.mark.parametrize("fault", [
+        "commit-before", "commit-after", "analysis", "containing-readback", "entry-readback",
+    ])
+    @pytest.mark.parametrize("batch", [False, True], ids=["standalone", "singleton-batch"])
+    @pytest.mark.parametrize("output_args", [
+        (), ("--format", "json", "--summary"), ("--format", "json"),
+    ], ids=["default", "compact-json", "full-json"])
+    def test_post_removal_failure_reports_committed_deletion(
+        self, shared_bn, tmp_path, fault, batch, output_args,
+    ):
         shared_bn.load(PARSER_BINARY, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
         start, _ = _function_start_and_size(shared_bn, "parse_record")
+        injected_error = f"delete966 injected {fault} failure"
+        if batch:
+            manifest = tmp_path / "delete.json"
+            manifest.write_text(json.dumps({
+                "ops": [{"op": "function_delete", "address": hex(start)}],
+            }), encoding="utf-8")
+            command = ("batch", "apply", str(manifest))
+        else:
+            command = ("function", "delete", hex(start))
         installed = _py_line(shared_bn, (
             "from binaryninja import BinaryView\n"
-            "BinaryView._delete966_original_analysis = BinaryView.update_analysis_and_wait\n"
+            f"BinaryView._delete966_fault = {fault!r}\n"
+            f"BinaryView._delete966_error = {injected_error!r}\n"
+            f"BinaryView._delete966_entry = {start}\n"
+            "BinaryView._delete966_analysis_done = False\n"
+            "BinaryView._delete966_pending_commit = None\n"
+            "BinaryView._delete966_originals = {name: getattr(BinaryView, name) for name in "
+            "('commit_undo_actions', 'update_analysis_and_wait', "
+            "'get_functions_containing', 'get_function_at')}\n"
+            "def fail_commit(self, state, *args, **kwargs):\n"
+            "    if BinaryView._delete966_fault == 'commit-before':\n"
+            "        BinaryView._delete966_pending_commit = state\n"
+            "        raise RuntimeError(BinaryView._delete966_error)\n"
+            "    result = BinaryView._delete966_originals['commit_undo_actions'](self, state, *args, **kwargs)\n"
+            "    if BinaryView._delete966_fault == 'commit-after':\n"
+            "        raise RuntimeError(BinaryView._delete966_error)\n"
+            "    return result\n"
             "def fail_analysis(self, *args, **kwargs):\n"
-            "    raise RuntimeError('delete966 injected analysis failure')\n"
+            "    if BinaryView._delete966_fault == 'analysis':\n"
+            "        raise RuntimeError(BinaryView._delete966_error)\n"
+            "    result = BinaryView._delete966_originals['update_analysis_and_wait'](self, *args, **kwargs)\n"
+            "    BinaryView._delete966_analysis_done = True\n"
+            "    return result\n"
+            "def fail_containing(self, address, *args, **kwargs):\n"
+            "    if (BinaryView._delete966_fault == 'containing-readback' and\n"
+            "            BinaryView._delete966_analysis_done and address == BinaryView._delete966_entry):\n"
+            "        raise RuntimeError(BinaryView._delete966_error)\n"
+            "    return BinaryView._delete966_originals['get_functions_containing'](self, address, *args, **kwargs)\n"
+            "def fail_entry(self, address, *args, **kwargs):\n"
+            "    if (BinaryView._delete966_fault == 'entry-readback' and\n"
+            "            BinaryView._delete966_analysis_done and address == BinaryView._delete966_entry):\n"
+            "        raise RuntimeError(BinaryView._delete966_error)\n"
+            "    return BinaryView._delete966_originals['get_function_at'](self, address, *args, **kwargs)\n"
+            "BinaryView.commit_undo_actions = fail_commit\n"
             "BinaryView.update_analysis_and_wait = fail_analysis\n"
+            "BinaryView.get_functions_containing = fail_containing\n"
+            "BinaryView.get_function_at = fail_entry\n"
             "print('INSTALLED=True')\n"
         ), "INSTALLED")
         try:
             assert installed == "True"
-            deleted = shared_bn.run("function", "delete", hex(start), *output_args)
+            deleted = shared_bn.run(*command, *output_args)
         finally:
             restored = _py_line(shared_bn, (
                 "from binaryninja import BinaryView\n"
-                "BinaryView.update_analysis_and_wait = BinaryView._delete966_original_analysis\n"
-                "del BinaryView._delete966_original_analysis\n"
+                "for name, original in BinaryView._delete966_originals.items():\n"
+                "    setattr(BinaryView, name, original)\n"
                 "print('RESTORED=True')\n"
             ), "RESTORED")
-            assert restored == "True"
+            try:
+                assert restored == "True"
+                gone = _py_line(shared_bn, (
+                    f"print('GONE=' + str(bv.get_function_at({start:#x}) is None))\n"
+                ), "GONE")
+                # In particular, a journal failure must not leave the bridge
+                # reporting a clean target. Read before closing a pending journal.
+                target_info = shared_bn.json("target", "info")
+            finally:
+                cleaned = _py_line(shared_bn, (
+                    "from binaryninja import BinaryView\n"
+                    "try:\n"
+                    "    if BinaryView._delete966_pending_commit is not None:\n"
+                    "        bv.commit_undo_actions(BinaryView._delete966_pending_commit)\n"
+                    "finally:\n"
+                    "    for name in ('fault', 'error', 'entry', 'analysis_done', 'pending_commit', 'originals'):\n"
+                    "        delattr(BinaryView, '_delete966_' + name)\n"
+                    "print('CLEANED=True')\n"
+                ), "CLEANED")
+                assert cleaned == "True"
 
         assert deleted.returncode == 3, f"{deleted.stdout}\n{deleted.stderr}"
-        assert _py_line(shared_bn, (
-            f"print('GONE=' + str(bv.get_function_at({start:#x}) is None))\n"
-        ), "GONE") == "True"
+        assert gone == "True"
+        assert target_info["unsaved"] is True, target_info
+        assert injected_error in deleted.stdout, deleted.stdout
         if output_args:
-            summary = json.loads(deleted.stdout)
-            assert summary["success"] is False, summary
-            assert summary["committed"] is True, summary
-            assert summary["rolled_back"] is False, summary
-            assert summary["changed_count"] == 1, summary
-            assert summary["dirty_after"] is True, summary
-            assert summary["failed_count"] == 1, summary
-            assert summary["verified_count"] == 0, summary
+            payload = json.loads(deleted.stdout)
+            assert payload["success"] is False, payload
+            assert payload["committed"] is True, payload
+            assert payload["rolled_back"] is False, payload
+            if "--summary" in output_args:
+                assert payload["changed_count"] == 1, payload
+                assert payload["dirty_after"] is True, payload
+                assert payload["failed_count"] == 1, payload
+                assert payload["verified_count"] == 0, payload
+            else:
+                assert len(payload["results"]) == 1, payload
+                row = payload["results"][0]
+                assert row["status"] == "verification_failed", row
+                assert row["irreversible_change"] is True, row
+                assert row["observed"]["error"] == injected_error, row
+                assert row["observed"]["error_stage"], row
         else:
-            for field in ("changed=1", "dirty_after=True", "failed=1", "verified=0"):
+            for field in ("mutation: committed", "changed=1", "dirty_after=True",
+                          "failed=1", "verified=0"):
                 assert field in deleted.stdout, deleted.stdout
 
 
