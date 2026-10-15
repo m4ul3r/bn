@@ -311,11 +311,12 @@ _FALLTHROUGH_BRANCH_KINDS = frozenset({"FalseBranch"})
 
 
 def _create_fallthrough_source(bv, addr: int) -> int | None:
-    """The instruction that runs straight into *addr*, if one provably does.
+    """The preceding word's fall-through decode, if available.
 
-    #997 item 2: an address the previous instruction falls through into is
-    the middle of a body, not an entry -- the shape of an aarch64 `adrp` page
-    base nominated as a missing function. (Named apart from
+    #997 item 2: the previous decoded instruction may fall through into the
+    middle of a body, as with an aarch64 `adrp` page base nominated as a
+    missing function. Untyped literal-pool bytes may decode too; this is not
+    proof of code or a pool detector. (Named apart from
     `read_decompile._fallthrough_predecessor`, which asks about a FUNCTION's
     neighbour by different rules.) Only a FIXED-WIDTH ISA can name the
     previous instruction (on x86 any byte before *addr* might start one), so
@@ -386,7 +387,7 @@ def _falls_through(bv, arch, width: int, address: int) -> bool:
 
 
 def _with_fallthrough_note(row: dict, predecessor: int | None) -> dict:
-    """Disclose a create at an address reached by fall-through (#997 item 2).
+    """Disclose a preceding fall-through decode (#997 item 2).
 
     ONE builder for both create paths. The create still goes ahead -- BN's
     own boundaries are not authoritative there, and the address may be an
@@ -397,8 +398,8 @@ def _with_fallthrough_note(row: dict, predecessor: int | None) -> dict:
         return row
     row = dict(row)
     row["fallthrough_from"] = hex(predecessor)
-    warning = (f"{row.get('address', '<unknown>')} is reached by fall-through from "
-               f"{hex(predecessor)}; likely mid-function, not an entry")
+    warning = (f"{row.get('address', '<unknown>')}: preceding word decodes as a "
+               f"fall-through instruction at {hex(predecessor)}; may be mid-function")
     row["note"] = f"{row['note']}; {warning}" if row.get("note") else warning
     return row
 

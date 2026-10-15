@@ -57,6 +57,10 @@ class BridgeError(RuntimeError):
         self.observed = observed
 
 
+class MultiTargetError(BridgeError):
+    """Refusal because several targets are open and no selector was given."""
+
+
 class BridgeUnreachableError(BridgeError):
     """A request that never REACHED the bridge: the process is stopped, gone,
     resolved for lifecycle commands only (#694), recorded without an identity
@@ -1553,7 +1557,8 @@ def _verify_response_identity(
             f"expected {expected!r}, received {actual!r}; "
             "refusing data from a different or stale bridge"
         )
-def _send_cancel_request(instance: BridgeInstance, request_id: str) -> None:
+def _send_cancel_request(instance: BridgeInstance, request_id: str) -> bool:
+    """Return whether the cancellation request was sent, not whether it took effect."""
     payload = {
         "id": str(uuid.uuid4()),
         "op": "cancel_request",
@@ -1572,8 +1577,9 @@ def _send_cancel_request(instance: BridgeInstance, request_id: str) -> None:
             with contextlib.suppress(OSError):
                 while sock.recv(65536):
                     pass
+        return True
     except (OSError, BridgeError):
-        pass
+        return False
 
 
 def _send_request_to_instance(
@@ -1679,6 +1685,8 @@ def _send_request_to_instance(
     # reached the bridge; one after it is the bridge's own (see
     # BridgeUnreachableError).
     reached = False
+    cancel_sent = False
+    send_attempted = False
     for attempt in range(connect_retries):
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -1697,6 +1705,10 @@ def _send_request_to_instance(
                     _verify_socket_peer_pid(sock, instance, required=True)
                 else:
                     _verify_socket_peer_pid(sock, instance)
+                # sendall can transmit a complete JSON value and then time out
+                # before its newline. The bridge also accepts JSON at EOF, so
+                # delivery is uncertain from the first transmission attempt.
+                send_attempted = True
                 sock.sendall(encoded)
                 with contextlib.suppress(OSError):
                     sock.shutdown(socket.SHUT_WR)
@@ -1728,8 +1740,8 @@ def _send_request_to_instance(
             break
         except OSError as exc:
             last_error = exc
-            if isinstance(exc, TimeoutError):
-                _send_cancel_request(instance, str(payload["id"]))
+            if isinstance(exc, TimeoutError) and send_attempted:
+                cancel_sent = _send_cancel_request(instance, str(payload["id"]))
             if exc.errno not in TRANSIENT_SOCKET_ERRNOS or attempt == connect_retries - 1:
                 break
             delay = 0.05 * (attempt + 1)
@@ -1744,6 +1756,14 @@ def _send_request_to_instance(
                     break
             time.sleep(delay)
 
+    cancellation = (
+        "A cancel request was sent; the operation may keep running until "
+        "it checks for cancellation. "
+        if cancel_sent else
+        "A cancel request could not be sent; the operation may still be running. "
+        if send_attempted else
+        "The request was not sent. "
+    )
     if last_error is not None and chunks:
         # Bytes arrived and then the connection failed: a timeout or reset
         # mid-response. Don't fall through to json.loads on the truncated
@@ -1751,6 +1771,7 @@ def _send_request_to_instance(
         raise BridgeError(
             f"Connection to Binary Ninja bridge pid {instance.pid} failed mid-response for op '{op}' "
             f"after {len(b''.join(chunks))} bytes ({type(last_error).__name__}: {last_error})"
+            + (f". {cancellation}" if isinstance(last_error, TimeoutError) else "")
         ) from last_error
     if last_error is not None:
         if isinstance(last_error, TimeoutError):
@@ -1765,9 +1786,8 @@ def _send_request_to_instance(
             )
             raise BridgeError(
                 f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path}"
-                f"{timeout_suffix} (op '{op}'). The bridge may be busy with analysis; "
-                f"inspect progress with `bn -i {instance_selector(instance)} target info`, "
-                "then raise or disable the limit with "
+                f"{timeout_suffix} (op '{op}'). {cancellation}"
+                "Raise or disable the limit with "
                 "BN_REQUEST_TIMEOUT=<seconds|0> if the operation is intentionally long."
             ) from last_error
         # A failure before connect() ever succeeded (socket gone, nothing
@@ -1848,6 +1868,38 @@ def unwrap_result(response: Any, op: str) -> Any:
             f"determined. Compare the bridge and CLI builds with `bn doctor`."
         )
     return response["result"]
+
+
+def implicit_target_selector(response: Any) -> str:
+    """Pin the sole listed view; never substitute the volatile GUI focus."""
+    # Imported here because formatters itself uses BridgeError.
+    from .formatters import _render_target_choices
+    from .target_hint import SELECT_HINT_LINE
+
+    targets = unwrap_result(response, "list_targets")
+    if not isinstance(targets, list):
+        raise BridgeError(
+            "malformed bridge reply to list_targets (no target list); the "
+            "bridge may be stale -- restart it or pass an explicit --target"
+        )
+    if not targets:
+        raise BridgeError("No BinaryView targets are open")
+    if len(targets) > 1:
+        raise MultiTargetError(
+            "\n".join([
+                "This command requires --target when multiple targets are open.",
+                SELECT_HINT_LINE,
+                _render_target_choices(targets),
+            ])
+        )
+    row = targets[0]
+    target_id = row.get("target_id") if isinstance(row, dict) else None
+    if not target_id:
+        raise BridgeError(
+            "bridge listed the open target without a target_id; pass an "
+            "explicit --target"
+        )
+    return str(target_id)
 
 
 def _find_bn_agent() -> list[str]:
@@ -2304,6 +2356,36 @@ def send_request(
                 f"Timed out selecting a bridge instance for op {op!r}; "
                 "the end-to-end request deadline expired before connecting"
             )
+    # Only positive feature evidence permits a bare refresh to skip the legacy
+    # CLI count refusal. Use the selected registry, not a separate probe or
+    # second choose_instance call: both preflight and act must name this bridge.
+    capabilities = (
+        instance.meta.get("capabilities") if op == "refresh" and target is None else None
+    )
+    if op == "refresh" and target is None and not (
+        isinstance(capabilities, dict)
+        and capabilities.get("refresh_target_gate") is True
+    ):
+        listed = _send_request_to_instance(
+            instance,
+            "list_targets",
+            params={},
+            target=None,
+            timeout=timeout,
+            timeout_display=requested_timeout,
+            default_timeout=default_timeout,
+            connect_retries=connect_retries,
+            resolved=True,
+            idle_probe=idle_probe,
+        )
+        target = implicit_target_selector(listed)
+        if deadline is not None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise BridgeError(
+                    "Timed out resolving a legacy bridge target for refresh; "
+                    "the end-to-end request deadline expired before refresh"
+                )
     response = _send_request_to_instance(
         instance,
         op,

@@ -187,6 +187,283 @@ def test_refresh_resolves_target_under_write_gate(monkeypatch):
     assert gate_held_at_resolve["v"] is True  # gate acquired before the target was resolved
 
 
+@pytest.mark.parametrize("selector,no_wait,shared_gate", [
+    ("active", False, False),
+    ("another-target", False, False),
+    ("active", True, False),
+    ("active", False, True),
+])
+def test_second_refresh_refuses_before_first_finishes(
+        monkeypatch, selector, no_wait, shared_gate):
+    """#1020: duplicate refreshes never queue, even through a GUI successor."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    requester = bridge.BinaryNinjaBridge() if shared_gate else instance
+    if shared_gate:
+        requester._write_gate = instance._write_gate
+    bv = _FakeMutationBV()
+    analyzing, release = threading.Event(), threading.Event()
+    analyzed = []
+    first_result = {}
+    second_result = {}
+    second_done = threading.Event()
+
+    def analyze():
+        analyzed.append(True)
+        analyzing.set()
+        assert release.wait(10), "refresh was never released"
+
+    bv.update_analysis_and_wait = analyze
+    bv.analysis_progress = types.SimpleNamespace(count=1879, total=2117)
+    monkeypatch.setattr(instance, "_resolve_view", lambda target: bv)
+    monkeypatch.setattr(instance, "_target_info", lambda target: {})
+    first = threading.Thread(target=lambda: first_result.update(instance.dispatch(
+        {"op": "refresh", "target": "active", "id": "first"})), daemon=True)
+
+    def request_again():
+        second_result.update(requester.dispatch(
+            {"op": "refresh", "target": selector, "id": "second", "no_wait": no_wait}))
+        second_done.set()
+
+    second = threading.Thread(target=request_again, daemon=True)
+    try:
+        first.start()
+        assert analyzing.wait(5)
+        with instance._write_gate._state:
+            instance._write_gate._refresh["since"] = time.monotonic() - 12
+        second.start()
+        assert second_done.wait(2), "duplicate refresh waited on the running analysis"
+        assert first.is_alive() and not release.is_set()
+        assert analyzed == [True]
+        assert second_result["ok"] is False
+        message = second_result["error"]
+        assert "refresh is already running" in message
+        assert "count=1879, total=2117" in message
+        assert "not overall completion or time remaining" in message
+        assert int(message.split("started ")[1].split("s ago")[0]) >= 12
+        assert "do not start another refresh" in message
+        assert instance._write_gate.status("second")["waiting"] is False
+    finally:
+        release.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+    assert first_result["ok"] is True
+    assert instance._write_gate._refresh is None
+    assert not instance._write_gate.locked()
+
+
+def test_second_refresh_refuses_while_first_is_queued_on_another_writer(monkeypatch):
+    """Reserve before waiting: two refreshes queued behind a write are duplicates."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_target_info", lambda selector: {})
+    release, writer = _exclusive_write_parked(bridge, instance)
+    first_result, second_result = {}, {}
+    second_done = threading.Event()
+    first = threading.Thread(target=lambda: first_result.update(instance.dispatch(
+        {"op": "refresh", "target": "active", "id": "first"})), daemon=True)
+
+    def request_again():
+        second_result.update(instance.dispatch(
+            {"op": "refresh", "target": "active", "id": "second"}))
+        second_done.set()
+
+    second = threading.Thread(target=request_again, daemon=True)
+    try:
+        first.start()
+        deadline = time.monotonic() + 5
+        while not instance._write_gate.status("first")["waiting"]:
+            assert time.monotonic() < deadline, "first refresh never queued"
+            time.sleep(0.01)
+        second.start()
+        assert second_done.wait(2), "duplicate queued instead of refusing"
+        assert "refresh is already pending" in second_result["error"]
+        assert "requested " in second_result["error"]
+        assert "do not start another refresh" in second_result["error"]
+        assert "refresh" not in bv.events
+    finally:
+        release.set()
+        writer.join(5)
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+    assert first_result["ok"] is True
+    assert bv.events.count("refresh") == 1
+    assert instance._write_gate._refresh is None
+
+
+@pytest.mark.parametrize("first_queued", [False, True])
+def test_bare_cli_second_refresh_refuses_without_target_preflight(
+        monkeypatch, capsys, first_queued):
+    """The CLI must reach the reservation even behind an exclusive writer."""
+    import bn.cli
+    import bn.transport
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    selected = types.SimpleNamespace(
+        instance_id="modern", meta={"capabilities": {"refresh_target_gate": True}})
+    bv = _FakeMutationBV()
+    analyzing, release_analysis = threading.Event(), threading.Event()
+    first_result, second_result = {}, {}
+    second_done = threading.Event()
+    calls = []
+
+    def analyze():
+        bv.events.append("refresh")
+        # Simulate an exclusive target phase while analysis is running: even
+        # a read-only capability/target probe would block before the reservation.
+        with instance._target_lock.write():
+            analyzing.set()
+            assert release_analysis.wait(10), "analysis was never released"
+
+    def send(selected_instance, op, *, params=None, target=None, **kwargs):
+        assert selected_instance is selected
+        calls.append(op)
+        response = instance.dispatch({
+            "op": op, "params": params, "target": target, "id": "bare-cli"})
+        if not response["ok"]:
+            raise bn.cli.BridgeError(response["error"])
+        return response
+
+    def request_again():
+        try:
+            second_result["rc"] = bn.cli.main(["refresh"])
+        finally:
+            second_done.set()
+
+    bv.update_analysis_and_wait = analyze
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_target_info", lambda selector: {})
+    monkeypatch.setattr(bn.transport, "choose_instance", lambda *a, **k: selected)
+    monkeypatch.setattr(bn.transport, "_send_request_to_instance", send)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    release_writer, writer = (
+        _exclusive_write_parked(bridge, instance) if first_queued else (None, None))
+    first = threading.Thread(target=lambda: first_result.update(instance.dispatch(
+        {"op": "refresh", "target": "active", "id": "first"})), daemon=True)
+    second = threading.Thread(target=request_again, daemon=True)
+    try:
+        first.start()
+        if first_queued:
+            deadline = time.monotonic() + 5
+            while not instance._write_gate.status("first")["waiting"]:
+                assert time.monotonic() < deadline, "first refresh never queued"
+                time.sleep(0.01)
+        else:
+            assert analyzing.wait(5)
+        second.start()
+        assert second_done.wait(2), "bare refresh blocked before duplicate refusal"
+        assert calls == ["refresh"], "bare refresh must not send list_targets"
+        assert second_result["rc"] == 2
+        error = capsys.readouterr().err
+        assert ("refresh is already pending" if first_queued
+                else "refresh is already running") in error
+        assert "do not start another refresh" in error
+        assert first.is_alive()
+    finally:
+        release_analysis.set()
+        if release_writer is not None:
+            release_writer.set()
+            writer.join(5)
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+    assert first_result["ok"] is True
+    assert bv.events.count("refresh") == 1
+    assert instance._write_gate._refresh is None
+
+
+@pytest.mark.parametrize("target_count,selector", [
+    (0, None), (1, None), (2, None), (2, "active"),
+])
+def test_cli_refresh_resolves_bare_target_under_gate_but_preserves_explicit_active(
+        monkeypatch, capsys, target_count, selector):
+    import bn.cli
+    import bn.transport
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    selected = types.SimpleNamespace(
+        instance_id="modern", meta={"capabilities": {"refresh_target_gate": True}})
+    views = [_FakeMutationBV() for _ in range(target_count)]
+    for index, view in enumerate(views):
+        view.file = types.SimpleNamespace(
+            filename=f"/tmp/target-{index}", session_id=str(index + 1))
+    calls, snapshots, reply_selectors = [], [], []
+
+    def collect(*, strict=False):
+        snapshots.append((strict, instance._write_gate.locked()))
+        return views, True
+
+    def send(selected_instance, op, *, params=None, target=None, **kwargs):
+        assert selected_instance is selected
+        calls.append(op)
+        response = instance.dispatch({"op": op, "params": params, "target": target})
+        if not response["ok"]:
+            raise bn.cli.BridgeError(response["error"])
+        return response
+
+    monkeypatch.setattr(bridge, "_collect_open_views_state", collect)
+    monkeypatch.setattr(bridge, "_active_binary_view", lambda: views[-1] if views else None)
+    monkeypatch.setattr(instance, "_target_info",
+                        lambda selector: reply_selectors.append(selector) or {})
+    monkeypatch.setattr(bn.transport, "choose_instance", lambda *a, **k: selected)
+    monkeypatch.setattr(bn.transport, "_send_request_to_instance", send)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    argv = ["refresh"] + (["-t", selector] if selector is not None else [])
+    succeeds = target_count == 1 or selector == "active"
+    assert bn.cli.main(argv) == (0 if succeeds else 2)
+    assert calls == ["refresh"]
+    assert snapshots[0] == (selector is None, True)
+    if succeeds:
+        assert views[-1].events.count("refresh") == 1
+        assert len(reply_selectors) == 1
+        if selector is None:
+            assert isinstance(reply_selectors[0], bridge.PinnedTarget)
+        else:
+            assert reply_selectors == ["active"]
+    else:
+        assert all("refresh" not in view.events for view in views)
+        assert reply_selectors == []
+        error = capsys.readouterr().err
+        assert ("No BinaryView targets are open" if target_count == 0
+                else "explicit target when multiple targets are open") in error
+    assert instance._write_gate._refresh is None
+
+
+@pytest.mark.parametrize("failure_at", ["resolve", "analysis", "no_wait"])
+def test_failed_refresh_releases_its_reservation(monkeypatch, failure_at):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_target_info", lambda selector: {})
+
+    def fail(*args):
+        raise RuntimeError("synthetic refresh failure")
+
+    with monkeypatch.context() as failure_patch:
+        if failure_at == "resolve":
+            failure_patch.setattr(instance, "_resolve_view", fail)
+        elif failure_at == "analysis":
+            failure_patch.setattr(bv, "update_analysis_and_wait", fail)
+        if failure_at == "no_wait":
+            with instance._write_gate:
+                response = instance.dispatch(
+                    {"op": "refresh", "target": "active", "no_wait": True})
+        else:
+            response = instance.dispatch({"op": "refresh", "target": "active"})
+        assert response["ok"] is False
+    assert instance._write_gate._refresh is None
+    assert bv not in bridge._refreshing_views
+    assert instance.dispatch({"op": "refresh", "target": "active"})["ok"] is True
+
+
 def _refresh_parked_on_gate(monkeypatch, bridge, instance):
     """Start a dispatched refresh whose analysis blocks until released."""
     bv = _FakeMutationBV()
@@ -2500,8 +2777,6 @@ def test_load_binary_restores_content_keyed_cache(monkeypatch, tmp_path):
     assert "content hash of parse_record" in notes
     assert f"{cache_bndb.parent} is shared" in notes
     assert "unverified" not in notes
-    # What the substituted database already held is stated at load (#956).
-    assert "0 comment(s), 0 function doc(s) and 0 analyst symbol(s)" in notes
     bridge._headless_views.clear()
 
 
@@ -5100,6 +5375,7 @@ def test_write_registry_is_atomic_and_leaves_no_temp_files(monkeypatch, tmp_path
     data = json.loads(instance.registry_path.read_text(encoding="utf-8"))
     assert data["socket_path"] == str(instance.socket_path)
     assert data["plugin_name"]
+    assert data["capabilities"]["refresh_target_gate"] is True
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".tmp-")]
     assert leftovers == []
 

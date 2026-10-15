@@ -82,6 +82,7 @@ def _pointer_table_for_view(
     read_width: int | None = None,
     stop_after_invalid: int | None = None,
     error_on_unmapped: bool = False,
+    relative_base: int | None = None,
 ) -> dict[str, Any]:
     # Consult the address context up front: a table whose BASE is unmapped is
     # not backed by any segment, so every row would be a fabricated
@@ -143,8 +144,10 @@ def _pointer_table_for_view(
                 )
                 break
             continue
-        target = ctx._normalize_code_pointer(bv, value)
-        likely_scalar = target["status"] == "unmapped" and 0 < value < mapped_floor
+        offset = value - (1 << 32) if relative_base is not None and value & (1 << 31) else value
+        decoded = relative_base + offset if relative_base is not None else value
+        target = ctx._normalize_code_pointer(bv, decoded)
+        likely_scalar = relative_base is None and target["status"] == "unmapped" and 0 < value < mapped_floor
         # A legitimate inline scalar field is not an "invalid" run member either,
         # so it must not trip stop_after_invalid in interior windows.
         if target["plausible"] or target["status"] == "null" or likely_scalar:
@@ -168,6 +171,8 @@ def _pointer_table_for_view(
                 "target": target,
             }
         )
+        if relative_base is not None:
+            rows[-1].update(offset=offset, decoded_address=hex(decoded))
         if stop_after_invalid is not None and invalid_run >= stop_after_invalid:
             warnings.append(
                 f"stopped after {invalid_run} unreadable/implausible entries at {hex(entry_address)}"
@@ -193,7 +198,7 @@ def _pointer_table_for_view(
         warnings.append("table start is in an executable segment; this may be code, not a pointer table")
     non_null_rows = [
         row for row in rows
-        if row.get("readable") and row.get("value") not in {None, "0x0"}
+        if row.get("readable") and (relative_base is not None or row.get("value") not in {None, "0x0"})
     ]
     plausible_rows = [row for row in non_null_rows if row.get("plausible")]
     scalar_rows = [row for row in non_null_rows if row.get("likely_scalar")]
@@ -202,11 +207,12 @@ def _pointer_table_for_view(
         row for row in non_null_rows
         if not row.get("plausible") and not row.get("likely_scalar")
     ]
+    entry_label = "decoded entries" if relative_base is not None else "non-null entries"
     if non_null_rows and not plausible_rows and unresolved_rows:
-        warnings.append("no non-null entries resolve to mapped addresses; low confidence pointer table")
+        warnings.append(f"no {entry_label} resolve to mapped addresses; low confidence pointer table")
     elif unresolved_rows:
         warnings.append(
-            f"{len(unresolved_rows)} non-null entries do not resolve to mapped addresses"
+            f"{len(unresolved_rows)} {entry_label} do not resolve to mapped addresses"
         )
     if scalar_rows:
         warnings.append(
@@ -232,6 +238,7 @@ def _pointer_table_for_view(
         "pointer_size": pointer_size,
         "stride": stride_size,
         "read_width": read_width,
+        **({"decode": "relative-int32", "base": hex(relative_base)} if relative_base is not None else {}),
         "context": table_context,
         "items": rows,
         "total": len(rows),
@@ -792,11 +799,22 @@ def _got_alias_target(ctx, bv, start: int, pointer_size: int):
 
 
 def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, stride=None,
-                   width=None, record_size=None, ptr_fields=None, fields=None):
+                   width=None, record_size=None, ptr_fields=None, fields=None,
+                   decode: str = "absolute", base: Any = None):
     if entries < 0:
         raise OperationFailure("invalid_entries", f"Invalid table entry count: {entries}")
     bv = ctx._resolve_view(selector)
     start = _parse_address(address)
+    if decode not in {"absolute", "relative-int32"}:
+        raise OperationFailure("invalid_request", "decode must be absolute or relative-int32")
+    relative = decode == "relative-int32"
+    if relative and base in (None, ""):
+        raise OperationFailure("invalid_request", "--decode relative-int32 requires --base")
+    if not relative and base not in (None, ""):
+        raise OperationFailure("invalid_request", "--base requires --decode relative-int32")
+    relative_base = _parse_address(base) if relative else None
+    if relative and (record_size not in (None, "") or ptr_fields or fields):
+        raise OperationFailure("invalid_request", "relative-int32 cannot be combined with record fields")
     pointer_size = ctx._pointer_size(bv)
     # #455/#467: record-aware mode -- a mixed dispatch descriptor (scalar/string +
     # pointer fields), not a pure pointer table. Declared here (before the GOT-alias /
@@ -829,7 +847,7 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
     # A GOT/import-address slot is a pointer TO a table, not a table; walking it
     # would fabricate adjacent unrelated GOT entries as bogus slots (#313).
     # Refuse and point at the real table (*slot[0]) instead.
-    alias = _got_alias_target(ctx, bv, start, pointer_size)
+    alias = None if relative else _got_alias_target(ctx, bv, start, pointer_size)
     if alias is not None:
         sym_name, deref = alias
         name_part = f" ({sym_name})" if sym_name else ""
@@ -847,13 +865,17 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
             f"table: walking it would present adjacent unrelated GOT entries as "
             f"bogus slots{target_part}",
         )
-    stride_size = _parse_address(stride) if stride not in (None, "") else pointer_size
+    stride_size = _parse_address(stride) if stride not in (None, "") else (4 if relative else pointer_size)
     if stride_size <= 0:
         raise OperationFailure("invalid_stride", f"Invalid table stride: {stride_size}")
     # Explicit --width overrides the stride-derived read width (#225).
     read_width = _parse_address(width) if width not in (None, "") else None
     if read_width is not None and read_width <= 0:
         raise OperationFailure("invalid_width", f"Invalid read width: {read_width}")
+    if relative:
+        if read_width not in (None, 4):
+            raise OperationFailure("invalid_request", "relative-int32 requires --width 4")
+        read_width = 4
     # #275: _pointer_table_for_view already returns the canonical {kind, items,
     # total, ...} envelope -- identical standalone and embedded.
     return _pointer_table_for_view(
@@ -864,6 +886,7 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
         stride_size=stride_size,
         read_width=read_width,
         error_on_unmapped=True,
+        relative_base=relative_base,
     )
 
 
