@@ -7034,3 +7034,80 @@ def test_class_apply_types_plan_builds_the_typing_batch(monkeypatch):
     assert "no table type of its own" in excinfo.value.message
     assert "No struct named" not in excinfo.value.message
     assert "demo::Widget::demo::Leaf::VTable" in excinfo.value.message
+
+
+@pytest.mark.parametrize("preview", [False, True])
+def test_mixed_comment_batch_keeps_base_cost_with_slow_type_container(monkeypatch, preview):
+    """A parser in a batch must not charge every comment for listing all types."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class SlowTypes:
+        @property
+        def type_ids(self):
+            time.sleep(0.002)
+            return tuple(f"user:{index}" for index in range(3000))
+
+    class SlowTypeBV(_FakeMutationBV):
+        type_container = SlowTypes()
+
+        @property
+        def type_names(self):
+            time.sleep(0.002)
+            return tuple(f"Syn{index}" for index in range(3000))
+
+    fn = _FakeFunction(0x401000, "entry")
+    bv = SlowTypeBV(functions=[fn], memory={0x402000: bytes(300)})
+    fn.view = bv
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    comments = [{"op": "set_comment", "address": hex(0x402000 + index),
+                 "comment": f"note {index}"} for index in range(300)]
+    # A no-op AUTO prototype still exercises the nested preview/prototype parser
+    # path, without introducing an unrelated irreversible-user-type refusal.
+    prototype = {"op": "set_prototype", "identifier": "entry", "prototype": "int32_t entry()"}
+
+    def run(operations):
+        started = time.perf_counter()
+        result = instance._mutation("active", preview, operations)
+        elapsed = time.perf_counter() - started
+        assert result["success"] is True, result
+        assert len(result["results"]) == len(operations), result
+        assert not result.get("kept_library_imports"), result
+        return elapsed
+
+    base = run(comments)
+    mixed = run([*comments, prototype])
+    # Whole-container latency is injected at the SDK seam, not into engine
+    # helpers. Allow scheduling noise and constant parser overhead, not 300
+    # comments each paying the latency again.
+    assert mixed < base * 6 + 0.25, {"comment_only": base, "mixed": mixed}
+    assert all(bv.get_comment_at(0x402000 + index) == ("" if preview else f"note {index}")
+               for index in range(300))
+
+
+def test_unattempted_plain_declaration_discloses_snapshot_parse(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+    plain = _FakeType("struct Plain", members=[_FakeMember(0, "x", "int32_t")])
+    bv = _FakeMutationBV(types_={"Plain": plain})
+    bv.type_names = ["Plain"]
+    parses = []
+
+    def parse(ctx, view, declaration, *, source_path=None):
+        parses.append(declaration)
+        return {"types": [("Plain", plain)], "functions": [], "variables": []}
+
+    monkeypatch.setattr(me, "_parse_declaration_source", parse)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._mutation("active", True, [
+        {"op": "set_comment", "function": "missing", "comment": "x"},
+        {"op": "types_declare", "declaration": "struct Plain { int x; };"},
+    ])
+    assert parses, "the snapshot really parsed the later declaration"
+    assert result["success"] is False, result
+    row = result["results"][1]
+    assert row["status"] == "not_attempted", result
+    assert row["parse_performed"] is True, result
+    assert "imported_from_library" not in row, result
+    assert not result.get("kept_library_imports"), result

@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import struct
 import sys
@@ -4749,6 +4750,77 @@ class TestOffsetTypeLookup1000:
             assert (shown.returncode == 0) == exists, (name, shown.stdout, shown.stderr)
 
 
+def test_unattempted_nonimporting_declaration_reports_snapshot_parse(shared_bn, tmp_path):
+    shared_bn.load(ADD_BINARY)
+    manifest = tmp_path / "plain-snapshot.json"
+    manifest.write_text(json.dumps({"ops": [
+        {"op": "set_comment", "function": "missing", "comment": "x"},
+        {"op": "types_declare", "declaration": "struct PlainSnapshot { int x; };"},
+    ]}))
+    response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+    assert response.returncode == 3, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert result["results"][0]["status"] == "unsupported", result
+    row = result["results"][1]
+    assert row["status"] == "not_attempted", result
+    assert row["parse_performed"] is True, result
+    assert "imported_from_library" not in row, result
+    assert not result.get("kept_library_imports"), result
+    assert shared_bn.run("types", "show", "PlainSnapshot").returncode == 2
+
+
+class TestBatchTypeTrackingPerformance1031:
+    @pytest.mark.parametrize("preview", [False, True])
+    def test_large_type_view_mixed_batch_stays_near_comment_only_cost(
+            self, shared_bn, tmp_path, preview):
+        """Exercise the reviewer's real 3000-type/300-comment CLI regression."""
+        shared_bn.load(ADD_BINARY)
+        setup = shared_bn.json(
+            "py", "exec", "--code",
+            "import binaryninja as bn\n"
+            "record = bn.Type.structure(members=[(bn.Type.int(4), 'a'), "
+            "(bn.Type.int(4), 'b')])\n"
+            "for index in range(3000):\n"
+            "    bv.define_user_type(f'Syn{index}', record)\n"
+            "result = {'start': hex(bv.start), "
+            "'count': sum(str(n).startswith('Syn') for n in bv.type_names)}\n")["result"]
+        assert setup["count"] == 3000, setup
+        start = int(setup["start"], 16)
+        field = {"op": "struct_field_set", "struct_name": "Syn1", "offset": "0x0",
+                 "field_name": "z", "field_type": "int32_t"}
+        samples = {False: [], True: []}
+        flags = ["--preview"] if preview else []
+        for repeat in range(2):
+            for mixed in (False, True):
+                stamp = f"{repeat}-{mixed}"
+                comments = [{"op": "set_comment", "address": hex(start + index),
+                             "comment": f"performance note {stamp} {index}"}
+                            for index in range(300)]
+                operations = [*comments, field] if mixed else comments
+                manifest = tmp_path / f"timing-{stamp}.json"
+                manifest.write_text(json.dumps({"ops": operations}))
+                begun = time.perf_counter()
+                response = shared_bn.run(
+                    "batch", "apply", str(manifest), *flags, "--format", "json", timeout=120)
+                samples[mixed].append(time.perf_counter() - begun)
+                assert response.returncode == 0, response.stdout + response.stderr
+                result = json.loads(response.stdout)
+                assert result["success"] is True, result
+                assert len(result["results"]) == len(operations), result
+                assert all(row["status"] in {"verified", "noop"} for row in result["results"]), result
+                assert result["rolled_back"] is preview, result
+                assert not result.get("kept_library_imports"), result
+        # Best-of-two removes one-off process scheduling stalls. This is a
+        # generous relative guard, not a machine-speed budget: constant scans
+        # for the one parser are fine; scans for all 300 comments are not.
+        base, mixed = min(samples[False]), min(samples[True])
+        print(f"mixed batch preview={preview}: comments={base:.3f}s mixed={mixed:.3f}s")
+        assert mixed < base * 6 + 1.0, samples
+        shown = shared_bn.json("types", "show", "Syn1")
+        expected_field = "int32_t a" if preview else "int32_t z"
+        assert expected_field in shown["layout"], shown
+
+
 class TestBatchPreviewImports1012:
     @pytest.mark.parametrize("kind", [
         "struct_field_set", "set_prototype", "local_retype", "data_retype",
@@ -4898,3 +4970,142 @@ class TestBatchPreviewImports1012:
         summary = json.loads(corrected.stdout)
         assert summary["noop_count"] == 1 and summary["verified_count"] == 1, summary
         assert shared_bn.json("function", "info", "add")["function"]["name"] == "add"
+
+
+@pytest.mark.parametrize("error_location", ["included", "main"])
+@pytest.mark.parametrize("filename", ["main_err.h", 'main"\\err.h'])
+def test_real_declaration_included_header_error_preserves_context_1031(
+        shared_bn, tmp_path, error_location, filename):
+    shared_bn.load(ADD_BINARY)
+    main_path = tmp_path / filename
+    sub_path = tmp_path / "sub_err.h"
+    sub_path.write_text(
+        "typedef struct SubE { int a; nosuch_t b; } SubE;\n"
+        if error_location == "included" else
+        "typedef struct SubE { int a; int b; } SubE;\n",
+        encoding="utf-8",
+    )
+    main_path.write_text(
+        '#include "sub_err.h"\nstruct UsesSubE { SubE s; };\n'
+        + ("struct MainError { nosuch_t value; };\n" if error_location == "main" else ""),
+        encoding="utf-8",
+    )
+
+    response = shared_bn.run(
+        "types", "declare", "--file", str(main_path), "--format", "json",
+    )
+
+    assert response.returncode == 3, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    row = result["results"][0]
+    assert row["status"] == "invalid_request", result
+    assert "unknown type name 'nosuch_t'" in row["message"], result
+    expected_path = sub_path if error_location == "included" else main_path
+    assert str(expected_path) in row["message"], result
+    assert "file not found" not in row["message"], result
+
+
+def test_real_declaration_library_fallback_preserves_source_context_1031(
+        shared_bn, tmp_path):
+    shared_bn.load(ADD_BINARY)
+    main_path = tmp_path / "main_pid.h"
+    main_path.write_text(
+        "struct PidRecord { pid_t pid; };\nstruct UsesPid { struct PidRecord value; pid_t owner; };\n",
+        encoding="utf-8",
+    )
+
+    response = shared_bn.run(
+        "types", "declare", "--file", str(main_path), "--format", "json",
+    )
+
+    assert response.returncode == 0, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert result["results"][0]["status"] == "verified", result
+    assert result["results"][0]["include_root"] == str(tmp_path.resolve()), result
+    assert "pid" in shared_bn.json("types", "show", "PidRecord")["layout"]
+    assert "value" in shared_bn.json("types", "show", "UsesPid")["layout"]
+    assert "pid_t owner" in shared_bn.json("types", "show", "UsesPid")["layout"]
+
+
+@pytest.mark.parametrize("summary", [False, True])
+def test_importing_auto_prototype_retains_irreversible_refusal_1031(shared_bn, summary):
+    shared_bn.load(ADD_BINARY)
+    args = ["proto", "set", "mul", "int mul(struct passwd* p, int b)",
+            "--preview", "--format", "json"]
+    if summary:
+        args.append("--summary")
+    response = shared_bn.run(*args)
+    assert response.returncode == 3, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert "passwd" in result["kept_library_imports"], result
+    message = result["first_error"] if summary else result["results"][0]["message"]
+    assert "has_user_type" in message and "cleanly reverted" in message, result
+    assert "a preview cannot undo an import" in message, result
+    if not summary:
+        assert "has_user_type" in result["message"], result
+    flag = shared_bn.run("py", "exec", "--code",
+                         "print(bv.get_functions_by_name('mul')[0].has_user_type)")
+    assert flag.returncode == 0 and flag.stdout.strip() == "False", flag.stdout + flag.stderr
+
+
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize("interface", ["cli", "wire"])
+def test_analysis_exception_discloses_kept_imports_without_replacing_error_1031(
+        shared_bn, preview, interface):
+    shared_bn.load(ADD_BINARY)
+    probe = ("import json\nprint(json.dumps({str(i): str(bv.get_type_name_by_id(i)) "
+             "for i in bv.type_container.type_ids}))")
+    before = json.loads(shared_bn.run("py", "exec", "--code", probe).stdout)
+    injected = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+original = bn.BinaryView.update_analysis_and_wait
+def fail_once(view, _original=original):
+    bn.BinaryView.update_analysis_and_wait = _original
+    raise RuntimeError('synthetic SDK analysis failure')
+fail_once._review_original = original
+bn.BinaryView.update_analysis_and_wait = fail_once
+""")
+    assert injected.returncode == 0, injected.stdout + injected.stderr
+    try:
+        declaration = "struct Exceptional1031 { timespec* p; };"
+        if interface == "cli":
+            args = ["types", "declare", declaration, "--format", "json"]
+            if preview:
+                args.append("--preview")
+            response = shared_bn.run(*args)
+            assert response.returncode == 2, response.stdout + response.stderr
+            result = json.loads(response.stdout)
+        else:
+            registry = json.loads((shared_bn.cache_dir / "instances"
+                                   / f"{shared_bn.instance_id}.json").read_text())
+            identity = {"instance_id": registry["instance_id"], "pid": registry["pid"],
+                        "token": registry["instance_token"]}
+            request = {"op": "types_declare", "target": ADD_BINARY.name,
+                       "_bridge_identity": identity,
+                       "params": {"declaration": declaration, "preview": preview}}
+            endpoint = shared_bn.cache_dir / "instances" / f"{shared_bn.instance_id}.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(30)
+                connection.connect(str(endpoint))
+                connection.sendall(json.dumps(request).encode() + b"\n")
+                with connection.makefile("rb") as stream:
+                    result = json.loads(stream.readline())
+            assert "status" not in result, result
+    finally:
+        cleanup = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+original = getattr(bn.BinaryView.update_analysis_and_wait, '_review_original', None)
+if original is not None:
+    bn.BinaryView.update_analysis_and_wait = original
+""")
+        assert cleanup.returncode == 0, cleanup.stdout + cleanup.stderr
+    assert result["ok"] is False, result
+    assert "internal error: RuntimeError: synthetic SDK analysis failure" in result["error"], result
+    after = json.loads(shared_bn.run("py", "exec", "--code", probe).stdout)
+    imported = sorted(name for type_id, name in after.items() if type_id not in before)
+    assert "timespec" in imported, (result, imported)
+    assert ("kept library imports (a rollback cannot remove them): "
+            + ", ".join(imported)) in result["error"], result
+    if interface == "wire":
+        assert result["result"]["kept_library_imports"] == imported, result
+    assert shared_bn.run("types", "show", "Exceptional1031").returncode == 2
