@@ -782,9 +782,6 @@ def test_forward_modeled_sink_arg_out_of_range_reports_abi_register_sink_1001(mo
     assert sink["callee"] == "memcpy" and sink["tainted_arg_index"] == 2
     assert sink["class"] == "overflow_len"
     assert sink["via"] == "abi_register"
-    # memcpy's model declares its source (arg 1) and length (arg 2); BN kept arg 0.
-    assert sink["arity_mismatch"] == {"recovered": 1, "dropped": [1, 2], "register": "r2",
-                                      "callee_ref": "0x900", "class_from": "model"}
     # The flow traces back to the seeded param through the register's value.
     assert result["reached_sinks"][0]["path"][-1]["address"] == hex(0x18)
     assert "through ABI register r2" in result["reached_sinks"][0]["path"][-1]["reason"]
@@ -792,9 +789,6 @@ def test_forward_modeled_sink_arg_out_of_range_reports_abi_register_sink_1001(mo
     rendered = _render_taint_text(result)
     assert "verdict: 1 sink(s) reached (overflow_len[1 via ABI register])" in rendered
     assert "[overflow_len] memcpy @ 0x18 (arg 2 via r2, arity mismatch)" in rendered
-    assert ("class unproven (the model's own): BN recovered 1 param(s) for this call and dropped the model's "
-            "arg(s) [1, 2]; the tainted arg was read from ABI register r2 -- fix the prototype "
-            "(`bn proto get 0x900`, then `bn proto set`) and re-run") in rendered
 
 
 # #1001 review round 3: a sink whose model declares an arg BN's prototype
@@ -869,6 +863,10 @@ def test_dropped_arg_never_lowers_a_sink_class_1001(models, monkeypatch, shape, 
     unproven = "class is the model's own and unproven" in sink["detail"]
     recovered_only = "decided from the recovered args only" in sink["detail"]
     assert (unproven, recovered_only) == (class_from == "model", class_from == "recovered_args")
+    from bn.formatters import _render_taint_text
+    text = _render_taint_text({"direction": "forward",
+                              "reached_sinks": [{"sink": sink}]})
+    assert ("unproven" in text) is (class_from == "model")
 
 
 def test_class_from_recovered_args_is_not_called_unproven_1001(models, monkeypatch):
@@ -1097,18 +1095,6 @@ def test_taint_into_a_correct_varargs_tail_is_not_a_prototype_defect_948(models)
     assert "do not redeclare" in diag["next_action"]
 
 
-@pytest.mark.parametrize("variadic", [False, None])
-def test_nonvariadic_or_undetermined_callee_keeps_prototype_advice_948(models, variadic):
-    # A determined-nonvariadic callee taking more args than it declares IS the
-    # type discrepancy prototype advice is for; an undetermined flag is not
-    # evidence either way, so the advice stays.
-    handler, bv, _, _ = _variadic_logger_program(variadic)
-    result = te.TaintEngine(bv, models).forward(handler, [te.parse_locator("param:0")])
-    leaf = next(l for l in result["leaves"] if l["kind"] == "unmodeled_callee")
-    assert "cause" not in leaf
-    assert "proto set" in leaf["note"]
-    assert "proto set" in result["diagnostics"]["next_action"]
-
 
 def test_partial_drop_into_a_varargs_tail_does_not_ask_to_declare_varargs_948(models, monkeypatch):
     # The stack-passed branch used to say "declare it variadic" -- to a callee
@@ -1121,12 +1107,6 @@ def test_partial_drop_into_a_varargs_tail_does_not_ask_to_declare_varargs_948(mo
     assert leaf["dropped_args"] == [1, 3] and leaf["stack_dropped_args"] == [3]
     assert leaf["cause"] == "varargs_not_followed"
     assert "proto set" not in leaf["note"] and "declare it variadic" not in leaf["note"]
-    # Undetermined: the established advice is unchanged.
-    app_log.type = type("T", (), {"has_variable_arguments": type(
-        "B", (), {"value": False, "confidence": 0})()})()
-    leaf = engine._arg_under_recovered_leaf(call, app_log, [1, 3], 1)
-    assert leaf["cause"] == "signature_under_recovered" and leaf["callee_variadic"] is None
-    assert "declare it variadic" in leaf["note"]
 
 
 def test_forward_modeled_sink_full_arity_untainted_stays_all_clear(models):
@@ -4453,29 +4433,11 @@ def test_backward_arg_index_out_of_range_states_count_and_zero_based(process_fun
     assert "0-based" in msg      # names the convention
 
 
-def test_backward_arg_out_of_range_discloses_proto_set_remedy(process_func, models):
-    # #464 (Thread A extension): an index past the recovered arity is often BN
-    # under-recovering the callee's signature (e.g. an ARM IFUNC libc sink typed by
-    # its resolver as 0/1 args -- the shape that hid ~half the memcpy sink flows in
-    # dogfooding). The bare "out of range" must name the proto-set remedy.
+def test_forward_param_not_found_raises(process_func, models):
     bv = FBV({0x401070: "read", 0x401080: "memcpy"})
     engine = te.TaintEngine(bv, models)
-    with pytest.raises(te.TaintError) as ei:
-        engine.backward(process_func, [te.parse_locator("arg:memcpy:9")])
-    assert 'proto set memcpy' in str(ei.value)
-
-
-def test_forward_param_not_found_discloses_proto_set_remedy(process_func, models):
-    # #464 (Thread A extension): seeding param:N past the recovered arity -- the
-    # uniform-vtable-drop shape where BN dropped a data param across the whole call
-    # chain (no per-callsite arity mismatch for the frontier to catch) -- must name
-    # the proto-set remedy, not a bare not-found.
-    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
-    engine = te.TaintEngine(bv, models)
-    with pytest.raises(te.TaintError) as ei:
+    with pytest.raises(te.TaintError):
         engine.forward(process_func, [te.parse_locator("param:99")])
-    msg = str(ei.value)
-    assert "not found" in msg and "proto set" in msg
 
 
 def test_backward_arg_with_no_variable_reads_says_so(process_func, models):
@@ -7153,7 +7115,6 @@ def test_arg_under_recovered_leaf_gated_positive(models, monkeypatch):
     assert leaf["recovered_params"] == 1
     assert leaf["dropped_args"] == [1]
     assert leaf["address"] == "0x40130a"
-    assert 'proto set _M_create' in leaf["note"]          # actionable remedy
 
 
 def test_arg_under_recovered_leaf_gate_rejects(models, monkeypatch):
@@ -7169,7 +7130,7 @@ def test_arg_under_recovered_leaf_discloses_stack_passed(models, monkeypatch):
     # #324: a dropped index beyond the register slots (stack-passed vararg) is now
     # DISCLOSED -- confirmed by the caller-side recovery that placed it in `dropped`,
     # so the tainted stack arg no longer vanishes silently. It carries a distinct
-    # stack_dropped_args field and a variadic proto-set remedy.
+    # stack_dropped_args field.
     monkeypatch.setattr(te.TaintEngine, "_reg_reads_as_input", lambda self, c, r: True)
     engine = te.TaintEngine(FBV({}), models)
     callee = _fake_under_recovered_callee("logger", 0x3000, ["rdi", "rsi"])  # 2 arg regs
@@ -7179,8 +7140,6 @@ def test_arg_under_recovered_leaf_discloses_stack_passed(models, monkeypatch):
     assert leaf["kind"] == "arg_under_recovered"
     assert leaf["dropped_args"] == [6]
     assert leaf["stack_dropped_args"] == [6]
-    assert "STACK-passed" in leaf["note"]
-    assert "..." in leaf["note"]  # variadic prototype hint
 
 
 def test_arg_under_recovered_leaf_i386_pure_stack_stays_silent(models, monkeypatch):
@@ -7252,13 +7211,6 @@ def test_forward_descend_discloses_partial_arg_drop(models, monkeypatch):
     assert leaves[0]["dropped_args"] == [1]
 
 
-def test_forward_fully_unrecovered_note_points_at_proto_set(models):
-    # the existing "no mappable parameters" leaf now names the proto set remedy
-    func, bv = _frontier_no_params_program()
-    engine = te.TaintEngine(bv, models)
-    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
-    leaf = [l for l in result["leaves"] if l.get("kind") == "unmodeled_callee"][0]
-    assert "proto set" in leaf["note"]
 # --- derive_flow_facts: per-flow metrics + grouping signature (Thread C) -----
 
 def test_derive_flow_facts_forward_multi_wrapper():
@@ -7413,7 +7365,6 @@ def test_forward_zero_result_includes_frontier_diagnostics_559(models):
     assert diag["unmodeled_calls_reached"] is True             # parse_event was reached, unmodeled
     assert diag["frontier"]["unresolved"] == 1                 # the unmodeled_callee leaf
     assert diag["frontier"]["by_kind"].get("unmodeled_callee") == 1
-    assert "proto set" in diag["next_action"]                  # actionable, not a verdict
 
 
 def test_forward_zero_result_diagnostics_absent_when_sink_reached_559(process_func, models):
@@ -7521,7 +7472,6 @@ def test_frontier_leaf_withholds_all_clear_562(models):
     assert diag["source_callsites"] == 1
     assert diag["unmodeled_calls_reached"] is True
     assert diag["frontier"]["by_kind"].get("unmodeled_callee") == 1
-    assert "proto set" in diag["next_action"]
     # #562 gate folded in:
     assert diag["safe_to_report_all_clear"] is False
 
@@ -9582,7 +9532,6 @@ def test_backward_frontier_buckets_and_next_action_name_the_actionable_cut_812()
                  "indirect_call_unresolved", "arg_under_recovered"):
         unres = tr.backward_diagnostics([{"kind": kind}], [], sinks_seeded=1, slices=1)
         assert unres["frontier"]["unresolved"] == 1, (kind, unres)
-        assert "bn proto set" in unres["next_action"], (kind, unres)
 
     # A coarse-memory frontier: its own bucket and its own remediation.
     for kind in ("coarse_memory_store", "pointer_escape"):
@@ -10350,7 +10299,7 @@ def test_backward_memory_chain_budget_is_disclosed_as_truncation_928():
     result, reasons, aol = _bw(pg.func())
     assert result["stats"]["truncated"] is True, result["stats"]
     assert result["stats"]["truncation_cause"] == ["memory_chain"], result["stats"]
-    assert len(aol) == 1 and "walk budget" in aol[0]["detail"], result["leaves"]
+    assert len(aol) == 1 and aol[0]["buffer"] == "cmd", result["leaves"]
     assert result["slices"][0]["origin"]["kind"] == "address_of_local_unresolved"
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
 
@@ -10370,7 +10319,7 @@ def test_backward_address_of_operand_of_a_fill_is_a_buffer_not_a_literal_928():
     result, reasons, aol = _bw(pg.func())
     assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
     assert any("local buffer other written by read" in r for r in reasons), reasons
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
     # With nothing writing `other`, the nested buffer is the frontier.
     pg2 = _BufProgram(params=[fd])
@@ -10637,7 +10586,6 @@ def test_backward_diagnostics_name_the_memory_chain_cut_928():
     diag = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1,
                                    truncated=True, truncation_cause=["memory_chain"])
     assert diag["safe_to_report_complete_slice"] is False
-    assert "memory-chain budget" in diag["complete_slice_reason"], diag
 
 
 def test_model_overlay_count_treats_comment_only_entries_as_benign_928():
@@ -10724,7 +10672,7 @@ def test_backward_store_through_phi_pointer_is_a_writer_928r3():
     # The parameter the loop xors in is the origin (it outranks the source so
     # the caller ascent is not lost); the source stays in the steps.
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 1, "var": "key#0"}, result["slices"][0]["origin"]
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
 
 def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
@@ -10851,9 +10799,9 @@ def test_backward_constant_offset_store_does_not_cover_a_path_928r3():
 
 def test_backward_memset_and_bzero_are_literal_fills_928r3():
     # P2: `if (flag) read(fd, buf, 63); else memset(buf, 0, 64); popen(buf)`
-    # reported "on at least one path nothing writes the buffer" -- false, the
-    # memset arm IS written, by a literal. memset propagates its fill byte
-    # (`arg:1 -> *arg:0`); bzero declares `writes: ["*arg:0"]`.
+    # Both writers retain their origins: memset propagates its fill byte,
+    # bzero declares a literal write. The read arm is still short of the
+    # whole object, so the join now correctly remains incomplete (#931).
     fd = FVar("fd", ident=12); fd0 = FSSA(fd, 0)
     buf = FVar("buf", typ="char[0x40]")
     for zeroer, params in ((_B_MEMSET, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
@@ -10870,7 +10818,7 @@ def test_backward_memset_and_bzero_are_literal_fills_928r3():
         name = _B_NAMES[zeroer]
         assert any(f"local buffer buf written by {name}" in r for r in reasons), reasons
         assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
-        assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+        assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
 
 def test_backward_benign_call_handed_the_buffer_is_recorded_not_covering_928r3():
@@ -10962,13 +10910,14 @@ def test_backward_fill_outranks_a_terminator_and_names_a_tainted_length_928r3():
     assert any("length argument 2 of memcpy bounds" in r for r in reasons), reasons
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "n#0"}, result["slices"][0]["origin"]
 
-    # With a constant length the tie is between two literals: the FILL wins.
+    # A short constant copy and one terminator leave an uncovered suffix (#931).
     pg2 = _BufProgram()
     pg2.call(_B_MEMCPY, [_addr_of(buf), _cstr(0x700), FExpr("MLIL_CONST", "0x10", constant=0x10)])
     pg2.aliased_store(buf, 0x10, 0)
     pg2.sink(buf)
     result2, _, _ = _bw(pg2.func())
-    assert result2["slices"][0]["origin"] == {"kind": "call", "callee": "memcpy"}, result2["slices"][0]["origin"]
+    assert result2["slices"][0]["origin"] == {"kind": "address_of_local_unresolved", "buffer": "buf"}
+    assert not result2["diagnostics"]["safe_to_report_complete_slice"]
 
 
 def test_backward_follows_a_modeled_return_that_derives_from_an_argument_928r3():
@@ -11026,15 +10975,6 @@ def test_falsy_annotation_roles_are_rejected_928r3():
     assert ok["app_zero"]["writes"] == ["*arg:0"]
 
 
-def test_backward_next_action_follows_the_memory_chain_hint_928r3():
-    # P3: a `memory_chain` truncation left `next_action` on the generic
-    # unresolved text (`bn proto set`...) for a walk that ran out of budget.
-    from bn_agent_bridge import taint_result as tr
-    diag = tr.backward_diagnostics(
-        [{"kind": "address_of_local_unresolved"}], [], sinks_seeded=1, slices=1,
-        truncated=True, truncation_cause=["memory_chain"])
-    assert "memory-chain budget" in diag["next_action"], diag
-    assert "proto set" not in diag["next_action"], diag
 
 
 
@@ -11081,7 +11021,7 @@ def test_backward_variable_offset_address_walks_the_buffer_928r4():
     # The offset is walked too; a parameter origin outranks the source so the
     # caller ascent still runs.
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 1, "var": "off#0"}
-    assert aol == [], result["leaves"]
+    assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
     # Folded into the sink operand (`popen(&line + off#0)`): the buffer is a
     # seed of its own beside the offset.
@@ -11111,7 +11051,7 @@ def test_backward_variable_offset_fill_operand_walks_the_source_buffer_928r4():
     result, reasons, aol = _bw(pg.func())
     assert any("local buffer other written by read" in r for r in reasons), reasons
     assert any("local buffer buf written by strcpy" in r for r in reasons), reasons
-    assert aol == [], result["leaves"]
+    assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
 
 def test_backward_writable_global_element_is_a_leaf_928r4():

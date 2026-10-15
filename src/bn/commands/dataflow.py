@@ -130,6 +130,7 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
         "defuse",
         {"identifier": args.identifier, "var": args.var},
         require_target=True,
+        contextual_hints=True,
         text_renderer=lambda value: _resolution_note(value) + _render_defuse_text(value),
         stem="defuse",
     )
@@ -242,6 +243,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "max_iters": int(args.max_iters),
         "unknown_call": args.unknown_call,
         "enabled_sink_classes": list(args.sink_classes or []),
+        "mangled": args.mangled,
     }
     _add_resolve_map(args, params)
     _add_user_models(args, params)
@@ -250,6 +252,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
+        contextual_hints=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
                                                     mangled=args.mangled)),
         stem="taint-forward",
@@ -287,6 +290,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "function": args.function,
         "sinks": list(args.sinks),
         "max_depth": int(args.max_depth),
+        "mangled": args.mangled,
     }
     _add_resolve_map(args, params)
     _add_user_models(args, params)
@@ -295,6 +299,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
+        contextual_hints=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
                                                     mangled=args.mangled)),
         stem="taint-backward",

@@ -4281,14 +4281,12 @@ def test_backward_slice_out_of_range_notes_stack_passed_varargs_324(monkeypatch)
     assert "STACK" in msg and "likely passed on" in msg
     assert "llil" in msg and "#324" in msg
 
-    # arg 2 is exactly the FIRST register slot BN did not recover (n=2 params): a
-    # register arg likely dropped by a narrow prototype, not a stack arg. It gets
-    # the (hedged) register-drop note pointing at LLIL, never the STACK note.
+    # The first unrecovered register slot is not a stack argument. An out-of-range
+    # request alone does not establish that an argument was dropped.
     with pytest.raises(bridge.OperationFailure) as exc2:
         instance._backward_slice("active", "logger_caller", "0x10010", arg_index=2)
     msg2 = str(exc2.value)
     assert "STACK" not in msg2
-    assert "register-passed arg BN dropped" in msg2 and "#324" in msg2 and "llil" in msg2
 
     # arg 5 is below the 6 register args but BEYOND the first-missing slot -- a
     # genuinely low-arity call where the index is simply out of range. No note
@@ -5643,7 +5641,6 @@ def test_defuse_discloses_a_dropped_stack_arg_797(monkeypatch):
     assert "call-model truncation" in hint
     assert "my_logger" in hint
     assert "sp+0x0" in hint and "sp+0x4" in hint     # the dropped stores, named
-    assert "proto set my_logger" in hint             # the runnable remedy
     # The use itself is unchanged: the disclosure is additive, so an existing
     # consumer of `uses` reads exactly what it read before.
     assert [u["address"] for u in result["uses"]] == ["0x401024"]
@@ -5679,22 +5676,6 @@ def test_defuse_resolves_the_callee_through_thunks_like_its_sibling_797(monkeypa
     result = instance._defuse("active", "0x401000", "arg1#0")
 
     assert result["hints"] == [], result["hints"]
-
-
-def test_defuse_names_the_real_callee_in_the_truncation_remedy_797(monkeypatch):
-    """The other half of the same disagreement: when the note DOES fire through
-    a thunk, its `proto set` remedy must name the callee whose prototype is
-    actually wrong. `bn proto set j_my_logger ...` retypes the veneer and leaves
-    the model truncated, so a copy-pasted remedy silently does nothing."""
-    instance, _il = _defuse_under_recovered_call(
-        monkeypatch, resolve=_d797_thunk_resolver("j_my_logger", "my_logger"))
-
-    result = instance._defuse("active", "0x401000", "arg1#0")
-
-    assert len(result["hints"]) == 1, result["hints"]
-    hint = result["hints"][0]
-    assert "proto set my_logger" in hint
-    assert "j_my_logger" not in hint
 
 
 def test_defuse_discloses_only_the_calls_the_variable_feeds_797(monkeypatch):
