@@ -6891,7 +6891,5 @@ def test_prototype_parameter_name_does_not_determine_object_semantics(monkeypatc
                         lambda arch, name: (None, []), raising=False)
     note = instance._get_prototype("active", "0x401000")["implicit_object_note"]
     assert "implicit object parameter" not in note
-    if user_type:
-        assert "user-defined prototype" in note and "BN recovered" not in note
-    else:
-        assert "named `this`" in note and "int32_t" in note
+    assert "named `this`" in note and "int32_t" in note
+    assert "BN recovered" not in note and "user-defined prototype" not in note

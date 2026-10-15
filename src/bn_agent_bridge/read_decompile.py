@@ -2328,8 +2328,7 @@ def _return_width_inference_note(bv, func) -> str | None:
 def _demangled_object_parameter(bv, func) -> bool:
     """Whether BN's C++ demangler describes a leading object parameter.
 
-    A recovered parameter's spelling alone is not evidence: C permits `this`.
-    The demangler is still only BN's signature, not independent ABI proof.
+    This is only a demangler observation, not parameter provenance or ABI proof.
     """
     raw = str(getattr(func, "raw_name", func.name))
     demangle = (getattr(bn, "demangle_gnu3", None) if raw.startswith("_Z")
@@ -2358,31 +2357,18 @@ def _get_prototype(ctx, selector: str | None, identifier):
         **il_format._function_metadata(func),
     }
     params = list(getattr(getattr(func, "type", None), "parameters", None) or [])
-    if bool(getattr(func, "has_user_type", False)):
-        result["implicit_object_note"] = (
-            "This is a user-defined prototype, not an automatically recovered "
-            "signature. Parameter names and types reflect the user definition; "
-            "no C++ ABI is verified by this read.")
-    elif params and str(getattr(params[0], "name", "")) == "this":
-        if _demangled_object_parameter(bv, func):
-            result["implicit_object_note"] = (
-                f"BN recovered parameter 1 (`this`, {params[0].type}) as the implicit "
-                "object parameter in its demangled C++ signature. This reports "
-                "BN's recovery, not a verified C++ ABI.")
-        else:
-            result["implicit_object_note"] = (
-                f"BN recovered parameter 1 named `this` with type {params[0].type}. "
-                "Its name alone does not establish C++ object semantics.")
-    elif _demangled_object_parameter(bv, func):
-        if params:
-            name = str(getattr(params[0], "name", "")) or "<unnamed>"
-            current = f"Current prototype parameter 1 is named `{name}` with type {params[0].type}"
-        else:
-            current = "The current prototype has no parameters"
-        result["implicit_object_note"] = (
-            f"{current}, while BN's demangled C++ signature describes a leading "
-            "object parameter. These are observations of the current prototype "
-            "and demangled signature, not a verified C++ ABI.")
+    if params:
+        name = str(getattr(params[0], "name", "")) or "<unnamed>"
+        current = f"Current prototype parameter 1 is named `{name}` with type {params[0].type}"
+    else:
+        current = "The current prototype has no parameters"
+    if _demangled_object_parameter(bv, func):
+        comparison = (
+            ", while BN's demangled C++ signature describes a leading object parameter")
+    else:
+        comparison = ". No demangled leading-object-parameter observation is available"
+    result["implicit_object_note"] = (
+        f"{current}{comparison}. This read makes no parameter-provenance or ABI claim.")
     note = _return_width_inference_note(bv, func)
     if note:
         result["return_width_note"] = note

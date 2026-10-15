@@ -1468,7 +1468,7 @@ class TestPrototypeRecovery:
         shared_bn.load(CLASSES_BINARY)
         got = shared_bn.json("proto", "get", "svc::EchoHandler::handle")
         note = got["implicit_object_note"]
-        assert "`this`" in note and "implicit object parameter" in note, got
+        assert "`this`" in note and "struct svc::EchoHandler*" in note, got
         text = shared_bn.run("proto", "get", "svc::EchoHandler::handle")
         assert text.returncode == 0, text.stderr
         assert "svc::EchoHandler::handle(" in text.stdout.splitlines()[0], text.stdout
@@ -1499,6 +1499,31 @@ class TestPrototypeRecovery:
         assert text.returncode == 0 and note in text.stdout, (text.stdout, text.stderr)
 
 
+    def test_local_parameter_edits_do_not_attribute_recovery(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        function = "svc::EchoHandler::handle"
+        before = shared_bn.json("proto", "get", function)
+        address = before["function"]["address"]
+        flag_probe = (
+            f"f = bv.get_function_at({address})\n"
+            "result = [f.has_user_type, f.is_var_user_defined(f.parameter_vars[0])]")
+        assert shared_bn.json("py", "exec", flag_probe)["result"] == [False, False]
+        retyped = shared_bn.json("local", "retype", function, "this", "int64_t")
+        assert retyped["results"][0]["status"] == "verified", retyped
+        assert shared_bn.json("py", "exec", flag_probe)["result"] == [False, True]
+        after = shared_bn.json("proto", "get", function)
+        note = after["implicit_object_note"]
+        assert "`this`" in note and "int64_t" in note, after
+        assert "BN recovered" not in note and "implicit object parameter" not in note, after
+        renamed = shared_bn.json("local", "rename", function, "this", "__sync")
+        assert renamed["results"][0]["status"] == "verified", renamed
+        renamed_back = shared_bn.json("local", "rename", function, "__sync", "this")
+        assert renamed_back["results"][0]["status"] == "verified", renamed_back
+        again = shared_bn.json("proto", "get", function)
+        assert "`this`" in again["implicit_object_note"] and "int64_t" in again["implicit_object_note"], again
+        assert "BN recovered" not in again["implicit_object_note"], again
+
+
     def test_this_refusal_advice_and_nested_template(self, shared_bn):
         shared_bn.load(CLASSES_BINARY)
         shared_bn.json("types", "declare", "struct `ns::Box<int, ns::Tag<char> >` { int value; };")
@@ -1516,8 +1541,9 @@ class TestPrototypeRecovery:
         assert applied["results"][0]["status"] == "verified", applied
         got = shared_bn.json("proto", "get", "svc::EchoHandler::handle")
         assert "ns::Box<int, ns::Tag<char> >* self" in got["prototype"], got
-        assert "user-defined prototype" in got["implicit_object_note"], got
-        assert "BN did not identify" not in got["implicit_object_note"], got
+        assert "`self`" in got["implicit_object_note"], got
+        assert "BN recovered" not in got["implicit_object_note"], got
+        assert "user-defined prototype" not in got["implicit_object_note"], got
 
     def test_named_function_type_fallback(self, shared_bn):
         shared_bn.load(HELLO_BINARY)
