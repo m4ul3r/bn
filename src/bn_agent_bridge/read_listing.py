@@ -387,7 +387,7 @@ def _callee_vtable_refs(bv, refs: list[int]) -> list[dict[str, Any]]:
     from .elf_dynamic import _Elf
 
     raw = getattr(bv, "parent_view", None)
-    getter = getattr(bv, "get_symbol_by_raw_name", None)
+    getter = getattr(bv, "get_symbols_by_raw_name", None)
     if raw is None or not callable(getter):
         return []
     try:
@@ -415,27 +415,38 @@ def _callee_vtable_refs(bv, refs: list[int]) -> list[dict[str, Any]]:
         address_points: dict[tuple[int, int, str], str | None] = {}
         ptr = 8 if elf.is64 else 4
         marker = re.compile(r"^_?vtable[ _]for[ _](.+)$")
+        # Use the loader's documented relocation delta once for every extent.
+        image_base = getattr(bv, "image_base", None)
+        original_base = getattr(bv, "original_image_base", None)
+        bias = int(image_base) - int(original_base) if (
+            image_base is not None and original_base is not None) else 0
         for section in sections:
             if section[1] not in (2, 11):  # SHT_SYMTAB / SHT_DYNSYM
                 continue
             off, size, link, entry_size = section[4], section[5], section[6], section[9]
             expected = 24 if elf.is64 else 16
             if entry_size != expected or size % expected or link >= count:
-                continue
+                return []
             strings_section = sections[link]
             string_size = strings_section[5]
             n = size // expected
             if strings_section[1] != 3 or n > symbols_left or size + string_size > budget:
-                continue
+                return []
             symbols_left -= n
             budget -= size + string_size
             symbols = elf.bytes_at(off, size)
             strings = elf.bytes_at(strings_section[4], string_size)
             if symbols is None or strings is None:
-                continue
+                return []
             symfmt = elf.endian + ("IBBHQQ" if elf.is64 else "IIIBBH")
             for row in struct.iter_unpack(symfmt, symbols):
                 name_off = row[0]
+                # An unreadable name can hide another overlapping class.
+                if not 0 <= name_off < len(strings):
+                    return []
+                end = strings.find(b"\0", name_off, min(len(strings), name_off + 4096))
+                if end < 0:
+                    return []
                 info, index, extent = (row[1], row[3], row[5]) if elf.is64 else (row[3], row[5], row[2])
                 if info & 15 != 1 or index == 0 or index >= count or extent <= 2 * ptr:
                     continue
@@ -444,35 +455,27 @@ def _callee_vtable_refs(bv, refs: list[int]) -> list[dict[str, Any]]:
                 if owner[1] != 1 or not owner[2] & 2 or not (
                         owner[3] <= value and value + extent <= owner[3] + owner[5]):
                     continue
-                if not 0 <= name_off < len(strings) or strings[name_off:name_off + 4] != b"_ZTV":
+                if strings[name_off:name_off + 4] != b"_ZTV":
                     continue
-                end = strings.find(b"\0", name_off, min(len(strings), name_off + 4096))
-                if end < 0:
+                start = value + bias
+                relevant_refs = [ref for ref in refs if start + 2 * ptr <= ref < start + extent]
+                if not relevant_refs:
                     continue
-                name = strings[name_off:end].decode("utf-8", errors="replace")
-                sym = getter(name)
-                if sym is None:
-                    continue
-                class_match = marker.fullmatch(str(getattr(sym, "short_name", "") or ""))
-                if not class_match:
-                    continue
-                start = int(sym.address)
-                # BN's normal PIE loading and rebases relocate file symbols by
-                # the documented image-base delta; do not infer it from nearby
-                # symbols. Missing metadata only confirms original addresses.
-                image_base = getattr(bv, "image_base", None)
-                original_base = getattr(bv, "original_image_base", None)
-                bias = int(image_base) - int(original_base) if (
-                    image_base is not None and original_base is not None) else 0
-                if start != value + bias:
-                    continue
-                symbol_type = getattr(sym, "type", None)
-                type_name = str(getattr(symbol_type, "name", symbol_type)).rsplit(".", 1)[-1]
-                if type_name in {"ImportAddressSymbol", "ImportedDataSymbol",
-                                 "ImportedFunctionSymbol", "ExternalSymbol"}:
-                    continue
-                for ref in refs:
-                    if start + 2 * ptr <= ref < start + extent:
+                name = strings[name_off:end].decode("utf-8", errors="strict")
+                local_identity_found = False
+                for sym in getter(name):
+                    if int(sym.address) != start:
+                        continue
+                    symbol_type = getattr(sym, "type", None)
+                    type_name = str(getattr(symbol_type, "name", symbol_type)).rsplit(".", 1)[-1]
+                    if type_name in {"ImportAddressSymbol", "ImportedDataSymbol",
+                                     "ImportedFunctionSymbol", "ExternalSymbol"}:
+                        continue
+                    class_match = marker.fullmatch(str(getattr(sym, "short_name", "") or ""))
+                    if not class_match:
+                        continue
+                    local_identity_found = True
+                    for ref in relevant_refs:
                         key = (start, extent, class_match[1])
                         if key not in address_points:
                             address_points[key] = _callee_vtable_address_point(
@@ -483,6 +486,10 @@ def _callee_vtable_refs(bv, refs: list[int]) -> list[dict[str, Any]]:
                         candidates = matches.setdefault(ref, [])
                         if entry not in candidates:
                             candidates.append(entry)
+                # A relevant ELF object whose local class identity is unreadable
+                # can conceal an overlapping alias just like an unread table.
+                if not local_identity_found:
+                    return []
         # Conflicting overlapping symbol extents do not establish one class.
         return [matches[ref][0] for ref in refs if len(matches.get(ref, [])) == 1]
     except Exception:
@@ -698,11 +705,10 @@ def _callsites(
             scope_functions, caller_scan_truncated, caller_scan_note = (
                 _scan_caller_functions(ctx, bv, {int(callee.start), *stub_addrs})
             )
-    # #998 item 1: a function whose address is stored in data (a vtable slot,
-    # a function-pointer table) can be called through it, and no call
-    # instruction names such a call. Report only the FACT -- how many data
-    # refs there are and where -- so a short (or empty) direct-call list is not
-    # read as "rarely called"; what those refs are is `xrefs`'s to show.
+    # Data locations holding the callee's address do not identify indirect callers.
+    # Report their count and addresses, and offer class-layout navigation only
+    # where bounded ELF object evidence proves a named vtable's ownership.
+    # Unknown locations keep an honest data-location xrefs fallback.
     data_ref_fields = _callee_data_refs(bv, int(callee.start))
     # #558: an imported variadic (scanf/printf-family) callee's HLIL callsite text
     # can show only the fixed argument; attach a steer to the argument-recovery views.

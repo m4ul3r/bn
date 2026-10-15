@@ -3988,6 +3988,34 @@ class TestClassLensRttiGuards922:
             "class", "list", "--query", "svc::EchoHandler", "--count", "-t", target)
         assert count["count"] == 1
         assert "vtable_recovery_budget_exhausted" not in count
+        renamed = shared_bn.run(
+            "symbol", "rename", card["vtable"]["slots"][2]["address"],
+            "svc::EchoHandler::handle", "-t", target)
+        assert renamed.returncode == 0, (renamed.stdout, renamed.stderr)
+        named_card = shared_bn.json("class", "show", "svc::EchoHandler", "-t", target)
+        named_list = shared_bn.json(
+            "class", "list", "--query", "svc::EchoHandler", "-t", target)
+        named_row, = named_list["items"]
+        assert named_row["has_vtable"] is True, named_row
+        assert named_row["method_count"] == len(named_card["methods"]) == 1
+        assert named_row["vtable_slot_count"] == named_card["vtable"]["total"] == 4
+        assert named_card["vtable"]["address_point"] == card["vtable"]["address_point"]
+        unavailable = shared_bn.json(
+            "py", "exec",
+            "from bn_agent_bridge import read_class, seam\n"
+            "class RaisingRefs:\n"
+            "    def __getattr__(self, name): return getattr(bv, name)\n"
+            "    def get_data_refs(self, address):\n"
+            "        raise RuntimeError('synthetic reference API failure')\n"
+            "proxy = RaisingRefs()\n"
+            "ctx = seam.BridgeContext(None)\n"
+            "ctx._resolve_view = lambda selector: proxy\n"
+            "result = read_class._class_list(ctx, None, query='svc::EchoHandler')\n",
+            "-t", target)["result"]
+        unknown_row, = unavailable["items"]
+        assert unknown_row["has_vtable"] is unknown_row["vtable_slot_count"] is None
+        assert unknown_row["vtable_status"] == "unavailable"
+        assert unknown_row["method_count"] == 1
 
     def test_stripped_slot_array_symbols_preserve_vtable_contents_935(self, shared_bn):
         # Both builds use the same source/options except -s. Compare raw slot
@@ -4220,6 +4248,112 @@ class TestVirtualMethods998:
         res = shared_bn.run(*args, "--format", "json")
         assert res.returncode == 0, (res.stdout, res.stderr)
         return json.loads(res.stdout)
+
+    def test_capped_census_never_attributes_an_overlapping_local_alias(self, shared_bn, tmp_path):
+        import re
+        import shlex
+
+        header = """
+.text
+.globl handler
+.hidden handler
+.type handler,@function
+handler:
+ mov $7,%eax
+ ret
+.size handler,.-handler
+.section .data.rel.ro,"aw",@progbits
+.p2align 3
+.globl _ZTV5Short
+.type _ZTV5Short,@object
+_ZTV5Short:
+ .quad 0,_ZTI5Short,handler
+.size _ZTV5Short,24
+.local _ZTV5Alias
+.type _ZTV5Alias,@object
+.set _ZTV5Alias,_ZTV5Short
+.size _ZTV5Alias,24
+.globl _ZTI5Short
+.type _ZTI5Short,@object
+_ZTI5Short:
+ .quad 0,_ZTS5Short
+.size _ZTI5Short,16
+.section .rodata
+.globl _ZTS5Short
+.type _ZTS5Short,@object
+_ZTS5Short:
+ .asciz "5Short"
+.size _ZTS5Short,7
+"""
+        filler = r"""
+.altmacro
+.macro filler index
+.local padding_\index
+.set padding_\index,1
+.endm
+.set count,0
+"""
+        for padding in (0, 65536):
+            source = tmp_path / "census.s"
+            source.write_text(
+                header + filler + f".rept {padding}\n"
+                "filler %count\n.set count,count+1\n.endr\n"
+                '.section .note.GNU-stack,"",@progbits\n')
+            binary = tmp_path / f"census-{padding}.so"
+            build = subprocess.run(["cc", "-shared", "-fPIC", "-o", str(binary), str(source)],
+                                   capture_output=True, text=True)
+            assert build.returncode == 0, build.stderr
+            target = shared_bn.load(binary)
+            slot = shared_bn.json(
+                "py", "exec",
+                "result = hex(next(s.address for s in bv.get_symbols_by_raw_name('_ZTV5Short') "
+                "if s.type.name == 'DataSymbol') + 2*bv.address_size)",
+                "-t", target)["result"]
+            out = self._json(shared_bn, "callsites", "handler", "-t", target)
+            assert out["callee_data_ref_count"] == 1, out
+            assert out["callee_data_refs"] == [slot]
+            assert out["callee_data_ref_vtables"] == []
+            text = shared_bn.run("callsites", "handler", "-t", target).stdout
+            commands = re.findall(r"`(bn [^`]+)`", text)
+            assert [shlex.split(command) for command in commands] == [["bn", "xrefs", slot]]
+            result = shared_bn.run("-t", target, *shlex.split(commands[0])[1:])
+            assert result.returncode == 0, (result.stdout, result.stderr)
+
+    def test_pic_vtable_hint_uses_local_definition_beside_got_alias(self, shared_bn, tmp_path):
+        import re
+        import shlex
+
+        source = tmp_path / "pic.cpp"
+        source.write_text(
+            "struct Short { Short(); virtual ~Short(); virtual int method(); };\n"
+            "Short::Short() {} Short::~Short() {} int Short::method() { return 7; }\n"
+            "extern \"C\" Short* make_short() { return new Short; }\n")
+        binary = tmp_path / "pic.so"
+        build = subprocess.run(
+            ["c++", "-O0", "-shared", "-fPIC", "-o", str(binary), str(source)],
+            capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        symbols = shared_bn.json(
+            "py", "exec",
+            "result = [{'address': hex(s.address), 'kind': s.type.name} "
+            "for s in bv.get_symbols_by_raw_name('_ZTV5Short')]",
+            "-t", target)["result"]
+        assert {"ImportAddressSymbol", "DataSymbol"} <= {sym["kind"] for sym in symbols}, symbols
+        out = self._json(shared_bn, "callsites", "Short::method", "-t", target)
+        row, = out["callee_data_ref_vtables"]
+        local = next(sym for sym in symbols if sym["kind"] == "DataSymbol")
+        assert row["vtable_address"] == local["address"]
+        assert row["class_name"] == "Short"
+        card = self._json(shared_bn, "class", "show", "Short", "-t", target)
+        assert row["address_point"] == card["vtable"]["address_point"]
+        text = shared_bn.run("callsites", "Short::method", "-t", target).stdout
+        commands = re.findall(r"`(bn class show [^`]+)`", text)
+        assert len(commands) == 1, text
+        for command in commands:
+            result = shared_bn.run("-t", target, *shlex.split(command)[1:])
+            assert result.returncode == 0, (command, result.stderr)
+            assert result.stdout.startswith("class Short ")
 
     def test_callsites_says_when_the_callee_is_stored_in_data(self, shared_bn):
         # `reg` is never called directly; its address sits in two named vtable

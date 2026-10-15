@@ -1219,7 +1219,7 @@ def _class_list(
     page = candidates[offset:] if offset else candidates
     if limit is not None:
         page = page[:limit]
-    # Bases stay page-local. RTTI-only rows also get show's primary backwalk,
+    # Bases stay page-local. Missing-vtable RTTI rows also get show's backwalk,
     # with one fixed deadline for this page. Do not run _enrich: method thunk
     # analysis, object size and instance tracking remain show-only.
     rows = []
@@ -1237,7 +1237,7 @@ def _class_list(
         except Exception:
             rec["bases"] = []
         row = _list_row(rec)
-        if (rec["confidence"] == "rtti" and not rec["methods"]
+        if (rec["confidence"] == "rtti"
                 and rec["vtable"] is None and rec.get("typeinfo")
                 and not row["artifact"]):
             if recovery_deadline is None:
@@ -1247,6 +1247,11 @@ def _class_list(
             except _VtableRecoveryBudgetExpired:
                 recovery_budget_exhausted = True
                 row.update({"has_vtable": None, "vtable_status": "budget_exhausted",
+                            "vtable_slot_count": None})
+            except Exception:
+                # Recovery uses optional view/read APIs. A failed read says
+                # nothing about absence and must not discard the rest of the page.
+                row.update({"has_vtable": None, "vtable_status": "unavailable",
                             "vtable_slot_count": None})
         rows.append(row)
     returned = len(rows)

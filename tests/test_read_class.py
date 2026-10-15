@@ -969,6 +969,30 @@ def test_class_list_recovers_rtti_only_primary_like_show(rtti_only_list_ctx):
     assert "methods=0  vtable  slots=2" in text
 
 
+def test_class_list_recovers_after_a_stripped_method_is_named(rtti_only_list_ctx):
+    ctx, bv = rtti_only_list_ctx
+    before, = read_class._class_list(ctx, None, query="Alpha")["items"]
+    assert before["method_count"] == 0
+    assert before["vtable_slot_count"] == 2
+
+    # The registry is already memoised; the ordinary symbol notification must
+    # expose the new method without making the missing vtable a false absence.
+    named = bv.functions[0]
+    named.name = named.raw_name = "_ZN5Alpha4stepEv"
+    named.symbol.short_name = "Alpha::step()"
+    bv.fire("symbol_updated", named)
+    listed = read_class._class_list(ctx, None, query="Alpha")
+    row, = listed["items"]
+    shown = read_class._class_show(ctx, None, "Alpha")
+    assert row["method_count"] == len(shown["methods"]) == 1
+    assert row["has_vtable"] is True
+    assert row["vtable_status"] == "recovered"
+    assert row["vtable_slot_count"] == shown["vtable"]["total"] == 2
+    from bn.formatters import _render_class_list_text
+    assert "methods=1  vtable  slots=2" in _render_class_list_text(listed)
+
+
+
 def test_class_list_budget_stops_inside_slot_scan_and_discloses_unknown(
         monkeypatch, rtti_only_list_ctx):
     ctx, bv = rtti_only_list_ctx
@@ -1108,6 +1132,65 @@ def test_class_list_unavailable_refs_are_unknown(monkeypatch, rtti_only_list_ctx
     text = _render_class_list_text(listing)
     assert "vtable=? (unavailable)" in text and "no-vtable" not in text
     assert "malformed" not in text
+
+
+@pytest.mark.parametrize("api", ["get_data_refs", "pointer", "slot"])
+@pytest.mark.parametrize("failed_class", ["Alpha", "Beta"])
+def test_class_list_raising_recovery_api_is_unknown_and_row_local(
+        monkeypatch, rtti_only_list_ctx, api, failed_class):
+    ctx, bv = rtti_only_list_ctx
+    failed_typeinfo = {"Alpha": 0xb000, "Beta": 0xb100}[failed_class]
+    failed_table = {"Alpha": 0x9000, "Beta": 0xa000}[failed_class]
+    if api == "get_data_refs":
+        get_refs = bv.get_data_refs
+
+        def raising_refs(addr):
+            if addr == failed_typeinfo:
+                raise RuntimeError("optional reference API failed")
+            return get_refs(addr)
+
+        monkeypatch.setattr(bv, "get_data_refs", raising_refs)
+    elif api == "pointer":
+        read_pointer = ctx._read_pointer_value
+
+        def raising_pointer(bv, addr, *, size=None):
+            if addr == failed_table:
+                raise RuntimeError("optional pointer reader failed")
+            return read_pointer(bv, addr, size=size)
+
+        monkeypatch.setattr(ctx, "_read_pointer_value", raising_pointer)
+    else:
+        read_table = ctx._pointer_table_layout
+
+        def raising_slot(bv, start, *, entries, stride):
+            # One slot was already read: do not publish that partial layout.
+            if start == failed_table + 24:
+                raise RuntimeError("optional slot reader failed")
+            return read_table(bv, start, entries=entries, stride=stride)
+
+        monkeypatch.setattr(ctx, "_pointer_table_layout", raising_slot)
+
+    listing = read_class._class_list(ctx, None)
+    assert listing["total"] == listing["returned"] == 3
+    assert listing["vtable_recovery_budget_exhausted"] is False
+    rows = {row["name"]: row for row in listing["items"]}
+    failed = rows[failed_class]
+    assert failed["has_vtable"] is failed["vtable_slot_count"] is None
+    assert failed["vtable_status"] == "unavailable"
+    other = rows["Beta" if failed_class == "Alpha" else "Alpha"]
+    assert other["has_vtable"] is True
+    assert other["vtable_status"] == "recovered"
+    assert other["vtable_slot_count"] == 2
+    assert rows["NoTable"]["has_vtable"] is False
+    assert rows["NoTable"]["vtable_status"] == "not_found"
+    from bn.formatters import _render_class_list_text
+    text = _render_class_list_text(listing)
+    failed_line, = (line for line in text.splitlines() if failed_class in line)
+    assert "vtable=? (unavailable)" in failed_line
+    assert "no-vtable" not in failed_line
+    assert "malformed" not in text
+
+
 
 
 class _VtableCtx:
