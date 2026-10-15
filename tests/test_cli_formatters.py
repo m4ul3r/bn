@@ -221,8 +221,6 @@ def test_parser_default_formats():
     assert parser.parse_args(["decompile", "sub_401000"]).target is None
     assert parser.parse_args(["decompile", "sub_401000"]).format == "text"
 
-    # Setup-style commands keep JSON for structured envelopes; skill install is human-friendly.
-    assert parser.parse_args(["plugin", "install"]).format == "json"
     assert parser.parse_args(["skill", "install"]).format == "text"
     assert parser.parse_args(["skill", "install"]).mode == "symlink"
     assert parser.parse_args(["bundle", "function", "sub_401000"]).format == "json"

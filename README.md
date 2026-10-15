@@ -41,7 +41,17 @@ bn skill install
 
 That symlinks the bundled skills into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
 
-Re-running either install is safe: an existing link (or copy, under `--mode copy`) of the same source, or a skills root that is linked to the source itself, is reported as already installed. A destination holding anything else, typically a link into a previous checkout, is never reported as installed: `skill install` lists it with what it points at (or that it dangles, cannot be read, or is a foreign directory) and exits `1`, and `plugin install` refuses it. `--force` replaces only what it can remove and proves is this install's own: a link, an empty directory, or a previous copy, losing any local edits in that copy, so check them first. It refuses anything else (a foreign directory or file, an unreadable or read-only copy, an unwritable parent), and a forced run is all-or-nothing: a refusal changes no destination.
+Re-running either install is safe: an existing link (or byte-identical copy, under `--mode copy`) of the same source, or a skills root linked to the source itself, is reported as already installed. A different destination is not reported as installed: `skill install` lists it and exits `1`, and `plugin install` refuses it. Both installers default to text; use `--format json` for structured output.
+
+`--mode copy` writes `.bn-copy-install.json` at each artifact's destination, with exactly `{"format":"bn-copy-install-v1","artifact":"<source directory name>"}`. This small ownership marker survives source updates. `--force` accepts a non-empty directory only when its marker is a regular, non-symlink file containing that identity; source-like names or matching bytes are not proof. It replaces the entire marked copy, **losing local edits and added files**, so back them up first. A pre-marker copy is refused without claiming it is unrelated: move that destination to a backup by hand, then re-run the same install command without `--force`. Do not add markers by hand to bypass ownership checks.
+
+Copies are prepared with their marker **before** copied directory permissions are finalized, so a readable, read-only source directory is supported and its final mode is preserved. A failed marker write removes the prepared copy and leaves any previous destination in place. The marker is installation metadata, excluded from the engine-code fingerprint.
+
+`--force` can also replace a destination link (without following it) or an empty directory, including an empty read-only directory. It refuses unproved ownership, files, directories it cannot list or empty, and unwritable parents. An unreadable file inside a marked copy does not prevent removal when its directory can be emptied. A skills root linked into an unmarked checkout is refused, preserving that checkout's edits.
+
+If a refusal identifies the **skills root itself as a link**, do not move directories inside its target checkout. Run the printed `Recovery command` to unlink only that skills-root link and create a new directory at the same path, then re-run the same install command. The target checkout and its edits remain untouched. Ancestor links, such as a `~/.claude` link holding settings and other files, are never automatic recovery targets: leave them in place and choose a new `--dest` outside the linked tree or inspect the configuration manually. This is distinct from moving an ordinary, unlinked legacy-copy destination aside.
+
+The per-destination `--force` verdict is a dry run of the forced install's own preflight, not a separate prediction. Normal skill-install output includes every destination even when all are current, and a whole-run verdict (`force_plan` and `force_ready` in JSON). Each plan row carries a normalized `destination_id` identifying the installation entry independently of its requested/display spelling. Text joins an installation row with a verdict only when both entry identity and advice agree; roots with different advice retain separate rows, even if they reach the same entry. An explicit `--dest` refusal also publishes the full plan, exits `2`, and writes no destination or `--out` artifact; its JSON carries `ok: false` and an `error`. With `BN_SPILL_TOKENS` enabled, a cache artifact may hold the full refusal/plan, but this install command's stdout envelope still carries `ok: false` and the error. That is an install-only refusal policy: ordinary artifact envelopes retain their file-write-success meaning, including mutation `--out` envelopes. Path-blocked rows have `state: "blocked"`. A successful install recomputes the verdict against the new on-disk state. A forced run lists **every** preflight refusal and changes no destination if any is refused. The dry run performs no writes; filesystem races or write-time errors can still fail a run after preflight and leave earlier destinations installed.
 
 If the plugin code changes, reload Binary Ninja Python plugins or restart Binary Ninja.
 
@@ -196,7 +206,7 @@ Every command supports:
 - `--format ndjson`
 - `--out <path>`
 
-Interactive read commands default to `text`. Mutation, setup, and export commands default to `json`.
+Interactive read commands and `plugin install` / `skill install` default to `text`. Other setup and export commands default to `json`.
 Add `--format json` when you need stable fields for automation or piping into structured tooling.
 
 Examples:

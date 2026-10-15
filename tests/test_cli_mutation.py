@@ -5179,3 +5179,36 @@ def test_comment_list_explicit_limit_wins(fake_transport):
     rc = bn.cli.main(["comment", "list", "--target", "active", "--limit", "17"])
     assert rc == 0
     assert calls[-1]["params"]["limit"] == 17
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson", "text"])
+def test_failed_mutation_out_envelope_reports_file_write_success(
+    fake_transport, tmp_path, capsys, monkeypatch, fmt
+):
+    fake_transport({"rename_symbol": {"ok": True, "result": {
+        "success": False, "committed": False, "rolled_back": True, "preview": False,
+        "results": [{
+            "op": "rename_symbol", "status": "verification_failed", "address": "0x401000",
+            "requested": {"name": "renamed_handler"}, "observed": {"name": "original_handler"},
+            "message": "name readback mismatch",
+        }],
+        "affected_functions": [], "affected_types": [],
+    }}})
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1")
+    destination = tmp_path / f"mutation.{fmt}"
+    assert bn.cli.main([
+        "symbol", "rename", "--target", "active", "original_handler", "renamed_handler",
+        "--format", fmt, "--out", str(destination),
+    ]) == 3
+    captured = capsys.readouterr()
+    if fmt == "text":
+        assert "ok: true" in captured.out.splitlines()
+        assert "[verification_failed]" in destination.read_text()
+    else:
+        envelope = json.loads(captured.out)
+        assert envelope["ok"] is True
+        assert envelope["spilled"] is False
+        assert "error" not in envelope
+        detail = json.loads(destination.read_text())
+        assert detail["ok"] is False
+        assert detail["results"][0]["status"] == "verification_failed"

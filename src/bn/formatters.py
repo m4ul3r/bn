@@ -2866,7 +2866,8 @@ def _render_xrefs_any_text(value: Any) -> str:
         if s.get("present"):
             lines.append(
                 f"  {s.get('symbol')}: {s.get('code_ref_count', 0)} code refs across "
-                f"{s.get('caller_function_count', 0)} fn(s)  @ {s.get('address', '?')}")
+                f"{s.get('caller_function_count', 0)} fn(s)  @ {s.get('address', '?')}"
+                + (" [string]" if s.get("target_kind") == "string" else ""))
             if s.get("target_kind") == "string":
                 string_targets += 1
         else:
@@ -7282,6 +7283,15 @@ def _render_py_exec_text(value: Any) -> str:
 
 
 @_discloses
+def _render_plugin_install_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if value.get("installed"):
+        return f"Installed plugin ({value.get('mode')}): {value.get('destination')}\n"
+    return f"Plugin {value.get('note', 'already installed')}.\n"
+
+
+@_discloses
 def _render_skill_install_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -7290,31 +7300,88 @@ def _render_skill_install_text(value: Any) -> str:
     skipped = _field_list(value, "skipped_destinations")
     not_updated = [row for row in _field_list(value, "not_updated_destinations")
                    if isinstance(row, dict)]
+    force_plan = [row for row in _field_list(value, "force_plan")
+                  if isinstance(row, dict)]
+
+    def identity(dest: Any) -> Any:
+        row = next((row for row in force_plan if row.get("destination") == dest), None)
+        return (_text_value(row, "destination_id") or dest) if row is not None else dest
+
     # A list, not a set: membership must not hash wire values (#619).
-    not_updated_paths = [row.get("destination") for row in not_updated]
-    up_to_date = [dest for dest in skipped if dest not in not_updated_paths]
+    not_updated_paths = [identity(row.get("destination")) for row in not_updated]
+    up_to_date = [dest for dest in skipped if identity(dest) not in not_updated_paths]
+
+    def advice_row(dest: Any) -> dict[str, Any] | None:
+        exact = next((row for row in force_plan if row.get("destination") == dest), None)
+        if exact is not None:
+            return exact
+        matches = [row for row in force_plan
+                   if _text_value(row, "destination_id") == identity(dest)]
+        if matches and all(row.get("detail") == matches[0].get("detail") for row in matches):
+            return matches[0]
+        return None
+
+    def force_detail(dest: Any) -> str:
+        row = advice_row(dest)
+        return f"; --force: {row.get('detail')}" if row is not None else ""
+
+    # A normalized installed path can name several displayed roots. If their
+    # advice differs, keep those roots separate instead of choosing one remedy.
+    installed_display = []
+    for dest in installed:
+        matches = [row for row in force_plan
+                   if _text_value(row, "destination_id") == identity(dest)]
+        if matches and advice_row(dest) is None:
+            installed_display.extend(row.get("destination") for row in matches)
+        else:
+            installed_display.append(dest)
+
     lines = []
+    error = _text_value(value, "error")
+    if error:
+        lines.append(error)
 
     if installed:
         lines.append(f"Installed skills ({value.get('mode', 'unknown')}):")
-        lines.extend(f"- {dest}" for dest in installed)
+        lines.extend(f"- {dest}{force_detail(dest)}" for dest in installed_display)
     elif not not_updated:
         lines.append("Skills already installed.")
 
     if up_to_date:
         lines.append("Already up to date:")
-        lines.extend(f"- {dest}" for dest in up_to_date)
+        lines.extend(f"- {dest}{force_detail(dest)}" for dest in up_to_date)
 
-    # #1002: these were left alone and are NOT this install -- a link into a
-    # previous checkout, dangling, another mode, or a foreign directory. Never
-    # "installed". One closing note about --force, not a per-row verdict.
+    # Existing destinations are not claimed as installed. The force verdicts
+    # come from the forced run's own no-write preflight, including current rows.
     if not_updated:
-        lines.append("Not updated, existing destination differs from the requested install:")
-        lines.extend(f"- {row.get('destination')} ({row.get('detail')})"
-                     for row in not_updated)
-        force_note = _text_value(value, "force_note")
-        if force_note:
-            lines.append(force_note)
+        lines.append("Not updated, destination differs or is blocked:")
+        lines.extend(
+            f"- {row.get('destination')} ({row.get('detail')})"
+            f"{force_detail(row.get('destination'))}" for row in not_updated
+        )
+    listed = [
+        (identity(dest), row.get("detail"))
+        for dest in installed_display + skipped
+        if (row := advice_row(dest)) is not None
+    ]
+    other = [
+        row for row in force_plan
+        if (_text_value(row, "destination_id"), row.get("detail")) not in listed
+    ]
+    if other:
+        lines.append("Other destinations (--force dry run):")
+        lines.extend(
+            f"- {row.get('destination')}{force_detail(row.get('destination'))}" for row in other
+        )
+    if force_plan:
+        ready = "ready" if value.get("force_ready") else "refused; fix every blocker first"
+        lines.append(
+            f"--force preflight: {ready}. Checked without writes; "
+            "filesystem races or write errors can still fail the install."
+        )
+    force_note = _text_value(value, "force_note")
+    if force_note:
+        lines.append(force_note)
 
     return "\n".join(lines) + "\n"
 

@@ -843,6 +843,14 @@ def test_build_id_for_package_detects_engine_edit(tmp_path):
     (pkg / "taint_engine.py").write_text("X = 2\n", encoding="utf-8")
     after = build_id_for_package(pkg)
     assert after and after != before
+    # Ownership is installation metadata, not engine/model content.
+    marker = pkg / ".bn-copy-install.json"
+    marker.write_text('{"format":"bn-copy-install-v1","artifact":"bn_agent_bridge"}\n')
+    assert build_id_for_package(pkg) == after
+    marker.write_text("changed installation metadata")
+    assert build_id_for_package(pkg) == after
+    (pkg / "taint_models.json").write_text('{"models":[]}\n')
+    assert build_id_for_package(pkg) != after
 
 
 def test_format_operation_result_falls_back_to_requested():
