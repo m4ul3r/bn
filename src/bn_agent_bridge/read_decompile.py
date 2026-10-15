@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import unicodedata
 
 from typing import Any
 
@@ -795,7 +796,9 @@ def _demangled_arity(bv, raw_name: str) -> tuple[int, int, bool] | None:
 
 def _call_arity_findings(bv, func) -> list[dict[str, Any]]:
     """One row per call whose rendered argument list is shorter than the call
-    site's (#955), or -- for a mangled callee -- longer than its signature.
+    site's (#955), or -- for a mangled callee -- longer than its signature, or
+    whose callee's prototype declares no parameters at all while HLIL renders
+    some (#1038 item 1).
 
     HLIL renders exactly the callee prototype's parameter count. When that
     prototype is short -- BN's bundled C++ type libraries declare many library
@@ -816,9 +819,21 @@ def _call_arity_findings(bv, func) -> list[dict[str, Any]]:
     the issue saw) is reported against the mangled signature only, and never
     for a variadic one.
 
+    The third shape claims no arity: an import BN's type library has no entry
+    for gets `int64_t socket()`, and HLIL then renders whatever argument
+    registers BN's call-site analysis picked (`socket(1, 2, 0,
+    __stack_chk_guard, 0)`). A prototype with no parameters cannot be where
+    rendered arguments came from, so they are BN's guess -- unless BN or the
+    analyst gave this call its own type (`get_call_type_adjustment`), or BN
+    determined the callee variadic. The row says that and nothing about how
+    many arguments the callee really takes (`shape: "no_parameters"`).
+
     Each row keeps what the inline note needs (#1000 item 2): the argument
-    registers past the rendered ones, with the value the call site wrote into
-    each when it wrote one. Empty when every call agrees; never raises.
+    registers past the rendered ones, with the value each holds at the call
+    when it is known -- the value the call site wrote, else BN's own dataflow
+    value there (#1038 item 2: `adrp x1; add x1, x1, #off` is a constant
+    pointer BN knows, and its name is the argument a reader needs). Empty
+    when every call agrees; never raises.
     """
     try:
         llil = getattr(func, "llil", None) or getattr(func, "low_level_il", None)
@@ -848,15 +863,19 @@ def _call_arity_findings(bv, func) -> list[dict[str, Any]]:
             no_body = kind in _IMPORT_SYMBOL_KINDS or bool(getattr(callee, "is_thunk", False))
             signature = _demangled_arity(bv, raw_name)
             setup, writes = _argument_setup_count(bv.arch, window, arg_regs) if arg_regs else (0, {})
+            unprototyped = (signature is None and rendered > 0
+                            and _declares_no_parameters(func, callee, address))
         except Exception:  # noqa: BLE001 - one odd call must not hide the rest
             continue
         setup_text = f"the call site writes {', '.join(writes)} just before it"
+        shape = "shortfall"
         if signature is not None:
             # The demangled signature is the arity whenever there is one: the
             # register witness only corroborates it, never overrides it.
             total, explicit, variadic = signature
             if rendered > total and not variadic:
                 expected = total
+                shape = "excess"
                 evidence = [f"the demangled signature takes only {total}"]
             elif rendered >= total or not (explicit > rendered or setup > rendered):
                 continue
@@ -866,20 +885,67 @@ def _call_arity_findings(bv, func) -> list[dict[str, Any]]:
                             + (" with `this`" if total != explicit else "")]
                 if setup > rendered:
                     evidence.append(setup_text)
+        elif unprototyped:
+            # No expected count: nothing here knows how many the callee takes.
+            expected, shape = rendered, "no_parameters"
+            evidence = [("its prototype declares no parameters, so the rendered arguments "
+                         "are BN's guess from the registers at the call site")]
+            if writes:
+                evidence.append(setup_text)
         elif no_body and setup > rendered:
             expected, evidence = setup, [setup_text]
         else:
             continue
         values = _window_values(bv, func, window, select_ids)
-        missing = [(reg, values.get(reg) if reg in writes else None)
+        missing = [(reg, _missing_value(bv, func, address, reg,
+                                        values.get(reg) if reg in writes else None))
                    for reg in arg_regs[rendered:expected]]
         rows.append({
             "address": address, "target": target,
             "label": _callee_label(symbol, callee, target),
-            "rendered": rendered, "expected": expected,
+            "rendered": rendered, "expected": expected, "shape": shape,
             "evidence": tuple(evidence), "missing": missing,
         })
     return rows
+
+
+def _declares_no_parameters(func, callee, address: int) -> bool:
+    """True when *callee*'s prototype has no parameters, is not one BN
+    determined variadic, and the call at *address* has no call-type
+    adjustment of its own (which, not the prototype, is then what HLIL
+    renders)."""
+    if callee is None:
+        return False
+    params = getattr(getattr(callee, "type", None), "parameters", None)
+    if params is None or len(list(params)) != 0:
+        return False
+    if il_format._variadic_determination(callee) is True:
+        return False
+    try:
+        return func.get_call_type_adjustment(address) is None
+    except Exception:  # noqa: BLE001 - an unreadable adjustment is not "none"
+        return False
+
+
+def _missing_value(bv, func, address: int, reg: str, written: str | None) -> str | None:
+    """What an unrendered argument register holds at the call: the value the
+    call site wrote (*written*), else BN's own dataflow value at the call
+    when that is a constant (#1038 item 2). A value BN's dataflow calls a
+    constant POINTER carries the name the view gives that address (`0x4008e0
+    (on_packet)`); a plain constant is never named, since a length of 0x30
+    can equal a symbol's address. None when neither knows."""
+    if written is not None:
+        return written
+    try:
+        value = func.get_reg_value_at(address, reg)
+        kind = str(getattr(getattr(value, "type", None), "name", ""))
+        if kind not in ("ConstantValue", "ConstantPointerValue"):
+            return None
+        text = hex(int(value.value))
+    except Exception:  # noqa: BLE001 - no dataflow: the register stands alone
+        return None
+    name = il_format._view_name_at(bv, int(value.value)) if kind == "ConstantPointerValue" else None
+    return f"{text} ({name})" if name else text
 
 
 _WRITE_TEXT_MAX = 40
@@ -1051,14 +1117,24 @@ def _window_values(bv, func, window: list, select_ids: set[int]) -> dict[str, st
     return {reg: (value[0] if value is not None else None) for reg, value in values.items()}
 
 
-def _arity_line_note(row: dict[str, Any]) -> str:
-    """The `/* bn: ... */` note appended to the rendered call line."""
+def _arity_text(row: dict[str, Any]) -> str:
+    """What one arity finding says about its call, in a few words: the body
+    of the inline `/* bn: ... */` note and of a `callsites` row's `arity`."""
+    if row.get("shape") == "no_parameters":
+        return (f"prototype declares no params; the {row['rendered']} "
+                f"arg{'s' if row['rendered'] != 1 else ''} shown are BN's guess")
     if row["rendered"] > row["expected"]:
-        return (f"/* bn: renders {row['rendered']} args, "
-                f"signature takes {row['expected']} */")
+        return f"renders {row['rendered']} args, signature takes {row['expected']}"
     regs = ", ".join(f"{reg} = {value}" if value else reg for reg, value in row["missing"])
     count = row["expected"] - row["rendered"]
-    return f"/* bn: +{count} arg{'s' if count != 1 else ''} not rendered: {regs} */"
+    return f"+{count} arg{'s' if count != 1 else ''} not rendered: {regs}"
+
+
+def _arity_line_note(row: dict[str, Any], *, named: bool = False) -> str:
+    """The `/* bn: ... */` note appended to the rendered call line; *named*
+    prefixes the callee, for a line that is not the call's alone."""
+    prefix = f"{_short_callee(row['label'])}: " if named else ""
+    return f"/* bn: {prefix}{_arity_text(row)} */"
 
 
 def _short_callee(label: str) -> str:
@@ -1075,11 +1151,12 @@ def _call_arity_warning(bv, func, findings: list[dict[str, Any]] | None = None,
         findings = _call_arity_findings(bv, func)
     if not findings:
         return None
-    groups: dict[tuple[int, int, int], dict[str, Any]] = {}
+    groups: dict[tuple[int, int, int, str], dict[str, Any]] = {}
     for row in findings:
         # One entry per callee and shape, so ten identical calls cannot push a
         # rarer finding past the listing cap (#985 review).
-        group = groups.setdefault((row["target"], row["rendered"], row["expected"]), {
+        shape = row.get("shape", "shortfall")
+        group = groups.setdefault((row["target"], row["rendered"], row["expected"], shape), {
             "label": row["label"], "addresses": [], "evidence": {},
         })
         group["addresses"].append(row["address"])
@@ -1089,7 +1166,7 @@ def _call_arity_warning(bv, func, findings: list[dict[str, Any]] | None = None,
         group["evidence"][row["evidence"]] = group["evidence"].get(row["evidence"], 0) + 1
     described = []
     short = []
-    for (_target, rendered, expected), group in groups.items():
+    for (_target, rendered, expected, shape), group in groups.items():
         addrs = group["addresses"]
         where = ", ".join(hex(a) for a in addrs[:3]) + (
             f" and {len(addrs) - 3} more" if len(addrs) > 3 else "")
@@ -1100,22 +1177,29 @@ def _call_arity_warning(bv, func, findings: list[dict[str, Any]] | None = None,
         else:
             evidence = " / ".join(f"{n} of {len(addrs)}: {'; '.join(ev)}"
                                   for ev, n in variants.items())
-        if rendered > expected:
+        if shape == "no_parameters":
+            described.append(f"{group['label']} ({noun} at {where}) renders {rendered} "
+                             f"arguments, but {evidence}")
+            count = f"{rendered} guessed"
+        elif rendered > expected:
             described.append(f"{group['label']} ({noun} at {where}) renders {rendered} "
                              f"arguments but {evidence}")
+            count = f"{rendered}/{expected}"
         else:
             described.append(f"{group['label']} ({noun} at {where}) renders {rendered} of "
                              f"{expected} arguments ({evidence})")
-        short.append(f"{_short_callee(group['label'])} {rendered}/{expected} @ "
+            count = f"{rendered}/{expected}"
+        short.append(f"{_short_callee(group['label'])} {count} @ "
                      + ", ".join(hex(a) for a in addrs[:2])
                      + (f" +{len(addrs) - 2}" if len(addrs) > 2 else ""))
     calls = len(findings)
+    guessed = sum(1 for row in findings if row.get("shape") == "no_parameters")
+    wrong = calls - guessed
     listed = described[:_ARITY_LISTED_MAX]
     more = len(described) - len(listed)
     marked = sum(1 for row in findings if row["address"] in inline)
     if marked == calls:
-        marked_text = ("Each call is marked inline with a `/* bn: ... */` note naming "
-                       "the registers it does not render. ")
+        marked_text = "Each call is marked inline with a `/* bn: ... */` note. "
         summary_mark = ", marked inline"
     elif marked:
         marked_text = (f"{marked} of the {calls} calls are marked inline with a "
@@ -1125,25 +1209,50 @@ def _call_arity_warning(bv, func, findings: list[dict[str, Any]] | None = None,
     else:
         marked_text = ""
         summary_mark = ""
+    counted = []
+    detail_counted = []
+    if wrong:
+        counted.append(f"{wrong} call(s) render the wrong argument count")
+        detail_counted.append(f"{wrong} call(s) render a different argument count than "
+                              "the call site passes")
+    if guessed:
+        counted.append(f"{guessed} call(s) render arguments a no-parameter prototype "
+                       "does not give")
+        detail_counted.append(f"{guessed} call(s) render arguments their callee's "
+                              "prototype does not declare")
     head = short[:3]
-    summary = (f"{calls} call(s) render the wrong argument count{summary_mark}: "
+    summary = (" and ".join(counted) + f"{summary_mark}: "
                + "; ".join(head) + (f"; +{len(short) - 3} more callee(s)" if len(short) > 3 else ""))
+    meaning = []
+    if wrong:
+        meaning.append("The callee's prototype (often from a type library) has the wrong "
+                       "arity, so the decompiled call silently drops or invents arguments.")
+    if guessed:
+        meaning.append(
+            "A callee whose prototype declares no parameters (an import with no "
+            "type-library entry gets `int64_t f()`) is rendered with the argument "
+            "registers BN's call-site analysis picked: any of them may be a value the "
+            "call does not pass, and an argument it does pass may be missing.")
+    first = findings[0]
     detail = (
-        f"call arity: {calls} call(s) render a different argument count than "
-        f"the call site passes: {'; '.join(listed)}"
+        f"call arity: {' and '.join(detail_counted)}: {'; '.join(listed)}"
         + (f"; and {more} more callee(s)" if more > 0 else "")
-        + ". The callee's prototype (often from a type library) has the wrong arity, so "
-        "the decompiled call silently drops or invents arguments. " + marked_text
-        + "Read the real arguments with `bn callsites <callee address> --within "
-        f"{hex(int(func.start))} --context 4`; fix the callee with `bn proto set`."
+        + ". " + " ".join(meaning) + " " + marked_text
+        # #1033: a printed command runs as printed, so it names a real callee.
+        + f"Read a call's real arguments in its disassembly with `bn callsites "
+        f"{hex(first['target'])} --within {hex(int(func.start))} --context 4` (for "
+        f"{_short_callee(first['label'])}; use the callee's address for another); fix "
+        "the callee with `bn proto set`."
     )
     return _warning_row("arity", summary, detail, calls=[
         {
             "address": hex(row["address"]),
             "callee": _short_callee(row["label"]),
             "callee_address": hex(row["target"]),
+            "shape": row.get("shape", "shortfall"),
             "rendered": row["rendered"],
-            "expected": row["expected"],
+            # A no-parameter prototype gives no count to compare against.
+            "expected": None if row.get("shape") == "no_parameters" else row["expected"],
             "missing": [{"register": reg, "value": value} for reg, value in row["missing"]],
             "inline": row["address"] in inline,
         }
@@ -1532,7 +1641,6 @@ def _callee_split_notes(bv, func) -> list[dict[str, Any]]:
 
 
 _SHORT_STRING_MAX = 64
-_STRING_NOTE_LISTED_MAX = 8
 # Without a `char *` parameter to say so, a run this short is as likely a small
 # integer, a UTF-16 code unit or a struct field as a string: `{0x41, 0, 0, 0}`
 # reads as "A" (#985 review). Three printable bytes is the issue's own `" -n"`.
@@ -1612,24 +1720,39 @@ def _read_only_data(bv, address: int) -> bool:
                 and not getattr(segment, "executable", True))
 
 
-def _undefined_c_string(bv, address: int, *, min_length: int) -> str | None:
-    """The printable NUL-terminated string at *address*, when BN defined none
-    and it is at least *min_length* characters long."""
+def _undefined_text(bv, address: int) -> tuple[bytes, str] | None:
+    """The NUL-terminated run at *address* and its decoding, when BN defined
+    no string there, the analyst gave the address no other type, it sits in
+    read-only data, and every byte before the NUL decodes as printable UTF-8
+    (ASCII included). None otherwise.
+
+    An address the analyst typed (`bn data retype 0x400760 'int32_t[4]'`)
+    is theirs to read, not a string to suggest (#1019 item 6)."""
     if bv.get_string_at(address) is not None:
         return None
     var = bv.get_data_var_at(address)
-    if var is not None and "char" in str(getattr(var, "type", "")):
-        return None
+    if var is not None:
+        spelled = str(getattr(var, "type", "")).strip()
+        if "char" in spelled:
+            return None
+        if not bool(getattr(var, "auto_discovered", True)) and spelled not in ("", "void"):
+            return None
     if not _read_only_data(bv, address):
         return None
     data = bytes(bv.read(address, _SHORT_STRING_MAX) or b"")
     end = data.find(b"\0")
-    if end < max(1, min_length):
+    if end < 1:
         return None
     body = data[:end]
-    if not all(0x20 <= c < 0x7f or c in (0x09, 0x0a, 0x0d) for c in body):
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
         return None
-    return body.decode("ascii")
+    # Any character but a control or unassigned one: `str.isprintable` turns
+    # down U+00A0, the no-break space AArch64 libstdc++ compares against.
+    if any(unicodedata.category(ch).startswith("C") and ch not in "\t\n\r" for ch in text):
+        return None
+    return body, text
 
 
 def _char_pointer_parameter(bv, target: int | None, index: int,
@@ -1638,12 +1761,14 @@ def _char_pointer_parameter(bv, target: int | None, index: int,
     `char *`, by its prototype or by its demangled signature. Either may be off
     by `this` (#955), so agreement from either is enough.
 
-    A callee BN has no prototype for at *index* -- an import (its body is not
-    here, so BN's parameters are a guess) or a prototype that stops short --
-    is looked up by its C library name instead (#994 item 2; see
-    `_libc_char_pointer`). A prototype the analyst applied (`bn proto set`)
-    is never second-guessed by that lookup. *memo* caches the type-library
-    lookups across one read."""
+    An import BN has no prototype for at *index* -- its body is not here, so
+    BN's parameters are a guess -- is looked up by its C library name instead
+    (#994 item 2; see `_libc_char_pointer`). Only a real import qualifies
+    (#1019 item 6 / #1017 item 8): a local function that happens to be named
+    `strcmp`, and a symbol the analyst named (a user alias), are not the C
+    library's. A prototype the analyst applied (`bn proto set`) is never
+    second-guessed by that lookup. *memo* caches the type-library lookups
+    across one read."""
     if target is None:
         return False
     spellings: list[str] = []
@@ -1665,10 +1790,10 @@ def _char_pointer_parameter(bv, target: int | None, index: int,
     if any(_CHAR_POINTER_RE.match(s.strip()) for s in spellings):
         return True
     kind = str(getattr(getattr(symbol, "type", None), "name", ""))
-    untyped = (index >= len(params) or kind in _IMPORT_SYMBOL_KINDS
-               or bool(getattr(callee, "is_thunk", False)))
+    imported = kind in _IMPORT_SYMBOL_KINDS or bool(getattr(callee, "is_thunk", False))
+    user_named = not bool(getattr(symbol, "auto", True))
     user_typed = bool(getattr(callee, "has_user_type", False))
-    if not untyped or user_typed or not raw_name or raw_name.startswith("_Z"):
+    if not imported or user_named or user_typed or not raw_name or raw_name.startswith("_Z"):
         return False
     return _libc_char_pointer(bv, raw_name, index, {} if memo is None else memo)
 
@@ -1703,9 +1828,9 @@ def _libc_char_pointer(bv, raw_name: str, index: int, memo: dict[str, Any]) -> b
                 and _CHAR_POINTER_RE.match(str(getattr(library_params[index], "type", "")).strip()))
 
 
-def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
-    """Name call arguments rendered as a raw address that point at a short C
-    string BN never defined (#970).
+def _raw_string_pointer_findings(bv, func, text: str) -> dict[int, dict[str, Any]]:
+    """Call arguments rendered as a raw address that point at short text BN
+    never defined (#970): ``{address: {value, calls, string, data}}``.
 
     BN's string scan has a minimum length, so `" -n"` in `s << "cat " << f <<
     " -n"` stays an untyped address: decompile prints `0x402ae0` and `strings`
@@ -1714,16 +1839,20 @@ def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
     pointer BN already renders as a literal or a writable buffer never is.
 
     Printable bytes before a NUL are weak evidence on their own: an `int[]`, a
-    UTF-16 string and a struct all start that way (#985 review). So a run is
-    reported at any length only when the callee takes a `char *` there, and
-    otherwise only from `_UNTYPED_STRING_MIN` characters.
-    Read-only: defining the string is the caller's choice (`bn data retype`)."""
+    UTF-16 string and a struct all start that way (#985 review), and
+    `memcmp(p, 0x400760, 16)` once named an `int[4]` "ABC" (#1019 item 6). So
+    only ASCII passed where the callee takes a narrow `char *` is a STRING
+    (``string: True``, at any length). Everything else that decodes -- a run
+    of `_UNTYPED_STRING_MIN` or more characters passed to a callee with no
+    `char *` there, or UTF-8 text (`"’"`, #1017 item 8) -- is reported as its
+    bytes and their decoding, claiming no string (``string: False``).
+    Read-only: defining a string is the caller's choice (`bn data retype`)."""
     try:
         mlil = getattr(func, "mlil", None) or getattr(func, "medium_level_il", None)
         instructions = list(mlil.instructions) if mlil is not None else []
     except Exception:  # noqa: BLE001
-        return None
-    found: dict[int, tuple[str, int]] = {}
+        return {}
+    found: dict[int, dict[str, Any]] = {}
     memo: dict[str, Any] = {}
     # Every address the text renders raw, tokenised once rather than searched
     # per operand (#985 review: decompile cost on large functions).
@@ -1744,45 +1873,139 @@ def _raw_string_pointer_note(bv, func, text: str) -> dict[str, Any] | None:
         target = getattr(dest, "constant", None) \
             if il_format._il_op_name(dest) in ("MLIL_CONST_PTR", "MLIL_CONST", "MLIL_IMPORT") \
             else None
+        call = int(getattr(ins, "address", 0))
         for index, param in enumerate(list(getattr(ins, "params", None) or [])):
             if il_format._il_op_name(param) not in ("MLIL_CONST_PTR", "MLIL_CONST"):
                 continue
             try:
                 address = int(param.constant)
-                if address in found or (address not in raw and address not in placeholders):
+                entry = found.get(address)
+                if entry is not None and entry["string"]:
+                    # Already named: this call's line gets the same note.
+                    if call not in entry["calls"]:
+                        entry["calls"].append(call)
+                    continue
+                if address not in raw and address not in placeholders:
                     continue
                 typed = _char_pointer_parameter(bv, target, index, memo)
                 if address in placeholders and not typed:
                     continue
-                value = _undefined_c_string(
-                    bv, address, min_length=1 if typed else _UNTYPED_STRING_MIN)
+                decoded = _undefined_text(bv, address) if entry is None else (
+                    entry["data"], entry["value"])
             except Exception:  # noqa: BLE001 - one odd operand must not hide the rest
                 continue
-            if value is not None:
-                found[address] = (value, int(getattr(ins, "address", 0)))
+            if decoded is None:
+                continue
+            data, value = decoded
+            is_string = typed and data.isascii()
+            if entry is None:
+                if not is_string and len(value) < (1 if typed else _UNTYPED_STRING_MIN):
+                    continue
+                entry = found[address] = {"value": value, "calls": [], "string": is_string,
+                                          "data": data}
+            # A later call that passes it as a `char *` makes it a string.
+            entry["string"] = entry["string"] or is_string
+            if call not in entry["calls"]:
+                entry["calls"].append(call)
+    return found
+
+
+def _inline_marking(found: dict[int, Any], inline: set[int]) -> tuple[int, str]:
+    marked = sum(1 for address in found if address in inline)
+    if marked == len(found):
+        return marked, ", each marked inline at its call"
+    if marked:
+        return marked, f", {marked} marked inline at their call"
+    return marked, ""
+
+
+def _raw_string_pointer_note(bv, func, text: str,
+                             found: dict[int, dict[str, Any]] | None = None,
+                             inline: set[int] = frozenset()) -> dict[str, Any] | None:
+    """The `string` warning for the strings in *found*
+    (`_raw_string_pointer_findings`, computed from *text* when not given).
+    *inline* holds the addresses the rendered text marks at their call
+    (#1038 item 3). Every value is listed in the detail: the short form once
+    kept two and said `+N more`, and the reader spent one `bn read` per
+    hidden one."""
+    if found is None:
+        found = _raw_string_pointer_findings(bv, func, text)
+    found = {a: e for a, e in found.items() if e["string"]}
     if not found:
         return None
-    rows = [f"{hex(a)} = {_c_quote(v)} (call at {hex(c)})"
-            for a, (v, c) in list(found.items())[:_STRING_NOTE_LISTED_MAX]]
-    more = len(found) - len(rows)
-    first, (value, _) = next(iter(found.items()))
-    retype = f"bn data retype {hex(first)} 'char[{len(value) + 1}]'"
+    rows = [f"{hex(a)} = {_c_quote(e['value'])} (call at {hex(e['calls'][0])})"
+            for a, e in found.items()]
+    first, entry = next(iter(found.items()))
+    retype = f"bn data retype {hex(first)} 'char[{len(entry['data']) + 1}]'"
+    marked, where = _inline_marking(found, inline)
+    rest = (f"; +{len(found) - 2} more (--explain lists all)" if len(found) > 2 else "")
     return _warning_row(
         "string",
-        f"{len(found)} raw address(es) hold an undefined string: {'; '.join(rows[:2])}"
-        + (f"; +{len(found) - 2} more" if len(found) > 2 else "")
-        + f"; define with `{retype}`",
+        f"{len(found)} raw address(es) hold an undefined string{where}: {'; '.join(rows[:2])}"
+        + rest + f"; define with `{retype}`",
         f"raw string pointer(s): {len(found)} call argument(s) render as an address "
         f"that holds a NUL-terminated string BN did not define (so `bn strings` does not "
-        f"list it either): {'; '.join(rows)}" + (f"; and {more} more" if more > 0 else "")
-        + f". To render it inline, define it: `{retype}`.",
-        strings=[{"address": hex(a), "value": v, "call": hex(c)} for a, (v, c) in found.items()],
+        f"list it either): {'; '.join(rows)}. "
+        + ("A `/* bn: <address> = \"...\" */` note on a call's line gives the value "
+           "there. " if marked else "")
+        + f"To render it inline, define it: `{retype}`.",
+        strings=[{"address": hex(a), "value": e["value"], "call": hex(e["calls"][0]),
+                  "inline": a in inline}
+                 for a, e in found.items()],
+    )
+
+
+_TEXT_BYTES_SHOWN = 16
+
+
+def _hex_bytes(data: bytes) -> str:
+    """*data* and its NUL as spaced hex, the first `_TEXT_BYTES_SHOWN` bytes."""
+    shown = (data + b"\0")[:_TEXT_BYTES_SHOWN]
+    more = len(data) + 1 - len(shown)
+    return shown.hex(" ") + (f" ... (+{more})" if more > 0 else "")
+
+
+def _text_bytes_text(entry: dict[str, Any]) -> str:
+    """`41 42 43 00 (ASCII "ABC")`: the bytes, then what they decode to."""
+    encoding = "ASCII" if entry["data"].isascii() else "UTF-8"
+    return f"{_hex_bytes(entry['data'])} ({encoding} {_c_quote(entry['value'])})"
+
+
+def _text_bytes_note(found: dict[int, dict[str, Any]],
+                     inline: set[int] = frozenset()) -> dict[str, Any] | None:
+    """The `text_bytes` warning (#1019 item 6, #1017 item 8): raw addresses
+    whose bytes decode as text, where nothing says the callee takes a `char
+    *` or the text is not ASCII. It gives the bytes and their decoding and
+    claims nothing else: no "string", and no `data retype` advice, since an
+    `int[4]` of small values reads the same."""
+    found = {a: e for a, e in found.items() if not e["string"]}
+    if not found:
+        return None
+    rows = [f"{hex(a)}: {_text_bytes_text(e)} (call at {hex(e['calls'][0])})"
+            for a, e in found.items()]
+    _marked, where = _inline_marking(found, inline)
+    rest = (f"; +{len(found) - 2} more (--explain lists all)" if len(found) > 2 else "")
+    return _warning_row(
+        "text_bytes",
+        f"{len(found)} raw address(es) hold bytes that decode as text{where}: "
+        f"{'; '.join(rows[:2])}{rest}",
+        f"raw address(es) whose bytes decode as text: {len(found)} call argument(s) render "
+        f"as an address holding a NUL-terminated run that decodes as printable text: "
+        f"{'; '.join(rows)}. Nothing here says it is a string: the callee does not take a "
+        "narrow `char *` there by any prototype bn reads, or the text is not ASCII. An "
+        "`int[]`, a struct or a UTF-16 run can read the same, so read the callee and the "
+        "bytes (`bn read <address> <length>`) before calling it one.",
+        bytes=[{"address": hex(a), "hex": entry["data"].hex(), "decoded": entry["value"],
+                "call": hex(entry["calls"][0]), "inline": a in inline}
+               for a, entry in found.items()],
     )
 
 
 def _c_quote(value: str) -> str:
     escaped = (value.replace("\\", "\\\\").replace('"', '\\"')
-               .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"))
+               .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+               # It goes inside a `/* bn: ... */` note, which a `*/` would end.
+               .replace("*/", "*\\/"))
     return f'"{escaped}"'
 
 
@@ -1901,15 +2124,20 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
             "jump reads from -- references to its base address only, so a store to a later "
             "entry may be missing; when it is filled at run time (a `.bss` table) its "
             "writes are where the target addresses are stored")
+        # #1033 item 9: a base-relative int32 table (the common PIC switch
+        # shape) reads as implausible 8-byte values without `--decode`.
         steps.append(
-            f"`bn evidence table {hex(table)}` reads that data's current bytes, which name "
-            "targets only for a static table (absolute pointers; with `--stride 4 --width "
-            f"4`, 4-byte signed offsets that are added to the table base {hex(table)}); a "
-            "table filled at run time reads as zeros")
+            f"`bn evidence table {hex(table)}` reads that data's current bytes as absolute "
+            f"pointers, and `bn evidence table {hex(table)} --decode relative-int32 --base "
+            f"{hex(table)}` as signed 4-byte offsets added to {hex(table)} (a table whose "
+            "offsets count from another base needs that base instead); either names "
+            "targets only for a static table, and a table filled at run time reads as zeros")
     steps.append(
         "stores in this decompile that write code or table addresses into what the jump "
         "reads may name the targets or their table; "
-        "a table a store names is read with `bn evidence table <address>`. "
+        "a table a store names is read with `bn evidence table <address>`, or with "
+        "`bn evidence table <address> --decode relative-int32 --base <address>` when its "
+        "entries are 4-byte offsets from its base. "
         "For a `data_<hex>` placeholder, use its hexadecimal address; "
         "resolve a symbol with `bn xrefs <symbol>` (its header gives `<address>`)")
     detail = (
@@ -2151,6 +2379,72 @@ def _decompile_batch(
     }
 
 
+def _note_anchors(func, calls: list[int]) -> dict[int, int]:
+    """``{call address: address of the line its note goes on}`` -- the HLIL
+    statement the call renders in (`il_format._hlil_statement_address`), or
+    the call's own address when that cannot be found."""
+    anchors: dict[int, int] = {}
+    for call in calls:
+        anchor = None
+        try:
+            llil = func.get_llil_at(call)
+            if il_format._il_op_name(llil) in _CALL_OPS:
+                anchor = il_format._hlil_statement_address(llil)
+        except Exception:  # noqa: BLE001 - no IL: the call's own address
+            anchor = None
+        anchors[call] = call if anchor is None else anchor
+    return anchors
+
+
+def _note_needs_callee(line: int, rows: list[dict[str, Any]]) -> bool:
+    """Whether a line's arity notes must name their callee: the line is a
+    statement other than the call itself, or holds several noted calls."""
+    return len({row["address"] for row in rows}) > 1 or any(row["address"] != line for row in rows)
+
+
+def _place_string_notes(func, text: str, line_addresses: list[int | None],
+                        strings: dict[int, dict[str, Any]]) -> tuple[str, set[int]]:
+    """*text* with a note on the line of each call that passes one of
+    *strings* (`_raw_string_pointer_findings`) as a raw address (#1038 item
+    3) -- `/* bn: 0x400c98 = "a" */` for a string, `/* bn: 0x400760: 41 42 43
+    00 (ASCII "ABC") */` for bytes that only decode as text -- and the
+    addresses so marked. A note goes only on a line whose code shows the raw
+    spelling it explains, the first such line of the call's statement; a call
+    whose line cannot be found stays unmarked and the warning says so."""
+    lines = text.split("\n")
+    if not strings or len(lines) != len(line_addresses):
+        return text, set()
+    calls = sorted({call for entry in strings.values() for call in entry["calls"]})
+    anchors = _note_anchors(func, calls)
+    wanted: dict[int, list[int]] = {}
+    for address, entry in strings.items():
+        for call in entry["calls"]:
+            listed = wanted.setdefault(anchors[call], [])
+            if address not in listed:
+                listed.append(address)
+    inline: set[int] = set()
+    done: set[int] = set()
+    for index, line_address in enumerate(line_addresses):
+        if line_address is None or line_address not in wanted or line_address in done:
+            continue
+        code, _comment = il_format._code_and_comment(lines[index])
+        shown = [a for a in wanted[line_address]
+                 if re.search(rf"\b(?:{hex(a)}|data_{a:x})\b", code)]
+        if not shown:
+            continue
+        note = "/* bn: " + ", ".join(
+            f"{hex(a)} = {_c_quote(strings[a]['value'])}" if strings[a]["string"]
+            else f"{hex(a)}: {_text_bytes_text(strings[a])}"
+            for a in shown) + " */"
+        noted = il_format._with_line_note(lines[index], note)
+        if noted is None:
+            continue
+        lines[index] = noted
+        done.add(line_address)
+        inline.update(shown)
+    return "\n".join(lines), inline
+
+
 def _decompile(
     ctx,
     selector: str | None,
@@ -2173,14 +2467,24 @@ def _decompile(
     # like the whole call.
     arity = _call_arity_findings(bv, func)
     jumps = _unresolved_jump_findings(bv, func)
-    line_notes: dict[int, list[str]] = {}
+    anchors = _note_anchors(func, [row["address"] for row in arity])
+    by_line: dict[int, list[dict[str, Any]]] = {}
     for row in arity:
-        line_notes.setdefault(row["address"], []).append(_arity_line_note(row))
+        by_line.setdefault(anchors[row["address"]], []).append(row)
+    line_notes = {
+        line: [_arity_line_note(row, named=_note_needs_callee(line, rows))
+               for row in rows]
+        for line, rows in by_line.items()
+    }
     jump_notes = {row["address"]: _JUMP_LINE_NOTE for row in jumps}
-    placed: set[int] = set()
+    placed_lines: set[int] = set()
+    line_addresses: list[int | None] = []
     text = il_format._decompile_text(bv, func, addresses=addresses,
-                                     line_notes=line_notes, placed=placed,
-                                     jump_notes=jump_notes)
+                                     line_notes=line_notes, placed=placed_lines,
+                                     jump_notes=jump_notes, line_addresses=line_addresses)
+    placed = {row["address"] for row in arity if anchors[row["address"]] in placed_lines}
+    strings = _raw_string_pointer_findings(bv, func, text)
+    text, strings_inline = _place_string_notes(func, text, line_addresses, strings)
     if include_annotations:
         annotation_summary = {
             "comment_count": len(_annotation_entries(func, comments)),
@@ -2215,14 +2519,17 @@ def _decompile(
     arity_warn = _call_arity_warning(bv, func, arity, placed)
     if arity_warn:
         warnings.append(arity_warn)
-    warnings.extend(_unresolved_jump_warning(func, row, row["address"] in placed)
+    warnings.extend(_unresolved_jump_warning(func, row, row["address"] in placed_lines)
                     for row in jumps)
     warnings.extend(_resolved_branch_warnings(bv, func))
     warnings.extend(_split_body_notes(bv, func))
     warnings.extend(_callee_split_notes(bv, func))
-    string_note = _raw_string_pointer_note(bv, func, text)
+    string_note = _raw_string_pointer_note(bv, func, text, strings, strings_inline)
     if string_note:
         warnings.append(string_note)
+    bytes_note = _text_bytes_note(strings, strings_inline)
+    if bytes_note:
+        warnings.append(bytes_note)
     for warning in warnings:
         warning.setdefault("address", hex(int(func.start)))
     result = {
@@ -3281,16 +3588,25 @@ def _pvs_targets(ctx, bv, pvs) -> list[dict[str, Any]]:
         # resolves to its function (#89 Problem B). The raw address is kept
         # in the reported "address".
         fn = _taint.function_at(bv, addr)
-        name = None
-        if fn is not None:
-            name = str(getattr(fn, "name", None))
-        else:
+        sym = None
+        if fn is None:
             sym = bv.get_symbol_at(addr) if hasattr(bv, "get_symbol_at") else None
             if sym is None and (addr & 1) and hasattr(bv, "get_symbol_at"):
                 sym = bv.get_symbol_at(addr & ~1)
-            name = str(getattr(sym, "name", None)) if sym is not None else None
-        targets.append({"address": hex(addr), "name": name})
+        targets.append({"address": hex(addr), **_callgraph_names(fn, sym)})
     return targets
+
+
+def _callgraph_names(fn, sym) -> dict[str, Any]:
+    """``{name, display_name}`` for a callgraph end (#1037 item 8): ``name``
+    stays the raw name it always carried, ``display_name`` the demangled one
+    text prints (#978). Both None when nothing names the address."""
+    if fn is not None:
+        return {"name": str(getattr(fn, "name", None)), "display_name": il_format._display_name(fn)}
+    if sym is not None:
+        name = str(getattr(sym, "name", None))
+        return {"name": name, "display_name": str(getattr(sym, "short_name", "") or name)}
+    return {"name": None, "display_name": None}
 
 
 def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resolve_indirect: bool = True):
@@ -3300,7 +3616,7 @@ def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resol
     # (it is a composite callees+callers structure, not a flat items list) (#371.2).
     result: dict[str, Any] = {
         "kind": "callgraph",
-        "function": {"name": func.name, "address": hex(func.start)},
+        "function": il_format._function_identity(func),
     }
 
     if direction in ("callees", "both"):
@@ -3325,11 +3641,11 @@ def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resol
             }
             if target is not None:
                 fn = resolved.function or (bv.get_function_at(target) if hasattr(bv, "get_function_at") else None)
-                name = str(fn.name) if fn is not None else None
-                if name is None:
-                    sym = bv.get_symbol_at(target) if hasattr(bv, "get_symbol_at") else None
-                    name = str(sym.name) if sym is not None else None
-                row.update({"kind": "direct", "target": {"address": hex(target), "name": name}})
+                sym = None
+                if fn is None and hasattr(bv, "get_symbol_at"):
+                    sym = bv.get_symbol_at(target)
+                row.update({"kind": "direct",
+                            "target": {"address": hex(target), **_callgraph_names(fn, sym)}})
             else:
                 row.update({"kind": "indirect", "dest_expr": str(getattr(ins, "dest", ""))})
                 if resolve_indirect:
@@ -3351,9 +3667,7 @@ def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resol
             if fn is None:
                 functions = ctx._functions_containing(bv, addr)
                 fn = functions[0] if functions else None
-            caller = (
-                {"address": hex(int(fn.start)), "name": str(fn.name)} if fn is not None else None
-            )
+            caller = il_format._function_identity(fn) if fn is not None else None
             callers.append({"call_addr": hex(addr), "caller": caller})
         if not callers:
             for fn in (list(getattr(func, "callers", None) or [])):
@@ -3361,7 +3675,7 @@ def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resol
                 if marker in seen:
                     continue
                 seen.add(marker)
-                callers.append({"caller": {"address": hex(marker), "name": str(fn.name)}})
+                callers.append({"caller": il_format._function_identity(fn)})
         result["callers"] = callers
 
     _annotate_containment(ctx, result, identifier, func)
@@ -3388,11 +3702,13 @@ def _possible_values(ctx, selector, identifier, at):
         # No MLIL instruction begins at --at: returning a success dict with
         # expression:None makes a bogus address look like a real instruction
         # with an unknown value-set. Refuse instead of emitting a false read (#526).
+        # #1033 item 8: the advice is a command that runs as printed (`bn
+        # function il` is not one), naming the function by its address.
         raise OperationFailure(
             "no_instruction",
             f"No MLIL instruction at {hex(address)} in {func.name}: --at must name the "
-            f"address of an instruction within the function (use `bn function il "
-            f"--view mlil` to list valid instruction addresses).",
+            f"address of an instruction within the function (`bn il {hex(int(func.start))} "
+            f"--view mlil --ssa` lists valid instruction addresses).",
             requested={"identifier": str(identifier), "at": hex(address)},
         )
     instr_pvs = getattr(target_ins, "possible_values", None) if target_ins is not None else None

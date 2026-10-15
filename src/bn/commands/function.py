@@ -928,6 +928,8 @@ def _callsites(args: argparse.Namespace) -> int:
         "callsites",
         params,
         require_target=True,
+        # #1033 item 6: the variadic note's commands carry this call's -i/-t.
+        contextual_hints=True,
         text_renderer=lambda value: _render_callsites_text(
             value,
             prefer_caller_static=bool(args.caller_static),

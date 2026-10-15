@@ -332,13 +332,19 @@ def _is_hlil_trivial_wrapper(instruction) -> bool:
     }
 
 
+# A tail call is a call too (#1038 item 5): BN renders `b fold_value` as the
+# statement `return fold_value(arg2, arg1)` (a HighLevelILTailcall), and a
+# callsite row describing only HighLevelILCall roots left it `null`.
+_HLIL_CALL_ROOT_TYPES = frozenset({"HighLevelILCall", "HighLevelILTailcall"})
+
+
 def _hlil_call_roots(insn) -> list[Any]:
     roots = []
     seen: set[tuple[str, int]] = set()
     for candidate in _hlil_candidates_for_llil(insn):
         current = candidate
         while current is not None:
-            if _hlil_type_name(current) == "HighLevelILCall":
+            if _hlil_type_name(current) in _HLIL_CALL_ROOT_TYPES:
                 marker = _hlil_marker(current)
                 if marker not in seen:
                     seen.add(marker)
@@ -443,7 +449,7 @@ def _hlil_statement_localization(insn) -> tuple[str | None, str | None]:
       at all (nothing to render).
     * ``hlil_not_call_shaped`` -- HLIL exists for the LLIL call but folded into a
       non-call statement (a coarse assignment/return/block), so no
-      ``HighLevelILCall`` root is reachable to describe.
+      ``HighLevelILCall``/``HighLevelILTailcall`` root is reachable to describe.
     * ``ambiguous_fold`` -- BN folded several calls into this one LLIL
       instruction (#475/#476) and none of the resulting call roots sit at this
       call's address, so attributing a statement would risk describing a
@@ -477,6 +483,50 @@ def _hlil_statement_localization(insn) -> tuple[str | None, str | None]:
 def _hlil_statement_text(insn) -> str | None:
     text, _reason = _hlil_statement_localization(insn)
     return text
+
+
+def _hlil_statement_address(insn) -> int | None:
+    """The address of the HLIL statement the LLIL call *insn* renders in --
+    the one Pseudo-C prints on its own line -- or None when no call root at
+    this address is found.
+
+    A rendered line carries its STATEMENT's address, not the call's:
+    `int32_t x19 = socket(...)` is the assignment at the next instruction,
+    and `if (strcmp(arg1, 0x400c98))` is the `if`. So a note keyed by the
+    call address found no line (#1038 items 1 and 3). The walk goes up from
+    the call to the child of the enclosing block, or to the control-flow
+    statement whose condition holds the call."""
+    roots = _hlil_call_roots(insn)
+    call_addr = int(getattr(insn, "address", 0) or 0)
+    matched = [r for r in roots if int(getattr(r, "address", -1) or -1) == call_addr]
+    if not matched and len(roots) == 1:
+        matched = roots
+    if len(matched) != 1:
+        return None
+    current = matched[0]
+    seen: set[tuple[str, int]] = set()
+    while True:
+        marker = _hlil_marker(current)
+        if marker in seen:
+            break
+        seen.add(marker)
+        parent = _il_parent(current)
+        if parent is None or _hlil_type_name(parent) == "HighLevelILBlock":
+            break
+        if _is_hlil_control_flow(parent):
+            # A one-statement body hangs off its `if` with no block, and is
+            # its own line; only a condition (or loop header) is the parent's.
+            bodies = {_hlil_marker(b) for b in (getattr(parent, attr, None)
+                                                for attr in ("true", "false", "body", "default"))
+                      if b is not None}
+            if marker not in bodies:
+                current = parent
+            break
+        current = parent
+    try:
+        return int(current.address)
+    except Exception:  # noqa: BLE001 - an address-less node anchors nothing
+        return None
 
 
 def _hlil_pre_branch_condition(insn) -> str | None:
@@ -843,6 +893,55 @@ def _instruction_length(bv, address: int, *, arch=None, strict: bool = False) ->
     return 1
 
 
+_ADDRESS_TOKEN_TYPES = frozenset({"PossibleAddressToken", "CodeRelativeAddressToken"})
+
+
+def _view_name_at(bv, address: int) -> str | None:
+    """The name the view gives *address*: its symbol, else the function that
+    starts there. None for an address the view never named (a local branch
+    inside one function)."""
+    try:
+        symbol = bv.get_symbol_at(address)
+        name = str(getattr(symbol, "short_name", "") or getattr(symbol, "name", "") or "") \
+            if symbol is not None else ""
+        if not name:
+            func = bv.get_function_at(address)
+            name = _display_name(func) if func is not None else ""
+    except Exception:  # noqa: BLE001 - an unnamed address stays a bare address
+        return None
+    return name or None
+
+
+def _token_text(bv, arch, data: bytes, address: int, tokens) -> str:
+    """Join *tokens*, naming each call/branch target the view knows (#1038
+    item 4): `bl 0x400880 <socket>`. `arch.get_instruction_text` has no view,
+    so it renders every target as a bare address. Only an address token that
+    is one of the instruction's own branch destinations (BN's instruction
+    info) is named, so an `adrp` page or an immediate that happens to equal a
+    symbol's address stays as BN rendered it."""
+    targets: set[int] = set()
+    try:
+        info = arch.get_instruction_info(data, address)
+        for branch in list(getattr(info, "branches", None) or []):
+            target = getattr(branch, "target", None)
+            if isinstance(target, int) and target:
+                targets.add(int(target))
+    except Exception:  # noqa: BLE001 - no branch info names nothing
+        targets = set()
+    parts = []
+    for token in tokens:
+        parts.append(str(token))
+        if not targets:
+            continue
+        kind = str(getattr(getattr(token, "type", None), "name", ""))
+        value = getattr(token, "value", None)
+        if kind in _ADDRESS_TOKEN_TYPES and isinstance(value, int) and value in targets:
+            name = _view_name_at(bv, value)
+            if name:
+                parts.append(f" <{name}>")
+    return "".join(parts)
+
+
 def _disasm_instruction(bv, address: int, *, arch=None, strict: bool = False) -> tuple[str, int]:
     """Pair rendered text with its physical width, not an analysis span.
 
@@ -857,7 +956,7 @@ def _disasm_instruction(bv, address: int, *, arch=None, strict: bool = False) ->
             data = bv.read(address, max_length)
             tokens, length = arch.get_instruction_text(data, address)
             if tokens:
-                text = "".join(str(t) for t in tokens)
+                text = _token_text(bv, arch, data, address, tokens)
                 length = int(length)
                 if text and length > 0:
                     return text, length
@@ -970,7 +1069,8 @@ def _with_line_note(text: str, note: str) -> str | None:
 def _pseudo_c_text(func, *, addresses: bool = False,
                    line_notes: dict[int, list[str]] | None = None,
                    placed: set[int] | None = None,
-                   jump_notes: dict[int, str] | None = None) -> str:
+                   jump_notes: dict[int, str] | None = None,
+                   line_addresses: list[int | None] | None = None) -> str:
     """Render Binary Ninja's Pseudo C for one function (GUI-equivalent).
 
     Walks the language-representation linear view a batch of lines at a
@@ -983,7 +1083,9 @@ def _pseudo_c_text(func, *, addresses: bool = False,
     added to EVERY `jump ->` line at that address: BN repeats one machine
     jump in several switch cases, and each copy reads the same. Each address
     placed is added to *placed*, so the caller can say which notes it could
-    not attach.
+    not attach. *line_addresses*, when given, receives each returned line's
+    address (None for a blank line), so a caller can annotate the text it
+    reads after rendering.
     """
     settings = bn.DisassemblySettings()
     # Suppress BN's built-in address column so `--addresses` controls the
@@ -1001,6 +1103,7 @@ def _pseudo_c_text(func, *, addresses: bool = False,
     cursor = bn.lineardisassembly.LinearViewCursor(view_obj)
     cursor.seek_to_begin()
     out: list[str] = []
+    out_addrs: list[int | None] = []
     seen_content = False
     while True:
         for line in cursor.lines:
@@ -1010,6 +1113,7 @@ def _pseudo_c_text(func, *, addresses: bool = False,
                 # lone address in the gutter (decide blankness on content,
                 # not on the prefixed string).
                 out.append("")
+                out_addrs.append(None)
                 continue
             header = not seen_content
             if header:
@@ -1038,26 +1142,32 @@ def _pseudo_c_text(func, *, addresses: bool = False,
                 out.append(f"{prefix}{text}")
             else:
                 out.append(text)
+            out_addrs.append(int(addr) if addr is not None else None)
         if not cursor.next():
             break
     while out and not out[0]:
         out.pop(0)
+        out_addrs.pop(0)
     while out and not out[-1]:
         out.pop()
+        out_addrs.pop()
+    if line_addresses is not None:
+        line_addresses[:] = out_addrs
     return "\n".join(out)
 
 
 def _decompile_text(bv, func, *, addresses: bool = False,
                     line_notes: dict[int, list[str]] | None = None,
                     placed: set[int] | None = None,
-                    jump_notes: dict[int, str] | None = None) -> str:
+                    jump_notes: dict[int, str] | None = None,
+                    line_addresses: list[int | None] | None = None) -> str:
     """Pseudo C for a function, degrading to wrapped HLIL if it is unavailable.
-    *line_notes*/*placed*/*jump_notes* are `_pseudo_c_text`'s; the HLIL
-    fallback places none."""
+    *line_notes*/*placed*/*jump_notes*/*line_addresses* are `_pseudo_c_text`'s;
+    the HLIL fallback places none and leaves *line_addresses* empty."""
     marker = ""
     try:
         text = _pseudo_c_text(func, addresses=addresses, line_notes=line_notes, placed=placed,
-                              jump_notes=jump_notes)
+                              jump_notes=jump_notes, line_addresses=line_addresses)
     except Exception as exc:
         # Make the failure visible instead of silently returning the HLIL
         # fallback (or worse, an empty body) with ok:true.
@@ -1074,6 +1184,8 @@ def _decompile_text(bv, func, *, addresses: bool = False,
         return text
     if placed is not None:
         placed.clear()  # the fallback below carries none of the notes
+    if line_addresses is not None:
+        line_addresses.clear()
     sig = _function_signature(func)
     body = _function_text(bv, func, view="hlil", addresses=addresses)
     if addresses:

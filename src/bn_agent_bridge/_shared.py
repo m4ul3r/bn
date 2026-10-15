@@ -112,7 +112,7 @@ _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
         "previous_instructions", "next_instructions", "disasm_context_reason",
         "hlil_statement", "hlil_statement_reason", "pre_branch_condition",
         "callee_variadic", "call_index", "within_query", "decompile_excerpt",
-        "also_in",
+        "also_in", "arity",
     ),
 }
 
