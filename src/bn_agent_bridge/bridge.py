@@ -2334,6 +2334,7 @@ class BinaryNinjaBridge:
             "source_dir": SOURCE_DIR,
             "started_at": self._started_at,
             "gui": ui is not None,
+            "capabilities": {"refresh_target_gate": True},
         }
         # Durable process identity (#694): a pid alone cannot distinguish this
         # bridge from an unrelated process that recycles its number after a crash,

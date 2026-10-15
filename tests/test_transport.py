@@ -1556,6 +1556,78 @@ def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch, cancel
         assert "until it checks for cancellation" in message
 
 
+@pytest.mark.parametrize("cancel_sent", [False, True])
+@pytest.mark.parametrize("transmit_json", [False, True])
+def test_sendall_timeout_preserves_delivery_uncertainty(
+    tmp_path, monkeypatch, cancel_sent, transmit_json
+):
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    # A native socketpair establishes the EOF boundary without filling a
+    # machine-dependent send buffer or racing a receiver against a deadline.
+    # Inject only the sendall timeout, after optionally transmitting the entire
+    # JSON value except its newline; the receiver waits until the sender closes.
+    writer, reader = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    attempted = []
+    cancellations = []
+
+    class SendTimeoutSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            writer.close()
+            return False
+
+        def settimeout(self, timeout):
+            writer.settimeout(timeout)
+
+        def connect(self, path):
+            assert path == str(instance.socket_path)
+
+        def sendall(self, payload):
+            attempted.append(json.loads(payload))
+            assert payload.endswith(b"\n")
+            if transmit_json:
+                writer.sendall(payload[:-1])
+            raise TimeoutError("timed out during sendall")
+
+    def cancel(inst, request_id):
+        assert inst is instance
+        cancellations.append(request_id)
+        return cancel_sent
+
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **kw: SendTimeoutSocket())
+    monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda *a: None)
+    monkeypatch.setattr(transport, "_send_cancel_request", cancel)
+
+    with writer, reader:
+        with pytest.raises(BridgeError, match="Timed out") as caught:
+            transport._send_request_to_instance(instance, "ping", timeout=5.0)
+        # Like the production reader, readline accepts a valid JSON value at
+        # EOF even when the framing newline never arrived.
+        reader.settimeout(5.0)
+        with reader.makefile("rb") as received:
+            raw = received.readline()
+        if transmit_json:
+            assert not raw.endswith(b"\n")
+            assert json.loads(raw) == attempted[0]
+        else:
+            assert raw == b""
+
+    assert len(attempted) == 1
+    assert cancellations == [attempted[0]["id"]]
+    message = str(caught.value)
+    assert "The request was not sent." not in message
+    if cancel_sent:
+        assert "A cancel request was sent" in message
+        assert "operation may keep running until it checks for cancellation" in message
+    else:
+        assert "A cancel request could not be sent" in message
+        assert "operation may still be running" in message
+
+
 def test_timeout_message_shows_subsecond_value(tmp_path, monkeypatch):
     """A sub-second BN_REQUEST_TIMEOUT must render its real value, not round to
     'after 0.0s' (#370.3)."""
@@ -2856,6 +2928,7 @@ def test_send_request_load_refresh_use_larger_default(tmp_path, monkeypatch):
 
     monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
     instance = _make_instance(tmp_path)
+    instance.meta["capabilities"] = {"refresh_target_gate": True}
     monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
     fake_socket = _make_timeout_probe_socket()
     monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: fake_socket())

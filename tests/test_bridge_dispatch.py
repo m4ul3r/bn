@@ -300,9 +300,12 @@ def test_bare_cli_second_refresh_refuses_without_target_preflight(
         monkeypatch, capsys, first_queued):
     """The CLI must reach the reservation even behind an exclusive writer."""
     import bn.cli
+    import bn.transport
 
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
+    selected = types.SimpleNamespace(
+        instance_id="modern", meta={"capabilities": {"refresh_target_gate": True}})
     bv = _FakeMutationBV()
     analyzing, release_analysis = threading.Event(), threading.Event()
     first_result, second_result = {}, {}
@@ -311,10 +314,14 @@ def test_bare_cli_second_refresh_refuses_without_target_preflight(
 
     def analyze():
         bv.events.append("refresh")
-        analyzing.set()
-        assert release_analysis.wait(10), "analysis was never released"
+        # Simulate an exclusive target phase while analysis is running: even
+        # a read-only capability/target probe would block before the reservation.
+        with instance._target_lock.write():
+            analyzing.set()
+            assert release_analysis.wait(10), "analysis was never released"
 
-    def send(op, *, params=None, target=None, **kwargs):
+    def send(selected_instance, op, *, params=None, target=None, **kwargs):
+        assert selected_instance is selected
         calls.append(op)
         response = instance.dispatch({
             "op": op, "params": params, "target": target, "id": "bare-cli"})
@@ -331,7 +338,8 @@ def test_bare_cli_second_refresh_refuses_without_target_preflight(
     bv.update_analysis_and_wait = analyze
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
     monkeypatch.setattr(instance, "_target_info", lambda selector: {})
-    monkeypatch.setattr(bn.cli, "send_request", send)
+    monkeypatch.setattr(bn.transport, "choose_instance", lambda *a, **k: selected)
+    monkeypatch.setattr(bn.transport, "_send_request_to_instance", send)
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
     release_writer, writer = (
         _exclusive_write_parked(bridge, instance) if first_queued else (None, None))
@@ -375,9 +383,12 @@ def test_bare_cli_second_refresh_refuses_without_target_preflight(
 def test_cli_refresh_resolves_bare_target_under_gate_but_preserves_explicit_active(
         monkeypatch, capsys, target_count, selector):
     import bn.cli
+    import bn.transport
 
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
+    selected = types.SimpleNamespace(
+        instance_id="modern", meta={"capabilities": {"refresh_target_gate": True}})
     views = [_FakeMutationBV() for _ in range(target_count)]
     for index, view in enumerate(views):
         view.file = types.SimpleNamespace(
@@ -388,7 +399,8 @@ def test_cli_refresh_resolves_bare_target_under_gate_but_preserves_explicit_acti
         snapshots.append((strict, instance._write_gate.locked()))
         return views, True
 
-    def send(op, *, params=None, target=None, **kwargs):
+    def send(selected_instance, op, *, params=None, target=None, **kwargs):
+        assert selected_instance is selected
         calls.append(op)
         response = instance.dispatch({"op": op, "params": params, "target": target})
         if not response["ok"]:
@@ -399,7 +411,8 @@ def test_cli_refresh_resolves_bare_target_under_gate_but_preserves_explicit_acti
     monkeypatch.setattr(bridge, "_active_binary_view", lambda: views[-1] if views else None)
     monkeypatch.setattr(instance, "_target_info",
                         lambda selector: reply_selectors.append(selector) or {})
-    monkeypatch.setattr(bn.cli, "send_request", send)
+    monkeypatch.setattr(bn.transport, "choose_instance", lambda *a, **k: selected)
+    monkeypatch.setattr(bn.transport, "_send_request_to_instance", send)
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
 
     argv = ["refresh"] + (["-t", selector] if selector is not None else [])
@@ -5316,6 +5329,7 @@ def test_write_registry_is_atomic_and_leaves_no_temp_files(monkeypatch, tmp_path
     data = json.loads(instance.registry_path.read_text(encoding="utf-8"))
     assert data["socket_path"] == str(instance.socket_path)
     assert data["plugin_name"]
+    assert data["capabilities"]["refresh_target_gate"] is True
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".tmp-")]
     assert leftovers == []
 
