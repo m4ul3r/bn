@@ -1483,6 +1483,73 @@ def test_pointer_table_read_width_tracks_substride(monkeypatch):
     assert rw["items"][0]["value"] == "0x40c370"
 
 
+@pytest.mark.parametrize("order", ["little", "big"])
+def test_relative_int32_table_decodes_signed_offsets_without_guessing(monkeypatch, order):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    offsets = [-0x100, 0x120, 0, -(1 << 31), (1 << 31) - 1]
+    table = b"".join(off.to_bytes(4, order, signed=True) for off in offsets) + b"\x01\x02"
+    bv = _FakeBV(
+        arch=_FakeArch(name="x86_64", address_size=8),
+        functions=[_FakeFunction(addr, f"handler_{addr:x}") for addr in (0x4F00, 0x5120, 0x5000)],
+        memory={0x3000: table},
+    )
+    bv.endianness = "BigEndian" if order == "big" else "LittleEndian"
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._pointer_table(
+        "active", "0x3000", entries=6, decode="relative-int32", base="0x5000",
+    )
+    rows = result["items"]
+    assert [row["entry_address"] for row in rows] == [
+        "0x3000", "0x3004", "0x3008", "0x300c", "0x3010", "0x3014",
+    ]
+    assert [row["offset"] for row in rows[:5]] == offsets
+    assert [row["decoded_address"] for row in rows[:5]] == [
+        hex(0x5000 + offset) for offset in offsets
+    ]
+    assert [row["target"]["function"]["address"] for row in rows[:3]] == [
+        "0x4f00", "0x5120", "0x5000",
+    ]
+    assert rows[0]["value"] == "0xffffff00"
+    assert rows[2]["value"] == "0x0" and rows[2]["status"] == "function"
+    assert all(not row["plausible"] and not row["likely_scalar"] for row in rows[3:5])
+    assert rows[5]["status"] == "unreadable" and "decoded_address" not in rows[5]
+
+    # The same bytes stay absolute unless the consumer explicitly selects decoding.
+    absolute = instance._pointer_table("active", "0x3000", entries=3, stride="4")
+    assert absolute["items"][0]["status"] == "unmapped"
+    assert absolute["items"][2]["status"] == "null"
+
+
+def test_relative_int32_table_supports_explicit_stride_and_unmapped_zero_offset(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(memory={0x3000: b"\0" * 16})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._pointer_table(
+        "active", "0x3000", entries=2, stride="8", decode="relative-int32", base="0x7000",
+    )
+    assert [row["entry_address"] for row in result["items"]] == ["0x3000", "0x3008"]
+    assert all(row["status"] == "unmapped" and not row["likely_scalar"] for row in result["items"])
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"decode": "relative-int32"},
+    {"base": "0x3000"},
+    {"decode": "relative-int32", "base": "0x3000", "width": "8"},
+    {"decode": "relative-int32", "base": "0x3000", "record_size": "8", "ptr_fields": ["0"]},
+    {"decode": "guessed"},
+])
+def test_relative_int32_table_refuses_inconsistent_decode_requests(monkeypatch, kwargs):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _FakeBV())
+    with pytest.raises(bridge.OperationFailure) as caught:
+        instance._pointer_table("active", "0x3000", **kwargs)
+    assert caught.value.status == "invalid_request"
+
+
 def test_message_lens_excludes_dynstr_and_resolves_rtti(monkeypatch):
     """On a symbol-retaining binary, evidence message must exclude the noisy
     .dynstr symbol-name matches and instead resolve the real RTTI data symbols
@@ -2889,6 +2956,52 @@ def test_hidden_surface_scan_503(monkeypatch):
     assert re._hidden_surface(_Ctx(), None, table_min_run=5)["candidate_tables"] == []
     with pytest.raises(re.OperationFailure):
         re._hidden_surface(_Ctx(), None, table_min_run=1)
+
+
+@pytest.mark.parametrize("missing_labels", [(), (0x2034,)])
+def test_hidden_surface_computed_goto_labels_use_containing_function_1017(
+        monkeypatch, missing_labels):
+    # GCC's computed-goto table points inside one dispatch function, not at
+    # separate function entries. Keep the table, but only nominate labels BN
+    # has not recovered as part of that function.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+
+    class _ComputedGotoBV(_SurfBV):
+        _VALS = [0x2004, 0x2014, 0x2024, 0x2034, 0]
+
+        def get_function_at(self, addr):
+            return None
+
+        def get_functions_containing(self, addr):
+            if 0x2000 <= int(addr) < 0x2040 and int(addr) not in missing_labels:
+                return [types.SimpleNamespace(start=0x2000, name="dispatch")]
+            return []
+
+    bv = _ComputedGotoBV()
+    bv.arch = type("_A", (_SurfArch,), {"name": "x86_64"})()
+    labels = bv._VALS[:-1]
+    assert all(bv.get_function_at(addr) is None for addr in labels)
+    assert {bv.get_functions_containing(addr)[0].start
+            for addr in labels if addr not in missing_labels} == {0x2000}
+
+    class _Ctx:
+        def _resolve_view(self, selector): return bv
+        def _pointer_size(self, view): return 8
+        def _byteorder(self, view): return "little"
+
+    out = re._hidden_surface(_Ctx(), None)
+    table, = out["candidate_tables"]
+    assert table["slots"] == [hex(addr) for addr in labels]
+    assert table["entries"] == len(labels)
+    assert table["resolved_functions"] == len(labels) - len(missing_labels)
+    assert table["missing_functions"] == len(missing_labels)
+    assert {row["address"] for row in out["missing_function_candidates"]} == {
+        hex(addr) for addr in missing_labels}
+    assert all(row["provenance"] == "table:0x1000"
+               for row in out["missing_function_candidates"])
+    assert out["summary"]["missing_function_candidates"] == len(missing_labels)
 
 
 def test_hidden_surface_segment_fallback_503(monkeypatch):
@@ -7186,14 +7299,17 @@ def test_evidence_card_target_line_follows_the_978_naming_rule_994(monkeypatch):
     assert "display_name" not in bridge.BinaryNinjaBridge().ctx._function_entry_for_address(
         bv, 0x401030)
 
-    card = {"function": {"name": "main", "address": "0x401100"},
+    card = {"function": {"name": "_ZN4demo5relayEv", "display_name": "demo::relay",
+                         "address": "0x401100"},
             "thunk": {"is_candidate": False, "target": target},
             "calls": [{"address": "0x401120", "operation": "MLIL_CALL", "direct": True,
                        "target": target}]}
     text = _render_function_evidence_text(card)
+    assert text.splitlines()[0] == "demo::relay @ 0x401100"
     assert "  target: operator delete @ 0x401030" in text
     assert "  tail branch -> operator delete @ 0x401030" in text
     raw = _render_function_evidence_text(card, mangled=True)
+    assert raw.splitlines()[0] == "_ZN4demo5relayEv @ 0x401100"
     assert "  target: _ZdlPvm @ 0x401030" in raw
     assert "  tail branch -> _ZdlPvm @ 0x401030" in raw
 
@@ -7219,3 +7335,35 @@ def test_only_the_evidence_card_demangles_its_thunk_target_994(monkeypatch):
     shared = bridge.read_evidence._function_thunk_summary(instance.ctx, bv, ctor)
     assert shared["target"]["function"]["name"] == "_ZN4Impl4initEv"
     assert "display_name" not in shared["target"]["function"]
+
+
+@pytest.mark.parametrize("total", [0, 1, 40])
+def test_orient_truncated_sample_hint_is_a_runnable_command(total):
+    from bn.formatters import _render_orient_text
+    from bn.cli import build_parser
+    sample = [{"address": "0x2000", "value": "synthetic"}] if total else []
+    text = _render_orient_text({"strings_sample": {"items": sample, "total": total}})
+    hints = [line.strip().removeprefix("more strings: ")
+             for line in text.splitlines() if line.strip().startswith("more strings: ")]
+    if total <= len(sample):
+        assert not hints
+    else:
+        import shlex
+        command = shlex.split(hints[0])
+        assert command[0] == "bn"
+        args = build_parser().parse_args(command[1:])
+        assert args.strings_limit == total
+
+
+def test_evidence_card_header_publishes_both_function_names_1017(monkeypatch):
+    from bn.formatters import _render_function_evidence_text
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["a", "b"])
+    fn = instance.ctx._find_function(bv, "probe_device")
+    fn.name = "_ZN4demo5relayEi"
+    fn.symbol = types.SimpleNamespace(short_name="demo::relay")
+    card = instance._function_evidence("active", hex(fn.start), context=0)
+    assert _render_function_evidence_text(card).splitlines()[0] == f"demo::relay @ {hex(fn.start)}"
+    assert _render_function_evidence_text(card, mangled=True).splitlines()[0] == (
+        f"_ZN4demo5relayEi @ {hex(fn.start)}")

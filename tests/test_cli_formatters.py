@@ -1228,6 +1228,36 @@ def test_render_surface_non_dict_summary_degrades():
     assert out != _render_surface_text({})
 
 
+def test_render_surface_keeps_resolved_label_table_without_missing_candidates_1017():
+    from bn.formatters import _render_surface_text
+
+    table = {"address": "0x402020", "section": ".rodata", "entries": 4,
+             "resolved_functions": 4, "missing_functions": 0,
+             "slots": ["0x4011c7", "0x4011bf", "0x4011b7", "0x4011ae"]}
+    value = {"summary": {"init_sections": 0, "candidate_tables": 1,
+                         "missing_function_candidates": 0},
+             "candidate_tables": [table], "missing_function_candidates": []}
+    resolved = _render_surface_text(value)
+    assert any("0x402020" in line and "entries=4" in line and "fn=4" in line
+               and "missing=0" in line for line in resolved.splitlines())
+    # `via table:` explains why an unrecovered target was nominated. It is
+    # not a per-slot rendering of a table whose labels BN already recovered.
+    assert "via table:" not in resolved
+    assert all(address not in resolved for address in table["slots"])
+
+    missing = {"address": "0x4011c7", "section": ".text", "aligned": False,
+               "decode_depth": 4, "code_likely": False,
+               "provenance": "table:0x402020"}
+    unresolved = _render_surface_text({
+        **value,
+        "summary": {**value["summary"], "missing_function_candidates": 1},
+        "candidate_tables": [{**table, "resolved_functions": 3, "missing_functions": 1}],
+        "missing_function_candidates": [missing],
+    })
+    assert any("0x4011c7" in line and "via table:0x402020" in line
+               for line in unresolved.splitlines())
+
+
 def test_render_surface_code_ref_candidate_names_its_site_and_count_967():
     from bn.formatters import _render_surface_text
     row = {"address": "0x401158", "section": ".text", "aligned": True, "decode_depth": 16,
