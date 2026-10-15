@@ -8053,3 +8053,20 @@ def test_close_refusal_replay_preserves_json_output_artifact_1029(
             assert [item["path"] for item in payload["closed"]] == [filename]
     finally:
         bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+@pytest.mark.parametrize("active", [False, True])
+def test_raw_target_row_filename_cannot_execute_shell_metadata(tmp_path, shell, active):
+    import subprocess
+    from bn.target_hint import target_row
+
+    row = target_row({
+        "selector": "sample;touch SELECTOR_MARKER",
+        "filename": "/public/sample;touch FILENAME_MARKER; $(touch SUBSTITUTION_MARKER)",
+        "target_id": "9:1:1", "view_id": "1", "active": active,
+    })
+    subprocess.run([shell, "-c", row], cwd=tmp_path, capture_output=True, timeout=10)
+    assert not any((tmp_path / name).exists() for name in (
+        "SELECTOR_MARKER", "FILENAME_MARKER", "SUBSTITUTION_MARKER",
+    ))

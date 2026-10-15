@@ -69,7 +69,7 @@ def target_row(target: dict[str, Any]) -> str:
         f"  {marker} {target_option(selector)}"
         f"  view_id={target.get('view_id', '')}"
         f"  target_id={target.get('target_id', '')}"
-        f"  {_escape_controls(str(target.get('filename', '')))}"
+        f"  {shlex.quote(_escape_controls(str(target.get('filename', ''))))}"
     )
 
 
