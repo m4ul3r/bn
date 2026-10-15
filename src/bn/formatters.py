@@ -6579,7 +6579,12 @@ def _mutation_summary(value: Any) -> Any:
         reported_success=bool(value.get("success", True)),
         failure_rows=failed,
         failed=len(failed),
-        changed=verified,
+        # An irreversible attempt remains changed/possibly changed even when
+        # verification failed. Never let its failure status imply a clean DB.
+        changed=verified + sum(
+            row.get("irreversible_change") is True
+            for row in failed
+        ),
         verified=verified,
         noop=noop,
         committed=bool(value.get("committed", False)),

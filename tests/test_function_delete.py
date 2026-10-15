@@ -116,6 +116,34 @@ def test_delete_failure_never_claims_verified_or_clean_rollback(monkeypatch, fai
     assert not _has_event(bv, "revert")
 
 
+def test_delete_analysis_failure_compact_summary_reports_dirty_commit(monkeypatch):
+    from bn.cli import _mutation_exit_code
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+
+    _, instance, bv, _, _ = _setup(monkeypatch)
+
+    def analyze():
+        raise RuntimeError("analysis failed")
+
+    monkeypatch.setattr(bv, "update_analysis_and_wait", analyze)
+    result = instance._mutation(None, False, [{"op": "function_delete", "address": "0x1010"}])
+
+    assert bv.get_function_at(0x1010) is None
+    assert result["results"][0]["observed"]["analysis_error"] == "analysis failed"
+    summary = _mutation_summary(result)
+    assert summary["success"] is False
+    assert summary["committed"] is True
+    assert summary["rolled_back"] is False
+    assert summary["changed_count"] == 1
+    assert summary["dirty_after"] is True
+    assert summary["failed_count"] == 1
+    assert summary["verified_count"] == 0
+    assert _mutation_exit_code(result, _mutation_summary) == 3
+    rendered = _render_mutation_summary_text(summary)
+    for field in ("changed=1", "dirty_after=True", "failed=1", "verified=0"):
+        assert field in rendered, rendered
+
+
 def test_single_delete_batch_uses_observed_mutation_result(monkeypatch):
     _, instance, bv, _, _ = _setup(monkeypatch)
     result = instance._mutation(None, False, [{"op": "function_delete", "address": "0x1010"}])

@@ -124,6 +124,10 @@ def _function_delete(ctx, bv, address, *, exclusive=None):
             "results": [{
                 "op": "function_delete", "address": hex(addr), "function": name,
                 "status": "verified" if success else "verification_failed",
+                # A failed readback does not undo the suppression write. Even
+                # an API exception can follow a partial write; preserve that
+                # possibly-changed state independently of verification.
+                "irreversible_change": True,
                 "requested": requested, "observed": observed,
                 "message": outcome + " " + warning,
             }],

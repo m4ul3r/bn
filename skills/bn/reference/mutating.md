@@ -64,6 +64,8 @@ Printable punctuation, including literal quote characters, remains valid and is 
 
 The mutation's `observed` state reports `function_removed`, `function_at_entry`, `bodies_containing_deleted_entry` (rows with `address` and `name`), `reanalysis_completed`, and `clean_undo_available: false`. Verification requires the entry to be absent and reanalysis to have completed. A body containing the deleted entry proves only that address is contained, not that the full tail merged or that the resulting boundaries are correct. Read the reported bodies with `bn disasm` and `bn decompile` before relying on them. A failure cannot promise automatic restoration.
 
+An attempted live deletion carries `irreversible_change: true` even if removal or reanalysis raises: a partial write cannot be ruled out or cleanly undone. Its compact summary therefore counts that operation as changed/possibly changed and reports `dirty_after: true`, independently of `verified_count`. A failed verification still reports failure (exit 3); changed does not imply verified.
+
 For `go rename`, `--verbose` (alias `--diffs`) requests detail and `--summary` (alias `--quiet`) forces the compact summary. It takes the standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`, `--out`) and nothing else.
 
 Per-op statuses:

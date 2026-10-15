@@ -3198,6 +3198,61 @@ def _is_estimate_envelope(out: str) -> bool:
         return any(line.strip() == "estimated: true" for line in out.splitlines())
 
 
+# Public read paths that promise estimator support, independent of registry
+# flags. Keep the contract explicit so removing an estimable flag cannot also
+# remove that command from the behavioral sweep. Dual-role group nodes (`types`
+# and `exports`) deliberately do not advertise the flag; use their leaf reads.
+_ESTIMATE_SUPPORTED_READ_PATHS = {
+    ("target", "info"),
+    ("class", "list"),
+    ("class", "show"),
+    ("dataflow", "defuse"),
+    ("dataflow", "callgraph"),
+    ("dataflow", "values"),
+    ("taint", "forward"),
+    ("taint", "backward"),
+    ("taint", "models"),
+    ("function", "list"),
+    ("function", "search"),
+    ("function", "info"),
+    ("decompile",),
+    ("il",),
+    ("function", "structured-il"),
+    ("disasm",),
+    ("function", "cfg"),
+    ("xrefs",),
+    ("callsites",),
+    ("evidence", "function"),
+    ("evidence", "xrefs"),
+    ("evidence", "table"),
+    ("evidence", "calls"),
+    ("evidence", "virtual-call"),
+    ("evidence", "surface"),
+    ("evidence", "message"),
+    ("evidence", "orient"),
+    ("evidence", "init"),
+    ("trace",),
+    ("strings",),
+    ("imports",),
+    ("exports", "list"),
+    ("sections",),
+    ("data", "vars"),
+    ("data", "symbols"),
+    ("go", "functions"),
+    ("bundle", "function"),
+    ("read",),
+    ("comment", "list"),
+    ("comment", "get"),
+    ("proto", "get"),
+    ("local", "list"),
+    ("tag", "types"),
+    ("tag", "get"),
+    ("tag", "list"),
+    ("types", "show"),
+    ("struct", "show"),
+}
+
+
 def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
         fake_transport, capsys, monkeypatch):
     """#796 review: the flag lives on the code path that implements it, not on
@@ -3213,8 +3268,8 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
 
     The rule is the `fanout=True` precedent (#169 L1 review): an EXPLICIT
     allow-list on the registry. What proves the allow-list is a coverage claim
-    rather than a wish is the sweep below, which RUNS every marked command in
-    every emit mode its parser offers and reads what landed on stdout.
+    rather than a wish is the independent supported-read contract and the sweep
+    below, which RUNS every supported command in every emit mode its parser offers.
 
     That is deliberately not a source-text derivation. The previous version of
     this test derived the set by grepping each handler for `_call(` with no
@@ -3267,13 +3322,12 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
         f"advertised {sorted(advertised - (marked - groups))} without being marked, "
         f"or marked-and-advertisable but not advertised "
         f"{sorted((marked - groups) - advertised)}")
-    # ...and everything else refuses it BY ABSENCE (argparse's own rc 2), which is
-    # stronger than a bespoke refusal: there is no path on which the flag is
-    # accepted and ignored, because the parser never builds it.
-    assert all(not spec.get("estimable") for spec in bn.cli._COMMANDS
-               if tuple(spec["path"]) not in marked)
+    assert advertised == _ESTIMATE_SUPPORTED_READ_PATHS, (
+        "estimator support differs from the explicit supported-read contract: "
+        f"missing {sorted(_ESTIMATE_SUPPORTED_READ_PATHS - advertised)}, "
+        f"unexpected {sorted(advertised - _ESTIMATE_SUPPORTED_READ_PATHS)}")
 
-    # THE COVERAGE CLAIM, observed. One invariant over every marked command in
+    # THE COVERAGE CLAIM, observed. One invariant over every supported read in
     # every emit mode its parser offers: whatever lands on stdout is the
     # ESTIMATE ENVELOPE or a machine-readable refusal -- never a payload -- and
     # a run that exits 0 produced the envelope. A handler that reaches an emit
@@ -3282,7 +3336,7 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
                                          if not a[0][0].startswith("-")]
                    for spec in bn.cli._COMMANDS}
     leaked, emitted, covered = [], 0, set()
-    for path in sorted(advertised):
+    for path in sorted(_ESTIMATE_SUPPORTED_READ_PATHS):
         required, unfillable = _estimate_required_flags(leaf(path))
         unfillable += [p for p in positionals[path]
                        if p not in _ESTIMATE_ARG_VALUES]
@@ -3321,9 +3375,10 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
         "these invocations of --estimate-output put something other than the "
         f"estimate envelope on stdout: {leaked[:6]}")
     # ...and the sweep cannot quietly degrade into "every probe errored out":
-    # every advertised command reached an emitting path at least once.
-    assert covered == advertised, (
-        f"never reached an emitting path: {sorted(advertised - covered)}")
+    # every supported read reached an emitting path at least once.
+    assert covered == _ESTIMATE_SUPPORTED_READ_PATHS, (
+        "never reached an emitting path: "
+        f"{sorted(_ESTIMATE_SUPPORTED_READ_PATHS - covered)}")
     assert emitted, "no probe reached an emit path at all"
 
 

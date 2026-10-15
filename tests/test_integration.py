@@ -2978,7 +2978,7 @@ class TestFunctionDeleteRepair966:
         build = subprocess.run([cc, "-nostdlib", "-static", str(source), "-o", str(binary)],
                                capture_output=True, text=True, timeout=120)
         assert build.returncode == 0, build.stderr
-        shared_bn.load(binary)
+        shared_bn.load(binary, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
         split = int(_py_line(shared_bn,
                             "print('TAIL=' + hex(bv.get_functions_by_name('shared_tail')[0].start))",
                             "TAIL"), 16)
@@ -3008,6 +3008,48 @@ class TestFunctionDeleteRepair966:
         ), "BODIES"))
         assert observed["bodies_containing_deleted_entry"] == actual
         assert {row["name"] for row in actual} == {"build_widget", "other_user"}
+
+    @pytest.mark.parametrize("output_args", [(), ("--format", "json", "--summary")],
+                             ids=["default", "compact-json"])
+    def test_analysis_failure_reports_committed_deletion(self, shared_bn, output_args):
+        shared_bn.load(PARSER_BINARY, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        start, _ = _function_start_and_size(shared_bn, "parse_record")
+        installed = _py_line(shared_bn, (
+            "from binaryninja import BinaryView\n"
+            "BinaryView._delete966_original_analysis = BinaryView.update_analysis_and_wait\n"
+            "def fail_analysis(self, *args, **kwargs):\n"
+            "    raise RuntimeError('delete966 injected analysis failure')\n"
+            "BinaryView.update_analysis_and_wait = fail_analysis\n"
+            "print('INSTALLED=True')\n"
+        ), "INSTALLED")
+        try:
+            assert installed == "True"
+            deleted = shared_bn.run("function", "delete", hex(start), *output_args)
+        finally:
+            restored = _py_line(shared_bn, (
+                "from binaryninja import BinaryView\n"
+                "BinaryView.update_analysis_and_wait = BinaryView._delete966_original_analysis\n"
+                "del BinaryView._delete966_original_analysis\n"
+                "print('RESTORED=True')\n"
+            ), "RESTORED")
+            assert restored == "True"
+
+        assert deleted.returncode == 3, f"{deleted.stdout}\n{deleted.stderr}"
+        assert _py_line(shared_bn, (
+            f"print('GONE=' + str(bv.get_function_at({start:#x}) is None))\n"
+        ), "GONE") == "True"
+        if output_args:
+            summary = json.loads(deleted.stdout)
+            assert summary["success"] is False, summary
+            assert summary["committed"] is True, summary
+            assert summary["rolled_back"] is False, summary
+            assert summary["changed_count"] == 1, summary
+            assert summary["dirty_after"] is True, summary
+            assert summary["failed_count"] == 1, summary
+            assert summary["verified_count"] == 0, summary
+        else:
+            for field in ("changed=1", "dirty_after=True", "failed=1", "verified=0"):
+                assert field in deleted.stdout, deleted.stdout
 
 
 class TestFunctionCreateSplitRestore:
