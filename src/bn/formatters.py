@@ -7240,14 +7240,22 @@ def _render_skill_install_text(value: Any) -> str:
     skipped = _field_list(value, "skipped_destinations")
     not_updated = [row for row in _field_list(value, "not_updated_destinations")
                    if isinstance(row, dict)]
-    # A list, not a set: membership must not hash wire values (#619).
-    not_updated_paths = [row.get("destination") for row in not_updated]
-    up_to_date = [dest for dest in skipped if dest not in not_updated_paths]
     force_plan = [row for row in _field_list(value, "force_plan")
                   if isinstance(row, dict)]
 
-    def force_detail(dest: Any) -> str:
+    def identity(dest: Any) -> Any:
         row = next((row for row in force_plan if row.get("destination") == dest), None)
+        return (_text_value(row, "destination_id") or dest) if row is not None else dest
+
+    # A list, not a set: membership must not hash wire values (#619).
+    not_updated_paths = [identity(row.get("destination")) for row in not_updated]
+    up_to_date = [dest for dest in skipped if identity(dest) not in not_updated_paths]
+
+    def force_detail(dest: Any) -> str:
+        key = identity(dest)
+        row = next(
+            (row for row in force_plan if _text_value(row, "destination_id") == key), None
+        )
         if row is None:
             return ""
         return f"; --force: {row.get('detail')}"
@@ -7275,8 +7283,8 @@ def _render_skill_install_text(value: Any) -> str:
             f"- {row.get('destination')} ({row.get('detail')})"
             f"{force_detail(row.get('destination'))}" for row in not_updated
         )
-    listed = installed + skipped
-    other = [row for row in force_plan if row.get("destination") not in listed]
+    listed = [identity(dest) for dest in installed + skipped]
+    other = [row for row in force_plan if _text_value(row, "destination_id") not in listed]
     if other:
         lines.append("Other destinations (--force dry run):")
         lines.extend(

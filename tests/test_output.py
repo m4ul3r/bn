@@ -1073,3 +1073,24 @@ def test_estimate_output_result_text_envelope_is_the_artifact_shape_796():
     assert fields["format"] == "text"
     assert int(fields["tokens"]) > 0 and int(fields["bytes"]) > 0
     assert "path" not in fields and "spilled" not in fields
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+@pytest.mark.parametrize("to_file", [False, True])
+def test_artifact_envelope_preserves_failed_operation(tmp_path, monkeypatch, fmt, to_file):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    payload = {"ok": False, "error": "Ownership could not be proved", "details": ["blocked"]}
+    rendered = write_output(
+        payload, fmt=fmt, out_path=tmp_path / "error.json" if to_file else None,
+        stem="refusal", spill_token_limit=1,
+    )
+    if fmt == "json":
+        envelope = json.loads(rendered)
+        assert envelope["ok"] is False
+        assert envelope["error"] == "Ownership could not be proved"
+        assert envelope["spilled"] is not to_file
+    else:
+        envelope = _parse_envelope(rendered)
+        assert envelope["ok"] == "false"
+        assert envelope["error"] == "Ownership could not be proved"
+        assert envelope["spilled"] == str(not to_file).lower()

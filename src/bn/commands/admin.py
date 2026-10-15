@@ -615,8 +615,17 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
         raise BridgeError(f"Cannot install into {dest}: {exc}") from exc
 
 
-def _install_recovery_advice(linked_root: Path | None) -> str:
+def _install_recovery_advice(
+    linked_root: Path | None, *, linked_ancestor: bool = False
+) -> str:
     if linked_root is None:
+        if linked_ancestor:
+            return (
+                "An ancestor of this destination is a symlink, not the skills root link. "
+                "Leave that ancestor and its unrelated configuration files in place. "
+                "Choose a new install destination outside the linked tree with --dest, "
+                "or inspect and update the skills configuration manually."
+            )
         return (
             "Move this destination aside by hand, then re-run the "
             "same install command without --force to create a fresh install."
@@ -631,16 +640,18 @@ def _install_recovery_advice(linked_root: Path | None) -> str:
     )
 
 
-def _refuse_replacement(dest: Path, reason: str, *, linked_root: Path | None) -> NoReturn:
+def _refuse_replacement(dest: Path, reason: str, *, recovery: str) -> NoReturn:
     raise BridgeError(
         f"Refusing to replace {dest} with --force: {reason}. "
         "--force replaces only what it can prove is an install of this "
         "artifact (a link, an empty directory, or a marked copy), never an "
-        f"unrelated path. {_install_recovery_advice(linked_root)}"
+        f"unrelated path. {recovery}"
     )
 
 
-def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
+def _plan_install(
+    source: Path, dest: Path, *, mode: str, force: bool, skill_root: Path | None = None
+) -> Path:
     """The path this install will write to, or a refusal raised.
 
     Both `plugin install` and the `skill install` pre-pass call this, on the
@@ -659,7 +670,11 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
     if not source.exists():
         raise BridgeError(f"Source directory is missing: {source}")
     requested_dest = dest
-    linked_root = next((parent for parent in dest.parents if parent.is_symlink()), None)
+    # Only the skill installer supplies its exact root. An arbitrary ancestor
+    # may hold settings or other data and is never an automatic recovery target.
+    linked_root = skill_root if skill_root is not None and skill_root.is_symlink() else None
+    linked_ancestor = any(parent.is_symlink() for parent in dest.parents)
+    recovery = _install_recovery_advice(linked_root, linked_ancestor=linked_ancestor)
     dest = _install_path(dest)
     forbidden = _never_an_install_destination(dest, source)
     if forbidden is not None:
@@ -670,13 +685,15 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
         )
     unusable = _unusable_parent_reason(dest)
     if unusable is not None:
-        recovery = f" {_install_recovery_advice(linked_root)}" if linked_root else ""
-        raise BridgeError(f"Cannot install into {dest}: {unusable}.{recovery}")
+        advice = f" {recovery}" if linked_ancestor else ""
+        raise BridgeError(f"Cannot install into {dest}: {unusable}.{advice}")
     if not force:
         state = _existing_install_state(source, dest, mode=mode)
         if state is not None:
             try:
-                _plan_install(source, requested_dest, mode=mode, force=True)
+                _plan_install(
+                    source, requested_dest, mode=mode, force=True, skill_root=skill_root
+                )
             except BridgeError as exc:
                 force_detail = f"--force preflight refuses: {exc}"
             else:
@@ -688,7 +705,7 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
         return dest
     reason = _force_refusal_reason(dest, source)
     if reason is not None:
-        _refuse_replacement(dest, reason, linked_root=linked_root)
+        _refuse_replacement(dest, reason, recovery=recovery)
     if dest.is_dir() and not dest.is_symlink():
         try:
             blocker = _removal_blocker(dest)
@@ -697,7 +714,7 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
         if blocker is not None:
             raise BridgeError(
                 f"Cannot replace {dest} with --force: {blocker}. "
-                + (_install_recovery_advice(linked_root) if linked_root else
+                + (recovery if linked_ancestor else
                    "Fix the permissions, or move it aside by hand, and re-run.")
             )
     return dest
@@ -715,18 +732,22 @@ def _plan_forced_installs(
     pending: list[tuple[Path, Path]] = []
     verdicts: list[dict[str, Any]] = []
     for source, dest in installs:
+        planned: Path | None = None
         row: dict[str, Any] = {"destination": str(dest)}
         if _is_install_source(source, dest):
             row.update(allowed=True, detail="install source itself; no replacement needed")
         else:
             try:
-                planned = _plan_install(source, dest, mode=mode, force=True)
+                planned = _plan_install(
+                    source, dest, mode=mode, force=True, skill_root=dest.parent
+                )
             except BridgeError as exc:
                 row.update(allowed=False, detail=str(exc))
             else:
                 row.update(allowed=True, detail="passes --force preflight")
                 if not any(queued == planned for _, queued in pending):
                     pending.append((source, planned))
+        row["destination_id"] = str(planned if planned is not None else _install_path(dest))
         verdicts.append(row)
     return pending, verdicts
 
@@ -790,7 +811,9 @@ def _skill_install(args: argparse.Namespace) -> int:
                 )
                 continue
             try:
-                planned = _plan_install(source, dest, mode=args.mode, force=False)
+                planned = _plan_install(
+                    source, dest, mode=args.mode, force=False, skill_root=dest.parent
+                )
             except BridgeError as exc:
                 if not explicit_dest:
                     raise

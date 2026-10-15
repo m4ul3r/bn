@@ -5412,3 +5412,103 @@ def test_printed_root_link_recovery_preserves_checkout_and_reinstalls_outside_it
     assert not root.is_symlink()
     assert (root / source.name / "SKILL.md").read_bytes() == (source / "SKILL.md").read_bytes()
     assert _install_disk_snapshot(old) == before
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_skill_recovery_never_unlinks_a_configuration_ancestor(
+    tmp_path, monkeypatch, capsys, explicit
+):
+    from pathlib import Path
+
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    dotfiles = tmp_path / "dotfiles"
+    legacy = dotfiles / "skills" / source.name
+    legacy.mkdir(parents=True)
+    (legacy / "SKILL.md").write_text("legacy copy with local edits")
+    settings = dotfiles / "settings.json"
+    settings.write_text('{"theme":"preserve"}')
+    config_link = Path(os.environ["HOME"]) / ".claude"
+    config_link.symlink_to(dotfiles)
+    skills_root = config_link / "skills"
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: skills_root)
+    argv = ["skill", "install", "--force"]
+    if explicit:
+        argv += ["--dest", str(skills_root)]
+    assert bn.cli.main(argv) == 2
+    refusal = capsys.readouterr().err
+    assert "Recovery command:" not in refusal
+    assert "unlink --" not in refusal
+    assert "--dest" in refusal
+    assert config_link.is_symlink()
+    assert (config_link / "settings.json").read_bytes() == settings.read_bytes()
+    assert (skills_root / source.name / "SKILL.md").read_text() == "legacy copy with local edits"
+
+
+def test_spilled_explicit_skill_refusal_preserves_error_status(
+    tmp_path, tmp_path_factory, monkeypatch, capsys
+):
+    from pathlib import Path
+
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    for name in ("second", "third"):
+        skill = source.parent / name
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(name)
+    store = tmp_path / "store"
+    (store / "sample").mkdir(parents=True)
+    (store / "second").mkdir()
+    (store / "second" / "mine.txt").write_text("preserve")
+    requested = tmp_path / "requested.json"
+    # The caller opted into a cache artifact, not changes to any install or
+    # --out path. Keep that authorized output outside the refusal snapshot.
+    cache = tmp_path_factory.mktemp("install-refusal-spill")
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "100")
+    assert bn.cli.main([
+        "skill", "install", "--dest", str(store), "--format", "json",
+        "--out", str(requested),
+    ]) == 2
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["spilled"] is True
+    assert envelope["ok"] is False
+    assert envelope["error"]
+    artifact = json.loads(Path(envelope["artifact_path"]).read_text())
+    assert artifact["ok"] is False
+    assert envelope["error"] == artifact["error"]
+    assert artifact["force_ready"] is False
+    assert {row["destination"]: row["allowed"] for row in artifact["force_plan"]} == {
+        str(store / "sample"): True, str(store / "second"): False,
+        str(store / "third"): True,
+    }
+    assert not requested.exists()
+    assert not (store / "third").exists()
+
+
+@pytest.mark.parametrize("mode", ["copy", "symlink"])
+@pytest.mark.parametrize("root_kind", ["relative", "linked"])
+def test_skill_install_text_joins_destination_spellings_once(
+    tmp_path, monkeypatch, capsys, mode, root_kind
+):
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    work = tmp_path / "work"
+    work.mkdir()
+    if root_kind == "linked":
+        actual_root = tmp_path / "physical-skills"
+        actual_root.mkdir()
+        (work / "store").symlink_to(actual_root)
+    else:
+        actual_root = work / "store"
+    monkeypatch.chdir(work)
+    argv = ["skill", "install", "--dest", "store", "--mode", mode]
+    assert bn.cli.main(argv) == 0
+    text = capsys.readouterr().out
+    rows = [line for line in text.splitlines() if line.startswith("- ")]
+    assert len(rows) == 1
+    assert str(actual_root / source.name) in rows[0]
+    assert "; --force:" in rows[0]
+    assert bn.cli.main(argv) == 0
+    current = capsys.readouterr().out
+    rows = [line for line in current.splitlines() if line.startswith("- ")]
+    assert len(rows) == 1
+    assert f"store/{source.name}" in rows[0]
+    assert "; --force:" in rows[0]
