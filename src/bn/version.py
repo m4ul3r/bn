@@ -64,10 +64,14 @@ def build_id_for_package(directory: Path) -> str | None:
     (name + bytes). The single-file :func:`build_id_for_file` on ``bridge.py``
     misses edits to sibling modules, so a live session running an edited
     ``taint_engine.py`` looked fresh; this whole-package hash lets ``doctor`` flag
-    a stale *engine* (#161). Returns None if the directory can't be read."""
+    a stale *engine* (#161). Install ownership metadata is excluded.
+    Returns None if the directory can't be read."""
     try:
         files = sorted(
-            list(directory.glob("*.py")) + list(directory.glob("*.json")),
+            list(directory.glob("*.py")) + [
+                path for path in directory.glob("*.json")
+                if path.name != ".bn-copy-install.json"
+            ],
             key=lambda p: p.name,
         )
     except OSError:

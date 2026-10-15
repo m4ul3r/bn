@@ -57,6 +57,10 @@ class BridgeError(RuntimeError):
         self.observed = observed
 
 
+class MultiTargetError(BridgeError):
+    """Refusal because several targets are open and no selector was given."""
+
+
 class BridgeUnreachableError(BridgeError):
     """A request that never REACHED the bridge: the process is stopped, gone,
     resolved for lifecycle commands only (#694), recorded without an identity
@@ -1177,33 +1181,13 @@ def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
 _PROC_ROOT = Path("/proc")
 
 
-def _is_bn_agent_named(argv: list[str], instance_id: str) -> bool:
-    """Whether *argv* is a headless bridge launched as ``--instance-id <id>``,
-    under any of its three launch spellings (console script, ``bn.headless``,
-    ``bn_agent_bridge``)."""
-    return any(
-        os.path.basename(part) == "bn-agent" or part in ("bn.headless", "bn_agent_bridge")
-        for part in argv
-    ) and any(
-        part == "--instance-id" and argv[i + 1:i + 2] == [instance_id]
-        for i, part in enumerate(argv)
-    )
-
-
-def _proc_argv(entry: Path) -> list[str]:
-    """``/proc/<pid>/cmdline`` as decoded arguments (raises OSError)."""
-    return [os.fsdecode(part) for part in
-            entry.joinpath("cmdline").read_bytes().split(b"\0") if part]
-
-
 def _agent_cache_dirs_for(instance_id: str, proc: Path | None = None) -> list[Path]:
-    """Cache roots of this user's running bridges named *instance_id*.
+    """Candidate cache roots from readable same-user process environments.
 
-    Read from each `bn-agent` process's own argv and environment, so it needs no
-    state written anywhere: a bridge launched with ``--instance-id <id>`` under
-    ``BN_CACHE_DIR=<dir>`` answers ``<dir>`` (an unset variable answers the
-    platform default). Another user's processes are unreadable and skipped; a
-    host without /proc answers nothing.
+    Launch argv is neither necessary nor sufficient evidence of a bridge:
+    hand-launched scripts need not name ``bn-agent``, and unrelated processes
+    can put that name anywhere in their argv. These roots are only candidates
+    for *instance_id*; ``_registry_names_live_bridge`` verifies the actual socket.
     """
     found: list[Path] = []
     proc = _PROC_ROOT if proc is None else proc
@@ -1215,7 +1199,7 @@ def _agent_cache_dirs_for(instance_id: str, proc: Path | None = None) -> list[Pa
         if not entry.name.isdigit():
             continue
         try:
-            if not _is_bn_agent_named(_proc_argv(entry), instance_id):
+            if entry.stat().st_uid != os.getuid():
                 continue
             environ = entry.joinpath("environ").read_bytes().split(b"\0")
         except OSError:
@@ -1232,20 +1216,21 @@ def _agent_cache_dirs_for(instance_id: str, proc: Path | None = None) -> list[Pa
                     except OSError:
                         cache_dir = None  # type: ignore[assignment]
                 break
-        if cache_dir is not None:
+        if cache_dir is not None and cache_dir not in found:
             found.append(cache_dir)
     return found
 
 
-def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool:
-    """Whether *registry_path* is a parseable registry of a still-running bridge.
+def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool | None:
+    """Whether the registry's socket serves the live bridge with this identity.
 
-    The "registered elsewhere" hint replaces the start advice, so a stale file
-    (dead or recycled pid, an orphaned ``{}``, another id's payload) must not
-    produce it (#996 review) -- and neither may a live pid that is not that
-    bridge: the process must be a ``bn-agent`` launched with this
-    ``--instance-id`` (its own cmdline says so), and its recorded start
-    identity must not contradict the live process.
+    A live pid or convincing argv cannot prove who bound a socket. Require the
+    kernel's peer pid and an identity-checked protocol reply instead. This is a
+    bounded, idle probe that takes no target/write lock, so discovery neither
+    queues behind analysis nor keeps an otherwise idle bridge alive. A timeout
+    or stopped process is unknown (None), not evidence that another bridge
+    should be started. Invalid evidence retains ordinary start advice; this
+    lookup never deletes files.
     """
     try:
         payload = json.loads(registry_path.read_text(encoding="utf-8"))
@@ -1254,30 +1239,55 @@ def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool:
     if not isinstance(payload, dict):
         return False
     pid = payload.get("pid")
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+    raw_socket_path = payload.get("socket_path")
+    if not _registry_fields_are_well_formed(
+        raw_socket_path, pid, payload.get("instance_id")
+    ) or payload.get("instance_id") != instance_id:
         return False
-    if payload.get("instance_id") != instance_id:
+    if not _process_running(pid) or identity_verdict(payload, pid) == "mismatch":
         return False
-    try:
-        argv = _proc_argv(_PROC_ROOT / str(pid))
-    except OSError:
-        return False
-    return (
-        _is_bn_agent_named(argv, instance_id)
-        and _process_alive(pid)
-        and identity_verdict(payload, pid) != "mismatch"
+    instance = BridgeInstance(
+        pid=pid,
+        socket_path=_record_socket_path(registry_path, raw_socket_path),
+        registry_path=registry_path,
+        plugin_name=str(payload.get("plugin_name", "bn_agent_bridge")),
+        plugin_version=str(payload.get("plugin_version", "0")),
+        started_at=payload.get("started_at"),
+        meta=payload,
+        instance_id=instance_id,
+        instance_token=payload.get("instance_token"),
     )
+    try:
+        _send_request_to_instance(
+            instance, "write_gate_status",
+            params={"request_id": str(uuid.uuid4())},
+            timeout=0.2, connect_retries=1, resolved=True, idle_probe=True,
+            require_peer_pid=True,
+        )
+    except (BridgeError, OSError, ValueError) as exc:
+        if isinstance(exc, BridgeUnreachableError) and str(exc).startswith("bridge_stopped:"):
+            return None
+        if isinstance(exc, TimeoutError) or isinstance(exc.__cause__, TimeoutError):
+            return None
+        return False
+    return True
 
 
-def _instance_registered_elsewhere(instance_id: str) -> Path | None:
+class _BusyRegistry(NamedTuple):
+    cache_root: Path
+
+
+def _instance_registered_elsewhere(instance_id: str) -> Path | _BusyRegistry | None:
     """The cache root, other than the current one, where *instance_id* is registered.
 
     BN_CACHE_DIR moves the instance registry along with the database cache, so
     a shell that lost (or never had) the variable cannot see a bridge started
     under it, and the reverse (#996). Candidates are the platform default root
-    when BN_CACHE_DIR is set, plus the root every running bridge of that name
-    was launched under; one counts only when its ``instances/<id>.json`` names
-    a live bridge.
+    when BN_CACHE_DIR is set, plus roots read from same-user process environments.
+    A candidate counts only when its ``instances/<id>.json`` leads to the live
+    bridge's identity-checked socket, regardless of how that bridge was launched.
+    A timed-out or stopped candidate is retained as busy/unknown unless a later
+    candidate supplies a verified reply.
     """
     try:
         current = cache_home().resolve()
@@ -1287,16 +1297,21 @@ def _instance_registered_elsewhere(instance_id: str) -> Path | None:
     if os.environ.get("BN_CACHE_DIR"):
         candidates.append(default_cache_home())
     candidates.extend(_agent_cache_dirs_for(instance_id))
+    busy = None
     for candidate in candidates:
         try:
             if candidate.resolve() == current:
                 continue
-            if _registry_names_live_bridge(
-                    candidate / "instances" / f"{instance_id}.json", instance_id):
+            verdict = _registry_names_live_bridge(
+                candidate / "instances" / f"{instance_id}.json", instance_id
+            )
+            if verdict is True:
                 return candidate
+            if verdict is None:
+                busy = _BusyRegistry(candidate)
         except OSError:
             continue
-    return None
+    return busy
 
 
 def instance_not_found_message(instance_id: str, advice: str) -> str:
@@ -1309,6 +1324,12 @@ def instance_not_found_message(instance_id: str, advice: str) -> str:
     searched = instances_dir()
     head = f"No bridge instance found with id: {instance_id} (searched {searched})."
     elsewhere = _instance_registered_elsewhere(instance_id)
+    if isinstance(elsewhere, _BusyRegistry):
+        return (
+            f"{head} Instance {instance_id} may be busy or stopped under {elsewhere.cache_root}: "
+            "the registry probe could not verify its identity. "
+            "Wait and retry, or resume the bridge if stopped; do not start a duplicate bridge."
+        )
     if elsewhere is not None:
         return (
             f"{head} Instance {instance_id} is registered under {elsewhere}: "
@@ -1503,16 +1524,20 @@ def _instance_identity(instance: BridgeInstance) -> dict[str, Any]:
     }
 
 
-def _verify_socket_peer_pid(sock: socket.socket, instance: BridgeInstance) -> None:
-    if not hasattr(socket, "SO_PEERCRED"):
-        return
+def _verify_socket_peer_pid(
+    sock: socket.socket, instance: BridgeInstance, *, required: bool = False,
+) -> None:
     getter = getattr(sock, "getsockopt", None)
-    if not callable(getter):
+    if not hasattr(socket, "SO_PEERCRED") or not callable(getter):
+        if required:
+            raise BridgeError("Cannot establish the bridge socket's peer pid")
         return
     try:
         raw = getter(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
         peer_pid, _uid, _gid = struct.unpack("3i", raw)
-    except (OSError, ValueError, struct.error):
+    except (OSError, ValueError, struct.error) as exc:
+        if required:
+            raise BridgeError("Cannot establish the bridge socket's peer pid") from exc
         return
     if peer_pid != instance.pid:
         raise BridgeError(
@@ -1532,7 +1557,8 @@ def _verify_response_identity(
             f"expected {expected!r}, received {actual!r}; "
             "refusing data from a different or stale bridge"
         )
-def _send_cancel_request(instance: BridgeInstance, request_id: str) -> None:
+def _send_cancel_request(instance: BridgeInstance, request_id: str) -> bool:
+    """Return whether the cancellation request was sent, not whether it took effect."""
     payload = {
         "id": str(uuid.uuid4()),
         "op": "cancel_request",
@@ -1551,8 +1577,9 @@ def _send_cancel_request(instance: BridgeInstance, request_id: str) -> None:
             with contextlib.suppress(OSError):
                 while sock.recv(65536):
                     pass
+        return True
     except (OSError, BridgeError):
-        pass
+        return False
 
 
 def _send_request_to_instance(
@@ -1567,6 +1594,7 @@ def _send_request_to_instance(
     connect_retries: int = 4,
     resolved: bool = False,
     idle_probe: bool = False,
+    require_peer_pid: bool = False,
 ) -> dict[str, Any]:
     process_state = _process_state(instance.pid)
     if process_state in {"T", "t"}:
@@ -1657,6 +1685,8 @@ def _send_request_to_instance(
     # reached the bridge; one after it is the bridge's own (see
     # BridgeUnreachableError).
     reached = False
+    cancel_sent = False
+    send_attempted = False
     for attempt in range(connect_retries):
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -1671,7 +1701,14 @@ def _send_request_to_instance(
                     sock.settimeout(remaining)
                 sock.connect(str(instance.socket_path))
                 reached = True
-                _verify_socket_peer_pid(sock, instance)
+                if require_peer_pid:
+                    _verify_socket_peer_pid(sock, instance, required=True)
+                else:
+                    _verify_socket_peer_pid(sock, instance)
+                # sendall can transmit a complete JSON value and then time out
+                # before its newline. The bridge also accepts JSON at EOF, so
+                # delivery is uncertain from the first transmission attempt.
+                send_attempted = True
                 sock.sendall(encoded)
                 with contextlib.suppress(OSError):
                     sock.shutdown(socket.SHUT_WR)
@@ -1703,8 +1740,8 @@ def _send_request_to_instance(
             break
         except OSError as exc:
             last_error = exc
-            if isinstance(exc, TimeoutError):
-                _send_cancel_request(instance, str(payload["id"]))
+            if isinstance(exc, TimeoutError) and send_attempted:
+                cancel_sent = _send_cancel_request(instance, str(payload["id"]))
             if exc.errno not in TRANSIENT_SOCKET_ERRNOS or attempt == connect_retries - 1:
                 break
             delay = 0.05 * (attempt + 1)
@@ -1719,6 +1756,14 @@ def _send_request_to_instance(
                     break
             time.sleep(delay)
 
+    cancellation = (
+        "A cancel request was sent; the operation may keep running until "
+        "it checks for cancellation. "
+        if cancel_sent else
+        "A cancel request could not be sent; the operation may still be running. "
+        if send_attempted else
+        "The request was not sent. "
+    )
     if last_error is not None and chunks:
         # Bytes arrived and then the connection failed: a timeout or reset
         # mid-response. Don't fall through to json.loads on the truncated
@@ -1726,6 +1771,7 @@ def _send_request_to_instance(
         raise BridgeError(
             f"Connection to Binary Ninja bridge pid {instance.pid} failed mid-response for op '{op}' "
             f"after {len(b''.join(chunks))} bytes ({type(last_error).__name__}: {last_error})"
+            + (f". {cancellation}" if isinstance(last_error, TimeoutError) else "")
         ) from last_error
     if last_error is not None:
         if isinstance(last_error, TimeoutError):
@@ -1740,9 +1786,8 @@ def _send_request_to_instance(
             )
             raise BridgeError(
                 f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path}"
-                f"{timeout_suffix} (op '{op}'). The bridge may be busy with analysis; "
-                f"inspect progress with `bn -i {instance_selector(instance)} target info`, "
-                "then raise or disable the limit with "
+                f"{timeout_suffix} (op '{op}'). {cancellation}"
+                "Raise or disable the limit with "
                 "BN_REQUEST_TIMEOUT=<seconds|0> if the operation is intentionally long."
             ) from last_error
         # A failure before connect() ever succeeded (socket gone, nothing
@@ -1823,6 +1868,38 @@ def unwrap_result(response: Any, op: str) -> Any:
             f"determined. Compare the bridge and CLI builds with `bn doctor`."
         )
     return response["result"]
+
+
+def implicit_target_selector(response: Any) -> str:
+    """Pin the sole listed view; never substitute the volatile GUI focus."""
+    # Imported here because formatters itself uses BridgeError.
+    from .formatters import _render_target_choices
+    from .target_hint import SELECT_HINT_LINE
+
+    targets = unwrap_result(response, "list_targets")
+    if not isinstance(targets, list):
+        raise BridgeError(
+            "malformed bridge reply to list_targets (no target list); the "
+            "bridge may be stale -- restart it or pass an explicit --target"
+        )
+    if not targets:
+        raise BridgeError("No BinaryView targets are open")
+    if len(targets) > 1:
+        raise MultiTargetError(
+            "\n".join([
+                "This command requires --target when multiple targets are open.",
+                SELECT_HINT_LINE,
+                _render_target_choices(targets),
+            ])
+        )
+    row = targets[0]
+    target_id = row.get("target_id") if isinstance(row, dict) else None
+    if not target_id:
+        raise BridgeError(
+            "bridge listed the open target without a target_id; pass an "
+            "explicit --target"
+        )
+    return str(target_id)
 
 
 def _find_bn_agent() -> list[str]:
@@ -2279,6 +2356,36 @@ def send_request(
                 f"Timed out selecting a bridge instance for op {op!r}; "
                 "the end-to-end request deadline expired before connecting"
             )
+    # Only positive feature evidence permits a bare refresh to skip the legacy
+    # CLI count refusal. Use the selected registry, not a separate probe or
+    # second choose_instance call: both preflight and act must name this bridge.
+    capabilities = (
+        instance.meta.get("capabilities") if op == "refresh" and target is None else None
+    )
+    if op == "refresh" and target is None and not (
+        isinstance(capabilities, dict)
+        and capabilities.get("refresh_target_gate") is True
+    ):
+        listed = _send_request_to_instance(
+            instance,
+            "list_targets",
+            params={},
+            target=None,
+            timeout=timeout,
+            timeout_display=requested_timeout,
+            default_timeout=default_timeout,
+            connect_retries=connect_retries,
+            resolved=True,
+            idle_probe=idle_probe,
+        )
+        target = implicit_target_selector(listed)
+        if deadline is not None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise BridgeError(
+                    "Timed out resolving a legacy bridge target for refresh; "
+                    "the end-to-end request deadline expired before refresh"
+                )
     response = _send_request_to_instance(
         instance,
         op,

@@ -1260,6 +1260,7 @@ _BATCH_OP_PARITY = {
     "struct_field_delete": {"required": ("struct_name", "field_name"),                       "one_of": (),                           "enum": {},                                     "cli": "bn struct field delete"},
     "types_declare":       {"required": ("declaration",),                                    "one_of": (),                           "enum": {},                                     "cli": "bn types declare"},
     "function_create":     {"required": ("address",),                                        "one_of": (),                           "enum": {},                                     "cli": "bn function create"},
+    "function_delete":     {"required": ("address",),                                        "one_of": (),                           "enum": {},                                     "cli": "bn function delete"},
     "tag_add":             {"required": ("type",),                                           "one_of": (("function", "address"),),   "enum": {},                                     "cli": "bn tag add"},
     "tag_remove":          {"required": (),                                                  "one_of": (("tag_id", "address", "function"),), "enum": {},                             "cli": "bn tag remove"},
     "tag_type_create":     {"required": ("name", "icon"),                                    "one_of": (),                           "enum": {},                                     "cli": "bn tag type create"},

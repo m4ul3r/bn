@@ -49,6 +49,130 @@ from ._shared import (
 )
 
 
+def _function_delete(ctx, bv, address, *, exclusive=None):
+    """Journal an irreversible deletion and report only post-analysis facts.
+
+    The caller holds the write gate. Analysis runs outside the exclusive read
+    lock; a suppression override cannot be rolled back, even if analysis fails.
+    """
+    scope = exclusive or contextlib.nullcontext
+    addr = _parse_address(address)
+    requested = {"op": "function_delete", "address": hex(addr)}
+    warning = "No clean undo: BN retains a user override suppressing function creation here."
+    result = None
+    phase = "scope_enter"
+    try:
+        with scope():
+            fn = bv.get_function_at(addr)
+            if fn is None:
+                raise OperationFailure("invalid_request", "No function starts at this address.",
+                                       requested=requested, observed={"request_applied": False})
+            name = str(fn.name)
+            predecessors = {ref.function.start for ref in bv.get_code_refs(addr)
+                            if ref.function is not None and ref.function.start != addr}
+            # Cross-function fall-through need not have a code reference.
+            for candidate in bv.functions:
+                if candidate.start != addr and any(block.end == addr for block in candidate.basic_blocks):
+                    predecessors.add(candidate.start)
+            state = bv.begin_undo_actions()
+            # Establish the response BEFORE entering the irreversible API. All
+            # observations start unknown; failed readback must not invent state.
+            observed = {
+                "function_removed": None,
+                "function_at_entry": None,
+                "bodies_containing_deleted_entry": None,
+                "reanalysis_completed": False,
+                "clean_undo_available": False,
+            }
+            row = {
+                "op": "function_delete", "address": hex(addr), "function": name,
+                "status": "verification_failed", "irreversible_change": True,
+                "requested": requested, "observed": observed,
+            }
+            result = {
+                "preview": False, "success": False, "committed": True,
+                "rolled_back": False, "results": [row],
+                "affected_functions": [], "affected_types": [],
+            }
+            phase = "mark_dirty"
+            ctx.targets.mark_dirty(bv)
+            phase = "remove_user_function"
+            try:
+                bv.remove_user_function(fn)
+            except Exception as exc:
+                # The API itself can raise after writing. Retain that error
+                # while still closing its journal; the view is already dirty.
+                observed["apply_error"] = str(exc)
+                observed["error"] = str(exc)
+                observed["error_stage"] = phase
+            phase = "commit_undo_actions"
+            bv.commit_undo_actions(state)
+            for start in predecessors:
+                phase = "predecessor_lookup"
+                parent = bv.get_function_at(start)
+                if parent is not None:
+                    phase = "reanalyze"
+                    parent.reanalyze()
+            phase = "scope_exit"
+        phase = "update_analysis_and_wait"
+        bv.update_analysis_and_wait()
+        observed["reanalysis_completed"] = True
+        phase = "scope_enter"
+        with scope():
+            phase = "get_function_at"
+            remaining = bv.get_function_at(addr)
+            # Publish each observation only after its entire read succeeds.
+            entry_name = str(remaining.name) if remaining is not None else None
+            observed["function_removed"] = remaining is None
+            observed["function_at_entry"] = entry_name
+            phase = "get_functions_containing"
+            observed["bodies_containing_deleted_entry"] = [
+                {"address": hex(parent.start), "name": str(parent.name)}
+                for parent in bv.get_functions_containing(addr) if parent.start != addr
+            ]
+            phase = "scope_exit"
+    except Exception as exc:
+        if result is None:
+            raise  # Preflight never entered the irreversible mutation.
+        # One boundary covers EVERY later phase, including context-manager
+        # exit, journal closing, reanalysis, and lazy readback iteration.
+        observed.setdefault("error", str(exc))
+        observed.setdefault("error_stage", phase)
+        if phase == "update_analysis_and_wait":
+            observed["analysis_error"] = str(exc)
+        elif phase in ("predecessor_lookup", "reanalyze"):
+            observed["apply_error"] = str(exc)
+        if observed["error"] != str(exc):
+            observed["later_error"] = str(exc)
+            observed["later_error_stage"] = phase
+    except BaseException as exc:
+        if result is not None:
+            observed["error"] = str(exc)
+            observed["error_stage"] = phase
+        raise  # Dirty tracking precedes the write; cancellation still propagates.
+
+    removed = observed["function_removed"]
+    containing = observed["bodies_containing_deleted_entry"]
+    outcome = ("Function is absent at the entry." if removed is True else
+               "A function still starts at the deleted entry." if removed is False else
+               "Function entry readback is unavailable.")
+    if containing is None:
+        outcome += " Containing-body readback is unavailable."
+    elif containing:
+        outcome += " Entry is now inside: " + ", ".join(parent["name"] for parent in containing) + "."
+    else:
+        outcome += " No other analyzed body contains the deleted entry."
+    if "error" in observed:
+        outcome += f" Failed at {observed['error_stage']}: {observed['error']}."
+        if "later_error" in observed:
+            outcome += f" Failed at {observed['later_error_stage']}: {observed['later_error']}."
+    success = removed is True and "error" not in observed
+    result["success"] = success
+    row["status"] = "verified" if success else "verification_failed"
+    result["message"] = row["message"] = outcome + " " + warning
+    return result
+
+
 def _remove_created_function(ctx, bv, addr: int) -> bool:
     """Remove a just-created function and confirm it is gone.
 
@@ -311,11 +435,12 @@ _FALLTHROUGH_BRANCH_KINDS = frozenset({"FalseBranch"})
 
 
 def _create_fallthrough_source(bv, addr: int) -> int | None:
-    """The instruction that runs straight into *addr*, if one provably does.
+    """The preceding word's fall-through decode, if available.
 
-    #997 item 2: an address the previous instruction falls through into is
-    the middle of a body, not an entry -- the shape of an aarch64 `adrp` page
-    base nominated as a missing function. (Named apart from
+    #997 item 2: the previous decoded instruction may fall through into the
+    middle of a body, as with an aarch64 `adrp` page base nominated as a
+    missing function. Untyped literal-pool bytes may decode too; this is not
+    proof of code or a pool detector. (Named apart from
     `read_decompile._fallthrough_predecessor`, which asks about a FUNCTION's
     neighbour by different rules.) Only a FIXED-WIDTH ISA can name the
     previous instruction (on x86 any byte before *addr* might start one), so
@@ -386,7 +511,7 @@ def _falls_through(bv, arch, width: int, address: int) -> bool:
 
 
 def _with_fallthrough_note(row: dict, predecessor: int | None) -> dict:
-    """Disclose a create at an address reached by fall-through (#997 item 2).
+    """Disclose a preceding fall-through decode (#997 item 2).
 
     ONE builder for both create paths. The create still goes ahead -- BN's
     own boundaries are not authoritative there, and the address may be an
@@ -397,8 +522,8 @@ def _with_fallthrough_note(row: dict, predecessor: int | None) -> dict:
         return row
     row = dict(row)
     row["fallthrough_from"] = hex(predecessor)
-    warning = (f"{row.get('address', '<unknown>')} is reached by fall-through from "
-               f"{hex(predecessor)}; likely mid-function, not an entry")
+    warning = (f"{row.get('address', '<unknown>')}: preceding word decodes as a "
+               f"fall-through instruction at {hex(predecessor)}; may be mid-function")
     row["note"] = f"{row['note']}; {warning}" if row.get("note") else warning
     return row
 

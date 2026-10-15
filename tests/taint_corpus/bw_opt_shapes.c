@@ -41,7 +41,7 @@ void read_or_memset(int fd, int flag) {
     else
         memset(buf, 0, sizeof buf);  /* -O1: `__builtin_memset`, a LITERAL fill */
     buf[63] = 0;
-    popen(buf, "r");                /* SINK: both arms are written */
+    popen(buf, "r");                /* SINK: short read arm remains uncertain */
 }
 
 void literal_init(const char *host) {

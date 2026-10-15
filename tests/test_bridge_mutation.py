@@ -1110,6 +1110,158 @@ def test_op_set_prototype_hints_to_declare_unknown_struct(monkeypatch):
     assert "syntaxerror" not in message    # raw exception class must not leak
 
 
+@pytest.mark.parametrize("prototype,replacement", [
+    ("int run(struct Widget* this)", "self"),
+    ("int32_t c_plain(struct Widget* this, int self)", "self_1"),
+    ("int run(struct Widget* this, int self, int self_1)", "self_2"),
+    ("int self(struct Widget* this, int self_2)", "self_1"),
+    ("int run(struct Widget* this, struct self* p, int self_1)", "self_2"),
+    ("int run(struct Widget* this, int myself, int self_10)", "self"),
+])
+def test_proto_set_this_parameter_suggests_only_free_self_1013(
+        monkeypatch, prototype, replacement):
+    """The consumer gets one spelling correction, not a local-retype workaround."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "run")
+    bv = _FakeBV(functions=[fn], types_={"Widget": _FakeType("struct Widget")})
+
+    def reject(text):
+        raise SyntaxError("error: string.hpp:1:29 invalid parameter name: "
+                          "'this' is a keyword\n"
+                          "error: string.hpp:1:16 unknown type name 'Widget'")
+
+    monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._apply_operation(bv, {
+            "op": "set_prototype", "identifier": "run", "prototype": prototype,
+        })
+
+    assert exc.value.status == "invalid_request"
+    assert exc.value.message.startswith(f"could not parse prototype {prototype!r}")
+    assert exc.value.message.endswith(f"Rename that parameter to `{replacement}`.")
+    assert exc.value.message.count("Rename that parameter") == 1
+    for noise in ("local retype", "declare it first", "Closest existing type", "or keep"):
+        assert noise not in exc.value.message
+    assert fn.has_user_type is False
+    assert str(fn.type) == "int32_t()"
+
+
+@pytest.mark.parametrize("prototype", [
+    "int run(struct `demo::Box<std::pair<int, demo::Node> >::Value`* self)",
+    "struct `demo::Box<std::pair<int, demo::Node> >::Value`* run(void)",
+])
+def test_proto_set_nested_template_parse_failure_is_invalid_request_1013(
+        monkeypatch, prototype):
+    """Even a failing named-type fallback preserves the prototype diagnostic."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "run")
+    bv = _FakeBV(functions=[fn], qualified_types_={
+        ("demo", "Box<std::pair<int, demo::Node> >", "Value"):
+            _FakeType("struct demo::Box<std::pair<int, demo::Node> >::Value"),
+    })
+
+    def reject(text):
+        raise SyntaxError("error: string.hpp:1:19 expected unqualified-id")
+
+    def broken_fallback(view, text):
+        raise SyntaxError("synthetic named-type fallback failure")
+
+    monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
+    monkeypatch.setattr(bridge.mutation_engine, "_resolve_named_type_string",
+                        broken_fallback)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._apply_operation(bv, {
+            "op": "set_prototype", "identifier": "run", "prototype": prototype,
+        })
+
+    assert exc.value.status == "invalid_request"
+    assert exc.value.message.startswith(f"could not parse prototype {prototype!r}")
+    assert "expected unqualified-id" in exc.value.message
+    assert "SyntaxError" not in exc.value.message
+    assert "internal error" not in exc.value.message
+    assert fn.has_user_type is False
+    assert str(fn.type) == "int32_t()"
+
+
+
+
+def test_named_type_fallback_exception_preserves_original_parse_error_1013(monkeypatch):
+    """An optional resolver failure cannot escape as an internal SyntaxError."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+
+    def reject(text):
+        raise SyntaxError("error: string.hpp:1:1 unknown type name 'nosuch'")
+
+    def broken_fallback(view, text):
+        raise SyntaxError("synthetic named-type fallback failure")
+
+    monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
+    monkeypatch.setattr(bridge.mutation_engine, "_resolve_named_type_string",
+                        broken_fallback)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        bridge.mutation_engine._parse_type_or_hint(
+            instance.ctx, bv, {"op": "local_retype", "new_type": "nosuch*"},
+            "nosuch*", label="type")
+
+    assert exc.value.status == "invalid_request"
+    assert "unknown type name 'nosuch'" in exc.value.message
+    assert "synthetic named-type fallback failure" not in exc.value.message
+    assert "SyntaxError" not in exc.value.message
+
+
+def test_proto_set_accepts_namespaced_named_function_fallback_1026(monkeypatch):
+    """A registered function type remains valid when the native parser refuses it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callback = _FakeType("int32_t(int32_t value)", type_class="FunctionTypeClass")
+    bv = _FakeBV(qualified_types_={("ns", "Callback"): callback})
+
+    def reject(text):
+        raise SyntaxError("error: string.hpp:1:1 unknown type name 'ns'")
+
+    monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
+    parsed = bridge.mutation_engine._parse_prototype(
+        instance.ctx, bv, {"op": "set_prototype", "prototype": "ns::Callback"})
+
+    assert parsed is callback
+
+
+@pytest.mark.parametrize("prototype", [
+    "void* method(struct ns::Cls* const self, void* p)",
+    "void* ns::Cls::method(struct ns::Cls* const self, void* p)",
+    "void* `ns::Cls::method`(struct ns::Cls* const self, void* p)",
+])
+def test_proto_set_display_name_does_not_shadow_type_hint_1026(monkeypatch, prototype):
+    """The consumer gets the parameter type's spelling, not the method's namespace."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "method")
+    bv = _FakeBV(functions=[fn], types_={
+        "ns::Cls": _FakeType("struct ns::Cls"),
+        "ns::Cls::methods": _FakeType("struct ns::Cls::methods"),
+    })
+
+    def reject(text):
+        raise SyntaxError("error: string.hpp:1:20 use of undeclared identifier 'ns'")
+
+    monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._apply_operation(bv, {
+            "op": "set_prototype", "identifier": "method", "prototype": prototype,
+        })
+
+    assert exc.value.status == "invalid_request"
+    assert exc.value.message.startswith(f"could not parse prototype {prototype!r}")
+    assert "Closest existing type(s)" in exc.value.message
+    assert "struct `ns::Cls`" in exc.value.message
+    assert "ns::Cls::methods" not in exc.value.message
+    assert fn.has_user_type is False
+
+
 def test_batch_struct_field_accepts_type_name_alias(monkeypatch):
     """A struct_field_* batch op may use `type_name` (the key the output /
     affected_types surface uses, and an analyst's natural reflex) as an alias
@@ -4445,7 +4597,7 @@ def test_a_qualified_prototype_name_is_quoted_999(monkeypatch, text, expected):
 
 @pytest.mark.parametrize("detail,hint", [
     ("error: string.hpp:1:32 invalid parameter name: 'this' is a keyword",
-     "bn local retype <function> this"),
+     "Rename that parameter to `self`"),
     ("error: string.hpp:1:10 out-of-line declaration of 'run' does not match any "
      "declaration in 'Cls'", "must be quoted with backticks"),
     ("error: string.hpp:1:11 unknown type name 'nosuch'", "declare it first"),

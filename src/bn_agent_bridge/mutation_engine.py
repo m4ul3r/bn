@@ -77,6 +77,7 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "struct_field_delete": ("struct_name", "field_name"),
     "types_declare": ("declaration",),
     "function_create": ("address",),
+    "function_delete": ("address",),
     "tag_add": ("type",),
     "tag_remove": (),
     "tag_type_create": ("name", "icon"),
@@ -145,7 +146,7 @@ _VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
 _BATCH_OP_NAMES = (
     "rename_symbol", "set_comment", "delete_comment", "set_prototype",
     "local_rename", "local_retype", "data_retype", "struct_field_set", "struct_field_rename",
-    "struct_field_delete", "types_declare", "function_create", "tag_add", "tag_remove",
+    "struct_field_delete", "types_declare", "function_create", "function_delete", "tag_add", "tag_remove",
     "tag_type_create", "tag_type_remove",
 )
 
@@ -2742,6 +2743,26 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
     operations = [_normalize_struct_alias(op) for op in operations]
     # #652: reject a same-key-twice manifest BEFORE touching the view.
     _reject_duplicate_write_keys(ctx, operations)
+    deletions = [op for op in operations
+                 if isinstance(op, dict) and op.get("op") == "function_delete"]
+    if deletions:
+        with exclusive_scope():
+            bv = ctx._resolve_view(selector)
+            refuse_quick_view(bv, requested={"op": "function_delete"})
+            if preview or len(operations) != 1:
+                raise OperationFailure(
+                    "unsupported",
+                    "function delete has no clean undo: remove_user_function leaves a "
+                    "persistent suppression override. --preview and combining deletion "
+                    "with other batch operations are refused before writing. Apply one "
+                    "function_delete operation without --preview, then read back the outcome.",
+                    requested={"op": "function_delete"},
+                    observed={"request_applied": False},
+                )
+            _validate_operation_request(ctx, deletions[0], index=0)
+        return create_comments._function_delete(
+            ctx, bv, deletions[0]["address"], exclusive=exclusive_scope)
+
 
     with exclusive_scope():
         bv = ctx._resolve_view(selector)
@@ -3725,6 +3746,18 @@ def _type_spelling_hint(bv, text: str, detail: str, *, limit: int = 5) -> str:
     if not population:
         return ""
     suggestions: list[str] = []
+    # A displayed prototype may name the same namespace in its function name
+    # and a parameter type. Only types should participate in spelling hints.
+    text = str(text)
+    span = _qualified_declarator_span(text)
+    if span is None:
+        head, sep, _ = text.partition("(")
+        quoted = re.search(r"`[^`]*::[^`]*`\s*$", head) if sep else None
+        if quoted is not None and head[:quoted.start()].strip():
+            span = quoted.span()
+    if span is not None:
+        start, end = span
+        text = text[:start] + " " + text[end:]
     for token in dict.fromkeys(tokens):
         # Widen a leading component back to the qualified name it started.
         full = token
@@ -3768,11 +3801,12 @@ def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: s
     except OperationFailure:
         raise
     except Exception as exc:
-        # BN's C type-string parser rejects a ::-qualified user type even when it
-        # is defined and resolvable (every recovered C++ class type is
-        # namespaced). Before erroring, try to build the type from an existing
-        # named type, optionally wrapped in trailing '*' pointer levels (#200).
-        resolved = _resolve_named_type_string(bv, str(type_text))
+        # An optional fallback failure must not replace the original parse
+        # error with an internal exception (#1013 items 6-7).
+        try:
+            resolved = _resolve_named_type_string(bv, str(type_text))
+        except Exception:
+            resolved = None
         if resolved is not None:
             return resolved, None
         # Collapse BN's multi-line parser output ("error: ...\n1 error
@@ -3807,10 +3841,14 @@ def _parse_failure_hint(bv, text: str, detail: str) -> str:
     The #962 existing-type spelling still wins over the generic ``::`` advice
     when it can name the type the string meant."""
     if "'this' is a keyword" in detail:
-        return (" `this` is a keyword the parser rejects as a parameter name: name "
-                "the parameter something else (e.g. self), or keep the existing "
-                "`this` and set its type with `bn local retype <function> this "
-                "'<type>'`.")
+        identifiers = set(re.findall(r"[A-Za-z_]\w*", text))
+        replacement = "self"
+        suffix = 0
+        while replacement in identifiers:
+            suffix += 1
+            replacement = f"self_{suffix}"
+        return (" `this` is a keyword the parser rejects as a parameter name. "
+                f"Rename that parameter to `{replacement}`.")
     spelling = _type_spelling_hint(bv, text, detail)
     if spelling:
         return spelling

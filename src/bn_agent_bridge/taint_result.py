@@ -152,13 +152,13 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
                 "sites were never followed; narrow the sink or inspect the "
                 "capped sites named in the caller_sites_truncated leaf")
     if "memory_chain" in causes:
-        # Backward-only cause: the local-buffer writer walk ran out of
-        # memory-SSA versions before reaching the function entry, so writers
-        # older than the cut are absent from the slice.
-        return ("the backward walk through a local buffer's writers exhausted "
-                "its memory-chain budget -- older writers were never examined; "
-                "seed closer to the sink or inspect the earlier writes named in "
-                "the address_of_local_unresolved leaf")
+        # A cut may interrupt discovery or a fixed-point sweep. Existing
+        # writer rows need not be missing for the proof to be incomplete.
+        return ("the backward proof through a local buffer's writers exhausted "
+                "its shared memory-chain budget -- graph discovery or the "
+                "coverage/escape solve is unfinished; seed closer to the sink "
+                "or inspect the writes and unresolved calls named in the "
+                "address_of_local_unresolved leaf")
     return "depth/recursion cutoff"
 
 
@@ -306,12 +306,19 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
             "variadic, which the engine does not follow -- its prototype is correct, "
             "so do not redeclare it; inspect how the callee consumes its va_list or "
             "re-run `bn taint forward` seeded inside it")
+    elif unmodeled_reached and not ext_no_model and all(
+            lf.get("cause") == "signature_under_recovered"
+            for lf in leaves if str(lf.get("kind", "?")) in UNRESOLVED):
+        next_action = (
+            "confirmed extra arguments disagree with a determined nonvariadic "
+            "declaration; recover the actual callee prototype with `bn proto set` "
+            "and re-run, or seed inside the callee to inspect the incomplete flow")
     elif unmodeled_reached:
         next_action = (
-            "taint reached an unmodeled call frontier (an unresolved/in-binary "
-            "callee or an external callee with no taint model); recover the "
-            "callee prototype with `bn proto set` or re-run `bn taint forward` "
-            "seeded inside it to follow the flow further")
+            "taint reached an unmodeled call frontier; inspect the frontier leaves "
+            "and callee argument consumption, or re-run `bn taint forward` seeded "
+            "inside it. Repair a prototype only where confirmed extra arguments "
+            "disagree with a determined nonvariadic declaration")
     elif coarse_n:
         next_action = (
             "taint escaped through a coarse-memory frontier (a pointer/store not "
@@ -474,12 +481,28 @@ def backward_diagnostics(
         # to `bn proto set` for a walk that simply ran out of budget (round 3).
         next_action = _truncation_hint(truncation_cause)
     elif unresolved_n:
+        unresolved_leaves = [lf for lf in leaves or [] if lf.get("kind") in UNRESOLVED]
         next_action = (
-            "the walk bottomed out at an unresolved def (an indirect call, a "
-            "field load the engine could not key, or a local buffer whose "
-            "contents it could not account for); recover the callee prototype "
-            "with `bn proto set`, seed inside the producing function, or "
-            "re-run `bn taint forward --source var:<buf>` on the buffer")
+            "the walk bottomed out at an unresolved definition; inspect the frontier "
+            "leaves and argument consumption, seed inside the producing function, "
+            "or re-run `bn taint forward --source var:<buf>` on the buffer")
+        if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
+               for lf in unresolved_leaves):
+            next_action += (
+                ". A known call may have written the local buffer; inspect and model "
+                "that call's buffer writes and input propagation, or seed inside it")
+        elif unresolved_leaves and not unresolved_origins and all(
+                lf.get("cause") == "varargs_not_followed" for lf in unresolved_leaves):
+            next_action += (
+                ". The callee is already declared variadic; the engine does not follow "
+                "its variadic tail. Inspect its va_list consumption rather than "
+                "redeclaring the prototype")
+        elif unresolved_leaves and not unresolved_origins and all(
+                lf.get("cause") == "signature_under_recovered" for lf in unresolved_leaves):
+            next_action += (
+                ". The callee is determined nonvariadic; apply `bn proto set` only "
+                "where independent argument evidence demonstrates a declaration "
+                "discrepancy, then re-run")
     elif coarse_n:
         next_action = (
             "the walk crossed a coarse-memory frontier (a pointer/store not "

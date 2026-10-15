@@ -47,6 +47,43 @@ def test_registry_records_boot_id_and_process_start_time(instance):
     assert payload["boot_id"] == boot_id()
 
 
+def test_registry_updates_preserve_bridge_start_time(instance, monkeypatch, tmp_path):
+    module = __import__(type(instance).__module__, fromlist=["datetime"])
+    instance._write_registry()
+    started = json.loads(instance.registry_path.read_text())["started_at"]
+
+    class LaterClock:
+        @staticmethod
+        def now(tz):
+            return types.SimpleNamespace(isoformat=lambda: "2099-01-01T00:00:00+00:00")
+
+    monkeypatch.setattr(module, "datetime", LaterClock)
+    project = tmp_path / "project"
+    project.mkdir()
+    instance._associate_project_roots([str(project)])
+    updated = json.loads(instance.registry_path.read_text())
+    assert updated["project_roots"] == [str(project)]
+    assert updated["started_at"] == started
+
+
+@pytest.mark.parametrize("counts,has_note", [
+    ((0, 0, 0), False),
+    ((1, 0, 0), True),
+    ((0, 1, 0), True),
+    ((0, 0, 1), True),
+])
+def test_load_annotation_note_only_discloses_inherited_work(monkeypatch, counts, has_note):
+    module = _load_bridge(monkeypatch)
+    record = dict(zip(("comments", "function_comments", "analyst_symbols"), counts))
+    record.update(path="/tmp/sample.bndb", placeholder_symbols=4)
+    note = module._opened_annotation_note(record)
+    assert (note is not None) is has_note
+    if has_note:
+        assert f"{counts[0]} comment(s)" in note
+        assert f"{counts[1]} function doc(s)" in note
+        assert f"{counts[2]} analyst symbol(s)" in note
+
+
 # --------------------------------------------------------------------------
 # Teardown latch: no publication after stop()
 # --------------------------------------------------------------------------
