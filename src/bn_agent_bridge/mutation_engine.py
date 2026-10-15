@@ -2586,9 +2586,16 @@ def refuse_quick_view(bv, *, requested: dict[str, Any],
         )
 
 
-def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
-              exclusive=None):
-    """Judge imports from one request-level ID delta, independent of attribution."""
+@contextlib.contextmanager
+def _import_outcome(ctx, selector, preview: bool, *, exclusive=None, direct: bool = False):
+    """Share one retained-ID outcome across a request, including direct previews.
+
+    The caller holds its write gate; only the two type snapshots take the target
+    lock. A nested engine call keeps this request's baseline and finalizer.
+    """
+    if _IMPORT_TRACE.get() is not None or (direct and not preview):
+        yield lambda result: result
+        return
     token = _PREVIEW_PARSE.set(bool(preview))
     trace: dict[str, Any] = {
         "imports": {}, "library_imports": {}, "parsed": set(), "import_errors": {},
@@ -2597,69 +2604,103 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     trace_token = _IMPORT_TRACE.set(trace)
     exclusive_scope = exclusive if exclusive is not None else contextlib.nullcontext
     try:
+        if direct:
+            with exclusive_scope():
+                bv = ctx._resolve_view(selector)
+                baseline = _declare_batch_type_names(bv, [])
+                trace.update(bv=bv, baseline=baseline, operations=[])
+                _start_import_observer(bv, trace)
         try:
-            result = _apply_batch(ctx, selector, preview, operations, exclusive=exclusive)
+            yield lambda result: _finalize_import_outcome(
+                ctx, trace, result, preview, exclusive_scope)
         except Exception as exc:
-            # A preflight/snapshot can parse before an undo group exists. Even
-            # this exit must disclose its irreversible imports and their owner.
             with exclusive_scope():
                 _collect_import_outcome(trace)
             if trace["library_imports"]:
                 exc.kept_library_imports = sorted(trace["library_imports"])
                 if isinstance(exc, OperationFailure):
                     exc.observed["kept_library_imports"] = exc.kept_library_imports
-            if (not trace["library_imports"] or trace.get("transaction_started")
-                    or not isinstance(exc, OperationFailure)):
-                raise
-            ops = trace["operations"]
-            failed_id = trace.get("failed_op")
-            rows = [
-                _operation_failure_result(ctx, op, exc)
-                if id(op) == failed_id and isinstance(exc, OperationFailure)
-                else _unattempted_results(ctx, [op])[0]
-                for op in ops
-            ]
-            _report_library_imports(trace["bv"], trace["baseline"], rows)
-            if preview:
-                rows = _fail_importing_preview(rows)
-            result = {
-                "preview": preview, "success": False, "committed": False,
-                "rolled_back": True, "message": str(exc), "results": rows,
-                "affected_functions": [], "affected_types": [],
-                "affected_summary": {"referenced": 0, "reflowed": 0},
-            }
-        with exclusive_scope():
-            _collect_import_outcome(trace)
-        if trace["parsed"] or trace["library_imports"]:
-            _report_library_imports(trace["bv"], trace["baseline"], result["results"])
-        if trace["library_imports"]:
-            if preview or not result.get("committed"):
-                result["kept_library_imports"] = sorted(trace["library_imports"])
-            if trace["unattributed"]:
-                result["unattributed_library_imports"] = sorted(trace["unattributed"])
-            if preview:
-                explanation = (result.get("message") or "") if not result.get("success") else (
-                    "Preview changes were reverted." if result.get("rolled_back")
-                    else "Preview restoration did not complete.")
-                result["results"] = _fail_importing_preview(result["results"])
-                result["results"] = _restamp_reverted_siblings(
-                    ctx, result["results"], bool(result.get("rolled_back")))
-                result["success"] = False
-                result["status"] = "unsupported"
-                result["message"] = (
-                    f"{explanation} Cannot --preview retained new types: types "
-                    "stay in the view (a rollback cannot remove them).").strip()
-                if trace["unattributed"]:
-                    result["message"] += (
-                        " No operation attribution is available for: "
-                        + ", ".join(sorted(trace["unattributed"])) + ".")
-        return result
+            raise
     finally:
         try:
             _stop_import_observer(trace)
         finally:
             _IMPORT_TRACE.reset(trace_token)
             _PREVIEW_PARSE.reset(token)
+
+
+def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
+              exclusive=None):
+    """Judge imports from one request-level ID delta, independent of attribution."""
+    with _import_outcome(ctx, selector, preview, exclusive=exclusive) as finish:
+        return finish(_apply_mutation(ctx, selector, preview, operations, exclusive=exclusive))
+
+
+def _apply_mutation(ctx, selector, preview: bool, operations, *, exclusive=None):
+    trace = _IMPORT_TRACE.get()
+    exclusive_scope = exclusive if exclusive is not None else contextlib.nullcontext
+    try:
+        result = _apply_batch(ctx, selector, preview, operations, exclusive=exclusive)
+    except Exception as exc:
+        # A preflight/snapshot can parse before an undo group exists. Even
+        # this exit must disclose its irreversible imports and their owner.
+        with exclusive_scope():
+            _collect_import_outcome(trace)
+        if trace["library_imports"]:
+            exc.kept_library_imports = sorted(trace["library_imports"])
+            if isinstance(exc, OperationFailure):
+                exc.observed["kept_library_imports"] = exc.kept_library_imports
+        if (not trace["library_imports"] or trace.get("transaction_started")
+                or not isinstance(exc, OperationFailure)):
+            raise
+        ops = trace["operations"]
+        failed_id = trace.get("failed_op")
+        rows = [
+            _operation_failure_result(ctx, op, exc)
+            if id(op) == failed_id and isinstance(exc, OperationFailure)
+            else _unattempted_results(ctx, [op])[0]
+            for op in ops
+        ]
+        _report_library_imports(trace["bv"], trace["baseline"], rows)
+        if preview:
+            rows = _fail_importing_preview(rows)
+        result = {
+            "preview": preview, "success": False, "committed": False,
+            "rolled_back": True, "message": str(exc), "results": rows,
+            "affected_functions": [], "affected_types": [],
+            "affected_summary": {"referenced": 0, "reflowed": 0},
+        }
+    return result
+
+
+def _finalize_import_outcome(ctx, trace, result, preview: bool, exclusive_scope):
+    with exclusive_scope():
+        _collect_import_outcome(trace)
+    if trace["parsed"] or trace["library_imports"]:
+        _report_library_imports(trace["bv"], trace["baseline"], result["results"])
+    if trace["library_imports"]:
+        if preview or not result.get("committed"):
+            result["kept_library_imports"] = sorted(trace["library_imports"])
+        if trace["unattributed"]:
+            result["unattributed_library_imports"] = sorted(trace["unattributed"])
+        if preview:
+            explanation = (result.get("message") or "") if not result.get("success") else (
+                "Preview changes were reverted." if result.get("rolled_back")
+                else "Preview completed without committing." if "rolled_back" not in result
+                else "Preview restoration did not complete.")
+            result["results"] = _fail_importing_preview(result["results"])
+            result["results"] = _restamp_reverted_siblings(
+                ctx, result["results"], bool(result.get("rolled_back")))
+            result["success"] = False
+            result["status"] = "unsupported"
+            result["message"] = (
+                f"{explanation} Cannot --preview retained new types: types "
+                "stay in the view (a rollback cannot remove them).").strip()
+            if trace["unattributed"]:
+                result["message"] += (
+                    " No operation attribution is available for: "
+                    + ", ".join(sorted(trace["unattributed"])) + ".")
+    return result
 
 
 def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
@@ -2720,8 +2761,10 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
         library_baseline = _declare_batch_type_names(bv, operations)
         trace = _IMPORT_TRACE.get()
         if trace is not None:
-            trace.update(bv=bv, baseline=library_baseline, operations=operations)
-            _start_import_observer(bv, trace)
+            if "baseline" not in trace:
+                trace.update(bv=bv, baseline=library_baseline)
+                _start_import_observer(bv, trace)
+            trace["operations"] = operations
         # #650: validate EVERY op's shape before applying ANY. The batch is atomic, so a
         # guessed op or field name in op 13 previously rolled back 12 good ops -- and with
         # no argparse layer on this path, guessing is the norm, not the exception. It runs
@@ -4809,6 +4852,8 @@ def _declare_batch_type_names(bv, operations) -> _TypeBaseline | None:
         isinstance(op, dict) and op.get("op") in {
             "types_declare", "struct_field_set", "set_prototype", "local_retype", "data_retype",
         } for op in operations)
+    if "baseline" in trace:
+        return trace["baseline"]
     return _TypeBaseline(_view_type_names(bv) or set(), _view_type_ids(bv))
 
 

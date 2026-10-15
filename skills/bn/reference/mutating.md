@@ -47,6 +47,17 @@ A declaration that only *references* an existing type (`struct Alpha* a;`, ``str
 
 The common no-import path takes one initial type-ID snapshot and one final snapshot for the whole request, not scans around individual operations or repeated parses. Lightweight SDK type-definition notifications record ID/operation evidence; preview attribution is resolved for retained IDs in the final difference without requiring recognized library provenance. Events outside an operation's own SDK thread remain unowned. This avoids replaying irreversible imports or predicting parser behavior. `parse_performed: true` separately discloses actual parsing, including a snapshot parse for an unattempted write that imported nothing; `not_attempted` describes the write, not the snapshot parse.
 
+Preview entry-point coverage:
+
+| Entry point | Retained-ID guard |
+|---|---|
+| Symbol rename (including alias), comments, prototypes, locals, data, structs, declarations, tags and batch apply | Mutation-engine request guard |
+| Standalone `function create --preview` | Same guard around the direct create/analysis/revert path |
+| `go rename --preview`, including no candidates | Same guard around recovery and direct chunked renaming |
+| `class apply-types --preview`, including planning/no-op results | Same guard around planning; engine-routed writes reuse that request scope |
+| `spill gc --dry-run` | Filesystem-only inspection; no BinaryView or bridge mutation is performed |
+
+
 Live import reporting and provenance classification remain limited to recognized attached-library or lookup metadata. An import from an explicitly selected platform's unattached `SYSCALLS` library historically escaped that classifier. The conservative preview ID rule now catches its retained IDs without classifying their provenance; it does not fix the live classifier. Explicit-platform provenance classification and the remaining #1012 items 2–3 work are left to a split follow-up for the coordinator to file.
 
 For an unattributed, batch-level retained-ID failure, per-operation failed counts may be zero because no particular operation is blamed; `success`/`ok` remain false, exit status is 3, and `first_error` plus the retained-type list explain the failure.

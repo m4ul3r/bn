@@ -5450,3 +5450,195 @@ result = state
         # to routine bookkeeping, but reject the review's ~6x declaration and
         # ~3x field-set regressions without a machine-specific seconds budget.
         assert tracked < control * max_ratio, (samples, wall_samples, max_ratio)
+
+
+class TestDirectPreviewRetainedTypes1031:
+    """Direct mutation entry points obey the same final-ID rule as batches."""
+
+    @staticmethod
+    def _state(shared_bn):
+        response = shared_bn.run("py", "exec", "--code", """
+import json
+print(json.dumps({
+    'ids': {str(i): str(bv.get_type_name_by_id(i))
+            for i in bv.type_container.type_ids},
+    'functions': {hex(f.start): f.name for f in bv.functions},
+}))
+""")
+        assert response.returncode == 0, response.stdout + response.stderr
+        return json.loads(response.stdout)
+
+    @staticmethod
+    def _retained(before, after, result, names):
+        assert {i: after["ids"].get(i) for i in before["ids"]} == before["ids"]
+        added = {i: name for i, name in after["ids"].items() if i not in before["ids"]}
+        assert sorted(set(added.values())) == sorted(names), (added, result)
+        assert result["success"] is False, result
+        assert result["status"] == "unsupported", result
+        assert result["preview"] is True and result["committed"] is False, result
+        assert result["kept_library_imports"] == sorted(names), result
+        assert result["unattributed_library_imports"] == sorted(names), result
+
+    @pytest.mark.parametrize("syscall", [True, False], ids=["syscall-residue", "preexisting-types-clean"])
+    def test_standalone_function_create_preview(self, shared_bn, tmp_path, syscall):
+        # The public round-four reproducer: the second .text syscall stub is
+        # deliberately unreferenced and lacks a symbol after strip. Obtain its
+        # address before stripping rather than depending on compiler layout.
+        source = tmp_path / "stubs.c"
+        source.write_text("""
+__attribute__((section(".text"), used, aligned(16)))
+unsigned char stub_blob[] = {
+  0x48,0x89,0xf8, 0xb8,0x3f,0x00,0x00,0x00, 0x0f,0x05, 0xc3,
+  0x48,0x89,0xf8, 0xb8,0x63,0x00,0x00,0x00, 0x0f,0x05, 0xc3
+};
+int main(int c, char **v) { (void)v; return c; }
+""", encoding="utf-8")
+        binary = tmp_path / "stubs"
+        built = subprocess.run(
+            ["cc", "-O2", "-fno-pie", "-no-pie", str(source), "-o", str(binary)],
+            capture_output=True, text=True)
+        assert built.returncode == 0, built.stderr
+        symbols = subprocess.run(["nm", "-n", str(binary)], capture_output=True, text=True)
+        assert symbols.returncode == 0, symbols.stderr
+        addresses = {parts[2]: int(parts[0], 16)
+                     for line in symbols.stdout.splitlines()
+                     if len(parts := line.split()) == 3}
+        address = addresses["stub_blob"] + 11
+        stripped = subprocess.run(["strip", str(binary)], capture_output=True, text=True)
+        assert stripped.returncode == 0, stripped.stderr
+        shared_bn.load(binary, copy=False)
+        if not syscall:
+            # The identical fresh target is clean when its syscall types already
+            # exist: pre-existing IDs must not turn a reversible preview into a failure.
+            primed = shared_bn.run("py", "exec", "--code", """
+library = next(x for x in bv.platform.type_libraries if x.name == 'SYSCALLS')
+assert bv.import_library_type('sysinfo', library) is not None
+bv.update_analysis_and_wait()
+""")
+            assert primed.returncode == 0, primed.stdout + primed.stderr
+        before = self._state(shared_bn)
+        assert hex(address) not in before["functions"], before
+        response = shared_bn.run(
+            "function", "create", hex(address), "--preview", "--format", "json")
+        assert response.returncode == (3 if syscall else 0), response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        after = self._state(shared_bn)
+        assert hex(address) not in after["functions"], (result, after)
+        assert after["functions"] == before["functions"], (result, before, after)
+        assert result["rolled_back"] is True, result
+        if syscall:
+            self._retained(before, after, result, [
+                "__kernel_long_t", "__kernel_ulong_t", "__u16", "__u32", "sysinfo"])
+        else:
+            assert result["success"] is True and result["committed"] is False, result
+            assert result["results"][0]["status"] == "verified", result
+            assert after["ids"] == before["ids"]
+            assert not result.get("kept_library_imports"), result
+
+    @pytest.mark.parametrize("retained", [True, False], ids=["retained", "clean"])
+    @pytest.mark.parametrize("candidates", [True, False], ids=["rename", "no-candidates"])
+    def test_go_rename_preview_guards_recovery_and_preserves_counters(
+            self, shared_bn, retained, candidates):
+        # No Go binary is required: replace only pcln recovery, not the actual
+        # CLI/direct rename implementation, its live readback or rollback.
+        shared_bn.load(ADD_BINARY)
+        setup = shared_bn.run("py", "exec", "--code", """
+f = next(f for f in bv.functions if f.name == 'mul')
+f.name = f'sub_{f.start:x}'
+""")
+        assert setup.returncode == 0, setup.stdout + setup.stderr
+        before = self._state(shared_bn)
+        try:
+            installed = shared_bn.run("py", "exec", "--code", f"""
+import binaryninja as bn
+from bn_agent_bridge import read_go
+original = read_go._go_functions
+def synthetic_recovery(ctx, selector, _original=original):
+    view = ctx._resolve_view(selector)
+    auto = next(f for f in view.functions if f.name == f'sub_{{f.start:x}}')
+    user = next(f for f in view.functions if f.name == 'add')
+    named = next(f for f in view.functions if f.name == 'main')
+    if {retained!r}:
+        view.define_user_type('RetainedGo1031', bn.Type.int(4))
+    return {{'defined_count': 4, 'items': [
+        {{'address': hex(auto.start), 'name': 'probe.Go1031' if {candidates!r} else auto.name, 'defined': True}},
+        {{'address': hex(user.start), 'name': 'probe.User1031', 'defined': True}},
+        {{'address': hex(named.start), 'name': named.name, 'defined': True}},
+        {{'address': hex(auto.start + 1), 'name': 'probe.Interior1031', 'defined': True}},
+    ]}}
+synthetic_recovery._review_direct_original = original
+read_go._go_functions = synthetic_recovery
+""")
+            assert installed.returncode == 0, installed.stdout + installed.stderr
+            response = shared_bn.run("go", "rename", "--preview", "--format", "json")
+        finally:
+            restored = shared_bn.run("py", "exec", "--code", """
+from bn_agent_bridge import read_go
+original = getattr(read_go._go_functions, '_review_direct_original', None)
+if original is not None:
+    read_go._go_functions = original
+""")
+            assert restored.returncode == 0, restored.stdout + restored.stderr
+        assert response.returncode == (3 if retained else 0), response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        after = self._state(shared_bn)
+        assert after["functions"] == before["functions"], (before, after, result)
+        assert result["defined_count"] == 4, result
+        assert result["go_renamed_candidates"] == int(candidates), result
+        assert result["go_verified_count"] == int(candidates), result
+        assert result["go_failed_count"] == 0 and result["go_committed_count"] == 0, result
+        assert result["skipped_user_named"] == 1, result
+        assert result["skipped_already_named"] == (1 if candidates else 2), result
+        assert result["skipped_interior_pc"] == 1, result
+        if retained:
+            self._retained(before, after, result, ["RetainedGo1031"])
+        else:
+            assert result["success"] is True and result["committed"] is False, result
+            assert after["ids"] == before["ids"]
+            assert not result.get("kept_library_imports"), result
+
+    @pytest.mark.parametrize("retained", [True, False], ids=["retained", "clean"])
+    def test_class_apply_types_preview_guards_noop_planning(self, shared_bn, retained):
+        shared_bn.load(CLASSES_STRIPPED_BINARY)
+        first = shared_bn.json("class", "apply-types", "svc::Codec")
+        assert first["success"] is True, first
+        before = self._state(shared_bn)
+        layout = shared_bn.json("types", "show", "svc::Codec")["layout"]
+        try:
+            installed = shared_bn.run("py", "exec", "--code", f"""
+import binaryninja as bn
+from bn_agent_bridge import mutation_engine as engine
+original = engine._class_apply_types_plan
+def observed_plan(ctx, selector, name, _original=original):
+    operations, plan = _original(ctx, selector, name)
+    assert not operations, 'fixture must exercise the direct noop return'
+    if {retained!r}:
+        ctx._resolve_view(selector).define_user_type('RetainedClass1031', bn.Type.int(4))
+    return operations, plan
+observed_plan._review_direct_original = original
+engine._class_apply_types_plan = observed_plan
+""")
+            assert installed.returncode == 0, installed.stdout + installed.stderr
+            response = shared_bn.run(
+                "class", "apply-types", "svc::Codec", "--preview", "--format", "json")
+        finally:
+            restored = shared_bn.run("py", "exec", "--code", """
+from bn_agent_bridge import mutation_engine as engine
+original = getattr(engine._class_apply_types_plan, '_review_direct_original', None)
+if original is not None:
+    engine._class_apply_types_plan = original
+""")
+            assert restored.returncode == 0, restored.stdout + restored.stderr
+        assert response.returncode == (3 if retained else 0), response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        after = self._state(shared_bn)
+        assert after["functions"] == before["functions"]
+        assert shared_bn.json("types", "show", "svc::Codec")["layout"] == layout
+        assert result["class_apply_types"]["instance_struct"] == "unchanged", result
+        if retained:
+            self._retained(before, after, result, ["RetainedClass1031"])
+        else:
+            assert result["success"] is True and result["rolled_back"] is True, result
+            assert result["results"][0]["status"] == "noop", result
+            assert after["ids"] == before["ids"]
+            assert not result.get("kept_library_imports"), result
