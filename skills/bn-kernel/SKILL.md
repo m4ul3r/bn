@@ -9,15 +9,15 @@ Use this skill for list-shaped, multi-function, or locally filtered reads in an 
 
 ## Bootstrap and bind
 
-In the first eval cell, use the absolute directory of this installed skill:
+In the first eval cell, use the absolute directory of this installed skill. `bn doctor` prints it as `bn-kernel skill_dir: <dir>`, and `bn skill install` prints the same line for each root it installed or found current:
 
 ```python
 from pathlib import Path
-skill_dir = Path("<absolute-installed-skill-dir>")
+skill_dir = Path("<dir printed as bn-kernel skill_dir>")
 exec((skill_dir / "bootstrap.py").read_text(encoding="utf-8"))
 ```
 
-Rerun bootstrap after a kernel reset. It prints whether the source was reused or reloaded, plus its path and hash. Bind both selectors and confirm the observed loaded file before trusting data:
+Rerun bootstrap after a kernel reset, `skill_dir` line included: a reset clears it too, and bootstrap refuses to guess. It prints whether the source was reused or reloaded, plus its path and hash. Bind both selectors and confirm the observed loaded file before trusting data:
 
 ```python
 s = bn_kernel.session(instance="analysis-1", target="<selector-from-target-list>")
@@ -42,17 +42,25 @@ count, sample = await bn_kernel.scoped(
 
 In OMP setups where ordinary sibling task agents share one retained eval namespace, globals can be rebound between cells. `bn_kernel.scoped(callback, instance=..., target=...)` protects bindings: scopes on the same `(instance, target)` may overlap, but a concurrent scope on a different pair is refused in the same Python process. It does not isolate `os.environ` or an in-flight cell from a sibling killing the shared process. Use separate kernel processes for concurrent reads of different targets; otherwise use direct `bn -i ... -t ...` CLI commands. Check the current harness's isolation before relying on a particular agent-launch API.
 
+### Bulk loops and kernel resets
+
+An eval cell that hits the harness's cell timeout can reset the kernel and lose every global: the session, helper functions, and collected rows. For a loop over more than about 50 reads, give the cell its own longer timeout, prefer one batched call (`decompile_many`, `limit=None` collections) over a per-item loop, and keep bootstrap, binding, and helper definitions in one cell you can rerun unchanged. Write rows you cannot afford to refetch to a file as the loop goes.
+
 ## Reads and result shape
 
-Curated helpers include `info`, `functions`, `search`, `function_info`, `decompile`, `il`, `disasm`, `xrefs`, `callsites`, `strings`, `imports`, and `sections`. They validate response shapes on both native and CLI backends; malformed or truncated payloads raise rather than becoming empty results. List helpers return rows; inside a scoped callback, `bound.last.payload` holds the complete envelope, including `total`, `has_more`, and `row_fields` when available. `last` is cleared after a failed request. A policy refusal from `assert_unannotated()` is the exception: it retains the successful orientation digest for inspection.
+Curated helpers include `info`, `functions`, `search`, `function_info`, `decompile`, `decompile_many`, `il`, `disasm`, `xrefs`, `callsites`, `strings`, `imports`, and `sections`. They validate response shapes on both native and CLI backends; malformed or truncated payloads raise rather than becoming empty results. List helpers return rows; the complete envelope, including `total`, `has_more`, and `row_fields` when available, is on the session's `last` (`bound.last.payload` inside a scoped callback), never on the returned value. `await s.run(..., unwrap=False)` returns that envelope as a plain dict, which has no `.payload`; read it directly or through `s.last.payload`. `last` is cleared after a failed request. A policy refusal from `assert_unannotated()` is the exception: it retains the successful orientation digest for inspection.
 
 `brief()` takes a list of row mappings, not the envelope or text. Row fields vary by collection; use `bound.last.row_fields` or inspect a row before naming columns. Addresses are hex strings, so use `int(row["address"], 0)` for arithmetic. Prefer `0x` for address inputs: a bare decimal address can resolve to a containing function and is disclosed under `resolved_from` with its offset.
 
-`limit=0` on a curated collection is a one-request schema probe that returns no rows. `row_fields` can be absent for an empty, undeclared kind; ask for a real row instead. `strings()` defaults to 100 rows; pass `limit=None` for all rows. `callsites()` defaults to 100 rows. `decompile()` omits stored annotation bodies by default; use `include_annotations=True` only after a contamination decision. Skipped function analysis requires `force_analysis=True` and may be expensive.
+`limit=0` on a curated collection (or `s.all`) is a one-request schema probe that returns no rows. The CLI itself refuses `--limit 0` (`count must be an integer >= 1`), so `s.run(..., limit=0)` fails rather than probing. `row_fields` can be absent for an empty, undeclared kind; ask for a real row instead. `strings()` defaults to 100 rows; pass `limit=None` for all rows, and `with_xrefs=True` for each string's referencing functions. `callsites()` defaults to 100 rows. `decompile()` omits stored annotation bodies by default; use `include_annotations=True` only after a contamination decision. Skipped function analysis requires `force_analysis=True` and may be expensive.
+
+`decompile(identifier, max_chars=N)` returns at most `N` characters; when it cut, `s.last.truncated` is `{"returned_chars", "total_chars"}`, a note says so, and `s.last.payload` keeps the full text. A single large function can exceed 100k characters, so bound it whenever the text might reach the transcript. `decompile_many(identifiers)` decompiles all of them in one bridge request and returns one row per identifier, in order: `{"identifier", "ok", "decompiled" | "error"}` plus `text` (and `truncated`, under `max_chars`) on a successful row. An identifier that does not resolve, or whose body is an analysis placeholder, is an `ok: False` row rather than an exception.
 
 A page with `total=None` is not zero findings. For high-fan-in `callsites`, inspect `scan_truncated`, `caller_scan_truncated`, `caller_scan_note`, and `callers_scanned` versus `caller_total` before claiming coverage. Both backends' merged envelopes retain the final request's **cumulative** scan coverage: the producer scans from row zero, including lookahead, rather than scanning only the requested page. Counts are not summed across pages. `total_lower_bound` advances with that scan and is omitted once an exact `total` is known. Finite limits and nonzero offsets still bound the returned rows, not the scan counts; a `limit=0` result retains the one-row probe's coverage. `has_more=False` means no more discovered rows at this offset, **not** complete caller enumeration: `caller_scan_truncated=True` and `total=None` can remain on a terminal collection.
 
-A read's `timeout=` is one end-to-end budget, including pagination. Native reads default to 120 seconds. When set, `BN_REQUEST_TIMEOUT` overrides even explicit session, scope, and per-read `timeout=` values; `0`, `none`, `off`, or empty disables the deadline. Unset it for explicit budgets to take effect. Avoid unlimited collections when the bridge cannot determine a total. `BN_BACKEND=auto|cli|native` selects the backend; an explicit non-auto `backend=` wins. `await s.help("evidence")` is local CLI help, while `await s.run("capabilities", unwrap=False)` returns the registry catalog. `Session.run()` uses the CLI artifact path even if curated reads use the native backend. Use it for generic commands and the `bn` skill's verification loop for any mutation.
+A read's `timeout=` is one end-to-end budget, including pagination. Native reads default to 120 seconds. When set, `BN_REQUEST_TIMEOUT` overrides even explicit session, scope, and per-read `timeout=` values; `0`, `none`, `off`, or empty disables the deadline. Unset it for explicit budgets to take effect. Avoid unlimited collections when the bridge cannot determine a total. `await s.help("evidence")` is local CLI help, while `await s.run("capabilities", unwrap=False)` returns the registry catalog. `Session.run()` uses the CLI artifact path even if curated reads use the native backend. Use it for generic commands and the `bn` skill's verification loop for any mutation.
+
+`BN_BACKEND=auto|cli|native` selects the backend; an explicit non-auto `backend=` wins. `auto` uses the native in-process `bn.Client` when `from bn import Client` works in the kernel's interpreter, and otherwise falls back to the CLI backend, printing `bn_kernel: backend=cli (auto: ...)` once with the import error; `s.backend` and `s.backend_reason` say which was chosen and why. On the CLI backend every curated read is one `bn` subprocess, so batch (`decompile_many`) rather than loop; a `limit=None` collection is a single uncapped request. For native, install bn into the kernel's interpreter (bn needs Python 3.14 or newer), for example `uv pip install --python <that interpreter> <bn checkout>`, then create a new session.
 
 ## Own only what you start
 

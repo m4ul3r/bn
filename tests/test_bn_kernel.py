@@ -2588,9 +2588,15 @@ def test_callsites_cumulative_coverage_on_both_backends(
     pages = {}
     start = offset
     while True:
-        size = 1 if limit == 0 else (
-            500 if limit is None else min(500, limit - (start - offset))
-        )
+        # Native pages 500 rows per request; the CLI backend asks for the whole
+        # remainder in one subprocess (no `--limit` when unlimited, #1039.4).
+        remaining = None if limit is None else limit - (start - offset)
+        if limit == 0:
+            size = 1
+        elif backend == "native":
+            size = 500 if remaining is None else min(500, remaining)
+        else:
+            size = len(rows) - start if remaining is None else remaining
         examined = min(start + size + 1, len(rows))
         truncated = examined < len(rows)
         page_rows = rows[start:start + size]
@@ -3534,9 +3540,10 @@ def test_cross_binding_warning_is_not_repeated_for_a_known_pair():
 def _page_script(body: str, *, counter: Path | None = None, cap: int = 0) -> str:
     """A fake `bn` that emits one page per call.
 
-    `counter`/`cap` add a persistent page guard so a regression test for an
-    *unbounded* loop fails fast on the old implementation instead of paging
-    forever until the harness times out.
+    `limit` is None for an uncapped request (no `--limit`, as `all()` sends
+    for `limit=None` by default). `counter`/`cap` add a persistent page guard
+    so a regression test for an *unbounded* loop fails fast on the old
+    implementation instead of paging forever until the harness times out.
     """
     guard = ""
     if counter is not None:
@@ -3554,7 +3561,7 @@ if seen + 1 > {cap}:
 import json, os, sys
 argv = sys.argv[1:]
 out = argv[argv.index("--out") + 1]
-limit = int(argv[argv.index("--limit") + 1])
+limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else None
 offset = int(argv[argv.index("--offset") + 1])
 {guard}
 {body}
@@ -4075,3 +4082,211 @@ def test_info_accepts_the_canonical_payload_and_a_null_import_count():
         _canonical_target_info(filename=None, basename=None)
     )
     assert _run(null_names.info())["basename"] is None
+
+
+# --- #1039 -------------------------------------------------------------------
+
+
+def test_auto_fallback_to_cli_is_announced_once_with_its_observed_cause(
+    monkeypatch, capsys
+):
+    def unavailable(*args):
+        raise ImportError("No module named 'bn'")
+
+    monkeypatch.setattr(bn_kernel, "_load_native_client", unavailable)
+    monkeypatch.setattr(bn_kernel, "_ANNOUNCED_BACKEND_NOTES", set())
+    monkeypatch.delenv("BN_BACKEND", raising=False)
+
+    first = bn_kernel.Session(instance="worker", target="one")
+    second = bn_kernel.Session(instance="worker", target="one")
+
+    out = capsys.readouterr().out
+    assert out.count("bn_kernel: backend=cli (auto: ") == 1
+    assert sys.executable in out
+    assert "No module named 'bn'" in out
+    assert first.backend == second.backend == "cli"
+    assert "No module named 'bn'" in first.backend_reason
+
+    # An explicit choice is not a fallback and says nothing.
+    explicit = bn_kernel.Session(instance="worker", target="one", backend="cli")
+    assert capsys.readouterr().out == ""
+    assert explicit.backend_reason.startswith("requested")
+
+
+def test_strings_forwards_with_xrefs_on_both_backends(monkeypatch, tmp_path):
+    native, client = _native_session()
+    _run(native.strings(query="usage", with_xrefs=True, limit=5))
+    assert client.calls[-1] == (
+        "collect", "strings", {"query": "usage", "with_xrefs": True}, {"limit": 5},
+    )
+
+    marker = tmp_path / "argv.json"
+    script = _page_script(
+        f'json.dump(argv, open({str(marker)!r}, "w"))\n'
+        'page = {"items": [{"value": "usage", "code_refs": []}], "offset": offset,\n'
+        '        "returned": 1, "has_more": False, "total": 1}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    cli = bn_kernel.Session(instance="worker", target="sample", backend="cli")
+    rows = _run(cli.strings(query="usage", with_xrefs=True, limit=5))
+    assert rows == [{"value": "usage", "code_refs": []}]
+    assert "--with-xrefs" in json.loads(marker.read_text())
+
+
+def test_all_unlimited_is_one_uncapped_cli_request(monkeypatch, tmp_path):
+    """`limit=None` sends no `--limit`, which the CLI's `--out` export answers
+    uncapped: one subprocess instead of one per 500 rows (#1039 item 4)."""
+    counter = tmp_path / "pages.count"
+    script = _page_script(
+        'assert limit is None, argv\n'
+        'rows = [{"name": f"f{i}", "address": hex(i), "size": 1, "size_known": True}\n'
+        '        for i in range(offset, 1234)]\n'
+        'page = {"kind": "functions", "items": rows, "offset": offset,\n'
+        '        "returned": len(rows), "has_more": False, "total": 1234}',
+        counter=counter,
+        cap=1,
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(instance="worker", target="sample", backend="cli")
+
+    rows = _run(session.functions())
+
+    assert len(rows) == 1234
+    assert counter.read_text() == "1"
+    assert "--limit" not in session.last.argv
+    assert session.last.payload["total"] == 1234
+    assert session.last.payload["has_more"] is False
+
+
+def test_all_unlimited_follows_a_page_that_still_reports_more(monkeypatch, tmp_path):
+    """An uncapped page is still checked: `has_more` is followed from its end
+    and a later page that contradicts `total` is refused."""
+    script = _page_script(
+        'end = 3 if offset == 0 else 5\n'
+        'rows = [{"value": str(i)} for i in range(offset, end)]\n'
+        'page = {"items": rows, "offset": offset, "returned": len(rows),\n'
+        '        "has_more": end < 5, "total": 5}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+    rows = _run(session.all("strings"))
+    assert [row["value"] for row in rows] == ["0", "1", "2", "3", "4"]
+
+    lying = _page_script(
+        'rows = [{"value": "0"}]\n'
+        'page = {"items": rows, "offset": offset, "returned": 1,\n'
+        '        "has_more": False, "total": 5}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, lying)))
+    with pytest.raises(bn_kernel.BnError, match="total=5 requires has_more"):
+        _run(session.all("strings"))
+    assert session.last is None
+
+
+def test_decompile_max_chars_bounds_the_text_and_discloses_the_cut():
+    session, _ = _native_session()
+
+    text = _run(session.decompile("main", max_chars=6))
+
+    assert text == "decomp"
+    assert session.last.value == "decomp"
+    assert session.last.truncated == {"returned_chars": 6, "total_chars": 14}
+    assert session.last.payload == {"text": "decompile text"}
+    assert any("first 6 of 14 characters" in note for note in session.last.notes)
+
+    assert _run(session.decompile("main", max_chars=100)) == "decompile text"
+    assert session.last.truncated is None
+
+    with pytest.raises(ValueError, match="max_chars"):
+        _run(session.decompile("main", max_chars=0))
+    assert session.last is None
+
+
+def _batch_row(identifier, text=None, error=None, **decompiled):
+    if error is not None:
+        return {"identifier": identifier, "ok": False, "error": error}
+    return {"identifier": identifier, "ok": True,
+            "decompiled": {"text": text, **decompiled}}
+
+
+def test_decompile_many_native_keeps_order_and_fails_rows_not_the_batch():
+    session = bn_kernel.Session(instance="worker", target="sample", backend="native")
+    envelope = {
+        "kind": "decompile_batch", "requested": 3, "resolved": 2,
+        "functions": [
+            _batch_row("main", "int main() { return helper(); }"),
+            _batch_row("nope", error="No function found for 'nope'"),
+            _batch_row("big", "/* stub */", analysis_skipped=True),
+        ],
+    }
+    calls = []
+
+    class BatchClient:
+        def request(self, op, params=None):
+            calls.append((op, params))
+            return envelope
+
+    session._client = BatchClient()
+    rows = _run(session.decompile_many(["main", "nope", "big"], max_chars=8))
+
+    assert calls == [("decompile_batch", {
+        "identifiers": ["main", "nope", "big"], "addresses": False,
+        "force_analysis": False, "include_annotations": False,
+    })]
+    assert [row["identifier"] for row in rows] == ["main", "nope", "big"]
+    assert rows[0]["ok"] is True and rows[0]["text"] == "int main"
+    assert rows[0]["truncated"] == {"returned_chars": 8, "total_chars": 31}
+    assert rows[1] == {"identifier": "nope", "ok": False,
+                       "error": "No function found for 'nope'"}
+    assert rows[2]["ok"] is False and "force_analysis=True" in rows[2]["error"]
+    assert session.last.payload is envelope
+
+    envelope["functions"].reverse()
+    with pytest.raises(bn_kernel.BnError, match="out of order"):
+        _run(session.decompile_many(["main", "nope", "big"]))
+    assert session.last is None
+
+
+def test_decompile_many_cli_reads_the_batch_a_failed_row_exits_2_with(
+    monkeypatch, tmp_path
+):
+    marker = tmp_path / "argv.json"
+    script = f"""
+import json, sys
+argv = sys.argv[1:]
+out = argv[argv.index("--out") + 1]
+json.dump(argv, open({str(marker)!r}, "w"))
+names = argv[argv.index("decompile") + 1:argv.index("--format")]
+rows = [
+    {{"identifier": n, "ok": True, "decompiled": {{"text": "void " + n + "() {{}}"}}}}
+    if n != "nope" else {{"identifier": n, "ok": False, "error": "not found"}}
+    for n in names
+]
+json.dump({{"kind": "decompile_batch", "requested": len(rows),
+           "resolved": sum(r["ok"] for r in rows), "functions": rows}}, open(out, "w"))
+sys.exit(0 if all(r["ok"] for r in rows) else 2)
+"""
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(instance="worker", target="sample", backend="cli")
+
+    rows = _run(session.decompile_many(["alpha", "nope"]))
+    assert [(row["identifier"], row["ok"]) for row in rows] == [
+        ("alpha", True), ("nope", False),
+    ]
+    assert rows[0]["text"] == "void alpha() {}"
+
+    # A lone identifier still comes back as a batch row on the CLI backend.
+    rows = _run(session.decompile_many(["nope"]))
+    assert rows == [{"identifier": "nope", "ok": False, "error": "not found"}]
+    assert session.last.payload["requested"] == 1
+    argv = json.loads(marker.read_text())
+    assert argv[argv.index("decompile") + 1:argv.index("--format")] == ["nope", "nope"]
+
+    # Exit 2 WITHOUT a batch body is a real failure, not an empty batch.
+    monkeypatch.setenv(
+        "BN_BIN",
+        str(_fake_bn(tmp_path, _payload_script({"ok": False}, rc=2, stderr="boom"))),
+    )
+    with pytest.raises(bn_kernel.BridgeError, match="boom"):
+        _run(session.decompile_many(["alpha", "beta"]))
+    assert session.last is None

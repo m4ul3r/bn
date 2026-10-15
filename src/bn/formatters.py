@@ -5789,12 +5789,19 @@ def _render_doctor_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
+    kernel_dirs = _field_list(value, "bn_kernel_skill_dirs")
     lines = [
         f"cli version: {value.get('cli_version', '<unknown>')}",
         f"plugin source: {value.get('plugin_source_dir', '<unknown>')}",
         f"plugin install: {value.get('plugin_install_dir', '<unknown>')}",
         f"plugin source build: {value.get('plugin_source_build_id', '<unknown>')}",
         f"plugin install build: {value.get('plugin_install_build_id', '<unknown>')}",
+        # #1039 item 2: the bn-kernel bootstrap's `skill_dir`, so a reset kernel
+        # can re-bootstrap without hunting for the install.
+        *(f"bn-kernel skill_dir: {d}" for d in kernel_dirs),
+        *(() if kernel_dirs or not _field_present(value, "bn_kernel_skill_dirs")
+          else (("bn-kernel skill_dir: not installed in a default skill root "
+                 "(bn skill install)"),)),
         "",
         "instances:",
     ]
@@ -7339,8 +7346,13 @@ def _render_skill_install_text(value: Any) -> str:
             return matches[0]
         return None
 
+    # A forced run has already acted on its preflight: restating that preflight
+    # after `Installed skills` read as if nothing had been written yet (#1035
+    # install comment 1). The dry-run advice belongs to the unforced run only.
+    forced = value.get("forced") is True
+
     def force_detail(dest: Any) -> str:
-        row = advice_row(dest)
+        row = None if forced else advice_row(dest)
         return f"; --force: {row.get('detail')}" if row is not None else ""
 
     # A normalized installed path can name several displayed roots. If their
@@ -7386,20 +7398,28 @@ def _render_skill_install_text(value: Any) -> str:
         row for row in force_plan
         if (_text_value(row, "destination_id"), row.get("detail")) not in listed
     ]
-    if other:
+    if other and not forced:
         lines.append("Other destinations (--force dry run):")
         lines.extend(
             f"- {row.get('destination')}{force_detail(row.get('destination'))}" for row in other
         )
-    if force_plan:
+    if force_plan and not forced:
         ready = "ready" if value.get("force_ready") else "refused; fix every blocker first"
         lines.append(
             f"--force preflight: {ready}. Checked without writes; "
             "filesystem races or write errors can still fail the install."
         )
     force_note = _text_value(value, "force_note")
-    if force_note:
+    if force_note and not forced:
         lines.append(force_note)
+    # #1035 install comment 2: the whole rerun, not a flag to splice in by hand.
+    force_command = _text_value(value, "force_command")
+    if force_command:
+        lines.append(f"Rerun with --force to replace them: {force_command}")
+    # #1039 item 2: the bn-kernel bootstrap's `skill_dir` after a kernel reset.
+    lines.extend(
+        f"bn-kernel skill_dir: {d}" for d in _field_list(value, "bn_kernel_skill_dirs")
+    )
 
     return "\n".join(lines) + "\n"
 
