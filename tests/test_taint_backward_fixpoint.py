@@ -121,3 +121,58 @@ def test_nested_loop_escape_reaches_inner_call(escape, reverse):
     assert result["diagnostics"]["safe_to_report_complete_slice"] is not escape
     assert any(l.get("callee") == "compose" for l in leaves) is escape
     assert not result["stats"]["truncated"]
+
+
+def test_future_stash_does_not_invent_an_earlier_buffer_writer():
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_MEMSET, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
+                       FExpr("MLIL_CONST", "64", constant=64)])
+    reload = FExpr("MLIL_LOAD_SSA", "[stash]", src=_cstr(0x404000), src_memory=pg.mem)
+    pg.call(_B_STRCPY, [reload, _cstr(0x700)])
+    pg.store(_cstr(0x404000), _addr_of(buf))
+    pg.sink(buf)
+    result, reasons, leaves = _bw(pg.func())
+    assert not any("written by strcpy" in reason for reason in reasons)
+    assert result["diagnostics"]["safe_to_report_complete_slice"]
+    assert not leaves
+
+
+def test_discovery_cut_keeps_nearby_escaped_call_frontier():
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    unknown = next(k for k, v in _B_NAMES.items() if v == "compose")
+    for _ in range(300):
+        pg.call(unknown, [])
+    pg.call(_B_MEMSET, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
+                       FExpr("MLIL_CONST", "64", constant=64)])
+    pg.store(_cstr(0x404000), _addr_of(buf))
+    near = pg.call(unknown, [])
+    pg.sink(buf)
+    result, _, leaves = _bw(pg.func())
+    assert result["stats"]["truncated"]
+    assert not result["diagnostics"]["safe_to_report_complete_slice"]
+    assert any(l.get("callee") == "compose" and l["address"] == hex(near.address)
+               for l in leaves)
+
+
+@pytest.mark.parametrize("name", ["wmemcpy", "wmemmove", "__wmemcpy_chk", "__wmemmove_chk"])
+@pytest.mark.parametrize("element_size", [2, 4])
+@pytest.mark.parametrize("written_bytes", [0, 32, 64])
+def test_wide_fill_count_uses_callee_element_width(monkeypatch, name, element_size, written_bytes):
+    from types import SimpleNamespace
+
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_READ, [_addr_of(buf), _cstr(0x700),
+                     FExpr("MLIL_CONST", str(written_bytes // element_size),
+                           constant=written_bytes // element_size)])
+    pg.sink(buf)
+    original = te.function_at
+    callee = SimpleNamespace(name=name, parameter_vars=[
+        SimpleNamespace(type=SimpleNamespace(target=SimpleNamespace(width=element_size)))])
+    monkeypatch.setattr(te, "function_at",
+                        lambda bv, addr: callee if addr == _B_READ else original(bv, addr))
+    result, reasons, leaves = _bw(pg.func(), extra_names={_B_READ: name})
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (written_bytes == 64)
+    assert bool(leaves) is (written_bytes < 64)

@@ -152,13 +152,13 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
                 "sites were never followed; narrow the sink or inspect the "
                 "capped sites named in the caller_sites_truncated leaf")
     if "memory_chain" in causes:
-        # Backward-only cause: the local-buffer writer walk ran out of
-        # memory-SSA versions before reaching the function entry, so writers
-        # older than the cut are absent from the slice.
-        return ("the backward walk through a local buffer's writers exhausted "
-                "its memory-chain budget -- older writers were never examined; "
-                "seed closer to the sink or inspect the earlier writes named in "
-                "the address_of_local_unresolved leaf")
+        # A cut may interrupt discovery or a fixed-point sweep. Existing
+        # writer rows need not be missing for the proof to be incomplete.
+        return ("the backward proof through a local buffer's writers exhausted "
+                "its shared memory-chain budget -- graph discovery or the "
+                "coverage/escape solve is unfinished; seed closer to the sink "
+                "or inspect the writes and unresolved calls named in the "
+                "address_of_local_unresolved leaf")
     return "depth/recursion cutoff"
 
 

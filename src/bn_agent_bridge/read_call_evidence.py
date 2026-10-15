@@ -1471,8 +1471,7 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         # this payload apart from any other object-shaped read.
         "kind": "function_evidence",
         "function": {
-            "name": func.name,
-            "address": hex(func.start),
+            **il_format._function_identity(func),
             "raw_name": getattr(func, "raw_name", func.name),
         },
         **il_format._function_metadata(func),

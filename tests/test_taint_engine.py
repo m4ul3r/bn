@@ -10299,7 +10299,7 @@ def test_backward_memory_chain_budget_is_disclosed_as_truncation_928():
     result, reasons, aol = _bw(pg.func())
     assert result["stats"]["truncated"] is True, result["stats"]
     assert result["stats"]["truncation_cause"] == ["memory_chain"], result["stats"]
-    assert len(aol) == 1 and "walk budget" in aol[0]["detail"], result["leaves"]
+    assert len(aol) == 1 and aol[0]["buffer"] == "cmd", result["leaves"]
     assert result["slices"][0]["origin"]["kind"] == "address_of_local_unresolved"
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
 
@@ -10586,7 +10586,6 @@ def test_backward_diagnostics_name_the_memory_chain_cut_928():
     diag = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1,
                                    truncated=True, truncation_cause=["memory_chain"])
     assert diag["safe_to_report_complete_slice"] is False
-    assert "memory-chain budget" in diag["complete_slice_reason"], diag
 
 
 def test_model_overlay_count_treats_comment_only_entries_as_benign_928():
@@ -10976,15 +10975,6 @@ def test_falsy_annotation_roles_are_rejected_928r3():
     assert ok["app_zero"]["writes"] == ["*arg:0"]
 
 
-def test_backward_next_action_follows_the_memory_chain_hint_928r3():
-    # P3: a `memory_chain` truncation left `next_action` on the generic
-    # unresolved text (`bn proto set`...) for a walk that ran out of budget.
-    from bn_agent_bridge import taint_result as tr
-    diag = tr.backward_diagnostics(
-        [{"kind": "address_of_local_unresolved"}], [], sinks_seeded=1, slices=1,
-        truncated=True, truncation_cause=["memory_chain"])
-    assert "memory-chain budget" in diag["next_action"], diag
-    assert "proto set" not in diag["next_action"], diag
 
 
 

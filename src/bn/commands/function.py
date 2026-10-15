@@ -1011,6 +1011,11 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
              arg("--width", default=None,
                  help="Bytes read per entry (default: min(stride, pointer size); "
                       "use 4 for a uint32[] table at --stride 4)"),
+             arg("--decode", choices=("absolute", "relative-int32"), default="absolute",
+                 help="Explicit entry format (never inferred): absolute pointers or signed "
+                      "32-bit offsets added to --base; relative mode defaults to stride/width 4"),
+             arg("--base", default=None,
+                 help="Base address added to every signed offset under --decode relative-int32"),
              arg("--record-size", dest="record_size", default=None,
                  help="Record-aware mode: byte size of each MIXED record (scalar + pointer "
                       "fields), e.g. a dispatch descriptor. Requires --ptr-fields and/or --field"),
@@ -1036,6 +1041,8 @@ def _evidence_table(args: argparse.Namespace) -> int:
             "entries": args.entries,
             "stride": args.stride,
             "width": args.width,
+            "decode": args.decode,
+            "base": args.base,
             "record_size": getattr(args, "record_size", None),
             "ptr_fields": ptr_fields,
             "fields": getattr(args, "field_specs", None),
