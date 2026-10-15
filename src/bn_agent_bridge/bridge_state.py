@@ -76,14 +76,19 @@ def view_session_key(bv: Any) -> str:
 
 
 def _progress_fragment(bv: Any) -> str:
-    """`` (N/M)`` from BN's live analysis progress, or "" when it says nothing."""
+    """BN's reported counters, explicitly not a stable completion fraction."""
     try:
         ap = bv.analysis_progress
         count = int(getattr(ap, "count", 0) or 0)
         total = int(getattr(ap, "total", 0) or 0)
     except Exception:  # noqa: BLE001 - not all view types expose progress
         return ""
-    return f" ({count}/{total})" if total else ""
+    if not total:
+        return ""
+    return (
+        f" (BN reports count={count}, total={total}; both may reset or change, "
+        "not overall completion or time remaining)"
+    )
 
 
 def analysis_unavailable(

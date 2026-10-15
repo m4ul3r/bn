@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import os
 import shlex
 import shutil
 import signal
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -29,6 +31,7 @@ from ..formatters import (
     _render_instance_gc_text,
     _render_instance_use_text,
     _render_pin_clear_text,
+    _render_plugin_install_text,
     _render_session_list_text,
     _render_session_start_text,
     _render_session_status_text,
@@ -38,6 +41,11 @@ from ..formatters import (
     _render_target_use_text,
 )
 from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, unwrap_result
+
+# An ACK starts teardown, not process exit: BN still releases views and native
+# workers. Give that work room on a loaded host before considering pinned signals.
+_SHUTDOWN_TEARDOWN_TIMEOUT = 30.0
+_SIGNAL_TEARDOWN_TIMEOUT = 5.0
 
 
 @command("capabilities",
@@ -196,15 +204,22 @@ def _doctor(args: argparse.Namespace) -> int:
         bridge_source = (ping.get("source_dir") if isinstance(ping, dict) else None) \
             or meta.get("source_dir")
         bridge_source = bridge_source if isinstance(bridge_source, str) and bridge_source else None
-        # #992: what this bridge SHOULD be running. A GUI bridge loads the
-        # installed plugin file, so that is its reference. A headless bridge
-        # runs the package of the interpreter that spawned it, so the reference
-        # is THIS CLI's own source: comparing it to the installed plugin called a
-        # worktree's own, current bridge stale (with a restart that loads the
-        # same code) and reported another checkout's bridge clean.
+        # The GUI's reported source is the package it actually loaded, including
+        # private BN_USER_DIRECTORY installs and resolved plugin symlinks.
+        # Older GUI bridges have no source metadata: retain the install fallback.
+        # Headless bridges are compared with this CLI's checkout (#992).
         is_gui = bool(meta.get("gui")) or getattr(instance, "instance_id", None) is None
-        reference_build_id = install_build_id if is_gui else source_build_id
-        reference_engine_id = install_engine_id if is_gui else source_engine_id
+        reference_dir = Path(bridge_source) if is_gui and bridge_source else (
+            install_dir if is_gui else source_dir
+        )
+        reference_build_id = (
+            cli.build_id_for_file(reference_dir / "bridge.py") if is_gui and bridge_source
+            else install_build_id if is_gui else source_build_id
+        )
+        reference_engine_id = (
+            cli.build_id_for_package(reference_dir) if is_gui and bridge_source
+            else install_engine_id if is_gui else source_engine_id
+        )
         other_checkout = (
             not is_gui
             and bridge_source is not None
@@ -223,6 +238,10 @@ def _doctor(args: argparse.Namespace) -> int:
                 "bn_build_id": bn_build_id,
                 "gui": is_gui,
                 "bridge_source_dir": bridge_source,
+                "bridge_source_unknown": bridge_source is None,
+                "reference_plugin_dir": str(reference_dir),
+                "reference_plugin_build_id": reference_build_id,
+                "reference_engine_build_id": reference_engine_id,
                 # A headless bridge started from another checkout than this
                 # CLI's: restarting it from here would not change its code
                 # unless this CLI's interpreter spawns it (#992).
@@ -233,9 +252,8 @@ def _doctor(args: argparse.Namespace) -> int:
                     bool(loaded_version)
                     and str(loaded_version) != cli.VERSION
                 ),
-                # Against the reference above -- the installed plugin file for a
-                # GUI bridge, this CLI's source for a headless one; never set for
-                # a bridge from another checkout, which `other_checkout` names.
+                # GUI: its reported package on disk (install fallback for old
+                # bridges). Headless: this CLI's checkout, except known others.
                 "stale_plugin_code": (
                     not other_checkout
                     and bool(loaded_build_id)
@@ -244,10 +262,7 @@ def _doctor(args: argparse.Namespace) -> int:
                 ),
                 "engine_build_id": loaded_engine_id,
                 "installed_engine_build_id": install_engine_id,
-                # The loaded engine package diverges from its reference on disk:
-                # this live session is running stale logic (e.g. an edited
-                # taint_engine.py after a git pull). `bn session restart <id>`
-                # reloads it (#161).
+                # The loaded engine package diverges from its reference on disk.
                 "stale_engine": (
                     not other_checkout
                     and bool(loaded_engine_id)
@@ -284,13 +299,13 @@ def _doctor(args: argparse.Namespace) -> int:
     return 1 if unhealthy else 0
 
 
-@command("plugin", "install", help="Install the GUI plugin", fmt="json",
+@command("plugin", "install", help="Install the GUI plugin", fmt="text",
          args=[
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
              arg("--force", action="store_true",
-                 help="Replace an existing destination: a link to another tree, or a "
-                      "previous install of this plugin"),
+                 help="Replace a link, an empty directory, or a marked copy "
+                      "(discarding local edits in that copy)"),
          ])
 def _plugin_install(args: argparse.Namespace) -> int:
     source = cli.plugin_source_dir()
@@ -315,7 +330,9 @@ def _plugin_install(args: argparse.Namespace) -> int:
     }
     if up_to_date:
         result["note"] = f"already installed: {state[1]}"
-    cli._emit_result(args, result, stem="plugin-install")
+    cli._emit_result(
+        args, result, text_renderer=_render_plugin_install_text, stem="plugin-install"
+    )
     return 0
 
 
@@ -325,7 +342,10 @@ def _plugin_install(args: argparse.Namespace) -> int:
 # ownership: a directory holding only bytecode is refused, because nothing in
 # it proves an install of this artifact wrote it.
 _INSTALL_BYTECODE_PATTERNS = ("__pycache__", "*.pyc", "*.pyo")
-_IGNORED_INSTALL_ENTRIES = shutil.ignore_patterns(*_INSTALL_BYTECODE_PATTERNS)
+_COPY_INSTALL_MARKER = ".bn-copy-install.json"
+_IGNORED_INSTALL_ENTRIES = shutil.ignore_patterns(
+    *_INSTALL_BYTECODE_PATTERNS, _COPY_INSTALL_MARKER
+)
 
 
 def _is_install_bytecode(name: str) -> bool:
@@ -333,13 +353,19 @@ def _is_install_bytecode(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in _INSTALL_BYTECODE_PATTERNS)
 
 
-def _foreign_install_entry(dest: Path, source: Path) -> str | None:
+def _copy_install_identity(source: Path) -> dict[str, str]:
+    return {"format": "bn-copy-install-v1", "artifact": source.name}
+
+
+def _foreign_install_entry(dest: Path, source: Path, *, root: bool = True) -> str | None:
     """The first entry under `dest` a copy-mode install of `source` would not
     have produced, as a slash-joined path relative to `dest`, or None when
     every entry mirrors the source tree -- directories included, so a user file
     added inside a directory the source also has is not mistaken for ours.
     """
     for entry in sorted(dest.iterdir()):
+        if root and entry.name == _COPY_INSTALL_MARKER:
+            continue
         if _is_install_bytecode(entry.name):
             continue
         counterpart = source / entry.name
@@ -348,88 +374,50 @@ def _foreign_install_entry(dest: Path, source: Path) -> str | None:
         if entry.is_dir() != counterpart.is_dir():
             return entry.name
         if entry.is_dir():
-            nested = _foreign_install_entry(entry, counterpart)
+            nested = _foreign_install_entry(entry, counterpart, root=False)
             if nested is not None:
                 return f"{entry.name}/{nested}"
     return None
 
 
-def _any_file_matches_source(dest: Path, source: Path) -> bool:
-    """Whether one readable file under `dest` is still byte-identical to its
-    source counterpart. That is the content proof this tree is an install of
-    `source` rather than a directory that merely reuses its entry names -- a
-    user's own `plugin.json` sitting where ours sits is not ours (#766).
-    An entry that cannot be read is skipped rather than raised, so the answer
-    depends on what the tree holds, not on where an unreadable file sorts.
-    """
-    try:
-        entries = sorted(dest.iterdir())
-    except OSError:
-        return False
-    for entry in entries:
-        if _is_install_bytecode(entry.name):
-            continue
-        counterpart = source / entry.name
-        if entry.is_symlink():
-            continue
-        if entry.is_dir():
-            if counterpart.is_dir() and _any_file_matches_source(entry, counterpart):
-                return True
-        elif counterpart.is_file():
-            try:
-                if entry.read_bytes() == counterpart.read_bytes():
-                    return True
-            except OSError:
-                continue
-    return False
-
-
 def _unsafe_replace_reason(dest: Path, source: Path) -> str | None:
-    """Why `--force` must not remove directory `dest`, or None when it may.
+    """Accept empty directories or explicitly marked copies, never lookalikes.
 
-    `--dest` is caller-supplied, so `--force` used to `shutil.rmtree` whatever
-    was there -- unrelated user data included (#766). A directory is only
-    replaceable when it is provably this artifact's own: empty, or a previous
-    install of `source` -- the source tree's own layout, entry for entry, with
-    at least one file still byte-identical to the source's, and the bytecode
-    caches importing it in place leaves behind tolerated but never counted as
-    proof. Entry names alone decide nothing: a directory that merely reuses
-    them is somebody else's. Everything else is refused with the deliberate
-    alternative named, the same "refuse and name the escape hatch" shape as
-    the bridge's destructive-op gate, rather than learned from a half-populated
-    install. Paths are compared as `_install_path` resolved them, so a symlinked
-    ancestor cannot smuggle the rmtree past the check, and the pure path rules
-    (`_never_an_install_destination`) were already applied to this same path.
+    The marker identifies the artifact, not a checkout or its current bytes:
+    upgrading a single-file skill and removing old source files must both work.
+    It grants replacement of the whole copy, including local edits. Unmarked
+    legacy copies cannot be distinguished from user directories.
     """
     if not any(dest.iterdir()):
         return None
-    foreign = _foreign_install_entry(dest, source)
-    if foreign is not None:
-        return (
-            "it is not a previous install of this artifact "
-            f"({foreign} is not what this install writes)"
-        )
-    if not _any_file_matches_source(dest, source):
-        return (
-            "it is not a previous install of this artifact (no file under it "
-            "still matches the source tree)"
-        )
-    return None
+    marker = dest / _COPY_INSTALL_MARKER
+    if not marker.is_symlink() and marker.is_file():
+        try:
+            identity = json.loads(marker.read_text())
+        except (OSError, ValueError):
+            identity = None
+        if identity == _copy_install_identity(source):
+            return None
+    return (
+        f"ownership cannot be proved: it has no valid {_COPY_INSTALL_MARKER} "
+        f"marker for {source.name!r}. This may be an unmarked older copy or an "
+        "unrelated directory"
+    )
 
 
-def _copy_matches_source(dest: Path, source: Path) -> bool:
+def _copy_matches_source(dest: Path, source: Path, *, root: bool = True) -> bool:
     """Whether directory `dest` is exactly what a copy-mode install of `source`
     writes: the same entries, every file byte-identical. Bytecode is ignored on
     both sides, as the copy omits it and importing in place regenerates it.
     An unreadable entry raises `OSError`; the caller reports it."""
-    if _foreign_install_entry(dest, source) is not None:
+    if _foreign_install_entry(dest, source, root=root) is not None:
         return False
     for entry in source.iterdir():
-        if _is_install_bytecode(entry.name):
+        if _is_install_bytecode(entry.name) or entry.name == _COPY_INSTALL_MARKER:
             continue
         counterpart = dest / entry.name
         if entry.is_dir():
-            if not counterpart.is_dir() or not _copy_matches_source(counterpart, entry):
+            if not counterpart.is_dir() or not _copy_matches_source(counterpart, entry, root=False):
                 return False
         elif not counterpart.is_file() or counterpart.read_bytes() != entry.read_bytes():
             return False
@@ -493,14 +481,14 @@ def _removal_blocker(dest: Path) -> str | None:
     pending = [dest]
     while pending:
         directory = pending.pop()
+        entries = list(directory.iterdir())
         missing = [
             name for flag, name in ((os.R_OK, "read"), (os.X_OK, "search"))
-            if not os.access(directory, flag)
+            if (flag == os.R_OK or entries) and not os.access(directory, flag)
         ]
         if missing:
             return (f"{directory} lacks {' and '.join(missing)} permission, so its "
-                    "contents cannot be listed")
-        entries = list(directory.iterdir())
+                    "contents cannot be removed")
         if entries and not os.access(directory, os.W_OK):
             return f"{directory} lacks write permission, so its contents cannot be removed"
         for entry in entries:
@@ -522,18 +510,11 @@ def _force_refusal_reason(dest: Path, source: Path) -> str | None:
         return f"it could not be read ({exc})"
 
 
-# Printed under destinations an install left alone. One plain line rather than
-# a per-destination verdict on whether --force would succeed (split out of
-# #1004 to its own follow-up), so it states the rule instead of a promise: it
-# must stay true for every state it is printed under.
+# Ownership is explicit for copies; old unmarked copies require manual removal.
 FORCE_NOTE = ("--force replaces only what it can remove and proves is this "
-              "install's own (a link, an empty directory, or a previous copy, "
+              "install's own (a link, an empty directory, or a marked copy, "
               "losing any local edits in that copy); it refuses anything else "
               "and then changes no destination.")
-FORCE_NOTE_ONE = ("--force replaces it only if it can remove it and it is a link, "
-                  "an empty directory, or a previous copy of this install (losing "
-                  "any local edits in that copy); otherwise it refuses and "
-                  "changes nothing.")
 
 
 def _install_path(dest: Path) -> Path:
@@ -604,18 +585,7 @@ def _unusable_parent_reason(dest: Path) -> str | None:
     return None
 
 
-def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
-    if not source.exists():
-        raise BridgeError(f"Source directory is missing: {source}")
-
-    dest = _plan_install(source, dest, mode=mode, force=force)
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise BridgeError(
-            f"Cannot create the parent directory of {dest}: {exc}"
-        ) from exc
-
+def _remove_install_destination(dest: Path) -> None:
     try:
         if dest.is_symlink():
             dest.unlink()
@@ -624,22 +594,76 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
     except OSError as exc:
         raise BridgeError(f"Cannot replace {dest}: {exc}") from exc
 
-    if mode == "copy":
-        shutil.copytree(source, dest, ignore=_IGNORED_INSTALL_ENTRIES)
-    else:
-        os.symlink(source, dest, target_is_directory=True)
+
+def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
+    dest = _plan_install(source, dest, mode=mode, force=force)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BridgeError(
+            f"Cannot create the parent directory of {dest}: {exc}"
+        ) from exc
 
 
-def _refuse_replacement(dest: Path, reason: str) -> NoReturn:
-    raise BridgeError(
-        f"Refusing to replace {dest} with --force: {reason}. "
-        "--force replaces only what it can prove is an install of this "
-        "artifact (a link, an empty directory, or a previous copy), never an "
-        "unrelated path. Move it aside by hand and re-run if that is what you want."
+    try:
+        if mode == "copy":
+            # Write ownership before copytree finalizes directory metadata.
+            # Prepare the complete copy before removing a previous install,
+            # so marker/copy failures leave no unmarked destination behind.
+            with tempfile.TemporaryDirectory(prefix=f".{dest.name}-", dir=dest.parent) as temporary:
+                prepared = Path(temporary)
+                (prepared / _COPY_INSTALL_MARKER).write_text(
+                    json.dumps(_copy_install_identity(source), separators=(",", ":")) + "\n"
+                )
+                shutil.copytree(
+                    source, prepared, dirs_exist_ok=True, ignore=_IGNORED_INSTALL_ENTRIES
+                )
+                _remove_install_destination(dest)
+                prepared.replace(dest)
+        else:
+            _remove_install_destination(dest)
+            os.symlink(source, dest, target_is_directory=True)
+    except OSError as exc:
+        raise BridgeError(f"Cannot install into {dest}: {exc}") from exc
+
+
+def _install_recovery_advice(
+    linked_root: Path | None, *, linked_ancestor: bool = False
+) -> str:
+    if linked_root is None:
+        if linked_ancestor:
+            return (
+                "An ancestor of this destination is a symlink, not the skills root link. "
+                "Leave that ancestor and its unrelated configuration files in place. "
+                "Choose a new install destination outside the linked tree with --dest, "
+                "or inspect and update the skills configuration manually."
+            )
+        return (
+            "Move this destination aside by hand, then re-run the "
+            "same install command without --force to create a fresh install."
+        )
+    root = shlex.quote(str(linked_root.absolute()))
+    return (
+        f"The destination is reached through root link {linked_root}. "
+        "Do not move or replace directories inside its target. Replace only "
+        "the root link with a new directory:\n"
+        f"Recovery command: unlink -- {root} && mkdir -- {root}\n"
+        "Then re-run the same install command."
     )
 
 
-def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
+def _refuse_replacement(dest: Path, reason: str, *, recovery: str) -> NoReturn:
+    raise BridgeError(
+        f"Refusing to replace {dest} with --force: {reason}. "
+        "--force replaces only what it can prove is an install of this "
+        "artifact (a link, an empty directory, or a marked copy), never an "
+        f"unrelated path. {recovery}"
+    )
+
+
+def _plan_install(
+    source: Path, dest: Path, *, mode: str, force: bool, skill_root: Path | None = None
+) -> Path:
     """The path this install will write to, or a refusal raised.
 
     Both `plugin install` and the `skill install` pre-pass call this, on the
@@ -655,6 +679,14 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
     install of `source` that rmtree can empty may be replaced; a regular file
     under `--dest` is somebody else's and is refused instead of unlinked.
     """
+    if not source.exists():
+        raise BridgeError(f"Source directory is missing: {source}")
+    requested_dest = dest
+    # Only the skill installer supplies its exact root. An arbitrary ancestor
+    # may hold settings or other data and is never an automatic recovery target.
+    linked_root = skill_root if skill_root is not None and skill_root.is_symlink() else None
+    linked_ancestor = any(parent.is_symlink() for parent in dest.parents)
+    recovery = _install_recovery_advice(linked_root, linked_ancestor=linked_ancestor)
     dest = _install_path(dest)
     forbidden = _never_an_install_destination(dest, source)
     if forbidden is not None:
@@ -665,17 +697,27 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
         )
     unusable = _unusable_parent_reason(dest)
     if unusable is not None:
-        raise BridgeError(f"Cannot install into {dest}: {unusable}.")
+        advice = f" {recovery}" if linked_ancestor else ""
+        raise BridgeError(f"Cannot install into {dest}: {unusable}.{advice}")
     if not force:
         state = _existing_install_state(source, dest, mode=mode)
         if state is not None:
+            try:
+                _plan_install(
+                    source, requested_dest, mode=mode, force=True, skill_root=skill_root
+                )
+            except BridgeError as exc:
+                force_detail = f"--force preflight refuses: {exc}"
+            else:
+                force_detail = "--force preflight accepts this destination"
             raise BridgeError(
-                f"Destination already exists: {dest} ({state[1]}). {FORCE_NOTE_ONE}"
+                f"Destination already exists: {dest} ({state[1]}).\n"
+                f"{force_detail}\n{FORCE_NOTE}"
             )
         return dest
     reason = _force_refusal_reason(dest, source)
     if reason is not None:
-        _refuse_replacement(dest, reason)
+        _refuse_replacement(dest, reason, recovery=recovery)
     if dest.is_dir() and not dest.is_symlink():
         try:
             blocker = _removal_blocker(dest)
@@ -683,10 +725,43 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
             blocker = f"it could not be read ({exc})"
         if blocker is not None:
             raise BridgeError(
-                f"Cannot replace {dest} with --force: {blocker}. Fix the "
-                "permissions, or move it aside by hand, and re-run."
+                f"Cannot replace {dest} with --force: {blocker}. "
+                + (recovery if linked_ancestor else
+                   "Fix the permissions, or move it aside by hand, and re-run.")
             )
     return dest
+
+
+def _plan_forced_installs(
+    installs: list[tuple[Path, Path]], *, mode: str
+) -> tuple[list[tuple[Path, Path]], list[dict[str, Any]]]:
+    """The forced run's preflight, also used as a no-write dry run.
+
+    Include every destination, even one a normal install skips as current:
+    a forced run replaces current copies too, and may refuse their permissions.
+    Filesystem races and errors during writing remain possible after preflight.
+    """
+    pending: list[tuple[Path, Path]] = []
+    verdicts: list[dict[str, Any]] = []
+    for source, dest in installs:
+        planned: Path | None = None
+        row: dict[str, Any] = {"destination": str(dest)}
+        if _is_install_source(source, dest):
+            row.update(allowed=True, detail="install source itself; no replacement needed")
+        else:
+            try:
+                planned = _plan_install(
+                    source, dest, mode=mode, force=True, skill_root=dest.parent
+                )
+            except BridgeError as exc:
+                row.update(allowed=False, detail=str(exc))
+            else:
+                row.update(allowed=True, detail="passes --force preflight")
+                if not any(queued == planned for _, queued in pending):
+                    pending.append((source, planned))
+        row["destination_id"] = str(planned if planned is not None else _install_path(dest))
+        verdicts.append(row)
+    return pending, verdicts
 
 
 @command("skill", "install", help="Install the bundled agent skills", fmt="text",
@@ -694,8 +769,8 @@ def _plan_install(source: Path, dest: Path, *, mode: str, force: bool) -> Path:
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
              arg("--force", action="store_true",
-                 help="Replace existing destinations: links to another tree, or "
-                      "previous installs of these skills"),
+                 help="Replace links, empty directories, or marked copies "
+                      "(discarding local edits in those copies)"),
          ])
 def _skill_install(args: argparse.Namespace) -> int:
     skills_root = cli.skills_source_dir()
@@ -720,43 +795,60 @@ def _skill_install(args: argparse.Namespace) -> int:
             }
         )
 
+    forced_pending, force_plan = _plan_forced_installs(install_plan, mode=args.mode)
     pending_installs = []
     skipped_destinations = []
     not_updated_destinations = []
-    for source, dest in install_plan:
-        if args.force and _is_install_source(source, dest):
-            skipped_destinations.append(str(dest))
-            continue
-        if not args.force:
+    if args.force:
+        refusals = [row["detail"] for row in force_plan if not row["allowed"]]
+        if refusals:
+            raise BridgeError(
+                "Forced install refused; no destinations changed:\n"
+                + "\n".join(f"- {reason}" for reason in refusals)
+            )
+        pending_installs = forced_pending
+        skipped_destinations = [
+            str(dest) for source, dest in install_plan if _is_install_source(source, dest)
+        ]
+    else:
+        for source, dest in install_plan:
             state = _existing_install_state(source, dest, mode=args.mode)
             if state is not None and state[0] == "up_to_date":
                 skipped_destinations.append(str(dest))
                 continue
-            if state is not None and not explicit_dest:
-                # A default root holds something else -- most often a link into
-                # a previous checkout. Leave it, but say so and fail the run:
-                # "already installed" here kept every link on the old tree with
-                # exit 0 (#1002). An explicit --dest is refused by the plan.
+            if state is not None:
                 skipped_destinations.append(str(dest))
                 not_updated_destinations.append(
                     {"destination": str(dest), "state": state[0], "detail": state[1]}
                 )
                 continue
-        # Planned, not just checked: the path validated here is the path the
-        # install writes to, and every destination is refused before the first
-        # one is written -- so no refusal can leave half a store installed. An
-        # OS error while writing (a filesystem that fills, a race) still can,
-        # with the destinations reached first left in place.
-        # Two target roots can name one directory (a symlinked skills root, or
-        # an equal CLAUDE_HOME and CODEX_HOME), and installing there twice would
-        # write the same skills over the copy the first entry just made.
-        planned = _plan_install(source, dest, mode=args.mode, force=args.force)
-        if any(queued == planned for _, queued in pending_installs):
-            continue
-        pending_installs.append((source, planned))
+            try:
+                planned = _plan_install(
+                    source, dest, mode=args.mode, force=False, skill_root=dest.parent
+                )
+            except BridgeError as exc:
+                if not explicit_dest:
+                    raise
+                skipped_destinations.append(str(dest))
+                not_updated_destinations.append(
+                    {"destination": str(dest), "state": "blocked", "detail": str(exc)}
+                )
+                continue
+            if not any(queued == planned for _, queued in pending_installs):
+                pending_installs.append((source, planned))
+
+    # An explicit destination collision is a refusal, not a partial install.
+    # Gather every row first, then publish the complete dry run without writes.
+    explicit_refusal = explicit_dest and bool(not_updated_destinations) and not args.force
+    if explicit_refusal:
+        pending_installs = []
 
     for source, dest in pending_installs:
         _install_tree(source, dest, mode=args.mode, force=args.force)
+    if pending_installs:
+        # Report a future forced run against the disk as it now stands, not
+        # against destinations that this normal run just replaced/created.
+        _, force_plan = _plan_forced_installs(install_plan, mode=args.mode)
 
     result = {
         # #620(b): report installed=false when every destination was skipped,
@@ -770,9 +862,25 @@ def _skill_install(args: argparse.Namespace) -> int:
         "skipped_destinations": skipped_destinations,
         "not_updated_destinations": not_updated_destinations,
         "skills": results,
+        "force_note": FORCE_NOTE,
+        "force_plan": force_plan,
+        "force_ready": all(row["allowed"] for row in force_plan),
     }
-    if not_updated_destinations:
-        result["force_note"] = FORCE_NOTE
+    if explicit_refusal:
+        result.update(ok=False, error="Skill install refused; no destinations changed.")
+        if args.format != "text":
+            # Only an install refusal carries operation failure on its spill
+            # envelope. Shared output envelopes describe file-write success.
+            emission = cli.write_output_result(
+                result, fmt=args.format, out_path=None, stem="skill-install"
+            )
+            if emission.spilled and emission.artifact is not None:
+                emission.artifact.update(ok=False, error=result["error"])
+                sys.stdout.write(cli.render_envelope(emission.artifact, args.format))
+            else:
+                sys.stdout.write(emission.rendered)
+        print(_render_skill_install_text(result), file=sys.stderr, end="")
+        return 2
     cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
     return 1 if not_updated_destinations else 0
 
@@ -905,15 +1013,23 @@ def _session_start(args: argparse.Namespace) -> int:
         # go through that same pin, so cleanup can never terminate an unrelated
         # process that recycled this pid.
         with cli.BridgeProcessSignal(instance) as signaller:
+            acknowledged = False
             try:
                 cli.send_request("shutdown", instance_id=instance.instance_id)
+                acknowledged = True
             except BridgeError as exc:
                 cleanup_errors.append(f"shutdown request failed: {exc}")
                 reason = signaller.send(signal.SIGTERM)
                 if reason is not None:
                     cleanup_errors.append(f"SIGTERM not sent: {reason}")
-            stopped = cli.wait_for_teardown(instance, timeout=5.0)
-            if not stopped:
+            stopped = cli.wait_for_teardown(
+                instance,
+                timeout=(
+                    _SHUTDOWN_TEARDOWN_TIMEOUT
+                    if acknowledged else _SIGNAL_TEARDOWN_TIMEOUT
+                ),
+            )
+            if not stopped and (not acknowledged or signaller.refusal is None):
                 reason = signaller.send(signal.SIGKILL)
                 if reason is not None:
                     cleanup_errors.append(f"SIGKILL not sent: {reason}")
@@ -924,7 +1040,7 @@ def _session_start(args: argparse.Namespace) -> int:
         if not stopped:
             result["cleanup_error"] = (
                 f"bridge instance {instance.instance_id} (pid {instance.pid}) "
-                "did not fully tear down"
+                "timed out waiting for teardown; no clean stop was confirmed"
             )
 
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-start")
@@ -1076,22 +1192,26 @@ def _session_stop(args: argparse.Namespace) -> int:
         # instance and fail as a duplicate (#92 Problem B). Escalate to SIGKILL if
         # graceful teardown stalls, and report failure if it never converges.
         if inst is not None and signaller is not None:
-            if not cli.wait_for_teardown(inst, timeout=5.0):
-                # Escalate through the SAME verified pin: SIGKILL against an
-                # unproven or recycled pid is the most destructive form of the bug
-                # (#694), so an unproven pin sends nothing and reports instead.
-                reason = signaller.send(signal.SIGKILL)
-                converged = (
-                    cli.wait_for_teardown(inst, timeout=2.0)
-                    if reason is None
-                    else False
-                )
+            teardown_timeout = (
+                _SHUTDOWN_TEARDOWN_TIMEOUT
+                if method == "shutdown" else _SIGNAL_TEARDOWN_TIMEOUT
+            )
+            if not cli.wait_for_teardown(inst, timeout=teardown_timeout):
+                # An acknowledged shutdown without a verified pin is just a
+                # timeout, not a reason to attempt an unsafe signal.
+                reason = None
+                converged = False
+                if signaller.refusal is None:
+                    reason = signaller.send(signal.SIGKILL)
+                    if reason is None:
+                        converged = cli.wait_for_teardown(inst, timeout=2.0)
                 if not converged:
                     result["stopped"] = False
                     detail = f" {reason}." if reason is not None else ""
                     result["error"] = (
-                        f"bridge instance {target_id} (pid {inst.pid}) did not fully "
-                        f"tear down; registry/socket may be stale.{detail}"
+                        f"timed out waiting for bridge instance {target_id} "
+                        f"(pid {inst.pid}) to fully tear down; "
+                        f"registry/socket may be stale.{detail}"
                     )
                     cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
                     return 1
@@ -1198,16 +1318,26 @@ def _session_restart(args: argparse.Namespace) -> int:
     # Both signals are gated on durable process identity: a restart must never
     # terminate an unrelated process that recycled the recorded pid (#694).
     with cli.BridgeProcessSignal(inst) as signaller:
+        acknowledged = False
         try:
             cli.send_request("shutdown", instance_id=resolved_id)
+            acknowledged = True
         except BridgeError:
             _require_signal_delivered(signaller.send(signal.SIGTERM), target_id)
-        if not cli.wait_for_teardown(inst, timeout=5.0):
-            _require_signal_delivered(signaller.send(signal.SIGKILL), target_id)
-            if not cli.wait_for_teardown(inst, timeout=2.0):
+        teardown_timeout = (
+            _SHUTDOWN_TEARDOWN_TIMEOUT
+            if acknowledged else _SIGNAL_TEARDOWN_TIMEOUT
+        )
+        if not cli.wait_for_teardown(inst, timeout=teardown_timeout):
+            converged = False
+            if signaller.refusal is None:
+                _require_signal_delivered(signaller.send(signal.SIGKILL), target_id)
+                converged = cli.wait_for_teardown(inst, timeout=2.0)
+            if not converged:
                 raise BridgeError(
-                    f"bridge instance {target_id} (pid {inst.pid}) did not tear down; "
-                    "cannot restart cleanly. Stop it manually and re-spawn."
+                    f"timed out waiting for bridge instance {target_id} "
+                    f"(pid {inst.pid}) to tear down; cannot restart cleanly. "
+                    "Stop it manually and re-spawn."
                 )
 
     instance = cli.spawn_instance(resolved_id)

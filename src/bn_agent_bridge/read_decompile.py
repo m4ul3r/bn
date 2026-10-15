@@ -57,6 +57,13 @@ def _warning_row(code: str, summary: str, detail: str, **extra: Any) -> dict[str
 
     Text used to print *detail* alone, and agents filtered every `warning:` line
     out wholesale -- dropping the ones that mattered with the boilerplate."""
+    if "address" not in extra:
+        addresses = extra.get("addresses") or []
+        calls = extra.get("calls") or []
+        if addresses:
+            extra["address"] = addresses[0]
+        elif calls:
+            extra["address"] = calls[0]["address"]
     return {"code": code, "summary": summary, "detail": detail, **extra}
 
 
@@ -1901,10 +1908,10 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
             "table filled at run time reads as zeros")
     steps.append(
         "stores in this decompile that write code or table addresses into what the jump "
-        "reads (`tbl = &data_...`, `var_10 = &a.1`) may name the targets or their table; "
-        "a table a store names is read with `bn evidence table <address>`, where a "
-        "`data_420010` name is the address 0x420010 and a symbol name resolves with "
-        "`bn xrefs a.1` (it prints `resolved 'a.1' as a data symbol @ <address>`)")
+        "reads may name the targets or their table; "
+        "a table a store names is read with `bn evidence table <address>`. "
+        "For a `data_<hex>` placeholder, use its hexadecimal address; "
+        "resolve a symbol with `bn xrefs <symbol>` (its header gives `<address>`)")
     detail = (
         f"unresolved indirect jump at {where} to `{row['target']}`: BN renders it as "
         "`❓ /* jump -> ... */` -- the ❓ marks control flow it could not resolve -- and "
@@ -1925,8 +1932,48 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
                         table=hex(table) if table is not None else None)
 
 
+def _resolved_branch_warnings(bv: Any, func: Any) -> list[dict[str, Any]]:
+    """Report BN's indirect-branch records without reconstructing missing targets."""
+    if _is_plt_stub(bv, func):
+        return []
+    groups: dict[int, set[int]] = {}
+    for branch in getattr(func, "indirect_branches", None) or []:
+        source = int(branch.source_addr)
+        groups.setdefault(source, set()).add(int(branch.dest_addr))
+    warnings = []
+    for source, destinations in sorted(groups.items()):
+        targets = []
+        separate = []
+        for address in sorted(destinations):
+            target: dict[str, Any] = {"address": hex(address)}
+            other = bv.get_function_at(address)
+            if other is not None and int(other.start) == address and address != int(func.start):
+                target["function"] = {"address": hex(address),
+                                      "name": il_format._display_name(other)}
+                separate.append(_function_label(other))
+            targets.append(target)
+        where = hex(source)
+        listed = ", ".join(target["address"] for target in targets[:3])
+        if len(targets) > 3:
+            listed += f" +{len(targets) - 3} more"
+        detail = (f"BN reports indirect branch targets at {where}: "
+                  + ", ".join(target["address"] for target in targets)
+                  + ". These are the targets BN resolved, not a claim that every "
+                  "table entry or possible destination was recovered.")
+        if separate:
+            detail += (" BN models these target addresses as separate function starts: "
+                       + "; ".join(separate)
+                       + ". Their bodies are listed separately; read them with "
+                       "`bn decompile <address>`.")
+        warnings.append(_warning_row(
+            "branch", f"BN resolved {len(targets)} indirect branch target(s) at {where}: "
+            + listed + (f"; {len(separate)} separate function start(s)" if separate else ""),
+            detail, address=where, targets=targets))
+    return warnings
+
+
 _OFFSET_RE = re.compile(r"__offset\((.+?), (-?(?:0x[0-9a-fA-F]+|\d+))\)")
-_OFFSET_SUMMARY_NAMES = 100
+_OFFSET_SUMMARY_MAX = 240
 
 
 def _type_lookup(bv):
@@ -1979,16 +2026,20 @@ def _this_pointee(func) -> str | None:
     return None
 
 
-def _name_list(names: list[str]) -> str:
-    """Whole names only -- never cut inside one -- while they fit the summary;
-    the rest as a count."""
+def _name_list(names: list[str], budget: int) -> str:
+    """Fit whole names and an omitted count within the caller's total budget."""
     shown: list[str] = []
-    for name in names:
-        if shown and len(", ".join([*shown, name])) > _OFFSET_SUMMARY_NAMES:
+    used = 0
+    for index, name in enumerate(names):
+        rest = len(names) - index - 1
+        suffix = f" +{rest} more" if rest else ""
+        added = len(name) + (2 if shown else 0)
+        if used + added + len(suffix) > budget:
             break
         shown.append(name)
+        used += added
     rest = len(names) - len(shown)
-    return ", ".join(shown) + (f" +{rest} more" if rest else "")
+    return ", ".join(shown) + (f"{' ' if shown else ''}+{rest} more" if rest else "")
 
 
 def _offset_warning(bv, func, text: str) -> dict[str, Any] | None:
@@ -2035,16 +2086,18 @@ def _offset_warning(bv, func, text: str) -> dict[str, Any] | None:
             "the vtable's address point, the value a constructor stores into an object's vptr.")
     if this_type and this_type in missing and this_type not in names:
         parts.append(f"`this` points at {this_type}, which has no definition either.")
-    summary_parts = []
-    if plain:
-        summary_parts.append(f"no type defined for {_name_list(plain)}")
-    if vtables:
-        summary_parts.append(f"vtable object(s), not types: {_name_list(vtables)}")
-    if defined:
-        summary_parts.append(f"defined: {_name_list(defined)}")
-    summary = ("__offset(T, N) is a pointer N bytes into T; "
-               + ("; ".join(summary_parts) or "its base types could not be read"))
-    return _warning_row("offset", summary, " ".join(parts),
+    groups = [(label, group) for label, group in (
+        ("no type defined for ", plain),
+        ("vtable object(s), not types: ", vtables),
+        ("defined: ", defined),
+    ) if group]
+    prefix = "__offset(T, N) is a pointer N bytes into T; "
+    budget = (_OFFSET_SUMMARY_MAX - len(prefix)
+              - sum(len(label) for label, _ in groups) - 2 * max(0, len(groups) - 1))
+    summary_parts = [label + _name_list(group, budget // len(groups))
+                     for label, group in groups]
+    summary = prefix + ("; ".join(summary_parts) or "its base types could not be read")
+    return _warning_row("offset", summary, " ".join(parts), address=hex(int(func.start)),
                         types={"defined": defined, "missing": missing})
 
 
@@ -2164,11 +2217,14 @@ def _decompile(
         warnings.append(arity_warn)
     warnings.extend(_unresolved_jump_warning(func, row, row["address"] in placed)
                     for row in jumps)
+    warnings.extend(_resolved_branch_warnings(bv, func))
     warnings.extend(_split_body_notes(bv, func))
     warnings.extend(_callee_split_notes(bv, func))
     string_note = _raw_string_pointer_note(bv, func, text)
     if string_note:
         warnings.append(string_note)
+    for warning in warnings:
+        warning.setdefault("address", hex(int(func.start)))
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": text,
@@ -2333,6 +2389,24 @@ def _return_width_inference_note(bv, func) -> str | None:
     )
 
 
+def _demangled_object_parameter(bv, func) -> bool:
+    """Whether BN's C++ demangler describes a leading object parameter.
+
+    This is only a demangler observation, not parameter provenance or ABI proof.
+    """
+    raw = str(getattr(func, "raw_name", func.name))
+    demangle = (getattr(bn, "demangle_gnu3", None) if raw.startswith("_Z")
+                else getattr(bn, "demangle_ms", None) if raw.startswith("?") else None)
+    if demangle is None:
+        return False
+    try:
+        signature, _ = demangle(bv.arch, raw)
+        parameters = list(getattr(signature, "parameters", None) or [])
+        return bool(parameters) and str(getattr(parameters[0], "name", "")) == "this"
+    except Exception:
+        return False
+
+
 def _get_prototype(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
@@ -2341,12 +2415,24 @@ def _get_prototype(ctx, selector: str | None, identifier):
             "name": func.name,
             "address": hex(func.start),
             "raw_name": getattr(func, "raw_name", func.name),
-            # #999 item 3: the demangled name `decompile` shows; `name` stays
-            # the symbol name the text splices into a pasteable C declaration.
+            # Keep symbol identity beside the descriptive display spelling.
             "display_name": il_format._display_name(func),
         },
         **il_format._function_metadata(func),
     }
+    params = list(getattr(getattr(func, "type", None), "parameters", None) or [])
+    if params:
+        name = str(getattr(params[0], "name", "")) or "<unnamed>"
+        current = f"Current prototype parameter 1 is named `{name}` with type {params[0].type}"
+    else:
+        current = "The current prototype has no parameters"
+    if _demangled_object_parameter(bv, func):
+        comparison = (
+            ", while BN's demangled C++ signature describes a leading object parameter")
+    else:
+        comparison = ". No demangled leading-object-parameter observation is available"
+    result["implicit_object_note"] = (
+        f"{current}{comparison}. This read makes no parameter-provenance or ABI claim.")
     note = _return_width_inference_note(bv, func)
     if note:
         result["return_width_note"] = note
@@ -3292,7 +3378,10 @@ def _possible_values(ctx, selector, identifier, at):
         for ins in list(il.instructions):
             if int(getattr(ins, "address", -1)) == address:
                 target_ins = ins
-                break
+                # SSA inserts PHIs at the following instruction's address.
+                # Keep a PHI only if there is no actual operation at that site.
+                if il_format._il_op_name(ins) not in ("MLIL_VAR_PHI", "MLIL_MEM_PHI"):
+                    break
     except Exception:
         target_ins = None
     if target_ins is None:
@@ -3331,5 +3420,18 @@ def _possible_values(ctx, selector, identifier, at):
         "source_expression": str(src_expr) if src_expr is not None else None,
         "possible_values": il_format._serialize_pvs(chosen),
     }
+    # The destination's addresses are not possible instruction/return values.
+    # Expose the operand separately, even when its analysis is undetermined,
+    # without changing the instruction/source selection above (#947).
+    opn = il_format._il_op_name(target_ins)
+    if opn.startswith(("MLIL_CALL", "MLIL_TAILCALL")):
+        dest_expr = getattr(target_ins, "dest", None)
+        result["call_destination"] = {
+            "expression": str(dest_expr) if dest_expr is not None else None,
+            "value_basis": "destination_expression",
+            "possible_values": il_format._serialize_pvs(
+                getattr(dest_expr, "possible_values", None) if dest_expr is not None else None
+            ),
+        }
     _annotate_containment(ctx, result, identifier, func)
     return result

@@ -386,6 +386,7 @@ class _WriteGate:
         self._state = threading.Lock()
         self._holder: dict[str, Any] | None = None
         self._waiters: set[str] = set()
+        self._refresh: dict[str, Any] | None = None
 
     def locked(self) -> bool:
         return self._lock.locked()
@@ -416,6 +417,34 @@ class _WriteGate:
     def holder(self) -> dict[str, Any] | None:
         with self._state:
             return _holder_view(self._holder)
+
+    @contextlib.contextmanager
+    def refresh(self):
+        """Reserve one refresh before it can queue on the writer gate.
+
+        The reservation lives on the gate, which a GUI successor shares with
+        its predecessor, so restarting the bridge cannot start a duplicate.
+        """
+        with self._state:
+            previous = dict(self._refresh) if self._refresh is not None else None
+            if previous is None:
+                self._refresh = {"since": time.monotonic(), "view": None}
+        if previous is not None:
+            elapsed = max(0, int(time.monotonic() - previous["since"]))
+            bv = previous["view"]
+            if bv is None:
+                detail = f"already pending (requested {elapsed}s ago)"
+            else:
+                detail = (f"already running{_progress_fragment(bv)}, "
+                          f"started {elapsed}s ago")
+            raise RuntimeError(
+                f"A refresh is {detail}; retry when it finishes -- "
+                "do not start another refresh.")
+        try:
+            yield
+        finally:
+            with self._state:
+                self._refresh = None
 
     def status(self, request_id: str) -> dict[str, Any]:
         with self._state:
@@ -1129,6 +1158,29 @@ class TargetManager:
                     pairs[vid] = raw_vid
         return pairs
 
+    def _pairing_notes(self, records: dict[str, TargetRecord]) -> list[str]:
+        """Explain rejected save pairs from the ledger and current file state."""
+        notes = []
+        for raw_vid, path in self._database_paths.items():
+            if raw_vid not in records:
+                continue
+            for vid, record in records.items():
+                if vid == raw_vid or not _same_file(record.filename, path):
+                    continue
+                identity = self._database_identities.get(raw_vid)
+                if identity is not None and _file_identity(path) != identity:
+                    notes.append(
+                        f"The saved database {path!r} no longer has the file "
+                        "identity recorded at save; its save pairing with the "
+                        "raw view is no longer valid."
+                    )
+                elif _source_verified.get(record.session_id) is False:
+                    notes.append(
+                        f"The database {path!r} was loaded without verified "
+                        "raw-source content, so its save pairing is not used."
+                    )
+        return notes
+
     def stripped_only_match(self, selector: str | None, bv) -> tuple[str, str] | None:
         """``(filename, listed selector)`` of *bv* when *selector* names it ONLY
         through a `.bndb`-stripped alias (`hello` for `hello.bndb`), else None.
@@ -1330,6 +1382,11 @@ class TargetManager:
                         "filename": record.filename,
                         "basename": record.basename,
                         "selector": selectors[view_id],
+                        "selector_reason": (
+                            "No filename or path suffix uniquely selects this "
+                            "view among the open targets; use its full target_id."
+                            if selectors[view_id] == record.target_id() else None
+                        ),
                         "view_name": record.view_name,
                         "active": _same_view(view, active),
                         # Per-target analysis state so `target list` can flag a
@@ -1416,6 +1473,12 @@ class TargetManager:
             rows = [target_row(t) for t in targets if t.get("view_id") in matched]
             raise RuntimeError("\n".join([
                 f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})",
+                *self._pairing_notes({
+                    record.view_id: record for record in matches
+                }),
+                "Filename aliases (including `.bndb`-stripped names) match "
+                "more than one open view; only a valid recorded save pairing "
+                "can prefer its original raw view.",
                 "Matching targets:",
                 *rows,
             ]))
@@ -1826,6 +1889,7 @@ class BinaryNinjaBridge:
     def __init__(self, instance_id: str | None = None):
         self.instance_id = instance_id
         self.instance_token = str(uuid.uuid4())
+        self._started_at = datetime.now(timezone.utc).isoformat()
         self._project_roots: set[str] = set()
         self._load_jobs_lock = threading.Lock()
         self._load_jobs: dict[str, dict[str, Any]] = {}
@@ -2302,8 +2366,9 @@ class BinaryNinjaBridge:
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
             "source_dir": SOURCE_DIR,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": self._started_at,
             "gui": ui is not None,
+            "capabilities": {"refresh_target_gate": True},
         }
         # Durable process identity (#694): a pid alone cannot distinguish this
         # bridge from an unrelated process that recycles its number after a crash,
@@ -3070,7 +3135,9 @@ class BinaryNinjaBridge:
             opened_known, opened_record = _opened_annotation_record(
                 bv, load_path if load_path.suffix == ".bndb" else None)
             if substitute is not None and opened_record is not None:
-                notes.append(_opened_annotation_note(opened_record))
+                annotation_note = _opened_annotation_note(opened_record)
+                if annotation_note is not None:
+                    notes.append(annotation_note)
             # The load note is one-shot; the target row keeps the verdict so a
             # later `target info` can still answer whether the restored
             # database was verified against the raw file.
@@ -3090,6 +3157,12 @@ class BinaryNinjaBridge:
                 if opened_known:
                     _opened_annotations[view_session_key(bv)] = opened_record
                 targets = self.targets.refresh()
+                loaded_target = self._loaded_target_row(targets, bv)
+                if loaded_target and loaded_target.get("selector_reason"):
+                    notes.append(
+                        f"Target selector {loaded_target['selector']!r}: "
+                        f"{loaded_target['selector_reason']}"
+                    )
 
             self._record_project_root(workdir)
             # Persist both the open-binary and project-root inventories.
@@ -3830,11 +3903,20 @@ class BinaryNinjaBridge:
         # could invalidate/close the view, leaving update_analysis_and_wait() to
         # run on a dead view (TOCTOU). Acquiring the gate first serializes refresh
         # against those writers before we ever touch the view.
-        with self._write_gate:
+        with self._write_gate.refresh(), self._write_gate:
+            # Bare CLI requests deliberately skip list_targets so a duplicate
+            # reaches the reservation before any target read can block. Reuse
+            # the sole-target gate here, then carry its identity-only pin into
+            # both analysis and the reply rather than following GUI focus.
+            if selector is None:
+                selector = self.targets.pin_destructive_target("refresh", selector)
             bv = self._resolve_view(selector)
+            started = time.monotonic()
+            with self._write_gate._state:
+                self._write_gate._refresh = {"since": started, "view": bv}
             # #996: gated reads on other connections see the refresh running and
             # say "retry", instead of telling the agent to start another one.
-            _refreshing_views[bv] = time.monotonic()
+            _refreshing_views[bv] = started
             try:
                 bv.update_analysis_and_wait()
                 with self._target_lock.write():
@@ -5117,6 +5199,7 @@ from .bridge_state import (  # noqa: E402
     _headless_views_lock,
     _quick_loaded_views,
     _opened_annotations,
+    _progress_fragment,
     _refreshing_views,
     _source_verified,
     _unanalyzed_views,
@@ -5250,7 +5333,10 @@ def _bind_close_binary(bridge, params, target):
     # spelling, so no filename can ever carry pin semantics.
     pinned = _validate_bool(params.get("pinned_target"), label="pinned_target",
                             default=False)
-    if pinned and not (isinstance(target, str) and target.strip()):
+    if pinned and not (
+        isinstance(target, str) and target.strip()
+        and target.strip() != "active"
+    ):
         raise ValueError("close_binary: pinned_target needs a target_id selector")
     return bridge._close_binary(
         params.get("path"),
@@ -5548,6 +5634,8 @@ def _bind_pointer_table(bridge, params, target):
         entries=int(params.get("entries", 16)),
         stride=params.get("stride"),
         width=params.get("width"),
+        decode=params.get("decode", "absolute"),
+        base=params.get("base"),
         record_size=params.get("record_size"),
         ptr_fields=params.get("ptr_fields"),
         fields=params.get("fields"),
@@ -5613,6 +5701,7 @@ def _bind_backward_slice(bridge, params, target):
         max_depth=int(params.get("max_depth", 50)),
         interprocedural=_validate_bool(params.get("interprocedural"), label="interprocedural", default=False),
         ip_depth=int(params.get("ip_depth", 2)),
+        mangled=_validate_bool(params.get("mangled"), label="mangled", default=False),
     )
 
 
@@ -6482,8 +6571,10 @@ def _opened_annotation_record(bv, database: Path | None) -> tuple[bool, dict[str
     }
 
 
-def _opened_annotation_note(record: dict[str, Any]) -> str:
-    """The load note stating what a substituted database already held."""
+def _opened_annotation_note(record: dict[str, Any]) -> str | None:
+    """Disclose inherited analyst work, omitting a measured all-zero record."""
+    if all(record[key] == 0 for key in ("comments", "function_comments", "analyst_symbols")):
+        return None
     return (
         f"{Path(record['path']).name} already held {record['comments']} comment(s), "
         f"{record['function_comments']} function doc(s) and "
@@ -6691,7 +6782,9 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
         opened_known, opened_record = _opened_annotation_record(
             bv, load_path if load_path.suffix == ".bndb" else None)
         if substitute is not None and opened_record is not None:
-            bn.log_info(_opened_annotation_note(opened_record))
+            annotation_note = _opened_annotation_note(opened_record)
+            if annotation_note is not None:
+                bn.log_info(annotation_note)
         if verified is not None:
             _source_verified[view_session_key(bv)] = verified
         if opened_known:

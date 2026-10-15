@@ -221,8 +221,6 @@ def test_parser_default_formats():
     assert parser.parse_args(["decompile", "sub_401000"]).target is None
     assert parser.parse_args(["decompile", "sub_401000"]).format == "text"
 
-    # Setup-style commands keep JSON for structured envelopes; skill install is human-friendly.
-    assert parser.parse_args(["plugin", "install"]).format == "json"
     assert parser.parse_args(["skill", "install"]).format == "text"
     assert parser.parse_args(["skill", "install"]).mode == "symlink"
     assert parser.parse_args(["bundle", "function", "sub_401000"]).format == "json"
@@ -849,23 +847,19 @@ def _callsite_row(call_addr: str) -> dict:
     }
 
 
-def test_render_callsites_notes_data_refs_to_the_callee_998():
-    """#998 item 1: a function stored in data may be called through it (a
-    vtable slot, a function-pointer table), which no call instruction names.
-    The note states how many such refs there are and where -- nothing more --
-    and points at `xrefs`."""
+@pytest.mark.parametrize("field", ["address", "class_name", "address_point"])
+def test_callsites_unreadable_vtable_hint_falls_back_with_disclosure(field):
     from bn.formatters import _render_callsites_text
-    value = {"items": [], "total": 0, "has_more": False, "scan_truncated": False,
-             "callee_data_ref_count": 5,
-             "callee_data_refs": ["0x41fc68", "0x41fcc8", "0x41fd00", "0x41fd08", "0x41fd10"]}
-    out = _render_callsites_text(value)
-    assert out.startswith("(no callsites)")
-    assert ("note: the callee's address is stored in 5 data location(s) (0x41fc68, 0x41fcc8, "
-            "0x41fd00, +2 more); they may be vtable slots or function-pointer tables, so it "
-            "may also be called indirectly -- see `bn xrefs` on the callee") in out
-    for count in (0, None):
-        assert "data location" not in _render_callsites_text(
-            {**value, "callee_data_ref_count": count, "callee_data_refs": []})
+    table = {"address": "0x401018", "class_name": "Widget",
+             "address_point": "0x401010", "evidence": "elf_symbol_size",
+             field: {"unreadable": True}}
+    out = _render_callsites_text({
+        "items": [], "total": 0, "callee_data_ref_count": 1,
+        "callee_data_refs": ["0x401018"], "callee_data_ref_vtables": [table],
+    })
+    assert "bn class show" not in out
+    assert "`bn xrefs 0x401018`" in out
+    assert f"malformed {field} field" in out
 
 
 def test_render_callsites_lists_the_other_containing_functions_998():
@@ -1226,6 +1220,36 @@ def test_render_surface_non_dict_summary_degrades():
     assert "hidden surface: ? init section(s)" in out
     assert "malformed summary field" in out
     assert out != _render_surface_text({})
+
+
+def test_render_surface_keeps_resolved_label_table_without_missing_candidates_1017():
+    from bn.formatters import _render_surface_text
+
+    table = {"address": "0x402020", "section": ".rodata", "entries": 4,
+             "resolved_functions": 4, "missing_functions": 0,
+             "slots": ["0x4011c7", "0x4011bf", "0x4011b7", "0x4011ae"]}
+    value = {"summary": {"init_sections": 0, "candidate_tables": 1,
+                         "missing_function_candidates": 0},
+             "candidate_tables": [table], "missing_function_candidates": []}
+    resolved = _render_surface_text(value)
+    assert any("0x402020" in line and "entries=4" in line and "fn=4" in line
+               and "missing=0" in line for line in resolved.splitlines())
+    # `via table:` explains why an unrecovered target was nominated. It is
+    # not a per-slot rendering of a table whose labels BN already recovered.
+    assert "via table:" not in resolved
+    assert all(address not in resolved for address in table["slots"])
+
+    missing = {"address": "0x4011c7", "section": ".text", "aligned": False,
+               "decode_depth": 4, "code_likely": False,
+               "provenance": "table:0x402020"}
+    unresolved = _render_surface_text({
+        **value,
+        "summary": {**value["summary"], "missing_function_candidates": 1},
+        "candidate_tables": [{**table, "resolved_functions": 3, "missing_functions": 1}],
+        "missing_function_candidates": [missing],
+    })
+    assert any("0x4011c7" in line and "via table:0x402020" in line
+               for line in unresolved.splitlines())
 
 
 def test_render_surface_code_ref_candidate_names_its_site_and_count_967():
@@ -4279,9 +4303,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # `data_ref_count`; #969 the imports listing's `library_unattributed`.
     # #978 adds the `function search` mangled-only match count.
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
-    assert len(sites) == 61, (
+    # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
+    assert len(sites) == 62, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 61. A "
+        "count helper, not 62. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4372,6 +4397,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # row, so the pair is skipped by the HARNESS rather than by the
         # renderer -- which DOES state it, pinned in the named test above.
         "_render_class_list_text(method_count) [count not stated in this context]",
+        # Another row-level count; refusal and intentional unknown are exercised
+        # in test_class_list_malformed_slot_count_is_disclosed_per_row in test_read_class.
+        "_render_class_list_text(vtable_slot_count) [count not stated in this context]",
         # #812: all three live NESTED under the diagnostics block's `frontier`
         # container, so a top-level probe never reaches the read that states
         # them -- the same shape as the `existing_annotations` pair below, not a
@@ -5875,6 +5903,60 @@ def test_render_session_start_text_omits_capture_error_when_absent():
     }
     out = _render_session_start_text(value)
     assert "target capture error" not in out
+
+
+def test_render_session_start_text_discloses_failed_cleanup():
+    from bn.formatters import _render_session_start_text
+
+    out = _render_session_start_text({
+        "instance_id": "worker-1",
+        "pid": 4242,
+        "socket_path": "/tmp/worker-1.sock",
+        "stopped": False,
+        "cleanup_error": "bridge instance worker-1 timed out waiting for teardown",
+    })
+
+    assert "cleanup error: bridge instance worker-1 timed out waiting for teardown" in out
+    assert "bridge process may still be running" in out
+    assert "session stopped:" not in out
+
+
+def test_render_session_start_text_preserves_successful_cleanup():
+    from bn.formatters import _render_session_start_text
+
+    out = _render_session_start_text({"instance_id": "worker-1", "stopped": True})
+
+    assert "session stopped: no binaries loaded successfully" in out
+    assert "cleanup error:" not in out
+    assert "may still be running" not in out
+
+
+def test_render_session_stop_text_does_not_claim_success_after_timeout():
+    from bn.formatters import _render_session_stop_text
+
+    out = _render_session_stop_text({
+        "instance_id": "worker-1",
+        "stopped": False,
+        "error": "timed out waiting for bridge instance worker-1 to fully tear down",
+    })
+
+    assert "stop failed: worker-1" in out
+    assert "error: timed out waiting for bridge instance worker-1" in out
+    assert "bridge process may still be running" in out
+    assert "stopped:" not in out
+
+
+@pytest.mark.parametrize("method", [None, "sigterm", "sigkill"])
+def test_render_session_stop_text_preserves_successful_stop(method):
+    from bn.formatters import _render_session_stop_text
+
+    value = {"instance_id": "worker-1", "stopped": True}
+    if method:
+        value["method"] = method
+
+    out = _render_session_stop_text(value)
+
+    assert out == "stopped: worker-1" + (f" ({method})" if method else "")
 
 
 def test_resolution_note_does_not_claim_containment_for_an_exact_start():
