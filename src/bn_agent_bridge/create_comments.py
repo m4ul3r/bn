@@ -60,7 +60,7 @@ def _function_delete(ctx, bv, address, *, exclusive=None):
     requested = {"op": "function_delete", "address": hex(addr)}
     warning = "No clean undo: BN retains a user override suppressing function creation here."
     result = None
-    phase = "preflight"
+    phase = "scope_enter"
     try:
         with scope():
             fn = bv.get_function_at(addr)
@@ -94,17 +94,17 @@ def _function_delete(ctx, bv, address, *, exclusive=None):
                 "rolled_back": False, "results": [row],
                 "affected_functions": [], "affected_types": [],
             }
+            phase = "mark_dirty"
+            ctx.targets.mark_dirty(bv)
             phase = "remove_user_function"
             try:
                 bv.remove_user_function(fn)
             except Exception as exc:
                 # The API itself can raise after writing. Retain that error
-                # while still closing its journal and marking the view dirty.
+                # while still closing its journal; the view is already dirty.
                 observed["apply_error"] = str(exc)
                 observed["error"] = str(exc)
                 observed["error_stage"] = phase
-            phase = "mark_dirty"
-            ctx.targets.mark_dirty(bv)
             phase = "commit_undo_actions"
             bv.commit_undo_actions(state)
             for start in predecessors:
@@ -113,9 +113,11 @@ def _function_delete(ctx, bv, address, *, exclusive=None):
                 if parent is not None:
                     phase = "reanalyze"
                     parent.reanalyze()
+            phase = "scope_exit"
         phase = "update_analysis_and_wait"
         bv.update_analysis_and_wait()
         observed["reanalysis_completed"] = True
+        phase = "scope_enter"
         with scope():
             phase = "get_function_at"
             remaining = bv.get_function_at(addr)
@@ -128,6 +130,7 @@ def _function_delete(ctx, bv, address, *, exclusive=None):
                 {"address": hex(parent.start), "name": str(parent.name)}
                 for parent in bv.get_functions_containing(addr) if parent.start != addr
             ]
+            phase = "scope_exit"
     except Exception as exc:
         if result is None:
             raise  # Preflight never entered the irreversible mutation.
@@ -142,6 +145,11 @@ def _function_delete(ctx, bv, address, *, exclusive=None):
         if observed["error"] != str(exc):
             observed["later_error"] = str(exc)
             observed["later_error_stage"] = phase
+    except BaseException as exc:
+        if result is not None:
+            observed["error"] = str(exc)
+            observed["error_stage"] = phase
+        raise  # Dirty tracking precedes the write; cancellation still propagates.
 
     removed = observed["function_removed"]
     containing = observed["bodies_containing_deleted_entry"]

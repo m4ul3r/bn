@@ -163,6 +163,8 @@ def test_delete_analysis_failure_compact_summary_reports_dirty_commit(monkeypatc
     "containing_start",
     "containing_name",
     "scope_exit",
+    "readback_scope_enter",
+    "readback_scope_exit",
 ])
 def test_delete_post_removal_exceptions_preserve_irreversible_result(monkeypatch, failure_point):
     from bn.cli import _mutation_exit_code
@@ -173,6 +175,7 @@ def test_delete_post_removal_exceptions_preserve_irreversible_result(monkeypatch
     removed = False
     marks = []
     commits = []
+    readback_reached = False
     targets = instance.ctx.targets
     view_id = "post-removal-test-view"
     targets._ids_by_object[bv] = view_id
@@ -191,7 +194,7 @@ def test_delete_post_removal_exceptions_preserve_irreversible_result(monkeypatch
         removed = True
 
     def mark(view):
-        assert removed, "dirty tracking must follow the irreversible write"
+        assert not removed, "dirty tracking must precede the irreversible write"
         marks.append(view)
         if failure_point == "mark_dirty":
             fail()
@@ -235,6 +238,8 @@ def test_delete_post_removal_exceptions_preserve_irreversible_result(monkeypatch
         fail()
 
     def containing(address):
+        nonlocal readback_reached
+        readback_reached = True
         if failure_point == "containing_lookup":
             fail()
         if failure_point == "containing_iteration":
@@ -252,7 +257,7 @@ def test_delete_post_removal_exceptions_preserve_irreversible_result(monkeypatch
         monkeypatch.setattr(host, "reanalyze", fail)
     if failure_point == "analysis":
         monkeypatch.setattr(bv, "update_analysis_and_wait", fail)
-    if failure_point == "scope_exit":
+    if failure_point in {"scope_exit", "readback_scope_enter", "readback_scope_exit"}:
         original_write = instance._target_lock.write
         scope_failed = False
 
@@ -260,8 +265,13 @@ def test_delete_post_removal_exceptions_preserve_irreversible_result(monkeypatch
         def write_scope():
             nonlocal scope_failed
             with original_write():
+                if removed and failure_point == "readback_scope_enter":
+                    fail()
                 yield
-            if removed and not scope_failed:
+            if removed and not scope_failed and (
+                failure_point == "scope_exit"
+                or (failure_point == "readback_scope_exit" and readback_reached)
+            ):
                 scope_failed = True
                 fail()
 
@@ -269,23 +279,32 @@ def test_delete_post_removal_exceptions_preserve_irreversible_result(monkeypatch
 
     result = instance._mutation(None, False, [{"op": "function_delete", "address": "0x1010"}])
 
-    assert removed
+    assert removed is (failure_point != "mark_dirty")
     assert marks == [bv]
-    if failure_point != "mark_dirty":
+    assert (view_id in targets._dirty_view_ids) is (failure_point != "mark_dirty")
+    if failure_point == "mark_dirty":
+        assert original_lookup(0x1010) is not None
+        assert not commits
+    else:
         assert commits
-        assert view_id in targets._dirty_view_ids
     if failure_point == "commit_before":
         assert not _has_event(bv, "commit")
     if failure_point == "commit_after":
         assert _has_event(bv, "commit")
     assert not _has_event(bv, "revert")
-    assert 0x1010 in bv._suppressed
+    assert (0x1010 in bv._suppressed) is (failure_point != "mark_dirty")
     row = result["results"][0]
     assert row["status"] == "verification_failed"
     assert row["irreversible_change"] is True
     observed = row["observed"]
     assert observed["error"] == error
     assert isinstance(observed["error_stage"], str) and observed["error_stage"]
+    if failure_point in {"scope_exit", "readback_scope_exit"}:
+        assert observed["error_stage"] == "scope_exit"
+        assert "apply_error" not in observed and "analysis_error" not in observed
+    if failure_point == "readback_scope_enter":
+        assert observed["error_stage"] == "scope_enter"
+        assert "analysis_error" not in observed
     assert observed["clean_undo_available"] is False
     if failure_point in {"entry_readback", "entry_name"}:
         assert observed["function_at_entry"] is None
@@ -334,3 +353,33 @@ def test_delete_requires_exact_entry_not_containing_body(monkeypatch):
         instance._mutation(None, False, [{"op": "function_delete", "address": "0x1004"}])
     assert failure.value.status == "invalid_request"
     assert bv.events == []
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit, BaseException])
+@pytest.mark.parametrize("phase", ["remove", "analysis", "readback"])
+def test_delete_interruption_propagates_with_real_dirty_ledger(monkeypatch, exception_type, phase):
+    _, instance, bv, _, _ = _setup(monkeypatch)
+    targets = instance.ctx.targets
+    targets._ids_by_object[bv] = "interrupted-delete"
+    original_remove = bv.remove_user_function
+    interruption = exception_type("injected deletion interruption")
+
+    def fail(*args, **kwargs):
+        raise interruption
+
+    def remove(fn):
+        assert "interrupted-delete" in targets._dirty_view_ids
+        original_remove(fn)
+        if phase == "remove":
+            fail()
+
+    monkeypatch.setattr(bv, "remove_user_function", remove)
+    if phase == "analysis":
+        monkeypatch.setattr(bv, "update_analysis_and_wait", fail)
+    if phase == "readback":
+        monkeypatch.setattr(bv, "get_functions_containing", fail)
+    with pytest.raises(exception_type) as caught:
+        instance._mutation(None, False, [{"op": "function_delete", "address": "0x1010"}])
+    assert caught.value is interruption
+    assert bv.get_function_at(0x1010) is None
+    assert "interrupted-delete" in targets._dirty_view_ids
