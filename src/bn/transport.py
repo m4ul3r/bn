@@ -1217,14 +1217,15 @@ def _agent_cache_dirs_for(instance_id: str, proc: Path | None = None) -> list[Pa
     return found
 
 
-def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool:
+def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool | None:
     """Whether the registry's socket serves the live bridge with this identity.
 
     A live pid or convincing argv cannot prove who bound a socket. Require the
     kernel's peer pid and an identity-checked protocol reply instead. This is a
     bounded, idle probe that takes no target/write lock, so discovery neither
-    queues behind analysis nor keeps an otherwise idle bridge alive. Missing
-    evidence retains the ordinary start advice; this lookup never deletes files.
+    queues behind analysis nor keeps an otherwise idle bridge alive. A timeout
+    is unknown (None), not evidence that another bridge should be started.
+    Invalid evidence retains ordinary start advice; this lookup never deletes files.
     """
     try:
         payload = json.loads(registry_path.read_text(encoding="utf-8"))
@@ -1258,12 +1259,18 @@ def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool:
             timeout=0.2, connect_retries=1, resolved=True, idle_probe=True,
             require_peer_pid=True,
         )
-    except (BridgeError, OSError, ValueError):
+    except (BridgeError, OSError, ValueError) as exc:
+        if isinstance(exc, TimeoutError) or isinstance(exc.__cause__, TimeoutError):
+            return None
         return False
     return True
 
 
-def _instance_registered_elsewhere(instance_id: str) -> Path | None:
+class _BusyRegistry(NamedTuple):
+    cache_root: Path
+
+
+def _instance_registered_elsewhere(instance_id: str) -> Path | _BusyRegistry | None:
     """The cache root, other than the current one, where *instance_id* is registered.
 
     BN_CACHE_DIR moves the instance registry along with the database cache, so
@@ -1272,6 +1279,8 @@ def _instance_registered_elsewhere(instance_id: str) -> Path | None:
     when BN_CACHE_DIR is set, plus roots read from same-user process environments.
     A candidate counts only when its ``instances/<id>.json`` leads to the live
     bridge's identity-checked socket, regardless of how that bridge was launched.
+    A timed-out candidate is retained as busy/unknown unless a later candidate
+    supplies a verified reply.
     """
     try:
         current = cache_home().resolve()
@@ -1281,16 +1290,21 @@ def _instance_registered_elsewhere(instance_id: str) -> Path | None:
     if os.environ.get("BN_CACHE_DIR"):
         candidates.append(default_cache_home())
     candidates.extend(_agent_cache_dirs_for(instance_id))
+    busy = None
     for candidate in candidates:
         try:
             if candidate.resolve() == current:
                 continue
-            if _registry_names_live_bridge(
-                    candidate / "instances" / f"{instance_id}.json", instance_id):
+            verdict = _registry_names_live_bridge(
+                candidate / "instances" / f"{instance_id}.json", instance_id
+            )
+            if verdict is True:
                 return candidate
+            if verdict is None:
+                busy = _BusyRegistry(candidate)
         except OSError:
             continue
-    return None
+    return busy
 
 
 def instance_not_found_message(instance_id: str, advice: str) -> str:
@@ -1303,6 +1317,12 @@ def instance_not_found_message(instance_id: str, advice: str) -> str:
     searched = instances_dir()
     head = f"No bridge instance found with id: {instance_id} (searched {searched})."
     elsewhere = _instance_registered_elsewhere(instance_id)
+    if isinstance(elsewhere, _BusyRegistry):
+        return (
+            f"{head} Instance {instance_id} may be busy under {elsewhere.cache_root}: "
+            "the registry probe timed out before its identity could be verified. "
+            "Wait and retry; do not start a duplicate bridge."
+        )
     if elsewhere is not None:
         return (
             f"{head} Instance {instance_id} is registered under {elsewhere}: "

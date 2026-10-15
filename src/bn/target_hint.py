@@ -126,41 +126,12 @@ def respell_for_positional(message: str, command: str) -> str:
                          f"{command} <selector>")
 
 
-def respell_for_option(message: str, argv: list[str], value_options: set[str]) -> str:
-    """Preserve the invocation's operands/options, replacing only its selector."""
-    kept: list[str] = []
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token == "--":
-            kept.extend(argv[index:])
-            break
-        if token in ("-t", "--target"):
-            index += 2
-            continue
-        if token.startswith("--target=") or (token.startswith("-t") and token != "-t"):
-            index += 1
-            continue
-        if token in ("-i", "--instance") and index + 1 < len(argv):
-            value = argv[index + 1]
-            kept.extend([f"--instance={value}"] if value.startswith("-") else [token, value])
-            index += 2
-            continue
-        if token.startswith("-i") and not token.startswith("--"):
-            value = token[2:].removeprefix("=")
-            if value.startswith("-"):
-                kept.append(f"--instance={value}")
-                index += 1
-                continue
-        if token in value_options and index + 1 < len(argv):
-            kept.extend(argv[index:index + 2])
-            index += 2
-            continue
-        kept.append(token)
-        index += 1
+def respell_for_option(message: str, argv: list[str]) -> str:
+    """Render canonical parsed arguments, which contain no target selector."""
+    command = shlex.join(argv)
     return _respell_rows(
-        message, lambda selector: f"bn {target_option(selector)} {shlex.join(kept)}",
-        "bn -t <selector> " + shlex.join(kept),
+        message, lambda selector: f"bn {target_option(selector)} {command}",
+        "bn -t <selector> " + command,
     )
 
 

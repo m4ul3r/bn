@@ -297,7 +297,8 @@ def _close_hint_in_run_form(args: argparse.Namespace, exc: BridgeError) -> Bridg
         return exc
     command = (f"{_target_close_prefix(args)} {positional_selector(selector)}"
                if getattr(args, "_close_spelling", None) == "target close"
-               else f"bn {_routing(args)}close {target_option(selector)}")
+               else f"{getattr(args, '_target_hint_command', f'bn {_routing(args)}close')} "
+                    f"{target_option(selector)}")
     return BridgeError(f"{head}close it with `{command}`.")
 
 
@@ -311,7 +312,7 @@ def _routing(args: argparse.Namespace) -> str:
 
 
 def _target_close_prefix(args: argparse.Namespace) -> str:
-    return f"bn {_routing(args)}target close"
+    return getattr(args, "_target_hint_command", f"bn {_routing(args)}target close")
 
 
 @command("target", "close", help="Close one open target by selector", fmt="text",

@@ -205,7 +205,9 @@ only one target is open.
 Restart/export hints are offered only after checking the registry's live
 socket peer identity and receiving a bridge response. Process command-line
 spelling alone is not evidence that the registered socket belongs to that
-bridge; unverifiable endpoints receive no export hint.
+bridge; unverifiable endpoints receive no export hint. If a registry probe
+times out, the instance may be busy: wait and retry rather than starting a
+duplicate bridge. A timeout does not establish that the instance is absent.
 
 ## Output Behavior
 

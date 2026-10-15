@@ -5,6 +5,7 @@ import json
 import os
 import re
 import select
+import shlex
 import stat
 import sys
 import time
@@ -3004,6 +3005,57 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
                     "`bn target list`")
 
 
+def _target_hint_argv(args: argparse.Namespace, root: argparse.ArgumentParser) -> list[str]:
+    """Serialize argparse's result, not argv spelling or option-arity guesses."""
+    selected = getattr(args, "_parser", root)
+    path = tuple(args._command_path)
+    options: list[str] = []
+    operands: list[str] = []
+    seen: set[str] = set()
+    # Leaf actions own defaults and aliases; root actions supply global-only flags.
+    for action in [*selected._actions, *root._actions]:
+        dest = action.dest
+        if (dest in seen or dest in ("target", "instance")
+                or isinstance(action, (argparse._SubParsersAction, argparse._HelpAction))
+                or not hasattr(args, dest)):
+            continue
+        if (path == ("close",) and dest == "path"
+                or path == ("target", "close") and dest == "selector"):
+            continue
+        value = getattr(args, dest)
+        if value is None or value == argparse.SUPPRESS:
+            continue
+        if not action.option_strings:
+            operands.extend(str(item) for item in (value if isinstance(value, list) else [value]))
+            seen.add(dest)
+            continue
+        if dest == "format":
+            if not getattr(args, "_format_explicit", False):
+                continue
+        elif value == action.default:
+            continue
+        flag = next((flag for flag in action.option_strings if flag.startswith("--")),
+                    action.option_strings[0])
+        if action.nargs == 0:
+            if value != getattr(action, "const", None):
+                continue
+            options.append(flag)
+        else:
+            values = value if isinstance(action, argparse._AppendAction) else [value]
+            for item in values:
+                if isinstance(item, tuple) and action.type is _parse_line_range:
+                    options.append(f"{flag}={item[0]}:{item[1]}")
+                elif isinstance(item, list):
+                    options.extend([flag, *(str(part) for part in item)])
+                else:
+                    options.append(f"{flag}={item}")
+        seen.add(dest)
+    instance = getattr(args, "instance", None)
+    routing = ([] if instance is None else
+               [f"--instance={instance}"] if str(instance).startswith("-") else ["-i", str(instance)])
+    return [*routing, *path, *options, *(["--"] if operands else []), *operands]
+
+
 def main(argv: list[str] | None = None) -> int:
     global _MACHINE_ERROR_FORMAT
     parser = build_parser()
@@ -3031,6 +3083,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     _apply_sticky_defaults(args)
+    hint_argv = _target_hint_argv(args, parser)
+    args._target_hint_command = "bn " + shlex.join(hint_argv)
 
     try:
         return handler(args)
@@ -3038,20 +3092,7 @@ def main(argv: list[str] | None = None) -> int:
         msg = str(exc)
         if tuple(getattr(args, "_command_path", ())) != ("target", "close"):
             from .target_hint import respell_for_option
-            hint_argv = parse_argv
-            if tuple(getattr(args, "_command_path", ())) == ("close",):
-                hint_argv = ["close"]
-                if getattr(args, "instance", None):
-                    hint_argv.insert(0, f"--instance={args.instance}")
-            selected = _selected_parser_for_argv(parser, parse_argv)
-            value_options = {
-                option for option, action in selected._option_string_actions.items()
-                if action.nargs != 0
-            }
-            if (getattr(args, "instance", None) and not args._explicit_instance
-                    and tuple(getattr(args, "_command_path", ())) != ("close",)):
-                hint_argv = [f"--instance={args.instance}", *hint_argv]
-            msg = respell_for_option(msg, hint_argv, value_options)
+            msg = respell_for_option(msg, hint_argv)
         if getattr(args, "_sticky_instance", False) and _looks_like_dead_bridge(msg):
             msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
         status = getattr(exc, "status", None)

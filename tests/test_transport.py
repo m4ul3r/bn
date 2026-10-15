@@ -2498,6 +2498,74 @@ def test_missing_instance_points_at_the_registry_that_holds_it_996(tmp_path, mon
         assert "BN_CACHE_DIR is set, and it scopes the instance registry" in str(exc.value)
 
 
+@pytest.mark.parametrize("failure", ["timeout", "wrapped", "mid-response"])
+def test_missing_instance_probe_timeout_never_advises_duplicate_start(
+    tmp_path, monkeypatch, failure
+):
+    from bn import transport
+
+    default_root = tmp_path / "default"
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(transport, "default_cache_home", lambda: default_root)
+    monkeypatch.setattr(transport, "_agent_cache_dirs_for", lambda instance_id: [])
+    registry = default_root / "instances" / "demo.json"
+    registry.parent.mkdir(parents=True)
+    document = json.dumps({
+        "pid": os.getpid(), "instance_id": "demo",
+        "socket_path": str(tmp_path / "busy.sock"),
+        "instance_token": "hint-token",
+    })
+    registry.write_text(document, encoding="utf-8")
+
+    def timeout(*args, **kwargs):
+        assert kwargs["timeout"] == 0.2
+        assert kwargs["require_peer_pid"] is True
+        assert kwargs["idle_probe"] is True
+        if failure == "timeout":
+            raise TimeoutError("busy")
+        try:
+            raise TimeoutError("busy")
+        except TimeoutError as exc:
+            message = (
+                "failed mid-response after 10 bytes"
+                if failure == "mid-response" else "Timed out waiting for bridge"
+            )
+            raise BridgeError(message) from exc
+
+    monkeypatch.setattr(transport, "_send_request_to_instance", timeout)
+    with pytest.raises(BridgeError) as exc:
+        choose_instance("demo")
+    message = str(exc.value)
+    assert "may be busy" in message
+    assert str(default_root) in message
+    assert "Wait and retry" in message
+    assert "Start one with" not in message
+    assert "session start" not in message
+    assert "export BN_CACHE_DIR" not in message
+    assert registry.read_text(encoding="utf-8") == document
+
+
+def test_verified_registry_hint_takes_precedence_over_busy_candidate(tmp_path, monkeypatch):
+    from bn import transport
+
+    busy_root = tmp_path / "busy"
+    verified_root = tmp_path / "verified"
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(transport, "default_cache_home", lambda: busy_root)
+    monkeypatch.setattr(
+        transport, "_agent_cache_dirs_for", lambda instance_id: [verified_root]
+    )
+    monkeypatch.setattr(
+        transport, "_registry_names_live_bridge",
+        lambda registry, instance_id: None if registry.parent.parent == busy_root else True,
+    )
+
+    message = transport.instance_not_found_message("demo", "Start one with: bn session start")
+    assert f"export BN_CACHE_DIR={verified_root}" in message
+    assert "may be busy" not in message
+    assert "Start one with" not in message
+
+
 @pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="Requires kernel peer pid")
 @pytest.mark.parametrize("argv", [
     b"/venv/bin/bn-agent\0--instance-id\0demo\0",
@@ -2582,7 +2650,10 @@ def test_registry_export_rejects_decoy_argv_1020(tmp_path, monkeypatch, endpoint
                     registry.write_text(json.dumps(payload), encoding="utf-8")
             message = transport.instance_not_found_message("demo", "Start one.")
             assert "export BN_CACHE_DIR" not in message
-            assert "Start one." in message
+            if endpoint == "unresponsive":
+                assert "Start one." not in message
+            else:
+                assert "Start one." in message
             assert json.loads(registry.read_text(encoding="utf-8")) == payload
             if endpoint == "foreign":
                 assert server.requests == []  # kernel peer mismatch: no request sent
