@@ -1952,3 +1952,424 @@ def _rendered_lines(bridge, monkeypatch, batches):
     func = _FakeFunction(0x500000, "handle_reply")
     _install_fake_pseudo_c(monkeypatch, bridge, func, [batches])
     return bridge.read_listing._callsite_decompile_render(_FakeBV(), func)
+
+
+@pytest.mark.parametrize("is64,endian", [(True, "<"), (True, ">"), (False, "<"), (False, ">")])
+@pytest.mark.parametrize("extent,symbol_address", [(24, 0x4000), (0, 0x4000), (24, 0x8000)])
+@pytest.mark.parametrize("symbol_type", ["DataSymbol", "ImportAddressSymbol", "ExternalSymbol"])
+@pytest.mark.parametrize("image_base", [0, 0x400000])
+def test_callee_data_refs_require_actual_elf_vtable_extent(monkeypatch, is64, endian, extent, symbol_address, symbol_type, image_base):
+    import struct
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    ptr = 8 if is64 else 4
+    data = bytearray(1024)
+    data[:16] = b"\x7fELF" + bytes([2 if is64 else 1, 1 if endian == "<" else 2]) + bytes(10)
+    struct.pack_into(endian + ("Q" if is64 else "I"), data, 40 if is64 else 32, 64)
+    stride = 64 if is64 else 40
+    struct.pack_into(endian + "HH", data, 58 if is64 else 46, stride, 4)
+    shfmt = endian + ("IIQQQQIIQQ" if is64 else "IIIIIIIIII")
+    sections = [
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (0, 1, 2, 0x4000, 512, 64, 0, 0, ptr, 0),
+        (0, 3, 0, 0, 640, 9, 0, 0, 1, 0),
+        (0, 2, 0, 0, 704, 24 if is64 else 16, 2, 0, ptr, 24 if is64 else 16),
+    ]
+    for i, section in enumerate(sections):
+        struct.pack_into(shfmt, data, 64 + i * stride, *section)
+    data[640:649] = b"\0_ZTV1X\0\0"
+    if is64:
+        struct.pack_into(endian + "IBBHQQ", data, 704, 1, 1, 0, 1, 0x4000, extent)
+    else:
+        struct.pack_into(endian + "IIIBBH", data, 704, 1, 0x4000, extent, 1, 0, 1)
+    reads = []
+
+    def read(off, size):
+        reads.append((off, size))
+        assert 0 <= off <= off + size <= len(data)
+        return data[off:off + size]
+
+    sym = SimpleNamespace(address=symbol_address + image_base, short_name="vtable for X",
+                          raw_name="_ZTV1X", type=symbol_type)
+    inside, adjacent = image_base + 0x4000 + 2 * ptr, image_base + 0x4000 + max(extent, 24)
+    bv = SimpleNamespace(
+        image_base=image_base, original_image_base=0,
+        address_size=ptr, functions=[], get_symbols=lambda: [sym],
+        parent_view=SimpleNamespace(start=0, length=len(data), read=read),
+        get_symbols_by_raw_name=lambda name: [sym] if name == "_ZTV1X" else [],
+        get_data_refs=lambda address: [adjacent, inside])
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert result["callee_data_refs"] == [hex(inside), hex(adjacent)]
+    expected = [hex(inside)] if extent == 24 and symbol_address == 0x4000 and symbol_type == "DataSymbol" else []
+    assert [row["address"] for row in result["callee_data_ref_vtables"]] == expected
+    assert sum(size for _, size in reads) < 1024
+
+
+def _callee_elf_census_fixture(*, failure=None, irrelevant=0, aliases=()):
+    """Two real ELF symbol tables; the local one can hide an overlap."""
+    import struct
+    from types import SimpleNamespace
+
+    strings = b"\0_ZTV1X\0_ZTV1Y\0"
+    dyn_rows = [(1, 1, 0, 1, 0x4000, 24)]
+    for i in range(irrelevant):
+        name_offset = len(strings)
+        strings += f"_ZTVMiss{i}\0".encode()
+        dyn_rows.append((name_offset, 1, 0, 1, 0x4100 + i * 32, 24))
+    local_rows = [] if failure == "complete_single" else [(8, 1, 0, 1, 0x4000, 24)]
+    shapes = {
+        "size_zero": (8, 1, 0, 1, 0x4000, 0),
+        "short_extent": (8, 1, 0, 1, 0x4000, 16),
+        "notype": (8, 0, 0, 1, 0x4000, 24),
+        "unsupported_type": (8, 2, 0, 1, 0x4000, 24),
+        "absolute": (8, 1, 0, 0xfff1, 0x4000, 24),
+        "common": (8, 1, 0, 0xfff2, 0x4000, 24),
+        "wrong_owner": (8, 1, 0, 2, 0x4000, 24),
+        "bad_bounds": (8, 1, 0, 1, 0x3ff0, 24),
+        "overflow": (8, 1, 0, 1, (1 << 64) - 8, 24),
+        "invalid_index": (8, 1, 0, 6, 0x4000, 24),
+        "invalid_index_notype": (0, 0, 0, 6, 0, 0),
+        "xindex": (8, 1, 0, 0xffff, 0x4000, 24),
+        "xindex_companion": (8, 1, 0, 0xffff, 0x4000, 24),
+        "undefined": (8, 0, 0, 0, 0, 0),
+    }
+    if failure in shapes:
+        local_rows = [shapes[failure]]
+    if failure == "irrelevant_absolute":
+        local_rows = [(len(strings), 0, 0, 0xfff1, 0x4000, 0)]
+        strings += b"padding\0"
+    if failure == "symbol_cap":
+        local_rows = [(0, 0, 0, 0, 0, 0)] * 65536 + local_rows
+    if failure == "name_offset":
+        local_rows[0] = (len(strings), 1, 0, 1, 0x4000, 24)
+    local_strings = strings if failure != "unterminated" else b"\0_ZTV1X\0_ZTV1Y"
+    data = bytearray(512)
+
+    def append(blob):
+        off = len(data)
+        data.extend(blob)
+        return off, len(blob)
+
+    dynstr = append(strings)
+    dynsym = append(b"".join(struct.pack("<IBBHQQ", *row) for row in dyn_rows))
+    strtab = append(local_strings)
+    symtab = append(b"".join(struct.pack("<IBBHQQ", *row) for row in local_rows))
+    data[:16] = b"\x7fELF\x02\x01" + bytes(10)
+    struct.pack_into("<Q", data, 40, 64)
+    struct.pack_into("<HH", data, 58, 64, 6)
+    sections = [
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (0, 1, 2, 0x4000, 0, 0x100 + irrelevant * 32, 0, 0, 8, 0),
+        (0, 3, 0, 0, *dynstr, 0, 0, 1, 0),
+        (0, 11, 0, 0, *dynsym, 2, 0, 8, 24),
+        (0, 3, 0, 0, *strtab, 0, 0, 1, 0),
+        (0, 2, 0, 0, *symtab, 4, 0, 8, 24),
+    ]
+    if failure == "xindex_companion":
+        companion = append(struct.pack("<I", 1))
+        sections.append((0, 18, 0, 0, *companion, 5, 0, 4, 4))
+        struct.pack_into("<HH", data, 58, 64, len(sections))
+    if failure == "byte_cap":
+        sections[4] = (0, 3, 0, 0, strtab[0], 4 * 1024 * 1024, 0, 0, 1, 0)
+    if failure == "entry_size":
+        sections[5] = (*sections[5][:-1], 23)
+    if failure == "bad_link":
+        sections[5] = (*sections[5][:6], 6, *sections[5][7:])
+    if failure == "not_strings":
+        sections[4] = (0, 1, *sections[4][2:])
+    for i, section in enumerate(sections):
+        struct.pack_into("<IIQQQQIIQQ", data, 64 + i * 64, *section)
+    lookups, header_reads = [], []
+
+    def read(off, size):
+        if failure == "unread_symbols" and (off, size) == symtab:
+            return None
+        if failure == "unread_strings" and (off, size) == strtab:
+            return None
+        return data[off:off + size]
+
+    local_x = SimpleNamespace(address=0x4000, short_name="vtable for X",
+                              raw_name="_ZTV1X", type="DataSymbol")
+    x_symbols = [local_x if kind == "DataSymbol" else SimpleNamespace(
+        address=0x4000, short_name="vtable for Wrong", raw_name="_ZTV1X", type=kind)
+        for kind in aliases] or [local_x]
+    y_symbols = [] if failure == "complete_single" else [
+        SimpleNamespace(address=0x4000, short_name="vtable for Y",
+                        raw_name="_ZTV1Y", type="DataSymbol")]
+    native_symbols = [*x_symbols, *y_symbols]
+
+    def symbols(name):
+        lookups.append(name)
+        return {"_ZTV1X": x_symbols, "_ZTV1Y": y_symbols}.get(name, [])
+
+    def header_read(address, size):
+        header_reads.append((address, size))
+        return bytes(size)
+
+    bv = SimpleNamespace(
+        parent_view=SimpleNamespace(start=0, length=len(data), read=read),
+        address_size=8, functions=[], get_symbols=lambda: native_symbols,
+        image_base=0, original_image_base=0, read=header_read, get_symbol_at=lambda address: None,
+        get_symbols_by_raw_name=symbols, get_data_refs=lambda address: [0x4010, 0x900000])
+    return bv, lookups, header_reads
+
+
+@pytest.mark.parametrize("failure", [
+    "symbol_cap", "byte_cap", "unread_symbols", "unread_strings",
+    "name_offset", "unterminated", "entry_size", "bad_link", "not_strings",
+])
+def test_callee_vtable_incomplete_symbol_census_discards_earlier_dynsym(monkeypatch, failure):
+    bridge = _load_bridge(monkeypatch)
+    bv, _, _ = _callee_elf_census_fixture(failure=failure)
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert result["callee_data_ref_count"] == 2
+    assert result["callee_data_refs"] == ["0x4010", "0x900000"]
+    assert result["callee_data_ref_vtables"] == []
+
+
+@pytest.mark.parametrize("import_type", [
+    "ImportAddressSymbol", "ImportedDataSymbol", "ImportedFunctionSymbol", "ExternalSymbol",
+])
+@pytest.mark.parametrize("local_first", [False, True])
+def test_callee_vtable_plural_symbols_keep_local_alias_in_either_order(monkeypatch, import_type, local_first):
+    bridge = _load_bridge(monkeypatch)
+    aliases = ("DataSymbol", import_type) if local_first else (import_type, "DataSymbol")
+    bv, _, _ = _callee_elf_census_fixture(failure="complete_single", aliases=aliases)
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert result["callee_data_ref_vtables"] == [{
+        "address": "0x4010", "class_name": "X", "vtable_address": "0x4000",
+        "address_point": None, "evidence": "elf_symbol_size",
+    }]
+
+
+@pytest.mark.parametrize("local_alias_visible", [False, True])
+def test_callee_vtable_complete_census_refuses_overlapping_classes(monkeypatch, local_alias_visible):
+    bridge = _load_bridge(monkeypatch)
+    bv, _, _ = _callee_elf_census_fixture()
+    if not local_alias_visible:
+        symbols = bv.get_symbols_by_raw_name
+        bv.get_symbols_by_raw_name = lambda name: [] if name == "_ZTV1Y" else symbols(name)
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert result["callee_data_ref_count"] == 2
+    assert result["callee_data_ref_vtables"] == []
+
+
+@pytest.mark.parametrize("known_ref", [False, True])
+def test_callee_vtable_off_extent_symbols_skip_bn_lookup_and_header_reads(monkeypatch, known_ref):
+    bridge = _load_bridge(monkeypatch)
+    bv, lookups, header_reads = _callee_elf_census_fixture(failure="complete_single", irrelevant=5000)
+    if not known_ref:
+        bv.get_data_refs = lambda address: [0x900000]
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert [row["class_name"] for row in result["callee_data_ref_vtables"]] == (["X"] if known_ref else [])
+    assert lookups == (["_ZTV1X"] if known_ref else [])
+    if not known_ref:
+        assert header_reads == []
+
+
+def test_callee_vtable_hint_rejects_hostile_section_count_without_large_reads(monkeypatch):
+    import struct
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    data = bytearray(64)
+    data[:16] = b"\x7fELF\x02\x01" + bytes(10)
+    struct.pack_into("<Q", data, 40, 64)
+    struct.pack_into("<HH", data, 58, 64, 65535)
+    reads = []
+
+    def read(off, size):
+        reads.append(size)
+        assert size <= 16
+        return data[off:off + size]
+
+    bv = SimpleNamespace(parent_view=SimpleNamespace(start=0, length=1 << 40, read=read),
+                         get_symbols_by_raw_name=lambda name: [],
+                         get_data_refs=lambda address: [0x401018])
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert result["callee_data_refs"] == ["0x401018"]
+    assert result["callee_data_ref_vtables"] == []
+    assert reads == [16, 8, 4]
+
+
+@pytest.mark.parametrize("ptr,endian", [(8, "<"), (8, ">"), (4, "<"), (4, ">")])
+@pytest.mark.parametrize("prefix_words", [0, 3, 65])
+def test_callee_address_point_reads_header_after_virtual_offsets(monkeypatch, ptr, endian, prefix_words):
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    order = "little" if endian == "<" else "big"
+    words = [0] * prefix_words + [0, 0x9000, 0x5000]
+    data = b"".join(word.to_bytes(ptr, order) for word in words)
+    reads = []
+
+    def read(address, size):
+        reads.append((address, size))
+        return data[:size]
+
+    typeinfo = SimpleNamespace(short_name="_typeinfo_for_X", type="DataSymbol")
+    bv = SimpleNamespace(read=read, get_symbol_at=lambda address: typeinfo if address == 0x9000 else None)
+    point = bridge.read_listing._callee_vtable_address_point(bv, 0x4000, len(data), "X", ptr, endian)
+    assert point == (hex(0x4000 + (prefix_words + 2) * ptr) if prefix_words < 64 else None)
+    assert reads == [(0x4000, min(len(data), 64 * ptr))]
+
+
+def test_callee_address_point_refuses_ambiguous_primary_headers(monkeypatch):
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    data = b"".join(word.to_bytes(8, "little") for word in [0, 0x9000, 0x5000, 0, 0x9000, 0x5100])
+    typeinfo = SimpleNamespace(short_name="typeinfo for X", type="DataSymbol")
+    bv = SimpleNamespace(read=lambda address, size: data[:size],
+                         get_symbol_at=lambda address: typeinfo if address == 0x9000 else None)
+    assert bridge.read_listing._callee_vtable_address_point(bv, 0x4000, len(data), "X", 8, "<") is None
+
+
+@pytest.mark.parametrize("failure", [
+    "size_zero", "short_extent", "notype", "unsupported_type", "absolute", "common",
+    "wrong_owner", "bad_bounds", "overflow", "invalid_index", "invalid_index_notype",
+    "xindex", "xindex_companion",
+])
+def test_callee_vtable_unresolved_defined_identity_refuses_all_hints(monkeypatch, failure):
+    bridge = _load_bridge(monkeypatch)
+    bv, _, _ = _callee_elf_census_fixture(failure=failure)
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert result["callee_data_ref_count"] == 2
+    assert result["callee_data_refs"] == ["0x4010", "0x900000"]
+    assert result["callee_data_ref_vtables"] == []
+
+
+@pytest.mark.parametrize("failure", ["undefined", "irrelevant_absolute"])
+def test_callee_vtable_known_nondefinitions_do_not_hide_unique_class(monkeypatch, failure):
+    bridge = _load_bridge(monkeypatch)
+    bv, _, _ = _callee_elf_census_fixture(failure=failure)
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert [row["class_name"] for row in result["callee_data_ref_vtables"]] == ["X"]
+
+
+@pytest.mark.parametrize("same_raw_name", [False, True])
+def test_callee_vtable_duplicate_native_class_names_refuse_both_objects(monkeypatch, same_raw_name):
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    bv, _, _ = _callee_elf_census_fixture(failure="complete_single", irrelevant=1)
+    original = bv.get_symbols()[0]
+    other = SimpleNamespace(address=0x4100, short_name="vtable for X", type="DataSymbol",
+                            raw_name=original.raw_name if same_raw_name else "_ZTVMiss0")
+    bv.get_symbols = lambda: [original, other]
+    getter = bv.get_symbols_by_raw_name
+    bv.get_symbols_by_raw_name = lambda name: (
+        [original, other] if same_raw_name and name == "_ZTV1X" else
+        [other] if name == "_ZTVMiss0" else getter(name))
+    bv.get_data_refs = lambda address: [0x4010, 0x4110]
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert result["callee_data_ref_count"] == 2
+    assert result["callee_data_refs"] == ["0x4010", "0x4110"]
+    assert result["callee_data_ref_vtables"] == []
+
+
+def test_callee_vtable_nested_elf_head_is_not_a_synthesized_marker(monkeypatch):
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    bv, _, _ = _callee_elf_census_fixture(failure="complete_single")
+    original = bv.get_symbols()[0]
+    other = SimpleNamespace(address=0x4080, short_name="vtable for X",
+                            raw_name=original.raw_name, type="DataSymbol")
+    bv.get_symbols = lambda: [original, other]
+    candidate = {"address": "0x4010", "class_name": "X",
+                 "vtable_address": "0x4000", "address_point": "0x4080",
+                 "evidence": "elf_symbol_size"}
+    assert bridge.read_listing._callee_vtable_named_refs(
+        bridge.BinaryNinjaBridge().ctx, bv, [candidate],
+        {0x4000: 0x100, 0x4080: 24}) == []
+
+
+@pytest.mark.parametrize("proved_point", [False, True])
+def test_callee_vtable_only_proven_synthesized_marker_keeps_name_hint(monkeypatch, proved_point):
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    bv, _, _ = _callee_elf_census_fixture(failure="complete_single")
+    original = bv.get_symbols()[0]
+    address_point = SimpleNamespace(address=0x4010, short_name="vtable for X",
+                                    raw_name="_vtable_for_X", type="DataSymbol")
+    bv.get_symbols = lambda: [original, address_point]
+    if proved_point:
+        ti = SimpleNamespace(address=0x6000, short_name="typeinfo for X",
+                             raw_name="_ZTI1X", type="DataSymbol")
+        memory = b"".join(word.to_bytes(8, "little") for word in (0, 0x6000, 0x5000))
+        bv.read = lambda address, size: (
+            memory[address - 0x4000:address - 0x4000 + size]
+            if 0x4000 <= address < 0x4018 else bytes(size))
+        bv.get_symbol_at = lambda address: ti if address == 0x6000 else None
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert [row["class_name"] for row in result["callee_data_ref_vtables"]] == (["X"] if proved_point else [])
+
+
+@pytest.mark.parametrize("surface", ["symbols_missing", "functions_missing", "symbol_budget",
+                                    "function_budget", "symbols_unbounded", "functions_unbounded"])
+def test_callee_vtable_missing_or_unbounded_native_census_refuses_hint(monkeypatch, surface):
+    bridge = _load_bridge(monkeypatch)
+    bv, _, _ = _callee_elf_census_fixture(failure="complete_single")
+    if surface == "symbols_missing":
+        del bv.get_symbols
+    elif surface == "functions_missing":
+        del bv.functions
+    elif surface == "symbol_budget":
+        symbols = bv.get_symbols()
+        bv.get_symbols = lambda: symbols * 65537
+    elif surface == "function_budget":
+        bv.functions = [_FakeFunction(0x5000, "X::f()")] * 65537
+    elif surface == "symbols_unbounded":
+        symbols = bv.get_symbols()
+        bv.get_symbols = lambda: iter(symbols)
+    else:
+        bv.functions = iter(())
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert result["callee_data_refs"] == ["0x4010", "0x900000"]
+    assert result["callee_data_ref_vtables"] == []
+
+
+@pytest.mark.parametrize("name", ["Derived{for `Base'}", "non-virtual thunk to X"])
+def test_callee_vtable_artifact_names_are_not_class_navigation_targets(monkeypatch, name):
+    bridge = _load_bridge(monkeypatch)
+    bv, _, _ = _callee_elf_census_fixture(failure="complete_single")
+    bv.get_symbols()[0].short_name = f"vtable for {name}"
+    result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
+    assert result["callee_data_ref_vtables"] == []
+
+
+@pytest.mark.parametrize("alias_only", [False, True])
+def test_callee_vtable_actual_registry_must_resolve_exact_canonical_object(monkeypatch, alias_only):
+    from types import SimpleNamespace
+
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv, _, _ = _callee_elf_census_fixture(failure="complete_single")
+    original = bv.get_symbols()[0]
+    if alias_only:
+        # Both RTTI spellings describe one head, but the method-bearing spelling
+        # wins canonicalization. X is an alias, not an exact registry key.
+        canonical = SimpleNamespace(address=0x4000, short_name="vtable for app::X",
+                                    raw_name="_vtable_for_app::X", type="DataSymbol")
+        bv.get_symbols = lambda: [original, canonical]
+        bv.functions = [_FakeFunction(0x5000, "app::X::f()")]
+        expected_name, expected_address = "app::X", "0x4000"
+    else:
+        # A synthesized marker is within the proven object, but if it wins the
+        # native registry and cannot normalize, name navigation selects its
+        # address point rather than the captured ELF head.
+        point = SimpleNamespace(address=0x4010, short_name="vtable for X",
+                                raw_name="_vtable_for_X", type="DataSymbol")
+        bv.get_symbols = lambda: [point, original]
+        expected_name, expected_address = "X", "0x4010"
+    from bn_agent_bridge.read_class import _build_class_registry
+    registry = _build_class_registry(ctx, bv)
+    assert registry[expected_name]["vtable"]["address"] == expected_address
+    if alias_only:
+        assert "X" not in registry and "X" in registry[expected_name]["aliases"]
+    result = bridge.read_listing._callee_data_refs(ctx, bv, 0x5000)
+    assert result["callee_data_refs"] == ["0x4010", "0x900000"]
+    assert result["callee_data_ref_vtables"] == []

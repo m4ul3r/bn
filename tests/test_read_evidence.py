@@ -574,6 +574,8 @@ def test_callsites_returns_empty_for_unreferenced_import_symbol(monkeypatch):
         fake_bn.SymbolType.ImportAddressSymbol, 0x3000, "receive_record"
     )
     bv = _FakeBV(symbols=[symbol], code_refs={})
+    # Imported callees retain the same data-ref hints even with no local body.
+    bv.get_data_refs = lambda address: [0x6000] if address == 0x3000 else []
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._callsites(
@@ -583,6 +585,8 @@ def test_callsites_returns_empty_for_unreferenced_import_symbol(monkeypatch):
     assert result["items"] == []
     assert result["total"] == 0
     assert result["callee_symbol_only"] is True
+    assert result["callee_data_refs"] == ["0x6000"]
+    assert result["callee_data_ref_vtables"] == []
 
 
 def test_callsites_enumerates_import_callers_absent_from_the_code_ref_db(monkeypatch):

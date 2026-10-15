@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import difflib
 import functools
+import itertools
 import re
+import time
 from typing import Any, NamedTuple
 
 from . import il_format
@@ -1058,6 +1060,43 @@ def _class_lens_inputs(ctx, bv) -> dict[str, int]:
     }
 
 
+# #1018.4: an additive budget, shared by the returned page, not per class.
+# A stopped backwalk is unknown, never a cached negative or a partial layout.
+_CLASS_LIST_VTABLE_BUDGET_SECONDS = 0.05
+
+
+class _VtableRecoveryBudgetExpired(Exception):
+    pass
+
+
+class _VtableRecoveryUnavailable(Exception):
+    pass
+
+
+def _check_vtable_recovery_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _VtableRecoveryBudgetExpired
+
+
+def _class_list_vtable(ctx, bv, rec: dict[str, Any], deadline: float) -> dict[str, Any]:
+    """The stripped primary only; no methods, size or instance enrichment."""
+    _check_vtable_recovery_deadline(deadline)
+    typeinfo_addr = int(rec["typeinfo"]["address"], 16)
+    imported = _typeinfo_is_import_slot(ctx, bv, typeinfo_addr)
+    _check_vtable_recovery_deadline(deadline)
+    if imported or not callable(getattr(bv, "get_data_refs", None)):
+        return {"has_vtable": None, "vtable_status": "unavailable",
+                "vtable_slot_count": None}
+    recovered = _recover_vtables_from_typeinfo(
+        ctx, bv, typeinfo_addr, deadline=deadline, primary_only=True)
+    primary = recovered["primary"] if recovered else None
+    if primary is None:
+        return {"has_vtable": False, "vtable_status": "not_found",
+                "vtable_slot_count": 0}
+    return {"has_vtable": True, "vtable_status": "recovered",
+            "vtable_slot_count": primary["total"]}
+
+
 def _class_list(
     ctx,
     selector: str | None,
@@ -1184,11 +1223,12 @@ def _class_list(
     page = candidates[offset:] if offset else candidates
     if limit is not None:
         page = page[:limit]
-    # Populate RTTI bases for the RETURNED PAGE only: base decode is cheap (a few
-    # typeinfo reads per class) and bounded to the page, so a single `class list`
-    # recovers the inheritance graph without N `class show` calls. Vtable layout
-    # and object size stay show-only -- they are far costlier per class. (#205 review)
+    # Bases stay page-local. Missing-vtable RTTI rows also get show's backwalk,
+    # with one fixed deadline for this page. Do not run _enrich: method thunk
+    # analysis, object size and instance tracking remain show-only.
     rows = []
+    recovery_deadline = None
+    recovery_budget_exhausted = False
     for rec in page:
         if rec["confidence"] == _DECLARED_CONFIDENCE:
             # #675.2: the declared row's size, taken for this page only -- the
@@ -1200,7 +1240,24 @@ def _class_list(
             rec["bases"] = ctx._bases_for(bv, rec)
         except Exception:
             rec["bases"] = []
-        rows.append(_list_row(rec))
+        row = _list_row(rec)
+        if (rec["confidence"] == "rtti"
+                and rec["vtable"] is None and rec.get("typeinfo")
+                and not row["artifact"]):
+            if recovery_deadline is None:
+                recovery_deadline = time.monotonic() + _CLASS_LIST_VTABLE_BUDGET_SECONDS
+            try:
+                row.update(_class_list_vtable(ctx, bv, rec, recovery_deadline))
+            except _VtableRecoveryBudgetExpired:
+                recovery_budget_exhausted = True
+                row.update({"has_vtable": None, "vtable_status": "budget_exhausted",
+                            "vtable_slot_count": None})
+            except Exception:
+                # Recovery uses optional view/read APIs. A failed read says
+                # nothing about absence and must not discard the rest of the page.
+                row.update({"has_vtable": None, "vtable_status": "unavailable",
+                            "vtable_slot_count": None})
+        rows.append(row)
     returned = len(rows)
     result = {
         "kind": "classes",
@@ -1218,6 +1275,8 @@ def _class_list(
         "construction_vtables_suppressed": construction_vtables_suppressed,
         "thunks_suppressed": thunks_suppressed,
         "declared_suppressed": declared_suppressed,
+        "vtable_recovery_budget_seconds": _CLASS_LIST_VTABLE_BUDGET_SECONDS,
+        "vtable_recovery_budget_exhausted": recovery_budget_exhausted,
         **_analysis_state_fields(bv),
     }
     if total == 0:
@@ -1446,7 +1505,22 @@ def _vtable_slot_probe(
     return {"status": "resolved", "slot": slot, "rows_scanned": count}
 
 
-def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[str, Any]:
+def _budgeted_vtable_rows(ctx, bv, start: int, *, entries: int, ptr: int,
+                         deadline: float):
+    """Read one row at a time so the list deadline applies inside table reads."""
+    for index in range(entries):
+        _check_vtable_recovery_deadline(deadline)
+        table = ctx._pointer_table_layout(
+            bv, start + index * ptr, entries=1, stride=ptr)
+        _check_vtable_recovery_deadline(deadline)
+        rows = table.get("items") or table.get("entries") or []
+        if not rows or not isinstance(rows[0], dict) or not rows[0].get("readable"):
+            raise _VtableRecoveryUnavailable
+        yield rows[0]
+
+
+def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64,
+                   deadline: float | None = None) -> dict[str, Any]:
     """Function slots of an Itanium vtable. Words [0] (offset-to-top) and [1]
     (typeinfo ptr) are header; slots start at +2*ptr_size. Reuses the
     Thumb-aware pointer-table reader. Only CODE targets count as slots.
@@ -1480,6 +1554,7 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
       * ``truncated_reason`` -- the machine-readable why for a ``None`` ``total``
         (see above), ``None`` once the table's end was observed.
     ``_vtable_slot_probe`` resolves a requested slot past this window."""
+    _check_vtable_recovery_deadline(deadline)
     ptr = ctx._pointer_size(bv)
     # Itanium invariant: word[1] (vtable_addr + ptr) points to the class's
     # typeinfo. If it doesn't resolve to a typeinfo symbol, this address is NOT
@@ -1488,6 +1563,8 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # Decoding +2*ptr there would render adjacent GOT/data as fake slots
     # (#205 review), so report no slots and let the caller note it.
     ti_ptr = ctx._read_pointer_value(bv, vtable_addr + ptr, size=ptr)
+    if deadline is not None and ti_ptr is None:
+        raise _VtableRecoveryUnavailable
     if not ti_ptr or ctx._typeinfo_name_at(bv, ti_ptr) is None:
         # #822: this is a DECIDED "no local vtable body", not a capped scan -- it
         # never read a slot, so an exact `total: 0` would count a table this gate
@@ -1523,7 +1600,12 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # lookahead ONLY -- never a slot in its own right (the window below
     # excludes it from both scanning and `slots`) -- consulted after the loop
     # to resolve the trailing-null ambiguity (see the `else` branch).
-    table = ctx._pointer_table_layout(bv, start, entries=max_slots + 1, stride=ptr)
+    if deadline is None:
+        table = ctx._pointer_table_layout(bv, start, entries=max_slots + 1, stride=ptr)
+        raw_entries = iter(table.get("items") or table.get("entries") or [])
+    else:
+        raw_entries = _budgeted_vtable_rows(
+            ctx, bv, start, entries=max_slots + 1, ptr=ptr, deadline=deadline)
     slots: list[dict[str, Any]] = []
     # #303: the pointer-table reader (`_pointer_table_for_view`) returns the
     # canonical #275 envelope, whose rows live under `items`. This loop read the
@@ -1540,8 +1622,7 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # external slots as valid entries and terminate only at a genuine boundary --
     # an unmapped word (the next sub-vtable's offset-to-top, e.g. -8) or a mapped
     # DATA pointer (the next object's typeinfo). Trailing null slots are trimmed.
-    raw_entries = table.get("items") or table.get("entries") or []
-    window = raw_entries[:max_slots]
+    window = itertools.islice(raw_entries, max_slots)
     scanned = 0
     truncated = False
     # #822 review (round 1): WHY the scan stopped, which is what decides whether
@@ -1557,6 +1638,7 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # scan alone can't tell whether the real vtable ends there or continues
     # past `max_slots` (the lookahead below resolves it).
     for i, row in enumerate(window):
+        _check_vtable_recovery_deadline(deadline)
         scanned = i + 1
         # #822: the row -> slot classification lives in `_vtable_row_slot` so the
         # one-slot probe past the window applies the SAME boundary rules; `None`
@@ -1586,7 +1668,7 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
         # is a boundary here too -- a value-only classifier read it as proof
         # of a 65th slot and turned an exact 64-slot table into `total: null`.
         if scanned >= max_slots > 0:
-            lookahead = raw_entries[max_slots] if len(raw_entries) > max_slots else None
+            lookahead = next(raw_entries, None)
             lookahead_d = lookahead if isinstance(lookahead, dict) else {}
             if lookahead_d and _vtable_row_slot(
                     bv, max_slots, lookahead_d,
@@ -1607,7 +1689,9 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # table whose end was never observed.
     if stop_reason is None:
         while slots and slots[-1].get("null"):
+            _check_vtable_recovery_deadline(deadline)
             slots.pop()
+    _check_vtable_recovery_deadline(deadline)
     # #822 (the #584 residual): two different questions, two flags, one truth.
     # `truncated` answers "is my LISTING a prefix?"; `scan_truncated` answers
     # "is `total` exact?" -- and the answer to the second is what keeps a capped
@@ -1963,6 +2047,9 @@ def _instances(ctx, bv, record: dict[str, Any], *, cap: int = 128) -> dict[str, 
     found and ``*_truncated`` says the listing is a prefix. A capped 128 must
     never read as "this class is constructed exactly 128 times"."""
     sites = ctx._ctor_construction_sites(bv, record)
+    # BN's inbound-ref iteration order can vary across sessions. Sort numerically
+    # before capping so both the displayed order and the selected prefix are stable.
+    sites.sort(key=lambda site: int(site["address"], 16))
     stored = ctx._global_vtable_stores(bv, record) if record.get("vtable") else []
     shown_sites = sites[:cap]
     shown_stored = stored[:cap]
@@ -2233,7 +2320,10 @@ def _note_secondaries(rec: dict[str, Any], secondaries: list[dict[str, Any]]) ->
         notes.append(_SECONDARY_RTTI_NOTE)
 
 
-def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any] | None:
+def _recover_vtables_from_typeinfo(
+    ctx, bv, typeinfo_addr: int, *, deadline: float | None = None,
+    primary_only: bool = False,
+) -> dict[str, Any] | None:
     """#354/#412: in a STRIPPED binary the ``_ZTV`` DataSymbol is gone, so the class
     registry carries no vtable address -- but the typeinfo symbol usually survives.
     An Itanium vtable's word[1] holds the class typeinfo pointer, so a DATA xref to
@@ -2264,6 +2354,7 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
     Returns ``{"primary": layout | None, "secondary": [layout, ...], "rejected":
     [{"address", "offset_to_top", "reason"}, ...]}`` or None when nothing
     resolves as a vtable."""
+    _check_vtable_recovery_deadline(deadline)
     getter = getattr(bv, "get_data_refs", None)
     if not callable(getter):
         return None
@@ -2273,26 +2364,45 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
     rejected: list[dict[str, Any]] = []
     seen: set[int] = set()
     for ref in getter(int(typeinfo_addr)):
+        _check_vtable_recovery_deadline(deadline)
         vt_addr = int(ref) - ptr
         if vt_addr < 0 or vt_addr in seen:
             continue
         seen.add(vt_addr)
-        layout = ctx._vtable_layout_for(bv, vt_addr)
+        # List needs only the primary. Reject non-zero offset-to-top words
+        # before decoding their slots; show still inspects every secondary.
+        raw = ctx._read_pointer_value(bv, vt_addr, size=ptr) if primary_only else None
+        if primary_only:
+            if raw is None:
+                raise _VtableRecoveryUnavailable
+            if raw != 0:
+                continue
+        layout = (ctx._vtable_layout_for(bv, vt_addr) if deadline is None
+                  else _vtable_layout(ctx, bv, vt_addr, deadline=deadline))
+        if primary_only and layout and layout.get("truncated_reason") == "unreadable_row":
+            raise _VtableRecoveryUnavailable
         if not layout or not layout.get("slots"):
             continue
-        raw = ctx._read_pointer_value(bv, vt_addr, size=ptr)
+        if not primary_only:
+            raw = ctx._read_pointer_value(bv, vt_addr, size=ptr)
         ott, reason, proof = _classify_backwalk_candidate(
             ctx, bv, vt_addr, raw, ptr, layout, class_name)
+        _check_vtable_recovery_deadline(deadline)
         if reason is not None:
             rejected.append({"address": hex(vt_addr), "offset_to_top": ott, "reason": reason})
             continue
         layout["offset_to_top"] = ott
         layout["typeinfo_backwalk"] = True   # provenance: recovered without a _ZTV symbol
+        if primary_only and ott == 0:
+            return {"primary": layout, "secondary": [], "rejected": rejected}
         if ott != 0:
             layout["confidence"] = "rtti" if proof else "heuristic"
             if proof:
                 layout["confidence_reason"] = proof
         groups.append((ott, layout))
+    _check_vtable_recovery_deadline(deadline)
+    if primary_only:
+        return None
     if not groups:
         return None
     # Classify by offset-to-top VALUE, not by sort rank. The primary subobject
