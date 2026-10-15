@@ -2743,10 +2743,23 @@ def _render_function_list_text(value: Any, *, mangled: bool = False) -> str:
     # of 15"); this note does not, so borrowing that rule rendered an empty
     # listing as a bare `// duplicate starts: ...` -- the alarm with no answer
     # beside it (#757 review).
-    for note in (_duplicate_starts_note(value), _mangled_only_note(value)):
+    for note in (_duplicate_starts_note(value), _mangled_only_note(value),
+                 _exact_first_note(value)):
         if note:
             body = f"{body}\n{note}"
     return body
+
+
+def _exact_first_note(value: Any) -> str:
+    """`function search` moves exact name matches ahead of the substring hits
+    under its default order (#1037 item 9); say so, since the rows no longer
+    read in plain address order."""
+    count = _nonnegative_count(value, "exact_matches_first")
+    if not count:
+        return ""
+    noun = "exact name match is" if count == 1 else "exact name matches are"
+    return (f"// {count} {noun} listed first, then the other matches by "
+            "address; --exact shows only exact matches")
 
 
 def _group_refs_by_caller(refs: list[Any], *, mangled: bool = False) -> list[dict[str, Any]]:
@@ -2936,11 +2949,11 @@ def _render_xrefs_text(value: Any, limit: int | None = None, *, mangled: bool = 
     if amb.get("note"):
         lines.insert(0, f"note: {amb['note']}")
         lines.insert(1, "")
-    # Data-symbol resolution fallback (#224b).
-    rsym = _field_dict(value, "resolved_symbol")
-    if rsym.get("kind") == "data":
-        lines.insert(0, f"note: resolved '{rsym.get('name')}' as a data symbol @ {rsym.get('address')}")
-        lines.insert(1, "")
+    # Data-symbol resolution fallback (#224b), and a rendered `data_<hex>` no
+    # symbol carries (#1042 item 2).
+    for note in reversed(_resolved_symbol_notes(value)):
+        lines.insert(0, "")
+        lines.insert(0, note)
     lines.extend(_render_group(code_refs, total_code, "code refs"))
     lines.append("")
     lines.extend(_render_group(data_refs, total_data, "data refs"))
@@ -5589,7 +5602,14 @@ def _render_data_vars_text(value: Any) -> str:
         if row.get("section"):
             cells.append(f"[{row['section']}]")
         lines.append("  ".join(cells))
-    body = "\n".join(lines) if lines else _EMPTY_RESULT
+    if lines:
+        body = "\n".join(lines)
+    elif _text_value(value, "at"):
+        # `data vars --at X` asks about ONE variable: an empty answer must
+        # name the address it looked at, not read as a view with no data.
+        body = f"none: no typed data variable starts at {_text_value(value, 'at')}"
+    else:
+        body = _EMPTY_RESULT
     if value.get("has_more"):
         hint = ""
         # Through the choke point: a container-shaped address on the LAST row
@@ -5604,7 +5624,41 @@ def _render_data_vars_text(value: Any) -> str:
             except ValueError:
                 pass
         body += f"\n// more data vars remain in the window{hint}"
-    return body
+    return _with_resolved_notes(value, body)
+
+
+def _resolved_symbol_notes(value: Any) -> list[str]:
+    """One `note: resolved …` line per name an address operand resolved
+    through (#224b, #1042 item 2): `resolved_symbol` (one operand) and
+    `resolved_symbols` (several). The wording keeps xrefs' original data-symbol
+    line, so a reader who learned it there reads the same line everywhere."""
+    entries = []
+    single = _field_dict(value, "resolved_symbol")
+    if single:
+        entries.append(single)
+    entries.extend(e for e in _field_list(value, "resolved_symbols") if isinstance(e, dict))
+    notes = []
+    for entry in entries:
+        how = {
+            "data": "as a data symbol",
+            "function": "as a function symbol",
+            "placeholder": "as the address its name spells (no symbol has that name)",
+        }.get(str(entry.get("kind")))
+        if how is not None:
+            notes.append(f"note: resolved '{entry.get('name')}' {how} @ {entry.get('address')}")
+    return notes
+
+
+def _with_resolved_notes(value: Any, body: str) -> str:
+    notes = _resolved_symbol_notes(value)
+    return "\n".join([*notes, "", body]) if notes else body
+
+
+@_discloses
+def _render_resolved_symbol_notes(value: Any) -> str:
+    """The resolved-name notes alone, for an emit path whose stdout is the
+    payload itself (`read --encoding bytes` prints them on stderr)."""
+    return "\n".join(_resolved_symbol_notes(value))
 
 
 @_discloses
@@ -5713,7 +5767,7 @@ def _render_read_text(value: Any) -> str:
         lines.append("")
         lines.append(f"note: {note}")
 
-    return "\n".join(lines)
+    return _with_resolved_notes(value, "\n".join(lines))
 
 
 # #971: the C escapes `read --encoding escaped` writes. Every escape stands for
@@ -5780,7 +5834,7 @@ def _render_read_escaped_text(value: Any) -> str:
     if note:
         lines.append("")
         lines.append(f"note: {note}")
-    return "\n".join(lines)
+    return _with_resolved_notes(value, "\n".join(lines))
 
 
 

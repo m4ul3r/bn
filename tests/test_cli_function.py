@@ -3596,3 +3596,89 @@ def test_batch_decompile_refusal_rows_replay_all_operands(monkeypatch, tmp_path,
         assert calls[-1][0] == expected
         assert calls[-1][1]["identifiers"] == identifiers
         assert calls[-1][2] == "-demo"
+
+
+# ---------------------------------------------------------------------------
+# #1042 item 3: `bn function info a b c` -- the decompile batch shape
+# ---------------------------------------------------------------------------
+
+
+def _info_row(name: str, address: str) -> dict:
+    return {"identifier": name, "ok": True, "info": {
+        "function": {"name": name, "address": address, "raw_name": name,
+                     "display_name": name},
+        "prototype": f"int32_t {name}()", "parameters": [], "locals": [],
+        "xref_count": 1}}
+
+
+def test_function_info_several_identifiers_is_one_request_with_rows_in_place_1042(
+        fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "function_info_batch": {"ok": True, "result": {
+            "kind": "function_info_batch", "requested": 3, "resolved": 2, "functions": [
+                _info_row("pick_mode", "0x400ae0"),
+                {"identifier": "nosuch", "ok": False, "error": "Function not found: nosuch"},
+                _info_row("fold_value", "0x400b60"),
+            ]}},
+    })
+
+    code = bn.cli.main(["function", "info", "pick_mode", "nosuch", "fold_value", "--blocks"])
+
+    assert code == 2, "a NAMED identifier that missed fails the run"
+    assert [c["op"] for c in calls] == ["list_targets", "function_info_batch"]
+    assert calls[1]["params"] == {"identifiers": ["pick_mode", "nosuch", "fold_value"],
+                                  "blocks": True}
+    out = capsys.readouterr().out
+    assert out.index("pick_mode @ 0x400ae0") < out.index("error: Function not found: nosuch") \
+        < out.index("fold_value @ 0x400b60")
+    assert out.rstrip().endswith("2 of 3 resolved")
+
+
+def test_function_info_one_identifier_keeps_the_singular_op_1042(fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "function_info": {"ok": True, "result": _info_row("main", "0x4008c0")["info"]},
+    })
+
+    assert bn.cli.main(["function", "info", "main"]) == 0
+    assert [c["op"] for c in calls] == ["list_targets", "function_info"]
+    assert calls[1]["params"] == {"identifier": "main", "blocks": False}
+
+
+# ---------------------------------------------------------------------------
+# #1037 item 9: filtered counts are labelled as filtered
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flags, label", [
+    ([], "Total functions: 28"),
+    (["--named"], "Named functions: 16"),
+    (["--unnamed"], "Unnamed (sub_*) functions: 16"),
+    (["--min-size", "64"], "Matching functions: 16"),
+])
+def test_function_list_count_label_names_the_filter_1037(fake_transport, capsys, flags, label):
+    total = 28 if not flags else 16
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "list_functions": {"ok": True, "result": {"kind": "functions", "count": total,
+                                                  "total": total}},
+    })
+
+    assert bn.cli.main(["function", "list", "--count", *flags]) == 0
+    assert capsys.readouterr().out.strip() == label
+
+
+def test_function_search_text_says_exact_matches_lead_1037(fake_transport, capsys):
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "search_functions": {"ok": True, "result": {
+            "kind": "functions", "total": 2, "offset": 0, "limit": 100, "returned": 2,
+            "has_more": False, "exact_matches_first": 1, "items": [
+                {"name": "main", "address": "0x4008c0"},
+                {"name": "__libc_start_main", "address": "0x4007f0"}]}},
+    })
+    assert bn.cli.main(["function", "search", "main"]) == 0
+    out = capsys.readouterr().out
+    assert out.index("main") < out.index("__libc_start_main")
+    assert "// 1 exact name match is listed first, then the other matches by address" in out

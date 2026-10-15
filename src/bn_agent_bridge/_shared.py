@@ -516,6 +516,26 @@ def _parse_address(value: Any) -> int:
         ) from None
 
 
+# The two auto-name spellings BN renders for an address with no symbol of its
+# own: `data_<hex>` for an unnamed data variable and `sub_<hex>` for a function
+# (#1042 item 1). Both spell the address they sit at. `j_sub_<hex>` is NOT one:
+# BN names a thunk after the function it JUMPS to, so the hex is the target's
+# address, not the thunk's -- resolving it to the address it spells would land
+# on the wrong function.
+_PLACEHOLDER_NAME_RE = re.compile(r"(data|sub)_([0-9a-fA-F]+)")
+
+
+def _placeholder_address(value: Any) -> tuple[str, int] | None:
+    """``(prefix, address)`` for a rendered ``data_<hex>``/``sub_<hex>`` name,
+    else None. Only the SPELLING is read here; whether a symbol already owns the
+    name, and whether the address is real, is the caller's check -- a name a
+    symbol carries always means that symbol."""
+    match = _PLACEHOLDER_NAME_RE.fullmatch(str(value).strip())
+    if match is None:
+        return None
+    return match.group(1), int(match.group(2), 16)
+
+
 def _artifact_summary(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return {"kind": "object", "keys": sorted(value.keys())[:10], "count": len(value)}

@@ -7263,3 +7263,103 @@ def test_unattempted_plain_declaration_discloses_snapshot_parse(monkeypatch):
     assert row["parse_performed"] is True, result
     assert "imported_from_library" not in row, result
     assert not result.get("kept_library_imports"), result
+
+
+# --- #1042 items 1-2: rendered placeholder names and symbol names as targets --
+
+
+def _stripped_rename_bv(**kwargs):
+    """A stripped view: `sub_401000` is the function's own auto name, and the
+    global at 0x460000 has no symbol at all -- the decompile prints it as
+    `data_460000`."""
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("int32_t")},
+                    functions=[_FakeFunction(0x401000, "sub_401000")], **kwargs)
+    for fn in bv.functions:
+        fn.view = bv
+    return bv
+
+
+def test_batch_rename_of_a_rendered_data_placeholder_lands_1042(monkeypatch):
+    bv = _stripped_rename_bv()
+    bridge, instance = _data_retype_instance(monkeypatch, bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "rename_symbol", "identifier": "data_460000", "new_name": "g_live",
+         "kind": "data"},
+        {"op": "rename_symbol", "identifier": "0x401000", "new_name": "fold_value"},
+    ])
+
+    assert result["success"] is True, result
+    assert [row["status"] for row in result["results"]] == ["verified", "verified"]
+    row = result["results"][0]
+    assert row["address"] == "0x460000" and row["before_name"] is None
+    assert row["resolved_symbol"] == {"name": "data_460000", "kind": "placeholder",
+                                      "address": "0x460000"}
+    # Readback, not the row's claim: the symbol is on the view now.
+    assert bv.get_symbol_at(0x460000).name == "g_live"
+
+
+def test_placeholder_rename_needs_the_kind_its_prefix_names_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+    bv = _stripped_rename_bv()
+    resolve = instance.ctx._resolve_rename_target
+
+    # A renamed function is still reachable by the auto name it USED to show,
+    # because no symbol carries that name any more.
+    bv.functions[0].name = bv.functions[0].raw_name = "fold_value"
+    target = resolve(bv, "sub_401000", "function")
+    assert target["address"] == 0x401000 and target["before_name"] == "fold_value"
+    assert target["resolved_symbol"]["kind"] == "placeholder"
+
+    # No function STARTS at the spelled address: a miss, under the prefix the
+    # batch's renamed-reference explainer reads.
+    with pytest.raises(bridge.OperationFailure) as no_fn:
+        resolve(bv, "sub_401004", "function")
+    assert me._is_resolver_miss(no_fn.value.message, "sub_401004")
+    assert "no function starts at the address it spells (0x401004)" in no_fn.value.message
+
+    # `sub_` never names data and `data_` never names a function.
+    for identifier, kind in (("data_460000", "function"), ("sub_401000", "data")):
+        with pytest.raises(bridge.OperationFailure):
+            resolve(bv, identifier, kind)
+
+    # A thunk's `j_sub_<hex>` spells its jump TARGET, not its own address.
+    with pytest.raises(bridge.OperationFailure) as thunk:
+        resolve(bv, "j_sub_401000", "auto")
+    assert thunk.value.message == "Symbol not found: j_sub_401000"
+
+
+def test_unmapped_data_placeholder_rename_says_why_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _stripped_rename_bv(mapped=False)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance.ctx._resolve_rename_target(bv, "data_460000", "data")
+    assert exc.value.message.startswith("Symbol not found: data_460000.")
+    assert "not mapped" in exc.value.message
+
+
+def test_data_retype_takes_a_data_symbol_name_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fake_bn = sys.modules["binaryninja"]
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("void")},
+                    symbols=[fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x460000, "g_table")])
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "data_retype", "address": "g_table", "new_type": "uint32_t[4]"}])
+
+    assert result["success"] is True, result
+    row = result["results"][0]
+    assert row["status"] == "verified" and row["address"] == "0x460000"
+    assert row["resolved_symbol"]["kind"] == "data"
+    assert str(bv.get_data_var_at(0x460000).type) == "uint32_t[4]"
+
+    missed = instance._mutation("active", False, [
+        {"op": "data_retype", "address": "g_tabel", "new_type": "uint32_t[4]"}])
+    assert missed["success"] is False
+    assert missed["results"][-1]["message"].startswith("Symbol not found: g_tabel.")

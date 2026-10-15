@@ -1985,6 +1985,26 @@ def _search_functions(
         return _disclose_collapsed_starts(result, collapsed_starts, unresolved_starts)
     sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0],
                                        mangled=mangled, name_of=lambda pair: pair[1])
+    exact_first = 0
+    if sort == "address" and not reverse and not (regex or exact):
+        # #1037 item 9: `function search main` listed `__libc_start_main` before
+        # `main`, and on a large binary the exact name sat among 69 substring
+        # hits. Under the DEFAULT order an exact (case-insensitive) name match is
+        # moved to the front -- stably, so both groups keep address order -- and
+        # the envelope counts them so the text can say why the order changed. An
+        # explicit `--sort` is left exactly as asked.
+        needle = query.lower()
+
+        def is_exact(pair) -> bool:
+            fn, display = pair
+            forms = ((str(fn.name), str(getattr(fn, "raw_name", fn.name)))
+                     if mangled else (display,))
+            return any(form.lower() == needle for form in forms if form)
+
+        ranked = [pair for pair in matched if is_exact(pair)]
+        if ranked and len(ranked) < len(matched):
+            matched[:] = ranked + [pair for pair in matched if not is_exact(pair)]
+            exact_first = len(ranked)
     start, stop = read_misc._page_window(len(matched), offset=offset, limit=limit)
     # Same per-row labels as `function list`: one record of a collided start
     # must not read differently depending on which command returned it.
@@ -2002,5 +2022,7 @@ def _search_functions(
         kind="functions", items=items, total=len(matched), offset=offset, limit=limit,
     )
     result.update(hint)
+    if exact_first:
+        result["exact_matches_first"] = exact_first
     result.update(_analysis_state_fields(bv))
     return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts, unresolved_starts))

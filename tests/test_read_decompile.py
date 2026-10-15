@@ -7013,3 +7013,24 @@ def test_jump_table_guidance_uses_generic_symbol_and_address_placeholders_1019()
     assert "bn xrefs <symbol>" in detail
     assert "bn evidence table <address>" in detail
     assert not re.search(r"\b(?:data_[0-9a-f]+|a\.1)\b", detail)
+
+
+# --- #1042 item 3: function_info_batch --------------------------------------
+
+
+def test_function_info_batch_keeps_a_miss_in_place_at_the_bridge_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "handle"),
+                            _FakeFunction(0x402000, "parse_file")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_info_batch(None, ["handle", "nosuchfn", "0x402000"])
+
+    assert result["kind"] == "function_info_batch"
+    assert [row["identifier"] for row in result["functions"]] == [
+        "handle", "nosuchfn", "0x402000"]
+    assert [row["ok"] for row in result["functions"]] == [True, False, True]
+    assert result["functions"][2]["info"]["function"]["name"] == "parse_file"
+    assert "nosuchfn" in result["functions"][1]["error"]
+    assert (result["requested"], result["resolved"]) == (3, 2)

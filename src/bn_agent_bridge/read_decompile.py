@@ -2320,6 +2320,36 @@ def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = Fals
     return result
 
 
+def _function_info_batch(ctx, selector: str | None, identifiers, *, blocks: bool = False):
+    """`function info` for several functions in ONE round trip (#1042 item 3).
+
+    The row shape and the failure rule are `_decompile_batch`'s: one
+    `{identifier, ok, info | error}` row per requested identifier, in request
+    order, and a miss is a failed row rather than an abort -- an agent asking
+    about five functions used to run five calls in a shell loop.
+    """
+    rows: list[dict[str, Any]] = []
+    for identifier in identifiers:
+        try:
+            rows.append({
+                "identifier": identifier,
+                "ok": True,
+                "info": _function_info(ctx, selector, identifier, blocks=blocks),
+            })
+        except Exception as exc:  # noqa: BLE001 - one miss must not sink the batch
+            rows.append({
+                "identifier": identifier,
+                "ok": False,
+                "error": str(exc) or exc.__class__.__name__,
+            })
+    return {
+        "kind": "function_info_batch",
+        "requested": len(rows),
+        "resolved": sum(1 for row in rows if row["ok"]),
+        "functions": rows,
+    }
+
+
 # Architectures whose ABI returns in a register WIDER than a 32-bit write,
 # where that narrower write ZERO-EXTENDS the full register -- so BN infers a
 # 64-bit return for a function that only ever writes 32 bits.

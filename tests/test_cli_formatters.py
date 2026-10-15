@@ -4308,9 +4308,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
     # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
-    assert len(sites) == 63, (
+    # #1037 item 9 adds the `function search` exact-matches-first count.
+    assert len(sites) == 64, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 63. A "
+        "count helper, not 64. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4377,6 +4378,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # #978: the `function search` mangled-only line is a fragment helper the
         # list and `--count` renderers both append, like the line above.
         "_mangled_only_note(mangled_only_matches) [not a payload renderer]",
+        # #1037 item 9: the exact-matches-first line is the same kind of
+        # fragment helper, appended by the `function search` list renderer.
+        "_exact_first_note(exact_matches_first) [not a payload renderer]",
         "_operation_row_text(count) [not a payload renderer]",
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",

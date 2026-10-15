@@ -3961,6 +3961,9 @@ class BinaryNinjaBridge:
     def _resolve_rename_target(self, *a, **k):
         return self.ctx._resolve_rename_target(*a, **k)
 
+    def _resolve_address_operand(self, *a, **k):
+        return self.ctx._resolve_address_operand(*a, **k)
+
     def _functions_containing(self, *a, **k):
         return self.ctx._functions_containing(*a, **k)
 
@@ -4176,6 +4179,9 @@ class BinaryNinjaBridge:
 
     def _function_info(self, *a, **k):
         return read_decompile._function_info(self.ctx, *a, **k)
+
+    def _function_info_batch(self, *a, **k):
+        return read_decompile._function_info_batch(self.ctx, *a, **k)
 
     def _get_prototype(self, *a, **k):
         return read_decompile._get_prototype(self.ctx, *a, **k)
@@ -5419,6 +5425,18 @@ def _bind_function_info(bridge, params, target):
     )
 
 
+@op("function_info_batch", lock="read")
+def _bind_function_info_batch(bridge, params, target):
+    identifiers = params.get("identifiers")
+    if not isinstance(identifiers, list) or not identifiers:
+        raise OperationFailure("invalid_request",
+                               "function_info_batch requires a non-empty `identifiers` list")
+    return bridge._function_info_batch(
+        target, identifiers,
+        blocks=_validate_bool(params.get("blocks"), label="blocks", default=False),
+    )
+
+
 @op("get_prototype", lock="read")
 def _bind_get_prototype(bridge, params, target):
     return bridge._get_prototype(target, params["identifier"])
@@ -5455,7 +5473,8 @@ def _bind_decompile(bridge, params, target):
 def _bind_decompile_batch(bridge, params, target):
     identifiers = params.get("identifiers")
     if not isinstance(identifiers, list) or not identifiers:
-        raise BridgeError("decompile_batch requires a non-empty `identifiers` list")
+        raise OperationFailure("invalid_request",
+                               "decompile_batch requires a non-empty `identifiers` list")
     return bridge._decompile_batch(
         target,
         identifiers,
@@ -5552,8 +5571,9 @@ def _bind_cfg(bridge, params, target):
 def _bind_data_vars(bridge, params, target):
     return bridge._data_vars(
         target,
-        start=params["start"],
-        end=params["end"],
+        start=params.get("start"),
+        end=params.get("end"),
+        at=params.get("at"),
         limit=params.get("limit"),
     )
 
@@ -5564,6 +5584,7 @@ def _bind_data_symbols(bridge, params, target):
         target,
         offset=int(params.get("offset") or 0),
         limit=params.get("limit"),
+        query=params.get("query"),
     )
 
 

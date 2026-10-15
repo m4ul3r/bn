@@ -278,16 +278,94 @@ class BnArgumentParser(argparse.ArgumentParser):
         args: Any = None,
         namespace: Any = None,
     ) -> argparse.Namespace:
-        parsed, extras = self.parse_known_args(args, namespace)
+        argv = list(sys.argv[1:] if args is None else args)
+        parsed, extras = self.parse_known_args(argv, namespace)
         if extras:
             # Route unrecognized arguments to the most-specific subcommand parser
             # so the usage/error text reflects the command the user actually ran,
             # not the bare root parser. Each subparser records itself as `_parser`.
             selected_parser = getattr(parsed, "_parser", self)
-            selected_parser.error(
-                f"unrecognized arguments: {' '.join(extras)}"
-            )
+            message = f"unrecognized arguments: {' '.join(extras)}"
+            hint = _unrecognized_arguments_hint(self, selected_parser, parsed, argv, extras)
+            selected_parser.error(f"{message}\n{hint}" if hint else message)
         return parsed
+
+
+def _option_takes_value(parsers: tuple[argparse.ArgumentParser, ...], token: str) -> bool:
+    """Whether *token* is an option that consumes the NEXT argv token."""
+    if not token.startswith("-") or "=" in token:
+        return False
+    for parser in parsers:
+        action = parser._option_string_actions.get(token)
+        if action is not None:
+            return action.nargs != 0
+    return False
+
+
+def _unrecognized_arguments_hint(
+    root: argparse.ArgumentParser,
+    selected: argparse.ArgumentParser,
+    parsed: argparse.Namespace,
+    argv: list[str],
+    extras: list[str],
+) -> str | None:
+    """A targeted line under argparse's `unrecognized arguments` (#1042 item 4,
+    #1037 item 10), for two argument shapes whose bare refusal names the wrong
+    token. None when neither applies.
+
+    * A value after a SWITCH (`strings --regex 'a|b'`): argparse rejects the
+      value, not the switch, so the error reads as a bad pattern. Name the
+      switch; when the command takes `--query` and none was given, print the
+      corrected command.
+    * `--estimate-output` on a dual-role node (`exports`, `types`): the flag is
+      withheld there on purpose (#796 r2, see `_group_paths`), so say so, and
+      print the alias subcommand form when the node has one (`exports list`).
+
+    Printed commands are this argv with the one change applied, so they keep
+    every other option the caller passed."""
+    parsers = (selected, root)
+    for index in range(1, len(argv)):
+        token, switch = argv[index], argv[index - 1]
+        if token not in extras or token.startswith("-"):
+            continue
+        action = selected._option_string_actions.get(switch)
+        if action is None or action.nargs != 0:
+            continue
+        if index >= 2 and _option_takes_value(parsers, argv[index - 2]):
+            continue   # `switch` is itself the value of the option before it
+        query = selected._option_string_actions.get("--query")
+        if (switch == "--regex" and query is not None
+                and getattr(parsed, query.dest, None) is None
+                and getattr(parsed, "query", None) is None):
+            fixed = [*argv[:index - 1], "--query", token, switch, *argv[index + 1:]]
+            return (f"{switch} is a switch and takes no value; pass the pattern "
+                    f"with --query: {shlex.join(['bn', *fixed])}")
+        return f"{switch} is a switch and takes no value; {token!r} is left over"
+    path = tuple(getattr(parsed, "_command_path", ()) or ())
+    if "--estimate-output" in extras and path and path in _group_paths():
+        node = next((spec for spec in _COMMANDS if spec["path"] == path), None)
+        # The alias leaf is the child that takes the node's own arguments (the
+        # one registration list `exports`/`exports list` share), so the printed
+        # command keeps every option the caller already passed valid.
+        alias = next((spec["path"][-1] for spec in _COMMANDS
+                      if node is not None and spec["path"][:-1] == path
+                      and spec["args"] == node["args"] and spec.get("estimable")),
+                     None)
+        label = " ".join(path)
+        lead = (f"--estimate-output is not accepted on `bn {label}` itself: it is also "
+                f"a command group, and a flag there would reach its subcommands too")
+        if alias is None:
+            return f"{lead}."
+        for index in range(len(argv) - len(path) + 1):
+            if argv[index:index + len(path)] != list(path):
+                continue
+            if index and _option_takes_value(parsers, argv[index - 1]):
+                continue
+            at = index + len(path)
+            fixed = [*argv[:at], alias, *argv[at:]]
+            return f"{lead}; use the `{label} {alias}` form: {shlex.join(['bn', *fixed])}"
+        return f"{lead}; use `bn {label} {alias} --estimate-output`."
+    return None
 
 
 def _resolve_out_path(value: str) -> Path:
@@ -2441,6 +2519,10 @@ def _call(
         note = truncation_note(spill_context)
         if note:
             print(note, file=sys.stderr)
+    if not estimate_only:
+        page_note = _default_page_note(args, spill_context)
+        if page_note:
+            print(page_note, file=sys.stderr)
     return exit_code
 
 
@@ -2798,7 +2880,46 @@ def _effective_limit(args: argparse.Namespace) -> int | None:
     "not set"), not 100."""
     if getattr(args, "limit", None) is not None:
         return args.limit
-    return None if getattr(args, "out", None) else 100
+    if getattr(args, "out", None):
+        return None
+    # #1037 item 4: remember that the page size was OURS, not the caller's, so
+    # `_call` can say so on stderr when it truncated (`_default_page_note`).
+    args._default_page_limit = _DEFAULT_PAGE_LIMIT
+    return _DEFAULT_PAGE_LIMIT
+
+
+_DEFAULT_PAGE_LIMIT = 100
+
+
+def _default_page_note(args: argparse.Namespace, result: Any) -> str | None:
+    """The stderr line for a page the DEFAULT limit cut short (#1037 item 4).
+
+    The `// showing N of TOTAL` footer is on stdout, so `bn imports | grep recv`
+    filters it away and `--format json` carries only `has_more` -- an agent
+    read 100 imports as the binary's whole import table. stderr survives both,
+    so the note goes there in every format. It fires only when the caller gave
+    no `--limit` (and no `--out`, which uncaps) and the bridge says more rows
+    exist; an explicit `--limit` is the caller's own choice and stays quiet."""
+    limit = getattr(args, "_default_page_limit", None)
+    if limit is None or not isinstance(result, dict) or result.get("has_more") is not True:
+        return None
+    returned, total, offset = (result.get(key) for key in ("returned", "total", "offset"))
+    if not _is_count(returned):
+        items = result.get("items")
+        returned = len(items) if isinstance(items, list) else None
+    offset = offset if _is_count(offset) else 0
+    if returned is None:
+        shown = "a partial page"
+        resume = "--offset with a larger --limit"
+    else:
+        shown = f"{returned} of {total}" if _is_count(total) else f"{returned} (more exist)"
+        resume = f"--offset {offset + returned}"
+    return (f"note: the default --limit {limit} cut this page short ({shown}); "
+            f"rerun with {resume}, a larger --limit, or --out FILE for every row")
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _add_function_address_args(parser: argparse.ArgumentParser) -> None:
