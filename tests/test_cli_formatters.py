@@ -5875,6 +5875,60 @@ def test_render_session_start_text_omits_capture_error_when_absent():
     assert "target capture error" not in out
 
 
+def test_render_session_start_text_discloses_failed_cleanup():
+    from bn.formatters import _render_session_start_text
+
+    out = _render_session_start_text({
+        "instance_id": "worker-1",
+        "pid": 4242,
+        "socket_path": "/tmp/worker-1.sock",
+        "stopped": False,
+        "cleanup_error": "bridge instance worker-1 timed out waiting for teardown",
+    })
+
+    assert "cleanup error: bridge instance worker-1 timed out waiting for teardown" in out
+    assert "bridge process may still be running" in out
+    assert "session stopped:" not in out
+
+
+def test_render_session_start_text_preserves_successful_cleanup():
+    from bn.formatters import _render_session_start_text
+
+    out = _render_session_start_text({"instance_id": "worker-1", "stopped": True})
+
+    assert "session stopped: no binaries loaded successfully" in out
+    assert "cleanup error:" not in out
+    assert "may still be running" not in out
+
+
+def test_render_session_stop_text_does_not_claim_success_after_timeout():
+    from bn.formatters import _render_session_stop_text
+
+    out = _render_session_stop_text({
+        "instance_id": "worker-1",
+        "stopped": False,
+        "error": "timed out waiting for bridge instance worker-1 to fully tear down",
+    })
+
+    assert "stop failed: worker-1" in out
+    assert "error: timed out waiting for bridge instance worker-1" in out
+    assert "bridge process may still be running" in out
+    assert "stopped:" not in out
+
+
+@pytest.mark.parametrize("method", [None, "sigterm", "sigkill"])
+def test_render_session_stop_text_preserves_successful_stop(method):
+    from bn.formatters import _render_session_stop_text
+
+    value = {"instance_id": "worker-1", "stopped": True}
+    if method:
+        value["method"] = method
+
+    out = _render_session_stop_text(value)
+
+    assert out == "stopped: worker-1" + (f" ({method})" if method else "")
+
+
 def test_resolution_note_does_not_claim_containment_for_an_exact_start():
     # Bare-decimal input is disclosed with offset +0x0 when it names the exact
     # function start. The old text said "<addr> is inside <fn> @ <addr> (+0x0);

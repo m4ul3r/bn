@@ -3557,6 +3557,34 @@ def test_session_stop_reports_a_plain_timeout_without_a_verified_pin(monkeypatch
     assert "refusing to signal" not in parsed["error"]
 
 
+@pytest.mark.parametrize("verified_pin", [False, True])
+def test_session_stop_default_text_reports_unconfirmed_teardown(
+    monkeypatch, capsys, verified_pin
+):
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda op, **kwargs: {"ok": True, "result": {"shutting_down": True}},
+    )
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _fake_bridge_instance("abc123")  # noqa: F405
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: False)
+    _fake_signaller(
+        monkeypatch,
+        refusal=None if verified_pin else "no verifiable process identity",
+    )
+
+    rc = bn.cli.main(["session", "stop", "abc123"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "stop failed: abc123" in out
+    assert "timed out waiting for bridge instance abc123" in out
+    assert "process may still be running" in out
+    assert "stopped:" not in out
+    assert "[unsaved changes discarded]" not in out
+
+
 def test_session_stop_resolves_an_unreachable_bridge(monkeypatch, capsys):
     # A socket-less bridge is hidden from `session list` (nothing can be
     # dispatched to it), but stopping the live process it names is exactly what a
@@ -3726,6 +3754,37 @@ def test_session_start_cleanup_reports_a_refused_signal(monkeypatch, capsys, tmp
     errors = " ".join(parsed["cleanup_errors"])
     assert "SIGTERM not sent" in errors and "SIGKILL not sent" in errors
     assert "no verifiable process identity" in errors
+
+
+def test_session_start_default_text_discloses_cleanup_timeout(
+    monkeypatch, capsys, tmp_path
+):
+    from bn.transport import BridgeError
+
+    monkeypatch.setattr(
+        bn.cli, "spawn_instance", lambda instance_id=None: _failing_start_instance()
+    )
+
+    def send_request(op, **kwargs):
+        if op == "associate_project_roots":
+            return {"ok": True, "result": {"associated": [str(tmp_path)]}}
+        if op == "shutdown":
+            return {"ok": True, "result": {"shutting_down": True}}
+        raise BridgeError("load failed")
+
+    monkeypatch.setattr(bn.cli, "send_request", send_request)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: False)
+    _fake_signaller(monkeypatch)
+
+    rc = bn.cli.main(["session", "start", str(tmp_path / "app.bin")])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "load failed" in out
+    assert "cleanup error:" in out
+    assert "timed out waiting for teardown" in out
+    assert "process may still be running" in out
+    assert "session stopped:" not in out
 
 
 # --------------------------------------------------------------------------

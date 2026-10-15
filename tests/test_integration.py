@@ -79,6 +79,9 @@ def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
 # larger, explicitly named budget -- on whichever call does the analysing.
 _SESSION_START_TIMEOUT = 120.0
 _CROSS_ARCH_ANALYSIS_TIMEOUT = 300.0
+# Stop includes the 30s graceful teardown allowance, a 2s post-KILL wait,
+# the unsaved-target probe and outer CLI startup/shutdown overhead.
+_SESSION_STOP_TIMEOUT = 60.0
 
 # How much of a bridge log to attach to a timeout: the crash output that matters
 # is at the end, and the tail cannot be allowed to swamp the failure report.
@@ -167,7 +170,7 @@ def _session_start(*binaries: str, timeout: float = _SESSION_START_TIMEOUT) -> d
     return json.loads(result.stdout)
 
 
-def _session_stop(instance_id: str, timeout: float = 10.0) -> None:
+def _session_stop(instance_id: str, timeout: float = _SESSION_STOP_TIMEOUT) -> None:
     # Teardown, so the discard is deliberate: a test that mutated its private
     # copy and never saved would otherwise be REFUSED here (#925) and leak the
     # bridge until the idle reaper caught it.
@@ -1947,6 +1950,35 @@ class TestAArch64ProbeStrictGate:
         assert isinstance(failed.value, Failed), failed.value
         assert "cannot find crt1.o" in str(failed.value) and "exit 1" in str(failed.value)
         assert "BN_REQUIRE_REAL_TESTS" in str(failed.value)
+
+
+class TestSessionStopCleanupBudget:
+    def test_cleanup_completes_after_full_teardown_allowance(
+        self, monkeypatch, tmp_path
+    ):
+        # Exercise a real subprocess deadline, scaled 10:1 to avoid spending
+        # 35 seconds on a stand-in. It needs the full 30s teardown allowance,
+        # 2s escalation wait and 3s of outer CLI overhead before it finishes.
+        completed = tmp_path / "cleanup-completed"
+        program = (
+            "import pathlib, sys, time\n"
+            "assert sys.argv[1:] == ['session', 'stop', 'budget-edge', '--discard-unsaved']\n"
+            "time.sleep(3.5)\n"
+            f"pathlib.Path({str(completed)!r}).write_text('process exited')\n"
+        )
+        monkeypatch.setattr(
+            sys.modules[__name__], "_BN_CLI", [sys.executable, "-c", program]
+        )
+        run = subprocess.run
+
+        def scaled_run(*args, timeout, **kwargs):
+            return run(*args, timeout=timeout / 10.0, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", scaled_run)
+
+        _session_stop("budget-edge")
+
+        assert completed.read_text() == "process exited"
 
 
 class TestSessionStartTimeoutDiagnostics:

@@ -130,12 +130,8 @@ def test_target_list_text_format_renders_summary(fake_transport, capsys):
     assert '"selector"' not in output
 
 
-def test_refresh_uses_implicit_target_when_single_target_is_open(fake_transport, capsys):
+def test_refresh_defers_implicit_target_resolution_until_bridge_reservation(fake_transport, capsys):
     calls = fake_transport({
-        "list_targets": {
-            "ok": True,
-            "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
-        },
         "refresh": {
             "ok": True,
             "result": {
@@ -155,11 +151,39 @@ def test_refresh_uses_implicit_target_when_single_target_is_open(fake_transport,
     rc = bn.cli.main(["refresh", "--format", "text"])
 
     assert rc == 0
-    assert [call["op"] for call in calls] == ["list_targets", "refresh"]
-    assert calls[1]["target"] == "123:1:7"  # implicit resolution pins the target_id (#690 R3)
+    assert [call["op"] for call in calls] == ["refresh"]
+    assert calls[0]["target"] is None  # resolved safely inside the reserved bridge gate
     output = capsys.readouterr().out
     assert "refreshed: true" in output
     assert "SnailMail_unwrapped.exe.bndb" in output
+
+
+@pytest.mark.parametrize("source", ["environment", "sticky"])
+@pytest.mark.parametrize("value", ["", "   "])
+def test_refresh_refuses_broken_ambient_target_without_sending(
+        monkeypatch, fake_transport, capsys, source, value):
+    calls = fake_transport({})
+    monkeypatch.setattr(
+        bn.cli.session_state, "read",
+        lambda: {"target": value} if source == "sticky" else {})
+    if source == "environment":
+        monkeypatch.setenv("BN_TARGET", value)
+
+    assert bn.cli.main(["refresh"]) == 2
+    assert calls == []
+    error = capsys.readouterr().err
+    assert ("BN_TARGET is exported but empty" if source == "environment"
+            else "the sticky target pin is set but empty") in error
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_refresh_refuses_explicit_empty_target_without_sending(
+        fake_transport, capsys, value):
+    calls = fake_transport({})
+
+    assert bn.cli.main(["refresh", "-t", value]) == 2
+    assert calls == []
+    assert "--target is empty" in capsys.readouterr().err
 
 
 def test_target_summary_text_marks_quick_view():

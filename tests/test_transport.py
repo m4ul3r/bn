@@ -719,9 +719,11 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
     assert _FakeSocket.attempts == 2
 
 
+@pytest.mark.parametrize("failure", ["refused", "missing", "connect_timeout", "deadline"])
 def test_transient_connect_retries_obey_end_to_end_deadline(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, failure
 ):
+    import bn.transport as transport
     from bn.transport import BridgeInstance
 
     instance = BridgeInstance(
@@ -734,9 +736,16 @@ def test_transient_connect_retries_obey_end_to_end_deadline(
         meta={},
         instance_token="test-token",
     )
-    monkeypatch.setattr(
-        "bn.transport.choose_instance", lambda instance_id=None, **kw: instance
-    )
+    clock = [0.0]
+    def monotonic():
+        now = clock[0]
+        if failure == "deadline":
+            clock[0] += 1.0
+        return now
+    monkeypatch.setattr(transport.time, "monotonic", monotonic)
+    monkeypatch.setattr(transport.time, "sleep", lambda duration: clock.__setitem__(0, clock[0] + duration))
+    monkeypatch.setattr(transport, "_send_cancel_request",
+                        lambda *args: pytest.fail("cancelling a request that was never sent"))
 
     class RefusingSocket:
         def __enter__(self):
@@ -749,17 +758,25 @@ def test_transient_connect_retries_obey_end_to_end_deadline(
             self.timeout = timeout
 
         def connect(self, path):
+            if failure == "connect_timeout":
+                raise TimeoutError("connect timed out")
+            if failure == "missing":
+                raise FileNotFoundError(errno.ENOENT, "Socket missing")
             raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+
+        def sendall(self, payload):
+            pytest.fail("request must not be sent after a failed connect")
 
     monkeypatch.setattr(
         "bn.transport.socket.socket", lambda *args, **kwargs: RefusingSocket()
     )
-    started = time.monotonic()
 
-    with pytest.raises(BridgeError, match="Timed out"):
-        send_request("ping", timeout=0.01)
+    with pytest.raises(BridgeError, match="Timed out") as caught:
+        transport._send_request_to_instance(instance, "ping", timeout=0.01)
 
-    assert time.monotonic() - started < 0.1
+    assert "The request was not sent." in str(caught.value)
+    assert "may still be running" not in str(caught.value)
+    assert "may keep running" not in str(caught.value)
 
 
 def _make_timeout_probe_socket():

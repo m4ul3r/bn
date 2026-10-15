@@ -1660,6 +1660,7 @@ def _send_request_to_instance(
     # BridgeUnreachableError).
     reached = False
     cancel_sent = False
+    request_sent = False
     for attempt in range(connect_retries):
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -1676,6 +1677,7 @@ def _send_request_to_instance(
                 reached = True
                 _verify_socket_peer_pid(sock, instance)
                 sock.sendall(encoded)
+                request_sent = True
                 with contextlib.suppress(OSError):
                     sock.shutdown(socket.SHUT_WR)
                 # #976: after WRITE_GATE_NOTICE_AFTER of silence, ask once on a
@@ -1706,7 +1708,7 @@ def _send_request_to_instance(
             break
         except OSError as exc:
             last_error = exc
-            if isinstance(exc, TimeoutError):
+            if isinstance(exc, TimeoutError) and request_sent:
                 cancel_sent = _send_cancel_request(instance, str(payload["id"]))
             if exc.errno not in TRANSIENT_SOCKET_ERRNOS or attempt == connect_retries - 1:
                 break
@@ -1727,6 +1729,8 @@ def _send_request_to_instance(
         "it checks for cancellation. "
         if cancel_sent else
         "A cancel request could not be sent; the operation may still be running. "
+        if request_sent else
+        "The request was not sent. "
     )
     if last_error is not None and chunks:
         # Bytes arrived and then the connection failed: a timeout or reset

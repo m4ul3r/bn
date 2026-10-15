@@ -417,11 +417,16 @@ def _save(args: argparse.Namespace) -> int:
               "so); set BN_NO_WAIT=1 to make them fail fast with `busy:` instead.",
          target=True)
 def _refresh(args: argparse.Namespace) -> int:
+    # Reserve at the bridge before resolving an implicit target: list_targets
+    # can wait on an exclusive writer ahead of the first refresh. Keep the
+    # broken-default refusal local, since the bridge cannot know its source.
+    if getattr(args, "_empty_ambient_target", None):
+        raise BridgeError(cli._empty_target_message(args))
     return _call(
         args,
         "refresh",
         {},
-        require_target=True,
+        require_target=False,
         text_renderer=_render_refresh_text,
         stem="refresh",
         # The one-time full re-analysis can run far past the 600s read-op default

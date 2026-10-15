@@ -3863,6 +3863,12 @@ class BinaryNinjaBridge:
         # run on a dead view (TOCTOU). Acquiring the gate first serializes refresh
         # against those writers before we ever touch the view.
         with self._write_gate.refresh(), self._write_gate:
+            # Bare CLI requests deliberately skip list_targets so a duplicate
+            # reaches the reservation before any target read can block. Reuse
+            # the sole-target gate here, then carry its identity-only pin into
+            # both analysis and the reply rather than following GUI focus.
+            if selector is None:
+                selector = self.targets.pin_destructive_target("refresh", selector)
             bv = self._resolve_view(selector)
             started = time.monotonic()
             with self._write_gate._state:

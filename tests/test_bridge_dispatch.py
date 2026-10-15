@@ -295,6 +295,134 @@ def test_second_refresh_refuses_while_first_is_queued_on_another_writer(monkeypa
     assert instance._write_gate._refresh is None
 
 
+@pytest.mark.parametrize("first_queued", [False, True])
+def test_bare_cli_second_refresh_refuses_without_target_preflight(
+        monkeypatch, capsys, first_queued):
+    """The CLI must reach the reservation even behind an exclusive writer."""
+    import bn.cli
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    analyzing, release_analysis = threading.Event(), threading.Event()
+    first_result, second_result = {}, {}
+    second_done = threading.Event()
+    calls = []
+
+    def analyze():
+        bv.events.append("refresh")
+        analyzing.set()
+        assert release_analysis.wait(10), "analysis was never released"
+
+    def send(op, *, params=None, target=None, **kwargs):
+        calls.append(op)
+        response = instance.dispatch({
+            "op": op, "params": params, "target": target, "id": "bare-cli"})
+        if not response["ok"]:
+            raise bn.cli.BridgeError(response["error"])
+        return response
+
+    def request_again():
+        try:
+            second_result["rc"] = bn.cli.main(["refresh"])
+        finally:
+            second_done.set()
+
+    bv.update_analysis_and_wait = analyze
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_target_info", lambda selector: {})
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    release_writer, writer = (
+        _exclusive_write_parked(bridge, instance) if first_queued else (None, None))
+    first = threading.Thread(target=lambda: first_result.update(instance.dispatch(
+        {"op": "refresh", "target": "active", "id": "first"})), daemon=True)
+    second = threading.Thread(target=request_again, daemon=True)
+    try:
+        first.start()
+        if first_queued:
+            deadline = time.monotonic() + 5
+            while not instance._write_gate.status("first")["waiting"]:
+                assert time.monotonic() < deadline, "first refresh never queued"
+                time.sleep(0.01)
+        else:
+            assert analyzing.wait(5)
+        second.start()
+        assert second_done.wait(2), "bare refresh blocked before duplicate refusal"
+        assert calls == ["refresh"], "bare refresh must not send list_targets"
+        assert second_result["rc"] == 2
+        error = capsys.readouterr().err
+        assert ("refresh is already pending" if first_queued
+                else "refresh is already running") in error
+        assert "do not start another refresh" in error
+        assert first.is_alive()
+    finally:
+        release_analysis.set()
+        if release_writer is not None:
+            release_writer.set()
+            writer.join(5)
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+    assert first_result["ok"] is True
+    assert bv.events.count("refresh") == 1
+    assert instance._write_gate._refresh is None
+
+
+@pytest.mark.parametrize("target_count,selector", [
+    (0, None), (1, None), (2, None), (2, "active"),
+])
+def test_cli_refresh_resolves_bare_target_under_gate_but_preserves_explicit_active(
+        monkeypatch, capsys, target_count, selector):
+    import bn.cli
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    views = [_FakeMutationBV() for _ in range(target_count)]
+    for index, view in enumerate(views):
+        view.file = types.SimpleNamespace(
+            filename=f"/tmp/target-{index}", session_id=str(index + 1))
+    calls, snapshots, reply_selectors = [], [], []
+
+    def collect(*, strict=False):
+        snapshots.append((strict, instance._write_gate.locked()))
+        return views, True
+
+    def send(op, *, params=None, target=None, **kwargs):
+        calls.append(op)
+        response = instance.dispatch({"op": op, "params": params, "target": target})
+        if not response["ok"]:
+            raise bn.cli.BridgeError(response["error"])
+        return response
+
+    monkeypatch.setattr(bridge, "_collect_open_views_state", collect)
+    monkeypatch.setattr(bridge, "_active_binary_view", lambda: views[-1] if views else None)
+    monkeypatch.setattr(instance, "_target_info",
+                        lambda selector: reply_selectors.append(selector) or {})
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    argv = ["refresh"] + (["-t", selector] if selector is not None else [])
+    succeeds = target_count == 1 or selector == "active"
+    assert bn.cli.main(argv) == (0 if succeeds else 2)
+    assert calls == ["refresh"]
+    assert snapshots[0] == (selector is None, True)
+    if succeeds:
+        assert views[-1].events.count("refresh") == 1
+        assert len(reply_selectors) == 1
+        if selector is None:
+            assert isinstance(reply_selectors[0], bridge.PinnedTarget)
+        else:
+            assert reply_selectors == ["active"]
+    else:
+        assert all("refresh" not in view.events for view in views)
+        assert reply_selectors == []
+        error = capsys.readouterr().err
+        assert ("No BinaryView targets are open" if target_count == 0
+                else "explicit target when multiple targets are open") in error
+    assert instance._write_gate._refresh is None
+
+
 @pytest.mark.parametrize("failure_at", ["resolve", "analysis", "no_wait"])
 def test_failed_refresh_releases_its_reservation(monkeypatch, failure_at):
     bridge = _load_bridge(monkeypatch)

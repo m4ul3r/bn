@@ -1530,6 +1530,12 @@ def _render_session_start_text(value: Any) -> str:
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")
+    elif value.get("stopped") is False:
+        lines.append("")
+        lines.append(
+            f"cleanup error: {value.get('cleanup_error') or 'timed out waiting for teardown'}"
+        )
+        lines.append("warning: bridge process may still be running; no clean stop was confirmed")
     lines.extend(_discarded_unsaved_lines(value))
     return "\n".join(lines)
 
@@ -1572,6 +1578,12 @@ def _render_session_status_text(value: Any) -> str:
 def _render_session_stop_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
+    if value.get("stopped") is False:
+        return "\n".join([
+            f"stop failed: {value.get('instance_id', '<unknown>')}",
+            f"error: {value.get('error') or 'timed out waiting for teardown'}",
+            "warning: bridge process may still be running; no clean stop was confirmed",
+        ])
     line = f"stopped: {value.get('instance_id', '<unknown>')}"
     method = value.get("method")
     if method:

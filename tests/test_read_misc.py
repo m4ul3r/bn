@@ -1380,7 +1380,8 @@ def test_refresh_clears_quick_state_and_enables_strings(monkeypatch):
     # same refresh), so the composed seam needs stubbing too.
     monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
                         lambda selector: (bv, []), raising=False)
-    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "refresh",
+                        lambda strict=False: [{"target_id": "sole-target"}])
 
     bridge._quick_loaded_views.add(bv)
     instance._refresh(None)  # runs analysis and clears the quick flag
@@ -1406,7 +1407,8 @@ def test_gated_reads_say_retry_while_a_refresh_is_running_996(monkeypatch):
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
     monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
                         lambda selector: (bv, []), raising=False)
-    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "refresh",
+                        lambda strict=False: [{"target_id": "sole-target"}])
     bridge._quick_loaded_views.add(bv)
 
     with pytest.raises(RuntimeError, match=r"Run `bn refresh`"):
