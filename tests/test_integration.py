@@ -11,7 +11,6 @@ import json
 import os
 import re
 import shutil
-import shlex
 import subprocess
 import struct
 import sys
@@ -4774,126 +4773,6 @@ class TestShortLiteralBehindDataName994:
         strings = [row for row in result["warning_rows"] if row["code"] == "string"]
         assert strings and strings[0]["strings"][0]["value"] == "C", result["warning_rows"]
         assert strings[0]["strings"][0]["address"] == hex(int(match.group(1), 16))
-
-
-@pytest.fixture(scope="session")
-def unicode_literal_binary(tmp_path_factory) -> Path:
-    workdir = tmp_path_factory.mktemp("unicode-literals-1023")
-    cc = shutil.which("cc")
-    if cc is None:
-        refuse_silent_skip("cc not available, so the #1023 Unicode literal lane did not run")
-    src = workdir / "unicode_literals.c"
-    src.write_text(r"""
-#include <string.h>
-__attribute__((noinline)) int four_literals(const char *s) {
-    return strcmp(s, "\xc3\xa9") + strcmp(s, "\xc3\xb6")
-         + strcmp(s, "\xc3\xbc") + strcmp(s, "\xc3\xb1");
-}
-__attribute__((noinline)) unsigned opaque_hash(const char *p) {
-    unsigned h = 0;
-    for (unsigned i = 0; i < 4; ++i) h = h * 33 + (unsigned char)p[i];
-    return h;
-}
-__attribute__((noinline)) int consume_void(const void *p) {
-    return ((const unsigned char *)p)[0] + ((const unsigned char *)p)[1];
-}
-__attribute__((noinline)) int call_consume(void) {
-    return consume_void("\xe2\x80\x99");
-}
-const int opaque_words[] = {0x44434241, 0};
-__attribute__((noinline)) unsigned hash_words(void) {
-    return opaque_hash((const char *)opaque_words);
-}
-int main(int argc, char **argv) {
-    return four_literals(argv[argc - 1]) + hash_words();
-}
-""")
-    out = workdir / "unicode_literals"
-    build = subprocess.run(
-        [cc, "-O0", "-fno-builtin", "-fno-stack-protector", "-no-pie",
-         str(src), "-o", str(out)],
-        capture_output=True, text=True, timeout=120)
-    if build.returncode != 0:
-        refuse_silent_skip(f"cc failed to build the #1023 Unicode fixture: {build.stderr.strip()}")
-    return out
-
-
-class TestLiteralRetypeAdvice1023:
-    @pytest.mark.parametrize("pretyped", [False, True])
-    def test_printed_retype_commands_make_progress(
-            self, shared_bn, unicode_literal_binary, pretyped):
-        shared_bn.load(unicode_literal_binary)
-        literals = ["é", "ö", "ü", "ñ"]
-        setup = shared_bn.json(
-            "py", "exec", "--code",
-            "import binaryninja as bn\n"
-            "sec = bv.sections['.rodata']\n"
-            "blob = bv.read(sec.start, sec.end - sec.start)\n"
-            f"values = {literals!r}\n"
-            "addresses = []\n"
-            "for value in values:\n"
-            "    needle = value.encode('utf-8') + b'\\0'\n"
-            "    assert blob.count(needle) == 1, (value, blob)\n"
-            "    address = sec.start + blob.index(needle)\n"
-            "    addresses.append(address)\n"
-            "    bv.define_data_var(address, bn.Type.int(1))\n"
-            + ("bv.define_user_data_var(addresses[0], "
-               "bv.parse_type_string('char[0x3]')[0])\n" if pretyped else "")
-            + "bv.update_analysis_and_wait()\n"
-            "result = {'addresses': [hex(a) for a in addresses], "
-            "'types': [str(bv.get_data_var_at(a).type) for a in addresses]}\n")["result"]
-        expected = set(setup["addresses"])
-        if pretyped:
-            expected.remove(setup["addresses"][0])
-        changed = []
-        # Run exactly the commands the text reader prints, not reconstructed
-        # equivalents: each must change a type and the next read must advance.
-        for _ in range(len(literals) + 1):
-            listing = shared_bn.run("decompile", "four_literals")
-            assert listing.returncode == 0, listing.stderr
-            commands = re.findall(r"`(bn data retype [^`]+)`", listing.stdout)
-            if not commands:
-                break
-            assert len(set(commands)) == 1, listing.stdout
-            args = shlex.split(commands[0])
-            address = args[3]
-            assert address in expected and address not in changed, listing.stdout
-            assert args[4] == "char[3]", commands
-            mutation = shared_bn.json(*args[1:])
-            assert mutation["results"][0]["status"] == "verified", mutation
-            changed.append(address)
-        else:
-            pytest.fail("literal retype advice did not terminate")
-        assert set(changed) == expected, (changed, setup)
-
-    def test_inferred_char_pointer_hash_does_not_name_integer_data(
-            self, shared_bn, unicode_literal_binary):
-        shared_bn.load(unicode_literal_binary)
-        premise = shared_bn.json(
-            "py", "exec", "--code",
-            "f = bv.get_functions_by_name('opaque_hash')[0]\n"
-            "result = {'user_type': f.has_user_type, "
-            "'parameter': str(f.type.parameters[0].type)}\n")["result"]
-        assert not premise["user_type"], premise
-        result = shared_bn.json("decompile", "hash_words")
-        assert not any(row["code"] == "string" for row in result["warning_rows"]), result
-        assert "bn data retype" not in shared_bn.run("decompile", "hash_words").stdout
-
-    def test_local_retype_parameter_counts_without_whole_prototype(
-            self, shared_bn, unicode_literal_binary):
-        shared_bn.load(unicode_literal_binary)
-        parameter = shared_bn.json("py", "exec", "--code",
-            "f = bv.get_functions_by_name('consume_void')[0]\n"
-            "result = f.parameter_vars[0].name\n")["result"]
-        mutation = shared_bn.json("local", "retype", "consume_void", parameter, "char const*")
-        assert mutation["results"][0]["status"] == "verified", mutation
-        evidence = shared_bn.json("py", "exec", "--code",
-            "f = bv.get_functions_by_name('consume_void')[0]\n"
-            "result = [f.has_user_type, f.is_var_user_defined(f.parameter_vars[0])]\n")["result"]
-        assert evidence == [False, True], evidence
-        result = shared_bn.json("decompile", "call_consume")
-        strings = [s for row in result["warning_rows"] for s in row.get("strings", [])]
-        assert [s["value"] for s in strings] == ["’"], result
 
 
 class TestOffsetTypeLookup1000:

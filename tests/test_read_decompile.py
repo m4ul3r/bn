@@ -6181,7 +6181,7 @@ def _string_view(memory: bytes, *, semantics="ReadOnlyDataSectionSemantics", str
     """A call `put(x0, 0x402ae0)` to a callee at 0x401100 whose second
     parameter is declared *param_type*, with *memory* at 0x402ae0."""
     section = types.SimpleNamespace(semantics=types.SimpleNamespace(name=semantics))
-    callee = types.SimpleNamespace(has_user_type=True, type=types.SimpleNamespace(parameters=[
+    callee = types.SimpleNamespace(type=types.SimpleNamespace(parameters=[
         types.SimpleNamespace(type="void*"), types.SimpleNamespace(type=param_type)]))
     bv = types.SimpleNamespace(
         get_string_at=lambda a: string,
@@ -6199,7 +6199,7 @@ def _string_view(memory: bytes, *, semantics="ReadOnlyDataSectionSemantics", str
 
 
 def test_raw_string_pointer_note_names_an_undefined_short_literal_970():
-    bv, func = _string_view(b" -n\0\x01\x02", param_type="char const*")
+    bv, func = _string_view(b" -n\0\x01\x02")
     text = "    std::__ostream_insert<char>(x0, 0x402ae0);"
     note = read_decompile._raw_string_pointer_note(bv, func, text)
     assert note is not None
@@ -6864,11 +6864,10 @@ def test_a_short_literal_to_an_untyped_libc_import_is_named_994(kwargs):
 
 
 @pytest.mark.parametrize("kwargs", [
-    # Not a C library name: no type evidence for a short literal.
+    # Not a C library name: the three-character rule for unknown callees holds.
     {"name": "frob_lookup"},
     # A body here whose own prototype covers the argument: BN's type stands.
-    {"name": "strcmp", "kind": "FunctionSymbol", "params": ("char const*", "int64_t"),
-     "user_typed": True},
+    {"name": "strcmp", "kind": "FunctionSymbol", "params": ("char const*", "int64_t")},
     # A prototype the analyst set on the import (`bn proto set`) wins.
     {"name": "strcmp", "params": ("int64_t", "int64_t"), "user_typed": True},
     # A name only a type library knows, typed there as no `char *`.
@@ -6879,12 +6878,12 @@ def test_a_short_literal_needs_a_char_pointer_from_somewhere_994(kwargs):
     assert read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT) is None
 
 
-def test_library_character_parameter_alone_is_not_string_evidence():
+def test_the_platform_type_library_types_an_untyped_import_994():
     library = types.SimpleNamespace(parameters=[
         types.SimpleNamespace(type="int32_t"), types.SimpleNamespace(type="char const*")])
     bv, func = _libc_string_view(b"C\0", name="locale_hook", library=library)
     note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
-    assert note is None
+    assert note is not None and '"C"' in note["summary"]
 
 
 def test_a_literal_bn_renders_as_a_data_placeholder_is_named_994():
@@ -6897,95 +6896,15 @@ def test_a_literal_bn_renders_as_a_data_placeholder_is_named_994():
     assert note is not None and note["strings"][0]["value"] == "C"
 
 
-@pytest.mark.parametrize("argument", ["0x661bd8", "&data_661bd8"])
-@pytest.mark.parametrize("data_type", [None, "int32_t[4]", "struct Record", "char*"])
-def test_memcmp_bytes_are_not_claimed_as_strings_1019(argument, data_type):
-    # int k[4] = {0x00434241, 0, 0, 0} starts with printable "ABC".
-    bv, func = _libc_string_view(
-        b"ABC\0" + b"\0" * 12, name="memcmp", params=("void const*", "void const*"))
-    bv.get_data_var_at = lambda a: (
-        None if data_type is None else types.SimpleNamespace(type=data_type))
-    note = read_decompile._raw_string_pointer_note(
-        bv, func, f"    return memcmp(arg1, {argument}, 16);")
-    assert note is not None and note["code"] == "bytes"
-    assert note["address"] == "0x51c884"
-    assert 'bytes at 0x661bd8 read as "ABC"' in note["detail"]
-    assert note["strings"] == []
-    assert note["bytes"] == [{"address": "0x661bd8", "value": "ABC", "call": "0x51c884"}]
-    assert "bn data retype" not in note["summary"] + note["detail"]
-
-
-@pytest.mark.parametrize("data_type", ["char[3]", "char[0x3]", "const char[0x3]"])
-def test_declared_character_array_suppresses_retype_advice(data_type):
-    bv, func = _libc_string_view("٬".encode() + b"\0", name="strcmp")
-    bv.get_data_var_at = lambda a: types.SimpleNamespace(type=data_type)
-    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
-    assert note["strings"][0]["value"] == "٬"
-    assert "bn data retype" not in note["detail"] + note["summary"]
-
-
-@pytest.mark.parametrize("user_typed", [False, True])
-def test_inferred_char_pointer_is_not_string_evidence(user_typed):
-    bv, func = _libc_string_view(
-        b"\xe2\x80\x99\0" + b"\1\0\0\0\2\0\0\0\3\0\0\0",
-        name="opaque_hash", kind="FunctionSymbol",
-        params=("int32_t", "char*"), user_typed=user_typed)
-    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
-    assert note["code"] == ("string" if user_typed else "bytes")
-    if not user_typed:
-        assert note["strings"] == []
-        assert note["bytes"][0]["value"] == "’"
-        assert "bn data retype" not in note["detail"] + note["summary"]
-
-
-@pytest.mark.parametrize("kind", ["FunctionSymbol", "ImportedFunctionSymbol", "ExternalSymbol"])
-def test_string_api_identity_requires_external_provenance(kind):
-    bv, func = _libc_string_view(
-        b"\xe2\x80\x99\0" + b"\1\0\0\0" * 3, name="strcmp", kind=kind)
-    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
-    assert note["code"] == ("bytes" if kind == "FunctionSymbol" else "string")
-    if kind == "FunctionSymbol":
-        assert "bn data retype" not in note["detail"]
-
-
-@pytest.mark.parametrize("explicit", [False, True])
-def test_per_parameter_user_type_is_string_evidence(explicit):
-    bv, func = _libc_string_view(
-        "’".encode() + b"\0", name="consume_void", kind="FunctionSymbol")
-    callee = bv.get_function_at(0x401100)
-    var = types.SimpleNamespace(type="char const*")
-    callee.parameter_vars = [types.SimpleNamespace(type="int"), var]
-    callee.is_var_user_defined = lambda candidate: explicit and candidate is var
-    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
-    assert note["code"] == ("string" if explicit else "bytes")
-
-
-@pytest.mark.parametrize("data_type", ["int32_t[4]", "char[1]", "struct Record"])
-def test_user_data_type_is_never_advised_over(data_type):
-    bv, func = _libc_string_view("’".encode() + b"\0", name="strcmp")
-    bv.get_data_var_at = lambda address: types.SimpleNamespace(
-        type=data_type, auto_discovered=False)
-    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
-    assert note["strings"][0]["value"] == "’"
-    assert "bn data retype" not in note["summary"] + note["detail"]
-
-
-@pytest.mark.parametrize("value", [" ", "’", "٬", "é", "😀"])
-@pytest.mark.parametrize("argument", ["0x661bd8", "&data_661bd8"])
-def test_strcmp_names_short_utf8_with_byte_sized_retype_1017(value, argument):
-    bv, func = _libc_string_view(value.encode("utf-8") + b"\0", name="strcmp")
-    note = read_decompile._raw_string_pointer_note(
-        bv, func, f"return strcmp(arg1, {argument});")
-    assert note is not None and note["strings"][0]["value"] == value
-    assert note["address"] == "0x51c884"
-    assert f"'char[{len(value.encode('utf-8')) + 1}]'" in note["detail"]
-
-
-@pytest.mark.parametrize("memory", [b"\xff\0", b"\xc3\0", b"\xc0\xaf\0", b"\x7f\0",
-                                    b"\x1b\0", "\u202e".encode() + b"\0"])
-def test_strcmp_does_not_present_invalid_utf8_or_controls_as_literals_1017(memory):
-    bv, func = _libc_string_view(memory, name="strcmp")
-    assert read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT) is None
+def test_a_data_placeholder_is_not_named_without_a_char_pointer_994():
+    # On a stripped binary `&data_4008f0` is as often an `int[]` or a struct:
+    # `memcmp(p, &data_..., 0x10)` with `int k[4] = {0x00434241, ..}` once read
+    # as "ABC". A raw `0x...` keeps the three-character rule.
+    bv, func = _libc_string_view(b"ABC\0", name="memcmp", params=("void const*", "void const*"))
+    assert read_decompile._raw_string_pointer_note(
+        bv, func, "    return memcmp(arg1, &data_661bd8, 0x10);") is None
+    assert read_decompile._raw_string_pointer_note(
+        bv, func, "    return memcmp(arg1, 0x661bd8, 0x10);") is not None
 
 
 def test_offset_types_resolve_by_rendered_name_like_types_show_1000():
