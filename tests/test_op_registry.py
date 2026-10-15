@@ -49,8 +49,8 @@ EXPECTED_SELF_MANAGED = {
     "cancel_request", "load_binary", "load_binary_async", "load_status",
     "go_rename", "shutdown", "refresh", "write_gate_status",
     # #628: every binder that routes through bridge._mutation() -- all of them
-    # reanalyze inside their own body -- plus the standalone function_create.
-    "function_create", "rename_symbol", "set_comment", "delete_comment",
+    # reanalyze inside their own body -- plus standalone function creation/deletion.
+    "function_create", "function_delete", "rename_symbol", "set_comment", "delete_comment",
     "set_prototype", "local_rename", "local_retype", "data_retype",
     "struct_field_set", "struct_field_rename", "struct_field_delete",
     "types_declare", "batch_apply", "tag_add", "tag_remove",
@@ -173,7 +173,7 @@ def test_escalation_exists_only_for_force_analysis(op_registry):
 # is a policy declaration, so an op gaining or losing it is a deliberate
 # change. `close_binary` is absent on purpose -- it refuses the ambiguous case
 # in `_resolve_sole_target_for_close`, which also names its `all=true` escape.
-EXPECTED_DESTRUCTIVE = {"save_database", "py_exec", "batch_apply", "go_rename"}
+EXPECTED_DESTRUCTIVE = {"save_database", "py_exec", "batch_apply", "go_rename", "function_delete"}
 
 
 def test_the_destructive_ops_are_exactly_these(op_registry):

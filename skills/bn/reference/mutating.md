@@ -22,6 +22,8 @@ bn class apply-types ns::Widget --preview
 bn struct field rename Record flags options --preview
 bn struct field delete Record options --preview
 bn function create 0x402000 --preview
+# Irreversible repair only after inspecting both bodies; --preview refuses.
+bn function delete 0x402000
 bn comment set --address 0x402010 'length comes from header' --preview
 bn comment delete --address 0x402010 --preview
 bn tag type create audit_note --icon A --preview
@@ -57,6 +59,16 @@ bn local retype ns::dispatch <this_local_id> 'struct `ns::Widget`*'
 Printable punctuation, including literal quote characters, remains valid and is preserved. In a shell, `bn rename parse_record ''` delivers an empty argument and is rejected; `bn rename parse_record "''"` delivers two literal single quotes and names the symbol `''`. A readback containing those two characters is not evidence that an empty-string value was accepted.
 
 `function create` is for an address auto-analysis missed. An address **inside** an existing function is refused (`invalid_request`, exit 3) naming the containing function, its start, the offset and whether the address is an instruction boundary there, because Binary Ninja does not simply add a second function beside it: at an instruction boundary it truncates the host at the new start (the host keeps only the bytes before it), and at a mid-instruction address it leaves the host intact beside an overlapping function that decodes a different instruction stream -- the shape of a mistyped address. Pass `--allow-overlap` (batch op field `"allow_overlap": true`) only for a deliberate cut of an over-extended function; the compact status line then carries `overlaps=N` and an `overlapping_functions:` line naming each host as `truncated` or `intact`, `--format json --summary` carries `overlapping_functions`, and the full result lists the host under `affected_functions` too. `--preview` obeys the same rule, and its revert verifies the host is back as it was before the command -- in a batch, as it was before the batch's first op, so a sibling rename of the host is undone with the rest -- a host that cannot be restored is reported as `rollback_failed` with `dirty_after` true, never as a clean revert (when the batch itself errored after applying, the error envelope carries `status: rollback_failed` and `observed.dirty_after: true` instead of a result). An unmapped, non-executable or `--quick`-loaded target is refused the same way on both surfaces.
+
+`bn function delete <address>` repairs an erroneous function entry, such as a shared tail identified by the split-body warning. For example, `bn function delete 0x402000` removes the entry at `0x402000` with Binary Ninja's `remove_user_function`, then waits for reanalysis. This mutation is journaled but has **no clean undo**: it leaves a persistent user override suppressing automatic function creation at that address, and recreating an entry does not restore its prior analysis or annotations. `--preview` returns `unsupported` before any writes, without changes. Save a durable database before applying if you need a recoverable baseline.
+
+The mutation's `observed` state reports `function_removed`, `function_at_entry`, `bodies_containing_deleted_entry` (rows with `address` and `name`), `reanalysis_completed`, and `clean_undo_available: false`. Verification requires the entry to be absent and reanalysis to have completed. A body containing the deleted entry proves only that address is contained, not that the full tail merged or that the resulting boundaries are correct. Read the reported bodies with `bn disasm` and `bn decompile` before relying on them. A failure cannot promise automatic restoration.
+
+An attempted live deletion carries `irreversible_change: true` even if removal or reanalysis raises: a partial write cannot be ruled out or cleanly undone. Its compact summary therefore counts that operation as changed/possibly changed and reports `dirty_after: true`, independently of `verified_count`. A failed verification still reports failure (exit 3); changed does not imply verified.
+
+The irreversible result is established and the view is marked dirty before removal. An ordinary subsequent exception, including journal or readback failure, returns that failed result with the original `observed.error` and `observed.error_stage` rather than a generic read error. Post-state observations not obtained are `null`, not invented absence or empty ownership; `function_at_entry: null` proves absence only when `function_removed: true`. Errors also appear in the mutation's default text and compact `first_error`.
+
+Known limitations: `KeyboardInterrupt`, `SystemExit`, and other direct `BaseException` interruptions propagate rather than returning a mutation response. Dirty tracking is already established before removal, so an interrupted write remains protected by the unsaved-change gate while the bridge survives; reconnect and inspect before saving or discarding. If dirty marking itself fails, removal is not attempted. Its response may conservatively say changed/dirty even though no deletion occurred. No clean undo or interrupted-journal restoration is promised.
 
 For `go rename`, `--verbose` (alias `--diffs`) requests detail and `--summary` (alias `--quiet`) forces the compact summary. It takes the standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`, `--out`) and nothing else.
 
@@ -97,6 +109,7 @@ This table describes the stable object from `--format json --summary`; the defau
 | `dirty_after` | whether a live change may need saving; true is the safe value when measurement or rollback failed |
 | `prototype_user_type_residue` | unclearable user-type override after a failed/reverted prototype change |
 | `overlapping_functions` | the `{name, address, offset, instruction_boundary, truncated}` of each function a `function create --allow-overlap` landed inside (`truncated` says whether the host was cut at the new start or left intact); absent for an ordinary create |
+| `function_deletions` | optional `function delete` outcome rows `{address, message, observed}`; preserves the deletion outcome and no-clean-undo disclosure in compact JSON and default text output rather than reporting counts alone. `observed.bodies_containing_deleted_entry` establishes entry containment only, not a full-tail merge |
 | `replaced_members` | the `{struct_name, field_name, field_type, offset}` of each member a `struct field set` removed because the new field overlaps it (the member rewritten in place under its own name is not listed); also rendered as `replaced=N` and a `replaced:` line |
 | `kept_library_imports` | the library types Binary Ninja imported that stay in the view although the declare did not land: a failed live declare's, or a preview's (which then fails, since a preview cannot undo an import); also rendered as a `kept library imports (a rollback cannot remove them):` line |
 | `class_apply_types` | `class apply-types` only: `class`, `vtable_type` (the vptr points at `struct <vtable_type>*`), `instance_struct` (`declared`, `vptr_retyped`, `vptr_added` or `unchanged`), `vptr_member_before` (`{field_name, field_type}` of a retyped offset-0 member), `size` and `size_source`, `retyped_methods` (`{address, name, status}`; `noop` when `this` already had the type) and `skipped_methods` (`{address, name, reason}`); also rendered as `class:`, `this retyped:` and `skipped:` lines |
@@ -116,6 +129,8 @@ If a required measurement source is missing, a supplied counter is unreadable, o
 ## Batch apply
 
 Use `batch apply` for related writes that should verify and revert as one unit. Give it a concrete selector; a CLI `-t` wins over a manifest `"target"`. Do not use `"target": "active"` in a multi-target headless manifest. A quoted heredoc keeps comments literal:
+
+Exception: `function_delete` is non-reversible and must be the **only operation** in its batch. Mixed batches and multiple deletes are refused before any writes; preview of a singleton delete is also refused before writes. A singleton manifest is `{"ops":[{"op":"function_delete","address":"0x402000"}]}`. Do not rely on rollback to restore a deletion.
 
 ```bash
 bn batch apply -t <selector> --preview - <<'BN_EOF'
@@ -147,6 +162,7 @@ Help locates this reference within the installed `bn` skill; a source checkout o
 | `struct_field_delete` | `struct_name`, `field_name` | — | `bn struct field delete` |
 | `types_declare` | `declaration` | — | `bn types declare` |
 | `function_create` | `address` | — | `bn function create` |
+| `function_delete` | `address` | — | `bn function delete` (singleton batch only; no preview or clean undo) |
 | `tag_add` | `type` | `function` \| `address` | `bn tag add` |
 | `tag_remove` | — | `tag_id` \| `address` \| `function` | `bn tag remove` |
 | `tag_type_create` | `name`, `icon` | — | `bn tag type create` |

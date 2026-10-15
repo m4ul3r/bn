@@ -5829,6 +5829,14 @@ def _bind_function_create(bridge, params, target):
     )
 
 
+@op("function_delete", lock="none", destructive=True)
+def _bind_function_delete(bridge, params, target):
+    return bridge._mutation(
+        target, _validate_bool(params.get("preview"), label="preview", default=False),
+        [{"op": "function_delete", "address": params["address"]}],
+    )
+
+
 @op("bundle_function", lock="read")
 def _bind_bundle_function(bridge, params, target):
     return bridge._bundle_function(

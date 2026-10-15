@@ -288,6 +288,17 @@ def _function_create(args: argparse.Namespace) -> int:
     )
 
 
+@command("function", "delete",
+         help="Remove a function and suppress its recreation; no clean undo",
+         target=True, fmt="json",
+         args=[preview_arg("Refused before writing: deletion has no clean undo"),
+               *mutation_output_args(),
+               arg("address", help="Exact function entry address (hex or decimal)")])
+def _function_delete(args: argparse.Namespace) -> int:
+    return _mutate(args, "function_delete", {"address": args.address},
+                   preview=bool(args.preview), stem="function-delete")
+
+
 def _require_text_format(args: argparse.Namespace, flag: str) -> None:
     """Reject display-only flags outside text mode instead of ignoring them.
 
