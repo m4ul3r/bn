@@ -1241,8 +1241,9 @@ def _call_arity_warning(bv, func, findings: list[dict[str, Any]] | None = None,
         # #1033: a printed command runs as printed, so it names a real callee.
         + f"Read a call's real arguments in its disassembly with `bn callsites "
         f"{hex(first['target'])} --within {hex(int(func.start))} --context 4` (for "
-        f"{_short_callee(first['label'])}; use the callee's address for another); fix "
-        "the callee with `bn proto set`."
+        f"{_short_callee(first['label'])}; use the callee's address for another). "
+        f"`bn proto get {hex(first['target'])}` shows the prototype BN has; apply the "
+        "real one with `proto set`."
     )
     return _warning_row("arity", summary, detail, calls=[
         {
