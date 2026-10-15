@@ -719,9 +719,11 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
     assert _FakeSocket.attempts == 2
 
 
+@pytest.mark.parametrize("failure", ["refused", "missing", "connect_timeout", "deadline"])
 def test_transient_connect_retries_obey_end_to_end_deadline(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, failure
 ):
+    import bn.transport as transport
     from bn.transport import BridgeInstance
 
     instance = BridgeInstance(
@@ -734,9 +736,16 @@ def test_transient_connect_retries_obey_end_to_end_deadline(
         meta={},
         instance_token="test-token",
     )
-    monkeypatch.setattr(
-        "bn.transport.choose_instance", lambda instance_id=None, **kw: instance
-    )
+    clock = [0.0]
+    def monotonic():
+        now = clock[0]
+        if failure == "deadline":
+            clock[0] += 1.0
+        return now
+    monkeypatch.setattr(transport.time, "monotonic", monotonic)
+    monkeypatch.setattr(transport.time, "sleep", lambda duration: clock.__setitem__(0, clock[0] + duration))
+    monkeypatch.setattr(transport, "_send_cancel_request",
+                        lambda *args: pytest.fail("cancelling a request that was never sent"))
 
     class RefusingSocket:
         def __enter__(self):
@@ -749,17 +758,25 @@ def test_transient_connect_retries_obey_end_to_end_deadline(
             self.timeout = timeout
 
         def connect(self, path):
+            if failure == "connect_timeout":
+                raise TimeoutError("connect timed out")
+            if failure == "missing":
+                raise FileNotFoundError(errno.ENOENT, "Socket missing")
             raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+
+        def sendall(self, payload):
+            pytest.fail("request must not be sent after a failed connect")
 
     monkeypatch.setattr(
         "bn.transport.socket.socket", lambda *args, **kwargs: RefusingSocket()
     )
-    started = time.monotonic()
 
-    with pytest.raises(BridgeError, match="Timed out"):
-        send_request("ping", timeout=0.01)
+    with pytest.raises(BridgeError, match="Timed out") as caught:
+        transport._send_request_to_instance(instance, "ping", timeout=0.01)
 
-    assert time.monotonic() - started < 0.1
+    assert "The request was not sent." in str(caught.value)
+    assert "may still be running" not in str(caught.value)
+    assert "may keep running" not in str(caught.value)
 
 
 def _make_timeout_probe_socket():
@@ -1473,7 +1490,8 @@ def test_only_a_failure_before_connect_is_unreachable(tmp_path, monkeypatch):
     assert isinstance(raised(), BridgeUnreachableError)
 
 
-def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cancel_connect_fails", [False, True])
+def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch, cancel_connect_fails):
     from bn.transport import BridgeError, BridgeInstance
 
     instance = BridgeInstance(
@@ -1503,6 +1521,8 @@ def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch):
             self.timeout = timeout
 
         def connect(self, path):
+            if self.index == 1 and cancel_connect_fails:
+                raise ConnectionRefusedError("cancel connection refused")
             self.path = path
 
         def sendall(self, payload):
@@ -1521,11 +1541,91 @@ def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch):
 
     monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
 
-    with pytest.raises(BridgeError, match="Timed out waiting for Binary Ninja bridge pid 999"):
+    with pytest.raises(BridgeError, match="Timed out waiting for Binary Ninja bridge pid 999") as caught:
         send_request("ping", timeout=12.5)
 
-    assert [payload["op"] for payload in sent_payloads] == ["ping", "cancel_request"]
-    assert sent_payloads[1]["params"]["request_id"] == sent_payloads[0]["id"]
+    message = str(caught.value)
+    assert "busy with analysis" not in message
+    if cancel_connect_fails:
+        assert [payload["op"] for payload in sent_payloads] == ["ping"]
+        assert "cancel request could not be sent" in message
+    else:
+        assert [payload["op"] for payload in sent_payloads] == ["ping", "cancel_request"]
+        assert sent_payloads[1]["params"]["request_id"] == sent_payloads[0]["id"]
+        assert "cancel request was sent" in message
+        assert "until it checks for cancellation" in message
+
+
+@pytest.mark.parametrize("cancel_sent", [False, True])
+@pytest.mark.parametrize("transmit_json", [False, True])
+def test_sendall_timeout_preserves_delivery_uncertainty(
+    tmp_path, monkeypatch, cancel_sent, transmit_json
+):
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    # A native socketpair establishes the EOF boundary without filling a
+    # machine-dependent send buffer or racing a receiver against a deadline.
+    # Inject only the sendall timeout, after optionally transmitting the entire
+    # JSON value except its newline; the receiver waits until the sender closes.
+    writer, reader = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    attempted = []
+    cancellations = []
+
+    class SendTimeoutSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            writer.close()
+            return False
+
+        def settimeout(self, timeout):
+            writer.settimeout(timeout)
+
+        def connect(self, path):
+            assert path == str(instance.socket_path)
+
+        def sendall(self, payload):
+            attempted.append(json.loads(payload))
+            assert payload.endswith(b"\n")
+            if transmit_json:
+                writer.sendall(payload[:-1])
+            raise TimeoutError("timed out during sendall")
+
+    def cancel(inst, request_id):
+        assert inst is instance
+        cancellations.append(request_id)
+        return cancel_sent
+
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **kw: SendTimeoutSocket())
+    monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda *a: None)
+    monkeypatch.setattr(transport, "_send_cancel_request", cancel)
+
+    with writer, reader:
+        with pytest.raises(BridgeError, match="Timed out") as caught:
+            transport._send_request_to_instance(instance, "ping", timeout=5.0)
+        # Like the production reader, readline accepts a valid JSON value at
+        # EOF even when the framing newline never arrived.
+        reader.settimeout(5.0)
+        with reader.makefile("rb") as received:
+            raw = received.readline()
+        if transmit_json:
+            assert not raw.endswith(b"\n")
+            assert json.loads(raw) == attempted[0]
+        else:
+            assert raw == b""
+
+    assert len(attempted) == 1
+    assert cancellations == [attempted[0]["id"]]
+    message = str(caught.value)
+    assert "The request was not sent." not in message
+    if cancel_sent:
+        assert "A cancel request was sent" in message
+        assert "operation may keep running until it checks for cancellation" in message
+    else:
+        assert "A cancel request could not be sent" in message
+        assert "operation may still be running" in message
 
 
 def test_timeout_message_shows_subsecond_value(tmp_path, monkeypatch):
@@ -2828,6 +2928,7 @@ def test_send_request_load_refresh_use_larger_default(tmp_path, monkeypatch):
 
     monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
     instance = _make_instance(tmp_path)
+    instance.meta["capabilities"] = {"refresh_target_gate": True}
     monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
     fake_socket = _make_timeout_probe_socket()
     monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: fake_socket())
@@ -3415,11 +3516,17 @@ def test_bridge_signal_refuses_without_an_atomic_primitive(tmp_path, monkeypatch
     import bn.transport as transport
 
     monkeypatch.setattr(proc_identity, "PIDFD_AVAILABLE", False)
+    monkeypatch.setattr(os, "kill", lambda *a: pytest.fail("no unpinned signal"))
+    monkeypatch.setattr(
+        transport, "identity_verdict",
+        lambda *a: pytest.fail("no check-then-signal identity fallback"),
+    )
 
     with transport.BridgeProcessSignal(_instance(tmp_path)) as signaller:
         assert signaller.refusal is not None
         assert "provides no pidfd" in signaller.refusal
         assert signaller.send(signal.SIGTERM) is not None
+        assert signaller.send(signal.SIGKILL) is not None
 
 
 def test_bridge_signal_reports_a_process_that_exited_before_delivery(

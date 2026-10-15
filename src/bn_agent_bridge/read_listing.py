@@ -26,6 +26,7 @@ import THIS module one-way (design spec §3.2).
 from __future__ import annotations
 
 import re
+import struct
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 
@@ -341,19 +342,246 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
 _CALLEE_DATA_REFS_LISTED = 8
 
 
-def _callee_data_refs(bv, address: int) -> dict[str, Any]:
+def _callee_vtable_address_point(bv, start: int, extent: int, class_name: str,
+                                ptr: int, endian: str) -> str | None:
+    """Read a primary header, not an assumed two-word prefix.
+
+    Virtual-base offset words can precede the offset-to-top/typeinfo header.
+    Limit this optional read to 64 words; an unseen/ambiguous header is unknown.
+    """
+    from .read_class import _is_alias_symbol, _rtti_kind_and_class
+
+    reader = getattr(bv, "read", None)
+    symbol_at = getattr(bv, "get_symbol_at", None)
+    if not callable(reader) or not callable(symbol_at):
+        return None
+    data = reader(start, min(extent, 64 * ptr))
+    if not data:
+        return None
+    points = []
+    order = "little" if endian == "<" else "big"
+    for offset in range(0, len(data) - 2 * ptr + 1, ptr):
+        if int.from_bytes(data[offset:offset + ptr], order) != 0:
+            continue
+        typeinfo = int.from_bytes(data[offset + ptr:offset + 2 * ptr], order)
+        symbol = symbol_at(typeinfo) if typeinfo else None
+        if symbol is None or _is_alias_symbol(symbol):
+            continue
+        if _rtti_kind_and_class(symbol) != ("typeinfo", class_name):
+            continue
+        point = start + offset + 2 * ptr
+        if point < start + extent:
+            points.append(point)
+    return hex(points[0]) if len(points) == 1 else None
+
+
+def _callee_vtable_named_refs(ctx, bv, candidates: list[dict[str, Any]],
+                              extents: dict[int, int]) -> list[dict[str, Any]]:
+    """Prove that name-only class navigation selects this exact ELF object."""
+    from .read_class import (
+        _build_class_registry, _is_alias_symbol, _is_construction_vtable_artifact,
+        _is_thunk_artifact, _rtti_kind_and_class,
+    )
+
+    if not candidates:
+        return []
+    # Registry construction scans both populations. Unsupported/unbounded native
+    # surfaces cannot establish uniqueness, even if an ELF lookup found a name.
+    functions = bv.functions
+    if len(functions) > 65536:
+        return []
+    symbols = bv.get_symbols()
+    if len(symbols) > 65536:
+        return []
+    local_names: dict[str, set[int]] = {}
+    for sym in symbols:
+        kind, name = _rtti_kind_and_class(sym)
+        if kind == "vtable" and not _is_alias_symbol(sym):
+            local_names.setdefault(name, set()).add(int(sym.address))
+    unique = []
+    for candidate in candidates:
+        name = candidate["class_name"]
+        start = int(candidate["vtable_address"], 16)
+        if _is_construction_vtable_artifact(name) or _is_thunk_artifact(name):
+            continue
+        addresses = local_names.get(name, set())
+        # Only a header-proven primary address point can be another marker for
+        # this object. Mere containment in its extent cannot prove identity.
+        allowed = {start}
+        if candidate["address_point"] is not None:
+            allowed.add(int(candidate["address_point"], 16))
+        if not addresses or any(
+                address not in allowed or (address != start and address in extents)
+                for address in addresses):
+            continue
+        unique.append(candidate)
+    if not unique:
+        return []
+    registry = _build_class_registry(ctx, bv)
+    result = []
+    for candidate in unique:
+        record = registry.get(candidate["class_name"])
+        vtable = record.get("vtable") if record else None
+        if vtable and vtable["address"] == candidate["vtable_address"]:
+            result.append(candidate)
+    return result
+
+
+def _callee_vtable_refs(ctx, bv, refs: list[int]) -> list[dict[str, Any]]:
+    """Confirm membership only from a defined ELF _ZTV object's st_size.
+
+    No nearest-symbol or function-pointer-run inference: an anonymous table
+    immediately after a named vtable must remain unknown. Optional hint work is
+    capped at 4096 sections, 65536 symbols and 4 MiB of table/string bytes.
+    """
+    if not refs:
+        return []
+    from .elf_dynamic import _Elf
+
+    raw = getattr(bv, "parent_view", None)
+    getter = getattr(bv, "get_symbols_by_raw_name", None)
+    if raw is None or not callable(getter):
+        return []
+    try:
+        base = int(getattr(raw, "start", 0))
+        elf = _Elf(lambda off, size: raw.read(base + off, size), int(raw.length), False, "<")
+        ident = elf.bytes_at(0, 16)
+        if not ident or ident[:4] != b"\x7fELF" or ident[4] not in (1, 2) or ident[5] not in (1, 2):
+            return []
+        elf.is64 = ident[4] == 2
+        elf.endian = "<" if ident[5] == 1 else ">"
+        shoff = elf.unpack("Q" if elf.is64 else "I", 40 if elf.is64 else 32)
+        counts = elf.unpack("HH", 58 if elf.is64 else 46)
+        if shoff is None or counts is None:
+            return []
+        stride, count = counts
+        if stride != (64 if elf.is64 else 40) or not 0 < count <= 4096:
+            return []
+        headers = elf.bytes_at(shoff[0], stride * count)
+        if headers is None:
+            return []
+        fmt = elf.endian + ("IIQQQQIIQQ" if elf.is64 else "IIIIIIIIII")
+        sections = list(struct.iter_unpack(fmt, headers))
+        budget, symbols_left = 4 * 1024 * 1024, 65536
+        matches: dict[int, list[dict[str, Any]]] = {}
+        extents: dict[int, int] = {}
+        address_points: dict[tuple[int, int, str], str | None] = {}
+        ptr = 8 if elf.is64 else 4
+        marker = re.compile(r"^_?vtable[ _]for[ _](.+)$")
+        # Use the loader's documented relocation delta once for every extent.
+        image_base = getattr(bv, "image_base", None)
+        original_base = getattr(bv, "original_image_base", None)
+        bias = int(image_base) - int(original_base) if (
+            image_base is not None and original_base is not None) else 0
+        for section in sections:
+            if section[1] not in (2, 11):  # SHT_SYMTAB / SHT_DYNSYM
+                continue
+            off, size, link, entry_size = section[4], section[5], section[6], section[9]
+            expected = 24 if elf.is64 else 16
+            if entry_size != expected or size % expected or link >= count:
+                return []
+            strings_section = sections[link]
+            string_size = strings_section[5]
+            n = size // expected
+            if strings_section[1] != 3 or n > symbols_left or size + string_size > budget:
+                return []
+            symbols_left -= n
+            budget -= size + string_size
+            symbols = elf.bytes_at(off, size)
+            strings = elf.bytes_at(strings_section[4], string_size)
+            if symbols is None or strings is None:
+                return []
+            symfmt = elf.endian + ("IBBHQQ" if elf.is64 else "IIIBBH")
+            for row in struct.iter_unpack(symfmt, symbols):
+                name_off = row[0]
+                # An unreadable name can hide another overlapping class.
+                if not 0 <= name_off < len(strings):
+                    return []
+                end = strings.find(b"\0", name_off, min(len(strings), name_off + 4096))
+                if end < 0:
+                    return []
+                info, index, extent = (row[1], row[3], row[5]) if elf.is64 else (row[3], row[5], row[2])
+                # Validate every index before type filtering: a non-object or
+                # unnamed row must not conceal an unsupported extended index.
+                if index == 0xffff or (0 < index < 0xff00 and index >= count):
+                    return []
+                if index >= 0xff00 and index not in (0xfff1, 0xfff2):
+                    return []
+                if strings[name_off:name_off + 4] != b"_ZTV" or index == 0:
+                    continue
+                # Undefined imports are known non-definitions. Every defined
+                # _ZTV, including zero-size linker aliases, must be resolved;
+                # dropping an unsupported shape would falsely prove uniqueness.
+                if index >= count or info & 15 != 1 or extent <= 2 * ptr:
+                    return []
+                value = row[4] if elf.is64 else row[1]
+                owner = sections[index]
+                limit = 1 << (ptr * 8)
+                if owner[1] != 1 or not owner[2] & 2 or not (
+                        owner[3] <= value < value + extent <= owner[3] + owner[5] <= limit
+                        and owner[4] + owner[5] <= int(raw.length)):
+                    return []
+                name = strings[name_off:end].decode("utf-8", errors="strict")
+                start = value + bias
+                extents[start] = extent
+                relevant_refs = [ref for ref in refs if start + 2 * ptr <= ref < start + extent]
+                if not relevant_refs:
+                    continue
+                local_identity_found = False
+                local_symbols = getter(name)
+                if len(local_symbols) > 65536:
+                    return []
+                for sym in local_symbols:
+                    if int(sym.address) != start:
+                        continue
+                    symbol_type = getattr(sym, "type", None)
+                    type_name = str(getattr(symbol_type, "name", symbol_type)).rsplit(".", 1)[-1]
+                    if type_name in {"ImportAddressSymbol", "ImportedDataSymbol",
+                                     "ImportedFunctionSymbol", "ExternalSymbol"}:
+                        continue
+                    class_match = marker.fullmatch(str(getattr(sym, "short_name", "") or ""))
+                    if not class_match:
+                        continue
+                    local_identity_found = True
+                    for ref in relevant_refs:
+                        key = (start, extent, class_match[1])
+                        if key not in address_points:
+                            address_points[key] = _callee_vtable_address_point(
+                                bv, start, extent, class_match[1], ptr, elf.endian)
+                        entry = {"address": hex(ref), "class_name": class_match[1],
+                                 "vtable_address": hex(start), "address_point": address_points[key],
+                                 "evidence": "elf_symbol_size"}
+                        candidates = matches.setdefault(ref, [])
+                        if entry not in candidates:
+                            candidates.append(entry)
+                # A relevant ELF object whose local class identity is unreadable
+                # can conceal an overlapping alias just like an unread table.
+                if not local_identity_found:
+                    return []
+        # Conflicting overlapping symbol extents do not establish one class.
+        candidates = [matches[ref][0] for ref in refs if len(matches.get(ref, [])) == 1]
+        return _callee_vtable_named_refs(ctx, bv, candidates, extents)
+    except Exception:
+        return []
+
+
+def _callee_data_refs(ctx, bv, address: int) -> dict[str, Any]:
     """``callee_data_ref_count`` and the first ``_CALLEE_DATA_REFS_LISTED``
     ``callee_data_refs`` (hex) of BN's data refs to *address*; the count is
-    None when BN cannot list them."""
+    None when BN cannot list them. ``callee_data_ref_vtables`` annotates only
+    listed locations whose membership has a section-backed ELF symbol extent."""
     getter = getattr(bv, "get_data_refs", None)
     try:
         refs = sorted({int(r) for r in getter(address)}) if callable(getter) else None
     except Exception:
         refs = None
     if refs is None:
-        return {"callee_data_ref_count": None, "callee_data_refs": []}
+        return {"callee_data_ref_count": None, "callee_data_refs": [],
+                "callee_data_ref_vtables": []}
+    listed = refs[:_CALLEE_DATA_REFS_LISTED]
     return {"callee_data_ref_count": len(refs),
-            "callee_data_refs": [hex(r) for r in refs[:_CALLEE_DATA_REFS_LISTED]]}
+            "callee_data_refs": [hex(r) for r in listed],
+            "callee_data_ref_vtables": _callee_vtable_refs(ctx, bv, listed)}
 
 
 def _other_containing_functions(ctx, bv, call_addr: str, func) -> list[dict[str, str]]:
@@ -546,14 +774,13 @@ def _callsites(
             scope_functions, caller_scan_truncated, caller_scan_note = (
                 _scan_caller_functions(ctx, bv, {int(callee.start), *stub_addrs})
             )
+    # Data locations holding the callee's address do not identify indirect callers.
+    # Report their count and addresses, and offer class-layout navigation only
+    # where bounded ELF object evidence proves a named vtable's ownership.
+    # Unknown locations keep an honest data-location xrefs fallback.
+    data_ref_fields = _callee_data_refs(ctx, bv, int(callee.start))
     # #558: an imported variadic (scanf/printf-family) callee's HLIL callsite text
     # can show only the fixed argument; attach a steer to the argument-recovery views.
-    # #998 item 1: a function whose address is stored in data (a vtable slot,
-    # a function-pointer table) can be called through it, and no call
-    # instruction names such a call. Report only the FACT -- how many data
-    # refs there are and where -- so a short (or empty) direct-call list is not
-    # read as "rarely called"; what those refs are is `xrefs`'s to show.
-    data_ref_fields = _callee_data_refs(bv, int(callee.start))
     variadic_hint = _callee_variadic_hint(callee)
 
     rows = []

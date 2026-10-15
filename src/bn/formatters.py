@@ -5,6 +5,7 @@ import contextvars
 import functools
 import json
 import re
+import shlex
 from typing import Any, Callable, Iterator, Sequence
 
 from .target_hint import open_target_lines, target_row
@@ -1530,6 +1531,12 @@ def _render_session_start_text(value: Any) -> str:
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")
+    elif value.get("stopped") is False:
+        lines.append("")
+        lines.append(
+            f"cleanup error: {value.get('cleanup_error') or 'timed out waiting for teardown'}"
+        )
+        lines.append("warning: bridge process may still be running; no clean stop was confirmed")
     lines.extend(_discarded_unsaved_lines(value))
     return "\n".join(lines)
 
@@ -1572,6 +1579,12 @@ def _render_session_status_text(value: Any) -> str:
 def _render_session_stop_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
+    if value.get("stopped") is False:
+        return "\n".join([
+            f"stop failed: {value.get('instance_id', '<unknown>')}",
+            f"error: {value.get('error') or 'timed out waiting for teardown'}",
+            "warning: bridge process may still be running; no clean stop was confirmed",
+        ])
     line = f"stopped: {value.get('instance_id', '<unknown>')}"
     method = value.get("method")
     if method:
@@ -4084,7 +4097,8 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         has_more = bool(value.get("has_more"))
         caller_scan_note = value.get("caller_scan_note")
         data_ref_note = _callsites_data_ref_note(value.get("callee_data_ref_count"),
-                                                 value.get("callee_data_refs"))
+                                                 value.get("callee_data_refs"),
+                                                 value.get("callee_data_ref_vtables"))
         value = _field_list(value, "items")
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -4243,20 +4257,37 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
     return body
 
 
-def _callsites_data_ref_note(raw_count: Any, raw_refs: Any) -> str | None:
-    """#998 item 1: the callee's address is stored in data, so it may also be
-    called through a vtable slot or a function-pointer table -- calls no call
-    instruction names, absent from the rows above. States the fact (how many,
-    where) and nothing more; `xrefs` shows what those locations are."""
+def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = None) -> str | None:
+    """Data storage is not a recovered indirect caller; offer bounded next reads."""
     if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count <= 0:
         return None
     refs = [str(r) for r in _field_list({"callee_data_refs": raw_refs}, "callee_data_refs")]
-    shown = ", ".join(refs[:3])
-    more = f", +{raw_count - len(refs[:3])} more" if raw_count > len(refs[:3]) else ""
-    where = f" ({shown}{more})" if shown else ""
-    return (f"note: the callee's address is stored in {raw_count} data location(s){where}; "
-            "they may be vtable slots or function-pointer tables, so it may also be called "
-            "indirectly -- see `bn xrefs` on the callee")
+    known = {}
+    for row in _field_list({"callee_data_ref_vtables": raw_vtables}, "callee_data_ref_vtables"):
+        if not isinstance(row, dict) or row.get("evidence") != "elf_symbol_size":
+            continue
+        address = _text_value(row, "address")
+        class_name = _text_value(row, "class_name")
+        address_point = _text_value(row, "address_point")
+        if address and class_name and (address_point or row.get("address_point") is None):
+            known[address] = {"class_name": class_name, "address_point": address_point}
+    lines = [f"note: the callee's address is stored in {raw_count} data location(s); "
+             "data refs do not identify indirect callers."]
+    for ref in refs:
+        row = known.get(ref)
+        if row is not None:
+            cls = str(row["class_name"])
+            point = row["address_point"]
+            point_note = f"primary address point {point}" if point else "primary address point not decoded"
+            lines.append(f"  {ref}: inside the named vtable for {_escape_control_chars(cls)} "
+                         f"({point_note}); "
+                         f"inspect its class layout with `bn class show -- {shlex.quote(cls)}`")
+        else:
+            lines.append(f"  {ref}: table identity unknown; inspect references to this data "
+                         f"location with `bn xrefs {shlex.quote(ref)}` (not a virtual-caller list)")
+    if raw_count > len(refs):
+        lines.append(f"  +{raw_count - len(refs)} unlisted data location(s)")
+    return "\n".join(lines)
 
 
 @_discloses
@@ -5802,17 +5833,31 @@ def _render_doctor_text(value: Any) -> str:
                 "compared with this CLI's. `bn session restart "
                 + str(item.get("instance_id") or "<id>")
                 + "` from this CLI would respawn it on this CLI's checkout")
+        elif not item.get("gui", True) and item.get("bridge_source_unknown"):
+            lines.append(
+                "  note: bridge source is unknown (not reported by this bridge); "
+                "`bn session restart " + str(item.get("instance_id") or "<id>")
+                + "` from this CLI would respawn it on this CLI's checkout: "
+                + str(value.get("plugin_source_dir", "<unknown>")))
         if item.get("stale_plugin_version"):
             lines.append("  stale: loaded plugin version differs from CLI version")
-        # The reference differs by kind (#992): a GUI bridge loads the installed
-        # plugin file, a headless one this CLI's own source.
-        reference = "installed plugin file" if item.get("gui", True) else "this CLI's source"
+        # GUI comparisons use its actual reported package, not a guessed install.
+        is_gui = item.get("gui", True)
+        reference = (
+            "reported plugin source on disk" if item.get("bridge_source_dir")
+            else "installed plugin file"
+        ) if is_gui else "this CLI's source"
         if item.get("stale_plugin_code"):
             lines.append(f"  stale: loaded plugin code does not match {reference}")
         if item.get("stale_engine"):
+            remedy = (
+                "reload Binary Ninja plugins or restart Binary Ninja"
+                if is_gui else "run `bn session restart "
+                + str(item.get("instance_id") or "<id>") + "`"
+            )
             lines.append(
                 f"  stale: loaded engine code (taint/IL modules) does not match {reference} -- "
-                "run `bn session restart " + str(item.get("instance_id") or "<id>") + "`")
+                + remedy)
         if item.get("started_at"):
             lines.append(f"  started: {item['started_at']}")
         if item.get("socket_path"):
@@ -7668,11 +7713,23 @@ def _render_class_list_text(value: Any) -> str:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)
     lines = [header]
+    if value.get("vtable_recovery_budget_exhausted"):
+        lines.append(
+            "! vtable recovery budget exhausted; unchecked rows are unknown, "
+            "not proven missing. Use class show to inspect them.")
     for rec in rows:
         if not isinstance(rec, dict):
             lines.append(_render_fallback_text(rec))
             continue
-        vt = "vtable" if rec.get("has_vtable") else "no-vtable"
+        status = rec.get("vtable_status")
+        if rec.get("has_vtable") is None and status == "budget_exhausted":
+            vt = "vtable=? (unchecked)"
+        elif rec.get("has_vtable") is None and status == "unavailable":
+            vt = "vtable=? (unavailable)"
+        elif status == "not_found":
+            vt = "no-vtable (checked)"
+        else:
+            vt = "vtable" if rec.get("has_vtable") else "no-vtable"
         size = rec.get("size")
         size_s = size.get("value") if isinstance(size, dict) else size
         # `bases` arrives as name-dicts (what class show renders) or bare strings;
@@ -7697,6 +7754,16 @@ def _render_class_list_text(value: Any) -> str:
         token = _SKEWED_FIELDS.set([])
         try:
             methods = _stated_count(rec, "method_count")
+            slot_s = ""
+            if "vtable_slot_count" in rec:
+                # A capped layout and a stopped/unsupported backwalk deliberately
+                # leave the count null. They are unknown, not malformed payloads.
+                if (rec["vtable_slot_count"] is None
+                        and status in ("recovered", "budget_exhausted", "unavailable")):
+                    slots = "?"
+                else:
+                    slots = _stated_count(rec, "vtable_slot_count")
+                slot_s = f"  slots={slots}"
             row_unreadable = list(_SKEWED_FIELDS.get() or ())
         finally:
             _SKEWED_FIELDS.reset(token)
@@ -7708,7 +7775,7 @@ def _render_class_list_text(value: Any) -> str:
         aka_s = f"  (aka {aliases})" if aliases else ""
         lines.append(
             f"  {rec.get('name', '<unknown>')}  "
-            f"methods={methods}  {vt}  "
+            f"methods={methods}  {vt}{slot_s}  "
             f"size={size_s if size_s is not None else '?'}  "
             f"[{rec.get('confidence', '?')}]{base_s}{art_s}{aka_s}"
         )

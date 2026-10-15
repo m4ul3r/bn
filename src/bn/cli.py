@@ -24,11 +24,9 @@ from .formatters import (
     _render_fanout_text,
     _render_mutation_summary_text,
     _render_mutation_text,
-    _render_target_choices,
 )
 from .output import (estimate_output_result, render_envelope, render_error, render_value,
                      write_output_result)
-from .target_hint import SELECT_HINT_LINE
 
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
@@ -50,12 +48,14 @@ from .transport import (  # noqa: F401
     BridgeError,
     BridgeProcessSignal,
     DEFAULT_REQUEST_TIMEOUT,
+    MultiTargetError,
     _resolve_timeout,
     _send_request_to_instance,
     find_lifecycle_instance,
     gc_instances,
     instance_not_found_message,
     instance_selector,
+    implicit_target_selector,
     list_instances,
     send_request,
     spawn_instance,
@@ -1378,13 +1378,6 @@ def _spill_next_step_hint(
     return core + ", or read that artifact to inspect the full output"
 
 
-class MultiTargetError(BridgeError):
-    """Refusal because several targets are open and no selector was given.
-
-    A distinct type so callers (close's `-t active` note) can match the
-    condition without sniffing message prose."""
-
-
 def _require_nonempty_instance(args: argparse.Namespace) -> None:
     """Reject an explicit-but-empty --instance before anything is sent.
 
@@ -1472,35 +1465,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
         target=None,
         instance_id=getattr(args, "instance", None),
     )
-    result = unwrap_result(response, "list_targets")
-    if not isinstance(result, list):
-        raise BridgeError(
-            "malformed bridge reply to list_targets (no target list); the "
-            "bridge may be stale -- restart it or pass an explicit --target"
-        )
-    targets = list(result)
-    if not targets:
-        raise BridgeError("No BinaryView targets are open")
-    if len(targets) > 1:
-        # Same grammar as the bridge resolver's refusal for the same condition
-        # (#688): headline, instruction line, then the shared `-t` listing.
-        raise MultiTargetError(
-            "\n".join(
-                [
-                    "This command requires --target when multiple targets are open.",
-                    SELECT_HINT_LINE,
-                    _render_target_choices(targets),
-                ]
-            )
-        )
-    row = targets[0]
-    target_id = row.get("target_id") if isinstance(row, dict) else None
-    if not target_id:
-        raise BridgeError(
-            "bridge listed the open target without a target_id; pass an "
-            "explicit --target"
-        )
-    return str(target_id)
+    return implicit_target_selector(response)
 
 
 def _resolve_target(
