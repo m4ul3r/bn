@@ -1022,6 +1022,11 @@ def _render_proto_text(value: Any, *, mangled: bool = False) -> str:
     object_note = _text_value(value, "implicit_object_note")
     if object_note:
         width_note += f"\n\nnote: {object_note}"
+    # #1013: per-call-site first-argument fact and undefined-type advice.
+    for key in ("first_argument_entry_value_note", "undefined_type_note"):
+        extra = _text_value(value, key)
+        if extra:
+            width_note += f"\n\nnote: {extra}"
     fn = value.get("function")
     name = _shown_name(fn, mangled=mangled) if isinstance(fn, dict) else None
     head, sep, rest = prototype.partition("(")
@@ -6240,7 +6245,10 @@ def _add_mutation_ok(value: Any) -> Any:
     # idempotent. One decider means one on EVERY input (#447/#619/#685).
     if value.get("kind") == "go_rename":
         rest = {key: val for key, val in value.items() if key != "ok"}
-        return {"ok": bool(_go_rename_summary(value)["ok"]), **rest}
+        # `ok` does not turn on the retained-import residue list (#1012), so
+        # it is not read here; the compact summary still discloses it.
+        decided = {key: val for key, val in rest.items() if key != "kept_library_imports"}
+        return {"ok": bool(_go_rename_summary(decided)["ok"]), **rest}
     if "ok" in value:
         return value
     # Read inside a capture: this transform runs BEFORE any renderer, so the
@@ -6503,6 +6511,19 @@ def _build_mutation_summary(
 _DECLARED_TYPE_NAME_CAP = 10
 
 
+def _kept_library_imports(value: dict[str, Any],
+                          results: Sequence[dict[str, Any]]) -> list[str]:
+    """Library types left in the view: the envelope's own list, plus a
+    declare row's imports when that row did not land -- or any declare row of
+    a preview, which imports nothing on purpose, so an import stamped there is
+    one BN made and kept."""
+    return list(dict.fromkeys(
+        [str(name) for name in _field_list(value, "kept_library_imports")] + [
+            str(name) for r in results
+            if value.get("preview") or r.get("status") not in ("verified", "noop")
+            for name in _field_list(r, "imported_from_library")]))
+
+
 def _declared_types_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
     """#964: the types a `types_declare` row set actually landed (verified or
     noop rows), counted per TYPE rather than per op, with the names capped, plus
@@ -6685,14 +6706,7 @@ def _mutation_summary(value: Any) -> Any:
         ],
         class_apply_types=(_field_dict(value, "class_apply_types")
                            if _field_declared(value, "class_apply_types") else None),
-        # A declare row whose imports stayed in the view although the row did
-        # not land -- or any declare row of a preview, which imports nothing on
-        # purpose, so an import stamped there is one BN made and kept.
-        kept_library_imports=list(dict.fromkeys(
-            [str(name) for name in _field_list(value, "kept_library_imports")] + [
-            str(name) for r in results
-            if value.get("preview") or r.get("status") not in ("verified", "noop")
-            for name in _field_list(r, "imported_from_library")])),
+        kept_library_imports=_kept_library_imports(value, results),
         fallthrough_entries=[
             {"address": _text_value(r, "address") or "<unknown>",
              "fallthrough_from": _text_value(r, "fallthrough_from")}
@@ -6956,6 +6970,8 @@ def _go_rename_summary(value: Any) -> Any:
         rolled_back=rolled_back,
         message=_text_value(value, "message"),
         default_error="go rename failed",
+        # #1012: the same retained-import list the generic summary carries.
+        kept_library_imports=_kept_library_imports(value, failure_rows),
     )
     # Preserve operation-count semantics while exposing the scan buckets.
     # The user-named wire counter includes apply-time skips; its overlap is

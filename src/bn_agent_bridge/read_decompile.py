@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import re
 import shlex
-
 from typing import Any
 
 try:
@@ -44,7 +43,12 @@ from . import read_types
 from . import read_xrefs
 from . import taint_engine as _taint
 from . import vars as vars_mod
-from ._shared import OperationFailure, _parse_address  # noqa: F401
+from ._shared import (  # noqa: F401
+    OperationFailure,
+    _lookup_named_type,
+    _named_type_references,
+    _parse_address,
+)
 from .bridge_state import require_analysis
 from .read_listing import _analysis_state_fields
 
@@ -2407,6 +2411,131 @@ def _demangled_object_parameter(bv, func) -> bool:
         return False
 
 
+# Direct call sites `proto get` inspects for the first-argument fact.
+_ENTRY_VALUE_SITE_CAP = 32
+_CALL_SSA_OPS = frozenset({"MLIL_CALL_SSA", "MLIL_TAILCALL_SSA"})
+_DIRECT_DEST_OPS = frozenset({"MLIL_CONST_PTR", "MLIL_CONST", "MLIL_IMPORT"})
+
+
+def _op_name(ins) -> str:
+    op = getattr(ins, "operation", None)
+    return str(getattr(op, "name", op))
+
+
+def _first_argument_entry_value(bv, func) -> dict[str, Any] | None:
+    """At each direct call site of *func*, is the first argument the caller's
+    OWN entry value of a register (its SSA variable at version 0)?
+
+    A fact about the callers' MLIL SSA, not a verdict on *func*: a caller that
+    is itself a method forwarding its own object is counted too, which is still
+    literally "a value that caller never set". Only a call whose destination is
+    the constant entry of *func* counts as direct; indirect calls and calls
+    through a thunk are not *func*'s caller sites and are not inspected.
+    """
+    sites = list(getattr(func, "caller_sites", None) or [])
+    checked = entry = 0
+    registers: list[str] = []
+    for site in sites[:_ENTRY_VALUE_SITE_CAP]:
+        caller = getattr(site, "function", None)
+        addr = int(getattr(site, "address", -1))
+        try:
+            ssa = caller.mlil.ssa_form
+            call = next((i for i in ssa.instructions
+                         if _op_name(i) in _CALL_SSA_OPS
+                         and int(getattr(i, "address", -1)) == addr), None)
+        except Exception:  # noqa: BLE001 - an unlifted caller is not a site we read
+            continue
+        if call is None:
+            continue
+        dest = getattr(call, "dest", None)
+        if (_op_name(dest) not in _DIRECT_DEST_OPS
+                or int(getattr(dest, "constant", -1)) != int(func.start)):
+            continue
+        checked += 1
+        args = list(getattr(call, "params", None) or [])
+        if not args or _op_name(args[0]) != "MLIL_VAR_SSA":
+            continue
+        ssa_var = getattr(args[0], "src", None)
+        var = getattr(ssa_var, "var", None)
+        source = getattr(var, "source_type", None)
+        if getattr(ssa_var, "version", None) != 0 or getattr(
+                source, "name", source) != "RegisterVariableSourceType":
+            continue
+        try:
+            reg = str(bv.arch.get_reg_name(var.storage))
+        except Exception:  # noqa: BLE001
+            continue
+        entry += 1
+        if reg not in registers:
+            registers.append(reg)
+    if not checked:
+        return None
+    return {"direct_call_sites": len(sites), "checked": checked,
+            "entry_value": entry, "registers": registers,
+            "truncated": len(sites) > _ENTRY_VALUE_SITE_CAP}
+
+
+def _entry_value_note(fact: dict[str, Any]) -> str:
+    regs = " / ".join(fact["registers"])
+    if fact["entry_value"]:
+        text = (f"At {fact['entry_value']} of {fact['checked']} direct call sites the "
+                f"first argument is the caller's own entry value of {regs} (SSA version 0): "
+                "at those sites the caller passes a value it never set itself (a caller "
+                "forwarding its own incoming argument also counts).")
+    else:
+        text = (f"At none of {fact['checked']} direct call sites is the first argument "
+                "the caller's own entry value of a register.")
+    if fact["truncated"]:
+        text += (f" Only the first {_ENTRY_VALUE_SITE_CAP} of "
+                 f"{fact['direct_call_sites']} call sites were inspected.")
+    return text
+
+
+_TAG_BEFORE = r"\b(struct|class|union|enum)\s+{}(?![\w:])"
+
+
+def _undefined_type_advice(bv, func, params) -> list[dict[str, Any]]:
+    """Named types the current prototype references that the view does not
+    define. `proto set` refuses a prototype naming one (`Reference to unknown
+    type`) until it is declared; a struct/class one gets the declare command."""
+    ftype = getattr(func, "type", None)
+    names: list[str] = []
+    for part in [getattr(ftype, "return_value", None),
+                 *(getattr(p, "type", None) for p in params)]:
+        try:
+            refs = _named_type_references(part)
+        except Exception:  # noqa: BLE001
+            refs = []
+        names.extend(n for n in refs if n not in names)
+    rendered = str(ftype) if ftype is not None else ""
+    rows = []
+    for name in names:
+        if _lookup_named_type(bv, name) is not None:
+            continue
+        row: dict[str, Any] = {"name": name}
+        tag = re.search(_TAG_BEFORE.format(re.escape(name)), rendered)
+        if tag and tag.group(1) in ("struct", "class"):
+            spelled = name if re.fullmatch(r"[A-Za-z_]\w*", name) else f"`{name}`"
+            row["declare_command"] = "bn types declare " + shlex.quote(f"struct {spelled};")
+        rows.append(row)
+    return rows
+
+
+def _undefined_type_note(rows, params) -> str:
+    names = ", ".join(f"`{r['name']}`" for r in rows)
+    text = (f"This prototype names type(s) the view does not define: {names}. "
+            "`bn proto set` refuses a prototype naming an undefined type until it is declared")
+    cmds = [r["declare_command"] for r in rows if r.get("declare_command")]
+    text += (": run " + "; ".join(f"`{c}`" for c in cmds) + " first.") if cmds else \
+        " (declare it first with `bn types declare`)."
+    if any("::" in r["name"] for r in rows):
+        text += " In a type string, spell a `::`-qualified name in backticks (struct `ns::Foo`*)."
+    if any(str(getattr(p, "name", "")) == "this" for p in params):
+        text += (" `this` is a keyword the parser rejects as a parameter name: rename it "
+                 "(`self`) in the prototype you pass to `bn proto set`.")
+    return text
+
+
 def _get_prototype(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
@@ -2433,6 +2562,15 @@ def _get_prototype(ctx, selector: str | None, identifier):
         comparison = ". No demangled leading-object-parameter observation is available"
     result["implicit_object_note"] = (
         f"{current}{comparison}. This read makes no parameter-provenance or ABI claim.")
+    if params:
+        fact = _first_argument_entry_value(bv, func)
+        if fact is not None:
+            result["first_argument_entry_value"] = fact
+            result["first_argument_entry_value_note"] = _entry_value_note(fact)
+    undefined = _undefined_type_advice(bv, func, params)
+    if undefined:
+        result["undefined_types"] = undefined
+        result["undefined_type_note"] = _undefined_type_note(undefined, params)
     note = _return_width_inference_note(bv, func)
     if note:
         result["return_width_note"] = note
