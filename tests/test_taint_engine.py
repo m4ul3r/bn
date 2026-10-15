@@ -6766,7 +6766,9 @@ def test_forward_recvmsg_arg_seed_nudges_to_buffer_306(models):
     bv = FBV({0x2000: "recvmsg"})
     engine = te.TaintEngine(bv, models)
     result = engine.forward(func, [te.parse_locator("arg:recvmsg:1")])
-    assert any("msg_iov" in a and "var:<buf>" in a for a in result["assumptions"])
+    # The nudge's reseed is a command that runs as printed (#1033 item 6).
+    assert any("msg_iov" in a and "`bn taint forward -f 0x10 --source call:recvmsg`" in a
+               for a in result["assumptions"])
 
 
 def test_forward_non_recvmsg_arg_seed_has_no_nudge_306(models):

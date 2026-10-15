@@ -57,6 +57,7 @@ from .taint_locators import (  # noqa: F401
 from .taint_result import (  # noqa: F401
     BLOCKING_LEAF_KINDS,
     backward_diagnostics,
+    command_template,
     forward_zero_diagnostics,
     indirect_pointer_slot_leaf,
     misanchored_recv_leaf,
@@ -4129,7 +4130,8 @@ class TaintEngine:
                 "recovered_params": n_params, "dropped_args": sorted(dropped),
                 "stack_dropped_args": [i for i in sorted(dropped) if cc is not None and i >= len(arg_regs)],
                 "cause": "varargs_not_followed", "callee_variadic": True,
-                "note": self._varargs_tail_note(self._prose_function(callee_fn), n_params, dropped),
+                "note": self._varargs_tail_note(self._prose_function(callee_fn), n_params, dropped,
+                                                hex(int(getattr(callee_fn, "start", 0)))),
             }
         try:
             cc = (getattr(callee_fn, "calling_convention", None)
@@ -4191,17 +4193,20 @@ class TaintEngine:
         }
 
     @staticmethod
-    def _varargs_tail_note(name: str, n_params: int, idxs: list) -> str:
+    def _varargs_tail_note(name: str, n_params: int, idxs: list, at: str) -> str:
         """The #948 disclosure for taint landing in a determined-variadic
         callee's `...` tail: a tracking limit, stated with the observed counts,
-        and never a prototype repair."""
+        and never a prototype repair. No `param:N` names a vararg, so the seed
+        inside the callee is a template (#1033 item 6)."""
+        seed = command_template(f"bn taint forward -f {at} --source var:VAR")
         return (f"tainted arg(s) {sorted(idxs)} passed to {name} land in its variadic "
                 f"tail: {name} is declared variadic (`...`) with {n_params} named "
                 f"parameter(s), and taint is mapped only onto named parameters, so the "
                 f"flow into its varargs was NOT followed. This is a tracking limit, not "
                 f"a signature defect -- the prototype is already variadic and "
                 f"redeclaring it changes nothing. Inspect how {name} consumes its "
-                f"va_list (e.g. a v*printf call), or seed `bn taint forward` inside it.")
+                f"va_list (e.g. a v*printf call), or seed taint inside it from the "
+                f"value it reads ({seed}).")
 
     def _descend(self, ins: Any, callee_fn: Any, tainted_args: dict, why: dict,
                  depth: int, max_depth: int, *, via: str | None = None,
@@ -4231,7 +4236,8 @@ class TaintEngine:
                 # #948: every tainted arg is in a correctly-variadic tail.
                 leaf.update(cause="varargs_not_followed", callee_variadic=True,
                             note=self._varargs_tail_note(
-                                self._prose_function(callee_fn), n_params, list(tainted_args)))
+                                self._prose_function(callee_fn), n_params, list(tainted_args),
+                                hex(int(getattr(callee_fn, "start", 0)))))
                 out["assumptions"].append(
                     f"tainted args to {self._prose_function(callee_fn)} land in its variadic tail, which "
                     f"is not followed; conservative")
@@ -4513,17 +4519,40 @@ class TaintEngine:
         processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
         out_params: set[int] = set()         # this func's params whose pointee got tainted
         out_param_elems: set = set()         # (param_idx, field) descriptor-array elems filled (#319b)
-        # Static-state tokenizers (`continuation` models, e.g. strtok): the most
-        # recent call in THIS function whose `null_arg` was tainted, keyed by
-        # model key -> (tainted node, call address, call instruction). A later `strtok(NULL, ..)`
-        # reads that state, not an argument, so without it every token after
-        # the first silently dropped taint -- no leaf, no assumption.
-        continuation_state: dict[str, tuple] = {}
-        # model key -> [(addr, call instruction)] of the CLEAN non-NULL calls
-        # seen after the tainted one (address order): together they kill the
-        # continuation only when they lie on every path from the tainted call
-        # to the `strtok(NULL)` (`_reaches_avoiding`).
-        clean_resets: dict[str, list[tuple]] = {}
+        # Static-state tokenizers (`continuation` models, e.g. strtok): every
+        # call SITE in THIS function whose `null_arg` was tainted, keyed by
+        # (model key, IL index) -> (tainted node, call address, call
+        # instruction). A later `strtok(NULL, ..)` reads that state, not an
+        # argument, so without it every token after the first silently dropped
+        # taint -- no leaf, no assumption. The set only grows, and a new site
+        # forces another fixpoint pass (#932): an optimised lift can list the
+        # continuation BEFORE the initializer that arms it, and a pass that
+        # discovered state without revisiting left that continuation unarmed.
+        continuation_state: dict[tuple[str, int], tuple] = {}
+        # model key -> every non-NULL call of a continuation model in this
+        # function, collected up front so the reset test does not depend on IL
+        # order. A candidate is a clean reset while its string is untainted
+        # (taint only grows, so it can stop being one, never become one again);
+        # clean resets kill a continuation only when they lie on EVERY path from
+        # the tainted call to the `strtok(NULL)` (`_reaches_avoiding`).
+        reset_candidates: dict[str, list[tuple]] = {}
+        for _cand in instrs:
+            if not self._is_call(_cand):
+                continue
+            _cname = self._callee_name(self._resolve_direct_target(_cand))
+            _ckey, _cmodel = lookup_model(self.models, _cname)
+            _co = (_cmodel or {}).get("continuation")
+            if _co is None:
+                continue
+            _ci = int(_co.get("null_arg", 0))
+            _cp = self._call_params(_cand)
+            if _ci < len(_cp) and self._int_const(_cp[_ci]) != 0:
+                reset_candidates.setdefault(_ckey or _cname or "?", []).append(
+                    (int(getattr(_cand, "address", 0)), _cand, _cp, _ci))
+
+        def clean_resets(ckey: str) -> list[tuple]:
+            return [(a, rins) for a, rins, rparams, ci in reset_candidates.get(ckey, [])
+                    if self._token_hit_node(ssaf, rparams, f"*arg:{ci}", tainted) is None]
         reached_return = False
 
         def add_assumption(msg: str) -> None:
@@ -5215,9 +5244,11 @@ class TaintEngine:
                 ckey = mkey or name or "?"
                 if cidx < len(params):
                     if self._int_const(params[cidx]) == 0:
-                        st = continuation_state.get(ckey)
-                        if st is not None:
-                            st_node, st_addr, st_ins = st
+                        resets = clean_resets(ckey)
+                        for (state_key, _site), (st_node, st_addr, st_ins) in list(
+                                continuation_state.items()):
+                            if state_key != ckey:
+                                continue
                             # A clean non-NULL call resets libc's state -- but
                             # it kills the continuation only when the clean
                             # calls lie on EVERY path from the tainted call to
@@ -5227,40 +5258,41 @@ class TaintEngine:
                             # call yet the tainted call at the bottom of the
                             # body reaches it around the back-edge (round 4
                             # P2) -- so the test is reachability with the
-                            # resets removed, not dominance.
-                            resets = clean_resets.get(ckey) or []
-                            killed = bool(resets) and self._reaches_avoiding(
+                            # resets removed, not dominance. It runs with NO
+                            # resets too (#932): every tainted site is state now,
+                            # not just the latest in IL order, so a site that
+                            # cannot reach this call at all must not arm it. A
+                            # view without block information answers None and
+                            # stays armed.
+                            killed = self._reaches_avoiding(
                                 st_ins, ins, [rins for _, rins in resets]) is False
-                            if not killed:
-                                for rule in model.get("propagates") or []:
-                                    if _try_arg_index(str(rule.get("from") or "")) != cidx:
-                                        continue
-                                    if apply_token(rule.get("to"), [st_node]):
-                                        changed = True
-                                partial = ""
-                                if resets:
-                                    partial = (
-                                        f"; a clean {self._prose_name(name or mkey)} @ "
-                                        f"{', '.join(hex(ra) for ra, _ in resets)} resets "
-                                        f"the state on SOME path but not on every path "
-                                        f"from the tainted call to this one, so the tainted "
-                                        f"line continues on the others")
-                                add_assumption(
-                                    f"{self._prose_name(name or mkey)}(NULL, ...) @ {hex(addr)} continues the "
-                                    f"tokenizer state of the tainted {self._prose_name(name or mkey)} call @ "
-                                    f"{hex(st_addr)}: modeled flow-insensitively (the most "
-                                    f"recent tainted {self._prose_name(name or mkey)} in this function), not by "
-                                    f"control flow; a continuation of a buffer tokenized in "
-                                    f"ANOTHER function is not followed{partial}")
+                            if killed:
+                                continue
+                            for rule in model.get("propagates") or []:
+                                if _try_arg_index(str(rule.get("from") or "")) != cidx:
+                                    continue
+                                if apply_token(rule.get("to"), [st_node]):
+                                    changed = True
+                            partial = ""
+                            if resets:
+                                partial = (
+                                    f"; a clean {self._prose_name(name or mkey)} @ "
+                                    f"{', '.join(hex(ra) for ra, _ in resets)} resets "
+                                    f"the state on SOME path but not on every path "
+                                    f"from the tainted call to this one, so the tainted "
+                                    f"line continues on the others")
+                            add_assumption(
+                                f"{self._prose_name(name or mkey)}(NULL, ...) @ {hex(addr)} continues the "
+                                f"tokenizer state of the tainted {self._prose_name(name or mkey)} call @ "
+                                f"{hex(st_addr)}, which reaches it on a path with no clean "
+                                f"reset; a continuation of a buffer tokenized in "
+                                f"ANOTHER function is not followed{partial}")
                     else:
                         hit = self._token_hit_node(ssaf, params, f"*arg:{cidx}", tainted)
-                        if hit is not None:
-                            continuation_state[ckey] = (hit, addr, ins)
-                            # Resets recorded before this (address-ordered)
-                            # tainted call cannot kill what it re-arms.
-                            clean_resets.pop(ckey, None)
-                        elif not any(ra == addr for ra, _ in clean_resets.get(ckey) or []):
-                            clean_resets.setdefault(ckey, []).append((addr, ins))
+                        state_key = (ckey, int(getattr(ins, "instr_index", addr)))
+                        if hit is not None and state_key not in continuation_state:
+                            continuation_state[state_key] = (hit, addr, ins)
+                            changed = True
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
                 frm = rule.get("from")
@@ -6076,8 +6108,8 @@ class TaintEngine:
         # was the M-15 hole one call deeper (PR-928 review P2). Disclosed under
         # a marker the zero-sink gate withholds the all-clear on.
         rets = [i for i in instrs if op_name(i) == "MLIL_RET"]
-        for ckey, (_, st_addr, st_ins) in continuation_state.items():
-            resets = clean_resets.get(ckey) or []
+        for (ckey, _site), (_, st_addr, st_ins) in continuation_state.items():
+            resets = clean_resets(ckey)
             # The state is clean at return only when the clean resets lie on
             # EVERY path from the tainted call to every return (the same
             # reachability test as the in-function continuation, round 4 P2);
@@ -6092,13 +6124,17 @@ class TaintEngine:
                 partial = (f" (a clean {self._prose_name(ckey)} @ "
                            f"{', '.join(hex(ra) for ra, _ in resets)} resets it on some "
                            f"path but not on every path to a return)")
+            # #1033 item 6: which function continues the tokenizer is not known
+            # here, so the seed inside it is a template, not a command.
+            reseed = command_template(
+                f"bn taint forward -f FUNCTION --source {shlex.quote('ret:' + ckey)}")
             add_assumption(
                 f"tokenizer_state_escapes @ {hex(st_addr)}: the static tokenizer "
                 f"state of {self._prose_name(ckey)} is tainted by the {self._prose_name(ckey)} call @ {hex(st_addr)} when "
                 f"{self._prose_function(func)} returns{partial}; a {self._prose_name(ckey)}(NULL, ...) continuation in "
                 f"ANOTHER function (a caller or a callee) is not followed, so a 'no "
-                f"sinks reached' result is NOT an all-clear -- seed `bn taint forward` "
-                f"inside the function that continues the tokenizer")
+                f"sinks reached' result is NOT an all-clear -- seed the tokens inside "
+                f"the function that continues the tokenizer ({reseed})")
 
         # #193 Part 1 honesty: for each registered recv-buffer slot that the fixpoint
         # did NOT correlate to a re-load, emit the deferred "may be missed" caveat --
@@ -6309,14 +6345,17 @@ class TaintEngine:
                 # false all-clear. Nudge the user to seed the filled buffer var so
                 # the silent miss becomes actionable.
                 if kind == "arg" and (callee or "").split("@", 1)[0].lstrip("_") in _RECVMSG_FAMILY:
+                    _fn = hex(int(func.start))
                     add_assumption(
                         f"{self._prose_name(callee)} writes the received bytes to the scatter-gather iov "
                         f"buffer(s) (msghdr->msg_iov[i].iov_base; for recvmmsg, per msgvec "
                         f"entry), not the header pointer this --source seeds; the payload "
-                        f"taint is NOT followed from here. Use --source call:{callee}, which "
-                        f"resolves the iovec buffer from the msg_iov/iov_base setup "
-                        f"automatically, or seed the filled buffer directly (--source "
-                        f"var:<buf>) when the iovec is built dynamically."
+                        f"taint is NOT followed from here. Use "
+                        f"`bn taint forward -f {_fn} --source {shlex.quote('call:' + str(callee))}`, "
+                        f"which resolves the iovec buffer from the msg_iov/iov_base setup "
+                        f"automatically, or seed the filled buffer directly when the iovec "
+                        f"is built dynamically "
+                        f"({command_template(f'bn taint forward -f {_fn} --source var:VAR')})."
                     )
                     # #562: structured leaf so JSON `leaves` is non-empty and the
                     # claim gate withholds an all-clear. An arg:recvmsg:N seed
@@ -6557,8 +6596,9 @@ class TaintEngine:
                                     f"not be statically resolved -- likely a dynamically-built "
                                     f"iovec or a receive-helper whose caller passes the out-buffer "
                                     f"(#452). The payload taint is NOT followed from here; seed the "
-                                    f"filled buffer directly (--source var:<buf>) or, for a helper, "
-                                    f"seed the buffer the caller passes in.")
+                                    f"filled buffer directly "
+                                    f"({command_template(f'bn taint forward -f {hex(int(func.start))} --source var:VAR')}) "
+                                    f"or, for a helper, seed the buffer the caller passes in.")
                         elif to.startswith("*arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):

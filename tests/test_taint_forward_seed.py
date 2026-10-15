@@ -14,7 +14,8 @@ import shlex
 import pytest
 
 from test_taint_engine import (  # noqa: F401 -- `models` is a fixture
-    FBV, FBVStr, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar, _slot_recv_func, models, te,
+    FBV, FBVStr, FBlock, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar, _FEdge, _addr_of, _cstr,
+    _ext_call, _slot_recv_func, models, te,
 )
 from bn_agent_bridge import il_format
 from bn_agent_bridge.read_taint_models import build_catalog
@@ -263,3 +264,52 @@ def test_format_arg_without_first_dest_is_refused_1041():
     with pytest.raises(te.TaintError, match="first_dest"):
         _validate_model_interior("my_scanf", {"sink": {"class": "overflow_unbounded",
                                                        "format_arg": 0}}, "--models x.json")
+
+
+# --------------------------------------------------------------------------
+# #932: discovering tokenizer state is part of fixpoint convergence
+# --------------------------------------------------------------------------
+
+def _continuation_before_initializer(*, back_edge: bool):
+    """tok(line#0): { x = strtok(NULL, " "); system(x) } then `strtok(&line, " ")`
+    with its return unused -- the IL lists the continuation FIRST. With a
+    back-edge from the initializer's block to the continuation's, the
+    initializer arms it on the next iteration; without one it never can."""
+    line = FVar("line", typ="char[0x40]")
+    x = FSSA(FVar("x"), 1)
+    STRTOK, SYS = 0x900, 0x901
+    cont = _ext_call(0, 0x10, 'x#1 = strtok(nullptr, " ")', STRTOK,
+                     [FExpr("MLIL_CONST", "0", constant=0), _cstr(0x700)], writes=[x])
+    sink = _ext_call(1, 0x14, "system(x#1)", SYS, [FExpr("MLIL_VAR_SSA", "x#1", reads=[x])],
+                     reads=[x])
+    init = _ext_call(2, 0x18, 'strtok(&line, " ")', STRTOK, [_addr_of(line), _cstr(0x700)])
+    ret = FInstr(3, 0x1c, "MLIL_RET", "return")
+    head, tail, exit_ = FBlock(0, 2), FBlock(2, 3), FBlock(3, 4)
+    head.outgoing_edges = [_FEdge(tail)]
+    tail.outgoing_edges = [_FEdge(head), _FEdge(exit_)] if back_edge else [_FEdge(exit_)]
+    exit_.outgoing_edges = []
+    for ins, block in ((cont, head), (sink, head), (init, tail), (ret, exit_)):
+        ins.il_basic_block = block
+    func = FFunc("tok", 0x10, FSSAFunc([cont, sink, init, ret]), params=[line])
+    return func, FBV({STRTOK: "strtok", SYS: "system"})
+
+
+def test_state_discovered_after_its_continuation_is_revisited_932(models):
+    """The initializer's return is unused, so arming the state changes nothing
+    else in the pass; the discovery itself must force the revisit."""
+    func, bv = _continuation_before_initializer(back_edge=True)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+
+    sinks = [(s["sink"]["callee"], s["sink"]["class"]) for s in result["reached_sinks"]]
+    assert sinks == [("system", "command_injection")], result["assumptions"]
+
+
+def test_state_that_cannot_reach_the_continuation_does_not_arm_it_932(models):
+    """Every tainted site is state now, not only the latest in IL order, so the
+    reachability test runs even with no clean reset: an initializer that runs
+    only AFTER the continuation must not arm it."""
+    func, bv = _continuation_before_initializer(back_edge=False)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+
+    assert result["reached_sinks"] == []
+    assert any(a.startswith("tokenizer_state_escapes") for a in result["assumptions"])
