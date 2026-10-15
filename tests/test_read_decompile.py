@@ -6850,9 +6850,13 @@ def test_prototype_object_note_reports_recovery_not_assumed_abi(monkeypatch, par
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fn = _cxx_function(0x401000, "_ZN2ns3Cls4openEPKc", "ns::Cls::open")
-    fn.type = types.SimpleNamespace(parameters=[
-        types.SimpleNamespace(name=parameter_name, type="char const*")])
+    fn.set_auto_type(types.SimpleNamespace(parameters=[
+        types.SimpleNamespace(name=parameter_name, type="char const*")]))
     bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(bridge.read_decompile.bn, "demangle_gnu3",
+                        lambda arch, name: (types.SimpleNamespace(parameters=[
+                            types.SimpleNamespace(name="this")]), ["ns", "Cls", "open"]),
+                        raising=False)
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     result = instance._get_prototype("active", "0x401000")
     note = result["implicit_object_note"]
@@ -6862,4 +6866,30 @@ def test_prototype_object_note_reports_recovery_not_assumed_abi(monkeypatch, par
         assert "implicit object parameter" in note
     else:
         assert "did not identify" in note
-        assert "do not reinterpret the first named parameter" in note
+        assert "do not reinterpret the first named parameter" in note.lower()
+
+
+@pytest.mark.parametrize("user_type", [False, True])
+@pytest.mark.parametrize("cxx", [False, True])
+def test_prototype_parameter_name_does_not_determine_object_semantics(monkeypatch, user_type, cxx):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = (_cxx_function(0x401000, "_ZN2ns3Cls3runEi", "ns::Cls::run")
+          if cxx else _FakeFunction(0x401000, "cfunc"))
+    signature = types.SimpleNamespace(parameters=[
+        types.SimpleNamespace(name="this", type="int32_t")])
+    if user_type:
+        fn.set_user_type(signature)
+    else:
+        fn.set_auto_type(signature)
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # No demangled object parameter: a C name or an unrecognized C++ signature.
+    monkeypatch.setattr(bridge.read_decompile.bn, "demangle_gnu3",
+                        lambda arch, name: (None, []), raising=False)
+    note = instance._get_prototype("active", "0x401000")["implicit_object_note"]
+    assert "implicit object parameter" not in note
+    if user_type:
+        assert "user-defined prototype" in note and "BN recovered" not in note
+    else:
+        assert "named `this`" in note and "int32_t" in note

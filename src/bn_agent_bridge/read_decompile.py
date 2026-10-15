@@ -2325,6 +2325,25 @@ def _return_width_inference_note(bv, func) -> str | None:
     )
 
 
+def _demangled_object_parameter(bv, func) -> bool:
+    """Whether BN's C++ demangler describes a leading object parameter.
+
+    A recovered parameter's spelling alone is not evidence: C permits `this`.
+    The demangler is still only BN's signature, not independent ABI proof.
+    """
+    raw = str(getattr(func, "raw_name", func.name))
+    demangle = (getattr(bn, "demangle_gnu3", None) if raw.startswith("_Z")
+                else getattr(bn, "demangle_ms", None) if raw.startswith("?") else None)
+    if demangle is None:
+        return False
+    try:
+        signature, _ = demangle(bv.arch, raw)
+        parameters = list(getattr(signature, "parameters", None) or [])
+        return bool(parameters) and str(getattr(parameters[0], "name", "")) == "this"
+    except Exception:
+        return False
+
+
 def _get_prototype(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
@@ -2339,17 +2358,27 @@ def _get_prototype(ctx, selector: str | None, identifier):
         **il_format._function_metadata(func),
     }
     params = list(getattr(getattr(func, "type", None), "parameters", None) or [])
-    if params and str(getattr(params[0], "name", "")) == "this":
+    if bool(getattr(func, "has_user_type", False)):
         result["implicit_object_note"] = (
-            f"BN recovered parameter 1 (`this`, {params[0].type}) as the implicit "
-            "object parameter. This reports BN's recovered prototype, not a "
-            "verified C++ ABI; use `self` as its name in `proto set`.")
-    elif str(getattr(func, "raw_name", func.name)).startswith(("_Z", "?")):
+            "This is a user-defined prototype, not an automatically recovered "
+            "signature. Parameter names and types reflect the user definition; "
+            "no C++ ABI is verified by this read.")
+    elif params and str(getattr(params[0], "name", "")) == "this":
+        if _demangled_object_parameter(bv, func):
+            result["implicit_object_note"] = (
+                f"BN recovered parameter 1 (`this`, {params[0].type}) as the implicit "
+                "object parameter in its demangled C++ signature. This reports "
+                "BN's recovery, not a verified C++ ABI.")
+        else:
+            result["implicit_object_note"] = (
+                f"BN recovered parameter 1 named `this` with type {params[0].type}. "
+                "Its name alone does not establish C++ object semantics.")
+    elif _demangled_object_parameter(bv, func):
         result["implicit_object_note"] = (
             "BN did not identify an implicit object parameter (`this`) in this "
-            "recovered prototype. For a C++ instance method it may be missing; "
-            "do not reinterpret the first named parameter as the object parameter. "
-            "This prototype is not a verified C++ ABI.")
+            "recovered prototype, although its demangled C++ signature describes "
+            "one. Do not reinterpret the first named parameter as the object "
+            "parameter. This prototype is not a verified C++ ABI.")
     note = _return_width_inference_note(bv, func)
     if note:
         result["return_width_note"] = note

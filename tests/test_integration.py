@@ -1495,6 +1495,66 @@ class TestPrototypeRecovery:
         assert applied["results"][0]["status"] == "verified", applied
         got = shared_bn.json("proto", "get", "svc::EchoHandler::handle")
         assert "ns::Box<int, ns::Tag<char> >* self" in got["prototype"], got
+        assert "user-defined prototype" in got["implicit_object_note"], got
+        assert "BN did not identify" not in got["implicit_object_note"], got
+
+    def test_named_function_type_fallback(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "typedef int `ns::Callback`(int value);")
+        applied = shared_bn.json("proto", "set", "main", "ns::Callback")
+        assert applied["results"][0]["status"] == "verified", applied
+        got = shared_bn.json("proto", "get", "main")
+        assert got["prototype"] == "int32_t(int32_t value)", got
+
+    def test_display_declarator_preserves_type_spelling_hint(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        shared_bn.json("types", "declare", "struct `ns::Cls` { int value; };")
+        for declarator in ["ns::Cls::method", "method"]:
+            prototype = f"void* {declarator}(struct ns::Cls* const self, void* p)"
+            rejected = shared_bn.run("proto", "set", "svc::EchoHandler::handle",
+                                     prototype, "--format", "json")
+            assert rejected.returncode == 3, (rejected.stdout, rejected.stderr)
+            row = json.loads(rejected.stdout)["results"][0]
+            assert "struct `ns::Cls`" in row["message"], row
+            assert "declare it first" not in row["message"], row
+            applied = shared_bn.json("proto", "set", "svc::EchoHandler::handle",
+                                     prototype.replace("struct ns::Cls", "struct `ns::Cls`"))
+            assert applied["results"][0]["status"] == "verified", applied
+
+    def test_this_advice_avoids_existing_parameter_names(self, shared_bn):
+        shared_bn.load(HELLO_BINARY)
+        shared_bn.json("types", "declare", "struct W { int value; };")
+        prototype = "int32_t c_plain(struct W* this, int self, int self_1)"
+        rejected = shared_bn.run("proto", "set", "main", prototype, "--format", "json")
+        assert rejected.returncode == 3, (rejected.stdout, rejected.stderr)
+        row = json.loads(rejected.stdout)["results"][0]
+        suggestion = re.search(r"Rename that parameter to `(\w+)`", row["message"])
+        assert suggestion is not None, row
+        name = suggestion.group(1)
+        assert name not in {"self", "self_1", "this"}, row
+        # Use precisely the suggested spelling, not a separately chosen fix.
+        applied = shared_bn.json("proto", "set", "main", prototype.replace("* this", f"* {name}"))
+        assert applied["results"][0]["status"] == "verified", applied
+        got = shared_bn.json("proto", "get", "main")
+        assert f"* {name}" in got["prototype"], got
+
+    def test_c_this_parameter_is_not_an_object(self, shared_bn, tmp_path):
+        c_source = tmp_path / "cfunc.c"
+        cpp_source = tmp_path / "driver.cpp"
+        obj = tmp_path / "cfunc.o"
+        binary = tmp_path / "c_this"
+        c_source.write_text("int cfunc(int this) { return this + 13; }\n", encoding="utf-8")
+        cpp_source.write_text(
+            'extern "C" int cfunc(int); int main() { return cfunc(2); }\n', encoding="utf-8")
+        subprocess.run(["cc", "-g", "-O0", "-c", str(c_source), "-o", str(obj)],
+                       check=True, capture_output=True, text=True, timeout=30)
+        subprocess.run(["c++", "-g", "-O0", str(cpp_source), str(obj), "-o", str(binary)],
+                       check=True, capture_output=True, text=True, timeout=30)
+        shared_bn.load(binary)
+        got = shared_bn.json("proto", "get", "cfunc")
+        assert "this" in got["prototype"], got
+        note = got["implicit_object_note"]
+        assert "implicit object parameter" not in note, got
 
 
 class TestDisasmLinear:

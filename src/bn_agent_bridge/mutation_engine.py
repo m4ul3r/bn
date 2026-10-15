@@ -3650,6 +3650,18 @@ def _type_spelling_hint(bv, text: str, detail: str, *, limit: int = 5) -> str:
     if not population:
         return ""
     suggestions: list[str] = []
+    # A displayed prototype may name the same namespace in its function name
+    # and a parameter type. Only types should participate in spelling hints.
+    text = str(text)
+    span = _qualified_declarator_span(text)
+    if span is None:
+        head, sep, _ = text.partition("(")
+        quoted = re.search(r"`[^`]*::[^`]*`\s*$", head) if sep else None
+        if quoted is not None and head[:quoted.start()].strip():
+            span = quoted.span()
+    if span is not None:
+        start, end = span
+        text = text[:start] + " " + text[end:]
     for token in dict.fromkeys(tokens):
         # Widen a leading component back to the qualified name it started.
         full = token
@@ -3674,8 +3686,7 @@ def _type_spelling_hint(bv, text: str, detail: str, *, limit: int = 5) -> str:
 
 
 def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: str,
-                        shown: str | None = None, column_of=None,
-                        named_type_fallback: bool = True):
+                        shown: str | None = None, column_of=None):
     """``bv.parse_type_string`` with a friendly, actionable error.
 
     A prototype/type that references a struct or type not defined yet fails to
@@ -3684,24 +3695,20 @@ def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: s
     ``_apply_operation`` would otherwise emit -- which leaks the Python
     exception class name and gives no way forward (#122). *shown* is the text
     the error quotes when *type_text* is a rewrite of what the caller typed, and
-    *column_of* maps a 1-based column of *type_text* to the same spot in it.
-    The named-type fallback is for standalone types, never whole prototypes."""
+    *column_of* maps a 1-based column of *type_text* to the same spot in it."""
     try:
         return bv.parse_type_string(str(type_text))
     except OperationFailure:
         raise
     except Exception as exc:
-        # Only standalone types can be rebuilt from a registered name (#200).
-        # A whole prototype must not resolve to a non-function type, and an
-        # optional fallback failure must not replace the original parse error
-        # with an internal exception (#1013 items 6-7).
-        if named_type_fallback:
-            try:
-                resolved = _resolve_named_type_string(bv, str(type_text))
-            except Exception:
-                resolved = None
-            if resolved is not None:
-                return resolved, None
+        # An optional fallback failure must not replace the original parse
+        # error with an internal exception (#1013 items 6-7).
+        try:
+            resolved = _resolve_named_type_string(bv, str(type_text))
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            return resolved, None
         # Collapse BN's multi-line parser output ("error: ...\n1 error
         # generated.") into a single clean clause.
         detail = " ".join(str(exc).split()).rstrip(".")
@@ -3734,8 +3741,14 @@ def _parse_failure_hint(bv, text: str, detail: str) -> str:
     The #962 existing-type spelling still wins over the generic ``::`` advice
     when it can name the type the string meant."""
     if "'this' is a keyword" in detail:
+        identifiers = set(re.findall(r"[A-Za-z_]\w*", text))
+        replacement = "self"
+        suffix = 0
+        while replacement in identifiers:
+            suffix += 1
+            replacement = f"self_{suffix}"
         return (" `this` is a keyword the parser rejects as a parameter name. "
-                "Rename that parameter to `self`.")
+                f"Rename that parameter to `{replacement}`.")
     spelling = _type_spelling_hint(bv, text, detail)
     if spelling:
         return spelling
@@ -3808,7 +3821,7 @@ def _parse_prototype(ctx, bv, op: dict[str, Any]):
 
     expected_type, _ = _parse_type_or_hint(
         ctx, bv, op, _quote_qualified_declarator(typed), label="prototype", shown=typed,
-        column_of=column_of, named_type_fallback=False)
+        column_of=column_of)
     return expected_type
 
 
