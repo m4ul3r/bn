@@ -6845,28 +6845,30 @@ def test_offset_summary_never_cuts_a_name_1000():
                        f"vtable object(s), not types: {long} +1 more")
 
 
-@pytest.mark.parametrize("parameter_name", ["this", "__s"])
-def test_prototype_object_note_reports_recovery_not_assumed_abi(monkeypatch, parameter_name):
+
+
+@pytest.mark.parametrize("parameters", [
+    [types.SimpleNamespace(name="__s", type="char const*")],
+    [],
+])
+def test_prototype_demangled_difference_reports_current_parameters(monkeypatch, parameters):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fn = _cxx_function(0x401000, "_ZN2ns3Cls4openEPKc", "ns::Cls::open")
-    fn.set_auto_type(types.SimpleNamespace(parameters=[
-        types.SimpleNamespace(name=parameter_name, type="char const*")]))
+    fn.set_auto_type(types.SimpleNamespace(parameters=parameters))
     bv = _FakeBV(functions=[fn])
     monkeypatch.setattr(bridge.read_decompile.bn, "demangle_gnu3",
                         lambda arch, name: (types.SimpleNamespace(parameters=[
                             types.SimpleNamespace(name="this")]), ["ns", "Cls", "open"]),
                         raising=False)
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
-    result = instance._get_prototype("active", "0x401000")
-    note = result["implicit_object_note"]
-    if parameter_name == "this":
-        assert "BN recovered parameter 1" in note
-        assert "`this`" in note and "char const*" in note
-        assert "implicit object parameter" in note
+    note = instance._get_prototype("active", "0x401000")["implicit_object_note"]
+    if parameters:
+        assert "`__s`" in note and "char const*" in note
     else:
-        assert "did not identify" in note
-        assert "do not reinterpret the first named parameter" in note.lower()
+        assert "current prototype has no parameters" in note
+    assert "demangled C++ signature describes a leading object parameter" in note
+    assert "did not identify" not in note and "Do not reinterpret" not in note
 
 
 @pytest.mark.parametrize("user_type", [False, True])

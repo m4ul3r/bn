@@ -2374,11 +2374,15 @@ def _get_prototype(ctx, selector: str | None, identifier):
                 f"BN recovered parameter 1 named `this` with type {params[0].type}. "
                 "Its name alone does not establish C++ object semantics.")
     elif _demangled_object_parameter(bv, func):
+        if params:
+            name = str(getattr(params[0], "name", "")) or "<unnamed>"
+            current = f"Current prototype parameter 1 is named `{name}` with type {params[0].type}"
+        else:
+            current = "The current prototype has no parameters"
         result["implicit_object_note"] = (
-            "BN did not identify an implicit object parameter (`this`) in this "
-            "recovered prototype, although its demangled C++ signature describes "
-            "one. Do not reinterpret the first named parameter as the object "
-            "parameter. This prototype is not a verified C++ ABI.")
+            f"{current}, while BN's demangled C++ signature describes a leading "
+            "object parameter. These are observations of the current prototype "
+            "and demangled signature, not a verified C++ ABI.")
     note = _return_width_inference_note(bv, func)
     if note:
         result["return_width_note"] = note

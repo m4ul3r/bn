@@ -1478,6 +1478,27 @@ class TestPrototypeRecovery:
         assert got["function"]["name"] + "(" in raw.stdout.splitlines()[0], raw.stdout
 
 
+    def test_local_rename_keeps_object_note_observational(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        function = "svc::EchoHandler::handle"
+        before = shared_bn.json("proto", "get", function)
+        address = before["function"]["address"]
+        flag_probe = f"result = bv.get_function_at({address}).has_user_type"
+        assert shared_bn.json("py", "exec", flag_probe)["result"] is False
+        assert "`this`" in before["implicit_object_note"], before
+        renamed = shared_bn.json("local", "rename", function, "this", "self")
+        assert renamed["results"][0]["status"] == "verified", renamed
+        after = shared_bn.json("proto", "get", function)
+        assert shared_bn.json("py", "exec", flag_probe)["result"] is False
+        assert "* self" in after["prototype"], after
+        note = after["implicit_object_note"]
+        assert "`self`" in note and "struct svc::EchoHandler*" in note, after
+        assert "demangled C++ signature describes a leading object parameter" in note, after
+        assert "did not identify" not in note and "Do not reinterpret" not in note, after
+        text = shared_bn.run("proto", "get", function)
+        assert text.returncode == 0 and note in text.stdout, (text.stdout, text.stderr)
+
+
     def test_this_refusal_advice_and_nested_template(self, shared_bn):
         shared_bn.load(CLASSES_BINARY)
         shared_bn.json("types", "declare", "struct `ns::Box<int, ns::Tag<char> >` { int value; };")
