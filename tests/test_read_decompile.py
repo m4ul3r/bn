@@ -3483,12 +3483,15 @@ def test_possible_values_uses_source_when_instruction_undetermined(monkeypatch):
     # BN leaves a SET_VAR instruction's value-set undetermined while the SOURCE
     # expression carries the real const; report the source's value-set (#52).
     src = types.SimpleNamespace(possible_values=_pvs("ConstantValue", value=0xc48))
-    ins = types.SimpleNamespace(address=0x1000, possible_values=_pvs("UndeterminedValue"), src=src)
+    ins = types.SimpleNamespace(
+        address=0x1000, operation=types.SimpleNamespace(name="MLIL_SET_VAR_SSA"),
+        possible_values=_pvs("UndeterminedValue"), src=src, dest="value#1")
     bridge, instance = _dataflow_values_instance(monkeypatch, ins)
     res = instance._possible_values(None, "f", "0x1000")
     assert res["value_basis"] == "source_expression"
     assert res["possible_values"]["type"] == "ConstantValue"
     assert res["possible_values"]["value"] == 0xc48
+    assert "call_destination" not in res
 
 
 def test_possible_values_keeps_instruction_set_when_determined(monkeypatch):
@@ -3510,6 +3513,105 @@ def test_possible_values_no_source_uses_instruction(monkeypatch):
     res = instance._possible_values(None, "f", "0x1000")
     assert res["value_basis"] == "instruction"
     assert res["possible_values"]["value"] == 3
+
+
+class _ValuesExpression(types.SimpleNamespace):
+    def __str__(self):
+        return self.text
+
+
+@pytest.mark.parametrize("operation", [
+    "MLIL_CALL", "MLIL_CALL_SSA", "MLIL_CALL_UNTYPED", "MLIL_CALL_UNTYPED_SSA",
+    "MLIL_TAILCALL", "MLIL_TAILCALL_SSA", "MLIL_TAILCALL_UNTYPED", "MLIL_TAILCALL_UNTYPED_SSA",
+])
+@pytest.mark.parametrize("instruction_value", [None, 7])
+def test_possible_values_call_destination_is_separate(monkeypatch, operation, instruction_value):
+    dest = _ValuesExpression(
+        text="handler#2", possible_values=_pvs("InSetOfValues", values={0x402000, 0x403000}))
+    instr_pvs = (_pvs("UndeterminedValue") if instruction_value is None
+                 else _pvs("ConstantValue", value=instruction_value))
+    ins = _ValuesExpression(
+        text="handler#2(request#0)", address=0x401120,
+        operation=types.SimpleNamespace(name=operation), possible_values=instr_pvs, dest=dest)
+    bridge, instance = _dataflow_values_instance(monkeypatch, ins)
+    res = instance._possible_values(None, "dispatch_request", "0x401120")
+    assert res["value_basis"] == "instruction"
+    assert res["expression"] == "handler#2(request#0)"
+    assert res["source_expression"] is None
+    assert res["possible_values"] == bridge.il_format._serialize_pvs(instr_pvs)
+    assert "values" not in res["possible_values"]
+    assert res["call_destination"] == {
+        "expression": "handler#2",
+        "value_basis": "destination_expression",
+        "possible_values": bridge.il_format._serialize_pvs(dest.possible_values),
+    }
+    assert res["call_destination"]["possible_values"]["values"] == [0x402000, 0x403000]
+    # The same native operand is what callgraph's resolution reads.
+    targets = instance._pvs_targets(object(), dest.possible_values)
+    assert sorted(row["address"] for row in targets) == ["0x402000", "0x403000"]
+    # The JSON surface keeps the sets in distinct objects, not just in text.
+    encoded = json.loads(json.dumps(res))
+    assert encoded["call_destination"]["value_basis"] == "destination_expression"
+    assert "values" not in encoded["possible_values"]
+
+
+@pytest.mark.parametrize("destination_state", ["undetermined", "no_values", "no_operand"])
+def test_possible_values_unknown_call_destination_stays_unknown(monkeypatch, destination_state):
+    ins = _ValuesExpression(
+        text="handler#2(request#0)", address=0x401120,
+        operation=types.SimpleNamespace(name="MLIL_CALL_SSA"),
+        possible_values=_pvs("UndeterminedValue"))
+    if destination_state != "no_operand":
+        ins.dest = _ValuesExpression(text="handler#2")
+        if destination_state == "undetermined":
+            ins.dest.possible_values = _pvs("UndeterminedValue")
+    bridge, instance = _dataflow_values_instance(monkeypatch, ins)
+    res = instance._possible_values(None, "dispatch_request", "0x401120")
+    assert res["possible_values"]["type"] == "UndeterminedValue"
+    destination = res["call_destination"]
+    assert destination["value_basis"] == "destination_expression"
+    assert destination["expression"] == (None if destination_state == "no_operand" else "handler#2")
+    if destination_state == "undetermined":
+        assert destination["possible_values"]["type"] == "UndeterminedValue"
+        assert "values" not in destination["possible_values"]
+    else:
+        assert destination["possible_values"] is None
+
+
+@pytest.mark.parametrize("phi_op", ["MLIL_VAR_PHI", "MLIL_MEM_PHI"])
+def test_possible_values_call_at_phi_address_reads_call_operand(monkeypatch, phi_op):
+    phi = _ValuesExpression(
+        text="handler#2 = phi(handler#0, handler#1)", address=0x401120,
+        operation=types.SimpleNamespace(name=phi_op),
+        possible_values=_pvs("UndeterminedValue"))
+    call = _ValuesExpression(
+        text="handler#2(request#0)", address=0x401120,
+        operation=types.SimpleNamespace(name="MLIL_CALL_SSA"),
+        possible_values=_pvs("UndeterminedValue"),
+        dest=_ValuesExpression(
+            text="handler#2", possible_values=_pvs("InSetOfValues", values={0x402000, 0x403000})))
+    bridge, instance = _dataflow_values_instance(monkeypatch, call)
+    monkeypatch.setattr(bridge.il_format, "_il_function_for",
+                        lambda *args: types.SimpleNamespace(instructions=[phi, call]))
+    result = instance._possible_values(None, "dispatch_request", "0x401120")
+    assert result["expression"] == str(call)
+    assert result["possible_values"]["type"] == "UndeterminedValue"
+    assert result["call_destination"]["possible_values"]["values"] == [0x402000, 0x403000]
+
+
+def test_possible_values_call_destination_does_not_rescue_invalid_at(monkeypatch):
+    ins = _ValuesExpression(
+        text="handler#2(request#0)", address=0x401120,
+        operation=types.SimpleNamespace(name="MLIL_CALL_SSA"),
+        possible_values=_pvs("UndeterminedValue"),
+        dest=_ValuesExpression(
+            text="handler#2", possible_values=_pvs("InSetOfValues", values={0x402000, 0x403000})))
+    bridge, instance = _dataflow_values_instance(monkeypatch, ins)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._possible_values(None, "dispatch_request", "0x401121")
+    assert exc.value.status == "no_instruction"
+    assert exc.value.requested["at"] == "0x401121"
+
 
 
 def test_possible_values_no_instruction_at_address_raises(monkeypatch):
@@ -6538,9 +6640,6 @@ def test_every_unresolved_exit_jump_gets_one_neutral_warning_1000(dest):
     warning = read_decompile._unresolved_jump_warning(func, row, True)
     assert warning["code"] == "jump" and warning["address"] == "0x40058c"
     assert warning["target"] == str(row["target"])
-    assert warning["summary"] == (
-        "unresolved jump at 0x40058c (❓): a tail call whose args are not rendered, or a "
-        "computed goto/jump table; --explain says how to read each")
     detail = warning["detail"]
     assert f"to `{row['target']}`" in detail and "❓ marks control flow" in detail
     assert "argument registers (x0, x1, x2)" in detail and "bn proto set" in detail
@@ -6554,12 +6653,6 @@ def test_every_unresolved_exit_jump_gets_one_neutral_warning_1000(dest):
     # decompile's own stores are offered, as a "may".
     assert "None of these steps is sure to find the targets" in detail
     assert "may name the targets" in detail and "`bn xrefs 0x" not in detail
-    # A table a store names is read through its address: a `data_<hex>` name
-    # is one, a symbol resolves with `bn xrefs <symbol>`; `bn xrefs
-    # data_420010` itself fails.
-    assert "`bn evidence table <address>`" in detail
-    assert "`data_420010` name is the address 0x420010" in detail
-    assert "`bn xrefs a.1`" in detail and "`bn xrefs <name>`" not in detail
     note = read_decompile._JUMP_LINE_NOTE
     assert note.startswith("/* bn:") and note.endswith("*/")
     assert "tail call" in note and "computed goto" in note and "virtual" not in note
@@ -6687,10 +6780,6 @@ def test_offset_warning_says_which_base_types_have_no_definition_1000():
     assert "No definition: Req, demo::Store" in detail and "bn types declare" in detail
     assert "vtable_for_demo::Store names a class's vtable OBJECT" in detail
     assert "`this` points at demo::Store, which has no definition either." in detail
-    # A vtable object is not filed under "no type defined".
-    assert warning["summary"].endswith(
-        "no type defined for Req, demo::Store; vtable object(s), not types: "
-        "vtable_for_demo::Store")
 
 
 def test_offset_warning_names_defined_types_and_the_vtable_route_1000():
@@ -6815,12 +6904,64 @@ def test_offset_types_resolve_by_rendered_name_like_types_show_1000():
     assert "bn struct show 'std::map<std::string, int>'" in warning["detail"]
 
 
-def test_offset_summary_never_cuts_a_name_1000():
-    long = "vtable_for_std::basic_ios<char, std::char_traits<char> >"
-    other = "vtable_for_std::basic_filebuf<char, std::char_traits<char> >"
-    bv = types.SimpleNamespace(get_type_by_name=lambda name: None, types={})
-    text = f"    a = __offset({long}, 0x10);\n    b = __offset({other}, 0x10);"
-    summary = read_decompile._offset_warning(bv, _offset_func("x"), text)["summary"]
-    assert long in summary and "…" not in summary
-    assert summary == ("__offset(T, N) is a pointer N bytes into T; no type defined for x; "
-                       f"vtable object(s), not types: {long} +1 more")
+@pytest.mark.parametrize("names", [
+    ["demo::" + "Template" * 30],
+    ["demo::" + "Template" * 20, "vtable_for_demo::" + "Template" * 20,
+     "known::" + "Template" * 20],
+    [f"demo::Type{index}" for index in range(100)],
+])
+def test_offset_summary_caps_total_length_without_truncating_names_1019(names):
+    bv = types.SimpleNamespace(
+        get_type_by_name=lambda name: object() if name.startswith("known::") else None,
+        types={})
+    text = "\n".join(f"__offset({name}, 8)" for name in names)
+    row = read_decompile._offset_warning(
+        bv, types.SimpleNamespace(start=0x401000, parameter_vars=[]), text)
+    assert len(row["summary"]) <= 240
+    assert row["address"] == "0x401000"
+    assert set(row["types"]["defined"] + row["types"]["missing"]) == set(names)
+    for name in names:
+        assert name in row["detail"]
+        if name not in row["summary"]:
+            assert name[:min(20, len(name))] not in row["summary"]
+    assert "more" in row["summary"]
+
+
+def test_resolved_branch_facts_include_separate_starts_not_guessed_targets_1019():
+    bv, func = _jump_case()
+    other = types.SimpleNamespace(start=0x400800, name="dispatch_case")
+    bv.get_function_at = lambda address: other if address == other.start else None
+    func.indirect_branches = [
+        types.SimpleNamespace(source_addr=0x40058c, dest_addr=address)
+        for address in (0x400580, 0x400800, 0x400800)]
+    [row] = read_decompile._resolved_branch_warnings(bv, func)
+    assert row["address"] == "0x40058c"
+    assert row["targets"] == [
+        {"address": "0x400580"},
+        {"address": "0x400800",
+         "function": {"address": "0x400800", "name": "dispatch_case"}},
+    ]
+    assert "0x400800" in row["summary"] and "dispatch_case" in row["detail"]
+    func.indirect_branches = []
+    assert read_decompile._resolved_branch_warnings(bv, func) == []
+
+
+def test_warning_address_uses_first_site_and_preserves_all_sites_1019():
+    select = read_decompile._warning_row(
+        "select", "summary", "detail", addresses=["0x401024", "0x401030"])
+    arity = read_decompile._warning_row(
+        "arity", "summary", "detail",
+        calls=[{"address": "0x401040"}, {"address": "0x401050"}])
+    assert select["address"] == select["addresses"][0] == "0x401024"
+    assert arity["address"] == arity["calls"][0]["address"] == "0x401040"
+
+
+def test_jump_table_guidance_uses_generic_symbol_and_address_placeholders_1019():
+    import re
+
+    bv, func = _jump_case()
+    [finding] = read_decompile._unresolved_jump_findings(bv, func)
+    detail = read_decompile._unresolved_jump_warning(func, finding, False)["detail"]
+    assert "bn xrefs <symbol>" in detail
+    assert "bn evidence table <address>" in detail
+    assert not re.search(r"\b(?:data_[0-9a-f]+|a\.1)\b", detail)

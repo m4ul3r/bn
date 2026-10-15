@@ -4926,6 +4926,19 @@ __attribute__((noinline)) int labels2(int op, int v) {
 l0: return v + 1;
 l1: return v * 3;
 }
+__attribute__((noinline)) int labels3(int op) {
+  static void *const labels[] = { &&a, &&b, &&c };
+  goto *labels[op % 3];
+a: return 10;
+b: return 20;
+c: return 30;
+}
+__attribute__((noinline)) int handler_a(int x) { return x + 3; }
+__attribute__((noinline)) int handler_b(int x) { return x * 3; }
+__attribute__((noinline)) int dispatch_call(int n) {
+  fn_t fn = n ? handler_a : handler_b;
+  return fn(n) + 1;
+}
 int idxjump(long *p);
 __asm__(IDXJUMP);
 __attribute__((noinline)) char *use_c_locale(void) { return setlocale(LC_ALL, "C"); }
@@ -5049,6 +5062,55 @@ class TestDecompileRepeatedJump1000:
         assert sorted(jumps) == sorted(copies), (jumps, result["text"])
         for _, line in lines:
             assert line.count("/* bn: unresolved jump") == 1, line
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+def test_decompile_reports_native_branch_targets_and_separate_starts_1019(
+        shared_bn, tail_jump_binaries, arch):
+    shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+    # Make the split deterministic across BN releases: the compiler's static
+    # label table is real, while explicit function starts model the split body.
+    facts = shared_bn.json("py", "exec", "--code",
+        "f = bv.get_functions_by_name('labels3')[0]\n"
+        "targets = sorted({b.dest_addr for b in f.indirect_branches})\n"
+        "assert len(targets) == 3, f.indirect_branches\n"
+        "for address in targets[1:]:\n"
+        "    bv.create_user_function(address)\n"
+        "bv.update_analysis_and_wait()\n"
+        "result = [{'source': hex(b.source_addr), 'target': hex(b.dest_addr), "
+        "'separate': bv.get_function_at(b.dest_addr) is not None} "
+        "for b in f.indirect_branches]\n")["result"]
+    decompiled = shared_bn.json("decompile", "labels3")
+    rows = [row for row in decompiled["warning_rows"] if row["code"] == "branch"]
+    actual = {(row["address"], target["address"], "function" in target)
+              for row in rows for target in row["targets"]}
+    expected = {(fact["source"], fact["target"], fact["separate"]) for fact in facts}
+    assert actual == expected
+    assert sum(separate for _, _, separate in actual) == 2
+    for row in rows:
+        for target in row["targets"]:
+            if "function" in target:
+                body = shared_bn.json("decompile", target["address"])
+                assert body["function"]["address"] == target["address"]
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+def test_values_keeps_native_call_result_separate_from_destination_947(
+        shared_bn, tail_jump_binaries, arch):
+    shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+    graph = shared_bn.json("dataflow", "callgraph", "dispatch_call")
+    [call] = [row for row in graph["callees"] if row["kind"] == "indirect"]
+    expected = {int(row["address"], 16) for row in call["resolved"]}
+    assert len(expected) == 2
+    values = shared_bn.json("dataflow", "values", "dispatch_call", "--at", call["call_addr"])
+    assert values["value_basis"] == "instruction"
+    assert values["possible_values"]["type"] == "UndeterminedValue"
+    assert set(values["call_destination"]["possible_values"]["values"]) == expected
+    assert values["call_destination"]["value_basis"] == "destination_expression"
+    text = shared_bn.run("dataflow", "values", "dispatch_call", "--at", call["call_addr"])
+    assert text.returncode == 0, text.stderr
+    assert "possible values: UndeterminedValue" in text.stdout
+    assert "call destination possible values: InSetOfValues" in text.stdout
 
 
 class TestShortLiteralBehindDataName994:
