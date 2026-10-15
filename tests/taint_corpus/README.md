@@ -38,6 +38,12 @@ brittle across compilers/optimisation.
 | `bw_global_operand.c`  | a `CONST_PTR` fill operand is a literal only in read-only storage: `sprintf(cmd, "%s", g_host)` from a `.bss` array is a frontier leaf with origin `global` (`complete_slice: false`); the `.rodata` literal twin is complete |
 | `bw_offset_address.c`  | an address built on a buffer at a VARIABLE offset is that buffer: `popen(line + off)` and `strcpy(buf, &other[i])` walk the `read` that filled it beside the offset; `g_hosts[i]` (a `.bss` array element) is a `global` frontier leaf. `bw_offset_address_o1.c` rebuilds it at -O1 |
 | `bw_byte_coverage.c`   | coverage by bytes, not by writer kind: a `read` through a pointer that may point at another local, a one-byte indexed terminator, an escape of `&buf` and a copy at a constant offset each leave the bare path a frontier (`complete_slice: false`); a copy at offset 0 covers. `bw_byte_coverage_o1.c` rebuilds it at -O1 |
+| `bw_stash_epoch.c`     | stash identity is flow-sensitive (#1034 item 1): a pointer loaded before `&buf` escaped and copied through a second slot, an overwritten slot and a restored slot are not `&buf`, so their `strcpy(.., getenv(..))` is never a writer or the `source` origin of `buf`; the direct stash is |
+| `stash_pointer_width.c` | an 8-byte stash reloaded at 4 bytes and zero-extended is not the pointer (#1034 item 2): writes through it cover nothing; the full-width reload is a definite writer. `stash_pointer_width_o1.c` rebuilds it at -O1, where `snprintf` folds into short stores |
+| `stash_must_paths.c`   | a reload that may still hold the stash's previous target (first do-while trip, untaken branch) never certifies the buffer; an escape after a finished loop does not make the loop's call a writer. `stash_must_paths_o1.c` rebuilds it at -O1 |
+| `loop_escape_index.c`  | a loop-carried escape makes the helper that runs before it opaque on the next trip; an indexed byte of a memset buffer walks the buffer's writers beside the index. `loop_escape_index_o1.c` rebuilds it at -O1 |
+| `bw_loop_frontier.c`   | a memory-chain proof cut (300 unrelated calls) keeps the loop-carried escaped call `compose` named, like the uncut control (#1034 item 3) |
+| `bw_wide_load.c`       | loads are walked through the writers of the loaded bytes, never the pointer (#1041 item 2): the upper half of a wider field store is the input it came from, not the caller's malloc; a field stored on one path only, or overwritten through a second pointer, is a `field_load_unresolved` frontier. `bw_wide_load_o2.c` rebuilds it at -O2 (`sx.q([m + 0xc].d)` operands) |
 
 ## `EXPECTED.json` schema
 
@@ -48,7 +54,7 @@ brittle across compilers/optimisation.
   "forward":  [{"function","source","sink_classes":[...],"sinks":[{"callee","class","arg"}],"leaves":[{"kind"}],"all_clear": false}],
   // "resolve_map": {"in_function": <fn>, "target": <callee>},  // optional: pin the lone indirect call in <fn> to <callee> via --resolve-map (addresses resolved at test time). <fn> must contain EXACTLY ONE indirect call so the harness can resolve it unambiguously.
   // "assumptions_contain": ["substr", ...],                    // optional: each substring must appear in an assumptions entry
-  "backward": [{"function","sink","origin_kinds":[...],"forbid_origin_kinds":[...],"leaves":[{"kind"}],"forbid_leaves":[{"kind"}],"leaf_details_contain":["substr"],"step_reasons_contain":["substr"],"complete_slice": false,"expect_crossed": "<fn>"}],
+  "backward": [{"function","sink","origin_kinds":[...],"forbid_origin_kinds":[...],"leaves":[{"kind"}],"forbid_leaves":[{"kind"}],"leaf_details_contain":["substr"],"forbid_leaf_details_contain":["substr"],"step_reasons_contain":["substr"],"forbid_step_reasons_contain":["substr"],"complete_slice": false,"expect_crossed": "<fn>"}],
   "negative": [{"function","source","sink_classes":[...],"forbid_sink_classes":[...],"all_clear": true}],
   "callgraph":[{"function","expect_indirect": true}]
 }

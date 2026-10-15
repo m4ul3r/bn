@@ -562,7 +562,7 @@ def test_backward_narrow_store_does_not_mask_wider_tainted_writer(models):
     # #562/F1: a recent narrow UNTAINTED store that only PARTIALLY overlaps the
     # loaded range must NOT be reported as the reaching writer -- the slice must
     # keep walking to the wider tainted store underneath. Regression for the
-    # width-aware `_reaching_writer`: stopping on "overlap" (not just "cover")
+    # width-aware backward load walk: stopping on "overlap" (not just "cover")
     # masked the real writer and reported the narrow store's constant as origin.
     MALLOC, READ_U32, MEMCPY = 0xa00, 0xa10, 0xa20
     h = FVar("h", ident=80); t = FVar("t", ident=81); x = FVar("x", ident=82)
@@ -4666,10 +4666,11 @@ def test_backward_field_load_recovers_source_call(models):
     assert not any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
 
 
-def test_backward_stack_buffer_load_keeps_prior_behavior(models):
-    # A plain stack-buffer byte load (base is neither allocator nor parameter)
-    # with no in-scope store/source must NOT become field_load_unresolved -- the
-    # #158 path must not over-trigger on ordinary stack loads.
+def test_backward_unwritten_stack_buffer_load_is_a_local_buffer_frontier(models):
+    # A byte loaded from a stack buffer is the buffer's CONTENTS: the slice
+    # walks the buffer's writers (not the #158 field-load path), and with no
+    # writer at all the bytes are whatever the stack held -- a frontier, not
+    # a complete slice.
     buf = FVar("buf", typ="char[0x40]"); x = FVar("x", ident=60)
     x1 = FSSA(x, 1)
     load_src = FExpr("MLIL_LOAD_SSA", "[&buf]", reads=[], src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
@@ -4688,7 +4689,9 @@ def test_backward_stack_buffer_load_keeps_prior_behavior(models):
     result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
     assert result["slices"]
     assert not any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
-    assert {sl["origin"]["kind"] for sl in result["slices"]} <= {"entry", "unresolved"}
+    assert any(l["kind"] == "address_of_local_unresolved" and l["buffer"] == "buf"
+               for l in result["leaves"])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 # --------------------------------------------------------------------------
@@ -10605,7 +10608,11 @@ def test_backward_indexed_loop_store_is_a_writer_of_the_buffer_928():
     pg = _BufProgram(params=[host])
     pg.store(FExpr("MLIL_ADD", "&cmd + i#1", left=_addr_of(cmd),
                    right=FExpr("MLIL_VAR_SSA", "i#1", reads=[i1])),
-             FExpr("MLIL_LOAD_SSA", "[host#0 + i#1].b", reads=[host0, i1]), reads=[host0, i1])
+             FExpr("MLIL_LOAD_SSA", "[host#0 + i#1].b", reads=[host0, i1],
+                   src=FExpr("MLIL_ADD", "host#0 + i#1", reads=[host0, i1],
+                             left=FExpr("MLIL_VAR_SSA", "host#0", reads=[host0]),
+                             right=FExpr("MLIL_VAR_SSA", "i#1", reads=[i1]))),
+             reads=[host0, i1])
     pg.phi(0, 1)
     pg.sink(cmd)
     result, reasons, aol = _bw(pg.func())

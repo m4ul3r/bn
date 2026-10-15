@@ -4473,7 +4473,8 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
         if leaf.get("width") is not None:
             bits.append(f"width={leaf['width']}")
         meta = ("  " + " ".join(bits)) if bits else ""
-        return f"  field_load_unresolved @ {leaf.get('address')}{meta}"
+        return (f"  field_load_unresolved @ {leaf.get('address')}{meta}"
+                + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else ""))
     if kind == "arg_under_recovered":
         cal = _field_dict(leaf, "callee")
         return (

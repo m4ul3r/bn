@@ -1,0 +1,59 @@
+{
+  "description": "A pointer stashed at 8 bytes and reloaded at 4 (zero-extended) is not the stashed pointer: writes through it cannot cover the buffer (#1034 item 2). The full-width reload stays a definite writer; a scalar loaded before a later fill keeps the earlier writer. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline",
+    "-fno-builtin",
+    "-fno-strict-aliasing"
+  ],
+  "backward": [
+    {
+      "function": "truncated_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "forbid_origin_kinds": [
+        "call"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "full_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "call"
+      ],
+      "step_reasons_contain": [
+        "written by snprintf"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    },
+    {
+      "function": "copied_epoch",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "call"
+      ],
+      "step_reasons_contain": [
+        "written by memset"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    }
+  ]
+}

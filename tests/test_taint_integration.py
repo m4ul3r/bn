@@ -175,10 +175,16 @@ def test_corpus_target(expected_path, tmp_path, shared_bn):
         for sub in case.get("leaf_details_contain", []):
             assert any(sub in str(l.get("detail") or "") for l in result["leaves"]), \
                 f"{stem}: no backward leaf detail containing {sub!r} in {result['leaves']}"
+        for sub in case.get("forbid_leaf_details_contain", []):
+            assert not any(sub in str(l.get("detail") or "") for l in result["leaves"]), \
+                f"{stem}: forbidden backward leaf detail {sub!r} in {result['leaves']}"
+        reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
         for sub in case.get("step_reasons_contain", []):
-            reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
             assert any(sub in r for r in reasons), \
                 f"{stem}: no slice step reason containing {sub!r} in {reasons}"
+        for sub in case.get("forbid_step_reasons_contain", []):
+            assert not any(sub in r for r in reasons), \
+                f"{stem}: forbidden slice step reason {sub!r} in {reasons}"
         if "complete_slice" in case:
             gate = result["diagnostics"]["safe_to_report_complete_slice"]
             assert gate is case["complete_slice"], \
@@ -297,6 +303,74 @@ int main(void) { handle(); return 0; }
     outputs = _run_diagnostic_commands(shared_bn, " ".join(trace["hints"]))
     assert {out.split()[0] for out in outputs} == {"backward", "forward"}
     assert all(f"{name} @ {trace['function_address']}" in out for out in outputs)
+
+
+def test_backward_frontier_advice_runs_as_printed(tmp_path, shared_bn):
+    """#1033 item 6: every command a backward leaf or next_action prints runs
+    as printed -- the forward run names its function and buffer, the global
+    leaf's inspection names the global -- with a second target open."""
+    src = tmp_path / "advice.c"
+    src.write_text("""
+#include <stdio.h>
+#include <string.h>
+char g_host[64];
+__attribute__((noinline)) void cond_fill(int c, const char *x) {
+    char buf[64];
+    if (c)
+        strcpy(buf, x);
+    popen(buf, "r");
+}
+__attribute__((noinline)) void from_global(void) {
+    char cmd[64];
+    sprintf(cmd, "%s", g_host);
+    popen(cmd, "r");
+}
+int main(int argc, char **argv) { cond_fill(argc, argv[0]); from_global(); return 0; }
+""")
+    first, second = tmp_path / "advice one", tmp_path / "advice two"
+    _compile(src, first, ["-fno-inline"])
+    shutil.copy2(first, second)
+    target = shared_bn.load(first, copy=False)
+    shared_bn.load(second, copy=False)
+    for fn, verb in (("cond_fill", "forward"), ("from_global", "xrefs")):
+        result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
+                          "--sink", "arg:popen:0")
+        assert not result["diagnostics"]["safe_to_report_complete_slice"], result
+        prose = " ".join([str(lf.get("detail") or "") for lf in result["leaves"]]
+                         + [result["diagnostics"]["next_action"]])
+        commands = re.findall(r"`(bn [^`]+)`", prose)
+        assert any(verb in shlex.split(c) for c in commands), prose
+        outputs = _run_diagnostic_commands(shared_bn, prose)
+        if verb == "forward":
+            assert any(out.startswith("forward taint in cond_fill") for out in outputs), outputs
+
+
+def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):
+    """#1041 item 2 on the architecture it was found on: two 4-byte
+    sign-extending loads of the upper half of an 8-byte field store feed the
+    memcpy lengths; the slice follows the store to its input, never the
+    caller's malloc of the object, and claims no complete slice."""
+    cc = shutil.which("aarch64-linux-gnu-gcc")
+    if cc is None:
+        refuse_silent_skip(
+            "aarch64-linux-gnu-gcc is required for the AArch64 wide-load fixture; "
+            "install the cross toolchain (Debian/Ubuntu: gcc-aarch64-linux-gnu)")
+    binary = tmp_path / "bw_wide_load_a64"
+    built = subprocess.run(
+        [cc, "-O2", "-g", "-fno-stack-protector", "-fno-inline", "-no-pie",
+         str(CORPUS / "bw_wide_load.c"), "-o", str(binary)],
+        capture_output=True, text=True, timeout=120.0)
+    if built.returncode:
+        raise FixtureBuildError(f"AArch64 wide-load fixture compile failed: {built.stderr}")
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "deser",
+                      "--sink", "arg:memcpy:2")
+    origins = [sl["origin"] for sl in result["slices"]]
+    assert len(origins) == 2, result
+    assert all(o["kind"] == "field_load_unresolved" for o in origins), origins
+    reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
+    assert any("reaching store to field" in r for r in reasons), reasons
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 def test_aarch64_oversized_big_preserves_flow_after_force_analysis(tmp_path, shared_bn):

@@ -1,0 +1,67 @@
+{
+  "description": "Stash identity is flow-sensitive (#1034 item 1): a pointer loaded before the escape, an overwritten slot and a restored slot are not &buf, so their strcpy never becomes a writer or the getenv source of buf; the direct stash is. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline"
+  ],
+  "backward": [
+    {
+      "function": "held_copy",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "call"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ]
+    },
+    {
+      "function": "overwrite",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "call"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ]
+    },
+    {
+      "function": "restore",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "call"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ]
+    },
+    {
+      "function": "direct",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "source"
+      ],
+      "step_reasons_contain": [
+        "buf written by strcpy"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    }
+  ]
+}

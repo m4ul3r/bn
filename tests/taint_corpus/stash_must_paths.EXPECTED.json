@@ -1,0 +1,78 @@
+{
+  "description": "A reload that may still hold the stash's previous target (first do-while trip, untaken branch) never certifies the buffer; an escape after a finished loop does not make the loop's earlier call a writer (the literal strcpy lowers to a short strncpy, so coverage itself stays unproven). Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline"
+  ],
+  "backward": [
+    {
+      "function": "dowhile_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "dowhile_stash_strcpy",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "branch_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "escape_after_loop",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "call"
+      ],
+      "forbid_leaf_details_contain": [
+        "touch"
+      ],
+      "forbid_step_reasons_contain": [
+        "touch"
+      ]
+    },
+    {
+      "function": "ptr_copy_load",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "call"
+      ],
+      "step_reasons_contain": [
+        "written by memset"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    }
+  ]
+}

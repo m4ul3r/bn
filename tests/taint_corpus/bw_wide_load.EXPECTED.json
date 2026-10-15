@@ -1,0 +1,59 @@
+{
+  "description": "Loads are walked through the writers of the loaded bytes, never through the pointer (#1041 item 2): the upper half of a wider field is the input it was stored from, not the caller's malloc; a field set on one path only or overwritten through a second pointer is a frontier. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline"
+  ],
+  "backward": [
+    {
+      "function": "deser",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved"
+      ],
+      "forbid_origin_kinds": [
+        "call"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "half_set",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "what the caller left"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "two_ptrs",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "address_of_local_unresolved",
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "cannot prove disjoint"
+      ],
+      "complete_slice": false
+    }
+  ]
+}
