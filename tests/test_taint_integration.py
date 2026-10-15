@@ -389,3 +389,131 @@ int main(int argc, char **argv) {
     ), result
     assert result["stats"]["functions_visited"] == 3, result
     assert not any("has no model" in a for a in result["assumptions"]), result
+
+
+_TEMPLATE = "template, fill in the UPPER-CASE words: `"
+
+
+def _forward_prose(result) -> str:
+    """Every prose field a forward result prints: its advice, caveats and notes."""
+    parts = [str((result.get("diagnostics") or {}).get("next_action") or "")]
+    parts += [str(a) for a in result.get("assumptions") or []]
+    for leaf in result.get("leaves") or []:
+        parts += [str(leaf.get(k) or "") for k in ("note", "detail")]
+    return "\n".join(parts)
+
+
+def _run_or_check_template(shared_bn, prose: str) -> tuple[int, int]:
+    """Run each backticked `bn` command exactly as printed; a command marked as
+    a template must instead parse as shell words with no `<...>` placeholder
+    and name its blanks in UPPER-CASE (#1033 item 6)."""
+    from conftest import _BN_CLI
+
+    ran = templates = 0
+    for match in re.finditer(r"`(bn [^`]+)`", prose):
+        argv = shlex.split(match.group(1))
+        if prose[:match.start()].endswith(_TEMPLATE[:-1]):
+            assert not any(c in match.group(1) for c in "<>"), match.group(1)
+            assert any(w.isupper() or w.split(":")[-1].isupper() for w in argv), match.group(1)
+            templates += 1
+            continue
+        res = subprocess.run([*_BN_CLI, *argv[1:]], capture_output=True, text=True,
+                             env=shared_bn.env(), timeout=300.0)
+        assert res.returncode == 0, f"{match.group(1)}: {res.stderr}"
+        ran += 1
+    return ran, templates
+
+
+def test_forward_advice_runs_as_printed_or_is_a_marked_template(tmp_path, shared_bn):
+    """#1033 item 6 / #1041 item 1: the commands forward taint prints."""
+    src = tmp_path / "advice.c"
+    src.write_text(r"""
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
+struct conn { int fd; char *buf; };
+__attribute__((noinline)) int pump(struct conn *c, long have) {
+    recv(c->fd, c->buf + have, 64, 0);           /* member buffer: not keyed */
+    return c->buf[4];
+}
+__attribute__((noinline)) int sink_len(long n) {
+    char d[8]; memcpy(d, "0123456789abcdef", n); return d[0];
+}
+__attribute__((noinline)) int deep(int fd) {
+    char b[16]; long n = read(fd, b, sizeof b); return sink_len(n);
+}
+__attribute__((noinline)) int hdr(int fd) {
+    char b[32]; struct iovec v = {b, sizeof b};
+    struct msghdr m = {0}; m.msg_iov = &v; m.msg_iovlen = 1;
+    recvmsg(fd, &m, 0); return b[0];
+}
+int main(int argc, char **argv) {
+    struct conn c = {argc, argv[0]};
+    return pump(&c, argc) + deep(argc) + hdr(argc);
+}
+""")
+    binary = tmp_path / "advice"
+    _compile(src, binary)
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn, *extra):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn, *extra)
+
+    unkeyed = forward("pump", "--source", "call:recv")
+    assert unkeyed["diagnostics"]["safe_to_report_all_clear"] is False
+    assert any(lf.get("seed") == "call" for lf in unkeyed["leaves"]), unkeyed["leaves"]
+    assert _run_or_check_template(shared_bn, _forward_prose(unkeyed))[1] >= 1
+
+    # Depth 0 stops at sink_len: the advice seeds inside it, filled in.
+    stopped = forward("deep", "--source", "call:read", "--max-depth", "0")
+    assert _run_or_check_template(shared_bn, _forward_prose(stopped))[0] >= 1
+
+    # arg:recvmsg seeds the header; the nudge names the call: reseed.
+    header = forward("hdr", "--source", "arg:recvmsg:1")
+    assert _run_or_check_template(shared_bn, _forward_prose(header))[0] >= 1
+
+
+def test_aarch64_identity_tail_wrapper_is_a_frontier_not_an_all_clear(tmp_path, shared_bn):
+    """#1034 item 5: BN recovers the AArch64 `ident` (a bare `ret`) with a
+    valueless return; the flow it carried is a frontier, never an all-clear."""
+    cc = shutil.which("aarch64-linux-gnu-gcc")
+    if cc is None:
+        refuse_silent_skip(
+            "aarch64-linux-gnu-gcc is required for the AArch64 tail-wrapper taint fixture; "
+            "install the cross toolchain (Debian/Ubuntu: gcc-aarch64-linux-gnu)")
+    src = tmp_path / "tail_ident.c"
+    src.write_text("""
+extern long read(int, void *, unsigned long);
+extern void *__memcpy_chk(void *, const void *, unsigned long, unsigned long);
+__attribute__((noinline, noipa)) long ident(long v) { return v; }
+__attribute__((noinline, noipa)) long conditional_tail(long v, int take) {
+    if (take)
+        return ident(v);
+    return 0;
+}
+int main(int argc, char **argv) {
+    char input[32], output[16];
+    long n = read(0, input, sizeof(input));
+    n = conditional_tail(n, argc & 1);
+    __memcpy_chk(output, input, (unsigned long)n, sizeof(output));
+    return output[0];
+}
+""")
+    binary = tmp_path / "tail_ident_a64"
+    built = subprocess.run(
+        [cc, "-O2", "-g", "-fno-stack-protector", "-fno-builtin", "-foptimize-sibling-calls",
+         "-no-pie", str(src), "-o", str(binary)],
+        capture_output=True, text=True, timeout=120.0)
+    if built.returncode != 0:
+        raise FixtureBuildError(f"aarch64 build failed: {built.stderr.strip()}")
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                      "--source", "call:read")
+
+    # Judged on what BN recovered: the flow itself, or a frontier naming it.
+    lost = [lf for lf in result["leaves"] if lf.get("cause") == "return_value_unrecovered"]
+    assert result["reached_sinks"] or lost, result
+    if not result["reached_sinks"]:
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+        assert _run_or_check_template(shared_bn, _forward_prose(result))[0] >= 1

@@ -32,6 +32,7 @@ from ..formatters import (
 # instead of "depth" in the argparse error -- an iteration budget of 0 analyses
 # nothing, so the floor is 1.
 _iters_int = _int_at_least(1, "iterations")
+_callsite_limit_int = _int_at_least(0, "callsite limit")
 
 
 def _models_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
@@ -328,6 +329,10 @@ def _taint_backward(args: argparse.Namespace) -> int:
              arg("--all-sites", action="store_true", default=False,
                  help="With --callsites: also list the self-stub and constant-argument "
                       "inline-builtin rows that are otherwise only counted (implies --callsites)"),
+             arg("--callsite-limit", dest="callsite_limit", type=_callsite_limit_int, default=10,
+                 metavar="N",
+                 help="Text output: print at most N callsite rows per model and count the "
+                      "rest (default: 10; 0 = all). JSON always lists every row"),
              mangled_arg(),
              _models_arg(),
          ],
@@ -359,6 +364,7 @@ def _taint_models(args: argparse.Namespace) -> int:
         "taint_models",
         params,
         require_target=needs_target,
-        text_renderer=lambda value: _render_taint_models_text(value, mangled=args.mangled),
+        text_renderer=lambda value: _render_taint_models_text(
+            value, mangled=args.mangled, callsite_limit=args.callsite_limit),
         stem="taint-models",
     )

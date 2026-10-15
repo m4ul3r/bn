@@ -4726,8 +4726,49 @@ def _render_flow_line(f: dict[str, Any], *, mangled: bool = False) -> str:
     unresolved = "y" if m.get("traverses_unresolved") else "n"
     facts = f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} unresolved={unresolved}}}"
     callee = _sink_callee_text(sink, mangled=mangled) or "?"
+    if not mangled:
+        # #1041 item 6: a flow through STL code printed ~800 bytes of template
+        # arguments per line. The compact line names each function with its
+        # template arguments elided; --verbose and JSON keep the full names.
+        sig = _elide_template_args(str(sig))
+        callee = _elide_template_args(str(callee))
     head = f"[{sink.get('class') or '?'}] {callee} @ {sink.get('address')}{arg}"
     return f"  {head}   {sig}   {facts}".rstrip()
+
+
+# `operator<`, `operator<<=`, `operator->`, ... : angle brackets that open no
+# template argument list.
+_OPERATOR_ANGLES = re.compile(r"operator\s*(?:<=>|<<=|>>=|<<|>>|<=|>=|->\*|->|<|>)")
+
+
+def _elide_template_args(text: str) -> str:
+    """``std::_Hashtable<std::string, ...>::clear`` -> ``std::_Hashtable<…>::clear``.
+    Every outermost ``<...>`` collapses to ``<…>``; the angle brackets of an
+    operator name are kept. Unbalanced text is returned unchanged rather than
+    cut somewhere wrong."""
+    out: list[str] = []
+    depth = 0
+    i = 0
+    while i < len(text):
+        op = _OPERATOR_ANGLES.match(text, i)
+        if op is not None:
+            if depth == 0:
+                out.append(op.group(0))
+            i = op.end()
+            continue
+        ch = text[i]
+        if ch == "<":
+            if depth == 0:
+                out.append("<…")
+            depth += 1
+        elif ch == ">" and depth:
+            depth -= 1
+            if depth == 0:
+                out.append(">")
+        elif depth == 0:
+            out.append(ch)
+        i += 1
+    return text if depth else "".join(out)
 
 
 def _sink_callee_text(sink: dict[str, Any], *, mangled: bool = False) -> Any:
@@ -5061,7 +5102,11 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
 
 
 @_discloses
-def _render_taint_models_text(value: Any, *, mangled: bool = False) -> str:
+def _render_taint_models_text(value: Any, *, mangled: bool = False,
+                              callsite_limit: int = 0) -> str:
+    """``callsite_limit`` caps the callsite rows printed under each model (0 =
+    all): `operator new` alone listed 225 rows ahead of every other class
+    (#1041 item 6). The count line names how many were left out."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     lines: list[str] = []
@@ -5083,7 +5128,8 @@ def _render_taint_models_text(value: Any, *, mangled: bool = False) -> str:
             # them and the text dropped them, so the flag read as ignored.
             lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}"
                          f"{_callsite_count_note(s)}")
-            lines.extend(_render_callsite_rows(s, indent="    ", mangled=mangled))
+            lines.extend(_render_callsite_rows(s, indent="    ", mangled=mangled,
+                                               limit=callsite_limit))
     sbc = _field_dict(value, "sinks_by_class")
     if sbc:
         lines.append("")
@@ -5106,7 +5152,8 @@ def _render_taint_models_text(value: Any, *, mangled: bool = False) -> str:
                 if not isinstance(e, dict):
                     lines.append(f"    {e!r}")
                     continue
-                lines.extend(_render_taint_sink_entry(e, mangled=mangled))
+                lines.extend(_render_taint_sink_entry(e, mangled=mangled,
+                                                      callsite_limit=callsite_limit))
     props = _field_list(value, "propagators")
     if props:
         lines.append("")
@@ -5148,6 +5195,9 @@ def _sink_arg_spec(e: dict[str, Any]) -> str:
     if la is not None:
         ba = e.get("buf_arg")
         parts.append(f"len arg {la}" + (f" into arg {ba}" if ba is not None else ""))
+    fa = e.get("format_arg")
+    if fa is not None:
+        parts.append(f"width-less %s/%[ in format arg {fa}")
     return ", ".join(parts) if parts else "unconditional"
 
 
@@ -5155,12 +5205,16 @@ _HIDDEN_KIND_LABELS = {"self_stub": "self stub",
                        "inline_builtin": "constant-argument inline builtin"}
 
 
-def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = False) -> list[str]:
+def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = False,
+                          limit: int = 0) -> list[str]:
     """The enriched callsite rows of a present model entry (address + containing
     function + non-audit kind + one line of disassembly), then a count of the
-    non-audit rows the bridge left out (#958: `--all-sites` shows them)."""
+    non-audit rows the bridge left out (#958: `--all-sites` shows them). With a
+    ``limit``, only the first ``limit`` rows print and a line counts the rest."""
     out = []
-    for c in _field_list(e, "callsites"):
+    rows = _field_list(e, "callsites")
+    cut = rows[limit:] if limit > 0 else []
+    for c in (rows[:limit] if limit > 0 else rows):
         if not isinstance(c, dict):
             out.append(f"{indent}{c!r}")
             continue
@@ -5176,6 +5230,9 @@ def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = Fal
         # bridge older than this CLI) renders exactly the previous row.
         dis = str(c.get("disasm") or "").strip()
         out.append(f"{indent}{c.get('address')}  {fn}{tag}" + (f"  {dis}" if dis else ""))
+    if cut:
+        out.append(f"{indent}+{len(cut)} more callsite(s) not shown; --callsite-limit 0 "
+                   f"lists them all")
     hidden = _field_dict(e, "hidden_callsites")
     shown = [(k, n) for k, n in hidden.items()
              if isinstance(n, int) and not isinstance(n, bool) and n > 0]
@@ -5186,7 +5243,8 @@ def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = Fal
     return out
 
 
-def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False) -> list[str]:
+def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False,
+                             callsite_limit: int = 0) -> list[str]:
     """One present/catalog sink entry: the model line plus, under --callsites, its
     enriched callsite rows (address + containing function + non-audit kind)."""
     p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
@@ -5194,7 +5252,8 @@ def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False) -> lis
     head = (f"    {e.get('symbol', '<unknown>')} ({_sink_arg_spec(e)}){p}"
             f"{_callsite_count_note(e)}{desc}")
     out = [head]
-    out.extend(_render_callsite_rows(e, indent="      ", mangled=mangled))
+    out.extend(_render_callsite_rows(e, indent="      ", mangled=mangled,
+                                     limit=callsite_limit))
     return out
 
 

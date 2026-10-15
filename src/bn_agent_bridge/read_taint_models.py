@@ -113,6 +113,9 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
                     entry["len_arg"] = sink.get("len_arg")
                 if sink.get("buf_arg") is not None:
                     entry["buf_arg"] = sink.get("buf_arg")
+                # #1041 item 4: a format-gated sink arms on its constant format.
+                if sink.get("format_arg") is not None:
+                    entry["format_arg"] = sink.get("format_arg")
                 sinks_by_class.setdefault(cls, []).append(entry)
         # A `writes` role (`bzero`: a pointee filled from no argument) is a
         # flow role too, listed beside the propagates rules as

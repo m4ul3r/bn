@@ -9909,3 +9909,45 @@ def test_failed_import_preview_counts_reverted_siblings_and_all_kept_types_1012(
     text = _render_mutation_summary_text(summary)
     assert "reverted=1" in text
     assert "kept library imports (a rollback cannot remove them): passwd, __uid_t" in text
+
+
+# --------------------------------------------------------------------------
+# #1041 item 6: taint output volume
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("name", "elided"), [
+    ("std::_Hashtable<std::string, std::pair<std::string const, int>>::clear",
+     "std::_Hashtable<…>::clear"),
+    ("std::operator<< <std::char_traits<char> >", "std::operator<< <…>"),
+    ("cmp::operator<(cmp const&)", "cmp::operator<(cmp const&)"),
+    ("Widget::operator->()", "Widget::operator->()"),
+    ("broken<int", "broken<int"),                  # unbalanced: untouched
+])
+def test_compact_flow_line_elides_template_arguments_1041(name, elided):
+    from bn.formatters import _elide_template_args
+    assert _elide_template_args(name) == elided
+
+
+def test_compact_flow_line_keeps_full_names_under_mangled_1041():
+    from bn.formatters import _render_flow_line
+    sig = {"rendered": "call:recv → _ZN3fooIiE3barEv → [alloc_size] _Znam",
+           "rendered_display": "call:recv → foo<int>::bar() → [alloc_size] operator new[]"}
+    flow = {"sink": {"class": "alloc_size", "callee": "Znam", "address": "0x10",
+                     "tainted_arg_index": 0}, "signature": sig, "metrics": {}}
+    assert "foo<…>::bar()" in _render_flow_line(flow)
+    assert "_ZN3fooIiE3barEv" in _render_flow_line(flow, mangled=True)
+
+
+def test_taint_models_text_caps_callsite_rows_and_counts_the_rest_1041():
+    from bn.formatters import _render_taint_models_text
+    rows = [{"address": hex(0x1000 + i), "function": f"f{i}"} for i in range(25)]
+    value = {"sinks_by_class": {"alloc_size": [
+        {"symbol": "Znwm", "tainted_args": [0], "present": True,
+         "callsite_count": 25, "callsites": rows}]}}
+
+    capped = _render_taint_models_text(value, callsite_limit=10).splitlines()
+    assert sum(1 for ln in capped if ln.strip().startswith("0x")) == 10
+    assert any("+15 more callsite(s)" in ln for ln in capped)
+    every = _render_taint_models_text(value, callsite_limit=0).splitlines()
+    assert sum(1 for ln in every if ln.strip().startswith("0x")) == 25
+    assert not any("more callsite" in ln for ln in every)

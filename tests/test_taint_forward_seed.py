@@ -313,3 +313,26 @@ def test_state_that_cannot_reach_the_continuation_does_not_arm_it_932(models):
 
     assert result["reached_sinks"] == []
     assert any(a.startswith("tokenizer_state_escapes") for a in result["assumptions"])
+
+
+# --------------------------------------------------------------------------
+# #1041 item 6: each flow of a several-source run names its own source
+# --------------------------------------------------------------------------
+
+def test_each_flow_names_the_source_it_starts_from_1041(models):
+    """`f(a, b)`: `memcpy(.., .., a)` and `memcpy(.., .., b)`. Run with both
+    params as sources, each flow used to say `multiple`."""
+    a, b = FVar("a"), FVar("b")
+    a0, b0 = FSSA(a, 0), FSSA(b, 0)
+    MEMCPY = 0x901
+
+    def copy(i, addr, length):
+        return _ext_call(i, addr, f"memcpy(0x6000, 0x7000, {length.var.name}#0)", MEMCPY,
+                         [_const(0x6000), _const(0x7000), _var(length)], reads=[length])
+
+    func = FFunc("f", 0x10, FSSAFunc([copy(0, 0x10, a0), copy(1, 0x14, b0)]), params=[a, b])
+    result = te.TaintEngine(FBV({MEMCPY: "memcpy"}), models).forward(
+        func, [te.parse_locator("param:0"), te.parse_locator("param:1")])
+
+    named = {s["sink"]["address"]: s["signature"]["source"] for s in result["reached_sinks"]}
+    assert named == {"0x10": "param:0", "0x14": "param:1"}

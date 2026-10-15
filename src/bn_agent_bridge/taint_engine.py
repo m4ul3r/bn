@@ -4272,6 +4272,9 @@ class TaintEngine:
             note = f"[{via}-resolved] " + note
         prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)],
                                   callee=getattr(callee_fn, "name", None)))
+        root = self._root_source(first_hit, why)
+        if root:
+            prefix[0].setdefault("source", root)
         out["handoff_node"] = [n for i in sorted(valid) for n in tainted_args[i]]
         for f in sub["findings"]:
             rebuilt = {"sink": f["sink"], "path": prefix + f["path"]}
@@ -4612,8 +4615,15 @@ class TaintEngine:
         # local to this run, so a descended callee's run keeps its own.
         buffer_slots: dict = {}
         correlated_slots: set = set()
+        # #1041 item 6: the top run records which locator seeded each node, so
+        # a flow of a run with several --source flags names its own source
+        # instead of `multiple` (a descended callee's seeds are synthetic).
+        seed_sources: dict | None = {} if top else None
         seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption,
-                                    buffer_slots, leaves)
+                                    buffer_slots, leaves, seed_sources)
+        for _node, _locator in (seed_sources or {}).items():
+            if _node in why:
+                why[_node]["source"] = _locator
         if not seeded:
             if top:
                 raise TaintError("no taint sources resolved; check --source locator")
@@ -6298,7 +6308,10 @@ class TaintEngine:
             f"parameter {idx} not found on {self._prose_function(func)}{have}: {advice}")
 
     def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption,
-                      buffer_slots=None, leaves=None) -> bool:
+                      buffer_slots=None, leaves=None, seed_sources=None) -> bool:
+        """Seed every source locator. ``seed_sources``, when given, maps each
+        node a source seeded to that source's locator, so a flow of a
+        several-source run can name which source it starts from (#1041 item 6)."""
         if buffer_slots is None:
             buffer_slots = {}
         if leaves is None:
@@ -6311,8 +6324,19 @@ class TaintEngine:
             if leaf and leaf not in leaves:
                 leaves.append(leaf)
 
+        def recording(taint: Any, locator: str) -> Any:
+            def tag(node, label, ins, reason, parents):
+                if taint(node, label, ins, reason, parents):
+                    seed_sources.setdefault(node, locator)
+                    return True
+                return False
+            return tag
+
+        seed_node = taint_node
         seeded = False
         for src in sources:
+            if seed_sources is not None:
+                taint_node = recording(seed_node, format_locator(src))
             kind = src.get("kind")
             if kind == "param":
                 idx = int(src["index"])
@@ -6727,6 +6751,9 @@ class TaintEngine:
             last["callee"] = callee
         else:
             path.append(_instr_dict(ins, reason=reason, tainted=tainted_labels, callee=callee))
+        root = self._root_source(hit_nodes[0], why)
+        if root:
+            path[0].setdefault("source", root)
         return {
             "sink": {
                 "callee": callee,
@@ -6833,6 +6860,22 @@ class TaintEngine:
             cur = parents[0] if parents else None
         chain.reverse()
         return chain
+
+    @staticmethod
+    def _root_source(node, why) -> str | None:
+        """#1041 item 6: the --source the rendered chain of *node* starts from --
+        the locator the top run recorded on the seed node at the end of the
+        parents[0] walk `_reconstruct_path` renders. None for a root no
+        declared source seeded (a descended callee's synthetic seed)."""
+        seen = set()
+        cur = node
+        while cur is not None and cur in why and cur not in seen:
+            seen.add(cur)
+            parents = why[cur].get("parents") or []
+            if not parents:
+                return why[cur].get("source")
+            cur = parents[0]
+        return None
 
     # -- backward ---------------------------------------------------------
 
