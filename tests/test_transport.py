@@ -2545,6 +2545,64 @@ def test_missing_instance_probe_timeout_never_advises_duplicate_start(
     assert registry.read_text(encoding="utf-8") == document
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux process-state inspection")
+def test_missing_instance_stopped_bridge_never_advises_duplicate_start(
+    tmp_path, monkeypatch,
+):
+    from bn import transport
+
+    default_root = tmp_path / "default"
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(transport, "default_cache_home", lambda: default_root)
+    monkeypatch.setattr(transport, "_agent_cache_dirs_for", lambda instance_id: [])
+    registry = default_root / "instances" / "demo.json"
+    registry.parent.mkdir(parents=True)
+    socket_path = tmp_path / _PROBE_SOCK
+    bridge = subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import os, signal, socket, sys, time; "
+            "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); "
+            "sock.bind(sys.argv[1]); sock.listen(); "
+            "print('ready', flush=True); os.kill(os.getpid(), signal.SIGSTOP); "
+            "time.sleep(60)",
+            str(socket_path),
+        ],
+        stdout=subprocess.PIPE,
+    )
+    try:
+        assert bridge.stdout.readline() == b"ready\n"
+        waited_pid, status = os.waitpid(bridge.pid, os.WUNTRACED)
+        assert waited_pid == bridge.pid and os.WIFSTOPPED(status)
+        document = json.dumps({
+            "pid": bridge.pid, "instance_id": "demo",
+            "socket_path": str(socket_path), "instance_token": "hint-token",
+        })
+        registry.write_text(document, encoding="utf-8")
+
+        assert transport._registry_names_live_bridge(registry, "demo") is None
+        with pytest.raises(BridgeError) as exc:
+            choose_instance("demo")
+        message = str(exc.value)
+        assert "may be busy or stopped" in message
+        assert str(default_root) in message
+        assert "resume the bridge if stopped" in message
+        assert "timed out" not in message
+        assert "Start one with" not in message
+        assert "session start" not in message
+        assert "export BN_CACHE_DIR" not in message
+        assert registry.read_text(encoding="utf-8") == document
+        assert socket_path.exists()
+        assert transport._process_state(bridge.pid) in {"T", "t"}
+    finally:
+        if bridge.poll() is None:
+            bridge.send_signal(signal.SIGCONT)
+            bridge.terminate()
+        bridge.wait(timeout=5)
+        bridge.stdout.close()
+        socket_path.unlink(missing_ok=True)
+
+
 def test_verified_registry_hint_takes_precedence_over_busy_candidate(tmp_path, monkeypatch):
     from bn import transport
 

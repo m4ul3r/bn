@@ -3056,6 +3056,17 @@ def _target_hint_argv(args: argparse.Namespace, root: argparse.ArgumentParser) -
     return [*routing, *path, *options, *(["--"] if operands else []), *operands]
 
 
+def _target_hint_message(args: argparse.Namespace, message: str) -> str:
+    """Use the same parsed replay command for raised and per-item refusals."""
+    if tuple(getattr(args, "_command_path", ())) == ("target", "close"):
+        return message
+    argv = getattr(args, "_target_hint_argv", None)
+    if argv is None:
+        return message
+    from .target_hint import respell_for_option
+    return respell_for_option(message, argv)
+
+
 def main(argv: list[str] | None = None) -> int:
     global _MACHINE_ERROR_FORMAT
     parser = build_parser()
@@ -3084,15 +3095,13 @@ def main(argv: list[str] | None = None) -> int:
 
     _apply_sticky_defaults(args)
     hint_argv = _target_hint_argv(args, parser)
+    args._target_hint_argv = hint_argv
     args._target_hint_command = "bn " + shlex.join(hint_argv)
 
     try:
         return handler(args)
     except BridgeError as exc:
-        msg = str(exc)
-        if tuple(getattr(args, "_command_path", ())) != ("target", "close"):
-            from .target_hint import respell_for_option
-            msg = respell_for_option(msg, hint_argv)
+        msg = _target_hint_message(args, str(exc))
         if getattr(args, "_sticky_instance", False) and _looks_like_dead_bridge(msg):
             msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
         status = getattr(exc, "status", None)

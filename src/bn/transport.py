@@ -1224,8 +1224,9 @@ def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool |
     kernel's peer pid and an identity-checked protocol reply instead. This is a
     bounded, idle probe that takes no target/write lock, so discovery neither
     queues behind analysis nor keeps an otherwise idle bridge alive. A timeout
-    is unknown (None), not evidence that another bridge should be started.
-    Invalid evidence retains ordinary start advice; this lookup never deletes files.
+    or stopped process is unknown (None), not evidence that another bridge
+    should be started. Invalid evidence retains ordinary start advice; this
+    lookup never deletes files.
     """
     try:
         payload = json.loads(registry_path.read_text(encoding="utf-8"))
@@ -1260,6 +1261,8 @@ def _registry_names_live_bridge(registry_path: Path, instance_id: str) -> bool |
             require_peer_pid=True,
         )
     except (BridgeError, OSError, ValueError) as exc:
+        if isinstance(exc, BridgeUnreachableError) and str(exc).startswith("bridge_stopped:"):
+            return None
         if isinstance(exc, TimeoutError) or isinstance(exc.__cause__, TimeoutError):
             return None
         return False
@@ -1279,8 +1282,8 @@ def _instance_registered_elsewhere(instance_id: str) -> Path | _BusyRegistry | N
     when BN_CACHE_DIR is set, plus roots read from same-user process environments.
     A candidate counts only when its ``instances/<id>.json`` leads to the live
     bridge's identity-checked socket, regardless of how that bridge was launched.
-    A timed-out candidate is retained as busy/unknown unless a later candidate
-    supplies a verified reply.
+    A timed-out or stopped candidate is retained as busy/unknown unless a later
+    candidate supplies a verified reply.
     """
     try:
         current = cache_home().resolve()
@@ -1319,9 +1322,9 @@ def instance_not_found_message(instance_id: str, advice: str) -> str:
     elsewhere = _instance_registered_elsewhere(instance_id)
     if isinstance(elsewhere, _BusyRegistry):
         return (
-            f"{head} Instance {instance_id} may be busy under {elsewhere.cache_root}: "
-            "the registry probe timed out before its identity could be verified. "
-            "Wait and retry; do not start a duplicate bridge."
+            f"{head} Instance {instance_id} may be busy or stopped under {elsewhere.cache_root}: "
+            "the registry probe could not verify its identity. "
+            "Wait and retry, or resume the bridge if stopped; do not start a duplicate bridge."
         )
     if elsewhere is not None:
         return (

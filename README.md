@@ -206,8 +206,11 @@ Restart/export hints are offered only after checking the registry's live
 socket peer identity and receiving a bridge response. Process command-line
 spelling alone is not evidence that the registered socket belongs to that
 bridge; unverifiable endpoints receive no export hint. If a registry probe
-times out, the instance may be busy: wait and retry rather than starting a
-duplicate bridge. A timeout does not establish that the instance is absent.
+times out or finds a stopped bridge, the instance may be busy or stopped:
+wait and retry (or resume an intentionally stopped bridge) rather than starting
+a duplicate. Neither outcome establishes that the instance is absent.
+The same complete-command hint reconstruction applies to errors inside a
+batched decompile, not only top-level refusals.
 
 ## Output Behavior
 
