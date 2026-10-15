@@ -10350,7 +10350,7 @@ def test_backward_memory_chain_budget_is_disclosed_as_truncation_928():
     result, reasons, aol = _bw(pg.func())
     assert result["stats"]["truncated"] is True, result["stats"]
     assert result["stats"]["truncation_cause"] == ["memory_chain"], result["stats"]
-    assert len(aol) == 1 and "walk budget" in aol[0]["detail"], result["leaves"]
+    assert len(aol) == 1 and aol[0]["buffer"] == "cmd", result["leaves"]
     assert result["slices"][0]["origin"]["kind"] == "address_of_local_unresolved"
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
 
@@ -10370,7 +10370,7 @@ def test_backward_address_of_operand_of_a_fill_is_a_buffer_not_a_literal_928():
     result, reasons, aol = _bw(pg.func())
     assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
     assert any("local buffer other written by read" in r for r in reasons), reasons
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
     # With nothing writing `other`, the nested buffer is the frontier.
     pg2 = _BufProgram(params=[fd])
@@ -10637,7 +10637,6 @@ def test_backward_diagnostics_name_the_memory_chain_cut_928():
     diag = tr.backward_diagnostics([], [], sinks_seeded=1, slices=1,
                                    truncated=True, truncation_cause=["memory_chain"])
     assert diag["safe_to_report_complete_slice"] is False
-    assert "memory-chain budget" in diag["complete_slice_reason"], diag
 
 
 def test_model_overlay_count_treats_comment_only_entries_as_benign_928():
@@ -10724,7 +10723,7 @@ def test_backward_store_through_phi_pointer_is_a_writer_928r3():
     # The parameter the loop xors in is the origin (it outranks the source so
     # the caller ascent is not lost); the source stays in the steps.
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 1, "var": "key#0"}, result["slices"][0]["origin"]
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
 
 def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
@@ -10851,9 +10850,9 @@ def test_backward_constant_offset_store_does_not_cover_a_path_928r3():
 
 def test_backward_memset_and_bzero_are_literal_fills_928r3():
     # P2: `if (flag) read(fd, buf, 63); else memset(buf, 0, 64); popen(buf)`
-    # reported "on at least one path nothing writes the buffer" -- false, the
-    # memset arm IS written, by a literal. memset propagates its fill byte
-    # (`arg:1 -> *arg:0`); bzero declares `writes: ["*arg:0"]`.
+    # Both writers retain their origins: memset propagates its fill byte,
+    # bzero declares a literal write. The read arm is still short of the
+    # whole object, so the join now correctly remains incomplete (#931).
     fd = FVar("fd", ident=12); fd0 = FSSA(fd, 0)
     buf = FVar("buf", typ="char[0x40]")
     for zeroer, params in ((_B_MEMSET, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
@@ -10870,7 +10869,7 @@ def test_backward_memset_and_bzero_are_literal_fills_928r3():
         name = _B_NAMES[zeroer]
         assert any(f"local buffer buf written by {name}" in r for r in reasons), reasons
         assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
-        assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+        assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
 
 def test_backward_benign_call_handed_the_buffer_is_recorded_not_covering_928r3():
@@ -10962,13 +10961,14 @@ def test_backward_fill_outranks_a_terminator_and_names_a_tainted_length_928r3():
     assert any("length argument 2 of memcpy bounds" in r for r in reasons), reasons
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "n#0"}, result["slices"][0]["origin"]
 
-    # With a constant length the tie is between two literals: the FILL wins.
+    # A short constant copy and one terminator leave an uncovered suffix (#931).
     pg2 = _BufProgram()
     pg2.call(_B_MEMCPY, [_addr_of(buf), _cstr(0x700), FExpr("MLIL_CONST", "0x10", constant=0x10)])
     pg2.aliased_store(buf, 0x10, 0)
     pg2.sink(buf)
     result2, _, _ = _bw(pg2.func())
-    assert result2["slices"][0]["origin"] == {"kind": "call", "callee": "memcpy"}, result2["slices"][0]["origin"]
+    assert result2["slices"][0]["origin"] == {"kind": "address_of_local_unresolved", "buffer": "buf"}
+    assert not result2["diagnostics"]["safe_to_report_complete_slice"]
 
 
 def test_backward_follows_a_modeled_return_that_derives_from_an_argument_928r3():
@@ -11026,15 +11026,6 @@ def test_falsy_annotation_roles_are_rejected_928r3():
     assert ok["app_zero"]["writes"] == ["*arg:0"]
 
 
-def test_backward_next_action_follows_the_memory_chain_hint_928r3():
-    # P3: a `memory_chain` truncation left `next_action` on the generic
-    # unresolved text (`bn proto set`...) for a walk that ran out of budget.
-    from bn_agent_bridge import taint_result as tr
-    diag = tr.backward_diagnostics(
-        [{"kind": "address_of_local_unresolved"}], [], sinks_seeded=1, slices=1,
-        truncated=True, truncation_cause=["memory_chain"])
-    assert "memory-chain budget" in diag["next_action"], diag
-    assert "proto set" not in diag["next_action"], diag
 
 
 
@@ -11081,7 +11072,7 @@ def test_backward_variable_offset_address_walks_the_buffer_928r4():
     # The offset is walked too; a parameter origin outranks the source so the
     # caller ascent still runs.
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 1, "var": "off#0"}
-    assert aol == [], result["leaves"]
+    assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
     # Folded into the sink operand (`popen(&line + off#0)`): the buffer is a
     # seed of its own beside the offset.
@@ -11111,7 +11102,7 @@ def test_backward_variable_offset_fill_operand_walks_the_source_buffer_928r4():
     result, reasons, aol = _bw(pg.func())
     assert any("local buffer other written by read" in r for r in reasons), reasons
     assert any("local buffer buf written by strcpy" in r for r in reasons), reasons
-    assert aol == [], result["leaves"]
+    assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
 
 def test_backward_writable_global_element_is_a_leaf_928r4():

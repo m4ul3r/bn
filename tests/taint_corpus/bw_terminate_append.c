@@ -5,7 +5,7 @@
  * input -- is not dropped and the later literal append cannot pose as a
  * complete origin. Built at -O1 (FORTIFY `_chk` callees), the shape a reviewer
  * reproduced; the slice must bottom out at the parameter (no caller: `main`
- * does not call it) / the `read` source, with no unresolved leaf. */
+ * does not call it) / the `read` source, retaining short-fill uncertainty. */
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>

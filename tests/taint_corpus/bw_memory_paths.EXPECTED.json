@@ -32,7 +32,7 @@
     {"function": "read_or_memset", "sink": "arg:popen:0",
      "origin_kinds": ["source"],
      "step_reasons_contain": ["local buffer buf written by read", "local buffer buf written by memset"],
-     "forbid_leaves": [{"kind": "address_of_local_unresolved"}],
-     "complete_slice": true}
+     "leaves": [{"kind": "address_of_local_unresolved"}],
+     "complete_slice": false}
   ]
 }

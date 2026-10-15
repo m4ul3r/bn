@@ -6,7 +6,7 @@
  * the stashed pointer back (`strcpy(g_stash, host)`), which is a fill of the
  * buffer, not a call to trust to its model; a 1-byte terminator after a
  * conditional fill does not cover the bare arm; a memset arm is a literal
- * fill, so `if (f) read(); else memset();` IS covered on both paths. */
+ * fill, but a short read on the other arm does not prove whole-object coverage. */
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -64,7 +64,7 @@ void read_or_memset(int fd, int flag) {
     else
         memset(buf, 0, sizeof buf);          /* a literal fill: this arm IS written */
     buf[63] = 0;
-    popen(buf, "r");                         /* SINK: covered on both arms */
+    popen(buf, "r");                         /* SINK: short read arm remains uncertain */
 }
 
 int main(int argc, char **argv) {
