@@ -1806,14 +1806,15 @@ class TaintEngine:
         return int(m.group(1), 0) if m else None
 
     def _ptr_aliases_local(self, ssaf: Any, expr: Any, base_key: Any, *,
-                           escaped: bool, escape_addrs: set, visited: set | None = None,
+                           escaped: bool, escape_addrs: dict[int, frozenset[int]],
+                           visited: set | None = None,
                            depth: int = 0) -> str:
         """Does the pointer *expr* point INTO local buffer *base_key*?
         ``"yes"`` when it is provably built on ``&base`` (a constant or
         non-constant offset, through SSA copies, every arm of a ``VAR_PHI``,
         the return of a modeled call that derives it from ``&base``, or a
-        reload of the slot ``&base`` escaped into); ``"no"`` when it provably
-        is not (another local's address, a constant, a parameter / loaded /
+        reload of a slot reached by an escape at that LOAD's memory epoch);
+        ``"no"`` when it provably is not (another local's address, a constant, a parameter / loaded /
         callee-returned pointer while ``&base`` has NOT escaped -- a stack
         address that was never stored can only be reached through ``&base``);
         ``"maybe"`` otherwise -- a loaded or parameter pointer after the
@@ -1832,7 +1833,8 @@ class TaintEngine:
             a = getattr(expr, "src", None)
             if a is not None and "CONST_PTR" in op_name(a):
                 c = self._int_const(a)
-                if c is not None and c in escape_addrs:
+                if c is not None and c in escape_addrs.get(
+                        getattr(expr, "src_memory", None), frozenset()):
                     return "yes"
             return "maybe" if escaped else "no"
         if "CONST" in op or "EXTERN_PTR" in op or "IMPORT" in op:
@@ -1973,9 +1975,10 @@ class TaintEngine:
         (round 4 P2): a writer covers a path only when its pointer is a
         MUST-alias of ``&base + 0`` (``_must_offset`` -- every phi arm
         resolves to this base at offset 0). The current classifier accepts
-        a modeled fill / source / ``writes`` call unless a constant length
-        is zero or smaller than the recovered object. This remains a model
-        classification, not a consumed-region initialization proof (#931).
+        a modeled fill / source / ``writes`` call unless a guarded constant
+        length (selected from its sink metadata) is zero or smaller than the
+        recovered object. Source-only models without that metadata are not
+        guarded. This is not a consumed-region initialization proof (#931).
         It also accepts an unmodeled call handed
         ``&base`` itself (its opaque leaf already blocks), a whole-variable
         ``SET_VAR_ALIASED`` or a store at least the variable's width. An
@@ -1997,9 +2000,9 @@ class TaintEngine:
         # ever published. Coverage descends from top, escape ascends from bottom.
         memo: dict[int, tuple[bool, bool]] = {}
         truncated = False
-        # Constant addresses `&buf` was stored to: a later reload of one of
-        # them IS the buffer (`g_stash = buf; strcpy(g_stash, host)`).
-        escape_addrs: set[int] = set()
+        # Reaching stash slots at EACH memory epoch, not a function-wide union:
+        # a future `stash = &buf` must not reclassify an earlier LOAD of stash.
+        escape_addrs: dict[int, frozenset[int]] = {}
 
         def _alias(expr: Any, escaped: bool) -> str:
             return self._ptr_aliases_local(ssaf, expr, base_key, escaped=escaped,
@@ -2089,11 +2092,22 @@ class TaintEngine:
             len_idxs = [i for i in len_idxs if i < len(params) and i not in from_idxs]
             # First-step extent guard (#931), not a proven-write-extent model:
             # a requested I/O length still need not be the actual write length.
+            count_scale: int | None = 1
+            if mkey in ("wmemcpy", "wmemmove", "wmemcpy_chk", "wmemmove_chk"):
+                # These models count wchar_t elements, not bytes. Use the
+                # callee's recovered destination pointee width, never a host
+                # wchar_t assumption (it differs across target ABIs).
+                callee_fn = function_at(self.bv, const_target(getattr(defn, "dest", None)))
+                callee_params = list(getattr(callee_fn, "parameter_vars", []) or [])
+                dest_type = getattr(callee_params[0], "type", None) if callee_params else None
+                width = getattr(getattr(dest_type, "target", None), "width", None)
+                count_scale = int(width) if width is not None and int(width) > 0 else None
             short_fill = any(
                 op_name(params[i]) in ("MLIL_CONST", "MLIL_CONST_PTR")
                 and (int(getattr(params[i], "constant", 0)) <= 0
-                     or base_size is None
-                     or int(getattr(params[i], "constant", 0)) < base_size)
+                     or (count_scale is not None
+                         and (base_size is None or
+                              int(getattr(params[i], "constant", 0)) * count_scale < base_size)))
                 for i in len_idxs)
             writers.append(("fill", defn, mkey or name, params, from_idxs, is_source, len_idxs))
             # A fill at a constant offset (`strcpy(buf + 60, "x")`) or through
@@ -2140,17 +2154,20 @@ class TaintEngine:
                 truncated = True
             graph[v] = (defn, deps)
             memo[v] = (True, False)
+            escape_addrs[v] = frozenset()
             pending.extend(deps)
 
-        def transfer(v: int) -> tuple[bool, bool]:
+        def transfer(v: int) -> tuple[bool, bool, frozenset[int]]:
             defn, deps = graph[v]
             if defn is None:
-                res = (False, False)
+                res = (False, False, frozenset())
             elif "MEM_PHI" in op_name(defn):
                 arms = [memo.get(s, (False, False)) for s in deps]
-                res = (bool(arms) and all(c for c, _ in arms), any(e for _, e in arms))
+                res = (bool(arms) and all(c for c, _ in arms), any(e for _, e in arms),
+                       frozenset().union(*(escape_addrs.get(s, frozenset()) for s in deps)))
             else:
                 cov, esc = memo.get(deps[0], (False, False))
+                addrs = escape_addrs.get(deps[0], frozenset())
                 op = op_name(defn)
                 if "STORE" in op or op in _NAMED_STORE_OPS:
                     slot = self._field_store_slot(ssaf, defn)
@@ -2191,10 +2208,10 @@ class TaintEngine:
                         if "STORE" in op:
                             c = self._const_ptr_addr(ssaf, getattr(defn, "dest", None))
                             if c is not None:
-                                escape_addrs.add(int(c))
+                                addrs = addrs | {int(c)}
                 elif self._is_call(defn):
                     cov = _call_writer(defn, esc) or cov
-                res = (cov, esc)
+                res = (cov, esc, addrs)
             return res
 
         # Solve escape and remembered escape slots first. Writer classification
@@ -2202,26 +2219,31 @@ class TaintEngine:
         for escape_phase in (True, False):
             while True:
                 changed = False
-                before_addrs = len(escape_addrs)
                 for v in reversed(graph):
                     work += 1
                     if work > MEM_CHAIN_BUDGET:
                         truncated = True
                         break
-                    cov, esc = transfer(v)
+                    cov, esc, addrs = transfer(v)
                     old_cov, old_esc = memo[v]
                     new = ((old_cov, old_esc or esc) if escape_phase
                            else (old_cov and cov, old_esc))
-                    changed |= new != memo[v]
+                    new_addrs = escape_addrs[v] | addrs
+                    changed |= new != memo[v] or new_addrs != escape_addrs[v]
                     memo[v] = new
+                    escape_addrs[v] = new_addrs
                 writers.clear()
-                changed |= len(escape_addrs) != before_addrs
                 if truncated or not changed:
                     break
             if truncated:
                 break
+        # One bounded frontier-collection pass also carries already-discovered
+        # escape facts forward when the proof allowance was exhausted. It cannot
+        # certify coverage, but must retain a nearby known escaped-call leaf.
         for v in reversed(graph):
-            transfer(v)
+            cov, esc, addrs = transfer(v)
+            memo[v] = (memo[v][0] and cov, memo[v][1] or esc)
+            escape_addrs[v] = escape_addrs[v] | addrs
         covered = not truncated and memo.get(int(mv), (False, False))[0]
         writers.reverse()
         return {"writers": writers, "covered": covered, "truncated": truncated}
@@ -6944,18 +6966,19 @@ class TaintEngine:
                 _set_origin({"kind": "address_of_local_unresolved",
                              "buffer": label, "callee": opaque[0]})
             if res["truncated"]:
-                # Writers behind the cut are absent: the same contract as the
-                # caller-site cap (#810) -- stats say truncated, a blocking
-                # leaf says where, and the gate withholds.
+                # Discovery or fixed-point proof work was cut. Known writer
+                # rows remain visible, but missing writers or an unfinished
+                # solve prevent a complete-slice claim.
                 self._bw_truncated = True
                 self._bw_truncation_causes.add("memory_chain")
                 _buffer_leaf(
                     defn, label,
-                    f"the memory-SSA chain from the sink back through the writers "
-                    f"of local buffer {label} exceeded the walk budget "
-                    f"({MEM_CHAIN_BUDGET} versions); writers before the cut are "
-                    "missing and the slice is NOT complete -- seed closer to the "
-                    "sink or inspect the earlier writes to the buffer")
+                    f"the memory-SSA proof for local buffer {label} exhausted "
+                    f"the shared allowance ({MEM_CHAIN_BUDGET} work units across "
+                    "graph discovery and fixed-point sweeps); earlier writers may "
+                    "be missing or the coverage/escape solve may be unfinished, "
+                    "so the slice is NOT complete -- seed closer to the sink or "
+                    "inspect the writes and unresolved calls")
                 _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
             elif not res["covered"]:
                 benign = [w[2] for w in res["writers"] if w[0] == "benign"]
