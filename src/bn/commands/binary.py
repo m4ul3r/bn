@@ -259,7 +259,7 @@ def _close(args: argparse.Namespace) -> int:
                     raise BridgeError(
                         f"{exc}\nnote: `active` follows the GUI selection, "
                         "which is not honored for close: pass a concrete "
-                        "selector from the list above (`bn close --all` closes "
+                        f"selector from the list above (`bn {_routing(args)}close --all` closes "
                         "every open target, including GUI tabs bn did not load)."
                     ) from None
                 raise BridgeError(
@@ -299,17 +299,22 @@ def _close_hint_in_run_form(args: argparse.Namespace, exc: BridgeError) -> Bridg
         return exc
     command = (f"{_target_close_prefix(args)} {positional_selector(selector)}"
                if getattr(args, "_close_spelling", None) == "target close"
-               else f"bn {_routing(args)}close {target_option(selector)}")
+               else f"{getattr(args, '_target_hint_command', f'bn {_routing(args)}close')} "
+                    f"{target_option(selector)}")
     return BridgeError(f"{head}close it with `{command}`.")
 
 
 def _routing(args: argparse.Namespace) -> str:
     instance = getattr(args, "instance", None)
-    return f"-i {shlex.quote(str(instance))} " if instance else ""
+    if not instance:
+        return ""
+    value = str(instance)
+    return (f"--instance={shlex.quote(value)} " if value.startswith("-")
+            else f"-i {shlex.quote(value)} ")
 
 
 def _target_close_prefix(args: argparse.Namespace) -> str:
-    return f"bn {_routing(args)}target close"
+    return getattr(args, "_target_hint_command", f"bn {_routing(args)}target close")
 
 
 @command("target", "close", help="Close one open target by selector", fmt="text",

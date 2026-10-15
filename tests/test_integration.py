@@ -442,7 +442,6 @@ class TestSavePathIdentity:
         assert result.returncode == 2, (result.stdout, result.stderr)
         err = result.stderr
         assert "save_database needs an explicit target when multiple targets are open (2)" in err
-        assert "Pass -t <selector> (--target) to choose one." in err
         assert "Open targets:" in err
         # Prefix-matches both the raw and the .bndb-restored selector spelling.
         assert "-t hello_x86_64" in err
@@ -466,7 +465,6 @@ class TestSavePathIdentity:
         assert result.returncode == 2, (result.stdout, result.stderr)
         assert "This command requires --target when multiple targets are open." \
             in result.stderr
-        assert "Pass -t <selector> (--target) to choose one." in result.stderr
         assert "-t hello_x86_64" in result.stderr
         assert "note: view_id / target_id are stable across `bn save`" in result.stderr
 

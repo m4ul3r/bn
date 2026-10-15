@@ -37,7 +37,11 @@ LISTED_SELECTOR_LEAD = "close it by its listed selector instead: "
 def _escape_controls(text: str) -> str:
     """*text* on one line: backslash, newline and carriage return escaped, so a
     crafted file name cannot start a line of its own in a listing."""
-    return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+    return "".join(
+        f"\\x{ord(char):02x}" if ord(char) < 32 or 127 <= ord(char) < 160
+        else "\\\\" if char == "\\" else char
+        for char in text
+    )
 
 
 def target_option(selector: str) -> str:
@@ -58,11 +62,14 @@ def positional_selector(selector: str) -> str:
 def target_row(target: dict[str, Any]) -> str:
     """One listing row, indent and active marker included."""
     marker = "*" if target.get("active") else " "
+    selector = str(target.get("selector", ""))
+    if any(ord(char) < 32 or 127 <= ord(char) < 160 for char in selector):
+        selector = str(target.get("target_id") or selector)
     return (
-        f"  {marker} {target_option(str(target.get('selector', '')))}"
+        f"  {marker} {target_option(selector)}"
         f"  view_id={target.get('view_id', '')}"
         f"  target_id={target.get('target_id', '')}"
-        f"  {_escape_controls(str(target.get('filename', '')))}"
+        f"  {shlex.quote(_escape_controls(str(target.get('filename', ''))))}"
     )
 
 
@@ -115,27 +122,35 @@ def _parse_row(text: str) -> tuple[bool, str, str] | None:
 
 
 def respell_for_positional(message: str, command: str) -> str:
-    """Rewrite a refusal's `-t` rows and instruction line for a command whose
-    selector is POSITIONAL (`bn target close <sel>`), where `-t` is rejected.
+    return _respell_rows(message, lambda selector: f"{command} {positional_selector(selector)}",
+                         f"{command} <selector>")
 
-    The bridge and the CLI both render this module's grammar, whatever command
-    the selector will go to; only the CLI knows that command. *command* is the
-    full prefix to print, e.g. ``bn -i demo target close`` (#996 re-dogfood).
 
-    Each row becomes ONE complete, shell-safe command: the selector quoted (and
-    after `--` when it starts with `-`), the active marker and the metadata
-    after a `#` comment with control characters escaped, so a whole pasted
-    line runs exactly that command and nothing else (#996 re-check). Rows are
-    parsed by their grammar, so a line inside a selector that contains a
-    newline is never mistaken for a row of its own.
-    """
-    lines = message.split("\n")
+def respell_for_option(message: str, argv: list[str]) -> str:
+    """Render canonical parsed arguments, which contain no target selector."""
+    command = shlex.join(argv)
+    return _respell_rows(
+        message, lambda selector: f"bn {target_option(selector)} {command}",
+        "bn -t <selector> " + command,
+    )
+
+
+def _respell_rows(message: str, render: Callable[[str], str], example: str) -> str:
+    """Render only grammar-valid listing rows, never row-shaped error prose."""
+    # Only the final, complete listing is trusted. A typed selector in the
+    # headline may itself contain row-shaped text or an entire fake listing.
+    headings = ("\n" + OPEN_TARGETS_HEADING + "\n", "\nMatching targets:\n")
+    heading = max(message.rfind(value) for value in headings)
+    if heading < 0:
+        return message
+    prefix, listing = message[:heading + 1], message[heading + 1:]
+    lines = listing.split("\n")
     out: list[str] = []
     index = 0
     while index < len(lines):
         line = lines[index]
         if line == SELECT_HINT_LINE:
-            out.append(f"Run one of these to choose: {command} <selector>")
+            out.append(f"Run one of these to choose: {example}")
             index += 1
             continue
         parsed = None
@@ -155,6 +170,7 @@ def respell_for_positional(message: str, command: str) -> str:
         # The metadata is one line by construction: `target_row` escapes the
         # file name, and the parse stops at the end of the quoted selector.
         note = ("active  " if active else "") + metadata
-        out.append(f"  {command} {positional_selector(selector)}  # {note}")
+        out.append(f"  {render(selector)}  # {note}")
         index = end + 1
-    return "\n".join(out)
+    instruction = f"Run one of these to choose: {example}"
+    return prefix.replace(SELECT_HINT_LINE, instruction) + "\n".join(out)

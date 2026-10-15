@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Callable
 
+from .. import cli
 from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, _refuse_count_only_slices, arg, command, demangle_compat_arg, mangled_arg, mutex, mutation_output_args, preview_arg, read_text_input
 from ..formatters import (
     disclosure_boundary,
@@ -372,6 +373,7 @@ def _decompile_many(
                 # appears in a trailing tally reads as if that function had
                 # been skipped rather than attempted.
                 reason = _text_value(row, "error") or "did not resolve"
+                reason = cli._target_hint_message(args, reason)
                 chunks.append(f"===== {name} =====\nerror: {reason}")
         # Stated, not derived from len(chunks): the tally is a headline a
         # caller acts on, so an unreadable counter must print `?` rather than

@@ -197,6 +197,50 @@ bn decompile update_player_movement_flags --target SnailMail_unwrapped.exe.bndb
 
 Omitting `--target` only works when exactly one target is open. If multiple targets are open, the CLI rejects the command instead of silently falling back to `active`.
 
+For top-level refusals, `close` and `target close`, and batched decompile
+**text** errors, target rows are complete, shell-safe commands retaining the
+invoked command's operands and options. Paste the whole command; trailing
+metadata is a shell comment. A selector containing terminal control characters
+is replaced in the listing command by its exact `target_id`.
+
+**Remaining limitation (split into a follow-up):** fan-out per-instance errors
+and structured JSON/ndjson batch error messages still carry raw `-t` fragment
+rows, as on base. They are **not runnable commands**; do not paste them as such.
+Their filename metadata is now shell-quoted by the shared row renderer, but
+this does not reconstruct those deferred error paths into commands.
+
+The bridge prefers a raw view over its `.bndb`-stripped database alias only
+when this bridge recorded their save pairing and the database still has the
+recorded file identity and verified-source status permits pairing. Replacing
+the database invalidates that pairing; an ambiguity refusal explains the
+observed file-identity change rather than assuming the database's contents.
+An unrelated raw view opened with `load --no-bndb` has no such recorded save
+pairing. If no filename or path suffix uniquely identifies it, the load note
+explains why its selector is the full `target_id`; target rows expose the same
+explanation as `selector_reason`.
+
+Pairing uses filesystem identity (device, inode, size and modification time),
+not a database-content comparison. A same-size in-place overwrite that preserves
+that identity can leave the pairing intact; do not treat pairing as proof of
+unchanged database contents.
+
+Close requests that pin a listed `target_id` require a bridge supporting
+`pinned_target`. Older bridges silently ignore that flag and therefore do not
+provide its identity-only protection against a view being replaced between
+listing and closing. Restart or update the bridge before relying on pinned
+close behavior. Current bridges reject a pinned `active` selector even when
+only one target is open.
+
+Restart/export hints are offered only after checking the registry's live
+socket peer identity and receiving a bridge response. Process command-line
+spelling alone is not evidence that the registered socket belongs to that
+bridge; unverifiable endpoints receive no export hint. If a registry probe
+times out or finds a stopped bridge, the instance may be busy or stopped:
+wait and retry (or resume an intentionally stopped bridge) rather than starting
+a duplicate. Neither outcome establishes that the instance is absent.
+Complete-command reconstruction is limited to the top-level, close/target-close
+and batched-decompile text paths described above.
+
 ## Output Behavior
 
 Every command supports:

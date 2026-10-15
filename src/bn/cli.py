@@ -3058,6 +3058,68 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
                     "`bn target list`")
 
 
+def _target_hint_argv(args: argparse.Namespace, root: argparse.ArgumentParser) -> list[str]:
+    """Serialize argparse's result, not argv spelling or option-arity guesses."""
+    selected = getattr(args, "_parser", root)
+    path = tuple(args._command_path)
+    options: list[str] = []
+    operands: list[str] = []
+    seen: set[str] = set()
+    # Leaf actions own defaults and aliases; root actions supply global-only flags.
+    for action in [*selected._actions, *root._actions]:
+        dest = action.dest
+        if (dest in seen or dest in ("target", "instance")
+                or isinstance(action, (argparse._SubParsersAction, argparse._HelpAction))
+                or not hasattr(args, dest)):
+            continue
+        if (path == ("close",) and dest == "path"
+                or path == ("target", "close") and dest == "selector"):
+            continue
+        value = getattr(args, dest)
+        if value is None or value == argparse.SUPPRESS:
+            continue
+        if not action.option_strings:
+            operands.extend(str(item) for item in (value if isinstance(value, list) else [value]))
+            seen.add(dest)
+            continue
+        if dest == "format":
+            if not getattr(args, "_format_explicit", False):
+                continue
+        elif value == action.default:
+            continue
+        flag = next((flag for flag in action.option_strings if flag.startswith("--")),
+                    action.option_strings[0])
+        if action.nargs == 0:
+            if value != getattr(action, "const", None):
+                continue
+            options.append(flag)
+        else:
+            values = value if isinstance(action, argparse._AppendAction) else [value]
+            for item in values:
+                if isinstance(item, tuple) and action.type is _parse_line_range:
+                    options.append(f"{flag}={item[0]}:{item[1]}")
+                elif isinstance(item, list):
+                    options.extend([flag, *(str(part) for part in item)])
+                else:
+                    options.append(f"{flag}={item}")
+        seen.add(dest)
+    instance = getattr(args, "instance", None)
+    routing = ([] if instance is None else
+               [f"--instance={instance}"] if str(instance).startswith("-") else ["-i", str(instance)])
+    return [*routing, *path, *options, *(["--"] if operands else []), *operands]
+
+
+def _target_hint_message(args: argparse.Namespace, message: str) -> str:
+    """Use the same parsed replay command for raised and per-item refusals."""
+    if tuple(getattr(args, "_command_path", ())) == ("target", "close"):
+        return message
+    argv = getattr(args, "_target_hint_argv", None)
+    if argv is None:
+        return message
+    from .target_hint import respell_for_option
+    return respell_for_option(message, argv)
+
+
 def main(argv: list[str] | None = None) -> int:
     global _MACHINE_ERROR_FORMAT
     parser = build_parser()
@@ -3085,11 +3147,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     _apply_sticky_defaults(args)
+    hint_argv = _target_hint_argv(args, parser)
+    args._target_hint_argv = hint_argv
+    args._target_hint_command = "bn " + shlex.join(hint_argv)
 
     try:
         return handler(args)
     except BridgeError as exc:
-        msg = str(exc)
+        msg = _target_hint_message(args, str(exc))
         if getattr(args, "_sticky_instance", False) and _looks_like_dead_bridge(msg):
             msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
         status = getattr(exc, "status", None)

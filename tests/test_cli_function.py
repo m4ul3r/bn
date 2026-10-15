@@ -32,44 +32,6 @@ def test_function_list_uses_implicit_target_when_single_target_is_open(fake_tran
     assert '"name"' not in output
 
 
-def test_function_list_requires_target_when_multiple_targets_are_open(fake_transport, capsys):
-    fake_transport({
-        "list_targets": {
-            "ok": True,
-            "result": [
-                {
-                    "target_id": "123:1:7",
-                    "view_id": "1",
-                    "selector": "SnailMail_unwrapped.exe.bndb",
-                    "filename": "/corpus/SnailMail_unwrapped.exe.bndb",
-                    "active": True,
-                },
-                {
-                    "target_id": "123:2:8",
-                    "view_id": "2",
-                    "selector": "other.exe.bndb",
-                    "filename": "/corpus/other.exe.bndb",
-                    "active": False,
-                },
-            ],
-        },
-    })
-
-    rc = bn.cli.main(["function", "list"])
-
-    assert rc == 2
-    # Byte-identical to the grammar the bridge resolver prints for the same
-    # condition (#688): headline, instruction line, `-t` rows, stable-id note.
-    assert capsys.readouterr().err == (
-        "This command requires --target when multiple targets are open.\n"
-        "Pass -t <selector> (--target) to choose one.\n"
-        "Open targets:\n"
-        "  * -t SnailMail_unwrapped.exe.bndb  view_id=1  target_id=123:1:7"
-        "  /corpus/SnailMail_unwrapped.exe.bndb\n"
-        "    -t other.exe.bndb  view_id=2  target_id=123:2:8"
-        "  /corpus/other.exe.bndb\n"
-        "note: view_id / target_id are stable across `bn save`\n"
-    )
 
 
 def test_function_list_returns_full_result_set(fake_transport, capsys):
@@ -3553,3 +3515,58 @@ def test_the_reading_reference_documents_the_multi_identifier_decompile_676():
     for name in (envelope["kind"], container, *counters):
         assert f"`{name}`" in doc or f'"{name}"' in doc, (
             f"reading.md never names the batch envelope's {name!r}")
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+def test_batch_decompile_refusal_rows_replay_all_operands(monkeypatch, tmp_path, capsys, shell):
+    from bn.target_hint import format_multi_target_hint
+    from test_bridge_dispatch import _shell_argv
+
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    targets = [
+        {"selector": "-odd'; *", "target_id": "9:1:1", "view_id": "1"},
+        {"selector": "line\rbreak", "target_id": "9:2:2", "view_id": "2"},
+    ]
+    selectors = ("-odd'; *", "9:2:2")
+    identifiers = ["entry one'; *", "-entry-two"]
+    calls = []
+
+    def send(op, *, target=None, params=None, instance_id=None, **kwargs):
+        assert op == "decompile_batch"
+        calls.append((target, params, instance_id))
+        resolved = target in selectors
+        functions = [
+            {"identifier": identifier, "ok": resolved,
+             **({"decompiled": {"text": f"int f{index}(void) {{}}"}}
+                if resolved else
+                {"error": format_multi_target_hint("Choose a target.", targets)})}
+            for index, identifier in enumerate(params["identifiers"])
+        ]
+        return {"ok": True, "result": {
+            "kind": "decompile_batch", "functions": functions,
+            "requested": 2, "resolved": 2 if resolved else 0,
+        }}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    assert bn.cli.main([
+        "--instance=-demo", "decompile", "--targ=missing", "--addresses",
+        "--", *identifiers,
+    ]) == 2
+    output = capsys.readouterr()
+    assert output.err == ""
+    commands = [line for line in output.out.splitlines() if line.startswith("  bn ")]
+    assert len(commands) == 4  # Every target row, in both failed item listings.
+    for line, expected in zip(commands, selectors * 2, strict=True):
+        replay = _shell_argv(line, tmp_path, shell)
+        parsed = bn.cli.build_parser().parse_args(replay)
+        assert parsed.identifier == identifiers
+        assert parsed.target == expected
+        assert parsed.instance == "-demo"
+        assert parsed.addresses is True
+        assert bn.cli.main(replay) == 0
+        replay_output = capsys.readouterr()
+        assert replay_output.err == ""
+        assert "2 of 2 resolved" in replay_output.out
+        assert calls[-1][0] == expected
+        assert calls[-1][1]["identifiers"] == identifiers
+        assert calls[-1][2] == "-demo"

@@ -1752,6 +1752,49 @@ def test_load_binary_no_bndb_opt_out(monkeypatch, tmp_path):
     bridge._headless_views.clear()
 
 
+def test_load_no_bndb_explains_target_id_selector(monkeypatch, tmp_path):
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    monkeypatch.setattr(
+        instance.targets, "refresh",
+        types.MethodType(bridge.TargetManager.refresh, instance.targets),
+    )
+    raw = tmp_path / "hello"
+    raw.write_bytes(b"raw")
+    db = _FakeFileBV(str(raw) + ".bndb", session_id="database")
+    _register_views(bridge, db)
+    try:
+        result = instance._load_binary(str(raw), prefer_bndb=False)
+        target = result["target"]
+        assert loaded_paths == [str(raw)]
+        assert target["selector"] == target["target_id"]
+        assert "No filename or path suffix uniquely selects" in target["selector_reason"]
+        assert any(target["target_id"] in note and "full target_id" in note
+                   for note in result["notes"])
+    finally:
+        bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("target", ["active", " active ", "", None])
+def test_pinned_close_refuses_non_identity_without_closing(monkeypatch, target):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    sole = _FakeFileBV("/samples/hello", session_id="1")
+    _register_views(bridge, sole)
+    calls = []
+    monkeypatch.setattr(instance, "_close_binary", lambda *args: calls.append(args))
+    try:
+        result = instance.dispatch({
+            "op": "close_binary", "params": {"pinned_target": True},
+            "target": target,
+        })
+        assert result["ok"] is False
+        assert "pinned_target needs a target_id selector" in result["error"]
+        assert calls == []
+        assert bridge._headless_views == [sole]
+    finally:
+        bridge._headless_views.clear()
+
+
 def test_load_binary_no_sibling(monkeypatch, tmp_path):
     bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
     raw = tmp_path / "foo.so"
@@ -3351,6 +3394,8 @@ def test_selector_falls_back_to_target_id_for_identical_paths(monkeypatch):
     assert targets[0]["selector"] == targets[0]["target_id"]
     assert targets[1]["selector"] == targets[1]["target_id"]
     assert targets[0]["selector"] != targets[1]["selector"]
+    assert all("No filename or path suffix uniquely selects" in row["selector_reason"]
+               for row in targets)
     bridge._headless_views.clear()
 
 
@@ -3601,7 +3646,7 @@ def test_saved_database_keeps_the_raw_views_selector_996(monkeypatch, tmp_path):
 
         # The database view loaded as UNVERIFIED against its raw bytes: no pair.
         bridge._source_verified["2"] = False
-        with pytest.raises(Exception, match="mbiguous"):
+        with pytest.raises(RuntimeError, match="without verified raw-source content"):
             manager.resolve("foo")
         bridge._source_verified.pop("2")
         assert manager.resolve("foo") is raw
@@ -3610,8 +3655,9 @@ def test_saved_database_keeps_the_raw_views_selector_996(monkeypatch, tmp_path):
         replacement = tmp_path / "other.bndb"
         replacement.write_bytes(b"another binary's database")
         os.replace(replacement, db_path)
-        with pytest.raises(Exception, match="mbiguous"):
+        with pytest.raises(RuntimeError, match="identity recorded at save") as exc:
             manager.resolve("foo")
+        assert "save pairing" in str(exc.value)
         assert manager.refresh()[0]["selector"] != "foo"
 
         # A later save through this bridge re-pairs with what it wrote.
@@ -7927,8 +7973,8 @@ def test_the_degraded_rehomed_save_also_discloses_a_collision_857(monkeypatch, t
 # --- #996 re-dogfood: every printed close suggestion runs as printed ---------
 
 
-def _shell_argv(line: str, tmp_path: Path) -> list[str]:
-    """Run *line* through a real `sh -c` with a recording stub `bn` on PATH and
+def _shell_argv(line: str, tmp_path: Path, shell: str = "sh") -> list[str]:
+    """Run *line* through a real shell with a recording stub `bn` on PATH and
     return the argv `bn` received. The cwd holds an executable named `aaa` and
     `.` is on PATH, so an unquoted glob (`*`) or a `;` in a pasted line would
     run something else and the stub would not see the command it should."""
@@ -7946,32 +7992,23 @@ def _shell_argv(line: str, tmp_path: Path) -> list[str]:
         (glob_dir / "aaa").chmod(0o755)
     record.unlink(missing_ok=True)
     env = dict(os.environ, PATH=f"{stub_dir}:.:{os.environ.get('PATH', '')}")
-    done = subprocess.run(["sh", "-c", line], cwd=glob_dir, env=env,
+    done = subprocess.run([shell, "-c", line], cwd=glob_dir, env=env,
                           capture_output=True, text=True, timeout=10)
     assert done.returncode == 0 and record.exists(), (line, done.stderr)
     return [part for part in record.read_bytes().decode().split("\0")][:-1]
 
 
-def _close_suggestions(err: str, routing: str = "") -> list[tuple[str, str | None]]:
-    """The shell lines a close refusal hands over, with the filename each row
-    says it closes (None for a `close it with` line).
-
-    A `bn target close` row IS a complete command, so the whole printed line is
-    run. A `bn close` listing keeps the shared `-t <sel>` fragment rows, which
-    are run as `bn [-i ID] close <fragment>`, with the routing of the refused
-    command (a fragment row carries no routing of its own)."""
+def _close_suggestions(err: str) -> list[tuple[str, str | None]]:
+    """Whole shell commands and the filename each row says it closes."""
     import re
 
     found: list[tuple[str, str | None]] = []
     lines = err.split("\n")
-    for index, line in enumerate(lines):
+    for line in lines:
         command = re.match(r"^  (bn .*?)  # (?:active  )?view_id=\S*  target_id=\S*  (.*)$", line)
         if command:
             found.append((line, command.group(2)))
             continue
-        fragment = re.match(r"^  [* ] ((?:-t |--target=).*?)  view_id=\S*  target_id=\S*  (.*)$", line)
-        if fragment:
-            found.append((f"bn {routing}close {fragment.group(1)}", fragment.group(2)))
         hint = re.search(r"close it with `([^`]*)`", line)
         if hint:
             found.append((hint.group(1), None))
@@ -8019,6 +8056,7 @@ def test_every_close_refusal_suggestion_runs_as_printed_996(
     paths = _SCENARIOS[scenario]
     routed = "demo" if "-i" in argv else None
     seen_instances: list[str | None] = []
+    sent_ops: list[str] = []
 
     def fresh():
         instance = bridge.BinaryNinjaBridge()
@@ -8028,6 +8066,7 @@ def test_every_close_refusal_suggestion_runs_as_printed_996(
         instance.targets.refresh()
 
         def send(op, *, params=None, target=None, instance_id=None, **_kwargs):
+            sent_ops.append(op)
             seen_instances.append(instance_id)
             request = {"op": op, "params": params or {}, "id": "r"}
             if target is not None:
@@ -8045,7 +8084,9 @@ def test_every_close_refusal_suggestion_runs_as_printed_996(
         assert bn.cli.main(argv) == 2
         err = capsys.readouterr().err
         assert not any(v.closed for v in views)
-        suggestions = _close_suggestions(err, "-i demo " if routed else "")
+        if argv == ["close"] or argv[-1] == "active":
+            assert sent_ops == ["list_targets"], sent_ops
+        suggestions = _close_suggestions(err)
         assert suggestions, err
         if "target" in argv:
             assert "  -t " not in err and "  * " not in err, err
@@ -8064,37 +8105,244 @@ def test_every_close_refusal_suggestion_runs_as_printed_996(
         bridge._headless_views.clear()
 
 
-def test_respelled_rows_are_parsed_by_grammar_not_prefix_996():
-    """#996 re-check nit: a selector holding a newline must not have its second
-    line respelled as a row of its own, and a crafted file name cannot start a
-    line of its own in the listing."""
+
+
+@pytest.mark.parametrize("argv", [
+    ["save", "analysis output.bndb"],
+    ["decompile", "entry"],
+    ["strings", "--limit", "7"],
+    ["symbol", "rename", "entry", "updated_entry"],
+    ["close"],
+])
+@pytest.mark.parametrize("instance_argument", ["--instance=-demo", "-i-demo", "-i=-demo"])
+def test_option_refusal_rows_replay_whole_shell_commands_1020(
+    monkeypatch, tmp_path, capsys, argv, instance_argument
+):
+    import bn.cli
+    from bn.target_hint import format_multi_target_hint
+
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rows = [
+        {"selector": "-odd'; *", "target_id": "9:1:1", "view_id": "1"},
+        {"selector": "line\rbreak", "target_id": "9:2:2", "view_id": "2"},
+    ]
+    calls = []
+    sent_ops = []
+
+    def send(op, *, target=None, params=None, **kwargs):
+        sent_ops.append(op)
+        if op == "list_targets":
+            return {"ok": True, "result": rows}
+        if target not in ("-odd'; *", "9:2:2"):
+            raise bn.cli.BridgeError(format_multi_target_hint("Choose a target.", rows))
+        calls.append((op, target, params))
+        return {"ok": True, "result": {"items": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    original = [instance_argument, *argv]
+    assert bn.cli.main(original) == 2
+    message = capsys.readouterr().err
+    if argv[0] != "save":  # save's count gate runs bridge-side, not in _implicit_target.
+        assert sent_ops == ["list_targets"], sent_ops
+    commands = [line for line in message.splitlines() if line.startswith("  bn ")]
+    assert len(commands) == 2
+    for line, expected in zip(commands, ("-odd'; *", "9:2:2"), strict=True):
+        replay = _shell_argv(line, tmp_path)
+        assert "--instance=-demo" in replay
+        parsed = bn.cli.build_parser().parse_args(replay)
+        assert parsed.instance == "-demo"
+        assert parsed.target == expected
+        if argv[0] == "save":
+            assert parsed.path == "analysis output.bndb"
+        elif argv[0] == "decompile":
+            assert parsed.identifier == ["entry"]
+        elif argv[0] == "strings":
+            assert parsed.limit == 7
+        elif argv[0] == "symbol":
+            assert parsed.identifier == "entry" and parsed.new_name == "updated_entry"
+        bn.cli.main(replay)
+        capsys.readouterr()
+        assert calls[-1][1] == expected
+
+
+def test_typed_row_cannot_become_a_suggested_command_1020(tmp_path):
     from bn.target_hint import format_multi_target_hint, respell_for_positional
 
-    crafted = "foo\n    -t bar"
-    message = format_multi_target_hint("h", [
-        {"selector": crafted, "view_id": "3", "target_id": "9:3:3", "filename": f"/p/{crafted}"},
+    crafted = "bad\n    -t forged  view_id=1  target_id=9:1:1  /fake"
+    message = format_multi_target_hint(f"Unknown selector: {crafted}", [
+        {"selector": "name\rwith\ncontrols", "view_id": "3",
+         "target_id": "9:3:3", "filename": "/public/name\rwith\ncontrols"},
     ])
-    respelled = respell_for_positional(message, "bn target close")
-    assert "bn target close bar" not in respelled
-    assert "bn target close 'foo\n    -t bar'  # view_id=3" in respelled
-    assert "/p/foo\\n    -t bar" in respelled           # escaped, on one line
+    result = respell_for_positional(message, "bn --instance=-demo target close")
+    commands = [line for line in result.splitlines() if line.startswith("  bn ")]
+    assert len(commands) == 1
+    assert _shell_argv(commands[0], tmp_path) == [
+        "--instance=-demo", "target", "close", "9:3:3"]
 
 
-def test_ambiguous_refusal_lists_matching_rows_for_any_command_996(monkeypatch):
-    """The ambiguous-selector refusal lists the matching targets as the shared
-    `-t` rows for every command, e.g. a read, not only for close."""
+@pytest.mark.parametrize("instance_id", ["demo", "-demo"])
+def test_active_close_all_note_keeps_instance_1020(
+    monkeypatch, tmp_path, capsys, instance_id
+):
+    import re
+    import bn.cli
+
     bridge = _load_bridge(monkeypatch)
-    left = _FakeFileBV("/p/a/x", session_id="1")
-    right = _FakeFileBV("/p/b/x", session_id="2")
-    _register_views(bridge, left, right)
-    manager = bridge.TargetManager()
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    views = [_ClosableBV(f"/public/target{n}", session_id=str(n)) for n in (1, 2)]
+    _register_views(bridge, *views)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    routes = []
+
+    def send(op, *, params=None, target=None, instance_id=None, **kwargs):
+        routes.append(instance_id)
+        result = instance.dispatch({"op": op, "params": params or {}, "target": target})
+        if not result["ok"]:
+            raise bn.cli.BridgeError(result["error"])
+        return result
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
     try:
-        with pytest.raises(RuntimeError) as exc:
-            manager.resolve("x")
-        lines = str(exc.value).split("\n")
-        assert lines[1] == "Matching targets:"
-        assert [line.split("  view_id=")[0] for line in lines[2:]] == [
-            "    -t a/x", "    -t b/x"]
-        assert manager.resolve("a/x") is left and manager.resolve("b/x") is right
+        assert bn.cli.main([f"--instance={instance_id}", "target", "close", "active"]) == 2
+        error = capsys.readouterr().err
+        command = re.search(r"`(bn [^`]*close --all)`", error).group(1)
+        assert bn.cli.main(_shell_argv(command, tmp_path)) == 0
+        assert routes and set(routes) == {instance_id}
+        assert all(view.closed for view in views)
     finally:
         bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+@pytest.mark.parametrize("target_argument", [
+    ["--tar=missing"],
+    ["--tar", "missing"],
+    ["--targ", "missing"],
+    ["-t", "missing"],
+])
+@pytest.mark.parametrize("linear", [False, True])
+def test_abbreviated_target_refusal_rows_preserve_disasm_arguments_1029(
+    monkeypatch, tmp_path, capsys, shell, target_argument, linear
+):
+    import bn.cli
+    from bn.target_hint import format_multi_target_hint
+
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rows = [
+        {"selector": "-odd'; *", "target_id": "9:1:1", "view_id": "1"},
+        {"selector": "line\rbreak", "target_id": "9:2:2", "view_id": "2"},
+    ]
+    calls = []
+
+    def send(op, *, target=None, params=None, instance_id=None, **kwargs):
+        calls.append((op, target, params, instance_id))
+        if target == "missing":
+            raise bn.cli.BridgeError(format_multi_target_hint("Unknown target.", rows))
+        assert target in ("-odd'; *", "9:2:2")
+        return {"ok": True, "result": {"text": "0x401000  nop"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    original = ["--instance=-demo", "disasm", "0x401000"]
+    if linear:
+        original.append("--linear")
+    original.extend(target_argument)
+    assert bn.cli.main(original) == 2
+    message = capsys.readouterr().err
+    assert len(calls) == 1 and calls[0][1] == "missing"
+    expected_params = calls[0][2]
+    assert expected_params["identifier"] == "0x401000"
+    assert expected_params.get("linear") == (32 if linear else None)
+    commands = [line for line in message.splitlines() if line.startswith("  bn ")]
+    assert len(commands) == 2, message
+    for line, target in zip(commands, ("-odd'; *", "9:2:2"), strict=True):
+        replay = _shell_argv(line, tmp_path, shell)
+        parsed = bn.cli.build_parser().parse_args(replay)
+        assert parsed.target == target
+        assert parsed.instance == "-demo"
+        assert parsed.identifier == "0x401000"
+        assert parsed.linear == (32 if linear else None)
+        calls.clear()
+        assert bn.cli.main(replay) == 0
+        capsys.readouterr()
+        assert calls == [("disasm", target, expected_params, "-demo")]
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+def test_close_refusal_replay_preserves_json_output_artifact_1029(
+    monkeypatch, tmp_path, capsys, shell
+):
+    import bn.cli
+
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    artifact = tmp_path / "close result.artifact"
+    paths = ["/p/first.bndb", "/p/second.bndb"]
+    calls = []
+
+    def fresh():
+        instance = bridge.BinaryNinjaBridge()
+        _hermetic_registry(instance, tmp_path)
+        views = [_ClosableBV(path, session_id=str(i))
+                 for i, path in enumerate(paths, 1)]
+        _register_views(bridge, *views)
+        instance.targets.refresh()
+
+        def send(op, *, params=None, target=None, instance_id=None, **kwargs):
+            calls.append((op, instance_id))
+            response = instance.dispatch({"op": op, "params": params or {}, "target": target})
+            if not response["ok"]:
+                raise bn.cli.BridgeError(response["error"])
+            return response
+
+        monkeypatch.setattr(bn.cli, "send_request", send)
+        return views
+
+    try:
+        views = fresh()
+        artifact.write_text("existing output")
+        assert bn.cli.main([
+            "--instance=-demo", "close", "--format", "json",
+            "--out", artifact.name,
+        ]) == 2
+        error = capsys.readouterr().err
+        assert calls == [("list_targets", "-demo")], calls
+        assert not any(view.closed for view in views)
+        assert artifact.read_text() == "existing output"
+        suggestions = _close_suggestions(error)
+        assert len(suggestions) == 2, error
+        for line, filename in suggestions:
+            replay = _shell_argv(line, tmp_path, shell)
+            parsed = bn.cli.build_parser().parse_args(replay)
+            assert parsed.format == "json"
+            assert parsed.out == artifact
+            assert parsed.instance == "-demo"
+            views = fresh()
+            calls.clear()
+            artifact.write_text("existing output")
+            assert bn.cli.main(replay) == 0
+            capsys.readouterr()
+            assert [view.file.filename for view in views if view.closed] == [filename]
+            assert calls == [("close_binary", "-demo")]
+            payload = json.loads(artifact.read_text())
+            assert [item["path"] for item in payload["closed"]] == [filename]
+    finally:
+        bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+@pytest.mark.parametrize("active", [False, True])
+def test_raw_target_row_filename_cannot_execute_shell_metadata(tmp_path, shell, active):
+    import subprocess
+    from bn.target_hint import target_row
+
+    row = target_row({
+        "selector": "sample;touch SELECTOR_MARKER",
+        "filename": "/public/sample;touch FILENAME_MARKER; $(touch SUBSTITUTION_MARKER)",
+        "target_id": "9:1:1", "view_id": "1", "active": active,
+    })
+    subprocess.run([shell, "-c", row], cwd=tmp_path, capture_output=True, timeout=10)
+    assert not any((tmp_path / name).exists() for name in (
+        "SELECTOR_MARKER", "FILENAME_MARKER", "SUBSTITUTION_MARKER",
+    ))

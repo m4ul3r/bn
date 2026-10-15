@@ -1158,6 +1158,29 @@ class TargetManager:
                     pairs[vid] = raw_vid
         return pairs
 
+    def _pairing_notes(self, records: dict[str, TargetRecord]) -> list[str]:
+        """Explain rejected save pairs from the ledger and current file state."""
+        notes = []
+        for raw_vid, path in self._database_paths.items():
+            if raw_vid not in records:
+                continue
+            for vid, record in records.items():
+                if vid == raw_vid or not _same_file(record.filename, path):
+                    continue
+                identity = self._database_identities.get(raw_vid)
+                if identity is not None and _file_identity(path) != identity:
+                    notes.append(
+                        f"The saved database {path!r} no longer has the file "
+                        "identity recorded at save; its save pairing with the "
+                        "raw view is no longer valid."
+                    )
+                elif _source_verified.get(record.session_id) is False:
+                    notes.append(
+                        f"The database {path!r} was loaded without verified "
+                        "raw-source content, so its save pairing is not used."
+                    )
+        return notes
+
     def stripped_only_match(self, selector: str | None, bv) -> tuple[str, str] | None:
         """``(filename, listed selector)`` of *bv* when *selector* names it ONLY
         through a `.bndb`-stripped alias (`hello` for `hello.bndb`), else None.
@@ -1359,6 +1382,11 @@ class TargetManager:
                         "filename": record.filename,
                         "basename": record.basename,
                         "selector": selectors[view_id],
+                        "selector_reason": (
+                            "No filename or path suffix uniquely selects this "
+                            "view among the open targets; use its full target_id."
+                            if selectors[view_id] == record.target_id() else None
+                        ),
                         "view_name": record.view_name,
                         "active": _same_view(view, active),
                         # Per-target analysis state so `target list` can flag a
@@ -1445,6 +1473,12 @@ class TargetManager:
             rows = [target_row(t) for t in targets if t.get("view_id") in matched]
             raise RuntimeError("\n".join([
                 f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})",
+                *self._pairing_notes({
+                    record.view_id: record for record in matches
+                }),
+                "Filename aliases (including `.bndb`-stripped names) match "
+                "more than one open view; only a valid recorded save pairing "
+                "can prefer its original raw view.",
                 "Matching targets:",
                 *rows,
             ]))
@@ -3123,6 +3157,12 @@ class BinaryNinjaBridge:
                 if opened_known:
                     _opened_annotations[view_session_key(bv)] = opened_record
                 targets = self.targets.refresh()
+                loaded_target = self._loaded_target_row(targets, bv)
+                if loaded_target and loaded_target.get("selector_reason"):
+                    notes.append(
+                        f"Target selector {loaded_target['selector']!r}: "
+                        f"{loaded_target['selector_reason']}"
+                    )
 
             self._record_project_root(workdir)
             # Persist both the open-binary and project-root inventories.
@@ -5293,7 +5333,10 @@ def _bind_close_binary(bridge, params, target):
     # spelling, so no filename can ever carry pin semantics.
     pinned = _validate_bool(params.get("pinned_target"), label="pinned_target",
                             default=False)
-    if pinned and not (isinstance(target, str) and target.strip()):
+    if pinned and not (
+        isinstance(target, str) and target.strip()
+        and target.strip() != "active"
+    ):
         raise ValueError("close_binary: pinned_target needs a target_id selector")
     return bridge._close_binary(
         params.get("path"),
