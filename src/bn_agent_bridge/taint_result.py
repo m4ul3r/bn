@@ -48,6 +48,7 @@ Reconciliation notes:
 """
 from __future__ import annotations
 
+import shlex
 from typing import Any
 
 # Leaf kinds that mean "taint stopped somewhere attacker-relevant" -- an empty
@@ -217,8 +218,7 @@ def _derive_all_clear(
     if weak_seed:
         return False, (
             "no sinks/leaves, but the source seed was incomplete or mis-anchored "
-            "(see caveats) -- NOT an all-clear; reseed with --source call:<recv> "
-            "or var:<buf>")
+            "(see caveats) -- NOT an all-clear")
     if unmodeled_reached:
         return False, (
             "no modeled sink reached, but taint reached an unmodeled call "
@@ -246,10 +246,120 @@ def _derive_all_clear(
         "may-analysis -- not a proof of safety")
 
 
+def command_template(command: str) -> str:
+    """Mark printed advice that bn cannot complete (#1033 item 6).
+
+    Advice in backticks is pasted as-is, so a command missing an argument the
+    result does not know must say so rather than look runnable. The unknown
+    parts are UPPER-CASE words (``VAR``, ``N``) -- never ``<name>``, which a
+    shell reads as a redirection before bn ever parses the line -- and the
+    marker below precedes the backticks so a reader (and the test that pastes
+    every printed command) can tell a template from a command."""
+    return f"template, fill in the UPPER-CASE words: `{command}`"
+
+
+def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int],
+                         unmodeled_reached: bool, ext_no_model: bool,
+                         tainted_values: int, function: str | None) -> str:
+    """The single suggested next step for a zero-sink forward run.
+
+    Every command it prints in backticks either runs as printed (the function
+    and source are filled in from the result) or is a :func:`command_template`
+    (#1033 item 6). ``function`` is the analysed function's address; without it
+    nothing can be filled in and the advice stays prose."""
+    fn = function
+
+    def forward(fn_ref: str, source: str) -> str:
+        return f"bn taint forward -f {shlex.quote(fn_ref)} --source {shlex.quote(source)}"
+
+    UNRESOLVED = ("unmodeled_callee", "arg_under_recovered", "indirect_call_unresolved")
+    unresolved = [lf for lf in leaves if str(lf.get("kind", "?")) in UNRESOLVED]
+    misanchored = [lf for lf in leaves if lf.get("kind") in _SEED_MISANCHORED_KINDS]
+    if misanchored:
+        # A weak/mis-anchored seed is the highest-priority footgun: the pointer
+        # was tainted but the received buffer was not keyed, so an empty result
+        # is a SEED failure, not a clean path. Only a leaf that names a source
+        # that keys MORE (arg:recvmsg -> call:recvmsg) earns a reseed command;
+        # an unkeyable buffer fails the same way under arg: and call: (#1041
+        # item 1), so recommending the other locator would loop the agent.
+        reseed = next((str(lf["suggested_source"]) for lf in misanchored
+                       if str(lf.get("suggested_source") or "").startswith("call:")), None)
+        head = ("the seed tainted a buffer pointer but did not key the buffer it "
+                "fills, so payload stores/loads were not followed -- an empty "
+                "result here means the seed was wrong, not that the path is clean")
+        if reseed:
+            run = (f"`{forward(fn, reseed)}`" if fn else f"--source {reseed}")
+            return f"{head}; reseed with {run}, which keys the payload"
+        if fn:
+            return (f"{head}. Reseeding with arg: or call: keys the same pointer and "
+                    f"fails the same way; seed a value read from the buffer instead "
+                    f"({command_template(forward(fn, 'var:VAR'))}) or the parser that "
+                    f"consumes it ({command_template(forward('PARSER', 'param:N'))})")
+        return (f"{head}. Reseeding with arg: or call: keys the same pointer and "
+                f"fails the same way; seed a value read from the buffer (var:) or "
+                f"the consuming parser's parameter (param:) instead")
+    if unmodeled_reached and not ext_no_model and all(
+            lf.get("cause") == "varargs_not_followed" for lf in unresolved):
+        # #948: every unresolved frontier is taint entering the `...` tail of a
+        # callee BN already types variadic. Prototype repair is the wrong
+        # advice there: the declaration is correct, the engine just does not
+        # map varargs onto anything -- and no param:N names the tail, so the
+        # seed inside it is a template.
+        callee = ((unresolved[0].get("callee") or {}) if unresolved else {})
+        inside = callee.get("address") if isinstance(callee, dict) else None
+        seed = (f" ({command_template(forward(str(inside), 'var:VAR'))})"
+                if inside else "")
+        return ("taint reached the variadic tail (`...`) of a callee already declared "
+                "variadic, which the engine does not follow -- its prototype is correct, "
+                "so do not redeclare it; inspect how the callee consumes its va_list or "
+                f"seed taint inside it from the value it reads{seed}")
+    if unmodeled_reached and not ext_no_model and all(
+            lf.get("cause") == "signature_under_recovered" for lf in unresolved):
+        callee = ((unresolved[0].get("callee") or {}) if unresolved else {})
+        at = callee.get("address") if isinstance(callee, dict) else None
+        fix = (f" ({command_template(f'bn proto set {at} PROTOTYPE')})" if at else "")
+        return ("confirmed extra arguments disagree with a determined nonvariadic "
+                f"declaration; recover the actual callee prototype with proto set{fix} "
+                "and re-run, or seed inside the callee to inspect the incomplete flow")
+    if unmodeled_reached:
+        # An in-binary callee the walk did not descend (depth bound, recursion,
+        # unanalysable body) and whose tainted argument is a named parameter
+        # can be seeded exactly: param:<that index> inside it. Leaves with a
+        # `cause` are the past-the-arity cases, where no param:N exists.
+        inside = None
+        for lf in unresolved:
+            callee = lf.get("callee")
+            args = lf.get("tainted_args") or []
+            if (lf.get("kind") == "unmodeled_callee" and not lf.get("cause")
+                    and isinstance(callee, dict) and callee.get("address") and args):
+                inside = forward(str(callee["address"]), f"param:{min(args)}")
+                break
+        seed = (f"re-run seeded inside the first one with `{inside}`" if inside
+                else "seed taint inside the callee")
+        return ("taint reached an unmodeled call frontier; inspect the frontier leaves "
+                f"and callee argument consumption, or {seed}. Repair a prototype only "
+                "where confirmed extra arguments disagree with a determined "
+                "nonvariadic declaration")
+    if by_kind.get("coarse_memory_store", 0) or by_kind.get("pointer_escape", 0):
+        # The coarse leaf exists precisely because the destination could not be
+        # keyed, so no var: names it; the template seeds a value read back.
+        seed = (f" ({command_template(forward(fn, 'var:VAR'))})" if fn else "")
+        return ("taint escaped through a coarse-memory frontier (a pointer/store not "
+                "precisely tracked); inspect the frontier leaves or seed a value read "
+                f"back from those bytes{seed}")
+    if tainted_values <= 1:
+        return ("the source seeded but produced no further tainted uses; verify the "
+                "`--source` locator matches the intended value")
+    return ("taint propagated but reached no modeled sink and hit no unresolved "
+            "frontier; the flow appears to dead-end locally -- inspect the last "
+            "propagated use or widen `--max-depth`")
+
+
 def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
                              truncated: bool = False,
                              truncation_cause: list[str] | None = None,
-                             analysis_incomplete: bool = False) -> dict[str, Any]:
+                             analysis_incomplete: bool = False,
+                             function: str | None = None) -> dict[str, Any]:
     """Frontier diagnostics + honesty gate for a zero-sink forward run (#559/#562).
 
     Purely descriptive: seed reach (matched source callsites, tainted SSA
@@ -259,7 +369,10 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     suggested next action. Also folds in the honesty claim gate
     (``safe_to_report_all_clear`` + ``all_clear_reason``). Never asserts a
     vulnerability -- it explains "flow hit an unmodeled parser we couldn't
-    follow" / "the seed did not key the buffer" vs "nothing flows"."""
+    follow" / "the seed did not key the buffer" vs "nothing flows".
+
+    ``function`` is the analysed function's address, used to fill in the
+    commands the next action prints (#1033 item 6)."""
     diag = sub.get("diag") or {}
     leaves = sub.get("leaves") or []
     assumptions = sub.get("assumptions") or []
@@ -284,55 +397,9 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     unmodeled_reached = bool(unresolved_n or ext_no_model)
     tainted_values = int(diag.get("tainted_values", 0))
 
-    if seed_misanchored_n:
-        # A weak/mis-anchored recv-family seed is the highest-priority footgun:
-        # the pointer was tainted but the received buffer was not keyed, so an
-        # empty result is a SEED failure, not a clean path.
-        next_action = (
-            "the --source arg seed did not key the received buffer (only the "
-            "pointer value was tainted); reseed with --source call:<recv> (seeds "
-            "the filled buffer/iovec payload) or --source var:<buf> so the "
-            "payload is followed -- an empty result here means the seed was "
-            "wrong, not that the path is clean")
-    elif unmodeled_reached and not ext_no_model and all(
-            lf.get("cause") == "varargs_not_followed"
-            for lf in leaves if str(lf.get("kind", "?")) in UNRESOLVED):
-        # #948: every unresolved frontier is taint entering the `...` tail of a
-        # callee BN already types variadic. Prototype repair is the wrong
-        # advice there: the declaration is correct, the engine just does not
-        # map varargs onto anything.
-        next_action = (
-            "taint reached the variadic tail (`...`) of a callee already declared "
-            "variadic, which the engine does not follow -- its prototype is correct, "
-            "so do not redeclare it; inspect how the callee consumes its va_list or "
-            "re-run `bn taint forward` seeded inside it")
-    elif unmodeled_reached and not ext_no_model and all(
-            lf.get("cause") == "signature_under_recovered"
-            for lf in leaves if str(lf.get("kind", "?")) in UNRESOLVED):
-        next_action = (
-            "confirmed extra arguments disagree with a determined nonvariadic "
-            "declaration; recover the actual callee prototype with `bn proto set` "
-            "and re-run, or seed inside the callee to inspect the incomplete flow")
-    elif unmodeled_reached:
-        next_action = (
-            "taint reached an unmodeled call frontier; inspect the frontier leaves "
-            "and callee argument consumption, or re-run `bn taint forward` seeded "
-            "inside it. Repair a prototype only where confirmed extra arguments "
-            "disagree with a determined nonvariadic declaration")
-    elif coarse_n:
-        next_action = (
-            "taint escaped through a coarse-memory frontier (a pointer/store not "
-            "precisely tracked); inspect the frontier leaves or seed the "
-            "destination buffer directly with `--source var:<buf>`")
-    elif tainted_values <= 1:
-        next_action = (
-            "the source seeded but produced no further tainted uses; verify the "
-            "`--source` locator matches the intended value")
-    else:
-        next_action = (
-            "taint propagated but reached no modeled sink and hit no unresolved "
-            "frontier; the flow appears to dead-end locally -- inspect the last "
-            "propagated use or widen `--max-depth`")
+    next_action = _forward_next_action(
+        leaves, by_kind=by_kind, unmodeled_reached=unmodeled_reached,
+        ext_no_model=ext_no_model, tainted_values=tainted_values, function=function)
 
     safe, reason = _derive_all_clear(
         leaves, assumptions, truncated=truncated,
@@ -552,37 +619,55 @@ def misanchored_recv_leaf(
     arg_index: int,
     address: str | None = None,
     reason: str = "buffer_not_keyed",
+    seed: str = "arg",
 ) -> dict[str, Any]:
-    """Structured leaf for a weak ``arg:<recv*>:<n>`` seed (#306/#562 dogfood
-    footgun): the pointer arg was tainted but the FILLED buffer was not keyed as
-    a stable taint location, so payload stores/loads may be silently missed. A
-    real taint-graph leaf -- it lands in ``result["leaves"]`` and feeds the
-    frontier accounting -- so an empty ``reached_sinks`` with this leaf stops
-    reading as a clean all-clear. This is a propagation/coverage fact, not a
-    vulnerability claim."""
+    """Structured leaf for a seed that tainted a buffer POINTER but did not key
+    the FILLED buffer as a stable taint location (#306/#562 dogfood footgun), so
+    payload stores/loads may be silently missed. A real taint-graph leaf -- it
+    lands in ``result["leaves"]`` and feeds the frontier accounting -- so an
+    empty ``reached_sinks`` with this leaf stops reading as a clean all-clear.
+    This is a propagation/coverage fact, not a vulnerability claim.
+
+    ``seed`` names the locator kind that produced it: ``arg`` (an
+    ``arg:<callee>:N`` source) or ``call`` (the ``call:<callee>`` preset, whose
+    modeled ``*arg:N`` output could not be keyed, #1041 item 1). Only the
+    recvmsg header case has a reseed that keys more: ``call:`` resolves the
+    iovec payload. For ``buffer_not_keyed`` both locators resolve the buffer
+    through the same pointer, so ``call:`` would fail the same way and is never
+    suggested (``suggested_source`` is None)."""
     base = (callee or "").split("@", 1)[0].lstrip("_")
-    if base in ("recvmsg", "recvmmsg"):
+    locator = f"call:{base}" if seed == "call" else f"arg:{base}:{arg_index}"
+    suggest: str | None
+    if base in ("recvmsg", "recvmmsg") and seed != "call":
         detail = (
             f"arg:{base}:{arg_index} seeds the msghdr*/msgvec pointer, not the "
             f"scatter-gather payload at msg_iov[i].iov_base -- buffer content is "
             f"NOT followed from this seed ({reason})")
         suggest = f"call:{base}"
+        note = (f"NOT an all-clear -- reseed with --source {suggest}; empty "
+                f"reached_sinks with this leaf means the seed was wrong, not that "
+                f"the path is clean")
     else:
         detail = (
-            f"arg:{base}:{arg_index} could not key the filled buffer as a stable "
-            f"taint location ({reason}); only the pointer value was seeded, so "
-            f"payload stores/loads may be missed")
-        suggest = f"call:{base}"
+            f"{locator} could not key the buffer arg {arg_index} points at as a "
+            f"stable taint location ({reason}); only the pointer value was "
+            f"seeded, so payload stores/loads may be missed")
+        suggest = None
+        note = (
+            "NOT an all-clear -- the filled buffer is reached through a pointer "
+            "the engine cannot key (e.g. a struct field plus an offset), and "
+            "arg: and call: seeds key it the same way; seed a value read from "
+            "the buffer with var:, or the consuming parser's parameter with "
+            "param:, instead")
     leaf: dict[str, Any] = {
         "kind": "source_seed_misanchored",
         "callee": base,
         "arg_index": arg_index,
+        "reason": reason,
+        "seed": seed,
         "detail": detail,
         "suggested_source": suggest,
-        "note": (
-            f"NOT an all-clear -- reseed with --source {suggest} or var:<buf>; "
-            f"empty reached_sinks with this leaf means the seed was wrong, not "
-            f"that the path is clean"),
+        "note": note,
     }
     if address is not None:
         leaf["address"] = address
@@ -621,7 +706,7 @@ def indirect_pointer_slot_leaf(
         "note": (
             "NOT an all-clear -- the indirect-load pointer slot was not "
             "correlated forward; seed the parser entry directly with param:N "
-            "or the filled buffer with --source var:<buf>"),
+            "or a value read from the filled buffer with var:"),
     }
     if slot is not None:
         leaf["slot"] = str(slot)

@@ -52,7 +52,7 @@ from .taint_il import (  # noqa: F401
 from .taint_locators import (  # noqa: F401
     parse_locator, _locator_index, format_locator, var_label_of,
     node_label, _instr_dict, _render_source, _make_signature,
-    derive_flow_facts,
+    derive_flow_facts, normalize_resolve_map,
 )
 from .taint_result import (  # noqa: F401
     BLOCKING_LEAF_KINDS,
@@ -150,6 +150,8 @@ class TaintEngine:
         find_variable: Any = None,
         unknown_call_policy: str = "conservative",
         resolve_map: dict[str, Any] | None = None,
+        resolve_map_origin: str = "--resolve-map",
+        find_function: Any = None,
         max_iters: int = 256,
         max_depth: int = 64,
         mangled: bool = False,
@@ -158,8 +160,12 @@ class TaintEngine:
         self.models = models
         self._find_variable = find_variable
         self.unknown_call_policy = unknown_call_policy
-        # agent-supplied indirect-call resolution: {call_addr_hex: [target_addr, ...]}
-        self.resolve_map = resolve_map or {}
+        # agent-supplied indirect-call resolution, validated here -- once, naming
+        # the file -- rather than when the walk first needs it (#1041 item 3):
+        # {call_address: [target_address, ...]}. `find_function` resolves a
+        # target spelled as a function name exactly as `-f` does.
+        self.resolve_map = normalize_resolve_map(
+            resolve_map or {}, origin=resolve_map_origin, find_function=find_function)
         self.max_iters = max_iters
         self.max_depth = max_depth
         self.mangled = mangled
@@ -2464,9 +2470,9 @@ class TaintEngine:
         resolution. Returns ``([], None)`` for a direct call or no resolution."""
         if const_target(getattr(ins, "dest", None)) is not None:
             return [], None
-        mapped = self.resolve_map.get(hex(int(getattr(ins, "address", 0))))
+        mapped = self.resolve_map.get(int(getattr(ins, "address", 0)))
         if mapped:
-            return [int(x, 16) if isinstance(x, str) else int(x) for x in mapped], "agent-map"
+            return list(mapped), "agent-map"
         cands = self._call_targets_from_pvs(
             getattr(getattr(ins, "dest", None), "possible_values", None))
         return (cands, "value-set") if cands else ([], None)
@@ -2746,10 +2752,10 @@ class TaintEngine:
         # factual frontier diagnostic (NOT a verdict) explaining where the seed
         # went and why the frontier stopped.
         if not unique_findings:
-            result["diagnostics"] = self._forward_zero_diagnostics(sub)
+            result["diagnostics"] = self._forward_zero_diagnostics(sub, func)
         return result
 
-    def _forward_zero_diagnostics(self, sub: dict[str, Any]) -> dict[str, Any]:
+    def _forward_zero_diagnostics(self, sub: dict[str, Any], func: Any) -> dict[str, Any]:
         """Frontier diagnostics for a zero-sink forward run (#559).
 
         Purely descriptive: seed reach (matched source callsites, tainted SSA
@@ -2766,7 +2772,8 @@ class TaintEngine:
             sub, seed_callsites=int(getattr(self, "_seed_callsites", 0)),
             truncated=bool(getattr(self, "_truncated", False)),
             truncation_cause=sorted(getattr(self, "_truncation_causes", set())),
-            analysis_incomplete=bool(getattr(self, "_analysis_incomplete", ())))
+            analysis_incomplete=bool(getattr(self, "_analysis_incomplete", ())),
+            function=hex(int(func.start)))
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
         """Distinct call addresses to attribute a single ret/arg source across.
@@ -2942,7 +2949,8 @@ class TaintEngine:
                 union_sub,
                 seed_callsites=len(callsite_addrs),
                 truncated=truncated, truncation_cause=sorted(truncation_causes),
-                analysis_incomplete=bool(incomplete_funcs))
+                analysis_incomplete=bool(incomplete_funcs),
+                function=hex(int(func.start)))
             out["diagnostics"]["last_use_by_source"] = {
                 a: d.get("last_use") for a, d in per_source_diag.items()
             }
@@ -3257,7 +3265,7 @@ class TaintEngine:
 
     def _register_indirect_buffer_slot(self, ssaf, ptr_expr, callsite, callee, idx,
                                        buffer_slots, add_assumption,
-                                       add_leaf=None, recv_buffer_covered=False) -> None:
+                                       add_leaf=None, recv_buffer_covered=False) -> bool:
         """When a buffer source's pointer is an indirect load `[slot]`, register the
         slot so a later re-load of it can be correlated forward (#193 Part 1). If the
         slot can't be named, fall back to today's honest "may be missed" caveat. When
@@ -3272,9 +3280,13 @@ class TaintEngine:
         mechanism -- exactly like the recv-buffer case. ``recv_buffer_covered`` is
         set by the ``arg:`` caller when it already emits a recv-buffer misanchored
         leaf for this (callee, idx), so the leaf is not double-counted there; the
-        ``*arg:`` (call: preset) caller has no such leaf and passes False."""
+        ``*arg:`` (call: preset) caller has no such leaf and passes False.
+
+        Returns True when the pointer IS an indirect load, i.e. this helper owns
+        the disclosure for it (an immediate or a deferred leaf); False when it did
+        nothing, so the caller must disclose the unkeyed buffer itself."""
         if not self._arg_ptr_is_indirect_load(ssaf, ptr_expr):
-            return
+            return False
         pending = (
             f"source {callee} arg{idx} buffer pointer is loaded indirectly (from a "
             f"global/struct slot); the seed anchors to the pointer value, not the "
@@ -3296,7 +3308,7 @@ class TaintEngine:
             add_assumption(pending)
             if pending_leaf is not None:
                 add_leaf(pending_leaf)
-            return
+            return True
         recv_node = None
         for r in expr_reads(ptr_expr):
             recv_node = (var_key(r), getattr(r, "version", None))
@@ -3306,6 +3318,7 @@ class TaintEngine:
             "callee": callee, "idx": idx, "recv_node": recv_node, "pending": pending,
             "pending_leaf": pending_leaf,
         }
+        return True
 
     def _as_single_ssa_var(self, expr: Any) -> Any | None:
         """The lone SSA variable an expression reads, but ONLY when the
@@ -5419,9 +5432,9 @@ class TaintEngine:
                     if target is not None:
                         candidates, via = [target], None
                     else:
-                        mapped = self.resolve_map.get(hex(int(getattr(ins, "address", 0))))
+                        mapped = self.resolve_map.get(int(getattr(ins, "address", 0)))
                         if mapped:
-                            candidates = [int(x, 16) if isinstance(x, str) else int(x) for x in mapped]
+                            candidates = list(mapped)
                             via = "agent-map"
                         else:
                             candidates = self._call_targets_from_pvs(
@@ -6430,12 +6443,23 @@ class TaintEngine:
                                                       f"source: {callee} arg{idx} (call: preset)", []):
                                             seeded = True
                                     # #562: no recv-buffer leaf fires on the call:
-                                    # preset path, so the indirect-slot leaf is the
-                                    # only thing that can withhold the all-clear here.
-                                    self._register_indirect_buffer_slot(
+                                    # preset path. The indirect-slot helper owns an
+                                    # indirect-load pointer (its slot may correlate
+                                    # forward, #193, so it decides post-fixpoint);
+                                    # every other unkeyable destination -- e.g.
+                                    # `c->buf + have`, a field load plus an offset --
+                                    # left only the pointer seeded, so disclose it as
+                                    # the arg: path does (#1041 item 1). A constant
+                                    # NULL destination receives nothing.
+                                    owned = self._register_indirect_buffer_slot(
                                         ssaf, params[idx], c, callee, idx, buffer_slots,
                                         add_assumption, add_leaf=add_leaf,
                                         recv_buffer_covered=False)
+                                    if not owned and self._int_const(params[idx]) != 0:
+                                        add_leaf(misanchored_recv_leaf(
+                                            callee=str(callee), arg_index=idx,
+                                            address=hex(int(getattr(c, "address", 0))),
+                                            reason="buffer_not_keyed", seed="call"))
                         elif to.startswith("arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):

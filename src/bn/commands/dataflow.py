@@ -102,6 +102,9 @@ def _add_resolve_map(args: argparse.Namespace, params: dict[str, Any]) -> None:
     params["resolve_map"] = decode_json_input(
         read_text_input(Path(args.resolve_map), what="--resolve-map file"),
         refusal=f"could not read --resolve-map {args.resolve_map}")
+    # #1041 item 3: the bridge validates the entries (names resolve as -f
+    # does) and names this file in any refusal.
+    params["resolve_map_path"] = str(args.resolve_map)
 
 
 @command("dataflow", "defuse",
@@ -215,8 +218,9 @@ _SINK_LOCATOR_HELP = (
                       "reports truncation_cause fixpoint_exhausted; the configured "
                       "value is echoed back in run_params."),
              arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
-                 help="JSON file mapping indirect call addresses to target lists: "
-                      '{"0x4011f0": ["0x401176", "0x401195"]}'),
+                 help="JSON file mapping indirect call addresses to target lists; a "
+                      "target is an address or a function name (resolved as -f is): "
+                      '{"0x4011f0": ["0x401176", "parse_frame"]}'),
              arg("--unknown-call", choices=("conservative", "stop"), default="conservative",
                  help="How to treat un-analyzed/external calls reached by taint (default: conservative)"),
              arg("--sink-class", dest="sink_classes", action="append", default=None,
@@ -275,8 +279,9 @@ def _taint_forward(args: argparse.Namespace) -> int:
                       "0 = intraprocedural only). The in-function def-chain walk caps at 64 "
                       "steps; truncation is recorded under assumptions."),
              arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
-                 help="JSON file mapping indirect call addresses to target lists: "
-                      '{"0x4011f0": ["0x401176", "0x401195"]}'),
+                 help="JSON file mapping indirect call addresses to target lists; a "
+                      "target is an address or a function name (resolved as -f is): "
+                      '{"0x4011f0": ["0x401176", "parse_frame"]}'),
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
