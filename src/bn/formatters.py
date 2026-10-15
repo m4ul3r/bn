@@ -6322,6 +6322,7 @@ def _build_mutation_summary(
     kept_library_imports: Sequence[str] = (),
     fallthrough_entries: Sequence[dict[str, Any]] = (),
     preview_skipped: Sequence[dict[str, Any]] = (),
+    reverted: int = 0,
     function_deletions: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
@@ -6445,6 +6446,8 @@ def _build_mutation_summary(
             or proto_residue
         )),
     }
+    if reverted:
+        summary["reverted_count"] = None if unmeasured else reverted
     if proto_residue:
         summary["prototype_user_type_residue"] = True
     if overlapping_functions:
@@ -6643,6 +6646,7 @@ def _mutation_summary(value: Any) -> Any:
         ),
         verified=verified,
         noop=noop,
+        reverted=sum(1 for r in results if r.get("status") == "reverted"),
         committed=bool(value.get("committed", False)),
         preview=bool(value.get("preview", False)),
         rolled_back=value.get("rolled_back"),
@@ -6685,10 +6689,10 @@ def _mutation_summary(value: Any) -> Any:
         # not land -- or any declare row of a preview, which imports nothing on
         # purpose, so an import stamped there is one BN made and kept.
         kept_library_imports=list(dict.fromkeys(
+            [str(name) for name in _field_list(value, "kept_library_imports")] + [
             str(name) for r in results
-            if r.get("op") == "types_declare"
-            and (value.get("preview") or r.get("status") not in ("verified", "noop"))
-            for name in _field_list(r, "imported_from_library"))),
+            if value.get("preview") or r.get("status") not in ("verified", "noop")
+            for name in _field_list(r, "imported_from_library")])),
         fallthrough_entries=[
             {"address": _text_value(r, "address") or "<unknown>",
              "fallthrough_from": _text_value(r, "fallthrough_from")}
@@ -7000,6 +7004,8 @@ def _render_mutation_summary_text(value: Any) -> str:
         f"failed={value.get('failed_count', 0)}",
         f"dirty_after={value.get('dirty_after')}",
     ]
+    if _field_declared(value, "reverted_count"):
+        parts.append(f"reverted={_stated_count(value, 'reverted_count')}")
     # M-03: the split a `function create --allow-overlap` made is reported HERE,
     # on the line every loop reads, not only in the verbose row note. Count on
     # the line, hosts on the next, so the line stays grep-stable.

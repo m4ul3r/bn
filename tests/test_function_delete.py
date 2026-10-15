@@ -347,6 +347,36 @@ def test_single_delete_batch_uses_observed_mutation_result(monkeypatch):
     assert bv.get_function_at(0x1010) is None
 
 
+def test_singleton_delete_preserves_result_when_post_apply_lock_raises(monkeypatch):
+    from bn.formatters import _mutation_summary
+
+    _, instance, bv, _, _ = _setup(monkeypatch)
+    targets = instance.ctx.targets
+    targets._ids_by_object[bv] = "post-apply-delete"
+    original_write = instance._target_lock.write
+
+    @contextmanager
+    def post_apply_failure():
+        with original_write():
+            if 0x1010 in bv._suppressed:
+                raise RuntimeError("post-apply exclusive scope unavailable")
+            yield
+
+    monkeypatch.setattr(instance._target_lock, "write", post_apply_failure)
+    result = instance._mutation(None, False, [
+        {"op": "function_delete", "address": "0x1010"},
+    ])
+    assert result["committed"] is True and result["rolled_back"] is False
+    row = result["results"][0]
+    assert row["irreversible_change"] is True
+    assert row["observed"]["error_stage"] == "scope_enter"
+    assert row["observed"]["error"] == "post-apply exclusive scope unavailable"
+    assert bv.get_function_at(0x1010) is None
+    assert "post-apply-delete" in targets._dirty_view_ids
+    summary = _mutation_summary(result)
+    assert summary["dirty_after"] is True and summary["changed_count"] == 1
+
+
 def test_delete_requires_exact_entry_not_containing_body(monkeypatch):
     bridge, instance, bv, _, _ = _setup(monkeypatch)
     with pytest.raises(bridge.OperationFailure) as failure:

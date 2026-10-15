@@ -4410,7 +4410,9 @@ class BinaryNinjaBridge:
         truly parallelizing. It never wedges or corrupts: rename, reads, and a
         client-timeout cancellation (full rollback) all complete.
         """
-        with self._write_gate:
+        with self._write_gate, mutation_engine._import_outcome(
+            self.ctx, selector, preview, exclusive=self._target_lock.write, direct=True
+        ) as finish:
             with self._target_lock.read():
                 bv = self._resolve_view(selector)
                 # #952: this op bypasses the generic engine, so it must apply the
@@ -4484,13 +4486,13 @@ class BinaryNinjaBridge:
                           "go_verified_count": 0, "go_committed_count": 0,
                           "go_failed_count": 0,
                           "defined_count": recovered.get("defined_count", 0)}
-                return _disclose_go_rename_skips(
+                return finish(_disclose_go_rename_skips(
                     result,
                     skipped_already_named=skipped_already_named,
                     skipped_interior_pc=skipped_interior_pc,
-                )
+                ))
 
-            return self._apply_go_renames_chunked(
+            return finish(self._apply_go_renames_chunked(
                 bv,
                 candidates,
                 preview=preview,
@@ -4498,7 +4500,7 @@ class BinaryNinjaBridge:
                 skipped_already_named=skipped_already_named,
                 skipped_interior_pc=skipped_interior_pc,
                 defined_count=recovered.get("defined_count", 0),
-            )
+            ))
 
     def _go_rename_failure_row(
         self,
@@ -4669,16 +4671,19 @@ class BinaryNinjaBridge:
     def _is_executable_address(self, *a, **k):
         return read_misc._is_executable_address(self.ctx, *a, **k)
 
-    def _function_create(self, *a, **k):
+    def _function_create(self, selector, address, preview: bool, *, allow_overlap: bool = False):
         # #628: same self-managed lock split as _mutation -- the op is
         # @op lock="none", so the write gate here serializes writers for the whole
         # call while create_comments._function_create holds the exclusive target
         # lock only around the create/readback/revert phases, NOT around the
         # post-create update_analysis_and_wait(). See _mutation.
-        with self._write_gate:
-            return create_comments._function_create(
-                self.ctx, *a, exclusive=self._target_lock.write, **k
-            )
+        with self._write_gate, mutation_engine._import_outcome(
+            self.ctx, selector, preview, exclusive=self._target_lock.write, direct=True
+        ) as finish:
+            return finish(create_comments._function_create(
+                self.ctx, selector, address, preview, allow_overlap=allow_overlap,
+                exclusive=self._target_lock.write,
+            ))
 
     def _get_comment(self, *a, **k):
         return create_comments._get_comment(self.ctx, *a, **k)
@@ -5124,13 +5129,15 @@ class BinaryNinjaBridge:
         """#993 item 3: plan the class's typing ops (read_class's card, under the
         read lock) and apply them as ONE mutation, holding the write gate across
         both so no other writer can change the class between plan and apply."""
-        with self._write_gate:
+        with self._write_gate, mutation_engine._import_outcome(
+            self.ctx, selector, preview, exclusive=self._target_lock.write, direct=True
+        ) as finish:
             with self._target_lock.read():
                 operations, plan = mutation_engine._class_apply_types_plan(self.ctx, selector, name)
             if not operations:
-                return mutation_engine._class_apply_types_noop(plan, preview=preview)
+                return finish(mutation_engine._class_apply_types_noop(plan, preview=preview))
             result = self._mutation(selector, preview, operations, gate_held=True)
-        return mutation_engine._with_class_apply_types_plan(result, plan)
+            return mutation_engine._with_class_apply_types_plan(finish(result), plan)
 
     def _op_rename_symbol(self, *a, **k):
         return mutation_engine._op_rename_symbol(self.ctx, *a, **k)

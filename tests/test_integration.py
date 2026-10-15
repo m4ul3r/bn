@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import struct
 import sys
@@ -5468,6 +5469,898 @@ class TestOffsetTypeLookup1000:
             assert (shown.returncode == 0) == exists, (name, shown.stdout, shown.stderr)
 
 
+def test_unattempted_nonimporting_declaration_reports_snapshot_parse(shared_bn, tmp_path):
+    shared_bn.load(ADD_BINARY)
+    manifest = tmp_path / "plain-snapshot.json"
+    manifest.write_text(json.dumps({"ops": [
+        {"op": "set_comment", "function": "missing", "comment": "x"},
+        {"op": "types_declare", "declaration": "struct PlainSnapshot { int x; };"},
+    ]}))
+    response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+    assert response.returncode == 3, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert result["results"][0]["status"] == "unsupported", result
+    row = result["results"][1]
+    assert row["status"] == "not_attempted", result
+    assert row["parse_performed"] is True, result
+    assert "imported_from_library" not in row, result
+    assert not result.get("kept_library_imports"), result
+    assert shared_bn.run("types", "show", "PlainSnapshot").returncode == 2
+
+
+class TestBatchTypeTrackingPerformance1031:
+    @pytest.mark.parametrize("preview", [False, True])
+    def test_large_type_view_mixed_batch_stays_near_comment_only_cost(
+            self, shared_bn, tmp_path, preview):
+        """Exercise the reviewer's real 3000-type/300-comment CLI regression."""
+        shared_bn.load(ADD_BINARY)
+        setup = shared_bn.json(
+            "py", "exec", "--code",
+            "import binaryninja as bn\n"
+            "record = bn.Type.structure(members=[(bn.Type.int(4), 'a'), "
+            "(bn.Type.int(4), 'b')])\n"
+            "for index in range(3000):\n"
+            "    bv.define_user_type(f'Syn{index}', record)\n"
+            "result = {'start': hex(bv.start), "
+            "'count': sum(str(n).startswith('Syn') for n in bv.type_names)}\n")["result"]
+        assert setup["count"] == 3000, setup
+        start = int(setup["start"], 16)
+        field = {"op": "struct_field_set", "struct_name": "Syn1", "offset": "0x0",
+                 "field_name": "z", "field_type": "int32_t"}
+        samples = {False: [], True: []}
+        flags = ["--preview"] if preview else []
+        for repeat in range(2):
+            for mixed in (False, True):
+                stamp = f"{repeat}-{mixed}"
+                comments = [{"op": "set_comment", "address": hex(start + index),
+                             "comment": f"performance note {stamp} {index}"}
+                            for index in range(300)]
+                operations = [*comments, field] if mixed else comments
+                manifest = tmp_path / f"timing-{stamp}.json"
+                manifest.write_text(json.dumps({"ops": operations}))
+                begun = time.perf_counter()
+                response = shared_bn.run(
+                    "batch", "apply", str(manifest), *flags, "--format", "json", timeout=120)
+                samples[mixed].append(time.perf_counter() - begun)
+                assert response.returncode == 0, response.stdout + response.stderr
+                result = json.loads(response.stdout)
+                assert result["success"] is True, result
+                assert len(result["results"]) == len(operations), result
+                assert all(row["status"] in {"verified", "noop"} for row in result["results"]), result
+                assert result["rolled_back"] is preview, result
+                assert not result.get("kept_library_imports"), result
+        # Best-of-two removes one-off process scheduling stalls. This is a
+        # generous relative guard, not a machine-speed budget: constant scans
+        # for the one parser are fine; scans for all 300 comments are not.
+        base, mixed = min(samples[False]), min(samples[True])
+        print(f"mixed batch preview={preview}: comments={base:.3f}s mixed={mixed:.3f}s")
+        assert mixed < base * 6 + 1.0, samples
+        shown = shared_bn.json("types", "show", "Syn1")
+        expected_field = "int32_t a" if preview else "int32_t z"
+        assert expected_field in shown["layout"], shown
+
+
+class TestBatchPreviewImports1012:
+    @pytest.mark.parametrize("kind", [
+        "struct_field_set", "set_prototype", "local_retype", "data_retype",
+    ])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_every_type_parser_discloses_kept_imports(self, shared_bn, tmp_path, kind, batched):
+        shared_bn.load(ADD_BINARY)
+        address = shared_bn.json("function", "info", "add")["function"]["address"]
+        shared_bn.json("types", "declare", "struct PreviewSlot { int a; int b; };")
+        if kind == "set_prototype":
+            shared_bn.json("proto", "set", "add", "int add(int a, int b)")
+            op = {"op": kind, "identifier": "add", "prototype": "int add(struct passwd* p)"}
+            command = ["proto", "set", "add", op["prototype"]]
+        elif kind == "local_retype":
+            op = {"op": kind, "function": "add", "variable": "arg1", "new_type": "struct passwd*"}
+            command = ["local", "retype", "add", "arg1", op["new_type"]]
+        elif kind == "data_retype":
+            op = {"op": kind, "address": address, "new_type": "struct passwd*"}
+            command = ["data", "retype", address, op["new_type"]]
+        else:
+            op = {"op": kind, "struct_name": "PreviewSlot", "offset": "0x10",
+                  "field_name": "p", "field_type": "struct passwd*"}
+            command = ["struct", "field", "set", "PreviewSlot", "0x10", "p", op["field_type"]]
+        probe = ("import json\nprint(json.dumps(sorted((str(i), str(bv.get_type_name_by_id(i))) "
+                 "for i in bv.type_container.type_ids)))")
+        before = dict(json.loads(shared_bn.run("py", "exec", "--code", probe).stdout))
+        if batched:
+            manifest = tmp_path / "preview.json"
+            manifest.write_text(json.dumps({"ops": [
+                {"op": "set_comment", "function": "mul", "comment": "preview only"}, op]}))
+            command = ["batch", "apply", str(manifest)]
+        response = shared_bn.run(*command, "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        after = dict(json.loads(shared_bn.run("py", "exec", "--code", probe).stdout))
+        imported = {name for type_id, name in after.items() if type_id not in before}
+        assert "passwd" in imported, result
+        assert set(result["kept_library_imports"]) == imported, result
+        assert set(result["results"][-1]["imported_from_library"]) == imported, result
+        assert result["results"][-1]["status"] == "unsupported", result
+        if batched:
+            assert result["results"][0]["status"] == "reverted", result
+            assert "imported_from_library" not in result["results"][0], result
+
+    def test_snapshot_import_belongs_to_unattempted_later_declare(self, shared_bn, tmp_path):
+        shared_bn.load(ADD_BINARY)
+        manifest = tmp_path / "late.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "set_comment", "function": "missing_function", "comment": "x"},
+            {"op": "types_declare", "declaration": "struct LateImport { timespec* p; };"}]}))
+        response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert "timespec" in result["kept_library_imports"], result
+        assert "imported_from_library" not in result["results"][0], result
+        assert "timespec" in result["results"][1]["imported_from_library"], result
+        assert result["results"][1]["parse_performed"] is True, result
+        assert result["results"][1]["status"] == "unsupported", result
+
+    def test_skipped_auto_prototype_parse_is_an_importing_step(self, shared_bn, tmp_path):
+        shared_bn.load(ADD_BINARY)
+        manifest = tmp_path / "auto.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "set_prototype", "identifier": "add", "prototype": "int add(struct passwd* p)"},
+            {"op": "set_comment", "function": "mul", "comment": "preview only"}]}))
+        response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert "passwd" in result["kept_library_imports"], result
+        assert result["results"][0]["status"] == "unsupported", result
+        assert result["results"][0]["parse_performed"] is True, result
+        assert result["results"][1]["status"] == "reverted", result
+        assert shared_bn.json("proto", "get", "add")["function"]["name"] == "add"
+
+    def test_preflight_import_survives_later_preflight_error_honestly(self, shared_bn, tmp_path):
+        shared_bn.load(ADD_BINARY)
+        manifest = tmp_path / "preflight.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "set_prototype", "identifier": "add", "prototype": "int add(struct passwd* p)"},
+            {"op": "set_prototype", "identifier": "missing", "prototype": "int missing(int x)"}]}))
+        response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert "passwd" in result["kept_library_imports"], result
+        assert result["results"][0]["status"] == "unsupported", result
+        assert result["results"][0]["parse_performed"] is True, result
+        assert "imported_from_library" not in result["results"][1], result
+        assert "Function not found: missing" in result["results"][1]["message"], result
+        assert result["results"][1]["status"] == "unsupported", result
+
+    @pytest.mark.parametrize("kind", ["function", "data"])
+    @pytest.mark.parametrize("user_type", [False, True])
+    def test_renamed_prototype_uses_preview_state(self, shared_bn, tmp_path, user_type, kind):
+        shared_bn.load(ADD_BINARY)
+        if user_type:
+            shared_bn.json("proto", "set", "add", "int add(int a, int b)")
+        identifier = (shared_bn.json("function", "info", "add")["function"]["address"]
+                      if kind == "data" else "add")
+        manifest = tmp_path / "renamed.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": identifier, "kind": kind, "new_name": "preview_sum"},
+            {"op": "set_prototype", "identifier": "preview_sum",
+             "prototype": "int preview_sum(long a, int b)"}]}))
+        response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert response.returncode == 0, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert result["results"][0]["status"] == "verified", result
+        assert result["results"][1]["status"] == ("verified" if user_type else "not_previewed"), result
+        if not user_type:
+            assert result["results"][1]["parse_performed"] is True, result
+        assert shared_bn.json("function", "info", "add")["function"]["name"] == "add"
+        assert shared_bn.run("function", "info", "preview_sum").returncode == 2
+
+    def test_import_warning_preserves_the_real_declaration_failure(self, shared_bn):
+        shared_bn.load(ADD_BINARY)
+        response = shared_bn.run(
+            "types", "declare",
+            "struct ImportThenFail { rusage r; }; struct uint32_t { int x; };",
+            "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert "rusage" in result["kept_library_imports"], result
+        row = result["results"][0]
+        assert row["status"] == "unsupported", result
+        assert "uint32_t" in row["message"], result
+        assert "a preview cannot undo an import" in row["message"], result
+
+    def test_rename_advice_runs_with_an_earlier_noop(self, shared_bn, tmp_path):
+        shared_bn.load(ADD_BINARY)
+        address = shared_bn.json("function", "info", "add")["function"]["address"]
+        operations = [
+            {"op": "rename_symbol", "identifier": "add", "new_name": "add"},
+            {"op": "rename_symbol", "identifier": address, "new_name": "intermediate"},
+            {"op": "rename_symbol", "identifier": "intermediate", "new_name": 'final"sum'},
+        ]
+        manifest = tmp_path / "rename.json"
+        manifest.write_text(json.dumps({"ops": operations}))
+        response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert response.returncode == 3, response.stdout + response.stderr
+        row = json.loads(response.stdout)["results"][2]
+        assert row["requested"]["conflicting_op_indices"] == [1, 2], row
+        message = row["message"]
+        replacement = json.JSONDecoder().raw_decode(message[message.index('{"op"'):])[0]
+        manifest.write_text(json.dumps({"ops": [operations[0], replacement]}))
+        corrected = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json", "--summary")
+        assert corrected.returncode == 0, corrected.stdout + corrected.stderr
+        summary = json.loads(corrected.stdout)
+        assert summary["noop_count"] == 1 and summary["verified_count"] == 1, summary
+        assert shared_bn.json("function", "info", "add")["function"]["name"] == "add"
+
+
+@pytest.mark.parametrize("error_location", ["included", "main"])
+@pytest.mark.parametrize("filename", ["main_err.h", 'main"\\err.h'])
+def test_real_declaration_included_header_error_preserves_context_1031(
+        shared_bn, tmp_path, error_location, filename):
+    shared_bn.load(ADD_BINARY)
+    main_path = tmp_path / filename
+    sub_path = tmp_path / "sub_err.h"
+    sub_path.write_text(
+        "typedef struct SubE { int a; nosuch_t b; } SubE;\n"
+        if error_location == "included" else
+        "typedef struct SubE { int a; int b; } SubE;\n",
+        encoding="utf-8",
+    )
+    main_path.write_text(
+        '#include "sub_err.h"\nstruct UsesSubE { SubE s; };\n'
+        + ("struct MainError { nosuch_t value; };\n" if error_location == "main" else ""),
+        encoding="utf-8",
+    )
+
+    response = shared_bn.run(
+        "types", "declare", "--file", str(main_path), "--format", "json",
+    )
+
+    assert response.returncode == 3, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    row = result["results"][0]
+    assert row["status"] == "invalid_request", result
+    assert "unknown type name 'nosuch_t'" in row["message"], result
+    expected_path = sub_path if error_location == "included" else main_path
+    assert str(expected_path) in row["message"], result
+    assert "file not found" not in row["message"], result
+
+
+def test_real_declaration_library_fallback_preserves_source_context_1031(
+        shared_bn, tmp_path):
+    shared_bn.load(ADD_BINARY)
+    main_path = tmp_path / "main_pid.h"
+    main_path.write_text(
+        "struct PidRecord { pid_t pid; };\nstruct UsesPid { struct PidRecord value; pid_t owner; };\n",
+        encoding="utf-8",
+    )
+
+    response = shared_bn.run(
+        "types", "declare", "--file", str(main_path), "--format", "json",
+    )
+
+    assert response.returncode == 0, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert result["results"][0]["status"] == "verified", result
+    assert result["results"][0]["include_root"] == str(tmp_path.resolve()), result
+    assert "pid" in shared_bn.json("types", "show", "PidRecord")["layout"]
+    assert "value" in shared_bn.json("types", "show", "UsesPid")["layout"]
+    assert "pid_t owner" in shared_bn.json("types", "show", "UsesPid")["layout"]
+
+
+@pytest.mark.parametrize("summary", [False, True])
+def test_importing_auto_prototype_retains_irreversible_refusal_1031(shared_bn, summary):
+    shared_bn.load(ADD_BINARY)
+    args = ["proto", "set", "mul", "int mul(struct passwd* p, int b)",
+            "--preview", "--format", "json"]
+    if summary:
+        args.append("--summary")
+    response = shared_bn.run(*args)
+    assert response.returncode == 3, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert "passwd" in result["kept_library_imports"], result
+    message = result["first_error"] if summary else result["results"][0]["message"]
+    assert "has_user_type" in message and "cleanly reverted" in message, result
+    assert "a preview cannot undo an import" in message, result
+    if not summary:
+        assert "has_user_type" in result["message"], result
+    flag = shared_bn.run("py", "exec", "--code",
+                         "print(bv.get_functions_by_name('mul')[0].has_user_type)")
+    assert flag.returncode == 0 and flag.stdout.strip() == "False", flag.stdout + flag.stderr
+
+
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize("interface", ["cli", "wire"])
+def test_analysis_exception_discloses_kept_imports_without_replacing_error_1031(
+        shared_bn, preview, interface):
+    shared_bn.load(ADD_BINARY)
+    probe = ("import json\nprint(json.dumps({str(i): str(bv.get_type_name_by_id(i)) "
+             "for i in bv.type_container.type_ids}))")
+    before = json.loads(shared_bn.run("py", "exec", "--code", probe).stdout)
+    injected = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+original = bn.BinaryView.update_analysis_and_wait
+def fail_once(view, _original=original):
+    bn.BinaryView.update_analysis_and_wait = _original
+    raise RuntimeError('synthetic SDK analysis failure')
+fail_once._review_original = original
+bn.BinaryView.update_analysis_and_wait = fail_once
+""")
+    assert injected.returncode == 0, injected.stdout + injected.stderr
+    try:
+        declaration = "struct Exceptional1031 { timespec* p; };"
+        if interface == "cli":
+            args = ["types", "declare", declaration, "--format", "json"]
+            if preview:
+                args.append("--preview")
+            response = shared_bn.run(*args)
+            assert response.returncode == 2, response.stdout + response.stderr
+            result = json.loads(response.stdout)
+        else:
+            registry = json.loads((shared_bn.cache_dir / "instances"
+                                   / f"{shared_bn.instance_id}.json").read_text())
+            identity = {"instance_id": registry["instance_id"], "pid": registry["pid"],
+                        "token": registry["instance_token"]}
+            request = {"op": "types_declare", "target": ADD_BINARY.name,
+                       "_bridge_identity": identity,
+                       "params": {"declaration": declaration, "preview": preview}}
+            endpoint = shared_bn.cache_dir / "instances" / f"{shared_bn.instance_id}.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(30)
+                connection.connect(str(endpoint))
+                connection.sendall(json.dumps(request).encode() + b"\n")
+                with connection.makefile("rb") as stream:
+                    result = json.loads(stream.readline())
+            assert "status" not in result, result
+    finally:
+        cleanup = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+original = getattr(bn.BinaryView.update_analysis_and_wait, '_review_original', None)
+if original is not None:
+    bn.BinaryView.update_analysis_and_wait = original
+""")
+        assert cleanup.returncode == 0, cleanup.stdout + cleanup.stderr
+    assert result["ok"] is False, result
+    assert "internal error: RuntimeError: synthetic SDK analysis failure" in result["error"], result
+    after = json.loads(shared_bn.run("py", "exec", "--code", probe).stdout)
+    imported = sorted(name for type_id, name in after.items() if type_id not in before)
+    assert "timespec" in imported, (result, imported)
+    assert ("kept library imports (a rollback cannot remove them): "
+            + ", ".join(imported)) in result["error"], result
+    if interface == "wire":
+        assert result["result"]["kept_library_imports"] == imported, result
+    assert shared_bn.run("types", "show", "Exceptional1031").returncode == 2
+
+
+@pytest.mark.parametrize("mixed", [False, True], ids=["comment-only", "comment-and-field"])
+@pytest.mark.parametrize("phase", ["write", "analysis"])
+@pytest.mark.parametrize("summary", [False, True], ids=["detail", "summary"])
+def test_nonparsing_import_outcome_1031(shared_bn, tmp_path, mixed, phase, summary):
+    """The whole-request guard works with or without an observed operation owner."""
+    shared_bn.load(ADD_BINARY)
+    setup = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+bv.define_user_type('NonParsing1031', bn.Type.structure(
+    members=[(bn.Type.int(4), 'original')]))
+bv.set_comment_at(bv.start, 'original nonparser comment')
+""")
+    assert setup.returncode == 0, setup.stdout + setup.stderr
+    probe = """
+import json
+print(json.dumps({
+    'ids': {str(i): str(bv.get_type_name_by_id(i))
+            for i in bv.type_container.type_ids},
+    'comment': bv.get_comment_at(bv.start),
+    'struct': str(bv.get_type_by_name('NonParsing1031')),
+    'address': hex(bv.start),
+}))
+"""
+    before = json.loads(shared_bn.run("py", "exec", "--code", probe).stdout)
+    assert "timespec" not in before["ids"].values(), before
+    original_layout = shared_bn.json("struct", "show", "NonParsing1031")["layout"]
+    operations = [{"op": "set_comment", "address": before["address"],
+                   "comment": "temporary nonparser comment"}]
+    if mixed:
+        operations.append({
+            "op": "struct_field_set", "struct_name": "NonParsing1031",
+            "offset": "0x0", "field_name": "changed", "field_type": "int32_t",
+        })
+    manifest = tmp_path / "nonparser-import.json"
+    manifest.write_text(json.dumps({"ops": operations}), encoding="utf-8")
+    try:
+        injected = shared_bn.run("py", "exec", "--code", f"""
+import binaryninja as bn
+method = {'set_comment_at' if phase == 'write' else 'update_analysis_and_wait'!r}
+original = getattr(bn.BinaryView, method)
+def import_once(view, *args, _original=original, _method=method, **kwargs):
+    setattr(bn.BinaryView, _method, _original)
+    imported = view.import_library_type('timespec')
+    assert imported is not None, 'synthetic fixture needs libc timespec'
+    return _original(view, *args, **kwargs)
+import_once._review_nonparsing_original = original
+setattr(bn.BinaryView, method, import_once)
+""")
+        assert injected.returncode == 0, injected.stdout + injected.stderr
+        response = shared_bn.run(
+            "batch", "apply", str(manifest), "--preview", "--format", "json",
+            *(["--summary"] if summary else []))
+    finally:
+        cleanup = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+for method in ('set_comment_at', 'update_analysis_and_wait'):
+    original = getattr(getattr(bn.BinaryView, method), '_review_nonparsing_original', None)
+    if original is not None:
+        setattr(bn.BinaryView, method, original)
+""")
+        assert cleanup.returncode == 0, cleanup.stdout + cleanup.stderr
+    assert response.returncode == 3, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert result["success"] is False, result
+    assert result["preview"] is True, result
+    assert result["committed"] is False, result
+    after = json.loads(shared_bn.run("py", "exec", "--code", probe).stdout)
+    assert {type_id: after["ids"].get(type_id) for type_id in before["ids"]} == before["ids"]
+    added = {type_id: name for type_id, name in after["ids"].items()
+             if type_id not in before["ids"]}
+    imported = sorted(set(added.values()))
+    assert "timespec" in imported, (result, added)
+    assert after["ids"] == {**before["ids"], **added}
+    assert result["kept_library_imports"] == imported, result
+    if summary:
+        assert result["ok"] is False, result
+        assert result["verified_count"] == result["changed_count"] == 0, result
+        if phase == "analysis":
+            assert "No operation attribution is available" in result["first_error"], result
+    else:
+        assert result["status"] == "unsupported", result
+        if phase == "write":
+            owner = result["results"][0]
+            assert owner["status"] == "unsupported", result
+            assert sorted(owner["imported_from_library"]) == imported, result
+            assert "parse_performed" not in owner, result
+        else:
+            assert result["unattributed_library_imports"] == imported, result
+            assert "No operation attribution is available" in result["message"], result
+            assert all(row["status"] == "reverted" for row in result["results"]), result
+            assert all("imported_from_library" not in row for row in result["results"]), result
+            for row in result["results"]:
+                assert "sibling" not in row["message"].lower(), result
+                assert "live-session verification" not in row["message"].lower(), result
+        if mixed:
+            sibling = result["results"][1]
+            assert sibling["status"] == "reverted", result
+            assert not sibling.get("imported_from_library"), result
+    assert after["comment"] == before["comment"]
+    assert after["struct"] == before["struct"]
+    assert shared_bn.json("struct", "show", "NonParsing1031")["layout"] == original_layout
+
+
+def test_explicit_platform_library_import_refuses_comment_preview_1031(shared_bn, tmp_path):
+    """An unattached platform library can retain types without lookup provenance."""
+    shared_bn.load(ADD_BINARY)
+    probe = """
+import json
+print(json.dumps({
+    'ids': {str(i): str(bv.get_type_name_by_id(i))
+            for i in bv.type_container.type_ids},
+    'libraries': [str(library.name) for library in bv.type_libraries],
+    'lookup': bv.lookup_imported_type_library('ipc_perm') is not None,
+    'comment': bv.get_comment_at(bv.start),
+    'address': hex(bv.start),
+}))
+"""
+    before_response = shared_bn.run("py", "exec", "--code", probe)
+    assert before_response.returncode == 0, before_response.stdout + before_response.stderr
+    before = json.loads(before_response.stdout)
+    assert "ipc_perm" not in before["ids"].values(), before
+    assert "SYSCALLS" not in before["libraries"], before
+    assert before["lookup"] is False, before
+    manifest = tmp_path / "platform-import-preview.json"
+    manifest.write_text(json.dumps({"ops": [{
+        "op": "set_comment", "address": before["address"],
+        "comment": "temporary explicit platform import comment",
+    }]}), encoding="utf-8")
+    try:
+        injected = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+library = next(library for library in bv.platform.type_libraries
+               if library.name == 'SYSCALLS')
+original = bn.BinaryView.set_comment_at
+def import_once(view, *args, _original=original, _library=library, **kwargs):
+    bn.BinaryView.set_comment_at = _original
+    imported = view.import_library_type('ipc_perm', _library)
+    assert imported is not None, 'synthetic fixture needs SYSCALLS ipc_perm'
+    return _original(view, *args, **kwargs)
+import_once._review_platform_original = original
+bn.BinaryView.set_comment_at = import_once
+""")
+        assert injected.returncode == 0, injected.stdout + injected.stderr
+        response = shared_bn.run(
+            "batch", "apply", str(manifest), "--preview", "--format", "json")
+    finally:
+        cleanup = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+original = getattr(bn.BinaryView.set_comment_at, '_review_platform_original', None)
+if original is not None:
+    bn.BinaryView.set_comment_at = original
+""")
+        assert cleanup.returncode == 0, cleanup.stdout + cleanup.stderr
+    assert response.returncode == 3, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert result["success"] is False, result
+    assert result["preview"] is True, result
+    assert result["committed"] is False, result
+    assert result["status"] == "unsupported", result
+    after_response = shared_bn.run("py", "exec", "--code", probe)
+    assert after_response.returncode == 0, after_response.stdout + after_response.stderr
+    after = json.loads(after_response.stdout)
+    assert {type_id: after["ids"].get(type_id) for type_id in before["ids"]} == before["ids"]
+    added = {type_id: name for type_id, name in after["ids"].items()
+             if type_id not in before["ids"]}
+    imported = sorted(set(added.values()))
+    assert "ipc_perm" in imported, (result, added)
+    assert after["ids"] == {**before["ids"], **added}
+    assert result["kept_library_imports"] == imported, result
+    assert result["results"][0]["status"] == "unsupported", result
+    assert sorted(result["results"][0]["imported_from_library"]) == imported, result
+    assert after["libraries"] == before["libraries"], after
+    assert "SYSCALLS" not in after["libraries"], after
+    assert after["lookup"] is False, after
+    assert after["comment"] == before["comment"], after
+
+
+class TestParserHeavyTrackingPerformance1031:
+    """Compare real parser-heavy batches with the same build's untraced core."""
+
+    @staticmethod
+    def _sample(shared_bn, manifest, *, preview, tracked):
+        # Keep the bridge, transaction, parsers, verifiers and SDK identical.
+        # Only request import bookkeeping is absent from the control. Measuring
+        # inside _mutation excludes CLI startup/JSON transfer from both samples.
+        installed = shared_bn.run("py", "exec", "--code", f"""
+import time
+from bn_agent_bridge import mutation_engine as engine
+original_mutation = engine._mutation
+original_baseline = engine._declare_batch_type_names
+def timed_mutation(ctx, selector, preview, operations, *, exclusive=None):
+    started = time.perf_counter()
+    try:
+        if {tracked!r}:
+            return original_mutation(ctx, selector, preview, operations, exclusive=exclusive)
+        preview_token = engine._PREVIEW_PARSE.set(bool(preview))
+        trace_token = engine._IMPORT_TRACE.set(None)
+        try:
+            return engine._apply_batch(ctx, selector, preview, operations, exclusive=exclusive)
+        finally:
+            engine._IMPORT_TRACE.reset(trace_token)
+            engine._PREVIEW_PARSE.reset(preview_token)
+    finally:
+        timed_mutation._review_elapsed = time.perf_counter() - started
+timed_mutation._review_original = original_mutation
+timed_mutation._review_baseline = original_baseline
+timed_mutation._review_elapsed = None
+engine._mutation = timed_mutation
+if not {tracked!r}:
+    engine._declare_batch_type_names = lambda bv, operations: None
+""")
+        assert installed.returncode == 0, installed.stdout + installed.stderr
+        try:
+            started = time.perf_counter()
+            response = shared_bn.run(
+                "batch", "apply", str(manifest),
+                *(["--preview"] if preview else []), "--format", "json", timeout=180)
+            wall = time.perf_counter() - started
+        finally:
+            restored = shared_bn.json("py", "exec", "--code", """
+from bn_agent_bridge import mutation_engine as engine
+timed_mutation = engine._mutation
+try:
+    result = {'seconds': timed_mutation._review_elapsed}
+finally:
+    engine._mutation = timed_mutation._review_original
+    engine._declare_batch_type_names = timed_mutation._review_baseline
+""")
+        seconds = restored["result"]["seconds"]
+        assert seconds is not None and seconds > 0, restored
+        return response, seconds, wall
+
+    @pytest.mark.parametrize(("kind", "preview", "max_ratio"), [
+        pytest.param("declarations", True, 4.0, id="declarations-preview"),
+        pytest.param("fields", True, 2.5, id="fields-preview"),
+        pytest.param("fields", False, 2.5, id="fields-live"),
+    ])
+    def test_parser_heavy_batch_stays_near_untraced_core(
+            self, shared_bn, tmp_path, kind, preview, max_ratio):
+        shared_bn.load(ADD_BINARY)
+        setup = shared_bn.json("py", "exec", "--code", """
+import binaryninja as bn
+record = bn.Type.structure(members=[(bn.Type.int(4), 'a'), (bn.Type.int(4), 'b')])
+for index in range(3000):
+    bv.define_user_type(f'Syn{index}', record)
+result = {'count': sum(str(name).startswith('Syn') for name in bv.type_names),
+          'width': record.width,
+          'members': [member.name for member in record.members]}
+""")["result"]
+        assert setup == {"count": 3000, "width": 8, "members": ["a", "b"]}, setup
+
+        samples = {"control": [], "tracked": []}
+        wall_samples = {"control": [], "tracked": []}
+        outcomes = []
+        for repeat in range(2):
+            # Reverse order in the second pair to avoid always giving either
+            # path the warm parser/cache or the earlier analysis scheduling.
+            for tracked in ((False, True) if repeat == 0 else (True, False)):
+                mode = "tracked" if tracked else "control"
+                stamp = f"{mode}_{repeat}"
+                if kind == "declarations":
+                    names = [f"ParserTiming1031_{stamp}_{index}" for index in range(300)]
+                    operations = [
+                        {"op": "types_declare",
+                         "declaration": f"struct {name} {{ int x; int y; }};"}
+                        for name in names
+                    ]
+                else:
+                    # Disjoint targets and fresh member names ensure neither
+                    # live repeats nor the control can turn into no-op writes.
+                    first = 600 * repeat + (300 if tracked else 0)
+                    names = [f"Syn{first + index}" for index in range(300)]
+                    operations = [
+                        {"op": "struct_field_set", "struct_name": name, "offset": "0x0",
+                         "field_name": f"changed_{stamp}_{index}", "field_type": "int"}
+                        for index, name in enumerate(names)
+                    ]
+                manifest = tmp_path / f"parser-timing-{kind}-{stamp}.json"
+                manifest.write_text(json.dumps({"ops": operations}))
+                response, seconds, wall = self._sample(
+                    shared_bn, manifest, preview=preview, tracked=tracked)
+                samples[mode].append(seconds)
+                wall_samples[mode].append(wall)
+                assert response.returncode == 0, response.stdout + response.stderr
+                result = json.loads(response.stdout)
+                assert result["success"] is True, result
+                assert result["committed"] is (not preview), result
+                assert result["rolled_back"] is preview, result
+                assert len(result["results"]) == 300, result
+                assert all(row["status"] == "verified" for row in result["results"]), result
+                assert len(result["affected_types"]) == 300, result
+                assert not result.get("kept_library_imports"), result
+                assert not any(row.get("imported_from_library")
+                               for row in result["results"]), result
+
+                # Inspect the real SDK state after every control/tracked run,
+                # outside the measured interval. Preview must undo all 300
+                # writes; live fields must retain all 300 fresh names.
+                expected = (
+                    [None] * 300 if kind == "declarations" else
+                    [f"changed_{stamp}_{index}" if not preview else "a"
+                     for index in range(300)]
+                )
+                state = shared_bn.json("py", "exec", "--code", f"""
+names = {names!r}
+state = []
+for name in names:
+    type_obj = bv.get_type_by_name(name)
+    if type_obj is None:
+        state.append(None)
+    else:
+        state.append({{'width': type_obj.width,
+                      'members': [[member.name, member.offset, member.type.width]
+                                  for member in type_obj.members]}})
+result = state
+""")["result"]
+                wanted = [
+                    None if field is None else
+                    {"width": 8, "members": [[field, 0, 4], ["b", 4, 4]]}
+                    for field in expected
+                ]
+                assert state == wanted, (mode, repeat, state, wanted)
+                outcomes.append({
+                    "success": result["success"], "committed": result["committed"],
+                    "rolled_back": result["rolled_back"],
+                    "statuses": dict(collections.Counter(
+                        row["status"] for row in result["results"])),
+                    "affected_types": len(result["affected_types"]),
+                    "checked_state_count": len(state),
+                })
+
+        assert all(outcome == outcomes[0] for outcome in outcomes), outcomes
+        control, tracked = min(samples["control"]), min(samples["tracked"])
+        print(f"parser-heavy {kind} preview={preview}: core_samples={samples} "
+              f"wall_samples={wall_samples} best_ratio={tracked / control:.3f}")
+        # Best-of-two tolerates one-off scheduling stalls. Ratios are generous
+        # to routine bookkeeping, but reject the review's ~6x declaration and
+        # ~3x field-set regressions without a machine-specific seconds budget.
+        assert tracked < control * max_ratio, (samples, wall_samples, max_ratio)
+
+
+class TestDirectPreviewRetainedTypes1031:
+    """Direct mutation entry points obey the same final-ID rule as batches."""
+
+    @staticmethod
+    def _state(shared_bn):
+        response = shared_bn.run("py", "exec", "--code", """
+import json
+print(json.dumps({
+    'ids': {str(i): str(bv.get_type_name_by_id(i))
+            for i in bv.type_container.type_ids},
+    'functions': {hex(f.start): f.name for f in bv.functions},
+}))
+""")
+        assert response.returncode == 0, response.stdout + response.stderr
+        return json.loads(response.stdout)
+
+    @staticmethod
+    def _retained(before, after, result, names):
+        assert {i: after["ids"].get(i) for i in before["ids"]} == before["ids"]
+        added = {i: name for i, name in after["ids"].items() if i not in before["ids"]}
+        assert sorted(set(added.values())) == sorted(names), (added, result)
+        assert result["success"] is False, result
+        assert result["status"] == "unsupported", result
+        assert result["preview"] is True and result["committed"] is False, result
+        assert result["kept_library_imports"] == sorted(names), result
+        assert result["unattributed_library_imports"] == sorted(names), result
+
+    @pytest.mark.parametrize("syscall", [True, False], ids=["syscall-residue", "preexisting-types-clean"])
+    def test_standalone_function_create_preview(self, shared_bn, tmp_path, syscall):
+        # The public round-four reproducer: the second .text syscall stub is
+        # deliberately unreferenced and lacks a symbol after strip. Obtain its
+        # address before stripping rather than depending on compiler layout.
+        source = tmp_path / "stubs.c"
+        source.write_text("""
+__attribute__((section(".text"), used, aligned(16)))
+unsigned char stub_blob[] = {
+  0x48,0x89,0xf8, 0xb8,0x3f,0x00,0x00,0x00, 0x0f,0x05, 0xc3,
+  0x48,0x89,0xf8, 0xb8,0x63,0x00,0x00,0x00, 0x0f,0x05, 0xc3
+};
+int main(int c, char **v) { (void)v; return c; }
+""", encoding="utf-8")
+        binary = tmp_path / "stubs"
+        built = subprocess.run(
+            ["cc", "-O2", "-fno-pie", "-no-pie", str(source), "-o", str(binary)],
+            capture_output=True, text=True)
+        assert built.returncode == 0, built.stderr
+        symbols = subprocess.run(["nm", "-n", str(binary)], capture_output=True, text=True)
+        assert symbols.returncode == 0, symbols.stderr
+        addresses = {parts[2]: int(parts[0], 16)
+                     for line in symbols.stdout.splitlines()
+                     if len(parts := line.split()) == 3}
+        address = addresses["stub_blob"] + 11
+        stripped = subprocess.run(["strip", str(binary)], capture_output=True, text=True)
+        assert stripped.returncode == 0, stripped.stderr
+        shared_bn.load(binary, copy=False)
+        if not syscall:
+            # The identical fresh target is clean when its syscall types already
+            # exist: pre-existing IDs must not turn a reversible preview into a failure.
+            primed = shared_bn.run("py", "exec", "--code", """
+library = next(x for x in bv.platform.type_libraries if x.name == 'SYSCALLS')
+assert bv.import_library_type('sysinfo', library) is not None
+bv.update_analysis_and_wait()
+""")
+            assert primed.returncode == 0, primed.stdout + primed.stderr
+        before = self._state(shared_bn)
+        assert hex(address) not in before["functions"], before
+        response = shared_bn.run(
+            "function", "create", hex(address), "--preview", "--format", "json")
+        assert response.returncode == (3 if syscall else 0), response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        after = self._state(shared_bn)
+        assert hex(address) not in after["functions"], (result, after)
+        assert after["functions"] == before["functions"], (result, before, after)
+        assert result["rolled_back"] is True, result
+        if syscall:
+            self._retained(before, after, result, [
+                "__kernel_long_t", "__kernel_ulong_t", "__u16", "__u32", "sysinfo"])
+        else:
+            assert result["success"] is True and result["committed"] is False, result
+            assert result["results"][0]["status"] == "verified", result
+            assert after["ids"] == before["ids"]
+            assert not result.get("kept_library_imports"), result
+
+    @pytest.mark.parametrize("retained", [True, False], ids=["retained", "clean"])
+    @pytest.mark.parametrize("candidates", [True, False], ids=["rename", "no-candidates"])
+    def test_go_rename_preview_guards_recovery_and_preserves_counters(
+            self, shared_bn, retained, candidates):
+        # No Go binary is required: replace only pcln recovery, not the actual
+        # CLI/direct rename implementation, its live readback or rollback.
+        shared_bn.load(ADD_BINARY)
+        setup = shared_bn.run("py", "exec", "--code", """
+f = next(f for f in bv.functions if f.name == 'mul')
+f.name = f'sub_{f.start:x}'
+""")
+        assert setup.returncode == 0, setup.stdout + setup.stderr
+        before = self._state(shared_bn)
+        try:
+            installed = shared_bn.run("py", "exec", "--code", f"""
+import binaryninja as bn
+from bn_agent_bridge import read_go
+original = read_go._go_functions
+def synthetic_recovery(ctx, selector, _original=original):
+    view = ctx._resolve_view(selector)
+    auto = next(f for f in view.functions if f.name == f'sub_{{f.start:x}}')
+    user = next(f for f in view.functions if f.name == 'add')
+    named = next(f for f in view.functions if f.name == 'main')
+    if {retained!r}:
+        view.define_user_type('RetainedGo1031', bn.Type.int(4))
+    return {{'defined_count': 4, 'items': [
+        {{'address': hex(auto.start), 'name': 'probe.Go1031' if {candidates!r} else auto.name, 'defined': True}},
+        {{'address': hex(user.start), 'name': 'probe.User1031', 'defined': True}},
+        {{'address': hex(named.start), 'name': named.name, 'defined': True}},
+        {{'address': hex(auto.start + 1), 'name': 'probe.Interior1031', 'defined': True}},
+    ]}}
+synthetic_recovery._review_direct_original = original
+read_go._go_functions = synthetic_recovery
+""")
+            assert installed.returncode == 0, installed.stdout + installed.stderr
+            response = shared_bn.run("go", "rename", "--preview", "--format", "json")
+        finally:
+            restored = shared_bn.run("py", "exec", "--code", """
+from bn_agent_bridge import read_go
+original = getattr(read_go._go_functions, '_review_direct_original', None)
+if original is not None:
+    read_go._go_functions = original
+""")
+            assert restored.returncode == 0, restored.stdout + restored.stderr
+        assert response.returncode == (3 if retained else 0), response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        after = self._state(shared_bn)
+        assert after["functions"] == before["functions"], (before, after, result)
+        assert result["defined_count"] == 4, result
+        assert result["go_renamed_candidates"] == int(candidates), result
+        assert result["go_verified_count"] == int(candidates), result
+        assert result["go_failed_count"] == 0 and result["go_committed_count"] == 0, result
+        assert result["skipped_user_named"] == 1, result
+        assert result["skipped_already_named"] == (1 if candidates else 2), result
+        assert result["skipped_interior_pc"] == 1, result
+        if retained:
+            self._retained(before, after, result, ["RetainedGo1031"])
+        else:
+            assert result["success"] is True and result["committed"] is False, result
+            assert after["ids"] == before["ids"]
+            assert not result.get("kept_library_imports"), result
+
+    @pytest.mark.parametrize("retained", [True, False], ids=["retained", "clean"])
+    def test_class_apply_types_preview_guards_noop_planning(self, shared_bn, retained):
+        shared_bn.load(CLASSES_STRIPPED_BINARY)
+        first = shared_bn.json("class", "apply-types", "svc::Codec")
+        assert first["success"] is True, first
+        before = self._state(shared_bn)
+        layout = shared_bn.json("types", "show", "svc::Codec")["layout"]
+        try:
+            installed = shared_bn.run("py", "exec", "--code", f"""
+import binaryninja as bn
+from bn_agent_bridge import mutation_engine as engine
+original = engine._class_apply_types_plan
+def observed_plan(ctx, selector, name, _original=original):
+    operations, plan = _original(ctx, selector, name)
+    assert not operations, 'fixture must exercise the direct noop return'
+    if {retained!r}:
+        ctx._resolve_view(selector).define_user_type('RetainedClass1031', bn.Type.int(4))
+    return operations, plan
+observed_plan._review_direct_original = original
+engine._class_apply_types_plan = observed_plan
+""")
+            assert installed.returncode == 0, installed.stdout + installed.stderr
+            response = shared_bn.run(
+                "class", "apply-types", "svc::Codec", "--preview", "--format", "json")
+        finally:
+            restored = shared_bn.run("py", "exec", "--code", """
+from bn_agent_bridge import mutation_engine as engine
+original = getattr(engine._class_apply_types_plan, '_review_direct_original', None)
+if original is not None:
+    engine._class_apply_types_plan = original
+""")
+            assert restored.returncode == 0, restored.stdout + restored.stderr
+        assert response.returncode == (3 if retained else 0), response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        after = self._state(shared_bn)
+        assert after["functions"] == before["functions"]
+        assert shared_bn.json("types", "show", "svc::Codec")["layout"] == layout
+        assert result["class_apply_types"]["instance_struct"] == "unchanged", result
+        if retained:
+            self._retained(before, after, result, ["RetainedClass1031"])
+        else:
+            assert result["success"] is True and result["rolled_back"] is True, result
+            assert result["results"][0]["status"] == "noop", result
+            assert after["ids"] == before["ids"]
+            assert not result.get("kept_library_imports"), result
 def test_diagnostic_recovery_and_target_commands_run_as_printed(tmp_path):
     """Transport recovery starts fresh; target inspection keeps its live routing."""
     import re

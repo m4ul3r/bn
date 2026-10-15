@@ -4133,6 +4133,9 @@ _GO_RENAME_NON_COUNT_READS = {
     "kind", "committed", "preview", "success", "rolled_back", "message",
     "results", "prototype_user_type_residue",
     "changed_count", "verified_count", "noop_count", "failed_count",
+    # #1012: read only by the composed renderer, derived from generic result
+    # rows; never an input counter of the go-rename summary.
+    "reverted_count",
     "measured", "dirty_after", "first_error",
     # M-03: the paired renderer reads the split-host listing back off the
     # summary; a listing, not a count, and absent on every `go rename`.
@@ -4303,10 +4306,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # `data_ref_count`; #969 the imports listing's `library_unattributed`.
     # #978 adds the `function search` mangled-only match count.
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
+    # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
-    assert len(sites) == 62, (
+    assert len(sites) == 63, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 62. A "
+        "count helper, not 63. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -9884,3 +9888,24 @@ def test_dynamic_section_notes_reach_every_text_face_987():
          "has_more": False, "items": [], "dynamic_section_notes": [note]})
     assert f"! dynamic section: {note}" in _render_imports_summary_text(
         {"total_symbols": 0, "dynamic_section_notes": [note]})
+
+
+def test_failed_import_preview_counts_reverted_siblings_and_all_kept_types_1012():
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+    value = {
+        "preview": True, "success": False, "committed": False, "rolled_back": True,
+        "kept_library_imports": ["passwd", "__uid_t"],
+        "results": [
+            {"op": "set_comment", "status": "reverted"},
+            {"op": "local_retype", "status": "unsupported", "message": "imported passwd",
+             "imported_from_library": ["passwd", "__uid_t"]},
+        ],
+    }
+    summary = _mutation_summary(value)
+    assert summary["reverted_count"] == 1
+    assert summary["verified_count"] == summary["changed_count"] == 0
+    assert summary["failed_count"] == 1
+    assert summary["kept_library_imports"] == ["passwd", "__uid_t"]
+    text = _render_mutation_summary_text(summary)
+    assert "reverted=1" in text
+    assert "kept library imports (a rollback cannot remove them): passwd, __uid_t" in text

@@ -299,29 +299,41 @@ def _serialize_error(exc: BaseException) -> str:
     # OperationFailure subclasses RuntimeError, so it is already covered by the
     # tuple below; it is listed explicitly to document the intent.
     if isinstance(exc, OperationFailure):
-        return str(exc)
-    if isinstance(exc, USER_FACING_ERRORS) and _raised_inside_this_project(exc):
-        return str(exc)
-    return f"internal error: {type(exc).__name__}: {exc}"
+        message = str(exc)
+    elif isinstance(exc, USER_FACING_ERRORS) and _raised_inside_this_project(exc):
+        message = str(exc)
+    else:
+        message = f"internal error: {type(exc).__name__}: {exc}"
+    imports = getattr(exc, "kept_library_imports", ())
+    if imports:
+        message += (
+            "\nkept library imports (a rollback cannot remove them): "
+            + ", ".join(imports)
+        )
+    return message
 
 
 def _residue_error_disclosure(exc: BaseException) -> dict[str, Any] | None:
-    """Structured disclosure for the ``result`` field of an ``ok:false`` response
-    when the raised exception carries an unclearable ``has_user_type`` residue.
+    """Disclose irreversible mutation residue without replacing the exception.
 
-    A mutation can raise AFTER an applied ``set_prototype`` pinned
-    ``BNFunctionHasUserType`` on an AUTO function -- BN exposes no API to clear it,
-    so the value revert leaves the view MODIFIED. The exception is annotated with
-    ``prototype_user_type_residue = True`` (see ``mutation_engine._mutation``), but
-    ``str(exc)`` alone does not disclose that residue. An unattended control loop
-    reads the raw response, so surface the residue there -- ``success:false`` /
-    ``rolled_back:false`` / ``prototype_user_type_residue:true`` plus an
-    explanation -- rather than forcing the caller to infer it from a later
-    ``close`` (#630 round 3). Returns None when there is no residue, so a plain
-    error response keeps ``result: null``."""
-    if not getattr(exc, "prototype_user_type_residue", False):
+    Both an unclearable prototype override and kept library imports survive an
+    exceptional exit. Generic errors keep their original class/status and error
+    envelope; raw protocol clients also get the retained imports as a list here.
+    """
+    imports = getattr(exc, "kept_library_imports", ())
+    prototype_residue = bool(getattr(exc, "prototype_user_type_residue", False))
+    if not prototype_residue and not imports:
         return None
-    return {
+    result: dict[str, Any] = {"success": False}
+    if imports:
+        result["kept_library_imports"] = list(imports)
+        result["message"] = (
+            "Library types imported before the failure stay in the view "
+            "(a rollback cannot remove them)."
+        )
+    if not prototype_residue:
+        return result
+    result.update({
         "success": False,
         "rolled_back": False,
         "prototype_user_type_residue": True,
@@ -331,7 +343,8 @@ def _residue_error_disclosure(exc: BaseException) -> dict[str, Any] | None:
             "modified even though the operation did not complete. The unsaved "
             "state must be reverted or discarded (e.g. reload the target)."
         ),
-    }
+    })
+    return result
 
 
 class OperationFailure(RuntimeError):
