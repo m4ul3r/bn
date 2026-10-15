@@ -1079,7 +1079,7 @@ def _restamp_reverted_siblings(
     failed keeps its failure status, message and observed evidence."""
     stamp = "reverted" if restored else "rollback_failed"
     note = (
-        "Rolled back because a sibling operation failed live-session verification."
+        "Rolled back because the batch did not commit."
         if restored
         else "Rollback failed; this operation may still be applied."
     )
@@ -2647,7 +2647,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 result["success"] = False
                 result["status"] = "unsupported"
                 result["message"] = (
-                    f"{explanation} Cannot --preview imports: library types "
+                    f"{explanation} Cannot --preview retained new types: types "
                     "stay in the view (a rollback cannot remove them).").strip()
                 if trace["unattributed"]:
                     result["message"] += (
@@ -4813,14 +4813,15 @@ def _declare_batch_type_names(bv, operations) -> _TypeBaseline | None:
 
 
 def _new_library_imports(bv, baseline: _TypeBaseline) -> dict[str, str | None]:
-    """New library names mapped to their IDs, or None for name-only SDKs.
+    """Retained names/IDs: every new ID in previews, recognized imports live.
 
-    Preserve the IDs from the outcome diff as the attribution key, rather than
-    looking them up again through a potentially different name/alias mapping."""
+    Preview safety is deliberately provenance-independent, including explicit
+    imports from unattached platform libraries and retained non-library IDs."""
     current_ids = _view_type_ids(bv) if baseline.ids is not None else None
     if current_ids is None:
         current = _view_type_names(bv) or set()
-        return {name: None for name in current - baseline.names if _is_library_import(bv, name)}
+        return {name: None for name in current - baseline.names
+                if _PREVIEW_PARSE.get() or _is_library_import(bv, name)}
     try:
         guids = {str(library.guid) for library in getattr(bv, "type_libraries", None) or []}
     except Exception:
@@ -4831,9 +4832,9 @@ def _new_library_imports(bv, baseline: _TypeBaseline) -> dict[str, str | None]:
             name = str(bv.get_type_name_by_id(type_id) or "")
         except Exception:
             name = ""
-        if not name:
-            continue
-        if _is_library_import(bv, name) or type_id.split(":", 1)[0] in guids:
+        if _PREVIEW_PARSE.get():
+            found[name or type_id] = type_id
+        elif name and (_is_library_import(bv, name) or type_id.split(":", 1)[0] in guids):
             found[name] = type_id
     return found
 
@@ -4882,7 +4883,7 @@ def _fail_importing_preview(results: list) -> list:
             if trace is not None:
                 prior = trace["import_errors"].setdefault(index, prior)
             message = (
-                "Binary Ninja imported type-library type(s) during this operation "
+                "Binary Ninja retained new type(s) from this operation "
                 f"({', '.join(mine)}); a preview cannot undo an import, so the imported "
                 "types stay in the view (a rollback cannot remove them). "
                 + ("Run the declare without --preview." if row.get("op") == "types_declare"

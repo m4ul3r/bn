@@ -5202,6 +5202,9 @@ for method in ('set_comment_at', 'update_analysis_and_wait'):
             assert "No operation attribution is available" in result["message"], result
             assert all(row["status"] == "reverted" for row in result["results"]), result
             assert all("imported_from_library" not in row for row in result["results"]), result
+            for row in result["results"]:
+                assert "sibling" not in row["message"].lower(), result
+                assert "live-session verification" not in row["message"].lower(), result
         if mixed:
             sibling = result["results"][1]
             assert sibling["status"] == "reverted", result
@@ -5209,6 +5212,80 @@ for method in ('set_comment_at', 'update_analysis_and_wait'):
     assert after["comment"] == before["comment"]
     assert after["struct"] == before["struct"]
     assert shared_bn.json("struct", "show", "NonParsing1031")["layout"] == original_layout
+
+
+def test_explicit_platform_library_import_refuses_comment_preview_1031(shared_bn, tmp_path):
+    """An unattached platform library can retain types without lookup provenance."""
+    shared_bn.load(ADD_BINARY)
+    probe = """
+import json
+print(json.dumps({
+    'ids': {str(i): str(bv.get_type_name_by_id(i))
+            for i in bv.type_container.type_ids},
+    'libraries': [str(library.name) for library in bv.type_libraries],
+    'lookup': bv.lookup_imported_type_library('ipc_perm') is not None,
+    'comment': bv.get_comment_at(bv.start),
+    'address': hex(bv.start),
+}))
+"""
+    before_response = shared_bn.run("py", "exec", "--code", probe)
+    assert before_response.returncode == 0, before_response.stdout + before_response.stderr
+    before = json.loads(before_response.stdout)
+    assert "ipc_perm" not in before["ids"].values(), before
+    assert "SYSCALLS" not in before["libraries"], before
+    assert before["lookup"] is False, before
+    manifest = tmp_path / "platform-import-preview.json"
+    manifest.write_text(json.dumps({"ops": [{
+        "op": "set_comment", "address": before["address"],
+        "comment": "temporary explicit platform import comment",
+    }]}), encoding="utf-8")
+    try:
+        injected = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+library = next(library for library in bv.platform.type_libraries
+               if library.name == 'SYSCALLS')
+original = bn.BinaryView.set_comment_at
+def import_once(view, *args, _original=original, _library=library, **kwargs):
+    bn.BinaryView.set_comment_at = _original
+    imported = view.import_library_type('ipc_perm', _library)
+    assert imported is not None, 'synthetic fixture needs SYSCALLS ipc_perm'
+    return _original(view, *args, **kwargs)
+import_once._review_platform_original = original
+bn.BinaryView.set_comment_at = import_once
+""")
+        assert injected.returncode == 0, injected.stdout + injected.stderr
+        response = shared_bn.run(
+            "batch", "apply", str(manifest), "--preview", "--format", "json")
+    finally:
+        cleanup = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+original = getattr(bn.BinaryView.set_comment_at, '_review_platform_original', None)
+if original is not None:
+    bn.BinaryView.set_comment_at = original
+""")
+        assert cleanup.returncode == 0, cleanup.stdout + cleanup.stderr
+    assert response.returncode == 3, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert result["success"] is False, result
+    assert result["preview"] is True, result
+    assert result["committed"] is False, result
+    assert result["status"] == "unsupported", result
+    after_response = shared_bn.run("py", "exec", "--code", probe)
+    assert after_response.returncode == 0, after_response.stdout + after_response.stderr
+    after = json.loads(after_response.stdout)
+    assert {type_id: after["ids"].get(type_id) for type_id in before["ids"]} == before["ids"]
+    added = {type_id: name for type_id, name in after["ids"].items()
+             if type_id not in before["ids"]}
+    imported = sorted(set(added.values()))
+    assert "ipc_perm" in imported, (result, added)
+    assert after["ids"] == {**before["ids"], **added}
+    assert result["kept_library_imports"] == imported, result
+    assert result["results"][0]["status"] == "unsupported", result
+    assert sorted(result["results"][0]["imported_from_library"]) == imported, result
+    assert after["libraries"] == before["libraries"], after
+    assert "SYSCALLS" not in after["libraries"], after
+    assert after["lookup"] is False, after
+    assert after["comment"] == before["comment"], after
 
 
 class TestParserHeavyTrackingPerformance1031:
