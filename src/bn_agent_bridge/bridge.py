@@ -386,6 +386,7 @@ class _WriteGate:
         self._state = threading.Lock()
         self._holder: dict[str, Any] | None = None
         self._waiters: set[str] = set()
+        self._refresh: dict[str, Any] | None = None
 
     def locked(self) -> bool:
         return self._lock.locked()
@@ -416,6 +417,34 @@ class _WriteGate:
     def holder(self) -> dict[str, Any] | None:
         with self._state:
             return _holder_view(self._holder)
+
+    @contextlib.contextmanager
+    def refresh(self):
+        """Reserve one refresh before it can queue on the writer gate.
+
+        The reservation lives on the gate, which a GUI successor shares with
+        its predecessor, so restarting the bridge cannot start a duplicate.
+        """
+        with self._state:
+            previous = dict(self._refresh) if self._refresh is not None else None
+            if previous is None:
+                self._refresh = {"since": time.monotonic(), "view": None}
+        if previous is not None:
+            elapsed = max(0, int(time.monotonic() - previous["since"]))
+            bv = previous["view"]
+            if bv is None:
+                detail = f"already pending (requested {elapsed}s ago)"
+            else:
+                detail = (f"already running{_progress_fragment(bv)}, "
+                          f"started {elapsed}s ago")
+            raise RuntimeError(
+                f"A refresh is {detail}; retry when it finishes -- "
+                "do not start another refresh.")
+        try:
+            yield
+        finally:
+            with self._state:
+                self._refresh = None
 
     def status(self, request_id: str) -> dict[str, Any]:
         with self._state:
@@ -1826,6 +1855,7 @@ class BinaryNinjaBridge:
     def __init__(self, instance_id: str | None = None):
         self.instance_id = instance_id
         self.instance_token = str(uuid.uuid4())
+        self._started_at = datetime.now(timezone.utc).isoformat()
         self._project_roots: set[str] = set()
         self._load_jobs_lock = threading.Lock()
         self._load_jobs: dict[str, dict[str, Any]] = {}
@@ -2302,8 +2332,9 @@ class BinaryNinjaBridge:
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
             "source_dir": SOURCE_DIR,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": self._started_at,
             "gui": ui is not None,
+            "capabilities": {"refresh_target_gate": True},
         }
         # Durable process identity (#694): a pid alone cannot distinguish this
         # bridge from an unrelated process that recycles its number after a crash,
@@ -3070,7 +3101,9 @@ class BinaryNinjaBridge:
             opened_known, opened_record = _opened_annotation_record(
                 bv, load_path if load_path.suffix == ".bndb" else None)
             if substitute is not None and opened_record is not None:
-                notes.append(_opened_annotation_note(opened_record))
+                annotation_note = _opened_annotation_note(opened_record)
+                if annotation_note is not None:
+                    notes.append(annotation_note)
             # The load note is one-shot; the target row keeps the verdict so a
             # later `target info` can still answer whether the restored
             # database was verified against the raw file.
@@ -3830,11 +3863,20 @@ class BinaryNinjaBridge:
         # could invalidate/close the view, leaving update_analysis_and_wait() to
         # run on a dead view (TOCTOU). Acquiring the gate first serializes refresh
         # against those writers before we ever touch the view.
-        with self._write_gate:
+        with self._write_gate.refresh(), self._write_gate:
+            # Bare CLI requests deliberately skip list_targets so a duplicate
+            # reaches the reservation before any target read can block. Reuse
+            # the sole-target gate here, then carry its identity-only pin into
+            # both analysis and the reply rather than following GUI focus.
+            if selector is None:
+                selector = self.targets.pin_destructive_target("refresh", selector)
             bv = self._resolve_view(selector)
+            started = time.monotonic()
+            with self._write_gate._state:
+                self._write_gate._refresh = {"since": started, "view": bv}
             # #996: gated reads on other connections see the refresh running and
             # say "retry", instead of telling the agent to start another one.
-            _refreshing_views[bv] = time.monotonic()
+            _refreshing_views[bv] = started
             try:
                 bv.update_analysis_and_wait()
                 with self._target_lock.write():
@@ -5117,6 +5159,7 @@ from .bridge_state import (  # noqa: E402
     _headless_views_lock,
     _quick_loaded_views,
     _opened_annotations,
+    _progress_fragment,
     _refreshing_views,
     _source_verified,
     _unanalyzed_views,
@@ -6476,8 +6519,10 @@ def _opened_annotation_record(bv, database: Path | None) -> tuple[bool, dict[str
     }
 
 
-def _opened_annotation_note(record: dict[str, Any]) -> str:
-    """The load note stating what a substituted database already held."""
+def _opened_annotation_note(record: dict[str, Any]) -> str | None:
+    """Disclose inherited analyst work, omitting a measured all-zero record."""
+    if all(record[key] == 0 for key in ("comments", "function_comments", "analyst_symbols")):
+        return None
     return (
         f"{Path(record['path']).name} already held {record['comments']} comment(s), "
         f"{record['function_comments']} function doc(s) and "
@@ -6685,7 +6730,9 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
         opened_known, opened_record = _opened_annotation_record(
             bv, load_path if load_path.suffix == ".bndb" else None)
         if substitute is not None and opened_record is not None:
-            bn.log_info(_opened_annotation_note(opened_record))
+            annotation_note = _opened_annotation_note(opened_record)
+            if annotation_note is not None:
+                bn.log_info(annotation_note)
         if verified is not None:
             _source_verified[view_session_key(bv)] = verified
         if opened_known:

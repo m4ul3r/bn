@@ -1380,7 +1380,8 @@ def test_refresh_clears_quick_state_and_enables_strings(monkeypatch):
     # same refresh), so the composed seam needs stubbing too.
     monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
                         lambda selector: (bv, []), raising=False)
-    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "refresh",
+                        lambda strict=False: [{"target_id": "sole-target"}])
 
     bridge._quick_loaded_views.add(bv)
     instance._refresh(None)  # runs analysis and clears the quick flag
@@ -1406,35 +1407,67 @@ def test_gated_reads_say_retry_while_a_refresh_is_running_996(monkeypatch):
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
     monkeypatch.setattr(instance.targets, "resolve_with_snapshot",
                         lambda selector: (bv, []), raising=False)
-    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    monkeypatch.setattr(instance.targets, "refresh",
+                        lambda strict=False: [{"target_id": "sole-target"}])
     bridge._quick_loaded_views.add(bv)
 
     with pytest.raises(RuntimeError, match=r"Run `bn refresh`"):
         bridge_state.require_analysis(bv, "Callsites")
 
-    seen: dict[str, str] = {}
+    seen: list[tuple[str, int, int]] = []
 
     def analyse():
-        bv.analysis_progress = types.SimpleNamespace(count=1592, total=3209)
-        for what, call in (
-            ("callsites", lambda: bridge_state.require_analysis(bv, "Callsites")),
-            ("strings", lambda: instance._strings(None, query=None, offset=0, limit=10)),
-        ):
-            with pytest.raises(RuntimeError) as exc:
-                call()
-            seen[what] = str(exc.value)
+        # BN can grow the total and reset the count during one refresh (#1020).
+        for count, total in ((1879, 2117), (238, 2607), (20440, 20471)):
+            bv.analysis_progress = types.SimpleNamespace(count=count, total=total)
+            for call in (
+                lambda: bridge_state.require_analysis(bv, "Callsites"),
+                lambda: instance._strings(None, query=None, offset=0, limit=10),
+            ):
+                with pytest.raises(RuntimeError) as exc:
+                    call()
+                seen.append((str(exc.value), count, total))
 
     bv.update_analysis_and_wait = analyse
     instance._refresh(None)
 
-    for message in seen.values():
-        assert "full analysis is in progress (1592/3209)" in message
+    for message, count, total in seen:
+        assert "full analysis is in progress" in message
+        assert f"BN reports count={count}, total={total}" in message
+        assert "both may reset or change" in message
+        assert "not overall completion or time remaining" in message
+        assert "started " in message and "s ago" in message
         assert "do not start another refresh" in message
         assert "loaded with --quick" in message
         assert "Run `bn refresh`" not in message
     assert bv not in bridge._quick_loaded_views
     assert bv not in bridge_state._refreshing_views
     bridge_state.require_analysis(bv, "Callsites")  # analysed: no refusal
+
+
+@pytest.mark.parametrize("progress", [
+    None,
+    types.SimpleNamespace(count=0, total=0),
+    types.SimpleNamespace(count="unavailable", total=1),
+])
+def test_gated_read_uses_elapsed_time_when_progress_is_unavailable(monkeypatch, progress):
+    bridge = _load_bridge(monkeypatch)
+    bridge_state = types.SimpleNamespace(**bridge.view_session_key.__globals__)
+    bv = _FakeBV()
+    bv.analysis_progress = progress
+    bridge._quick_loaded_views.add(bv)
+    bridge._refreshing_views[bv] = time.monotonic() - 12
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            bridge_state.require_analysis(bv, "Callsites")
+        message = str(exc.value)
+        assert "full analysis is in progress, started " in message
+        assert int(message.split("started ")[1].split("s ago")[0]) >= 12
+        assert "count=" not in message and "total=" not in message
+        assert "do not start another refresh" in message
+    finally:
+        bridge._refreshing_views.pop(bv, None)
+        bridge._quick_loaded_views.discard(bv)
 
 
 def test_sections_rejects_negative_count(monkeypatch):
