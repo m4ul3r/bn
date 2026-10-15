@@ -1069,6 +1069,10 @@ class _VtableRecoveryBudgetExpired(Exception):
     pass
 
 
+class _VtableRecoveryUnavailable(Exception):
+    pass
+
+
 def _check_vtable_recovery_deadline(deadline: float | None) -> None:
     if deadline is not None and time.monotonic() >= deadline:
         raise _VtableRecoveryBudgetExpired
@@ -1080,11 +1084,11 @@ def _class_list_vtable(ctx, bv, rec: dict[str, Any], deadline: float) -> dict[st
     typeinfo_addr = int(rec["typeinfo"]["address"], 16)
     imported = _typeinfo_is_import_slot(ctx, bv, typeinfo_addr)
     _check_vtable_recovery_deadline(deadline)
-    if not imported and not callable(getattr(bv, "get_data_refs", None)):
+    if imported or not callable(getattr(bv, "get_data_refs", None)):
         return {"has_vtable": None, "vtable_status": "unavailable",
                 "vtable_slot_count": None}
-    recovered = (None if imported else _recover_vtables_from_typeinfo(
-        ctx, bv, typeinfo_addr, deadline=deadline, primary_only=True))
+    recovered = _recover_vtables_from_typeinfo(
+        ctx, bv, typeinfo_addr, deadline=deadline, primary_only=True)
     primary = recovered["primary"] if recovered else None
     if primary is None:
         return {"has_vtable": False, "vtable_status": "not_found",
@@ -1510,8 +1514,8 @@ def _budgeted_vtable_rows(ctx, bv, start: int, *, entries: int, ptr: int,
             bv, start + index * ptr, entries=1, stride=ptr)
         _check_vtable_recovery_deadline(deadline)
         rows = table.get("items") or table.get("entries") or []
-        if not rows:
-            return
+        if not rows or not isinstance(rows[0], dict) or not rows[0].get("readable"):
+            raise _VtableRecoveryUnavailable
         yield rows[0]
 
 
@@ -1559,6 +1563,8 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64,
     # Decoding +2*ptr there would render adjacent GOT/data as fake slots
     # (#205 review), so report no slots and let the caller note it.
     ti_ptr = ctx._read_pointer_value(bv, vtable_addr + ptr, size=ptr)
+    if deadline is not None and ti_ptr is None:
+        raise _VtableRecoveryUnavailable
     if not ti_ptr or ctx._typeinfo_name_at(bv, ti_ptr) is None:
         # #822: this is a DECIDED "no local vtable body", not a capped scan -- it
         # never read a slot, so an exact `total: 0` would count a table this gate
@@ -2366,10 +2372,15 @@ def _recover_vtables_from_typeinfo(
         # List needs only the primary. Reject non-zero offset-to-top words
         # before decoding their slots; show still inspects every secondary.
         raw = ctx._read_pointer_value(bv, vt_addr, size=ptr) if primary_only else None
-        if primary_only and raw not in (None, 0):
-            continue
+        if primary_only:
+            if raw is None:
+                raise _VtableRecoveryUnavailable
+            if raw != 0:
+                continue
         layout = (ctx._vtable_layout_for(bv, vt_addr) if deadline is None
                   else _vtable_layout(ctx, bv, vt_addr, deadline=deadline))
+        if primary_only and layout and layout.get("truncated_reason") == "unreadable_row":
+            raise _VtableRecoveryUnavailable
         if not layout or not layout.get("slots"):
             continue
         if not primary_only:

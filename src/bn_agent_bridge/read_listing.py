@@ -375,7 +375,59 @@ def _callee_vtable_address_point(bv, start: int, extent: int, class_name: str,
     return hex(points[0]) if len(points) == 1 else None
 
 
-def _callee_vtable_refs(bv, refs: list[int]) -> list[dict[str, Any]]:
+def _callee_vtable_named_refs(ctx, bv, candidates: list[dict[str, Any]],
+                              extents: dict[int, int]) -> list[dict[str, Any]]:
+    """Prove that name-only class navigation selects this exact ELF object."""
+    from .read_class import (
+        _build_class_registry, _is_alias_symbol, _is_construction_vtable_artifact,
+        _is_thunk_artifact, _rtti_kind_and_class,
+    )
+
+    if not candidates:
+        return []
+    # Registry construction scans both populations. Unsupported/unbounded native
+    # surfaces cannot establish uniqueness, even if an ELF lookup found a name.
+    functions = bv.functions
+    if len(functions) > 65536:
+        return []
+    symbols = bv.get_symbols()
+    if len(symbols) > 65536:
+        return []
+    local_names: dict[str, set[int]] = {}
+    for sym in symbols:
+        kind, name = _rtti_kind_and_class(sym)
+        if kind == "vtable" and not _is_alias_symbol(sym):
+            local_names.setdefault(name, set()).add(int(sym.address))
+    unique = []
+    for candidate in candidates:
+        name = candidate["class_name"]
+        start = int(candidate["vtable_address"], 16)
+        if _is_construction_vtable_artifact(name) or _is_thunk_artifact(name):
+            continue
+        addresses = local_names.get(name, set())
+        # Only a header-proven primary address point can be another marker for
+        # this object. Mere containment in its extent cannot prove identity.
+        allowed = {start}
+        if candidate["address_point"] is not None:
+            allowed.add(int(candidate["address_point"], 16))
+        if not addresses or any(
+                address not in allowed or (address != start and address in extents)
+                for address in addresses):
+            continue
+        unique.append(candidate)
+    if not unique:
+        return []
+    registry = _build_class_registry(ctx, bv)
+    result = []
+    for candidate in unique:
+        record = registry.get(candidate["class_name"])
+        vtable = record.get("vtable") if record else None
+        if vtable and vtable["address"] == candidate["vtable_address"]:
+            result.append(candidate)
+    return result
+
+
+def _callee_vtable_refs(ctx, bv, refs: list[int]) -> list[dict[str, Any]]:
     """Confirm membership only from a defined ELF _ZTV object's st_size.
 
     No nearest-symbol or function-pointer-run inference: an anonymous table
@@ -412,6 +464,7 @@ def _callee_vtable_refs(bv, refs: list[int]) -> list[dict[str, Any]]:
         sections = list(struct.iter_unpack(fmt, headers))
         budget, symbols_left = 4 * 1024 * 1024, 65536
         matches: dict[int, list[dict[str, Any]]] = {}
+        extents: dict[int, int] = {}
         address_points: dict[tuple[int, int, str], str | None] = {}
         ptr = 8 if elf.is64 else 4
         marker = re.compile(r"^_?vtable[ _]for[ _](.+)$")
@@ -448,22 +501,37 @@ def _callee_vtable_refs(bv, refs: list[int]) -> list[dict[str, Any]]:
                 if end < 0:
                     return []
                 info, index, extent = (row[1], row[3], row[5]) if elf.is64 else (row[3], row[5], row[2])
-                if info & 15 != 1 or index == 0 or index >= count or extent <= 2 * ptr:
+                # Validate every index before type filtering: a non-object or
+                # unnamed row must not conceal an unsupported extended index.
+                if index == 0xffff or (0 < index < 0xff00 and index >= count):
+                    return []
+                if index >= 0xff00 and index not in (0xfff1, 0xfff2):
+                    return []
+                if strings[name_off:name_off + 4] != b"_ZTV" or index == 0:
                     continue
+                # Undefined imports are known non-definitions. Every defined
+                # _ZTV, including zero-size linker aliases, must be resolved;
+                # dropping an unsupported shape would falsely prove uniqueness.
+                if index >= count or info & 15 != 1 or extent <= 2 * ptr:
+                    return []
                 value = row[4] if elf.is64 else row[1]
                 owner = sections[index]
+                limit = 1 << (ptr * 8)
                 if owner[1] != 1 or not owner[2] & 2 or not (
-                        owner[3] <= value and value + extent <= owner[3] + owner[5]):
-                    continue
-                if strings[name_off:name_off + 4] != b"_ZTV":
-                    continue
+                        owner[3] <= value < value + extent <= owner[3] + owner[5] <= limit
+                        and owner[4] + owner[5] <= int(raw.length)):
+                    return []
+                name = strings[name_off:end].decode("utf-8", errors="strict")
                 start = value + bias
+                extents[start] = extent
                 relevant_refs = [ref for ref in refs if start + 2 * ptr <= ref < start + extent]
                 if not relevant_refs:
                     continue
-                name = strings[name_off:end].decode("utf-8", errors="strict")
                 local_identity_found = False
-                for sym in getter(name):
+                local_symbols = getter(name)
+                if len(local_symbols) > 65536:
+                    return []
+                for sym in local_symbols:
                     if int(sym.address) != start:
                         continue
                     symbol_type = getattr(sym, "type", None)
@@ -491,12 +559,13 @@ def _callee_vtable_refs(bv, refs: list[int]) -> list[dict[str, Any]]:
                 if not local_identity_found:
                     return []
         # Conflicting overlapping symbol extents do not establish one class.
-        return [matches[ref][0] for ref in refs if len(matches.get(ref, [])) == 1]
+        candidates = [matches[ref][0] for ref in refs if len(matches.get(ref, [])) == 1]
+        return _callee_vtable_named_refs(ctx, bv, candidates, extents)
     except Exception:
         return []
 
 
-def _callee_data_refs(bv, address: int) -> dict[str, Any]:
+def _callee_data_refs(ctx, bv, address: int) -> dict[str, Any]:
     """``callee_data_ref_count`` and the first ``_CALLEE_DATA_REFS_LISTED``
     ``callee_data_refs`` (hex) of BN's data refs to *address*; the count is
     None when BN cannot list them. ``callee_data_ref_vtables`` annotates only
@@ -512,7 +581,7 @@ def _callee_data_refs(bv, address: int) -> dict[str, Any]:
     listed = refs[:_CALLEE_DATA_REFS_LISTED]
     return {"callee_data_ref_count": len(refs),
             "callee_data_refs": [hex(r) for r in listed],
-            "callee_data_ref_vtables": _callee_vtable_refs(bv, listed)}
+            "callee_data_ref_vtables": _callee_vtable_refs(ctx, bv, listed)}
 
 
 def _other_containing_functions(ctx, bv, call_addr: str, func) -> list[dict[str, str]]:
@@ -709,7 +778,7 @@ def _callsites(
     # Report their count and addresses, and offer class-layout navigation only
     # where bounded ELF object evidence proves a named vtable's ownership.
     # Unknown locations keep an honest data-location xrefs fallback.
-    data_ref_fields = _callee_data_refs(bv, int(callee.start))
+    data_ref_fields = _callee_data_refs(ctx, bv, int(callee.start))
     # #558: an imported variadic (scanf/printf-family) callee's HLIL callsite text
     # can show only the fixed argument; attach a steer to the argument-recovery views.
     variadic_hint = _callee_variadic_hint(callee)

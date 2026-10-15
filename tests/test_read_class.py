@@ -1060,6 +1060,124 @@ def test_class_list_checked_no_vtable_is_not_unknown(rtti_only_list_ctx):
     assert "unchecked" not in text and "budget exhausted" not in text
 
 
+@pytest.mark.parametrize("fault", ["raise", "none", "short"])
+@pytest.mark.parametrize("fault_address", [0x9000, 0x9008, 0x9010, 0x9018, 0x9020])
+def test_class_list_raw_read_faults_remain_unknown(
+        monkeypatch, rtti_only_list_ctx, fault, fault_address):
+    ctx, bv = rtti_only_list_ctx
+    words = {
+        0x9000: 0, 0x9008: 0xb000, 0x9010: 0x1000, 0x9018: 0x1000,
+        0x9020: 0x7000,
+        0xa000: 0, 0xa008: 0xb100, 0xa010: 0x1000, 0xa018: 0x1000,
+        0xa020: 0x7000,
+    }
+
+    def read_bytes(address, size):
+        return words.get(address, 0).to_bytes(8, "little")[:size]
+
+    def faulty_read(address, size):
+        if address == fault_address:
+            if fault == "raise":
+                raise RuntimeError("synthetic read failure")
+            return None if fault == "none" else read_bytes(address, size)[:-1]
+        return read_bytes(address, size)
+
+    def target(bv, value):
+        if value == 0x1000:
+            return {"status": "function", "plausible": True,
+                    "normalized": hex(value), "function": {"name": "sub_1000"}}
+        return {"status": "mapped", "plausible": True, "context": {"kind": "data"}}
+
+    # Exercise the real seam decoder AND its unreadable pointer-table rows,
+    # rather than replacing a failed raw read with a pre-decided layout.
+    monkeypatch.setattr(bv, "read", faulty_read, raising=False)
+    monkeypatch.setattr(ctx, "_read_pointer_value", types.MethodType(
+        seam.BridgeContext._read_pointer_value, ctx))
+    monkeypatch.setattr(ctx, "_pointer_table_layout", types.MethodType(
+        seam.BridgeContext._pointer_table_layout, ctx))
+    monkeypatch.setattr(ctx, "_address_context", lambda bv, addr: {"kind": "data"})
+    monkeypatch.setattr(ctx, "_normalize_code_pointer", target)
+
+    listing = read_class._class_list(ctx, None)
+    alpha, beta, no_table = listing["items"]
+    assert alpha["has_vtable"] is alpha["vtable_slot_count"] is None
+    assert alpha["vtable_status"] == "unavailable"
+    assert beta["has_vtable"] is True and beta["vtable_slot_count"] == 2
+    assert no_table["has_vtable"] is False and no_table["vtable_slot_count"] == 0
+    assert no_table["vtable_status"] == "not_found"
+    assert listing["vtable_recovery_budget_exhausted"] is False
+    from bn.formatters import _render_class_list_text
+    text = _render_class_list_text({**listing, "items": [alpha]})
+    assert "no-vtable" not in text and "slots=0" not in text
+
+    if fault_address in (0x9018, 0x9020):
+        # List fails closed, but show retains its established partial layout.
+        shown = read_class._class_show(ctx, None, "Alpha")["vtable"]
+        assert len(shown["slots"]) == (fault_address - 0x9010) // 8
+        assert shown["total"] is None
+        assert shown["truncated_reason"] == "unreadable_row"
+
+    # A successful zero offset-to-top is not an unavailable read, and the
+    # failed attempt must neither cache a negative nor promote a partial table.
+    monkeypatch.setattr(bv, "read", read_bytes)
+    recovered, = read_class._class_list(ctx, None, query="Alpha")["items"]
+    assert recovered["has_vtable"] is True
+    assert recovered["vtable_status"] == "recovered"
+    assert recovered["vtable_slot_count"] == 2
+
+
+@pytest.mark.parametrize("missing_address", [0x9010, 0x9018, 0x9020])
+def test_class_list_missing_slot_rows_are_unknown(
+        monkeypatch, rtti_only_list_ctx, missing_address):
+    ctx, bv = rtti_only_list_ctx
+    read_table = ctx._pointer_table_layout
+
+    def missing_row(bv, start, *, entries, stride):
+        if start == missing_address:
+            return {"items": []}
+        return read_table(bv, start, entries=entries, stride=stride)
+
+    monkeypatch.setattr(ctx, "_pointer_table_layout", missing_row)
+    alpha, beta, no_table = read_class._class_list(ctx, None)["items"]
+    assert alpha["has_vtable"] is alpha["vtable_slot_count"] is None
+    assert alpha["vtable_status"] == "unavailable"
+    assert beta["has_vtable"] is True and beta["vtable_slot_count"] == 2
+    assert no_table["has_vtable"] is False and no_table["vtable_slot_count"] == 0
+
+
+@pytest.mark.parametrize("import_kind", ["alias", "got"])
+def test_class_list_imported_rtti_with_named_methods_is_unknown(
+        monkeypatch, rtti_only_list_ctx, import_kind):
+    ctx, bv = rtti_only_list_ctx
+    imported = _Sym(
+        "_ZTISt13runtime_error", "typeinfo for std::runtime_error", 0xc000,
+        "SymbolType.ImportedDataSymbol" if import_kind == "alias" else "SymbolType.DataSymbol",
+    )
+    bv._symbols.append(imported)
+    bv.functions.append(_Fn(
+        0x2000, "_ZNSt13runtime_errorD1Ev", "std::runtime_error::~runtime_error()"))
+    monkeypatch.setattr(
+        bv, "get_symbol_at",
+        lambda addr: next((sym for sym in bv._symbols if sym.address == addr), None),
+        raising=False,
+    )
+    if import_kind == "got":
+        bv.sections = {".got": _FakeSection(".got", 0xc000, 0xc008)}
+    listing = read_class._class_list(ctx, None)
+    rows = {row["name"]: row for row in listing["items"]}
+    row = rows["std::runtime_error"]
+    assert row["method_count"] == 1
+    assert row["has_vtable"] is row["vtable_slot_count"] is None
+    assert row["vtable_status"] == "unavailable"
+    assert 0xc000 not in bv.ref_reads
+    assert rows["Alpha"]["has_vtable"] is rows["Beta"]["has_vtable"] is True
+    assert rows["NoTable"]["has_vtable"] is False
+    from bn.formatters import _render_class_list_text
+    text = _render_class_list_text({**listing, "items": [row]})
+    assert "no-vtable" not in text and "slots=0" not in text
+
+
+
 def test_class_list_count_only_skips_vtable_recovery(rtti_only_list_ctx):
     ctx, bv = rtti_only_list_ctx
     counted = read_class._class_list(ctx, None, count_only=True)

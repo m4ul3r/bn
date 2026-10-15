@@ -4000,22 +4000,41 @@ class TestClassLensRttiGuards922:
         assert named_row["method_count"] == len(named_card["methods"]) == 1
         assert named_row["vtable_slot_count"] == named_card["vtable"]["total"] == 4
         assert named_card["vtable"]["address_point"] == card["vtable"]["address_point"]
-        unavailable = shared_bn.json(
-            "py", "exec",
-            "from bn_agent_bridge import read_class, seam\n"
-            "class RaisingRefs:\n"
-            "    def __getattr__(self, name): return getattr(bv, name)\n"
-            "    def get_data_refs(self, address):\n"
-            "        raise RuntimeError('synthetic reference API failure')\n"
-            "proxy = RaisingRefs()\n"
-            "ctx = seam.BridgeContext(None)\n"
-            "ctx._resolve_view = lambda selector: proxy\n"
-            "result = read_class._class_list(ctx, None, query='svc::EchoHandler')\n",
-            "-t", target)["result"]
-        unknown_row, = unavailable["items"]
-        assert unknown_row["has_vtable"] is unknown_row["vtable_slot_count"] is None
-        assert unknown_row["vtable_status"] == "unavailable"
-        assert unknown_row["method_count"] == 1
+        for failure in ("refs", "raw_raise", "raw_none", "raw_short"):
+            unavailable = shared_bn.json(
+                "py", "exec",
+                "from bn_agent_bridge import read_class, seam\n"
+                f"failure = {failure!r}\n"
+                "class FailedRead:\n"
+                "    def __getattr__(self, name): return getattr(bv, name)\n"
+                "    def get_data_refs(self, address):\n"
+                "        if failure == 'refs': raise RuntimeError('synthetic reference failure')\n"
+                "        return bv.get_data_refs(address)\n"
+                "    def read(self, address, size):\n"
+                "        if failure == 'raw_raise': raise RuntimeError('synthetic raw failure')\n"
+                "        if failure == 'raw_none': return None\n"
+                "        if failure == 'raw_short': return b''\n"
+                "        return bv.read(address, size)\n"
+                "proxy = FailedRead()\n"
+                "ctx = seam.BridgeContext(None)\n"
+                "ctx._resolve_view = lambda selector: proxy\n"
+                "result = read_class._class_list(ctx, None, query='svc::EchoHandler')\n",
+                "-t", target)["result"]
+            unknown_row, = unavailable["items"]
+            assert unknown_row["has_vtable"] is unknown_row["vtable_slot_count"] is None, failure
+            assert unknown_row["vtable_status"] == "unavailable", failure
+            assert unknown_row["method_count"] == 1
+        imported = shared_bn.json(
+            "class", "list", "--query", "std::runtime_error", "-t", target)
+        imported_row, = imported["items"]
+        assert imported_row["has_vtable"] is imported_row["vtable_slot_count"] is None
+        assert imported_row["vtable_status"] == "unavailable"
+        imported_card = shared_bn.json("class", "show", "std::runtime_error", "-t", target)
+        assert imported_card["typeinfo"]["import_slot"] is True
+        imported_text = shared_bn.run(
+            "class", "list", "--query", "std::runtime_error", "-t", target).stdout
+        assert "vtable=? (unavailable)" in imported_text
+        assert "slots=0" not in imported_text and "no-vtable (checked)" not in imported_text
 
     def test_stripped_slot_array_symbols_preserve_vtable_contents_935(self, shared_bn):
         # Both builds use the same source/options except -s. Compare raw slot
@@ -4248,6 +4267,81 @@ class TestVirtualMethods998:
         res = shared_bn.run(*args, "--format", "json")
         assert res.returncode == 0, (res.stdout, res.stderr)
         return json.loads(res.stdout)
+
+    def test_defsym_size_zero_alias_keeps_location_xrefs_fallback(self, shared_bn, tmp_path):
+        import re
+        import shlex
+
+        source = tmp_path / "alias.cpp"
+        source.write_text(
+            "struct Short { virtual int method() { return 7; } };\n"
+            "int main() { Short value; return value.method(); }\n")
+        binary = tmp_path / "alias"
+        build = subprocess.run(
+            ["c++", "-O0", "-o", str(binary), str(source),
+             "-Wl,--defsym=_ZTV5Alias=_ZTV5Short"],
+            capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        symbols = shared_bn.json(
+            "py", "exec",
+            "result = {name: [hex(s.address) for s in bv.get_symbols_by_raw_name(name)] "
+            "for name in ('_ZTV5Short', '_ZTV5Alias')}",
+            "-t", target)["result"]
+        assert set(symbols["_ZTV5Short"]) & set(symbols["_ZTV5Alias"]), symbols
+        out = self._json(shared_bn, "callsites", "Short::method", "-t", target)
+        assert out["callee_data_ref_count"] == 1, out
+        assert out["callee_data_ref_vtables"] == []
+        text = shared_bn.run("callsites", "Short::method", "-t", target).stdout
+        assert "bn class show" not in text
+        commands = re.findall(r"`(bn xrefs [^`]+)`", text)
+        assert {shlex.split(command)[-1] for command in commands} == set(out["callee_data_refs"])
+        for command in commands:
+            result = shared_bn.run("-t", target, *shlex.split(command)[1:])
+            assert result.returncode == 0, (command, result.stderr)
+
+    def test_duplicate_anonymous_class_names_never_print_wrong_card(self, shared_bn, tmp_path):
+        import re
+        import shlex
+
+        first, second, main = (tmp_path / name for name in ("first.cpp", "second.cpp", "main.cpp"))
+        first.write_text(
+            "namespace { struct Foo { virtual int a() { return 1; } "
+            "virtual int b() { return 2; } }; }\n"
+            "extern \"C\" void* make_first() { return new Foo; }\n")
+        second.write_text(
+            "namespace { struct Foo { virtual int c() { return 3; } "
+            "virtual int d() { return 4; } virtual int e() { return 5; } }; }\n"
+            "extern \"C\" void* make_second() { return new Foo; }\n")
+        main.write_text(
+            "extern \"C\" void* make_first(); extern \"C\" void* make_second();\n"
+            "int main() { return make_first() == make_second(); }\n")
+        binary = tmp_path / "locals"
+        build = subprocess.run(
+            ["c++", "-O0", "-o", str(binary), str(first), str(second), str(main)],
+            capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        native = shared_bn.json(
+            "py", "exec",
+            "result = {'tables': [hex(s.address) for s in "
+            "bv.get_symbols_by_raw_name('_ZTVN12_GLOBAL__N_13FooE') "
+            "if s.type.name == 'DataSymbol'], "
+            "'methods': [hex(f.start) for f in bv.functions if f.symbol and "
+            "f.symbol.raw_name.endswith(('3Foo1aEv', '3Foo1dEv'))]}\n",
+            "-t", target)["result"]
+        assert len(set(native["tables"])) == len(native["methods"]) == 2, native
+        for callee in native["methods"]:
+            out = self._json(shared_bn, "callsites", callee, "-t", target)
+            assert out["callee_data_ref_count"] == 1, out
+            assert out["callee_data_ref_vtables"] == []
+            text = shared_bn.run("callsites", callee, "-t", target).stdout
+            assert "bn class show" not in text
+            commands = re.findall(r"`(bn xrefs [^`]+)`", text)
+            assert {shlex.split(command)[-1] for command in commands} == set(out["callee_data_refs"])
+            for command in commands:
+                result = shared_bn.run("-t", target, *shlex.split(command)[1:])
+                assert result.returncode == 0, (command, result.stderr)
 
     def test_capped_census_never_attributes_an_overlapping_local_alias(self, shared_bn, tmp_path):
         import re
