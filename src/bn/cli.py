@@ -5,6 +5,7 @@ import json
 import os
 import re
 import select
+import shlex
 import stat
 import sys
 import time
@@ -2127,6 +2128,82 @@ def _mutate(
     )
 
 
+def _contextualize_diagnostic_hints(
+    value: Any, *, target: str | None, instance: str | None,
+) -> Any:
+    """Bind commands in diagnostic prose to the invocation's routing context.
+
+    Only prose fields are visited: symbol keys, locators and IL are data, not
+    commands. Registry target requirements distinguish inspection/mutation hints
+    from lifecycle recovery, which must retain its own instance/spawn arguments.
+    """
+    if not instance and not target:
+        return value
+    # As in build_parser(), defer registration until cli.py is fully imported.
+    from . import commands  # noqa: F401
+
+    def route(match: re.Match[str]) -> str:
+        command_text = match.group(1)
+        try:
+            words = shlex.split(command_text)
+        except ValueError:
+            return match.group(0)
+        # Routing flags are accepted at root/group/leaf level. Skip their values
+        # when identifying the registry path: an instance may itself be named
+        # "il" or "session". Keep the original shell text for the actual edit.
+        path: tuple[str, ...] = ()
+        index = 0
+        while index < len(words):
+            word = words[index]
+            if word in ("-i", "--instance", "-t", "--target"):
+                index += 2
+                continue
+            if word.startswith(("--instance=", "--target=", "-i", "-t")):
+                index += 1
+                continue
+            candidate = (*path, word)
+            if not any(spec["path"][:len(candidate)] == candidate for spec in _COMMANDS):
+                break
+            path = candidate
+            index += 1
+        if not any(spec["path"] == path and spec["target"] for spec in _COMMANDS):
+            return match.group(0)
+        flags = []
+        options = words[:words.index("--")] if "--" in words else words
+        if instance and not any(word.startswith(("--instance=", "-i"))
+                                or word == "--instance" for word in options):
+            flags.append(f"-i {shlex.quote(instance)}")
+        if target and not any(word.startswith(("--target=", "-t"))
+                              or word == "--target" for word in options):
+            flags.append(f"-t {shlex.quote(target)}" if not target.startswith("-")
+                         else shlex.quote(f"--target={target}"))
+        if not flags:
+            return match.group(0)
+        return "`bn " + " ".join(flags) + " " + command_text + "`"
+
+    def route_prose(text: str) -> str:
+        return re.sub(r"`bn ([^`]+)`", route, text)
+
+    prose_keys = {"error", "hints", "assumptions", "note", "detail", "next_action", "recovery_advice"}
+
+    def visit(item: Any, *, prose: bool = False) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key in prose_keys and isinstance(child, str):
+                    item[key] = route_prose(child)
+                elif isinstance(child, (dict, list)):
+                    visit(child, prose=key in prose_keys)
+        elif isinstance(item, list):
+            for index, child in enumerate(item):
+                if prose and isinstance(child, str):
+                    item[index] = route_prose(child)
+                elif isinstance(child, (dict, list)):
+                    visit(child, prose=prose)
+
+    visit(value)
+    return value
+
+
 def _call(
     args: argparse.Namespace,
     op: str,
@@ -2157,6 +2234,7 @@ def _call(
     # #996: copy the answering instance (stamped by `send_request`) into a dict
     # result, so the output names which bridge answered.
     stamp_instance: bool = False,
+    contextual_hints: bool = False,
 ) -> int:
     _require_nonempty_instance(args)
     # THE BOUNDARY (#101/#715/#716). Every transform a handler hands this call is
@@ -2223,14 +2301,25 @@ def _call(
         default=op_default_timeout if op_default_timeout is not None else DEFAULT_REQUEST_TIMEOUT,
     )
     deadline = time.monotonic() + budget if budget is not None else None
-    response = send_request(
-        op,
-        params=request_params,
-        target=target,
-        instance_id=getattr(args, "instance", None),
-        spawn_missing_named=spawn_missing_named,
-        **timeout_kwargs,
-    )
+    try:
+        response = send_request(
+            op,
+            params=request_params,
+            target=target,
+            instance_id=getattr(args, "instance", None),
+            spawn_missing_named=spawn_missing_named,
+            **timeout_kwargs,
+        )
+    except BridgeError as exc:
+        if contextual_hints:
+            routed = _contextualize_diagnostic_hints(
+                {"error": str(exc)}, target=target,
+                instance=getattr(args, "instance", None))
+            exc.args = (routed["error"],)
+        raise
+    if contextual_hints:
+        response = _contextualize_diagnostic_hints(
+            response, target=target, instance=getattr(args, "instance", None))
     result = unwrap_result(response, op)
     if stamp_instance and isinstance(result, dict) and isinstance(response, dict):
         answering = response.get("instance")

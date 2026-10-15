@@ -1261,8 +1261,10 @@ def _trace(args: argparse.Namespace) -> int:
             "max_depth": args.max_depth,
             "interprocedural": args.interprocedural,
             "ip_depth": args.ip_depth,
+            "mangled": args.mangled,
         },
         require_target=True,
+        contextual_hints=True,
         text_renderer=lambda v: _render_trace_text(v, mangled=args.mangled),
         stem="trace",
     )

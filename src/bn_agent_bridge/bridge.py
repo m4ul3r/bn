@@ -5658,6 +5658,7 @@ def _bind_backward_slice(bridge, params, target):
         max_depth=int(params.get("max_depth", 50)),
         interprocedural=_validate_bool(params.get("interprocedural"), label="interprocedural", default=False),
         ip_depth=int(params.get("ip_depth", 2)),
+        mangled=_validate_bool(params.get("mangled"), label="mangled", default=False),
     )
 
 

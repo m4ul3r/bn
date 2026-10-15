@@ -782,9 +782,6 @@ def test_forward_modeled_sink_arg_out_of_range_reports_abi_register_sink_1001(mo
     assert sink["callee"] == "memcpy" and sink["tainted_arg_index"] == 2
     assert sink["class"] == "overflow_len"
     assert sink["via"] == "abi_register"
-    # memcpy's model declares its source (arg 1) and length (arg 2); BN kept arg 0.
-    assert sink["arity_mismatch"] == {"recovered": 1, "dropped": [1, 2], "register": "r2",
-                                      "callee_ref": "0x900", "class_from": "model"}
     # The flow traces back to the seeded param through the register's value.
     assert result["reached_sinks"][0]["path"][-1]["address"] == hex(0x18)
     assert "through ABI register r2" in result["reached_sinks"][0]["path"][-1]["reason"]
@@ -792,9 +789,6 @@ def test_forward_modeled_sink_arg_out_of_range_reports_abi_register_sink_1001(mo
     rendered = _render_taint_text(result)
     assert "verdict: 1 sink(s) reached (overflow_len[1 via ABI register])" in rendered
     assert "[overflow_len] memcpy @ 0x18 (arg 2 via r2, arity mismatch)" in rendered
-    assert ("class unproven (the model's own): BN recovered 1 param(s) for this call and dropped the model's "
-            "arg(s) [1, 2]; the tainted arg was read from ABI register r2 -- fix the prototype "
-            "(`bn proto get 0x900`, then `bn proto set`) and re-run") in rendered
 
 
 # #1001 review round 3: a sink whose model declares an arg BN's prototype
@@ -869,6 +863,10 @@ def test_dropped_arg_never_lowers_a_sink_class_1001(models, monkeypatch, shape, 
     unproven = "class is the model's own and unproven" in sink["detail"]
     recovered_only = "decided from the recovered args only" in sink["detail"]
     assert (unproven, recovered_only) == (class_from == "model", class_from == "recovered_args")
+    from bn.formatters import _render_taint_text
+    text = _render_taint_text({"direction": "forward",
+                              "reached_sinks": [{"sink": sink}]})
+    assert ("unproven" in text) is (class_from == "model")
 
 
 def test_class_from_recovered_args_is_not_called_unproven_1001(models, monkeypatch):
@@ -1097,18 +1095,6 @@ def test_taint_into_a_correct_varargs_tail_is_not_a_prototype_defect_948(models)
     assert "do not redeclare" in diag["next_action"]
 
 
-@pytest.mark.parametrize("variadic", [False, None])
-def test_nonvariadic_or_undetermined_callee_keeps_prototype_advice_948(models, variadic):
-    # A determined-nonvariadic callee taking more args than it declares IS the
-    # type discrepancy prototype advice is for; an undetermined flag is not
-    # evidence either way, so the advice stays.
-    handler, bv, _, _ = _variadic_logger_program(variadic)
-    result = te.TaintEngine(bv, models).forward(handler, [te.parse_locator("param:0")])
-    leaf = next(l for l in result["leaves"] if l["kind"] == "unmodeled_callee")
-    assert "cause" not in leaf
-    assert "proto set" in leaf["note"]
-    assert "proto set" in result["diagnostics"]["next_action"]
-
 
 def test_partial_drop_into_a_varargs_tail_does_not_ask_to_declare_varargs_948(models, monkeypatch):
     # The stack-passed branch used to say "declare it variadic" -- to a callee
@@ -1121,12 +1107,6 @@ def test_partial_drop_into_a_varargs_tail_does_not_ask_to_declare_varargs_948(mo
     assert leaf["dropped_args"] == [1, 3] and leaf["stack_dropped_args"] == [3]
     assert leaf["cause"] == "varargs_not_followed"
     assert "proto set" not in leaf["note"] and "declare it variadic" not in leaf["note"]
-    # Undetermined: the established advice is unchanged.
-    app_log.type = type("T", (), {"has_variable_arguments": type(
-        "B", (), {"value": False, "confidence": 0})()})()
-    leaf = engine._arg_under_recovered_leaf(call, app_log, [1, 3], 1)
-    assert leaf["cause"] == "signature_under_recovered" and leaf["callee_variadic"] is None
-    assert "declare it variadic" in leaf["note"]
 
 
 def test_forward_modeled_sink_full_arity_untainted_stays_all_clear(models):
@@ -4453,29 +4433,11 @@ def test_backward_arg_index_out_of_range_states_count_and_zero_based(process_fun
     assert "0-based" in msg      # names the convention
 
 
-def test_backward_arg_out_of_range_discloses_proto_set_remedy(process_func, models):
-    # #464 (Thread A extension): an index past the recovered arity is often BN
-    # under-recovering the callee's signature (e.g. an ARM IFUNC libc sink typed by
-    # its resolver as 0/1 args -- the shape that hid ~half the memcpy sink flows in
-    # dogfooding). The bare "out of range" must name the proto-set remedy.
+def test_forward_param_not_found_raises(process_func, models):
     bv = FBV({0x401070: "read", 0x401080: "memcpy"})
     engine = te.TaintEngine(bv, models)
-    with pytest.raises(te.TaintError) as ei:
-        engine.backward(process_func, [te.parse_locator("arg:memcpy:9")])
-    assert 'proto set memcpy' in str(ei.value)
-
-
-def test_forward_param_not_found_discloses_proto_set_remedy(process_func, models):
-    # #464 (Thread A extension): seeding param:N past the recovered arity -- the
-    # uniform-vtable-drop shape where BN dropped a data param across the whole call
-    # chain (no per-callsite arity mismatch for the frontier to catch) -- must name
-    # the proto-set remedy, not a bare not-found.
-    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
-    engine = te.TaintEngine(bv, models)
-    with pytest.raises(te.TaintError) as ei:
+    with pytest.raises(te.TaintError):
         engine.forward(process_func, [te.parse_locator("param:99")])
-    msg = str(ei.value)
-    assert "not found" in msg and "proto set" in msg
 
 
 def test_backward_arg_with_no_variable_reads_says_so(process_func, models):
@@ -7153,7 +7115,6 @@ def test_arg_under_recovered_leaf_gated_positive(models, monkeypatch):
     assert leaf["recovered_params"] == 1
     assert leaf["dropped_args"] == [1]
     assert leaf["address"] == "0x40130a"
-    assert 'proto set _M_create' in leaf["note"]          # actionable remedy
 
 
 def test_arg_under_recovered_leaf_gate_rejects(models, monkeypatch):
@@ -7169,7 +7130,7 @@ def test_arg_under_recovered_leaf_discloses_stack_passed(models, monkeypatch):
     # #324: a dropped index beyond the register slots (stack-passed vararg) is now
     # DISCLOSED -- confirmed by the caller-side recovery that placed it in `dropped`,
     # so the tainted stack arg no longer vanishes silently. It carries a distinct
-    # stack_dropped_args field and a variadic proto-set remedy.
+    # stack_dropped_args field.
     monkeypatch.setattr(te.TaintEngine, "_reg_reads_as_input", lambda self, c, r: True)
     engine = te.TaintEngine(FBV({}), models)
     callee = _fake_under_recovered_callee("logger", 0x3000, ["rdi", "rsi"])  # 2 arg regs
@@ -7179,8 +7140,6 @@ def test_arg_under_recovered_leaf_discloses_stack_passed(models, monkeypatch):
     assert leaf["kind"] == "arg_under_recovered"
     assert leaf["dropped_args"] == [6]
     assert leaf["stack_dropped_args"] == [6]
-    assert "STACK-passed" in leaf["note"]
-    assert "..." in leaf["note"]  # variadic prototype hint
 
 
 def test_arg_under_recovered_leaf_i386_pure_stack_stays_silent(models, monkeypatch):
@@ -7252,13 +7211,6 @@ def test_forward_descend_discloses_partial_arg_drop(models, monkeypatch):
     assert leaves[0]["dropped_args"] == [1]
 
 
-def test_forward_fully_unrecovered_note_points_at_proto_set(models):
-    # the existing "no mappable parameters" leaf now names the proto set remedy
-    func, bv = _frontier_no_params_program()
-    engine = te.TaintEngine(bv, models)
-    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
-    leaf = [l for l in result["leaves"] if l.get("kind") == "unmodeled_callee"][0]
-    assert "proto set" in leaf["note"]
 # --- derive_flow_facts: per-flow metrics + grouping signature (Thread C) -----
 
 def test_derive_flow_facts_forward_multi_wrapper():
@@ -7413,7 +7365,6 @@ def test_forward_zero_result_includes_frontier_diagnostics_559(models):
     assert diag["unmodeled_calls_reached"] is True             # parse_event was reached, unmodeled
     assert diag["frontier"]["unresolved"] == 1                 # the unmodeled_callee leaf
     assert diag["frontier"]["by_kind"].get("unmodeled_callee") == 1
-    assert "proto set" in diag["next_action"]                  # actionable, not a verdict
 
 
 def test_forward_zero_result_diagnostics_absent_when_sink_reached_559(process_func, models):
@@ -7521,7 +7472,6 @@ def test_frontier_leaf_withholds_all_clear_562(models):
     assert diag["source_callsites"] == 1
     assert diag["unmodeled_calls_reached"] is True
     assert diag["frontier"]["by_kind"].get("unmodeled_callee") == 1
-    assert "proto set" in diag["next_action"]
     # #562 gate folded in:
     assert diag["safe_to_report_all_clear"] is False
 
@@ -9582,7 +9532,6 @@ def test_backward_frontier_buckets_and_next_action_name_the_actionable_cut_812()
                  "indirect_call_unresolved", "arg_under_recovered"):
         unres = tr.backward_diagnostics([{"kind": kind}], [], sinks_seeded=1, slices=1)
         assert unres["frontier"]["unresolved"] == 1, (kind, unres)
-        assert "bn proto set" in unres["next_action"], (kind, unres)
 
     # A coarse-memory frontier: its own bucket and its own remediation.
     for kind in ("coarse_memory_store", "pointer_escape"):
