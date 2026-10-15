@@ -719,9 +719,11 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
     assert _FakeSocket.attempts == 2
 
 
+@pytest.mark.parametrize("failure", ["refused", "missing", "connect_timeout", "deadline"])
 def test_transient_connect_retries_obey_end_to_end_deadline(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, failure
 ):
+    import bn.transport as transport
     from bn.transport import BridgeInstance
 
     instance = BridgeInstance(
@@ -734,9 +736,16 @@ def test_transient_connect_retries_obey_end_to_end_deadline(
         meta={},
         instance_token="test-token",
     )
-    monkeypatch.setattr(
-        "bn.transport.choose_instance", lambda instance_id=None, **kw: instance
-    )
+    clock = [0.0]
+    def monotonic():
+        now = clock[0]
+        if failure == "deadline":
+            clock[0] += 1.0
+        return now
+    monkeypatch.setattr(transport.time, "monotonic", monotonic)
+    monkeypatch.setattr(transport.time, "sleep", lambda duration: clock.__setitem__(0, clock[0] + duration))
+    monkeypatch.setattr(transport, "_send_cancel_request",
+                        lambda *args: pytest.fail("cancelling a request that was never sent"))
 
     class RefusingSocket:
         def __enter__(self):
@@ -749,17 +758,25 @@ def test_transient_connect_retries_obey_end_to_end_deadline(
             self.timeout = timeout
 
         def connect(self, path):
+            if failure == "connect_timeout":
+                raise TimeoutError("connect timed out")
+            if failure == "missing":
+                raise FileNotFoundError(errno.ENOENT, "Socket missing")
             raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+
+        def sendall(self, payload):
+            pytest.fail("request must not be sent after a failed connect")
 
     monkeypatch.setattr(
         "bn.transport.socket.socket", lambda *args, **kwargs: RefusingSocket()
     )
-    started = time.monotonic()
 
-    with pytest.raises(BridgeError, match="Timed out"):
-        send_request("ping", timeout=0.01)
+    with pytest.raises(BridgeError, match="Timed out") as caught:
+        transport._send_request_to_instance(instance, "ping", timeout=0.01)
 
-    assert time.monotonic() - started < 0.1
+    assert "The request was not sent." in str(caught.value)
+    assert "may still be running" not in str(caught.value)
+    assert "may keep running" not in str(caught.value)
 
 
 def _make_timeout_probe_socket():
@@ -1473,7 +1490,8 @@ def test_only_a_failure_before_connect_is_unreachable(tmp_path, monkeypatch):
     assert isinstance(raised(), BridgeUnreachableError)
 
 
-def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cancel_connect_fails", [False, True])
+def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch, cancel_connect_fails):
     from bn.transport import BridgeError, BridgeInstance
 
     instance = BridgeInstance(
@@ -1503,6 +1521,8 @@ def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch):
             self.timeout = timeout
 
         def connect(self, path):
+            if self.index == 1 and cancel_connect_fails:
+                raise ConnectionRefusedError("cancel connection refused")
             self.path = path
 
         def sendall(self, payload):
@@ -1521,11 +1541,91 @@ def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch):
 
     monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
 
-    with pytest.raises(BridgeError, match="Timed out waiting for Binary Ninja bridge pid 999"):
+    with pytest.raises(BridgeError, match="Timed out waiting for Binary Ninja bridge pid 999") as caught:
         send_request("ping", timeout=12.5)
 
-    assert [payload["op"] for payload in sent_payloads] == ["ping", "cancel_request"]
-    assert sent_payloads[1]["params"]["request_id"] == sent_payloads[0]["id"]
+    message = str(caught.value)
+    assert "busy with analysis" not in message
+    if cancel_connect_fails:
+        assert [payload["op"] for payload in sent_payloads] == ["ping"]
+        assert "cancel request could not be sent" in message
+    else:
+        assert [payload["op"] for payload in sent_payloads] == ["ping", "cancel_request"]
+        assert sent_payloads[1]["params"]["request_id"] == sent_payloads[0]["id"]
+        assert "cancel request was sent" in message
+        assert "until it checks for cancellation" in message
+
+
+@pytest.mark.parametrize("cancel_sent", [False, True])
+@pytest.mark.parametrize("transmit_json", [False, True])
+def test_sendall_timeout_preserves_delivery_uncertainty(
+    tmp_path, monkeypatch, cancel_sent, transmit_json
+):
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    # A native socketpair establishes the EOF boundary without filling a
+    # machine-dependent send buffer or racing a receiver against a deadline.
+    # Inject only the sendall timeout, after optionally transmitting the entire
+    # JSON value except its newline; the receiver waits until the sender closes.
+    writer, reader = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    attempted = []
+    cancellations = []
+
+    class SendTimeoutSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            writer.close()
+            return False
+
+        def settimeout(self, timeout):
+            writer.settimeout(timeout)
+
+        def connect(self, path):
+            assert path == str(instance.socket_path)
+
+        def sendall(self, payload):
+            attempted.append(json.loads(payload))
+            assert payload.endswith(b"\n")
+            if transmit_json:
+                writer.sendall(payload[:-1])
+            raise TimeoutError("timed out during sendall")
+
+    def cancel(inst, request_id):
+        assert inst is instance
+        cancellations.append(request_id)
+        return cancel_sent
+
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **kw: SendTimeoutSocket())
+    monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda *a: None)
+    monkeypatch.setattr(transport, "_send_cancel_request", cancel)
+
+    with writer, reader:
+        with pytest.raises(BridgeError, match="Timed out") as caught:
+            transport._send_request_to_instance(instance, "ping", timeout=5.0)
+        # Like the production reader, readline accepts a valid JSON value at
+        # EOF even when the framing newline never arrived.
+        reader.settimeout(5.0)
+        with reader.makefile("rb") as received:
+            raw = received.readline()
+        if transmit_json:
+            assert not raw.endswith(b"\n")
+            assert json.loads(raw) == attempted[0]
+        else:
+            assert raw == b""
+
+    assert len(attempted) == 1
+    assert cancellations == [attempted[0]["id"]]
+    message = str(caught.value)
+    assert "The request was not sent." not in message
+    if cancel_sent:
+        assert "A cancel request was sent" in message
+        assert "operation may keep running until it checks for cancellation" in message
+    else:
+        assert "A cancel request could not be sent" in message
+        assert "operation may still be running" in message
 
 
 def test_timeout_message_shows_subsecond_value(tmp_path, monkeypatch):
@@ -2419,109 +2519,341 @@ def test_choose_instance_spawn_missing_named_spawns_new(tmp_path, monkeypatch):
     assert "No bridge instance found with id: brandnew" in str(exc.value)
 
 
-def test_missing_instance_points_at_the_registry_that_holds_it_996(tmp_path, monkeypatch):
-    """#996: BN_CACHE_DIR moves the instance registry too. An id missing from
-    the searched registry but registered under the other root must be answered
-    with the export that reaches it -- never "start one", which spawns a
-    duplicate bridge under the same name."""
-    import shlex
+@contextlib.contextmanager
+def _registered_hint_bridge(cache_root, socket_path):
+    """A real socket with an independently supplied bridge identity."""
+    registry = cache_root / "instances" / "demo.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(), "instance_id": "demo",
+        "socket_path": str(socket_path), "instance_token": "hint-token",
+    }
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+    server = _Server(str(socket_path), _Handler)
+    server.bridge_identity = {
+        "instance_id": "demo", "pid": os.getpid(), "token": "hint-token",
+    }
+    threading.Thread(
+        target=server.serve_forever, args=(_SERVE_POLL_SECONDS,), daemon=True,
+    ).start()
+    try:
+        yield server, registry, payload
+    finally:
+        server.shutdown()
+        server.server_close()
 
-    default_root = tmp_path / "default root"          # a space: the export is quoted
-    (default_root / "instances").mkdir(parents=True)
-    live = json.dumps({"pid": os.getpid(), "instance_id": "demo"})
-    (default_root / "instances" / "demo.json").write_text(live)
-    # This test process stands in for the bridge: a synthetic /proc says it is
-    # `bn-agent --instance-id demo` (the registry check reads its cmdline).
-    proc = tmp_path / "proc"
-    (proc / str(os.getpid())).mkdir(parents=True)
-    cmdline = proc / str(os.getpid()) / "cmdline"
-    cmdline.write_bytes(b"/venv/bin/bn-agent\0--instance-id\0demo\0")
-    monkeypatch.setattr("bn.transport._PROC_ROOT", proc)
-    monkeypatch.setattr("bn.transport.default_cache_home", lambda: default_root)
-    monkeypatch.setattr("bn.transport._agent_cache_dirs_for", lambda instance_id: [])
+
+@pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="Requires kernel peer pid")
+def test_missing_instance_points_at_the_registry_that_holds_it_996(tmp_path, monkeypatch):
+    """The export is backed by a live socket, not a file or process argv."""
+    import shlex
+    from bn import transport
+
+    default_root = tmp_path / "default root"  # export must quote the space
     private = tmp_path / "private"
+    monkeypatch.setattr(transport, "default_cache_home", lambda: default_root)
+    monkeypatch.setattr(transport, "_agent_cache_dirs_for", lambda instance_id: [])
     monkeypatch.setenv("BN_CACHE_DIR", str(private))
 
-    with pytest.raises(BridgeError) as exc:
-        choose_instance("demo")
-    message = str(exc.value)
-    assert message.startswith("No bridge instance found with id: demo")
-    assert f"searched {private / 'instances'}" in message
-    assert f"export BN_CACHE_DIR={shlex.quote(str(default_root))} " in message
-    assert "Start one with" not in message
-
-    # A stale registry there is no evidence: a dead pid, an orphaned `{}`,
-    # garbage, or another id's payload keep the start advice (#996 review).
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
-    for stale in (json.dumps({"pid": dead.pid, "instance_id": "demo"}), "{}",
-                  "not json", json.dumps({"pid": os.getpid(), "instance_id": "other"})):
-        (default_root / "instances" / "demo.json").write_text(stale)
+    with _registered_hint_bridge(default_root, tmp_path / _PROBE_SOCK) as (
+        server, registry, payload,
+    ):
         with pytest.raises(BridgeError) as exc:
             choose_instance("demo")
-        assert "export BN_CACHE_DIR" not in str(exc.value), stale
-        assert "Start one with" in str(exc.value), stale
+        message = str(exc.value)
+        assert message.startswith("No bridge instance found with id: demo")
+        assert f"searched {private / 'instances'}" in message
+        assert f"export BN_CACHE_DIR={shlex.quote(str(default_root))} " in message
+        assert "Start one with" not in message
+        assert len(server.requests) == 1
+        probe = server.requests[0]
+        assert probe["op"] == "write_gate_status"
+        assert probe["idle_probe"] is True
+        assert "target" not in probe
 
-    # A live pid that is NOT that bridge (any other process) is no evidence
-    # either (#996 review N3).
-    (default_root / "instances" / "demo.json").write_text(live)
-    for argv in (b"/usr/bin/python3\0-m\0pytest\0",
-                 b"/venv/bin/bn-agent\0--instance-id\0someone-else\0"):
-        cmdline.write_bytes(argv)
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        for stale in (
+            json.dumps({**payload, "pid": dead.pid}), "{}", "not json",
+            json.dumps({**payload, "instance_id": "other"}),
+            json.dumps({**payload, "pid": True}),
+            json.dumps({**payload, "pid": 2**80}),
+            json.dumps({**payload, "socket_path": None}),
+            json.dumps({**payload, "socket_path": str(tmp_path / "absent.sock")}),
+            json.dumps({**payload, "instance_token": None}),
+            json.dumps({**payload, "instance_token": "retired-token"}),
+            json.dumps({**payload, **_identity(ticks_delta=1)}),
+        ):
+            registry.write_text(stale, encoding="utf-8")
+            with pytest.raises(BridgeError) as exc:
+                choose_instance("demo")
+            assert "export BN_CACHE_DIR" not in str(exc.value), stale
+            assert "Start one with" in str(exc.value), stale
+            assert registry.read_text(encoding="utf-8") == stale
+            assert server.socket.fileno() != -1
+
         with pytest.raises(BridgeError) as exc:
-            choose_instance("demo")
-        assert "export BN_CACHE_DIR" not in str(exc.value), argv
-        assert "Start one with" in str(exc.value), argv
-
-    # An id registered nowhere else keeps the start advice, and says the
-    # variable scopes the registry.
-    with pytest.raises(BridgeError) as exc:
-        choose_instance("other")
-    assert "Start one with" in str(exc.value)
-    assert "BN_CACHE_DIR is set, and it scopes the instance registry" in str(exc.value)
+            choose_instance("other")
+        assert "Start one with" in str(exc.value)
+        assert "BN_CACHE_DIR is set, and it scopes the instance registry" in str(exc.value)
 
 
-def test_missing_instance_found_through_a_running_bridges_environment_996(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("failure", ["timeout", "wrapped", "mid-response"])
+def test_missing_instance_probe_timeout_never_advises_duplicate_start(
+    tmp_path, monkeypatch, failure
 ):
-    """The reverse direction: the shell lost BN_CACHE_DIR, the bridge still has
-    it. The running `bn-agent` process's own argv/environment name the root."""
     from bn import transport
 
     default_root = tmp_path / "default"
-    elsewhere = tmp_path / "elsewhere"
-    (elsewhere / "instances").mkdir(parents=True)
-    (elsewhere / "instances" / "demo.json").write_text(
-        json.dumps({"pid": os.getpid(), "instance_id": "demo"}))
-    # A bridge started with a RELATIVE BN_CACHE_DIR: it is relative to the
-    # bridge's own cwd, read from /proc/<pid>/cwd, not the caller's.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(transport, "default_cache_home", lambda: default_root)
+    monkeypatch.setattr(transport, "_agent_cache_dirs_for", lambda instance_id: [])
+    registry = default_root / "instances" / "demo.json"
+    registry.parent.mkdir(parents=True)
+    document = json.dumps({
+        "pid": os.getpid(), "instance_id": "demo",
+        "socket_path": str(tmp_path / "busy.sock"),
+        "instance_token": "hint-token",
+    })
+    registry.write_text(document, encoding="utf-8")
+
+    def timeout(*args, **kwargs):
+        assert kwargs["timeout"] == 0.2
+        assert kwargs["require_peer_pid"] is True
+        assert kwargs["idle_probe"] is True
+        if failure == "timeout":
+            raise TimeoutError("busy")
+        try:
+            raise TimeoutError("busy")
+        except TimeoutError as exc:
+            message = (
+                "failed mid-response after 10 bytes"
+                if failure == "mid-response" else "Timed out waiting for bridge"
+            )
+            raise BridgeError(message) from exc
+
+    monkeypatch.setattr(transport, "_send_request_to_instance", timeout)
+    with pytest.raises(BridgeError) as exc:
+        choose_instance("demo")
+    message = str(exc.value)
+    assert "may be busy" in message
+    assert str(default_root) in message
+    assert "Wait and retry" in message
+    assert "Start one with" not in message
+    assert "session start" not in message
+    assert "export BN_CACHE_DIR" not in message
+    assert registry.read_text(encoding="utf-8") == document
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux process-state inspection")
+def test_missing_instance_stopped_bridge_never_advises_duplicate_start(
+    tmp_path, monkeypatch,
+):
+    from bn import transport
+
+    default_root = tmp_path / "default"
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(transport, "default_cache_home", lambda: default_root)
+    monkeypatch.setattr(transport, "_agent_cache_dirs_for", lambda instance_id: [])
+    registry = default_root / "instances" / "demo.json"
+    registry.parent.mkdir(parents=True)
+    socket_path = tmp_path / _PROBE_SOCK
+    bridge = subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import os, signal, socket, sys, time; "
+            "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); "
+            "sock.bind(sys.argv[1]); sock.listen(); "
+            "print('ready', flush=True); os.kill(os.getpid(), signal.SIGSTOP); "
+            "time.sleep(60)",
+            str(socket_path),
+        ],
+        stdout=subprocess.PIPE,
+    )
+    try:
+        assert bridge.stdout.readline() == b"ready\n"
+        waited_pid, status = os.waitpid(bridge.pid, os.WUNTRACED)
+        assert waited_pid == bridge.pid and os.WIFSTOPPED(status)
+        document = json.dumps({
+            "pid": bridge.pid, "instance_id": "demo",
+            "socket_path": str(socket_path), "instance_token": "hint-token",
+        })
+        registry.write_text(document, encoding="utf-8")
+
+        assert transport._registry_names_live_bridge(registry, "demo") is None
+        with pytest.raises(BridgeError) as exc:
+            choose_instance("demo")
+        message = str(exc.value)
+        assert "may be busy or stopped" in message
+        assert str(default_root) in message
+        assert "resume the bridge if stopped" in message
+        assert "timed out" not in message
+        assert "Start one with" not in message
+        assert "session start" not in message
+        assert "export BN_CACHE_DIR" not in message
+        assert registry.read_text(encoding="utf-8") == document
+        assert socket_path.exists()
+        assert transport._process_state(bridge.pid) in {"T", "t"}
+    finally:
+        if bridge.poll() is None:
+            bridge.send_signal(signal.SIGCONT)
+            bridge.terminate()
+        bridge.wait(timeout=5)
+        bridge.stdout.close()
+        socket_path.unlink(missing_ok=True)
+
+
+def test_verified_registry_hint_takes_precedence_over_busy_candidate(tmp_path, monkeypatch):
+    from bn import transport
+
+    busy_root = tmp_path / "busy"
+    verified_root = tmp_path / "verified"
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(transport, "default_cache_home", lambda: busy_root)
+    monkeypatch.setattr(
+        transport, "_agent_cache_dirs_for", lambda instance_id: [verified_root]
+    )
+    monkeypatch.setattr(
+        transport, "_registry_names_live_bridge",
+        lambda registry, instance_id: None if registry.parent.parent == busy_root else True,
+    )
+
+    message = transport.instance_not_found_message("demo", "Start one with: bn session start")
+    assert f"export BN_CACHE_DIR={verified_root}" in message
+    assert "may be busy" not in message
+    assert "Start one with" not in message
+
+
+@pytest.mark.skipif(not hasattr(socket, "SO_PEERCRED"), reason="Requires kernel peer pid")
+@pytest.mark.parametrize("argv", [
+    b"/venv/bin/bn-agent\0--instance-id\0demo\0",
+    b"/venv/bin/bn-agent\0--instance-id=demo\0",
+    b"/usr/bin/python3\0/public/headless.py\0--instance-id=demo\0",
+])
+@pytest.mark.parametrize("relative", [False, True])
+def test_missing_instance_found_through_a_running_bridges_environment_996(
+    tmp_path, monkeypatch, argv, relative,
+):
+    """Hand-launched bridges work too; a relative cache uses the process cwd."""
+    from bn import transport
+
+    default_root = tmp_path / "default"
     bridge_cwd = tmp_path / "bridge-cwd"
-    (bridge_cwd / "rel" / "instances").mkdir(parents=True)
+    elsewhere = bridge_cwd / "rel" if relative else tmp_path / "elsewhere"
+    bridge_cwd.mkdir()
     proc = tmp_path / "proc"
-    for pid, argv, env in (
-        (str(os.getpid()), b"/venv/bin/bn-agent\0--instance-id\0demo\0",
-         b"HOME=/h\0BN_CACHE_DIR=" + str(elsewhere).encode() + b"\0"),
-        ("4343", b"/usr/bin/python3\0other.py\0--instance-id\0demo\0",
-         b"BN_CACHE_DIR=/nowhere\0"),
-        ("4444", b"/venv/bin/bn-agent\0--instance-id\0demo\0",
-         b"BN_CACHE_DIR=rel\0"),
-    ):
-        (proc / pid).mkdir(parents=True)
-        (proc / pid / "cmdline").write_bytes(argv)
-        (proc / pid / "environ").write_bytes(env)
-    (proc / "4444" / "cwd").symlink_to(bridge_cwd)
-    real_scan = transport._agent_cache_dirs_for
-    monkeypatch.setattr(transport, "_agent_cache_dirs_for",
-                        lambda instance_id: real_scan(instance_id, proc=proc))
+    entry = proc / str(os.getpid())
+    entry.mkdir(parents=True)
+    entry.joinpath("cmdline").write_bytes(argv)
+    cache_value = b"rel" if relative else os.fsencode(elsewhere)
+    entry.joinpath("environ").write_bytes(b"HOME=/h\0BN_CACHE_DIR=" + cache_value + b"\0")
+    entry.joinpath("cwd").symlink_to(bridge_cwd)
+    # An unrelated process can locate a candidate root; it cannot prove a bridge.
+    decoy = proc / "4343"
+    decoy.mkdir()
+    decoy.joinpath("environ").write_bytes(b"BN_CACHE_DIR=/nowhere\0")
     monkeypatch.setattr(transport, "_PROC_ROOT", proc)
     monkeypatch.setattr(transport, "default_cache_home", lambda: default_root)
     monkeypatch.delenv("BN_CACHE_DIR", raising=False)
     monkeypatch.setattr(transport, "cache_home", lambda: default_root)
     monkeypatch.setattr(transport, "instances_dir", lambda: default_root / "instances")
 
-    assert sorted(real_scan("demo", proc=proc)) == sorted([elsewhere, bridge_cwd / "rel"])
-    message = transport.instance_not_found_message("demo", "Start one.")
-    assert f"export BN_CACHE_DIR={elsewhere}" in message
+    with _registered_hint_bridge(elsewhere, tmp_path / _PROBE_SOCK):
+        assert set(transport._agent_cache_dirs_for("demo")) == {elsewhere, Path("/nowhere")}
+        message = transport.instance_not_found_message("demo", "Start one.")
+        assert f"export BN_CACHE_DIR={elsewhere}" in message
+        assert "Start one." not in message
+        # Cmdline is not evidence, nor is it needed to locate the registry.
+        entry.joinpath("cmdline").unlink()
+        assert f"export BN_CACHE_DIR={elsewhere}" in transport.instance_not_found_message(
+            "demo", "Start one.",
+        )
+
+
+@pytest.mark.parametrize("endpoint", ["absent", "bound", "unresponsive", "foreign"])
+def test_registry_export_rejects_decoy_argv_1020(tmp_path, monkeypatch, endpoint):
+    """Even real decoy argv cannot vouch for an absent, inert or foreign socket."""
+    from bn import transport
+
+    elsewhere = tmp_path / "elsewhere"
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(transport, "default_cache_home", lambda: elsewhere)
+    monkeypatch.setattr(transport, "_agent_cache_dirs_for", lambda instance_id: [])
+    registry = elsewhere / "instances" / "demo.json"
+    registry.parent.mkdir(parents=True)
+    socket_path = tmp_path / _PROBE_SOCK
+    decoy = subprocess.Popen([
+        sys.executable, "-c", "import time; time.sleep(60)",
+        "bn-agent", "--instance-id", "demo",
+    ])
+    payload = {
+        "pid": decoy.pid, "instance_id": "demo",
+        "socket_path": str(socket_path), "instance_token": "hint-token",
+    }
+    registry.write_text(json.dumps(payload), encoding="utf-8")
+    try:
+        with contextlib.ExitStack() as stack:
+            if endpoint == "foreign":
+                server, registry, _ = stack.enter_context(
+                    _registered_hint_bridge(elsewhere, socket_path),
+                )
+                registry.write_text(json.dumps(payload), encoding="utf-8")
+            elif endpoint != "absent":
+                listener = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+                listener.bind(str(socket_path))
+                if endpoint == "unresponsive":
+                    listener.listen()
+                    # The right pid without a protocol reply is also insufficient.
+                    payload["pid"] = os.getpid()
+                    registry.write_text(json.dumps(payload), encoding="utf-8")
+            message = transport.instance_not_found_message("demo", "Start one.")
+            assert "export BN_CACHE_DIR" not in message
+            if endpoint == "unresponsive":
+                assert "Start one." not in message
+            else:
+                assert "Start one." in message
+            assert json.loads(registry.read_text(encoding="utf-8")) == payload
+            if endpoint == "foreign":
+                assert server.requests == []  # kernel peer mismatch: no request sent
+    finally:
+        decoy.terminate()
+        decoy.wait(timeout=5)
+        socket_path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("evidence", ["unavailable", "unreadable", "malformed", "wrong_identity"])
+def test_registry_export_requires_peer_and_response_identity_1020(
+    tmp_path, monkeypatch, evidence,
+):
+    from bn import transport
+
+    elsewhere = tmp_path / "elsewhere"
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "private"))
+    monkeypatch.setattr(transport, "default_cache_home", lambda: elsewhere)
+    monkeypatch.setattr(transport, "_agent_cache_dirs_for", lambda instance_id: [])
+    with _registered_hint_bridge(elsewhere, tmp_path / _PROBE_SOCK) as (server, _, _):
+        if evidence == "unavailable":
+            monkeypatch.delattr(socket, "SO_PEERCRED", raising=False)
+        elif evidence in {"unreadable", "malformed"}:
+            real_verify = transport._verify_socket_peer_pid
+
+            class UnreadablePeer:
+                def getsockopt(self, *args):
+                    if evidence == "unreadable":
+                        raise OSError("Synthetic peer credentials unavailable")
+                    return b"short"
+
+            monkeypatch.setattr(
+                transport, "_verify_socket_peer_pid",
+                lambda sock, instance, **kwargs: real_verify(UnreadablePeer(), instance, **kwargs),
+            )
+        else:
+            server.bridge_identity = {**server.bridge_identity, "instance_id": "other"}
+        message = transport.instance_not_found_message("demo", "Start one.")
+        assert "export BN_CACHE_DIR" not in message
+        assert "Start one." in message
+        if evidence != "wrong_identity":
+            assert server.requests == []
 
 
 def test_lone_unassociated_instance_is_named_on_stderr_996(tmp_path, monkeypatch, capsys):
@@ -2828,6 +3160,7 @@ def test_send_request_load_refresh_use_larger_default(tmp_path, monkeypatch):
 
     monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
     instance = _make_instance(tmp_path)
+    instance.meta["capabilities"] = {"refresh_target_gate": True}
     monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
     fake_socket = _make_timeout_probe_socket()
     monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: fake_socket())
@@ -3415,11 +3748,17 @@ def test_bridge_signal_refuses_without_an_atomic_primitive(tmp_path, monkeypatch
     import bn.transport as transport
 
     monkeypatch.setattr(proc_identity, "PIDFD_AVAILABLE", False)
+    monkeypatch.setattr(os, "kill", lambda *a: pytest.fail("no unpinned signal"))
+    monkeypatch.setattr(
+        transport, "identity_verdict",
+        lambda *a: pytest.fail("no check-then-signal identity fallback"),
+    )
 
     with transport.BridgeProcessSignal(_instance(tmp_path)) as signaller:
         assert signaller.refusal is not None
         assert "provides no pidfd" in signaller.refusal
         assert signaller.send(signal.SIGTERM) is not None
+        assert signaller.send(signal.SIGKILL) is not None
 
 
 def test_bridge_signal_reports_a_process_that_exited_before_delivery(

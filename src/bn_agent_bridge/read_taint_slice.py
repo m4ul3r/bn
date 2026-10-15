@@ -33,6 +33,7 @@ added edge stays acyclic.
 from __future__ import annotations
 
 import re
+import shlex
 from typing import Any
 
 try:
@@ -48,7 +49,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 from . import il_format
 from . import taint_engine as _taint
 from . import vars as vars_mod
-from ._shared import OperationFailure, _parse_address, is_imported_function
+from ._shared import OperationFailure, _parse_address, _validate_bool, is_imported_function
 from .bridge_state import require_analysis
 from .read_taint_models import build_catalog
 from .read_listing import _analysis_state_fields
@@ -92,6 +93,7 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
         find_variable=_find_variable,
         unknown_call_policy=str(params.get("unknown_call", "conservative")),
         resolve_map=params.get("resolve_map") or {},
+        mangled=_validate_bool(params.get("mangled"), label="mangled", default=False),
         **_engine_kwargs,
     )
     try:
@@ -678,12 +680,11 @@ def _read_cstring(bv, addr: int, *, cap: int = 256) -> str | None:
 
 
 def _params_have_format_string(bv, params) -> bool:
-    """True when a recovered arg is a const pointer to a rodata string containing a
-    printf conversion specifier -- a strong POSITIVE signal that the callee is a
-    variadic (printf/log-family) function, so its dropped stack stores really are
-    variadic args and not a fixed-arity libc/BSD call's frame noise. This is the
-    discriminator that keeps the #489 frontier from firing on strchr/memset/bcopy/
-    __gedf2 etc., whose recovered args have no format string (#489 review)."""
+    """Whether a recovered constant string contains a printf conversion.
+
+    This narrows the candidate diagnostic to format-shaped calls. It proves
+    neither that the callee is variadic nor that nearby stores feed the call.
+    """
     if bv is None:
         return False
     for p in params or []:
@@ -698,14 +699,12 @@ def _params_have_format_string(bv, params) -> bool:
 
 def _call_model_truncation_note(bv, func, call_insn, target_addr: int,
                                 params: list, callee_name: str | None) -> str | None:
-    """#489: a PROACTIVE truncation disclosure. BN auto-types an internal variadic /
-    many-arg callee as fixed-arity, so the call site's MLIL `.params` omit the
-    stack-passed args -- and unlike the reactive out-of-range message (#324/#488),
-    an analyst asking only for in-range args gets no hint the drop exists. Fire when
-    BN recovered NO stack params (`len(params) <= int_arg_regs`) yet LLIL shows
-    outgoing stack-arg stores feeding the call. Conservative: silent when the arch's
-    arg-reg count is unknown, or when BN already recovered stack params. None = no
-    disclosure."""
+    """Disclose possible call-model truncation from nearby stack candidates.
+
+    A format-shaped argument and a contiguous stack-store run warrant inspection,
+    not a claim of argument provenance. Stay silent when the convention is unknown
+    or the call already has recovered stack arguments.
+    """
     reg_count = _int_arg_reg_count(func)
     if reg_count is None or len(params) > reg_count:
         return None
@@ -715,24 +714,13 @@ def _call_model_truncation_note(bv, func, call_insn, target_addr: int,
     _base = str(callee_name or "").split("@", 1)[0].lstrip("_")
     if _base in _KNOWN_FIXED_ARITY:
         return None
-    # POSITIVE variadic signal (review): only fire when a recovered arg is a format
-    # string. Offset shape alone can't tell a truncated variadic from a fixed-arity
-    # libc/BSD call (strchr/memset/bcopy/__gedf2) whose frame happens to have low
-    # contiguous sp stores -- those had a ~2-10% false-positive rate on real
-    # firmware. Requiring a caller-passed format string makes "auto-typed
-    # variadic-as-fixed" actually plausible and excludes those FPs (their args have
-    # no format string). Scope: this catches the printf/log/err family (format
-    # passed by the caller); it deliberately does NOT flag a variadic whose format
-    # is INTERNAL (a `sprintf(buf,"...",...)` wrapper) or a non-format variadic --
-    # a no-false-positive trade, since those can't be confirmed from the call site.
+    # Keep the diagnostic focused on format-shaped calls. This filter does not
+    # establish a prototype defect or distinguish arguments from local spills.
     if not _params_have_format_string(bv, params):
         return None
     raw = _stack_arg_store_offsets(func, target_addr)
-    # Distinguish deliberate outgoing-argument pushes from isolated local spills:
-    # require a CONTIGUOUS pointer-width run of >=2 stores STARTING near sp (the
-    # low outgoing-arg region -- sp+0 on AAPCS, up to the 16-byte arg-save area on
-    # MIPS-o32). An isolated store at sp+0x8/0x28 is a local, not an arg -- staying
-    # silent there is the no-false-positive direction for a proactive frontier.
+    # A contiguous pointer-width run near sp is a candidate region only; local
+    # and spill stores can have the same shape.
     try:
         word = int(getattr(getattr(func, "arch", None), "address_size", 0)) or 4
     except Exception:
@@ -749,7 +737,8 @@ def _call_model_truncation_note(bv, func, call_insn, target_addr: int,
         return None
     disp = callee_name or "the callee"
     off_list = ", ".join(f"sp+{hex(o)}" for o in offsets)
-    fn_name = getattr(func, "name", "<fn>")
+    fn_name = shlex.quote(hex(int(func.start)) if getattr(func, "start", None) is not None
+                          else str(getattr(func, "name", "<fn>")))
     target = None
     if call_insn is not None:
         try:
@@ -764,7 +753,8 @@ def _call_model_truncation_note(bv, func, call_insn, target_addr: int,
         f"register-passed), and the call's LLIL block has {len(offsets)} candidate "
         f"outgoing stack store(s) [{off_list}] before it (identified by offset shape "
         f"only, not proven to feed the call)")
-    if il_format._variadic_determination(getattr(target, "function", None)) is True:
+    variadic = il_format._variadic_determination(getattr(target, "function", None))
+    if variadic is True:
         # #948: the callee is ALREADY declared variadic, so "declare it variadic"
         # promised a fix that changes nothing. If those stores are arguments,
         # this is a call-recovery limit at this site, not a prototype defect.
@@ -775,40 +765,21 @@ def _call_model_truncation_note(bv, func, call_insn, target_addr: int,
             f"call model at this site omits them and `trace`/`taint`/`defuse` cannot "
             f"see them. Inspect the stores with `bn il {fn_name} --view llil --ssa`."
         )
-    # Pick a RUNNABLE `proto set` selector: the callee name if known, else its
-    # resolved entry address (a direct call's constant dest still gives us an
-    # address even when the target is unnamed). An unnamed/indirect callee with
-    # neither has no runnable selector -- emit prose guidance, never the literal
-    # `bn proto set the callee ...` command, which cannot be copy-pasted (#534).
-    selector = callee_name or None
-    addr = getattr(target, "address", None)
-    if selector is None and addr is not None:
-        selector = hex(int(addr))
-    if selector is not None:
-        proto_name = callee_name or "<callee>"
-        remedy = (
-            f"declare it variadic with "
-            f"`bn proto set {selector} \"<ret> {proto_name}(<fixed args>, ...)\"` "
-            f"(or the full prototype) and re-run."
-        )
-    else:
-        remedy = (
-            "declare it variadic on the concrete callee once you resolve this "
-            "indirect/unnamed call -- run "
-            "`bn proto set <callee> \"<ret> <callee>(<fixed args>, ...)\"` against "
-            "the resolved target's address or name and re-run."
-        )
+    status = ("the callee is determined nonvariadic" if variadic is False else
+              "the callee's variadic status is undetermined")
     return (
-        f"call-model truncation (#489): {observed}. If they are arguments they are "
-        f"DROPPED from the call model, most often a variadic callee auto-typed as "
-        f"fixed-arity. `trace`/`taint`/`defuse` cannot see them until the prototype "
-        f"is fixed: {remedy} Inspect the stores with "
-        f"`bn il {fn_name} --view llil --ssa`."
+        f"possible call-model truncation (#489): {observed}; {status}. "
+        f"Inspect the stores and callee prototype with "
+        f"`bn il {fn_name} --view llil --ssa`. Nearby local/spill stores and a "
+        f"format literal do not establish argument provenance. If independent "
+        f"ABI/value evidence confirms omitted arguments, distinguish a recovery "
+        f"limitation from a declaration discrepancy before changing the prototype."
     )
 
 
 def _out_of_range_arg_msg(func, arg_index: int, n: int, *,
-                          variadic_callee: str | None = None) -> str:
+                          variadic_callee: str | None = None,
+                          callee_variadic: bool | None = None) -> str:
     """The precise out-of-range message for `trace --arg N`, with the #324 stack-
     passed / first-missing-register notes. Used when no #433 register fallback
     applies. *variadic_callee* names a callee BN DETERMINED variadic (#948): its
@@ -834,7 +805,7 @@ def _out_of_range_arg_msg(func, arg_index: int, n: int, *,
         )
         msg += (
             f" Note: {where}; BN's MLIL/HLIL call model often omits stack-passed "
-            f"(e.g. variadic) args -- inspect `bn il {func.name} --view llil "
+            f"(e.g. variadic) args -- inspect `bn il {shlex.quote(func.name)} --view llil "
             f"--ssa` for the stack stores feeding the call (#324)."
         )
     elif reg_count is not None and n < reg_count and arg_index == n:
@@ -844,11 +815,10 @@ def _out_of_range_arg_msg(func, arg_index: int, n: int, *,
         msg += (
             f" Note: arg {arg_index} is the first integer-arg register this "
             f"convention passes that BN did not recover as a param ({n} "
-            f"recovered) -- if the callee's prototype is narrower than the "
-            f"actual call (variadic mis-typed as fixed-arity, or an indirect "
-            f"call through a too-narrow function-pointer type), it may be a "
-            f"real register-passed arg BN dropped; inspect `bn il {func.name} "
-            f"--view llil --ssa` for the args feeding the call (#324)."
+            f"recovered); the requested index alone does not prove that an "
+            f"argument exists or that the prototype is wrong. Inspect "
+            f"`bn il {shlex.quote(func.name)} --view llil --ssa` for independent evidence "
+            f"that a value feeds the call (#324)."
         )
     if variadic_callee:
         msg += (
@@ -856,6 +826,13 @@ def _out_of_range_arg_msg(func, arg_index: int, n: int, *,
             f"missing here, that is a limit of BN's call recovery at this site, not a "
             f"prototype defect -- redeclaring the prototype will not add it."
         )
+    elif callee_variadic is False:
+        msg += (" The callee is determined nonvariadic. If independent argument "
+                "provenance demonstrates extra arguments, recover and apply the "
+                "actual prototype; an out-of-range request alone is not a discrepancy.")
+    else:
+        msg += (" The callee's variadic status is undetermined; inspect its prototype "
+                "and argument provenance before diagnosing missing arguments.")
     return msg
 
 
@@ -1207,7 +1184,8 @@ def _summarize_frontiers(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(groups.values(), key=lambda g: (-g["count"], g["reason"]))
 
 
-def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_depth: int) -> list[str]:
+def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_depth: int,
+                       mangled: bool = False) -> list[str]:
     """#671: honest caveats for a backward ``trace`` result, mirroring the
     ``assumptions`` key already emitted by ``taint forward``/``taint
     backward`` (see ``_render_taint_text``'s ``caveats`` block). Non-empty
@@ -1226,9 +1204,9 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
     out_param_reasons = {"interprocedural_out_param_not_followed", "out_param_not_followed"}
     for step in trace:
         if isinstance(step, dict) and step.get("reason") in out_param_reasons:
-            # Free-text caveats keep raw names (the step and roll-up carry the
-            # display name), so `--mangled` and the default agree here.
-            callee = step.get("out_param_callee") or "a callee"
+            callee = ((step.get("out_param_callee") if mangled else
+                       step.get("out_param_callee_display_name") or step.get("out_param_callee"))
+                      or "a callee")
             assumptions.append(
                 f"value crosses an out-parameter fill by {callee} that this "
                 f"trace did not follow; the true origin may be inside it"
@@ -1546,6 +1524,7 @@ def _backward_slice(
     max_depth: int = 50,
     interprocedural: bool = False,
     ip_depth: int = 2,
+    mangled: bool = False,
 ) -> dict[str, Any]:
     if max_depth < 1:
         raise OperationFailure("invalid_max_depth", f"Invalid max_depth: {max_depth}")
@@ -1620,7 +1599,8 @@ def _backward_slice(
                     func, arg_index, len(params),
                     variadic_callee=(str(getattr(_oor_callee, "name", "") or "the callee")
                                      if il_format._variadic_determination(_oor_callee) is True
-                                     else None)))
+                                     else None),
+                    callee_variadic=il_format._variadic_determination(_oor_callee)))
 
     arg_label = _arg_label(ctx, bv, call_insn, arg_index, func)
 
@@ -1688,7 +1668,8 @@ def _backward_slice(
         # "arg N is the address of local X" would be false there (#1001 review).
         local_name = _copied_address_of_local(ssa_func, initial_vars)
     if local_name is not None:
-        hints.append(_address_of_local_hint(arg_index, local_name, arg_label, func))
+        hints.append(_address_of_local_hint(arg_index, local_name, arg_label, func,
+                                           mangled=mangled))
 
     truncated = len(trace) >= max_depth
     return {
@@ -1721,7 +1702,8 @@ def _backward_slice(
         # #671: non-empty ONLY when the slice is provably incomplete (depth cap
         # or an unfollowed out-param fill) -- mirrors `taint forward`/`backward`'s
         # `assumptions` key so `caveats (N)` renders in text mode too.
-        "assumptions": _trace_assumptions(trace, truncated=truncated, max_depth=max_depth),
+        "assumptions": _trace_assumptions(trace, truncated=truncated, max_depth=max_depth,
+                                         mangled=mangled),
         "hints": hints,
     }
 
@@ -1754,7 +1736,8 @@ def _copied_address_of_local(ssa_func, initial_vars: list) -> str | None:
     return None
 
 
-def _address_of_local_hint(arg_index: int, local_name: str, arg_label: dict, func) -> str:
+def _address_of_local_hint(arg_index: int, local_name: str, arg_label: dict, func,
+                           *, mangled: bool = False) -> str:
     """The #166 / #1001 item 2 hint for an argument that is the address of a
     local: trace follows the pointer, not the bytes in the pointee. Every
     command it prints runs as printed (#1001 review): the `arg:` sink locator
@@ -1771,15 +1754,16 @@ def _address_of_local_hint(arg_index: int, local_name: str, arg_label: dict, fun
         return (head + " The call's target did not resolve, so no `arg:` locator can "
                 f"name it; read the stores into the local with `bn decompile {fn_ref}`, "
                 "or resolve the target before slicing.")
-    shown = arg_label.get("callee_display_name") or callee
+    shown = callee if mangled else arg_label.get("callee_display_name") or callee
     _, model = _taint.lookup_model(_taint.load_models(), callee)
     # `call:` seeds what the model declares the callee writes; use it only when
     # that includes THIS argument's buffer (`*arg:N`) -- for recvfrom's
     # `addrlen`, `call:recvfrom` seeds the payload and return, not addrlen.
     writes_this = any(str((s or {}).get("to", "")) == f"*arg:{arg_index}"
                       for s in (model or {}).get("sources") or [])
-    source = f"call:{callee}" if writes_this else f"arg:{callee}:{arg_index}"
+    source = shlex.quote(f"call:{callee}" if writes_this else f"arg:{callee}:{arg_index}")
+    sink = shlex.quote(f"arg:{callee}:{arg_index}")
     return (head + f" To slice the stores into it before the call (array elements, "
             f"struct fields), run `bn taint backward -f {fn_ref} --sink "
-            f"arg:{callee}:{arg_index}`; if {shown} fills it instead (an output "
+            f"{sink}`; if {shown} fills it instead (an output "
             f"pointer), run `bn taint forward -f {fn_ref} --source {source}`.")

@@ -41,7 +41,17 @@ bn skill install
 
 That symlinks the bundled skills into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
 
-Re-running either install is safe: an existing link (or copy, under `--mode copy`) of the same source, or a skills root that is linked to the source itself, is reported as already installed. A destination holding anything else, typically a link into a previous checkout, is never reported as installed: `skill install` lists it with what it points at (or that it dangles, cannot be read, or is a foreign directory) and exits `1`, and `plugin install` refuses it. `--force` replaces only what it can remove and proves is this install's own: a link, an empty directory, or a previous copy, losing any local edits in that copy, so check them first. It refuses anything else (a foreign directory or file, an unreadable or read-only copy, an unwritable parent), and a forced run is all-or-nothing: a refusal changes no destination.
+Re-running either install is safe: an existing link (or byte-identical copy, under `--mode copy`) of the same source, or a skills root linked to the source itself, is reported as already installed. A different destination is not reported as installed: `skill install` lists it and exits `1`, and `plugin install` refuses it. Both installers default to text; use `--format json` for structured output.
+
+`--mode copy` writes `.bn-copy-install.json` at each artifact's destination, with exactly `{"format":"bn-copy-install-v1","artifact":"<source directory name>"}`. This small ownership marker survives source updates. `--force` accepts a non-empty directory only when its marker is a regular, non-symlink file containing that identity; source-like names or matching bytes are not proof. It replaces the entire marked copy, **losing local edits and added files**, so back them up first. A pre-marker copy is refused without claiming it is unrelated: move that destination to a backup by hand, then re-run the same install command without `--force`. Do not add markers by hand to bypass ownership checks.
+
+Copies are prepared with their marker **before** copied directory permissions are finalized, so a readable, read-only source directory is supported and its final mode is preserved. A failed marker write removes the prepared copy and leaves any previous destination in place. The marker is installation metadata, excluded from the engine-code fingerprint.
+
+`--force` can also replace a destination link (without following it) or an empty directory, including an empty read-only directory. It refuses unproved ownership, files, directories it cannot list or empty, and unwritable parents. An unreadable file inside a marked copy does not prevent removal when its directory can be emptied. A skills root linked into an unmarked checkout is refused, preserving that checkout's edits.
+
+If a refusal identifies the **skills root itself as a link**, do not move directories inside its target checkout. Run the printed `Recovery command` to unlink only that skills-root link and create a new directory at the same path, then re-run the same install command. The target checkout and its edits remain untouched. Ancestor links, such as a `~/.claude` link holding settings and other files, are never automatic recovery targets: leave them in place and choose a new `--dest` outside the linked tree or inspect the configuration manually. This is distinct from moving an ordinary, unlinked legacy-copy destination aside.
+
+The per-destination `--force` verdict is a dry run of the forced install's own preflight, not a separate prediction. Normal skill-install output includes every destination even when all are current, and a whole-run verdict (`force_plan` and `force_ready` in JSON). Each plan row carries a normalized `destination_id` identifying the installation entry independently of its requested/display spelling. Text joins an installation row with a verdict only when both entry identity and advice agree; roots with different advice retain separate rows, even if they reach the same entry. An explicit `--dest` refusal also publishes the full plan, exits `2`, and writes no destination or `--out` artifact; its JSON carries `ok: false` and an `error`. With `BN_SPILL_TOKENS` enabled, a cache artifact may hold the full refusal/plan, but this install command's stdout envelope still carries `ok: false` and the error. That is an install-only refusal policy: ordinary artifact envelopes retain their file-write-success meaning, including mutation `--out` envelopes. Path-blocked rows have `state: "blocked"`. A successful install recomputes the verdict against the new on-disk state. A forced run lists **every** preflight refusal and changes no destination if any is refused. The dry run performs no writes; filesystem races or write-time errors can still fail a run after preflight and leave earlier destinations installed.
 
 If the plugin code changes, reload Binary Ninja Python plugins or restart Binary Ninja.
 
@@ -91,6 +101,14 @@ bn instance clear
 
 Spawn naming is separate from routing: `bn session start /path/to/bin --instance-id myid` names the new bridge; subsequent commands use `bn -i myid …` to talk to it.
 
+With multiple bridges running, `bn load` requires explicit instance routing and lists the running IDs when it refuses. A sticky `bn instance use` pin does not choose where a load lands. Use `session start` to preload several paths into a new bridge.
+
+The registry's `started_at` (shown by `session list` and `doctor`) is fixed for the bridge's lifetime; loads, closes and project-association updates do not reset it.
+
+After an acknowledged headless shutdown, `session stop` and `session restart` allow up to 30 seconds for process teardown before considering escalation. Signals still require a verified pidfd; platforms without that primitive get a plain timeout, never a `/proc` or bare-PID fallback. If `session stop` cannot confirm teardown, it exits 1 and default text reports the timeout and warns that the bridge process may still be running, rather than claiming it stopped. The same warning appears when cleanup after an entirely failed `session start` cannot confirm teardown.
+
+When a request times out, the error reports whether a cancel request was sent. Cancellation is cooperative: an operation can continue until it checks for cancellation. Once transmission has been attempted, even a timeout during `sendall` leaves delivery uncertain: the bridge may accept complete JSON at EOF without its final newline. The client attempts cancellation and retains the warning that the operation may keep running. Only a timeout before any transmission attempt says the request was not sent. A timeout does not establish that analysis is the cause.
+
 `BN_CACHE_DIR` moves more than the database cache: the instance registry (`instances/`) and the sticky `instance use` / `target use` pins live under it too. A bridge started with it set is only visible to bn commands run with the same value, so set it on every command (in a harness where each shell call is fresh, export it per call or wrap `bn`). When an id is missing from the searched registry but registered under another root, the error names that root and the `export BN_CACHE_DIR=…` that reaches it. With exactly one bridge running and no `-i`, commands use it from any directory; `target list` / `target info` name the answering instance, and stderr notes when that bridge is not associated with the current project.
 
 `bn load` and `bn close` are available for dynamic binary management (useful in headless, but also work with the GUI bridge). All commands work identically in GUI and headless mode.
@@ -111,7 +129,7 @@ Ready immediately after `--quick`:
 Need `bn refresh` first — these depend on the analysis pass:
 
 - `bn strings` **errors** until you refresh — it refuses with "Strings are not available: this target was loaded with --quick (no analysis). Run bn refresh …" rather than return an empty list that looks like "this binary has no strings".
-  While a `bn refresh` is already analysing that target, the refusal says `… full analysis is in progress (N/M), started Ns ago by bn refresh. Retry when it finishes -- do not start another refresh.` instead; wait rather than start a second refresh.
+  While a `bn refresh` is already analysing that target, the refusal reports the elapsed time and, when available, BN's current `count` and `total`, then says to retry when it finishes rather than start another refresh. Those counters may reset or change during one analysis: they are not overall completion or a time-remaining estimate.
 - `bn function list` / `bn function search` return a **partial** set — only entry-point and symbol functions exist before analysis; the count grows once the analysis pass recovers the rest.
 - `bn decompile` / `bn il` / `bn disasm` / `bn xrefs` across the binary are partial for the same reason (functions BN hasn't discovered yet aren't there to read).
 - Every mutation, `bn go rename` included, **refuses** with `invalid_request` (exit 3) until you refresh: mutations reanalyze under the write lock, and `go rename` would only see the few functions a quick view defines.
@@ -126,6 +144,8 @@ bn refresh                              # runs update_analysis_and_wait()
 bn strings                              # now returns the full string set
 ```
 
+A second `bn refresh` on a current bridge refuses immediately while the first is running, with its age and available counters; it does not queue another full analysis behind the first. This includes bare `bn refresh` without `-t` when the selected bridge advertises `capabilities.refresh_target_gate: true` in its registry: target resolution happens inside the reserved write gate, not through a preliminary target-list request that could block behind another writer. A bare first refresh still requires exactly one open target and refuses a broken empty ambient target default. For older bridges without that capability, the CLI retains its target-list preflight: multiple open targets are refused before refresh, and a sole target is pinned by its stable `target_id` on the same selected bridge. That legacy preflight can wait behind an exclusive writer; update the GUI bridge to get prompt bare duplicate refusal. The current bridge's duplicate refusal also applies across different targets and a GUI bridge restart, since the writer gate is shared. If the first refresh is still waiting for the write gate or resolving its target, the refusal says it is pending rather than analysing.
+
 Single-function escape hatch — analyze just one function without a full refresh:
 
 ```bash
@@ -133,6 +153,8 @@ bn decompile handle_request --force-analysis
 ```
 
 Loading a `.bndb` ignores `--quick`: a database already carries its saved analysis, so the flag is a no-op there. That includes an adjacent `<binary>.bndb`, which `bn load <binary>` prefers (pass `--no-bndb` for the raw bytes). A database `bn save` wrote to the cache (`<cache>/bndb/`, used when the binary's own directory is read-only) is different: the cache is shared by every bn instance using the same `BN_CACHE_DIR` (by default, every one on the machine), so `--quick` never restores it — the raw bytes load quickly and the note names the skipped entry with the `bn load <entry>` that restores it. On a read-only mount, a target that did not load an existing cache entry (`--quick`, `--no-bndb`) cannot `bn save` over it: the save is refused and points at `bn save <path>`. Give each agent or project its own `BN_CACHE_DIR` to keep their caches apart.
+
+Loading a saved database still reports inherited comments, function documentation and analyst symbols when any of those counts is nonzero. A measured all-zero record does not add an annotation note; current counts remain available through `target info`.
 
 ### Detecting a quick view programmatically
 
@@ -175,6 +197,50 @@ bn decompile update_player_movement_flags --target SnailMail_unwrapped.exe.bndb
 
 Omitting `--target` only works when exactly one target is open. If multiple targets are open, the CLI rejects the command instead of silently falling back to `active`.
 
+For top-level refusals, `close` and `target close`, and batched decompile
+**text** errors, target rows are complete, shell-safe commands retaining the
+invoked command's operands and options. Paste the whole command; trailing
+metadata is a shell comment. A selector containing terminal control characters
+is replaced in the listing command by its exact `target_id`.
+
+**Remaining limitation (split into a follow-up):** fan-out per-instance errors
+and structured JSON/ndjson batch error messages still carry raw `-t` fragment
+rows, as on base. They are **not runnable commands**; do not paste them as such.
+Their filename metadata is now shell-quoted by the shared row renderer, but
+this does not reconstruct those deferred error paths into commands.
+
+The bridge prefers a raw view over its `.bndb`-stripped database alias only
+when this bridge recorded their save pairing and the database still has the
+recorded file identity and verified-source status permits pairing. Replacing
+the database invalidates that pairing; an ambiguity refusal explains the
+observed file-identity change rather than assuming the database's contents.
+An unrelated raw view opened with `load --no-bndb` has no such recorded save
+pairing. If no filename or path suffix uniquely identifies it, the load note
+explains why its selector is the full `target_id`; target rows expose the same
+explanation as `selector_reason`.
+
+Pairing uses filesystem identity (device, inode, size and modification time),
+not a database-content comparison. A same-size in-place overwrite that preserves
+that identity can leave the pairing intact; do not treat pairing as proof of
+unchanged database contents.
+
+Close requests that pin a listed `target_id` require a bridge supporting
+`pinned_target`. Older bridges silently ignore that flag and therefore do not
+provide its identity-only protection against a view being replaced between
+listing and closing. Restart or update the bridge before relying on pinned
+close behavior. Current bridges reject a pinned `active` selector even when
+only one target is open.
+
+Restart/export hints are offered only after checking the registry's live
+socket peer identity and receiving a bridge response. Process command-line
+spelling alone is not evidence that the registered socket belongs to that
+bridge; unverifiable endpoints receive no export hint. If a registry probe
+times out or finds a stopped bridge, the instance may be busy or stopped:
+wait and retry (or resume an intentionally stopped bridge) rather than starting
+a duplicate. Neither outcome establishes that the instance is absent.
+Complete-command reconstruction is limited to the top-level, close/target-close
+and batched-decompile text paths described above.
+
 ## Output Behavior
 
 Every command supports:
@@ -184,7 +250,7 @@ Every command supports:
 - `--format ndjson`
 - `--out <path>`
 
-Interactive read commands default to `text`. Mutation, setup, and export commands default to `json`.
+Interactive read commands and `plugin install` / `skill install` default to `text`. Other setup and export commands default to `json`.
 Add `--format json` when you need stable fields for automation or piping into structured tooling.
 
 Examples:
@@ -417,6 +483,13 @@ Check bridge state:
 ```bash
 bn doctor
 ```
+`doctor` compares GUI bridge code with the plugin source that the bridge reports,
+including private `BN_USER_DIRECTORY` installs, rather than assuming the default
+plugin directory. Reload Binary Ninja plugins or restart Binary Ninja to update
+a stale GUI bridge; `bn session restart` is for headless sessions. For older
+headless bridges that do not report their source, doctor discloses that restarting
+from this CLI moves the session onto this CLI's checkout.
+
 
 If `bn target list` is empty:
 

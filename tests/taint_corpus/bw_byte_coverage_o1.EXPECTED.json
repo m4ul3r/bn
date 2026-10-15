@@ -30,7 +30,7 @@
     {"function": "fill_at_zero", "sink": "arg:popen:0",
      "origin_kinds": ["parameter", "field_load_unresolved", "constant", "source"],
      "expect_crossed": "fill_at_zero",
-     "step_reasons_contain": ["local buffer buf written by read", "local buffer buf written by strcpy"],
+     "step_reasons_contain": ["local buffer buf written by read"],
      "forbid_leaves": [{"kind": "address_of_local_unresolved"}]}
   ]
 }

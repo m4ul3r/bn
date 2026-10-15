@@ -79,6 +79,9 @@ def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
 # larger, explicitly named budget -- on whichever call does the analysing.
 _SESSION_START_TIMEOUT = 120.0
 _CROSS_ARCH_ANALYSIS_TIMEOUT = 300.0
+# Stop includes the 30s graceful teardown allowance, a 2s post-KILL wait,
+# the unsaved-target probe and outer CLI startup/shutdown overhead.
+_SESSION_STOP_TIMEOUT = 60.0
 
 # How much of a bridge log to attach to a timeout: the crash output that matters
 # is at the end, and the tail cannot be allowed to swamp the failure report.
@@ -167,7 +170,7 @@ def _session_start(*binaries: str, timeout: float = _SESSION_START_TIMEOUT) -> d
     return json.loads(result.stdout)
 
 
-def _session_stop(instance_id: str, timeout: float = 10.0) -> None:
+def _session_stop(instance_id: str, timeout: float = _SESSION_STOP_TIMEOUT) -> None:
     # Teardown, so the discard is deliberate: a test that mutated its private
     # copy and never saved would otherwise be REFUSED here (#925) and leak the
     # bridge until the idle reaper caught it.
@@ -439,7 +442,6 @@ class TestSavePathIdentity:
         assert result.returncode == 2, (result.stdout, result.stderr)
         err = result.stderr
         assert "save_database needs an explicit target when multiple targets are open (2)" in err
-        assert "Pass -t <selector> (--target) to choose one." in err
         assert "Open targets:" in err
         # Prefix-matches both the raw and the .bndb-restored selector spelling.
         assert "-t hello_x86_64" in err
@@ -463,7 +465,6 @@ class TestSavePathIdentity:
         assert result.returncode == 2, (result.stdout, result.stderr)
         assert "This command requires --target when multiple targets are open." \
             in result.stderr
-        assert "Pass -t <selector> (--target) to choose one." in result.stderr
         assert "-t hello_x86_64" in result.stderr
         assert "note: view_id / target_id are stable across `bn save`" in result.stderr
 
@@ -2088,6 +2089,35 @@ class TestAArch64ProbeStrictGate:
         assert "BN_REQUIRE_REAL_TESTS" in str(failed.value)
 
 
+class TestSessionStopCleanupBudget:
+    def test_cleanup_completes_after_full_teardown_allowance(
+        self, monkeypatch, tmp_path
+    ):
+        # Exercise a real subprocess deadline, scaled 10:1 to avoid spending
+        # 35 seconds on a stand-in. It needs the full 30s teardown allowance,
+        # 2s escalation wait and 3s of outer CLI overhead before it finishes.
+        completed = tmp_path / "cleanup-completed"
+        program = (
+            "import pathlib, sys, time\n"
+            "assert sys.argv[1:] == ['session', 'stop', 'budget-edge', '--discard-unsaved']\n"
+            "time.sleep(3.5)\n"
+            f"pathlib.Path({str(completed)!r}).write_text('process exited')\n"
+        )
+        monkeypatch.setattr(
+            sys.modules[__name__], "_BN_CLI", [sys.executable, "-c", program]
+        )
+        run = subprocess.run
+
+        def scaled_run(*args, timeout, **kwargs):
+            return run(*args, timeout=timeout / 10.0, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", scaled_run)
+
+        _session_stop("budget-edge")
+
+        assert completed.read_text() == "process exited"
+
+
 class TestSessionStartTimeoutDiagnostics:
     """#718: `session start` must not race its own measurement, and a timeout
     must carry the evidence of how far the start got.
@@ -2656,6 +2686,8 @@ class TestRestartReopensAStaleDatabaseLoudly:
     had changed with `notes: []`. A private session: the restart IS the subject."""
 
     def test_restart_reports_the_database_whose_raw_file_changed(self, tmp_path):
+        from bn.commands.admin import _SHUTDOWN_TEARDOWN_TIMEOUT
+
         prog = tmp_path / "prog"
         hello = Path(HELLO_BINARY).read_bytes()
         prog.write_bytes(hello)
@@ -2663,15 +2695,24 @@ class TestRestartReopensAStaleDatabaseLoudly:
         sidecar = prog.with_name("prog.bndb")
         inst = None
         try:
-            inst = _session_start(str(prog))["instance_id"]
-            saved = json.loads(_bn("--instance", inst, "save", "--format", "json").stdout)
+            started = _session_start(str(prog))
+            inst = started["instance_id"]
+            saving = _bn("--instance", inst, "-t", str(prog), "save", "--format", "json")
+            assert saving.returncode == 0, f"{saving.stdout}\n{saving.stderr}"
+            saved = json.loads(saving.stdout)
             assert saved["path"] == str(sidecar), saved
             prog.write_bytes(Path(ADD_BINARY).read_bytes())
 
-            restarted = _bn("session", "restart", inst, "--format", "json",
-                            timeout=_SESSION_START_TIMEOUT)
+            # Restart includes old-process teardown AND a full new session start;
+            # don't make those phases compete for one startup-only outer budget.
+            restarted = _bn(
+                "session", "restart", inst, "--format", "json",
+                timeout=_SHUTDOWN_TEARDOWN_TIMEOUT + 2.0 + _SESSION_START_TIMEOUT,
+            )
             assert restarted.returncode == 0, f"{restarted.stdout}\n{restarted.stderr}"
             result = json.loads(restarted.stdout)
+            assert result["instance_id"] == inst, result
+            assert result["pid"] != started["pid"], result
             reloaded = result["loaded"][0]
             assert reloaded["path"] == str(sidecar), reloaded
             note = next((n for n in reloaded["notes"] if "requested explicitly" in n), None)
@@ -4106,6 +4147,75 @@ class TestClassLensRttiGuards922:
             "class", "list", "--no-stl", "--query", "basic_string", "--count", "--format", "json").stdout)
         assert counted["count"] == 1, counted
 
+    def test_stripped_rtti_only_list_recovers_the_same_primary_as_show_1018(self, shared_bn):
+        target = shared_bn.load(CLASSES_STRIPPED_BINARY)
+        listing = shared_bn.json(
+            "class", "list", "--query", "svc::EchoHandler", "-t", target)
+        row, = listing["items"]
+        assert row["has_vtable"] is True, row
+        assert row["vtable_status"] == "recovered", row
+        assert listing["vtable_recovery_budget_exhausted"] is False
+        card = shared_bn.json("class", "show", "svc::EchoHandler", "-t", target)
+        assert card["vtable"]["typeinfo_backwalk"] is True
+        assert row["method_count"] == len(card["methods"]) == 0
+        assert row["vtable_slot_count"] == card["vtable"]["total"] == 4
+        text = shared_bn.run(
+            "class", "list", "--query", "svc::EchoHandler", "-t", target)
+        assert text.returncode == 0, (text.stdout, text.stderr)
+        assert "methods=0  vtable  slots=4" in text.stdout
+        assert "no-vtable" not in text.stdout
+        count = shared_bn.json(
+            "class", "list", "--query", "svc::EchoHandler", "--count", "-t", target)
+        assert count["count"] == 1
+        assert "vtable_recovery_budget_exhausted" not in count
+        renamed = shared_bn.run(
+            "symbol", "rename", card["vtable"]["slots"][2]["address"],
+            "svc::EchoHandler::handle", "-t", target)
+        assert renamed.returncode == 0, (renamed.stdout, renamed.stderr)
+        named_card = shared_bn.json("class", "show", "svc::EchoHandler", "-t", target)
+        named_list = shared_bn.json(
+            "class", "list", "--query", "svc::EchoHandler", "-t", target)
+        named_row, = named_list["items"]
+        assert named_row["has_vtable"] is True, named_row
+        assert named_row["method_count"] == len(named_card["methods"]) == 1
+        assert named_row["vtable_slot_count"] == named_card["vtable"]["total"] == 4
+        assert named_card["vtable"]["address_point"] == card["vtable"]["address_point"]
+        for failure in ("refs", "raw_raise", "raw_none", "raw_short"):
+            unavailable = shared_bn.json(
+                "py", "exec",
+                "from bn_agent_bridge import read_class, seam\n"
+                f"failure = {failure!r}\n"
+                "class FailedRead:\n"
+                "    def __getattr__(self, name): return getattr(bv, name)\n"
+                "    def get_data_refs(self, address):\n"
+                "        if failure == 'refs': raise RuntimeError('synthetic reference failure')\n"
+                "        return bv.get_data_refs(address)\n"
+                "    def read(self, address, size):\n"
+                "        if failure == 'raw_raise': raise RuntimeError('synthetic raw failure')\n"
+                "        if failure == 'raw_none': return None\n"
+                "        if failure == 'raw_short': return b''\n"
+                "        return bv.read(address, size)\n"
+                "proxy = FailedRead()\n"
+                "ctx = seam.BridgeContext(None)\n"
+                "ctx._resolve_view = lambda selector: proxy\n"
+                "result = read_class._class_list(ctx, None, query='svc::EchoHandler')\n",
+                "-t", target)["result"]
+            unknown_row, = unavailable["items"]
+            assert unknown_row["has_vtable"] is unknown_row["vtable_slot_count"] is None, failure
+            assert unknown_row["vtable_status"] == "unavailable", failure
+            assert unknown_row["method_count"] == 1
+        imported = shared_bn.json(
+            "class", "list", "--query", "std::runtime_error", "-t", target)
+        imported_row, = imported["items"]
+        assert imported_row["has_vtable"] is imported_row["vtable_slot_count"] is None
+        assert imported_row["vtable_status"] == "unavailable"
+        imported_card = shared_bn.json("class", "show", "std::runtime_error", "-t", target)
+        assert imported_card["typeinfo"]["import_slot"] is True
+        imported_text = shared_bn.run(
+            "class", "list", "--query", "std::runtime_error", "-t", target).stdout
+        assert "vtable=? (unavailable)" in imported_text
+        assert "slots=0" not in imported_text and "no-vtable (checked)" not in imported_text
+
     def test_stripped_slot_array_symbols_preserve_vtable_contents_935(self, shared_bn):
         # Both builds use the same source/options except -s. Compare raw slot
         # words within each view; across views only proven external symbols use
@@ -4338,10 +4448,190 @@ class TestVirtualMethods998:
         assert res.returncode == 0, (res.stdout, res.stderr)
         return json.loads(res.stdout)
 
+    def test_defsym_size_zero_alias_keeps_location_xrefs_fallback(self, shared_bn, tmp_path):
+        import re
+        import shlex
+
+        source = tmp_path / "alias.cpp"
+        source.write_text(
+            "struct Short { virtual int method() { return 7; } };\n"
+            "int main() { Short value; return value.method(); }\n")
+        binary = tmp_path / "alias"
+        build = subprocess.run(
+            ["c++", "-O0", "-o", str(binary), str(source),
+             "-Wl,--defsym=_ZTV5Alias=_ZTV5Short"],
+            capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        symbols = shared_bn.json(
+            "py", "exec",
+            "result = {name: [hex(s.address) for s in bv.get_symbols_by_raw_name(name)] "
+            "for name in ('_ZTV5Short', '_ZTV5Alias')}",
+            "-t", target)["result"]
+        assert set(symbols["_ZTV5Short"]) & set(symbols["_ZTV5Alias"]), symbols
+        out = self._json(shared_bn, "callsites", "Short::method", "-t", target)
+        assert out["callee_data_ref_count"] == 1, out
+        assert out["callee_data_ref_vtables"] == []
+        text = shared_bn.run("callsites", "Short::method", "-t", target).stdout
+        assert "bn class show" not in text
+        commands = re.findall(r"`(bn xrefs [^`]+)`", text)
+        assert {shlex.split(command)[-1] for command in commands} == set(out["callee_data_refs"])
+        for command in commands:
+            result = shared_bn.run("-t", target, *shlex.split(command)[1:])
+            assert result.returncode == 0, (command, result.stderr)
+
+    def test_duplicate_anonymous_class_names_never_print_wrong_card(self, shared_bn, tmp_path):
+        import re
+        import shlex
+
+        first, second, main = (tmp_path / name for name in ("first.cpp", "second.cpp", "main.cpp"))
+        first.write_text(
+            "namespace { struct Foo { virtual int a() { return 1; } "
+            "virtual int b() { return 2; } }; }\n"
+            "extern \"C\" void* make_first() { return new Foo; }\n")
+        second.write_text(
+            "namespace { struct Foo { virtual int c() { return 3; } "
+            "virtual int d() { return 4; } virtual int e() { return 5; } }; }\n"
+            "extern \"C\" void* make_second() { return new Foo; }\n")
+        main.write_text(
+            "extern \"C\" void* make_first(); extern \"C\" void* make_second();\n"
+            "int main() { return make_first() == make_second(); }\n")
+        binary = tmp_path / "locals"
+        build = subprocess.run(
+            ["c++", "-O0", "-o", str(binary), str(first), str(second), str(main)],
+            capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        native = shared_bn.json(
+            "py", "exec",
+            "result = {'tables': [hex(s.address) for s in "
+            "bv.get_symbols_by_raw_name('_ZTVN12_GLOBAL__N_13FooE') "
+            "if s.type.name == 'DataSymbol'], "
+            "'methods': [hex(f.start) for f in bv.functions if f.symbol and "
+            "f.symbol.raw_name.endswith(('3Foo1aEv', '3Foo1dEv'))]}\n",
+            "-t", target)["result"]
+        assert len(set(native["tables"])) == len(native["methods"]) == 2, native
+        for callee in native["methods"]:
+            out = self._json(shared_bn, "callsites", callee, "-t", target)
+            assert out["callee_data_ref_count"] == 1, out
+            assert out["callee_data_ref_vtables"] == []
+            text = shared_bn.run("callsites", callee, "-t", target).stdout
+            assert "bn class show" not in text
+            commands = re.findall(r"`(bn xrefs [^`]+)`", text)
+            assert {shlex.split(command)[-1] for command in commands} == set(out["callee_data_refs"])
+            for command in commands:
+                result = shared_bn.run("-t", target, *shlex.split(command)[1:])
+                assert result.returncode == 0, (command, result.stderr)
+
+    def test_capped_census_never_attributes_an_overlapping_local_alias(self, shared_bn, tmp_path):
+        import re
+        import shlex
+
+        header = """
+.text
+.globl handler
+.hidden handler
+.type handler,@function
+handler:
+ mov $7,%eax
+ ret
+.size handler,.-handler
+.section .data.rel.ro,"aw",@progbits
+.p2align 3
+.globl _ZTV5Short
+.type _ZTV5Short,@object
+_ZTV5Short:
+ .quad 0,_ZTI5Short,handler
+.size _ZTV5Short,24
+.local _ZTV5Alias
+.type _ZTV5Alias,@object
+.set _ZTV5Alias,_ZTV5Short
+.size _ZTV5Alias,24
+.globl _ZTI5Short
+.type _ZTI5Short,@object
+_ZTI5Short:
+ .quad 0,_ZTS5Short
+.size _ZTI5Short,16
+.section .rodata
+.globl _ZTS5Short
+.type _ZTS5Short,@object
+_ZTS5Short:
+ .asciz "5Short"
+.size _ZTS5Short,7
+"""
+        filler = r"""
+.altmacro
+.macro filler index
+.local padding_\index
+.set padding_\index,1
+.endm
+.set count,0
+"""
+        for padding in (0, 65536):
+            source = tmp_path / "census.s"
+            source.write_text(
+                header + filler + f".rept {padding}\n"
+                "filler %count\n.set count,count+1\n.endr\n"
+                '.section .note.GNU-stack,"",@progbits\n')
+            binary = tmp_path / f"census-{padding}.so"
+            build = subprocess.run(["cc", "-shared", "-fPIC", "-o", str(binary), str(source)],
+                                   capture_output=True, text=True)
+            assert build.returncode == 0, build.stderr
+            target = shared_bn.load(binary)
+            slot = shared_bn.json(
+                "py", "exec",
+                "result = hex(next(s.address for s in bv.get_symbols_by_raw_name('_ZTV5Short') "
+                "if s.type.name == 'DataSymbol') + 2*bv.address_size)",
+                "-t", target)["result"]
+            out = self._json(shared_bn, "callsites", "handler", "-t", target)
+            assert out["callee_data_ref_count"] == 1, out
+            assert out["callee_data_refs"] == [slot]
+            assert out["callee_data_ref_vtables"] == []
+            text = shared_bn.run("callsites", "handler", "-t", target).stdout
+            commands = re.findall(r"`(bn [^`]+)`", text)
+            assert [shlex.split(command) for command in commands] == [["bn", "xrefs", slot]]
+            result = shared_bn.run("-t", target, *shlex.split(commands[0])[1:])
+            assert result.returncode == 0, (result.stdout, result.stderr)
+
+    def test_pic_vtable_hint_uses_local_definition_beside_got_alias(self, shared_bn, tmp_path):
+        import re
+        import shlex
+
+        source = tmp_path / "pic.cpp"
+        source.write_text(
+            "struct Short { Short(); virtual ~Short(); virtual int method(); };\n"
+            "Short::Short() {} Short::~Short() {} int Short::method() { return 7; }\n"
+            "extern \"C\" Short* make_short() { return new Short; }\n")
+        binary = tmp_path / "pic.so"
+        build = subprocess.run(
+            ["c++", "-O0", "-shared", "-fPIC", "-o", str(binary), str(source)],
+            capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        target = shared_bn.load(binary)
+        symbols = shared_bn.json(
+            "py", "exec",
+            "result = [{'address': hex(s.address), 'kind': s.type.name} "
+            "for s in bv.get_symbols_by_raw_name('_ZTV5Short')]",
+            "-t", target)["result"]
+        assert {"ImportAddressSymbol", "DataSymbol"} <= {sym["kind"] for sym in symbols}, symbols
+        out = self._json(shared_bn, "callsites", "Short::method", "-t", target)
+        row, = out["callee_data_ref_vtables"]
+        local = next(sym for sym in symbols if sym["kind"] == "DataSymbol")
+        assert row["vtable_address"] == local["address"]
+        assert row["class_name"] == "Short"
+        card = self._json(shared_bn, "class", "show", "Short", "-t", target)
+        assert row["address_point"] == card["vtable"]["address_point"]
+        text = shared_bn.run("callsites", "Short::method", "-t", target).stdout
+        commands = re.findall(r"`(bn class show [^`]+)`", text)
+        assert len(commands) == 1, text
+        for command in commands:
+            result = shared_bn.run("-t", target, *shlex.split(command)[1:])
+            assert result.returncode == 0, (command, result.stderr)
+            assert result.stdout.startswith("class Short ")
+
     def test_callsites_says_when_the_callee_is_stored_in_data(self, shared_bn):
-        # `reg` is never called directly; its address sits in the Dispatcher
-        # and AudioDisp vtables. `callsites` states that fact -- two data
-        # refs, where -- and claims nothing about what they are.
+        # `reg` is never called directly; its address sits in two named vtable
+        # objects. Execute the printed class-layout hints, not callee xrefs.
         shared_bn.load(VCALLS_BINARY)
         out = self._json(shared_bn, "callsites", "vc::Dispatcher::reg")
         assert out["total"] == 0, out
@@ -4351,11 +4641,50 @@ class TestVirtualMethods998:
             r["address"] for r in xrefs["items"] if r["kind"] == "data")
         text = shared_bn.run("callsites", "vc::Dispatcher::reg").stdout
         assert "note: the callee's address is stored in 2 data location(s)" in text, text
-        assert "may be vtable slots or function-pointer tables" in text
+        import re
+        import shlex
+        commands = re.findall(r"`(bn class show [^`]+)`", text)
+        assert len(commands) == 2, text
+        assert {shlex.split(command)[-1] for command in commands} == {"vc::Dispatcher", "vc::AudioDisp"}
+        for command in commands:
+            result = shared_bn.run(*shlex.split(command)[1:])
+            assert result.returncode == 0, (command, result.stderr)
+            row = next(row for row in out["callee_data_ref_vtables"]
+                       if row["class_name"] == shlex.split(command)[-1])
+            assert result.stdout.startswith(f"class {row['class_name']} ")
+            assert f"address point {row['address_point']}" in result.stdout.splitlines()[0]
         # A function stored nowhere gets no note.
         plain = self._json(shared_bn, "callsites", "vc::pump")
         assert plain["callee_data_ref_count"] == 0
         assert "data location" not in shared_bn.run("callsites", "vc::pump").stdout
+
+    def test_callsite_address_point_accounts_for_virtual_base_offsets(self, shared_bn, tmp_path):
+        import re
+        import shlex
+
+        source = tmp_path / "virtual.cpp"
+        source.write_text(
+            "struct Root { virtual void f() {} virtual ~Root() {} };\n"
+            "struct Leaf : virtual Root { void f() override {} };\n"
+            "int main() { Leaf value; Root* root = &value; root->f(); }\n")
+        binary = tmp_path / "virtual"
+        build = subprocess.run(["c++", "-O0", "-o", str(binary), str(source)],
+                               capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        shared_bn.load(binary)
+        out = self._json(shared_bn, "callsites", "Leaf::f")
+        row = next(row for row in out["callee_data_ref_vtables"] if row["class_name"] == "Leaf")
+        assert row["address_point"] == row["address"]
+        assert int(row["address_point"], 16) > int(row["vtable_address"], 16) + 16
+        refs = self._json(shared_bn, "xrefs", row["address_point"])
+        assert any(ref["kind"] == "code" for ref in refs["items"])
+        text = shared_bn.run("callsites", "Leaf::f").stdout
+        commands = re.findall(r"`(bn class show [^`]+)`", text)
+        assert len(commands) == 1, text
+        for command in commands:
+            result = shared_bn.run(*shlex.split(command)[1:])
+            assert result.returncode == 0, (command, result.stderr)
+            assert result.stdout.startswith("class Leaf")
 
     def test_vtable_address_point_is_what_objects_reference(self, shared_bn):
         shared_bn.load(VCALLS_BINARY)
@@ -4368,6 +4697,24 @@ class TestVirtualMethods998:
         assert self._json(shared_bn, "xrefs", vt["address"])["code_ref_count"] == 0
         text = shared_bn.run("class", "show", "vc::Dispatcher").stdout
         assert f"vtable @ {vt['address']}, address point {vt['address_point']}" in text
+
+    def test_unknown_table_hints_execute_xrefs_on_the_data_location(self, shared_bn):
+        import re
+        import shlex
+
+        shared_bn.load(CLASSES_STRIPPED_BINARY)
+        card = self._json(shared_bn, "class", "show", "svc::EchoHandler")
+        callee = card["vtable"]["slots"][0]["address"]
+        out = self._json(shared_bn, "callsites", callee)
+        assert out["callee_data_ref_vtables"] == []
+        text = shared_bn.run("callsites", callee).stdout
+        commands = re.findall(r"`(bn xrefs [^`]+)`", text)
+        assert {shlex.split(command)[-1] for command in commands} == set(out["callee_data_refs"])
+        assert card["vtable"]["address_point"] in out["callee_data_refs"]
+        for command in commands:
+            result = shared_bn.run(*shlex.split(command)[1:])
+            assert result.returncode == 0, (command, result.stderr)
+            assert result.stdout.startswith(f"xrefs to {shlex.split(command)[-1]} ")
 
 
 class TestStructLayoutAssistance903:
@@ -4716,6 +5063,19 @@ __attribute__((noinline)) int labels2(int op, int v) {
 l0: return v + 1;
 l1: return v * 3;
 }
+__attribute__((noinline)) int labels3(int op) {
+  static void *const labels[] = { &&a, &&b, &&c };
+  goto *labels[op % 3];
+a: return 10;
+b: return 20;
+c: return 30;
+}
+__attribute__((noinline)) int handler_a(int x) { return x + 3; }
+__attribute__((noinline)) int handler_b(int x) { return x * 3; }
+__attribute__((noinline)) int dispatch_call(int n) {
+  fn_t fn = n ? handler_a : handler_b;
+  return fn(n) + 1;
+}
 int idxjump(long *p);
 __asm__(IDXJUMP);
 __attribute__((noinline)) char *use_c_locale(void) { return setlocale(LC_ALL, "C"); }
@@ -4841,6 +5201,55 @@ class TestDecompileRepeatedJump1000:
             assert line.count("/* bn: unresolved jump") == 1, line
 
 
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+def test_decompile_reports_native_branch_targets_and_separate_starts_1019(
+        shared_bn, tail_jump_binaries, arch):
+    shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+    # Make the split deterministic across BN releases: the compiler's static
+    # label table is real, while explicit function starts model the split body.
+    facts = shared_bn.json("py", "exec", "--code",
+        "f = bv.get_functions_by_name('labels3')[0]\n"
+        "targets = sorted({b.dest_addr for b in f.indirect_branches})\n"
+        "assert len(targets) == 3, f.indirect_branches\n"
+        "for address in targets[1:]:\n"
+        "    bv.create_user_function(address)\n"
+        "bv.update_analysis_and_wait()\n"
+        "result = [{'source': hex(b.source_addr), 'target': hex(b.dest_addr), "
+        "'separate': bv.get_function_at(b.dest_addr) is not None} "
+        "for b in f.indirect_branches]\n")["result"]
+    decompiled = shared_bn.json("decompile", "labels3")
+    rows = [row for row in decompiled["warning_rows"] if row["code"] == "branch"]
+    actual = {(row["address"], target["address"], "function" in target)
+              for row in rows for target in row["targets"]}
+    expected = {(fact["source"], fact["target"], fact["separate"]) for fact in facts}
+    assert actual == expected
+    assert sum(separate for _, _, separate in actual) == 2
+    for row in rows:
+        for target in row["targets"]:
+            if "function" in target:
+                body = shared_bn.json("decompile", target["address"])
+                assert body["function"]["address"] == target["address"]
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+def test_values_keeps_native_call_result_separate_from_destination_947(
+        shared_bn, tail_jump_binaries, arch):
+    shared_bn.load(tail_jump_binaries[arch], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+    graph = shared_bn.json("dataflow", "callgraph", "dispatch_call")
+    [call] = [row for row in graph["callees"] if row["kind"] == "indirect"]
+    expected = {int(row["address"], 16) for row in call["resolved"]}
+    assert len(expected) == 2
+    values = shared_bn.json("dataflow", "values", "dispatch_call", "--at", call["call_addr"])
+    assert values["value_basis"] == "instruction"
+    assert values["possible_values"]["type"] == "UndeterminedValue"
+    assert set(values["call_destination"]["possible_values"]["values"]) == expected
+    assert values["call_destination"]["value_basis"] == "destination_expression"
+    text = shared_bn.run("dataflow", "values", "dispatch_call", "--at", call["call_addr"])
+    assert text.returncode == 0, text.stderr
+    assert "possible values: UndeterminedValue" in text.stdout
+    assert "call destination possible values: InSetOfValues" in text.stdout
+
+
 class TestShortLiteralBehindDataName994:
     def test_setlocale_literal_rendered_as_data_name_is_named(self, shared_bn, tail_jump_binaries):
         shared_bn.load(tail_jump_binaries["aarch64"], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
@@ -4886,3 +5295,62 @@ class TestOffsetTypeLookup1000:
         for name, exists in self._NAMES.items():
             shown = shared_bn.run("types", "show", name)
             assert (shown.returncode == 0) == exists, (name, shown.stdout, shown.stderr)
+
+
+def test_diagnostic_recovery_and_target_commands_run_as_printed(tmp_path):
+    """Transport recovery starts fresh; target inspection keeps its live routing."""
+    import re
+    import shlex
+    from types import SimpleNamespace
+
+    from bn.cli import _contextualize_diagnostic_hints
+    from bn.transport import _bridge_recovery_advice
+
+    def execute(command):
+        argv = shlex.split(command)
+        assert argv[0] == "bn"
+        result = _bn(*argv[1:], timeout=_SESSION_START_TIMEOUT)
+        assert result.returncode == 0, (command, result.stdout, result.stderr)
+        return result.stdout
+
+    advice = " ".join(_bridge_recovery_advice(
+        SimpleNamespace(registry_path=tmp_path / "dead.json")))
+    routed = _contextualize_diagnostic_hints(
+        {"error": advice}, target="my tgt", instance="X1")["error"]
+    commands = re.findall(r"`(bn [^`]+)`", routed)
+    start = next(c for c in commands if shlex.split(c)[1:3] == ["session", "start"])
+    started = execute(start)
+    match = re.search(r"^instance: (\S+)$", started, re.MULTILINE)
+    assert match, started
+    instance_id = match.group(1)
+    try:
+        loaded = _bn("-i", instance_id, "load", str(HELLO_BINARY))
+        assert loaded.returncode == 0, (loaded.stdout, loaded.stderr)
+        other = _bn("-i", instance_id, "load", str(ADD_BINARY))
+        assert other.returncode == 0, (other.stdout, other.stderr)
+
+        def hint(command):
+            value = _contextualize_diagnostic_hints(
+                {"error": f"Inspect with `{command}`."},
+                target=str(HELLO_BINARY), instance=instance_id)
+            return re.findall(r"`(bn [^`]+)`", value["error"])[0]
+
+        listing = hint("bn session list --format json")
+        before = json.loads(execute(listing))["items"]
+        old_pid = next(row["pid"] for row in before if row["instance_id"] == instance_id)
+        for command in (
+            "bn target info --format json",
+            f"bn -i {shlex.quote(instance_id)} target info --format json",
+        ):
+            info = json.loads(execute(hint(command)))
+            assert "libc.so.6" in info["needed_libraries"], info
+        execute(hint(f"bn -i {shlex.quote(instance_id)} session status --format json"))
+        execute(hint(f"bn session restart {shlex.quote(instance_id)} --discard-unsaved"))
+        after = json.loads(execute(listing))["items"]
+        new_pid = next(row["pid"] for row in after if row["instance_id"] == instance_id)
+        assert new_pid != old_pid
+        execute(hint(f"bn session stop {shlex.quote(instance_id)} --discard-unsaved"))
+        stopped = json.loads(execute(listing))["items"]
+        assert instance_id not in {row["instance_id"] for row in stopped}
+    finally:
+        _session_stop(instance_id)

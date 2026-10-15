@@ -5,6 +5,7 @@ import contextvars
 import functools
 import json
 import re
+import shlex
 from typing import Any, Callable, Iterator, Sequence
 
 from .target_hint import open_target_lines, target_row
@@ -1525,6 +1526,12 @@ def _render_session_start_text(value: Any) -> str:
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")
+    elif value.get("stopped") is False:
+        lines.append("")
+        lines.append(
+            f"cleanup error: {value.get('cleanup_error') or 'timed out waiting for teardown'}"
+        )
+        lines.append("warning: bridge process may still be running; no clean stop was confirmed")
     lines.extend(_discarded_unsaved_lines(value))
     return "\n".join(lines)
 
@@ -1567,6 +1574,12 @@ def _render_session_status_text(value: Any) -> str:
 def _render_session_stop_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
+    if value.get("stopped") is False:
+        return "\n".join([
+            f"stop failed: {value.get('instance_id', '<unknown>')}",
+            f"error: {value.get('error') or 'timed out waiting for teardown'}",
+            "warning: bridge process may still be running; no clean stop was confirmed",
+        ])
     line = f"stopped: {value.get('instance_id', '<unknown>')}"
     method = value.get("method")
     if method:
@@ -2848,7 +2861,8 @@ def _render_xrefs_any_text(value: Any) -> str:
         if s.get("present"):
             lines.append(
                 f"  {s.get('symbol')}: {s.get('code_ref_count', 0)} code refs across "
-                f"{s.get('caller_function_count', 0)} fn(s)  @ {s.get('address', '?')}")
+                f"{s.get('caller_function_count', 0)} fn(s)  @ {s.get('address', '?')}"
+                + (" [string]" if s.get("target_kind") == "string" else ""))
             if s.get("target_kind") == "string":
                 string_targets += 1
         else:
@@ -3120,7 +3134,7 @@ def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
         return _render_fallback_text(value)
     function = _field_dict(value, "function")
     lines = [
-        f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}",
+        f"{_escape_control_chars(_shown_name(function, mangled=mangled) or '<unknown>')} @ {function.get('address', '<unknown>')}",
         f"prototype: {value.get('prototype', '<unknown>')}",
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
     ]
@@ -3725,6 +3739,9 @@ def _render_pointer_table_text(value: Any) -> str:
         f"pointer-size: {value.get('pointer_size', '<unknown>')}  stride: {value.get('stride', '<unknown>')}"
         f"  read-width: {value.get('read_width', value.get('pointer_size', '<unknown>'))}",
     ]
+    if value.get("decode") == "relative-int32":
+        lines[0] = f"relative-int32 table @ {value.get('address', '<unknown>')}"
+        lines.append(f"decode: signed int32 + base {value.get('base', '<unknown>')}")
     # Through the choke point, so a malformed `context` envelope discloses
     # instead of rendering the table byte-identically to one with no context.
     suffix = _context_suffix(_field_dict(value, "context"))
@@ -3742,7 +3759,10 @@ def _render_pointer_table_text(value: Any) -> str:
             lines.append(f"{prefix}  <unreadable>")
             continue
         plausibility = "" if item.get("plausible", True) else "  [implausible]"
-        lines.append(f"{prefix}  {item.get('value', '<unknown>')} -> "
+        raw = str(item.get("value", "<unknown>"))
+        if value.get("decode") == "relative-int32":
+            raw += f" (offset {item.get('offset', '<unknown>')})"
+        lines.append(f"{prefix}  {raw} -> "
                      f"{_render_target_line(_field_dict(item, 'target'))}{plausibility}")
     return "\n".join(lines)
 
@@ -4004,6 +4024,9 @@ def _render_orient_text(value: Any) -> str:
                 raw = s.get("value")
                 shown = raw if isinstance(raw, str) else ("" if raw is None else repr(raw))
                 lines.append(f"    {s.get('address', '?')}  {shown[:80]!r}")
+        total = ss.get("total")
+        if isinstance(total, int) and not isinstance(total, bool) and total > len(items):
+            lines.append(f"  more strings: bn evidence orient --strings-limit {total}")
     return "\n".join(lines)
 
 
@@ -4070,7 +4093,8 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         has_more = bool(value.get("has_more"))
         caller_scan_note = value.get("caller_scan_note")
         data_ref_note = _callsites_data_ref_note(value.get("callee_data_ref_count"),
-                                                 value.get("callee_data_refs"))
+                                                 value.get("callee_data_refs"),
+                                                 value.get("callee_data_ref_vtables"))
         value = _field_list(value, "items")
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -4229,20 +4253,37 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
     return body
 
 
-def _callsites_data_ref_note(raw_count: Any, raw_refs: Any) -> str | None:
-    """#998 item 1: the callee's address is stored in data, so it may also be
-    called through a vtable slot or a function-pointer table -- calls no call
-    instruction names, absent from the rows above. States the fact (how many,
-    where) and nothing more; `xrefs` shows what those locations are."""
+def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = None) -> str | None:
+    """Data storage is not a recovered indirect caller; offer bounded next reads."""
     if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count <= 0:
         return None
     refs = [str(r) for r in _field_list({"callee_data_refs": raw_refs}, "callee_data_refs")]
-    shown = ", ".join(refs[:3])
-    more = f", +{raw_count - len(refs[:3])} more" if raw_count > len(refs[:3]) else ""
-    where = f" ({shown}{more})" if shown else ""
-    return (f"note: the callee's address is stored in {raw_count} data location(s){where}; "
-            "they may be vtable slots or function-pointer tables, so it may also be called "
-            "indirectly -- see `bn xrefs` on the callee")
+    known = {}
+    for row in _field_list({"callee_data_ref_vtables": raw_vtables}, "callee_data_ref_vtables"):
+        if not isinstance(row, dict) or row.get("evidence") != "elf_symbol_size":
+            continue
+        address = _text_value(row, "address")
+        class_name = _text_value(row, "class_name")
+        address_point = _text_value(row, "address_point")
+        if address and class_name and (address_point or row.get("address_point") is None):
+            known[address] = {"class_name": class_name, "address_point": address_point}
+    lines = [f"note: the callee's address is stored in {raw_count} data location(s); "
+             "data refs do not identify indirect callers."]
+    for ref in refs:
+        row = known.get(ref)
+        if row is not None:
+            cls = str(row["class_name"])
+            point = row["address_point"]
+            point_note = f"primary address point {point}" if point else "primary address point not decoded"
+            lines.append(f"  {ref}: inside the named vtable for {_escape_control_chars(cls)} "
+                         f"({point_note}); "
+                         f"inspect its class layout with `bn class show -- {shlex.quote(cls)}`")
+        else:
+            lines.append(f"  {ref}: table identity unknown; inspect references to this data "
+                         f"location with `bn xrefs {shlex.quote(ref)}` (not a virtual-caller list)")
+    if raw_count > len(refs):
+        lines.append(f"  +{raw_count - len(refs)} unlisted data location(s)")
+    return "\n".join(lines)
 
 
 @_discloses
@@ -4368,28 +4409,36 @@ def _render_values_text(value: Any) -> str:
     fn = _field_dict(value, "function")
     lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
     lines.append(f"at {value.get('at')}: {value.get('expression', '<no instruction at address>')}")
-    pvs = _field_dict(value, "possible_values")
-    if not pvs:
-        # `<unavailable>` is what an ABSENT field prints: a present but malformed
-        # one must not impersonate "the analysis had no answer" (#619).
-        lines.append(f"possible values: <malformed: {value['possible_values']!r}>"
-                     if value.get("possible_values")
-                     else "possible values: <unavailable>")
-        return "\n".join(lines)
-    # `str()` because the type is INTERPOLATED and then appended to: a non-string
-    # `type` beside a readable `value` made `summary +=` a TypeError and cost the
-    # whole values card, where the same payload without the type renders (#619).
-    summary = str(pvs.get("type", "?"))
-    if "value" in pvs:
-        summary += f"  value={pvs['value']:#x}" if isinstance(pvs["value"], int) else f"  value={pvs['value']}"
-    if pvs.get("values"):
-        summary += f"  values={pvs['values']}"
-    if pvs.get("ranges"):
-        summary += f"  ranges={pvs['ranges']}"
-    lines.append(f"possible values: {summary}")
-    lines.append(f"  raw: {pvs.get('raw', '')}")
-    if value.get("value_basis") == "source_expression" and value.get("source_expression"):
-        lines.append(f"  of source expression: {value['source_expression']}")
+    value_sets = [("possible values", value)]
+    if _field_present(value, "call_destination"):
+        destination = _field_dict(value, "call_destination")
+        lines.append(f"call destination: {destination.get('expression', '<unavailable>')}")
+        value_sets.append(("call destination possible values", destination))
+    for label, value_set in value_sets:
+        pvs = _field_dict(value_set, "possible_values")
+        if not pvs:
+            # An absent set is unavailable, not malformed analysis (#619).
+            lines.append(f"{label}: <malformed: {value_set['possible_values']!r}>"
+                         if value_set.get("possible_values")
+                         else f"{label}: <unavailable>")
+            continue
+        # Coerce the type before appending value details (#619).
+        summary = str(pvs.get("type", "?"))
+        if "value" in pvs:
+            summary += f"  value={pvs['value']:#x}" if isinstance(pvs["value"], int) else f"  value={pvs['value']}"
+        if pvs.get("values"):
+            summary += f"  values={pvs['values']}"
+        if pvs.get("ranges"):
+            summary += f"  ranges={pvs['ranges']}"
+        lines.append(f"{label}: {summary}")
+        lines.append(f"  raw: {pvs.get('raw', '')}")
+        basis = value_set.get("value_basis")
+        if basis == "source_expression" and value_set.get("source_expression"):
+            lines.append(f"  of source expression: {value_set['source_expression']}")
+        elif basis == "instruction":
+            lines.append("  of instruction")
+        elif basis == "destination_expression":
+            lines.append(f"  of destination expression: {value_set.get('expression')}")
     return "\n".join(lines)
 
 
@@ -4578,13 +4627,12 @@ def _taint_truncation_note(stats: dict[str, Any]) -> str:
         parts.append("caller-site cap reached (not every caller was followed; "
                      "see the caller_sites_truncated frontier)")
     if "memory_chain" in causes:
-        # Backward-only: the local-buffer writer walk ran out of memory-SSA
-        # versions before the function entry; the cut is named by the
-        # address_of_local_unresolved leaf (PR-928 round 3 P3).
-        parts.append("memory-chain budget exhausted while walking a local "
-                     "buffer's writers (older writers were never examined; seed "
-                     "closer to the sink -- see the address_of_local_unresolved "
-                     "frontier)")
+        # The shared graph-discovery/fixed-point allowance was exhausted;
+        # the cut can mean missing writers OR an unfinished proof.
+        parts.append("memory-chain budget exhausted while proving a local "
+                     "buffer's writers (discovery or fixed-point solve unfinished; "
+                     "seed closer to the sink -- see the "
+                     "address_of_local_unresolved frontier)")
     if not parts:
         return f" · truncated @depth {stats.get('max_depth')}"
     return " · truncated " + "; ".join(parts)
@@ -4840,13 +4888,12 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                     lines.append(f"  {f!r}")
                     continue
                 lines.append(_render_flow_line(f, mangled=mangled))
-                # #1001 item 1: the arity mismatch behind the sink, that its
-                # class is the model's own and unproven, and the command that
-                # settles it, on the compact view.
+                # Keep the class basis and the engine's prototype-aware recovery
+                # guidance visible in the compact view as well as full detail.
                 _arity = _field_dict(_field_dict(f, "sink"), "arity_mismatch")
                 if _arity:
-                    _ref = _text_value(_arity, "callee_ref")
                     _reg = _text_value(_arity, "register")
+                    _advice = _text_value(_arity, "recovery_advice")
                     _basis = (
                         "class from the recovered args only, without the dropped ones"
                         if _text_value(_arity, "class_from") == "recovered_args"
@@ -4856,8 +4903,8 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                         f"{_arity.get('recovered', '?')} param(s) for this call and dropped the "
                         f"model's arg(s) {_field_list(_arity, 'dropped')}"
                         + (f"; the tainted arg was read from ABI register {_reg}" if _reg else "")
-                        + (f" -- fix the prototype (`bn proto get {_ref}`, then `bn proto set`) "
-                           "and re-run" if _ref else " -- the call target did not resolve"))
+                        + (f" -- {_advice}" if _advice else
+                           " -- call argument recovery is incomplete; inspect its provenance"))
                 # #980: a finding whose class differs from its catalog entry says
                 # so, and why, on the compact view -- `taint models` lists the
                 # call as `[overflow_len] memcpy`, and two names for one sink with
@@ -5790,17 +5837,31 @@ def _render_doctor_text(value: Any) -> str:
                 "compared with this CLI's. `bn session restart "
                 + str(item.get("instance_id") or "<id>")
                 + "` from this CLI would respawn it on this CLI's checkout")
+        elif not item.get("gui", True) and item.get("bridge_source_unknown"):
+            lines.append(
+                "  note: bridge source is unknown (not reported by this bridge); "
+                "`bn session restart " + str(item.get("instance_id") or "<id>")
+                + "` from this CLI would respawn it on this CLI's checkout: "
+                + str(value.get("plugin_source_dir", "<unknown>")))
         if item.get("stale_plugin_version"):
             lines.append("  stale: loaded plugin version differs from CLI version")
-        # The reference differs by kind (#992): a GUI bridge loads the installed
-        # plugin file, a headless one this CLI's own source.
-        reference = "installed plugin file" if item.get("gui", True) else "this CLI's source"
+        # GUI comparisons use its actual reported package, not a guessed install.
+        is_gui = item.get("gui", True)
+        reference = (
+            "reported plugin source on disk" if item.get("bridge_source_dir")
+            else "installed plugin file"
+        ) if is_gui else "this CLI's source"
         if item.get("stale_plugin_code"):
             lines.append(f"  stale: loaded plugin code does not match {reference}")
         if item.get("stale_engine"):
+            remedy = (
+                "reload Binary Ninja plugins or restart Binary Ninja"
+                if is_gui else "run `bn session restart "
+                + str(item.get("instance_id") or "<id>") + "`"
+            )
             lines.append(
                 f"  stale: loaded engine code (taint/IL modules) does not match {reference} -- "
-                "run `bn session restart " + str(item.get("instance_id") or "<id>") + "`")
+                + remedy)
         if item.get("started_at"):
             lines.append(f"  started: {item['started_at']}")
         if item.get("socket_path"):
@@ -6419,7 +6480,7 @@ def _build_mutation_summary(
         summary["kept_library_imports"] = list(kept_library_imports)
     if fallthrough_entries:
         # #997 item 2: a `function create` at an address the previous
-        # instruction runs straight into -- likely mid-function. Conditional
+        # instruction runs straight into -- may be mid-function. Conditional
         # like the keys above; the row's `note` carries the sentence.
         summary["fallthrough_entries"] = list(fallthrough_entries)
     if preview_skipped:
@@ -6999,9 +7060,9 @@ def _render_mutation_summary_text(value: Any) -> str:
                 f"{_text_value(m, 'name') or '<unnamed>'} @{_text_value(m, 'address') or '<unknown>'} "
                 f"({_text_value(m, 'reason') or 'unknown reason'})" for m in skipped)
     for entry in _row_list(value, "fallthrough_entries"):
-        line += (f"\nwarning: {_text_value(entry, 'address') or '<unknown>'} is reached by "
-                 f"fall-through from {_text_value(entry, 'fallthrough_from') or '<unknown>'}; "
-                 "likely mid-function, not an entry")
+        line += (f"\nwarning: {_text_value(entry, 'address') or '<unknown>'}: preceding word "
+                 f"decodes as a fall-through instruction at {_text_value(entry, 'fallthrough_from') or '<unknown>'}; "
+                 "may be mid-function")
     if _field_declared(value, "go_rename"):
         go = _field_dict(value, "go_rename")
         line += "\ngo rename: " + "  ".join(
@@ -7217,6 +7278,15 @@ def _render_py_exec_text(value: Any) -> str:
 
 
 @_discloses
+def _render_plugin_install_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if value.get("installed"):
+        return f"Installed plugin ({value.get('mode')}): {value.get('destination')}\n"
+    return f"Plugin {value.get('note', 'already installed')}.\n"
+
+
+@_discloses
 def _render_skill_install_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -7225,31 +7295,88 @@ def _render_skill_install_text(value: Any) -> str:
     skipped = _field_list(value, "skipped_destinations")
     not_updated = [row for row in _field_list(value, "not_updated_destinations")
                    if isinstance(row, dict)]
+    force_plan = [row for row in _field_list(value, "force_plan")
+                  if isinstance(row, dict)]
+
+    def identity(dest: Any) -> Any:
+        row = next((row for row in force_plan if row.get("destination") == dest), None)
+        return (_text_value(row, "destination_id") or dest) if row is not None else dest
+
     # A list, not a set: membership must not hash wire values (#619).
-    not_updated_paths = [row.get("destination") for row in not_updated]
-    up_to_date = [dest for dest in skipped if dest not in not_updated_paths]
+    not_updated_paths = [identity(row.get("destination")) for row in not_updated]
+    up_to_date = [dest for dest in skipped if identity(dest) not in not_updated_paths]
+
+    def advice_row(dest: Any) -> dict[str, Any] | None:
+        exact = next((row for row in force_plan if row.get("destination") == dest), None)
+        if exact is not None:
+            return exact
+        matches = [row for row in force_plan
+                   if _text_value(row, "destination_id") == identity(dest)]
+        if matches and all(row.get("detail") == matches[0].get("detail") for row in matches):
+            return matches[0]
+        return None
+
+    def force_detail(dest: Any) -> str:
+        row = advice_row(dest)
+        return f"; --force: {row.get('detail')}" if row is not None else ""
+
+    # A normalized installed path can name several displayed roots. If their
+    # advice differs, keep those roots separate instead of choosing one remedy.
+    installed_display = []
+    for dest in installed:
+        matches = [row for row in force_plan
+                   if _text_value(row, "destination_id") == identity(dest)]
+        if matches and advice_row(dest) is None:
+            installed_display.extend(row.get("destination") for row in matches)
+        else:
+            installed_display.append(dest)
+
     lines = []
+    error = _text_value(value, "error")
+    if error:
+        lines.append(error)
 
     if installed:
         lines.append(f"Installed skills ({value.get('mode', 'unknown')}):")
-        lines.extend(f"- {dest}" for dest in installed)
+        lines.extend(f"- {dest}{force_detail(dest)}" for dest in installed_display)
     elif not not_updated:
         lines.append("Skills already installed.")
 
     if up_to_date:
         lines.append("Already up to date:")
-        lines.extend(f"- {dest}" for dest in up_to_date)
+        lines.extend(f"- {dest}{force_detail(dest)}" for dest in up_to_date)
 
-    # #1002: these were left alone and are NOT this install -- a link into a
-    # previous checkout, dangling, another mode, or a foreign directory. Never
-    # "installed". One closing note about --force, not a per-row verdict.
+    # Existing destinations are not claimed as installed. The force verdicts
+    # come from the forced run's own no-write preflight, including current rows.
     if not_updated:
-        lines.append("Not updated, existing destination differs from the requested install:")
-        lines.extend(f"- {row.get('destination')} ({row.get('detail')})"
-                     for row in not_updated)
-        force_note = _text_value(value, "force_note")
-        if force_note:
-            lines.append(force_note)
+        lines.append("Not updated, destination differs or is blocked:")
+        lines.extend(
+            f"- {row.get('destination')} ({row.get('detail')})"
+            f"{force_detail(row.get('destination'))}" for row in not_updated
+        )
+    listed = [
+        (identity(dest), row.get("detail"))
+        for dest in installed_display + skipped
+        if (row := advice_row(dest)) is not None
+    ]
+    other = [
+        row for row in force_plan
+        if (_text_value(row, "destination_id"), row.get("detail")) not in listed
+    ]
+    if other:
+        lines.append("Other destinations (--force dry run):")
+        lines.extend(
+            f"- {row.get('destination')}{force_detail(row.get('destination'))}" for row in other
+        )
+    if force_plan:
+        ready = "ready" if value.get("force_ready") else "refused; fix every blocker first"
+        lines.append(
+            f"--force preflight: {ready}. Checked without writes; "
+            "filesystem races or write errors can still fail the install."
+        )
+    force_note = _text_value(value, "force_note")
+    if force_note:
+        lines.append(force_note)
 
     return "\n".join(lines) + "\n"
 
@@ -7656,11 +7783,23 @@ def _render_class_list_text(value: Any) -> str:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)
     lines = [header]
+    if value.get("vtable_recovery_budget_exhausted"):
+        lines.append(
+            "! vtable recovery budget exhausted; unchecked rows are unknown, "
+            "not proven missing. Use class show to inspect them.")
     for rec in rows:
         if not isinstance(rec, dict):
             lines.append(_render_fallback_text(rec))
             continue
-        vt = "vtable" if rec.get("has_vtable") else "no-vtable"
+        status = rec.get("vtable_status")
+        if rec.get("has_vtable") is None and status == "budget_exhausted":
+            vt = "vtable=? (unchecked)"
+        elif rec.get("has_vtable") is None and status == "unavailable":
+            vt = "vtable=? (unavailable)"
+        elif status == "not_found":
+            vt = "no-vtable (checked)"
+        else:
+            vt = "vtable" if rec.get("has_vtable") else "no-vtable"
         size = rec.get("size")
         size_s = size.get("value") if isinstance(size, dict) else size
         # `bases` arrives as name-dicts (what class show renders) or bare strings;
@@ -7685,6 +7824,16 @@ def _render_class_list_text(value: Any) -> str:
         token = _SKEWED_FIELDS.set([])
         try:
             methods = _stated_count(rec, "method_count")
+            slot_s = ""
+            if "vtable_slot_count" in rec:
+                # A capped layout and a stopped/unsupported backwalk deliberately
+                # leave the count null. They are unknown, not malformed payloads.
+                if (rec["vtable_slot_count"] is None
+                        and status in ("recovered", "budget_exhausted", "unavailable")):
+                    slots = "?"
+                else:
+                    slots = _stated_count(rec, "vtable_slot_count")
+                slot_s = f"  slots={slots}"
             row_unreadable = list(_SKEWED_FIELDS.get() or ())
         finally:
             _SKEWED_FIELDS.reset(token)
@@ -7696,7 +7845,7 @@ def _render_class_list_text(value: Any) -> str:
         aka_s = f"  (aka {aliases})" if aliases else ""
         lines.append(
             f"  {rec.get('name', '<unknown>')}  "
-            f"methods={methods}  {vt}  "
+            f"methods={methods}  {vt}{slot_s}  "
             f"size={size_s if size_s is not None else '?'}  "
             f"[{rec.get('confidence', '?')}]{base_s}{art_s}{aka_s}"
         )

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import select
+import shlex
 import stat
 import sys
 import time
@@ -23,11 +24,9 @@ from .formatters import (
     _render_fanout_text,
     _render_mutation_summary_text,
     _render_mutation_text,
-    _render_target_choices,
 )
 from .output import (estimate_output_result, render_envelope, render_error, render_value,
                      write_output_result)
-from .target_hint import SELECT_HINT_LINE
 
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
@@ -49,12 +48,14 @@ from .transport import (  # noqa: F401
     BridgeError,
     BridgeProcessSignal,
     DEFAULT_REQUEST_TIMEOUT,
+    MultiTargetError,
     _resolve_timeout,
     _send_request_to_instance,
     find_lifecycle_instance,
     gc_instances,
     instance_not_found_message,
     instance_selector,
+    implicit_target_selector,
     list_instances,
     send_request,
     spawn_instance,
@@ -1377,13 +1378,6 @@ def _spill_next_step_hint(
     return core + ", or read that artifact to inspect the full output"
 
 
-class MultiTargetError(BridgeError):
-    """Refusal because several targets are open and no selector was given.
-
-    A distinct type so callers (close's `-t active` note) can match the
-    condition without sniffing message prose."""
-
-
 def _require_nonempty_instance(args: argparse.Namespace) -> None:
     """Reject an explicit-but-empty --instance before anything is sent.
 
@@ -1471,35 +1465,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
         target=None,
         instance_id=getattr(args, "instance", None),
     )
-    result = unwrap_result(response, "list_targets")
-    if not isinstance(result, list):
-        raise BridgeError(
-            "malformed bridge reply to list_targets (no target list); the "
-            "bridge may be stale -- restart it or pass an explicit --target"
-        )
-    targets = list(result)
-    if not targets:
-        raise BridgeError("No BinaryView targets are open")
-    if len(targets) > 1:
-        # Same grammar as the bridge resolver's refusal for the same condition
-        # (#688): headline, instruction line, then the shared `-t` listing.
-        raise MultiTargetError(
-            "\n".join(
-                [
-                    "This command requires --target when multiple targets are open.",
-                    SELECT_HINT_LINE,
-                    _render_target_choices(targets),
-                ]
-            )
-        )
-    row = targets[0]
-    target_id = row.get("target_id") if isinstance(row, dict) else None
-    if not target_id:
-        raise BridgeError(
-            "bridge listed the open target without a target_id; pass an "
-            "explicit --target"
-        )
-    return str(target_id)
+    return implicit_target_selector(response)
 
 
 def _resolve_target(
@@ -2162,6 +2128,82 @@ def _mutate(
     )
 
 
+def _contextualize_diagnostic_hints(
+    value: Any, *, target: str | None, instance: str | None,
+) -> Any:
+    """Bind commands in diagnostic prose to the invocation's routing context.
+
+    Only prose fields are visited: symbol keys, locators and IL are data, not
+    commands. Registry target requirements distinguish inspection/mutation hints
+    from lifecycle recovery, which must retain its own instance/spawn arguments.
+    """
+    if not instance and not target:
+        return value
+    # As in build_parser(), defer registration until cli.py is fully imported.
+    from . import commands  # noqa: F401
+
+    def route(match: re.Match[str]) -> str:
+        command_text = match.group(1)
+        try:
+            words = shlex.split(command_text)
+        except ValueError:
+            return match.group(0)
+        # Routing flags are accepted at root/group/leaf level. Skip their values
+        # when identifying the registry path: an instance may itself be named
+        # "il" or "session". Keep the original shell text for the actual edit.
+        path: tuple[str, ...] = ()
+        index = 0
+        while index < len(words):
+            word = words[index]
+            if word in ("-i", "--instance", "-t", "--target"):
+                index += 2
+                continue
+            if word.startswith(("--instance=", "--target=", "-i", "-t")):
+                index += 1
+                continue
+            candidate = (*path, word)
+            if not any(spec["path"][:len(candidate)] == candidate for spec in _COMMANDS):
+                break
+            path = candidate
+            index += 1
+        if not any(spec["path"] == path and spec["target"] for spec in _COMMANDS):
+            return match.group(0)
+        flags = []
+        options = words[:words.index("--")] if "--" in words else words
+        if instance and not any(word.startswith(("--instance=", "-i"))
+                                or word == "--instance" for word in options):
+            flags.append(f"-i {shlex.quote(instance)}")
+        if target and not any(word.startswith(("--target=", "-t"))
+                              or word == "--target" for word in options):
+            flags.append(f"-t {shlex.quote(target)}" if not target.startswith("-")
+                         else shlex.quote(f"--target={target}"))
+        if not flags:
+            return match.group(0)
+        return "`bn " + " ".join(flags) + " " + command_text + "`"
+
+    def route_prose(text: str) -> str:
+        return re.sub(r"`bn ([^`]+)`", route, text)
+
+    prose_keys = {"error", "hints", "assumptions", "note", "detail", "next_action", "recovery_advice"}
+
+    def visit(item: Any, *, prose: bool = False) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key in prose_keys and isinstance(child, str):
+                    item[key] = route_prose(child)
+                elif isinstance(child, (dict, list)):
+                    visit(child, prose=key in prose_keys)
+        elif isinstance(item, list):
+            for index, child in enumerate(item):
+                if prose and isinstance(child, str):
+                    item[index] = route_prose(child)
+                elif isinstance(child, (dict, list)):
+                    visit(child, prose=prose)
+
+    visit(value)
+    return value
+
+
 def _call(
     args: argparse.Namespace,
     op: str,
@@ -2192,6 +2234,7 @@ def _call(
     # #996: copy the answering instance (stamped by `send_request`) into a dict
     # result, so the output names which bridge answered.
     stamp_instance: bool = False,
+    contextual_hints: bool = False,
 ) -> int:
     _require_nonempty_instance(args)
     # THE BOUNDARY (#101/#715/#716). Every transform a handler hands this call is
@@ -2258,14 +2301,25 @@ def _call(
         default=op_default_timeout if op_default_timeout is not None else DEFAULT_REQUEST_TIMEOUT,
     )
     deadline = time.monotonic() + budget if budget is not None else None
-    response = send_request(
-        op,
-        params=request_params,
-        target=target,
-        instance_id=getattr(args, "instance", None),
-        spawn_missing_named=spawn_missing_named,
-        **timeout_kwargs,
-    )
+    try:
+        response = send_request(
+            op,
+            params=request_params,
+            target=target,
+            instance_id=getattr(args, "instance", None),
+            spawn_missing_named=spawn_missing_named,
+            **timeout_kwargs,
+        )
+    except BridgeError as exc:
+        if contextual_hints:
+            routed = _contextualize_diagnostic_hints(
+                {"error": str(exc)}, target=target,
+                instance=getattr(args, "instance", None))
+            exc.args = (routed["error"],)
+        raise
+    if contextual_hints:
+        response = _contextualize_diagnostic_hints(
+            response, target=target, instance=getattr(args, "instance", None))
     result = unwrap_result(response, op)
     if stamp_instance and isinstance(result, dict) and isinstance(response, dict):
         answering = response.get("instance")
@@ -3004,6 +3058,68 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
                     "`bn target list`")
 
 
+def _target_hint_argv(args: argparse.Namespace, root: argparse.ArgumentParser) -> list[str]:
+    """Serialize argparse's result, not argv spelling or option-arity guesses."""
+    selected = getattr(args, "_parser", root)
+    path = tuple(args._command_path)
+    options: list[str] = []
+    operands: list[str] = []
+    seen: set[str] = set()
+    # Leaf actions own defaults and aliases; root actions supply global-only flags.
+    for action in [*selected._actions, *root._actions]:
+        dest = action.dest
+        if (dest in seen or dest in ("target", "instance")
+                or isinstance(action, (argparse._SubParsersAction, argparse._HelpAction))
+                or not hasattr(args, dest)):
+            continue
+        if (path == ("close",) and dest == "path"
+                or path == ("target", "close") and dest == "selector"):
+            continue
+        value = getattr(args, dest)
+        if value is None or value == argparse.SUPPRESS:
+            continue
+        if not action.option_strings:
+            operands.extend(str(item) for item in (value if isinstance(value, list) else [value]))
+            seen.add(dest)
+            continue
+        if dest == "format":
+            if not getattr(args, "_format_explicit", False):
+                continue
+        elif value == action.default:
+            continue
+        flag = next((flag for flag in action.option_strings if flag.startswith("--")),
+                    action.option_strings[0])
+        if action.nargs == 0:
+            if value != getattr(action, "const", None):
+                continue
+            options.append(flag)
+        else:
+            values = value if isinstance(action, argparse._AppendAction) else [value]
+            for item in values:
+                if isinstance(item, tuple) and action.type is _parse_line_range:
+                    options.append(f"{flag}={item[0]}:{item[1]}")
+                elif isinstance(item, list):
+                    options.extend([flag, *(str(part) for part in item)])
+                else:
+                    options.append(f"{flag}={item}")
+        seen.add(dest)
+    instance = getattr(args, "instance", None)
+    routing = ([] if instance is None else
+               [f"--instance={instance}"] if str(instance).startswith("-") else ["-i", str(instance)])
+    return [*routing, *path, *options, *(["--"] if operands else []), *operands]
+
+
+def _target_hint_message(args: argparse.Namespace, message: str) -> str:
+    """Use the same parsed replay command for raised and per-item refusals."""
+    if tuple(getattr(args, "_command_path", ())) == ("target", "close"):
+        return message
+    argv = getattr(args, "_target_hint_argv", None)
+    if argv is None:
+        return message
+    from .target_hint import respell_for_option
+    return respell_for_option(message, argv)
+
+
 def main(argv: list[str] | None = None) -> int:
     global _MACHINE_ERROR_FORMAT
     parser = build_parser()
@@ -3031,11 +3147,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     _apply_sticky_defaults(args)
+    hint_argv = _target_hint_argv(args, parser)
+    args._target_hint_argv = hint_argv
+    args._target_hint_command = "bn " + shlex.join(hint_argv)
 
     try:
         return handler(args)
     except BridgeError as exc:
-        msg = str(exc)
+        msg = _target_hint_message(args, str(exc))
         if getattr(args, "_sticky_instance", False) and _looks_like_dead_bridge(msg):
             msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
         status = getattr(exc, "status", None)

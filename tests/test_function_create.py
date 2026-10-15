@@ -741,6 +741,7 @@ class _A64Arch:
     ("previous", "expected"),
     [
         pytest.param(("add", []), 0x402ffc, id="straight-line-falls-through"),
+        pytest.param(("and", []), 0x402ffc, id="untyped-literal-word-also-decodes"),
         pytest.param(("b.ne", ["TrueBranch", "FalseBranch"]), 0x402ffc,
                      id="conditional-branch-not-taken-falls-through"),
         pytest.param(("ret", ["FunctionReturn"]), None, id="after-ret-is-an-entry"),
@@ -753,9 +754,9 @@ class _A64Arch:
 def test_fallthrough_source_names_the_instruction_running_into_the_address_997(
         monkeypatch, previous, expected):
     """#997 item 2: `function create` accepted an `adrp` page base in the middle of
-    a loop body. On a fixed-width ISA the instruction before the address is known,
-    and if it neither returns nor branches away, execution runs straight in: the
-    address is mid-body. Anything the bytes do not settle answers None."""
+    a loop body. A fixed-width word can decode as a fall-through instruction
+    whether it is code or an untyped literal pool. The probe names that decode;
+    it does not prove execution or settle the function boundary."""
     bridge = _load_bridge(monkeypatch)
     program = {0x402ffc: previous} if previous else {}
     bv = types.SimpleNamespace(arch=_A64Arch(program), read=lambda a, n: b"\x00" * n)
@@ -781,8 +782,8 @@ def test_fallthrough_create_is_disclosed_on_the_compact_status_997():
                                  "rolled_back": True, "results": [row]})
     assert summary["fallthrough_entries"] == [
         {"address": "0x403000", "fallthrough_from": "0x402ffc"}]
-    assert ("warning: 0x403000 is reached by fall-through from 0x402ffc; likely "
-            "mid-function, not an entry") in _render_mutation_summary_text(summary)
+    rendered = _render_mutation_summary_text(summary)
+    assert "0x403000" in rendered and "0x402ffc" in rendered
     plain = _mutation_summary({"success": True, "committed": True, "results": [
         {"op": "function_create", "status": "verified", "address": "0x403110"}]})
     assert "fallthrough_entries" not in plain

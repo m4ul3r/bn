@@ -1596,37 +1596,6 @@ def test_symbol_rename_uses_implicit_target_when_single_target_is_open(fake_tran
     assert calls[1]["target"] == "123:1:7"  # implicit resolution pins the target_id (#690 R3)
 
 
-def test_symbol_rename_requires_target_when_multiple_targets_are_open(fake_transport, capsys):
-    fake_transport(
-        {
-            "list_targets": {
-                "ok": True,
-                "result": [
-                    {
-                        "target_id": "123:1:7",
-                        "selector": "SnailMail_unwrapped.exe.bndb",
-                        "active": True,
-                    },
-                    {"target_id": "123:2:8", "selector": "other.exe.bndb", "active": False},
-                ],
-            }
-        }
-    )
-
-    rc = bn.cli.main(["symbol", "rename", "sub_401000", "player_update"])
-
-    assert rc == 2
-    err = capsys.readouterr().err
-    # The exact block is pinned once, in test_cli_function; what matters here
-    # is that a MUTATION refuses pre-flight with the shared hint (#688) and
-    # sends nothing.
-    assert err.startswith(
-        "This command requires --target when multiple targets are open.\n"
-        "Pass -t <selector> (--target) to choose one.\n"
-        "Open targets:\n"
-    )
-    assert "  * -t SnailMail_unwrapped.exe.bndb" in err
-    assert "    -t other.exe.bndb" in err
 
 
 def test_function_create_builds_payload_explicit_json(fake_transport, capsys):
@@ -2840,7 +2809,7 @@ _CALL_DATA_PARAMS = frozenset({
     "page_label", "paged_spill", "stem",
     "bridge_writes_output", "spawn_missing_named", "regex_hint_query",
     "regex_fallback_query", "offset_hint_identifier", "op_default_timeout",
-    "stamp_instance",
+    "stamp_instance", "contextual_hints",
 })
 
 
@@ -5179,3 +5148,36 @@ def test_comment_list_explicit_limit_wins(fake_transport):
     rc = bn.cli.main(["comment", "list", "--target", "active", "--limit", "17"])
     assert rc == 0
     assert calls[-1]["params"]["limit"] == 17
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson", "text"])
+def test_failed_mutation_out_envelope_reports_file_write_success(
+    fake_transport, tmp_path, capsys, monkeypatch, fmt
+):
+    fake_transport({"rename_symbol": {"ok": True, "result": {
+        "success": False, "committed": False, "rolled_back": True, "preview": False,
+        "results": [{
+            "op": "rename_symbol", "status": "verification_failed", "address": "0x401000",
+            "requested": {"name": "renamed_handler"}, "observed": {"name": "original_handler"},
+            "message": "name readback mismatch",
+        }],
+        "affected_functions": [], "affected_types": [],
+    }}})
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1")
+    destination = tmp_path / f"mutation.{fmt}"
+    assert bn.cli.main([
+        "symbol", "rename", "--target", "active", "original_handler", "renamed_handler",
+        "--format", fmt, "--out", str(destination),
+    ]) == 3
+    captured = capsys.readouterr()
+    if fmt == "text":
+        assert "ok: true" in captured.out.splitlines()
+        assert "[verification_failed]" in destination.read_text()
+    else:
+        envelope = json.loads(captured.out)
+        assert envelope["ok"] is True
+        assert envelope["spilled"] is False
+        assert "error" not in envelope
+        detail = json.loads(destination.read_text())
+        assert detail["ok"] is False
+        assert detail["results"][0]["status"] == "verification_failed"
