@@ -1,0 +1,111 @@
+{
+  "description": "Bounded backward memory fixed points retain unwritten exits and loop-carried escapes",
+  "lang": "c",
+  "cflags": [
+    "-O1",
+    "-fno-inline"
+  ],
+  "backward": [
+    {
+      "function": "fill_first",
+      "sink": "arg:popen:0",
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false,
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "source",
+        "call",
+        "parameter",
+        "constant"
+      ]
+    },
+    {
+      "function": "fill_second",
+      "sink": "arg:popen:0",
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false,
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "source",
+        "call",
+        "parameter",
+        "constant"
+      ]
+    },
+    {
+      "function": "escape_loop",
+      "sink": "arg:popen:0",
+      "step_reasons_contain": [
+        "may be written by helper"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false,
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "source",
+        "call",
+        "parameter",
+        "constant"
+      ]
+    },
+    {
+      "function": "zero_fill",
+      "sink": "arg:popen:0",
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false,
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "source",
+        "call",
+        "parameter",
+        "constant"
+      ]
+    },
+    {
+      "function": "short_fill",
+      "sink": "arg:popen:0",
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false,
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "source",
+        "call",
+        "parameter",
+        "constant"
+      ]
+    },
+    {
+      "function": "dowhile_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    }
+  ]
+}

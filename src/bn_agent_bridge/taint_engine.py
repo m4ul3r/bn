@@ -1750,6 +1750,22 @@ class TaintEngine:
                                        getattr(expr, "size", None), set(), 0)
             if rw is None or rw[0] != "store":
                 return None
+            # _reaching_writer is a MAY query: a PHI can select a store
+            # from just one arm. Until all-path slot identity is modeled,
+            # require a straight memory chain to that producer (#951).
+            version = getattr(expr, "src_memory", None)
+            for _ in range(MEM_CHAIN_BUDGET):
+                try:
+                    producer = ssaf.get_ssa_memory_definition(int(version))
+                except (TypeError, ValueError):
+                    return None
+                if producer is None or "MEM_PHI" in op_name(producer):
+                    return None
+                if producer == rw[1]:
+                    break
+                version = self._mem_in(producer)
+            else:
+                return None
             return self._must_offset(ssaf, getattr(rw[1], "src", None), base_key,
                                      visited, depth + 1)
         if is_ssa_var(expr):
@@ -1958,27 +1974,30 @@ class TaintEngine:
         decided by the BYTES a writer provably writes, never by its kind
         (round 4 P2): a writer covers a path only when its pointer is a
         MUST-alias of ``&base + 0`` (``_must_offset`` -- every phi arm
-        resolves to this base at offset 0) AND it writes the whole variable:
-        a modeled fill / source / ``writes`` call at offset 0 (its model
-        declares the destination as the buffer), an unmodeled call handed
+        resolves to this base at offset 0). The current classifier accepts
+        a modeled fill / source / ``writes`` call unless a constant length
+        is zero or smaller than the recovered object. This remains a model
+        classification, not a consumed-region initialization proof (#931).
+        It also accepts an unmodeled call handed
         ``&base`` itself (its opaque leaf already blocks), a whole-variable
         ``SET_VAR_ALIASED`` or a store at least the variable's width. An
         escape writes no byte; an indexed store (``buf[n] = 0``), a
         constant-offset store or fill (``buf[63] = 0``, ``strcpy(buf + 60,
         ..)``), a may-alias writer (a phi that may point at another local, a
         maybe-store) and a ``{}``-modeled call are writers that cover nothing.
-        A memory-phi is covered only when every arm is; a loop back-edge arm
-        is neutral (it adds no path that does not also leave through the
-        entry arm). ``truncated`` is True when the walk exhausted
-        ``MEM_CHAIN_BUDGET`` -- writers behind the cut are missing.
-
+        Coverage is the greatest fixed point of the all-arm equations;
+        escape is the least fixed point of the any-arm equations, including
+        loop-carried stores of the address. ``truncated`` is True when graph
+        discovery or either fixed point exhausts the shared
+        ``MEM_CHAIN_BUDGET``; no incomplete solve certifies coverage.
         Deliberately does NOT stop at a full-cover writer: ``strcat`` after
         ``strcpy`` both write offset 0 and both feed the sink, and a may-analysis
         that drops the earlier one loses an origin. A partial store never masks
         anything either (mirrors ``_reaching_writer``)."""
         writers: list[tuple] = []     # oldest first while walking; reversed on return
-        # version -> (covered, escaped) once walked; None while on the stack
-        memo: dict[int, tuple[bool, bool] | None] = {}
+        # Discover the graph before solving it; no provisional cycle proof is
+        # ever published. Coverage descends from top, escape ascends from bottom.
+        memo: dict[int, tuple[bool, bool]] = {}
         truncated = False
         # Constant addresses `&buf` was stored to: a later reload of one of
         # them IS the buffer (`g_stash = buf; strcpy(g_stash, host)`).
@@ -2070,11 +2089,19 @@ class TaintEngine:
             elif str(sink.get("class") or "") in ("overflow_len", "fortified_overflow"):
                 len_idxs = [int(i) for i in (sink.get("tainted_args") or []) if isinstance(i, int)]
             len_idxs = [i for i in len_idxs if i < len(params) and i not in from_idxs]
+            # First-step extent guard (#931), not a proven-write-extent model:
+            # a requested I/O length still need not be the actual write length.
+            short_fill = any(
+                op_name(params[i]) in ("MLIL_CONST", "MLIL_CONST_PTR")
+                and (int(getattr(params[i], "constant", 0)) <= 0
+                     or base_size is None
+                     or int(getattr(params[i], "constant", 0)) < base_size)
+                for i in len_idxs)
             writers.append(("fill", defn, mkey or name, params, from_idxs, is_source, len_idxs))
             # A fill at a constant offset (`strcpy(buf + 60, "x")`) or through
             # a pointer that may point at another local writes bytes of this
             # buffer on some path, not the buffer (round 4 P2).
-            return _at_base(params, hit)
+            return not short_fill and _at_base(params, hit)
 
         def _store_covers(defn: Any, slot: tuple) -> bool:
             """A keyed store covers the buffer only when it writes ALL of it."""
@@ -2089,38 +2116,43 @@ class TaintEngine:
                 return False
             return width >= base_size
 
-        def rec(v: Any, depth: int) -> tuple[bool, bool]:
-            """``(covered, escaped)`` for the chain from version *v* back to
-            the entry: *covered* -- every path crosses a writer that accounts
-            for the buffer; *escaped* -- some path stores the buffer's address
-            to memory."""
-            nonlocal truncated
+        graph: dict[int, tuple[Any, list[int]]] = {}
+        pending = [mv]
+        work = 0
+        while pending:
             try:
-                v = int(v)
+                v = int(pending.pop())
             except (TypeError, ValueError):
-                return (False, False)
-            if v in memo:
-                m = memo[v]
-                # None: *v* is on the stack -- a loop back-edge. Neutral.
-                return m if m is not None else (True, False)
-            if depth > MEM_CHAIN_BUDGET:
                 truncated = True
-                return (False, False)
-            memo[v] = None
+                continue
+            if v in graph:
+                continue
+            work += 1
+            if work > MEM_CHAIN_BUDGET:
+                truncated = True
+                break
             try:
                 defn = ssaf.get_ssa_memory_definition(v)
+                deps = ([] if defn is None else
+                        self._mem_phi_sources(defn) if "MEM_PHI" in op_name(defn)
+                        else [self._mem_in(defn)])
+                deps = [int(s) for s in deps]
             except Exception:
-                defn = None
+                defn, deps = None, []
+                truncated = True
+            graph[v] = (defn, deps)
+            memo[v] = (True, False)
+            pending.extend(deps)
+
+        def transfer(v: int) -> tuple[bool, bool]:
+            defn, deps = graph[v]
             if defn is None:
-                # The entry state (mem#0): nothing on this path wrote the buffer.
                 res = (False, False)
             elif "MEM_PHI" in op_name(defn):
-                arms = [rec(sv, depth + 1) for sv in self._mem_phi_sources(defn)]
+                arms = [memo.get(s, (False, False)) for s in deps]
                 res = (bool(arms) and all(c for c, _ in arms), any(e for _, e in arms))
             else:
-                # Walk to the root FIRST so writers come out oldest-first and an
-                # escape is known before the calls that ran after it.
-                cov, esc = rec(self._mem_in(defn), depth + 1)
+                cov, esc = memo.get(deps[0], (False, False))
                 op = op_name(defn)
                 if "STORE" in op or op in _NAMED_STORE_OPS:
                     slot = self._field_store_slot(ssaf, defn)
@@ -2165,10 +2197,34 @@ class TaintEngine:
                 elif self._is_call(defn):
                     cov = _call_writer(defn, esc) or cov
                 res = (cov, esc)
-            memo[v] = res
             return res
 
-        covered, _ = rec(mv, 0)
+        # Solve escape and remembered escape slots first. Writer classification
+        # can change as these facts grow, so only collect final writer rows.
+        for escape_phase in (True, False):
+            while True:
+                changed = False
+                before_addrs = len(escape_addrs)
+                for v in reversed(graph):
+                    work += 1
+                    if work > MEM_CHAIN_BUDGET:
+                        truncated = True
+                        break
+                    cov, esc = transfer(v)
+                    old_cov, old_esc = memo[v]
+                    new = ((old_cov, old_esc or esc) if escape_phase
+                           else (old_cov and cov, old_esc))
+                    changed |= new != memo[v]
+                    memo[v] = new
+                writers.clear()
+                changed |= len(escape_addrs) != before_addrs
+                if truncated or not changed:
+                    break
+            if truncated:
+                break
+        for v in reversed(graph):
+            transfer(v)
+        covered = not truncated and memo.get(int(mv), (False, False))[0]
         writers.reverse()
         return {"writers": writers, "covered": covered, "truncated": truncated}
 
