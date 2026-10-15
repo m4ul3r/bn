@@ -2615,8 +2615,9 @@ def _import_outcome(ctx, selector, preview: bool, *, exclusive=None, direct: boo
             yield lambda result: _finalize_import_outcome(
                 ctx, trace, result, preview, exclusive_scope)
         except Exception as exc:
-            with exclusive_scope():
-                _collect_import_outcome(trace)
+            if trace.get("baseline") is not None:
+                with exclusive_scope():
+                    _collect_import_outcome(trace)
             if trace["library_imports"]:
                 exc.kept_library_imports = sorted(trace["library_imports"])
                 if isinstance(exc, OperationFailure):
@@ -2645,8 +2646,9 @@ def _apply_mutation(ctx, selector, preview: bool, operations, *, exclusive=None)
     except Exception as exc:
         # A preflight/snapshot can parse before an undo group exists. Even
         # this exit must disclose its irreversible imports and their owner.
-        with exclusive_scope():
-            _collect_import_outcome(trace)
+        if trace.get("baseline") is not None:
+            with exclusive_scope():
+                _collect_import_outcome(trace)
         if trace["library_imports"]:
             exc.kept_library_imports = sorted(trace["library_imports"])
             if isinstance(exc, OperationFailure):
@@ -2675,6 +2677,10 @@ def _apply_mutation(ctx, selector, preview: bool, operations, *, exclusive=None)
 
 
 def _finalize_import_outcome(ctx, trace, result, preview: bool, exclusive_scope):
+    # Irreversible deletion returns before initializing this guard. Its own
+    # result/dirty ledger must survive even when no further lock can be taken.
+    if trace.get("baseline") is None:
+        return result
     with exclusive_scope():
         _collect_import_outcome(trace)
     if trace["parsed"] or trace["library_imports"]:
