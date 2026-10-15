@@ -4747,3 +4747,62 @@ class TestOffsetTypeLookup1000:
         for name, exists in self._NAMES.items():
             shown = shared_bn.run("types", "show", name)
             assert (shown.returncode == 0) == exists, (name, shown.stdout, shown.stderr)
+
+
+def test_diagnostic_recovery_and_target_commands_run_as_printed(tmp_path):
+    """Transport recovery starts fresh; target inspection keeps its live routing."""
+    import re
+    import shlex
+    from types import SimpleNamespace
+
+    from bn.cli import _contextualize_diagnostic_hints
+    from bn.transport import _bridge_recovery_advice
+
+    def execute(command):
+        argv = shlex.split(command)
+        assert argv[0] == "bn"
+        result = _bn(*argv[1:], timeout=_SESSION_START_TIMEOUT)
+        assert result.returncode == 0, (command, result.stdout, result.stderr)
+        return result.stdout
+
+    advice = " ".join(_bridge_recovery_advice(
+        SimpleNamespace(registry_path=tmp_path / "dead.json")))
+    routed = _contextualize_diagnostic_hints(
+        {"error": advice}, target="my tgt", instance="X1")["error"]
+    commands = re.findall(r"`(bn [^`]+)`", routed)
+    start = next(c for c in commands if shlex.split(c)[1:3] == ["session", "start"])
+    started = execute(start)
+    match = re.search(r"^instance: (\S+)$", started, re.MULTILINE)
+    assert match, started
+    instance_id = match.group(1)
+    try:
+        loaded = _bn("-i", instance_id, "load", str(HELLO_BINARY))
+        assert loaded.returncode == 0, (loaded.stdout, loaded.stderr)
+        other = _bn("-i", instance_id, "load", str(ADD_BINARY))
+        assert other.returncode == 0, (other.stdout, other.stderr)
+
+        def hint(command):
+            value = _contextualize_diagnostic_hints(
+                {"error": f"Inspect with `{command}`."},
+                target=str(HELLO_BINARY), instance=instance_id)
+            return re.findall(r"`(bn [^`]+)`", value["error"])[0]
+
+        listing = hint("bn session list --format json")
+        before = json.loads(execute(listing))["items"]
+        old_pid = next(row["pid"] for row in before if row["instance_id"] == instance_id)
+        for command in (
+            "bn target info --format json",
+            f"bn -i {shlex.quote(instance_id)} target info --format json",
+        ):
+            info = json.loads(execute(hint(command)))
+            assert "libc.so.6" in info["needed_libraries"], info
+        execute(hint(f"bn -i {shlex.quote(instance_id)} session status --format json"))
+        execute(hint(f"bn session restart {shlex.quote(instance_id)} --discard-unsaved"))
+        after = json.loads(execute(listing))["items"]
+        new_pid = next(row["pid"] for row in after if row["instance_id"] == instance_id)
+        assert new_pid != old_pid
+        execute(hint(f"bn session stop {shlex.quote(instance_id)} --discard-unsaved"))
+        stopped = json.loads(execute(listing))["items"]
+        assert instance_id not in {row["instance_id"] for row in stopped}
+    finally:
+        _session_stop(instance_id)

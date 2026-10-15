@@ -1,6 +1,7 @@
 """#489: proactive call-model-truncation disclosure helpers in read_taint_slice."""
 from __future__ import annotations
 
+import shlex
 import types
 
 from _bridge_fakes import _load_bridge
@@ -283,6 +284,18 @@ def test_out_of_range_message_for_a_declared_variadic_callee_948(monkeypatch):
     assert "app_log is already declared variadic" in msg
     assert "not a prototype defect" in msg
     assert "already declared variadic" not in rts._out_of_range_arg_msg(func, 1, 1)
+
+
+def test_out_of_range_hints_quote_function_locators(monkeypatch):
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    name = "handle space$'symbol"
+    func = _func([], arg_regs=("x0", "x1", "x2", "x3"), name=name)
+    for arg in (1, 4):
+        msg = rts._out_of_range_arg_msg(func, arg, 1)
+        command = msg.split("`bn ", 1)[1].split("`", 1)[0]
+        assert shlex.split("bn " + command) == [
+            "bn", "il", name, "--view", "llil", "--ssa",
+        ]
 
 
 def test_truncation_note_prose_when_indirect_call_unresolvable(monkeypatch):

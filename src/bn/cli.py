@@ -2169,30 +2169,69 @@ def _contextualize_diagnostic_hints(
     """Bind commands in diagnostic prose to the invocation's routing context.
 
     Only prose fields are visited: symbol keys, locators and IL are data, not
-    commands. Both text and JSON consumers receive the same runnable hints.
+    commands. Registry target requirements distinguish inspection/mutation hints
+    from lifecycle recovery, which must retain its own instance/spawn arguments.
     """
-    flags = []
-    if instance:
-        flags.append(f"-i {shlex.quote(instance)}")
-    if target:
-        flags.append(f"-t {shlex.quote(target)}" if not target.startswith("-")
-                     else shlex.quote(f"--target={target}"))
-    if not flags:
+    if not instance and not target:
         return value
-    prefix = "`bn " + " ".join(flags) + " "
+    # As in build_parser(), defer registration until cli.py is fully imported.
+    from . import commands  # noqa: F401
+
+    def route(match: re.Match[str]) -> str:
+        command_text = match.group(1)
+        try:
+            words = shlex.split(command_text)
+        except ValueError:
+            return match.group(0)
+        # Routing flags are accepted at root/group/leaf level. Skip their values
+        # when identifying the registry path: an instance may itself be named
+        # "il" or "session". Keep the original shell text for the actual edit.
+        path: tuple[str, ...] = ()
+        index = 0
+        while index < len(words):
+            word = words[index]
+            if word in ("-i", "--instance", "-t", "--target"):
+                index += 2
+                continue
+            if word.startswith(("--instance=", "--target=", "-i", "-t")):
+                index += 1
+                continue
+            candidate = (*path, word)
+            if not any(spec["path"][:len(candidate)] == candidate for spec in _COMMANDS):
+                break
+            path = candidate
+            index += 1
+        if not any(spec["path"] == path and spec["target"] for spec in _COMMANDS):
+            return match.group(0)
+        flags = []
+        options = words[:words.index("--")] if "--" in words else words
+        if instance and not any(word.startswith(("--instance=", "-i"))
+                                or word == "--instance" for word in options):
+            flags.append(f"-i {shlex.quote(instance)}")
+        if target and not any(word.startswith(("--target=", "-t"))
+                              or word == "--target" for word in options):
+            flags.append(f"-t {shlex.quote(target)}" if not target.startswith("-")
+                         else shlex.quote(f"--target={target}"))
+        if not flags:
+            return match.group(0)
+        return "`bn " + " ".join(flags) + " " + command_text + "`"
+
+    def route_prose(text: str) -> str:
+        return re.sub(r"`bn ([^`]+)`", route, text)
+
     prose_keys = {"error", "hints", "assumptions", "note", "detail", "next_action", "recovery_advice"}
 
     def visit(item: Any, *, prose: bool = False) -> None:
         if isinstance(item, dict):
             for key, child in item.items():
                 if key in prose_keys and isinstance(child, str):
-                    item[key] = child.replace("`bn ", prefix)
+                    item[key] = route_prose(child)
                 elif isinstance(child, (dict, list)):
                     visit(child, prose=key in prose_keys)
         elif isinstance(item, list):
             for index, child in enumerate(item):
                 if prose and isinstance(child, str):
-                    item[index] = child.replace("`bn ", prefix)
+                    item[index] = route_prose(child)
                 elif isinstance(child, (dict, list)):
                     visit(child, prose=prose)
 

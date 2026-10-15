@@ -273,19 +273,30 @@ int main(void) { handle(); return 0; }
     shutil.copy2(first, second)
     target = shared_bn.load(first, copy=False)
     shared_bn.load(second, copy=False)
-    calls = _bn_json(shared_bn, "-t", target, "callsites", "puts", "--within", "handle")
+    name = "handle space$"
+    _bn_json(shared_bn, "-t", target, "rename", "handle", name)
+    calls = _bn_json(shared_bn, "-t", target, "callsites", "puts", "--within", name)
     site = calls["items"][0]["call_addr"]
-    trace = _bn_json(shared_bn, "-t", target, "trace", "handle", site, "--arg", "0")
+    for arg, branch in (("1", "first integer-arg register"), ("6", "STACK")):
+        for fmt in ("text", "json"):
+            refused = shared_bn.run("-t", target, "trace", name, site,
+                                    "--arg", arg, "--format", fmt)
+            assert refused.returncode == 2
+            prose = refused.stderr + refused.stdout
+            if fmt == "json":
+                # Decode JSON escapes before extracting commands as printed.
+                payload = json.loads(refused.stdout)
+                prose = payload["error"]
+            assert branch in prose, prose
+            commands = re.findall(r"`(bn [^`]+)`", prose)
+            assert commands, prose
+            assert all(shlex.split(command).count(name) == 1 for command in commands)
+            error_commands = _run_diagnostic_commands(shared_bn, prose)
+            assert all(re.search(r"\b\w+#\d+", output) for output in error_commands)
+    trace = _bn_json(shared_bn, "-t", target, "trace", name, site, "--arg", "0")
     outputs = _run_diagnostic_commands(shared_bn, " ".join(trace["hints"]))
     assert {out.split()[0] for out in outputs} == {"backward", "forward"}
-    assert all(f"handle @ {trace['function_address']}" in out for out in outputs)
-    for fmt in ("text", "json"):
-        refused = shared_bn.run("-t", target, "trace", "handle", site,
-                                "--arg", "6", "--format", fmt)
-        assert refused.returncode == 2
-        error_commands = _run_diagnostic_commands(
-            shared_bn, refused.stderr + refused.stdout)
-        assert all(re.search(r"\b\w+#\d+", output) for output in error_commands)
+    assert all(f"{name} @ {trace['function_address']}" in out for out in outputs)
 
 
 def test_aarch64_oversized_big_preserves_flow_after_force_analysis(tmp_path, shared_bn):

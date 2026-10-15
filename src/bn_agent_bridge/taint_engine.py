@@ -27,6 +27,7 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 from __future__ import annotations
 
 import re
+import shlex
 from typing import Any
 
 # Structural split (#562): the engine re-exports the moved names so existing
@@ -4146,7 +4147,7 @@ class TaintEngine:
                      f"exceed its {n_params} recovered parameter(s), and the callee is "
                      f"determined nonvariadic. The confirmed extra arguments disagree with "
                      f"that declaration; their flow was NOT followed. Recover the real "
-                     f"prototype and apply `bn proto set {name} \"<prototype>\"`, then re-run."),
+                     f"prototype and apply `bn proto set {shlex.quote(name)} \"<prototype>\"`, then re-run."),
         }
 
     @staticmethod
@@ -4198,7 +4199,7 @@ class TaintEngine:
                     leaf.update(cause="signature_under_recovered",
                                 note=leaf["note"] + " Recovered call arguments exceed a determined "
                                 "nonvariadic declaration: recover the actual signature with "
-                                f"`bn proto set {callee_fn.name} \"<prototype>\"` and re-run.")
+                                f"`bn proto set {shlex.quote(callee_fn.name)} \"<prototype>\"` and re-run.")
                 else:
                     leaf["cause"] = "prototype_status_unknown"
                 out["assumptions"].append(
@@ -6913,7 +6914,7 @@ class TaintEngine:
                     f"the sink reads the contents of local buffer {label} but the "
                     f"walk could not account for them (no memory version at the "
                     f"sink to walk); the slice stops at the address-of and is NOT "
-                    f"complete -- re-run `bn taint forward --source var:{label}` "
+                    f"complete -- re-run `bn taint forward --source {shlex.quote(f'var:{label}')}` "
                     f"or inspect the writes to the buffer")
                 _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
                 return
@@ -7041,7 +7042,7 @@ class TaintEngine:
                     defn, label,
                     f"the sink reads the contents of local buffer {label} but the "
                     f"walk could not account for them ({why}); the slice is NOT "
-                    f"complete -- re-run `bn taint forward --source var:{label}` "
+                    f"complete -- re-run `bn taint forward --source {shlex.quote(f'var:{label}')}` "
                     "or inspect the writes to the buffer")
                 # Classified like `field_load_unresolved`: the origin names the
                 # stop and the leaf is the one frontier entry, so the frontier
@@ -7438,7 +7439,7 @@ class TaintEngine:
                     elif determinations and all(v is False for v in determinations):
                         detail += (". The callee is determined nonvariadic. Only if independent "
                                    "argument evidence demonstrates a declaration discrepancy, "
-                                   f"apply `bn proto set {callee} \"<prototype>\"` and re-run.")
+                                   f"apply `bn proto set {shlex.quote(callee)} \"<prototype>\"` and re-run.")
                     else:
                         detail += (". Variadic status is undetermined; inspect the callee "
                                    "prototype and argument provenance before diagnosing a discrepancy.")

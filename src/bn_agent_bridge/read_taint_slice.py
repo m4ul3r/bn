@@ -805,7 +805,7 @@ def _out_of_range_arg_msg(func, arg_index: int, n: int, *,
         )
         msg += (
             f" Note: {where}; BN's MLIL/HLIL call model often omits stack-passed "
-            f"(e.g. variadic) args -- inspect `bn il {func.name} --view llil "
+            f"(e.g. variadic) args -- inspect `bn il {shlex.quote(func.name)} --view llil "
             f"--ssa` for the stack stores feeding the call (#324)."
         )
     elif reg_count is not None and n < reg_count and arg_index == n:
@@ -817,7 +817,7 @@ def _out_of_range_arg_msg(func, arg_index: int, n: int, *,
             f"convention passes that BN did not recover as a param ({n} "
             f"recovered); the requested index alone does not prove that an "
             f"argument exists or that the prototype is wrong. Inspect "
-            f"`bn il {func.name} --view llil --ssa` for independent evidence "
+            f"`bn il {shlex.quote(func.name)} --view llil --ssa` for independent evidence "
             f"that a value feeds the call (#324)."
         )
     if variadic_callee:
