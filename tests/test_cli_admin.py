@@ -5581,16 +5581,30 @@ def test_aliased_skill_roots_keep_their_own_recovery_advice(
 
 
 @pytest.mark.parametrize("mode", ["symlink", "copy"])
-def test_canceled_missing_component_keeps_destination_entry_identity(
+def test_skill_install_through_symlink_parent_is_repeatable(
     tmp_path, monkeypatch, capsys, mode
 ):
     source, _ = _one_skill_source(tmp_path, monkeypatch)
+    store = tmp_path / "store"
+    store.mkdir()
+    physical_parent = tmp_path / "else"
+    linked_directory = physical_parent / "dir"
+    linked_directory.mkdir(parents=True)
+    (store / "link").symlink_to(linked_directory)
     monkeypatch.chdir(tmp_path)
-    assert bn.cli.main(["skill", "install", "--dest", "store", "--mode", mode]) == 0
-    capsys.readouterr()
-    assert bn.cli.main([
-        "skill", "install", "--dest", "store/missing/..", "--mode", mode, "--format", "json",
-    ]) == 2
-    [row] = json.loads(capsys.readouterr().out)["force_plan"]
-    assert row["destination_id"] == str(tmp_path / "store" / source.name)
-    assert row["destination_id"] != str(source)
+    argv = [
+        "skill", "install", "--dest", "store/link/..", "--mode", mode, "--format", "json",
+    ]
+    assert bn.cli.main(argv) == 0
+    first = json.loads(capsys.readouterr().out)
+    destination = physical_parent / source.name
+    assert first["installed_destinations"] == [str(destination)]
+    assert (destination / "SKILL.md").read_bytes() == (source / "SKILL.md").read_bytes()
+    assert destination.is_symlink() is (mode == "symlink")
+    assert not (store / source.name).exists()
+    before = _install_disk_snapshot(tmp_path)
+    assert bn.cli.main(argv) == 0
+    repeated = json.loads(capsys.readouterr().out)
+    assert repeated["installed"] is False
+    assert repeated["installed_destinations"] == []
+    assert _install_disk_snapshot(tmp_path) == before

@@ -515,7 +515,6 @@ def _install_path(dest: Path) -> Path:
     and acting on this one path is what keeps a spelling from naming two
     different directories either side of a `mkdir`.
     """
-    dest = Path(os.path.abspath(dest))
     return dest.parent.resolve() / dest.name if dest.is_symlink() else dest.resolve()
 
 
