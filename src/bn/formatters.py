@@ -1531,6 +1531,12 @@ def _render_session_start_text(value: Any) -> str:
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")
+    elif value.get("stopped") is False:
+        lines.append("")
+        lines.append(
+            f"cleanup error: {value.get('cleanup_error') or 'timed out waiting for teardown'}"
+        )
+        lines.append("warning: bridge process may still be running; no clean stop was confirmed")
     lines.extend(_discarded_unsaved_lines(value))
     return "\n".join(lines)
 
@@ -1573,6 +1579,12 @@ def _render_session_status_text(value: Any) -> str:
 def _render_session_stop_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
+    if value.get("stopped") is False:
+        return "\n".join([
+            f"stop failed: {value.get('instance_id', '<unknown>')}",
+            f"error: {value.get('error') or 'timed out waiting for teardown'}",
+            "warning: bridge process may still be running; no clean stop was confirmed",
+        ])
     line = f"stopped: {value.get('instance_id', '<unknown>')}"
     method = value.get("method")
     if method:
@@ -3126,7 +3138,7 @@ def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
         return _render_fallback_text(value)
     function = _field_dict(value, "function")
     lines = [
-        f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}",
+        f"{_escape_control_chars(_shown_name(function, mangled=mangled) or '<unknown>')} @ {function.get('address', '<unknown>')}",
         f"prototype: {value.get('prototype', '<unknown>')}",
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
     ]
@@ -3731,6 +3743,9 @@ def _render_pointer_table_text(value: Any) -> str:
         f"pointer-size: {value.get('pointer_size', '<unknown>')}  stride: {value.get('stride', '<unknown>')}"
         f"  read-width: {value.get('read_width', value.get('pointer_size', '<unknown>'))}",
     ]
+    if value.get("decode") == "relative-int32":
+        lines[0] = f"relative-int32 table @ {value.get('address', '<unknown>')}"
+        lines.append(f"decode: signed int32 + base {value.get('base', '<unknown>')}")
     # Through the choke point, so a malformed `context` envelope discloses
     # instead of rendering the table byte-identically to one with no context.
     suffix = _context_suffix(_field_dict(value, "context"))
@@ -3748,7 +3763,10 @@ def _render_pointer_table_text(value: Any) -> str:
             lines.append(f"{prefix}  <unreadable>")
             continue
         plausibility = "" if item.get("plausible", True) else "  [implausible]"
-        lines.append(f"{prefix}  {item.get('value', '<unknown>')} -> "
+        raw = str(item.get("value", "<unknown>"))
+        if value.get("decode") == "relative-int32":
+            raw += f" (offset {item.get('offset', '<unknown>')})"
+        lines.append(f"{prefix}  {raw} -> "
                      f"{_render_target_line(_field_dict(item, 'target'))}{plausibility}")
     return "\n".join(lines)
 
@@ -4010,6 +4028,9 @@ def _render_orient_text(value: Any) -> str:
                 raw = s.get("value")
                 shown = raw if isinstance(raw, str) else ("" if raw is None else repr(raw))
                 lines.append(f"    {s.get('address', '?')}  {shown[:80]!r}")
+        total = ss.get("total")
+        if isinstance(total, int) and not isinstance(total, bool) and total > len(items):
+            lines.append(f"  more strings: bn evidence orient --strings-limit {total}")
     return "\n".join(lines)
 
 
@@ -4602,13 +4623,12 @@ def _taint_truncation_note(stats: dict[str, Any]) -> str:
         parts.append("caller-site cap reached (not every caller was followed; "
                      "see the caller_sites_truncated frontier)")
     if "memory_chain" in causes:
-        # Backward-only: the local-buffer writer walk ran out of memory-SSA
-        # versions before the function entry; the cut is named by the
-        # address_of_local_unresolved leaf (PR-928 round 3 P3).
-        parts.append("memory-chain budget exhausted while walking a local "
-                     "buffer's writers (older writers were never examined; seed "
-                     "closer to the sink -- see the address_of_local_unresolved "
-                     "frontier)")
+        # The shared graph-discovery/fixed-point allowance was exhausted;
+        # the cut can mean missing writers OR an unfinished proof.
+        parts.append("memory-chain budget exhausted while proving a local "
+                     "buffer's writers (discovery or fixed-point solve unfinished; "
+                     "seed closer to the sink -- see the "
+                     "address_of_local_unresolved frontier)")
     if not parts:
         return f" · truncated @depth {stats.get('max_depth')}"
     return " · truncated " + "; ".join(parts)
@@ -5814,17 +5834,31 @@ def _render_doctor_text(value: Any) -> str:
                 "compared with this CLI's. `bn session restart "
                 + str(item.get("instance_id") or "<id>")
                 + "` from this CLI would respawn it on this CLI's checkout")
+        elif not item.get("gui", True) and item.get("bridge_source_unknown"):
+            lines.append(
+                "  note: bridge source is unknown (not reported by this bridge); "
+                "`bn session restart " + str(item.get("instance_id") or "<id>")
+                + "` from this CLI would respawn it on this CLI's checkout: "
+                + str(value.get("plugin_source_dir", "<unknown>")))
         if item.get("stale_plugin_version"):
             lines.append("  stale: loaded plugin version differs from CLI version")
-        # The reference differs by kind (#992): a GUI bridge loads the installed
-        # plugin file, a headless one this CLI's own source.
-        reference = "installed plugin file" if item.get("gui", True) else "this CLI's source"
+        # GUI comparisons use its actual reported package, not a guessed install.
+        is_gui = item.get("gui", True)
+        reference = (
+            "reported plugin source on disk" if item.get("bridge_source_dir")
+            else "installed plugin file"
+        ) if is_gui else "this CLI's source"
         if item.get("stale_plugin_code"):
             lines.append(f"  stale: loaded plugin code does not match {reference}")
         if item.get("stale_engine"):
+            remedy = (
+                "reload Binary Ninja plugins or restart Binary Ninja"
+                if is_gui else "run `bn session restart "
+                + str(item.get("instance_id") or "<id>") + "`"
+            )
             lines.append(
                 f"  stale: loaded engine code (taint/IL modules) does not match {reference} -- "
-                "run `bn session restart " + str(item.get("instance_id") or "<id>") + "`")
+                + remedy)
         if item.get("started_at"):
             lines.append(f"  started: {item['started_at']}")
         if item.get("socket_path"):
@@ -6443,7 +6477,7 @@ def _build_mutation_summary(
         summary["kept_library_imports"] = list(kept_library_imports)
     if fallthrough_entries:
         # #997 item 2: a `function create` at an address the previous
-        # instruction runs straight into -- likely mid-function. Conditional
+        # instruction runs straight into -- may be mid-function. Conditional
         # like the keys above; the row's `note` carries the sentence.
         summary["fallthrough_entries"] = list(fallthrough_entries)
     if preview_skipped:
@@ -7023,9 +7057,9 @@ def _render_mutation_summary_text(value: Any) -> str:
                 f"{_text_value(m, 'name') or '<unnamed>'} @{_text_value(m, 'address') or '<unknown>'} "
                 f"({_text_value(m, 'reason') or 'unknown reason'})" for m in skipped)
     for entry in _row_list(value, "fallthrough_entries"):
-        line += (f"\nwarning: {_text_value(entry, 'address') or '<unknown>'} is reached by "
-                 f"fall-through from {_text_value(entry, 'fallthrough_from') or '<unknown>'}; "
-                 "likely mid-function, not an entry")
+        line += (f"\nwarning: {_text_value(entry, 'address') or '<unknown>'}: preceding word "
+                 f"decodes as a fall-through instruction at {_text_value(entry, 'fallthrough_from') or '<unknown>'}; "
+                 "may be mid-function")
     if _field_declared(value, "go_rename"):
         go = _field_dict(value, "go_rename")
         line += "\ngo rename: " + "  ".join(

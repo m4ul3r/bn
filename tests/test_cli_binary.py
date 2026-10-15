@@ -130,13 +130,18 @@ def test_target_list_text_format_renders_summary(fake_transport, capsys):
     assert '"selector"' not in output
 
 
-def test_refresh_uses_implicit_target_when_single_target_is_open(fake_transport, capsys):
-    calls = fake_transport({
-        "list_targets": {
-            "ok": True,
-            "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
-        },
-        "refresh": {
+def test_refresh_defers_implicit_target_resolution_until_bridge_reservation(monkeypatch, capsys):
+    import bn.transport
+
+    selected = _fake_bridge_instance()
+    selected.meta["capabilities"] = {"refresh_target_gate": True}
+    calls = []
+
+    def send(instance, op, *, target=None, **kwargs):
+        assert instance is selected
+        assert op == "refresh"
+        calls.append({"op": op, "target": target})
+        return {
             "ok": True,
             "result": {
                 "refreshed": True,
@@ -149,17 +154,150 @@ def test_refresh_uses_implicit_target_when_single_target_is_open(fake_transport,
                     "active": True,
                 },
             },
-        },
-    })
+        }
 
+    monkeypatch.setattr(bn.transport, "choose_instance", lambda *a, **k: selected)
+    monkeypatch.setattr(bn.transport, "_send_request_to_instance", send)
     rc = bn.cli.main(["refresh", "--format", "text"])
 
     assert rc == 0
-    assert [call["op"] for call in calls] == ["list_targets", "refresh"]
-    assert calls[1]["target"] == "123:1:7"  # implicit resolution pins the target_id (#690 R3)
+    assert [call["op"] for call in calls] == ["refresh"]
+    assert calls[0]["target"] is None  # resolved safely inside the reserved bridge gate
     output = capsys.readouterr().out
     assert "refreshed: true" in output
     assert "SnailMail_unwrapped.exe.bndb" in output
+
+
+@pytest.mark.parametrize("capabilities", [
+    None,
+    {"refresh_target_gate": False},
+    {"refresh_target_gate": 1},
+    {"refresh_target_gate": "true"},
+    ["refresh_target_gate"],
+])
+@pytest.mark.parametrize("target_count", [1, 2])
+@pytest.mark.parametrize("routed", [False, True])
+def test_legacy_refresh_counts_and_pins_on_the_selected_bridge(
+        monkeypatch, capsys, capabilities, target_count, routed):
+    import bn.transport
+
+    selected = _fake_bridge_instance("legacy")
+    if capabilities is not None:
+        selected.meta["capabilities"] = capabilities
+    choices, calls = [], []
+    targets = [
+        {"target_id": f"legacy:{index}", "selector": f"tab-{index}", "active": index == 1}
+        for index in range(target_count)
+    ]
+
+    def choose(instance_id, **kwargs):
+        choices.append(instance_id)
+        assert len(choices) == 1, "preflight must not choose or spawn another bridge"
+        assert kwargs["spawn_missing_named"] is False
+        return selected
+
+    def send(instance, op, *, target=None, **kwargs):
+        assert instance is selected
+        calls.append((op, target))
+        if op == "list_targets":
+            return {"ok": True, "result": targets}
+        assert op == "refresh" and target == "legacy:0"
+        return {"ok": True, "result": {"refreshed": True, "target": {}}}
+
+    monkeypatch.setattr(bn.transport, "choose_instance", choose)
+    monkeypatch.setattr(bn.transport, "_send_request_to_instance", send)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    argv = ["refresh"] + (["-i", "legacy"] if routed else [])
+    assert bn.cli.main(argv) == (0 if target_count == 1 else 2)
+    assert choices == ["legacy" if routed else None]
+    if target_count == 1:
+        assert calls == [("list_targets", None), ("refresh", "legacy:0")]
+    else:
+        assert calls == [("list_targets", None)]
+        error = capsys.readouterr().err
+        assert "requires --target when multiple targets are open" in error
+        assert "-t tab-0" in error and "-t tab-1" in error
+
+
+@pytest.mark.parametrize("selector", ["active", "legacy:0"])
+def test_legacy_refresh_preserves_explicit_target_without_preflight(
+        monkeypatch, capsys, selector):
+    import bn.transport
+
+    selected = _fake_bridge_instance("legacy")
+    calls = []
+
+    def send(instance, op, *, target=None, **kwargs):
+        assert instance is selected
+        calls.append((op, target))
+        return {"ok": True, "result": {"refreshed": True, "target": {}}}
+
+    monkeypatch.setattr(bn.transport, "choose_instance", lambda *a, **k: selected)
+    monkeypatch.setattr(bn.transport, "_send_request_to_instance", send)
+    assert bn.cli.main(["refresh", "-i", "legacy", "-t", selector]) == 0
+    assert calls == [("refresh", selector)]
+
+
+@pytest.mark.parametrize("preflight_elapsed", [3.0, 9.0])
+def test_legacy_refresh_preflight_shares_the_request_deadline(
+        monkeypatch, capsys, preflight_elapsed):
+    import bn.transport
+
+    selected = _fake_bridge_instance("legacy")
+    clock, calls = [100.0], []
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "10")
+    monkeypatch.setattr(bn.transport.time, "monotonic", lambda: clock[0])
+
+    def choose(*args, **kwargs):
+        clock[0] += 2.0
+        return selected
+
+    def send(instance, op, *, timeout=None, resolved=False, **kwargs):
+        assert instance is selected and resolved is True
+        calls.append((op, timeout))
+        if op == "list_targets":
+            clock[0] += preflight_elapsed
+            return {"ok": True, "result": [{"target_id": "legacy:0"}]}
+        return {"ok": True, "result": {"refreshed": True, "target": {}}}
+
+    monkeypatch.setattr(bn.transport, "choose_instance", choose)
+    monkeypatch.setattr(bn.transport, "_send_request_to_instance", send)
+    assert bn.cli.main(["refresh", "-i", "legacy"]) == (
+        0 if preflight_elapsed == 3.0 else 2)
+    assert calls[0] == ("list_targets", 8.0)
+    if preflight_elapsed == 3.0:
+        assert calls[1] == ("refresh", 5.0)
+    else:
+        assert len(calls) == 1
+        assert "deadline expired before refresh" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source", ["environment", "sticky"])
+@pytest.mark.parametrize("value", ["", "   "])
+def test_refresh_refuses_broken_ambient_target_without_sending(
+        monkeypatch, fake_transport, capsys, source, value):
+    calls = fake_transport({})
+    monkeypatch.setattr(
+        bn.cli.session_state, "read",
+        lambda: {"target": value} if source == "sticky" else {})
+    if source == "environment":
+        monkeypatch.setenv("BN_TARGET", value)
+
+    assert bn.cli.main(["refresh"]) == 2
+    assert calls == []
+    error = capsys.readouterr().err
+    assert ("BN_TARGET is exported but empty" if source == "environment"
+            else "the sticky target pin is set but empty") in error
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_refresh_refuses_explicit_empty_target_without_sending(
+        fake_transport, capsys, value):
+    calls = fake_transport({})
+
+    assert bn.cli.main(["refresh", "-t", value]) == 2
+    assert calls == []
+    assert "--target is empty" in capsys.readouterr().err
 
 
 def test_target_summary_text_marks_quick_view():
@@ -869,8 +1007,8 @@ def test_load_refuses_ambient_routing_with_multiple_instances(
         bn.cli,
         "list_instances",
         lambda: [
-            types.SimpleNamespace(instance_id="one"),
-            types.SimpleNamespace(instance_id="two"),
+            types.SimpleNamespace(instance_id="one", pid=11, socket_path="/tmp/one.sock", started_at=None),
+            types.SimpleNamespace(instance_id="two", pid=22, socket_path="/tmp/two.sock", started_at=None),
         ],
     )
 
@@ -878,7 +1016,10 @@ def test_load_refuses_ambient_routing_with_multiple_instances(
 
     assert rc == 2
     assert calls == []
-    assert "explicit -i/--instance" in capsys.readouterr().err
+    message = capsys.readouterr().err
+    assert "explicit -i/--instance" in message
+    assert "- one (pid=11" in message
+    assert "- two (pid=22" in message
 
 
 def test_load_routes_on_bn_instance_with_multiple_instances_992(
@@ -889,7 +1030,8 @@ def test_load_routes_on_bn_instance_with_multiple_instances_992(
     raw = tmp_path / "foo.so"
     raw.write_bytes(b"")
     monkeypatch.setattr(bn.cli, "list_instances", lambda: [
-        types.SimpleNamespace(instance_id="one"), types.SimpleNamespace(instance_id="two"),
+        types.SimpleNamespace(instance_id="one", pid=11, socket_path="/tmp/one.sock", started_at=None),
+        types.SimpleNamespace(instance_id="two", pid=22, socket_path="/tmp/two.sock", started_at=None),
     ])
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
     loaded = {"ok": True, "result": {"loaded": True, "path": str(raw), "targets": []}}
