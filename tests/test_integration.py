@@ -5109,3 +5109,267 @@ if original is not None:
     if interface == "wire":
         assert result["result"]["kept_library_imports"] == imported, result
     assert shared_bn.run("types", "show", "Exceptional1031").returncode == 2
+
+
+@pytest.mark.parametrize("mixed", [False, True], ids=["comment-only", "comment-and-field"])
+@pytest.mark.parametrize("phase", ["write", "analysis"])
+@pytest.mark.parametrize("summary", [False, True], ids=["detail", "summary"])
+def test_nonparsing_import_outcome_1031(shared_bn, tmp_path, mixed, phase, summary):
+    """The whole-request guard works with or without an observed operation owner."""
+    shared_bn.load(ADD_BINARY)
+    setup = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+bv.define_user_type('NonParsing1031', bn.Type.structure(
+    members=[(bn.Type.int(4), 'original')]))
+bv.set_comment_at(bv.start, 'original nonparser comment')
+""")
+    assert setup.returncode == 0, setup.stdout + setup.stderr
+    probe = """
+import json
+print(json.dumps({
+    'ids': {str(i): str(bv.get_type_name_by_id(i))
+            for i in bv.type_container.type_ids},
+    'comment': bv.get_comment_at(bv.start),
+    'struct': str(bv.get_type_by_name('NonParsing1031')),
+    'address': hex(bv.start),
+}))
+"""
+    before = json.loads(shared_bn.run("py", "exec", "--code", probe).stdout)
+    assert "timespec" not in before["ids"].values(), before
+    original_layout = shared_bn.json("struct", "show", "NonParsing1031")["layout"]
+    operations = [{"op": "set_comment", "address": before["address"],
+                   "comment": "temporary nonparser comment"}]
+    if mixed:
+        operations.append({
+            "op": "struct_field_set", "struct_name": "NonParsing1031",
+            "offset": "0x0", "field_name": "changed", "field_type": "int32_t",
+        })
+    manifest = tmp_path / "nonparser-import.json"
+    manifest.write_text(json.dumps({"ops": operations}), encoding="utf-8")
+    try:
+        injected = shared_bn.run("py", "exec", "--code", f"""
+import binaryninja as bn
+method = {'set_comment_at' if phase == 'write' else 'update_analysis_and_wait'!r}
+original = getattr(bn.BinaryView, method)
+def import_once(view, *args, _original=original, _method=method, **kwargs):
+    setattr(bn.BinaryView, _method, _original)
+    imported = view.import_library_type('timespec')
+    assert imported is not None, 'synthetic fixture needs libc timespec'
+    return _original(view, *args, **kwargs)
+import_once._review_nonparsing_original = original
+setattr(bn.BinaryView, method, import_once)
+""")
+        assert injected.returncode == 0, injected.stdout + injected.stderr
+        response = shared_bn.run(
+            "batch", "apply", str(manifest), "--preview", "--format", "json",
+            *(["--summary"] if summary else []))
+    finally:
+        cleanup = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+for method in ('set_comment_at', 'update_analysis_and_wait'):
+    original = getattr(getattr(bn.BinaryView, method), '_review_nonparsing_original', None)
+    if original is not None:
+        setattr(bn.BinaryView, method, original)
+""")
+        assert cleanup.returncode == 0, cleanup.stdout + cleanup.stderr
+    assert response.returncode == 3, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert result["success"] is False, result
+    assert result["preview"] is True, result
+    assert result["committed"] is False, result
+    after = json.loads(shared_bn.run("py", "exec", "--code", probe).stdout)
+    assert {type_id: after["ids"].get(type_id) for type_id in before["ids"]} == before["ids"]
+    added = {type_id: name for type_id, name in after["ids"].items()
+             if type_id not in before["ids"]}
+    imported = sorted(set(added.values()))
+    assert "timespec" in imported, (result, added)
+    assert after["ids"] == {**before["ids"], **added}
+    assert result["kept_library_imports"] == imported, result
+    if summary:
+        assert result["ok"] is False, result
+        assert result["verified_count"] == result["changed_count"] == 0, result
+        if phase == "analysis":
+            assert "No operation attribution is available" in result["first_error"], result
+    else:
+        assert result["status"] == "unsupported", result
+        if phase == "write":
+            owner = result["results"][0]
+            assert owner["status"] == "unsupported", result
+            assert sorted(owner["imported_from_library"]) == imported, result
+            assert "parse_performed" not in owner, result
+        else:
+            assert result["unattributed_library_imports"] == imported, result
+            assert "No operation attribution is available" in result["message"], result
+            assert all(row["status"] == "reverted" for row in result["results"]), result
+            assert all("imported_from_library" not in row for row in result["results"]), result
+        if mixed:
+            sibling = result["results"][1]
+            assert sibling["status"] == "reverted", result
+            assert not sibling.get("imported_from_library"), result
+    assert after["comment"] == before["comment"]
+    assert after["struct"] == before["struct"]
+    assert shared_bn.json("struct", "show", "NonParsing1031")["layout"] == original_layout
+
+
+class TestParserHeavyTrackingPerformance1031:
+    """Compare real parser-heavy batches with the same build's untraced core."""
+
+    @staticmethod
+    def _sample(shared_bn, manifest, *, preview, tracked):
+        # Keep the bridge, transaction, parsers, verifiers and SDK identical.
+        # Only request import bookkeeping is absent from the control. Measuring
+        # inside _mutation excludes CLI startup/JSON transfer from both samples.
+        installed = shared_bn.run("py", "exec", "--code", f"""
+import time
+from bn_agent_bridge import mutation_engine as engine
+original_mutation = engine._mutation
+original_baseline = engine._declare_batch_type_names
+def timed_mutation(ctx, selector, preview, operations, *, exclusive=None):
+    started = time.perf_counter()
+    try:
+        if {tracked!r}:
+            return original_mutation(ctx, selector, preview, operations, exclusive=exclusive)
+        preview_token = engine._PREVIEW_PARSE.set(bool(preview))
+        trace_token = engine._IMPORT_TRACE.set(None)
+        try:
+            return engine._apply_batch(ctx, selector, preview, operations, exclusive=exclusive)
+        finally:
+            engine._IMPORT_TRACE.reset(trace_token)
+            engine._PREVIEW_PARSE.reset(preview_token)
+    finally:
+        timed_mutation._review_elapsed = time.perf_counter() - started
+timed_mutation._review_original = original_mutation
+timed_mutation._review_baseline = original_baseline
+timed_mutation._review_elapsed = None
+engine._mutation = timed_mutation
+if not {tracked!r}:
+    engine._declare_batch_type_names = lambda bv, operations: None
+""")
+        assert installed.returncode == 0, installed.stdout + installed.stderr
+        try:
+            started = time.perf_counter()
+            response = shared_bn.run(
+                "batch", "apply", str(manifest),
+                *(["--preview"] if preview else []), "--format", "json", timeout=180)
+            wall = time.perf_counter() - started
+        finally:
+            restored = shared_bn.json("py", "exec", "--code", """
+from bn_agent_bridge import mutation_engine as engine
+timed_mutation = engine._mutation
+try:
+    result = {'seconds': timed_mutation._review_elapsed}
+finally:
+    engine._mutation = timed_mutation._review_original
+    engine._declare_batch_type_names = timed_mutation._review_baseline
+""")
+        seconds = restored["result"]["seconds"]
+        assert seconds is not None and seconds > 0, restored
+        return response, seconds, wall
+
+    @pytest.mark.parametrize(("kind", "preview", "max_ratio"), [
+        pytest.param("declarations", True, 4.0, id="declarations-preview"),
+        pytest.param("fields", True, 2.5, id="fields-preview"),
+        pytest.param("fields", False, 2.5, id="fields-live"),
+    ])
+    def test_parser_heavy_batch_stays_near_untraced_core(
+            self, shared_bn, tmp_path, kind, preview, max_ratio):
+        shared_bn.load(ADD_BINARY)
+        setup = shared_bn.json("py", "exec", "--code", """
+import binaryninja as bn
+record = bn.Type.structure(members=[(bn.Type.int(4), 'a'), (bn.Type.int(4), 'b')])
+for index in range(3000):
+    bv.define_user_type(f'Syn{index}', record)
+result = {'count': sum(str(name).startswith('Syn') for name in bv.type_names),
+          'width': record.width,
+          'members': [member.name for member in record.members]}
+""")["result"]
+        assert setup == {"count": 3000, "width": 8, "members": ["a", "b"]}, setup
+
+        samples = {"control": [], "tracked": []}
+        wall_samples = {"control": [], "tracked": []}
+        outcomes = []
+        for repeat in range(2):
+            # Reverse order in the second pair to avoid always giving either
+            # path the warm parser/cache or the earlier analysis scheduling.
+            for tracked in ((False, True) if repeat == 0 else (True, False)):
+                mode = "tracked" if tracked else "control"
+                stamp = f"{mode}_{repeat}"
+                if kind == "declarations":
+                    names = [f"ParserTiming1031_{stamp}_{index}" for index in range(300)]
+                    operations = [
+                        {"op": "types_declare",
+                         "declaration": f"struct {name} {{ int x; int y; }};"}
+                        for name in names
+                    ]
+                else:
+                    # Disjoint targets and fresh member names ensure neither
+                    # live repeats nor the control can turn into no-op writes.
+                    first = 600 * repeat + (300 if tracked else 0)
+                    names = [f"Syn{first + index}" for index in range(300)]
+                    operations = [
+                        {"op": "struct_field_set", "struct_name": name, "offset": "0x0",
+                         "field_name": f"changed_{stamp}_{index}", "field_type": "int"}
+                        for index, name in enumerate(names)
+                    ]
+                manifest = tmp_path / f"parser-timing-{kind}-{stamp}.json"
+                manifest.write_text(json.dumps({"ops": operations}))
+                response, seconds, wall = self._sample(
+                    shared_bn, manifest, preview=preview, tracked=tracked)
+                samples[mode].append(seconds)
+                wall_samples[mode].append(wall)
+                assert response.returncode == 0, response.stdout + response.stderr
+                result = json.loads(response.stdout)
+                assert result["success"] is True, result
+                assert result["committed"] is (not preview), result
+                assert result["rolled_back"] is preview, result
+                assert len(result["results"]) == 300, result
+                assert all(row["status"] == "verified" for row in result["results"]), result
+                assert len(result["affected_types"]) == 300, result
+                assert not result.get("kept_library_imports"), result
+                assert not any(row.get("imported_from_library")
+                               for row in result["results"]), result
+
+                # Inspect the real SDK state after every control/tracked run,
+                # outside the measured interval. Preview must undo all 300
+                # writes; live fields must retain all 300 fresh names.
+                expected = (
+                    [None] * 300 if kind == "declarations" else
+                    [f"changed_{stamp}_{index}" if not preview else "a"
+                     for index in range(300)]
+                )
+                state = shared_bn.json("py", "exec", "--code", f"""
+names = {names!r}
+state = []
+for name in names:
+    type_obj = bv.get_type_by_name(name)
+    if type_obj is None:
+        state.append(None)
+    else:
+        state.append({{'width': type_obj.width,
+                      'members': [[member.name, member.offset, member.type.width]
+                                  for member in type_obj.members]}})
+result = state
+""")["result"]
+                wanted = [
+                    None if field is None else
+                    {"width": 8, "members": [[field, 0, 4], ["b", 4, 4]]}
+                    for field in expected
+                ]
+                assert state == wanted, (mode, repeat, state, wanted)
+                outcomes.append({
+                    "success": result["success"], "committed": result["committed"],
+                    "rolled_back": result["rolled_back"],
+                    "statuses": dict(collections.Counter(
+                        row["status"] for row in result["results"])),
+                    "affected_types": len(result["affected_types"]),
+                    "checked_state_count": len(state),
+                })
+
+        assert all(outcome == outcomes[0] for outcome in outcomes), outcomes
+        control, tracked = min(samples["control"]), min(samples["tracked"])
+        print(f"parser-heavy {kind} preview={preview}: core_samples={samples} "
+              f"wall_samples={wall_samples} best_ratio={tracked / control:.3f}")
+        # Best-of-two tolerates one-off scheduling stalls. Ratios are generous
+        # to routine bookkeeping, but reject the review's ~6x declaration and
+        # ~3x field-set regressions without a machine-specific seconds budget.
+        assert tracked < control * max_ratio, (samples, wall_samples, max_ratio)

@@ -31,6 +31,7 @@ import difflib
 import functools
 import json
 import re
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -218,41 +219,74 @@ _IMPORT_TRACE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "bn_mutation_import_trace", default=None)
 
 
-def _track_operation_failure(handler: Any) -> Any:
-    """Remember the failing owner without inspecting the view's type container."""
-    @functools.wraps(handler)
-    def tracked(ctx: Any, bv: Any, op: Any, *args: Any, **kwargs: Any) -> Any:
-        try:
-            return handler(ctx, bv, op, *args, **kwargs)
-        except Exception:
-            trace = _IMPORT_TRACE.get()
-            if trace is not None:
-                trace["failed_op"] = id(op)
-            raise
-    return tracked
-
-
-def _track_type_imports(handler: Any) -> Any:
-    """Diff actual parser/importer steps, once for an enclosing operation."""
+def _track_operation(handler: Any) -> Any:
+    """Record the active operation without enumerating the type container."""
     @functools.wraps(handler)
     def tracked(ctx: Any, bv: Any, op: Any, *args: Any, **kwargs: Any) -> Any:
         trace = _IMPORT_TRACE.get()
-        if (trace is None or trace.get("baseline") is None
-                or trace.get("import_owner") is not None):
-            return handler(ctx, bv, op, *args, **kwargs)
-        baseline = _TypeBaseline(_view_type_names(bv) or set(), _view_type_ids(bv))
-        trace["import_owner"] = id(op)
+        previous = trace.get("owner") if trace is not None else None
+        if trace is not None and previous is None:
+            trace["owner"] = (id(op), threading.get_ident())
         try:
             return handler(ctx, bv, op, *args, **kwargs)
+        except Exception:
+            if trace is not None:
+                trace["failed_op"] = trace["owner"][0]
+            raise
         finally:
-            try:
-                imports = set(_new_library_imports(bv, baseline)) - trace["claimed"]
-                if imports:
-                    trace["imports"].setdefault(id(op), set()).update(imports)
-                    trace["claimed"].update(imports)
-            finally:
-                trace.pop("import_owner", None)
+            if trace is not None and previous is None:
+                trace.pop("owner", None)
     return tracked
+
+
+def _start_import_observer(bv: Any, trace: dict[str, Any]) -> None:
+    """Journal SDK definition events; only the final ID diff judges imports."""
+    if not (hasattr(bn, "BinaryDataNotification") and hasattr(bn, "NotificationType")
+            and callable(getattr(bv, "register_notification", None))
+            and callable(getattr(bv, "unregister_notification", None))):
+        return
+
+    class Definitions(bn.BinaryDataNotification):
+        def __init__(self) -> None:
+            super().__init__(bn.NotificationType.TypeDefined)
+
+        def type_defined(self, view: Any, name: Any, type_obj: Any) -> None:
+            type_id = view.get_type_id(name)
+            if not type_id:
+                return
+            owner = trace.get("owner")
+            # An event outside the operation's own SDK thread is not evidence
+            # that this operation caused it. Keep it unowned rather than guess.
+            operation = owner[0] if owner and owner[1] == threading.get_ident() else None
+            trace["definitions"].setdefault(str(type_id), operation)
+
+    observer = Definitions()
+    bv.register_notification(observer)
+    trace["observer"] = observer
+
+
+def _stop_import_observer(trace: dict[str, Any]) -> None:
+    observer = trace.pop("observer", None)
+    if observer is not None:
+        trace["bv"].unregister_notification(observer)
+
+
+def _collect_import_outcome(trace: dict[str, Any]) -> None:
+    """Take the one end-of-request snapshot, then attribute only actual imports."""
+    if trace.get("collected") or trace.get("baseline") is None:
+        return
+    _stop_import_observer(trace)
+    bv = trace["bv"]
+    imported = _new_library_imports(bv, trace["baseline"])
+    trace["library_imports"] = imported
+    owners = {id(op) for op in trace["operations"]} if imported else set()
+    for name, type_id in imported.items():
+        owner = trace["definitions"].get(type_id)
+        if owner not in owners:
+            trace["unattributed"].add(name)
+        else:
+            trace["imports"].setdefault(owner, set()).add(name)
+    trace["collected"] = True
 
 # A tag-keyword mention (`struct timespec`, ``struct `ns::X` ``).
 _TAG_MENTION_RE = re.compile(r"\b(?:struct|class|union|enum)\s+(?:`([^`]+)`|([A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*))")
@@ -321,7 +355,7 @@ def _parse_declaration_source(ctx, bv, declaration: str, *, source_path: str | N
 
 
 
-@_track_type_imports
+@_track_operation
 def _parse_operation_declaration(ctx, bv, op: dict[str, Any]):
     trace = _IMPORT_TRACE.get()
     if trace is not None:
@@ -1154,7 +1188,7 @@ def _resolve_prototype_target(ctx, bv, op: dict[str, Any]):
 _PROTOTYPE_DEPENDENT_OPS = frozenset({"local_rename", "local_retype"})
 
 
-@_track_operation_failure
+@_track_operation
 def _preview_operation_skip(ctx, bv, op: dict[str, Any], index: int,
                             skipped_prototypes: dict[int, int]) -> str | None:
     """Check one op immediately before applying it to the current preview view.
@@ -2067,7 +2101,7 @@ def _validate_operation_request(ctx, op: dict[str, Any], *, index: int | None = 
     return kind
 
 
-@_track_operation_failure
+@_track_operation
 def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None, *,
                      defer_reanalysis: bool = False):
     # A manifest op must be a JSON object; a non-object element (e.g.
@@ -2554,23 +2588,27 @@ def refuse_quick_view(bv, *, requested: dict[str, Any],
 
 def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
               exclusive=None):
-    """Run a mutation with request-local preview and parser-import attribution."""
+    """Judge imports from one request-level ID delta, independent of attribution."""
     token = _PREVIEW_PARSE.set(bool(preview))
     trace: dict[str, Any] = {
-        "imports": {}, "claimed": set(), "parsed": set(), "import_errors": {},
+        "imports": {}, "library_imports": {}, "parsed": set(), "import_errors": {},
+        "definitions": {}, "unattributed": set(),
     }
     trace_token = _IMPORT_TRACE.set(trace)
+    exclusive_scope = exclusive if exclusive is not None else contextlib.nullcontext
     try:
         try:
             result = _apply_batch(ctx, selector, preview, operations, exclusive=exclusive)
         except Exception as exc:
             # A preflight/snapshot can parse before an undo group exists. Even
             # this exit must disclose its irreversible imports and their owner.
-            if trace["claimed"]:
-                exc.kept_library_imports = sorted(trace["claimed"])
+            with exclusive_scope():
+                _collect_import_outcome(trace)
+            if trace["library_imports"]:
+                exc.kept_library_imports = sorted(trace["library_imports"])
                 if isinstance(exc, OperationFailure):
                     exc.observed["kept_library_imports"] = exc.kept_library_imports
-            if (not trace["claimed"] or trace.get("transaction_started")
+            if (not trace["library_imports"] or trace.get("transaction_started")
                     or not isinstance(exc, OperationFailure)):
                 raise
             ops = trace["operations"]
@@ -2590,21 +2628,38 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 "affected_functions": [], "affected_types": [],
                 "affected_summary": {"referenced": 0, "reflowed": 0},
             }
-        if trace["parsed"] or trace["claimed"]:
+        with exclusive_scope():
+            _collect_import_outcome(trace)
+        if trace["parsed"] or trace["library_imports"]:
             _report_library_imports(trace["bv"], trace["baseline"], result["results"])
-        if trace["claimed"]:
+        if trace["library_imports"]:
             if preview or not result.get("committed"):
-                result["kept_library_imports"] = sorted(trace["claimed"])
+                result["kept_library_imports"] = sorted(trace["library_imports"])
+            if trace["unattributed"]:
+                result["unattributed_library_imports"] = sorted(trace["unattributed"])
             if preview:
+                explanation = (result.get("message") or "") if not result.get("success") else (
+                    "Preview changes were reverted." if result.get("rolled_back")
+                    else "Preview restoration did not complete.")
                 result["results"] = _fail_importing_preview(result["results"])
+                result["results"] = _restamp_reverted_siblings(
+                    ctx, result["results"], bool(result.get("rolled_back")))
                 result["success"] = False
+                result["status"] = "unsupported"
                 result["message"] = (
-                    f"{result.get('message') or ''} Imported library types stay in the "
-                    "view (a rollback cannot remove them).").strip()
+                    f"{explanation} Cannot --preview imports: library types "
+                    "stay in the view (a rollback cannot remove them).").strip()
+                if trace["unattributed"]:
+                    result["message"] += (
+                        " No operation attribution is available for: "
+                        + ", ".join(sorted(trace["unattributed"])) + ".")
         return result
     finally:
-        _IMPORT_TRACE.reset(trace_token)
-        _PREVIEW_PARSE.reset(token)
+        try:
+            _stop_import_observer(trace)
+        finally:
+            _IMPORT_TRACE.reset(trace_token)
+            _PREVIEW_PARSE.reset(token)
 
 
 def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]], *,
@@ -2666,6 +2721,7 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
         trace = _IMPORT_TRACE.get()
         if trace is not None:
             trace.update(bv=bv, baseline=library_baseline, operations=operations)
+            _start_import_observer(bv, trace)
         # #650: validate EVERY op's shape before applying ANY. The batch is atomic, so a
         # guessed op or field name in op 13 previously rolled back 12 good ops -- and with
         # no argparse layer on this path, guessing is the norm, not the exception. It runs
@@ -2750,7 +2806,7 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
     # Explicit restores for local var ops, which BN's undo buffer can't
     # revert (see _run_local_restores). Replayed on every revert path.
     restores: list = []
-    if library_baseline is not None:
+    if library_baseline is not None and trace is not None and trace.get("parses_types"):
         # Registered first, so it runs last on every revert path, after the
         # journal has removed the batch's own types.
         restores.append(lambda: _clear_dangling_type_names(bv, library_baseline))
@@ -2792,13 +2848,7 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
     except OperationFailure as exc:
         exc = _explain_renamed_reference(operations[len(results)], results, exc)
         with exclusive_scope():
-            # #993 review round 2: the revert below keeps a live declare's
-            # library imports (BN cannot un-import), so the rows must say so --
-            # the failing op's row too, when its own parse imported (round 3).
             failed_row = _operation_failure_result(ctx, operations[len(results)], exc)
-            # A preview's rows are stamped too: it imports nothing on purpose, so
-            # anything stamped there is an import BN made that the pre-check missed.
-            _report_library_imports(bv, library_baseline, results, failed_row)
             # Run BOTH revert steps unconditionally: an `and` would short-circuit
             # past the explicit restores when the undo revert fails, leaving
             # non-journaled local/prototype changes applied.
@@ -2870,24 +2920,13 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
     try:
         bv.update_analysis_and_wait()
         with exclusive_scope():
-            # On a preview anything stamped is an import BN made that the
-            # pre-check missed; the summary reports it as kept.
-            _report_library_imports(bv, library_baseline, results)
             after = _capture_function_snapshots(ctx, bv, affected)
             type_after = _capture_type_snapshots(ctx, bv, operations)
             diffs = _diff_snapshots(ctx, before, after)
             type_diffs = _diff_type_snapshots(ctx, type_before, type_after)
             verified_results = [result if result.get("status") == NOT_PREVIEWED
                                 else _verify_operation(ctx, bv, result) for result in results]
-            _report_library_imports(bv, library_baseline, verified_results)
             annotated_results = _annotate_operation_results(ctx, verified_results, type_diffs)
-            # #993 review round 4: a preview never reports success while BN
-            # imported anything. Judged on what BN did (new type ids, see
-            # `_new_library_imports`), not predicted from the text.
-            preview_imports = (_new_library_imports(bv, library_baseline)
-                               if preview and library_baseline is not None else [])
-            if preview_imports:
-                annotated_results = _fail_importing_preview(annotated_results)
             failed = _has_failed_results(ctx, annotated_results)
             # Origin tag: a direct op (rename/prototype/comment) targets a specific
             # function; mark its affected-function diffs `direct` so a mixed batch
@@ -3666,7 +3705,7 @@ def _type_spelling_hint(bv, text: str, detail: str, *, limit: int = 5) -> str:
             "needs backticks (struct `ns::Foo`*).")
 
 
-@_track_type_imports
+@_track_operation
 def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: str,
                         shown: str | None = None, column_of=None):
     """``bv.parse_type_string`` with a friendly, actionable error.
@@ -4762,34 +4801,31 @@ def _view_type_ids(bv) -> set[str] | None:
 
 
 def _declare_batch_type_names(bv, operations) -> _TypeBaseline | None:
-    """Baseline all type-parsing mutation kinds, including declare-free batches.
-
-    It covers import disclosure, preview outcome checking and dangling-name
-    cleanup; None means no type parser or a view that cannot list its types."""
-    if not any(isinstance(op, dict) and op.get("op") in {
-        "types_declare", "struct_field_set", "set_prototype", "local_retype", "data_retype",
-    } for op in operations):
+    """One initial baseline for every mutation, even a comment-only preview."""
+    trace = _IMPORT_TRACE.get()
+    if trace is None:
         return None
-    names = _view_type_names(bv)
-    if names is None:
-        return None
-    return _TypeBaseline(names, _view_type_ids(bv))
+    trace["parses_types"] = any(
+        isinstance(op, dict) and op.get("op") in {
+            "types_declare", "struct_field_set", "set_prototype", "local_retype", "data_retype",
+        } for op in operations)
+    return _TypeBaseline(_view_type_names(bv) or set(), _view_type_ids(bv))
 
 
-def _new_library_imports(bv, baseline: _TypeBaseline) -> list[str]:
-    """The library types the view gained since *baseline*, by their current
-    names, sorted. A new type id counts when BN recorded its name as imported
-    or the id is sourced from a type library loaded on the view (BN may load
-    a further library during an import)."""
+def _new_library_imports(bv, baseline: _TypeBaseline) -> dict[str, str | None]:
+    """New library names mapped to their IDs, or None for name-only SDKs.
+
+    Preserve the IDs from the outcome diff as the attribution key, rather than
+    looking them up again through a potentially different name/alias mapping."""
     current_ids = _view_type_ids(bv) if baseline.ids is not None else None
     if current_ids is None:
         current = _view_type_names(bv) or set()
-        return sorted(name for name in current - baseline.names if _is_library_import(bv, name))
+        return {name: None for name in current - baseline.names if _is_library_import(bv, name)}
     try:
         guids = {str(library.guid) for library in getattr(bv, "type_libraries", None) or []}
     except Exception:
         guids = set()
-    found = []
+    found: dict[str, str | None] = {}
     for type_id in current_ids - baseline.ids:
         try:
             name = str(bv.get_type_name_by_id(type_id) or "")
@@ -4798,8 +4834,8 @@ def _new_library_imports(bv, baseline: _TypeBaseline) -> list[str]:
         if not name:
             continue
         if _is_library_import(bv, name) or type_id.split(":", 1)[0] in guids:
-            found.append(name)
-    return sorted(set(found))
+            found[name] = type_id
+    return found
 
 
 def _stamp_library_imports(row: dict[str, Any], names) -> None:
@@ -4830,7 +4866,6 @@ def _report_library_imports(bv, baseline: _TypeBaseline | None, results: list,
         names = trace["imports"].get(id(op), ())
         if names:
             _stamp_library_imports(row, names)
-            row["parse_performed"] = True
 
 
 def _fail_importing_preview(results: list) -> list:
@@ -4847,7 +4882,7 @@ def _fail_importing_preview(results: list) -> list:
             if trace is not None:
                 prior = trace["import_errors"].setdefault(index, prior)
             message = (
-                "Binary Ninja imported type-library type(s) while parsing this operation "
+                "Binary Ninja imported type-library type(s) during this operation "
                 f"({', '.join(mine)}); a preview cannot undo an import, so the imported "
                 "types stay in the view (a rollback cannot remove them). "
                 + ("Run the declare without --preview." if row.get("op") == "types_declare"
@@ -5233,7 +5268,7 @@ def _refuse_reserved_keyword_tags(ctx, op: dict[str, Any], named_types) -> None:
     )
 
 
-@_track_type_imports
+@_track_operation
 def _op_types_declare(ctx, bv, op: dict[str, Any]):
     declaration = str(op["declaration"])
     # Reject C bitfield syntax up front: BN's parser corrupts it (see
