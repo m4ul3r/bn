@@ -6904,6 +6904,54 @@ def test_offset_types_resolve_by_rendered_name_like_types_show_1000():
     assert "bn struct show 'std::map<std::string, int>'" in warning["detail"]
 
 
+@pytest.mark.parametrize("parameters", [
+    [types.SimpleNamespace(name="__s", type="char const*")],
+    [],
+])
+def test_prototype_demangled_difference_reports_current_parameters(monkeypatch, parameters):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _cxx_function(0x401000, "_ZN2ns3Cls4openEPKc", "ns::Cls::open")
+    fn.set_auto_type(types.SimpleNamespace(parameters=parameters))
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(bridge.read_decompile.bn, "demangle_gnu3",
+                        lambda arch, name: (types.SimpleNamespace(parameters=[
+                            types.SimpleNamespace(name="this")]), ["ns", "Cls", "open"]),
+                        raising=False)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    note = instance._get_prototype("active", "0x401000")["implicit_object_note"]
+    if parameters:
+        assert "`__s`" in note and "char const*" in note
+    else:
+        assert "current prototype has no parameters" in note
+    assert "demangled C++ signature describes a leading object parameter" in note
+    assert "did not identify" not in note and "Do not reinterpret" not in note
+
+
+@pytest.mark.parametrize("user_type", [False, True])
+@pytest.mark.parametrize("cxx", [False, True])
+def test_prototype_parameter_name_does_not_determine_object_semantics(monkeypatch, user_type, cxx):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = (_cxx_function(0x401000, "_ZN2ns3Cls3runEi", "ns::Cls::run")
+          if cxx else _FakeFunction(0x401000, "cfunc"))
+    signature = types.SimpleNamespace(parameters=[
+        types.SimpleNamespace(name="this", type="int32_t")])
+    if user_type:
+        fn.set_user_type(signature)
+    else:
+        fn.set_auto_type(signature)
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # No demangled object parameter: a C name or an unrecognized C++ signature.
+    monkeypatch.setattr(bridge.read_decompile.bn, "demangle_gnu3",
+                        lambda arch, name: (None, []), raising=False)
+    note = instance._get_prototype("active", "0x401000")["implicit_object_note"]
+    assert "implicit object parameter" not in note
+    assert "named `this`" in note and "int32_t" in note
+    assert "BN recovered" not in note and "user-defined prototype" not in note
+
+
 @pytest.mark.parametrize("names", [
     ["demo::" + "Template" * 30],
     ["demo::" + "Template" * 20, "vtable_for_demo::" + "Template" * 20,

@@ -205,7 +205,8 @@ def _proto_set(args: argparse.Namespace) -> int:
 
 
 @command("proto", "get", help="Show the current prototype", target=True,
-         args=[arg("identifier", help="Function name or address (hex 0x.. or decimal)")],
+         args=[arg("identifier", help="Function name or address (hex 0x.. or decimal)"),
+               mangled_arg()],
          estimable=True)
 def _proto_get(args: argparse.Namespace) -> int:
     return _call(
@@ -213,7 +214,7 @@ def _proto_get(args: argparse.Namespace) -> int:
         "get_prototype",
         {"identifier": args.identifier},
         require_target=True,
-        text_renderer=_render_proto_text,
+        text_renderer=lambda v: _render_proto_text(v, mangled=args.mangled),
         stem="prototype-get",
     )
 

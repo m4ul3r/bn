@@ -2381,6 +2381,24 @@ def _return_width_inference_note(bv, func) -> str | None:
     )
 
 
+def _demangled_object_parameter(bv, func) -> bool:
+    """Whether BN's C++ demangler describes a leading object parameter.
+
+    This is only a demangler observation, not parameter provenance or ABI proof.
+    """
+    raw = str(getattr(func, "raw_name", func.name))
+    demangle = (getattr(bn, "demangle_gnu3", None) if raw.startswith("_Z")
+                else getattr(bn, "demangle_ms", None) if raw.startswith("?") else None)
+    if demangle is None:
+        return False
+    try:
+        signature, _ = demangle(bv.arch, raw)
+        parameters = list(getattr(signature, "parameters", None) or [])
+        return bool(parameters) and str(getattr(parameters[0], "name", "")) == "this"
+    except Exception:
+        return False
+
+
 def _get_prototype(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
@@ -2389,12 +2407,24 @@ def _get_prototype(ctx, selector: str | None, identifier):
             "name": func.name,
             "address": hex(func.start),
             "raw_name": getattr(func, "raw_name", func.name),
-            # #999 item 3: the demangled name `decompile` shows; `name` stays
-            # the symbol name the text splices into a pasteable C declaration.
+            # Keep symbol identity beside the descriptive display spelling.
             "display_name": il_format._display_name(func),
         },
         **il_format._function_metadata(func),
     }
+    params = list(getattr(getattr(func, "type", None), "parameters", None) or [])
+    if params:
+        name = str(getattr(params[0], "name", "")) or "<unnamed>"
+        current = f"Current prototype parameter 1 is named `{name}` with type {params[0].type}"
+    else:
+        current = "The current prototype has no parameters"
+    if _demangled_object_parameter(bv, func):
+        comparison = (
+            ", while BN's demangled C++ signature describes a leading object parameter")
+    else:
+        comparison = ". No demangled leading-object-parameter observation is available"
+    result["implicit_object_note"] = (
+        f"{current}{comparison}. This read makes no parameter-provenance or ABI claim.")
     note = _return_width_inference_note(bv, func)
     if note:
         result["return_width_note"] = note
