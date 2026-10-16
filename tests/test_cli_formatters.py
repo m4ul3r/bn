@@ -4159,6 +4159,9 @@ _GO_RENAME_NON_COUNT_READS = {
     "preview_skipped",
     # #966: deletion outcomes are a listing, not a go-rename count.
     "function_deletions",
+    # #1036 review round 2: the bridge's plain-save refusal, passed through to
+    # the compact status; a disclosure, not a count.
+    "save_refusal",
 }
 
 

@@ -2693,7 +2693,7 @@ def test_a_cache_entry_this_instance_or_project_wrote_is_restored_with_its_count
         bridge._record_cache_writer(entry, "agent-b", [])
     else:
         bridge._record_cache_writer(entry, "agent-gone", [str(project)])
-    monkeypatch.setattr(bridge.read_listing, "_annotation_summary", lambda ctx, bv: {
+    monkeypatch.setattr(bridge.read_listing, "_annotation_summary", lambda ctx, bv, **kw: {
         "comments": 0, "function_comments": 0, "analyst_symbols": 0,
         "user_symbols": 0, "placeholder_symbols": 3})
 
@@ -2724,7 +2724,8 @@ def test_a_cache_save_records_who_wrote_the_entry_1036(monkeypatch, tmp_path):
     instance._stamp_cache_writer(str(entry), result)
 
     assert result["cache_writer"] == {
-        "instance_id": "agent-a", "project_roots": [str(tmp_path / "proj-a")]}
+        "instance_id": "agent-a", "pid": os.getpid(),
+        "project_roots": [str(tmp_path / "proj-a")]}
     assert bridge._cache_writer_verdict(entry, "agent-a", None)[0] is True
     assert bridge._cache_writer_verdict(entry, "agent-b", str(tmp_path / "proj-a"))[0] is True
     assert bridge._cache_writer_verdict(entry, "agent-b", str(tmp_path / "proj-b"))[0] is False
@@ -2759,6 +2760,12 @@ def test_a_reused_instance_name_does_not_claim_another_processs_entry_1036(
 @pytest.mark.parametrize("field,value", [
     ("project_roots", 3), ("project_roots", [1]), ("instance_id", ["x"]),
     ("entry_identity", "abc"), ("entry_identity", [1, 2]), ("writer_process", "me"),
+    # Review round 2, finding 2: malformed INSIDE the process identity, with a
+    # matching project root that used to restore the entry anyway.
+    ("writer_process", {"pid": "not-a-pid", "boot_id": [], "pid_start_ticks": {}}),
+    ("writer_process", {"pid": 1, "boot_id": "b"}),
+    ("writer_process", {"pid": True, "boot_id": "b", "pid_start_ticks": 1}),
+    ("writer_process", {"pid": 1, "boot_id": " ", "pid_start_ticks": -1}),
 ])
 def test_a_malformed_writer_record_loads_the_raw_bytes_and_says_why_1036(
         monkeypatch, tmp_path, field, value):
@@ -2782,6 +2789,52 @@ def test_a_malformed_writer_record_loads_the_raw_bytes_and_says_why_1036(
     [note] = [n for n in result["notes"] if n.startswith("did not restore")]
     assert f"malformed ({field})" in note, note
     bridge._headless_views.clear()
+
+
+def test_a_committed_mutation_carries_the_plain_save_refusal_1036(monkeypatch, tmp_path):
+    """Review round 2, finding 3: the bridge attaches `save_refusal` to a
+    committed mutation when -- by the save's own refusal rule, on the current
+    file system -- a plain save would be refused: the default destination is
+    not writable AND the cache fallback holds work this target did not load.
+    Either condition alone attaches nothing."""
+    if os.geteuid() == 0:
+        from conftest import refuse_silent_skip
+        refuse_silent_skip("root bypasses the read-only directory this test needs")
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path / "cache")
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    raw_path = ro / "demod"
+    raw_path.write_bytes(b"\x7fELF")
+    view = _FakeFileBV(str(raw_path), session_id="1")
+    _register_views(bridge, view)
+    instance = bridge.BinaryNinjaBridge()
+    instance.targets.refresh()
+    instance.targets.mark_dirty(view)
+    entry = bridge._cache_bndb_path(str(raw_path))
+    monkeypatch.setattr(instance, "_dispatch_on_main",
+                        lambda op, params, target: {"committed": True, "results": []})
+
+    def attached():
+        response = instance.dispatch({"op": "rename_symbol", "params": {}, "target": "demod"})
+        assert response["ok"] is True, response
+        return response["result"].get("save_refusal")
+
+    try:
+        ro.chmod(0o555)
+        assert attached() is None                     # read-only, but the cache is free
+        entry.parent.mkdir(parents=True)
+        entry.write_bytes(b"another run's database")
+        assert attached() == {"default_save_path": f"{raw_path}.bndb",
+                              "cache_fallback": str(entry)}
+        instance.targets.clear_dirty(view)
+        assert attached() is None                     # nothing unsaved, nothing to advise
+        instance.targets.mark_dirty(view)
+        ro.chmod(0o755)
+        assert attached() is None                     # the default destination is writable
+    finally:
+        ro.chmod(0o755)
+        bridge._headless_views.clear()
 
 
 def test_the_export_note_says_a_plain_save_would_be_refused_1036(monkeypatch, tmp_path):
@@ -3425,7 +3478,7 @@ def test_target_rows_keep_the_load_time_provenance_verdict(monkeypatch, tmp_path
 
     # The annotation block the two provenance surfaces share (#793) carries the
     # verdict beside the database flags, and the hint says which it is.
-    monkeypatch.setattr(bridge.read_listing, "_annotation_summary", lambda ctx, bv: {
+    monkeypatch.setattr(bridge.read_listing, "_annotation_summary", lambda ctx, bv, **kw: {
         "comments": 1, "function_comments": 0, "analyst_symbols": 0,
         "user_symbols": 0, "placeholder_symbols": 0})
     for verdict, phrase in ((True, "verified against the raw file's content"),
@@ -3977,35 +4030,63 @@ def test_an_exported_database_keeps_the_raw_views_selector_1036(monkeypatch, tmp
 
 
 class _AnnotatedDatabaseView:
-    """A view opened from a database: the comments and user symbols it holds."""
+    """A view opened from a database, shaped for the real `_annotation_summary`:
+    global comments, functions (doc + local comments) and user symbols."""
 
-    def __init__(self, filename, *, comments=None, symbols=None, session_id="db-1"):
+    def __init__(self, filename, *, comments=None, docs=None, symbols=None,
+                 session_id="db-1"):
         self.file = types.SimpleNamespace(filename=filename, session_id=session_id)
-        self._comments = dict(comments or {})
-        self._symbols = dict(symbols or {})
+        self.address_comments = dict(comments or {})
+        self.functions = [
+            types.SimpleNamespace(name=f"sub_{start:x}", start=start, comment=doc, comments={})
+            for start, doc in (docs or [])
+        ]
+        self._symbols = [
+            types.SimpleNamespace(name=name, raw_name=name, address=address, auto=False)
+            for address, name in (symbols or {}).items()
+        ]
 
-    def get_comment_at(self, address):
-        return self._comments.get(address, "")
-
-    def get_function_at(self, address):
-        return None
-
-    def get_symbol_at(self, address):
-        name = self._symbols.get(address)
-        return types.SimpleNamespace(name=name, auto=False) if name else None
+    def get_symbols(self, start=None, length=None):
+        if start is None:
+            return list(self._symbols)
+        return [s for s in self._symbols if s.address == start]
 
 
-def _existing_block(bridge, monkeypatch, db, opened_record, filename):
-    monkeypatch.setattr(bridge.read_listing, "_annotation_summary", lambda ctx, view: {
-        "comments": opened_record["comments"], "function_comments": 0,
-        "analyst_symbols": opened_record["analyst_symbols"],
-        "user_symbols": opened_record["analyst_symbols"], "placeholder_symbols": 0})
+def _own_judgement(bridge, manager, path, db):
+    """Load-time judgement of *db* (opened from *path*), as `_load_binary` makes it."""
+    written = manager.written_by_this_bridge(path)
+    known, record, own_ledger = bridge._opened_annotation_record(db, Path(path), written)
+    assert known is True
+    return record, own_ledger
+
+
+def _existing_block(bridge, db, opened_record, filename):
     bridge._opened_annotations[db.file.session_id] = opened_record
     try:
         return bridge.read_listing._existing_annotations(
             None, db, filename=filename, source_verified=True)
     finally:
         bridge._opened_annotations.pop(db.file.session_id, None)
+
+
+def _exporting_manager(bridge, tmp_path, *, comments=None, symbols=None):
+    """A bridge ledger that verified *comments*/*symbols* on a raw view, then
+    exported it to `out/demod.bndb` and closed the source."""
+    raw_path = tmp_path / "ro" / "demod"
+    raw_path.parent.mkdir()
+    raw_path.write_bytes(b"raw")
+    export = tmp_path / "out" / "demod.bndb"
+    export.parent.mkdir()
+    raw = _FakeFileBV(str(raw_path), session_id="1")
+    _register_views(bridge, raw)
+    manager = bridge.TargetManager()
+    manager.refresh()
+    manager.seed_session_ledger(raw, dict(comments or {}), dict(symbols or {}))
+    export.write_bytes(b"database exported by this bridge")
+    manager.note_export(raw, str(export))
+    manager.forget(raw)                                  # the source view closed
+    bridge._headless_views.clear()
+    return manager, raw_path, export
 
 
 def test_an_exported_inherited_comment_stays_inherited_1036(monkeypatch, tmp_path):
@@ -4019,61 +4100,99 @@ def test_an_exported_inherited_comment_stays_inherited_1036(monkeypatch, tmp_pat
     from bn.commands.binary import _render_target_info_text_with_annotations
 
     bridge = _load_bridge(monkeypatch)
-    raw_path = tmp_path / "ro" / "demod"
-    raw_path.parent.mkdir()
-    raw_path.write_bytes(b"raw")
-    export = tmp_path / "out" / "demod.bndb"
-    export.parent.mkdir()
-    raw = _FakeFileBV(str(raw_path), session_id="1")
-    _register_views(bridge, raw)
-    manager = bridge.TargetManager()
-    manager.refresh()
-    manager.note_session_annotations(raw, [{
-        "op": "rename_symbol", "status": "verified", "address": "0x401000",
-        "new_name": "fold_value_v2"}])
-    export.write_bytes(b"database exported by this bridge")
-    manager.note_export(raw, str(export))
-    manager.forget(raw)                                  # the source view closed
-    bridge._headless_views.clear()
-
+    manager, raw_path, export = _exporting_manager(
+        bridge, tmp_path, symbols={0x401000: "fold_value_v2"})
     written = manager.written_by_this_bridge(export)
     assert written is not None and written["kind"] == "export"
     assert written["filename"] == str(raw_path)
+
     db = _AnnotatedDatabaseView(str(export), comments={0x401100: "planted by an earlier run"},
                                 symbols={0x401000: "fold_value_v2"})
-    counts, comments, symbols = bridge._own_annotations_at_open(db, written)
-    assert counts == {"comments": 0, "function_comments": 0, "analyst_symbols": 1}
+    record, (comments, symbols) = _own_judgement(bridge, manager, export, db)
+    assert record["own_at_open"] == {"comments": 0, "function_comments": 0, "analyst_symbols": 1}
+    assert record["unmatched_at_open"] == {
+        "comments": 1, "function_comments": 0, "analyst_symbols": 0}
     assert comments == {} and symbols == {0x401000: "fold_value_v2"}
 
-    block = _existing_block(bridge, monkeypatch, db, {
-        "path": str(export), "comments": 1, "function_comments": 0,
-        "analyst_symbols": 1, "placeholder_symbols": 0, "own_at_open": counts,
-        "written_by_this_bridge": {k: written[k] for k in (
-            "kind", "filename", "target_id", "saved_at")}}, str(export))
-    assert block["provenance_hint"] is not None
-    assert "1 comment(s), 0 function doc(s), 0 analyst symbol(s)" in block["provenance_hint"]
-    assert block["own_at_open"] == counts
-    assert block["present_at_open"]["comments"] == 1
+    block = _existing_block(bridge, db, record, str(export))
+    hint = block["provenance_hint"]
+    assert hint is not None
+    assert "1 comment(s), 0 function doc(s), 1 analyst symbol(s) present" in hint, hint
+    assert "of these 2 annotation(s), 1 positively matched this bridge's own verified " \
+           "writes and 1 did not" in hint, hint
     text = _render_target_info_text_with_annotations(
         {"selector": "demod.bndb", "existing_annotations": block})
     assert f"opened from a file this bridge exported from {raw_path}" in text, text
     assert "that says who wrote the file, not who wrote its annotations" in text
-    assert "own work, not inherited" not in text
+    assert "not matched: 1 comment(s), 0 function doc(s), 0 analyst symbol(s)" in text, text
     assert "predate this run" in text
 
-    # With nothing in it but this bridge's own verified rename, nothing is
-    # inherited, so no hint.
+    # With nothing in it but this bridge's own verified rename, every measured
+    # annotation is matched, so no hint.
     clean = _AnnotatedDatabaseView(str(export), symbols={0x401000: "fold_value_v2"})
-    counts, _, _ = bridge._own_annotations_at_open(clean, written)
-    block = _existing_block(bridge, monkeypatch, clean, {
-        "path": str(export), "comments": 0, "function_comments": 0,
-        "analyst_symbols": 1, "placeholder_symbols": 0, "own_at_open": counts,
-        "written_by_this_bridge": {"kind": "export"}}, str(export))
-    assert block["provenance_hint"] is None
+    record, _ = _own_judgement(bridge, manager, export, clean)
+    assert _existing_block(bridge, clean, record, str(export))["provenance_hint"] is None
 
     # A symbol renamed again by someone else (or by `py exec`) is not a match.
     renamed = _AnnotatedDatabaseView(str(export), symbols={0x401000: "other_name"})
-    assert bridge._own_annotations_at_open(renamed, written)[0]["analyst_symbols"] == 0
+    record, _ = _own_judgement(bridge, manager, export, renamed)
+    assert record["own_at_open"]["analyst_symbols"] == 0
+    assert record["unmatched_at_open"]["analyst_symbols"] == 1
+
+
+@pytest.mark.parametrize("shape", ["placeholder_rename", "whitespace_doc"])
+def test_an_own_write_the_counts_exclude_never_offsets_inherited_work_1036(
+        monkeypatch, tmp_path, shape):
+    """Review round 2, blocker (the reviewers' counterexamples). Own credits
+    were counted over every ledger match while the totals excluded
+    placeholder-shaped names and whitespace-only docs, so an own write the
+    totals never counted cancelled an INHERITED one:
+
+    * a prior process renamed one function `prior_process_name`; this bridge
+      renamed a DIFFERENT function to the placeholder-shaped `sub_401126`;
+    * a prior process documented one function; this bridge set another's doc
+      to " ".
+
+    Own and unmatched now split the one measured population, so the inherited
+    entry stays unmatched and the hint stays."""
+    bridge = _load_bridge(monkeypatch)
+    if shape == "placeholder_rename":
+        manager, _, export = _exporting_manager(
+            bridge, tmp_path, symbols={0x401126: "sub_401126"})
+        db = _AnnotatedDatabaseView(str(export), symbols={
+            0x401100: "prior_process_name", 0x401126: "sub_401126"})
+        kind = "analyst_symbols"
+    else:
+        manager, _, export = _exporting_manager(
+            bridge, tmp_path, comments={("function_doc", 0x401200): " "})
+        db = _AnnotatedDatabaseView(str(export), docs=[
+            (0x401100, "documented by an earlier run"), (0x401200, " ")])
+        kind = "function_comments"
+
+    record, _ = _own_judgement(bridge, manager, export, db)
+
+    assert record[kind] == 1                       # the inherited entry alone is measured
+    assert record["own_at_open"][kind] == 0
+    assert record["unmatched_at_open"][kind] == 1
+    hint = _existing_block(bridge, db, record, str(export))["provenance_hint"]
+    assert hint is not None and "0 positively matched" in hint, hint
+
+
+def test_a_ledger_entry_matching_two_measured_entries_credits_neither_1036(
+        monkeypatch, tmp_path):
+    """Two Function records at one start (#757) both carrying the doc this
+    bridge set: one ledger entry cannot vouch for two annotations, so neither
+    is credited."""
+    bridge = _load_bridge(monkeypatch)
+    manager, _, export = _exporting_manager(
+        bridge, tmp_path, comments={("function_doc", 0x401000): "mine"})
+    db = _AnnotatedDatabaseView(str(export), docs=[(0x401000, "mine"), (0x401000, "mine")])
+
+    record, (comments, _) = _own_judgement(bridge, manager, export, db)
+
+    assert record["own_at_open"]["function_comments"] == 0
+    assert record["unmatched_at_open"]["function_comments"] == 2
+    assert comments == {}
 
 
 def test_an_in_place_save_is_remembered_as_this_bridges_file_1036(monkeypatch, tmp_path):

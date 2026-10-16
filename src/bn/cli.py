@@ -2090,6 +2090,8 @@ def _mutate(
         # --format controls the MEDIUM, --verbose/--summary the DETAIL. An explicit
         # --format still wins, and an --out extension is still inferred downstream.
         setattr(args, "format", "text")
+    summary_text = functools.partial(
+        _render_mutation_summary_text, save_command=lambda: _save_command(args))
     return _call(
         args,
         op,
@@ -2100,10 +2102,11 @@ def _mutate(
         # status line stays shared so #645's default is identical everywhere.
         # #1036 item 5: the compact status names the save that persists a
         # committed dirty change, routed like this invocation (resolved lazily:
-        # an implicit target is only known once the request routes).
-        text_renderer=(functools.partial(_render_mutation_summary_text,
-                                         save_command=lambda: _save_command(args))
-                       if compact else (detail_renderer or _render_mutation_text)),
+        # an implicit target is only known once the request routes). The same
+        # renderer serves the spill path below, so the advice does not depend
+        # on payload size (review round 2).
+        text_renderer=(summary_text if compact
+                       else (detail_renderer or _render_mutation_text)),
         # #715: the exit code is computed on the ORIGINAL result, before any
         # transform runs, so it cannot see the `measured` flag `_mutation_summary`
         # derives. Hand it the same transform this call renders/spills with (an
@@ -2128,7 +2131,7 @@ def _mutate(
         # transform (#693 item 4), so this transform sees the bridge's payload
         # and never its own output -- idempotence is not required of it.
         spill_status=(summary_transform or _mutation_summary),
-        spill_status_renderer=_render_mutation_summary_text,
+        spill_status_renderer=summary_text,
         **call_kwargs,
     )
 

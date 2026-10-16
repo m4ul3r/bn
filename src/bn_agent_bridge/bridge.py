@@ -2622,6 +2622,11 @@ class BinaryNinjaBridge:
                         if spec.selector is not None:
                             params = {**params, "target": pinned}
                 result = self._dispatch_on_main(op, params, target)
+                if isinstance(result, dict) and result.get("committed") is True:
+                    self._attach_save_refusal(
+                        result,
+                        spec.selector(params, target)
+                        if spec is not None and spec.selector is not None else target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
             # When the failure carries an unclearable has_user_type residue, the
@@ -3274,29 +3279,22 @@ class BinaryNinjaBridge:
             # (it is still unpublished), so the provenance hint never counts
             # the session's own annotations -- or a save's re-home -- as
             # inherited. Measured outside the lock; recorded inside it below.
-            opened_known, opened_record = _opened_annotation_record(
-                bv, load_path if load_path.suffix == ".bndb" else None)
+            #
+            # #1036 item 5: a database THIS bridge saved or exported, and still
+            # the very file it wrote, is disclosed as such -- a fact about the
+            # FILE. Which of its measured annotations are this bridge's own is
+            # judged one by one against the session ledgers copied at that
+            # save, within the same population the counts measure.
+            database = load_path if load_path.suffix == ".bndb" else None
+            written = (self.targets.written_by_this_bridge(load_path)
+                       if database is not None else None)
+            opened_known, opened_record, own_ledger = _opened_annotation_record(
+                bv, database, written)
             if substitute is not None and opened_record is not None:
                 annotation_note = _opened_annotation_note(
                     opened_record, restored=substitute.source == "cache")
                 if annotation_note is not None:
                     notes.append(annotation_note)
-            own_ledger: tuple[dict, dict] | None = None
-            if opened_record is not None:
-                # #1036 item 5: a database THIS bridge saved or exported, and
-                # still the very file it wrote, is disclosed as such -- a fact
-                # about the FILE. Which of its annotations are this bridge's own
-                # is judged one by one against the session ledgers copied at
-                # that save (location and body/name), never from the file fact:
-                # an exported inherited comment stays inherited.
-                written = self.targets.written_by_this_bridge(load_path)
-                if written is not None:
-                    own_counts, own_comments, own_symbols = _own_annotations_at_open(
-                        bv, written)
-                    opened_record["written_by_this_bridge"] = {
-                        key: written[key] for key in ("kind", "filename", "target_id", "saved_at")}
-                    opened_record["own_at_open"] = own_counts
-                    own_ledger = (own_comments, own_symbols)
             # The load note is one-shot; the target row keeps the verdict so a
             # later `target info` can still answer whether the restored
             # database was verified against the raw file.
@@ -3969,6 +3967,41 @@ class BinaryNinjaBridge:
         _disclose_open_target_collision(self.targets, bv, saved, result)
         return result
 
+    def _plain_save_refusal(self, bv) -> dict[str, Any] | None:
+        """What a plain `bn save` of *bv* would be refused with RIGHT NOW, or
+        None: its default destination's directory is not writable (so the
+        save falls back to the shared cache) AND that cache entry holds work
+        this target did not load -- the exact refusal `_save_database` raises,
+        judged by the same `_cache_holds_other_work` on the current state of
+        the file system. A writable default, or a free or own cache entry,
+        is None: that save is not refused."""
+        filename = str(getattr(getattr(bv, "file", None), "filename", "") or "")
+        if not filename:
+            return None
+        default = filename if filename.endswith(".bndb") else f"{filename}.bndb"
+        if _destination_writable(default):
+            return None
+        identity = _recorded_source_identity(bv)
+        cache_path = str(_cache_bndb_path(filename, identity.sha256 if identity else None))
+        if not self._cache_holds_other_work(bv, cache_path, filename):
+            return None
+        return {"default_save_path": default, "cache_fallback": cache_path}
+
+    def _attach_save_refusal(self, result: dict[str, Any], selector: Any) -> None:
+        """#1036 review round 2: a committed mutation whose target a plain
+        save would refuse says so (`save_refusal`), so the text status never
+        prints a known-refused `bn save` as the step that persists it.
+        Best-effort: an unanswerable probe adds nothing."""
+        try:
+            bv = self.targets.resolve(selector)
+            if not self.targets.is_dirty(bv):
+                return
+            refusal = self._plain_save_refusal(bv)
+        except Exception:  # noqa: BLE001 - advice, never a failure of the write
+            return
+        if refusal is not None:
+            result["save_refusal"] = refusal
+
     def _cache_holds_other_work(self, bv, cache_path: str, filename: str) -> bool:
         """Does the cache entry at *cache_path* exist and hold a database this
         target was neither opened from nor wrote with an earlier save? Then a
@@ -3990,7 +4023,10 @@ class BinaryNinjaBridge:
             return
         with self._teardown_lock:
             roots = sorted(self._project_roots)
-        writer = {"instance_id": self.instance_id, "project_roots": roots}
+        process = _this_process_identity()
+        writer = {"instance_id": self.instance_id,
+                  "pid": process["pid"] if process else None,
+                  "project_roots": roots}
         error = _record_cache_writer(Path(saved), self.instance_id, roots)
         if error is not None:
             writer["error"] = error
@@ -6785,7 +6821,11 @@ def _cache_writer_verdict(entry: Path, instance_id: str | None,
         return False, "its writer record is malformed (instance_id), so the writer is unknown"
     if not (isinstance(roots, list) and all(isinstance(root, str) for root in roots)):
         return False, "its writer record is malformed (project_roots), so the writer is unknown"
-    if process is not None and not isinstance(process, dict):
+    if process is not None and not _valid_process_identity(process):
+        # `None` is the platform-without-/proc case the writer itself records;
+        # anything else that is not a complete, well-typed identity is
+        # malformed, and malformed is unknown ownership by EITHER route
+        # (review round 2).
         return False, "its writer record is malformed (writer_process), so the writer is unknown"
     current = _file_identity(str(entry))
     if current is None or tuple(recorded) != current:
@@ -6797,6 +6837,29 @@ def _cache_writer_verdict(entry: Path, instance_id: str | None,
                     and bool(instance_id) and writer == instance_id)
     own = same_process or (project is not None and project in roots)
     return own, who
+
+
+def _valid_process_identity(process: Any) -> bool:
+    """Is *process* exactly what `_this_process_identity` writes: a positive
+    int ``pid``, a non-empty str ``boot_id`` and a non-negative int
+    ``pid_start_ticks``, and nothing else?"""
+    if not isinstance(process, dict) or set(process) != {"pid", "boot_id", "pid_start_ticks"}:
+        return False
+    pid, boot, ticks = process["pid"], process["boot_id"], process["pid_start_ticks"]
+    return (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+            and isinstance(boot, str) and bool(boot.strip())
+            and isinstance(ticks, int) and not isinstance(ticks, bool) and ticks >= 0)
+
+
+def _destination_writable(path: str) -> bool:
+    """Could a database be written at *path* now: its directory exists and is
+    writable, and an existing file there is writable too (`os.access`, which
+    also answers for a read-only mount)."""
+    target = Path(path)
+    parent = target.parent
+    if not parent.is_dir() or not os.access(parent, os.W_OK):
+        return False
+    return not target.exists() or os.access(target, os.W_OK)
 
 
 def _instance_option(instance_id: str | None) -> str:
@@ -6959,62 +7022,99 @@ def _sidecar_note(choice: _SidecarChoice, resolved: Path, who: str | None = None
     return f"loaded {choice.path} instead of {resolved} (use --no-bndb to skip)"
 
 
-def _opened_annotation_record(bv, database: Path | None) -> tuple[bool, dict[str, Any] | None]:
+def _opened_annotation_record(bv, database: Path | None,
+                              written: dict[str, Any] | None = None
+                              ) -> tuple[bool, dict[str, Any] | None,
+                                         tuple[dict, dict] | None]:
     """What *bv* carried as the bridge opened it, for `_opened_annotations`
-    (#973): ``(known, record)``. A raw open inherits nothing -- ``(True,
-    None)``; a database open records its counts and path; ``(False, None)``
-    when those counts cannot be read, so the hint falls back to the current
-    counts rather than claim a clean inheritance it never measured."""
+    (#973): ``(known, record, own ledger)``. A raw open inherits nothing --
+    ``(True, None, None)``; a database open records its counts and path;
+    ``(False, None, None)`` when those counts cannot be read, so the hint
+    falls back to the current counts rather than claim a clean inheritance
+    it never measured.
+
+    With *written* (what this bridge wrote at *database*, `written_by_this_
+    bridge`), the record also says which of the MEASURED annotations this
+    bridge's own verified writes account for (`_match_own_annotations`),
+    and the third value is the matched ledger entries to seed the view with."""
     if database is None:
-        return True, None
+        return True, None, None
+    population: dict[str, list] = {}
     try:
-        summary = read_listing._annotation_summary(None, bv)
+        summary = read_listing._annotation_summary(None, bv, population=population)
     except Exception:  # noqa: BLE001 - unmeasured is "unknown", never zero
-        return False, None
-    return True, {
+        return False, None, None
+    record: dict[str, Any] = {
         "path": str(database),
         **{key: summary[key] for key in read_listing.OPENED_ANNOTATION_COUNTS},
     }
+    if written is None:
+        return True, record, None
+    own, unmatched, comments, symbols = _match_own_annotations(population, written)
+    record["written_by_this_bridge"] = {
+        key: written[key] for key in ("kind", "filename", "target_id", "saved_at")}
+    record["own_at_open"] = own
+    record["unmatched_at_open"] = unmatched
+    return True, record, (comments, symbols)
 
 
-def _own_annotations_at_open(bv, written: dict[str, Any]) -> tuple[
-        dict[str, int], dict[tuple[str, int], str], dict[int, str]]:
-    """Which annotations in *bv*, just opened from a file this bridge wrote,
-    are this bridge's own: those the session ledgers copied at that save say
-    it wrote and verified, and that *bv* still holds at the same location
-    with the same body (comment) or name (user symbol). Anything else in the
-    database -- a comment the source view itself inherited and exported
-    unchanged, a rename made through `py exec` -- is not credited.
+def _match_own_annotations(population: dict[str, list], written: dict[str, Any]
+                           ) -> tuple[dict[str, int], dict[str, int],
+                                      dict[tuple[str, int], str], dict[int, str]]:
+    """Split the annotations `_annotation_summary` MEASURED (*population*:
+    the very entries its counts count, by the same rules) into those this
+    bridge's own verified writes positively account for and the rest.
 
-    Returns ``(counts, comments, symbols)``: counts in the
-    `present_at_open` keys, and the matched ledger entries."""
+    An entry is this bridge's own only when the session ledgers copied at
+    the save that wrote the file (*written*) hold the same thing at the same
+    place: a global address comment with that exact body, a function doc
+    with that exact raw text, an analyst symbol with that exact name. A
+    function-local comment is never one (this bridge writes only the global
+    map), and a ledger entry that matches more than one measured entry
+    credits none of them. Nothing outside *population* is ever counted, so
+    an own write the counts excluded (a placeholder-shaped rename, a
+    whitespace-only doc) cannot offset an inherited one (#1036 review round
+    2). Returns ``(own counts, unmatched counts, matched comments, matched
+    symbols)``; per kind, own + unmatched is the measured count."""
+    ledger_comments: dict[tuple[str, int], str] = written.get("comments", {})
+    ledger_symbols: dict[int, str] = written.get("symbols", {})
+
+    def as_int(value: Any) -> int | None:
+        try:
+            return int(value, 16) if isinstance(value, str) else int(value)
+        except (TypeError, ValueError):
+            return None
+
+    candidates: dict[str, list[tuple[Any, Any] | None]] = {
+        "comments": [], "function_comments": [], "analyst_symbols": []}
+    for store, address, text in population.get("comments", []):
+        key = ("address", as_int(address))
+        candidates["comments"].append(
+            (key, text) if store == "address" and ledger_comments.get(key) == text else None)
+    for start, raw_doc in population.get("function_comments", []):
+        key = ("function_doc", as_int(start))
+        candidates["function_comments"].append(
+            (key, raw_doc) if ledger_comments.get(key) == raw_doc else None)
+    for address, name in population.get("analyst_symbols", []):
+        key = as_int(address)
+        candidates["analyst_symbols"].append(
+            (key, name) if key is not None and ledger_symbols.get(key) == name else None)
+    own: dict[str, int] = {}
+    unmatched: dict[str, int] = {}
     comments: dict[tuple[str, int], str] = {}
-    for (scope, address), body in written.get("comments", {}).items():
-        try:
-            if scope == "function_doc":
-                fn = bv.get_function_at(address)
-                stored = str(getattr(fn, "comment", "") or "") if fn is not None else ""
-            else:
-                stored = str(bv.get_comment_at(address) or "")
-        except Exception:  # noqa: BLE001 - unreadable is not a match
-            continue
-        if stored and stored == body:
-            comments[(scope, address)] = body
     symbols: dict[int, str] = {}
-    for address, name in written.get("symbols", {}).items():
-        try:
-            symbol = bv.get_symbol_at(address)
-        except Exception:  # noqa: BLE001 - unreadable is not a match
-            continue
-        if (symbol is not None and getattr(symbol, "auto", True) is False
-                and getattr(symbol, "name", None) == name):
-            symbols[address] = name
-    counts = {
-        "comments": sum(1 for scope, _ in comments if scope == "address"),
-        "function_comments": sum(1 for scope, _ in comments if scope == "function_doc"),
-        "analyst_symbols": len(symbols),
-    }
-    return counts, comments, symbols
+    for kind, rows in candidates.items():
+        hits = [row for row in rows if row is not None]
+        repeated = {key for key, _ in hits if [k for k, _ in hits].count(key) > 1}
+        credited = [(key, value) for key, value in hits if key not in repeated]
+        own[kind] = len(credited)
+        unmatched[kind] = len(rows) - len(credited)
+        for key, value in credited:
+            if kind == "analyst_symbols":
+                symbols[key] = value
+            else:
+                comments[key] = value
+    return own, unmatched, comments, symbols
 
 
 def _opened_annotation_note(record: dict[str, Any], *, restored: bool = False) -> str | None:
@@ -7236,7 +7336,7 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True,
             _quick_loaded_views.discard(bv)
         if bndb_unanalyzed:
             _unanalyzed_views.add(bv)
-        opened_known, opened_record = _opened_annotation_record(
+        opened_known, opened_record, _own = _opened_annotation_record(
             bv, load_path if load_path.suffix == ".bndb" else None)
         if substitute is not None and opened_record is not None:
             annotation_note = _opened_annotation_note(

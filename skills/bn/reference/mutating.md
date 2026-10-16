@@ -112,7 +112,7 @@ Mutations print a compact **text status line** by default. Use `--format json --
 
 ### Compact status keys
 
-This table describes `--format json --summary`; default text shows fewer fields, while full JSON is the detailed audit. Conditional keys are `reverted_count` (reverted siblings present), `prototype_user_type_residue` (true only), `overlapping_functions`, `fallthrough_entries`, `replaced_members`, `declared_types`, `kept_library_imports` (recognized kept imports after a failed live mutation, or every retained new type ID after a preview), `class_apply_types`, `preview_skipped`, and `go_rename`; other keys below are always present.
+This table describes `--format json --summary`; default text shows fewer fields, while full JSON is the detailed audit. Conditional keys are `reverted_count` (reverted siblings present), `prototype_user_type_residue` (true only), `overlapping_functions`, `fallthrough_entries`, `replaced_members`, `declared_types`, `kept_library_imports` (recognized kept imports after a failed live mutation, or every retained new type ID after a preview), `class_apply_types`, `preview_skipped`, `go_rename`, and `save_refusal` (a committed change whose plain `bn save` the bridge found refused right now; see the runtime reference); other keys below are always present.
 
 | key | meaning |
 |---|---|
