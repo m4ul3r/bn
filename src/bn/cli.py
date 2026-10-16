@@ -2141,6 +2141,36 @@ def _contextualize_diagnostic_hints(
     """
     if not instance and not target:
         return value
+
+    def route_prose(text: str) -> str:
+        return _route_commands_in_text(text, target=target, instance=instance)
+
+    prose_keys = {"error", "hints", "assumptions", "note", "detail", "next_action", "recovery_advice"}
+
+    def visit(item: Any, *, prose: bool = False) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key in prose_keys and isinstance(child, str):
+                    item[key] = route_prose(child)
+                elif isinstance(child, (dict, list)):
+                    visit(child, prose=key in prose_keys)
+        elif isinstance(item, list):
+            for index, child in enumerate(item):
+                if prose and isinstance(child, str):
+                    item[index] = route_prose(child)
+                elif isinstance(child, (dict, list)):
+                    visit(child, prose=prose)
+
+    visit(value)
+    return value
+
+
+def _route_commands_in_text(text: str, *, target: str | None, instance: str | None) -> str:
+    """Add this invocation's -i/-t to each backticked `bn ...` command in *text*
+    whose command needs a target and does not already carry them, so a printed
+    command runs as printed when several targets or instances are open."""
+    if not instance and not target:
+        return text
     # As in build_parser(), defer registration until cli.py is fully imported.
     from . import commands  # noqa: F401
 
@@ -2183,27 +2213,7 @@ def _contextualize_diagnostic_hints(
             return match.group(0)
         return "`bn " + " ".join(flags) + " " + command_text + "`"
 
-    def route_prose(text: str) -> str:
-        return re.sub(r"`bn ([^`]+)`", route, text)
-
-    prose_keys = {"error", "hints", "assumptions", "note", "detail", "next_action", "recovery_advice"}
-
-    def visit(item: Any, *, prose: bool = False) -> None:
-        if isinstance(item, dict):
-            for key, child in item.items():
-                if key in prose_keys and isinstance(child, str):
-                    item[key] = route_prose(child)
-                elif isinstance(child, (dict, list)):
-                    visit(child, prose=key in prose_keys)
-        elif isinstance(item, list):
-            for index, child in enumerate(item):
-                if prose and isinstance(child, str):
-                    item[index] = route_prose(child)
-                elif isinstance(child, (dict, list)):
-                    visit(child, prose=prose)
-
-    visit(value)
-    return value
+    return re.sub(r"`bn ([^`]+)`", route, text)
 
 
 def _call(
@@ -2237,6 +2247,9 @@ def _call(
     # result, so the output names which bridge answered.
     stamp_instance: bool = False,
     contextual_hints: bool = False,
+    # Bind backticked `bn ...` commands the TEXT renderer prints to this
+    # invocation's -i/-t (per row under a fan-out), so they run as printed.
+    contextual_text_hints: bool = False,
 ) -> int:
     _require_nonempty_instance(args)
     # THE BOUNDARY (#101/#715/#716). Every transform a handler hands this call is
@@ -2283,6 +2296,7 @@ def _call(
             text_renderer=text_renderer,
             timeout_kwargs=timeout_kwargs,
             stem=stem,
+            contextual_text_hints=contextual_text_hints,
         )
 
     target = _resolve_target(
@@ -2405,6 +2419,9 @@ def _call(
     slice_hint = _slice_hint_for_args(args, fmt)
     if text_renderer is not None and fmt == "text":
         result = text_renderer(result)
+        if contextual_text_hints and isinstance(result, str):
+            result = _route_commands_in_text(
+                result, target=target, instance=getattr(args, "instance", None))
     spilled = _render_result(
         result,
         fmt=fmt,
@@ -2456,6 +2473,7 @@ def _fanout_call(
     text_renderer: Callable[[Any], str] | None,
     timeout_kwargs: dict[str, Any],
     stem: str,
+    contextual_text_hints: bool = False,
 ) -> int:
     """Run *op* across every running bridge instance (``--all-instances``) and/or
     every open target in each instance (``--all-targets``), and aggregate (#169 L1).
@@ -2645,7 +2663,12 @@ def _fanout_call(
     fmt = _resolve_output_format(args)
     rendered: Any = result
     if fmt == "text":
-        rendered = _render_fanout_text(result, inner_renderer=text_renderer)
+        rendered = _render_fanout_text(
+            result, inner_renderer=text_renderer,
+            row_text=(lambda text, row: _route_commands_in_text(
+                text, target=row.get("target"), instance=row.get("instance"))
+                if isinstance(text, str) else text)
+            if contextual_text_hints else None)
     _render_result(
         rendered, fmt=fmt, out_path=args.out, stem=stem or "fanout",
         spill_label="fanout", spill_context=result, paged=True,

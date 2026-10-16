@@ -7556,10 +7556,17 @@ def test_empty_page_row_fields_include_previously_missing_optional_keys(monkeypa
 
     assert result["items"] == []
     optional = result.get("row_fields_optional", {})
-    missing = [key for key in _PREVIOUSLY_MISSING_ROW_FIELDS[kind] if key not in optional]
-    assert not missing, f"{kind}: empty-page row_fields_optional missing {missing}"
-    promised = [key for key in _PREVIOUSLY_MISSING_ROW_FIELDS[kind] if key in result["row_fields"]]
+    advertised = set(result["row_fields"]) | set(optional)
+    missing = [key for key in _PREVIOUSLY_MISSING_ROW_FIELDS[kind] if key not in advertised]
+    assert not missing, f"{kind}: empty-page row_fields missing {missing}"
+    # A key the producer sets only conditionally is never promised on every
+    # row; one it sets on every row (callsites' `call_index`, #1037 review
+    # finding 9) is promised, not described with a false condition.
+    conditional = sys.modules["bn_test_bridge._shared"]._OPTIONAL_ROW_FIELDS.get(kind, {})
+    promised = [key for key in conditional if key in result["row_fields"]]
     assert not promised, f"{kind}: conditional keys promised on every row: {promised}"
+    if kind == "callsites":
+        assert {"call_index", "within_query", "also_in"} <= set(result["row_fields"])
 
 
 def test_row_fields_promise_only_keys_every_row_carries_1037():

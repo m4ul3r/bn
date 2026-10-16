@@ -2107,6 +2107,13 @@ def _render_name_address_rows(value: Any, *, mangled: bool = False) -> str:
             # table, not from the symbol itself, says so in the cell.
             source = " via exports" if item.get("library_source") == "needed-exports" else ""
             line += f" [{_escape_control_chars(library)}{source}]"
+        else:
+            # Needed libraries read that define it, when the lookup could not
+            # name one: neutral -- no claim which the loader binds.
+            exporting = [_escape_control_chars(str(lib))
+                         for lib in _field_list(item, "exporting_libraries")]
+            if exporting:
+                line += f" [library unknown; exported by {', '.join(exporting)}]"
         raw_name = item.get("raw_name")
         if raw_name and raw_name != name:
             # Both extra columns carry target-supplied text (an import's library
@@ -2213,6 +2220,41 @@ def _render_name_address_list_text(value: Any, *, mangled: bool = False) -> str:
     # library; name the DT_NEEDED list they can come from, so the null points at
     # the answer rather than reading as "no dependency".
     unattributed = _nonnegative_count(value, "library_unattributed")
+    if unattributed:
+        needed = ", ".join(_escape_control_chars(str(lib))
+                           for lib in _field_list(value, "needed_libraries"))
+        reasons = _field_dict(value, "library_unattributed_reasons")
+        why = "; ".join(f"{_fmt_count(count)} {_escape_control_chars(str(reason))}"
+                        for reason, count in reasons.items())
+        note = (f"// {unattributed} import(s) carry no library "
+                f"({why or 'no symbol version names one'}); "
+                f"this target needs: {needed or '?'} (also in `bn target info`)")
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    for note in _attribution_evidence_lines(value):
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    # #1037 item 5: rows whose 0 callers is BN's recorded refs only. Counted
+    # off the rows shown, so a collected listing counts every collected row.
+    unrecorded = sum(1 for item in _field_list(value, "items")
+                     if isinstance(item, dict) and _is_zero(item.get("code_ref_count")))
+    if unrecorded:
+        note = (f"// {unrecorded} import(s) show no recorded code refs; `bn xrefs <import>` "
+                "also scans function LLIL for calls BN did not record")
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    for dynamic_note in _dynamic_section_notes(value):
+        note = f"// dynamic section: {dynamic_note}"
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    return body
+
+
+def _is_zero(value: Any) -> bool:
+    """A measured zero: the int 0, not False, not null (unmeasured)."""
+    return value == 0 and not isinstance(value, bool) and isinstance(value, int)
+
+
+def _attribution_evidence_lines(value: Any) -> list[str]:
+    """#1037 item 6: where `[lib via exports]` names came from -- the files the
+    needed-library lookup read -- and the needed libraries it did not read,
+    with the reason. Shared by the imports listing and `--summary`."""
     files = [entry for entry in _field_list(value, "needed_library_files")
              if isinstance(entry, dict)]
     read, unread = [], []
@@ -2222,38 +2264,20 @@ def _render_name_address_list_text(value: Any, *, mangled: bool = False) -> str:
         if path:
             read.append(f"{library}={_escape_control_chars(path)}")
         else:
-            # null: not found; a skewed path is recorded by the reader above.
-            unread.append(library)
-    if unattributed:
-        needed = ", ".join(_escape_control_chars(str(lib))
-                           for lib in _field_list(value, "needed_libraries"))
-        why = "no symbol version names one"
-        if files:
-            why += ", and no needed library file read defines it"
-        note = (f"// {unattributed} import(s) carry no library ({why}); "
-                f"this target needs: {needed or '?'} (also in `bn target info`)")
-        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
-    # #1037 item 6: which needed-library files were read to attribute
-    # unversioned imports (`[lib via exports]`), and which were not found.
+            reason = _text_value(entry, "reason")
+            unread.append(f"{library} ({_escape_control_chars(reason)})" if reason else library)
+    lines = []
     if read:
-        note = ("// [lib via exports]: first needed library, in load order, whose "
-                f"export table defines the name; read {', '.join(read)}")
-        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+        lines.append(
+            f"// needed-library files read: {', '.join(read)}; `[lib via exports]` "
+            "marks the only one of them whose export table defines the name at its "
+            "default version, every needed library before it read")
     if unread:
-        note = (f"// needed libraries not found or not readable: {', '.join(unread)} "
-                "(searched DT_RUNPATH/DT_RPATH, the binary's directory, and --sysroot "
-                "when given); no import is attributed past the first of them")
-        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
-    # #1037 item 5: rows whose 0 callers is BN's recorded refs only.
-    unrecorded = _nonnegative_count(value, "callers_unrecorded")
-    if unrecorded:
-        note = (f"// {unrecorded} import(s) show no recorded code refs; `bn xrefs <import>` "
-                "also scans function LLIL for calls BN did not record")
-        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
-    for dynamic_note in _dynamic_section_notes(value):
-        note = f"// dynamic section: {dynamic_note}"
-        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
-    return body
+        lines.append(
+            f"// needed libraries not read: {', '.join(unread)} (searched DT_RUNPATH/"
+            "DT_RPATH, the binary's directory, and --sysroot when given); an import "
+            "is not attributed when one of these comes before its exporter")
+    return lines
 
 
 def _render_mangled_name_address_list_text(value: Any) -> str:
@@ -3919,7 +3943,8 @@ def _render_message_lens_text(value: Any) -> str:
 
 
 @_discloses
-def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None) -> str:
+def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None,
+                        row_text: Callable[[str, dict[str, Any]], str] | None = None) -> str:
     """Render an --all-instances fan-out (#169 L1): a header per instance, then
     that instance's result rendered by the command's own text renderer (or a
     fallback), and an ``error:`` line for instances that couldn't be reached/
@@ -3962,7 +3987,10 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
             inner = r.get("result")
             if inner_renderer is not None:
                 try:
-                    lines.append(inner_renderer(inner))
+                    text = inner_renderer(inner)
+                    # The CLI binds printed commands to THIS row's instance and
+                    # target (#1037 review: a hint is copied per row).
+                    lines.append(row_text(text, r) if row_text else text)
                 except BridgeError:
                     # A `BridgeError` is not a render failure: it is this CLI
                     # declaring it cannot TRUST the reply, and the documented
@@ -5375,15 +5403,32 @@ def _render_imports_summary_text(value: Any) -> str:
         lines.append("needed libraries (DT_NEEDED):")
         for lib in needed:
             lines.append(f"  {lib}")
-    # #969: per-import library attribution (ELF symbol versioning), aggregated.
-    # Shown only when at least one import IS attributed: a lone
-    # "(unattributed)" row restates the total and says nothing.
+    # #969/#1037: per-import library attribution, aggregated. Shown only when
+    # at least one import IS attributed: a lone "(unattributed)" row restates
+    # the total and says nothing. The label names no single source: a row's
+    # library may come from BN's namespace, its symbol version, or a needed
+    # library's export table, counted under "attribution source".
     by_library = _field_dict(value, "by_library")
     if any(lib != "(unattributed)" for lib in by_library):
         lines.append("")
-        lines.append("by library (symbol version requirements):")
+        lines.append("by library:")
         for lib, count in sorted(by_library.items(), key=lambda x: -_int_or_default(x[1])):
             lines.append(f"  {_fmt_count(count):>5}  {_escape_control_chars(lib)}")
+        by_source = _field_dict(value, "by_library_source")
+        if by_source:
+            lines.append("attribution source (namespace = BN namespace, symbol-version = "
+                         ".gnu.version_r, needed-exports = a needed library's export table):")
+            for source, count in sorted(by_source.items(), key=lambda x: -_int_or_default(x[1])):
+                lines.append(f"  {_fmt_count(count):>5}  {_escape_control_chars(source)}")
+        reasons = _field_dict(value, "library_unattributed_reasons")
+        if reasons:
+            lines.append("why unattributed:")
+            for reason, count in reasons.items():
+                lines.append(f"  {_fmt_count(count):>5}  {_escape_control_chars(str(reason))}")
+    evidence = _attribution_evidence_lines(value)
+    if evidence:
+        lines.append("")
+        lines.extend(evidence)
     notes = _dynamic_section_notes(value)
     if notes:
         lines.append("")
@@ -5432,9 +5477,11 @@ def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
         clipped = ""
         if isinstance(text, str) and len(text) > _STRING_VALUE_CLIP:
             # The tail names the exact bytes: `length` is the stored byte span.
+            # Backticked so the CLI binds it to this invocation's -i/-t: printed
+            # bare, it failed with several targets open (#1037 review).
             span = f" {length}" if isinstance(length, int) and not isinstance(length, bool) else ""
             clipped = (f" … (+{len(text) - _STRING_VALUE_CLIP} chars; full value: "
-                       f"--format json or bn read {address}{span} --encoding escaped)")
+                       f"--format json or `bn read {address}{span} --encoding escaped`)")
             text = text[:_STRING_VALUE_CLIP]
         rendered = json.dumps(text, ensure_ascii=True) + clipped
         if chars is not None and isinstance(length, int) and chars != length:
@@ -5451,8 +5498,11 @@ def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
         if directives:
             refs = item.get("code_ref_count")
             suffix = f"  [fmt: {' '.join(str(d) for d in directives)}"
-            if isinstance(refs, int) and not _field_declared(item, "xref_functions"):
-                suffix += f"; code_refs={refs}"
+            if not _field_declared(item, "xref_functions"):
+                if isinstance(refs, int) and not isinstance(refs, bool):
+                    suffix += f"; code_refs={refs}"
+                elif _text_value(item, "code_ref_note"):
+                    suffix += "; code_refs unknown"
             suffix += "]"
             row += suffix
         # #968 --with-xrefs: the functions that reference this string, capped
@@ -5465,9 +5515,14 @@ def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
 
 def _string_xref_suffix(item: dict[str, Any], *, mangled: bool = False) -> str:
     """The `[xrefs: ...]` tail of one `strings --with-xrefs` row (#968)."""
-    text = _capped_function_names(_field_list(item, "xref_functions"),
-                                  _nonnegative_count(item, "xref_function_count"),
-                                  mangled=mangled)
+    code_unmeasured = _text_value(item, "code_ref_note")
+    if code_unmeasured:
+        # A failed enumeration is not "0 functions" (#1037 review).
+        text = f"functions unknown ({_escape_control_chars(code_unmeasured)})"
+    else:
+        text = _capped_function_names(_field_list(item, "xref_functions"),
+                                      _nonnegative_count(item, "xref_function_count"),
+                                      mangled=mangled)
     # An unmeasured count arrives as null with a note: say so, never a zero.
     unmeasured = _text_value(item, "data_ref_note")
     if unmeasured:
@@ -5524,8 +5579,13 @@ def _strings_listing_text(value: Any, *, narrowed: bool, mangled: bool = False) 
             note = ("// the payload's dropped-noise count is not a number that "
                     "can be read (use --format json)")
             body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
-        # #1037 item 11: a 0-reference row on a binary with C++ exception tables.
-        unreferenced = _nonnegative_count(value, "unreferenced_strings")
+        # #1037 item 11: a 0-reference row on a binary with C++ exception
+        # tables. Counted off the rows shown, so a collected listing counts
+        # every collected row; the note itself is a fact about the binary.
+        unreferenced = sum(
+            1 for row in _field_list(value, "items")
+            if isinstance(row, dict) and _is_zero(row.get("code_ref_count"))
+            and _is_zero(row.get("data_ref_count")))
         unreferenced_note = _text_value(value, "unreferenced_note")
         if unreferenced and unreferenced_note:
             note = (f"// {unreferenced} listed string(s) show no references: "

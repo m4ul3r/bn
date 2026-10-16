@@ -4308,11 +4308,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
     # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
-    # #1037 adds the strings listing's `noise_dropped` and `unreferenced_strings`,
-    # and the imports listing's `callers_unrecorded` and per-row `caller_count`.
-    assert len(sites) == 67, (
+    # #1037 adds the strings listing's `noise_dropped` and the imports row's
+    # `caller_count` (the zero-reference tallies are counted off the rows).
+    assert len(sites) == 65, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 67. A "
+        "count helper, not 65. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4455,10 +4455,6 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # `test_imports_text_points_unattributed_rows_at_needed_libraries_969`.
         "_render_name_address_list_text(library_unattributed) [count not "
         "stated in this context]",
-        # #1037 item 5: the same harness cut. The note's wording is pinned in
-        # `tests/test_cli_misc.py::test_imports_text_names_callers_and_export_attribution_1037`.
-        "_render_name_address_list_text(callers_unrecorded) [count not "
-        "stated in this context]",
         # #968: a ROW fragment of `strings --with-xrefs`, reached only through
         # `_render_strings_rows`; pinned by
         # `tests/test_cli_misc.py::test_strings_with_xrefs_forwards_flag_and_renders_functions_968`.
@@ -4509,11 +4505,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # and dedicated string-count / noise-tip tests cover both output contexts.
         "_strings_listing_text(filtered) [not a payload renderer]",
         "_strings_listing_text(noise_strings) [not a payload renderer]",
-        # #1037 items 2 and 11, the same listing body; pinned by
-        # `tests/test_cli_misc.py::test_strings_query_text_counts_dropped_metadata_noise_1037`
-        # and `test_strings_text_states_the_landing_pad_note_1037`.
+        # #1037 item 2, the same listing body; pinned by
+        # `tests/test_cli_misc.py::test_strings_query_text_counts_dropped_metadata_noise_1037`.
         "_strings_listing_text(noise_dropped) [not a payload renderer]",
-        "_strings_listing_text(unreferenced_strings) [not a payload renderer]",
     ]), sorted(not_stated)
 
 
@@ -9810,7 +9804,7 @@ def test_imports_text_points_unattributed_rows_at_needed_libraries_969():
         "total_symbols": 3, "needed_libraries": ["libc.so.6"],
         "by_library": {"libc.so.6": 2, "(unattributed)": 1},
     })
-    assert "by library (symbol version requirements):\n      2  libc.so.6\n      1  (unattributed)" in summary
+    assert "by library:\n      2  libc.so.6\n      1  (unattributed)" in summary
     # Nothing attributed: the section would only restate the total.
     assert "by library" not in _render_imports_summary_text(
         {"total_symbols": 3, "by_library": {"(unattributed)": 3}})

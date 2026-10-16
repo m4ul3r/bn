@@ -1180,15 +1180,23 @@ def test_strings_text_clips_long_values_and_the_printed_read_parses_1037(fake_tr
         "address": "0x402020", "length": 16000, "chars": 16000, "type": "ascii",
         "value": value, "section": ".rodata"}],
         "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}
-    fake_transport({"strings": {"ok": True, "result": result}})
-    assert bn.cli.main(["strings", "--target", "active", "--format", "text"]) == 0
+    calls = fake_transport({"strings": {"ok": True, "result": result},
+                            "read": {"ok": True, "result": {"address": "0x402020"}}})
+    # #1037 review finding 4: with several targets open, the command printed
+    # without the invocation's routing exited 2. It carries -i/-t now.
+    assert bn.cli.main(["-i", "inst-a", "strings", "-t", "demod", "--format", "text"]) == 0
     row = capsys.readouterr().out.splitlines()[0]
     assert json.dumps(value[:200]) in row and value[:201] not in row
-    tail = row.split(" … (+15800 chars; full value: --format json or ", 1)[1]
-    printed = shlex.split(tail.rstrip(")"))
-    assert printed == ["bn", "read", "0x402020", "16000", "--encoding", "escaped"]
-    args = bn.cli.build_parser().parse_args(printed[1:])
-    assert (args.address, args.length_pos, args.encoding) == ("0x402020", 16000, "escaped")
+    tail = row.split(" … (+15800 chars; full value: --format json or `", 1)[1]
+    printed = shlex.split(tail.rstrip("`)"))
+    assert printed == ["bn", "-i", "inst-a", "-t", "demod", "read", "0x402020", "16000",
+                       "--encoding", "escaped"]
+    # Run as printed: it reaches the same instance and target.
+    assert bn.cli.main(printed[1:]) == 0
+    sent = calls[-1]
+    assert (sent["op"], sent["instance_id"], sent["target"]) == ("read", "inst-a", "demod")
+    assert (sent["params"]["address"], sent["params"]["length"]) == ("0x402020", 16000)
+    capsys.readouterr()
 
     fake_transport({"strings": {"ok": True, "result": result}})
     assert bn.cli.main(["strings", "--target", "active", "--format", "json"]) == 0
@@ -3562,11 +3570,21 @@ def test_imports_text_names_callers_and_export_attribution_1037(fake_transport, 
             {"name": "puts", "raw_name": "puts", "address": "0x401150", "kind": "function",
              "library": "libc.so.6", "library_source": "symbol-version", "namespace": "",
              "code_ref_count": 0, "caller_count": 0, "callers": []},
+            {"name": "dup", "raw_name": "dup", "address": "0x401160", "kind": "function",
+             "library": None, "namespace": "", "exporting_libraries": ["libreg.so", "libx.so"],
+             "library_note": "exported by more than one needed library",
+             "code_ref_count": None, "caller_count": None, "callers": [],
+             "callers_note": "code refs could not be read: RuntimeError: gone"},
         ],
-        "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": False,
-        "needed_library_files": [{"library": "libreg.so", "path": "/srv/app/libreg.so"},
-                                 {"library": "libc.so.6", "path": None}],
-        "callers_cap": 8, "callers_unrecorded": 1,
+        "total": 3, "offset": 0, "limit": 100, "returned": 3, "has_more": False,
+        "library_unattributed": 1, "needed_libraries": ["libreg.so", "libx.so", "libc.so.6"],
+        "library_unattributed_reasons": {"exported by more than one needed library": 1},
+        "needed_library_files": [
+            {"library": "libreg.so", "path": "/srv/app/libreg.so", "reason": None},
+            {"library": "libx.so", "path": "/srv/app/libx.so", "reason": None},
+            {"library": "libc.so.6", "path": None,
+             "reason": "not found in the search directories"}],
+        "callers_cap": 8,
     }}})
     assert bn.cli.main(["imports", "--target", "active", "--with-callers",
                         "--sysroot", str(tmp_path)]) == 0
@@ -3575,8 +3593,16 @@ def test_imports_text_names_callers_and_export_attribution_1037(fake_transport, 
             "[callers: start_0, start_1, start_2, start_3, start_4, start_5, start_6, "
             "start_7 (+1 more)]") in out
     assert "0x401150  puts [libc.so.6]  [callers: 0 functions]" in out
-    assert "read libreg.so=/srv/app/libreg.so" in out
-    assert "needed libraries not found or not readable: libc.so.6" in out
+    # #1037 review: an ambiguous name stays null and names its exporters
+    # neutrally; an unreadable ref list is unknown, not "0 functions".
+    assert ("0x401160  dup [library unknown; exported by libreg.so, libx.so]  "
+            "[callers unknown: code refs could not be read: RuntimeError: gone]") in out
+    assert ("// 1 import(s) carry no library (1 exported by more than one needed "
+            "library); this target needs: libreg.so, libx.so, libc.so.6") in out
+    assert ("files read: libreg.so=/srv/app/libreg.so, libx.so=/srv/app/libx.so;") in out
+    assert ("// needed libraries not read: libc.so.6 (not found in the search "
+            "directories)") in out
+    # Counted off the rows: only `puts` is a measured zero.
     assert "// 1 import(s) show no recorded code refs" in out
     params = calls[-1]["params"]
     assert (params["with_callers"], params["sysroot"]) == (True, str(tmp_path.resolve()))
@@ -3611,3 +3637,45 @@ def test_strings_text_states_the_landing_pad_note_1037(fake_transport, capsys):
         "data_ref_count": 0, "caller_function_count": 0, "unreferenced_note": note}}})
     assert bn.cli.main(["xrefs", "--target", "active", "0x402015"]) == 0
     assert f"note: {note}" in capsys.readouterr().out
+
+
+def test_imports_summary_text_names_every_attribution_source_1037(fake_transport, capsys):
+    """#1037 review finding 7: the summary labelled every library "symbol
+    version requirements", although some came from export files, and dropped
+    the files read."""
+    fake_transport({"imports": {"ok": True, "result": {
+        "kind": "imports_summary", "total_symbols": 4,
+        "needed_libraries": ["libA.so", "libc.so.6"],
+        "by_library": {"libA.so": 2, "libc.so.6": 1, "(unattributed)": 1},
+        "by_library_source": {"needed-exports": 2, "symbol-version": 1},
+        "library_unattributed_reasons": {"exported by more than one needed library": 1},
+        "needed_library_files": [
+            {"library": "libA.so", "path": "/srv/app/libA.so", "reason": None},
+            {"library": "libc.so.6", "path": None, "reason": "not found in the search directories"}],
+        "namespaces": {"(none)": 4}, "by_kind": {"function": 4},
+    }}})
+    assert bn.cli.main(["imports", "--target", "active", "--summary"]) == 0
+    out = capsys.readouterr().out
+    assert "symbol version requirements" not in out
+    assert "by library:" in out
+    assert "      2  needed-exports" in out and "      1  symbol-version" in out
+    assert "      1  exported by more than one needed library" in out
+    assert "files read: libA.so=/srv/app/libA.so" in out
+
+
+def test_strings_all_targets_routes_each_rows_printed_read_to_its_target_1037(
+        fake_transport, capsys):
+    """#1037 review finding 4, fan-out face: each target's clipped row prints a
+    `bn read` bound to THAT target."""
+    value = "x" * 300
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "tgt-a"}, {"target_id": "tgt-b"}]},
+        "strings": {"ok": True, "result": {"kind": "strings", "items": [{
+            "address": "0x5000", "length": 300, "chars": 300, "type": "ascii",
+            "value": value, "section": ".rodata"}],
+            "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}},
+    })
+    assert bn.cli.main(["strings", "--all-targets"]) == 0
+    out = capsys.readouterr().out
+    assert "`bn -t tgt-a read 0x5000 300 --encoding escaped`" in out
+    assert "`bn -t tgt-b read 0x5000 300 --encoding escaped`" in out

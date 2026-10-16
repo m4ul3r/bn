@@ -170,6 +170,8 @@ def _strings(args: argparse.Namespace) -> int:
         paged_spill=True,
         stem="strings",
         regex_hint_query=args.query,
+        # #1037 review: the clipped row's `bn read` must run as printed.
+        contextual_text_hints=True,
     )
 
 

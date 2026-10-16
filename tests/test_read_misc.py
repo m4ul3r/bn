@@ -1025,9 +1025,10 @@ def test_imports_without_raw_parent_keep_null_library_969(monkeypatch):
 
 
 def test_imports_attribute_unversioned_from_needed_library_exports_1037(monkeypatch, tmp_path):
-    """#1037 item 6: an unversioned import gets the first needed library, in
-    load order, whose file bn READ defines it -- here `libreg.so` beside the
-    binary -- marked `needed-exports`; nothing is guessed from the name."""
+    """#1037 item 6: an unversioned import gets a library only when exactly one
+    needed library bn READ defines it, and every needed library before it was
+    read -- here `libreg.so` beside the binary -- marked `needed-exports`.
+    Otherwise it stays null with the reason; nothing is guessed from the name."""
     from test_elf_dynamic import _build_elf, _library
 
     bridge = _load_bridge(monkeypatch)
@@ -1048,6 +1049,8 @@ def test_imports_attribute_unversioned_from_needed_library_exports_1037(monkeypa
     assert (rows["printf"]["library"], rows["printf"]["library_source"]) == (
         "libc.so.6", "symbol-version")
     assert rows["_ZNSo3putEc"]["library"] is None and "library_source" not in rows["_ZNSo3putEc"]
+    assert rows["_ZNSo3putEc"]["library_note"] == (
+        "not exported by the needed libraries read; some needed libraries could not be read")
 
     (tmp_path / "libreg.so").write_bytes(_library(["_ZNSo3putEc"]))
     listed = instance._imports(None)
@@ -1056,10 +1059,27 @@ def test_imports_attribute_unversioned_from_needed_library_exports_1037(monkeypa
         "libreg.so", "needed-exports")
     assert rows["__gmon_start__"]["library"] is None
     assert listed["needed_library_files"] == [
-        {"library": "libreg.so", "path": str(tmp_path / "libreg.so")},
-        {"library": "libc.so.6", "path": None},
-        {"library": "libstdc++.so.6", "path": None},
+        {"library": "libreg.so", "path": str(tmp_path / "libreg.so"), "reason": None},
+        {"library": "libc.so.6", "path": None,
+         "reason": "not found in the search directories"},
+        {"library": "libstdc++.so.6", "path": None,
+         "reason": "not found in the search directories"},
     ]
+    assert listed["library_unattributed_reasons"] == {
+        "not exported by the needed libraries read; some needed libraries could not be read": 1}
+
+    # Two needed libraries define it: null, both named, no claim which binds.
+    (tmp_path / "libc.so.6").write_bytes(_library(["_ZNSo3putEc"]))
+    rows = {i["name"]: i for i in instance._imports(None)["items"]}
+    assert rows["_ZNSo3putEc"]["library"] is None
+    assert rows["_ZNSo3putEc"]["exporting_libraries"] == ["libreg.so", "libc.so.6"]
+    assert rows["_ZNSo3putEc"]["library_note"] == "exported by more than one needed library"
+
+    # #1037 review finding 7: `--summary` carries the same evidence.
+    (tmp_path / "libc.so.6").unlink()
+    summary = instance._imports(None, summary=True)
+    assert summary["by_library_source"] == {"needed-exports": 1, "symbol-version": 1}
+    assert summary["needed_library_files"][0]["path"] == str(tmp_path / "libreg.so")
 
 
 def test_imports_with_callers_names_capped_calling_functions_1037(monkeypatch):
@@ -1087,8 +1107,34 @@ def test_imports_with_callers_names_capped_calling_functions_1037(monkeypatch):
     assert rows["recv"]["caller_count"] == 10
     assert [fn["name"] for fn in rows["recv"]["callers"]] == [fn.name for fn in callers[:8]]
     assert (rows["accept"]["caller_count"], rows["accept"]["callers"]) == (0, [])
-    assert listed["callers_unrecorded"] == 1
+    # No per-page tally: a collected listing would copy page one's (#1037 review).
+    assert "callers_unrecorded" not in listed
     assert "callers" not in instance._imports(None)["items"][0]
+
+
+def test_imports_with_callers_reports_an_unreadable_ref_list_as_unknown_1037(monkeypatch):
+    """#1037 review finding 5: a failed code-ref enumeration read as 0 callers."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "recv")
+    sym.short_name = "recv"
+    sym.namespace = ""
+    bv = _FakeBV(symbols=[sym])
+
+    def broken(address):
+        raise RuntimeError("code refs unavailable")
+
+    bv.get_code_refs = broken
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    row = instance._imports(None, with_callers=True)["items"][0]
+    assert (row["code_ref_count"], row["caller_count"], row["callers"]) == (None, None, [])
+    assert row["callers_note"] == "code refs could not be read: RuntimeError: code refs unavailable"
+
+    bv.strings = [_FakeStringRef(0x2000, 5, "hello")]
+    srow = instance._strings(None, query=None, offset=0, limit=10, with_xrefs=True)["items"][0]
+    assert (srow["code_ref_count"], srow["xref_function_count"]) == (None, None)
+    assert srow["code_ref_note"].startswith("code refs could not be read")
 
 
 

@@ -521,7 +521,13 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
         page["noise_dropped_sections"] = sorted(
             noise_dropped, key=lambda n: (-noise_dropped[n], n))
     if with_xrefs:
-        _note_unreferenced_strings(page, bv)
+        # #1037 item 11: a fact about the BINARY, stated on every page of a
+        # `--with-xrefs` read so a collected listing keeps it; the text shows it
+        # when a listed row has no reference. No per-page count rides along: a
+        # page-one tally copied onto a collected envelope described page one.
+        note = read_xrefs._landing_pad_note(bv)
+        if note:
+            page["unreferenced_note"] = note
     return page
 
 
@@ -564,28 +570,22 @@ def _string_entry(row: tuple[int, int, str, int, Any, list[str] | None, str], bv
         # `--with-xrefs` count it equals (#1037 item 3).
         entry["format_directives"] = directives
         entry["directive_count"] = len(directives)
-        entry["code_ref_count"] = read_xrefs._code_ref_count(bv, address)
+        refs, failure = _measured_code_refs(bv, address)
+        entry["code_ref_count"] = None if refs is None else len(refs)
+        if failure:
+            entry["code_ref_note"] = failure
     if with_xrefs:
         entry.update(_string_xref_functions(bv, address))
     return entry
 
 
-def _note_unreferenced_strings(page: dict[str, Any], bv) -> None:
-    """#1037 item 11: say why `0 functions` may not mean "unused".
-
-    A string used only from a C++ catch block is reached through a landing pad
-    that `.gcc_except_table` alone points at; BN makes no function for such a
-    pad, so the string shows no reference at all. When a returned row has no
-    code and no data reference and the binary carries that table, the page
-    counts those rows and states the limit. It claims nothing about any one
-    string: it does not look for landing pads."""
-    unreferenced = sum(
-        1 for row in page.get("items") or []
-        if row.get("code_ref_count") == 0 and row.get("data_ref_count") == 0)
-    note = read_xrefs._landing_pad_note(bv) if unreferenced else None
-    if note:
-        page["unreferenced_strings"] = unreferenced
-        page["unreferenced_note"] = note
+def _measured_code_refs(bv, address: int) -> tuple[list | None, str | None]:
+    """BN's code refs to *address* (#284-filtered), or ``(None, reason)`` when
+    the enumeration FAILED: a failed read is unmeasured, never "0 refs"."""
+    try:
+        return read_xrefs._code_refs_once(bv, address, propagate_read_errors=True)[1], None
+    except Exception as exc:  # noqa: BLE001 - one unreadable row must not fail the page
+        return None, f"code refs could not be read: {type(exc).__name__}: {exc}"
 
 
 # #968: the most referencing functions one `strings --with-xrefs` row names. The
@@ -602,14 +602,16 @@ def _string_xref_functions(bv, address: int) -> dict[str, Any]:
     string. Code refs (the #284-filtered population `xrefs` renders) give the
     functions; data refs are counted, not resolved, because a pointer table
     holding the string is not a function that uses it."""
-    code_refs = read_xrefs._genuine_code_refs(bv, address)
+    code_refs, failure = _measured_code_refs(bv, address)
     functions: dict[int, Any] = {}
-    for ref in code_refs:
+    for ref in code_refs or []:
         fn = getattr(ref, "function", None)
         if fn is None:
             continue
         functions.setdefault(int(fn.start), fn)
-    entry: dict[str, Any] = {"code_ref_count": len(code_refs)}
+    entry: dict[str, Any] = {"code_ref_count": None if code_refs is None else len(code_refs)}
+    if failure:
+        entry["code_ref_note"] = failure
     try:
         entry["data_ref_count"] = len(read_xrefs._data_refs_once(bv, address))
     except Exception as exc:  # noqa: BLE001 - one unreadable row must not fail the page
@@ -618,7 +620,7 @@ def _string_xref_functions(bv, address: int) -> dict[str, Any]:
         entry["data_ref_count"] = None
         entry["data_ref_note"] = f"data refs could not be read: {type(exc).__name__}: {exc}"
     ordered = sorted(functions.items())
-    entry["xref_function_count"] = len(ordered)
+    entry["xref_function_count"] = None if code_refs is None else len(ordered)
     # #978: raw `name` plus the demangled `display_name` the text shows, read
     # for the capped rows only.
     entry["xref_functions"] = [
@@ -969,6 +971,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         # Summary aggregates the whole import set; paging would distort the
         # counts, so it always reflects every symbol regardless of offset/limit.
         result = _imports_build_summary(items, needed_libraries)
+        _attach_attribution_evidence(result, items, needed_exports)
         if elf_info is not None and elf_info.notes:
             result["dynamic_section_notes"] = list(elf_info.notes)
         if self_defined_excluded:
@@ -1006,11 +1009,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     if unattributed and needed_libraries:
         result["library_unattributed"] = unattributed
         result["needed_libraries"] = needed_libraries
-    if needed_exports is not None:
-        # Which file each needed library was read from (null: not found or not
-        # readable), so an attribution, or the lack of one, can be checked.
-        result["needed_library_files"] = [
-            {"library": library, "path": path} for library, path in needed_exports.files]
+    _attach_attribution_evidence(result, items, needed_exports)
     # Why attribution may be partial: a dynamic-section structure that was out
     # of range for the file and skipped rather than read (#987 review).
     if elf_info is not None and elf_info.notes:
@@ -1039,14 +1038,17 @@ def _view_binary_path(bv) -> str | None:
 def _attribute_from_needed_exports(bv, items: list[dict[str, Any]],
                                    elf_info: ElfDynamicInfo | None,
                                    sysroot: str | None) -> NeededExports | None:
-    """Stamp `library_source` on attributed rows, and attribute the rest from
-    the needed libraries' export tables (#1037 item 6).
+    """Stamp `library_source` on attributed rows, and look the rest up in the
+    needed libraries' export tables (#1037 item 6).
 
     Sources: `namespace` (BN's own per-library namespace), `symbol-version`
     (the verneed entry the symbol's version names, #969) and `needed-exports`
-    (the first needed library, in load order, whose file was read and defines
-    the name; see `elf_dynamic.needed_export_libraries`). Returns what was read,
-    or None when no row needed it or the target has no DT_NEEDED list."""
+    (exactly one needed library read defines it at its default version, and
+    every needed library before it was read; see `NeededExports.verdict`). A
+    row the lookup leaves null carries `library_note` with the reason and, when
+    any library read defines the name, `exporting_libraries` -- a neutral list
+    that claims nothing about which one the loader binds. Returns what was
+    read, or None when no row needed it or the target has no DT_NEEDED list."""
     unattributed = []
     for item in items:
         namespace = item.get("namespace") or ""
@@ -1061,15 +1063,39 @@ def _attribute_from_needed_exports(bv, items: list[dict[str, Any]],
     search_dirs = library_search_dirs(
         binary_path=_view_binary_path(bv), runpath=elf_info.runpath,
         rpath=elf_info.rpath, sysroot=sysroot)
-    found = needed_export_libraries(elf_info.needed, search_dirs,
-                                    machine=elf_info.machine, sysroot=sysroot)
+    found = needed_export_libraries(elf_info.needed, search_dirs, abi=elf_info.abi,
+                                    flags=elf_info.flags, sysroot=sysroot)
     for item in unattributed:
         raw_name = str(item.get("raw_name") or "")
-        library = found.libraries.get(raw_name) or found.libraries.get(raw_name.split("@", 1)[0])
-        if library:
-            item["library"] = library
+        verdict = found.verdict(raw_name.split("@", 1)[0])
+        if verdict.library:
+            item["library"] = verdict.library
             item["library_source"] = "needed-exports"
+            continue
+        item["library_note"] = verdict.note
+        if verdict.exporting:
+            item["exporting_libraries"] = verdict.exporting
     return found
+
+
+def _attach_attribution_evidence(result: dict[str, Any], items: list[dict[str, Any]],
+                                 found: NeededExports | None) -> None:
+    """What the needed-library lookup read and why rows stayed null, counted
+    over the whole listing (not the page), for the listing and `--summary`."""
+    if found is None:
+        return
+    # Which file each needed library was read from, symlinks resolved; null
+    # with the reason when none was read.
+    result["needed_library_files"] = [
+        {"library": f.library, "path": f.path, "reason": f.reason} for f in found.files]
+    reasons: dict[str, int] = {}
+    for item in items:
+        note = item.get("library_note")
+        if not item.get("library") and isinstance(note, str):
+            reasons[note] = reasons.get(note, 0) + 1
+    if reasons:
+        result["library_unattributed_reasons"] = dict(
+            sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 # #1037 item 5: the most calling functions one `imports --with-callers` row
@@ -1084,17 +1110,17 @@ def _attach_import_callers(bv, page: dict[str, Any]) -> None:
     references to the import's address (the #284-filtered population `xrefs`
     renders); a row with none is counted on the envelope, because `bn xrefs
     <import>` also scans function LLIL for calls BN did not record and this
-    sweep does not."""
-    unrecorded = 0
+    sweep does not (the text says so for the rows with none).
+
+    A row whose code refs could not be READ carries null counts and a
+    `callers_note`, never a measured 0 (#1037 review)."""
     for item in page.get("items") or []:
-        try:
-            address = int(item["address"], 16)
-            refs = read_xrefs._genuine_code_refs(bv, address)
-        except Exception as exc:  # noqa: BLE001 - one unreadable row must not fail the page
+        refs, failure = _measured_code_refs(bv, int(item["address"], 16))
+        if refs is None:
             item["code_ref_count"] = None
             item["caller_count"] = None
             item["callers"] = []
-            item["callers_note"] = f"code refs could not be read: {type(exc).__name__}: {exc}"
+            item["callers_note"] = failure
             continue
         functions: dict[int, Any] = {}
         for ref in refs:
@@ -1106,10 +1132,9 @@ def _attach_import_callers(bv, page: dict[str, Any]) -> None:
         item["caller_count"] = len(ordered)
         item["callers"] = [il_format._function_identity(fn)
                            for _start, fn in ordered[:_IMPORT_CALLER_CAP]]
-        if not refs:
-            unrecorded += 1
+    # A constant, not a per-page count: a per-page tally copied onto a
+    # collected envelope described page one only (#1037 review).
     page["callers_cap"] = _IMPORT_CALLER_CAP
-    page["callers_unrecorded"] = unrecorded
 
 
 def _exports(ctx, selector: str | None, *, offset: int = 0, limit: int | None = None,
@@ -1175,6 +1200,7 @@ def _imports_build_summary(
     namespaces: dict[str, int] = {}
     by_kind: dict[str, int] = {}
     by_library: dict[str, int] = {}
+    by_source: dict[str, int] = {}
     for item in items:
         ns = str(item.get("namespace", "") or "") or "(none)"
         namespaces[ns] = namespaces.get(ns, 0) + 1
@@ -1184,6 +1210,10 @@ def _imports_build_summary(
         # version requirement binds is counted, not dropped.
         library = str(item.get("library") or "") or "(unattributed)"
         by_library[library] = by_library.get(library, 0) + 1
+        # #1037 item 6: where each attributed library came from.
+        source = item.get("library_source")
+        if item.get("library") and isinstance(source, str):
+            by_source[source] = by_source.get(source, 0) + 1
     return {
         # #275: a keyed aggregate, not a flat collection -- keeps its namespaces/
         # by_kind maps but carries a `kind` discriminator like every other read.
@@ -1191,6 +1221,7 @@ def _imports_build_summary(
         "total_symbols": len(items),
         "needed_libraries": needed_libraries or [],
         "by_library": dict(sorted(by_library.items(), key=lambda x: (-x[1], x[0]))),
+        "by_library_source": dict(sorted(by_source.items(), key=lambda x: (-x[1], x[0]))),
         "namespaces": dict(sorted(namespaces.items(), key=lambda x: -x[1])),
         "by_kind": dict(sorted(by_kind.items(), key=lambda x: -x[1])),
     }

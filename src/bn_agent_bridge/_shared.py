@@ -89,13 +89,13 @@ _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
     "strings": (
         "address", "value", "chars", "length", "type", "section",
         "format_directives", "directive_count", "code_ref_count",
-        "data_ref_count", "data_ref_note", "xref_function_count",
-        "xref_functions",
+        "code_ref_note", "data_ref_count", "data_ref_note",
+        "xref_function_count", "xref_functions",
     ),
     "imports": (
         "address", "name", "raw_name", "kind", "library", "namespace",
-        "library_source", "provenance", "code_ref_count", "caller_count",
-        "callers",
+        "library_source", "library_note", "exporting_libraries", "provenance",
+        "code_ref_count", "caller_count", "callers", "callers_note",
     ),
     "exports": (
         "address", "name", "raw_name", "display_name", "kind", "binding",
@@ -131,6 +131,8 @@ _OPTIONAL_ROW_FIELDS: dict[str, dict[str, str]] = {
         "format_directives": "--probable-format-strings",
         "directive_count": "--probable-format-strings",
         "code_ref_count": "--with-xrefs or --probable-format-strings",
+        "code_ref_note": "--with-xrefs or --probable-format-strings, when the code "
+                         "refs could not be read (code_ref_count is null)",
         "data_ref_count": "--with-xrefs",
         "data_ref_note": "--with-xrefs, when the data refs could not be read",
         "xref_function_count": "--with-xrefs",
@@ -138,10 +140,15 @@ _OPTIONAL_ROW_FIELDS: dict[str, dict[str, str]] = {
     },
     "imports": {
         "library_source": "rows whose library is attributed",
+        "library_note": "unattributed rows the needed-library lookup ran for: why "
+                        "library is null",
+        "exporting_libraries": "unattributed rows some needed library read defines "
+                               "(no claim which one the loader binds)",
         "provenance": "imports recovered from a relocation with no import symbol",
         "code_ref_count": "--with-callers",
         "caller_count": "--with-callers",
         "callers": "--with-callers",
+        "callers_note": "--with-callers, when the code refs could not be read",
     },
     "sections": {
         "readable": "sections backed by a segment",
@@ -156,9 +163,6 @@ _OPTIONAL_ROW_FIELDS: dict[str, dict[str, str]] = {
     },
     "callsites": {
         "callee_variadic": "variadic callees",
-        "call_index": "--within",
-        "within_query": "--within",
-        "also_in": "--within",
         "decompile_excerpt": "rows whose HLIL statement is null",
     },
 }

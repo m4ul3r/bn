@@ -12,9 +12,14 @@ import struct
 import pytest
 
 from bn_agent_bridge.elf_dynamic import (
+    NONDEFAULT_ONLY,
+    NOT_EXPORTED,
+    SEVERAL_EXPORTERS,
+    UNREAD_BEFORE,
     library_search_dirs,
     needed_export_libraries,
     parse_elf_dynamic,
+    read_elf_file,
 )
 
 _BASE = 0x400000
@@ -25,8 +30,8 @@ def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, run
     """An ELF image whose dynamic symbols are ``symbols``: ``(name, library)``
     pairs, ``library`` None for an unversioned symbol. ``count_source`` is
     ``"hash"`` (DT_HASH), ``"section"`` (a SHT_DYNSYM header) or ``"none"``.
-    ``defined`` adds DEFINED symbols as ``(name, st_info, st_other)`` triples
-    (unversioned); ``machine`` overrides e_machine."""
+    ``defined`` adds DEFINED symbols as ``(name, st_info, st_other[, versym])``
+    (versym 1, unversioned, by default); ``machine`` overrides e_machine."""
     e = endian
     strtab = bytearray(b"\x00")
 
@@ -45,7 +50,7 @@ def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, run
     lib_file = {lib: intern(lib) for lib in libraries}
     lib_ver = {lib: intern(f"V_{i}") for i, lib in enumerate(libraries)}
     sym_names = [intern(name) for name, _ in symbols]
-    defined_names = [(intern(name), info, other) for name, info, other in defined]
+    defined_names = [(intern(d[0]), d[1], d[2]) for d in defined]
 
     syment = 24 if is64 else 16
     dynsym = bytearray(syment)  # index 0: the null symbol
@@ -61,7 +66,7 @@ def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, run
             dynsym += struct.pack(e + "IIIBBH", name_off, 0x1000, 8, info, other, 1)
     versym = struct.pack(e + "H", 0) + b"".join(
         struct.pack(e + "H", version_index[lib] if lib else 1) for _, lib in symbols) + b"".join(
-        struct.pack(e + "H", 1) for _ in defined)
+        struct.pack(e + "H", d[3] if len(d) > 3 else 1) for d in defined)
     verneed = bytearray()
     for i, lib in enumerate(libraries):
         next_need = 32 if i + 1 < len(libraries) else 0
@@ -343,16 +348,19 @@ def test_file_size_bounds_reads_even_when_the_reader_could_serve_more():
 
 _GLOBAL_FUNC, _WEAK_FUNC, _LOCAL_FUNC = 0x12, 0x22, 0x02
 _HIDDEN = 2
+_X86_64 = (2, 1, 62, 0)       # ELFCLASS64, ELFDATA2LSB, EM_X86_64, SYSV
+_AARCH64 = (2, 1, 183, 0)
 
 
 def _library(names, *, is64=True, endian="<", machine=None, hidden=(), local=(),
-             needed=()):
+             needed=(), versioned=()):
     """A shared library image exporting *names* (global functions), plus
-    defined-but-not-exported *hidden* and *local* symbols, and one undefined
-    import of its own (`malloc`)."""
+    defined-but-not-exported *hidden* and *local* symbols, *versioned*
+    ``(name, versym)`` definitions, and one undefined import of its own."""
     defined = [(n, _GLOBAL_FUNC, 0) for n in names]
     defined += [(n, _GLOBAL_FUNC, _HIDDEN) for n in hidden]
     defined += [(n, _LOCAL_FUNC, 0) for n in local]
+    defined += [(n, _GLOBAL_FUNC, 0, versym) for n, versym in versioned]
     return _build_elf(is64=is64, endian=endian, machine=machine, needed=needed,
                       symbols=(("malloc", None),), defined=defined)
 
@@ -360,12 +368,16 @@ def _library(names, *, is64=True, endian="<", machine=None, hidden=(), local=(),
 @pytest.mark.parametrize("is64, endian", [(True, "<"), (False, ">")])
 def test_exports_are_the_defined_symbols_other_modules_can_bind(is64, endian):
     image = _library(["_ZN8Registry3getEv"], is64=is64, endian=endian,
-                     hidden=["internal_helper"], local=["static_helper"])
+                     hidden=["internal_helper"], local=["static_helper"],
+                     versioned=[("chosen", 0x8003), ("current", 2), ("both", 0x8003),
+                                ("both", 3)])
     size = len(image)
     info = parse_elf_dynamic(lambda o, n: image[o:o + n], size, with_exports=True)
     # The undefined import, the hidden definition and the local one are not
-    # symbols the loader resolves another module's reference against.
-    assert info.exports == frozenset({"_ZN8Registry3getEv"})
+    # symbols the loader resolves another module's reference against. A
+    # nondefault `chosen@V` is exported but not as a default definition.
+    assert info.exports == {"_ZN8Registry3getEv": True, "chosen": False, "current": True,
+                            "both": True}
     assert parse_elf_dynamic(lambda o, n: image[o:o + n], size).exports is None
 
 
@@ -375,38 +387,107 @@ def _write(path, image):
     return str(path)
 
 
-def test_first_needed_library_in_load_order_wins(tmp_path):
-    # Both define `shared_name`: the loader binds the first in DT_NEEDED
-    # order, whatever the alphabetical or directory order.
+def _lookup(needed, dirs, *, abi=_AARCH64, flags=0, sysroot=None):
+    return needed_export_libraries(needed, [str(d) for d in dirs], abi=abi, flags=flags,
+                                   sysroot=sysroot)
+
+
+def test_a_name_is_attributed_only_when_one_library_read_defines_it(tmp_path):
     _write(tmp_path / "libz_first.so", _library(["shared_name", "only_first"]))
     _write(tmp_path / "liba_second.so", _library(["shared_name", "only_second"]))
-    found = needed_export_libraries(["libz_first.so", "liba_second.so"], [str(tmp_path)],
-                                    machine=183)
-    assert found.libraries["shared_name"] == "libz_first.so"
-    assert found.libraries["only_second"] == "liba_second.so"
-    assert found.files == [("libz_first.so", str(tmp_path / "libz_first.so")),
-                           ("liba_second.so", str(tmp_path / "liba_second.so"))]
+    found = _lookup(["libz_first.so", "liba_second.so"], [tmp_path])
+    assert found.verdict("only_second").library == "liba_second.so"
+    # Two exporters: no load-order rule picks one; both are listed, neutrally.
+    shared = found.verdict("shared_name")
+    assert (shared.library, shared.exporting, shared.note) == (
+        None, ["libz_first.so", "liba_second.so"], SEVERAL_EXPORTERS)
+    assert found.verdict("absent").note == NOT_EXPORTED
+    assert [(f.library, f.path) for f in found.files] == [
+        ("libz_first.so", str(tmp_path / "libz_first.so")),
+        ("liba_second.so", str(tmp_path / "liba_second.so"))]
+
+
+def test_a_nondefault_symbol_version_is_never_attributed_1037_review(tmp_path):
+    """Review blocker 1: libold exported only `chosen@OLD_1` (hidden), libgood
+    a plain `chosen`; the process bound libgood's, and bn named libold."""
+    _write(tmp_path / "libold.so", _library([], versioned=[("chosen", 0x8003)]))
+    _write(tmp_path / "libgood.so", _library(["chosen"]))
+    both = _lookup(["libold.so", "libgood.so"], [tmp_path]).verdict("chosen")
+    assert (both.library, both.exporting) == (None, ["libold.so", "libgood.so"])
+    only_old = _lookup(["libold.so"], [tmp_path]).verdict("chosen")
+    assert (only_old.library, only_old.note) == (None, NONDEFAULT_ONLY)
 
 
 def test_no_attribution_past_a_needed_library_that_was_not_read(tmp_path):
-    # libmissing.so comes first and could define `only_second`: naming
-    # liba_second.so for it would be a guess, so it stays unattributed.
+    # libmissing.so comes first and could define `only_second`.
     _write(tmp_path / "libz_first.so", _library(["only_first"]))
     _write(tmp_path / "liba_second.so", _library(["only_second"]))
-    found = needed_export_libraries(
-        ["libz_first.so", "libmissing.so", "liba_second.so"], [str(tmp_path)], machine=183)
-    assert found.libraries == {"only_first": "libz_first.so"}
-    assert ("libmissing.so", None) in found.files
+    found = _lookup(["libz_first.so", "libmissing.so", "liba_second.so"], [tmp_path])
+    assert found.verdict("only_first").library == "libz_first.so"
+    blocked = found.verdict("only_second")
+    assert (blocked.library, blocked.exporting, blocked.note) == (
+        None, ["liba_second.so"], UNREAD_BEFORE)
+    assert found.files[1].path is None and found.files[1].reason
 
 
-def test_a_library_of_another_machine_is_skipped_like_the_loader_does(tmp_path):
+@pytest.mark.parametrize("is64, endian, machine", [
+    (False, "<", 62),   # Sol: an x32 ELF32 file shares EM_X86_64 with ELF64
+    (True, ">", 62),    # Opus: the other byte order on the same machine
+    (True, "<", 3),     # another machine
+])
+def test_a_library_of_another_abi_is_skipped_like_the_loader_does(tmp_path, is64, endian,
+                                                                   machine):
+    """Review blocker 2: e_machine alone accepted a file of the wrong class or
+    byte order, and attributed the import to the wrong file."""
+    _write(tmp_path / "wrongabi" / "libabiA.so",
+           _library(["foo"], is64=is64, endian=endian, machine=machine))
+    _write(tmp_path / "rightabi" / "libabiA.so", _library(["a_only"], machine=62))
+    _write(tmp_path / "rightabi" / "libabiB.so", _library(["foo"], machine=62))
+    found = _lookup(["libabiA.so", "libabiB.so"],
+                    [tmp_path / "wrongabi", tmp_path / "rightabi"], abi=_X86_64)
+    assert found.verdict("foo").library == "libabiB.so"
+    assert found.files[0].path == str(tmp_path / "rightabi" / "libabiA.so")
+
+
+def test_a_library_with_other_e_flags_is_not_read(tmp_path):
+    image = bytearray(_library(["foo"], machine=40, is64=False))
+    struct.pack_into("<I", image, 0x24, 0x5000200)   # soft-float EABI5
+    _write(tmp_path / "libarm.so", bytes(image))
+    found = _lookup(["libarm.so"], [tmp_path], abi=(1, 1, 40, 0), flags=0x5000400)
+    assert found.files[0].path is None and "e_flags" in found.files[0].reason
+    assert found.verdict("foo").library is None
+
+
+def test_sysroot_symlinks_resolve_inside_the_sysroot_1037_review(tmp_path):
+    """Review blocker 3: `sr/usr/lib/libA.so -> /abs/host/libA.so` was read
+    from the host. Under a sysroot an absolute link is re-rooted, and a link
+    that climbs out of the root is refused."""
+    root = tmp_path / "sr"
     host = tmp_path / "host"
-    target = tmp_path / "target"
-    _write(host / "libreg.so", _library(["wrong_arch_name"], machine=62))
-    _write(target / "libreg.so", _library(["right_arch_name"]))
-    found = needed_export_libraries(["libreg.so"], [str(host), str(target)], machine=183)
-    assert found.libraries == {"right_arch_name": "libreg.so"}
-    assert found.files == [("libreg.so", str(target / "libreg.so"))]
+    _write(host / "libA.so", _library(["host_only"]))
+    _write(root / "opt" / "real" / "libA.so", _library(["target_only"]))
+    (root / "usr" / "lib").mkdir(parents=True)
+    (root / "usr" / "lib" / "libA.so").symlink_to("/opt/real/libA.so")
+    (root / "usr" / "lib" / "libB.so").symlink_to(host / "libA.so")      # absolute, host path
+    (root / "usr" / "lib" / "libC.so").symlink_to("../../../host/libA.so")  # climbs out
+    dirs = library_search_dirs(binary_path=None, runpath=None, rpath=None, sysroot=str(root))
+    found = _lookup(["libA.so", "libB.so", "libC.so"], dirs, sysroot=str(root))
+    assert found.files[0].path == str(root / "opt" / "real" / "libA.so")
+    assert found.verdict("target_only").library == "libA.so"
+    assert found.verdict("host_only").library is None
+    # libB's absolute target, re-rooted, does not exist inside the sysroot.
+    assert found.files[1].path is None
+    assert found.files[2].path is None and "outside the sysroot" in found.files[2].reason
+
+
+def test_without_a_sysroot_an_absolute_library_symlink_is_not_followed(tmp_path):
+    host = _write(tmp_path / "host" / "libA.so", _library(["host_only"]))
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "libA.so").symlink_to(host)
+    (tmp_path / "app" / "libR.so").symlink_to("../host/libA.so")
+    found = _lookup(["libA.so", "libR.so"], [tmp_path / "app"])
+    assert found.files[0].path is None and "absolute symlink" in found.files[0].reason
+    assert found.files[1].path == host
 
 
 def test_search_dirs_expand_origin_and_read_absolute_entries_only_under_a_sysroot(tmp_path):
@@ -424,3 +505,9 @@ def test_search_dirs_expand_origin_and_read_absolute_entries_only_under_a_sysroo
                              str(sysroot / "opt" / "vendor" / "lib"), origin]
     assert str(sysroot / "usr" / "lib" / "aarch64-linux-gnu") in with_root
     assert "/ignored/when/runpath" not in " ".join(with_root)
+
+
+def test_read_elf_file_reports_the_abi_identity(tmp_path):
+    info = read_elf_file(_write(tmp_path / "lib32.so", _library(["x"], is64=False, endian=">",
+                                                                  machine=8)))
+    assert (info.abi, info.flags) == ((1, 2, 8, 0), 0)
