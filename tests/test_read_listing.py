@@ -2375,6 +2375,72 @@ def test_callee_vtable_actual_registry_must_resolve_exact_canonical_object(monke
     assert result["callee_data_ref_vtables"] == []
 
 
+# --- #1037 item 9: an exact name match leads the default search order --------
+
+
+def _main_population():
+    # `__libc_start_main` sits BELOW `main` in address order, as in a real ELF.
+    return [_FakeFunction(0x4007f0, "__libc_start_main"),
+            _FakeFunction(0x4008c0, "main"),
+            _FakeFunction(0x400900, "main_loop"),
+            _FakeFunction(0x400a00, "Main")]
+
+
+def test_search_lists_exact_name_matches_first_then_address_order_1037(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _view(monkeypatch, instance, _main_population())
+
+    result = instance._search_functions(None, "main")
+
+    # Both exact spellings (case-insensitive) first, each group in address order.
+    assert [row["name"] for row in result["items"]] == [
+        "main", "Main", "__libc_start_main", "main_loop"]
+    assert result["exact_matches_first"] == 2
+    # Paging walks the SAME order: page two starts where page one stopped.
+    page2 = instance._search_functions(None, "main", offset=2, limit=2)
+    assert [row["name"] for row in page2["items"]] == ["__libc_start_main", "main_loop"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"sort": "address", "reverse": True},
+    {"sort": "name"},
+    {"regex": True},
+])
+def test_search_keeps_an_explicit_order_and_regex_order_1037(monkeypatch, kwargs):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _view(monkeypatch, instance, _main_population())
+
+    result = instance._search_functions(None, "main", **kwargs)
+
+    assert "exact_matches_first" not in result
+    if kwargs.get("regex"):
+        assert result["items"][0]["name"] == "__libc_start_main"
+
+
+def test_search_does_not_announce_an_order_when_every_match_is_exact_1037(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _view(monkeypatch, instance, [_FakeFunction(0x4008c0, "main")])
+
+    assert "exact_matches_first" not in instance._search_functions(None, "main")
+
+
+def test_an_explicit_address_sort_is_plain_ascending_address_order_1048(monkeypatch):
+    """#1048 review blocker: `--sort address` asked for ascending address order,
+    and the exact-first rerank overrode it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _view(monkeypatch, instance, _main_population())
+
+    result = instance._search_functions(None, "main", sort="address")
+
+    assert [row["address"] for row in result["items"]] == [
+        "0x4007f0", "0x4008c0", "0x400900", "0x400a00"]
+    assert "exact_matches_first" not in result
+
+
 def _elf_vtable_image(symbols, *, symtab=True, data_words=(), endian="<",
                       section_flags=2, e_type=2):
     """A 64-bit ELF whose one PROGBITS section maps 0x4000..0x4200 and holds

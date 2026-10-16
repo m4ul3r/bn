@@ -6638,6 +6638,66 @@ def test_diagnostic_recovery_and_target_commands_run_as_printed(tmp_path):
         _session_stop(instance_id)
 
 
+class TestAddressOperandNames1042:
+    """#1042 items 1-2 on BN's own symbol table: whether a stripped view has a
+    symbol behind `data_<hex>` / `sub_<hex>` is BN's call, and the mocked fakes
+    can only model it. The dispatch fixture has a named data table (`table`)
+    and a `.bss` buffer (`g_out`) that a stripped copy renders as `data_<hex>`."""
+
+    def _table_address(self, shared_bn) -> str:
+        rows = shared_bn.json("data", "symbols", "--query", "table")["items"]
+        return next(row["a"] for row in rows if row["n"] == "table")
+
+    def test_read_and_data_vars_take_a_data_symbol_name(self, shared_bn):
+        shared_bn.load(DISPATCH_BINARY)
+        address = self._table_address(shared_bn)
+
+        by_name = shared_bn.json("read", "table", "16")
+        assert by_name["resolved_symbol"] == {"name": "table", "kind": "data",
+                                              "address": address}
+        assert by_name["hex"] == shared_bn.json("read", address, "16")["hex"]
+
+        at = shared_bn.json("data", "vars", "--at", "table")
+        assert [row["address"] for row in at["items"]] == [address]
+
+        text = shared_bn.run("read", "table", "8")
+        assert text.returncode == 0, text.stderr
+        assert text.stdout.startswith(f"note: resolved 'table' as a data symbol @ {address}\n")
+
+    def test_stripped_placeholders_resolve_and_rename(self, shared_bn, tmp_path):
+        stripped = tmp_path / "dispatch_stripped"
+        build = subprocess.run(["strip", "-o", str(stripped), str(DISPATCH_BINARY)],
+                               capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        nm = subprocess.run(["nm", str(DISPATCH_BINARY)], capture_output=True, text=True)
+        g_out = next(int(line.split()[0], 16) for line in nm.stdout.splitlines()
+                     if line.endswith(" g_out"))
+        shared_bn.load(stripped, copy=False)
+        placeholder = f"data_{g_out:x}"
+
+        read = shared_bn.json("read", placeholder, "4")
+        assert read["address"] == hex(g_out)
+        assert read["resolved_symbol"]["kind"] == "placeholder"
+        xrefs = shared_bn.json("xrefs", placeholder)
+        assert xrefs["resolved_symbol"]["kind"] == "placeholder" and xrefs["total"] > 0
+
+        # The batch that used to roll back on `Symbol not found: data_<hex>`.
+        function = next(f for f in shared_bn.json("function", "list", "--limit", "500")["items"]
+                        if f["name"].startswith("sub_"))
+        manifest = tmp_path / "rename.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": placeholder, "new_name": "g_out",
+             "kind": "data"},
+            {"op": "rename_symbol", "identifier": function["name"], "new_name": "h_first"},
+        ]}), encoding="utf-8")
+        result = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        rows = json.loads(result.stdout)["results"]
+        assert [row["status"] for row in rows] == ["verified", "verified"], rows
+        assert rows[0]["address"] == hex(g_out)
+        assert rows[0]["resolved_symbol"]["kind"] == "placeholder"
+
+
 _VTABLE_LAYOUT_ASM = r"""
 .text
 .macro fn name, value

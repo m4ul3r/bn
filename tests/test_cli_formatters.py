@@ -4293,6 +4293,10 @@ _GO_RENAME_NON_COUNT_READS = {
     "replaced_members", "class_apply_types",
     # #993 review round 2: the rolled-back declare's kept library imports.
     "kept_library_imports",
+    # #1042 review: the paired renderer prints how a name an op was given
+    # resolved (`note: resolved …`); a listing, not a count, and absent on
+    # every `go rename`.
+    "resolved_symbol", "resolved_symbols",
     # #997 item 2: the paired renderer reads the fall-through create warnings
     # back off the summary; a listing, not a count, and absent on every `go rename`.
     "fallthrough_entries",
@@ -4450,13 +4454,14 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
     # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
+    # #1037 item 9 adds the `function search` exact-matches-first count.
     # #1037 adds the `evidence function --callee` header's `excluded` count; the
     # recorded context carries a `callee_filter`, whose header always states the
     # paging, so `_render_function_evidence_text(offset)` is now checked below
     # instead of skipped as unstated.
-    assert len(sites) == 64, (
+    assert len(sites) == 65, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 64. A "
+        "count helper, not 65. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4523,6 +4528,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # #978: the `function search` mangled-only line is a fragment helper the
         # list and `--count` renderers both append, like the line above.
         "_mangled_only_note(mangled_only_matches) [not a payload renderer]",
+        # #1037 item 9: the exact-matches-first line is the same kind of
+        # fragment helper, appended by the `function search` list renderer.
+        "_exact_first_note(exact_matches_first) [not a payload renderer]",
         "_operation_row_text(count) [not a payload renderer]",
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",
@@ -8239,8 +8247,10 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                 keys.add(node.slice.value)
     # #825's include_root and #890's unapplied_prototypes both join the row;
     # M-03's split disclosure reads each overlap row's name/address/offset,
-    # and #927's observed fate adds `truncated`.
-    assert len(keys) == 16, f"the op row reads {sorted(keys)}, not 16 keys"
+    # and #927's observed fate adds `truncated`. #1042 review adds the row's
+    # resolution note, read through `_resolved_symbol_notes`: `resolved_symbol`,
+    # `resolved_symbols` and the entry's `kind`; none is a count.
+    assert len(keys) == 19, f"the op row reads {sorted(keys)}, not 19 keys"
 
     digits = re.compile(r"\d+")
     fabricated, rendered, checked = [], 0, 0
@@ -8267,14 +8277,15 @@ def test_an_op_row_never_states_a_count_the_payload_did_not():
                             f"{out!r}, which states {invented} -- a count the "
                             "payload never did")
     assert not fabricated, fabricated[:6]
-    # Measured with both keys: 3168 renders, 1848 examined after the readable
-    # container carve-out. The two sizes are separate coverage claims.
-    assert (rendered, checked) == (3168, 1848), (
-        f"the op-row count sweep RENDERED {rendered} cases, not 3168, and "
-        f"CHECKED {checked} of them, not 1848. Two sizes, because they are two "
-        "different claims: the carve-out for a readable container skips 1320 "
-        "renders before any assertion, and pinning only the larger number "
-        "overstated the covered set by 40%.")
+    # Measured with both keys: 3762 renders, 2178 examined after the readable
+    # container carve-out (the #1042 resolution note's three reads took it from
+    # 3168/1848). The two sizes are separate coverage claims.
+    assert (rendered, checked) == (3762, 2178), (
+        f"the op-row count sweep RENDERED {rendered} cases, not 3762, and "
+        f"CHECKED {checked} of them, not 2178. Two sizes, because they are two "
+        "different claims: the carve-out for a readable container skips "
+        f"{3762 - 2178} renders before any assertion, and pinning only the larger "
+        "number would overstate the covered set.")
     # The other half, and the reason this is not a blanket "never print a
     # number": a count the payload DID state must still be stated, or the
     # refusal would be a silent cap on every honest row.
@@ -10255,6 +10266,31 @@ def test_failed_import_preview_counts_reverted_siblings_and_all_kept_types_1012(
     text = _render_mutation_summary_text(summary)
     assert "reverted=1" in text
     assert "kept library imports (a rollback cannot remove them): passwd, __uid_t" in text
+
+
+def test_mutation_text_says_how_a_placeholder_name_resolved_1048():
+    """#1048 review: `rename data_420010 g_live` printed only counts; the compact
+    line and the verbose op row now carry the resolution note."""
+    from bn import formatters
+
+    resolved = {"name": "data_420010", "kind": "placeholder", "address": "0x420010"}
+    payload = {"success": True, "preview": True, "committed": False, "rolled_back": True,
+               "results": [{"op": "rename_symbol", "kind": "data", "address": "0x420010",
+                            "new_name": "g_live", "status": "verified",
+                            "resolved_symbol": resolved}]}
+
+    compact = formatters._render_mutation_summary_text(formatters._mutation_summary(payload))
+    assert compact.splitlines()[-1] == (
+        "note: resolved 'data_420010' as the address its name spells "
+        "(no symbol has that name) @ 0x420010")
+
+    row = formatters._format_operation_result(payload["results"][0])
+    assert row.startswith("rename_symbol data 0x420010 -> g_live  (resolved 'data_420010'")
+
+    plain = dict(payload["results"][0])
+    del plain["resolved_symbol"]
+    assert "resolved" not in formatters._render_mutation_summary_text(
+        formatters._mutation_summary({**payload, "results": [plain]}))
 
 
 def test_go_rename_compact_status_carries_kept_library_imports_1012():

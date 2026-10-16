@@ -760,49 +760,24 @@ def _find_import_symbol(ctx, bv, name: str):
     return None
 
 
-def _find_data_symbol(ctx, bv, name: str):
-    """A non-function symbol (DataSymbol, etc.) by name -- demangled or raw -- or
-    None. Lets `xrefs g_state_table` resolve a global/data symbol instead of
-    failing with a misleading 'use bn imports' (#224b)."""
-    cands: list[Any] = []
-    getbn = getattr(bv, "get_symbols_by_name", None)
-    if callable(getbn):
-        try:
-            cands = list(getbn(name) or [])
-        except Exception:
-            cands = []
-    if not cands:
-        graw = getattr(bv, "get_symbol_by_raw_name", None)
-        if callable(graw):
-            try:
-                s = graw(name)
-                if s is not None:
-                    cands = [s]
-            except Exception:
-                cands = []
-    for s in cands:
-        st = str(getattr(getattr(s, "type", None), "name", "") or "")
-        if "Function" in st:
-            continue  # functions are handled by _find_function; we want data here
-        if getattr(s, "address", None) is not None:
-            return s
-    return None
-
-
 def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
     sym = _find_import_symbol(ctx, bv, identifier)
     if sym is None:
         # #224b: not a function or import -- try a data symbol (a global table,
         # state struct, ...) and xref its address before erroring, so the result
         # matches `xrefs <address>` instead of a misleading import-only error.
-        data_sym = _find_data_symbol(ctx, bv, identifier)
-        if data_sym is not None:
-            result = _xrefs_to_address(ctx, bv, int(data_sym.address), offset=offset, limit=limit)
-            result["resolved_symbol"] = {
-                "name": str(identifier),
-                "kind": "data",
-                "address": hex(int(data_sym.address)),
-            }
+        # #1042 item 2: through the shared address-operand resolver, so `xrefs`,
+        # `read`, `data vars` and `data retype` resolve one name the same way --
+        # including a rendered `data_<hex>` no symbol carries.
+        try:
+            data_address, resolved = ctx._resolve_address_operand(bv, identifier)
+        except RuntimeError as exc:
+            if "Ambiguous" in str(exc):
+                raise
+            resolved = None
+        if resolved is not None and resolved.get("kind") in {"data", "placeholder"}:
+            result = _xrefs_to_address(ctx, bv, data_address, offset=offset, limit=limit)
+            result["resolved_symbol"] = resolved
             return result
         available: list[str] = []
         for attr_name, kind in _IMPORT_SYMBOL_TYPES:

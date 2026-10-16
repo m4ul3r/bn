@@ -502,8 +502,8 @@ def _functions_for_op(ctx, bv, op: dict[str, Any], *, type_limit: int | None):
         elif kind == "data_retype":
             # A global's type reflows every function that reads it, so the blast
             # radius is the code xrefs to the address, not a single function (#649).
-            functions = list(ctx._functions_referencing(bv, _parse_address(op["address"]),
-                                                       limit=type_limit))
+            address, _ = ctx._resolve_address_operand(bv, op["address"])
+            functions = list(ctx._functions_referencing(bv, address, limit=type_limit))
         elif kind.startswith("struct_") or kind == "types_declare":
             for type_name in _operation_type_names(ctx, bv, op):
                 functions.extend(_guess_type_affected_functions(ctx, bv, type_name, limit=type_limit))
@@ -3293,6 +3293,10 @@ def _op_rename_symbol(ctx, bv, op: dict[str, Any]):
     )
     target = ctx._resolve_rename_target(bv, identifier, kind)
     requested = _operation_requested(ctx, op)
+    # #1042 item 1: a rendered `data_<hex>`/`sub_<hex>` name resolved to the
+    # address it spells; the row says so, so the rename is not read as having
+    # found a symbol by that name.
+    resolved = {"resolved_symbol": target["resolved_symbol"]} if target.get("resolved_symbol") else {}
     if target["kind"] == "function":
         fn = bv.get_function_at(target["address"])
         if fn is None:
@@ -3306,6 +3310,7 @@ def _op_rename_symbol(ctx, bv, op: dict[str, Any]):
             "before_name": target["before_name"],
             "new_name": new_name,
             "requested": requested,
+            **resolved,
         }
     address = int(target["address"])
     if target["before_name"] != new_name:
@@ -3317,6 +3322,7 @@ def _op_rename_symbol(ctx, bv, op: dict[str, Any]):
         "before_name": target["before_name"],
         "new_name": new_name,
         "requested": requested,
+        **resolved,
     }
 
 
@@ -4236,7 +4242,14 @@ def _op_data_retype(ctx, bv, op: dict[str, Any]):
     atomicity, no audit trail. ``define_user_data_var`` IS journaled in BN's undo
     buffer (verified live: revert_undo_actions restores the prior auto type), so the
     standard preview/rollback machinery covers it with no explicit restore."""
-    address = _parse_address(op["address"])
+    # #1042 item 2: the address operand takes a symbol name (or a rendered
+    # `data_<hex>`) like every other address-taking surface, through the one
+    # resolver; the row records how the name resolved.
+    try:
+        address, resolved = ctx._resolve_address_operand(bv, op["address"])
+    except RuntimeError as exc:
+        raise OperationFailure("unsupported", str(exc),
+                               requested=_operation_requested(ctx, op)) from None
     _refuse_unmapped_mutation_address(
         ctx, bv, op, address, "no data variable can be defined there."
     )
@@ -4253,6 +4266,7 @@ def _op_data_retype(ctx, bv, op: dict[str, Any]):
         "before_auto_discovered": before_auto,
         "expected_type": str(expected_type),
         "requested": _operation_requested(ctx, op),
+        **({"resolved_symbol": resolved} if resolved else {}),
     }
 
 
