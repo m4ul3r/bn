@@ -3406,17 +3406,18 @@ class TaintEngine:
         }
         return True
 
-    def _format_destination_end(self, ssaf: Any, model: Any, params: list[Any]) -> int | None:
-        """For a scanf-family `call:` preset: one past the last argument the
-        call's CONSTANT format actually writes (``first_dest`` plus its
-        assigning conversions), else None (no format sink, an unreadable
-        format, or `%n$` positions -- seed the modeled run as before).
-
-        BN recovers a variadic call's arity from register writes, so a
-        `scanf("%s", buf)` can show a stale third argument (the stack-guard
-        address); seeding it named a "buffer" scanf never writes and, under
-        #1041 item 1, reported it unkeyed (#1050 re-dogfood). The format says
-        which arguments are destinations; nothing is guessed."""
+    def _format_destination_shortfall(self, ins: Any, ssaf: Any, callee: str, model: Any,
+                                      params: list[Any]) -> dict | None:
+        """A blocking `format_destination_unrecovered` leaf when the call's fully
+        read constant format writes more destinations than BN recovered
+        arguments for (#1050 review round 8): a forwarded incoming pointer left
+        in its argument register is passed, yet BN's MLIL call does not list it,
+        so it was never seeded. The missing arguments are not guessed and the
+        model range is not widened; the gap is disclosed by count. It only
+        adds a leaf, never removes a seed (round 9 removed destination
+        trimming). The constant-format test checks only the format's START
+        address: a format whose suffix lies in writable storage can be
+        under-counted, which then yields no leaf, as on base."""
         sink = (model or {}).get("sink") or {}
         fa, first = sink.get("format_arg"), sink.get("first_dest")
         if fa is None or first is None or int(fa) >= len(params):
@@ -3427,19 +3428,10 @@ class TaintEngine:
         specs = _format_specs(fmt, is_scanf=True)
         if any(s.positional for s in specs):
             return None
-        return int(first) + sum(1 for s in specs if not s.suppressed)
-
-    def _format_destination_shortfall(self, ins: Any, callee: str, model: Any,
-                                      params: list[Any], dest_end: int | None) -> dict | None:
-        """A blocking `format_destination_unrecovered` leaf when the call's fully
-        read constant format writes more destinations than BN recovered
-        arguments for (#1050 review round 8): a forwarded incoming pointer left
-        in its argument register is passed, yet BN's MLIL call does not list it,
-        so it was never seeded. The missing arguments are not guessed and the
-        model range is not widened; the gap is disclosed by count."""
-        if dest_end is None or dest_end <= len(params):
+        first = int(first)
+        dest_end = first + sum(1 for s in specs if not s.suppressed)
+        if dest_end <= len(params):
             return None
-        first = int(((model or {}).get("sink") or {}).get("first_dest") or 0)
         missing = dest_end - len(params)
         at = hex(int(getattr(ins, "address", 0)))
         return {
@@ -4493,158 +4485,30 @@ class TaintEngine:
             if lost is not None:
                 out["leaves"].append(lost)
         if not ssa_writes(ins) and "TAILCALL" not in op_name(ins):
-            dropped = self._dropped_result_leaf(ins, callee_fn, tainted_args, caller_fn,
-                                                caller_instrs)
-            if dropped is not None:
-                out["leaves"].append(dropped)
+            out["leaves"].append(self._dropped_result_leaf(ins, callee_fn, tainted_args,
+                                                           caller_fn))
         return out
 
     def _dropped_result_leaf(self, ins: Any, callee_fn: Any, tainted_args: dict,
-                             caller_fn: Any, caller_instrs: list | None) -> dict[str, Any] | None:
-        """#1034 item 5, at the call site (re-dogfood of #1050): BN's MLIL gives
-        a call with tainted arguments NO result, yet the caller's machine code
-        reads the calling convention's return register after it before writing
-        it -- so the caller uses a value BN dropped, and whatever the callee
-        returned is not followed. The callee's shape is not predicted; the fact
-        is read off the caller's LLIL (:meth:`_return_register_read_after`)."""
-        found = self._return_register_read_after(caller_fn, ins, caller_instrs)
-        if found is None:
-            return None
-        reg, seen = found
-        use = (f"the caller's machine code reads the return register {reg} after it"
-               if seen else
-               f"after it the caller's machine code reaches control flow Binary Ninja "
-               f"could not determine, which may read the return register {reg}")
+                             caller_fn: Any) -> dict[str, Any]:
+        """#1034 item 5, at the call site (#1050 review round 9): BN's MLIL gives
+        a descended call with tainted arguments NO result, so whatever the
+        callee returns is not followed. Whether the caller uses the return
+        register is not checked -- two rounds of LLIL scanning each missed a
+        read (a jump table, a loop back edge) -- so every such call is a
+        blocking frontier. The cost: a void callee that receives tainted
+        arguments withholds the all-clear too."""
         call_at = hex(int(getattr(ins, "address", 0)))
-        fn_at = hex(int(getattr(caller_fn, "start", 0)))
+        fn_at = hex(int(getattr(caller_fn, "start", 0) if caller_fn is not None
+                        else getattr(ins, "address", 0)))
         leaf = self._frontier_leaf(
             ins, callee_fn, tainted_args,
             f"tainted arg(s) {sorted(tainted_args)} passed to "
-            f"{self._prose_function(callee_fn)} at {call_at}: Binary Ninja's IL gives the "
-            f"call no result, but {use}, so the value the callee returns is not followed "
-            f"-- read the call site with `bn disasm {fn_at}`")
+            f"{self._prose_function(callee_fn)} at {call_at}: Binary Ninja recovered no "
+            f"result for this call; bn does not check whether the caller uses the return "
+            f"register -- check the disassembly after the call with `bn disasm {fn_at}`")
         leaf["cause"] = "return_value_unrecovered"
-        leaf["return_register"] = reg
-        leaf["return_register_use"] = "read" if seen else "undetermined_control_flow"
         return leaf
-
-    def _return_register_read_after(self, caller_fn: Any, ins: Any,
-                                    caller_instrs: list | None) -> tuple[str, bool] | None:
-        """``(register, True)`` -- the calling convention's integer return
-        register -- when the caller's LLIL, on some path after the call at
-        *ins*, reads it before anything writes all of it; ``(register, False)``
-        when such a path reaches control flow BN could not determine; else None
-        (also whenever the view cannot answer).
-
-        Another call clobbers it (end of that path). A partial write without
-        an implicit extension (`al`) does not end the path; `w0`/`eax` writes
-        zero-extend and do. Falling off a return counts as a read only when the
-        caller's MLIL returns carry a value -- a void caller's `ret` uses
-        nothing. A jump is no end: the scan continues along the block's CFG
-        edges as BN gives them (a jump table's known cases, #1050 review round
-        8), and a block whose outgoing edges BN could not determine -- or a
-        jump with none at all -- counts as a read, since what runs there is
-        unknown."""
-        try:
-            cc = getattr(caller_fn, "calling_convention", None) \
-                or self.bv.platform.default_calling_convention
-            arch = getattr(caller_fn, "arch", None) or self.bv.arch
-            # The scalar return register only: the high half (`x1`/`rdx`) of a
-            # two-register return is an ordinary argument register after a call.
-            ret_regs = {str(r) for r in (getattr(cc, "int_return_reg", None),) if r}
-            call_llil = caller_fn.get_low_level_il_at(int(getattr(ins, "address", 0)))
-            llil = caller_fn.llil
-        except Exception:  # noqa: BLE001 - no LLIL, no answer
-            return None
-        if not ret_regs or call_llil is None:
-            return None
-
-        def reg_info(name: str) -> tuple[str, bool]:
-            """(full-width register, whether a write of *name* replaces all of it)."""
-            try:
-                info = arch.regs[name]
-            except Exception:  # noqa: BLE001
-                return name, True
-            full = str(info.full_width_reg)
-            extend = int(getattr(info, "extend", 0) or 0)
-            return full, full == name or extend != 0
-
-        full_ret = {reg_info(r)[0] for r in ret_regs}
-        value_returning = any(op_name(i) == "MLIL_RET" and getattr(i, "src", None)
-                              for i in caller_instrs or [])
-
-        def reads(expr: Any, acc: set[str]) -> None:
-            if expr is None or not hasattr(expr, "operation"):
-                return
-            if op_name(expr) in ("LLIL_REG", "LLIL_REG_SSA", "LLIL_REG_SSA_PARTIAL"):
-                name = getattr(getattr(expr, "src", None), "name", None)
-                if name:
-                    acc.add(reg_info(str(name))[0])
-            for operand in getattr(expr, "operands", None) or []:
-                for item in operand if isinstance(operand, list) else [operand]:
-                    reads(item, acc)
-
-        def scan(index: int, end: int) -> str | bool | None:
-            """A register name: read first. True: the path ends here (written,
-            clobbered, or returned). None: falls through to the successors."""
-            for i in range(index, end):
-                cur = llil[i]
-                opn = op_name(cur)
-                got: set[str] = set()
-                reads(cur, got)
-                hit = got & full_ret
-                if hit:
-                    return sorted(hit)[0]
-                if "CALL" in opn or opn == "LLIL_TAILCALL":
-                    return True
-                if opn == "LLIL_RET":
-                    return sorted(full_ret)[0] if value_returning else True
-                if opn in ("LLIL_SET_REG", "LLIL_SET_REG_SPLIT"):
-                    for dest in (getattr(cur, "dest", None), getattr(cur, "hi", None),
-                                 getattr(cur, "lo", None)):
-                        name = getattr(dest, "name", None)
-                        if name:
-                            full, whole = reg_info(str(name))
-                            if full in full_ret and whole:
-                                return True
-            return None
-
-        unknown_read = (min(full_ret), False)
-
-        def open_end(b: Any) -> bool:
-            """BN cannot say where control goes after block *b*."""
-            if getattr(b, "has_undetermined_outgoing_edges", False):
-                return True
-            return (op_name(llil[int(b.end) - 1]) in ("LLIL_JUMP", "LLIL_JUMP_TO")
-                    and not list(b.outgoing_edges))
-
-        try:
-            block = call_llil.il_basic_block
-            first = scan(int(call_llil.instr_index) + 1, int(block.end))
-            if isinstance(first, str):
-                return first, True
-            if first is True:
-                return None
-            if open_end(block):
-                return unknown_read
-            seen = {int(block.start)}
-            work = [block]
-            while work:
-                for edge in list(work.pop().outgoing_edges):
-                    t = edge.target
-                    if int(t.start) in seen:
-                        continue
-                    seen.add(int(t.start))
-                    r = scan(int(t.start), int(t.end))
-                    if isinstance(r, str):
-                        return r, True
-                    if r is None:
-                        if open_end(t):
-                            return unknown_read
-                        work.append(t)
-        except Exception:  # noqa: BLE001 - a view without blocks proves nothing
-            return None
-        return None
 
     def _valueless_return_leaf(self, ins: Any, callee_fn: Any, tainted_args: dict,
                                caller_instrs: list | None) -> dict[str, Any] | None:
@@ -6941,8 +6805,7 @@ class TaintEngine:
                     )
                 for c in calls:
                     params = self._call_params(c)
-                    dest_end = self._format_destination_end(ssaf, model, params)
-                    short = self._format_destination_shortfall(c, callee, model, params, dest_end)
+                    short = self._format_destination_shortfall(c, ssaf, callee, model, params)
                     if short is not None:
                         add_leaf(short)
                     for sd in src_defs:
@@ -7029,8 +6892,7 @@ class TaintEngine:
                                     f"or, for a helper, seed the buffer the caller passes in.")
                         elif to.startswith("*arg:"):
                             idx = _try_arg_index(to)
-                            if idx is not None and idx < len(params) \
-                                    and (dest_end is None or idx < dest_end):
+                            if idx is not None and idx < len(params):
                                 bt = self._buffer_target(ssaf, params[idx])
                                 if bt is not None:
                                     key, label = bt

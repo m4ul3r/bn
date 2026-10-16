@@ -549,8 +549,8 @@ def _build_arch(tmp_path, arch: str, name: str, source: str) -> Path:
 
 def test_a_return_register_read_in_a_jump_table_case_is_a_frontier(tmp_path, shared_bn):
     """#1050 review round 8: the wrapper's MLIL call has no result, then a
-    dense switch (`br x1`) whose case 1 reads x0 into the copy's length. BN
-    gives the jump table's cases as ordinary LLIL edges; the scan follows them."""
+    dense switch (`br x1`) whose case 1 reads x0 into the copy's length. Since
+    round 9 every such call is a frontier, without reading the caller's LLIL."""
     cases = "\n".join(f'    case {i}: puts("c{i}"); break;' for i in (0, 2, 3, 4, 5, 6, 7, 8, 9, 10))
     binary = _build_arch(tmp_path, "a64", "switch_tail", f"""
 extern long read(int, void *, unsigned long);
@@ -637,3 +637,40 @@ int main(void) {{ return two(); }}
                       "--source", "call:scanf")
 
     assert "command_injection" in {s["sink"]["class"] for s in result["reached_sinks"]}, result
+
+
+def test_a_loop_reusing_the_previous_result_is_a_frontier(tmp_path, shared_bn):
+    """#1050 review round 9: each iteration copies with the count the wrapper
+    returned on the previous one, so the read of x0 sits in the call's own
+    block, reached by the back edge. Every descended no-result call with
+    tainted arguments is a frontier now, so the loop cannot hide it."""
+    binary = _build_arch(tmp_path, "a64", "loop_tail", """
+extern long read(int, void *, unsigned long);
+extern void *__memcpy_chk(void *, const void *, unsigned long, unsigned long);
+__attribute__((noinline, noipa)) long ident(long v) { return v; }
+__attribute__((noinline, noipa)) long conditional_tail(long v, int take) {
+    if (take)
+        return ident(v);
+    return 0;
+}
+int main(int argc, char **argv) {
+    char input[32], output[16];
+    long n = read(0, input, sizeof(input));
+    long prev = 0, cur = 0;
+    for (int i = 0; i < argc; i++) {
+        prev = cur;
+        cur = conditional_tail(n, i & 1);
+    }
+    __memcpy_chk(output, input, (unsigned long)prev, sizeof(output));
+    return output[0];
+}
+""")
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                      "--source", "call:read")
+
+    lost = [lf for lf in result["leaves"] if lf.get("cause") == "return_value_unrecovered"]
+    assert result["reached_sinks"] or lost, result
+    if not result["reached_sinks"]:
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+        assert _run_or_check_template(shared_bn, _forward_prose(result))[0] >= 1

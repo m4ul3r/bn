@@ -124,166 +124,42 @@ def test_recovered_or_unconsumed_return_is_no_frontier_1034(kind, wrapper_return
 
 
 # --------------------------------------------------------------------------
-# #1034 item 5 at the call site (re-dogfood of #1050): BN gives a call with
-# tainted arguments no result, and the caller's machine code reads the
-# return register after it. Judged on the caller's LLIL, not the callee.
+# #1034 item 5 at the call site (#1050 review round 9): every descended call
+# with tainted arguments to which BN's MLIL gives NO result is a blocking
+# frontier. Whether the caller uses the return register is not checked.
 # --------------------------------------------------------------------------
 
-class _Op:
-    def __init__(self, name):
-        self.name = name
-
-
-class _Reg:
-    def __init__(self, name):
-        self.name = name
-
-
-class _LLIL:
-    """`x2 = x0` (``kind="read"``), `x0 = 7` (``"write"``), `w0 = 7` (a
-    zero-extending 32-bit write, ``"wwrite"``), `ret` (``"ret"``),
-    `call(...)` (``"call"``) or a jump-table `jump(x1)` (``"jump"``)."""
-
-    def __init__(self, index, kind):
-        self.instr_index = index
-        self.il_basic_block = None
-        if kind == "call":
-            self.operation, self.operands = _Op("LLIL_CALL"), []
-        elif kind == "ret":
-            self.operation, self.operands = _Op("LLIL_RET"), []
-        elif kind == "jump":
-            self.operation, self.operands = _Op("LLIL_JUMP_TO"), []
-        else:
-            dest = {"read": "x2", "write": "x0", "wwrite": "w0"}[kind]
-            self.operation = _Op("LLIL_SET_REG")
-            self.dest = _Reg(dest)
-            if kind == "read":
-                src = type("R", (), {"operation": _Op("LLIL_REG"), "operands": [],
-                                     "src": _Reg("x0")})()
-            else:
-                src = type("C", (), {"operation": _Op("LLIL_CONST"), "operands": []})()
-            self.src = src
-            self.operands = [self.dest, src]
-
-
-class _RegInfo:
-    def __init__(self, full, extend=0):
-        self.full_width_reg, self.extend = full, extend
-
-
-class _Arch:
-    def __init__(self):
-        self.regs = {"x0": _RegInfo("x0"), "w0": _RegInfo("x0", extend=1),
-                     "x2": _RegInfo("x2"), "x1": _RegInfo("x1")}
-
-
-class _LLILBlock:
-    def __init__(self, start, end, undetermined=False):
-        self.start, self.end, self.outgoing_edges = start, end, []
-        self.has_undetermined_outgoing_edges = undetermined
-
-
-class _Edge:
-    def __init__(self, target):
-        self.target = target
-
-
-def _dropped_result_program(after, *, value_returning=False, cases=(), undetermined=False):
-    """main(n): `wrap(n)` -- an MLIL call with NO result -- whose LLIL is
-    followed by *after* (a list of `_LLIL` kinds). *cases* are further blocks
-    (lists of kinds), each a known successor of the call's block -- a jump
-    table's cases; *undetermined* marks that block's edges as unknown to BN."""
+def _dropped_result_program(*, callee_returns_value):
+    """main(n): `wrap(n)` -- an MLIL call with NO result. Nothing about the
+    caller's machine code is given: no LLIL is consulted."""
     n, p = FVar("n"), FVar("p")
-    ns = FSSA(n, 0)
+    ns, ps = FSSA(n, 0), FSSA(p, 0)
+    ret_src = [_value(ps)] if callee_returns_value else []
     callee = FFunc("wrap", 0x2000, FSSAFunc([
-        FInstr(0, 0x2004, "MLIL_RET", "return", reads=[], src=[])]), params=[p])
-    rets = ([FInstr(1, 0x1020, "MLIL_RET", "return 0", reads=[],
-                    src=[FExpr("MLIL_CONST", "0", constant=0)])] if value_returning else [])
+        FInstr(0, 0x2004, "MLIL_RET", "return", reads=[ps] if ret_src else [],
+               src=ret_src)]), params=[p])
     main = FFunc("main", 0x1000, FSSAFunc([
         FInstr(0, 0x1010, "MLIL_CALL_SSA", "wrap(n)", reads=[ns], writes=[],
-               params=[_value(ns)], dest=_const(0x2000)), *rets]), params=[n])
-    llil = [_LLIL(0, "call"), *[_LLIL(i + 1, k) for i, k in enumerate(after)]]
-    block = _LLILBlock(0, len(llil), undetermined)
-    blocks = [block]
-    for kinds in cases:
-        start = len(llil)
-        llil += [_LLIL(start + i, k) for i, k in enumerate(kinds)]
-        blocks.append(_LLILBlock(start, len(llil)))
-        block.outgoing_edges.append(_Edge(blocks[-1]))
-    for b in blocks:
-        for ins in llil[b.start:b.end]:
-            ins.il_basic_block = b
-    main.llil = llil
-    main.get_low_level_il_at = lambda addr: llil[0] if addr == 0x1010 else None
-    main.calling_convention = type("CC", (), {"int_return_reg": "x0",
-                                               "high_int_return_reg": "x1"})()
-    main.arch = _Arch()
+               params=[_value(ns)], dest=_const(0x2000))]), params=[n])
     return main, FBV({}, {0x1000: main, 0x2000: callee}), te.load_models()
 
 
 def _dropped(result):
-    return [lf for lf in result["leaves"] if lf.get("return_register")]
+    return [lf for lf in result["leaves"]
+            if lf.get("cause") == "return_value_unrecovered" and lf["address"] == "0x1010"]
 
 
-def test_a_dropped_result_the_caller_reads_is_a_frontier_1034():
-    """The compiler-default AArch64 `tail.c`: `bl wrap; mov x2, x0; bl copy`
-    while BN gives `wrap` no output and the copy a literal length."""
-    main, bv, models = _dropped_result_program(["read", "call"])
+@pytest.mark.parametrize("callee_returns_value", [True, False],
+                         ids=["value-callee", "void-callee"])
+def test_a_no_result_call_with_tainted_arguments_is_always_a_frontier_1034(callee_returns_value):
+    """The void callee is the accepted precision cost: it withholds the
+    all-clear too, since the caller's use of the register is not checked."""
+    main, bv, models = _dropped_result_program(callee_returns_value=callee_returns_value)
     result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
 
     [leaf] = _dropped(result)
-    assert (leaf["cause"], leaf["return_register"], leaf["address"]) == (
-        "return_value_unrecovered", "x0", "0x1010")
+    assert leaf["kind"] == "unmodeled_callee"
+    assert "return_register" not in leaf and "return_register_use" not in leaf
+    assert "bn disasm 0x1000" in str(leaf)
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
-
-@pytest.mark.parametrize(("after", "value_returning"), [
-    (["write", "read"], False),    # x0 overwritten before the read: not the result
-    (["wwrite", "read"], False),   # w0 zero-extends: a full write of x0
-    (["call", "read"], False),     # another call clobbers x0 first
-    (["ret"], False),              # a void caller's `ret` uses nothing
-])
-def test_a_result_the_caller_does_not_use_is_no_frontier_1034(after, value_returning):
-    main, bv, models = _dropped_result_program(after, value_returning=value_returning)
-    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
-
-    assert _dropped(result) == []
-
-
-def test_returning_straight_after_the_call_from_a_value_function_reads_it_1034():
-    main, bv, models = _dropped_result_program(["ret"], value_returning=True)
-    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
-
-    assert [lf["return_register"] for lf in _dropped(result)] == ["x0"]
-
-
-def test_a_read_in_a_known_jump_table_case_is_a_frontier_1050():
-    """#1050 review round 8: `bl wrap; ...; br x1` into a dense switch whose
-    case 1 does `mov x2, x0` before the copy. The jump is no end of the path:
-    BN's known CFG edges are followed."""
-    main, bv, models = _dropped_result_program(
-        ["jump"], cases=[["call", "read"], ["read", "call"], ["write", "ret"]])
-    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
-
-    [leaf] = _dropped(result)
-    assert (leaf["return_register"], leaf["return_register_use"]) == ("x0", "read")
-    assert result["diagnostics"]["safe_to_report_all_clear"] is False
-
-
-def test_jump_table_cases_that_never_read_it_are_no_frontier_1050():
-    main, bv, models = _dropped_result_program(
-        ["jump"], cases=[["call", "read"], ["write", "read"], ["ret"]])
-    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
-
-    assert _dropped(result) == []
-
-
-@pytest.mark.parametrize("undetermined", [True, False], ids=["undetermined-edges", "no-edges"])
-def test_a_jump_bn_could_not_resolve_is_a_possible_read_1050(undetermined):
-    """Fails closed: where control goes is unknown, so a read cannot be ruled
-    out -- with BN's undetermined-edge flag, or a jump with no edges at all."""
-    main, bv, models = _dropped_result_program(["jump"], undetermined=undetermined)
-    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
-
-    [leaf] = _dropped(result)
-    assert leaf["return_register_use"] == "undetermined_control_flow"

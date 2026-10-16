@@ -719,18 +719,13 @@ def _scanf_stale_arg(fmt):
     return func, FBVStr({0x900: "scanf"}, strings={0x5000: fmt} if fmt else {})
 
 
-def test_a_stale_argument_the_format_never_writes_is_not_a_destination_1050(models):
-    """#1050 re-dogfood: the call: preset seeded *arg:1..4 by the model, and
-    the #1041 item 1 leaf then called the stale arg 2 an unkeyed buffer. The
-    constant format says only arg 1 is written."""
-    func, bv = _scanf_stale_arg("%s")
-    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:scanf")])
-
-    assert not any(lf["kind"] == "source_seed_misanchored" for lf in result["leaves"])
-
-
-def test_an_unreadable_format_still_seeds_the_modeled_run_1050(models):
-    func, bv = _scanf_stale_arg(None)
+@pytest.mark.parametrize("fmt", ["%s", None], ids=["constant-format", "unreadable-format"])
+def test_a_stale_argument_is_still_seeded_by_the_modeled_range_1050(models, fmt):
+    """#1050 review round 9 removed destination trimming: the call: preset
+    seeds the model's whole *arg:1..4 run, so BN's stale arg 2 (the stack-
+    guard address) keeps its conservative `source_seed_misanchored` leaf --
+    a withheld all-clear, never a dropped destination."""
+    func, bv = _scanf_stale_arg(fmt)
     result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:scanf")])
 
     assert [lf["arg_index"] for lf in result["leaves"]
@@ -789,3 +784,20 @@ def test_a_format_prefix_without_its_terminator_never_trims_destinations_1050(mo
     assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"]
     unchecked = [lf for lf in result["leaves"] if lf["kind"] == "format_unchecked"]
     assert bool(unchecked) == (pad == 5000)   # unterminated within the read: unreadable
+
+
+def test_a_format_with_a_writable_suffix_never_drops_a_real_destination_1050(models):
+    """#1050 review round 9: the format starts in read-only storage and runs
+    into an adjacent writable segment, where the program rewrites it to add
+    a third conversion. The stored text names two destinations; the modeled
+    range is seeded regardless, so the third buffer's command sink is found."""
+    a, b, c = (FVar(n, typ="char[0x10]") for n in "abc")
+    scan = _ext_call(0, 0x10, "scanf(fmt, &a, &b, &c)", 0x900,
+                     [FExpr("MLIL_CONST_PTR", "fmt", constant=0x5000),
+                      _addr_of(a), _addr_of(b), _addr_of(c)])
+    run = _ext_call(1, 0x14, "system(&c)", 0x901, [_addr_of(c)])
+    func = FFunc("seg", 0x10, FSSAFunc([scan, run]), params=[])
+    bv = FBVStr({0x900: "scanf", 0x901: "system"}, strings={0x5000: "%15s %15s"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:scanf")])
+
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"]
