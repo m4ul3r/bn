@@ -33,7 +33,7 @@ def test_parse_declaration_source_uses_platform_parser_with_source_path(monkeypa
             super().__init__()
             self.platform = _Platform()
 
-        def parse_types_from_string(self, declaration):
+        def parse_types_from_string(self, declaration, **_):
             raise AssertionError("string parser should not be used when source parsing succeeds")
 
     header_path = tmp_path / "win32_min.h"
@@ -64,7 +64,7 @@ def test_declaration_fallback_keeps_the_actual_view_error_1012(monkeypatch, view
     class _LibraryBV(_FakeBV):
         platform = _Platform()
 
-        def parse_types_from_string(self, declaration):
+        def parse_types_from_string(self, declaration, **_):
             raise view_error
 
     with pytest.raises(bridge.OperationFailure) as mutation_exc:
@@ -121,7 +121,7 @@ def test_types_declare_inline_declaration_discloses_no_include_root_825(monkeypa
     instance = bridge.BinaryNinjaBridge()
 
     class _SourceBV(_FakeBV):
-        def parse_types_from_string(self, declaration):
+        def parse_types_from_string(self, declaration, **_):
             return _ParseResult(types={"Player": "struct Player"})
 
     result = instance._op_types_declare(_SourceBV(), {
@@ -149,7 +149,7 @@ def test_types_declare_refuses_source_without_named_types(monkeypatch):
             self.platform = _Platform()
             self.defined: list[tuple[str, str]] = []
 
-        def parse_types_from_string(self, declaration):
+        def parse_types_from_string(self, declaration, **_):
             raise AssertionError("string parser should not be used when source parsing succeeds")
 
         def get_type_by_name(self, name):
@@ -483,7 +483,7 @@ def test_op_types_declare_uses_canonical_defined_type_text(monkeypatch):
             super().__init__()
             self.platform = _Platform()
 
-        def parse_types_from_string(self, declaration):
+        def parse_types_from_string(self, declaration, **_):
             raise AssertionError("string parser should not be used when source parsing succeeds")
 
         def define_user_type(self, name, type_obj):
@@ -536,7 +536,7 @@ def test_empty_type_parse_rolls_back_and_reports_reason(
         comments={0x1000: "original"}, memory={0x1000: b"\x00"}
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(bv, "parse_types_from_string", lambda declaration: _ParseResult(), raising=False)
+    monkeypatch.setattr(bv, "parse_types_from_string", lambda declaration, **_: _ParseResult(), raising=False)
     result = instance._mutation("active", preview, [
         {"op": "set_comment", "address": "0x1000", "comment": "temporary"},
         {"op": "types_declare", "declaration": "struct Example { int value; };"},
@@ -576,7 +576,7 @@ def test_types_declare_malformed_declaration_is_clean_invalid_request(monkeypatc
     instance = bridge.BinaryNinjaBridge()
 
     class _BadDeclBV(_FakeBV):
-        def parse_types_from_string(self, declaration):
+        def parse_types_from_string(self, declaration, **_):
             raise SyntaxError("error: input:1:1 expected unqualified-id")
 
     bv = _BadDeclBV()
@@ -596,7 +596,7 @@ def test_mutation_malformed_types_declare_reports_clean_failure_not_escape(monke
     instance = bridge.BinaryNinjaBridge()
 
     class _BadDeclMutationBV(_FakeMutationBV):
-        def parse_types_from_string(self, declaration):
+        def parse_types_from_string(self, declaration, **_):
             raise SyntaxError("error: input:1:1 expected unqualified-id")
 
     bv = _BadDeclMutationBV()
@@ -623,7 +623,7 @@ def test_parse_type_or_hint_shared_by_all_type_ops(monkeypatch):
     me = bridge.mutation_engine
 
     class _BadParseBV(_FakeBV):
-        def parse_type_string(self, decl):
+        def parse_type_string(self, decl, **_):
             raise SyntaxError("error: <unknown>: Reference to unknown type Foo\n1 error generated.")
 
     with pytest.raises(bridge.OperationFailure) as excinfo:
@@ -668,7 +668,7 @@ def test_parse_type_or_hint_resolves_namespaced_user_type(monkeypatch):
     me = bridge.mutation_engine
 
     class _NsBV(_FakeBV):
-        def parse_type_string(self, decl):
+        def parse_type_string(self, decl, **_):
             # BN rejects the namespaced name outright.
             raise SyntaxError(
                 "error: <unknown>:1:1 use of undeclared identifier 'ns'\n1 error generated."
@@ -725,7 +725,7 @@ def test_parse_type_or_hint_resolves_const_qualified_namespaced_pointer(monkeypa
     me = bridge.mutation_engine
 
     class _NsBV(_FakeBV):
-        def parse_type_string(self, decl):
+        def parse_type_string(self, decl, **_):
             raise SyntaxError(
                 "error: <unknown>:1:1 use of undeclared identifier 'ns'\n1 error generated."
             )
@@ -786,7 +786,7 @@ def test_parse_type_or_hint_accepts_tag_keyword_and_backticks_on_namespaced_type
     foo = _FakeType("struct ns::demo::Foo")
 
     class _NsBV(_FakeBV):
-        def parse_type_string(self, decl):
+        def parse_type_string(self, decl, **_):
             raise SyntaxError("error: <unknown>:1:8 use of undeclared identifier 'ns'\n1 error generated.")
 
         def get_type_by_name(self, name):
@@ -1634,24 +1634,112 @@ def test_named_type_references_finds_every_member_reference(monkeypatch):
     assert me._named_type_references(_Struct()) == names
 
 
-def test_preview_library_needs_names_library_tags_the_view_lacks(monkeypatch):
-    """#993 review round 3: a preview never models a library import; it is
-    refused when the declaration names a library tag the view lacks -- by
-    value or through a pointer -- but not for a tag it defines, one the view
-    already has, a lone forward declaration, or a tag spelled in a string."""
+def test_preview_parse_imports_nothing_and_names_what_bn_refused_1012(monkeypatch):
+    """#1012 item 1: a preview parse passes BN's `import_dependencies=False`
+    (a live parse keeps BN's default), and BN's resulting refusal becomes a
+    `not previewed` failure naming, by a lookup that imports nothing, the
+    names in the text that the view lacks and a type library defines -- a
+    tag, an untagged name, a backticked one, never one in a comment or string
+    literal, never one the view already has."""
     me = _load_bridge(monkeypatch).mutation_engine
     bv = _FakeBV(functions=[], types_={"timeval": _FakeType("struct timeval", width=16)})
+    bv.platform = None
 
     class _Library:
+        name = "libc_x86_64.so.6"
+
         def get_named_type(self, name):
-            return _FakeType(f"struct {name}", width=16) if name in {"timespec", "tms", "timeval", "stat"} else None
+            known = {"timespec", "pid_t", "timeval", "ns::Lib", "FILE"}
+            return _FakeType(f"struct {name}", width=16) if name in known else None
 
     bv.type_libraries = [_Library()]
-    assert me._preview_library_needs(bv, "struct S { struct timespec ts; struct tms* p; };") == ["timespec", "tms"]
-    assert me._preview_library_needs(bv, "struct S { struct timeval tv; };") == []
-    assert me._preview_library_needs(bv, "struct stat { int x; }; struct U { struct stat s; };") == []
-    assert me._preview_library_needs(bv, "struct timespec;") == []
-    assert me._preview_library_needs(bv, 'struct S { int a; }; const char* m = "struct tms";') == []
-    # Untagged identifiers are never treated as type uses up front: a member
-    # named like a library type imports nothing (#993 review round 4).
-    assert me._preview_library_needs(bv, "struct S { int tms; int stat; struct S* timespec; };") == []
+    calls = []
+
+    def parse_types_from_string(text, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("import_dependencies") is False:
+            raise SyntaxError("warning: <unknown>: Parse succeeded, but parsed types reference "
+                              "Library or Archive types that were not imported.\n1 warning generated.")
+        return types.SimpleNamespace(types={}, variables={}, functions={})
+
+    bv.parse_types_from_string = parse_types_from_string
+    declaration = ('struct S { struct timespec ts; pid_t p; struct timeval tv; struct `ns::Lib`* q; '
+                   'int FILE_count; /* FILE */ const char* m; }; const char* s = "FILE";')
+    me._parse_declaration_source(None, bv, declaration)
+    assert calls == [{}]
+    token = me._PREVIEW_PARSE.set(True)
+    try:
+        with pytest.raises(me.OperationFailure) as refused:
+            me._parse_declaration_source(None, bv, declaration)
+    finally:
+        me._PREVIEW_PARSE.reset(token)
+    assert calls[-1] == {"import_dependencies": False}
+    failure = refused.value
+    assert failure.status == "unsupported"
+    assert failure.message.startswith(
+        "not previewed: Binary Ninja refused to parse this without importing")
+    assert "timespec, pid_t, ns::Lib (libc_x86_64.so.6) -- a by-name match" in failure.message
+    assert "Nothing was imported" in failure.message
+    assert failure.observed["library_name_matches"] == ["timespec", "pid_t", "ns::Lib"]
+    assert failure.observed["imported"] is False
+
+
+def test_preview_import_refusal_only_converts_bns_import_refusal_1012(monkeypatch):
+    """Any other parse error, and the same diagnostic outside a preview, keep
+    their own error; a refusal no name lookup explains says so instead of
+    naming a guess."""
+    me = _load_bridge(monkeypatch).mutation_engine
+    bv = _FakeBV(functions=[], types_={})
+    bv.type_libraries = []
+    refusal = SyntaxError("Parse succeeded, but parsed types reference Library or Archive types "
+                          "that were not imported.")
+    assert me._preview_import_refusal(bv, "struct S { mystery_t m; };", refusal) is None
+    token = me._PREVIEW_PARSE.set(True)
+    try:
+        assert me._preview_import_refusal(
+            bv, "struct S { nosuch_t m; };", SyntaxError("unknown type name 'nosuch_t'")) is None
+        failure = me._preview_import_refusal(bv, "struct S { mystery_t m; };", refusal)
+    finally:
+        me._PREVIEW_PARSE.reset(token)
+    assert "No name in the text matched a loaded type library by lookup" in failure.message
+    assert failure.observed["library_name_matches"] == []
+
+
+def test_live_imports_are_recognized_and_named_by_type_id_guid_1012(monkeypatch):
+    """#1012 item 2: the live classifier knew only attached libraries and BN's
+    lookup record, so a type from the platform's unattached library was not
+    reported. A new id `<guid>:<name>` is an import when BN resolves the guid
+    -- attached, platform, or BN's registry for the architecture -- and its
+    library is named; a user type's plain id, or a guid nothing resolves, is
+    not an import."""
+    me = _load_bridge(monkeypatch).mutation_engine
+    libc = types.SimpleNamespace(name="libc_x86_64.so.6", guid="1111")
+    syscalls = types.SimpleNamespace(name="SYSCALLS", guid="2222")
+    registered = types.SimpleNamespace(name="libm_x86_64.so.6", guid="3333")
+    monkeypatch.setattr(me.bn, "TypeLibrary", types.SimpleNamespace(
+        from_guid=lambda arch, guid: registered if guid == "3333" else None), raising=False)
+    names = {"1111:[\"timespec\"]": "timespec", "2222:[\"ipc_perm\"]": "ipc_perm",
+             "3333:[\"float_t\"]": "float_t", "9999:[\"ghost\"]": "ghost",
+             "5b1c7a2e-0000": "UserType", "old": "Existing"}
+
+    class _View:
+        type_libraries = [libc]
+        platform = types.SimpleNamespace(type_libraries=[libc, syscalls])
+        arch = object()
+        type_container = types.SimpleNamespace(type_ids=list(names))
+
+        def get_type_name_by_id(self, type_id):
+            return names[type_id]
+
+        def lookup_imported_type_library(self, name):
+            return None
+
+        def is_type_auto_defined(self, name):
+            return True
+
+    bv = _View()
+    baseline = me._TypeBaseline({"Existing"}, {"old"})
+    imported = me._new_library_imports(bv, baseline)
+    assert sorted(imported) == ["float_t", "ipc_perm", "timespec"]
+    assert {name: me._import_library_name(bv, name, type_id) for name, type_id in imported.items()} == {
+        "timespec": "libc_x86_64.so.6", "ipc_perm": "SYSCALLS", "float_t": "libm_x86_64.so.6"}

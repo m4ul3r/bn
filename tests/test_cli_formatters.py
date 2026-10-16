@@ -9909,3 +9909,30 @@ def test_failed_import_preview_counts_reverted_siblings_and_all_kept_types_1012(
     text = _render_mutation_summary_text(summary)
     assert "reverted=1" in text
     assert "kept library imports (a rollback cannot remove them): passwd, __uid_t" in text
+
+
+def test_go_rename_compact_status_carries_kept_library_imports_1012():
+    from bn.formatters import _go_rename_summary, _render_mutation_summary_text
+    value = {
+        "kind": "go_rename", "success": False, "committed": False, "rolled_back": True,
+        "go_renamed_candidates": 2, "go_committed_count": 0, "go_verified_count": 1,
+        "go_failed_count": 1, "skipped_user_named": 0,
+        "kept_library_imports": ["passwd", "__uid_t"],
+        "results": [{"op": "go_rename", "status": "failed", "message": "boom"}],
+    }
+    summary = _go_rename_summary(value)
+    assert summary["kept_library_imports"] == ["passwd", "__uid_t"]
+    text = _render_mutation_summary_text(summary)
+    assert "kept library imports (a rollback cannot remove them): passwd, __uid_t" in text
+
+
+def test_proto_text_prints_entry_value_and_undefined_type_notes_1013():
+    from bn.formatters import _render_proto_text
+    text = _render_proto_text({
+        "prototype": "int64_t(struct ns::Cls* this)",
+        "function": {"name": "ns::Cls::get", "display_name": "ns::Cls::get"},
+        "first_argument_entry_value_note": "At 2 of 2 direct call sites ...",
+        "undefined_type_note": "run `bn types declare 'struct `ns::Cls`;'` first.",
+    })
+    assert "\n\nnote: At 2 of 2 direct call sites ..." in text
+    assert "\n\nnote: run `bn types declare 'struct `ns::Cls`;'` first." in text

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -33,6 +34,7 @@ CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
 CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
 VCALLS_BINARY = FIXTURES_DIR / "vcalls_x86_64"
+STATICS_BINARY = FIXTURES_DIR / "statics_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -1209,22 +1211,56 @@ class TestTypeStringsAndInheritance:
         assert fresh["declared_types"]["created_by_reference"] == ["Leaf993"], fresh
         assert shared_bn.json("types", "show", "Leaf993")["layout"] == "struct Leaf993 // size=0x0"
 
+    def test_noreturn_prototype_sets_can_return_and_previews_restore_it_966(self, shared_bn):
+        """#966 (D13): `can_return` is set through `proto set ... __noreturn`
+        and verified by BN's effective `can_return` after reanalysis. A preview
+        and a live clear both work on a function with a user prototype, and
+        the preview restores the previous value."""
+        shared_bn.load(HELLO_BINARY)
+        probe = "print(bool(bv.get_functions_by_name('greet')[0].can_return))"
+
+        def can_return():
+            return shared_bn.run("py", "exec", "--code", probe).stdout.strip().splitlines()[-1]
+
+        assert can_return() == "True"
+        marked = shared_bn.json("proto", "set", "greet", "int greet(char const* who) __noreturn")
+        row = marked["results"][0]
+        assert row["status"] == "verified", row
+        assert row["observed"]["can_return"] is False, row
+        assert can_return() == "False"
+        preview = shared_bn.json("proto", "set", "greet", "int greet(char const* who)", "--preview")
+        assert preview["results"][0]["status"] == "verified", preview
+        assert preview["results"][0]["observed"]["can_return"] is True, preview
+        assert can_return() == "False"
+        cleared = shared_bn.json("proto", "set", "greet", "int greet(char const* who)")
+        assert cleared["results"][0]["observed"]["can_return"] is True, cleared
+        assert can_return() == "True"
+
     def test_preview_needing_a_library_type_is_refused_and_imports_nothing(self, tmp_path, shared_bn):
-        """#993 item 2 (round 3): parsing a declaration that uses a library type
-        makes BN import it, undo cannot revert that, and modelling the import
-        under a preview failed three reviews. A preview that would need a
-        library type the view lacks is refused, naming it, and the view's type
-        list is untouched -- a single declare, and a batch whose later op uses
-        the type. Once the type is in the view, the same batch previews."""
+        """#993 item 2 / #1012 item 1: parsing a declaration that uses a
+        library type makes BN import it, and undo cannot revert that. A preview
+        parses with BN's own `import_dependencies=False`, so BN refuses the
+        parse instead of importing; the preview is refused naming the library
+        type, and the view's type list is untouched -- a single declare, and a
+        batch whose later op uses the type. Once the type is in the view, the
+        same batch previews."""
         shared_bn.load(HELLO_BINARY)
         probe = "print(sorted(str(n) for n in bv.type_names))"
         before = shared_bn.run("py", "exec", "--code", probe).stdout
         refused = shared_bn.run("types", "declare", "struct Stamp993 { struct timespec ts; int y; };", "--preview")
         assert refused.returncode == 3, refused.stdout + refused.stderr
-        assert "Cannot --preview" in refused.stderr + refused.stdout
-        assert "timespec" in refused.stderr + refused.stdout
+        # By value: BN refuses the parse itself.
+        assert "not previewed: Binary Ninja refused to parse this without importing" in refused.stdout
+        assert "timespec (libc" in refused.stdout
+        # Only pointed at: the parse succeeds without importing, and the
+        # declaration is refused one step later, naming the parsed references
+        # (#1012 review r1: this path still printed the old wording).
         pointer = shared_bn.run("types", "declare", "struct Ptr993 { struct tms* p; };", "--preview")
-        assert pointer.returncode == 3 and "tms" in pointer.stderr + pointer.stdout, pointer.stderr
+        assert pointer.returncode == 3, pointer.stdout + pointer.stderr
+        assert ("not previewed: the declaration's types refer to type-library type(s) the view "
+                "does not have yet. The live declare imports them with the library types they "
+                "depend on: tms") in pointer.stdout, pointer.stdout
+        assert "Nothing was imported" in pointer.stdout, pointer.stdout
         manifest = tmp_path / "batch.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "types_declare", "declaration": "struct Px993 { struct timeval tv; int64_t pad; };"},
@@ -1246,38 +1282,95 @@ class TestTypeStringsAndInheritance:
         assert again.returncode == 0, again.stdout + again.stderr
         assert json.loads(again.stdout)["verified_count"] == 2, again.stdout
 
-    def test_preview_that_imported_fails_and_names_every_import(self, shared_bn):
-        """#993 review round 4: untagged library names, a macro hiding the
-        tag, and a user typedef standing in for a library name are not caught
-        up front, and BN imported while the preview reported `verified`, exit
-        0. The preview now judges by what BN did -- new type ids, so a renamed
-        import is counted too -- and fails (`unsupported`, exit 3) listing
-        every import as kept. A preview that verifies changed no type id."""
+    def test_untagged_and_macro_hidden_library_uses_preview_without_importing(self, shared_bn):
+        """#1012 item 1: untagged library names and a macro hiding the tag
+        used to import during the preview and then fail with the imports kept.
+        The preview parse now imports nothing: it is refused (exit 3) naming
+        the library type, and no type id changes. A user typedef standing in
+        for a library name (`sigset_t`) is the user's own type, so that
+        declaration previews, again without a new id."""
         shared_bn.load(HELLO_BINARY)
         ids = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", ids).stdout
         shapes = [
             ("struct U1_993 { rusage r; };", "rusage"),
             ("struct U2_993 { timespec* p; };", "timespec"),
             ("struct U3_993 { pthread_mutex_t m; };", "pthread_mutex_t"),
+            ("struct U5_993 { pid_t p; FILE* f; };", "pid_t, FILE"),
             ("#define TAGGED(x) struct x\nstruct U4_993 { TAGGED(tms) t; };", "tms"),
         ]
-        for declaration, library_type in shapes:
+        for declaration, library_types in shapes:
             res = shared_bn.run("types", "declare", declaration, "--preview", "--format", "json", "--summary")
             assert res.returncode == 3, (declaration, res.stdout, res.stderr)
             summary = json.loads(res.stdout)
             assert summary["ok"] is False and summary["verified_count"] == 0, summary
-            assert library_type in summary["kept_library_imports"], summary
-            assert "Run the declare without --preview" in summary["first_error"], summary
-        # The reviewed shape as ONE declaration: the user typedef and its use
-        # parse together, and BN imports libc's `sigset_t` (and `__sigset_t`)
-        # while parsing -- the preview must fail and name both (review round 5).
+            assert "not previewed: Binary Ninja refused to parse this without importing" in summary["first_error"], summary
+            assert f"{library_types} (libc" in summary["first_error"], summary
+            assert "Nothing was imported" in summary["first_error"], summary
+            assert "kept_library_imports" not in summary, summary
+        local = shared_bn.json("types", "declare", "typedef int sigset_t; struct Local993 { sigset_t s; };",
+                               "--preview", "--summary")
+        assert local["ok"] is True and local["verified_count"] == 1, local
+        assert shared_bn.run("py", "exec", "--code", ids).stdout == before
+
+    def test_preview_refusal_lists_name_matches_not_required_types_1012(self, shared_bn):
+        """#1012 review r1: `int FILE;` is an ordinary member, yet the refusal
+        said the declaration `needs pid_t, FILE`. BN's refusal names no type, so
+        the preview lists by-name matches as matches and claims no dependency;
+        the live run imports only what BN actually needed."""
+        shared_bn.load(HELLO_BINARY)
+        declaration = "struct MixedHint { pid_t p; int FILE; };"
+        res = shared_bn.run("types", "declare", declaration, "--preview", "--format", "json")
+        assert res.returncode == 3, res.stdout + res.stderr
+        row = json.loads(res.stdout)["results"][0]
+        assert "needs" not in row["message"], row
+        assert "pid_t, FILE (libc" in row["message"] and "a by-name match" in row["message"], row
+        assert row["observed"]["library_name_matches"] == ["pid_t", "FILE"], row
+        assert "library_types" not in row["observed"], row
+        live = shared_bn.json("types", "declare", declaration, "--summary")
+        assert sorted(live["declared_types"]["imported_from_library"]) == ["__pid_t", "pid_t"], live
+
+    def test_type_string_previews_import_nothing_1012(self, tmp_path, shared_bn):
+        """#1012 item 2: `struct field set`, `proto set`, `local retype` and
+        `data retype` previews imported the library types their type string
+        named. They now parse without importing: a preview that needs one is
+        refused naming it, and a prototype the preview leaves out anyway (no
+        user prototype yet) is `not_previewed` without importing, so its
+        sibling still previews at exit 0."""
+        shared_bn.load(HELLO_BINARY)
+        ids = "print(sorted(bv.type_container.type_ids))"
+        shared_bn.json("types", "declare", "struct Ex1012 { int a; int b; int c; int d; int e; };")
+        shared_bn.json("proto", "set", "main", "int main(int argc, char** argv)")
         before = shared_bn.run("py", "exec", "--code", ids).stdout
-        local = shared_bn.run("types", "declare", "typedef int sigset_t; struct Local993 { sigset_t s; };",
-                              "--preview", "--format", "json", "--summary")
-        summary = json.loads(local.stdout)
-        assert before != shared_bn.run("py", "exec", "--code", ids).stdout, "BN imported nothing"
-        assert local.returncode == 3 and summary["verified_count"] == 0, summary
-        assert {"sigset_t", "__sigset_t"} <= set(summary["kept_library_imports"]), summary
+        local_id = next(row["local_id"] for row in shared_bn.json("local", "list", "main")["items"]
+                        if row["name"] == "argc")
+        data = shared_bn.run("py", "exec", "--code",
+                             "print(hex(bv.sections['.data'].start))").stdout.strip().splitlines()[-1]
+        main = shared_bn.run("py", "exec", "--code",
+                             "print(hex(bv.get_functions_by_name('main')[0].start))").stdout.strip().splitlines()[-1]
+        commands = [
+            (("struct", "field", "set", "Ex1012", "0x10", "t", "struct tm"), "tm"),
+            (("proto", "set", "main", "int main(pid_t argc, char** argv)"), "pid_t"),
+            (("local", "retype", "main", local_id, "pid_t"), "pid_t"),
+            (("data", "retype", data, "pid_t"), "pid_t"),
+        ]
+        for args, library_type in commands:
+            res = shared_bn.run(*args, "--preview", "--format", "json", "--summary")
+            assert res.returncode == 3, (args, res.stdout, res.stderr)
+            summary = json.loads(res.stdout)
+            assert "not previewed: Binary Ninja refused to parse this without importing" in summary["first_error"], summary
+            assert f"{library_type} (libc" in summary["first_error"], summary
+            assert "kept_library_imports" not in summary, summary
+        manifest = tmp_path / "batch.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "set_comment", "address": main, "comment": "preview1012"},
+            {"op": "set_prototype", "identifier": "puts", "prototype": "int puts(pid_t s)"}]}))
+        batch = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert batch.returncode == 0, batch.stdout + batch.stderr
+        rows = json.loads(batch.stdout)["results"]
+        assert [row["status"] for row in rows] == ["verified", "not_previewed"], rows
+        assert "which a preview does not import; name matches: pid_t" in rows[1]["message"], rows[1]
+        assert shared_bn.run("py", "exec", "--code", ids).stdout == before
 
     def test_member_names_like_library_types_preview_normally(self, shared_bn):
         """#993 review round 4: the bare-identifier pre-check treated member
@@ -1604,6 +1697,41 @@ class TestPrototypeRecovery:
         assert "this" in got["prototype"], got
         note = got["implicit_object_note"]
         assert "implicit object parameter" not in note, got
+
+    def test_static_member_callers_pass_their_entry_value_1013(self, shared_bn):
+        """`reg::Registry::get` is static; BN still gives it a `this`. Both
+        callers pass their own entry `rdi` (SSA version 0); `set_handler`'s
+        callers pass the returned object."""
+        shared_bn.load(STATICS_BINARY)
+        got = shared_bn.json("proto", "get", "reg::Registry::get")
+        fact = got["first_argument_entry_value"]
+        assert fact["checked"] == 2 and fact["entry_value"] == 2, got
+        assert fact["registers"] == ["rdi"] and fact["truncated"] is False, got
+        assert "implicit_object_note" in got, got
+        text = shared_bn.run("proto", "get", "reg::Registry::get")
+        assert ("note: At 2 of 2 direct call sites the first argument is the caller's "
+                "own entry value of rdi (SSA version 0)") in text.stdout, text.stdout
+        member = shared_bn.json("proto", "get", "reg::Registry::set_handler")
+        assert member["first_argument_entry_value"]["entry_value"] == 0, member
+
+    def test_undefined_type_declare_command_runs_as_printed_1013(self, shared_bn):
+        shared_bn.load(STATICS_BINARY)
+        got = shared_bn.json("proto", "get", "reg::Registry::get")
+        [row] = got["undefined_types"]
+        assert row["name"] == "reg::Registry", got
+        command = row["declare_command"]
+        assert command == "bn types declare 'struct `reg::Registry`;'", got
+        assert f"`{command}`" in shared_bn.run("proto", "get", "reg::Registry::get").stdout
+        prototype = "int64_t get(struct `reg::Registry`* self)"
+        refused = shared_bn.run("proto", "set", "reg::Registry::get", prototype)
+        assert "Reference to unknown type" in refused.stdout + refused.stderr, refused
+        argv = shlex.split(command)
+        assert argv[0] == "bn", argv
+        declared = shared_bn.run(*argv[1:])
+        assert declared.returncode == 0, declared.stdout + declared.stderr
+        committed = shared_bn.json("proto", "set", "reg::Registry::get", prototype)
+        assert committed["results"][0]["status"] == "verified", committed
+        assert "undefined_types" not in shared_bn.json("proto", "get", "reg::Registry::get")
 
 
 class TestDisasmLinear:
@@ -5545,7 +5673,10 @@ class TestBatchPreviewImports1012:
         "struct_field_set", "set_prototype", "local_retype", "data_retype",
     ])
     @pytest.mark.parametrize("batched", [False, True])
-    def test_every_type_parser_discloses_kept_imports(self, shared_bn, tmp_path, kind, batched):
+    def test_every_type_parser_previews_without_importing(self, shared_bn, tmp_path, kind, batched):
+        """#1012 items 1-2: every type-string parser previews with
+        `import_dependencies=False`: the op is refused naming the library type,
+        no type id changes, and a batched sibling is reverted."""
         shared_bn.load(ADD_BINARY)
         address = shared_bn.json("function", "info", "add")["function"]["address"]
         shared_bn.json("types", "declare", "struct PreviewSlot { int a; int b; };")
@@ -5575,17 +5706,22 @@ class TestBatchPreviewImports1012:
         assert response.returncode == 3, response.stdout + response.stderr
         result = json.loads(response.stdout)
         after = dict(json.loads(shared_bn.run("py", "exec", "--code", probe).stdout))
-        imported = {name for type_id, name in after.items() if type_id not in before}
-        assert "passwd" in imported, result
-        assert set(result["kept_library_imports"]) == imported, result
-        assert set(result["results"][-1]["imported_from_library"]) == imported, result
-        assert result["results"][-1]["status"] == "unsupported", result
+        assert after == before, result
+        assert "kept_library_imports" not in result, result
+        row = result["results"][-1]
+        assert row["status"] == "unsupported", result
+        assert "not previewed: Binary Ninja refused to parse this without importing" in row["message"], result
+        assert "passwd (libc" in row["message"], result
+        assert "imported_from_library" not in row, result
         if batched:
             assert result["results"][0]["status"] == "reverted", result
-            assert "imported_from_library" not in result["results"][0], result
 
-    def test_snapshot_import_belongs_to_unattempted_later_declare(self, shared_bn, tmp_path):
+    def test_snapshot_parse_of_a_later_declare_imports_nothing(self, shared_bn, tmp_path):
+        """The pre-apply snapshot parses a later declare; under a preview that
+        parse imports nothing either, so an earlier failure keeps no types."""
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         manifest = tmp_path / "late.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "set_comment", "function": "missing_function", "comment": "x"},
@@ -5593,42 +5729,45 @@ class TestBatchPreviewImports1012:
         response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
         assert response.returncode == 3, response.stdout + response.stderr
         result = json.loads(response.stdout)
-        assert "timespec" in result["kept_library_imports"], result
-        assert "imported_from_library" not in result["results"][0], result
-        assert "timespec" in result["results"][1]["imported_from_library"], result
-        assert result["results"][1]["parse_performed"] is True, result
-        assert result["results"][1]["status"] == "unsupported", result
+        assert "kept_library_imports" not in result, result
+        assert all("imported_from_library" not in row for row in result["results"]), result
+        assert result["results"][1]["status"] == "not_attempted", result
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
 
-    def test_skipped_auto_prototype_parse_is_an_importing_step(self, shared_bn, tmp_path):
+    def test_skipped_auto_prototype_needing_a_library_type_imports_nothing(self, shared_bn, tmp_path):
+        """An AUTO prototype the preview leaves out anyway (has_user_type pin)
+        no longer imports while it is checked: it stays `not_previewed`, says
+        it needs `passwd`, and the sibling previews at exit 0."""
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         manifest = tmp_path / "auto.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "set_prototype", "identifier": "add", "prototype": "int add(struct passwd* p)"},
             {"op": "set_comment", "function": "mul", "comment": "preview only"}]}))
         response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
-        assert response.returncode == 3, response.stdout + response.stderr
+        assert response.returncode == 0, response.stdout + response.stderr
         result = json.loads(response.stdout)
-        assert "passwd" in result["kept_library_imports"], result
-        assert result["results"][0]["status"] == "unsupported", result
-        assert result["results"][0]["parse_performed"] is True, result
-        assert result["results"][1]["status"] == "reverted", result
+        assert "kept_library_imports" not in result, result
+        assert result["results"][0]["status"] == "not_previewed", result
+        assert "which a preview does not import; name matches: passwd" in result["results"][0]["message"], result
+        assert result["results"][1]["status"] == "verified", result
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
         assert shared_bn.json("proto", "get", "add")["function"]["name"] == "add"
 
-    def test_preflight_import_survives_later_preflight_error_honestly(self, shared_bn, tmp_path):
+    def test_preflight_library_need_then_later_preflight_error_imports_nothing(self, shared_bn, tmp_path):
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         manifest = tmp_path / "preflight.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "set_prototype", "identifier": "add", "prototype": "int add(struct passwd* p)"},
             {"op": "set_prototype", "identifier": "missing", "prototype": "int missing(int x)"}]}))
         response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
         assert response.returncode == 3, response.stdout + response.stderr
-        result = json.loads(response.stdout)
-        assert "passwd" in result["kept_library_imports"], result
-        assert result["results"][0]["status"] == "unsupported", result
-        assert result["results"][0]["parse_performed"] is True, result
-        assert "imported_from_library" not in result["results"][1], result
-        assert "Function not found: missing" in result["results"][1]["message"], result
-        assert result["results"][1]["status"] == "unsupported", result
+        assert "Function not found: missing" in response.stdout + response.stderr
+        assert "kept_library_imports" not in response.stdout, response.stdout
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
 
     @pytest.mark.parametrize("kind", ["function", "data"])
     @pytest.mark.parametrize("user_type", [False, True])
@@ -5653,19 +5792,24 @@ class TestBatchPreviewImports1012:
         assert shared_bn.json("function", "info", "add")["function"]["name"] == "add"
         assert shared_bn.run("function", "info", "preview_sum").returncode == 2
 
-    def test_import_warning_preserves_the_real_declaration_failure(self, shared_bn):
+    def test_library_refusal_comes_before_any_import_1012(self, shared_bn):
+        """A declaration that needs a library type and also collides with a
+        builtin: the preview stops at BN's refusal to import, imports nothing,
+        and names the library type."""
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         response = shared_bn.run(
             "types", "declare",
             "struct ImportThenFail { rusage r; }; struct uint32_t { int x; };",
             "--preview", "--format", "json")
         assert response.returncode == 3, response.stdout + response.stderr
         result = json.loads(response.stdout)
-        assert "rusage" in result["kept_library_imports"], result
+        assert "kept_library_imports" not in result, result
         row = result["results"][0]
         assert row["status"] == "unsupported", result
-        assert "uint32_t" in row["message"], result
-        assert "a preview cannot undo an import" in row["message"], result
+        assert "rusage" in row["message"] and "Nothing was imported" in row["message"], result
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
 
     def test_rename_advice_runs_with_an_earlier_noop(self, shared_bn, tmp_path):
         shared_bn.load(ADD_BINARY)
@@ -5756,12 +5900,13 @@ def test_importing_auto_prototype_retains_irreversible_refusal_1031(shared_bn, s
     response = shared_bn.run(*args)
     assert response.returncode == 3, response.stdout + response.stderr
     result = json.loads(response.stdout)
-    assert "passwd" in result["kept_library_imports"], result
-    message = result["first_error"] if summary else result["results"][0]["message"]
+    # Nothing was imported, so this is the plain AUTO-prototype refusal envelope
+    # (the same shape as one that never needed a library type).
+    assert result["ok"] is False and result["status"] == "unsupported", result
+    assert "kept_library_imports" not in json.dumps(result), result
+    message = result["error"]
     assert "has_user_type" in message and "cleanly reverted" in message, result
-    assert "a preview cannot undo an import" in message, result
-    if not summary:
-        assert "has_user_type" in result["message"], result
+    assert "which a preview does not import; name matches: passwd" in message, result
     flag = shared_bn.run("py", "exec", "--code",
                          "print(bv.get_functions_by_name('mul')[0].has_user_type)")
     assert flag.returncode == 0 and flag.stdout.strip() == "False", flag.stdout + flag.stderr
@@ -5775,18 +5920,26 @@ def test_analysis_exception_discloses_kept_imports_without_replacing_error_1031(
     probe = ("import json\nprint(json.dumps({str(i): str(bv.get_type_name_by_id(i)) "
              "for i in bv.type_container.type_ids}))")
     before = json.loads(shared_bn.run("py", "exec", "--code", probe).stdout)
+    # The failing analysis also imports `timespec` before it raises. A preview
+    # parse imports nothing any more (#1012 item 1), so the preview case gets
+    # its retained import only from this analysis-side import; the live case
+    # has already imported it while parsing. Either way the original exception
+    # and the retained-type disclosure must both survive (#1012 review r1).
     injected = shared_bn.run("py", "exec", "--code", """
 import binaryninja as bn
 original = bn.BinaryView.update_analysis_and_wait
 def fail_once(view, _original=original):
     bn.BinaryView.update_analysis_and_wait = _original
+    library = next(lib for lib in view.type_libraries if lib.get_named_type('timespec') is not None)
+    view.import_library_type('timespec', library)
     raise RuntimeError('synthetic SDK analysis failure')
 fail_once._review_original = original
 bn.BinaryView.update_analysis_and_wait = fail_once
 """)
     assert injected.returncode == 0, injected.stdout + injected.stderr
     try:
-        declaration = "struct Exceptional1031 { timespec* p; };"
+        declaration = ("struct Exceptional1031 { int x; };" if preview
+                       else "struct Exceptional1031 { timespec* p; };")
         if interface == "cli":
             args = ["types", "declare", declaration, "--format", "json"]
             if preview:
@@ -6171,6 +6324,44 @@ result = state
         assert tracked < control * max_ratio, (samples, wall_samples, max_ratio)
 
 
+def test_live_import_from_unattached_platform_library_is_named_1012(shared_bn):
+    """#1012 item 2: the live classifier knew only attached libraries and BN's
+    lookup record, so an import from the platform's unattached `SYSCALLS`
+    library went unreported on a committed run. An import is now recognized by
+    the guid in its type id, which BN resolves to the library it names."""
+    shared_bn.load(ADD_BINARY)
+    address = shared_bn.run("py", "exec", "--code", "print(hex(bv.start))").stdout.strip().splitlines()[-1]
+    try:
+        injected = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+library = next(library for library in bv.platform.type_libraries
+               if library.name == 'SYSCALLS')
+assert library not in bv.type_libraries
+original = bn.BinaryView.set_comment_at
+def import_once(view, *args, _original=original, _library=library, **kwargs):
+    bn.BinaryView.set_comment_at = _original
+    assert view.import_library_type('ipc_perm', _library) is not None
+    return _original(view, *args, **kwargs)
+import_once._review_platform_original = original
+bn.BinaryView.set_comment_at = import_once
+""")
+        assert injected.returncode == 0, injected.stdout + injected.stderr
+        response = shared_bn.run("comment", "set", address, "live platform import 1012", "--format", "json")
+    finally:
+        shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+original = getattr(bn.BinaryView.set_comment_at, '_review_platform_original', None)
+if original is not None:
+    bn.BinaryView.set_comment_at = original
+""")
+    assert response.returncode == 0, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert result["committed"] is True, result
+    assert "ipc_perm" in result["results"][0]["imported_from_library"], result
+    assert result["library_sources"]["ipc_perm"] == "SYSCALLS", result
+    assert set(result["library_sources"].values()) == {"SYSCALLS"}, result
+
+
 class TestDirectPreviewRetainedTypes1031:
     """Direct mutation entry points obey the same final-ID rule as batches."""
 
@@ -6198,11 +6389,12 @@ print(json.dumps({
         assert result["kept_library_imports"] == sorted(names), result
         assert result["unattributed_library_imports"] == sorted(names), result
 
-    @pytest.mark.parametrize("syscall", [True, False], ids=["syscall-residue", "preexisting-types-clean"])
-    def test_standalone_function_create_preview(self, shared_bn, tmp_path, syscall):
-        # The public round-four reproducer: the second .text syscall stub is
-        # deliberately unreferenced and lacks a symbol after strip. Obtain its
-        # address before stripping rather than depending on compiler layout.
+    @staticmethod
+    def _load_syscall_stubs(shared_bn, tmp_path) -> int:
+        """Build and load the public round-four reproducer; return the address
+        of its second .text syscall stub, deliberately unreferenced and without
+        a symbol after strip. The address is taken before stripping rather than
+        depending on compiler layout."""
         source = tmp_path / "stubs.c"
         source.write_text("""
 __attribute__((section(".text"), used, aligned(16)))
@@ -6222,10 +6414,36 @@ int main(int c, char **v) { (void)v; return c; }
         addresses = {parts[2]: int(parts[0], 16)
                      for line in symbols.stdout.splitlines()
                      if len(parts := line.split()) == 3}
-        address = addresses["stub_blob"] + 11
         stripped = subprocess.run(["strip", str(binary)], capture_output=True, text=True)
         assert stripped.returncode == 0, stripped.stderr
         shared_bn.load(binary, copy=False)
+        return addresses["stub_blob"] + 11
+
+    def test_live_standalone_function_create_reports_its_imports_1012(self, shared_bn, tmp_path):
+        """#1012 review r1: a LIVE standalone `function create` bypassed the
+        request-level outcome, so the five SYSCALLS types its analysis imported
+        went unreported. They are now listed, unattributed (defined during the
+        reanalysis, not on the create's own thread), with their library."""
+        address = self._load_syscall_stubs(shared_bn, tmp_path)
+        before = self._state(shared_bn)
+        assert hex(address) not in before["functions"], before
+        response = shared_bn.run("function", "create", hex(address), "--format", "json")
+        assert response.returncode == 0, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert result["committed"] is True, result
+        after = self._state(shared_bn)
+        imported = sorted(name for type_id, name in after["ids"].items()
+                          if type_id not in before["ids"])
+        assert imported == ["__kernel_long_t", "__kernel_ulong_t", "__u16", "__u32", "sysinfo"], imported
+        reported = set(result.get("unattributed_library_imports") or [])
+        for row in result["results"]:
+            reported |= set(row.get("imported_from_library") or [])
+        assert reported == set(imported), result
+        assert result["library_sources"] == {name: "SYSCALLS" for name in imported}, result
+
+    @pytest.mark.parametrize("syscall", [True, False], ids=["syscall-residue", "preexisting-types-clean"])
+    def test_standalone_function_create_preview(self, shared_bn, tmp_path, syscall):
+        address = self._load_syscall_stubs(shared_bn, tmp_path)
         if not syscall:
             # The identical fresh target is clean when its syscall types already
             # exist: pre-existing IDs must not turn a reversible preview into a failure.
