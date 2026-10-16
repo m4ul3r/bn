@@ -2140,7 +2140,8 @@ def test_callee_vtable_plural_symbols_keep_local_alias_in_either_order(monkeypat
     assert result["callee_data_ref_vtables"] == [{
         "address": "0x4010", "class_name": "X", "vtable_address": "0x4000",
         "address_point": None, "slot": None, "slot_address_point": None,
-        "offset_to_top": None, "evidence": "elf_symbol_size",
+        "offset_to_top": None, "slot_unknown_reason": "no_verified_header",
+        "evidence": "elf_symbol_size",
     }]
 
 
@@ -2376,17 +2377,21 @@ def test_callee_vtable_actual_registry_must_resolve_exact_canonical_object(monke
     assert result["callee_data_ref_vtables"] == []
 
 
-def _elf_vtable_image(symbols, *, symtab=True, data_words=(), endian="<"):
-    """A 64-bit ELF whose one PROGBITS section maps 0x4000..0x4200 and holds
-    *data_words*, with *symbols* ``(name, value, size, info, shndx)`` in a
-    ``.symtab`` (or, with ``symtab=False``, only a ``.dynsym``)."""
+def _elf_vtable_image(symbols, *, symtab=True, data_words=(), endian="<", typeinfo=(),
+                      size=0x200, section_flags=2):
+    """A 64-bit ELF whose one PROGBITS section maps 0x4000..0x4000+*size* and
+    holds *data_words*, with *symbols* ``(name, value, size, info, shndx)`` in a
+    ``.symtab`` (or, with ``symtab=False``, only a ``.dynsym``). Each
+    ``(address, name)`` in *typeinfo* writes a typeinfo record there: a null
+    vptr word, then a pointer to *name* stored 0x40 bytes later."""
     import struct
     from types import SimpleNamespace
 
+    order = "little" if endian == "<" else "big"
     strings = b"\0"
     rows = [(0, 0, 0, 0, 0, 0)]
-    for name, value, size, info, shndx in symbols:
-        rows.append((len(strings), info, 0, shndx, value, size))
+    for name, value, extent, info, shndx in symbols:
+        rows.append((len(strings), info, 0, shndx, value, extent))
         strings += name.encode() + b"\0"
     data = bytearray(512)
 
@@ -2395,8 +2400,13 @@ def _elf_vtable_image(symbols, *, symtab=True, data_words=(), endian="<"):
         data.extend(blob)
         return off, len(blob)
 
-    body = append(b"".join(word.to_bytes(8, "little" if endian == "<" else "big", signed=word < 0)
-                           for word in data_words).ljust(0x200, b"\0"))
+    image = bytearray(b"".join(word.to_bytes(8, order, signed=word < 0)
+                               for word in data_words).ljust(size, b"\0"))
+    for address, name in typeinfo:
+        at = address - 0x4000
+        image[at:at + 16] = bytes(8) + (address + 0x40).to_bytes(8, order)
+        image[at + 0x40:at + 0x41 + len(name)] = name.encode() + b"\0"
+    body = append(bytes(image))
     strtab = append(strings)
     symbol_bytes = append(b"".join(struct.pack(endian + "IBBHQQ", *row) for row in rows))
     data[:16] = b"\x7fELF\x02" + (b"\x01" if endian == "<" else b"\x02") + bytes(10)
@@ -2404,23 +2414,25 @@ def _elf_vtable_image(symbols, *, symtab=True, data_words=(), endian="<"):
     struct.pack_into(endian + "HH", data, 58, 64, 4)
     sections = [
         (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-        (0, 1, 2, 0x4000, body[0], 0x200, 0, 0, 8, 0),
+        (0, 1, section_flags, 0x4000, body[0], size, 0, 0, 8, 0),
         (0, 3, 0, 0, *strtab, 0, 0, 1, 0),
         (0, 2 if symtab else 11, 0, 0, *symbol_bytes, 2, 0, 8, 24),
     ]
     for i, section in enumerate(sections):
         struct.pack_into(endian + "IIQQQQIIQQ", data, 64 + i * 64, *section)
-    memory = bytes(data[body[0]:body[0] + 0x200])
+    memory = bytes(image)
+    reads = []
 
-    def read(address, size):
-        if 0x4000 <= address and address + size <= 0x4200:
-            return memory[address - 0x4000:address - 0x4000 + size]
-        return b""
+    def read(address, length):
+        reads.append((address, length))
+        if 0x4000 <= address and address + length <= 0x4000 + size:
+            return memory[address - 0x4000:address - 0x4000 + length]
+        return memory[address - 0x4000:] if 0x4000 <= address < 0x4000 + size else b""
 
     return SimpleNamespace(
         parent_view=SimpleNamespace(start=0, length=len(data),
-                                    read=lambda off, size: bytes(data[off:off + size])),
-        image_base=0, original_image_base=0, address_size=8, read=read)
+                                    read=lambda off, n: bytes(data[off:off + n])),
+        image_base=0, original_image_base=0, address_size=8, read=read, reads=reads)
 
 
 _OBJECT = 0x11  # STB_GLOBAL | STT_OBJECT
@@ -2435,10 +2447,11 @@ def test_elf_vtable_census_reports_vtable_and_construction_objects_1018(monkeypa
         ("_ZTI1D", 0x4100, 0x10, _OBJECT, 1),
         ("_ZTV5Alias", 0x4000, 0, 0x10, 1),         # a NOTYPE size-0 linker alias
         ("_ZTV6Import", 0, 0, _OBJECT, 0),          # undefined: not a definition
-    ])
+        ("_ZTI5Decoy", 0x4048, 0x10, 0x12, 1),      # an STT_FUNC alias, not typeinfo
+    ], typeinfo=[(0x4100, "1D")])
     census = rl._elf_vtable_census(bv)
     assert census["status"] == "ok" and census["symtab"] is True
-    assert census["typeinfo"] == {0x4100}
+    assert census["typeinfo"] == {0x4100: {"_ZTI1D"}}
     rows = {(o["raw_name"], o["kind"], o["supported"]) for o in census["objects"]}
     assert rows == {("_ZTV1D", "vtable", True),
                     ("_ZTC1D0_1B", "construction_vtable", True),
@@ -2492,7 +2505,7 @@ def test_vtable_slot_counts_from_the_governing_typeinfo_header_1018(monkeypatch,
     words = [0, 0x4100, 0x5000, 0x5010, 0x5020, -16, 0x4100, 0x5030, 0x5040]
     bv = _elf_vtable_image([("_ZTV1D", 0x4000, 0x48, _OBJECT, 1),
                             ("_ZTI1D", 0x4100, 0x10, _OBJECT, 1)], data_words=words,
-                           endian=endian)
+                           endian=endian, typeinfo=[(0x4100, "1D")])
     census = rl._elf_vtable_census(bv)
     slot = rl._vtable_slot(bv, census, 0x4000, 0x48, address)
     assert (slot["slot"], slot["slot_address_point"], slot["offset_to_top"]) == expected
@@ -2517,7 +2530,8 @@ def test_callee_data_refs_label_construction_vtable_slots_1018(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     words = [0x28, 0, 0x4100, 0x5000, 0x5010]
     bv = _elf_vtable_image([("_ZTC1D0_1B", 0x4000, 0x28, _OBJECT, 1),
-                            ("_ZTI1B", 0x4100, 0x10, _OBJECT, 1)], data_words=words)
+                            ("_ZTI1B", 0x4100, 0x10, _OBJECT, 1)], data_words=words,
+                           typeinfo=[(0x4100, "1B")])
     marker = SimpleNamespace(address=0x4000, short_name="construction_vtable_for_B-in-D",
                              raw_name="_ZTC1D0_1B", type="DataSymbol")
     bv.get_symbols_by_raw_name = lambda name: [marker] if name == "_ZTC1D0_1B" else []
@@ -2530,5 +2544,73 @@ def test_callee_data_refs_label_construction_vtable_slots_1018(monkeypatch):
         "address": "0x4020", "evidence": "elf_symbol_size", "objects": [{
             "object": "_ZTC1D0_1B", "label": "construction vtable for B-in-D",
             "kind": "construction_vtable", "object_address": "0x4000", "size": 0x28,
-            "slot": 1, "slot_address_point": "0x4018", "offset_to_top": 0}]}]
+            "slot": 1, "slot_address_point": "0x4018", "offset_to_top": 0,
+            "slot_unknown_reason": None}]}]
     assert result["callee_data_ref_census"]["status"] == "ok"
+
+
+@pytest.mark.parametrize("decoy", ["func_alias", "name_mismatch", "executable_section",
+                                   "header_at_object_start"])
+def test_vtable_slot_ignores_a_typeinfo_address_that_is_not_typeinfo_1046(monkeypatch, decoy):
+    """#1046 review: `_ZTV5Short` is `[0, &_ZTI5Short, first, second, third]`.
+    A pointer that merely equals some `_ZTI…` symbol must not restart slot
+    counting: an STT_FUNC alias of `first`, an OBJECT whose name string is not
+    its own, one in an executable section, or a typeinfo pointer in the
+    object's first word (no offset-to-top word inside it)."""
+    bridge = _load_bridge(monkeypatch)
+    rl = bridge.read_listing
+    first = 0x4100
+    words = [0, 0x4080, first, first + 0x10, first + 0x20]
+    symbols = [("_ZTV5Short", 0x4000, 0x28, _OBJECT, 1),
+               ("_ZTI5Short", 0x4080, 0x10, _OBJECT, 1)]
+    typeinfo = [(0x4080, "5Short")]
+    flags = 2
+    if decoy == "func_alias":
+        symbols.append(("_ZTI5Decoy", first, 0x10, 0x12, 1))
+    elif decoy == "name_mismatch":
+        symbols.append(("_ZTI5Decoy", first, 0x10, _OBJECT, 1))
+        typeinfo.append((first, "5Other"))
+    elif decoy == "executable_section":
+        symbols.append(("_ZTI5Decoy", first, 0x10, _OBJECT, 1))
+        typeinfo.append((first, "5Decoy"))
+        flags = 6   # SHF_ALLOC | SHF_EXECINSTR: no typeinfo lives there
+    else:
+        words = [0x4080, first, first + 0x10, first + 0x20]
+        symbols[0] = ("_ZTV5Short", 0x4000, 0x20, _OBJECT, 1)
+    bv = _elf_vtable_image(symbols, data_words=words, typeinfo=typeinfo, section_flags=flags)
+    census = rl._elf_vtable_census(bv)
+    size = symbols[0][2]
+    slots = [rl._vtable_slot(bv, census, 0x4000, size, 0x4000 + size - 0x10 + 8 * i)
+             for i in range(2)]
+    if decoy == "executable_section":
+        # The helper has one section, so every `_ZTI` here sits in code: none
+        # is typeinfo, and no slot is counted at all.
+        assert census["typeinfo"] == {}
+        assert {s["slot_unknown_reason"] for s in slots} == {"no_verified_header"}
+    elif decoy == "header_at_object_start":
+        assert [s["slot"] for s in slots] == [None, None]
+        assert {s["slot_unknown_reason"] for s in slots} == {"no_verified_header"}
+    else:
+        # `second` and `third` are primary slots 1 and 2, not a secondary table.
+        assert [(s["slot"], s["offset_to_top"], s["slot_address_point"]) for s in slots] == [
+            (1, 0, "0x4010"), (2, 0, "0x4010")]
+
+
+def test_vtable_slot_budget_is_not_reported_as_a_missing_header_1046(monkeypatch):
+    """#1046 review: a 68 KiB object with its header at the start and an entry
+    past the read budget gets `over_read_budget`, not `no_verified_header`,
+    and only the budget before the entry is read."""
+    bridge = _load_bridge(monkeypatch)
+    rl = bridge.read_listing
+    size = 0x11000
+    bv = _elf_vtable_image([("_ZTV4Huge", 0x4000, 0x10f00, _OBJECT, 1),
+                            ("_ZTI4Huge", 0x4000 + 0x10f00, 0x10, _OBJECT, 1)],
+                           data_words=[0, 0x4000 + 0x10f00], size=size,
+                           typeinfo=[(0x4000 + 0x10f00, "4Huge")])
+    census = rl._elf_vtable_census(bv)
+    near = rl._vtable_slot(bv, census, 0x4000, 0x10f00, 0x4000 + 0x30)
+    assert (near["slot"], near["slot_unknown_reason"]) == (4, None)
+    bv.reads.clear()
+    far = rl._vtable_slot(bv, census, 0x4000, 0x10f00, 0x4000 + 0x10800)
+    assert far["slot"] is None and far["slot_unknown_reason"] == "over_read_budget"
+    assert max(length for _, length in bv.reads) <= rl._VTABLE_SLOT_READ_BYTES

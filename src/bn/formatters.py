@@ -3223,7 +3223,7 @@ def _render_function_evidence_text(value: Any, *, mangled: bool = False,
     for call in calls:
         witnesses = _field_dict(call, "arity_witnesses") if isinstance(call, dict) else {}
         row_witnesses.append((witnesses, _witnesses_contradict(witnesses)))
-    hidden = 0 if (verbose or compact) else sum(
+    hidden = 0 if verbose else sum(
         1 for witnesses, contradicts in row_witnesses if witnesses and not contradicts)
     hidden_clause = (f"per-row witness lines shown only for contradictions "
                      f"({hidden} hidden; --verbose shows all)") if hidden else ""
@@ -3243,6 +3243,10 @@ def _render_function_evidence_text(value: Any, *, mangled: bool = False,
         if compact:
             lines.append(_render_compact_call_row(call, mangled=mangled,
                                                   contradicts=contradicts))
+            # #1046 review: the witness rule (and --verbose) holds in compact
+            # form too, so a contradiction keeps its compared counts.
+            if witnesses and (verbose or contradicts):
+                lines.append(_render_arity_witnesses(witnesses))
             continue
         call_addr = call.get("address", "<unknown>")
         operation = call.get("operation", "<unknown>")
@@ -3519,14 +3523,25 @@ def _callee_filter_call_header(callee_filter: dict[str, Any], shown: int,
 def _render_compact_call_row(call: dict[str, Any], *, mangled: bool,
                              contradicts: bool) -> str:
     """`evidence function --compact` (#1037): one line per call -- address,
-    direct/indirect, target, argument texts -- plus a short tag for each
-    diagnostic the full row would explain in its own line."""
+    direct/indirect, target, argument texts with what each resolves to -- plus
+    the operation when it is not a plain call, the argument source and
+    confidence (how far the list can be trusted), and a short tag for each
+    diagnostic the full row explains in its own line. Only the IL lines and
+    the instruction context are left out (#1046 review)."""
     target = _field_dict(call, "target")
     shown_target = _render_target_line(target, mangled=mangled) if target else "?"
     direct = "direct" if call.get("direct") else "indirect"
+    operation = _text_value(call, "operation")
+    kind = direct if operation in (None, "LLIL_CALL") else f"{direct} {operation}"
     args = [arg for arg in _field_list(call, "arguments") if isinstance(arg, dict)]
-    arg_text = ", ".join(_text_value(arg, "text") or "" for arg in args)
+    arg_text = ", ".join(
+        f"{_text_value(arg, 'text') or ''}{_render_resolved_arg(_field_dict(arg, 'resolved'))}"
+        for arg in args)
     tags = []
+    trust = " ".join(t for t in (_text_value(call, "argument_source"),
+                                 _text_value(call, "argument_confidence")) if t)
+    if trust:
+        tags.append(f"[args: {trust}]")
     if call.get("arity_unknown"):
         tags.append("[arity: unknown]")
     if call.get("arity_mismatch"):
@@ -3539,7 +3554,7 @@ def _render_compact_call_row(call: dict[str, Any], *, mangled: bool,
         tags.append("[variadic: under-recovered]")
     if contradicts:
         tags.append("[witness: contradiction]")
-    row = f"- {call.get('address', '<unknown>')}  {direct}  {shown_target}  ({arg_text})"
+    row = f"- {call.get('address', '<unknown>')}  {kind}  {shown_target}  ({arg_text})"
     return row + "".join(f" {tag}" for tag in tags)
 
 
@@ -3650,21 +3665,32 @@ def _render_surface_text(value: Any) -> str:
                 f"via {c.get('provenance', '?')}{more}  [{tag}: {', '.join(why)}]{suffix}")
             # #1017 comment: where the referencing code stores the address, as
             # BN's MLIL writes the store. A fact about the store, no role guess.
-            for store in _field_list(c, "stored_to"):
-                if isinstance(store, dict):
-                    lines.append(
-                        f"    stored to {_escape_control_chars(str(store.get('destination', '?')))} "
-                        f"in {_escape_control_chars(str(store.get('function', '?')))} "
-                        f"@ {store.get('address', '?')}")
-        first = _text_value(ordered[0], "address") if ordered else None
-        verify = (f"`bn disasm {shlex.quote(first)} --linear 16` (the first candidate; "
-                  "use the same form for the others -- a candidate lies outside every "
-                  "function, so plain `disasm <addr>` refuses it)"
-                  if first else "`disasm <addr> --linear 16`")
+            stores = [s for s in _field_list(c, "stored_to") if isinstance(s, dict)]
+            for store in stores:
+                lines.append(
+                    f"    stored to {_escape_control_chars(str(store.get('destination', '?')))} "
+                    f"in {_escape_control_chars(str(store.get('function', '?')))} "
+                    f"@ {store.get('address', '?')}")
+            # #1046 review: the producer lists the first few stores; say how
+            # many more it counted, so a listed prefix is not read as all.
+            stores_total = c.get("stored_to_total")
+            if isinstance(stores_total, int) and not isinstance(stores_total, bool):
+                if stores_total > len(stores):
+                    lines.append(f"    +{stores_total - len(stores)} more store(s) of this "
+                                 "address not listed")
+            elif stores_total is not None:
+                # Unreadable: say the listed stores may not be all, and record it.
+                _record_skew("stored_to_total")
+                lines.append("    (more stores of this address may exist: the total is unreadable)")
+        # #1033: the bridge's verify command, already bound to this
+        # invocation's -i/-t routing by the CLI (#1046 review).
+        verify = _text_value(value, "next_action") or (
+            "verify with `bn disasm <addr> --linear 16` (a candidate lies outside every "
+            "function, so plain `disasm <addr>` refuses it), then `function create`")
         lines.append("")
         lines.append("(candidates -- NOT confirmed functions. `decode` = clean instructions "
                      "before an undefined one; a low decode reliably means data. Start with the "
-                     f"code-likely subset; verify with {verify}, then `function create`.)")
+                     f"code-likely subset; {verify}.)")
     return "\n".join(lines)
 
 
@@ -3717,8 +3743,8 @@ def _surface_vtable_lines(table: dict[str, Any]) -> list[str]:
                           if isinstance(ott, int) and ott else "")
             slots = f"{inside} entr{'y' if inside == 1 else 'ies'} from slot {slot}{table_note}"
         else:
-            slots = (f"{inside} entr{'y' if inside == 1 else 'ies'} (no slot number: no "
-                     "typeinfo header precedes them in the object)")
+            slots = (f"{inside} entr{'y' if inside == 1 else 'ies'} "
+                     f"({_slot_unknown_text(obj)})")
         lines.append(f"    in {label} ({where}): {slots}")
     outside = table.get("entries_outside_elf_vtables")
     if lines and isinstance(outside, int) and not isinstance(outside, bool) and outside > 0:
@@ -4419,6 +4445,28 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
     return body
 
 
+#: `slot_unknown_reason` codes (#1046 review): why the bridge gave no slot.
+_SLOT_UNKNOWN_TEXT = {
+    "no_census": "the ELF symbol tables were not read",
+    "outside_object": "the entry lies outside the object",
+    "unaligned": "the entry is not pointer-aligned in the object",
+    "unreadable": "the object's bytes could not be read",
+    "over_read_budget": ("not read: no header in the bytes read before the entry, and "
+                         "earlier bytes are past the read budget"),
+    "no_verified_header": ("no verified typeinfo header precedes it in the object: no "
+                           "pointer to a defined _ZTI object whose name matches"),
+}
+
+
+def _slot_unknown_text(row: dict[str, Any]) -> str:
+    """`slot unknown: <why>`, from the bridge's `slot_unknown_reason` code."""
+    code = _text_value(row, "slot_unknown_reason")
+    if not code:
+        return "slot unknown"
+    why = _SLOT_UNKNOWN_TEXT.get(code, _escape_control_chars(code))
+    return f"slot unknown: {why}"
+
+
 def _vtable_slot_phrase(row: dict[str, Any]) -> str | None:
     """`slot N` (of a secondary table when its offset-to-top is nonzero), from the
     slot the bridge counted off a decoded typeinfo header; None when it had none."""
@@ -4447,7 +4495,9 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
         address_point = _text_value(row, "address_point")
         if address and class_name and (address_point or row.get("address_point") is None):
             known[address] = {"class_name": class_name, "address_point": address_point,
-                              "slot": _vtable_slot_phrase(row)}
+                              "slot": _vtable_slot_phrase(row),
+                              "slot_unknown": (None if row.get("slot_unknown_reason") is None
+                                               else _slot_unknown_text(row))}
     # #1018 item 1: sized ELF `_ZTV`/`_ZTC` objects holding a location whose
     # class navigation is not proven -- a label from the symbol extent only.
     objects: dict[str, list[str]] = {}
@@ -4461,9 +4511,9 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
                 continue
             label = _escape_control_chars(str(obj.get("label") or obj.get("object") or "?"))
             raw = _escape_control_chars(str(obj.get("object", "?")))
-            slot = _vtable_slot_phrase(obj)
+            slot = _vtable_slot_phrase(obj) or _slot_unknown_text(obj)
             labels.append(f"{label} ({raw} @ {obj.get('object_address', '?')}, "
-                          f"{obj.get('size', '?')} bytes{'; ' + slot if slot else ''})")
+                          f"{obj.get('size', '?')} bytes; {slot})")
         if address and labels:
             objects[address] = labels
     lines = [f"note: the callee's address is stored in {raw_count} data location(s); "
@@ -4476,6 +4526,8 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
             point = row["address_point"]
             point_note = f"primary address point {point}" if point else "primary address point not decoded"
             where = f"{row['slot']} of the named vtable" if row["slot"] else "inside the named vtable"
+            if not row["slot"] and row["slot_unknown"]:
+                point_note += f"; {row['slot_unknown']}"
             lines.append(f"  {ref}: {where} for {_escape_control_chars(cls)} "
                          f"({point_note}); "
                          f"inspect its class layout with `bn class show -- {shlex.quote(cls)}`")

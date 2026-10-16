@@ -32,6 +32,7 @@ imports ``read_xrefs`` but ``read_xrefs`` NEVER imports this module.
 """
 from __future__ import annotations
 
+import bisect
 import re
 from typing import Any
 
@@ -1356,7 +1357,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
     img_hi = int(getattr(bv, "end", 0) or 0) or (img_lo + (1 << 48))
     warnings: list[str] = []
     census = read_listing._elf_vtable_census(bv)
-    vtable_objects = read_listing._supported_vtable_objects(census)
+    vtable_index = _VtableIndex(bv, census, read_listing._supported_vtable_objects(census))
     vtable_tables_hidden = 0
 
     def containing(addr: int) -> list[Any]:
@@ -1524,19 +1525,24 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             nonlocal tables_over_cap, vtable_tables_hidden
             if len(run_vals) < table_min_run:
                 return
-            labels = (_run_vtable_labels(bv, census, vtable_objects, run_addr, len(run_vals), ps)
-                      if census["status"] == "ok" else None)
-            if hide_vtables and labels and labels["elf_vtables"] and \
-                    not labels["entries_outside_elf_vtables"]:
-                # Hidden from the table list only: a slot BN has no function
-                # for is still a missing-function candidate below.
-                vtable_tables_hidden += 1
-                for v in run_vals:
-                    note_missing(v, f"table:{hex(run_addr)}")
-                return
+            labelled = census["status"] == "ok"
+            if hide_vtables and labelled:
+                # Coverage only (no labels or slot reads): enough to decide.
+                cover = _run_vtable_labels(vtable_index, run_addr, len(run_vals), ps,
+                                           detail=False)
+                if cover["entries_outside_elf_vtables"] == 0:
+                    # Hidden from the table list only: a slot BN has no function
+                    # for is still a missing-function candidate below.
+                    vtable_tables_hidden += 1
+                    for v in run_vals:
+                        note_missing(v, f"table:{hex(run_addr)}")
+                    return
             if len(candidate_tables) >= max_tables:
                 tables_over_cap += 1   # #653.5: disclose the total, not a silent prefix
                 return
+            # #1046 review: labels (and their slot reads) only for shown tables.
+            labels = (_run_vtable_labels(vtable_index, run_addr, len(run_vals), ps)
+                      if labelled else None)
             # Normalize each pointer before the miss count so a Thumb pointer
             # (stored as addr|1) is checked at its real even entry -- matching what
             # note_missing already does (#530). Without this, every Thumb slot counts
@@ -1657,7 +1663,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             "the budget were not scanned -- on a monolithic image the pointer tables often "
             "sit in the TAIL, so raise --max-scan-bytes to cover the whole image")
     vtable_labels = read_listing._census_summary(census)
-    if hide_vtables and not vtable_objects:
+    if hide_vtables and not vtable_index.objects:
         warnings.append(f"--hide-vtables hid nothing: {vtable_labels['reason']}")
     tables_total = len(candidate_tables) + tables_over_cap
     candidates_total = len(missing) + len(missing_over_cap)
@@ -1675,11 +1681,12 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             "over-reports here -- lean on `aligned` and each table's resolved/missing ratio, and "
             "confirm with disasm")
 
-    return {
+    candidates = sorted(missing.values(), key=lambda m: m["address"])
+    result: dict[str, Any] = {
         "kind": "hidden_surface",
         "init_sections": init_sections,
         "candidate_tables": candidate_tables,
-        "missing_function_candidates": sorted(missing.values(), key=lambda m: m["address"]),
+        "missing_function_candidates": candidates,
         "summary": {
             "init_sections": len(init_sections),
             "candidate_tables": len(candidate_tables),
@@ -1695,6 +1702,16 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         },
         "warnings": warnings,
     }
+    if candidates:
+        # #1033: the verify step as a command, for the candidate listed first
+        # (code-likely ones lead). A prose field, so the CLI binds it to the
+        # invocation's -i/-t routing before it is printed.
+        first = next((m for m in candidates if m["code_likely"]), candidates[0])["address"]
+        result["next_action"] = (
+            f"verify with `bn disasm {first} --linear 16` (the first candidate; use the "
+            "same form for the others -- a candidate lies outside every function, so "
+            "plain `disasm <addr>` refuses it), then `function create`")
+    return result
 
 
 def _code_regions(bv) -> list[tuple[int, int]]:
@@ -1924,42 +1941,88 @@ def _constant_stores(func) -> list[tuple[int, int, str]]:
     return stores
 
 
-def _run_vtable_labels(bv, census: dict[str, Any], objects: list[dict[str, Any]],
-                       run_addr: int, count: int, ptr: int) -> dict[str, Any]:
+class _VtableIndex:
+    """The census's sized ``_ZTV``/``_ZTC`` objects sorted by start, with a
+    prefix maximum of their ends, so the objects overlapping one pointer run
+    are found by bisection instead of a scan of every object (#1046 review).
+    Labels are looked up once per object."""
+
+    def __init__(self, bv, census: dict[str, Any], objects: list[dict[str, Any]]):
+        self.bv = bv
+        self.census = census
+        self.objects = sorted(objects, key=lambda o: (o["start"], o["raw_name"]))
+        self._starts = [o["start"] for o in self.objects]
+        self._max_end: list[int] = []
+        best = -1
+        for obj in self.objects:
+            best = max(best, obj["start"] + obj["size"])
+            self._max_end.append(best)
+        self._labels: dict[tuple[str, int], str] = {}
+
+    def overlapping(self, lo: int, hi: int) -> list[dict[str, Any]]:
+        """Objects with ``start < hi`` and ``start + size > lo``, by start."""
+        k = bisect.bisect_left(self._starts, hi) - 1
+        found = []
+        while k >= 0 and self._max_end[k] > lo:
+            obj = self.objects[k]
+            if obj["start"] + obj["size"] > lo:
+                found.append(obj)
+            k -= 1
+        found.reverse()
+        return found
+
+    def label(self, obj: dict[str, Any]) -> str:
+        key = (obj["raw_name"], obj["start"])
+        if key not in self._labels:
+            self._labels[key] = read_listing._vtable_object_label(self.bv, obj)
+        return self._labels[key]
+
+
+def _run_vtable_labels(index: _VtableIndex, run_addr: int, count: int, ptr: int, *,
+                       detail: bool = True) -> dict[str, Any]:
     """#1017 item 1: the defined ELF ``_ZTV``/``_ZTC`` objects a pointer run's
     entries lie in, by symbol ``st_size`` only, and how many entries lie outside
     all of them. ``extends_past_elf_vtable`` flags a run whose last entry is past
     the end of an object it started in: the scanner merged that vtable with
     whatever follows it. No header or filler rule, so a registry record or
-    function table outside every object is never labelled."""
+    function table outside every object is never labelled. Without *detail*
+    only the coverage counts are computed (no label or slot reads), which is
+    all `--hide-vtables` needs to decide on a run that will not be shown."""
     end = run_addr + count * ptr
-    covered: set[int] = set()
+    spans: list[tuple[int, int]] = []
     rows = []
-    for obj in objects:
+    for obj in index.overlapping(run_addr, end):
         lo, hi = max(run_addr, obj["start"]), min(end, obj["start"] + obj["size"])
-        if lo >= hi:
-            continue
         first = -(-(lo - run_addr) // ptr)
         last = -(-(hi - run_addr) // ptr)
         if first >= last:
             continue
-        covered.update(range(first, last))
+        spans.append((first, last))
+        if not detail:
+            continue
         first_entry = run_addr + first * ptr
         rows.append({
             "object": obj["raw_name"],
-            "label": read_listing._vtable_object_label(bv, obj),
+            "label": index.label(obj),
             "kind": obj["kind"],
             "object_address": hex(obj["start"]),
             "size": obj["size"],
             "first_entry": hex(first_entry),
             "entries_inside": last - first,
-            **read_listing._vtable_slot(bv, census, obj["start"], obj["size"], first_entry),
+            **read_listing._vtable_slot(index.bv, index.census, obj["start"], obj["size"],
+                                        first_entry),
         })
+    covered = 0
+    reach = 0
+    for first, last in sorted(spans):
+        first = max(first, reach)
+        if last > first:
+            covered += last - first
+            reach = last
     return {
         "elf_vtables": rows,
-        "entries_outside_elf_vtables": count - len(covered),
-        "extends_past_elf_vtable": bool(covered) and (count - 1) not in covered
-        and max(covered) < count - 1,
+        "entries_outside_elf_vtables": count - covered,
+        "extends_past_elf_vtable": bool(spans) and 0 < reach < count,
     }
 
 

@@ -6598,6 +6598,32 @@ class TestEvidenceVtableLabels1017:
         text = shared_bn.run("evidence", "surface").stdout
         assert "vtable labels: none -- no .symtab (stripped)" in text
 
+    def test_a_function_named_like_typeinfo_does_not_restart_slots_1046(self, shared_bn,
+                                                                         tmp_path):
+        """#1046 review: an STT_FUNC alias `_ZTI5Decoy = first` equals the first
+        slot's value. `second` and `third` are primary slots 1 and 2 all the same."""
+        source = _VTABLE_LAYOUT_ASM.replace(
+            ".section .data.rel.ro",
+            ".globl _ZTI5Decoy\n.type _ZTI5Decoy,@function\n.set _ZTI5Decoy,short_a\n"
+            ".section .data.rel.ro", 1)
+        binary = self._build(tmp_path, "decoy", source)
+        kinds = subprocess.run(["readelf", "-Ws", str(binary)], capture_output=True, text=True)
+        assert any(line.split()[3:4] == ["FUNC"] and line.endswith(" _ZTI5Decoy")
+                   for line in kinds.stdout.splitlines()), kinds.stdout
+        shared_bn.load(binary)
+        vtable = self._symbols(shared_bn, "_ZTV5Short")["_ZTV5Short"]
+        out = self._json(shared_bn, "callsites", "short_b")
+        rows = out["callee_data_ref_vtables"] + [
+            {**obj, "address": row["address"]}
+            for row in out["callee_data_ref_objects"] for obj in row["objects"]]
+        row, = [r for r in rows if r["address"] == hex(vtable + 24)]
+        assert (row["slot"], row["offset_to_top"], row["slot_address_point"]) == (
+            1, 0, hex(vtable + 16))
+        surface = self._json(shared_bn, "evidence", "surface")
+        label, = [obj for t in surface["candidate_tables"] for obj in t["elf_vtables"]
+                  if obj["object"] == "_ZTV5Short"]
+        assert (label["slot"], label["offset_to_top"]) == (0, 0)
+
     def test_secondary_and_construction_tables_get_slots(self, shared_bn, tmp_path):
         import shlex
 
@@ -6633,11 +6659,15 @@ class TestEvidenceVtableLabels1017:
         assert result.returncode == 0, (command, result.stderr)
 
     def test_code_ref_store_and_footer_command_run_as_printed(self, shared_bn, tmp_path):
+        """The footer's verify command runs exactly as printed -- with a second
+        target open, so it must carry this invocation's routing (#1046 review)."""
         import shlex
+
+        from conftest import _BN_CLI
 
         binary = self._build(tmp_path, "steps", _HANDLER_STORE_C, "-O1",
                              compiler="cc", suffix=".c")
-        shared_bn.load(binary)
+        steps = shared_bn.load(binary)
         # BN made functions of both handlers; remove them so they are the
         # function-less, code-referenced addresses the surface reports.
         starts = shared_bn.json(
@@ -6648,20 +6678,26 @@ class TestEvidenceVtableLabels1017:
             "    bv.remove_user_function(f)\n"
             "bv.update_analysis_and_wait()\n")["result"]
         assert set(starts) == {"open_step", "close_step"}
-        out = self._json(shared_bn, "evidence", "surface")
+        shared_bn.load(self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM))
+        out = self._json(shared_bn, "evidence", "surface", "-t", steps)
         rows = {int(c["address"], 16): c for c in out["missing_function_candidates"]}
         for name, offset in (("open_step", "8"), ("close_step", "0x10")):
             stored = rows[starts[name]]["stored_to"]
             assert {(s["function"], s["destination"]) for s in stored} == {
                 ("steps_init", f"[arg1 + {offset}]")}, stored
-        text = shared_bn.run("evidence", "surface").stdout
+            assert rows[starts[name]]["stored_to_total"] == len(stored)
+        text = shared_bn.run("evidence", "surface", "-t", steps).stdout
         assert "    stored to [arg1 + 0x10] in steps_init @ " in text
         command, = re.findall(r"verify with `(bn [^`]+)`", text)
-        args = shlex.split(command)
-        assert args[1:2] == ["disasm"] and args[3:] == ["--linear", "16"]
-        result = shared_bn.run(*args[1:])
+        # Exactly as printed: no routing added by this harness.
+        result = subprocess.run([*_BN_CLI, *shlex.split(command)[1:]], capture_output=True,
+                                text=True, timeout=60, env=shared_bn.env())
         assert result.returncode == 0, (command, result.stderr)
-        assert result.stdout.startswith("// bn: linear disassembly of 16 units from ")
+        # The first listed candidate: code-likely ones lead, else address order.
+        cands = out["missing_function_candidates"]
+        first = int(next((c for c in cands if c["code_likely"]), cands[0])["address"], 16)
+        assert result.stdout.startswith(
+            f"// bn: linear disassembly of 16 units from {hex(first)} ")
 
     def test_evidence_function_callee_filter_1037(self, shared_bn, tmp_path):
         """#1037 item 7: `operator new` names every `_Znwm` call by its display

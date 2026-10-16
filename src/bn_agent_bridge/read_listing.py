@@ -442,7 +442,7 @@ _VTABLE_LABEL_RE = re.compile(r"^_?(construction[ _]vtable|vtable)[ _]for[ _](.+
 def _elf_vtable_census(bv) -> dict[str, Any]:
     """Every defined ``_ZTV``/``_ZTC`` object in the ELF symbol tables of the
     file BN loaded, as ``[start, start + st_size)`` in BN's (possibly rebased)
-    address space, plus the starts of the defined ``_ZTI`` typeinfo objects.
+    address space, plus the defined ``_ZTI`` typeinfo OBJECTs (start -> names).
 
     This is the one source of vtable identity and extent for `callsites` and
     `evidence surface` (#1017, #1018): no header, filler or nearest-symbol
@@ -461,7 +461,7 @@ def _elf_vtable_census(bv) -> dict[str, Any]:
     from .elf_dynamic import _Elf
 
     def refuse(status: str, reason: str) -> dict[str, Any]:
-        return {"status": status, "reason": reason, "objects": [], "typeinfo": set(),
+        return {"status": status, "reason": reason, "objects": [], "typeinfo": {},
                 "symtab": False, "pointer_size": None, "endian": None}
 
     raw = getattr(bv, "parent_view", None)
@@ -501,7 +501,7 @@ def _elf_vtable_census(bv) -> dict[str, Any]:
         bias = int(image_base) - int(original_base) if (
             image_base is not None and original_base is not None) else 0
         objects: list[dict[str, Any]] = []
-        typeinfo: set[int] = set()
+        typeinfo: dict[int, set[str]] = {}
         saw_symtab = False
         for section in sections:
             if section[1] not in (2, 11):  # SHT_SYMTAB / SHT_DYNSYM
@@ -548,8 +548,15 @@ def _elf_vtable_census(bv) -> dict[str, Any]:
                 prefix = strings[name_off:name_off + 4]
                 value = row[4] if elf.is64 else row[1]
                 if prefix == b"_ZTI":
-                    if index < count:
-                        typeinfo.add(value + bias)
+                    # #1046 review: only a defined, sized OBJECT in a loaded,
+                    # non-executable, file-backed section can be a typeinfo
+                    # record; an STT_FUNC alias named `_ZTI…` is not one.
+                    owner = sections[index] if index < count else None
+                    if (owner is not None and info & 15 == 1 and extent >= 2 * ptr
+                            and owner[1] == 1 and owner[2] & 2 and not owner[2] & 4
+                            and owner[3] <= value < value + extent <= owner[3] + owner[5]):
+                        typeinfo.setdefault(value + bias, set()).add(
+                            strings[name_off:end].decode("utf-8", errors="strict"))
                     continue
                 kind = _ELF_VTABLE_KINDS.get(prefix)
                 if kind is None:
@@ -597,40 +604,92 @@ def _census_summary(census: dict[str, Any] | None) -> dict[str, Any] | None:
     return summary
 
 
+def _typeinfo_verified(bv, census: dict[str, Any], address: int) -> bool:
+    """Is *address* a defined ``_ZTI`` OBJECT whose bytes have the typeinfo
+    shape: its second word points at a NUL-terminated name equal to the
+    symbol's own suffix (``_ZTI5Short`` -> ``5Short``, or GCC's ``*5Short``
+    for an internal-linkage type)? Cached per census."""
+    names = (census.get("typeinfo") or {}).get(address)
+    if not names:
+        return False
+    cache = census.setdefault("typeinfo_verified", {})
+    if address in cache:
+        return cache[address]
+    ptr = census["pointer_size"]
+    order = "little" if census.get("endian") == "<" else "big"
+    ok = False
+    try:
+        word = bytes(bv.read(address + ptr, ptr) or b"")
+        if len(word) == ptr:
+            name_at = int.from_bytes(word, order)
+            for name in names:
+                want = name[4:].encode()
+                got = bytes(bv.read(name_at, len(want) + 2) or b"")
+                if got[:len(want) + 1] == want + b"\0" or got == b"*" + want + b"\0":
+                    ok = True
+                    break
+    except Exception:
+        ok = False
+    cache[address] = ok
+    return ok
+
+
 def _vtable_slot(bv, census: dict[str, Any], start: int, size: int,
                  address: int) -> dict[str, Any]:
     """Where *address* sits inside the ELF vtable object ``[start, start+size)``.
 
     ``slot`` counts words from the nearest preceding address point: the word
-    after a pointer to a defined ``_ZTI`` object of the same ELF symbol tables.
-    ``offset_to_top`` is the word before that typeinfo pointer (0 for a primary
-    table, nonzero for a secondary one in the same group). Every field is None
-    when the entry is unaligned, lies before any such header, or past the read
-    budget: no slot number is guessed from the object start."""
-    unknown = {"slot": None, "slot_address_point": None, "offset_to_top": None}
+    after a pointer to a verified typeinfo OBJECT (see ``_typeinfo_verified``)
+    whose offset-to-top word also lies inside the object. ``offset_to_top`` is
+    that word (0 for a primary table, nonzero for a secondary one in the same
+    group). When no slot is given, ``slot_unknown_reason`` says why --
+    ``no_census``, ``outside_object``, ``unaligned``, ``unreadable``,
+    ``over_read_budget`` (no header in the bytes read before the entry; earlier
+    ones were not read) or ``no_verified_header``. No slot number is guessed
+    from the object start, and a read budget is never reported as a missing
+    header."""
+    def unknown(reason: str) -> dict[str, Any]:
+        return {"slot": None, "slot_address_point": None, "offset_to_top": None,
+                "slot_unknown_reason": reason}
+
     ptr = census.get("pointer_size")
-    typeinfo = census.get("typeinfo") or set()
-    if not ptr or not typeinfo or not start <= address < start + size or (address - start) % ptr:
-        return unknown
-    span = address - start
-    if span + ptr > _VTABLE_SLOT_READ_BYTES:
-        return unknown
+    if not ptr or census.get("status") != "ok":
+        return unknown("no_census")
+    if not start <= address < start + size:
+        return unknown("outside_object")
+    if (address - start) % ptr:
+        return unknown("unaligned")
+    # Read at most the budget immediately before the entry; the nearest
+    # header is the one that governs it.
+    lo = max(start, address - (_VTABLE_SLOT_READ_BYTES // ptr) * ptr)
+    span = address - lo
     try:
-        data = bytes(bv.read(start, span) or b"") if span else b""
+        data = bytes(bv.read(lo, span) or b"") if span else b""
     except Exception:
-        return unknown
+        return unknown("unreadable")
     if len(data) < span:
-        return unknown
+        return unknown("unreadable")
     order = "little" if census.get("endian") == "<" else "big"
     for i in range(span // ptr - 1, -1, -1):
-        if int.from_bytes(data[i * ptr:(i + 1) * ptr], order) not in typeinfo:
+        at = lo + i * ptr
+        if at - ptr < start:   # the offset-to-top word must be in the object too
+            break
+        if not _typeinfo_verified(bv, census, int.from_bytes(data[i * ptr:(i + 1) * ptr], order)):
             continue
-        point = start + (i + 1) * ptr
-        ott = (int.from_bytes(data[(i - 1) * ptr:i * ptr], order, signed=True)
-               if i else None)
+        if i:
+            ott_bytes = data[(i - 1) * ptr:i * ptr]
+        else:
+            try:
+                ott_bytes = bytes(bv.read(at - ptr, ptr) or b"")
+            except Exception:
+                return unknown("unreadable")
+            if len(ott_bytes) < ptr:
+                return unknown("unreadable")
+        point = at + ptr
         return {"slot": (address - point) // ptr, "slot_address_point": hex(point),
-                "offset_to_top": ott}
-    return unknown
+                "offset_to_top": int.from_bytes(ott_bytes, order, signed=True),
+                "slot_unknown_reason": None}
+    return unknown("over_read_budget" if lo > start else "no_verified_header")
 
 
 def _vtable_object_label(bv, obj: dict[str, Any]) -> str:

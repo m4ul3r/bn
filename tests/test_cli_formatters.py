@@ -1304,10 +1304,22 @@ def test_render_surface_names_a_secondary_table_and_an_undecoded_slot_1017():
     assert ("3 entries from slot 0 of the secondary table at address point 0x404998 "
             "(offset-to-top -16)") in secondary
     assert "outside every ELF vtable object" not in secondary
-    undecoded = _render_surface_text(_surface_value(
-        elf_vtables=[{**obj, "slot": None, "slot_address_point": None,
-                      "offset_to_top": None}], entries_outside_elf_vtables=0))
-    assert "3 entries (no slot number: no typeinfo header precedes them" in undecoded
+    # #1046 review: a budget refusal is not a missing header, and says so.
+    reasons = {
+        "over_read_budget": "slot unknown: not read: no header in the bytes read before "
+                            "the entry, and earlier bytes are past the read budget",
+        "no_verified_header": "slot unknown: no verified typeinfo header precedes it",
+    }
+    for code, text in reasons.items():
+        undecoded = _render_surface_text(_surface_value(
+            elf_vtables=[{**obj, "slot": None, "slot_address_point": None,
+                          "offset_to_top": None, "slot_unknown_reason": code}],
+            entries_outside_elf_vtables=0))
+        assert f"3 entries ({text}" in undecoded
+    budget = _render_surface_text(_surface_value(
+        elf_vtables=[{**obj, "slot": None, "slot_unknown_reason": "over_read_budget"}],
+        entries_outside_elf_vtables=0))
+    assert "precedes" not in budget
 
 
 @pytest.mark.parametrize("census,expected", [
@@ -1350,21 +1362,35 @@ def test_render_surface_says_resolved_slots_are_inside_a_function_body_1017():
     assert "inside" not in entries
 
 
-def test_render_surface_store_lines_and_runnable_verify_command():
-    import shlex
-
+def test_render_surface_store_lines_and_routed_verify_command():
     from bn.formatters import _render_surface_text
+    stores = [{"function": "init_steps", "address": hex(0x400958 + 4 * i),
+               "destination": f"[arg1 + {hex(0x10 + 8 * i)}]"} for i in range(4)]
     row = {"address": "0x4008e0", "section": ".text", "aligned": True, "decode_depth": 16,
            "code_likely": True, "provenance": "code_ref:init_steps@0x400950",
-           "stored_to": [{"function": "init_steps", "address": "0x400958",
-                          "destination": "[arg1 + 0x10]"}]}
-    out = _render_surface_text({"summary": {"missing_function_candidates": 1},
-                                "missing_function_candidates": [row]})
-    assert "    stored to [arg1 + 0x10] in init_steps @ 0x400958" in out.splitlines()
-    # #1033: the footer prints a command that runs on a function-less address.
-    command, = re.findall(r"verify with `(bn [^`]+)`", out)
-    assert shlex.split(command) == ["bn", "disasm", "0x4008e0", "--linear", "16"]
-    assert "member" not in out
+           "stored_to": stores, "stored_to_total": 6}
+    command = "`bn -i lab -t steps disasm 0x4008e0 --linear 16`"
+    value = {"summary": {"missing_function_candidates": 1},
+             "missing_function_candidates": [row],
+             "next_action": f"verify with {command} (the first candidate), then "
+                            "`function create`"}
+    lines = _render_surface_text(value).splitlines()
+    at = lines.index("    stored to [arg1 + 0x10] in init_steps @ 0x400958")
+    # #1046 review: four stores listed of six; the remainder is stated.
+    assert lines[at + 4] == "    +2 more store(s) of this address not listed"
+    assert "member" not in "\n".join(lines)
+    # #1033 / #1046 review: the footer prints the bridge's command as routed by
+    # the CLI, unchanged.
+    assert lines[-1].endswith(f"verify with {command} (the first candidate), then "
+                              "`function create`.)")
+    # All stores listed: no remainder line. Unreadable total: disclosed.
+    whole = _render_surface_text({**value, "missing_function_candidates": [
+        {**row, "stored_to_total": 4}]})
+    assert "more store(s)" not in whole
+    skewed = _render_surface_text({**value, "missing_function_candidates": [
+        {**row, "stored_to_total": "many"}]})
+    assert "(more stores of this address may exist: the total is unreadable)" in skewed
+    assert "malformed stored_to_total field" in skewed
 
 
 def test_callsites_note_states_slots_and_construction_vtables_1018():
@@ -1396,11 +1422,26 @@ def test_callsites_note_states_slots_and_construction_vtables_1018():
                         "not proven, so inspect references to this data location with "
                         "`bn xrefs 0x404a38` (not a virtual-caller list)")
     assert lines[4].startswith("  0x404c00: inside overlapping ELF objects construction vtable "
-                               "for B-in-D (_ZTC1D0_1B @ 0x404a20, 112 bytes), vtable for Alias")
+                               "for B-in-D (_ZTC1D0_1B @ 0x404a20, 112 bytes; slot unknown), vtable for Alias")
     assert lines[5].startswith("  0x405000: table identity unknown")
     assert len(lines) == 6
     # Every printed command is one of the two runnable forms.
     assert {cmd.split()[1] for cmd in re.findall(r"`(bn [^`]+)`", note)} == {"class", "xrefs"}
+
+
+def test_callsites_note_says_why_a_named_slot_is_unknown_1046():
+    """#1046 review: an entry past the slot read budget says so, and is not
+    described as having no typeinfo header."""
+    from bn.formatters import _callsites_data_ref_note
+    row = {"address": "0x420a40", "class_name": "Huge", "vtable_address": "0x410000",
+           "address_point": "0x410010", "slot": None, "slot_address_point": None,
+           "offset_to_top": None, "slot_unknown_reason": "over_read_budget",
+           "evidence": "elf_symbol_size"}
+    note = _callsites_data_ref_note(1, ["0x420a40"], [row], [], None)
+    line = note.splitlines()[1]
+    assert line.startswith("  0x420a40: inside the named vtable for Huge (primary address "
+                           "point 0x410010; slot unknown: not read:")
+    assert "precedes" not in line and "`bn class show -- Huge`" in line
 
 
 @pytest.mark.parametrize("census,shown", [
@@ -5845,23 +5886,46 @@ def test_render_evidence_function_callee_filter_header_1037():
 
 def test_render_evidence_function_compact_rows_1037():
     """#1037: `--compact` prints one line per call with short tags, and keeps
-    everything above the call list byte-identical."""
+    everything above the call list byte-identical. #1046 review: it keeps the
+    argument source/confidence, resolved values and the operation, and the
+    witness rule and `--verbose` hold under each row."""
     from bn.formatters import _render_function_evidence_text
     card = _evidence_card_1037(arity_witness_counts={
         "library": {"agreement": 0, "contradiction": 1, "unavailable": 1, "refused": 0}})
+    card["calls"][1]["arguments"] = [{"text": "0x402000",
+                                      "resolved": {"string": "ready", "section": ".rodata"}}]
+    card["calls"].append({
+        "address": "0x402040", "operation": "LLIL_TAILCALL", "direct": True,
+        "target": {"raw": "0x401050", "normalized": "0x401050", "status": "function",
+                   "function": {"name": "helper", "address": "0x401050"}},
+        "hlil_statement_reason": "hlil_not_call_shaped",
+        "argument_source": "mlil", "argument_confidence": "heuristic",
+        "arguments": [{"text": "arg1"}]})
     out = _render_function_evidence_text(card, compact=True)
-    rows = [line for line in out.splitlines() if line.startswith("- ")]
+    lines = out.splitlines()
+    rows = [line for line in lines if line.startswith("- ")]
     assert rows == [
         "- 0x402010  direct  operator delete @ 0x401030  (ctx, 0x18) "
-        "[arity: mismatch] [witness: contradiction]",
-        "- 0x402020  direct  log_line @ 0x401040  (\"closing\") [variadic: under-recovered]",
+        "[args: hlil inferred] [arity: mismatch] [witness: contradiction]",
+        "- 0x402020  direct  log_line @ 0x401040  (0x402000 -> \"ready\" [.rodata]) "
+        "[args: hlil recovered] [variadic: under-recovered]",
         "- 0x402030  indirect  ?  () [arity: unknown] [target unresolved]",
+        "- 0x402040  direct LLIL_TAILCALL  helper @ 0x401050  (arg1) [args: mlil heuristic]",
     ]
-    for noisy in ("instruction:", "hlil:", "llil:", "witnesses:", "arguments:"):
+    # The contradiction keeps its compared counts under its row.
+    assert lines[lines.index(rows[0]) + 1] == (
+        "  witnesses: library=contradiction (libstdc++ declares 2, prototype 1)")
+    assert "no_library_entry" not in out and "1 hidden; --verbose shows all" in out
+    for noisy in ("instruction:", "hlil:", "llil:", "arguments:"):
         assert noisy not in out
     head = out.split("\n- ", 1)[0]
     full_head = _render_function_evidence_text(card, verbose=True).split("\n- ", 1)[0]
-    assert head == full_head
+    assert head.replace("; per-row witness lines shown only for contradictions "
+                        "(1 hidden; --verbose shows all)", "") == full_head
+    # --verbose prints every witness line in compact form too.
+    verbose = _render_function_evidence_text(card, compact=True, verbose=True)
+    assert "  witnesses: library=unavailable (no_library_entry)" in verbose.splitlines()
+    assert "hidden" not in verbose
     # --mangled reaches the compact target too.
     raw = _render_function_evidence_text(card, compact=True, mangled=True)
     assert "- 0x402010  direct  _ZdlPv @ 0x401030  (ctx, 0x18)" in raw

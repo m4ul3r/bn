@@ -960,7 +960,8 @@ def _callsites(args: argparse.Namespace) -> int:
                  help="Drop calls whose resolved callee matches (same rule as --callee; "
                       "repeatable; unresolved/indirect calls are kept)"),
              arg("--compact", action="store_true", default=False,
-                 help="One line per call: address, kind, target, arguments, and short tags"),
+                 help="One line per call: address, kind, target, resolved arguments, the "
+                      "argument source/confidence, and short tags (witness lines as usual)"),
              arg("--verbose", "-v", action="store_true", default=False,
                  help="Print every per-row arity witness line (default: contradictions only)"),
              mangled_arg(),
@@ -1181,6 +1182,8 @@ def _evidence_surface(args: argparse.Namespace) -> int:
         "hidden_surface",
         params,
         require_target=True,
+        # #1046 review: the verify command in `next_action` carries -i/-t.
+        contextual_hints=True,
         text_renderer=_render_surface_text,
         stem="evidence-surface",
     )
