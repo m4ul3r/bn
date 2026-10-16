@@ -32,9 +32,9 @@ this project root and says so on stderr. `bn instance list --mine` lists only
 those (and the project's sticky pin).
 
 When a request gets an empty or cut-off reply, bn reports what it observed --
-whether the bridge process is still running and whether its registry entry is
-present -- and names no cause: a stop, a crash and a kill can each leave
-either state.
+whether the bridge process is still running, and whether its registry entry is
+present, absent, or could not be read -- and names no cause: a stop, a crash, a
+kill or a malformed reply can each leave either state.
 
 Instance routing is `-i` → `BN_INSTANCE` → project sticky pin → sole/unique project-associated live instance → auto-spawn. Target routing is `-t` → `BN_TARGET` → project sticky pin → single-open auto-pick; for `batch apply`, a manifest `"target"` wins over ambient defaults but loses to explicit `-t`. `BN_TARGET` is an ambient default, not an explicit command-line selection. A bare destructive `bn close` ignores the ambient target and closes only the sole open view or refuses with a target list; use `-t`, a path, or `--all` deliberately. An empty `BN_TARGET` or empty sticky target is refused when a command would use it. A valid ambient target can affect a bare `bn save`, so pass `-t` for the database you intend to write.
 

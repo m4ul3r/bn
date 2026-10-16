@@ -439,11 +439,17 @@ def _exit_evidence(instance: BridgeInstance, *, running: bool) -> str:
     closed: a stop, a crash and a kill can each leave either state, so no
     cause is named."""
     state = ("The process is still running" if running
-             else "The process is no longer running")
-    present = os.path.lexists(instance.registry_path)
-    return (f"{state}; its registry entry {instance.registry_path} is "
-            f"{'present' if present else 'absent'}. The reason it closed the "
-            "connection is unknown.")
+            else "The process is no longer running")
+    try:
+        os.lstat(instance.registry_path)
+        entry = "is present"
+    except (FileNotFoundError, NotADirectoryError):
+        entry = "is absent"
+    except (OSError, ValueError) as exc:
+        # A failed lookup is not absence (#1035 review round 4).
+        entry = f"could not be read ({type(exc).__name__}: {exc})"
+    return (f"{state}; its registry entry {instance.registry_path} {entry}. "
+            "The reason it closed the connection is unknown.")
 
 
 def _empty_response_error(instance: BridgeInstance, op: str | None) -> BridgeError:
@@ -486,30 +492,18 @@ def _unparseable_response_error(
     "returned invalid JSON" sends the reader hunting a protocol bug when the
     bridge simply died mid-write (#595).
 
-    The decoder cannot tell the two apart: a truncated document reports
-    `pos < len` as readily as a corrupt one (an unterminated string points at
-    where the string began), so the parse error is not evidence. Liveness is
-    the discriminator, and it is best-effort -- a recycled pid reads alive --
-    so it is REPORTED as the reason, never asserted as fact.
+    The decoder cannot tell a truncated document from a corrupt one, and
+    neither liveness nor the registry entry tells why the connection closed,
+    so both are reported as observed and no cause is named -- neither a crash
+    nor a version mismatch, which nothing here measured (#1035 review round 4).
     """
     op_label = f"op '{op}'" if op else "the request"
     parts = [
         f"Binary Ninja bridge sent a reply for {op_label} that could not be parsed "
         f"(instance {instance_selector(instance)}, pid {instance.pid}): "
-        f"the connection closed after {received} bytes ({type(exc).__name__}: {exc})."
+        f"the connection closed after {received} bytes ({type(exc).__name__}: {exc}).",
+        _exit_evidence(instance, running=_bridge_running(instance)),
     ]
-    if _bridge_running(instance):
-        parts.append(
-            "The process is still running, so the reply is malformed rather than "
-            "cut short -- a bridge older or newer than this CLI is the usual cause; "
-            "compare the build ids with `bn doctor`."
-        )
-    else:
-        parts.append(
-            "The reply was cut short by the process exiting -- this is a dead "
-            "bridge, not a protocol error. "
-            + _exit_evidence(instance, running=False)
-        )
     parts.extend(_bridge_recovery_advice(instance))
     return BridgeError(" ".join(parts))
 

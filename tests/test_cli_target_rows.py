@@ -18,6 +18,7 @@ import types
 from pathlib import Path
 
 import pytest
+from conftest import refuse_silent_skip
 
 import bn.cli
 from bn.paths import instances_dir
@@ -260,12 +261,38 @@ def test_an_empty_or_cut_reply_states_only_what_was_observed_1035_1(
             handle, "refresh", 9, ValueError("cut")))
     else:
         message = str(transport._empty_response_error(handle, "refresh"))
-    if not (truncated and running):     # a live truncated reply is the skew branch
-        presence = "present" if registry is not None else "absent"
-        assert f"registry entry {handle.registry_path} is {presence}" in message
-        assert "reason it closed the connection is unknown" in message
-    for claim in _CLAIMS:
+    presence = "present" if registry is not None else "absent"
+    assert f"registry entry {handle.registry_path} is {presence}" in message
+    assert "reason it closed the connection is unknown" in message
+    for claim in (*_CLAIMS, "malformed", "older or newer", "bn doctor", "cut short"):
         assert claim not in message
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_a_failed_registry_lookup_is_not_reported_as_absence_1035_1(
+    monkeypatch, tmp_path, truncated,
+):
+    """Review round 4: only ENOENT/ENOTDIR is absence; any other lookup error
+    is reported as such."""
+    from bn import transport
+
+    if os.geteuid() == 0:
+        refuse_silent_skip("running as root bypasses the directory permission; "
+                           "run as an unprivileged user")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    handle = _handle(locked / "x.json")
+    handle.registry_path.write_text("{}")
+    locked.chmod(0o600)                 # no search permission: lstat fails with EACCES
+    try:
+        monkeypatch.setattr(transport, "_process_running", lambda pid: False)
+        message = str(transport._unparseable_response_error(
+            handle, "refresh", 9, ValueError("cut")) if truncated
+            else transport._empty_response_error(handle, "refresh"))
+    finally:
+        locked.chmod(0o700)
+    assert f"registry entry {handle.registry_path} could not be read (PermissionError" in message
+    assert " is absent" not in message and " is present" not in message
 
 
 def test_no_stop_record_is_written_or_read_1035_1(monkeypatch, tmp_path):
