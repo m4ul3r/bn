@@ -7069,7 +7069,8 @@ def _render_mutation_summary_text(value: Any) -> str:
         methods = _row_list(plan, "retyped_methods")
         statuses = [_text_value(m, "status") for m in methods]
         retyped, already = statuses.count("verified"), statuses.count("noop")
-        # #1040.1: `this` where BN named one, else parameter 0 (its name kept).
+        # #1040.1: `this` where BN named one, else parameter 0 (its name kept)
+        # of a function whose own body stores the class's address point there.
         by_param0 = sum(1 for m in methods if _text_value(m, "variable") not in (None, "this"))
         line += f"\nobject parameter retyped: {retyped} method(s)"
         if already:
@@ -7077,15 +7078,11 @@ def _render_mutation_summary_text(value: Any) -> str:
         if len(methods) - retyped - already:
             line += f", not applied: {len(methods) - retyped - already}"
         if by_param0:
-            line += f" ({by_param0} by parameter 0: no parameter is named `this`)"
-        caveat = _text_value(plan, "parameter0_caveat")
-        if caveat:
-            line += f"\nnote: {caveat}"
-        shared = [m for m in methods if _count_field(m, "other_data_refs")]
-        if shared:
-            line += (f"\nnote: {len(shared)} retyped function(s) are also held by other data "
-                     "(a derived class's vtable, or a body folded with another class's); "
-                     "their rows carry `other_data_refs`")
+            line += (f" ({by_param0} by parameter 0: its body stores this class's vtable "
+                     "address point into it)")
+        if plan.get("address_point_refs_truncated") is True:
+            line += ("\nnote: more functions refer to the vtable address point than were read; "
+                     "some constructors may not be retyped")
         # #1040.1: skips are counted by reason, not listed -- a stripped class
         # can skip dozens -- and the JSON keeps every row.
         skipped = _row_list(plan, "skipped_methods")
@@ -7097,6 +7094,10 @@ def _render_mutation_summary_text(value: Any) -> str:
             line += (f"\nskipped: {len(skipped)} method(s) -- "
                      + "; ".join(f"{n} {reason}" for reason, n in reasons.items())
                      + " (`--format json` lists each)")
+            check = next((_text_value(m, "check") for m in skipped if _text_value(m, "check")), None)
+            if check:
+                line += (f"\nbefore typing a slot target's parameter by hand, read its prototype: "
+                         f"`{check}` (each row carries its own `check`)")
     for entry in _row_list(value, "fallthrough_entries"):
         line += (f"\nwarning: {_text_value(entry, 'address') or '<unknown>'}: preceding word "
                  f"decodes as a fall-through instruction at {_text_value(entry, 'fallthrough_from') or '<unknown>'}; "
@@ -7684,6 +7685,18 @@ def _render_trace_frontiers(frontiers: Any, *, mangled: bool = False) -> list[st
     return out
 
 
+def _typeinfo_scan_unnamed_note(value: Any) -> str:
+    """#1049 review: candidate typeinfo records the byte scan gave no class
+    name (an unparsed name string, or a base that is no class typeinfo), so a
+    listing never reads as the whole set of typeinfo objects in the data."""
+    if "typeinfo_scan_unnamed" not in value:
+        return ""
+    n = _stated_count(value, "typeinfo_scan_unnamed")
+    return (f"\n! typeinfo scan: {n} candidate record(s) given no class name (an unparsed "
+            "name string or an invalid base); `--format json` lists them under "
+            "typeinfo_scan_unnamed_samples")
+
+
 def _class_inputs_note(value: Any) -> str:
     """#653.6: on a ZERO-class result, print the empty inputs so the absence is
     ATTRIBUTABLE -- "this target is C" reads identically to "the lens failed to
@@ -7754,6 +7767,7 @@ def _render_class_list_text(value: Any) -> str:
         scan = ("\n! typeinfo byte scan stopped at its data cap; a class whose RTTI Binary "
                 "Ninja did not name may be missing from this count."
                 if value.get("abi_scan_truncated") else "")
+        scan += _typeinfo_scan_unnamed_note(value)
         return f"{quick_prefix}classes: {n}{tail}{_class_inputs_note(value)}{scan}"
     # #770: the count line states the PAGE, and the shared paging footer carries
     # the total/resume half -- the same split every other paged list uses. This
@@ -7847,6 +7861,9 @@ def _render_class_list_text(value: Any) -> str:
         lines.append(
             "! typeinfo byte scan stopped at its data cap; a class whose RTTI Binary "
             "Ninja did not name may be missing from this listing.")
+    unnamed = _typeinfo_scan_unnamed_note(value)
+    if unnamed:
+        lines.append(unnamed.lstrip("\n"))
     if value.get("vtable_recovery_budget_exhausted"):
         lines.append(
             "! vtable recovery budget exhausted; unchecked rows are unknown, "
@@ -7955,7 +7972,8 @@ def _vtable_slot_facts(s: dict[str, Any]) -> str:
     facts = []
     for write in _field_list(body, "writes_address_points"):
         if isinstance(write, dict):
-            facts.append(f"writes {_text_value(write, 'class') or '?'}'s vtable address point")
+            facts.append(f"writes {_text_value(write, 'class') or '?'}'s vtable address point"
+                         + (" into parameter 0" if write.get("into_parameter0") is True else ""))
     calls = [c for c in _field_list(body, "calls") if isinstance(c, dict)]
     if calls:
         facts.append("calls " + ", ".join(

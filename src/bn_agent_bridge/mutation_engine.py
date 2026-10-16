@@ -57,7 +57,6 @@ from ._shared import (
     _require_nonempty_name,
     _serialize_error,
     _validate_bool,
-    is_auto_function_name,
 )
 
 # Required request fields per mutation op kind, validated before dispatch so a
@@ -5869,19 +5868,21 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
       or its offset-0 member is retyped when it exists, keeping that member's
       name; nothing when it already holds the typed vptr;
     * the object parameter is retyped on the class's own methods: a parameter
-      named `this` wherever BN has one, else -- #1040.1, a stripped build names
-      none -- parameter 0, keeping its name, on the class's constructors and
-      destructors and on the targets of its OWN vtable slots, and only when
-      that parameter sits where the calling convention passes `this`: its
-      first integer argument register, or the first stack slot for one with
-      none (#1049 review: a method that never reads `this` gets a floating
-      parameter 0). A slot whose target is also a slot of a base's vtable is
-      inherited and left alone; a slot target with a name of its own that is
-      not a method of this class is not this class's; and when a base's vtable
-      cannot be decoded here no slot counts as the class's own. A thunk, or any
-      other method without a `this` (a static member, a non-virtual method of a
-      stripped build), is skipped and counted, never guessed at. Every retype
-      is verified by the engine's readback.
+      named `this` on a method the card lists under the class, else -- #1040.1,
+      a stripped build names none -- parameter 0, keeping its name, of a
+      function whose OWN body stores this class's vtable address point at
+      offset 0 of BN's parameter-0 variable (a constructor's or destructor's
+      vptr store, read from its MLIL; #1049 review). That store is direct
+      evidence that parameter 0 points at an object of the class, whatever the
+      ABI does with return buffers; nothing about a slot's position or name
+      is. Candidates are the card's methods, its vtable's slot targets and
+      every function with a code reference to the address point. A function
+      that also stores another class's address point there (a derived
+      constructor with an inlined base one) is skipped, naming both; one
+      whose parameter 0 is already a pointer to another struct is left alone;
+      a class known only through the typeinfo byte scan gets no parameter
+      retypes. Slot targets without the store are listed, not retyped. Every
+      retype is verified by the engine's readback.
 
     Refuses when the class has no primary vtable or BN defined no VTable type
     for it: then there is no table type for the vptr to point at."""
@@ -6015,34 +6016,30 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
                                "field_type": str(getattr(first, "type", ""))}
     retyped: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
-    seen: set[int] = set()
-    # #1040.1: which slot targets are the class's OWN -- in its primary vtable,
-    # and not a slot of any base's vtable (that one is inherited, and its
-    # object parameter is the base's). A base whose vtable cannot be decoded
-    # here leaves every slot unproven.
-    slot_targets = read_class._slot_target_addresses(vtable)
-    base_targets, unreadable_bases = read_class._base_vtable_targets(ctx, bv, card)
-    slot_array = (slot_start, slot_start + ptr * len(vtable.get("slots") or []))
+    own_ap = slot_start
+    scan_identity = card.get("confidence") == read_class._SCAN_PROVENANCE
     by_address: dict[int, dict[str, Any]] = {}
     for method in card.get("methods") or []:
         try:
             by_address.setdefault(int(str(method.get("address")), 16), method)
         except ValueError:
             continue
-    candidates = list(by_address.items())
+    slot_targets: list[int] = []
     for slot in vtable.get("slots") or []:
         target = (slot or {}).get("method") or {}
         try:
             address = int(str(target.get("address")), 16)
         except ValueError:
             continue
-        if address not in by_address:
-            candidates.append((address, {"address": hex(address), "demangled": str(
-                target.get("display_name") or target.get("name") or ""), "slot_only": True}))
-    for address, method in candidates:
-        if address in seen:
-            continue
-        seen.add(address)
+        slot_targets.append(address)
+        by_address.setdefault(address, {"address": hex(address), "demangled": str(
+            target.get("display_name") or target.get("name") or ""), "slot_only": True})
+    storers, storers_truncated = _address_point_referrers(bv, own_ap)
+    for address in storers:
+        fn = bv.get_function_at(address)
+        by_address.setdefault(address, {"address": hex(address), "demangled": str(
+            getattr(fn, "name", "") or ""), "ref_only": True})
+    for address, method in by_address.items():
         row = {"address": hex(address), "name": str(method.get("demangled") or method.get("mangled") or "")}
         fn = bv.get_function_at(address)
         thunk = method.get("thunk")
@@ -6052,64 +6049,60 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
             skipped.append({**row, "reason": "thunk"})
             continue
         params = list(getattr(fn, "parameter_vars", None) or []) if fn is not None else []
-        slot_only = bool(method.get("slot_only"))
-        if not slot_only and any(str(getattr(var, "name", "")) == "this" for var in params):
+        card_method = not (method.get("slot_only") or method.get("ref_only"))
+        if card_method and any(str(getattr(var, "name", "")) == "this" for var in params):
             operations.append({"op": "local_retype", "function": hex(address), "variable": "this",
                                "new_type": f"struct `{cls}`*"})
             retyped.append({**row, "variable": "this", "basis": "named `this`"})
             continue
-        owner = read_class._classify_function(fn)[1] if slot_only and fn is not None else None
-        kind = method.get("kind")
-        if kind in ("ctor", "dtor"):
-            basis = "constructor" if kind == "ctor" else "destructor"
-        elif owner is not None:
-            # A slot whose function BN (or the user) named as ANOTHER class's
-            # method -- an inherited slot, or a body folded with that class's.
-            skipped.append({**row, "reason": f"named as a method of {owner}"})
+        if scan_identity:
+            skipped.append({**row, "reason": "class identity comes from the typeinfo byte scan; "
+                                             "parameter 0 not retyped"})
             continue
-        elif slot_only and fn is not None and _has_own_name(fn):
-            # #1049 review: a slot target named as a free function (a symbol
-            # with no class) is not shown to take this class's object.
-            skipped.append({**row, "reason": f"named {getattr(fn, 'name', '') or '?'}, not a method of {cls}"})
+        if fn is None:
+            skipped.append({**row, "reason": "no function at this address"})
             continue
-        elif address not in slot_targets:
-            skipped.append({**row, "reason": "no parameter named `this`, and not a vtable slot, "
-                                             "constructor or destructor"})
+        stores = read_class._param0_address_point_stores(fn)
+        if stores is None:
+            skipped.append({**row, "reason": "IL unavailable or body too large to read; "
+                                             "parameter 0 not retyped"})
             continue
-        elif address in base_targets:
-            skipped.append({**row, "reason": "inherited: also a slot of a base's vtable"})
+        if own_ap not in stores:
+            if method.get("ref_only"):
+                continue   # references the address point, but never stores it into parameter 0
+            if address in slot_targets:
+                skipped.append({**row, "reason": "slot target, parameter 0 not retyped "
+                                                 "(no address-point store)",
+                                "check": f"bn proto get {hex(address)}"})
+            else:
+                skipped.append({**row, "reason": "no parameter named `this`, and no address-point "
+                                                 "store into parameter 0"})
             continue
-        elif unreadable_bases:
-            skipped.append({**row, "reason": "a base's vtable is not decodable here "
-                                             f"({', '.join(unreadable_bases)}), so an inherited "
-                                             "slot cannot be told from an override"})
-            continue
-        else:
-            basis = "own vtable slot"
-        if not params:
-            skipped.append({**row, "reason": "BN gives the function no parameters"})
+        others = sorted({name for name in (read_class._address_point_class(ctx, bv, value, ptr)
+                                           for value in stores if value != own_ap) if name})
+        if others:
+            skipped.append({**row, "reason": "stores the vtable address points of "
+                                             f"{', '.join([cls, *others])} into parameter 0"})
             continue
         param0 = params[0]
-        misplaced = _not_in_object_argument(bv, fn, param0)
-        if misplaced:
-            skipped.append({**row, "reason": misplaced})
+        current = str(getattr(param0, "type", "") or "")
+        # Only a single pointer to another struct counts (a user's or an
+        # earlier apply-types'); BN's own `struct X::VTable**` does not.
+        held = re.fullmatch(r"(?:struct|class) `?([^*`]+?)`?\s*\*", current)
+        if held and held.group(1) != cls:
+            skipped.append({**row, "reason": f"parameter 0 is already typed `{current}`"})
+            continue
+        basis = "stores the class's vtable address point into parameter 0"
+        if held:
+            # An earlier run's type: nothing to write, so a stripped re-run
+            # plans no op and takes the direct noop return.
+            retyped.append({**row, "variable": str(getattr(param0, "name", "")), "basis": basis,
+                            "status": "noop"})
             continue
         operations.append({"op": "local_retype", "function": hex(address),
                            "variable": vars_mod._local_id(fn, param0, is_parameter=True),
                            "new_type": f"struct `{cls}`*"})
-        retyped.append({**row, "variable": str(getattr(param0, "name", "")), "basis": basis,
-                        **_other_data_refs(bv, address, slot_array)})
-    # #1040.1: parameter 0 is the ABI's first argument. Where a by-value class
-    # return travels as a hidden first argument (x86-64 SysV, i386, 32-bit
-    # ARM), such a method takes its return slot there and `this` second;
-    # nothing in a stripped body says which methods do, so the plan states it.
-    arch = str(getattr(getattr(bv, "arch", None), "name", "") or "")
-    caveat = ("parameter 0 is the first argument; on this architecture a virtual method that "
-              "returns a class by value takes its return slot there and `this` second -- check "
-              "the decompile of any slot target that writes through parameter 0 before reading it"
-              if arch in _HIDDEN_RETURN_FIRST_ARCHES
-              and any(r.get("basis") == "own vtable slot" for r in retyped)
-              else None)
+        retyped.append({**row, "variable": str(getattr(param0, "name", "")), "basis": basis})
     plan = {
         "class": cls,
         "vtable_type": vtable_type,
@@ -6118,75 +6111,34 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
         "size_source": size_source,
         "retyped_methods": retyped,
         "skipped_methods": skipped,
-        **({"parameter0_caveat": caveat} if caveat else {}),
+        **({"address_point_refs_truncated": True} if storers_truncated else {}),
         **({"vptr_member_before": vptr_before} if vptr_before else {}),
     }
     return operations, plan
 
 
-#: #1040.1: BN architecture names whose C++ ABI passes a by-value class return
-#: as a hidden FIRST argument, ahead of `this` (AArch64 uses x8 instead).
-_HIDDEN_RETURN_FIRST_ARCHES = frozenset({"x86_64", "x86", "armv7", "thumb2", "armv7eb", "thumb2eb"})
+#: #1040.1: how many functions referring to the address point are read.
+_ADDRESS_POINT_REFERRERS_MAX = 256
 
 
-def _has_own_name(fn) -> bool:
-    """Whether *fn* carries a name that is not BN's auto name: a symbol from
-    the binary or the user, rather than ``sub_*`` analysis invented."""
-    sym = getattr(fn, "symbol", None)
-    auto = getattr(sym, "auto", None) if sym is not None else None
-    if auto is not None:
-        return not bool(auto)
-    return not is_auto_function_name(str(getattr(fn, "name", "") or ""))
-
-
-def _not_in_object_argument(bv, fn, var) -> str | None:
-    """None when *var* sits where *fn*'s calling convention passes the first
-    integer argument -- the place `this` arrives -- else why not (#1049
-    review). Register conventions: the first integer argument register (full
-    width compared, so `w0`/`edi` count as `x0`/`rdi`). A convention with
-    none (i386 cdecl): the first stack argument, just past the return address."""
-    arch = getattr(bv, "arch", None) or getattr(fn, "arch", None)
-    cc = getattr(fn, "calling_convention", None)
-    source = getattr(getattr(var, "source_type", None), "name", "") or str(getattr(var, "source_type", ""))
-    try:
-        regs = [str(r) for r in (getattr(cc, "int_arg_regs", None) or [])]
-    except Exception:
-        regs = []
-    if cc is None or arch is None:
-        return "parameter 0's placement could not be checked (no calling convention)"
-    if regs:
-        if "RegisterVariableSourceType" not in source:
-            return f"parameter 0 is not in {regs[0]}, where `this` is passed"
-        try:
-            name = str(arch.get_reg_name(int(var.storage)))
-            full = str(arch.regs[name].full_width_reg)
-            first = str(arch.regs[regs[0]].full_width_reg)
-        except Exception:
-            return "parameter 0's register could not be read"
-        if full != first:
-            return f"parameter 0 is in {name}, not {regs[0]}, where `this` is passed"
-        return None
-    if "StackVariableSourceType" not in source:
-        return "parameter 0 is not the first stack argument, where `this` is passed"
-    ptr = int(getattr(bv, "address_size", 0) or getattr(arch, "address_size", 0) or 0)
-    if int(getattr(var, "storage", -1)) != ptr:
-        return "parameter 0 is not the first stack argument, where `this` is passed"
-    return None
-
-
-def _other_data_refs(bv, address: int, slot_array: tuple[int, int]) -> dict[str, int]:
-    """#1040.1: how many data locations OUTSIDE this class's slot array BN says
-    hold *address* -- a derived class's vtable, or a copy folded with another
-    class's method. A count, not a verdict; absent when there are none."""
-    getter = getattr(bv, "get_data_refs", None)
+def _address_point_referrers(bv, address_point: int) -> tuple[list[int], bool]:
+    """The start addresses of the functions with a code reference to
+    *address_point* -- where a constructor or destructor stores the vptr --
+    in address order, at most :data:`_ADDRESS_POINT_REFERRERS_MAX`, and
+    whether that cap cut the list."""
+    getter = getattr(bv, "get_code_refs", None)
     if not callable(getter):
-        return {}
+        return [], False
+    starts: set[int] = set()
     try:
-        refs = [int(r) for r in getter(address)]
+        for ref in getter(address_point):
+            func = getattr(ref, "function", None)
+            if func is not None:
+                starts.add(int(func.start))
     except Exception:
-        return {}
-    others = sum(1 for r in refs if not slot_array[0] <= r < slot_array[1])
-    return {"other_data_refs": others} if others else {}
+        return [], False
+    ordered = sorted(starts)
+    return ordered[:_ADDRESS_POINT_REFERRERS_MAX], len(ordered) > _ADDRESS_POINT_REFERRERS_MAX
 
 
 def _is_pointer_to(type_obj, name: str) -> bool:
@@ -6237,25 +6189,29 @@ def _replaceable_vptr_slot(bv, type_obj, ptr: int) -> bool:
 def _with_class_apply_types_plan(result: Any, plan: dict[str, Any]) -> Any:
     """Attach *plan* to the batch result, each retyped method stamped with its
     own row's status (`verified`, or `noop` when `this` already had the type),
-    so `this retyped:` counts what changed rather than what was planned."""
+    so `this retyped:` counts what changed rather than what was planned. A
+    method the plan already settled (parameter 0 already this class's pointer,
+    so no op was planned) keeps its `noop` and takes no row."""
     if not isinstance(result, dict):
         return result
-    rows = [row for row in result.get("results") or []
-            if isinstance(row, dict) and row.get("op") == "local_retype"]
+    rows = iter([row for row in result.get("results") or []
+                 if isinstance(row, dict) and row.get("op") == "local_retype"])
     plan = dict(plan)
-    plan["retyped_methods"] = [
-        {**method, "status": rows[index].get("status")} if index < len(rows) else dict(method)
-        for index, method in enumerate(plan.get("retyped_methods") or [])
-    ]
+    stamped = []
+    for method in plan.get("retyped_methods") or []:
+        row = None if "status" in method else next(rows, None)
+        stamped.append({**method, "status": row.get("status")} if row is not None else dict(method))
+    plan["retyped_methods"] = stamped
     result["class_apply_types"] = plan
     return result
 
 
 def _class_apply_types_noop(plan: dict[str, Any], *, preview: bool) -> dict[str, Any]:
     """The result of a `class apply-types` with nothing left to write: the
-    struct already holds the typed vptr and no method has a `this` to retype
-    (a re-run on a stripped build). One `noop` row, like any all-noop batch,
-    so it exits 0 rather than being refused (#993 review)."""
+    struct already holds the typed vptr, no method has a `this` to retype and
+    every parameter-0 retype is already in place (a re-run on a stripped
+    build). One `noop` row, like any all-noop batch, so it exits 0 rather than
+    being refused (#993 review)."""
     return {
         "preview": preview,
         "success": True,

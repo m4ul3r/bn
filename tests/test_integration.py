@@ -1428,7 +1428,8 @@ class TestTypeStringsAndInheritance:
     def test_class_apply_types_stripped_rerun_is_a_noop(self, shared_bn):
         """#993 review: a re-run on a stripped build, where nothing is left to
         write, changes nothing and exits 0 rather than refusing; #1040.1: the
-        first run retyped parameter 0 of the class's own slots."""
+        first run retyped parameter 0 of the destructor that stores the class's
+        address point."""
         shared_bn.load(CLASSES_STRIPPED_BINARY)
         first = shared_bn.json("class", "apply-types", "svc::AuditHandler", "--summary")
         assert first["committed"] is True and first["failed_count"] == 0, first
@@ -1439,35 +1440,44 @@ class TestTypeStringsAndInheritance:
         assert summary["changed_count"] == 0 and summary["dirty_after"] is False, summary
         assert summary["class_apply_types"]["instance_struct"] == "unchanged", summary
 
-    def test_class_apply_types_retypes_parameter_0_on_a_stripped_build_1040(self, shared_bn):
-        """#1040.1: a stripped build names no parameter `this`, so every method
-        was skipped. Parameter 0 of the class's own slots (and destructors) is
-        retyped under its own name and read back; the slot inherited from the
-        base's vtable (`name()`, which AuditHandler does not override) is left
-        alone, and so is `flush()`, which never reads `this`, so BN gives it no
-        parameter at all. Skips are counted, not listed, in the text."""
+    def test_class_apply_types_retypes_parameter_0_only_where_the_address_point_is_stored_1049(
+            self, shared_bn):
+        """#1040.1 / #1049 review: on a stripped build, parameter 0 is retyped
+        only on a function whose own body stores this class's vtable address
+        point at offset 0 of parameter 0 -- here the complete-object destructor;
+        the other code that refers to the address point stores it elsewhere.
+        The other slot targets (the inherited `name()`, `handle()`, `flush()`,
+        the deleting destructor that calls the complete one) are listed and the
+        batch writes none of them; the printed `bn proto get` runs as printed.
+        (BN's own analysis then carries the new type into the deleting
+        destructor, which passes its argument straight to the retyped one: a
+        propagation, not a write of this command.)"""
         shared_bn.load(CLASSES_STRIPPED_BINARY)
         card = shared_bn.json("class", "show", "svc::AuditHandler")
         slots = [s["method"]["address"] for s in card["vtable"]["slots"]]
-        base = shared_bn.json("class", "show", "svc::EchoHandler")
-        base_slots = {s["method"]["address"] for s in base["vtable"]["slots"]}
-        inherited = set(slots) & base_slots
-        assert len(inherited) == 1, (slots, base["vtable"]["slots"])
+        storing = [s["method"]["address"] for s in card["vtable"]["slots"]
+                   if any(w.get("into_parameter0") for w in (s.get("body") or {}).get("writes_address_points", []))]
+        assert len(storing) == 1, card["vtable"]["slots"]
 
         text = shared_bn.run("class", "apply-types", "svc::AuditHandler", "--preview")
         assert text.returncode == 0, text.stdout + text.stderr
-        assert "\nobject parameter retyped: 3 method(s) (3 by parameter 0" in text.stdout, text.stdout
-        assert ("\nskipped: 2 method(s) -- 1 inherited: also a slot of a base's vtable; "
-                "1 BN gives the function no parameters") in text.stdout, text.stdout
-        assert next(iter(inherited)) not in text.stdout
+        assert "\nobject parameter retyped: 1 method(s) (1 by parameter 0: its body stores" in text.stdout, text.stdout
+        assert ("4 slot target, parameter 0 not retyped (no address-point store)") in text.stdout, text.stdout
+        check = re.search(r"read its prototype: `(bn proto get 0x[0-9a-f]+)`", text.stdout).group(1)
+        ran = shared_bn.run(*shlex.split(check)[1:])
+        assert ran.returncode == 0, ran.stdout + ran.stderr
+
         live = shared_bn.json("class", "apply-types", "svc::AuditHandler")
         rows = live["class_apply_types"]["retyped_methods"]
-        assert len(rows) == 3 and not inherited & {r["address"] for r in rows}, rows
-        for row in rows:
-            params = {v["name"]: v["type"] for v in shared_bn.json("local", "list", row["address"])["items"]
-                      if v["is_parameter"]}
-            assert row["variable"] != "this" and params[row["variable"]] == "struct svc::AuditHandler*", (
-                row, params)
+        assert [r["address"] for r in rows] == storing, rows
+        written = [(r.get("requested") or {}).get("function") for r in live["results"]
+                   if r.get("op") == "local_retype"]
+        assert written == storing, live["results"]
+        listed = {m["address"] for m in live["class_apply_types"]["skipped_methods"]
+                  if m["reason"] == "slot target, parameter 0 not retyped (no address-point store)"}
+        assert listed == set(slots) - set(storing), live["class_apply_types"]["skipped_methods"]
+        params = [v for v in shared_bn.json("local", "list", storing[0])["items"] if v["is_parameter"]]
+        assert params[0]["type"] == "struct svc::AuditHandler*", params
 
     def test_unnamed_slots_print_body_facts_and_no_role_1040(self, shared_bn):
         """#1040.2: the card states what each unnamed slot's body does -- the
@@ -1498,7 +1508,8 @@ class TestTypeStringsAndInheritance:
                        for name in rows), sorted(rows)
         assert listing["imported_suppressed"] >= 2, listing
         card = shared_bn.json("class", "show", "svc::AuditHandler")
-        assert card["typeinfo"]["source"] == "abi_scan", card["typeinfo"]
+        assert card["typeinfo"]["source"] == "typeinfo-scan", card["typeinfo"]
+        assert card["confidence"] == "typeinfo-scan", card
         assert len(card["vtable"]["slots"]) == 5, card["vtable"]
 
     def test_construction_sites_carry_their_own_allocation_request_1018(self, shared_bn):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import importlib
 import json
 import types
@@ -5252,76 +5253,77 @@ def test_untyped_vtt_does_not_own_adjacent_same_class_object_945(monkeypatch, pt
     assert any("extent is unknown" in note for note in card["notes"])
 
 
-# --- #1035.5: the ABI typeinfo scan (non-PIE builds BN's RTTI analysis skips) ---
+# --- #1035.5: the typeinfo byte scan (non-PIE builds BN's RTTI analysis skips) ---
 
 _SI_ABI_VTABLE = "_ZTVN10__cxxabiv120__si_class_type_infoE"
-_ABI_TYPES = {"N3app6WorkerE": "app::Worker", "N3app4BaseE": "app::Base",
-              "N3app5GhostE": "app::Ghost"}
-#: What BN's `_Z1f<enc>` parse yields as parameter type classes: a class name
-#: followed by more types parses too (`N3adv7PhantomEi` is Phantom, int).
-_ABI_PARAMS = {**{enc: ["NamedTypeReferenceClass"] for enc in _ABI_TYPES},
-               "N3adv7PhantomEi": ["NamedTypeReferenceClass", "IntegerTypeClass"],
-               "i": ["IntegerTypeClass"]}
-
-
-def _abi_demangle(arch, name):
-    """`bn.demangle_gnu3` stand-in. The lenient `_ZTI<enc>` names whatever it
-    is given (BN drops a trailing type), which is why the full parse must yield
-    EXACTLY one class type."""
-    enc = name[4:]
-    if name.startswith("_Z1f"):
-        kinds = _ABI_PARAMS.get(enc)
-        if kinds is None:
-            return None, None
-        params = [types.SimpleNamespace(type=types.SimpleNamespace(
-            type_class=types.SimpleNamespace(name=kind))) for kind in kinds]
-        return types.SimpleNamespace(parameters=params), None
-    if name.startswith("_ZTI"):
-        known = {"N3adv7PhantomEi": "adv::Phantom"}
-        return None, [f"typeinfo_for_{_ABI_TYPES.get(enc) or known.get(enc, 'junk')}"]
-    raise AssertionError(name)
+_CLASS_ABI_VTABLE = "_ZTVN10__cxxabiv117__class_type_infoE"
 
 
 class _AbiScanBV:
-    """A non-PIE view: the si ABI vtable COPY-relocated to 0x6000 (a local data
-    symbol plus the import alias at the same address), two si typeinfo objects
-    in .data.rel.ro -- Base, which BN named, and Worker, which it did not --
-    a typeinfo whose name string only the lenient demangle accepts, and a
-    vtable whose word[1] is Worker's typeinfo. Then two forged records (#1049
-    review): `N3adv7PhantomEi` (a class name followed by `int`) and a
-    well-named si record whose base word points at no typeinfo."""
+    """A non-PIE view: the ABI's class and si typeinfo vtables COPY-relocated
+    to 0x6100 / 0x6000 (a local data symbol plus the import alias at the same
+    address), and in .data.rel.ro:
+
+    * Base (BN named it) and Worker (it did not), Worker's vtable;
+    * FromStd, whose base is the imported `std::runtime_error` typeinfo;
+    * #1049 review counterexamples, none of which may become a class: a name
+      string whose length prefix lies, a class followed by `int`, a class
+      followed by a `void` marker; bases that are no typeinfo, an imported C
+      function, a rejected candidate, an imported fundamental type's
+      typeinfo, the record itself, and a two-record cycle."""
+
+    _RECORDS = (   # (address, vptr, name string, base word or None)
+        (0x8000, 0x6110, b"N3app4BaseE", None),
+        (0x8010, 0x6010, b"*N3app6WorkerE", 0x8000),
+        (0x8028, 0x6010, b"9junkjunk", 0x8000),
+        (0x8058, 0x6010, b"N3adv7PhantomEi", 0x8000),
+        (0x8070, 0x6010, b"N3app5GhostE", 0x1234),
+        (0x8088, 0x6010, b"N3app6SuffixEv", 0x8000),
+        (0x80a0, 0x6010, b"N3app8FromFuncE", 0x7000),
+        (0x80b8, 0x6010, b"N3app12FromRejectedE", 0x8070),
+        (0x80d0, 0x6010, b"N3app7FromIntE", 0x7010),
+        (0x80e8, 0x6010, b"N3app8SelfBaseE", 0x80e8),
+        (0x8100, 0x6010, b"N3app4CycAE", 0x8118),
+        (0x8118, 0x6010, b"N3app4CycBE", 0x8100),
+        (0x8130, 0x6010, b"N3app7FromStdE", 0x7020),
+    )
 
     def __init__(self):
         self.arch = types.SimpleNamespace(name="x86_64", address_size=8)
         self.functions = []
         self.abi = _Sym(_SI_ABI_VTABLE, "vtable for __cxxabiv1::__si_class_type_info",
                         0x6000, "SymbolType.DataSymbol")
-        self.abi_alias = _Sym(_SI_ABI_VTABLE, "vtable for __cxxabiv1::__si_class_type_info",
-                              0x6000, "SymbolType.ImportedDataSymbol")
-        self.base_ti = _Sym("_ZTIN3app4BaseE", "typeinfo for app::Base", 0x8000)
-        self._symbols = [self.abi, self.abi_alias, self.base_ti]
-        words = [
-            0x6010, 0x8100,          # 0x8000 typeinfo for app::Base (named)
-            0x6010, 0x8110, 0x8000,  # 0x8010 Worker: no symbol; base = app::Base
-            0x6010, 0x8120,          # 0x8028 a typeinfo whose name is garbage
-            0,                       # 0x8038
-            0, 0x8010, 0x1000,       # 0x8040 Worker's vtable: ott 0, typeinfo, slot
-            0x6010, 0x8130, 0x8000,  # 0x8058 "Phantom": two types in one name
-            0x6010, 0x8140, 0x1234,  # 0x8070 "Ghost": its base is no typeinfo
+        self.class_abi = _Sym(_CLASS_ABI_VTABLE, "vtable for __cxxabiv1::__class_type_info",
+                              0x6100, "SymbolType.DataSymbol")
+        self._symbols = [
+            self.abi, self.class_abi,
+            _Sym(_SI_ABI_VTABLE, "vtable for __cxxabiv1::__si_class_type_info", 0x6000,
+                 "SymbolType.ImportedDataSymbol"),
+            _Sym(_CLASS_ABI_VTABLE, "vtable for __cxxabiv1::__class_type_info", 0x6100,
+                 "SymbolType.ImportedDataSymbol"),
+            _Sym("_ZTIN3app4BaseE", "typeinfo for app::Base", 0x8000),
+            _Sym("puts", "puts", 0x7000, "SymbolType.ImportedFunctionSymbol"),
+            _Sym("_ZTIi", "typeinfo for int32_t", 0x7010, "SymbolType.ExternalSymbol"),
+            _Sym("_ZTISt13runtime_error", "typeinfo for std::runtime_error", 0x7020,
+                 "SymbolType.ExternalSymbol"),
         ]
-        strings = bytearray(0x50)
-        for at, text in ((0x00, b"N3app4BaseE"), (0x10, b"*N3app6WorkerE"), (0x20, b"9junkjunk"),
-                         (0x30, b"N3adv7PhantomEi"), (0x40, b"N3app5GhostE")):
-            strings[at:at + len(text)] = text
-        self._memory = {0x8000: b"".join(w.to_bytes(8, "little") for w in words),
-                        0x8100: bytes(strings)}
+        data = bytearray(0x148)
+        strings = bytearray(0x1a0)
+        for index, (address, vptr, name, base) in enumerate(self._RECORDS):
+            at = 0x8400 + index * 0x20
+            strings[at - 0x8400:at - 0x8400 + len(name)] = name
+            words = [vptr, at] + ([] if base is None else [base])
+            for k, word in enumerate(words):
+                data[address - 0x8000 + 8 * k:address - 0x8000 + 8 * k + 8] = word.to_bytes(8, "little")
+        data[0x40:0x58] = b"".join(w.to_bytes(8, "little") for w in (0, 0x8010, 0x1000))  # Worker's vtable
+        self._memory = {0x8000: bytes(data), 0x8400: bytes(strings)}
         sem = lambda name: types.SimpleNamespace(name=name)  # noqa: E731
         self.sections = {
-            ".data.rel.ro": types.SimpleNamespace(start=0x8000, end=0x8088,
+            ".data.rel.ro": types.SimpleNamespace(start=0x8000, end=0x8148,
                                                   semantics=sem("ReadWriteDataSectionSemantics")),
-            ".rodata": types.SimpleNamespace(start=0x8100, end=0x8150,
+            ".rodata": types.SimpleNamespace(start=0x8400, end=0x85a0,
                                              semantics=sem("ReadOnlyDataSectionSemantics")),
-            ".extern": types.SimpleNamespace(start=0x6000, end=0x6100,
+            ".extern": types.SimpleNamespace(start=0x6000, end=0x7100,
                                              semantics=sem("ExternalSectionSemantics")),
         }
         self.data_refs: dict[int, list[int]] = {}
@@ -5333,7 +5335,7 @@ class _AbiScanBV:
         return b""
 
     def get_symbols_by_name(self, raw):
-        return [self.abi] if raw == _SI_ABI_VTABLE else []
+        return [s for s in (self.abi, self.class_abi) if s.raw_name == raw]
 
     def get_symbols(self, address=None, length=None):
         if address is None:
@@ -5352,49 +5354,86 @@ class _AbiScanBV:
 
 @pytest.fixture
 def abi_scan_view(monkeypatch):
-    monkeypatch.setattr(read_class, "bn", types.SimpleNamespace(demangle_gnu3=_abi_demangle))
     bv = _AbiScanBV()
     ctx = seam.BridgeContext(None)
     monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
     return ctx, bv
 
 
-def test_abi_scan_finds_the_typeinfo_bn_did_not_name_1035(abi_scan_view):
+@pytest.mark.parametrize("encoding, expected", [
+    ("N3app6WorkerE", "app::Worker"), ("*N3app6WorkerE", "app::Worker"), ("6Worker", "Worker"),
+    ("N12_GLOBAL__N_13FooE", "(anonymous namespace)::Foo"),
+    ("N3adv4TailEi", None), ("N5probe6WidgetEv", None), ("N3app6WidgetEgarbage", None),
+    ("N3app3BoxIiEE", None), ("St9exception", None), ("N6WorkerE", None), ("N03appE", None),
+    ("9junkjunk", None), ("N3ap6WorkerE", None), ("Z4mainEUliE_", None), ("i", None), ("", None),
+])
+def test_typeinfo_names_parse_only_as_one_plain_class_1049(encoding, expected):
+    """#1049 review: BN's demangler normalised a class followed by a `void`
+    marker into that class. The scan's own parser accepts a source-name or a
+    nested name of source-names that consumes the WHOLE string, and nothing
+    else (templates, substitutions, local names are not named)."""
+    assert read_class._parse_class_encoding(encoding)[0] == expected
+
+
+def test_imported_base_names_may_use_the_std_prefix_only_for_imports_1049():
+    assert read_class._parse_class_encoding("St13runtime_error", allow_std=True)[0] == "std::runtime_error"
+    assert read_class._parse_class_encoding("i", allow_std=True)[0] is None
+
+
+def test_abi_scan_names_only_plain_classes_with_validated_bases_1049(abi_scan_view):
+    """Accepted: Worker (base Base, which BN named) and FromStd (base the
+    imported `std::runtime_error` typeinfo). Every counterexample from both
+    review rounds is given no class name and counted by reason."""
     ctx, bv = abi_scan_view
     scan = read_class._abi_rtti_scan(ctx, bv)
-    # Base already has a symbol (left to it). Refused (#1049 review): the
-    # garbage name, `N3adv7PhantomEi` -- which the lenient `_ZTI` demangle
-    # names `adv::Phantom` -- and Ghost, whose si base word is no typeinfo.
-    assert set(scan.typeinfo) == {0x8010}
-    assert scan.typeinfo[0x8010] == ("app::Worker", "si", "N3app6WorkerE", 0x8110, (0x8000,))
-    assert scan.rejected == 3
+    assert set(scan.typeinfo) == {0x8010, 0x8130}
+    assert scan.typeinfo[0x8010] == ("app::Worker", "si", "N3app6WorkerE", 0x8420, (0x8000,))
+    assert scan.rejected == {"bad_source_name": 1, "not_a_plain_class_name": 2, "invalid_base": 7}
+    assert {hex(a) for a, _, r in scan.samples if r == "invalid_base"} == {
+        "0x8070", "0x80a0", "0x80b8", "0x80d0", "0x80e8", "0x8100", "0x8118"}
     assert scan.truncated is False
     assert read_class._scanned_typeinfo_refs(ctx, bv, 0x8010) == (0x8048,)
     # The seam answers for an address no symbol names, through the scan.
     assert ctx._typeinfo_name_at(bv, 0x8010) == "app::Worker"
-    assert ctx._typeinfo_name_at(bv, 0x8028) is None
+    assert ctx._typeinfo_name_at(bv, 0x8070) is None
 
     registry = read_class._build_class_registry(ctx, bv)
     worker = registry["app::Worker"]
-    assert worker["confidence"] == "rtti"
+    # Labelled by provenance, never as symbol-backed RTTI.
+    assert worker["confidence"] == "typeinfo-scan"
     assert worker["typeinfo"] == {"address": "0x8010", "symbol": "_ZTIN3app6WorkerE",
-                                  "source": "abi_scan"}
-    assert worker["typeinfo_name"]["address"] == "0x8110"
+                                  "source": "typeinfo-scan"}
+    assert worker["typeinfo_name"]["address"] == "0x8420"
     assert worker["typeinfo_abi"] == "si"
     assert worker["imported"] is False
-    # A symbolized typeinfo keeps its symbol, not a scan provenance.
+    assert registry["app::Base"]["confidence"] == "rtti"
     assert "source" not in registry["app::Base"]["typeinfo"]
-    assert not any(n in name for name in registry for n in ("junk", "Phantom", "Ghost"))
-    # The copy-relocated ABI vtable is someone else's object.
+    for invented in ("junk", "Phantom", "Ghost", "Suffix", "FromFunc", "FromRejected",
+                     "FromInt", "SelfBase", "CycA", "CycB"):
+        assert not any(invented in name for name in registry), invented
     abi = registry["__cxxabiv1::__si_class_type_info"]
     assert abi["vtable"]["imported"] is True and abi["imported"] is True
+
+
+def test_class_list_discloses_the_candidates_it_gave_no_name_1049(monkeypatch, abi_scan_view):
+    from bn.formatters import _render_class_list_text
+    ctx, bv = abi_scan_view
+    monkeypatch.setattr(ctx, "_bases_for", lambda bv, rec: [])
+    listing = read_class._class_list(ctx, None, count_only=True)
+    assert listing["typeinfo_scan_unnamed"] == 10
+    assert {s["name_string"] for s in listing["typeinfo_scan_unnamed_samples"]} >= {
+        "N3adv7PhantomEi", "N3app6SuffixEv", "N3app8FromFuncE"}
+    assert "! typeinfo scan: 10 candidate record(s) given no class name" in _render_class_list_text(listing)
+    # A count no value reads out of is stated as unknown, never as a number.
+    skewed = _render_class_list_text({**listing, "typeinfo_scan_unnamed": "ten"})
+    assert "! typeinfo scan: ? candidate record(s) given no class name" in skewed
 
 
 def test_abi_scan_needs_an_abi_vtable_symbol_1035(abi_scan_view):
     ctx, bv = abi_scan_view
     bv.get_symbols_by_name = lambda raw: []
     scan = read_class._abi_rtti_scan(ctx, bv)
-    assert scan.typeinfo == {} and scan.rejected == 0
+    assert scan.typeinfo == {} and scan.rejected == {}
     assert "app::Worker" not in read_class._build_class_registry(ctx, bv)
 
 
@@ -5424,12 +5463,12 @@ def test_a_rename_does_not_rerun_the_byte_scan_but_written_data_does_1049(
         for notifier in notifiers:
             getattr(notifier, event)(bv)
 
-    assert set(read_class._abi_rtti_scan(ctx, bv).typeinfo) == {0x8010}
+    assert set(read_class._abi_rtti_scan(ctx, bv).typeinfo) == {0x8010, 0x8130}
     assert len(raw_scans) == 1
     # BN names Worker's typeinfo: the symbol half sees it, the bytes are not re-read.
     bv._symbols.append(_Sym("_ZTIN3app6WorkerE", "typeinfo for app::Worker", 0x8010))
     fire("symbol_added")
-    assert read_class._abi_rtti_scan(ctx, bv).typeinfo == {}
+    assert set(read_class._abi_rtti_scan(ctx, bv).typeinfo) == {0x8130}
     assert len(raw_scans) == 1
     fire("data_written")
     read_class._abi_rtti_scan(ctx, bv)
@@ -5715,6 +5754,59 @@ def test_unreadable_slot_bodies_say_why_1040(monkeypatch):
     _describe(monkeypatch, rec, {0x1100: {"read": False, "reason": "body_too_large"}})
     rec["vtable"]["address"] = "0x9000"
     assert "[body not read: body_too_large]" in _render_class_show_text({**rec, "confidence": "rtti"})
+
+
+# --- #1040.1: the address-point store `class apply-types` takes as evidence ---
+
+_SsaVar = collections.namedtuple("_SsaVar", "var version")
+
+
+def _store_fn(instructions, definitions, params=("arg1", "arg2")):
+    """A function whose MLIL SSA is *instructions*; *definitions* maps an SSA
+    variable to its defining instruction (absent: an incoming value)."""
+    ssa = types.SimpleNamespace(instructions=instructions,
+                                get_ssa_var_definition=lambda v: definitions.get(v))
+    return types.SimpleNamespace(parameter_vars=list(params),
+                                 mlil=types.SimpleNamespace(ssa_form=ssa))
+
+
+def _var(name, version=0):
+    return _il("MLIL_VAR_SSA", src=_SsaVar(name, version))
+
+
+def test_param0_address_point_stores_reads_only_offset_0_of_parameter_0_1049():
+    """The evidence is a store of a constant at offset 0 of BN's parameter-0
+    variable, read through plain copies (an -O0 spill and reload). A store into
+    parameter 1 (where `this` arrives when parameter 0 is a hidden return
+    buffer), at a nonzero offset (a secondary base), or of a non-constant is
+    none."""
+    rax, spill = _SsaVar("rax", 1), _SsaVar("var_10", 1)
+    defs = {rax: _il("MLIL_SET_VAR_SSA", src=_var("var_10", 1)),
+            spill: _il("MLIL_SET_VAR_SSA", src=_var("arg1"))}
+    through_copies = _il("MLIL_STORE_SSA", dest=_il("MLIL_VAR_SSA", src=rax),
+                         src=_il("MLIL_CONST_PTR", constant=0x404010))
+    into_param1 = _il("MLIL_STORE_SSA", dest=_var("arg2"), src=_il("MLIL_CONST_PTR", constant=0x405010))
+    at_offset_8 = _il("MLIL_STORE_STRUCT_SSA", dest=_var("arg1"), offset=8,
+                      src=_il("MLIL_CONST_PTR", constant=0x406010))
+    struct_at_0 = _il("MLIL_STORE_STRUCT_SSA", dest=_var("arg1"), offset=0,
+                      src=_il("MLIL_CONST_PTR", constant=0x407010))
+    not_constant = _il("MLIL_STORE_SSA", dest=_var("arg1"), src=_var("arg2"))
+    fn = _store_fn([through_copies, into_param1, at_offset_8, struct_at_0, not_constant], defs)
+    assert read_class._param0_address_point_stores(fn) == [0x404010, 0x407010]
+    assert read_class._param0_address_point_stores(_store_fn([into_param1], {})) == []
+    assert read_class._param0_address_point_stores(_store_fn([through_copies], defs, params=())) == []
+
+
+def test_slot_facts_mark_an_address_point_stored_into_parameter_0_1049():
+    from bn.formatters import _render_class_show_text
+    rec = _slot_rec(0x1100)
+    rec["vtable"]["address"] = "0x9000"
+    rec["vtable"]["slots"][0]["body"] = {
+        "read": True, "calls": [], "calls_operator_delete": False,
+        "writes_address_points": [{"address_point": "0x9010", "class": "app::Worker",
+                                   "into_parameter0": True}]}
+    text = _render_class_show_text({**rec, "confidence": "rtti"})
+    assert "[writes app::Worker's vtable address point into parameter 0]" in text
 
 
 # --- #1018.2: the allocation feeding a constructor call, from SSA def-use ---
