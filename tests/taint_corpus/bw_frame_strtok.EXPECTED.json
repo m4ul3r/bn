@@ -1,0 +1,31 @@
+{
+  "description": "strtok has no write frame: a possible writer of the length field.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline",
+    "-fno-builtin",
+    "-fno-strict-aliasing",
+    "-U_FORTIFY_SOURCE"
+  ],
+  "backward": [
+    {
+      "function": "tokenized_length",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "source",
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    }
+  ]
+}

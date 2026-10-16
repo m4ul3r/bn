@@ -1709,56 +1709,65 @@ class TaintEngine:
         width = getattr(getattr(dest_type, "target", None), "width", None)
         return int(width) if width is not None and int(width) > 0 else None
 
-    def _out_extents(self, call_ins: Any, params: list[Any], model: dict[str, Any],
-                     mkey: str | None) -> dict[int, int | None]:
-        """``{argument index: bytes written}`` for every ``*arg:N`` a model
-        writes through. The length is known only where the model's sink
-        metadata names a constant length for THAT pointer (``len_arg`` beside
-        ``buf_arg``, or the one out-pointer of an ``overflow_len`` copy);
-        otherwise it is None -- an open-ended write. A requested I/O length
-        bounds the write; it does not prove every byte was written (#931)."""
-        outs = self._model_out_arg_indices(model)
-        sink = model.get("sink") or {}
-        len_idx = sink.get("len_arg")
-        if len_idx is None and str(sink.get("class") or "") in ("overflow_len", "fortified_overflow"):
-            tainted = [i for i in (sink.get("tainted_args") or []) if isinstance(i, int)]
-            len_idx = tainted[0] if len(tainted) == 1 else None
-        buf_idx = sink.get("buf_arg")
-        if buf_idx is None and len(outs) == 1:
-            buf_idx = outs[0]
-        length: int | None = None
-        if isinstance(len_idx, int) and len_idx < len(params) and len_idx not in outs:
-            n = self._int_const(params[len_idx])
-            scale = self._count_scale(call_ins, mkey)
-            if n is not None and n >= 0 and scale is not None:
-                length = n * scale
-        return {i: (length if i == buf_idx else None) for i in outs}
+    def _write_frame(self, params: list[Any], model: dict[str, Any]) -> list[tuple[int, int | None]] | None:
+        """``[(argument index, bytes written or None)]`` for every pointee the
+        model's ``write_frame`` says the callee may write, or None when the
+        call's writes are NOT known to be confined: the model declares no
+        frame (taint flows -- ``propagates``/``sources`` -- are not a memory-
+        effect contract: strtok, asprintf, stat and the printf family write
+        memory they never name), or a frame pointer or its length argument
+        is missing from the recovered call (#1053 round 2). A length is the
+        constant of the frame's ``len_arg``; None is an unknown extent from
+        the pointer upward, which also contains an append's write. An empty
+        frame (``getenv``) declares a callee that writes no memory."""
+        frame = model.get("write_frame")
+        if not isinstance(frame, list):
+            return None
+        out: list[tuple[int, int | None]] = []
+        for e in frame:
+            tok, la = (e, None) if isinstance(e, str) else (e.get("to"), e.get("len_arg"))
+            idx = _try_arg_index(str(tok or ""))
+            if idx is None or idx >= len(params):
+                return None
+            length: int | None = None
+            if la is not None:
+                if not isinstance(la, int) or la >= len(params):
+                    return None
+                n = self._int_const(params[la])
+                length = n if n is not None and n >= 0 else None
+            out.append((idx, length))
+        return out
 
     def _call_load_effect(self, ssaf: Any, call_ins: Any, load: Any, la: tuple):
         """What the call *call_ins* did to the bytes *load* reads at exact
-        slot *la*: ``("none",)`` when every pointer its model writes through
-        is provably disjoint from them (a libc model declares what its callee
-        writes), ``("source", callee)`` when a modeled source's write covers
-        them, ``("partial_source", callee)`` when it covers only some,
-        ``("may_source", callee)`` when it may reach them (an inexact
-        destination, an unknown length), and ``("opaque",)`` otherwise -- an
-        unmodeled or ``{}``-modeled call, or a non-source write that may reach
-        them. A source whose destination is merely the same object is not a
-        writer of the field (#1053 review 2: ``recv(fd, p->hdr, 8)`` writes
-        bytes [0,8), not ``p->len`` at [8,12))."""
+        slot *la*. A call is proven NOT to have written them only by a
+        declared ``write_frame`` (:meth:`_write_frame`) whose every write is
+        provably disjoint: ``("none",)``. Otherwise ``("source", callee)``
+        when a modeled source's framed write, at an exact destination with a
+        constant length, covers them; ``("partial_source", callee)`` when it
+        covers some; ``("may_source", callee)`` for any other source -- one
+        with no frame, a missing pointer, an inexact destination or an
+        unknown length: named, and a frontier; and ``("opaque",)`` for every
+        other call that may have written them (unmodeled, ``{}``-modeled,
+        frameless, or a framed non-source write that may reach them). A
+        source writing another part of the object is not the field's
+        producer (#1053 review 2: ``recv(fd, p->hdr, 8)`` writes [0,8), not
+        ``p->len`` at [8,12))."""
         name = self._callee_name(self._resolve_direct_target(call_ins))
         mkey, model = lookup_model(self.models, name)
         if not model or model_is_benign_marker(model):
             return ("opaque",)
+        callee = mkey or name
         params = self._call_params(call_ins)
         source_outs = {_try_arg_index(str(s.get("to") or ""))
                        for s in (model.get("sources") or [])
                        if str(s.get("to") or "").startswith("*arg:")}
+        frame = self._write_frame(params, model)
+        if frame is None:
+            return ("may_source", callee) if source_outs else ("opaque",)
         source_rel: str | None = None
         rank = {"cover": 3, "overlap": 2, "may": 1}
-        for idx, length in self._out_extents(call_ins, params, model, mkey).items():
-            if idx >= len(params):
-                continue
+        for idx, length in frame:
             dest = params[idx]
             rel = self._write_relation(ssaf, dest, self._exact_addr(ssaf, dest), length,
                                        load, la, open_ended=length is None)
@@ -1768,7 +1777,6 @@ class TaintEngine:
                 return ("opaque",)
             if source_rel is None or rank[rel] > rank[source_rel]:
                 source_rel = rel
-        callee = mkey or name
         if source_rel is None:
             return ("none",)
         return ({"cover": "source", "overlap": "partial_source", "may": "may_source"}[source_rel],
@@ -2596,13 +2604,18 @@ class TaintEngine:
             unknown) through *dest* (exact slot *exact*): those it may
             overwrite are forgotten. A write at an exact constant address
             kills the slots it overlaps; a write through the address of a
-            stack local cannot reach a global slot; any other write -- through
-            a pointer the walk cannot pin -- may overwrite every one."""
+            stack local -- including a reload PROVEN to hold `&buf`
+            (`stash = buf; memset(stash, ..)`, #1053 round 2) -- cannot reach a
+            global slot; any other write, through a pointer the walk cannot
+            pin, may overwrite every one."""
             if not addrs:
                 return addrs
             lo = self._gconst_addr(exact)
             if lo is None:
-                return addrs if self._addr_root_kind(ssaf, dest) == "local" else frozenset()
+                if self._addr_root_kind(ssaf, dest) == "local" \
+                        or self._must_offset(ssaf, dest, base_key) is not None:
+                    return addrs
+                return frozenset()
             try:
                 hi = lo + int(length) if length is not None else None
             except (TypeError, ValueError):
@@ -2610,22 +2623,25 @@ class TaintEngine:
             return frozenset(s for s in addrs if s + ptr_size <= lo or (hi is not None and hi <= s))
 
         def _call_kills(defn: Any, addrs: frozenset[int]) -> frozenset[int]:
-            """Remembered slots that survive the call *defn*: a modeled
-            callee writes only what its model declares (each out-pointer with
-            its known extent -- `memcpy(&stash, &other, 8)` is a definite
-            overwrite, #1053 review 3); an unmodeled or ``{}``-modeled callee
-            may overwrite any of them."""
+            """Remembered slots that survive the call *defn*. Only a declared
+            ``write_frame`` whose pointers all appear in the call confines the
+            callee's writes (`memcpy(&stash, &other, 8)` overwrites exactly
+            the slot, #1053 review 3); any other call -- unmodeled,
+            ``{}``-modeled, frameless (asprintf retargets its `char **`), or
+            missing a frame pointer -- may overwrite every remembered slot."""
             if not addrs:
                 return addrs
             name = self._callee_name(const_target(getattr(defn, "dest", None)))
-            mkey, model = lookup_model(self.models, name)
+            _, model = lookup_model(self.models, name)
             if model is None or model_is_benign_marker(model):
                 return frozenset()
             params = self._call_params(defn)
-            for idx, length in self._out_extents(defn, params, model, mkey).items():
-                if idx < len(params):
-                    dest = params[idx]
-                    addrs = _kill(addrs, dest, self._exact_addr(ssaf, dest), length)
+            frame = self._write_frame(params, model)
+            if frame is None:
+                return frozenset()
+            for idx, length in frame:
+                dest = params[idx]
+                addrs = _kill(addrs, dest, self._exact_addr(ssaf, dest), length)
             return addrs
 
         def transfer(v: int) -> tuple[bool, bool, frozenset[int]]:

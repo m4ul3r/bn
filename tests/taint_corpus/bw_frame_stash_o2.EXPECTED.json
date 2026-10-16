@@ -1,0 +1,198 @@
+{
+  "description": "Stash slots are forgotten at every write that may reach them and kept across writes proven elsewhere (through the proven &buf, to another exact address). Analyze only. -O2.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline",
+    "-fno-builtin",
+    "-fno-strict-aliasing",
+    "-U_FORTIFY_SOURCE"
+  ],
+  "backward": [
+    {
+      "function": "ctl_direct",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    },
+    {
+      "function": "ctl_two_fills",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    },
+    {
+      "function": "ctl_snprintf",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    },
+    {
+      "function": "keep_adjacent",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    },
+    {
+      "function": "repeated_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    },
+    {
+      "function": "kill_strtol",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "global"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "kill_asprintf",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "global"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "kill_ptr_store",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "global"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "kill_gload_store",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "global"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "kill_memmove",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "global"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "kill_partial",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "global"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ],
+      "complete_slice": false
+    }
+  ]
+}

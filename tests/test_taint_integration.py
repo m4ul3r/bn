@@ -373,6 +373,54 @@ def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, share
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
+def test_modeled_write_with_an_unrecovered_pointer_is_a_possible_writer(tmp_path, shared_bn):
+    """#1053 round 2: when BN recovers `recv(fd)` only, the model's output
+    pointer is missing from the call. That is no proof recv wrote nothing:
+    the field stored before it and the stash slot it overwrites must stay
+    unproven, never an older store's constant/parameter or a named writer."""
+    src = tmp_path / "recovery.c"
+    src.write_text("""
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+struct packet { char hdr[8]; int len; };
+char *stash;
+__attribute__((noinline)) void field_omitted(int fd, struct packet *p, int n,
+        char *d, const char *s) {
+    p->len = n;
+    recv(fd, p, 12, 0);
+    memcpy(d, s, ((volatile struct packet *)p)->len);
+}
+__attribute__((noinline)) void stash_omitted(int fd, const char *host) {
+    char buf[64];
+    memset(buf, 0, sizeof buf);
+    stash = buf;
+    recv(fd, &stash, sizeof stash, 0);
+    strcpy(stash, host);
+    popen(buf, "r");
+}
+int main(void) { return 0; }
+""")
+    binary = tmp_path / "recovery"
+    _compile(src, binary, ["-O2", "-fno-inline", "-fno-builtin", "-U_FORTIFY_SOURCE"])
+    target = shared_bn.load(binary, copy=False)
+
+    def query(fn, sink):
+        return _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn, "--sink", sink)
+
+    full = query("field_omitted", "arg:memcpy:2")
+    assert {"kind": "source", "callee": "recv"} in [sl["origin"] for sl in full["slices"]], full
+    _bn_json(shared_bn, "-t", target, "proto", "set", "recv", "int64_t recv(int fd)")
+    field = query("field_omitted", "arg:memcpy:2")
+    assert field["diagnostics"]["safe_to_report_complete_slice"] is False, field["diagnostics"]
+    assert any(lf["kind"] == "field_load_unresolved" for lf in field["leaves"]), field["leaves"]
+    stash = query("stash_omitted", "arg:popen:0")
+    assert stash["diagnostics"]["safe_to_report_complete_slice"] is False, stash["diagnostics"]
+    reasons = [st.get("reason", "") for sl in stash["slices"] for st in sl["slice"]]
+    assert not any("buf written by strcpy" in r for r in reasons), reasons
+
+
 def test_aarch64_oversized_big_preserves_flow_after_force_analysis(tmp_path, shared_bn):
     """Public 84,004-byte add body; inspect BN's actual analysis, not a split prediction."""
     cc = shutil.which("aarch64-linux-gnu-gcc")

@@ -9,6 +9,8 @@ from test_taint_engine import (
     _B_MEMCPY,
     _B_MEMSET,
     _B_NAMES,
+    _B_READ,
+    _B_SNPRINTF,
     _B_STRCPY,
     FBV,
     FSSA,
@@ -24,8 +26,10 @@ from test_taint_engine import (
     te,
 )
 
-_READ_U32, _MEMCPY, _RECV = 0xa10, 0xa20, 0xa30
-_NAMES = {_READ_U32: "read_u32", _MEMCPY: "memcpy", _RECV: "recv"}
+_READ_U32, _MEMCPY, _RECV, _STRTOK, _STAT, _STRNCAT, _STRNCPY = (
+    0xa10, 0xa20, 0xa30, 0xa40, 0xa50, 0xa60, 0xa70)
+_NAMES = {_READ_U32: "read_u32", _MEMCPY: "memcpy", _RECV: "recv", _STRTOK: "strtok",
+          _STAT: "stat", _STRNCAT: "strncat", _STRNCPY: "strncpy"}
 
 
 class _FieldProgram:
@@ -234,6 +238,38 @@ def test_disjoint_source_fill_keeps_the_earlier_field_store():
     assert result["diagnostics"]["safe_to_report_complete_slice"] is True
 
 
+@pytest.mark.parametrize("between, proven", [
+    ("recv_pointer_unrecovered", False),   # BN recovered `recv(fd)` only
+    ("strtok", False),                     # no write frame: a taint flow is not one
+    ("stat", False),                       # sink-only model, yet it fills *arg:1
+    ("strncat", False),                    # appends at dst + strlen(dst), not [dst, dst+n)
+    ("strncpy", True),                     # writes exactly [dst, dst+3)
+])
+def test_modeled_call_is_passed_only_by_a_complete_write_frame(between, proven):
+    # #1053 round 2: `p->len = t; <call>; memcpy(.., p->len)`. A call proves it
+    # did not write the field only by a declared write frame whose pointers are
+    # all present and whose extents are destination-relative constants.
+    p = _FieldProgram()
+    p.store(p.addr(p.m0, 8), 4)
+    m = FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0])
+    src = FExpr("MLIL_VAR_SSA", "src#0", reads=[p.src0])
+    three = FExpr("MLIL_CONST", "3", constant=3)
+    target, params = {
+        "recv_pointer_unrecovered": (_RECV, [FExpr("MLIL_VAR_SSA", "fd", reads=[])]),
+        "strtok": (_STRTOK, [m, _cstr(0x700)]),
+        "stat": (_STAT, [_cstr(0x700), m]),
+        "strncat": (_STRNCAT, [m, src, three]),
+        "strncpy": (_STRNCPY, [m, src, three]),
+    }[between]
+    p.call(target, params)
+    p.sink(p.load(p.addr(p.m0, 8), 4))
+    result, origins, _, fields = p.run()
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is proven, result["diagnostics"]
+    assert bool(fields) is not proven, fields
+    if proven:
+        assert origins == [{"kind": "call", "callee": "read_u32"}], origins
+
+
 # --- stash identity (#1034 items 1 and 2) -------------------------------------
 
 _SLOT, _SLOT2, _OTHER = 0x404000, 0x404008, 0x405000
@@ -278,6 +314,9 @@ def test_stash_through_a_narrowed_slot_address_is_not_the_slot(narrowed):
 @pytest.mark.parametrize("between, kept", [
     ("memcpy_over_slot", False),
     ("memcpy_elsewhere", True),
+    ("memset_through_proven_buf", True),   # `stash = buf; memset(stash, ..)` (round 2)
+    ("read_pointer_unrecovered", False),   # `read(fd)`: the frame's pointer is missing
+    ("frameless_model", False),            # snprintf declares no write frame (%n)
     ("unmodeled_call", False),
     ("store_through_pointer", False),
 ])
@@ -294,6 +333,13 @@ def test_remembered_stash_dies_at_every_possible_overwrite(between, kept):
     if between.startswith("memcpy"):
         pg.call(_B_MEMCPY, [_cstr(_SLOT if between == "memcpy_over_slot" else _SLOT2),
                             _cstr(_OTHER), FExpr("MLIL_CONST", "8", constant=8)])
+    elif between == "memset_through_proven_buf":
+        pg.call(_B_MEMSET, [_reload(_SLOT, pg.mem, 8), FExpr("MLIL_CONST", "0", constant=0),
+                            FExpr("MLIL_CONST", "64", constant=64)])
+    elif between == "read_pointer_unrecovered":
+        pg.call(_B_READ, [FExpr("MLIL_CONST", "0", constant=0)])
+    elif between == "frameless_model":
+        pg.call(_B_SNPRINTF, [_cstr(_SLOT2), FExpr("MLIL_CONST", "8", constant=8), _cstr(0x700)])
     elif between == "unmodeled_call":
         pg.call(next(k for k, v in _B_NAMES.items() if v == "run"), [])
     else:

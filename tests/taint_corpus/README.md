@@ -48,6 +48,10 @@ brittle across compilers/optimisation.
 | `bw_fill_offset.c`     | a source fills a field only over its extent (#1053 review 2): `recv(fd, p->hdr, 8)` does not produce `p->len`; with no store the length is a `field_load_unresolved` frontier, with `p->len = n` it is `n` |
 | `bw_stash_overwrite.c` | `memcpy(&stash, &otherptr, 8)` forgets the remembered `&buf` (#1053 review 3): the later `strcpy(stash, ..)` is an opaque frontier, never a writer or `source` origin of `buf` |
 | `bw_global_load.c`     | a fixed-address load of a writable global nothing in the function wrote is a `field_load_unresolved` frontier (#1053 review 4) |
+| `bw_frame_outputs.c`   | a modeled call proves it did not write a field only from a declared `write_frame` with every pointer present (#1053 round 2): recv's frame bounds its write (union cover / short / overlap cases); recvmsg, readv, getline, stat, sscanf, asprintf and strtol have no frame and leave a `field_load_unresolved` frontier; strncat's open-ended frame may reach the field. `bw_frame_outputs_o2.c` rebuilds it at -O2 |
+| `bw_frame_stash.c`     | remembered stash slots are kept across framed writes proven elsewhere (through the proven `&buf`, an adjacent exact address) and forgotten at strtol/asprintf (frameless), a store through an unpinned pointer, memmove over the slot and a partial memcpy. `bw_frame_stash_o2.c` rebuilds it at -O2 |
+| `bw_frame_append.c`    | strncat's count is not `[dst, dst+n)` geometry: a field inside the string is a frontier; the strncpy control is complete |
+| `bw_frame_strtok.c`    | strtok declares no write frame, so it is a possible writer of a field it may tokenize. Built at -O2 |
 
 ## `EXPECTED.json` schema
 
