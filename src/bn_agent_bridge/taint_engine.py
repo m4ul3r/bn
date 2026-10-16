@@ -142,6 +142,11 @@ class _BufferSeed:
 # engine
 # --------------------------------------------------------------------------
 
+# The `resolve_map` default: no map was supplied. A distinct object, because a
+# supplied JSON `null` document is invalid, not an omission.
+_NO_RESOLVE_MAP: Any = object()
+
+
 class TaintEngine:
     def __init__(
         self,
@@ -150,7 +155,7 @@ class TaintEngine:
         *,
         find_variable: Any = None,
         unknown_call_policy: str = "conservative",
-        resolve_map: dict[str, Any] | None = None,
+        resolve_map: Any = _NO_RESOLVE_MAP,
         resolve_map_origin: str = "--resolve-map",
         find_function: Any = None,
         max_iters: int = 256,
@@ -164,9 +169,11 @@ class TaintEngine:
         # agent-supplied indirect-call resolution, validated here -- once, naming
         # the file -- rather than when the walk first needs it (#1041 item 3):
         # {call_address: [target_address, ...]}. `find_function` resolves a
-        # target spelled as a function name exactly as `-f` does.
+        # target spelled as a function name exactly as `-f` does. Only an
+        # OMITTED map is empty: a supplied document of any other shape, JSON
+        # `null` included, is refused by name (#1050 review rounds 1-2).
         self.resolve_map = normalize_resolve_map(
-            {} if resolve_map is None else resolve_map,
+            {} if resolve_map is _NO_RESOLVE_MAP else resolve_map,
             origin=resolve_map_origin, find_function=find_function)
         self.max_iters = max_iters
         self.max_depth = max_depth
@@ -3383,21 +3390,46 @@ class TaintEngine:
                             taint_node: Any, reason: str) -> bool:
         """Seed the POINTER value of a buffer argument the engine could not key.
 
-        Each variable the argument reads is seeded, and so is the root of its
-        pure-copy chain (`_canonical_ssa_var`): compiled code hands the call a
-        register copy (`x1 = buf; recv(fd, x1, ..)`) and every later use -- a
+        Each variable the argument reads is seeded. Compiled code hands the call
+        a register copy (`x1 = buf; recv(fd, x1, ..)`), and a later use -- a
         callback given the same pointer (`x0 = buf; g_cb(x0)`) -- reads another
-        copy of the same root. A pure copy is equality, so the root is that
-        same pointer, and the callback is then disclosed as the frontier it is
-        instead of vanishing (#1041 item 1, #1050 review finding 6). A pointer
-        re-derived afresh (`c->buf + have` loaded again) is NOT proven equal
-        and is not seeded. Returns whether anything was newly seeded."""
+        copy of the same root (`_canonical_ssa_var`; a pure copy is equality).
+        So every pure copy of that root that control flow can reach FROM the
+        call -- later in the block, or around a loop back-edge -- is seeded as
+        well, and the callback is disclosed as the frontier it is (#1041 item
+        1, #1050 review finding 6).
+
+        The root itself is NOT seeded: its SSA version also feeds uses that run
+        before the call, and bytes received later cannot reach them (`p` handed
+        to `system()` and only then to `recv`; #1050 round 2). A copy whose
+        order relative to the call is unknown (no block information, or
+        successors BN could not determine) is not seeded either. A pointer
+        re-derived afresh (`c->buf + have` loaded again) is not proven equal and
+        is not seeded. Returns whether the argument's own reads were seeded."""
         seeded = False
         for r in expr_reads(ptr_expr):
-            for v in (r, self._canonical_ssa_var(ssaf, r)):
-                if taint_node((var_key(v), getattr(v, "version", None)), var_label(v),
-                              callsite, reason, []):
-                    seeded = True
+            node = (var_key(r), getattr(r, "version", None))
+            if taint_node(node, var_label(r), callsite, reason, []):
+                seeded = True
+            root = self._canonical_ssa_var(ssaf, r)
+            if (var_key(root), getattr(root, "version", None)) == node:
+                continue
+            try:
+                uses = list(ssaf.get_ssa_var_uses(root) or [])
+            except Exception:
+                uses = []
+            for use in uses:
+                if use is callsite or op_name(use) != "MLIL_SET_VAR_SSA":
+                    continue
+                same = self._as_single_ssa_var(getattr(use, "src", None))
+                if same is None or (var_key(same), getattr(same, "version", None)) != (
+                        var_key(root), getattr(root, "version", None)):
+                    continue
+                if self._reaches_avoiding(callsite, use, []) is not True:
+                    continue
+                for w in ssa_writes(use):
+                    taint_node((var_key(w), getattr(w, "version", None)), var_label(w), use,
+                               f"{reason}: a copy of the same pointer, after the call", [])
         return seeded
 
     def _as_single_ssa_var(self, expr: Any) -> Any | None:

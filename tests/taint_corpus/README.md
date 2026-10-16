@@ -41,6 +41,7 @@ brittle across compilers/optimisation.
 | `scanf_unbounded.c`    | a width-less `%s` / `%[` scanf conversion is an `overflow_unbounded` sink: `fscanf` (stream input) fires unconditionally like `gets`, `sscanf` only while its input string is tainted; a width (`%63[^\n]`) or a constant input string is not a sink; a format in writable storage or with `%n$` positions is a `format_unchecked` frontier, never a guess (#1041 item 4) |
 | `strtok_undetermined.c` | a register-indirect jump BN cannot resolve follows the tainted `strtok`; undetermined successors never prove the `strtok(NULL)` unreachable, so the continuation still reaches `system()` (x86-64 inline asm) |
 | `recv_member_callback.c` | `call:recv` into `c->buf + have` (not keyable) is a `source_seed_misanchored` frontier, and the callback handed the same pointer is an `indirect_call_unresolved` frontier (#1041 item 1) |
+| `recv_member_order.c`  | a copy of an unkeyed receive pointer is seeded only where control flow reaches it from the receive: `system(p)` before `recv` stays clean, `g_cb(p)` before `recv` inside a loop is reached around the back-edge, `system(p)` after `recv` is a flow (#1050 review round 2) |
 | `strtok_fixpoint.c`    | an irreducible tokenizer loop with unused-return `strtok(line)` initializers: every tainted `strtok` that reaches the `strtok(NULL)` arms it whatever the IL order (#932); `_o1`/`_o2` rebuild it |
 
 ## `EXPECTED.json` schema

@@ -957,3 +957,19 @@ def test_render_taint_forward_header_names_the_call_locator_callee():
         "soundness": "may-analysis (intraprocedural, MVP)",
     }
     assert "sources: call:recv" in _render_taint_text(value)
+
+
+def test_taint_forward_forwards_a_null_resolve_map_as_present(monkeypatch, capsys, tmp_path):
+    # #1050 review round 2: the bridge refuses a supplied `null` map by name,
+    # so the CLI must send it as present, not drop it as though no flag was given.
+    rmap = tmp_path / "null.json"
+    rmap.write_text("null")
+    fake, calls = _fake({"taint": {"direction": "forward", "function": {"name": "p", "address": "0x1"},
+                                   "sources": [], "reached_sinks": [], "leaves": [],
+                                   "assumptions": [], "soundness": "x"}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    bn.cli.main(["taint", "forward", "-f", "dispatch", "--source", "param:1",
+                 "--resolve-map", str(rmap), "--target", "active"])
+    params = [c for c in calls if c["op"] == "taint"][0]["params"]
+    assert "resolve_map" in params and params["resolve_map"] is None
+    assert params["resolve_map_path"] == str(rmap)

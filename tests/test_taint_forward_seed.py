@@ -138,40 +138,88 @@ def test_call_preset_null_destination_receives_nothing_1041(models):
     assert _misanchored(result) == []
 
 
-def _callback_program():
-    """`p#1 = buf#1 + have`, `x1 = p#1; recv(fd, x1, ..)`, `x0 = p#1; fp(x0)`:
-    the callback receives a second register copy of the same unkeyed pointer
-    (the #1050 review finding 6 AArch64 shape)."""
+def _callback_program(*, order="after", use="callback"):
+    """`p#1 = buf#1 + have`, `x1 = p#1; recv(fd, x1, ..)`, and a second copy
+    `x0 = p#1` handed to `fp(x0)` (``use="callback"``) or `system(x0)`
+    (``use="system"``) -- two register copies of one unkeyed pointer (the
+    #1050 review finding 6 AArch64 shape). ``order``: the use runs ``after``
+    the receive, ``before`` it (#1050 round 2 `sys_before`), or before it in a
+    ``loop`` body whose back-edge runs it again after the receive."""
     c, fd, have, buf, p, x1, x0 = (FVar(s) for s in ("c", "fd", "have", "buf", "p", "x1", "x0"))
     c0, fd0, have0 = FSSA(c, 0), FSSA(fd, 0), FSSA(have, 0)
     buf1, p1, x11, x01 = FSSA(buf, 1), FSSA(p, 1), FSSA(x1, 1), FSSA(x0, 1)
-    instrs = [
+    prefix = [
         FInstr(0, 0x1000, "MLIL_SET_VAR_SSA", "buf#1 = [c#0 + 8]", reads=[c0], writes=[buf1],
                src=_field_load(c0, 8)),
-        FInstr(1, 0x1004, "MLIL_SET_VAR_SSA", "p#1 = buf#1 + have#0", reads=[buf1, have0],
+        FInstr(0, 0x1004, "MLIL_SET_VAR_SSA", "p#1 = buf#1 + have#0", reads=[buf1, have0],
                writes=[p1], src=FExpr("MLIL_ADD", "buf#1 + have#0", reads=[buf1, have0],
                                       left=_var(buf1), right=_var(have0))),
-        FInstr(2, 0x1008, "MLIL_SET_VAR_SSA", "x1#1 = p#1", reads=[p1], writes=[x11],
+    ]
+    receive = [
+        FInstr(0, 0x1008, "MLIL_SET_VAR_SSA", "x1#1 = p#1", reads=[p1], writes=[x11],
                src=_var(p1)),
-        FInstr(3, 0x100c, "MLIL_CALL_SSA", "recv(fd#0, x1#1, 0x40, 0)", reads=[x11],
+        FInstr(0, 0x100c, "MLIL_CALL_SSA", "recv(fd#0, x1#1, 0x40, 0)", reads=[x11],
                dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
                params=[_var(fd0), _var(x11), _const(0x40), _const(0)]),
-        FInstr(4, 0x1010, "MLIL_SET_VAR_SSA", "x0#1 = p#1", reads=[p1], writes=[x01],
-               src=_var(p1)),
-        FInstr(5, 0x1014, "MLIL_CALL_SSA", "fp(x0#1)", reads=[x01],
-               dest=FExpr("MLIL_VAR_SSA", "fp#1"), params=[_var(x01)]),
     ]
-    return FFunc("pump_cb", 0x1000, FSSAFunc(instrs), params=[c, fd, have])
+    target = (FExpr("MLIL_VAR_SSA", "fp#1") if use == "callback"
+              else FExpr("MLIL_CONST_PTR", "0x902", constant=0x902))
+    handoff = [
+        FInstr(0, 0x1010, "MLIL_SET_VAR_SSA", "x0#1 = p#1", reads=[p1], writes=[x01],
+               src=_var(p1)),
+        FInstr(0, 0x1014, "MLIL_CALL_SSA", f"{'fp' if use == 'callback' else 'system'}(x0#1)",
+               reads=[x01], dest=target, params=[_var(x01)]),
+    ]
+    body = receive + handoff if order == "after" else handoff + receive
+    ret = FInstr(0, 0x1020, "MLIL_RET", "return")
+    ordered = prefix + body + [ret]
+    for k, ins in enumerate(ordered):
+        ins.instr_index = k
+    entry, loop, exit_ = FBlock(0, 2), FBlock(2, 6), FBlock(6, 7)
+    entry.outgoing_edges = [_FEdge(loop)]
+    loop.outgoing_edges = ([_FEdge(loop), _FEdge(exit_)] if order == "loop"
+                           else [_FEdge(exit_)])
+    exit_.outgoing_edges = []
+    for ins in ordered:
+        ins.il_basic_block = entry if ins.instr_index < 2 else (
+            loop if ins.instr_index < 6 else exit_)
+    return FFunc("pump_cb", 0x1000, FSSAFunc(ordered), params=[c, fd, have])
 
 
+def _cb_engine(models):
+    return te.TaintEngine(FBV({0x900: "recv", 0x902: "system"}), models)
+
+
+@pytest.mark.parametrize("order", ["after", "loop"])
 @pytest.mark.parametrize("source", ["call:recv", "arg:recv:1"])
-def test_callback_given_the_same_unkeyed_pointer_is_a_frontier_1041(models, source):
-    result = _engine(models).forward(_callback_program(), [te.parse_locator(source)])
+def test_callback_given_the_same_unkeyed_pointer_is_a_frontier_1041(models, source, order):
+    result = _cb_engine(models).forward(_callback_program(order=order),
+                                        [te.parse_locator(source)])
 
     kinds = [lf["kind"] for lf in result["leaves"]]
     assert "source_seed_misanchored" in kinds
     assert any(lf["kind"] == "indirect_call_unresolved" and lf["address"] == "0x1014"
                for lf in result["leaves"]), result["leaves"]
+
+
+@pytest.mark.parametrize("use", ["system", "callback"])
+@pytest.mark.parametrize("source", ["call:recv", "arg:recv:1"])
+def test_a_use_that_only_runs_before_the_receive_stays_clean_1050(models, source, use):
+    """#1050 round 2 `sys_before`: `x0 = p; system(x0)` runs before
+    `x1 = p; recv(fd, x1, ..)` and no path leads back, so the bytes received
+    cannot reach it -- no sink, no callback frontier."""
+    result = _cb_engine(models).forward(_callback_program(order="before", use=use),
+                                        [te.parse_locator(source)])
+
+    assert result["reached_sinks"] == []
+    assert not any(lf["kind"] == "indirect_call_unresolved" for lf in result["leaves"])
+
+
+def test_a_system_call_after_the_receive_through_a_copy_is_a_flow_1050(models):
+    result = _cb_engine(models).forward(_callback_program(order="after", use="system"),
+                                        [te.parse_locator("call:recv")])
+
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"]
 
 
 # --------------------------------------------------------------------------
@@ -514,3 +562,10 @@ def test_a_false_y_resolve_map_document_is_refused_1050(models, doc):
     _dispatch, bv = _dispatch_program()
     with pytest.raises(te.TaintError, match="--resolve-map m.json"):
         te.TaintEngine(bv, models, resolve_map=doc, resolve_map_origin="--resolve-map m.json")
+
+
+def test_a_supplied_null_resolve_map_is_refused_1050(models):
+    """#1050 review round 2: JSON `null` is a supplied document, not an omission."""
+    _dispatch, bv = _dispatch_program()
+    with pytest.raises(te.TaintError, match="--resolve-map m.json: expected a JSON object"):
+        te.TaintEngine(bv, models, resolve_map=None, resolve_map_origin="--resolve-map m.json")
