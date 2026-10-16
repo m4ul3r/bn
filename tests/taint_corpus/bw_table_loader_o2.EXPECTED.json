@@ -1,5 +1,5 @@
 {
-  "description": "Loader-written bytes in a non-writable segment: .rodata tables in a PIE linked with -z notext whose entries the loader writes (a local IFUNC's IRELATIVE result, an external symbol's R_X86_64_64 under DT_TEXTREL). A masked index stays inside each table, yet each load is a frontier. Analyze only. -O2.",
+  "description": "Loader-written table entries at -O2: the same tables, but the toolchain may emit a writable .rodata in an RW segment with no DT_TEXTREL (layout not enforced; the -O0 target carries the non-writable case). Each masked load is a frontier. Analyze only.",
   "lang": "c",
   "cflags": [
     "-O2",

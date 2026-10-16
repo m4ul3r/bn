@@ -1,9 +1,12 @@
-/* Loader-written bytes in a non-writable segment (#1053 review 6): both tables
- * sit in .rodata of a PIE linked with `-z notext`, so the loader writes every
- * entry before the program runs -- the resolver result of a local IFUNC (an
- * IRELATIVE entry) or the address of an external symbol (an R_X86_64_64 under
- * DT_TEXTREL). A masked index stays inside each table, yet the loaded value is
- * not the file's bytes, so each load is a frontier. Analyze only. */
+/* Loader-written table entries (#1053 review 6): both tables sit in .rodata
+ * of a PIE linked with `-z notext`, so the loader writes every entry before
+ * the program runs -- the resolver result of a local IFUNC (an IRELATIVE
+ * entry) or the address of an external symbol (an R_X86_64_64). At -O0 the
+ * tables are in a non-writable segment under DT_TEXTREL; the -O2 build may
+ * instead get a writable .rodata in an RW segment with no DT_TEXTREL (the
+ * layout is not enforced). A masked index stays inside each table, yet the
+ * loaded value is not the file's bytes, so each load is a frontier.
+ * Analyze only. */
 #include <stdint.h>
 #include <stdlib.h>
 
