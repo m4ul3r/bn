@@ -2200,3 +2200,171 @@ def test_data_symbols_surfaces_a_lookup_failure_instead_of_reporting_none(monkey
 
     with pytest.raises(RuntimeError, match="core symbol table unavailable"):
         instance._data_symbols(None)
+
+
+# --- #1042 item 2: one name-to-address resolver for every address operand ----
+
+
+def _named_data_bv(*extra_symbols):
+    """`sock_path` (a pointer-typed data symbol) at 0x2018 and an unnamed int at
+    0x2010, the shape a stripped decompile prints as `data_2010`."""
+    fake_bn = sys.modules["binaryninja"]
+    ptr_t = _FakeType("char const*", width=4, type_class="PointerTypeClass")
+    int_t = _FakeType("int32_t", width=4, type_class="IntegerTypeClass", signed=True)
+    return _FakeBV(
+        arch=_FakeArch(name="x86", address_size=4),
+        data_vars={0x2010: _FakeDataVariable(0x2010, int_t),
+                   0x2018: _FakeDataVariable(0x2018, ptr_t)},
+        symbols=[fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2018, "sock_path"),
+                 *extra_symbols],
+        sections={".data": _FakeSection(".data", 0x2000, 0x2100)},
+        memory={0x2010: b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x60\x00\x00",
+                0x6000: b"demo.sock\x00"},
+    )
+
+
+def test_read_resolves_a_data_symbol_name_and_says_how_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _named_data_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._read(None, "sock_path", 4)
+
+    assert result["address"] == "0x2018" and result["hex"] == "00600000"
+    assert result["resolved_symbol"] == {"name": "sock_path", "kind": "data",
+                                         "address": "0x2018"}
+    # A number is still just an address, with nothing to disclose.
+    assert "resolved_symbol" not in instance._read(None, "0x2018", 4)
+
+
+def test_rendered_data_placeholder_resolves_only_when_no_symbol_has_the_name_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _named_data_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    spelled = instance._read(None, "data_2010", 4)
+    assert spelled["address"] == "0x2010" and spelled["hex"] == "01000000"
+    assert spelled["resolved_symbol"]["kind"] == "placeholder"
+
+    # The counterexample: a user NAMED something `data_2010`. The name means
+    # that symbol, wherever it is -- never the address the spelling encodes.
+    named = _named_data_bv(fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2018, "data_2010"))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: named)
+    owned = instance._read(None, "data_2010", 4)
+    assert owned["address"] == "0x2018"
+    assert owned["resolved_symbol"]["kind"] == "data"
+
+
+def test_unmapped_placeholder_and_unknown_name_miss_under_the_resolver_prefix_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _named_data_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError) as unmapped:
+        instance._read(None, "data_dead0", 4)
+    assert str(unmapped.value).startswith("Symbol not found: data_dead0.")
+    assert "nothing is mapped at the address it spells (0xdead0)" in str(unmapped.value)
+
+    # `sub_` claims a FUNCTION START, not merely mapped bytes.
+    with pytest.raises(RuntimeError, match="no function starts at the address it spells"):
+        instance._read(None, "sub_2010", 4)
+
+    # A malformed 0x token is a bad address, not a symbol miss.
+    with pytest.raises(ValueError, match="not a valid address"):
+        instance._read(None, "0xZZ", 4)
+
+    with pytest.raises(RuntimeError) as missing:
+        instance._read(None, "no_such_global", 4)
+    assert str(missing.value).startswith("Symbol not found: no_such_global.")
+
+
+def test_address_operand_prefers_the_data_slot_and_refuses_two_data_addresses_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    # An import is a data slot (GOT) and a stub under one spelling: a read of
+    # the name is a read of data, so the data symbol wins over the function.
+    bv = _named_data_bv(
+        fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x2014, "recv"),
+        fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1100, "recv"),
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    assert instance.ctx._resolve_address_operand(bv, "recv") == (
+        0x2014, {"name": "recv", "kind": "data", "address": "0x2014"})
+
+    # Two DATA addresses under one name is a choice the resolver will not make.
+    twice = _named_data_bv(fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2010, "sock_path"))
+    with pytest.raises(RuntimeError, match="Ambiguous symbol identifier: sock_path"):
+        instance.ctx._resolve_address_operand(twice, "sock_path")
+
+
+def test_data_vars_at_a_name_answers_the_one_variable_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _named_data_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._data_vars(None, at="sock_path")
+
+    assert [row["address"] for row in result["items"]] == ["0x2018"]
+    assert result["items"][0]["pointer"] == "0x6000"
+    assert result["items"][0]["pointer_string"] == "demo.sock"
+    assert result["at"] == "0x2018"
+    assert result["resolved_symbols"] == [{"name": "sock_path", "kind": "data",
+                                           "address": "0x2018"}]
+    # An interior address is not a variable start: the answer is empty, and
+    # names the address it looked at instead of reading as "no data here".
+    interior = instance._data_vars(None, at="0x2019")
+    assert interior["items"] == [] and interior["at"] == "0x2019"
+
+    window = instance._data_vars(None, start="data_2010", end="0x2100")
+    assert [row["address"] for row in window["items"]] == ["0x2010", "0x2018"]
+    assert [entry["kind"] for entry in window["resolved_symbols"]] == ["placeholder"]
+
+    for bad in ({}, {"at": "0x2018", "start": "0x2000", "end": "0x2100"},
+                {"start": "0x2000"}):
+        with pytest.raises(bridge.OperationFailure, match="either `at` or both"):
+            instance._data_vars(None, **bad)
+
+
+def test_data_symbols_query_filters_before_paging_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(symbols=[
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000 + 8 * i, f"g_slot_{i}")
+        for i in range(150)
+    ] + [fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x3000, "Sock_Path")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    hit = instance._data_symbols(None, query="sock")
+    assert hit["items"] == [{"a": "0x3000", "n": "Sock_Path"}]
+    assert hit["total"] == 1 and hit["query"] == "sock"
+
+    # The filter runs over the WHOLE population, not the first page of it.
+    late = instance._data_symbols(None, query="g_slot_14", limit=5)
+    assert [row["n"] for row in late["items"]] == [
+        "g_slot_14", "g_slot_140", "g_slot_141", "g_slot_142", "g_slot_143"]
+    assert late["total"] == 11 and late["has_more"] is True
+
+
+def test_an_import_name_reads_its_got_slot_not_the_extern_placeholder_1048(monkeypatch):
+    """#1048 review: `read puts 8` refused as ambiguous between the GOT slot
+    (ImportAddressSymbol) and BN's `.extern` placeholder (ExternalSymbol)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _named_data_bv(
+        fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x2014, "puts"),
+        fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x2080, "puts"),
+    )
+    assert instance.ctx._resolve_address_operand(bv, "puts") == (
+        0x2014, {"name": "puts", "kind": "data", "address": "0x2014"})
+    # With no slot at all, the placeholder is still a reachable answer.
+    only_extern = _named_data_bv(
+        fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x2080, "puts"))
+    assert instance.ctx._resolve_address_operand(only_extern, "puts")[0] == 0x2080

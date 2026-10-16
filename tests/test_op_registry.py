@@ -19,6 +19,9 @@ EXPECTED_READ = {
     # its singular sibling -- it loops the same handler under one lock instead
     # of paying a round trip and a lock acquisition per function.
     "decompile_batch",
+    # #1042 item 3: the multi-identifier form of `function_info`, READ-locked
+    # like `decompile_batch` for the same reason.
+    "function_info_batch",
     "il", "structured_il", "defuse", "resolved_calls", "possible_values", "taint", "taint_models",
     "disasm", "function_evidence", "xrefs", "xrefs_any", "field_xrefs", "pointer_table",
     "call_descriptors", "hidden_surface", "resolve_virtual_call",

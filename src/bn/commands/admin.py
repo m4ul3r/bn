@@ -285,6 +285,12 @@ def _doctor(args: argparse.Namespace) -> int:
         "engine_source_build_id": source_engine_id,
         "engine_install_build_id": install_engine_id,
         "instances": instances,
+        # #1039 item 2: the value the bn-kernel bootstrap needs as `skill_dir`
+        # after a kernel reset, from the default skill roots `skill install` uses.
+        "bn_kernel_skill_dirs": _current_skill_dirs(
+            [root / "bn-kernel" for root in _default_skill_install_roots()],
+            cli.skills_source_dir() / "bn-kernel",
+        ),
     }
     cli._emit_result(args, result, text_renderer=_render_doctor_text, stem="doctor")
     # #620(c): a doctor report that never fails exit code hides unreachable
@@ -436,8 +442,11 @@ def _existing_install_state(source: Path, dest: Path, *, mode: str) -> tuple[str
     of a reinstall onto a new checkout) or `existing` (any other directory or
     file, including one that cannot be read). Only `up_to_date` is an install
     that needs nothing; reporting the others as "already installed" left every
-    link pointing at the previous tree with exit 0 (#1002).
+    link pointing at the previous tree with exit 0 (#1002). Judged on
+    `_install_path(dest)`, the entry an install would write, so the state check
+    and the plan never inspect two different locations (#1035 item 4).
     """
+    dest = _install_path(dest)
     if _is_install_source(source, dest):
         return "up_to_date", f"is the install source {source} itself"
     if dest.is_symlink():
@@ -471,6 +480,7 @@ def _is_install_source(source: Path, dest: Path) -> bool:
     """Whether `dest` is the install source itself, reached through a symlinked
     ancestor -- a skills root linked to the checkout's own `skills/`. Nothing
     can be installed there and nothing needs to be, `--force` included."""
+    dest = _install_path(dest)
     return not dest.is_symlink() and dest.exists() and dest.resolve() == source.resolve()
 
 
@@ -520,16 +530,24 @@ FORCE_NOTE = ("--force replaces only what it can remove and proves is this "
 
 
 def _install_path(dest: Path) -> Path:
-    """The path an install at `dest` works on, decided without touching disk.
+    """The path an install at `dest` works on, decided before anything is written.
 
-    Ancestors are resolved -- so `store/missing/..` is `store`, not a directory
-    that only exists once something has created `missing` -- while a symlink AT
-    `dest` stays the link it is: it is unlinked, never followed, so its own
-    location is what gets replaced and what the path rules must judge. Planning
-    and acting on this one path is what keeps a spelling from naming two
-    different directories either side of a `mkdir`.
+    The parent is resolved with filesystem semantics -- so `store/missing/..`
+    is `store`, and `store/link/..` is the parent of the link's TARGET, exactly
+    where the kernel would land -- and the final entry is appended unresolved:
+    a symlink AT `dest` stays the link it is, unlinked and never followed, so
+    its own location is what gets replaced and what the path rules must judge.
+    Asking `dest.is_symlink()` of the raw spelling instead missed a link that a
+    canceled nonexistent component hides from `lstat` (`store/missing/../x`
+    fails with ENOENT while `store/x` is a link), and resolving the whole path
+    then followed that link to its target (#1035 item 4). A final `..` names a
+    directory, never an entry, so that spelling resolves whole. Planning and
+    acting on this one path is what keeps a spelling from naming two different
+    directories either side of a `mkdir`.
     """
-    return dest.parent.resolve() / dest.name if dest.is_symlink() else dest.resolve()
+    if dest.name in ("", ".."):
+        return dest.resolve()
+    return dest.parent.resolve() / dest.name
 
 
 def _never_an_install_destination(dest: Path, source: Path) -> str | None:
@@ -867,6 +885,22 @@ def _skill_install(args: argparse.Namespace) -> int:
         "force_note": FORCE_NOTE,
         "force_plan": force_plan,
         "force_ready": all(row["allowed"] for row in force_plan),
+        # A forced run has already acted on its preflight; the renderer must not
+        # restate it as a pending dry run (#1035 install comment 1).
+        "forced": bool(args.force),
+        # #1035 install comment 2, narrowed under the split rule (#1043 review
+        # 3): the refused run's arguments plus `--force`, never a claim about
+        # which executable to run them with.
+        "force_args": (
+            _forced_skill_install_args(args)
+            if not args.force and not_updated_destinations
+            and all(row["allowed"] for row in force_plan)
+            else None
+        ),
+        "bn_kernel_skill_dirs": _current_skill_dirs(
+            [dest for source, dest in install_plan if source.name == "bn-kernel"],
+            skills_root / "bn-kernel",
+        ),
     }
     if explicit_refusal:
         result.update(ok=False, error="Skill install refused; no destinations changed.")
@@ -885,6 +919,50 @@ def _skill_install(args: argparse.Namespace) -> int:
         return 2
     cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
     return 1 if not_updated_destinations else 0
+
+
+def _forced_skill_install_args(args: argparse.Namespace) -> list[str]:
+    """The refused run's own arguments plus `--force`, after the program name.
+
+    Rebuilt from the parsed arguments: `--dest` keeps the caller's spelling (a
+    relative path reruns from the same directory; normalising it could change
+    which entry a `..` names), a value starting with `-` takes the `=` form so
+    it cannot parse as an option, and `--out` keeps the requested receipt,
+    already absolute. Deliberately NO program name: the executable decides
+    which checkout's skills get installed, and which one ran (a PATH `bn`, a
+    console script, `python -m bn`, a wrapper setting PYTHONPATH) is not
+    something this process can prove -- three review rounds of provenance
+    checks each printed a command that installed another checkout (#1043).
+    The caller reruns its own invocation with these arguments."""
+    argv = ["skill", "install"]
+    if args.dest is not None:
+        dest = str(args.dest)
+        argv.extend([f"--dest={dest}"] if dest.startswith("-") else ["--dest", dest])
+    if args.mode != "symlink":
+        argv.extend(["--mode", args.mode])
+    if args.format != "text":
+        argv.extend(["--format", args.format])
+    if getattr(args, "out", None) is not None:
+        argv.extend(["--out", str(args.out)])
+    argv.append("--force")
+    return argv
+
+
+def _current_skill_dirs(dests: list[Path], source: Path) -> list[str]:
+    """Absolute install entries among `dests` that hold this build of `source`.
+
+    A link to `source` or a copy matching it, in either mode; a stale link into
+    an older checkout or a foreign directory is excluded, as its files are not
+    this build's. The path is the install entry itself (`_install_path`), so it
+    reads the same from any working directory -- the bn-kernel bootstrap needs
+    exactly this value as `skill_dir` after a kernel reset (#1039 item 2)."""
+    dirs: list[str] = []
+    for dest in dests:
+        entry = str(_install_path(dest))
+        state = _existing_install_state(source, dest, mode="symlink")
+        if entry not in dirs and state is not None and state[0] in ("up_to_date", "other_mode"):
+            dirs.append(entry)
+    return dirs
 
 
 def _default_skill_install_roots() -> list[Path]:

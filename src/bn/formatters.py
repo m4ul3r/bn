@@ -1022,6 +1022,11 @@ def _render_proto_text(value: Any, *, mangled: bool = False) -> str:
     object_note = _text_value(value, "implicit_object_note")
     if object_note:
         width_note += f"\n\nnote: {object_note}"
+    # #1013: per-call-site first-argument fact and undefined-type advice.
+    for key in ("first_argument_entry_value_note", "undefined_type_note"):
+        extra = _text_value(value, key)
+        if extra:
+            width_note += f"\n\nnote: {extra}"
     fn = value.get("function")
     name = _shown_name(fn, mangled=mangled) if isinstance(fn, dict) else None
     head, sep, rest = prototype.partition("(")
@@ -2744,10 +2749,23 @@ def _render_function_list_text(value: Any, *, mangled: bool = False) -> str:
     # of 15"); this note does not, so borrowing that rule rendered an empty
     # listing as a bare `// duplicate starts: ...` -- the alarm with no answer
     # beside it (#757 review).
-    for note in (_duplicate_starts_note(value), _mangled_only_note(value)):
+    for note in (_duplicate_starts_note(value), _mangled_only_note(value),
+                 _exact_first_note(value)):
         if note:
             body = f"{body}\n{note}"
     return body
+
+
+def _exact_first_note(value: Any) -> str:
+    """`function search` moves exact name matches ahead of the substring hits
+    under its default order (#1037 item 9); say so, since the rows no longer
+    read in plain address order."""
+    count = _nonnegative_count(value, "exact_matches_first")
+    if not count:
+        return ""
+    noun = "exact name match is" if count == 1 else "exact name matches are"
+    return (f"// {count} {noun} listed first, then the other matches by "
+            "address; --exact shows only exact matches")
 
 
 def _group_refs_by_caller(refs: list[Any], *, mangled: bool = False) -> list[dict[str, Any]]:
@@ -2937,11 +2955,11 @@ def _render_xrefs_text(value: Any, limit: int | None = None, *, mangled: bool = 
     if amb.get("note"):
         lines.insert(0, f"note: {amb['note']}")
         lines.insert(1, "")
-    # Data-symbol resolution fallback (#224b).
-    rsym = _field_dict(value, "resolved_symbol")
-    if rsym.get("kind") == "data":
-        lines.insert(0, f"note: resolved '{rsym.get('name')}' as a data symbol @ {rsym.get('address')}")
-        lines.insert(1, "")
+    # Data-symbol resolution fallback (#224b), and a rendered `data_<hex>` no
+    # symbol carries (#1042 item 2).
+    for note in reversed(_resolved_symbol_notes(value)):
+        lines.insert(0, "")
+        lines.insert(0, note)
     lines.extend(_render_group(code_refs, total_code, "code refs"))
     lines.append("")
     lines.extend(_render_group(data_refs, total_data, "data refs"))
@@ -3130,7 +3148,8 @@ def _render_target_line(target: Any, *, mangled: bool = False) -> str:
 
 
 @_discloses
-def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
+def _render_function_evidence_text(value: Any, *, mangled: bool = False,
+                                   verbose: bool = False, compact: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     function = _field_dict(value, "function")
@@ -3184,39 +3203,69 @@ def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
     # #471: show the slice window when the call set was paged/windowed.
     total_calls = value.get("total_calls")
     matched = value.get("matched_calls")
+    # #1037: a callee filter always states what it kept out of how many.
+    callee_filter = _field_dict(value, "callee_filter")
     call_hdr = f"calls: {len(calls)}"
-    if isinstance(total_calls, int) and (
-        value.get("offset") or value.get("limit") is not None or matched != total_calls
-    ):
-        call_hdr += f" of {matched if matched is not None else total_calls}"
-        if matched is not None and matched != total_calls:
-            call_hdr += f" in window (of {total_calls} total)"
-        if value.get("has_more"):
-            # Through the count choke point, like every other arithmetic read of
-            # a paging counter (see the paged-listing footer): `int(x or 0)`
-            # RAISED on a string and on a container, and it cost the WHOLE
-            # evidence card where the same payload with `offset` absent rendered
-            # cleanly (#619). The choke point answers 0 and discloses instead.
-            nxt = _count_field(value, "offset") + len(calls)
-            if _field_skewed("offset"):
-                # An ACTIONABLE number, not a descriptive one: a fabricated
-                # resume offset sends an agent paging from a window the payload
-                # never stated, which is the invented-offset harm the paging
-                # footer was fixed for (#722). Refuse the hint instead.
-                call_hdr += " -- more: page position unreadable, re-read with --format json"
-            else:
-                call_hdr += f" -- more: rerun with --offset {nxt}"
+    if callee_filter:
+        call_hdr = _callee_filter_call_header(callee_filter, len(calls), total_calls, matched)
+        paged = True
+    else:
+        paged = isinstance(total_calls, int) and (
+            value.get("offset") or value.get("limit") is not None or matched != total_calls
+        )
+        if paged:
+            call_hdr += f" of {matched if matched is not None else total_calls}"
+            if matched is not None and matched != total_calls:
+                call_hdr += f" in window (of {total_calls} total)"
+    if paged and value.get("has_more"):
+        # Through the count choke point, like every other arithmetic read of
+        # a paging counter (see the paged-listing footer): `int(x or 0)`
+        # RAISED on a string and on a container, and it cost the WHOLE
+        # evidence card where the same payload with `offset` absent rendered
+        # cleanly (#619). The choke point answers 0 and discloses instead.
+        nxt = _count_field(value, "offset") + len(calls)
+        if _field_skewed("offset"):
+            # An ACTIONABLE number, not a descriptive one: a fabricated
+            # resume offset sends an agent paging from a window the payload
+            # never stated, which is the invented-offset harm the paging
+            # footer was fixed for (#722). Refuse the hint instead.
+            call_hdr += " -- more: page position unreadable, re-read with --format json"
+        else:
+            call_hdr += f" -- more: rerun with --offset {nxt}"
     lines.append(call_hdr)
+    # #1037: a row's witness line is printed by default only when one of its
+    # verdicts is a contradiction -- the only status that is evidence against
+    # the row -- so a card of agreeing/unavailable witnesses is not one line per
+    # call of noise. Decided once per row here, because the tally line above the
+    # rows discloses how many were hidden.
+    row_witnesses: list[tuple[dict[str, Any], bool]] = []
+    for call in calls:
+        witnesses = _field_dict(call, "arity_witnesses") if isinstance(call, dict) else {}
+        row_witnesses.append((witnesses, _witnesses_contradict(witnesses)))
+    hidden = 0 if verbose else sum(
+        1 for witnesses, contradicts in row_witnesses if witnesses and not contradicts)
+    hidden_clause = (f"per-row witness lines shown only for contradictions "
+                     f"({hidden} hidden; --verbose shows all)") if hidden else ""
     witness_counts = _render_arity_witness_counts(_field_dict(value, "arity_witness_counts"),
                                                   total_calls)
     if witness_counts:
-        lines.append(witness_counts)
+        lines.append(witness_counts + (f"; {hidden_clause}" if hidden_clause else ""))
+    elif hidden_clause:
+        lines.append(hidden_clause)
     if not calls:
         return "\n".join(lines)
 
-    for call in calls:
+    for call, (witnesses, contradicts) in zip(calls, row_witnesses):
         if not isinstance(call, dict):
             lines.append("- " + _render_fallback_text(call))
+            continue
+        if compact:
+            lines.append(_render_compact_call_row(call, mangled=mangled,
+                                                  contradicts=contradicts))
+            # #1046 review: the witness rule (and --verbose) holds in compact
+            # form too, so a contradiction keeps its compared counts.
+            if witnesses and (verbose or contradicts):
+                lines.append(_render_arity_witnesses(witnesses))
             continue
         call_addr = call.get("address", "<unknown>")
         operation = call.get("operation", "<unknown>")
@@ -3325,9 +3374,8 @@ def _render_function_evidence_text(value: Any, *, mangled: bool = False) -> str:
                 "statement -- BN cannot tell a pinned prototype from a recovered one "
                 "here, so decide which is right for this binary."
             )
-        witnesses = _render_arity_witnesses(_field_dict(call, "arity_witnesses"))
-        if witnesses:
-            lines.append(witnesses)
+        if witnesses and (verbose or contradicts):
+            lines.append(_render_arity_witnesses(witnesses))
         variadic = _field_dict(call, "variadic")
         if variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
@@ -3463,6 +3511,98 @@ def _render_arity_witness_counts(counts: dict[str, Any], total_calls: Any) -> st
             "is neither")
 
 
+def _witnesses_contradict(witnesses: dict[str, Any]) -> bool:
+    """Does any verdict on this row state `contradiction` (#1037)?"""
+    return any(_text_value(_field_dict(witnesses, name), "status") == "contradiction"
+               for name, _ in _witness_items(witnesses))
+
+
+def _callee_filter_call_header(callee_filter: dict[str, Any], shown: int,
+                               total_calls: Any, matched: Any) -> str:
+    """The `calls:` header when `evidence function --callee/--exclude-callee`
+    narrowed the set (#1037): how many matched out of the full count, and how
+    many the filter removed. Zero matches is stated as such, so the card never
+    reads like a function that makes no calls."""
+    total = str(total_calls) if isinstance(total_calls, int) else "?"
+    excluded = _stated_count(callee_filter, "excluded") if "excluded" in callee_filter else None
+    # A window applied on top of the filter shrinks `matched` below what the
+    # filter alone kept; name it so the count is not blamed on the filter.
+    scope = "the callee filter"
+    if (isinstance(total_calls, int) and isinstance(matched, int)
+            and excluded is not None and excluded.isdigit()
+            and matched < total_calls - int(excluded)):
+        scope = "the callee filter and address window"
+    tail = f"of {total} total" + (f"; {excluded} excluded" if excluded is not None else "")
+    if matched == 0:
+        return f"calls: 0 -- no call matched {scope} ({tail})"
+    of = str(matched) if isinstance(matched, int) else "?"
+    return f"calls: {shown} of {of} matching {scope} ({tail})"
+
+
+def _render_compact_call_row(call: dict[str, Any], *, mangled: bool,
+                             contradicts: bool) -> str:
+    """`evidence function --compact` (#1037): one line per call -- address,
+    direct/indirect, target, argument texts with what each resolves to -- plus
+    the operation when it is not a plain call, the argument source and
+    confidence (how far the list can be trusted), and a tag carrying the facts
+    of each diagnostic the full row explains in its own line (counts, library,
+    variadic format and its confidence). Only the IL lines, the instruction
+    context and the diagnostics' advice prose are left out (#1046 review)."""
+    target = _field_dict(call, "target")
+    shown_target = _render_target_line(target, mangled=mangled) if target else "?"
+    direct = "direct" if call.get("direct") else "indirect"
+    operation = _text_value(call, "operation")
+    kind = direct if operation in (None, "LLIL_CALL") else f"{direct} {operation}"
+    args = [arg for arg in _field_list(call, "arguments") if isinstance(arg, dict)]
+    arg_text = ", ".join(
+        f"{_text_value(arg, 'text') or ''}{_render_resolved_arg(_field_dict(arg, 'resolved'))}"
+        for arg in args)
+    tags = []
+    trust = " ".join(t for t in (_text_value(call, "argument_source"),
+                                 _text_value(call, "argument_confidence")) if t)
+    if trust:
+        tags.append(f"[args: {trust}]")
+    if call.get("arity_unknown"):
+        # No recovered prototype: the list is BN's register guess.
+        saturated = ", saturates the ABI argument registers" if call.get(
+            "abi_register_saturated") else ""
+        tags.append(f"[arity: unknown, no recovered prototype{saturated}]")
+    declared = call.get("declared_arity")
+    declared_n = declared if isinstance(declared, int) and not isinstance(declared, bool) else None
+    if call.get("arity_mismatch"):
+        tags.append("[arity: mismatch" + (f", prototype declares {declared_n}"
+                                          if declared_n is not None else "") + "]")
+    if call.get("prototype_unverified"):
+        library = call.get("library_arity")
+        library_n = library if isinstance(library, int) and not isinstance(library, bool) else None
+        source = _text_value(call, "library_source") or "a type library"
+        detail = (f", prototype declares {declared_n} but {_escape_control_chars(source)} "
+                  f"declares {library_n}"
+                  if declared_n is not None and library_n is not None
+                  else ", disagrees with an attached type library")
+        tags.append(f"[arity: unverified{detail}]")
+    if call.get("callee_unresolved") and not call.get("arity_unknown"):
+        tags.append("[target unresolved, no signature to check against]")
+    elif call.get("callee_unresolved"):
+        tags.append("[target unresolved]")
+    variadic = _field_dict(call, "variadic")
+    if variadic.get("is_variadic"):
+        # #1046 review: the variadic diagnostic is its own (heuristic) fact,
+        # separate from the recovered argument list; keep it and its marker.
+        conf = (_text_value(variadic, "confidence") or "").strip()
+        mark = f", count: {conf}" if conf else ""
+        if variadic.get("under_recovered") and variadic.get("warning"):
+            tags.append(f"[variadic: under-recovered{mark}]")
+        elif variadic.get("format_string") is not None:
+            tags.append(f"[variadic: {variadic.get('callee', '?')} "
+                        f"format={variadic['format_string']!r} "
+                        f"conversions={variadic.get('format_conversions')}{mark}]")
+    if contradicts:
+        tags.append("[witness: contradiction]")
+    row = f"- {call.get('address', '<unknown>')}  {kind}  {shown_target}  ({arg_text})"
+    return row + "".join(f" {tag}" for tag in tags)
+
+
 def _render_resolved_arg(resolved: Any) -> str:
     if not isinstance(resolved, dict):
         return ""
@@ -3515,16 +3655,25 @@ def _render_surface_text(value: Any) -> str:
                 f"fn={sec.get('resolved_functions', 0)}  missing={sec.get('missing_functions', 0)}")
 
     tables = _field_list(value, "candidate_tables")
-    if tables:
+    hidden = s.get("vtable_tables_hidden")
+    if tables or (isinstance(hidden, int) and hidden):
         lines.append("")
         lines.append("candidate vtable / dispatch tables (runs of pointers-to-code):")
+        labels_note = _surface_vtable_census_note(_field_dict(s, "vtable_labels"))
+        if labels_note:
+            lines.append(f"  {labels_note}")
+        if isinstance(hidden, int) and hidden:
+            lines.append(f"  {hidden} table(s) lying wholly inside ELF vtable objects hidden "
+                         "(--hide-vtables); their missing slots stay listed as candidates")
         for t in tables:
             if not isinstance(t, dict):
                 continue
             lines.append(
                 f"  {t.get('address', '?')} [{t.get('section', '?')}]  "
-                f"entries={t.get('entries', '?')}  fn={t.get('resolved_functions', 0)}  "
+                f"entries={t.get('entries', '?')}  fn={t.get('resolved_functions', 0)}"
+                f"{_surface_interior_note(t)}  "
                 f"missing={t.get('missing_functions', 0)}")
+            lines.extend(_surface_vtable_lines(t))
 
     cands = _field_list(value, "missing_function_candidates")
     if cands:
@@ -3559,11 +3708,87 @@ def _render_surface_text(value: Any) -> str:
             lines.append(
                 f"  {c.get('address', '?')}  [{c.get('section') or '?'}]  "
                 f"via {c.get('provenance', '?')}{more}  [{tag}: {', '.join(why)}]{suffix}")
+            # #1017 comment: where the referencing code stores the address, as
+            # BN's MLIL writes the store. A fact about the store, no role guess.
+            stores = [s for s in _field_list(c, "stored_to") if isinstance(s, dict)]
+            for store in stores:
+                lines.append(
+                    f"    stored to {_escape_control_chars(str(store.get('destination', '?')))} "
+                    f"in {_escape_control_chars(str(store.get('function', '?')))} "
+                    f"@ {store.get('address', '?')}")
+            # #1046 review: the producer lists the first few stores; say how
+            # many more it counted, so a listed prefix is not read as all.
+            stores_total = c.get("stored_to_total")
+            if isinstance(stores_total, int) and not isinstance(stores_total, bool):
+                if stores_total > len(stores):
+                    lines.append(f"    +{stores_total - len(stores)} more store(s) of this "
+                                 "address not listed")
+            elif stores_total is not None:
+                # Unreadable: say the listed stores may not be all, and record it.
+                _record_skew("stored_to_total")
+                lines.append("    (more stores of this address may exist: the total is unreadable)")
+        # #1033: the bridge's verify command, already bound to this
+        # invocation's -i/-t routing by the CLI (#1046 review).
+        verify = _text_value(value, "next_action") or (
+            "verify with `bn disasm <addr> --linear 16` (a candidate lies outside every "
+            "function, so plain `disasm <addr>` refuses it), then `function create`")
         lines.append("")
         lines.append("(candidates -- NOT confirmed functions. `decode` = clean instructions "
                      "before an undefined one; a low decode reliably means data. Start with the "
-                     "code-likely subset; verify with `disasm`, then `function create`.)")
+                     f"code-likely subset; {verify}.)")
     return "\n".join(lines)
+
+
+def _surface_interior_note(table: dict[str, Any]) -> str:
+    """#1017 item 3: ` (N inside 1 function body, not entries: name @ addr)` when
+    resolved slots point inside a function rather than at its entry."""
+    interior = table.get("resolved_interior")
+    if isinstance(interior, bool) or not isinstance(interior, int) or interior <= 0:
+        return ""
+    names = [f"{_escape_control_chars(str(fn.get('name', '?')))} @ {fn.get('address', '?')}"
+             for fn in _field_list(table, "interior_functions") if isinstance(fn, dict)]
+    total = table.get("interior_functions_total")
+    count = total if isinstance(total, int) and not isinstance(total, bool) else len(names)
+    more = f", +{count - len(names)} more" if count > len(names) else ""
+    return (f" ({interior} inside {count} function bod{'y' if count == 1 else 'ies'}, "
+            f"not entries: {', '.join(names)}{more})")
+
+
+def _surface_vtable_census_note(census: dict[str, Any]) -> str | None:
+    """Why `evidence surface` tables carry no (or only some) vtable labels. A
+    complete `.symtab` read with no vtable objects needs no note: the binary
+    simply defines none."""
+    if not census:
+        return None
+    reason = _text_value(census, "reason")
+    if not reason or (census.get("status") == "ok" and census.get("symtab") is True):
+        return None
+    if census.get("status") == "ok" and census.get("objects"):
+        return f"vtable labels: partial -- {_escape_control_chars(reason)}"
+    return f"vtable labels: none -- {_escape_control_chars(reason)}"
+
+
+def _surface_vtable_lines(table: dict[str, Any]) -> list[str]:
+    """#1017 item 1: the ELF `_ZTV`/`_ZTC` objects a candidate table lies in,
+    by symbol size, and the entries that lie outside every one of them."""
+    lines = []
+    for obj in _field_list(table, "elf_vtables"):
+        if not isinstance(obj, dict):
+            continue
+        label = _escape_control_chars(str(obj.get("label") or obj.get("object") or "?"))
+        raw = _escape_control_chars(str(obj.get("object", "?")))
+        where = f"{raw} @ {obj.get('object_address', '?')}, {obj.get('size', '?')} bytes"
+        inside = obj.get("entries_inside", "?")
+        first = _text_value(obj, "first_entry")
+        slots = f"{inside} entr{'y' if inside == 1 else 'ies'}" + (f" from {first}" if first else "")
+        lines.append(f"    in {label} ({where}): {slots}")
+    outside = table.get("entries_outside_elf_vtables")
+    if lines and isinstance(outside, int) and not isinstance(outside, bool) and outside > 0:
+        past = (" -- the run continues past the object's st_size into data that is not "
+                "part of it" if table.get("extends_past_elf_vtable") else "")
+        lines.append(f"    {outside} entr{'y' if outside == 1 else 'ies'} outside every ELF "
+                     f"vtable object{past}")
+    return lines
 
 
 @_discloses
@@ -4095,7 +4320,9 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         caller_scan_note = value.get("caller_scan_note")
         data_ref_note = _callsites_data_ref_note(value.get("callee_data_ref_count"),
                                                  value.get("callee_data_refs"),
-                                                 value.get("callee_data_ref_vtables"))
+                                                 value.get("callee_data_ref_vtables"),
+                                                 value.get("callee_data_ref_objects"),
+                                                 value.get("callee_data_ref_census"))
         value = _field_list(value, "items")
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -4254,7 +4481,8 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
     return body
 
 
-def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = None) -> str | None:
+def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = None,
+                             raw_objects: Any = None, raw_census: Any = None) -> str | None:
     """Data storage is not a recovered indirect caller; offer bounded next reads."""
     if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count <= 0:
         return None
@@ -4268,8 +4496,26 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
         address_point = _text_value(row, "address_point")
         if address and class_name and (address_point or row.get("address_point") is None):
             known[address] = {"class_name": class_name, "address_point": address_point}
+    # #1018 item 1: sized ELF `_ZTV`/`_ZTC` objects holding a location whose
+    # class navigation is not proven -- a label from the symbol extent only.
+    objects: dict[str, list[str]] = {}
+    for row in _field_list({"callee_data_ref_objects": raw_objects}, "callee_data_ref_objects"):
+        if not isinstance(row, dict) or row.get("evidence") != "elf_symbol_size":
+            continue
+        address = _text_value(row, "address")
+        labels = []
+        for obj in _field_list(row, "objects"):
+            if not isinstance(obj, dict):
+                continue
+            label = _escape_control_chars(str(obj.get("label") or obj.get("object") or "?"))
+            raw = _escape_control_chars(str(obj.get("object", "?")))
+            labels.append(f"{label} ({raw} @ {obj.get('object_address', '?')}, "
+                          f"{obj.get('size', '?')} bytes)")
+        if address and labels:
+            objects[address] = labels
     lines = [f"note: the callee's address is stored in {raw_count} data location(s); "
              "data refs do not identify indirect callers."]
+    unknown = False
     for ref in refs:
         row = known.get(ref)
         if row is not None:
@@ -4279,11 +4525,23 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
             lines.append(f"  {ref}: inside the named vtable for {_escape_control_chars(cls)} "
                          f"({point_note}); "
                          f"inspect its class layout with `bn class show -- {shlex.quote(cls)}`")
+        elif ref in objects:
+            inside = objects[ref]
+            what = (f"inside {inside[0]}" if len(inside) == 1
+                    else f"inside overlapping ELF objects {', '.join(inside)}")
+            lines.append(f"  {ref}: {what} by ELF symbol size; class navigation is not proven, "
+                         f"so inspect references to this data location with "
+                         f"`bn xrefs {shlex.quote(ref)}` (not a virtual-caller list)")
         else:
+            unknown = True
             lines.append(f"  {ref}: table identity unknown; inspect references to this data "
                          f"location with `bn xrefs {shlex.quote(ref)}` (not a virtual-caller list)")
     if raw_count > len(refs):
         lines.append(f"  +{raw_count - len(refs)} unlisted data location(s)")
+    census = raw_census if isinstance(raw_census, dict) else {}
+    reason = _text_value(census, "reason") if census else None
+    if unknown and reason and not (census.get("status") == "ok" and census.get("symtab") is True):
+        lines.append(f"  (vtable extents: {_escape_control_chars(reason)})")
     return "\n".join(lines)
 
 
@@ -5590,7 +5848,14 @@ def _render_data_vars_text(value: Any) -> str:
         if row.get("section"):
             cells.append(f"[{row['section']}]")
         lines.append("  ".join(cells))
-    body = "\n".join(lines) if lines else _EMPTY_RESULT
+    if lines:
+        body = "\n".join(lines)
+    elif _text_value(value, "at"):
+        # `data vars --at X` asks about ONE variable: an empty answer must
+        # name the address it looked at, not read as a view with no data.
+        body = f"none: no typed data variable starts at {_text_value(value, 'at')}"
+    else:
+        body = _EMPTY_RESULT
     if value.get("has_more"):
         hint = ""
         # Through the choke point: a container-shaped address on the LAST row
@@ -5605,7 +5870,41 @@ def _render_data_vars_text(value: Any) -> str:
             except ValueError:
                 pass
         body += f"\n// more data vars remain in the window{hint}"
-    return body
+    return _with_resolved_notes(value, body)
+
+
+def _resolved_symbol_notes(value: Any) -> list[str]:
+    """One `note: resolved …` line per name an address operand resolved
+    through (#224b, #1042 item 2): `resolved_symbol` (one operand) and
+    `resolved_symbols` (several). The wording keeps xrefs' original data-symbol
+    line, so a reader who learned it there reads the same line everywhere."""
+    entries = []
+    single = _field_dict(value, "resolved_symbol")
+    if single:
+        entries.append(single)
+    entries.extend(e for e in _field_list(value, "resolved_symbols") if isinstance(e, dict))
+    notes = []
+    for entry in entries:
+        how = {
+            "data": "as a data symbol",
+            "function": "as a function symbol",
+            "placeholder": "as the address its name spells (no symbol has that name)",
+        }.get(str(entry.get("kind")))
+        if how is not None:
+            notes.append(f"note: resolved '{entry.get('name')}' {how} @ {entry.get('address')}")
+    return notes
+
+
+def _with_resolved_notes(value: Any, body: str) -> str:
+    notes = _resolved_symbol_notes(value)
+    return "\n".join([*notes, "", body]) if notes else body
+
+
+@_discloses
+def _render_resolved_symbol_notes(value: Any) -> str:
+    """The resolved-name notes alone, for an emit path whose stdout is the
+    payload itself (`read --encoding bytes` prints them on stderr)."""
+    return "\n".join(_resolved_symbol_notes(value))
 
 
 @_discloses
@@ -5714,7 +6013,7 @@ def _render_read_text(value: Any) -> str:
         lines.append("")
         lines.append(f"note: {note}")
 
-    return "\n".join(lines)
+    return _with_resolved_notes(value, "\n".join(lines))
 
 
 # #971: the C escapes `read --encoding escaped` writes. Every escape stands for
@@ -5781,7 +6080,7 @@ def _render_read_escaped_text(value: Any) -> str:
     if note:
         lines.append("")
         lines.append(f"note: {note}")
-    return "\n".join(lines)
+    return _with_resolved_notes(value, "\n".join(lines))
 
 
 
@@ -5790,12 +6089,19 @@ def _render_doctor_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
+    kernel_dirs = _field_list(value, "bn_kernel_skill_dirs")
     lines = [
         f"cli version: {value.get('cli_version', '<unknown>')}",
         f"plugin source: {value.get('plugin_source_dir', '<unknown>')}",
         f"plugin install: {value.get('plugin_install_dir', '<unknown>')}",
         f"plugin source build: {value.get('plugin_source_build_id', '<unknown>')}",
         f"plugin install build: {value.get('plugin_install_build_id', '<unknown>')}",
+        # #1039 item 2: the bn-kernel bootstrap's `skill_dir`, so a reset kernel
+        # can re-bootstrap without hunting for the install.
+        *(f"bn-kernel skill_dir: {d}" for d in kernel_dirs),
+        *(() if kernel_dirs or not _field_present(value, "bn_kernel_skill_dirs")
+          else (("bn-kernel skill_dir: not installed in a default skill root "
+                 "(bn skill install)"),)),
         "",
         "instances:",
     ]
@@ -5888,6 +6194,10 @@ def _operation_row(item: dict[str, Any]) -> tuple[str, list[str]]:
     token = _SKEWED_FIELDS.set([])
     try:
         row = _operation_row_text(item)
+        # #1042 review: an op that resolved a name (`data_<hex>`, a data
+        # symbol) says how, in the row it describes.
+        for note in _resolved_symbol_notes(item):
+            row += f"  ({note.removeprefix('note: ')})"
         unreadable = sorted(_SKEWED_FIELDS.get() or ())
     finally:
         _SKEWED_FIELDS.reset(token)
@@ -6241,7 +6551,10 @@ def _add_mutation_ok(value: Any) -> Any:
     # idempotent. One decider means one on EVERY input (#447/#619/#685).
     if value.get("kind") == "go_rename":
         rest = {key: val for key, val in value.items() if key != "ok"}
-        return {"ok": bool(_go_rename_summary(value)["ok"]), **rest}
+        # `ok` does not turn on the retained-import residue list (#1012), so
+        # it is not read here; the compact summary still discloses it.
+        decided = {key: val for key, val in rest.items() if key != "kept_library_imports"}
+        return {"ok": bool(_go_rename_summary(decided)["ok"]), **rest}
     if "ok" in value:
         return value
     # Read inside a capture: this transform runs BEFORE any renderer, so the
@@ -6325,6 +6638,7 @@ def _build_mutation_summary(
     preview_skipped: Sequence[dict[str, Any]] = (),
     reverted: int = 0,
     function_deletions: Sequence[dict[str, Any]] = (),
+    resolved_symbols: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -6496,12 +6810,30 @@ def _build_mutation_summary(
         # the counts above say nothing about the ops it skipped. Conditional
         # like the keys above: a preview that covered every op has none.
         summary["preview_skipped"] = list(preview_skipped)
+    if resolved_symbols:
+        # #1042 review: how a name an op was given became an address (a
+        # rendered `data_<hex>`, a data symbol name), so the compact status says
+        # it as `read`/`xrefs` do. Conditional like the keys above.
+        summary["resolved_symbols"] = list(resolved_symbols)
     return summary
 
 
 # How many declared type names the compact summary lists before it truncates;
 # the full set stays in the detailed result's `defined_types`.
 _DECLARED_TYPE_NAME_CAP = 10
+
+
+def _kept_library_imports(value: dict[str, Any],
+                          results: Sequence[dict[str, Any]]) -> list[str]:
+    """Library types left in the view: the envelope's own list, plus a
+    declare row's imports when that row did not land -- or any declare row of
+    a preview, which imports nothing on purpose, so an import stamped there is
+    one BN made and kept."""
+    return list(dict.fromkeys(
+        [str(name) for name in _field_list(value, "kept_library_imports")] + [
+            str(name) for r in results
+            if value.get("preview") or r.get("status") not in ("verified", "noop")
+            for name in _field_list(r, "imported_from_library")]))
 
 
 def _declared_types_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
@@ -6686,14 +7018,7 @@ def _mutation_summary(value: Any) -> Any:
         ],
         class_apply_types=(_field_dict(value, "class_apply_types")
                            if _field_declared(value, "class_apply_types") else None),
-        # A declare row whose imports stayed in the view although the row did
-        # not land -- or any declare row of a preview, which imports nothing on
-        # purpose, so an import stamped there is one BN made and kept.
-        kept_library_imports=list(dict.fromkeys(
-            [str(name) for name in _field_list(value, "kept_library_imports")] + [
-            str(name) for r in results
-            if value.get("preview") or r.get("status") not in ("verified", "noop")
-            for name in _field_list(r, "imported_from_library")])),
+        kept_library_imports=_kept_library_imports(value, results),
         fallthrough_entries=[
             {"address": _text_value(r, "address") or "<unknown>",
              "fallthrough_from": _text_value(r, "fallthrough_from")}
@@ -6708,6 +7033,8 @@ def _mutation_summary(value: Any) -> Any:
         ],
         preview_skipped=[row for row in _row_list(value, "preview_skipped")
                          if isinstance(row, dict)],
+        resolved_symbols=[_field_dict(r, "resolved_symbol") for r in results
+                          if _field_dict(r, "resolved_symbol")],
     )
 
 
@@ -6957,6 +7284,8 @@ def _go_rename_summary(value: Any) -> Any:
         rolled_back=rolled_back,
         message=_text_value(value, "message"),
         default_error="go rename failed",
+        # #1012: the same retained-import list the generic summary carries.
+        kept_library_imports=_kept_library_imports(value, failure_rows),
     )
     # Preserve operation-count semantics while exposing the scan buckets.
     # The user-named wire counter includes apply-time skips; its overlap is
@@ -7138,6 +7467,9 @@ def _render_mutation_summary_text(value: Any) -> str:
                  "before closing.")
     if value.get("first_error"):
         line += f"\nfirst_error: {value['first_error']}"
+    # #1042 review: the same `note: resolved …` lines `read`/`xrefs` print.
+    for note in _resolved_symbol_notes(value):
+        line += f"\n{note}"
     return line
 
 
@@ -7340,8 +7672,13 @@ def _render_skill_install_text(value: Any) -> str:
             return matches[0]
         return None
 
+    # A forced run has already acted on its preflight: restating that preflight
+    # after `Installed skills` read as if nothing had been written yet (#1035
+    # install comment 1). The dry-run advice belongs to the unforced run only.
+    forced = value.get("forced") is True
+
     def force_detail(dest: Any) -> str:
-        row = advice_row(dest)
+        row = None if forced else advice_row(dest)
         return f"; --force: {row.get('detail')}" if row is not None else ""
 
     # A normalized installed path can name several displayed roots. If their
@@ -7387,20 +7724,34 @@ def _render_skill_install_text(value: Any) -> str:
         row for row in force_plan
         if (_text_value(row, "destination_id"), row.get("detail")) not in listed
     ]
-    if other:
+    if other and not forced:
         lines.append("Other destinations (--force dry run):")
         lines.extend(
             f"- {row.get('destination')}{force_detail(row.get('destination'))}" for row in other
         )
-    if force_plan:
+    if force_plan and not forced:
         ready = "ready" if value.get("force_ready") else "refused; fix every blocker first"
         lines.append(
             f"--force preflight: {ready}. Checked without writes; "
             "filesystem races or write errors can still fail the install."
         )
     force_note = _text_value(value, "force_note")
-    if force_note:
+    if force_note and not forced:
         lines.append(force_note)
+    # #1035 install comment 2, narrowed under the split rule (#1043 review 3):
+    # the refused arguments plus `--force`, spelled with `bn` as a TEMPLATE.
+    # Which executable ran (and so which checkout gets installed) cannot be
+    # proven, so the note says to reuse the caller's own invocation.
+    force_args = _field_list(value, "force_args")
+    if force_args:
+        lines.append(
+            "To replace them, rerun with the same bn invocation you just used, "
+            "adding --force: " + shlex.join(["bn", *(str(word) for word in force_args)])
+        )
+    # #1039 item 2: the bn-kernel bootstrap's `skill_dir` after a kernel reset.
+    lines.extend(
+        f"bn-kernel skill_dir: {d}" for d in _field_list(value, "bn_kernel_skill_dirs")
+    )
 
     return "\n".join(lines) + "\n"
 
