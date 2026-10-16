@@ -6580,6 +6580,56 @@ def test_a_note_leaves_stored_comments_redacted_and_session_ones_marked_1000(mon
     assert result["warnings"] == [result["warning_rows"][0]["detail"]]
 
 
+def _scanned_decompile(monkeypatch, lines, arity_rows, comments):
+    """Run `_decompile` over a fake Pseudo-C render and return (result, the
+    text the string scanner was given)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x401111, "probe")
+    function.basic_blocks = [_FakeBasicBlock(0x401111, 0x401130)]
+    bv = _FakeBV(functions=[function], comments=comments)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(monkeypatch, bridge, function, [lines])
+    monkeypatch.setattr(bridge.read_decompile, "_call_arity_findings",
+                        lambda bv, func: arity_rows)
+    scanned = []
+    monkeypatch.setattr(bridge.read_decompile, "_raw_string_pointer_findings",
+                        lambda bv, func, text: scanned.append(text) or {})
+    return instance._decompile("active", "probe"), scanned[0]
+
+
+def test_a_hidden_stored_comment_is_not_string_evidence_1045(monkeypatch):
+    # #1045 review round 4 (cm2b-x86): an inherited comment `see 0x402010`,
+    # hidden by default, made `&data_402010` a raw address in the scanner's
+    # eyes, bypassing the placeholder's `char *` requirement: "GHI" and
+    # `data retype` advice appeared where base printed nothing.
+    result, scanned = _scanned_decompile(monkeypatch, [
+        (0x401111, "  uint64_t probe(char* arg1)"),
+        (0x401111, "{  // see 0x402010"),
+        (0x401115, "    return two(arg1, &data_402010);"),
+        (0x401111, "}"),
+    ], [], {0x401111: "see 0x402010"})
+    assert "<annotation redacted>" in result["text"]
+    assert "&data_402010" in scanned and "0x402010" not in scanned
+
+
+def test_a_bn_note_is_not_string_evidence_1045(monkeypatch):
+    # #1045 review round 4 (cm3-arm): the recovered `x1 = 0x400760` in the
+    # arity note supplied the raw hex that made the unrelated `idx(&data_400760)`
+    # a string. The note stays; the scanner sees the code only.
+    row = {"address": 0x400718, "target": 0x400510, "label": "two @ 0x400510",
+           "rendered": 1, "expected": 2, "shape": "shortfall",
+           "evidence": ("the demangled signature takes 2",), "missing": [("x1", "0x400760")]}
+    result, scanned = _scanned_decompile(monkeypatch, [
+        (0x401111, "  uint64_t probe(int64_t arg1)"),
+        (0x401111, "{"),
+        (0x400718, "    return two(arg1) + idx(&data_400760);"),
+        (0x401111, "}"),
+    ], [row], {})
+    assert "x1 = 0x400760 */" in result["text"]
+    assert "&data_400760" in scanned and "0x400760" not in scanned
+
+
 def _var(name):
     return _hop("HLIL_VAR", name, var=types.SimpleNamespace(name=name))
 

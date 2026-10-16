@@ -1787,6 +1787,19 @@ def _note_needs_callee(line: int, rows: list[dict[str, Any]]) -> bool:
     return len({row["address"] for row in rows}) > 1 or any(row["address"] != line for row in rows)
 
 
+_BN_NOTE_RE = re.compile(r"\s*/\* bn: .*? \*/")
+
+
+def _code_text(text: str) -> str:
+    """*text* with every line's trailing `//` comment and every `/* bn: ...
+    */` note removed: the code and operands BN rendered, not an annotation an
+    analyst stored (an address in a comment) nor an address bn itself wrote
+    into a note (`/* bn: two: +1 arg not rendered: x1 = 0x400818 */`). A
+    note's quoted value cannot end it early: `_c_quote` escapes `*/`."""
+    return "\n".join(_BN_NOTE_RE.sub("", il_format._code_and_comment(line)[0])
+                     for line in text.split("\n"))
+
+
 def _place_string_notes(func, text: str, line_addresses: list[int | None],
                         strings: dict[int, tuple[str, list[int]]]) -> tuple[str, set[int]]:
     """*text* with a `/* bn: 0x400c98 = "a" */` note on the line of each call
@@ -1812,7 +1825,7 @@ def _place_string_notes(func, text: str, line_addresses: list[int | None],
     for index, line_address in enumerate(line_addresses):
         if line_address is None or line_address not in wanted or line_address in done:
             continue
-        code, _comment = il_format._code_and_comment(lines[index])
+        code = _code_text(lines[index])
         shown = [a for a in wanted[line_address]
                  if re.search(rf"\b(?:{hex(a)}|data_{a:x})\b", code)]
         if not shown:
@@ -1866,7 +1879,9 @@ def _decompile(
                                      line_notes=line_notes, placed=placed_lines,
                                      jump_notes=jump_notes, line_addresses=line_addresses)
     placed = {row["address"] for row in arity if anchors[row["address"]] in placed_lines}
-    strings = _raw_string_pointer_findings(bv, func, text)
+    # Base's rule, on the evidence base gave it: the rendered code only, never a
+    # stored comment (hidden by default) nor a bn note's own hex (#1045 review).
+    strings = _raw_string_pointer_findings(bv, func, _code_text(text))
     text, strings_inline = _place_string_notes(func, text, line_addresses, strings)
     if include_annotations:
         annotation_summary = {

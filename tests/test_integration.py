@@ -5440,6 +5440,78 @@ class TestShortLiteralBehindDataName994:
         assert strings[0]["strings"][0]["address"] == hex(int(match.group(1), 16))
 
 
+_CM2B_SOURCE = """
+static const int words3[4] = {0x00494847, 7, 8, 9};
+__attribute__((noinline)) int two(void *o, const void *p) { const int *q = p; return q[1] + *(char *)o; }
+__attribute__((noinline)) int probe(void *o) { return two(o, words3); }
+int main(int c, char **v) { return probe(v[0]); }
+"""
+_CM3_LIB_SOURCE = "int two(void *o, const void *p) { return *(const char *)o + *(const char *)p; }\n"
+_CM3_SOURCE = """
+extern int two(void *o, const void *p);
+static const int words4[4] = {0x004c4b4a, 7, 8, 9};
+__attribute__((noinline)) int idx(const int *w) { return w[1] + w[2]; }
+__attribute__((noinline)) int arity_pair(void *o) { return two(o, words4) + idx(words4); }
+int main(int c, char **v) { return arity_pair(v[0]); }
+"""
+
+
+def _build(compiler: str, out: Path, *args: str) -> None:
+    cc = shutil.which(compiler)
+    if cc is None:
+        refuse_silent_skip(f"{compiler} not available, so the #1045 string-evidence lane did not run")
+    built = subprocess.run([cc, *args, "-o", str(out)], capture_output=True, text=True, timeout=120)
+    assert built.returncode == 0, built.stderr
+
+
+class TestStringScanSeesCodeOnly1045:
+    """#1045 review round 4: the (base) raw-string scanner was handed bn's own
+    notes and the analyst's stored comments, so a hex address in either made
+    a `&data_…` placeholder look like a raw address and skip the placeholder's
+    `char *` requirement. Base printed no string in both cases."""
+
+    def test_a_hidden_inherited_comment_is_not_string_evidence_cm2b_x86(
+            self, shared_bn, tmp_path):
+        src = tmp_path / "cm2b.c"
+        src.write_text(_CM2B_SOURCE)
+        binary = tmp_path / "cm2b"
+        _build("cc", binary, "-O1", "-fno-builtin", "-no-pie", "-s", str(src))
+        shared_bn.load(binary, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        probe = shared_bn.json("py", "exec", (
+            "probe = [f for f in bv.functions if len(f.callees) == 1 and "
+            "any('&data_' in str(i) for i in f.hlil.instructions)][0]\n"
+            "data = [int(t, 16) for t in __import__('re').findall(r'data_([0-9a-f]+)', str(probe.hlil))][0]\n"
+            "probe.set_comment_at(probe.start, 'see ' + hex(data))\n"
+            "result = [hex(probe.start), hex(data)]"))["result"]
+        result = shared_bn.json("decompile", probe[0])
+        assert f"&data_{int(probe[1], 16):x}" in result["text"], result["text"]
+        assert "<annotation redacted>" in result["text"]
+        assert "string" not in [row["code"] for row in result["warning_rows"]], result["warning_rows"]
+
+    def test_a_recovered_arity_value_is_not_string_evidence_cm3_arm(self, shared_bn, tmp_path):
+        lib_src, src = tmp_path / "libtwo.c", tmp_path / "cm3.c"
+        lib_src.write_text(_CM3_LIB_SOURCE)
+        src.write_text(_CM3_SOURCE)
+        _build("aarch64-linux-gnu-gcc", tmp_path / "libtwo.so", "-O2", "-shared", "-fPIC",
+               str(lib_src))
+        binary = tmp_path / "cm3"
+        _build("aarch64-linux-gnu-gcc", binary, "-O2", "-fno-builtin", "-no-pie", "-s", str(src),
+               f"-L{tmp_path}", "-ltwo")
+        shared_bn.load(binary, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        narrowed = shared_bn.run("proto", "set", "two", "int64_t two(int64_t arg1)")
+        assert narrowed.returncode == 0, narrowed.stdout + narrowed.stderr
+        caller = shared_bn.json("py", "exec", (
+            "result = hex([f for f in bv.functions if any(c.name == 'two' for c in f.callees)][0].start)"
+        ))["result"]
+        result = shared_bn.json("decompile", caller)
+        # The premise: the recovered value is in the arity note, beside the
+        # unrelated placeholder operand the base rule leaves alone.
+        match = re.search(r"x1 = (0x[0-9a-f]+) \*/", result["text"])
+        assert match, result["text"]
+        assert f"&data_{int(match.group(1), 16):x}" in result["text"], result["text"]
+        assert "string" not in [row["code"] for row in result["warning_rows"]], result["warning_rows"]
+
+
 class TestOffsetTypeLookup1000:
     """#1000 item 4 (review round 8): a type BN keys by a multi-part qualified
     name -- every type a library or the demangler supplies -- is not found by
