@@ -425,7 +425,6 @@ def _decompile_many(
                 # appears in a trailing tally reads as if that function had
                 # been skipped rather than attempted.
                 reason = _text_value(row, "error") or "did not resolve"
-                reason = cli._target_hint_message(args, reason)
                 chunks.append(f"===== {name} =====\nerror: {reason}")
         # Stated, not derived from len(chunks): the tally is a headline a
         # caller acts on, so an unreadable counter must print `?` rather than
@@ -433,6 +432,14 @@ def _decompile_many(
         resolved = _stated_count(value, "resolved")
         requested = _stated_count(value, "requested")
         return "\n\n".join(chunks) + f"\n\n{resolved} of {requested} resolved"
+
+    def _respell_row_errors(value: Any) -> Any:
+        # A failed row's error can carry a target listing; respell it as the
+        # command that was run in JSON/ndjson too, not only in text (#1033 item 1).
+        for row in (_field_list(value, "functions") or []) if isinstance(value, dict) else []:
+            if isinstance(row, dict) and isinstance(row.get("error"), str):
+                row["error"] = cli._target_hint_message(args, row["error"])
+        return value
 
     def _batch_exit_code(value: Any) -> int:
         if not isinstance(value, dict):
@@ -449,6 +456,7 @@ def _decompile_many(
         require_target=True,
         text_renderer=_render_batch_text,
         result_exit_code=_batch_exit_code,
+        result_transform=_respell_row_errors,
         stem=stem,
     )
 

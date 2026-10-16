@@ -63,6 +63,7 @@ from .transport import (  # noqa: F401
     validate_instance_id,
     wait_for_teardown,
 )
+from .target_hint import instance_option, respell_for_option
 from .version import VERSION, build_id_for_file, build_id_for_package  # noqa: F401
 
 
@@ -127,6 +128,7 @@ def _requested_output_format(argv: list[str]) -> str | None:
 
 
 _OUT_FORMAT_BY_SUFFIX = {".json": "json", ".ndjson": "ndjson"}
+_ROUTING_FLAGS = ("-i", "--instance", "-t", "--target")
 
 
 class _RecordExplicitFormat(argparse.Action):
@@ -2244,14 +2246,23 @@ def _contextualize_diagnostic_hints(
         # Routing flags are accepted at root/group/leaf level. Skip their values
         # when identifying the registry path: an instance may itself be named
         # "il" or "session". Keep the original shell text for the actual edit.
+        # A glued `-iX`/`-tX` counts as routing only BEFORE the leaf command,
+        # where no positional can stand: after it, a locator such as a function
+        # named `-th x` is an operand, not a target flag (#1033 item 7).
+        leaves = {spec["path"] for spec in _COMMANDS}
         path: tuple[str, ...] = ()
+        glued: list[str] = []
         index = 0
         while index < len(words):
             word = words[index]
-            if word in ("-i", "--instance", "-t", "--target"):
+            if word in _ROUTING_FLAGS:
                 index += 2
                 continue
-            if word.startswith(("--instance=", "--target=", "-i", "-t")):
+            if word.startswith(("--instance=", "--target=")):
+                index += 1
+                continue
+            if path not in leaves and word.startswith(("-i", "-t")):
+                glued.append(word)
                 index += 1
                 continue
             candidate = (*path, word)
@@ -2263,11 +2274,15 @@ def _contextualize_diagnostic_hints(
             return match.group(0)
         flags = []
         options = words[:words.index("--")] if "--" in words else words
-        if instance and not any(word.startswith(("--instance=", "-i"))
-                                or word == "--instance" for word in options):
-            flags.append(f"-i {shlex.quote(instance)}")
-        if target and not any(word.startswith(("--target=", "-t"))
-                              or word == "--target" for word in options):
+
+        def routed(long: str) -> bool:
+            return (any(word in (f"--{long}", f"-{long[0]}") or word.startswith(f"--{long}=")
+                        for word in options)
+                    or any(word.startswith(f"-{long[0]}") for word in glued))
+
+        if instance and not routed("instance"):
+            flags.append(instance_option(instance))
+        if target and not routed("target"):
             flags.append(f"-t {shlex.quote(target)}" if not target.startswith("-")
                          else shlex.quote(f"--target={target}"))
         if not flags:
@@ -2667,7 +2682,9 @@ def _fanout_call(
         if plan.get("auto"):
             auto_expanded.append(iid)
         if "error" in plan:
-            units.append(("error", {"instance": iid, "ok": False, "error": plan["error"]}))
+            units.append(("error", {"instance": iid, "ok": False,
+                                    "error": _target_hint_message(args, plan["error"],
+                                                                  fanout=True, instance=iid)}))
             continue
         for tsel in plan["tsels"]:
             units.append(("work", (iid, tsel)))
@@ -2703,7 +2720,10 @@ def _fanout_call(
             if note:
                 page_notes[(iid, target)] = note
         except BridgeError as exc:
-            row.update({"target": tsel, "ok": False, "error": str(exc)})
+            # The row's error is a refusal for ONE (instance, target) call, so
+            # its listing rows are respelled as that call (#1033 item 1).
+            row.update({"target": tsel, "ok": False,
+                        "error": _target_hint_message(args, str(exc), fanout=True, instance=iid)})
         # Per-row wall-clock so an agent can see WHERE a broad survey spent its
         # time, not just that it felt slow (#417).
         row["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
@@ -3265,15 +3285,37 @@ def _target_hint_argv(args: argparse.Namespace, root: argparse.ArgumentParser) -
     return [*routing, *path, *options, *(["--"] if operands else []), *operands]
 
 
-def _target_hint_message(args: argparse.Namespace, message: str) -> str:
-    """Use the same parsed replay command for raised and per-item refusals."""
+def _target_hint_message(
+    args: argparse.Namespace, message: str, *, fanout: bool = False, instance: Any = None,
+) -> str:
+    """Use the same parsed replay command for raised and per-item refusals.
+
+    *fanout* respells an `--all-instances`/`--all-targets` row as the single
+    call that row stands for: routed to that row's *instance* (when it has
+    one), without the fan-out flags (#1033 item 1)."""
     if tuple(getattr(args, "_command_path", ())) == ("target", "close"):
         return message
     argv = getattr(args, "_target_hint_argv", None)
     if argv is None:
         return message
-    from .target_hint import respell_for_option
+    if fanout:
+        argv = _single_call_argv(argv, None if instance is None else str(instance))
     return respell_for_option(message, argv)
+
+
+def _single_call_argv(argv: list[str], instance: str | None) -> list[str]:
+    """*argv* (from `_target_hint_argv`) without the fan-out flags, routed to
+    *instance* when one is given."""
+    if instance is not None:
+        if argv[:1] == ["-i"]:
+            argv = argv[2:]
+        elif argv and argv[0].startswith("--instance="):
+            argv = argv[1:]
+    end = argv.index("--") if "--" in argv else len(argv)
+    options = [word for word in argv[:end] if word not in ("--all-instances", "--all-targets")]
+    routing = ([] if instance is None else
+               [f"--instance={instance}"] if instance.startswith("-") else ["-i", instance])
+    return [*routing, *options, *argv[end:]]
 
 
 def main(argv: list[str] | None = None) -> int:

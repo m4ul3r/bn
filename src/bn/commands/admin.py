@@ -40,6 +40,8 @@ from ..formatters import (
     _render_target_list_text,
     _render_target_use_text,
 )
+from ..paths import project_root
+from ..target_hint import instance_option, target_option
 from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, unwrap_result
 
 # An ACK starts teardown, not process exit: BN still releases views and native
@@ -1585,7 +1587,7 @@ def _refuse_unverified_unsaved_state(
     raise BridgeError(
         f"session {verb}: cannot verify whether instance {instance_id} has "
         f"unsaved changes ({failure}); no shutdown was sent.\n"
-        f"Retry once `bn -i {shlex.quote(str(instance_id))} target list` answers, "
+        f"Retry once `bn {instance_option(str(instance_id))} target list` answers, "
         f"or pass --discard-unsaved to {verb} anyway and discard any unsaved changes."
     )
 
@@ -1621,12 +1623,15 @@ def _unsaved_targets_or_refuse(
         f"unsaved changes; a {verb} would discard them."
     ]
     lines.extend(
-        f"  -t {shlex.quote(str(entry['selector'] or ''))}  {entry['path'] or ''}"
+        f"  {target_option(str(entry['selector'] or ''))}  {shlex.quote(str(entry['path'] or ''))}"
         for entry in unsaved
     )
     lines.append("Save first:")
+    # `--target=`/`--instance=` for a value starting with `-`, which a bare
+    # `-t`/`-i` would read as the next option (#1033 item 5).
     lines.extend(
-        f"  bn -i {shlex.quote(str(instance_id))} -t {shlex.quote(str(entry['selector'] or ''))} save"
+        f"  bn {instance_option(str(instance_id))} "
+        f"{target_option(str(entry['selector'] or ''))} save"
         for entry in unsaved
     )
     lines.append(f"Or pass --discard-unsaved to {verb} anyway and discard them.")
@@ -1894,7 +1899,10 @@ def _session_list(args: argparse.Namespace) -> int:
     return 0
 
 
-@command("instance", "list", help="List running bridge instances (alias for `session list`)")
+@command("instance", "list", help="List running bridge instances (alias for `session list`)",
+         args=[arg("--mine", action="store_true", default=False,
+                   help="Only instances associated with this project root (the ones "
+                        "a bare command can route to) and the project's sticky pin")])
 def _instance_list(args: argparse.Namespace) -> int:
     # `instance list` ignores the selector entirely, but an explicit empty one is
     # still a caller mistake and is refused everywhere else in the CLI (#694).
@@ -1903,6 +1911,14 @@ def _instance_list(args: argparse.Namespace) -> int:
     # answers "which instance has libfoo.so?" from the registry alone, and #80
     # made round-trip-freedom that command's design contract.
     result: Any = _running_instances_result()
+    if args.mine:
+        # #1036 item 7: on a shared host the full list is every agent's bridge.
+        # Same association test the router uses, read from the same registry.
+        root = str(project_root())
+        result["items"] = [entry for entry in result["items"]
+                           if entry.get("sticky") or root in entry.get("project_roots", ())]
+        result["project_root"] = root
+        result["total_rss_mb"] = round(sum(entry["rss_mb"] or 0 for entry in result["items"]), 1)
     cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="instance-list")
     return 0
 
