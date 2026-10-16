@@ -36,6 +36,9 @@ EXPECTED_READ = {
 EXPECTED_WRITE = {
     # True short writers: gate + exclusive target lock for the whole op.
     "py_exec", "close_binary", "save_database",
+    # #1035 item 2: `py exec --no-target`, the same short writer with bv=None.
+    # Not destructive: it resolves no target, so the gate has nothing to count.
+    "py_exec_untargeted",
     # NB: the mutation ops and "function_create" are intentionally NOT here --
     # #628 made them lock="none" so they self-manage locking (the write gate
     # serializes writers for the whole op, while the exclusive target lock covers

@@ -6728,7 +6728,7 @@ def test_orient_hint_is_null_when_only_loader_placeholders_are_present(monkeypat
     """
     bridge = _load_bridge(monkeypatch)
     inst = bridge.BinaryNinjaBridge()
-    # A non-`.bndb` filename, so `analysis_cache_restored` cannot drive the hint.
+    # A non-`.bndb` filename, so `opened_from_database` cannot drive the hint.
     monkeypatch.setattr(inst, "_target_info",
                         lambda sel: {"basename": "netsvcd", "filename": "/opt/netsvcd",
                                      "analyzed": True, "analysis_state": "full"})
@@ -6753,7 +6753,7 @@ def test_orient_hint_is_null_when_only_loader_placeholders_are_present(monkeypat
     assert ea["user_symbols"] == 2
     assert ea["analyst_symbols"] == 0
     assert ea["placeholder_symbols"] == 2
-    assert ea["analysis_cache_restored"] is False
+    assert ea["opened_from_database"] is False
     assert ea["provenance_hint"] is None
 
     bv._symbols = [*bv._symbols, _NamedSym("parse_header", 0x401200)]
@@ -6781,7 +6781,7 @@ def test_orient_surfaces_existing_annotations(monkeypatch):
     d = inst._orient_digest(None)
     ea = d["existing_annotations"]
     assert ea["comments"] == 1
-    assert ea["analysis_cache_restored"] is True
+    assert ea["opened_from_database"] is True
     assert "predate this run" in ea["provenance_hint"]
 
 

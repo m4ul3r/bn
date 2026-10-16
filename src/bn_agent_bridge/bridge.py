@@ -66,7 +66,7 @@ from .proc_identity import identity_payload
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
 from .target_hint import (
-    LISTED_SELECTOR_LEAD, format_multi_target_hint, open_target_lines, target_row,
+    LISTED_SELECTOR_LEAD, format_multi_target_hint, open_target_lines, target_option, target_row,
 )
 from .version import VERSION, build_id_for_file, build_id_for_package
 
@@ -770,6 +770,19 @@ class TargetManager:
         # database view with its raw view for selector resolution only while
         # that file is still the one written (#996 review).
         self._database_identities: dict[str, tuple[int, int, int, int] | None] = {}
+        # Stable view_id -> {export path: file identity right after the write}.
+        # An explicit `bn save <path>` that is not the target's own database is
+        # an EXPORT: it must never move the restart identity above (#857 r4),
+        # but it is still a file THIS bridge wrote from this view, so loading
+        # it back pairs with the raw view for selector resolution exactly like
+        # a default save does, and its annotations are this bridge's own work
+        # rather than inherited (#1036 items 4-5). Kept apart from
+        # `_database_paths` so nothing that reads the restart identity can see
+        # an export.
+        self._exports: dict[str, dict[str, tuple[int, int, int, int] | None]] = {}
+        # Stable view_id -> when this bridge last saved/exported each path, so a
+        # reload of the file can say whose work it holds and since when.
+        self._saved_at: dict[str, dict[str, str]] = {}
         # Stable view_id -> the comments THIS bridge wrote and verified, keyed
         # (scope, address) -> body, scope "address" (a global address comment)
         # or "function_doc" (fn.comment, keyed at the function start). Decompile
@@ -807,6 +820,13 @@ class TargetManager:
             self._next_id = max(self._next_id, predecessor._next_id)
             self._dirty_view_ids = set(predecessor._dirty_view_ids)
             self._database_paths = dict(predecessor._database_paths)
+            self._database_identities = dict(predecessor._database_identities)
+            self._exports = {
+                vid: dict(paths) for vid, paths in predecessor._exports.items()
+            }
+            self._saved_at = {
+                vid: dict(stamps) for vid, stamps in predecessor._saved_at.items()
+            }
             self._session_annotations = {
                 vid: dict(ledger)
                 for vid, ledger in predecessor._session_annotations.items()
@@ -881,12 +901,24 @@ class TargetManager:
     def note_database(self, bv, path: str) -> None:
         """Record that *path* is the database backing *bv*'s analysis.
 
-        Called after a successful save, whose written path is the one thing
-        `bv.file.filename` will not tell a later reader (see ``_database_paths``).
+        Called after a successful save to the target's OWN database (its
+        sibling, its cache entry, or the database view saved in place), whose
+        written path is the one thing `bv.file.filename` will not tell a later
+        reader (see ``_database_paths``).
         """
+        self._note_written(bv, path, export=False)
+
+    def note_export(self, bv, path: str) -> None:
+        """Record that this bridge exported *bv* to *path* (``_exports``):
+        an explicit save anywhere other than the target's own database. Never
+        touches the restart identity."""
+        self._note_written(bv, path, export=True)
+
+    def _note_written(self, bv, path: str, *, export: bool) -> None:
         if not path:
             return
         identity = _file_identity(path)
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         # Only when it DIVERGES from the live filename. A target loaded from a
         # `.bndb` and saved in place has `saved == filename`, and recording that
         # contradicted this field's own contract ("the database when it is not the
@@ -898,27 +930,75 @@ class TargetManager:
             live = str(getattr(getattr(bv, "file", None), "filename", "") or "")
         except Exception:  # noqa: BLE001 - an odd view must not break a save
             live = ""
+        in_place = bool(live) and _same_file(live, path)
         with self._lock:
-            # A save rewrote *path*: every record pointing at that file now
-            # pairs with what this bridge just wrote -- including a save of the
-            # database view itself, which records nothing of its own below.
+            vid = self._stable_view_id(bv)
+            # A save rewrote *path*. A record pointing at that file still pairs
+            # with what was written when the writer is that record's own raw
+            # view, or the database view itself saved in place (its own file).
+            # Any other view's write replaced the analysis the record vouched
+            # for, so that record pairs with nothing from now on.
             for other, recorded in self._database_paths.items():
                 if _same_file(recorded, path):
-                    self._database_identities[other] = identity
-            if not (live and str(path) == live):
-                vid = self._stable_view_id(bv)
-                if vid is not None:
+                    self._database_identities[other] = (
+                        identity if (other == vid or in_place) else None)
+            for other, paths in self._exports.items():
+                for recorded in list(paths):
+                    if _same_file(recorded, path):
+                        paths[recorded] = identity if (other == vid or in_place) else None
+            if vid is not None and not in_place:
+                if export:
+                    self._exports.setdefault(vid, {})[str(path)] = identity
+                else:
                     self._database_paths[vid] = str(path)
                     self._database_identities[vid] = identity
+                self._saved_at.setdefault(vid, {})[str(path)] = stamp
             successor = self._successor
         if successor is not None:
-            successor.note_database(bv, path)
+            successor._note_written(bv, path, export=export)
 
     def recorded_database(self, bv) -> str | None:
         """The database `note_database` recorded for *bv*, or None."""
         with self._lock:
             vid = self._stable_view_id(bv)
             return self._database_paths.get(vid) if vid is not None else None
+
+    def recorded_exports(self, bv) -> list[str]:
+        """The paths this bridge exported *bv* to, oldest first."""
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            return list(self._exports.get(vid, {})) if vid is not None else []
+
+    def written_by_this_bridge(self, path: str | Path) -> dict[str, Any] | None:
+        """Which open view this bridge saved or exported *path* from, judged by
+        the file itself: *path* must still be the file written -- same device,
+        inode, size and mtime as recorded right after the save -- so a database
+        replaced or rewritten by anyone else since is not claimed. None
+        otherwise. Read BEFORE the view opened from *path* is published."""
+        current = _file_identity(str(path))
+        if current is None:
+            return None
+        with self._lock:
+            entries = [
+                (vid, recorded, self._database_identities.get(vid), "database")
+                for vid, recorded in self._database_paths.items()
+            ] + [
+                (vid, recorded, identity, "export")
+                for vid, paths in self._exports.items()
+                for recorded, identity in paths.items()
+            ]
+            for vid, recorded, identity, kind in entries:
+                if identity is None or identity != current or not _same_file(recorded, str(path)):
+                    continue
+                record = self._records.get(vid)
+                return {
+                    "kind": kind,
+                    "view_id": vid,
+                    "target_id": record.target_id() if record is not None else None,
+                    "filename": record.filename if record is not None else None,
+                    "saved_at": self._saved_at.get(vid, {}).get(recorded),
+                }
+        return None
 
     def open_target_for_path(self, path: str, *, exclude) -> dict[str, Any] | None:
         """The open target whose file IS *path*, other than *exclude*, or None.
@@ -983,6 +1063,8 @@ class TargetManager:
                 self._dirty_view_ids.discard(vid)
                 self._database_paths.pop(vid, None)
                 self._database_identities.pop(vid, None)
+                self._exports.pop(vid, None)
+                self._saved_at.pop(vid, None)
                 self._session_annotations.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
@@ -1132,6 +1214,19 @@ class TargetManager:
     def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
         return self._match_kind(record, selector) is not None
 
+    def _ledger_entries(self) -> list[tuple[str, str, tuple[int, int, int, int] | None]]:
+        """``(raw view id, written path, identity at write)`` for every file
+        this bridge saved: the target's own database AND its exports (#1036
+        item 4). Caller holds ``self._lock``."""
+        return [
+            (vid, path, self._database_identities.get(vid))
+            for vid, path in self._database_paths.items()
+        ] + [
+            (vid, path, identity)
+            for vid, paths in self._exports.items()
+            for path, identity in paths.items()
+        ]
+
     def _saved_pairs(self, records: dict[str, TargetRecord]) -> dict[str, str]:
         """database view id -> the raw view id THIS bridge saved it from.
 
@@ -1142,10 +1237,11 @@ class TargetManager:
         save -- and must not have loaded as unverified against its raw bytes.
         A database replaced since, or one that failed that check, pairs with
         nothing, so `-t foo` is ambiguous again exactly as without a save.
+        A default save and an explicit `bn save <path>` export pair alike
+        (#1036 item 4); only the default one is the restart identity.
         """
         pairs: dict[str, str] = {}
-        for raw_vid, path in self._database_paths.items():
-            identity = self._database_identities.get(raw_vid)
+        for raw_vid, path, identity in self._ledger_entries():
             if raw_vid not in records or identity is None:
                 continue
             for vid, record in records.items():
@@ -1161,14 +1257,19 @@ class TargetManager:
     def _pairing_notes(self, records: dict[str, TargetRecord]) -> list[str]:
         """Explain rejected save pairs from the ledger and current file state."""
         notes = []
-        for raw_vid, path in self._database_paths.items():
+        for raw_vid, path, identity in self._ledger_entries():
             if raw_vid not in records:
                 continue
             for vid, record in records.items():
                 if vid == raw_vid or not _same_file(record.filename, path):
                     continue
-                identity = self._database_identities.get(raw_vid)
-                if identity is not None and _file_identity(path) != identity:
+                if identity is None:
+                    notes.append(
+                        f"The saved database {path!r} was rewritten by another "
+                        "target's save (or its identity could not be read at "
+                        "save); its save pairing with the raw view is not used."
+                    )
+                elif _file_identity(path) != identity:
                     notes.append(
                         f"The saved database {path!r} no longer has the file "
                         "identity recorded at save; its save pairing with the "
@@ -1353,6 +1454,12 @@ class TargetManager:
                     vid: ident for vid, ident in self._database_identities.items()
                     if vid in alive
                 }
+                self._exports = {
+                    vid: paths for vid, paths in self._exports.items() if vid in alive
+                }
+                self._saved_at = {
+                    vid: stamps for vid, stamps in self._saved_at.items() if vid in alive
+                }
                 self._session_annotations = {
                     vid: ledger for vid, ledger in self._session_annotations.items()
                     if vid in alive
@@ -1417,6 +1524,12 @@ class TargetManager:
                         # database, so a consumer can tell "no database" from
                         # "database unknown" without inspecting paths.
                         "database_path": self._database_paths.get(view_id),
+                        # #1036 item 5: the files this bridge EXPORTED this view
+                        # to (`bn save <path>` anywhere but its own database).
+                        # Never the restart identity -- that is
+                        # `database_path` above -- so a reader can tell where
+                        # later saves go from where copies were written.
+                        "exports": list(self._exports.get(view_id, {})),
                         # Whether the database this view was restored from (a
                         # sidecar/cache preferred over the raw path, or an
                         # explicitly named .bndb judged against its sibling raw
@@ -2311,15 +2424,9 @@ class BinaryNinjaBridge:
 
     def _record_project_root(self, workdir: str | None) -> str | None:
         """Associate this live instance with the caller's canonical project root."""
-        if not workdir:
+        canonical = _caller_project(workdir)
+        if canonical is None:
             return None
-        try:
-            root = project_root(Path(workdir).expanduser())
-        except (OSError, RuntimeError):
-            return None
-        if not root.is_dir():
-            return None
-        canonical = str(root)
         with self._teardown_lock:
             if self._stopped:
                 return None
@@ -2922,7 +3029,9 @@ class BinaryNinjaBridge:
         # a save then certifies the bytes the view loaded, whatever sits at
         # the path by then. The same identity judges a preferred database.
         identity = _load_identity(resolved)
-        substitute, sidecar_note = _choose_sidecar(resolved, prefer_bndb, quick, identity)
+        substitute, sidecar_note = _choose_sidecar(
+            resolved, prefer_bndb, quick, identity,
+            instance_id=self.instance_id, project=_caller_project(workdir))
         if substitute is not None:
             load_path = substitute.path
         if sidecar_note:
@@ -3135,9 +3244,17 @@ class BinaryNinjaBridge:
             opened_known, opened_record = _opened_annotation_record(
                 bv, load_path if load_path.suffix == ".bndb" else None)
             if substitute is not None and opened_record is not None:
-                annotation_note = _opened_annotation_note(opened_record)
+                annotation_note = _opened_annotation_note(
+                    opened_record, restored=substitute.source == "cache")
                 if annotation_note is not None:
                     notes.append(annotation_note)
+            if opened_record is not None:
+                # #1036 item 5: a database THIS bridge saved or exported, and
+                # still the very file it wrote, holds this bridge's own work --
+                # judged by the file, not by its name.
+                own = self.targets.written_by_this_bridge(load_path)
+                if own is not None:
+                    opened_record["written_by_this_bridge"] = own
             # The load note is one-shot; the target row keeps the verdict so a
             # later `target info` can still answer whether the restored
             # database was verified against the raw file.
@@ -3160,8 +3277,8 @@ class BinaryNinjaBridge:
                 loaded_target = self._loaded_target_row(targets, bv)
                 if loaded_target and loaded_target.get("selector_reason"):
                     notes.append(
-                        f"Target selector {loaded_target['selector']!r}: "
-                        f"{loaded_target['selector_reason']}"
+                        f"Target selector: pass {target_option(loaded_target['selector'])} "
+                        f"({loaded_target['selector_reason']})"
                     )
 
             self._record_project_root(workdir)
@@ -3596,6 +3713,10 @@ class BinaryNinjaBridge:
         except Exception:  # noqa: BLE001 - no cache path is not ownership
             cache_path = None
         own_primary = _is_own_database_destination(out, filename, cache_path)
+        # A database view saved over its own file (the default for a target
+        # opened from a `.bndb`): neither an export nor a re-home. Decided now
+        # for the same reason as above -- the write replaces the inode.
+        in_place = bool(filename) and _same_file(out, filename)
         own_cache = (
             cache_path is not None
             and _is_own_database_destination(cache_path, filename, cache_path)
@@ -3721,6 +3842,7 @@ class BinaryNinjaBridge:
             # (#889c finding 1), because the write replaced the inode.
             if own_cache:
                 self.targets.note_database(bv, saved)
+            self._stamp_cache_writer(saved, result)
             _disclose_open_target_collision(self.targets, bv, saved, result)
             return result
 
@@ -3758,6 +3880,7 @@ class BinaryNinjaBridge:
             # be unconditional here too -- this degraded path wrote a real file
             # and can land on another open target exactly like the clean one.
             _disclose_open_target_collision(self.targets, bv, saved, degraded)
+            self._stamp_cache_writer(saved, degraded)
             return degraded
         self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
         # #753: the live filename was just restored to the ORIGINAL path, so from
@@ -3772,11 +3895,42 @@ class BinaryNinjaBridge:
         # that target fail to reload and vanish. That is the identity move
         # `_restore_filename` exists to prevent, deferred one step to restart
         # (#857 round-4 regression, introduced by this change).
-        if own_primary:
-            self.targets.note_database(bv, saved)
         result = {"ok": True, "saved": True, "path": saved}
+        if own_primary or in_place:
+            self.targets.note_database(bv, saved)
+        else:
+            # An EXPORT (#1036 items 4-5): recorded in its own ledger so a
+            # reload of the copy pairs with this view and reads as this
+            # bridge's work, and SAID to be an export, with where the target
+            # itself still saves and restarts from.
+            self.targets.note_export(bv, saved)
+            result["export"] = True
+            result["default_save_path"] = (
+                filename if filename.endswith(".bndb") else f"{filename}.bndb"
+            ) if filename else None
+            result["restart_path"] = self.targets.recorded_database(bv) or filename or None
+            result["restart_path_is_database"] = bool(
+                self.targets.recorded_database(bv) or filename.endswith(".bndb"))
+        self._stamp_cache_writer(saved, result)
         _disclose_open_target_collision(self.targets, bv, saved, result)
         return result
+
+    def _stamp_cache_writer(self, saved: str, result: dict[str, Any]) -> None:
+        """After a save that wrote a SHARED cache entry, record who wrote it
+        beside the entry (#1036 item 1): a later load restores that entry by
+        default only for this instance or one of these project roots. Never
+        fails the save, which already reached disk; a record that could not be
+        written leaves the entry unclaimed, so every load reports it instead of
+        restoring it, and the result says so."""
+        if not read_listing.is_cache_database(saved):
+            return
+        with self._teardown_lock:
+            roots = sorted(self._project_roots)
+        writer = {"instance_id": self.instance_id, "project_roots": roots}
+        error = _record_cache_writer(Path(saved), self.instance_id, roots)
+        if error is not None:
+            writer["error"] = error
+        result["cache_writer"] = writer
 
     def _target_info(self, selector: str | None, *, verbose: bool = False):
         # #775: ONE snapshot for both halves. This used to resolve (which
@@ -5871,6 +6025,21 @@ def _bind_py_exec(bridge, params, target):
     return bridge._py_exec(target, str(params["script"]))
 
 
+# #1035 item 2: `py exec --no-target`. Its own op rather than a flag on
+# `py_exec`, so the destructive gate above keeps judging every targeted run
+# exactly as before, while this one -- which acts on no target -- has nothing
+# for that gate to count. It refuses a selector rather than ignore one.
+@op("py_exec_untargeted", lock="write")
+def _bind_py_exec_untargeted(bridge, params, target):
+    if target is not None:
+        raise OperationFailure(
+            "invalid_request",
+            "py_exec_untargeted runs with bv=None and takes no target; send py_exec "
+            "to run against a target",
+        )
+    return bridge._py_exec(None, str(params["script"]), untargeted=True)
+
+
 # #525: every single-mutation binder below builds its manifest as
 # `{**params, "op": "<the_op>"}` -- the literal op is spread LAST so a
 # caller-supplied `params["op"]` can never override the endpoint's own
@@ -6298,39 +6467,61 @@ def _stored_bytes_identity(bv) -> _SourceIdentity | None:
         return None
 
 
+def _recorded_raw_path(bv, database: Path) -> Path | None:
+    """The raw file an explicitly opened *database* describes, when one is
+    on disk: its sibling ``<database minus .bndb>``, else the path Binary
+    Ninja recorded as the database's original file
+    (``bv.file.original_filename``). A working-folder copy or an export has
+    no sibling, but still names the binary it was saved from (#1036 item 5).
+    None when neither is a readable file other than the database itself."""
+    sibling = database.with_suffix("")
+    if sibling.is_file():
+        return sibling
+    try:
+        original = str(getattr(getattr(bv, "file", None), "original_filename", "") or "")
+    except Exception:  # noqa: BLE001 - an odd view records nothing usable
+        return None
+    if not original or original.endswith(".bndb"):
+        return None
+    candidate = Path(original)
+    if not candidate.is_file() or _same_file(str(candidate), str(database)):
+        return None
+    return candidate
+
+
 def _explicit_database_verdict(bv, database: Path) -> tuple[bool | None, str | None]:
-    """Does the explicitly requested database *bv* still describe its sibling
-    raw file? Informational only -- the caller asked for THIS database, so it
-    is kept whatever the answer (`session restart` reopens a target through
-    this door too, via the row's `database_path`).
+    """Does the explicitly requested database *bv* still describe its raw
+    file (`_recorded_raw_path`)? Informational only -- the caller asked for
+    THIS database, so it is kept whatever the answer (`session restart`
+    reopens a target through this door too, via the row's `database_path`).
 
     ``(verdict, note)``: ``(None, None)`` when there is nothing to judge (no
-    record, no sibling at ``<database minus .bndb>``, or one that cannot be
-    read); ``(True, None)`` when the record matches the sibling's bytes;
-    ``(False, note)`` when it names other bytes -- the note says the database
-    was kept because it was requested explicitly and how to get the current
-    bytes analyzed instead.
+    record, no raw file on disk, or one that cannot be read); ``(True,
+    None)`` when the record matches the raw file's bytes; ``(False, note)``
+    when it names other bytes -- the note says the database was kept because
+    it was requested explicitly and how to get the current bytes analyzed
+    instead.
     """
     recorded = _recorded_source_identity(bv)
     if recorded is None:
         return None, None
-    sibling = database.with_suffix("")
-    if not sibling.is_file():
+    raw = _recorded_raw_path(bv, database)
+    if raw is None:
         return None, None
     try:
-        current = _hash_file(sibling)
+        current = _hash_file(raw)
     except OSError:
         return None, None
     if recorded.sha256 == current.sha256:
         return True, None
     return False, (
-        f"{database} was saved for different bytes than {sibling} now holds "
+        f"{database} was saved for different bytes than {raw} now holds "
         f"(database: sha256 {recorded.sha256[:12]}, {recorded.size} bytes; file: "
         f"sha256 {current.sha256[:12]}, {current.size} bytes); it was kept because "
         "the database was requested explicitly, so its analysis may describe "
-        f"bytes no longer on disk. To analyze the current file: `bn load {sibling} "
-        "--no-bndb` (`bn load` of the raw path prefers this database only when "
-        "it matches)."
+        f"bytes no longer on disk. To analyze the current file: `bn load "
+        f"{shlex.quote(str(raw))} --no-bndb` (`bn load` of the raw path prefers "
+        "an adjacent database only when it matches)."
     )
 
 
@@ -6446,6 +6637,105 @@ def _cache_bndb_path(binary_path: str, content_sha256: str | None = None) -> Pat
     return cache_home() / "bndb" / f"{stem}.{digest}.bndb"
 
 
+# Beside every shared cache entry: who wrote it (#1036 item 1). The cache is one
+# directory for every bn instance using a BN_CACHE_DIR, so an entry found by
+# content hash may hold another agent's renames; a load restores it by default
+# only for the instance or project that wrote it.
+_CACHE_WRITER_SUFFIX = ".writer.json"
+
+
+def _cache_writer_path(entry: Path) -> Path:
+    return entry.with_name(entry.name + _CACHE_WRITER_SUFFIX)
+
+
+def _record_cache_writer(entry: Path, instance_id: str | None,
+                         project_roots: list[str]) -> str | None:
+    """Write the writer record for the cache *entry* just saved. The record
+    carries the entry's own file identity, so a later write by anything that
+    does not update the record (an older bn, a copy by hand) leaves a record
+    that no longer describes the entry, and the entry is not restored on its
+    word. Returns an error string, or None once the record is in place."""
+    identity = _file_identity(str(entry))
+    if identity is None:
+        return f"the entry {entry} could not be read back to record its writer"
+    record = {
+        "instance_id": instance_id,
+        "project_roots": list(project_roots),
+        "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "entry_identity": list(identity),
+    }
+    target = _cache_writer_path(entry)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".writer.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(record, fh)
+            os.replace(tmp, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+    except OSError as exc:
+        return f"could not write the writer record {target}: {exc}"
+    return None
+
+
+def _cache_writer_verdict(entry: Path, instance_id: str | None,
+                          project: str | None) -> tuple[bool, str]:
+    """``(restore by default?, who wrote it)`` for the cache *entry*.
+
+    True only when the writer record beside it still describes the entry
+    (same device, inode, size and mtime as right after the save) and names
+    this *instance_id* or lists the loading *project* root. No record, an
+    unreadable one, or one the entry has outlived is never ownership."""
+    try:
+        raw = json.loads(_cache_writer_path(entry).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False, "no writer record: saved by an older bn or copied in by hand"
+    except (OSError, ValueError):
+        return False, "its writer record is unreadable"
+    if not isinstance(raw, dict):
+        return False, "its writer record is unreadable"
+    recorded = raw.get("entry_identity")
+    current = _file_identity(str(entry))
+    if not isinstance(recorded, list) or current is None or tuple(recorded) != current:
+        return False, "rewritten since its writer record was made, so the writer is unknown"
+    writer = raw.get("instance_id")
+    roots = [root for root in raw.get("project_roots") or [] if isinstance(root, str)]
+    who = (f"written by instance {writer}" if isinstance(writer, str) and writer
+           else "written by a GUI bridge")
+    who += f" for project {', '.join(roots)}" if roots else " with no project association"
+    own = bool(instance_id and writer == instance_id) or (project is not None and project in roots)
+    return own, who
+
+
+def _instance_option(instance_id: str | None) -> str:
+    """The `-i` argument a printed command needs to reach this bridge, shell-
+    quoted; attached (`--instance=<id>`) when the id starts with `-`. Empty for
+    a bridge with no instance id (the GUI plugin)."""
+    if not instance_id:
+        return ""
+    if instance_id.startswith("-"):
+        return f"{shlex.quote('--instance=' + instance_id)} "
+    return f"-i {shlex.quote(instance_id)} "
+
+
+def _restore_command(entry: Path, instance_id: str | None) -> str:
+    return f"bn {_instance_option(instance_id)}load {shlex.quote(str(entry))}"
+
+
+def _caller_project(workdir: str | None) -> str | None:
+    """The canonical project root of the caller's *workdir* (`project_root`:
+    its git root, else the directory itself), or None when there is none."""
+    if not workdir:
+        return None
+    try:
+        root = project_root(Path(workdir).expanduser())
+    except (OSError, RuntimeError):
+        return None
+    return str(root) if root.is_dir() else None
+
+
 @dataclass(frozen=True, slots=True)
 class _SidecarChoice:
     """A saved database to load instead of the requested raw file."""
@@ -6490,31 +6780,51 @@ def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool,
 
 
 def _choose_sidecar(resolved: Path, prefer_bndb: bool, quick: bool,
-                    identity: _SourceIdentity | None) -> tuple[_SidecarChoice | None, str | None]:
+                    identity: _SourceIdentity | None, *,
+                    instance_id: str | None = None,
+                    project: str | None = None) -> tuple[_SidecarChoice | None, str | None]:
     """`_resolve_bndb_sidecar` plus the load's own policy on it, for both load
     paths: ``(database to open instead, note)``, either may be None.
 
-    ``--quick`` never restores a CACHE entry (#956). The cache is one directory
-    for every bn instance sharing a BN_CACHE_DIR, so the entry a quick look found was
-    written by whichever earlier run saved these bytes: restoring it replaced
-    the ~1s raw load the flag promises with a full database load (54s measured
-    on a firmware binary) and started a "fresh" look with that run's renames.
-    The quick load opens the raw bytes and the note names the entry it left
-    alone and how to restore it. An adjacent ``<binary>.bndb`` is still
-    preferred: it sits beside the file, where someone put it on purpose, and
-    the "--quick ignored" note says so.
+    A CACHE entry is restored by default only when the instance doing this
+    load (*instance_id*) or the caller's project root (*project*) wrote it,
+    as the writer record beside the entry says (#1036 item 1). The cache is
+    one directory for every bn instance sharing a BN_CACHE_DIR, so an entry
+    found by content hash may hold another agent's renames: restoring it
+    under a fresh start cost four of seven dogfood runs a reload or a
+    discard. Any other entry -- someone else's, a legacy one with no record,
+    one rewritten since its record -- loads the raw bytes, and the note names
+    the entry, its writer and the exact command that restores it.
+
+    ``--quick`` never restores a CACHE entry (#956), even this instance's own:
+    restoring replaced the ~1s raw load the flag promises with a full
+    database load (54s measured on a firmware binary). An adjacent
+    ``<binary>.bndb`` is still preferred: it sits beside the file, where
+    someone put it on purpose, and the "--quick ignored" note says so.
     """
     choice = _resolve_bndb_sidecar(resolved, prefer_bndb, identity)
     if choice is None:
         return None, None
-    if quick and choice.source == "cache":
+    if choice.source != "cache":
+        return choice, _sidecar_note(choice, resolved)
+    restore = _restore_command(choice.path, instance_id)
+    own, who = _cache_writer_verdict(choice.path, instance_id, project)
+    if quick:
         return None, (
             f"--quick: did not restore the cached database {choice.path} "
-            f"({_cache_entry_description(choice, resolved)}); loaded the raw "
-            f"bytes without analysis. To restore that analysis instead: "
-            f"`bn load {shlex.quote(str(choice.path))}`"
+            f"({_cache_entry_description(choice, resolved)}; {who}); loaded the raw "
+            f"bytes without analysis. To restore that analysis instead: `{restore}`"
         )
-    return choice, _sidecar_note(choice, resolved)
+    if not own:
+        return None, (
+            f"did not restore the cached database {choice.path} "
+            f"({_cache_entry_description(choice, resolved)}; {who}); loaded the raw "
+            "bytes. A cache entry is restored by default only for the instance or "
+            f"project that saved it, because {choice.path.parent} is shared by every "
+            "bn instance using that BN_CACHE_DIR. To restore that analysis instead: "
+            f"`{restore}`"
+        )
+    return choice, _sidecar_note(choice, resolved, who)
 
 
 def _cache_entry_description(choice: _SidecarChoice, resolved: Path) -> str:
@@ -6542,19 +6852,19 @@ def _age_text(seconds: float) -> str:
     return f"{seconds}s"
 
 
-def _sidecar_note(choice: _SidecarChoice, resolved: Path) -> str:
+def _sidecar_note(choice: _SidecarChoice, resolved: Path, who: str | None = None) -> str:
     """The one substitution message both load paths emit (notes[] / headless log)."""
     if choice.source == "cache":
         # The binary's own mount had no writable adjacent .bndb (a read-only
         # firmware image), so the annotations were saved to the writable cache.
         # Restore them instead of silently re-analyzing blank, which looked
         # like total annotation loss (#318) -- and say which entry and whose:
-        # the cache is shared by every bn instance using that cache dir (#956).
+        # the cache is shared by every bn instance using that cache dir (#956),
+        # so only this instance's or project's own entry gets here (#1036).
         return (
             f"restored cached database {choice.path} "
-            f"({_cache_entry_description(choice, resolved)}; {choice.path.parent} is "
-            "shared by every bn instance using that cache dir (BN_CACHE_DIR), so "
-            "its annotations may be another run's); pass --no-bndb to load the raw bytes"
+            f"({_cache_entry_description(choice, resolved)}; {who}); "
+            "pass --no-bndb to load the raw bytes"
         )
     return f"loaded {choice.path} instead of {resolved} (use --no-bndb to skip)"
 
@@ -6573,20 +6883,25 @@ def _opened_annotation_record(bv, database: Path | None) -> tuple[bool, dict[str
         return False, None
     return True, {
         "path": str(database),
-        **{key: summary[key] for key in (
-            "comments", "function_comments", "analyst_symbols", "placeholder_symbols")},
+        **{key: summary[key] for key in read_listing.OPENED_ANNOTATION_COUNTS},
     }
 
 
-def _opened_annotation_note(record: dict[str, Any]) -> str | None:
-    """Disclose inherited analyst work, omitting a measured all-zero record."""
-    if all(record[key] == 0 for key in ("comments", "function_comments", "analyst_symbols")):
+def _opened_annotation_note(record: dict[str, Any], *, restored: bool = False) -> str | None:
+    """Disclose the analyst work a substituted database carried when opened.
+
+    A measured all-zero record is omitted for an adjacent `<binary>.bndb`
+    (#1020 item 9), but never for a RESTORED cache entry: there, "it held
+    nothing" is the answer the agent would otherwise spend a `target info`
+    on (#1036 item 3)."""
+    if not restored and all(
+            record[key] == 0 for key in ("comments", "function_comments", "analyst_symbols")):
         return None
     return (
         f"{Path(record['path']).name} already held {record['comments']} comment(s), "
         f"{record['function_comments']} function doc(s) and "
-        f"{record['analyst_symbols']} analyst symbol(s) when opened -- not this "
-        "run's work (`bn target info` keeps reporting them as existing_annotations)"
+        f"{record['analyst_symbols']} analyst symbol(s) when opened -- saved before "
+        "this load (`bn target info` keeps reporting them as existing_annotations)"
     )
 
 
@@ -6715,7 +7030,8 @@ def _restore_bndb_analyzed_view(bv, load_path: Path):
     ), True
 
 
-def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
+def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True,
+                    instance_id: str | None = None):
     """Open one headless preload binary and register it.
 
     Mirrors _load_binary's sidecar + --quick bookkeeping so the preload path and
@@ -6731,7 +7047,11 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
 
     resolved = Path(path).expanduser().resolve()
     identity = _load_identity(resolved)
-    substitute, sidecar_note = _choose_sidecar(resolved, prefer_bndb, quick, identity)
+    # The preload runs in the bridge process, started from the caller's cwd,
+    # so that is the project a cache entry must belong to (#1036 item 1).
+    substitute, sidecar_note = _choose_sidecar(
+        resolved, prefer_bndb, quick, identity,
+        instance_id=instance_id, project=_caller_project(os.getcwd()))
     load_path = substitute.path if substitute is not None else resolved
     if sidecar_note:
         bn.log_info(sidecar_note)
@@ -6789,7 +7109,8 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
         opened_known, opened_record = _opened_annotation_record(
             bv, load_path if load_path.suffix == ".bndb" else None)
         if substitute is not None and opened_record is not None:
-            annotation_note = _opened_annotation_note(opened_record)
+            annotation_note = _opened_annotation_note(
+                opened_record, restored=substitute.source == "cache")
             if annotation_note is not None:
                 bn.log_info(annotation_note)
         if verified is not None:
@@ -6874,7 +7195,7 @@ def start_headless(
     # dead instance instead of an invisible orphan process.
     if binaries:
         for path in binaries:
-            _preload_binary(path, quick, prefer_bndb)
+            _preload_binary(path, quick, prefer_bndb, instance_id)
         # #524: _preload_binary appends to _headless_views but (unlike the
         # runtime `bn load` path, which calls _write_registry) never rewrites the
         # registry, so the on-disk registry still lists zero binaries while the

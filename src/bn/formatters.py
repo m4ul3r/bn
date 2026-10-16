@@ -8,7 +8,7 @@ import re
 import shlex
 from typing import Any, Callable, Iterator, Sequence
 
-from .target_hint import open_target_lines, target_row
+from .target_hint import open_target_lines, target_option, target_row
 from .transport import BridgeError
 
 # FAILED_MUTATION_STATUSES is DEFINED in `mutation_statuses`, a stdlib-only leaf
@@ -1249,11 +1249,13 @@ def _render_comment_text(value: Any) -> str:
             # The doc rides at the top of this listing as a row (the same store
             # `comment list` marks `[doc] `), so a multi-line doc gets the same
             # escaping as the address rows below (#771).
-            lines.append(f"[doc] {_escape_control_chars(doc)}")
+            lines.append(f"[doc] {_session_mark(value, 'function_doc_written_this_session')}"
+                         f"{_escape_control_chars(doc)}")
         if not comments and not doc:
             return _empty_result("comment")
         lines.extend(
-            f"{c.get('address', '?')}  {_escape_control_chars(c.get('comment', ''))}"
+            f"{c.get('address', '?')}  {_session_mark(c)}"
+            f"{_escape_control_chars(c.get('comment', ''))}"
             for c in comments if isinstance(c, dict)
         )
         return "\n".join(lines)
@@ -1294,8 +1296,15 @@ def _render_comment_list_text(value: Any, *, mangled: bool = False) -> str:
         # external writers can contain them too. Either raw cell splits the row
         # (#771), even though bn symbol rename now rejects controls (#923).
         lines.append(f"{address}  {_escape_control_chars(func)}  {prefix}"
-                     f"{_escape_control_chars(comment)}")
+                     f"{_session_mark(item)}{_escape_control_chars(comment)}")
     return "\n".join(lines)
+
+
+def _session_mark(row: Any, key: str = "written_this_session") -> str:
+    """``[this session] `` for a comment row this bridge wrote and verified
+    (#676 item 4) -- the decompile's own mark (#977). No mark is not a claim
+    that someone else wrote it: the bridge marks only what its ledger holds."""
+    return "[this session] " if _flag_field(row, key) is True else ""
 
 
 @_discloses
@@ -1429,7 +1438,23 @@ def _render_close_text(value: Any) -> str:
 def _render_save_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
+    export = value.get("export") is True
     line = f"saved: {value.get('path', '<unknown>')}"
+    if export:
+        # #1036 item 5: an explicit-path save is a copy. Say where the target
+        # itself still saves and restarts from, so neither this agent nor a
+        # second one reading `target list` mistakes the copy for its home.
+        restart = value.get("restart_path") or "<unknown>"
+        restart_what = (
+            "its database" if value.get("restart_path_is_database")
+            else "the raw file, without this analysis"
+        )
+        line += (
+            "\nnote: an export, not this target's own database: a plain `bn save` "
+            f"still writes {value.get('default_save_path') or '<unknown>'} (or the "
+            f"cache when that is not writable), and `session restart` reopens "
+            f"{restart} ({restart_what})"
+        )
     collision = _field_dict(value, "collides_with_open_target")
     if collision:
         # #857 r4: a save landing on a file another target already has open makes
@@ -1445,6 +1470,25 @@ def _render_save_text(value: Any) -> str:
         # database landed in the writable cache instead (#214).
         line += (f"\nnote: {value.get('requested_path')} was not writable; "
                  f"saved to the cache instead")
+    writer = _field_dict(value, "cache_writer")
+    if writer:
+        # #1036 item 1: the cache is shared, so say who a later load restores
+        # this entry for -- and that everyone else gets the raw bytes.
+        error = _text_value(writer, "error")
+        if error:
+            line += (f"\nnote: {error}; every later load will report this "
+                     "cache entry instead of restoring it")
+        else:
+            roots = [str(root) for root in _field_list(writer, "project_roots")]
+            owners = []
+            instance = _text_value(writer, "instance_id")
+            if instance:
+                owners.append(f"instance {instance}")
+            if roots:
+                owners.append(f"project {', '.join(roots)}")
+            line += ("\nnote: this cache entry is restored by default only for "
+                     f"{' or '.join(owners) or 'nobody'}; any other load of these "
+                     "bytes opens the raw file and prints the `bn load` that restores it")
     return line
 
 
@@ -1485,6 +1529,9 @@ def _render_session_start_text(value: Any) -> str:
                     )
                     if item.get("status_command"):
                         lines.append(f"  poll: {item['status_command']}")
+                        # #1036 item 6: the blocking form, so no agent writes
+                        # its own poll loop.
+                        lines.append(f"  wait: {item['status_command']} --wait")
                 else:
                     mark = "  [not analyzed]" if item.get("analyzed") is False else ""
                     lines.append(f"- {item.get('path', '<unknown>')}{mark}")
@@ -1492,13 +1539,7 @@ def _render_session_start_text(value: Any) -> str:
                     # view, so listing it repeated earlier binaries' selectors
                     # under later paths; an older bridge without `target` keeps
                     # the full list.
-                    own = _field_dict(item, "target")
-                    rows = [own] if own else _field_list(item, "targets")
-                    for tgt in rows:
-                        if isinstance(tgt, dict) and tgt.get("selector"):
-                            lines.append(
-                                f"  target: {tgt['selector']}"
-                                f"   (pass -t {tgt['selector']}; id {tgt.get('target_id', '?')})")
+                    lines.extend(_loaded_target_lines(item))
                 for note in _field_list(item, "notes"):
                     lines.append(f"  note: {note}")
             else:
@@ -1548,18 +1589,24 @@ def _render_session_status_text(value: Any) -> str:
         if not isinstance(item, dict):
             lines.append(_render_fallback_text(item))
             continue
+        result = _field_dict(item, "result")
+        mark = "  [not analyzed]" if result.get("analyzed") is False else ""
         lines.append(
             f"{item.get('job_id', '<unknown>')}  "
             f"{item.get('state', '<unknown>')}  "
-            f"{item.get('path', '<unknown>')}"
+            f"{item.get('path', '<unknown>')}{mark}"
         )
         if item.get("error"):
             lines.append(f"  error: {item['error']}")
-        result = _field_dict(item, "result")
         if result:
-            for target in _field_list(result, "targets"):
-                if isinstance(target, dict) and target.get("selector"):
-                    lines.append(f"  target: {target['selector']}")
+            # #1035 item 3: the target THIS job opened, as the foreground start
+            # prints it -- `targets` is every view open when it finished, so
+            # each job listed every earlier binary too. #1036 item 2: and the
+            # load's notes (a restored or skipped cache entry, inherited counts),
+            # which a detached start otherwise showed only in JSON.
+            lines.extend(_loaded_target_lines(result))
+            for note in _field_list(result, "notes"):
+                lines.append(f"  note: {note}")
     # A job-specific poll that has NOT finished names the exact command to
     # re-run, so text mode never leaves the caller reconstructing it. Terminal
     # jobs drop the hint: re-polling a finished job is pure waste and would
@@ -1567,6 +1614,28 @@ def _render_session_status_text(value: Any) -> str:
     status_command = value.get("status_command")
     if status_command and value.get("terminal") is False:
         lines.append(f"  poll: {status_command}")
+    waited = _field_dict(value, "waited")
+    if waited.get("timed_out"):
+        lines.append(
+            f"  wait: timed out after {waited.get('seconds', '?')}s with the job "
+            "still running")
+    return "\n".join(lines)
+
+
+def _loaded_target_lines(item: dict[str, Any]) -> list[str]:
+    """The `  target:` line of one completed load: the target THAT load opened
+    (#996), with the `-t` argument quoted so it pastes as printed (#1033 item
+    3). An older bridge without `target` keeps the full `targets` list."""
+    own = _field_dict(item, "target")
+    rows = [own] if own else _field_list(item, "targets")
+    lines = []
+    for tgt in rows:
+        if isinstance(tgt, dict) and tgt.get("selector"):
+            lines.append(
+                f"  target: {tgt['selector']}"
+                f"   (pass {target_option(str(tgt['selector']))}; "
+                f"id {tgt.get('target_id', '?')})")
+    return lines
     return "\n".join(lines)
 
 
@@ -1738,6 +1807,12 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         ("unsaved", _yes_no(value.get("unsaved"))),
         ("engine modified", _yes_no(value.get("engine_modified"))),
         ("file", value.get("filename")),
+        # #1036 item 5: where this target's analysis lives when that is not
+        # `file` (a save re-homed and restored the live filename), and the
+        # copies exported from it -- which are never where it saves or
+        # restarts from.
+        ("database", value.get("database_path")),
+        ("exported to", ", ".join(str(p) for p in _field_list(value, "exports"))),
         ("arch", value.get("arch")),
         ("platform", value.get("platform")),
         # Pointer width + byte order, so a text-mode reader decoding a raw dump
@@ -1864,6 +1939,33 @@ def _render_target_info_text(value: Any) -> str:
     return _render_target_summary(value)
 
 
+def _database_flags_fragment(annotations: Any) -> str:
+    """``, opened-from-database=<bool>, restored-from-cache=<bool>`` for the
+    existing-annotations line of `target info` and `evidence orient` (#1036
+    item 5: one flag used to mean "opened from any .bndb" while reading as
+    "restored from the shared cache"). Through the flag choke point, for the
+    one shape a raw truthiness test gets exactly backwards ("false")."""
+    opened = _flag_field(annotations, "opened_from_database")
+    restored = _flag_field(annotations, "restored_from_cache")
+    return (f", opened-from-database={bool(opened)}"
+            f", restored-from-cache={bool(restored)}")
+
+
+def _own_save_lines(annotations: Any) -> list[str]:
+    """The line saying the database this view opened is one THIS bridge saved
+    or exported (and still the file it wrote), so its annotations are this
+    bridge's own work rather than inherited (#1036 item 5)."""
+    own = _field_dict(annotations, "written_by_this_bridge")
+    if not own:
+        return []
+    kind = "exported" if own.get("kind") == "export" else "saved"
+    source = _text_value(own, "filename") or _text_value(own, "target_id") or "<unknown>"
+    saved_at = _text_value(own, "saved_at")
+    when = f" at {saved_at}" if saved_at else ""
+    return [(f"opened from a database this bridge {kind} from {source}{when}: "
+             "its annotations are this bridge's own work, not inherited")]
+
+
 def _source_verified_fragment(annotations: Any) -> str:
     """The ``, source-verified=<true|false|unknown>`` tail of the existing-
     annotations line, shared by `target info` and `evidence orient` so the
@@ -1917,12 +2019,10 @@ def _render_target_info_annotations_text(value: Any) -> str:
         row += f", analyst-symbols={_stated_count(annotations, 'analyst_symbols')}"
         if _field_present(annotations, "placeholder_symbols"):
             row += f", placeholders={_stated_count(annotations, 'placeholder_symbols')}"
-    # A flag, not a count: through the flag choke point for the one shape a raw
-    # truthiness test gets exactly backwards ("false" is True to Python).
-    restored = _flag_field(annotations, "analysis_cache_restored")
-    row += f", cache-restored={bool(restored)}"
+    row += _database_flags_fragment(annotations)
     row += _source_verified_fragment(annotations)
     lines = [row]
+    lines.extend(f"\t{line}" for line in _own_save_lines(annotations))
     hint = annotations.get("provenance_hint")
     if hint:
         lines.append(f"\t! {hint}")
@@ -3985,9 +4085,10 @@ def _render_orient_text(value: Any) -> str:
                     row += (
                         f", placeholders={_stated_count(ea, 'placeholder_symbols')}"
                     )
-            row += f", cache-restored={ea.get('analysis_cache_restored', False)}"
+            row += _database_flags_fragment(ea)
             row += _source_verified_fragment(ea)
             lines.append(row)
+            lines.extend(f"  {line}" for line in _own_save_lines(ea))
             if ea.get("provenance_hint"):
                 lines.append(f"  ! {ea['provenance_hint']}")
     ss = _field_dict(value, "strings_sample")

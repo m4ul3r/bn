@@ -1956,6 +1956,107 @@ def test_session_status_unknown_job_fails_loudly(monkeypatch, capsys):
     assert "Unknown load job: nope" in capsys.readouterr().err
 
 
+def _job_status(state: str, *, succeeded=None) -> dict:
+    terminal = state in ("complete", "failed")
+    job = {"job_id": "job123", "state": state, "path": "/tmp/s.bndb",
+           "error": "RuntimeError: Unable to open" if state == "failed" else None}
+    return {"ok": True, "result": {
+        "kind": "load_job", "job_id": "job123", "state": state, "terminal": terminal,
+        "succeeded": succeeded if terminal else None, "job": job, "items": [job],
+        "count": 1, "status_command": "bn -i worker session status job123"}}
+
+
+@pytest.mark.parametrize("final,succeeded,rc_expected", [
+    ("complete", True, 0), ("failed", False, 1)])
+def test_session_status_wait_blocks_until_the_job_is_terminal_1036(
+        monkeypatch, capsys, final, succeeded, rc_expected):
+    """#1036 item 6: every agent wrote its own poll loop, and one grepped for a
+    spelling that never matched and ran 8.5 minutes for a job done in two.
+    `--wait` polls on the bridge's own `terminal` verdict and exits 0 when the
+    job loaded, 1 when it failed."""
+    import bn.commands.admin as admin
+
+    replies = [_job_status("queued"), _job_status("running"),
+               _job_status(final, succeeded=succeeded)]
+    calls = []
+
+    def fake_send_request(op, **kwargs):
+        calls.append(op)
+        return replies[min(len(calls), len(replies)) - 1]
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(admin, "_STATUS_WAIT_INTERVAL", 0.0)
+
+    rc = bn.cli.main(["session", "status", "job123", "-i", "worker", "--wait",
+                      "--format", "json"])
+
+    assert rc == rc_expected
+    assert calls == ["load_status"] * 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["state"] == final and payload["waited"]["timed_out"] is False
+
+
+def test_session_status_wait_gives_up_at_its_timeout_1036(monkeypatch, capsys):
+    import bn.commands.admin as admin
+
+    monkeypatch.setattr(bn.cli, "send_request", lambda op, **kw: _job_status("running"))
+    monkeypatch.setattr(admin, "_STATUS_WAIT_INTERVAL", 0.01)
+
+    rc = bn.cli.main(["session", "status", "job123", "-i", "worker", "--wait",
+                      "--timeout", "0.05"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "job123  running  /tmp/s.bndb" in out
+    assert "wait: timed out after" in out
+
+
+@pytest.mark.parametrize("argv,message", [
+    (["session", "status", "-i", "worker", "--wait"], "--wait needs a job id"),
+    (["session", "status", "job123", "-i", "worker", "--timeout", "5"],
+     "--timeout applies only with --wait"),
+])
+def test_session_status_wait_refuses_what_it_cannot_wait_for(monkeypatch, capsys, argv, message):
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda op, **kw: pytest.fail("no request expected"))
+    assert bn.cli.main(argv) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_foreground_session_start_reports_a_long_load_on_stderr_1036(monkeypatch, capsys):
+    """#1036 item 6: a foreground start of a large binary printed nothing for
+    four minutes. A stderr line every interval says it is still working;
+    stdout stays the command's result."""
+    import threading
+
+    import bn.commands.admin as admin
+
+    release = threading.Event()
+    instance = types.SimpleNamespace(
+        instance_id="w1", pid=1, socket_path="/tmp/w1.sock", meta={})
+
+    def fake_send_request(op, **kwargs):
+        if op == "load_binary":
+            release.wait(0.3)
+            return {"ok": True, "result": {
+                "loaded": True, "path": kwargs["params"]["path"],
+                "targets": [{"selector": "big", "target_id": "1:1:1"}],
+                "target": {"selector": "big", "target_id": "1:1:1"}, "notes": []}}
+        return {"ok": True, "result": {"associated": [], "skipped": []}}
+
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id: instance)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(admin, "_START_PROGRESS_INTERVAL", 0.05)
+    monkeypatch.setattr(admin, "_instance_source_dir", lambda inst: None)
+
+    rc = bn.cli.main(["session", "start", "/tmp/big", "--instance-id", "w1"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "bn: still loading /tmp/big (" in captured.err
+    assert "still loading" not in captured.out
+    assert "target: big   (pass -t big; id 1:1:1)" in captured.out
+
 
 
 @pytest.mark.parametrize("flag", ["--instance", "--instance-id"])

@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import socket
 import sys
 import threading
@@ -1090,7 +1091,8 @@ def test_target_info_and_orient_digest_agree_on_existing_annotations_793(monkeyp
     digest = instance._orient_digest("active")
 
     assert info["existing_annotations"]["comments"] == 1
-    assert info["existing_annotations"]["analysis_cache_restored"] is True
+    assert info["existing_annotations"]["opened_from_database"] is True
+    assert info["existing_annotations"]["restored_from_cache"] is False
     assert "predate this run" in info["existing_annotations"]["provenance_hint"]
     # The agreement IS the fix: one builder, one answer, whichever surface asks.
     assert digest["existing_annotations"] == info["existing_annotations"]
@@ -1158,7 +1160,7 @@ def test_target_info_annotation_counts_degrade_but_stay_present_793(monkeypatch)
     annotations = instance._target_info("active")["existing_annotations"]
 
     assert "view is dead" in annotations["unavailable"]
-    assert annotations["analysis_cache_restored"] is True
+    assert annotations["opened_from_database"] is True
 
 
 def test_target_info_surfaces_image_base(monkeypatch):
@@ -1541,6 +1543,33 @@ def test_py_exec_explicit_mark_dirty_handles_preexisting_modified_bit(monkeypatc
 
     assert marked == [bv]
     assert result["dirty"] is True
+
+
+def test_py_exec_untargeted_runs_with_no_target_open_1035(monkeypatch):
+    """#1035 item 2: the documented snippet that closes a GUI first-run modal
+    was refused with `No BinaryView targets are open` -- the only state that
+    modal appears in. `py_exec_untargeted` resolves nothing, runs with
+    bv=None, is outside the destructive gate (no target to count), refuses a
+    selector rather than ignore one, and refuses `mark_dirty()`."""
+    bridge = _load_bridge(monkeypatch)
+    bridge._headless_views.clear()
+    instance = bridge.BinaryNinjaBridge()
+
+    targeted = instance.dispatch({"op": "py_exec", "params": {"script": "result = 1"}})
+    assert targeted["ok"] is False
+
+    ok = instance.dispatch({"op": "py_exec_untargeted",
+                            "params": {"script": "print('closing'); result = bv is None"}})
+    assert ok["ok"] is True, ok
+    assert ok["result"]["result"] is True and ok["result"]["stdout"] == "closing\n"
+    assert ok["result"]["dirty"] is False
+
+    refused = instance.dispatch({"op": "py_exec_untargeted", "target": "demod",
+                                 "params": {"script": "result = 1"}})
+    assert refused["ok"] is False and "takes no target" in refused["error"]
+
+    dirty = instance.dispatch({"op": "py_exec_untargeted", "params": {"script": "mark_dirty()"}})
+    assert dirty["ok"] is False and "mark_dirty() needs a target" in dirty["error"]
 
 
 def test_read_write_lock_blocks_reader_until_writer_releases(monkeypatch):
@@ -2472,6 +2501,7 @@ def test_load_binary_restores_cache_bndb_when_no_adjacent(monkeypatch, tmp_path)
     cache_bndb = bridge._cache_bndb_path(str(raw.resolve()))
     cache_bndb.parent.mkdir(parents=True, exist_ok=True)
     cache_bndb.write_bytes(b"")
+    _claim_cache_entry(bridge, instance, cache_bndb)
 
     result = instance._load_binary(str(raw))
 
@@ -2526,6 +2556,7 @@ def test_load_binary_quick_never_restores_a_cached_database(monkeypatch, tmp_pat
     assert len(skipped) == 1, result["notes"]
     assert "matches the content hash of widgetd" in skipped[0]
     assert skipped[0].endswith(f"`bn load {cache_bndb}`")
+    assert "no writer record" in skipped[0]
     assert "--quick ignored" not in " ".join(result["notes"])
     bridge._headless_views.clear()
 
@@ -2573,6 +2604,135 @@ def test_load_binary_adjacent_bndb_preferred_over_cache(monkeypatch, tmp_path):
     assert "instead of" in " ".join(result["notes"])
     assert "restored cached" not in " ".join(result["notes"])
     bridge._headless_views.clear()
+
+
+def _claim_cache_entry(bridge, instance, entry, *, instance_id="own-1", roots=()):
+    """Write the #1036 writer record a save leaves beside a cache entry,
+    naming *instance_id*, and make *instance* that instance."""
+    instance.instance_id = instance_id
+    assert bridge._record_cache_writer(Path(entry), instance_id, list(roots)) is None
+
+
+def _cache_entry_for(bridge, monkeypatch, tmp_path, data=b"\x7fELF v1"):
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path / "cache")
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    raw = tmp_path / "ro" / "demod"
+    raw.parent.mkdir()
+    raw.write_bytes(data)
+    entry = bridge._cache_bndb_path(str(raw.resolve()), bridge._hash_file(raw).sha256)
+    entry.parent.mkdir(parents=True)
+    entry.write_bytes(b"BNDB")
+    return raw, entry
+
+
+def _restore_argv(note: str) -> list[str]:
+    """The command a skipped-entry note prints, split as a shell would."""
+    return shlex.split(note.rsplit("`", 2)[1])
+
+
+@pytest.mark.parametrize("writer", ["other-instance", "other-project", "none", "rewritten"])
+def test_a_cache_entry_this_instance_or_project_did_not_write_is_not_restored_1036(
+        monkeypatch, tmp_path, writer):
+    """#1036 item 1 (decision D1): the cache is shared by every bn instance using
+    one BN_CACHE_DIR, and restoring whatever entry matched the bytes put
+    another agent's renames under four of seven fresh starts. An entry is
+    restored by default only when its writer record still matches it and names
+    this instance or the caller's project; otherwise the raw bytes load and the
+    note prints the command that restores it -- which runs as printed."""
+    data = b"\x7fELF v1"
+    bridge, instance, loaded_paths, _views = _setup_provenance_load_test(
+        monkeypatch, db_metadata=_provenance(data))
+    raw, entry = _cache_entry_for(bridge, monkeypatch, tmp_path, data)
+    project = tmp_path / "proj-b"
+    project.mkdir()
+    instance.instance_id = "agent-b"
+    if writer == "other-instance":
+        bridge._record_cache_writer(entry, "agent-a", [])
+        who = "written by instance agent-a with no project association"
+    elif writer == "other-project":
+        bridge._record_cache_writer(entry, None, [str(tmp_path / "proj-a")])
+        who = f"written by a GUI bridge for project {tmp_path / 'proj-a'}"
+    elif writer == "none":
+        who = "no writer record"
+    else:
+        # The record names THIS instance, but the entry was rewritten after it
+        # (an older bn, a copy by hand): the record no longer vouches for it.
+        bridge._record_cache_writer(entry, "agent-b", [str(project)])
+        entry.write_bytes(b"BNDB rewritten by someone else")
+        who = "rewritten since its writer record was made"
+
+    result = instance._load_binary(str(raw), workdir=str(project))
+
+    assert loaded_paths == [str(raw)], loaded_paths
+    [note] = [n for n in result["notes"] if n.startswith("did not restore the cached database")]
+    assert who in note, note
+    argv = _restore_argv(note)
+    assert argv == ["bn", "-i", "agent-b", "load", str(entry)], argv
+    from bn import cli as bn_cli
+
+    parsed = bn_cli.build_parser().parse_args(argv[1:])
+    assert parsed.instance == "agent-b" and parsed.path == str(entry)
+    bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("owner", ["instance", "project"])
+def test_a_cache_entry_this_instance_or_project_wrote_is_restored_with_its_counts_1036(
+        monkeypatch, tmp_path, owner):
+    """The other half of D1, and #1036 item 3: an own entry restores, the note
+    says whose it is, and the counts it held print even when all are zero --
+    "it held nothing" is the answer the agent would otherwise spend a
+    `target info` on."""
+    data = b"\x7fELF v1"
+    bridge, instance, loaded_paths, _views = _setup_provenance_load_test(
+        monkeypatch, db_metadata=_provenance(data))
+    raw, entry = _cache_entry_for(bridge, monkeypatch, tmp_path, data)
+    project = tmp_path / "proj"
+    project.mkdir()
+    instance.instance_id = "agent-b"
+    if owner == "instance":
+        bridge._record_cache_writer(entry, "agent-b", [])
+    else:
+        bridge._record_cache_writer(entry, "agent-gone", [str(project)])
+    monkeypatch.setattr(bridge.read_listing, "_annotation_summary", lambda ctx, bv: {
+        "comments": 0, "function_comments": 0, "analyst_symbols": 0,
+        "user_symbols": 0, "placeholder_symbols": 3})
+
+    result = instance._load_binary(str(raw), workdir=str(project))
+
+    assert loaded_paths == [str(entry)]
+    notes = result["notes"]
+    assert any(n.startswith(f"restored cached database {entry}") for n in notes), notes
+    assert any("already held 0 comment(s), 0 function doc(s) and 0 analyst symbol(s)" in n
+               for n in notes), notes
+    bridge._headless_views.clear()
+
+
+def test_a_cache_save_records_who_wrote_the_entry_1036(monkeypatch, tmp_path):
+    """The record a restore is judged by is written by the save that wrote the
+    entry, with the saver's instance and project roots and the entry's own file
+    identity, and the save result says who it will restore for."""
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path / "cache")
+    instance = bridge.BinaryNinjaBridge(instance_id="agent-a")
+    instance._project_roots.add(str(tmp_path / "proj-a"))
+    entry = tmp_path / "cache" / "bndb" / "demod.0011223344556677.bndb"
+    entry.parent.mkdir(parents=True)
+    entry.write_bytes(b"BNDB")
+    result: dict = {}
+
+    instance._stamp_cache_writer(str(entry), result)
+
+    assert result["cache_writer"] == {
+        "instance_id": "agent-a", "project_roots": [str(tmp_path / "proj-a")]}
+    assert bridge._cache_writer_verdict(entry, "agent-a", None)[0] is True
+    assert bridge._cache_writer_verdict(entry, "agent-b", str(tmp_path / "proj-a"))[0] is True
+    assert bridge._cache_writer_verdict(entry, "agent-b", str(tmp_path / "proj-b"))[0] is False
+    # A save anywhere else is not a cache entry and records nothing.
+    elsewhere: dict = {}
+    instance._stamp_cache_writer(str(tmp_path / "out.bndb"), elsewhere)
+    assert elsewhere == {}
+
 
 
 def test_cache_bndb_path_is_deterministic_and_content_keyed(monkeypatch, tmp_path):
@@ -2767,6 +2927,7 @@ def test_load_binary_restores_content_keyed_cache(monkeypatch, tmp_path):
     cache_bndb = bridge._cache_bndb_path(str(raw.resolve()), bridge._hash_file(raw).sha256)
     cache_bndb.parent.mkdir(parents=True)
     cache_bndb.write_bytes(b"BNDB")
+    _claim_cache_entry(bridge, instance, cache_bndb)
 
     result = instance._load_binary(str(raw))
 
@@ -2775,7 +2936,7 @@ def test_load_binary_restores_content_keyed_cache(monkeypatch, tmp_path):
     # The note names the entry, why it matched, and the cache dir it lives in.
     assert f"restored cached database {cache_bndb}" in notes
     assert "content hash of parse_record" in notes
-    assert f"{cache_bndb.parent} is shared" in notes
+    assert "written by instance own-1 with no project association" in notes
     assert "unverified" not in notes
     bridge._headless_views.clear()
 
@@ -2793,6 +2954,7 @@ def test_load_binary_still_finds_legacy_path_keyed_cache(monkeypatch, tmp_path):
     assert legacy != bridge._cache_bndb_path(str(raw.resolve()), bridge._hash_file(raw).sha256)
     legacy.parent.mkdir(parents=True)
     legacy.write_bytes(b"BNDB")
+    _claim_cache_entry(bridge, instance, legacy)
 
     result = instance._load_binary(str(raw))
 
@@ -2816,6 +2978,7 @@ def test_load_binary_refuses_legacy_cache_saved_for_different_bytes(monkeypatch,
     legacy = bridge._cache_bndb_path(str(raw.resolve()))
     legacy.parent.mkdir(parents=True)
     legacy.write_bytes(b"BNDB")
+    _claim_cache_entry(bridge, instance, legacy)
 
     result = instance._load_binary(str(raw))
 
@@ -3176,18 +3339,19 @@ def test_target_rows_keep_the_load_time_provenance_verdict(monkeypatch, tmp_path
     assert bridge._source_verdict(views[0]) is True and bridge._source_verdict(views[1]) is None
 
     # The annotation block the two provenance surfaces share (#793) carries the
-    # verdict beside `analysis_cache_restored`, and the hint says which it is.
+    # verdict beside the database flags, and the hint says which it is.
     monkeypatch.setattr(bridge.read_listing, "_annotation_summary", lambda ctx, bv: {
         "comments": 1, "function_comments": 0, "analyst_symbols": 0,
         "user_symbols": 0, "placeholder_symbols": 0})
     for verdict, phrase in ((True, "verified against the raw file's content"),
                             (False, "provenance is UNVERIFIED"),
-                            (None, "restored from a .bndb)")):
+                            (None, "(database opened)")):
         block = bridge.read_listing._existing_annotations(
             instance.ctx, views[0], filename=str(tmp_path / "parse_record.bndb"),
             source_verified=verdict)
         assert block["source_verified"] is verdict
-        assert block["analysis_cache_restored"] is True
+        assert block["opened_from_database"] is True
+        assert block["restored_from_cache"] is False
         assert phrase in block["provenance_hint"], block["provenance_hint"]
     bridge._headless_views.clear()
 
@@ -3231,7 +3395,7 @@ def test_provenance_hint_counts_only_what_the_view_held_at_open(monkeypatch, tmp
     instance._load_binary(str(raw), prefer_bndb=False)
     instance._load_binary(str(database))
     # This session renames a function in each view; the raw one is then saved
-    # and re-homed to its .bndb, the shape that flipped `cache-restored`.
+    # and re-homed to its .bndb, the shape that flipped the database flag.
     for view in views.values():
         view.symbol_table.append(SimpleNamespace(auto=False, name="my_handler", address=0x402000))
     raw_view = views[str(raw)]
@@ -3243,11 +3407,11 @@ def test_provenance_hint_counts_only_what_the_view_held_at_open(monkeypatch, tmp
         instance.ctx, views[str(database)], filename=str(database))
 
     assert raw_block["analyst_symbols"] == 1
-    assert raw_block["analysis_cache_restored"] is False
+    assert raw_block["opened_from_database"] is False
     assert raw_block["provenance_hint"] is None
     assert "present_at_open" not in raw_block
     assert db_block["analyst_symbols"] == 2
-    assert db_block["analysis_cache_restored"] is True
+    assert db_block["opened_from_database"] is True
     assert db_block["present_at_open"] == {
         "comments": 0, "function_comments": 0, "analyst_symbols": 1, "placeholder_symbols": 0}
     assert ("0 comment(s), 0 function doc(s), 1 analyst symbol(s) present when the "
@@ -3670,6 +3834,128 @@ def test_saved_database_keeps_the_raw_views_selector_996(monkeypatch, tmp_path):
             manager.resolve("foo")
     finally:
         bridge._headless_views.clear()
+
+
+def test_an_exported_database_keeps_the_raw_views_selector_1036(monkeypatch, tmp_path):
+    """#1036 item 4: the #996 round-trip exception held only for a DEFAULT save.
+    On a read-only mount an explicit `bn save <path>` is the only private
+    choice, and loading that copy back made `-t demod` ambiguous. The export is
+    now recorded in its own ledger -- pairing exactly like a default save while
+    the file is the one written -- and never becomes the restart identity."""
+    bridge = _load_bridge(monkeypatch)
+    raw_path = tmp_path / "ro" / "demod"
+    raw_path.parent.mkdir()
+    raw_path.write_bytes(b"raw")
+    export = tmp_path / "out" / "demod.bndb"
+    export.parent.mkdir()
+    raw = _FakeFileBV(str(raw_path), session_id="1")
+    _register_views(bridge, raw)
+    manager = bridge.TargetManager()
+    manager.refresh()
+    export.write_bytes(b"database exported by this bridge")
+    manager.note_export(raw, str(export))
+    db = _FakeFileBV(str(export), session_id="2")
+    _register_views(bridge, raw, db)
+    try:
+        rows = {row["filename"]: row for row in manager.refresh()}
+        assert rows[str(raw_path)]["selector"] == "demod"
+        assert rows[str(raw_path)]["database_path"] is None     # not the restart identity
+        assert rows[str(raw_path)]["exports"] == [str(export)]
+        assert manager.resolve("demod") is raw
+        assert manager.resolve("demod.bndb") is db
+        own = manager.written_by_this_bridge(export)
+        assert own["kind"] == "export" and own["filename"] == str(raw_path)
+
+        # The copy rewritten by anything else since: no pair, no ownership.
+        replacement = tmp_path / "other.bndb"
+        replacement.write_bytes(b"someone else's database, longer")
+        os.replace(replacement, export)
+        with pytest.raises(RuntimeError, match="identity recorded at save"):
+            manager.resolve("demod")
+        assert manager.written_by_this_bridge(export) is None
+
+        # A save of the database view over its own file is its own write: the
+        # pairing follows what was written.
+        manager.note_database(db, str(export))
+        assert manager.resolve("demod") is raw
+
+        # A DIFFERENT open view saving over the file leaves the pair void.
+        other = _FakeFileBV(str(tmp_path / "x" / "other"), session_id="3")
+        _register_views(bridge, raw, db, other)
+        manager.refresh()
+        export.write_bytes(b"other's analysis now")
+        manager.note_export(other, str(export))
+        with pytest.raises(RuntimeError, match="rewritten by another target's save"):
+            manager.resolve("demod")
+    finally:
+        bridge._headless_views.clear()
+
+
+def test_reloading_this_bridges_own_export_is_not_inherited_work_1036(monkeypatch, tmp_path):
+    """#1036 item 5: after `save <path>` and `load <path>`, `target info` said
+    `cache-restored=True` and that the annotations "may predate this run" --
+    about a rename this bridge made a minute earlier. The flag is split, and a
+    database this bridge wrote, still the very file it wrote, gets no
+    inheritance hint and says whose work it is."""
+    from bn.commands.binary import _render_target_info_text_with_annotations
+
+    bridge = _load_bridge(monkeypatch)
+    export = tmp_path / "out" / "demod.bndb"
+    own = {"kind": "export", "view_id": "1", "target_id": "9:1:1",
+           "filename": "/ro/demod", "saved_at": "2026-10-15T20:00:00+00:00"}
+    bv = types.SimpleNamespace(
+        file=types.SimpleNamespace(filename=str(export), session_id="s-own"))
+    monkeypatch.setattr(bridge.read_listing, "_annotation_summary", lambda ctx, view: {
+        "comments": 0, "function_comments": 0, "analyst_symbols": 1,
+        "user_symbols": 1, "placeholder_symbols": 0})
+    bridge._opened_annotations["s-own"] = {
+        "path": str(export), "comments": 0, "function_comments": 0,
+        "analyst_symbols": 1, "placeholder_symbols": 0, "written_by_this_bridge": own}
+    try:
+        block = bridge.read_listing._existing_annotations(
+            None, bv, filename=str(export), source_verified=True)
+    finally:
+        bridge._opened_annotations.pop("s-own", None)
+
+    assert block["opened_from_database"] is True
+    assert block["restored_from_cache"] is False
+    assert block["provenance_hint"] is None
+    assert block["written_by_this_bridge"] == own
+    assert "written_by_this_bridge" not in block["present_at_open"]
+    text = _render_target_info_text_with_annotations(
+        {"selector": "demod.bndb", "existing_annotations": block})
+    assert ("opened from a database this bridge exported from /ro/demod at "
+            "2026-10-15T20:00:00+00:00") in text, text
+    assert "predate this run" not in text
+
+
+def test_an_explicit_database_is_judged_against_the_raw_file_bn_recorded_1036(
+        monkeypatch, tmp_path):
+    """#1036 item 5: `source-verified` was judged only against a sibling
+    `<db minus .bndb>`, which an export in a working folder never has. Binary
+    Ninja records the database's original file; that is the raw file now."""
+    bridge = _load_bridge(monkeypatch)
+    raw = tmp_path / "ro" / "demod"
+    raw.parent.mkdir()
+    raw.write_bytes(b"\x7fELF v1")
+    export = tmp_path / "out" / "demod copy.bndb"
+    export.parent.mkdir()
+    export.write_bytes(b"BNDB")
+    bv = types.SimpleNamespace(
+        file=types.SimpleNamespace(filename=str(export), original_filename=str(raw)),
+        query_metadata=lambda key: _provenance(b"\x7fELF v1")[key])
+
+    assert bridge._explicit_database_verdict(bv, export) == (True, None)
+
+    raw.write_bytes(b"\x7fELF v2, rebuilt")
+    verdict, note = bridge._explicit_database_verdict(bv, export)
+    assert verdict is False
+    command = note.split("`")[1]
+    assert shlex.split(command) == ["bn", "load", str(raw), "--no-bndb"]
+
+    # No recorded raw file on disk: nothing to judge, never a guess.
+    raw.unlink()
+    assert bridge._explicit_database_verdict(bv, export) == (None, None)
 
 
 def test_resolve_stays_ambiguous_for_two_views_sharing_a_basename(monkeypatch):
@@ -4457,7 +4743,7 @@ def test_start_headless_rewrites_registry_after_preload(monkeypatch, tmp_path):
 
     loaded: list[str] = []
 
-    def fake_preload(path, quick, prefer_bndb=True):
+    def fake_preload(path, quick, prefer_bndb=True, instance_id=None):
         loaded.append(path)
         bridge._headless_views.append(object())
         return object()
@@ -5431,7 +5717,8 @@ def test_save_database_succeeds_when_file_is_written(monkeypatch, tmp_path):
     out = tmp_path / "x.bndb"
     result = instance._save_database(None, str(out))
 
-    assert result == {"ok": True, "saved": True, "path": str(out.resolve())}  # #364: top-level ok
+    assert result["ok"] is True and result["saved"] is True  # #364: top-level ok
+    assert result["path"] == str(out.resolve())
     assert out.exists()
     assert bv.created_with == str(out.resolve())
 
@@ -6009,7 +6296,11 @@ def test_save_path_preserves_target_identity(monkeypatch, tmp_path):
     out = tmp_path / "copy.bndb"
     result = instance._save_database("origbin", str(out))
 
-    assert result == {"ok": True, "saved": True, "path": str(out.resolve())}  # #364: top-level ok
+    # #364: top-level ok; #1036 item 5: and it says it is an export, and where
+    # the target itself still saves and restarts from.
+    assert result == {"ok": True, "saved": True, "path": str(out.resolve()),
+                      "export": True, "default_save_path": orig + ".bndb",
+                      "restart_path": orig, "restart_path_is_database": False}
     assert out.exists()
     assert bv.created_with == str(out.resolve())   # the copy WAS written
     assert bv.file.filename == orig                # ...but identity is preserved
