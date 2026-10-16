@@ -250,15 +250,24 @@ _EMPTY_TYPEINFO_SCAN = _TypeinfoScan((), False)
 
 
 def _abi_data_sections(bv) -> list[tuple[int, int]]:
-    out = []
+    """The data sections' ranges, merged where they overlap or touch, so each
+    address is read (and charged to the byte budget) once (#1049 review
+    round 4: a user section over existing data listed every candidate twice)."""
+    spans = []
     for sec in (getattr(bv, "sections", None) or {}).values():
         semantics = getattr(getattr(sec, "semantics", None), "name", "") or str(getattr(sec, "semantics", ""))
         if "DataSectionSemantics" not in semantics or "External" in semantics:
             continue
         start, end = int(getattr(sec, "start", 0)), int(getattr(sec, "end", 0))
         if end > start:
-            out.append((start, end))
-    return sorted(out)
+            spans.append((start, end))
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _abi_address_points(ctx, bv) -> dict[int, str]:
@@ -1458,9 +1467,6 @@ def _class_list(
         if no_vendor and _is_vendor_class(name, extra_vendors):
             vendor_suppressed += 1
             continue
-        if local_only and rec.get("imported"):
-            imported_suppressed += 1
-            continue
         if not (include_all or rec["confidence"] in ("rtti", "ctor")):
             # #675.2: a declared class type is not RTTI/ctor-confirmed either, so
             # the same gate folds it out of the default listing -- counted, so the
@@ -1473,6 +1479,11 @@ def _class_list(
             # even on the default listing.
             if rec["confidence"] == _DECLARED_CONFIDENCE:
                 declared_suppressed += 1
+            continue
+        # #1049 review round 4: after the confidence gate, so the count is only
+        # rows `--local` hides that the listing would otherwise show.
+        if local_only and rec.get("imported"):
+            imported_suppressed += 1
             continue
         candidates.append(rec)
     candidates.sort(key=lambda r: r["name"])
@@ -2480,8 +2491,8 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
     return rec
 
 
-#: #1040.1: the longest body whose MLIL `class apply-types` reads for an
-#: address-point store, and how many copies it follows back to parameter 0.
+#: #1040.2: the longest body whose MLIL `class show` reads for the
+#: `into parameter 0` fact, and how many copies it follows back to parameter 0.
 _AP_STORE_MAX_INSTRUCTIONS = 4096
 _AP_STORE_COPY_HOPS = 8
 
@@ -2519,11 +2530,12 @@ def _is_parameter0(ssa, expr, param0) -> bool:
 
 
 def _param0_address_point_stores(func) -> list[int] | None:
-    """#1040.1: the constants *func*'s own body stores at offset 0 of BN's
-    parameter-0 variable -- in a constructor or destructor, the vptr store --
-    read from its MLIL SSA; ``[]`` for none, None when the IL is unavailable or
+    """#1040.2: the constants *func*'s own body stores at offset 0 of BN's
+    parameter-0 variable, read from its MLIL SSA, for `class show`'s neutral
+    `into parameter 0` fact; ``[]`` for none, None when the IL is unavailable or
     the body is longer than :data:`_AP_STORE_MAX_INSTRUCTIONS`. A store at a
-    nonzero offset (a secondary base's vptr) is not one."""
+    nonzero offset is not one. It does not tell a full vptr store from a
+    partial-width one or a folded reload, so nothing is typed from it."""
     params = list(getattr(func, "parameter_vars", None) or [])
     if not params:
         return []
@@ -2605,8 +2617,8 @@ def _slot_body_facts(ctx, bv, address: int, ptr: int) -> dict[str, Any]:
             name = (il_format._display_name(callee) if callee is not None else None) or raw or hex(target)
             if len(calls) < _SLOT_FACT_MAX_CALLS and not any(c["address"] == hex(target) for c in calls):
                 calls.append({"address": hex(target), "name": name, "tail": op == "MLIL_TAILCALL"})
-    # #1040.1: which of those writes land at offset 0 of parameter 0 -- the
-    # one store `class apply-types` takes as evidence of the object's class.
+    # #1040.2: which of those writes land at offset 0 of parameter 0 -- a
+    # neutral fact only; nothing is retyped or named from it (#1049).
     try:
         into_param0 = set(_param0_address_point_stores(func) or ())
     except Exception:

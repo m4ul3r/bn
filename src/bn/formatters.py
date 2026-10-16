@@ -7684,8 +7684,8 @@ def _typeinfo_scan_candidates_note(value: Any) -> str:
         return ""
     n = _stated_count(value, "typeinfo_scan_candidates")
     return (f"\n! typeinfo byte scan: {n} candidate typeinfo record(s) Binary Ninja named "
-            "nothing at; no class row comes from them. `--format json` lists each address and "
-            "raw name string under typeinfo_scan_listing")
+            "nothing at; no class row comes from them. `--format json` lists the address and "
+            "raw name string of the first 64 under typeinfo_scan_listing")
 
 
 def _class_inputs_note(value: Any) -> str:

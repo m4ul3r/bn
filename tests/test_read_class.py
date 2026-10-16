@@ -5449,6 +5449,16 @@ def test_a_rename_does_not_rerun_the_byte_scan_but_written_data_does_1049(
     assert len(raw_scans) == 2
 
 
+def test_overlapping_data_sections_list_each_candidate_once_1049(abi_scan_view):
+    """#1049 review round 4: a user section added over existing data doubled
+    every candidate (and spent the byte budget twice)."""
+    ctx, bv = abi_scan_view
+    bv.sections["user"] = types.SimpleNamespace(
+        start=0x8000, end=0x8100, semantics=types.SimpleNamespace(name="ReadOnlyDataSectionSemantics"))
+    scan = read_class._typeinfo_scan(ctx, bv)
+    assert sorted(a for a, _, _ in scan.candidates) == sorted(_SCAN_CANDIDATES)
+
+
 # --- #1040.3: what the class list hides, and how it says so ---
 
 def _list_rec(name, *, vtable=True, typeinfo=None, methods=(), imported_rtti=False):
@@ -5515,6 +5525,21 @@ def test_class_list_local_only_hides_records_with_nothing_defined_here_1040(filt
     assert "1 defined in another module" in _render_class_list_text(local)
     text = _render_class_list_text(filter_list(query=None))
     assert "ext::Imported" in text and "[defined in another module]" in text
+
+
+def test_class_list_local_count_skips_rows_the_default_already_hides_1049(monkeypatch, filter_list):
+    """#1049 review round 4: an imported name-only cluster is hidden by the
+    confidence gate already; `--local` counted it again as "defined in
+    another module"."""
+    hidden = _list_rec("ext::NameOnly", vtable=False,
+                       methods=[{"address": "0x1300", "kind": "method", "imported": True}])
+    hidden["confidence"] = "name-only"
+    assert hidden["imported"] is True
+    real = read_class._build_class_registry
+    monkeypatch.setattr(read_class, "_build_class_registry",
+                        lambda ctx, bv, query=None: {**real(ctx, bv), "ext::NameOnly": dict(hidden)})
+    assert "ext::NameOnly" not in [r["name"] for r in filter_list()["items"]]
+    assert filter_list(local_only=True)["imported_suppressed"] == 1
 
 
 def test_class_list_vendor_prefixes_fold_named_namespaces_1040(filter_list):
