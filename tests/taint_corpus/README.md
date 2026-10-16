@@ -60,21 +60,26 @@ brittle across compilers/optimisation.
 | `bw_call_planted_store_init.c` | the planting call isolated (N1): the buffer is filled by plain stores, strtol is the only call before the reload of its end pointer (global or local slot), and the strcpy through it is a frontier. `bw_call_planted_store_init_o2.c` rebuilds it at -O2 |
 | `bw_store_regions.c`   | #931/#933: only plain stores prove the consumed region, from the sink's pointer to the end of the object. A 16-byte literal stored into the last member is complete (BN's `__builtin_strcpy`, whose LLIL is that store run); the same stores read through the whole struct, a member followed by another member, a 15-byte literal in a 16-byte buffer and a real `strncpy` call leave the unproven bytes in the leaf. `bw_store_regions_o2.c` rebuilds it at -O2, where the constant `memset` becomes a verified `__builtin_memset` and covers |
 | `bw_alias_followups.c` | #1053 review follow-ups S1/S2 on a store-initialized buffer: a pointer carried in a struct field, the pointer `strsep` returns, and `strtok_r` continuing are possible writers (the strcpy through them is a frontier), never unrelated; the no-pointer control stays complete. `bw_alias_followups_o2.c` rebuilds it at -O2, where `si_struct_write` folds to a direct `strcpy(&u, host)` after the store: `host`'s parameter origin is walked, and the object `host` points to is a `pointer_object_unresolved` frontier |
-| `bw_consumer_demand.c` | #931/#933 review round 1: the consumed region is the consumer's demand, carried back through arithmetic, copies and phis -- `p = b + 8; popen(p - 8)`, a cursor moving back into an unwritten prefix and a subtraction after a phi of members are incomplete, `p = (char *)&s; popen(p + 4)` and direct `popen(s.cmd)` complete over the stored member, and a `memset` the optimizer turned into four 16-byte stores completes with the end-of-object caveat. `fgets`'s returned pointer checks the local it filled, and a heap object or pointer parameter is a `pointer_object_unresolved` frontier whose `strcpy` and `host` stay in the slice. `bw_consumer_demand_o1.c`/`_o2.c` rebuild it at -O1/-O2 |
+| `bw_consumer_demand.c` | #931/#933 review rounds 1-2: the consumed region is the selected consumer's demand, carried back through arithmetic, copies and phis -- `p = b + 8; popen(p - 8)`, a cursor moving back into an unwritten prefix and a subtraction after a phi of members are incomplete, `p = (char *)&s; popen(p + 4)` and direct `popen(s.cmd)` complete over the stored, debug-typed member, a `memset` the optimizer turned into four 16-byte stores completes with the end-of-object caveat, and a member pointer moved 12 bytes back -- 8 bytes before the struct -- is an `object_extent_unknown` (`outside_object`) frontier, never clamped into it. `fgets`'s returned pointer checks the local, heap object or parameter object it filled, and a heap object or pointer parameter is a `pointer_object_unresolved` frontier whose `strcpy` and `host` stay in the slice. `bw_consumer_demand_o1.c`/`_o2.c` rebuild it at -O1/-O2 |
+| `bw_consumer_demand_nog.c` | the same shapes without debug info (`-g0`): BN recovers the stack objects itself (often as fragments of the real object), so no store proof completes -- every query is incomplete, the stores reported as facts in `object_extent_unknown` (`inferred_extent`, `offset_unknown`) leaves. `bw_consumer_demand_nog_o1.c`/`_o2.c` rebuild it at -O1/-O2 |
 | `bw_regions.c`         | from #941, verdicts re-derived: zero, short, full and suffix `read`s, an indexed row, a lone `strcat`, member `snprintf`/`memcpy` fills read by `popen` or `write` -- every call fill is incomplete with `calls` and the `unproven` byte ranges of the consumed region. `bw_regions_o1.c`/`bw_regions_o2.c` rebuild it at -O1/-O2 |
 | `scalar_member_regions.c` | from #941: a load of one member consumes only its 8 bytes -- the stored member is complete, the unwritten one is a frontier |
 | `store_member_identity.c` | from #941: a `snprintf` through a phi of `&buf` and a member reload is never proof (all incomplete, the control included, since #931); a store through a truncated pointer writes no byte of buf |
 | `external_member_regions.c` | from #941: field loads through a parameter pointer keep their store-matched origin or frontier (unchanged by the region model). `external_member_regions_o1.c` rebuilds it at -O1 |
 
 Backward completeness since #931/#933: a local buffer is checked over the
-region its consumer reads -- from the consumer's own offset, widened to the
-whole object when that offset is not one constant -- and only plain stores
-(plus BN's `__builtin_*` outlined store runs whose LLIL the walk checks) prove
-it initialised. No call does, on any consumer path -- so every target whose
-buffer a call fills (`snprintf`, `strcpy`, `memcpy`, `read`, ...) expects
+region its consumer reads -- from the selected operand's own offset -- and
+only plain stores (plus BN's `__builtin_*` outlined store runs whose LLIL the
+walk checks) prove it initialised, and only when the whole region lies inside
+a local whose extent came from debug info or a user-applied type. An offset
+that is not one constant, a region outside the object, or an extent BN
+recovered itself is an `object_extent_unknown` frontier with the stores as
+facts -- so a build without debug info rarely completes from store proofs (the
+`*_nog` targets). No call proves bytes, on any consumer path -- so every target
+whose buffer a call fills (`snprintf`, `strcpy`, `memcpy`, `read`, ...) expects
 `complete_slice: false`, with a leaf naming the call (`calls`), the consumed
 `region` and the `unproven` ranges; a pointer returned by a call checks the
-locals the call was handed, and a heap object or pointer parameter is a
+objects the call was handed, and a heap object or pointer parameter is a
 `pointer_object_unresolved` frontier. That is the deliberate cost; call-write
 extents are a follow-up.
 

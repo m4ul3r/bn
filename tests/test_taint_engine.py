@@ -171,7 +171,7 @@ class FSite:
 
 class FFunc:
     def __init__(self, name, start, ssa, params=(), symbol_type="FunctionSymbol",
-                 is_thunk=False, caller_sites=()):
+                 is_thunk=False, caller_sites=(), inferred_vars=()):
         self.name = name
         self.start = start
         self.mlil = FMLIL(ssa)
@@ -179,6 +179,12 @@ class FFunc:
         self.symbol = FSym(symbol_type)
         self.is_thunk = is_thunk
         self.caller_sites = list(caller_sites)
+        # Locals whose extent BN only inferred (no debug info, no user type);
+        # every other local is debug-typed, as in the corpus's `-g` builds.
+        self.inferred_vars = {getattr(v, "name", v) for v in inferred_vars}
+
+    def is_var_user_defined(self, var):
+        return getattr(var, "name", var) not in self.inferred_vars
 
 
 class FBV:

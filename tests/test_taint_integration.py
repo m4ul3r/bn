@@ -310,7 +310,8 @@ def test_backward_frontier_advice_runs_as_printed(tmp_path, shared_bn):
     as printed -- the forward run names its function and buffer, the global
     leaf's inspection names the global, and (#931) the call-fill disclosure's
     `callsites` shows the strcpy, for a local buffer and for a heap object
-    (round 1) -- with a second target open."""
+    (round 1), and the outside-object leaf's `il` (round 2) -- with a second
+    target open."""
     src = tmp_path / "advice.c"
     src.write_text("""
 #include <stdio.h>
@@ -333,8 +334,16 @@ __attribute__((noinline)) void heap_fill(const char *host) {
     strcpy(b, host);
     popen(b, "r");
 }
+struct req { int id; char cmd[16]; };
+__attribute__((noinline)) void outside(void) {
+    struct req s;
+    __builtin_memcpy(s.cmd, "ls -la /tmp/xyz", 16);
+    s.id = 1;
+    char *p = s.cmd;
+    popen(p - 12, "r");
+}
 int main(int argc, char **argv) {
-    cond_fill(argc, argv[0]); from_global(); heap_fill(argv[0]); return 0;
+    cond_fill(argc, argv[0]); from_global(); heap_fill(argv[0]); outside(); return 0;
 }
 """)
     first, second = tmp_path / "advice one", tmp_path / "advice two"
@@ -343,7 +352,7 @@ int main(int argc, char **argv) {
     target = shared_bn.load(first, copy=False)
     shared_bn.load(second, copy=False)
     for fn, verbs in (("cond_fill", ("forward", "callsites")), ("from_global", ("xrefs",)),
-                      ("heap_fill", ("callsites",))):
+                      ("heap_fill", ("callsites",)), ("outside", ("il",))):
         result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
                           "--sink", "arg:popen:0")
         assert not result["diagnostics"]["safe_to_report_complete_slice"], result
@@ -357,6 +366,8 @@ int main(int argc, char **argv) {
             assert any(out.startswith("forward taint in cond_fill") for out in outputs), outputs
         if "callsites" in verbs:
             assert any("callee: strcpy" in out for out in outputs), outputs
+        if "il" in verbs:
+            assert any("rax - 0xc" in out or "- 0xc" in out for out in outputs), outputs
 
 
 def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):

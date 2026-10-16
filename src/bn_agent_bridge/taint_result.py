@@ -88,6 +88,11 @@ BLOCKING_LEAF_KINDS = frozenset({
     # object's extent and earlier contents are unknown to the walk, so nothing
     # proves the bytes the consumer reads; its writers here stay in the slice.
     "pointer_object_unresolved",
+    # #931/#933 round 2: stores cover a consumed region the walk cannot bound
+    # -- the consumer reads outside the object, at an offset that is not one
+    # constant, or the object's extent is BN's own recovery (no debug info or
+    # user-applied type). The stores are reported as facts, not a proof.
+    "object_extent_unknown",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -422,7 +427,8 @@ def backward_diagnostics(
     # frontier a user can act on by re-running with a narrower sink.
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered",
                   "indirect_call_unresolved", "field_load_unresolved",
-                  "address_of_local_unresolved", "pointer_object_unresolved")
+                  "address_of_local_unresolved", "pointer_object_unresolved",
+                  "object_extent_unknown")
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)

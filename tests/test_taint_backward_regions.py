@@ -16,9 +16,9 @@ from test_taint_engine import (
     FVar,
     _addr_of,
     _BufProgram,
-    _vphi,
     _bw,
     _cstr,
+    _vphi,
 )
 
 _B_BUILTIN_MEMSET, _B_STRSEP = 0x980, 0x981
@@ -376,3 +376,113 @@ def test_pointer_object_walks_its_writers_and_fails_closed_r1(root):
     assert any(st.get("il_text", "").startswith("strcpy") or "strcpy" in st.get("reason", "")
                for st in result["slices"][0]["slice"]), result["slices"][0]["slice"]
     assert "`bn callsites strcpy --within 0x10`" in ptr[0]["detail"], ptr[0]["detail"]
+
+
+# --- round 2: the selected operand, outside-object demands, object extents ---
+
+def test_demand_is_the_selected_operand_not_another_argument_r2():
+    # `strcpy(p + 8, p)` with one SSA `p = &b`, only b[8..16) stored: the
+    # query selects the SOURCE (arg 1), which reads from offset 0 -- [0, 8)
+    # is unproven. Anchoring the demand on the first argument that reads `p`
+    # (the destination, at offset 8) claimed a complete slice. The
+    # destination query reads [8, 16) and is complete.
+    b = FVar("b", typ="char[16]")
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram()
+    pg.aliased_store(b, 8, 0x4141).size = 8
+    _set_ptr(pg, p1, "p#1 = &b", _addr_of(b))
+    ref = _ssa_ref(p1)
+    dest = FExpr("MLIL_ADD", "p#1 + 8", reads=[p1], left=ref, right=_const(8))
+    dest.size = 8
+    pg.call(_B_STRCPY, [dest, ref], reads=[p1])
+    src, _, aol = _bw(pg.func(), sink="arg:strcpy:1")
+    assert src["diagnostics"]["safe_to_report_complete_slice"] is False, src
+    assert [lf["unproven"] for lf in aol] == [[[0, 8]]], aol
+    dst, _, aol2 = _bw(pg.func(), sink="arg:strcpy:0")
+    assert dst["diagnostics"]["safe_to_report_complete_slice"] is True, dst["leaves"]
+
+
+@pytest.mark.parametrize("delta, where", [(-12, "0x8 bytes before it"),
+                                          (0x10, "at offset 0x14, past its 0x14-byte end")])
+def test_demand_outside_the_object_fails_closed_r2(delta, where):
+    # A fully stored `struct { int id; char cmd[16]; } s` (0x14 bytes), and a
+    # member pointer moved 12 bytes back -- 8 bytes before `s` -- or to its
+    # end. The consumer reads bytes outside the object: never clamped back
+    # into it (round 0/1 reported complete), an `object_extent_unknown` leaf.
+    s = FVar("s", typ="char[0x14]")
+    pg = _BufProgram()
+    pg.whole_store(s, 0x41)
+    p1, p2 = FSSA(FVar("p", typ="char*"), 1), FSSA(FVar("p", typ="char*"), 2)
+    _set_ptr(pg, p1, "p#1 = &s:4", _field_addr(s, 4))
+    op = "MLIL_SUB" if delta < 0 else "MLIL_ADD"
+    _set_ptr(pg, p2, f"p#2 = p#1 {'-' if delta < 0 else '+'} {abs(delta)}",
+             FExpr(op, "p#1 +- n", reads=[p1], left=_ssa_ref(p1), right=_const(abs(delta))),
+             reads=[p1])
+    _sink_ssa(pg, p2)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "object_extent_unknown"]
+    assert leaf["cause"] == "outside_object" and where in leaf["detail"], leaf
+    assert leaf["region"]["offset"] == 4 + delta, leaf
+
+
+def test_inferred_extent_is_no_proof_r2():
+    # The same whole-object stores, but BN recovered the local itself (no
+    # debug info, no user type): it may be a fragment of the object the
+    # consumer reads. The stores are reported as facts; nothing is proven.
+    buf = FVar("buf", typ="char[0x40]")
+    pg = _BufProgram()
+    pg.whole_store(buf, 0x41)
+    pg.sink(buf)
+    result, _, _ = _bw(pg.func(inferred_vars=[buf]))
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = result["leaves"]
+    assert leaf["kind"] == "object_extent_unknown" and leaf["cause"] == "inferred_extent", leaf
+    assert leaf["extent"] == "inferred" and leaf["unproven"] == [], leaf
+    assert not any("(#933)" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def test_unknown_offset_is_no_proof_r2():
+    # A loop cursor into a fully stored, debug-typed buffer: the consumer's
+    # offset is not one constant, so it may leave the object -- widening to
+    # the object cannot certify it.
+    b = FVar("b", typ="char[0x10]")
+    pg = _BufProgram()
+    pg.whole_store(b, 0x41)
+    p1, p3 = FSSA(FVar("p"), 1), FSSA(FVar("p"), 3)
+    _set_ptr(pg, p1, "p#1 = &b:8", _field_addr(b, 8))
+    p2, phi = _vphi(FVar("p"), 2, [p1, p3], *pg._next())
+    pg.instrs.append(phi)
+    _set_ptr(pg, p3, "p#3 = p#2 - 1",
+             FExpr("MLIL_SUB", "p#2 - 1", reads=[p2], left=_ssa_ref(p2), right=_const(1)),
+             reads=[p2])
+    _sink_ssa(pg, p2)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = result["leaves"]
+    assert leaf["kind"] == "object_extent_unknown" and leaf["cause"] == "offset_unknown", leaf
+
+
+@pytest.mark.parametrize("root", ["malloc", "parameter"])
+def test_returned_pointer_over_an_external_object_r2(root):
+    # `p = fgets(b, 64, f); write(1, p, 64)` with `b` a heap allocation or a
+    # pointer parameter: the return is `b`'s object, which no local is behind.
+    # The source stays the origin; the object is a `pointer_object_unresolved`
+    # frontier, as when the consumer reads `b` directly.
+    f = FVar("f", ident=51); f0 = FSSA(f, 0)
+    b = FVar("b", ident=52, typ="char*")
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[f] if root == "malloc" else [f, b])
+    if root == "malloc":
+        bv = FSSA(b, 1)
+        pg.call(_B_MALLOC, [_const(0x40)], writes=[bv])
+    else:
+        bv = FSSA(b, 0)
+    pg.call(_B_FGETS, [FExpr("MLIL_VAR_SSA", f"b#{bv.version}", reads=[bv]), _const(0x40),
+                       FExpr("MLIL_VAR_SSA", "f#0", reads=[f0])], reads=[bv, f0], writes=[p1])
+    _sink_ssa(pg, p1)
+    result, _, _ = _bw(pg.func())
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "fgets"}, result["slices"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    ptr = [lf for lf in result["leaves"] if lf["kind"] == "pointer_object_unresolved"]
+    assert any(lf["pointer"] == f"b#{bv.version}" for lf in ptr), result["leaves"]

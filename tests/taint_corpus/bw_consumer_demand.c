@@ -1,8 +1,11 @@
-/* #931/#933 review round 1: the consumed region is the CONSUMER's demand,
- * carried back through copies, arithmetic and phis (widened when the offset
- * is not one constant), and "no call certifies" holds on every consumer path:
- * a pointer a call returned into a local, a heap object and a pointer
- * parameter are never complete. Analyze only; never execute. */
+/* #931/#933 review rounds 1-2: the consumed region is the CONSUMER's demand,
+ * carried back through copies, arithmetic and phis -- an offset that is not
+ * one constant, or one outside the object, is never proven -- and "no call
+ * certifies" holds on every consumer path: a pointer a call returned (into a
+ * local, a heap object or a parameter's object), a heap object and a pointer
+ * parameter are never complete. Only a debug-typed or user-typed local's
+ * extent bounds a store proof; the _nog rebuilds (no debug info) are never
+ * complete. Analyze only; never execute. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
@@ -24,4 +27,7 @@ NI void fgets_ret_popen(FILE *f) { char c[64]; char *p = fgets(c, 64, f); if (p)
 NI void heap_fill(const char *host) { char *b = malloc(64); strcpy(b, host); popen(b, "r"); }
 NI void param_fill(char *b, const char *host) { strcpy(b, host); popen(b, "r"); }
 NI void nonul_memset(int v) { char c[64]; memset(c, v, 64); popen(c, "r"); }
+NI void negative_member(void) { struct req s; __builtin_memcpy(s.cmd, "ls -la /tmp/xyz", 16); s.id = 1; char *p = s.cmd; popen(p - 12, "r"); }
+NI void returned_heap(FILE *f) { char *b = malloc(64); char *p = fgets(b, 64, f); if (p) write(1, p, 64); }
+NI void returned_param(char *b, FILE *f) { char *p = fgets(b, 64, f); if (p) write(1, p, 64); }
 int main(void) { return 0; }

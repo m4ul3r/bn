@@ -1,5 +1,5 @@
 {
-  "description": "#931/#933 review round 1: the consumed region is the consumer's demand (widened when its offset is not one constant), and no call certifies a buffer on any consumer path -- a returned pointer, a heap object, a pointer parameter. Analyze only.",
+  "description": "#931/#933 review rounds 1-2: the consumed region is the selected consumer's demand (never clamped; an unknown or outside offset proves nothing), only a debug-typed or user-typed local bounds a store proof, and no call certifies a buffer on any consumer path -- a returned pointer (into a local, a heap object or a parameter's object), a heap object, a pointer parameter. Analyze only.",
   "lang": "c",
   "cflags": [
     "-O1",
@@ -18,9 +18,6 @@
         {
           "kind": "address_of_local_unresolved"
         }
-      ],
-      "leaf_details_contain": [
-        "writes [0x0, 0x8)"
       ]
     },
     {
@@ -34,9 +31,6 @@
         {
           "kind": "address_of_local_unresolved"
         }
-      ],
-      "leaf_details_contain": [
-        "writes [0x0, 0x8)"
       ]
     },
     {
@@ -50,9 +44,6 @@
         {
           "kind": "address_of_local_unresolved"
         }
-      ],
-      "leaf_details_contain": [
-        "writes [0x0, 0x8)"
       ]
     },
     {
@@ -68,6 +59,9 @@
         },
         {
           "kind": "pointer_object_unresolved"
+        },
+        {
+          "kind": "object_extent_unknown"
         }
       ],
       "assumptions_contain": [
@@ -87,6 +81,9 @@
         },
         {
           "kind": "pointer_object_unresolved"
+        },
+        {
+          "kind": "object_extent_unknown"
         }
       ],
       "assumptions_contain": [
@@ -176,10 +173,58 @@
         },
         {
           "kind": "pointer_object_unresolved"
+        },
+        {
+          "kind": "object_extent_unknown"
         }
       ],
       "assumptions_contain": [
         "Per-object byte coverage does not establish a NUL terminator"
+      ]
+    },
+    {
+      "function": "negative_member",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "returned_heap",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "pointer_object_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "which is no local of this function"
+      ]
+    },
+    {
+      "function": "returned_param",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "pointer_object_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "which is no local of this function"
       ]
     }
   ]
