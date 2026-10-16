@@ -10522,6 +10522,11 @@ def _strtok_reset_program(*, conditional: bool):
     if conditional:
         guarded = FBlock(1, 2, [entry])          # `if (mode)` arm holding the clean call
         join = FBlock(2, 5, [entry])             # NULL call, sink, return: entry dominates, the arm does not
+        # The edges establish the path facts the caveats state (#1050 review
+        # round 3): the arm runs between the tainted call and the NULL call.
+        entry.outgoing_edges = [_FEdge(guarded), _FEdge(join)]
+        guarded.outgoing_edges = [_FEdge(join)]
+        join.outgoing_edges = []
         tainted.il_basic_block = entry
         clean.il_basic_block = guarded
         for i in (cont, sink, ret):
@@ -10587,8 +10592,11 @@ def test_strtok_clean_reset_without_block_info_is_not_a_kill_928():
     result = te.TaintEngine(FBV({STRTOK: "strtok", SYS: "system"}), te.load_models()).forward(
         func, [te.parse_locator("param:0")])
     assert [s["sink"]["callee"] for s in result["reached_sinks"]] == ["system"], result["reached_sinks"]
-    assert any("not on every path from the tainted call" in a for a in result["assumptions"]), \
-        result["assumptions"]
+    # Without block information the path relation is unknown, so the caveat
+    # names the clean call neutrally rather than asserting a reset path
+    # (#1050 review round 3).
+    assert any("was not shown to lie on every path from the tainted call" in a
+               for a in result["assumptions"]), result["assumptions"]
 
 
 def test_backward_diagnostics_name_the_memory_chain_cut_928():
@@ -11228,7 +11236,10 @@ def test_strtok_priming_reset_before_a_loop_does_not_kill_the_back_edge_928r4():
     sinks = [(s["sink"]["callee"], s["sink"]["class"]) for s in result["reached_sinks"]]
     assert sinks == [("system", "command_injection")], result["reached_sinks"]
     cont = [a for a in result["assumptions"] if "continues the tokenizer state" in a]
-    assert cont and "not on every path from the tainted call" in cont[0], result["assumptions"]
+    # The priming reset runs before the loop: it is on NO path from the tainted
+    # call back to the NULL call, so the caveat must not name it a partial
+    # reset (#1050 review round 3).
+    assert cont and "clean strtok @ 0x10" not in cont[0], result["assumptions"]
 
     # Guard: the reset at the TOP of the body lies on every path from the
     # tainted call back to the NULL call -- a precise kill. The loop can exit

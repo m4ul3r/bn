@@ -3386,52 +3386,6 @@ class TaintEngine:
         }
         return True
 
-    def _seed_pointer_value(self, ssaf: Any, ptr_expr: Any, callsite: Any,
-                            taint_node: Any, reason: str) -> bool:
-        """Seed the POINTER value of a buffer argument the engine could not key.
-
-        Each variable the argument reads is seeded. Compiled code hands the call
-        a register copy (`x1 = buf; recv(fd, x1, ..)`), and a later use -- a
-        callback given the same pointer (`x0 = buf; g_cb(x0)`) -- reads another
-        copy of the same root (`_canonical_ssa_var`; a pure copy is equality).
-        So every pure copy of that root that control flow can reach FROM the
-        call -- later in the block, or around a loop back-edge -- is seeded as
-        well, and the callback is disclosed as the frontier it is (#1041 item
-        1, #1050 review finding 6).
-
-        The root itself is NOT seeded: its SSA version also feeds uses that run
-        before the call, and bytes received later cannot reach them (`p` handed
-        to `system()` and only then to `recv`; #1050 round 2). A copy whose
-        order relative to the call is unknown (no block information, or
-        successors BN could not determine) is not seeded either. A pointer
-        re-derived afresh (`c->buf + have` loaded again) is not proven equal and
-        is not seeded. Returns whether the argument's own reads were seeded."""
-        seeded = False
-        for r in expr_reads(ptr_expr):
-            node = (var_key(r), getattr(r, "version", None))
-            if taint_node(node, var_label(r), callsite, reason, []):
-                seeded = True
-            root = self._canonical_ssa_var(ssaf, r)
-            if (var_key(root), getattr(root, "version", None)) == node:
-                continue
-            try:
-                uses = list(ssaf.get_ssa_var_uses(root) or [])
-            except Exception:
-                uses = []
-            for use in uses:
-                if use is callsite or op_name(use) != "MLIL_SET_VAR_SSA":
-                    continue
-                same = self._as_single_ssa_var(getattr(use, "src", None))
-                if same is None or (var_key(same), getattr(same, "version", None)) != (
-                        var_key(root), getattr(root, "version", None)):
-                    continue
-                if self._reaches_avoiding(callsite, use, []) is not True:
-                    continue
-                for w in ssa_writes(use):
-                    taint_node((var_key(w), getattr(w, "version", None)), var_label(w), use,
-                               f"{reason}: a copy of the same pointer, after the call", [])
-        return seeded
-
     def _as_single_ssa_var(self, expr: Any) -> Any | None:
         """The lone SSA variable an expression reads, but ONLY when the
         expression is a bare var read (MLIL_VAR_SSA / an SSAVariable) -- not
@@ -5409,7 +5363,7 @@ class TaintEngine:
                             # site "clean" that a later pass tainted (round 1
                             # finding 7).
                             continuations[(ins_key(ins), state_key, _site)] = (
-                                name or mkey, ckey, addr, st_addr)
+                                name or mkey, ckey, addr, st_addr, st_ins, ins)
                     else:
                         hit = self._token_hit_node(ssaf, params, f"*arg:{cidx}", tainted)
                         state_key = (ckey, int(getattr(ins, "instr_index", addr)))
@@ -6225,19 +6179,40 @@ class TaintEngine:
             self._truncation_causes.add("fixpoint_exhausted")
 
         # The in-function continuations the fixpoint followed, written from the
-        # converged taint: the clean resets named are the ones still clean now,
-        # one caveat per (continuation, arming site).
-        for (_ck, _sk, _site), (cname, ckey, addr, st_addr) in sorted(
+        # converged taint, one caveat per (continuation, arming site). A clean
+        # call is named as a partial reset only when it provably lies on a path
+        # from the tainted call to this one -- a clean `strtok` that runs BEFORE
+        # the tainted call is on no such path (#1050 review round 3). One whose
+        # path relation is unknown (no block information) is named neutrally.
+        def on_path(src: Any, dsts: list[Any],
+                    resets: list[tuple]) -> tuple[list[int], list[int]]:
+            proven: list[int] = []
+            unknown: list[int] = []
+            for ra, rins in resets:
+                into = self._reaches_avoiding(src, rins, [])
+                out = [self._reaches_avoiding(rins, d, []) for d in dsts]
+                if into is True and any(o is True for o in out):
+                    proven.append(ra)
+                elif into is not False and any(o is not False for o in out):
+                    unknown.append(ra)
+            return proven, unknown
+
+        def reset_clause(name: str, proven: list[int], unknown: list[int], what: str) -> str:
+            parts = []
+            if proven:
+                parts.append(f"a clean {name} @ {', '.join(hex(a) for a in proven)} resets "
+                             f"the state on SOME path but not on every path {what}")
+            if unknown:
+                parts.append(f"a clean {name} @ {', '.join(hex(a) for a in unknown)} was not "
+                             f"shown to lie on every path {what} (no block information)")
+            return "; ".join(parts)
+
+        for (_ck, _sk, _site), (cname, ckey, addr, st_addr, st_ins, cins) in sorted(
                 continuations.items(), key=lambda kv: kv[0]):
-            resets = clean_resets(ckey)
-            partial = ""
-            if resets:
-                partial = (
-                    f"; a clean {self._prose_name(cname)} @ "
-                    f"{', '.join(hex(ra) for ra, _ in resets)} resets "
-                    f"the state on SOME path but not on every path "
-                    f"from the tainted call to this one, so the tainted "
-                    f"line continues on the others")
+            proven, unknown = on_path(st_ins, [cins], clean_resets(ckey))
+            clause = reset_clause(self._prose_name(cname), proven, unknown,
+                                  "from the tainted call to this one")
+            partial = f"; {clause}, so the tainted line is kept" if clause else ""
             add_assumption(
                 f"{self._prose_name(cname)}(NULL, ...) @ {hex(addr)} continues the "
                 f"tokenizer state of the tainted {self._prose_name(cname)} call @ "
@@ -6263,11 +6238,9 @@ class TaintEngine:
                     self._reaches_avoiding(st_ins, r, [rins for _, rins in resets]) is False
                     for r in rets):
                 continue
-            partial = ""
-            if resets:
-                partial = (f" (a clean {self._prose_name(ckey)} @ "
-                           f"{', '.join(hex(ra) for ra, _ in resets)} resets it on some "
-                           f"path but not on every path to a return)")
+            proven, unknown = on_path(st_ins, rets, resets)
+            clause = reset_clause(self._prose_name(ckey), proven, unknown, "to a return")
+            partial = f" ({clause})" if clause else ""
             # #1033 item 6: which function continues the tokenizer is not known
             # here, so the seed inside it is a template, not a command.
             reseed = command_template(
@@ -6598,10 +6571,11 @@ class TaintEngine:
                                     seeded = True
                             else:
                                 ptr_seeded = False
-                                if self._seed_pointer_value(ssaf, params[idx], c, taint_node,
-                                                            f"source: {callee} arg{idx}"):
-                                    seeded = True
-                                    ptr_seeded = True
+                                for r in expr_reads(params[idx]):
+                                    if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
+                                                  f"source: {callee} arg{idx}", []):
+                                        seeded = True
+                                        ptr_seeded = True
                                 # #562: a recv-family arg seed that tainted only the
                                 # pointer value (buffer not keyed) is the arg:recv:1
                                 # false-all-clear shape -- emit a structured leaf so
@@ -6774,10 +6748,10 @@ class TaintEngine:
                                                   f"source: {callee} fills arg{idx} buffer (call: preset)", []):
                                         seeded = True
                                 else:
-                                    if self._seed_pointer_value(
-                                            ssaf, params[idx], c, taint_node,
-                                            f"source: {callee} arg{idx} (call: preset)"):
-                                        seeded = True
+                                    for r in expr_reads(params[idx]):
+                                        if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
+                                                      f"source: {callee} arg{idx} (call: preset)", []):
+                                            seeded = True
                                     # #562: no recv-buffer leaf fires on the call:
                                     # preset path. The indirect-slot helper owns an
                                     # indirect-load pointer (its slot may correlate

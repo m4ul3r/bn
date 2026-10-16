@@ -190,16 +190,23 @@ def _cb_engine(models):
     return te.TaintEngine(FBV({0x900: "recv", 0x902: "system"}), models)
 
 
-@pytest.mark.parametrize("order", ["after", "loop"])
+@pytest.mark.parametrize("order", ["after", "loop", "before"])
 @pytest.mark.parametrize("source", ["call:recv", "arg:recv:1"])
-def test_callback_given_the_same_unkeyed_pointer_is_a_frontier_1041(models, source, order):
+def test_an_unkeyed_buffer_discloses_unfollowed_indirect_calls_1041(models, source, order):
+    """#1041 item 1, narrowed after #1050 review round 3: whether a callback
+    receives the same pointer is not decided from SSA copies (an alias made
+    before the receive defeated every gating rule tried). The unkeyed-buffer
+    leaf states it unconditionally, and no callback frontier is claimed."""
     result = _cb_engine(models).forward(_callback_program(order=order),
                                         [te.parse_locator(source)])
 
-    kinds = [lf["kind"] for lf in result["leaves"]]
-    assert "source_seed_misanchored" in kinds
-    assert any(lf["kind"] == "indirect_call_unresolved" and lf["address"] == "0x1014"
-               for lf in result["leaves"]), result["leaves"]
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "source_seed_misanchored"]
+    disclosure = ("indirect calls that may receive this buffer are not followed -- "
+                  "their callees are unchecked")
+    assert disclosure in leaf["detail"], leaf
+    assert "indirect calls that may receive this buffer are not followed" in (
+        result["diagnostics"]["next_action"])
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 @pytest.mark.parametrize("use", ["system", "callback"])
@@ -213,13 +220,6 @@ def test_a_use_that_only_runs_before_the_receive_stays_clean_1050(models, source
 
     assert result["reached_sinks"] == []
     assert not any(lf["kind"] == "indirect_call_unresolved" for lf in result["leaves"])
-
-
-def test_a_system_call_after_the_receive_through_a_copy_is_a_flow_1050(models):
-    result = _cb_engine(models).forward(_callback_program(order="after", use="system"),
-                                        [te.parse_locator("call:recv")])
-
-    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"]
 
 
 # --------------------------------------------------------------------------
@@ -429,6 +429,36 @@ def test_undetermined_successors_never_prove_disconnection_1050(models):
 
     sinks = [(s["sink"]["callee"], s["sink"]["class"]) for s in result["reached_sinks"]]
     assert sinks == [("system", "command_injection")], result["assumptions"]
+
+
+def test_a_clean_call_before_the_tainted_one_is_not_named_a_reset_1050(models):
+    """#1050 review round 3: straight-line `strtok(clean)`, `strtok(line)`,
+    `system(strtok(NULL))`. The clean call runs before the tainted one, so it
+    is on no path from it to the continuation or to the return; neither caveat
+    may call it a partial reset."""
+    line, clean = FVar("line", typ="char[0x40]"), FVar("clean", typ="char[0x10]")
+    x = FSSA(FVar("x"), 1)
+    STRTOK, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, 'strtok(&clean, " ")', STRTOK, [_addr_of(clean), _cstr(0x700)]),
+        _ext_call(1, 0x14, 'strtok(&line, " ")', STRTOK, [_addr_of(line), _cstr(0x700)]),
+        _ext_call(2, 0x18, 'x#1 = strtok(nullptr, " ")', STRTOK,
+                  [FExpr("MLIL_CONST", "0", constant=0), _cstr(0x700)], writes=[x]),
+        _ext_call(3, 0x1c, "system(x#1)", SYS, [FExpr("MLIL_VAR_SSA", "x#1", reads=[x])],
+                  reads=[x]),
+        FInstr(4, 0x20, "MLIL_RET", "return"),
+    ]
+    block = FBlock(0, 5)
+    block.outgoing_edges = []
+    for ins in instrs:
+        ins.il_basic_block = block
+    func = FFunc("tok", 0x10, FSSAFunc(instrs), params=[line])
+    result = te.TaintEngine(FBV({STRTOK: "strtok", SYS: "system"}), models).forward(
+        func, [te.parse_locator("param:0")])
+
+    assert [s["sink"]["callee"] for s in result["reached_sinks"]] == ["system"]
+    tokenizer = [a for a in result["assumptions"] if "strtok" in a]
+    assert tokenizer and not any("clean strtok @ 0x10" in a for a in tokenizer), tokenizer
 
 
 def test_reset_disclosure_is_written_from_converged_taint_1050(models):

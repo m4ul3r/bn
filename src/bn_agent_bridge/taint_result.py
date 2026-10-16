@@ -290,8 +290,10 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         reseed = next((str(lf["suggested_source"]) for lf in misanchored
                        if str(lf.get("suggested_source") or "").startswith("call:")), None)
         head = ("the seed tainted a buffer pointer but did not key the buffer it "
-                "fills, so payload stores/loads were not followed -- an empty "
-                "result here means the seed was wrong, not that the path is clean")
+                "fills, so payload stores/loads were not followed, and indirect "
+                "calls that may receive this buffer are not followed -- their "
+                "callees are unchecked; an empty result here means the seed was "
+                "wrong, not that the path is clean")
         if reseed:
             run = (f"`{forward(fn, reseed)}`" if fn else f"--source {reseed}")
             return (f"{head}; reseed with {run}, which seeds the iovec buffer this "
@@ -679,10 +681,16 @@ def misanchored_recv_leaf(
                     f"call:{base} cannot resolve its buffer either; seed the filled "
                     f"buffer with var:, or run taint from the caller that builds it")
     else:
+        # #1041 item 1, narrowed after #1050 review round 3: whether a callback
+        # later receives this same pointer cannot be decided soundly from the
+        # SSA copies (aliases made before the call, reloads), so it is disclosed
+        # unconditionally rather than claimed for some shapes.
         detail = (
             f"{locator} could not key the buffer arg {arg_index} points at as a "
             f"stable taint location ({reason}); only the pointer value was "
-            f"seeded, so payload stores/loads may be missed")
+            f"seeded, so payload stores/loads may be missed, and indirect calls "
+            f"that may receive this buffer are not followed -- their callees are "
+            f"unchecked")
         suggest = None
         note = (
             "NOT an all-clear -- the filled buffer is reached through a pointer "

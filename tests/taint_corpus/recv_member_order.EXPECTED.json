@@ -1,13 +1,7 @@
 {
-  "description": "#1050 review round 2: a copy of an unkeyed receive pointer is seeded only where control flow reaches it from the receive. system(p) before recv stays clean; g_cb(p) before recv inside a loop is reached around the back-edge and is a frontier; system(p) after recv is a flow. Each keeps the source_seed_misanchored frontier.",
+  "description": "#1050 review round 2: system(p) that runs before recv(fd, p, ..) into an unkeyed buffer must not become a flow; the run keeps its source_seed_misanchored frontier and is not an all-clear.",
   "lang": "c",
   "cflags": ["-O2", "-fno-builtin"],
-  "forward": [
-    {"function": "cb_loop", "source": "call:recv",
-     "leaves": [{"kind": "source_seed_misanchored"}, {"kind": "indirect_call_unresolved"}]},
-    {"function": "sys_after", "source": "call:recv",
-     "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}]}
-  ],
   "negative": [
     {"function": "sys_before", "source": "call:recv",
      "forbid_sink_classes": ["command_injection"], "all_clear": false},

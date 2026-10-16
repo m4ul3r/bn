@@ -1,7 +1,7 @@
-/* #1041 item 1 / #1050 review finding 6: recv fills a buffer reached through a
- * struct field plus an offset (not keyable), and the same pointer is then handed
- * to a callback. The seed is disclosed as misanchored and the callback as a
- * frontier. Synthetic. */
+/* #1041 item 1: recv fills a buffer reached through a struct field plus an
+ * offset (not keyable), and the same pointer is then handed to a callback. The
+ * seed is disclosed as misanchored; the callback is not followed and the leaf
+ * says so. Synthetic. */
 #include <sys/socket.h>
 
 typedef void (*cb_t)(const unsigned char *);
