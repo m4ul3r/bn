@@ -13,11 +13,7 @@ from ..cli import (
     mutation_output_args,
     preview_arg,
 )
-from ..formatters import (
-    _render_class_list_text,
-    _render_class_rename_manifest,
-    _render_class_show_text,
-)
+from ..formatters import _render_class_list_text, _render_class_show_text
 
 
 @command("class", "list", help="List C++ classes recovered from symbols/RTTI",
@@ -101,24 +97,9 @@ def _class_list(args: argparse.Namespace) -> int:
 
 @command("class", "show", help="Show a C++ class: methods, vtable, size, bases, instances",
          target=True,
-         args=[arg("name"),
-               arg("--emit-renames", action="store_true", default=False, dest="emit_renames",
-                   help="Print the names the card suggests for unnamed destructor slots "
-                        "as a `bn batch apply` manifest (JSON) instead of the card; "
-                        "exits 2 when no slot fits the destructor shape")],
+         args=[arg("name")],
          estimable=True)
 def _class_show(args: argparse.Namespace) -> int:
-    if args.emit_renames:
-        target = getattr(args, "target", None)
-        explicit = target if target and not getattr(args, "_sticky_target", False) else None
-        return _call(
-            args, "class_show", {"name": args.name},
-            require_target=True,
-            result_transform=lambda r: _class_rename_manifest(r, explicit),
-            text_renderer=_render_class_rename_manifest,
-            result_exit_code=lambda r: 0 if _class_rename_manifest(r, None).get("ops") else 2,
-            stem="class-show-renames",
-        )
     return _call(
         args, "class_show", {"name": args.name},
         require_target=True,
@@ -130,47 +111,14 @@ def _class_show(args: argparse.Namespace) -> int:
     )
 
 
-def _class_rename_manifest(result: Any, target: str | None) -> dict[str, Any]:
-    """#1040.2: the card's `suggested_renames` as a `batch apply` manifest. An
-    ambiguous query or a card with no suggestion yields no ops, and says why."""
-    if not isinstance(result, dict):
-        return {"ops": [], "note": "the bridge returned no class card"}
-    if result.get("ambiguous"):
-        names = ", ".join(str(m.get("name")) for m in result.get("matches") or [] if isinstance(m, dict))
-        return {"ops": [], "note": f"{result.get('query')!r} names more than one class ({names}); "
-                                   "pass the full name of one"}
-    suggested = result.get("suggested_renames")
-    ops = suggested.get("ops") if isinstance(suggested, dict) else None
-    if not isinstance(ops, list) or not ops:
-        return {"ops": [], "note": f"no unnamed vtable slot of {result.get('name')} fits the "
-                                   "destructor shape"}
-    manifest: dict[str, Any] = {"ops": ops}
-    if target:
-        manifest = {"target": target, **manifest}
-    return manifest
-
-
 @command("class", "apply-types",
          help="Type a C++ class for named virtual calls: its instance struct's vptr as BN's "
               "<Class>::VTable* and the object parameter of its own methods (`this`, or on a "
               "stripped build parameter 0 of its constructors, destructors and own vtable "
-              "slots), as one verified mutation",
+              "slots when it sits in the ABI's first integer argument), as one verified mutation",
          target=True, fmt="json",
          see_also=("class show", "struct show", "local retype"),
-         args=[preview_arg(), *mutation_output_args(),
-               arg("--size-from-allocation", action="store_true", default=False,
-                   dest="size_from_allocation",
-                   help="Declare a NEW instance struct as wide as the one allocation request "
-                        "the class card's construction sites agree on (a site that carries "
-                        "none, like a derived constructor's call on its own `this`, is not "
-                        "counted; `class show` lists them). An allocation is a fact about a "
-                        "site, not the class: a site may construct a derived object or a "
-                        "folded constructor, so this is opt-in, and refused when the sites "
-                        "disagree"),
-               arg("name")])
+         args=[preview_arg(), *mutation_output_args(), arg("name")])
 def _class_apply_types(args: argparse.Namespace) -> int:
-    params: dict[str, Any] = {"name": args.name}
-    if args.size_from_allocation:
-        params["size_from_allocation"] = True
-    return _mutate(args, "class_apply_types", params,
+    return _mutate(args, "class_apply_types", {"name": args.name},
                    preview=bool(args.preview), stem="class-apply-types")

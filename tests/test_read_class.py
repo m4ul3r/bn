@@ -5255,18 +5255,30 @@ def test_untyped_vtt_does_not_own_adjacent_same_class_object_945(monkeypatch, pt
 # --- #1035.5: the ABI typeinfo scan (non-PIE builds BN's RTTI analysis skips) ---
 
 _SI_ABI_VTABLE = "_ZTVN10__cxxabiv120__si_class_type_infoE"
-_ABI_TYPES = {"N3app6WorkerE": "app::Worker", "N3app4BaseE": "app::Base"}
+_ABI_TYPES = {"N3app6WorkerE": "app::Worker", "N3app4BaseE": "app::Base",
+              "N3app5GhostE": "app::Ghost"}
+#: What BN's `_Z1f<enc>` parse yields as parameter type classes: a class name
+#: followed by more types parses too (`N3adv7PhantomEi` is Phantom, int).
+_ABI_PARAMS = {**{enc: ["NamedTypeReferenceClass"] for enc in _ABI_TYPES},
+               "N3adv7PhantomEi": ["NamedTypeReferenceClass", "IntegerTypeClass"],
+               "i": ["IntegerTypeClass"]}
 
 
 def _abi_demangle(arch, name):
-    """`bn.demangle_gnu3` stand-in: the full parse (`_Z1f<enc>`) accepts only a
-    known encoding, while the lenient `_ZTI<enc>` names whatever it is given --
-    the gap the full parse exists to close."""
+    """`bn.demangle_gnu3` stand-in. The lenient `_ZTI<enc>` names whatever it
+    is given (BN drops a trailing type), which is why the full parse must yield
+    EXACTLY one class type."""
     enc = name[4:]
     if name.startswith("_Z1f"):
-        return (("type", enc) if enc in _ABI_TYPES else None), None
+        kinds = _ABI_PARAMS.get(enc)
+        if kinds is None:
+            return None, None
+        params = [types.SimpleNamespace(type=types.SimpleNamespace(
+            type_class=types.SimpleNamespace(name=kind))) for kind in kinds]
+        return types.SimpleNamespace(parameters=params), None
     if name.startswith("_ZTI"):
-        return None, [f"typeinfo_for_{_ABI_TYPES.get(enc, 'junk')}"]
+        known = {"N3adv7PhantomEi": "adv::Phantom"}
+        return None, [f"typeinfo_for_{_ABI_TYPES.get(enc) or known.get(enc, 'junk')}"]
     raise AssertionError(name)
 
 
@@ -5275,7 +5287,9 @@ class _AbiScanBV:
     symbol plus the import alias at the same address), two si typeinfo objects
     in .data.rel.ro -- Base, which BN named, and Worker, which it did not --
     a typeinfo whose name string only the lenient demangle accepts, and a
-    vtable whose word[1] is Worker's typeinfo."""
+    vtable whose word[1] is Worker's typeinfo. Then two forged records (#1049
+    review): `N3adv7PhantomEi` (a class name followed by `int`) and a
+    well-named si record whose base word points at no typeinfo."""
 
     def __init__(self):
         self.arch = types.SimpleNamespace(name="x86_64", address_size=8)
@@ -5292,17 +5306,20 @@ class _AbiScanBV:
             0x6010, 0x8120,          # 0x8028 a typeinfo whose name is garbage
             0,                       # 0x8038
             0, 0x8010, 0x1000,       # 0x8040 Worker's vtable: ott 0, typeinfo, slot
+            0x6010, 0x8130, 0x8000,  # 0x8058 "Phantom": two types in one name
+            0x6010, 0x8140, 0x1234,  # 0x8070 "Ghost": its base is no typeinfo
         ]
-        strings = bytearray(0x40)
-        for at, text in ((0x00, b"N3app4BaseE"), (0x10, b"*N3app6WorkerE"), (0x20, b"9junkjunk")):
+        strings = bytearray(0x50)
+        for at, text in ((0x00, b"N3app4BaseE"), (0x10, b"*N3app6WorkerE"), (0x20, b"9junkjunk"),
+                         (0x30, b"N3adv7PhantomEi"), (0x40, b"N3app5GhostE")):
             strings[at:at + len(text)] = text
         self._memory = {0x8000: b"".join(w.to_bytes(8, "little") for w in words),
                         0x8100: bytes(strings)}
         sem = lambda name: types.SimpleNamespace(name=name)  # noqa: E731
         self.sections = {
-            ".data.rel.ro": types.SimpleNamespace(start=0x8000, end=0x8058,
+            ".data.rel.ro": types.SimpleNamespace(start=0x8000, end=0x8088,
                                                   semantics=sem("ReadWriteDataSectionSemantics")),
-            ".rodata": types.SimpleNamespace(start=0x8100, end=0x8140,
+            ".rodata": types.SimpleNamespace(start=0x8100, end=0x8150,
                                              semantics=sem("ReadOnlyDataSectionSemantics")),
             ".extern": types.SimpleNamespace(start=0x6000, end=0x6100,
                                              semantics=sem("ExternalSectionSemantics")),
@@ -5345,11 +5362,12 @@ def abi_scan_view(monkeypatch):
 def test_abi_scan_finds_the_typeinfo_bn_did_not_name_1035(abi_scan_view):
     ctx, bv = abi_scan_view
     scan = read_class._abi_rtti_scan(ctx, bv)
-    # Base already has a symbol (left to it); the garbage name is refused by the
-    # full parse even though the lenient `_ZTI` demangle would have named it.
+    # Base already has a symbol (left to it). Refused (#1049 review): the
+    # garbage name, `N3adv7PhantomEi` -- which the lenient `_ZTI` demangle
+    # names `adv::Phantom` -- and Ghost, whose si base word is no typeinfo.
     assert set(scan.typeinfo) == {0x8010}
-    assert scan.typeinfo[0x8010] == ("app::Worker", "si", "N3app6WorkerE", 0x8110)
-    assert scan.undemangled == 1
+    assert scan.typeinfo[0x8010] == ("app::Worker", "si", "N3app6WorkerE", 0x8110, (0x8000,))
+    assert scan.rejected == 3
     assert scan.truncated is False
     assert read_class._scanned_typeinfo_refs(ctx, bv, 0x8010) == (0x8048,)
     # The seam answers for an address no symbol names, through the scan.
@@ -5366,7 +5384,7 @@ def test_abi_scan_finds_the_typeinfo_bn_did_not_name_1035(abi_scan_view):
     assert worker["imported"] is False
     # A symbolized typeinfo keeps its symbol, not a scan provenance.
     assert "source" not in registry["app::Base"]["typeinfo"]
-    assert not any("junk" in name for name in registry)
+    assert not any(n in name for name in registry for n in ("junk", "Phantom", "Ghost"))
     # The copy-relocated ABI vtable is someone else's object.
     abi = registry["__cxxabiv1::__si_class_type_info"]
     assert abi["vtable"]["imported"] is True and abi["imported"] is True
@@ -5376,7 +5394,7 @@ def test_abi_scan_needs_an_abi_vtable_symbol_1035(abi_scan_view):
     ctx, bv = abi_scan_view
     bv.get_symbols_by_name = lambda raw: []
     scan = read_class._abi_rtti_scan(ctx, bv)
-    assert scan.typeinfo == {} and scan.undemangled == 0
+    assert scan.typeinfo == {} and scan.rejected == 0
     assert "app::Worker" not in read_class._build_class_registry(ctx, bv)
 
 
@@ -5387,6 +5405,50 @@ def test_abi_scan_byte_cap_is_disclosed_as_truncated_1035(monkeypatch, abi_scan_
     scan = read_class._abi_rtti_scan(ctx, bv)
     assert scan.truncated is True
     assert scan.typeinfo == {}
+
+
+def test_a_rename_does_not_rerun_the_byte_scan_but_written_data_does_1049(
+        monkeypatch, abi_scan_view, view_memo_live):
+    """#1049 review: a symbol rename invalidated the view-generation memo and
+    re-read up to 64 MiB on every `class list`. The byte half is keyed on the
+    data generation: a rename re-checks symbols only, written bytes rescan."""
+    ctx, bv = abi_scan_view
+    notifiers = []
+    bv.register_notification = notifiers.append
+    raw_scans = []
+    real = read_class._abi_raw_scan
+    monkeypatch.setattr(read_class, "_abi_raw_scan",
+                        lambda *a: raw_scans.append(1) or real(*a))
+
+    def fire(event):
+        for notifier in notifiers:
+            getattr(notifier, event)(bv)
+
+    assert set(read_class._abi_rtti_scan(ctx, bv).typeinfo) == {0x8010}
+    assert len(raw_scans) == 1
+    # BN names Worker's typeinfo: the symbol half sees it, the bytes are not re-read.
+    bv._symbols.append(_Sym("_ZTIN3app6WorkerE", "typeinfo for app::Worker", 0x8010))
+    fire("symbol_added")
+    assert read_class._abi_rtti_scan(ctx, bv).typeinfo == {}
+    assert len(raw_scans) == 1
+    fire("data_written")
+    read_class._abi_rtti_scan(ctx, bv)
+    assert len(raw_scans) == 2
+
+
+def test_a_truncated_scan_is_disclosed_on_counts_and_misses_1049(monkeypatch, abi_scan_view):
+    """#1049 review: the cap was disclosed on the listing only; a count and a
+    `No class named` miss read as complete answers."""
+    from bn.formatters import _render_class_list_text
+    ctx, bv = abi_scan_view
+    monkeypatch.setattr(read_class, "_ABI_SCAN_MAX_BYTES", 0x10)
+    monkeypatch.setattr(ctx, "_bases_for", lambda bv, rec: [])
+    counted = read_class._class_list(ctx, None, count_only=True)
+    assert counted["abi_scan_truncated"] is True
+    assert "byte scan stopped at its data cap" in _render_class_list_text(counted)
+    with pytest.raises(read_class.OperationFailure) as miss:
+        read_class._class_show(ctx, None, "app::Worker")
+    assert "byte scan stopped at its data cap" in str(miss.value)
 
 
 def test_vtable_backwalk_walks_scanned_refs_after_bns_own_1035(monkeypatch, abi_scan_view):
@@ -5592,7 +5654,7 @@ def test_class_list_counts_a_shared_library_sole_base_1040(monkeypatch):
     assert "app::Core (only base of" not in text
 
 
-# --- #1040.2: facts and destructor suggestions for unnamed vtable slots ---
+# --- #1040.2: neutral facts for unnamed vtable slots ---
 
 def _slot_rec(*addresses, named=()):
     slots = []
@@ -5604,7 +5666,7 @@ def _slot_rec(*addresses, named=()):
     return {"name": "app::Worker", "vtable": {"slots": slots}}
 
 
-def _describe(monkeypatch, rec, facts, ancestors=("app::Base",)):
+def _describe(monkeypatch, rec, facts):
     read = []
 
     def slot_body_facts(ctx, bv, address, ptr):
@@ -5612,7 +5674,6 @@ def _describe(monkeypatch, rec, facts, ancestors=("app::Base",)):
         return facts[address]
 
     monkeypatch.setattr(read_class, "_slot_body_facts", slot_body_facts)
-    monkeypatch.setattr(read_class, "_rtti_ancestors", lambda ctx, bv, r: set(ancestors))
     ctx = types.SimpleNamespace(_pointer_size=lambda bv: 8)
     read_class._describe_unnamed_slots(ctx, object(), rec)
     return {int(s["method"]["address"], 16): s for s in rec["vtable"]["slots"]}, read
@@ -5626,73 +5687,34 @@ def _facts(writes=(), calls=(), delete=False):
             "calls_operator_delete": delete}
 
 
-def test_unnamed_slots_suggest_d1_and_d0_with_a_manifest_1040(monkeypatch):
-    rec = _slot_rec(0x1000, 0x1100, 0x1200, 0x1300, named=(0x1000,))
+def test_unnamed_slots_carry_body_facts_and_no_role_1040(monkeypatch):
+    """#1040.2 / #1049 review: the facts are printed, and NO destructor role is
+    inferred from them -- the destructor shape (writes this class's address
+    point; calls operator delete) is also the shape of a virtual `reset` that
+    placement-constructs into an argument, `clone`, and `release(){delete
+    this;}`, and the earlier suggestion renamed such a method."""
+    from bn.formatters import _render_class_show_text
+    rec = _slot_rec(0x1000, 0x1100, 0x1200, named=(0x1000,))
     slots, read = _describe(monkeypatch, rec, {
-        0x1100: _facts(writes=["app::Base"]),                   # ancestor's AP, no delete
-        0x1200: _facts(calls=[0x1100, 0x5000], delete=True),    # delete + calls the D1
-        0x1300: _facts(calls=[0x5000], delete=True),            # delete alone: not D0
-    })
-    assert 0x1000 not in read                                   # named slot is not read
-    assert "body" not in slots[0x1000]
-    assert slots[0x1100]["suggestion"] == "D1"
-    assert slots[0x1200]["suggestion"] == "D0"
-    assert not slots[0x1300].get("suggestion")
-    assert slots[0x1300]["body"]["calls_operator_delete"] is True
-    assert rec["suggested_renames"] == {"ops": [
-        {"op": "rename_symbol", "identifier": "0x1100", "new_name": "app::Worker::~Worker"},
-        {"op": "rename_symbol", "identifier": "0x1200", "new_name": "app::Worker::~Worker"},
-    ]}
-
-
-def test_unnamed_slot_d1_needs_this_class_or_an_ancestors_address_point_1040(monkeypatch):
-    rec = _slot_rec(0x1100, 0x1200, 0x1300)
-    slots, _ = _describe(monkeypatch, rec, {
-        0x1100: _facts(writes=["other::Thing"]),                # a stranger's AP
-        0x1200: _facts(calls=[0x1100], delete=True),            # calls a non-D1
-        0x1300: _facts(writes=["app::Worker"], delete=True),    # own AP + delete: D0
-    }, ancestors=())
-    assert not slots[0x1100].get("suggestion")
-    assert not slots[0x1200].get("suggestion")
-    assert slots[0x1300]["suggestion"] == "D0"
-    assert [op["identifier"] for op in rec["suggested_renames"]["ops"]] == ["0x1300"]
-
-
-def test_two_d1_shaped_slots_are_both_withheld_1040(monkeypatch):
-    """Two D1 shapes: neither is offered, and a slot whose only D0 evidence is
-    calling one of them is not offered either -- the D1 it leans on is exactly
-    what could not be told apart. A slot that writes the address point itself
-    still stands on its own."""
-    rec = _slot_rec(0x1100, 0x1400, 0x1200, 0x1300)
-    slots, _ = _describe(monkeypatch, rec, {
         0x1100: _facts(writes=["app::Worker"]),
-        0x1400: _facts(writes=["app::Base"]),
-        0x1200: _facts(writes=["app::Worker"], delete=True),
-        0x1300: _facts(calls=[0x1100], delete=True),
+        0x1200: _facts(writes=["app::Worker"], calls=[0x5000], delete=True),
     })
-    for address in (0x1100, 0x1400):
-        assert slots[address]["suggestion"] is None
-        assert slots[address]["suggestion_withheld"] == "2 slots fit the D1 shape"
-    assert slots[0x1200]["suggestion"] == "D0"
-    assert not slots[0x1300].get("suggestion")
-    assert [op["identifier"] for op in rec["suggested_renames"]["ops"]] == ["0x1200"]
-
-
-def test_unreadable_slot_bodies_suggest_nothing_1040(monkeypatch):
-    rec = _slot_rec(0x1100, 0x1200)
-    slots, _ = _describe(monkeypatch, rec, {
-        0x1100: {"read": False, "reason": "no_mlil"},
-        0x1200: {"read": False, "reason": "body_too_large"},
-    })
-    assert all(not s.get("suggestion") for s in slots.values())
+    assert 0x1000 not in read and "body" not in slots[0x1000]
+    assert slots[0x1200]["body"]["calls_operator_delete"] is True
+    assert not any(key.startswith("suggest") for slot in slots.values() for key in slot)
     assert "suggested_renames" not in rec
+    rec["vtable"]["address"] = "0x9000"
+    text = _render_class_show_text({**rec, "confidence": "rtti"})
+    assert "[writes app::Worker's vtable address point; calls 0x5000; calls operator delete]" in text
+    assert "likely" not in text and "destructor" not in text and "--emit-renames" not in text
 
 
-def test_destructor_name_drops_template_arguments_1040(monkeypatch):
+def test_unreadable_slot_bodies_say_why_1040(monkeypatch):
+    from bn.formatters import _render_class_show_text
     rec = _slot_rec(0x1100)
-    rec["name"] = "app::Box<int>"
-    _describe(monkeypatch, rec, {0x1100: _facts(writes=["app::Box<int>"])})
-    assert rec["suggested_renames"]["ops"][0]["new_name"] == "app::Box<int>::~Box"
+    _describe(monkeypatch, rec, {0x1100: {"read": False, "reason": "body_too_large"}})
+    rec["vtable"]["address"] = "0x9000"
+    assert "[body not read: body_too_large]" in _render_class_show_text({**rec, "confidence": "rtti"})
 
 
 # --- #1018.2: the allocation feeding a constructor call, from SSA def-use ---

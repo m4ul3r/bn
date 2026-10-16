@@ -5125,8 +5125,7 @@ class BinaryNinjaBridge:
                     pass
             return result
 
-    def _class_apply_types(self, selector, name: str, *, preview: bool = False,
-                           size_from_allocation: bool = False):
+    def _class_apply_types(self, selector, name: str, *, preview: bool = False):
         """#993 item 3: plan the class's typing ops (read_class's card, under the
         read lock) and apply them as ONE mutation, holding the write gate across
         both so no other writer can change the class between plan and apply."""
@@ -5134,8 +5133,7 @@ class BinaryNinjaBridge:
             self.ctx, selector, preview, exclusive=self._target_lock.write, direct=True
         ) as finish:
             with self._target_lock.read():
-                operations, plan = mutation_engine._class_apply_types_plan(
-                    self.ctx, selector, name, size_from_allocation=size_from_allocation)
+                operations, plan = mutation_engine._class_apply_types_plan(self.ctx, selector, name)
             if not operations:
                 return finish(mutation_engine._class_apply_types_noop(plan, preview=preview))
             result = self._mutation(selector, preview, operations, gate_held=True)
@@ -5521,8 +5519,6 @@ def _bind_class_apply_types(bridge, params, target):
     return bridge._class_apply_types(
         target, str(params["name"]),
         preview=_validate_bool(params.get("preview"), label="preview", default=False),
-        size_from_allocation=_validate_bool(params.get("size_from_allocation"),
-                                            label="size_from_allocation", default=False),
     )
 
 

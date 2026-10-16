@@ -57,6 +57,7 @@ from ._shared import (
     _require_nonempty_name,
     _serialize_error,
     _validate_bool,
+    is_auto_function_name,
 )
 
 # Required request fields per mutation op kind, validated before dispatch so a
@@ -5853,9 +5854,7 @@ def _verify_function_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _class_apply_types_plan(ctx, selector: str | None, name: str, *,
-                            size_from_allocation: bool = False,
-                            ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """#993 item 3: the batch `class apply-types` runs, and what it covers.
 
     Typing a class for named virtual calls took one declaration and one
@@ -5866,20 +5865,23 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str, *,
     `--preview` or on a failure, revert as one mutation:
 
     * the instance struct is DECLARED when the view has none (sized from the
-      class card's ``size`` when one was recovered, or -- only when the caller
-      opts in with *size_from_allocation* -- from the one allocation request
-      every shown construction site agrees on, padding after the vptr), or its
-      offset-0 member is retyped when it exists, keeping that member's name;
-      nothing when it already holds the typed vptr;
+      class card's ``size`` when one was recovered, padding after the vptr),
+      or its offset-0 member is retyped when it exists, keeping that member's
+      name; nothing when it already holds the typed vptr;
     * the object parameter is retyped on the class's own methods: a parameter
       named `this` wherever BN has one, else -- #1040.1, a stripped build names
       none -- parameter 0, keeping its name, on the class's constructors and
-      destructors and on the targets of its OWN vtable slots. A slot whose
-      target is also a slot of a base's vtable is inherited and left alone, and
-      when a base's vtable cannot be decoded here no slot counts as the class's
-      own. A thunk, or any other method without a `this` (a static member, a
-      non-virtual method of a stripped build), is skipped and counted, never
-      guessed at. Every retype is verified by the engine's readback.
+      destructors and on the targets of its OWN vtable slots, and only when
+      that parameter sits where the calling convention passes `this`: its
+      first integer argument register, or the first stack slot for one with
+      none (#1049 review: a method that never reads `this` gets a floating
+      parameter 0). A slot whose target is also a slot of a base's vtable is
+      inherited and left alone; a slot target with a name of its own that is
+      not a method of this class is not this class's; and when a base's vtable
+      cannot be decoded here no slot counts as the class's own. A thunk, or any
+      other method without a `this` (a static member, a non-virtual method of a
+      stripped build), is skipped and counted, never guessed at. Every retype
+      is verified by the engine's readback.
 
     Refuses when the class has no primary vtable or BN defined no VTable type
     for it: then there is no table type for the vptr to point at."""
@@ -5950,10 +5952,6 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str, *,
         width = 0
     size_value = size.get("value") if width else None
     size_source = card.get("size_source")
-    allocation_sites: list[str] = []
-    if size_from_allocation:
-        width, allocation_sites = _allocation_size_for(card, cls, instance, ptr, requested)
-        size_value, size_source = hex(width), "allocation_request"
     vptr_before: dict[str, str] | None = None
     if instance is None:
         body = f"struct `{vtable_type}`* vtable;"
@@ -6069,6 +6067,11 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str, *,
             # method -- an inherited slot, or a body folded with that class's.
             skipped.append({**row, "reason": f"named as a method of {owner}"})
             continue
+        elif slot_only and fn is not None and _has_own_name(fn):
+            # #1049 review: a slot target named as a free function (a symbol
+            # with no class) is not shown to take this class's object.
+            skipped.append({**row, "reason": f"named {getattr(fn, 'name', '') or '?'}, not a method of {cls}"})
+            continue
         elif address not in slot_targets:
             skipped.append({**row, "reason": "no parameter named `this`, and not a vtable slot, "
                                              "constructor or destructor"})
@@ -6087,20 +6090,25 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str, *,
             skipped.append({**row, "reason": "BN gives the function no parameters"})
             continue
         param0 = params[0]
+        misplaced = _not_in_object_argument(bv, fn, param0)
+        if misplaced:
+            skipped.append({**row, "reason": misplaced})
+            continue
         operations.append({"op": "local_retype", "function": hex(address),
                            "variable": vars_mod._local_id(fn, param0, is_parameter=True),
                            "new_type": f"struct `{cls}`*"})
         retyped.append({**row, "variable": str(getattr(param0, "name", "")), "basis": basis,
                         **_other_data_refs(bv, address, slot_array)})
-    # #1040.1: parameter 0 is the ABI's first argument. On x86-64 SysV a method
-    # returning a class by value receives its return slot there and `this`
-    # second; nothing in a stripped body says which methods do, so the plan
-    # states it rather than guess.
+    # #1040.1: parameter 0 is the ABI's first argument. Where a by-value class
+    # return travels as a hidden first argument (x86-64 SysV, i386, 32-bit
+    # ARM), such a method takes its return slot there and `this` second;
+    # nothing in a stripped body says which methods do, so the plan states it.
     arch = str(getattr(getattr(bv, "arch", None), "name", "") or "")
-    caveat = ("parameter 0 is the first argument; on x86-64 a virtual method that returns a "
-              "class by value takes its return slot there and `this` second -- check the "
-              "decompile of any slot target that writes through parameter 0 before reading it"
-              if arch == "x86_64" and any(r.get("basis") == "own vtable slot" for r in retyped)
+    caveat = ("parameter 0 is the first argument; on this architecture a virtual method that "
+              "returns a class by value takes its return slot there and `this` second -- check "
+              "the decompile of any slot target that writes through parameter 0 before reading it"
+              if arch in _HIDDEN_RETURN_FIRST_ARCHES
+              and any(r.get("basis") == "own vtable slot" for r in retyped)
               else None)
     plan = {
         "class": cls,
@@ -6108,13 +6116,62 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str, *,
         "instance_struct": struct_action,
         "size": size_value,
         "size_source": size_source,
-        **({"size_sites": allocation_sites} if allocation_sites else {}),
         "retyped_methods": retyped,
         "skipped_methods": skipped,
         **({"parameter0_caveat": caveat} if caveat else {}),
         **({"vptr_member_before": vptr_before} if vptr_before else {}),
     }
     return operations, plan
+
+
+#: #1040.1: BN architecture names whose C++ ABI passes a by-value class return
+#: as a hidden FIRST argument, ahead of `this` (AArch64 uses x8 instead).
+_HIDDEN_RETURN_FIRST_ARCHES = frozenset({"x86_64", "x86", "armv7", "thumb2", "armv7eb", "thumb2eb"})
+
+
+def _has_own_name(fn) -> bool:
+    """Whether *fn* carries a name that is not BN's auto name: a symbol from
+    the binary or the user, rather than ``sub_*`` analysis invented."""
+    sym = getattr(fn, "symbol", None)
+    auto = getattr(sym, "auto", None) if sym is not None else None
+    if auto is not None:
+        return not bool(auto)
+    return not is_auto_function_name(str(getattr(fn, "name", "") or ""))
+
+
+def _not_in_object_argument(bv, fn, var) -> str | None:
+    """None when *var* sits where *fn*'s calling convention passes the first
+    integer argument -- the place `this` arrives -- else why not (#1049
+    review). Register conventions: the first integer argument register (full
+    width compared, so `w0`/`edi` count as `x0`/`rdi`). A convention with
+    none (i386 cdecl): the first stack argument, just past the return address."""
+    arch = getattr(bv, "arch", None) or getattr(fn, "arch", None)
+    cc = getattr(fn, "calling_convention", None)
+    source = getattr(getattr(var, "source_type", None), "name", "") or str(getattr(var, "source_type", ""))
+    try:
+        regs = [str(r) for r in (getattr(cc, "int_arg_regs", None) or [])]
+    except Exception:
+        regs = []
+    if cc is None or arch is None:
+        return "parameter 0's placement could not be checked (no calling convention)"
+    if regs:
+        if "RegisterVariableSourceType" not in source:
+            return f"parameter 0 is not in {regs[0]}, where `this` is passed"
+        try:
+            name = str(arch.get_reg_name(int(var.storage)))
+            full = str(arch.regs[name].full_width_reg)
+            first = str(arch.regs[regs[0]].full_width_reg)
+        except Exception:
+            return "parameter 0's register could not be read"
+        if full != first:
+            return f"parameter 0 is in {name}, not {regs[0]}, where `this` is passed"
+        return None
+    if "StackVariableSourceType" not in source:
+        return "parameter 0 is not the first stack argument, where `this` is passed"
+    ptr = int(getattr(bv, "address_size", 0) or getattr(arch, "address_size", 0) or 0)
+    if int(getattr(var, "storage", -1)) != ptr:
+        return "parameter 0 is not the first stack argument, where `this` is passed"
+    return None
 
 
 def _other_data_refs(bv, address: int, slot_array: tuple[int, int]) -> dict[str, int]:
@@ -6130,51 +6187,6 @@ def _other_data_refs(bv, address: int, slot_array: tuple[int, int]) -> dict[str,
         return {}
     others = sum(1 for r in refs if not slot_array[0] <= r < slot_array[1])
     return {"other_data_refs": others} if others else {}
-
-
-def _allocation_size_for(card: dict[str, Any], cls: str, instance, ptr: int,
-                         requested: dict[str, Any]) -> tuple[int, list[str]]:
-    """#1018.2, opt-in: the width `--size-from-allocation` declares the struct
-    with -- the ONE allocation request every shown construction site of the
-    class agrees on -- and those sites. Refuses rather than choose: a struct
-    already exists, no site carries a request, the sites disagree, or the site
-    listing was capped so unshown sites could disagree."""
-    if instance is not None:
-        raise OperationFailure(
-            "invalid_request",
-            f"{cls} already has a struct, and --size-from-allocation only sizes a struct this "
-            "command declares; resize it with `bn types declare` instead.",
-            requested=requested)
-    instances = card.get("instances") or {}
-    sites = [s for s in instances.get("construction_sites") or []
-             if isinstance(s, dict) and isinstance(s.get("allocation_request"), int)]
-    if instances.get("construction_sites_truncated"):
-        raise OperationFailure(
-            "invalid_request",
-            f"{cls}'s construction-site listing is capped, so sites bn did not read could "
-            "disagree; --size-from-allocation needs every site.",
-            requested=requested)
-    values = sorted({int(s["allocation_request"]) for s in sites})
-    if not values:
-        raise OperationFailure(
-            "invalid_request",
-            f"no construction site of {cls} receives a constant global operator new "
-            "allocation as its first argument, so there is no allocation request to size from.",
-            requested=requested)
-    if len(values) > 1:
-        listed = "; ".join(f"{s['address']}: {hex(int(s['allocation_request']))}" for s in sites)
-        raise OperationFailure(
-            "invalid_request",
-            f"{cls}'s construction sites request different sizes ({listed}); an allocation is "
-            "per site, so --size-from-allocation picks none.",
-            requested=requested)
-    if values[0] < ptr:
-        raise OperationFailure(
-            "invalid_request",
-            f"{cls}'s construction sites request {hex(values[0])} bytes, less than the "
-            f"{ptr}-byte vptr.",
-            requested=requested)
-    return values[0], [str(s["address"]) for s in sites]
 
 
 def _is_pointer_to(type_obj, name: str) -> bool:

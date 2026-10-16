@@ -18,7 +18,7 @@ from . import il_format
 from ._shared import OperationFailure, _validate_count
 from .read_listing import _analysis_state_fields
 from .read_types import _follow_typedef
-from .seam import _view_memo
+from .seam import _view_data_memo, _view_memo
 
 try:
     import binaryninja as bn
@@ -256,34 +256,44 @@ class _ScannedSymbol(NamedTuple):
 
 
 class _AbiScan(NamedTuple):
-    #: {typeinfo address: (class name, layout, mangled type encoding, name string address)}
-    typeinfo: dict[int, tuple[str, str, str, int]]
+    #: {typeinfo address: (class name, layout, mangled type encoding, name string
+    #: address, base typeinfo addresses the record names)}
+    typeinfo: dict[int, tuple[str, str, str, int, tuple[int, ...]]]
     #: {typeinfo address: aligned data words holding that address}
     refs: dict[int, tuple[int, ...]]
     #: the byte cap stopped the scan before every data section was read
     truncated: bool
-    #: typeinfo objects whose name string BN's demangler would not take
-    undemangled: int
+    #: candidates refused: a name that is not exactly one class type, or a
+    #: record whose base list is not well formed
+    rejected: int
 
 
 _EMPTY_ABI_SCAN = _AbiScan({}, {}, False, 0)
+
+#: BN `TypeClass` names a class type can come back as from the demangler.
+_CLASS_TYPE_CLASSES = frozenset({"NamedTypeReferenceClass", "StructureTypeClass"})
 
 
 def _demangle_type_encoding(bv, encoding: str) -> str | None:
     """The class name BN's demangler gives a typeinfo name string, or None.
 
-    The string is the type's mangled encoding (`N3app6WorkerE`). BN's demangler
-    is lenient about trailing garbage under the `_ZTI` prefix, so the encoding
-    must first parse in full as a parameter type (`_Z1f<enc>`); the name itself
-    is then BN's own `typeinfo for` spelling, the one its RTTI analysis gives a
-    symbol in the builds where that analysis runs."""
+    The string is the type's mangled encoding (`N3app6WorkerE`). It must be
+    EXACTLY ONE class type with nothing left over (#1049 review): parsed as a
+    parameter list (`_Z1f<enc>`), it must yield one parameter, of a class
+    type -- `N3adv4TailEi` is two types, `N5probe6WidgetEgarbage` is several,
+    and `i` is no class. The name is then BN's own `typeinfo for` spelling,
+    the one its RTTI analysis gives a symbol in the builds where it runs."""
     demangle = getattr(bn, "demangle_gnu3", None) if bn is not None else None
     arch = getattr(bv, "arch", None)
     if demangle is None or arch is None or not _MANGLED_TYPE_RE.match(encoding):
         return None
     try:
         full, _ = demangle(arch, "_Z1f" + encoding)
-        if full is None:
+        params = list(getattr(full, "parameters", None) or []) if full is not None else []
+        if len(params) != 1:
+            return None
+        type_class = getattr(getattr(params[0], "type", None), "type_class", None)
+        if (getattr(type_class, "name", None) or str(type_class)) not in _CLASS_TYPE_CLASSES:
             return None
         _, parts = demangle(arch, "_ZTI" + encoding)
     except Exception:  # noqa: BLE001 - an undemanglable string names nothing
@@ -307,93 +317,159 @@ def _abi_data_sections(bv) -> list[tuple[int, int]]:
     return sorted(out)
 
 
+def _abi_address_points(ctx, bv) -> dict[int, str]:
+    """{address point: layout} of the ABI's class-typeinfo vtables in *bv*."""
+    lookup = getattr(bv, "get_symbols_by_name", None)
+    if not callable(lookup):
+        return {}
+    ptr = ctx._pointer_size(bv)
+    out: dict[int, str] = {}
+    for raw, layout in _ABI_CLASS_TYPEINFO_VTABLES:
+        try:
+            syms = list(lookup(raw) or [])
+        except Exception:
+            syms = []
+        for sym in syms:
+            out[int(sym.address) + 2 * ptr] = layout
+    return out
+
+
+def _abi_record_bases(ctx, bv, address: int, layout: str, ptr: int) -> tuple[int, ...] | None:
+    """The base typeinfo addresses a class typeinfo record at *address* names,
+    read per its ABI layout, or None when the record is not well formed: an
+    `si` record's base word is zero, a `vmi` record's count is out of range or
+    a base word is zero."""
+    after_name = address + 2 * ptr
+    if layout == "base":
+        return ()
+    if layout == "si":
+        base = ctx._read_pointer_value(bv, after_name, size=ptr)
+        return (int(base),) if base else None
+    count = ctx._read_u32(bv, after_name + 4)
+    if count is None or not 0 < count <= 64:
+        return None
+    bases = []
+    for index in range(count):
+        base = ctx._read_pointer_value(bv, after_name + 8 + index * 2 * ptr, size=ptr)
+        if not base:
+            return None
+        bases.append(int(base))
+    return tuple(bases)
+
+
+def _abi_raw_scan(ctx, bv, address_points: dict[int, str]) -> _AbiScan:
+    """The byte half of :func:`_abi_rtti_scan`: every aligned data word equal to
+    an ABI address point whose record names exactly one class and has a
+    well-formed base list, and the words referring to each. It reads bytes and
+    the demangler only -- no symbol -- so it is memoised on the view's DATA
+    generation and survives renames (#1049 review: each rename re-ran it)."""
+    ptr = ctx._pointer_size(bv)
+    order = ctx._byteorder(bv)
+    fmt = {(4, "little"): "<I", (8, "little"): "<Q", (4, "big"): ">I", (8, "big"): ">Q"}.get((ptr, order))
+    if fmt is None:
+        return _EMPTY_ABI_SCAN
+    chunks: list[tuple[int, bytes]] = []
+    budget = _ABI_SCAN_MAX_BYTES
+    truncated = False
+    for start, end in _abi_data_sections(bv):
+        aligned = start + (-start % ptr)
+        # A word-aligned object cannot start in the sub-word tail, so only
+        # the byte budget -- never that tail -- leaves words unread.
+        whole = (end - aligned) - (end - aligned) % ptr if end > aligned else 0
+        if whole <= 0:
+            continue
+        if whole > budget:
+            truncated = True
+        length = min(whole, budget - budget % ptr)
+        if length <= 0:
+            continue
+        try:
+            data = bytes(bv.read(aligned, length))
+        except Exception:
+            continue
+        data = data[:len(data) - len(data) % ptr]
+        chunks.append((aligned, data))
+        budget -= len(data)
+    typeinfo: dict[int, tuple[str, str, str, int, tuple[int, ...]]] = {}
+    rejected = 0
+    for base, data in chunks:
+        for ap, layout in address_points.items():
+            needle = ap.to_bytes(ptr, order)
+            at = data.find(needle)
+            while at != -1:
+                if at % ptr == 0:
+                    address = base + at
+                    name_at = ctx._read_pointer_value(bv, address + ptr, size=ptr)
+                    encoding = (_read_c_string(bv, name_at) or "").lstrip("*") if name_at else ""
+                    cls = _demangle_type_encoding(bv, encoding) if encoding else None
+                    bases = _abi_record_bases(ctx, bv, address, layout, ptr) if cls else None
+                    if cls is None or bases is None:
+                        rejected += 1
+                    else:
+                        typeinfo[address] = (cls, layout, encoding, int(name_at), bases)
+                at = data.find(needle, at + 1)
+    refs: dict[int, list[int]] = {}
+    if typeinfo:
+        wanted = set(typeinfo)
+        for base, data in chunks:
+            for index, (word,) in enumerate(struct.iter_unpack(fmt, data)):
+                if word in wanted:
+                    refs.setdefault(word, []).append(base + index * ptr)
+    return _AbiScan(typeinfo, {k: tuple(v) for k, v in refs.items()}, truncated, rejected)
+
+
 def _abi_rtti_scan(ctx, bv) -> _AbiScan:
-    """#1035.5: the class typeinfo objects in *bv*'s data, found from the bytes.
+    """#1035.5: the class typeinfo objects in *bv*'s data that BN did not name,
+    found from the bytes.
 
     Binary Ninja's RTTI analysis names typeinfo objects and vtables from their
     words, and in a non-PIE executable it names none: the ABI's
     ``__cxxabiv1::__*class_type_info`` vtables are COPY-relocated into the
     executable, so every typeinfo's word[0] points into a local copy instead
     of at an import. A stripped non-PIE build then had no class at all in the
-    lens. This reads what the ABI guarantees instead: an aligned data word equal
-    to one of those vtables' address points is a class typeinfo's vptr, and the
-    next word points at its mangled name. A typeinfo BN already named is left to
-    its symbol. For the ones it did not, the aligned words that hold the
-    typeinfo's address are recorded, because BN made no data references to an
-    object it never typed and the vtable backwalk starts from those.
+    lens. This reads what the ABI guarantees instead: an aligned data word
+    equal to one of those vtables' address points is a class typeinfo's vptr,
+    the next word points at its mangled name, which must be exactly one class
+    type, and the rest of the record is the base list its layout declares.
 
-    Bounded by :data:`_ABI_SCAN_MAX_BYTES` (disclosed as ``truncated``) and
-    memoised per view; a view with none of the three ABI vtables costs one
-    symbol lookup each."""
+    Of those, kept here: the ones BN put no typeinfo symbol on, whose every
+    named base is itself a typeinfo -- another scanned record, or one BN named
+    or imported. For each, the aligned words that hold its address are
+    recorded, because BN made no data references to an object it never typed
+    and the vtable backwalk starts from those.
+
+    The byte half is bounded by :data:`_ABI_SCAN_MAX_BYTES` (disclosed as
+    ``truncated``) and memoised on the view's data generation; this symbol
+    half is cheap and memoised per view generation. A view with none of the
+    three ABI vtables costs one symbol lookup each."""
     def build() -> _AbiScan:
-        lookup = getattr(bv, "get_symbols_by_name", None)
-        if not callable(lookup):
-            return _EMPTY_ABI_SCAN
-        ptr = ctx._pointer_size(bv)
-        order = ctx._byteorder(bv)
-        address_points: dict[int, str] = {}
-        for raw, layout in _ABI_CLASS_TYPEINFO_VTABLES:
-            try:
-                syms = list(lookup(raw) or [])
-            except Exception:
-                syms = []
-            for sym in syms:
-                address_points[int(sym.address) + 2 * ptr] = layout
+        address_points = _abi_address_points(ctx, bv)
         if not address_points:
             return _EMPTY_ABI_SCAN
-        fmt = {(4, "little"): "<I", (8, "little"): "<Q", (4, "big"): ">I", (8, "big"): ">Q"}.get((ptr, order))
-        if fmt is None:
-            return _EMPTY_ABI_SCAN
-        chunks: list[tuple[int, bytes]] = []
-        budget = _ABI_SCAN_MAX_BYTES
-        truncated = False
-        for start, end in _abi_data_sections(bv):
-            aligned = start + (-start % ptr)
-            # A word-aligned object cannot start in the sub-word tail, so only
-            # the byte budget -- never that tail -- leaves words unread.
-            whole = (end - aligned) - (end - aligned) % ptr if end > aligned else 0
-            if whole <= 0:
-                continue
-            if whole > budget:
-                truncated = True
-            length = min(whole, budget - budget % ptr)
-            if length <= 0:
-                continue
-            try:
-                data = bytes(bv.read(aligned, length))
-            except Exception:
-                continue
-            data = data[:len(data) - len(data) % ptr]
-            chunks.append((aligned, data))
-            budget -= len(data)
+        raw = _view_data_memo(bv, "abi_rtti_raw_scan", tuple(sorted(address_points.items())),
+                              lambda: _abi_raw_scan(ctx, bv, address_points))
         get_symbol_at = getattr(bv, "get_symbol_at", None)
-        typeinfo: dict[int, tuple[str, str, str, int]] = {}
-        undemangled = 0
-        for base, data in chunks:
-            for ap, layout in address_points.items():
-                needle = ap.to_bytes(ptr, order)
-                at = data.find(needle)
-                while at != -1:
-                    if at % ptr == 0:
-                        address = base + at
-                        sym = get_symbol_at(address) if callable(get_symbol_at) else None
-                        if sym is None or _rtti_kind_and_class(sym)[0] != "typeinfo":
-                            name_at = ctx._read_pointer_value(bv, address + ptr, size=ptr)
-                            encoding = _read_c_string(bv, name_at) if name_at else None
-                            cls = _demangle_type_encoding(bv, encoding.lstrip("*")) if encoding else None
-                            if cls is None:
-                                undemangled += 1
-                            else:
-                                typeinfo[address] = (cls, layout, encoding.lstrip("*"), int(name_at))
-                    at = data.find(needle, at + 1)
-        refs: dict[int, list[int]] = {}
-        if typeinfo:
-            wanted = set(typeinfo)
-            for base, data in chunks:
-                for index, (word,) in enumerate(struct.iter_unpack(fmt, data)):
-                    if word in wanted:
-                        refs.setdefault(word, []).append(base + index * ptr)
-        return _AbiScan(typeinfo, {k: tuple(v) for k, v in refs.items()}, truncated, undemangled)
+
+        def symbol_kind(address: int) -> str | None:
+            sym = get_symbol_at(address) if callable(get_symbol_at) else None
+            if sym is None:
+                return None
+            if _rtti_kind_and_class(sym)[0] == "typeinfo":
+                return "typeinfo"
+            return "alias" if _is_alias_symbol(sym) else "other"
+
+        typeinfo = {}
+        rejected = raw.rejected
+        for address, entry in raw.typeinfo.items():
+            if symbol_kind(address) == "typeinfo":
+                continue   # BN named it; its symbol answers
+            if not all(base in raw.typeinfo or symbol_kind(base) in ("typeinfo", "alias")
+                       for base in entry[4]):
+                rejected += 1
+                continue
+            typeinfo[address] = entry
+        refs = {address: raw.refs[address] for address in typeinfo if address in raw.refs}
+        return _AbiScan(typeinfo, refs, raw.truncated, rejected)
 
     return _view_memo(bv, "abi_rtti_scan", build)
 
@@ -417,7 +493,7 @@ def _merge_scanned_rtti(ctx, bv, maps: dict[str, dict[str, Any]]) -> dict[str, d
     class that has no typeinfo symbol of its own (#1035.5)."""
     if ctx is None:
         return maps
-    for address, (cls, _layout, encoding, name_at) in _abi_rtti_scan(ctx, bv).typeinfo.items():
+    for address, (cls, _layout, encoding, name_at, _bases) in _abi_rtti_scan(ctx, bv).typeinfo.items():
         slot = maps.setdefault(cls, {})
         if slot.get("typeinfo") is None:
             slot["typeinfo"] = _ScannedSymbol(address, "_ZTI" + encoding, f"typeinfo for {cls}")
@@ -1560,6 +1636,8 @@ def _class_list(
             "declared_suppressed": declared_suppressed,
             **_analysis_state_fields(bv),
         }
+        if _abi_rtti_scan(ctx, bv).truncated:
+            result["abi_scan_truncated"] = True   # #1049 review: the count too
         if total == 0:
             result["inputs"] = _class_lens_inputs(ctx, bv)   # #653.6
         return result
@@ -2593,30 +2671,6 @@ _SLOT_FACT_MAX_INSTRUCTIONS = 256
 _SLOT_FACT_MAX_CALLS = 4
 #: The global `operator delete` / `delete[]` (plain, sized, aligned forms).
 _GLOBAL_OPERATOR_DELETE_RE = re.compile(r"^_Zd[la]Pv")
-_RTTI_ANCESTRY_MAX_DEPTH = 16
-
-
-def _rtti_ancestors(ctx, bv, rec: dict[str, Any]) -> set[str]:
-    """The class names in *rec*'s RTTI base chain (bases of bases), bounded."""
-    names: set[str] = set()
-    pending = [(base, 1) for base in rec.get("bases") or [] if isinstance(base, dict)]
-    seen: set[str] = set()
-    while pending:
-        base, depth = pending.pop()
-        address = str(base.get("address") or "")
-        if base.get("name"):
-            names.add(str(base["name"]))
-        if not address or address in seen or depth >= _RTTI_ANCESTRY_MAX_DEPTH:
-            continue
-        seen.add(address)
-        try:
-            addr = int(address, 16)
-            if _typeinfo_is_import_slot(ctx, bv, addr):
-                continue
-            pending.extend((b, depth + 1) for b in _rtti_bases(ctx, bv, addr))
-        except Exception:
-            continue
-    return names
 
 
 def _address_point_class(ctx, bv, value: int, ptr: int) -> str | None:
@@ -2670,25 +2724,20 @@ def _slot_body_facts(ctx, bv, address: int, ptr: int) -> dict[str, Any]:
 
 
 def _describe_unnamed_slots(ctx, bv, rec: dict[str, Any]) -> None:
-    """#1040.2: facts for each unnamed primary-vtable slot, and -- only as a
-    suggestion -- which look like the class's destructors.
+    """#1040.2: neutral facts for each unnamed primary-vtable slot: the vtable
+    address points its body writes (each named by the RTTI it points at), the
+    functions it calls, and whether it calls the global ``operator delete``.
 
-    The facts claim nothing: the vtable address points a body writes (each
-    named by the RTTI it points at), the functions it calls, and whether it
-    calls the global ``operator delete``. The suggestion is the Itanium
-    destructor shape on top of them: a body that writes this class's or an
-    RTTI ancestor's address point and calls no ``operator delete`` is "likely
-    D1" (complete-object destructor); one that calls ``operator delete`` and
-    either writes such an address point or calls the "likely D1" slot is
-    "likely D0" (deleting destructor). The names are offered as a
-    ``batch apply`` manifest (``suggested_renames``), never applied."""
+    No role is inferred from them. A destructor writes an address point and a
+    deleting destructor calls ``operator delete``, but so do a virtual
+    ``reset`` that placement-constructs into an argument, a ``clone`` that
+    stamps a new object's vptr, and ``release() { delete this; }`` (#1049
+    review): the facts are what the reader names the slot from."""
     vtable = rec.get("vtable")
     slots = vtable.get("slots") if isinstance(vtable, dict) else None
     if not slots:
         return
     ptr = ctx._pointer_size(bv)
-    own = {str(rec.get("name") or "")} | _rtti_ancestors(ctx, bv, rec)
-    unnamed = []
     for slot in slots:
         method = slot.get("method") if isinstance(slot, dict) else None
         if not slot.get("unnamed") or not isinstance(method, dict) or not method.get("address"):
@@ -2697,40 +2746,6 @@ def _describe_unnamed_slots(ctx, bv, rec: dict[str, Any]) -> None:
             slot["body"] = _slot_body_facts(ctx, bv, int(str(method["address"]), 16), ptr)
         except Exception:
             slot["body"] = {"read": False, "reason": "il_unavailable"}
-        unnamed.append(slot)
-    def withhold(kind: str) -> None:
-        # Itanium gives a vtable ONE D1 and ONE D0 entry. Two slots with the
-        # same shape mean the shape does not tell them apart here, so neither
-        # is offered.
-        fits = [slot for slot in unnamed if slot.get("suggestion") == kind]
-        if len(fits) > 1:
-            for slot in fits:
-                slot["suggestion"] = None
-                slot["suggestion_withheld"] = f"{len(fits)} slots fit the {kind} shape"
-
-    for slot in unnamed:
-        body = slot["body"]
-        if (body.get("read") and not body["calls_operator_delete"]
-                and any(w["class"] in own for w in body["writes_address_points"])):
-            slot["suggestion"] = "D1"
-    withhold("D1")
-    # A D0 found only by calling the D1 slot relies on that D1, so it is
-    # decided after an ambiguous D1 has been withheld.
-    d1 = {str(slot["method"]["address"]) for slot in unnamed if slot.get("suggestion") == "D1"}
-    for slot in unnamed:
-        body = slot["body"]
-        if body.get("read") and body["calls_operator_delete"] and (
-                any(w["class"] in own for w in body["writes_address_points"])
-                or any(c["address"] in d1 for c in body["calls"])):
-            slot["suggestion"] = "D0"
-    withhold("D0")
-    suggested = [slot for slot in unnamed if slot.get("suggestion")]
-    if suggested:
-        cls = str(rec["name"])
-        dtor = f"{cls}::~{_last_component(cls)}"
-        rec["suggested_renames"] = {"ops": [
-            {"op": "rename_symbol", "identifier": str(slot["method"]["address"]), "new_name": dtor}
-            for slot in suggested]}
 
 
 def _class_name_suggestions(registry: dict[str, dict], name: str, *, limit: int = 5) -> str:
@@ -3079,6 +3094,10 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
                           " read, so a declared class of this name is not ruled out.")
         else:
             unreadable = ""
+        if ctx is not None and _abi_rtti_scan(ctx, bv).truncated:
+            # #1049 review: a bounded byte scan cannot rule a class out.
+            unreadable += (" The typeinfo byte scan stopped at its data cap, so a class whose"
+                           " RTTI Binary Ninja did not name is not ruled out.")
         raise OperationFailure(
             "unknown_class",
             f"No class named {name!r}.{_class_name_suggestions(registry, name)} "

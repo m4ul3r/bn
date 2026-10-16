@@ -7189,29 +7189,53 @@ def test_class_apply_types_plan_builds_the_typing_batch(monkeypatch):
     assert "demo::Widget::demo::Leaf::VTable" in excinfo.value.message
 
 
+class _ArgRegArch(_FakeArch):
+    """A register-convention arch: storage index -> register name, each with
+    its full-width register (`edi` is `rdi`'s low half)."""
+
+    _NAMES = {5: "rdi", 6: "rsi", 7: "edi", 40: "xmm0"}
+    _FULL = {"rdi": "rdi", "rsi": "rsi", "edi": "rdi", "xmm0": "zmm0"}
+
+    def __init__(self, name="x86_64"):
+        super().__init__(name=name, address_size=8)
+        self.regs = {n: types.SimpleNamespace(full_width_reg=f) for n, f in self._FULL.items()}
+
+    def get_reg_name(self, index):
+        return self._NAMES[index]
+
+
 def test_class_apply_types_retypes_parameter_0_of_the_classs_own_methods_1040(monkeypatch):
     """#1040.1: a stripped build names no parameter `this`, so the plan retypes
     parameter 0 -- under its own name -- of the class's constructors and
     destructors and of the targets of its OWN vtable slots. A slot a base's
     vtable also holds is inherited, a slot named as another class's method is
     not this class's, a non-virtual method is not proven to take `this`, and
-    when a base's vtable is unreadable no slot is proven the class's own."""
+    when a base's vtable is unreadable no slot is proven the class's own.
+
+    #1049 review: parameter 0 must sit where `this` is passed (the first integer
+    argument register; `edi` counts as `rdi`) -- a method that never reads
+    `this` has a floating parameter 0 -- and a slot target named as a free
+    function is not this class's method."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     me = bridge.mutation_engine
 
-    def fn(address, name):
+    def fn(address, name, storage=5, symbol_auto=None):
         func = _FakeFunction(address, name)
-        func.parameter_vars = [_FakeVariable(name="arg1", storage=5, var_type="int64_t",
+        func.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi"])
+        func.parameter_vars = [_FakeVariable(name="arg1", storage=storage, var_type="int64_t",
                                              identifier=address, source_type="RegisterVariableSourceType")]
+        if symbol_auto is not None:
+            func.symbol = types.SimpleNamespace(auto=symbol_auto, short_name=name, name=name)
         return func
 
     funcs = [fn(0x401100, "demo::Widget::Widget"), fn(0x401150, "demo::Widget::helper"),
-             fn(0x401200, "sub_401200"), fn(0x401300, "sub_401300"),
-             fn(0x401400, "demo::Other::poll"), fn(0x401500, "sub_401500")]
-    bv = _FakeBV(functions=funcs, arch=_FakeArch(address_size=8))
+             fn(0x401200, "sub_401200", storage=7), fn(0x401300, "sub_401300"),
+             fn(0x401400, "demo::Other::poll"), fn(0x401500, "sub_401500"),
+             fn(0x401600, "sub_401600", storage=40), fn(0x401700, "scale_value", symbol_auto=False)]
+    bv = _FakeBV(functions=funcs, arch=_ArgRegArch())
     bv.types["demo::Widget"] = _FakeType("struct demo::Widget", width=8, members=[])
-    slot_targets = (0x401200, 0x401300, 0x401400, 0x401500)
+    slot_targets = (0x401200, 0x401300, 0x401400, 0x401500, 0x401600, 0x401700)
     card = {"name": "demo::Widget", "bases": [{"name": "demo::Base", "address": "0x405000"}],
             "vtable": {"address": "0x404000", "slots": [
                 {"index": i, "method": {"address": hex(a), "display_name": f"sub_{a:x}"}}
@@ -7241,15 +7265,50 @@ def test_class_apply_types_retypes_parameter_0_of_the_classs_own_methods_1040(mo
         "0x401150": "no parameter named `this`, and not a vtable slot, constructor or destructor",
         "0x401300": "inherited: also a slot of a base's vtable",
         "0x401400": "named as a method of demo::Other",
+        "0x401600": "parameter 0 is in xmm0, not rdi, where `this` is passed",
+        "0x401700": "named scale_value, not a method of demo::Widget",
     }
-
+    assert "parameter0_caveat" in plan
     base["targets"], base["unreadable"] = set(), ["demo::Base"]
     operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
     assert [op["function"] for op in operations if op["op"] == "local_retype"] == ["0x401100", "0x401500"]
     unproven = {m["address"] for m in plan["skipped_methods"]
                 if "is not decodable here (demo::Base)" in m["reason"]}
-    assert unproven == {"0x401200", "0x401300"}
+    assert unproven == {"0x401200", "0x401300", "0x401600"}
 
+
+def test_class_apply_types_on_i386_checks_the_first_stack_argument_and_states_the_caveat_1049(monkeypatch):
+    """#1049 review: i386 cdecl passes `this` as the first STACK argument (just
+    past the return address), and a by-value class return travels ahead of it
+    there as on x86-64, so the parameter-0 caveat is stated on i386 too."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    def fn(address, storage):
+        func = _FakeFunction(address, f"sub_{address:x}")
+        func.calling_convention = types.SimpleNamespace(int_arg_regs=[])
+        func.parameter_vars = [_FakeVariable(name="arg1", storage=storage, var_type="int32_t",
+                                             identifier=address)]
+        return func
+
+    bv = _FakeBV(functions=[fn(0x8001000, 4), fn(0x8001100, 8)], arch=_FakeArch(name="x86"))
+    bv.types["demo::Widget"] = _FakeType("struct demo::Widget", width=4, members=[])
+    card = {"name": "demo::Widget", "bases": [], "methods": [],
+            "vtable": {"address": "0x8004000", "slots": [
+                {"index": i, "method": {"address": hex(a), "display_name": f"sub_{a:x}"}}
+                for i, a in enumerate((0x8001000, 0x8001100))]}}
+    monkeypatch.setattr(bridge.read_class, "_class_show", lambda ctx, selector, name: dict(card))
+    monkeypatch.setattr(bridge.read_class, "_bn_vtable_type_name", lambda view, start: "demo::Widget::VTable")
+    monkeypatch.setattr(bridge.read_evidence, "_function_thunk_summary",
+                        lambda ctx, view, func: {"is_candidate": False})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert [op["function"] for op in operations if op["op"] == "local_retype"] == ["0x8001000"]
+    assert plan["skipped_methods"] == [{
+        "address": "0x8001100", "name": "sub_8001100",
+        "reason": "parameter 0 is not the first stack argument, where `this` is passed"}]
+    assert "return slot there and `this` second" in plan["parameter0_caveat"]
 
 
 @pytest.mark.parametrize("preview", [False, True])

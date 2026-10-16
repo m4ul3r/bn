@@ -2719,46 +2719,6 @@ def test_class_list_local_and_vtable_budget_are_forwarded_1040(monkeypatch):
     assert "local_only" not in plain and "vtable_budget" not in plain
 
 
-_RENAMES_CARD = {"name": "app::Worker", "suggested_renames": {"ops": [
-    {"op": "rename_symbol", "identifier": "0x1100", "new_name": "app::Worker::~Worker"},
-    {"op": "rename_symbol", "identifier": "0x1200", "new_name": "app::Worker::~Worker"},
-]}}
-
-
-def test_class_show_emit_renames_prints_a_batch_manifest_1040(fake_transport, capsys):
-    calls = fake_transport({"class_show": {"ok": True, "result": _RENAMES_CARD}})
-    rc = bn.cli.main(["class", "show", "-t", "worker.bin", "app::Worker", "--emit-renames"])
-    assert rc == 0
-    manifest = json.loads(capsys.readouterr().out)
-    assert manifest == {"target": "worker.bin", "ops": _RENAMES_CARD["suggested_renames"]["ops"]}
-    assert calls[0]["params"] == {"name": "app::Worker"}
-
-
-def test_class_show_emit_renames_omits_an_ambient_target_1040(fake_transport, capsys, monkeypatch):
-    monkeypatch.setenv("BN_TARGET", "worker.bin")
-    calls = fake_transport({"class_show": {"ok": True, "result": _RENAMES_CARD}})
-    assert bn.cli.main(["class", "show", "app::Worker", "--emit-renames"]) == 0
-    manifest = json.loads(capsys.readouterr().out)
-    assert "target" not in manifest
-    assert manifest["ops"] == _RENAMES_CARD["suggested_renames"]["ops"]
-    assert calls[0]["target"] == "worker.bin"
-
-
-@pytest.mark.parametrize("card, reason", [
-    ({"name": "app::Worker"}, "no unnamed vtable slot of app::Worker fits the destructor shape"),
-    ({"name": "app::Worker", "suggested_renames": {"ops": []}}, "fits the destructor shape"),
-    ({"ambiguous": True, "query": "Worker",
-      "matches": [{"name": "a::Worker"}, {"name": "b::Worker"}]}, "a::Worker, b::Worker"),
-])
-def test_class_show_emit_renames_without_suggestions_exits_2_1040(
-        fake_transport, capsys, card, reason):
-    fake_transport({"class_show": {"ok": True, "result": card}})
-    rc = bn.cli.main(["class", "show", "-t", "worker.bin", "Worker", "--emit-renames"])
-    assert rc == 2
-    out = capsys.readouterr().out
-    assert out.startswith("no renames: ") and reason in out
-
-
 def test_admin_text_renderer_failure_becomes_clean_error(monkeypatch, capsys):
     # Admin commands build their result locally and render it WITHOUT going
     # through _call, so they must apply the SAME malformed-result guard _call has

@@ -1469,32 +1469,18 @@ class TestTypeStringsAndInheritance:
             assert row["variable"] != "this" and params[row["variable"]] == "struct svc::AuditHandler*", (
                 row, params)
 
-    def test_destructor_slots_are_suggested_and_the_manifest_applies_as_printed_1040(
-            self, shared_bn, tmp_path):
-        """#1040.2: the card states what each unnamed slot does and marks the
-        destructor shapes; the command it prints emits a manifest that `batch
-        apply` takes as is, after which the lens lists both as destructors."""
+    def test_unnamed_slots_print_body_facts_and_no_role_1040(self, shared_bn):
+        """#1040.2: the card states what each unnamed slot's body does -- the
+        vtable address points it writes, its calls, `operator delete` -- and
+        claims no role from it (#1049 review: the destructor shape also fits
+        ordinary reset/clone/release methods)."""
         shared_bn.load(CLASSES_STRIPPED_BINARY)
         card = shared_bn.run("class", "show", "svc::AuditHandler")
         assert card.returncode == 0, card.stderr
-        assert "likely D1 (complete-object destructor)" in card.stdout, card.stdout
-        assert "likely D0 (deleting destructor)" in card.stdout, card.stdout
-        hint = next(line for line in card.stdout.splitlines() if "--emit-renames" in line)
-        command = shlex.split(hint.split("`")[1])
-        assert command[0] == "bn", hint
-        emitted = shared_bn.run(*command[1:])
-        assert emitted.returncode == 0, emitted.stdout + emitted.stderr
-        manifest = json.loads(emitted.stdout)
-        assert [op["new_name"] for op in manifest["ops"]] == ["svc::AuditHandler::~AuditHandler"] * 2
-        path = tmp_path / "renames.json"
-        path.write_text(emitted.stdout, encoding="utf-8")
-        applied = shared_bn.run("batch", "apply", str(path))
-        assert applied.returncode == 0, applied.stdout + applied.stderr
-        after = shared_bn.json("class", "show", "svc::AuditHandler")
-        assert sorted(m["address"] for m in after["methods"] if m["kind"] == "dtor") == sorted(
-            op["identifier"] for op in manifest["ops"])
-        none = shared_bn.run("class", "show", "svc::AuditHandler", "--emit-renames")
-        assert none.returncode == 2 and none.stdout.startswith("no renames:"), none.stdout
+        assert "writes svc::AuditHandler's vtable address point" in card.stdout, card.stdout
+        assert "operator delete" in card.stdout, card.stdout
+        assert "likely" not in card.stdout and "--emit-renames" not in card.stdout
+        assert shared_bn.run("class", "show", "svc::AuditHandler", "--emit-renames").returncode == 2
 
     def test_non_pie_stripped_build_lists_its_classes_1035(self, shared_bn):
         """#1035.5: in a stripped non-PIE build BN's RTTI analysis names no
@@ -1518,8 +1504,8 @@ class TestTypeStringsAndInheritance:
     def test_construction_sites_carry_their_own_allocation_request_1018(self, shared_bn):
         """#1018.2: the allocation is per site. `make()` constructs a Dispatcher
         into `operator new(0x40)`; AudioDisp's constructor constructs its base
-        into its own `this`, so that site carries none. The card's size stays
-        unknown; `--size-from-allocation` is the opt-in that uses the request."""
+        into its own `this`, so that site carries none. It never becomes a class
+        size (#1049 review: trailing storage and a derived object agree too)."""
         shared_bn.load(VCALLS_BINARY)
         card = shared_bn.json("class", "show", "vc::Dispatcher")
         sites = {s["function"]: s for s in card["instances"]["construction_sites"]}
@@ -1527,11 +1513,9 @@ class TestTypeStringsAndInheritance:
         assert sites["vc::make"]["allocator"] == "_Znwm", sites
         assert "allocation_request" not in sites["vc::AudioDisp::AudioDisp"], sites
         assert card["size"] is None and card["size_reason"] == "no_defined_type", card
-        sized = shared_bn.json("class", "apply-types", "vc::Dispatcher", "--size-from-allocation",
-                               "--preview", "--summary")
-        plan = sized["class_apply_types"]
-        assert plan["size"] == "0x40" and plan["size_source"] == "allocation_request", plan
-        assert plan["size_sites"] == [sites["vc::make"]["address"]], plan
+        plan = shared_bn.json("class", "apply-types", "vc::Dispatcher", "--preview",
+                              "--summary")["class_apply_types"]
+        assert plan["size"] is None, plan
 
     def test_qualified_prototype_preview_and_display_name_999(self, shared_bn, tmp_path):
         """#999 on BN's real parser: a `::`-qualified type in backticks and a

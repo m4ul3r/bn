@@ -122,12 +122,21 @@ class _ViewChangeState(_NotificationBase):
 
     def __init__(self):
         self.generation = 0
-        self.values: dict[str, tuple[int, Any]] = {}
+        # #1049 review: what a memo of the view's BYTES depends on -- written
+        # data, a rebase, the segment/section map -- moves only this counter
+        # besides `generation`, so a rename does not invalidate a byte scan.
+        self.data_generation = 0
+        self.values: dict[str, tuple[Any, Any]] = {}
         self.lock = threading.Lock()
 
     def _changed(self):
         with self.lock:
             self.generation += 1
+
+    def _bytes_changed(self):
+        with self.lock:
+            self.generation += 1
+            self.data_generation += 1
 
     def symbol_added(self, *_args):
         self._changed()
@@ -157,7 +166,31 @@ class _ViewChangeState(_NotificationBase):
         self._changed()
 
     def data_written(self, *_args):
-        self._changed()
+        self._bytes_changed()
+
+    def data_inserted(self, *_args):
+        self._bytes_changed()
+
+    def data_removed(self, *_args):
+        self._bytes_changed()
+
+    def segment_added(self, *_args):
+        self._bytes_changed()
+
+    def segment_removed(self, *_args):
+        self._bytes_changed()
+
+    def segment_updated(self, *_args):
+        self._bytes_changed()
+
+    def section_added(self, *_args):
+        self._bytes_changed()
+
+    def section_removed(self, *_args):
+        self._bytes_changed()
+
+    def section_updated(self, *_args):
+        self._bytes_changed()
 
     def type_defined(self, *_args):
         self._changed()
@@ -166,7 +199,29 @@ class _ViewChangeState(_NotificationBase):
         self._changed()
 
     def rebased(self, *_args):
-        self._changed()
+        self._bytes_changed()
+
+
+def _view_data_memo(bv, slot: str, key: Any, build):
+    """Memoise ``build()`` -- a value derived from *bv*'s BYTES alone, plus a
+    caller-supplied *key* naming every other input -- across symbol, function
+    and type changes, and rebuild it only when the data generation (written
+    or moved bytes, the segment/section map) or *key* changes. Same soundness
+    rule as :func:`_view_memo`: with no notification surface nothing is cached,
+    and a value built while the data moved is not stored."""
+    state = _view_state(bv)
+    if state is None:
+        return build()
+    with state.lock:
+        stamp = (state.data_generation, key)
+        cached = state.values.get(slot)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    value = build()
+    with state.lock:
+        if state.data_generation == stamp[0]:
+            state.values[slot] = (stamp, value)
+    return value
 
 
 # Keyed weakly by the view: the state (and every memo it holds) dies with the

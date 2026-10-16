@@ -171,13 +171,6 @@ def test_class_apply_types_summary_states_the_plan():
         "class_apply_types": {**plan, "size": "0x20", "skipped_methods": []},
         "results": [{"op": "types_declare", "status": "verified"}]}))
     assert "instance struct: declared (size 0x20)" in sized and "\nskipped:" not in sized
-    # #1018.2: an opt-in allocation width names the sites it came from.
-    allocated = _render_mutation_summary_text(_mutation_summary({
-        "success": True, "committed": True, "rolled_back": False,
-        "class_apply_types": {**plan, "size": "0x38", "size_source": "allocation_request",
-                              "size_sites": ["0x402483", "0x4025a0"]},
-        "results": [{"op": "types_declare", "status": "verified"}]}))
-    assert "declared (size 0x38, the allocation request at 0x402483, 0x4025a0)" in allocated
     # The count is what each retype's row says happened: an already-typed
     # parameter is `noop`, not "retyped"; parameter-0 retypes are counted.
     rerun = _render_mutation_summary_text(_mutation_summary({

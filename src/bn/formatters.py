@@ -7055,12 +7055,7 @@ def _render_mutation_summary_text(value: Any) -> str:
         size_note = ""
         if action == "declared":
             size = _text_value(plan, "size")
-            if size and _text_value(plan, "size_source") == "allocation_request":
-                # #1018.2: the opt-in width says where it came from.
-                sites = ", ".join(str(s) for s in _field_list(plan, "size_sites"))
-                size_note = f" (size {size}, the allocation request at {sites or '?'})"
-            else:
-                size_note = f" (size {size})" if size else " (size unknown: only the vptr is declared)"
+            size_note = f" (size {size})" if size else " (size unknown: only the vptr is declared)"
         elif _field_declared(plan, "vptr_member_before"):
             before = _field_dict(plan, "vptr_member_before")
             size_note = (f" (was {_text_value(before, 'field_type') or '<unknown>'} "
@@ -7756,7 +7751,10 @@ def _render_class_list_text(value: Any) -> str:
             tail = " (? non-class RTTI/type artifacts)"
         else:
             tail = ""
-        return f"{quick_prefix}classes: {n}{tail}{_class_inputs_note(value)}"
+        scan = ("\n! typeinfo byte scan stopped at its data cap; a class whose RTTI Binary "
+                "Ninja did not name may be missing from this count."
+                if value.get("abi_scan_truncated") else "")
+        return f"{quick_prefix}classes: {n}{tail}{_class_inputs_note(value)}{scan}"
     # #770: the count line states the PAGE, and the shared paging footer carries
     # the total/resume half -- the same split every other paged list uses. This
     # header used to assert "classes: N shown of TOTAL" unconditionally, so a
@@ -7947,8 +7945,8 @@ def _vtable_slot_label(s: dict[str, Any]) -> str:
 
 
 def _vtable_slot_facts(s: dict[str, Any]) -> str:
-    """#1040.2: the body facts bn read for an UNNAMED slot, and the destructor
-    suggestion on top of them, as one bracketed tail ("" when none were read)."""
+    """#1040.2: the neutral body facts bn read for an UNNAMED slot, as one
+    bracketed tail ("" when none were read). No role is inferred from them."""
     if not _field_present(s, "body"):
         return ""
     body = _field_dict(s, "body")
@@ -7966,25 +7964,7 @@ def _vtable_slot_facts(s: dict[str, Any]) -> str:
     if body.get("calls_operator_delete") and not any(
             str(_text_value(c, "name") or "").startswith("operator delete") for c in calls):
         facts.append("calls operator delete")
-    tail = f"  [{'; '.join(facts)}]" if facts else ""
-    kind = _text_value(s, "suggestion")
-    if kind in ("D1", "D0"):
-        what = "complete-object destructor" if kind == "D1" else "deleting destructor"
-        tail += f"  likely {kind} ({what})"
-    elif _text_value(s, "suggestion_withheld"):
-        tail += f"  (no suggestion: {_text_value(s, 'suggestion_withheld')})"
-    return tail
-
-
-def _render_class_rename_manifest(value: Any) -> str:
-    """#1040.2: `class show --emit-renames` -- the manifest as JSON that `bn
-    batch apply -` reads as is, or the one-line reason there is none."""
-    if not isinstance(value, dict):
-        return _render_fallback_text(value)
-    ops = value.get("ops")
-    if isinstance(ops, list) and ops:
-        return json.dumps({k: v for k, v in value.items() if k != "note"}, indent=2)
-    return f"no renames: {value.get('note') or 'no suggestion on this card'}"
+    return f"  [{'; '.join(facts)}]" if facts else ""
 
 
 @_discloses
@@ -8093,13 +8073,6 @@ def _render_one_class(rec: Any) -> str:
         reason = _text_value(vt, "truncated_reason") or "unknown"
         lines.append(f"  vtable: symbol present, slots not proven ({reason}); "
                      f"inspect the table with `bn evidence table {vt_addr}`")
-    if _field_present(rec, "suggested_renames"):
-        ops = _field_list(_field_dict(rec, "suggested_renames"), "ops")
-        if ops:
-            lines.append(
-                f"  suggested names: {len(ops)} slot(s) above fit the destructor shape; "
-                f"`bn class show {shlex.quote(str(rec.get('name', '')))} --emit-renames` "
-                "prints them as a `bn batch apply` manifest")
     if vt.get("truncated"):
         # #822: the cap note now carries the bound instead of only the cap, so a
         # reader can see how much the cap hid -- the validated minimum, never a
