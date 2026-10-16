@@ -477,7 +477,7 @@ def test_gc_instances_on_empty_or_missing_dir_is_noop(tmp_path, monkeypatch):
     result = gc_instances()
     assert result == {
         "live_instances": 0, "registries_purged": 0, "logs_removed": 0,
-        "sockets_removed": 0, "last_used_removed": 0, "stop_records_removed": 0, "removed": [],
+        "sockets_removed": 0, "last_used_removed": 0, "removed": [],
     }
 
 

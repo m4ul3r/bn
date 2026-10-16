@@ -2708,7 +2708,6 @@ def test_instance_gc_json_carries_counts(monkeypatch, capsys):
     summary = {
         "live_instances": 0, "registries_purged": 0,
         "logs_removed": 0, "sockets_removed": 0, "last_used_removed": 0,
-        "stop_records_removed": 0,
         "removed": [],
     }
     monkeypatch.setattr(bn.cli, "gc_instances", lambda: summary)
@@ -2726,7 +2725,6 @@ def test_instance_gc_reports_summary_text(monkeypatch, capsys):
     monkeypatch.setattr(bn.cli, "gc_instances", lambda: {
         "live_instances": 2, "registries_purged": 1,
         "logs_removed": 147, "sockets_removed": 3, "last_used_removed": 2,
-        "stop_records_removed": 4,
         "removed": ["x"],
     })
 
@@ -2738,7 +2736,7 @@ def test_instance_gc_reports_summary_text(monkeypatch, capsys):
     # sidecar count and the registry count) cannot pass on a substring (#733 F6).
     assert out.strip() == (
         "gc: reaped 147 logs, 3 orphan sockets, 2 last-used sidecars, "
-        "4 stop records, 1 dead registry (2 live instances kept)"
+        "1 dead registry (2 live instances kept)"
     )
     assert "Traceback" not in out
 

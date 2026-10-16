@@ -1994,7 +1994,6 @@ def _render_instance_gc_text(value: Any) -> str:
     logs = _stated_count(value, "logs_removed")
     socks = _stated_count(value, "sockets_removed")
     last = _stated_count(value, "last_used_removed")
-    stops = _stated_count(value, "stop_records_removed")
     regs = _stated_count(value, "registries_purged")
     live = value.get("live_instances", 0)
     # The same rule twice on purpose: `_stated_count` for what is PRINTED, the
@@ -2002,16 +2001,18 @@ def _render_instance_gc_text(value: Any) -> str:
     # into a confident "nothing to reap" either -- that is the same claim as a
     # fabricated zero, one branch up. (`_count_field` re-reads are idempotent;
     # `_record_skew` dedupes.)
-    counters = ("logs_removed", "sockets_removed", "last_used_removed",
-                "stop_records_removed", "registries_purged")
-    reaped = sum(_count_field(value, key) for key in counters)
-    if reaped == 0 and not any(_field_skewed(key) for key in counters):
+    reaped = (_count_field(value, "logs_removed")
+              + _count_field(value, "sockets_removed")
+              + _count_field(value, "last_used_removed")
+              + _count_field(value, "registries_purged"))
+    if reaped == 0 and not any(_field_skewed(key) for key in
+                               ("logs_removed", "sockets_removed",
+                                "last_used_removed", "registries_purged")):
         return f"gc: nothing to reap ({live} live instance{'' if live == 1 else 's'})"
     return (
         f"gc: reaped {logs} log{'' if logs == '1' else 's'}, "
         f"{socks} orphan socket{'' if socks == '1' else 's'}, "
         f"{last} last-used sidecar{'' if last == '1' else 's'}, "
-        f"{stops} stop record{'' if stops == '1' else 's'}, "
         f"{regs} dead registr{'y' if regs == '1' else 'ies'} "
         f"({live} live instance{'' if live == 1 else 's'} kept)"
     )

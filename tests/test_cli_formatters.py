@@ -4308,10 +4308,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
     # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
-    # #1035 adds `instance gc`'s `stop_records_removed`.
-    assert len(sites) == 64, (
+    assert len(sites) == 63, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 64. A "
+        "count helper, not 63. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 

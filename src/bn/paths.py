@@ -213,18 +213,6 @@ def bridge_registry_path(instance_id: str | None = None) -> Path:
     return instances_dir() / f"{validate_instance_id(instance_id)}.json"
 
 
-def stop_record_path(registry_path: Path) -> Path:
-    """The `<id>.stopped` record beside the registry `<id>.json` (#1035 item 1).
-
-    Derived from the registry NAME, as `bn instance gc` reverse-maps it, not
-    with ``Path.with_suffix``: the legal ids ``...`` and ``....json`` have the
-    registries ``....json`` and ``....json.json``, and ``with_suffix`` maps both
-    to one record path.
-    """
-    return registry_path.with_name(registry_path.name.removesuffix(".json") + ".stopped")
-
-
-
 # A Unix-domain socket address is a fixed-size `sockaddr_un.sun_path` char array
 # -- 108 bytes on Linux, 104 on the BSDs/macOS -- and bind() needs room for the
 # trailing NUL, so the usable path is one byte shorter. Nothing bounded this, so
