@@ -1337,6 +1337,7 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
         flags = _database_flags(filename)
     from_database = flags["opened_from_database"]
     own_save = opened.get("written_by_this_bridge") if opened is not None else None
+    own_at_open = opened.get("own_at_open") if opened is not None else None
     try:
         annotations = _annotation_summary(ctx, bv)
     except Exception as exc:
@@ -1344,9 +1345,19 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
         unavailable.update(flags)
         return unavailable
     if opened_known:
-        inherited = ({k: v for k, v in opened.items() if k in OPENED_ANNOTATION_COUNTS}
-                     if opened else {})
-        present = opened is not None and own_save is None
+        present_at_open = ({k: v for k, v in opened.items() if k in OPENED_ANNOTATION_COUNTS}
+                           if opened else {})
+        inherited = dict(present_at_open)
+        if isinstance(own_at_open, dict):
+            # #1036 item 5: only annotations the session ledger shows this
+            # bridge wrote are subtracted -- never the whole file because this
+            # bridge wrote the file.
+            for key in ("comments", "function_comments", "analyst_symbols"):
+                inherited[key] = max(0, inherited.get(key, 0) - int(own_at_open.get(key, 0)))
+            present = any(inherited.get(key, 0) for key in (
+                "comments", "function_comments", "analyst_symbols"))
+        else:
+            present = opened is not None
     else:
         inherited = annotations
         present = from_database or bool(
@@ -1365,6 +1376,14 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
             )
         else:
             restored = f" (database {source})"
+        own_note = ""
+        if isinstance(own_at_open, dict) and any(own_at_open.values()):
+            own_note = (
+                f"; not counted: {own_at_open.get('comments', 0)} comment(s), "
+                f"{own_at_open.get('function_comments', 0)} function doc(s) and "
+                f"{own_at_open.get('analyst_symbols', 0)} analyst symbol(s) this "
+                "bridge's own verified writes account for"
+            )
         hint = (
             f"existing BNDB annotations may predate this run: "
             f"{inherited['comments']} comment(s), "
@@ -1373,6 +1392,7 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
             + ("present when the database was opened "
                if opened_known else "already present ")
             + f"({inherited['placeholder_symbols']} loader placeholder(s) excluded)"
+            + own_note
             + (restored if from_database else "")
             + " -- do not over-credit current-run analysis"
         )
@@ -1380,8 +1400,9 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
         **annotations,
         **flags,
         "source_verified": source_verified,
-        **({"present_at_open": inherited} if opened is not None else {}),
+        **({"present_at_open": present_at_open} if opened is not None else {}),
         **({"written_by_this_bridge": own_save} if own_save is not None else {}),
+        **({"own_at_open": own_at_open} if isinstance(own_at_open, dict) else {}),
         "provenance_hint": hint,
     }
 

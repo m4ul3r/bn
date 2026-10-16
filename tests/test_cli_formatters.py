@@ -4308,9 +4308,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
     # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
-    assert len(sites) == 63, (
+    # #1036 adds the three `own_at_open` counts of `_own_save_lines`.
+    assert len(sites) == 66, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 63. A "
+        "count helper, not 66. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4378,6 +4379,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # list and `--count` renderers both append, like the line above.
         "_mangled_only_note(mangled_only_matches) [not a payload renderer]",
         "_operation_row_text(count) [not a payload renderer]",
+        # #1036: a fragment helper under `existing_annotations`, covered by
+        # `test_an_exported_inherited_comment_stays_inherited_1036`.
+        "_own_save_lines(analyst_symbols) [not a payload renderer]",
+        "_own_save_lines(comments) [not a payload renderer]",
+        "_own_save_lines(function_comments) [not a payload renderer]",
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",
         "_paging_footer(total) [not a payload renderer]",
@@ -5939,7 +5945,7 @@ def test_save_text_says_an_export_is_not_the_targets_database():
     })
     assert out.splitlines()[0] == "saved: /out/demod.bndb"
     assert "an export, not this target's own database" in out
-    assert "still writes /ro/demod.bndb" in out
+    assert "a plain `bn save` writes /ro/demod.bndb" in out
     assert "reopens /ro/demod (the raw file, without this analysis)" in out
     plain = _render_save_text({"ok": True, "saved": True, "path": "/ro/demod.bndb"})
     assert plain == "saved: /ro/demod.bndb"

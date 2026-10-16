@@ -2714,12 +2714,15 @@ class TestSidecarContentValidation:
         assert back["targets"][0]["source_verified"] is True, back["targets"]
         assert shared_bn.run("close", str(sidecar)).returncode == 0
 
-    def test_an_export_reloads_paired_and_as_this_bridges_own_work_1036(
+    def test_an_export_reloads_paired_and_credits_only_the_ledgers_writes_1036(
             self, shared_bn, tmp_path):
         """#1036 items 4-5 on real BN: `save <path>` is an export that says so;
-        loading it back keeps `-t prog` on the raw view, verifies the copy
-        against the raw file BN recorded in it (no sibling exists), and reads
-        as this bridge's own work rather than inherited annotations."""
+        loading it back keeps `-t prog` on the raw view and verifies the copy
+        against the raw file BN recorded in it (no sibling exists). Only the
+        writes the session ledger shows this bridge verified are its own: a
+        comment set outside the ledger (here through `py exec`, as an earlier
+        run's would be) stays inherited, also after the source view closed
+        (review round 1, blocker and finding 4)."""
         prog = tmp_path / "ro" / "prog"
         prog.parent.mkdir()
         prog.write_bytes(Path(HELLO_BINARY).read_bytes())
@@ -2743,9 +2746,25 @@ class TestSidecarContentValidation:
         assert annotations["restored_from_cache"] is False, annotations
         assert annotations["source_verified"] is True, annotations
         assert annotations["written_by_this_bridge"]["kind"] == "export", annotations
+        assert annotations["own_at_open"]["analyst_symbols"] == 1, annotations
         assert annotations["provenance_hint"] is None, annotations
         shown = shared_bn.run("-t", "prog.bndb", "target", "info")
-        assert "opened from a database this bridge exported from" in shown.stdout, shown.stdout
+        assert "opened from a file this bridge exported from" in shown.stdout, shown.stdout
+        assert shared_bn.run("close", str(export)).returncode == 0
+
+        planted = shared_bn.run(
+            "-t", "prog", "py", "exec", "bv.set_comment_at(bv.entry_point, 'planted')")
+        assert planted.returncode == 0, planted.stdout + planted.stderr
+        second = tmp_path / "out" / "prog2.bndb"
+        assert shared_bn.json("-t", "prog", "save", str(second))["export"] is True
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        shared_bn.load(second, copy=False)
+        annotations = shared_bn.json("target", "info")["existing_annotations"]
+        assert annotations["written_by_this_bridge"]["kind"] == "export", annotations
+        assert annotations["own_at_open"] == {
+            "comments": 0, "function_comments": 0, "analyst_symbols": 1}, annotations
+        hint = annotations["provenance_hint"]
+        assert hint and "1 comment(s), 0 function doc(s), 0 analyst symbol(s)" in hint, hint
 
 
 class TestRestartReopensAStaleDatabaseLoudly:

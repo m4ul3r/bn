@@ -1449,11 +1449,23 @@ def _render_save_text(value: Any) -> str:
             "its database" if value.get("restart_path_is_database")
             else "the raw file, without this analysis"
         )
+        default = _text_value(value, "default_save_path") or "<unknown>"
+        fallback = _text_value(value, "default_cache_fallback")
+        refused = _flag_field(value, "default_cache_fallback_refused") is True
+        if fallback and refused:
+            # Review round 1, finding 6: say what a plain save does TODAY, not
+            # that it succeeds -- the cache entry it falls back to holds work
+            # this target did not load, so that save is refused.
+            plain = (f"tries {default}; if that is not writable it is refused, because "
+                     f"its cache fallback {fallback} already holds a database this "
+                     "target was not loaded from")
+        elif fallback:
+            plain = f"tries {default}, then the cache {fallback} if that is not writable"
+        else:
+            plain = f"writes {default}"
         line += (
-            "\nnote: an export, not this target's own database: a plain `bn save` "
-            f"still writes {value.get('default_save_path') or '<unknown>'} (or the "
-            f"cache when that is not writable), and `session restart` reopens "
-            f"{restart} ({restart_what})"
+            f"\nnote: an export, not this target's own database: a plain `bn save` "
+            f"{plain}; `session restart` reopens {restart} ({restart_what})"
         )
     collision = _field_dict(value, "collides_with_open_target")
     if collision:
@@ -1952,9 +1964,10 @@ def _database_flags_fragment(annotations: Any) -> str:
 
 
 def _own_save_lines(annotations: Any) -> list[str]:
-    """The line saying the database this view opened is one THIS bridge saved
-    or exported (and still the file it wrote), so its annotations are this
-    bridge's own work rather than inherited (#1036 item 5)."""
+    """The line saying the database this view opened is a FILE this bridge
+    saved or exported (and still the file it wrote) -- which says who wrote
+    the file, not who wrote its annotations -- and, when the session ledger
+    accounts for some of them, how many (#1036 item 5)."""
     own = _field_dict(annotations, "written_by_this_bridge")
     if not own:
         return []
@@ -1962,8 +1975,15 @@ def _own_save_lines(annotations: Any) -> list[str]:
     source = _text_value(own, "filename") or _text_value(own, "target_id") or "<unknown>"
     saved_at = _text_value(own, "saved_at")
     when = f" at {saved_at}" if saved_at else ""
-    return [(f"opened from a database this bridge {kind} from {source}{when}: "
-             "its annotations are this bridge's own work, not inherited")]
+    lines = [(f"opened from a file this bridge {kind} from {source}{when}; that says who "
+              "wrote the file, not who wrote its annotations")]
+    mine = _field_dict(annotations, "own_at_open")
+    if mine:
+        lines.append(
+            f"this bridge's own verified writes in it: {_stated_count(mine, 'comments')} "
+            f"comment(s), {_stated_count(mine, 'function_comments')} function doc(s), "
+            f"{_stated_count(mine, 'analyst_symbols')} analyst symbol(s)")
+    return lines
 
 
 def _source_verified_fragment(annotations: Any) -> str:
@@ -7078,7 +7098,8 @@ def _go_rename_summary(value: Any) -> Any:
 
 
 @_discloses
-def _render_mutation_summary_text(value: Any) -> str:
+def _render_mutation_summary_text(value: Any, *,
+                                  save_command: Callable[[], str] | None = None) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     # This word is the ONLY place the compact TEXT carries `rolled_back` (the
@@ -7238,6 +7259,12 @@ def _render_mutation_summary_text(value: Any) -> str:
                  "before closing.")
     if value.get("first_error"):
         line += f"\nfirst_error: {value['first_error']}"
+    if (save_command is not None and value.get("committed") is True
+            and value.get("dirty_after") is True):
+        # #1036 item 5: a committed change left the target dirty, so saving
+        # is the next step; the command is routed like the mutation was.
+        line += (f"\nnext: `{save_command()}` persists it "
+                 "(unsaved work is lost on close or session stop)")
     return line
 
 

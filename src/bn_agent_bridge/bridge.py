@@ -775,14 +775,17 @@ class TargetManager:
         # an EXPORT: it must never move the restart identity above (#857 r4),
         # but it is still a file THIS bridge wrote from this view, so loading
         # it back pairs with the raw view for selector resolution exactly like
-        # a default save does, and its annotations are this bridge's own work
-        # rather than inherited (#1036 items 4-5). Kept apart from
-        # `_database_paths` so nothing that reads the restart identity can see
-        # an export.
+        # a default save does (#1036 item 4). Kept apart from `_database_paths`
+        # so nothing that reads the restart identity can see an export.
         self._exports: dict[str, dict[str, tuple[int, int, int, int] | None]] = {}
-        # Stable view_id -> when this bridge last saved/exported each path, so a
-        # reload of the file can say whose work it holds and since when.
-        self._saved_at: dict[str, dict[str, str]] = {}
+        # Written path -> what this bridge wrote there: the file identity right
+        # after the write, the view it came from, when, and a copy of that
+        # view's session ledgers at that moment (#1036 item 5). Keyed by FILE,
+        # not by view, so it outlives closing the source view and covers a
+        # database saved in place. It says who wrote the FILE; whether a given
+        # annotation in it is this bridge's own is judged entry by entry
+        # against the copied ledgers, never from the file fact alone.
+        self._written_files: dict[str, dict[str, Any]] = {}
         # Stable view_id -> the comments THIS bridge wrote and verified, keyed
         # (scope, address) -> body, scope "address" (a global address comment)
         # or "function_doc" (fn.comment, keyed at the function start). Decompile
@@ -793,6 +796,11 @@ class TargetManager:
         # shares a location or a spelling with one is never credited to this
         # session.
         self._session_annotations: dict[str, dict[tuple[str, int], str]] = {}
+        # Stable view_id -> {address: name} of the function/data renames this
+        # bridge verified (`rename_symbol`), the symbol half of the same ledger:
+        # a reloaded database credits a symbol to this bridge only when its
+        # name at that address is one this bridge set (#1036 item 5).
+        self._session_symbols: dict[str, dict[int, str]] = {}
         # The manager that took this one's ledger over in a GUI bridge restart
         # (`succeed`). A request the old bridge admitted can still commit -- or
         # save, or close -- after the handover; its ledger change is forwarded
@@ -824,12 +832,15 @@ class TargetManager:
             self._exports = {
                 vid: dict(paths) for vid, paths in predecessor._exports.items()
             }
-            self._saved_at = {
-                vid: dict(stamps) for vid, stamps in predecessor._saved_at.items()
+            self._written_files = {
+                path: dict(record) for path, record in predecessor._written_files.items()
             }
             self._session_annotations = {
                 vid: dict(ledger)
                 for vid, ledger in predecessor._session_annotations.items()
+            }
+            self._session_symbols = {
+                vid: dict(ledger) for vid, ledger in predecessor._session_symbols.items()
             }
             predecessor._successor = self
 
@@ -856,41 +867,55 @@ class TargetManager:
             successor.clear_dirty(bv)
 
     def note_session_annotations(self, bv, results) -> None:
-        """Record the comments a committed mutation verified on *bv* (#977).
+        """Record the comments and symbol renames a committed mutation verified
+        on *bv* (#977, #1036 item 5).
 
         Only ``verified`` rows count: a ``noop`` set means the body was already
         stored, which is exactly the inherited case the redaction exists for.
         A verified delete forgets the location."""
         entries: list[tuple[tuple[str, int], str | None]] = []
+        renames: list[tuple[int, str]] = []
         for row in results or []:
             if not isinstance(row, dict) or row.get("status") != "verified":
                 continue
             op_name = row.get("op")
-            if op_name not in ("set_comment", "delete_comment"):
+            if op_name not in ("set_comment", "delete_comment", "rename_symbol"):
                 continue
             try:
                 address = int(str(row.get("address")), 16)
             except (TypeError, ValueError):
+                continue
+            if op_name == "rename_symbol":
+                name = row.get("new_name")
+                if isinstance(name, str) and name:
+                    renames.append((address, name))
                 continue
             scope = "function_doc" if row.get("scope") == "function_doc" else "address"
             body = None
             if op_name == "set_comment":
                 body = str((row.get("requested") or {}).get("comment") or "")
             entries.append(((scope, address), body or None))
-        if not entries:
+        if not entries and not renames:
             return
+        self.seed_session_ledger(bv, dict(entries), dict(renames))
+
+    def seed_session_ledger(self, bv, comments: dict[tuple[str, int], str | None],
+                            symbols: dict[int, str]) -> None:
+        """Merge verified writes into *bv*'s session ledgers (None deletes)."""
         with self._lock:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 ledger = self._session_annotations.setdefault(vid, {})
-                for key, body in entries:
+                for key, body in comments.items():
                     if body is None:
                         ledger.pop(key, None)
                     else:
                         ledger[key] = body
+                if symbols:
+                    self._session_symbols.setdefault(vid, {}).update(symbols)
             successor = self._successor
         if successor is not None:
-            successor.note_session_annotations(bv, results)
+            successor.seed_session_ledger(bv, comments, symbols)
 
     def session_annotations(self, bv) -> dict[tuple[str, int], str]:
         """The comments this bridge wrote on *bv*, keyed by (scope, address)."""
@@ -913,6 +938,9 @@ class TargetManager:
         an explicit save anywhere other than the target's own database. Never
         touches the restart identity."""
         self._note_written(bv, path, export=True)
+
+    # How many written files `_written_files` remembers; the oldest go first.
+    _WRITTEN_FILES_LIMIT = 256
 
     def _note_written(self, bv, path: str, *, export: bool) -> None:
         if not path:
@@ -952,7 +980,22 @@ class TargetManager:
                 else:
                     self._database_paths[vid] = str(path)
                     self._database_identities[vid] = identity
-                self._saved_at.setdefault(vid, {})[str(path)] = stamp
+            # The file ledger: every save, in place included, replaces what
+            # this bridge knew about that file.
+            for recorded in [p for p in self._written_files if _same_file(p, path)]:
+                del self._written_files[recorded]
+            record = self._records.get(vid) if vid is not None else None
+            self._written_files[str(path)] = {
+                "identity": identity,
+                "kind": "export" if export else "database",
+                "filename": record.filename if record is not None else (live or None),
+                "target_id": record.target_id() if record is not None else None,
+                "saved_at": stamp,
+                "comments": dict(self._session_annotations.get(vid, {})) if vid else {},
+                "symbols": dict(self._session_symbols.get(vid, {})) if vid else {},
+            }
+            while len(self._written_files) > self._WRITTEN_FILES_LIMIT:
+                del self._written_files[next(iter(self._written_files))]
             successor = self._successor
         if successor is not None:
             successor._note_written(bv, path, export=export)
@@ -970,34 +1013,23 @@ class TargetManager:
             return list(self._exports.get(vid, {})) if vid is not None else []
 
     def written_by_this_bridge(self, path: str | Path) -> dict[str, Any] | None:
-        """Which open view this bridge saved or exported *path* from, judged by
-        the file itself: *path* must still be the file written -- same device,
-        inode, size and mtime as recorded right after the save -- so a database
-        replaced or rewritten by anyone else since is not claimed. None
-        otherwise. Read BEFORE the view opened from *path* is published."""
+        """What this bridge wrote at *path*, judged by the file itself: *path*
+        must still be the file written -- same device, inode, size and mtime
+        as recorded right after the save -- so a database replaced or
+        rewritten by anyone else since is not claimed. Independent of whether
+        the view it was saved from is still open. None otherwise.
+
+        A copy of the record, including the session ledgers copied at the
+        save: it says who wrote the FILE, and only those ledgers can say which
+        annotations in it are this bridge's own."""
         current = _file_identity(str(path))
         if current is None:
             return None
         with self._lock:
-            entries = [
-                (vid, recorded, self._database_identities.get(vid), "database")
-                for vid, recorded in self._database_paths.items()
-            ] + [
-                (vid, recorded, identity, "export")
-                for vid, paths in self._exports.items()
-                for recorded, identity in paths.items()
-            ]
-            for vid, recorded, identity, kind in entries:
-                if identity is None or identity != current or not _same_file(recorded, str(path)):
-                    continue
-                record = self._records.get(vid)
-                return {
-                    "kind": kind,
-                    "view_id": vid,
-                    "target_id": record.target_id() if record is not None else None,
-                    "filename": record.filename if record is not None else None,
-                    "saved_at": self._saved_at.get(vid, {}).get(recorded),
-                }
+            for recorded, written in self._written_files.items():
+                if written["identity"] == current and _same_file(recorded, str(path)):
+                    return {**written, "comments": dict(written["comments"]),
+                            "symbols": dict(written["symbols"])}
         return None
 
     def open_target_for_path(self, path: str, *, exclude) -> dict[str, Any] | None:
@@ -1064,7 +1096,7 @@ class TargetManager:
                 self._database_paths.pop(vid, None)
                 self._database_identities.pop(vid, None)
                 self._exports.pop(vid, None)
-                self._saved_at.pop(vid, None)
+                self._session_symbols.pop(vid, None)
                 self._session_annotations.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
@@ -1457,8 +1489,9 @@ class TargetManager:
                 self._exports = {
                     vid: paths for vid, paths in self._exports.items() if vid in alive
                 }
-                self._saved_at = {
-                    vid: stamps for vid, stamps in self._saved_at.items() if vid in alive
+                self._session_symbols = {
+                    vid: ledger for vid, ledger in self._session_symbols.items()
+                    if vid in alive
                 }
                 self._session_annotations = {
                     vid: ledger for vid, ledger in self._session_annotations.items()
@@ -3248,13 +3281,22 @@ class BinaryNinjaBridge:
                     opened_record, restored=substitute.source == "cache")
                 if annotation_note is not None:
                     notes.append(annotation_note)
+            own_ledger: tuple[dict, dict] | None = None
             if opened_record is not None:
                 # #1036 item 5: a database THIS bridge saved or exported, and
-                # still the very file it wrote, holds this bridge's own work --
-                # judged by the file, not by its name.
-                own = self.targets.written_by_this_bridge(load_path)
-                if own is not None:
-                    opened_record["written_by_this_bridge"] = own
+                # still the very file it wrote, is disclosed as such -- a fact
+                # about the FILE. Which of its annotations are this bridge's own
+                # is judged one by one against the session ledgers copied at
+                # that save (location and body/name), never from the file fact:
+                # an exported inherited comment stays inherited.
+                written = self.targets.written_by_this_bridge(load_path)
+                if written is not None:
+                    own_counts, own_comments, own_symbols = _own_annotations_at_open(
+                        bv, written)
+                    opened_record["written_by_this_bridge"] = {
+                        key: written[key] for key in ("kind", "filename", "target_id", "saved_at")}
+                    opened_record["own_at_open"] = own_counts
+                    own_ledger = (own_comments, own_symbols)
             # The load note is one-shot; the target row keeps the verdict so a
             # later `target info` can still answer whether the restored
             # database was verified against the raw file.
@@ -3274,6 +3316,11 @@ class BinaryNinjaBridge:
                 if opened_known:
                     _opened_annotations[view_session_key(bv)] = opened_record
                 targets = self.targets.refresh()
+                if own_ledger is not None:
+                    # The new view's ledgers start with what this bridge
+                    # verified and the file still holds, so `comment list` and
+                    # decompile mark those as this session's like the hint does.
+                    self.targets.seed_session_ledger(bv, *own_ledger)
                 loaded_target = self._loaded_target_row(targets, bv)
                 if loaded_target and loaded_target.get("selector_reason"):
                     notes.append(
@@ -3791,10 +3838,7 @@ class BinaryNinjaBridge:
             # another run's saved analysis with this one. Write it only when it
             # is new, or is this view's own: opened from it, or written by an
             # earlier save of this view.
-            if Path(cache_path).exists() and not (
-                _same_file(cache_path, filename)
-                or _same_file(self.targets.recorded_database(bv), cache_path)
-            ):
+            if self._cache_holds_other_work(bv, cache_path, filename):
                 _restore_filename()
                 raise OperationFailure(
                     "invalid_request",
@@ -3900,20 +3944,40 @@ class BinaryNinjaBridge:
             self.targets.note_database(bv, saved)
         else:
             # An EXPORT (#1036 items 4-5): recorded in its own ledger so a
-            # reload of the copy pairs with this view and reads as this
-            # bridge's work, and SAID to be an export, with where the target
-            # itself still saves and restarts from.
+            # reload of the copy pairs with this view, and SAID to be an
+            # export, with where the target itself still saves and restarts
+            # from.
             self.targets.note_export(bv, saved)
             result["export"] = True
-            result["default_save_path"] = (
+            default_path = (
                 filename if filename.endswith(".bndb") else f"{filename}.bndb"
             ) if filename else None
+            result["default_save_path"] = default_path
+            # Where a plain save goes when the default is not writable, and --
+            # judged by the same predicate the save itself applies -- whether
+            # that fallback is refused today because the cache entry holds
+            # work this target did not load (review round 1, finding 6). The
+            # current state of the cache, not a prediction of writability.
+            if default_path and default_path != filename and cache_path:
+                result["default_cache_fallback"] = cache_path
+                result["default_cache_fallback_refused"] = self._cache_holds_other_work(
+                    bv, cache_path, filename)
             result["restart_path"] = self.targets.recorded_database(bv) or filename or None
             result["restart_path_is_database"] = bool(
                 self.targets.recorded_database(bv) or filename.endswith(".bndb"))
         self._stamp_cache_writer(saved, result)
         _disclose_open_target_collision(self.targets, bv, saved, result)
         return result
+
+    def _cache_holds_other_work(self, bv, cache_path: str, filename: str) -> bool:
+        """Does the cache entry at *cache_path* exist and hold a database this
+        target was neither opened from nor wrote with an earlier save? Then a
+        default save that falls back to it is refused rather than overwrite
+        another run's analysis."""
+        return Path(cache_path).exists() and not (
+            _same_file(cache_path, filename)
+            or _same_file(self.targets.recorded_database(bv), cache_path)
+        )
 
     def _stamp_cache_writer(self, saved: str, result: dict[str, Any]) -> None:
         """After a save that wrote a SHARED cache entry, record who wrote it
@@ -6660,6 +6724,10 @@ def _record_cache_writer(entry: Path, instance_id: str | None,
         return f"the entry {entry} could not be read back to record its writer"
     record = {
         "instance_id": instance_id,
+        # The durable identity of the writing PROCESS (pid + boot id + start
+        # ticks): an instance NAME is reusable by any later process, so it
+        # alone is no proof that the loader is the writer (#1036 review).
+        "writer_process": _this_process_identity(),
         "project_roots": list(project_roots),
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "entry_identity": list(identity),
@@ -6680,14 +6748,24 @@ def _record_cache_writer(entry: Path, instance_id: str | None,
     return None
 
 
+def _this_process_identity() -> dict[str, Any] | None:
+    """``{pid, boot_id, pid_start_ticks}`` of this process, or None when the
+    platform cannot supply a complete identity (then no record can prove the
+    writer is this process, and only a project root can claim an entry)."""
+    payload = identity_payload()
+    return {"pid": os.getpid(), **payload} if payload else None
+
+
 def _cache_writer_verdict(entry: Path, instance_id: str | None,
                           project: str | None) -> tuple[bool, str]:
     """``(restore by default?, who wrote it)`` for the cache *entry*.
 
     True only when the writer record beside it still describes the entry
-    (same device, inode, size and mtime as right after the save) and names
-    this *instance_id* or lists the loading *project* root. No record, an
-    unreadable one, or one the entry has outlived is never ownership."""
+    (same device, inode, size and mtime as right after the save) and either
+    was written by THIS process (its durable pid/boot/start-ticks identity,
+    not just a reusable instance name) or lists the loading *project* root.
+    No record, an unreadable or malformed one, or one the entry has outlived
+    is never ownership -- and never stops the raw bytes from loading."""
     try:
         raw = json.loads(_cache_writer_path(entry).read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -6695,17 +6773,29 @@ def _cache_writer_verdict(entry: Path, instance_id: str | None,
     except (OSError, ValueError):
         return False, "its writer record is unreadable"
     if not isinstance(raw, dict):
-        return False, "its writer record is unreadable"
+        return False, "its writer record is malformed (not an object), so the writer is unknown"
     recorded = raw.get("entry_identity")
-    current = _file_identity(str(entry))
-    if not isinstance(recorded, list) or current is None or tuple(recorded) != current:
-        return False, "rewritten since its writer record was made, so the writer is unknown"
     writer = raw.get("instance_id")
-    roots = [root for root in raw.get("project_roots") or [] if isinstance(root, str)]
-    who = (f"written by instance {writer}" if isinstance(writer, str) and writer
-           else "written by a GUI bridge")
+    roots = raw.get("project_roots")
+    process = raw.get("writer_process")
+    if not (isinstance(recorded, list) and len(recorded) == 4
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in recorded)):
+        return False, "its writer record is malformed (entry_identity), so the writer is unknown"
+    if writer is not None and not isinstance(writer, str):
+        return False, "its writer record is malformed (instance_id), so the writer is unknown"
+    if not (isinstance(roots, list) and all(isinstance(root, str) for root in roots)):
+        return False, "its writer record is malformed (project_roots), so the writer is unknown"
+    if process is not None and not isinstance(process, dict):
+        return False, "its writer record is malformed (writer_process), so the writer is unknown"
+    current = _file_identity(str(entry))
+    if current is None or tuple(recorded) != current:
+        return False, "rewritten since its writer record was made, so the writer is unknown"
+    who = (f"written by instance {writer}" if writer else "written by a GUI bridge")
     who += f" for project {', '.join(roots)}" if roots else " with no project association"
-    own = bool(instance_id and writer == instance_id) or (project is not None and project in roots)
+    me = _this_process_identity()
+    same_process = (me is not None and process == me
+                    and bool(instance_id) and writer == instance_id)
+    own = same_process or (project is not None and project in roots)
     return own, who
 
 
@@ -6885,6 +6975,46 @@ def _opened_annotation_record(bv, database: Path | None) -> tuple[bool, dict[str
         "path": str(database),
         **{key: summary[key] for key in read_listing.OPENED_ANNOTATION_COUNTS},
     }
+
+
+def _own_annotations_at_open(bv, written: dict[str, Any]) -> tuple[
+        dict[str, int], dict[tuple[str, int], str], dict[int, str]]:
+    """Which annotations in *bv*, just opened from a file this bridge wrote,
+    are this bridge's own: those the session ledgers copied at that save say
+    it wrote and verified, and that *bv* still holds at the same location
+    with the same body (comment) or name (user symbol). Anything else in the
+    database -- a comment the source view itself inherited and exported
+    unchanged, a rename made through `py exec` -- is not credited.
+
+    Returns ``(counts, comments, symbols)``: counts in the
+    `present_at_open` keys, and the matched ledger entries."""
+    comments: dict[tuple[str, int], str] = {}
+    for (scope, address), body in written.get("comments", {}).items():
+        try:
+            if scope == "function_doc":
+                fn = bv.get_function_at(address)
+                stored = str(getattr(fn, "comment", "") or "") if fn is not None else ""
+            else:
+                stored = str(bv.get_comment_at(address) or "")
+        except Exception:  # noqa: BLE001 - unreadable is not a match
+            continue
+        if stored and stored == body:
+            comments[(scope, address)] = body
+    symbols: dict[int, str] = {}
+    for address, name in written.get("symbols", {}).items():
+        try:
+            symbol = bv.get_symbol_at(address)
+        except Exception:  # noqa: BLE001 - unreadable is not a match
+            continue
+        if (symbol is not None and getattr(symbol, "auto", True) is False
+                and getattr(symbol, "name", None) == name):
+            symbols[address] = name
+    counts = {
+        "comments": sum(1 for scope, _ in comments if scope == "address"),
+        "function_comments": sum(1 for scope, _ in comments if scope == "function_doc"),
+        "analyst_symbols": len(symbols),
+    }
+    return counts, comments, symbols
 
 
 def _opened_annotation_note(record: dict[str, Any], *, restored: bool = False) -> str | None:
@@ -7195,7 +7325,12 @@ def start_headless(
     # dead instance instead of an invisible orphan process.
     if binaries:
         for path in binaries:
-            _preload_binary(path, quick, prefer_bndb, instance_id)
+            if _preload_binary(path, quick, prefer_bndb, instance_id) is not None:
+                # The preload judged cache ownership by this cwd's project, so
+                # the bridge is associated with it exactly as a runtime load
+                # records its caller's root -- a later save then names that
+                # project as the entry's writer (#1036 review).
+                _bridge._record_project_root(os.getcwd())
         # #524: _preload_binary appends to _headless_views but (unlike the
         # runtime `bn load` path, which calls _write_registry) never rewrites the
         # registry, so the on-disk registry still lists zero binaries while the

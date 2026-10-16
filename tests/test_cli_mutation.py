@@ -1938,6 +1938,36 @@ def test_function_create_without_overlap_grows_no_overlap_disclosure(fake_transp
         "mutation: committed  changed=1  verified=1  noop=0  failed=0  dirty_after=True")
 
 
+@pytest.mark.parametrize("argv,expected", [
+    (["--target", "123:1:7"], "bn -t 123:1:7 save"),
+    (["-i", "worker 1", "--target", "-vt stripped"], "bn -i 'worker 1' --target='-vt stripped' save"),
+])
+def test_a_dirty_committed_mutation_names_the_save_that_persists_it_1036(
+        fake_transport, capsys, argv, expected):
+    """#1036 item 5: `dirty_after=True` with no hint that saving is next. The
+    compact line now ends with the save command, routed like the mutation
+    itself, and that command parses as printed; a preview (nothing committed)
+    gets no hint."""
+    import shlex
+
+    result = _split_create_result()
+    del result["results"][0]["overlaps"]
+    del result["results"][0]["note"]
+    fake_transport({"function_create": {"ok": True, "result": result}})
+
+    assert bn.cli.main(["function", "create", *argv, "0x401a44"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1].startswith(f"next: `{expected}` persists it"), lines
+    printed = shlex.split(lines[1].split("`")[1])
+    parsed = bn.cli.build_parser().parse_args(printed[1:])
+    assert parsed.target == argv[-1]
+
+    preview = {**result, "committed": False, "preview": True}
+    fake_transport({"function_create": {"ok": True, "result": preview}})
+    bn.cli.main(["function", "create", "--target", "123:1:7", "--preview", "0x401a44"])
+    assert "next:" not in capsys.readouterr().out
+
+
 def test_render_target_line_shows_symbol_and_string_for_mapped_targets():
     # ILX #4: mapped non-function targets should surface symbol/string + section,
     # not just bare hex.

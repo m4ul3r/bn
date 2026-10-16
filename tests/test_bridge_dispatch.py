@@ -2734,6 +2734,91 @@ def test_a_cache_save_records_who_wrote_the_entry_1036(monkeypatch, tmp_path):
     assert elsewhere == {}
 
 
+def test_a_reused_instance_name_does_not_claim_another_processs_entry_1036(
+        monkeypatch, tmp_path):
+    """Review round 1, finding 2: instance `review-writer` saved project A's
+    entry and stopped; a new process given the same name in project B restored
+    it. The record names the writing PROCESS (pid, boot id, start ticks); a
+    name match alone is not ownership. The project-root claim is unchanged."""
+    bridge = _load_bridge(monkeypatch)
+    entry = tmp_path / "demod.0011223344556677.bndb"
+    entry.write_bytes(b"BNDB")
+    assert bridge._record_cache_writer(entry, "review-writer", ["/proj/a"]) is None
+    assert bridge._cache_writer_verdict(entry, "review-writer", "/proj/b")[0] is True
+
+    record_path = bridge._cache_writer_path(entry)
+    record = json.loads(record_path.read_text())
+    record["writer_process"] = {**record["writer_process"], "pid": os.getpid() + 1,
+                                "pid_start_ticks": 1}
+    record_path.write_text(json.dumps(record))
+    own, who = bridge._cache_writer_verdict(entry, "review-writer", "/proj/b")
+    assert own is False and "written by instance review-writer for project /proj/a" in who
+    assert bridge._cache_writer_verdict(entry, "review-writer", "/proj/a")[0] is True
+
+
+@pytest.mark.parametrize("field,value", [
+    ("project_roots", 3), ("project_roots", [1]), ("instance_id", ["x"]),
+    ("entry_identity", "abc"), ("entry_identity", [1, 2]), ("writer_process", "me"),
+])
+def test_a_malformed_writer_record_loads_the_raw_bytes_and_says_why_1036(
+        monkeypatch, tmp_path, field, value):
+    """Review round 1, finding 5: `project_roots: 3` made a plain load fail
+    with `TypeError: 'int' object is not iterable`. A malformed record is
+    unknown ownership: the raw bytes load and the note says why."""
+    data = b"\x7fELF v1"
+    bridge, instance, loaded_paths, _views = _setup_provenance_load_test(
+        monkeypatch, db_metadata=_provenance(data))
+    raw, entry = _cache_entry_for(bridge, monkeypatch, tmp_path, data)
+    instance.instance_id = "agent-b"
+    bridge._record_cache_writer(entry, "agent-b", [str(tmp_path)])
+    record_path = bridge._cache_writer_path(entry)
+    record = json.loads(record_path.read_text())
+    record[field] = value
+    record_path.write_text(json.dumps(record))
+
+    result = instance._load_binary(str(raw), workdir=str(tmp_path))
+
+    assert loaded_paths == [str(raw)]
+    [note] = [n for n in result["notes"] if n.startswith("did not restore")]
+    assert f"malformed ({field})" in note, note
+    bridge._headless_views.clear()
+
+
+def test_the_export_note_says_a_plain_save_would_be_refused_1036(monkeypatch, tmp_path):
+    """Review round 1, finding 6: after an export the note promised a plain
+    save "still writes <sibling> (or the cache)", and that save was refused at
+    once because the cache entry held another writer's database. The result
+    now reports the fallback and whether the save's own refusal rule applies
+    today, and the text says so."""
+    from bn.formatters import _render_save_text
+
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path / "cache")
+    raw = tmp_path / "ro" / "demod"
+    raw.parent.mkdir()
+    raw.write_bytes(b"\x7fELF")
+    instance = bridge.BinaryNinjaBridge()
+    bv = _RehomingSaveBV(str(raw))
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+    export = tmp_path / "out" / "demod.bndb"
+    export.parent.mkdir()
+
+    free = instance._save_database(None, str(export))
+    assert free["default_cache_fallback_refused"] is False
+    assert "then the cache" in _render_save_text(free)
+
+    entry = Path(free["default_cache_fallback"])
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_bytes(b"another writer's database")
+    taken = instance._save_database(None, str(export))
+    assert taken["default_cache_fallback_refused"] is True
+    text = _render_save_text(taken)
+    assert "if that is not writable it is refused" in text, text
+    assert "still writes" not in text
+
+
+
 
 def test_cache_bndb_path_is_deterministic_and_content_keyed(monkeypatch, tmp_path):
     # The save and load sides must agree on the cache location for the same
@@ -3891,42 +3976,130 @@ def test_an_exported_database_keeps_the_raw_views_selector_1036(monkeypatch, tmp
         bridge._headless_views.clear()
 
 
-def test_reloading_this_bridges_own_export_is_not_inherited_work_1036(monkeypatch, tmp_path):
-    """#1036 item 5: after `save <path>` and `load <path>`, `target info` said
-    `cache-restored=True` and that the annotations "may predate this run" --
-    about a rename this bridge made a minute earlier. The flag is split, and a
-    database this bridge wrote, still the very file it wrote, gets no
-    inheritance hint and says whose work it is."""
+class _AnnotatedDatabaseView:
+    """A view opened from a database: the comments and user symbols it holds."""
+
+    def __init__(self, filename, *, comments=None, symbols=None, session_id="db-1"):
+        self.file = types.SimpleNamespace(filename=filename, session_id=session_id)
+        self._comments = dict(comments or {})
+        self._symbols = dict(symbols or {})
+
+    def get_comment_at(self, address):
+        return self._comments.get(address, "")
+
+    def get_function_at(self, address):
+        return None
+
+    def get_symbol_at(self, address):
+        name = self._symbols.get(address)
+        return types.SimpleNamespace(name=name, auto=False) if name else None
+
+
+def _existing_block(bridge, monkeypatch, db, opened_record, filename):
+    monkeypatch.setattr(bridge.read_listing, "_annotation_summary", lambda ctx, view: {
+        "comments": opened_record["comments"], "function_comments": 0,
+        "analyst_symbols": opened_record["analyst_symbols"],
+        "user_symbols": opened_record["analyst_symbols"], "placeholder_symbols": 0})
+    bridge._opened_annotations[db.file.session_id] = opened_record
+    try:
+        return bridge.read_listing._existing_annotations(
+            None, db, filename=filename, source_verified=True)
+    finally:
+        bridge._opened_annotations.pop(db.file.session_id, None)
+
+
+def test_an_exported_inherited_comment_stays_inherited_1036(monkeypatch, tmp_path):
+    """Review round 1, blocker. That this bridge wrote the FILE is not that it
+    wrote the annotations in it: a database holding a comment from an earlier
+    process, exported unchanged and reloaded, said "its annotations are this
+    bridge's own work" and dropped the inherited-work hint. Only what the
+    session ledger copied at the save shows this bridge verified -- here the
+    rename -- is credited; the inherited comment still counts. This holds
+    after the source view has closed (finding 4)."""
     from bn.commands.binary import _render_target_info_text_with_annotations
 
     bridge = _load_bridge(monkeypatch)
+    raw_path = tmp_path / "ro" / "demod"
+    raw_path.parent.mkdir()
+    raw_path.write_bytes(b"raw")
     export = tmp_path / "out" / "demod.bndb"
-    own = {"kind": "export", "view_id": "1", "target_id": "9:1:1",
-           "filename": "/ro/demod", "saved_at": "2026-10-15T20:00:00+00:00"}
-    bv = types.SimpleNamespace(
-        file=types.SimpleNamespace(filename=str(export), session_id="s-own"))
-    monkeypatch.setattr(bridge.read_listing, "_annotation_summary", lambda ctx, view: {
-        "comments": 0, "function_comments": 0, "analyst_symbols": 1,
-        "user_symbols": 1, "placeholder_symbols": 0})
-    bridge._opened_annotations["s-own"] = {
-        "path": str(export), "comments": 0, "function_comments": 0,
-        "analyst_symbols": 1, "placeholder_symbols": 0, "written_by_this_bridge": own}
-    try:
-        block = bridge.read_listing._existing_annotations(
-            None, bv, filename=str(export), source_verified=True)
-    finally:
-        bridge._opened_annotations.pop("s-own", None)
+    export.parent.mkdir()
+    raw = _FakeFileBV(str(raw_path), session_id="1")
+    _register_views(bridge, raw)
+    manager = bridge.TargetManager()
+    manager.refresh()
+    manager.note_session_annotations(raw, [{
+        "op": "rename_symbol", "status": "verified", "address": "0x401000",
+        "new_name": "fold_value_v2"}])
+    export.write_bytes(b"database exported by this bridge")
+    manager.note_export(raw, str(export))
+    manager.forget(raw)                                  # the source view closed
+    bridge._headless_views.clear()
 
-    assert block["opened_from_database"] is True
-    assert block["restored_from_cache"] is False
-    assert block["provenance_hint"] is None
-    assert block["written_by_this_bridge"] == own
-    assert "written_by_this_bridge" not in block["present_at_open"]
+    written = manager.written_by_this_bridge(export)
+    assert written is not None and written["kind"] == "export"
+    assert written["filename"] == str(raw_path)
+    db = _AnnotatedDatabaseView(str(export), comments={0x401100: "planted by an earlier run"},
+                                symbols={0x401000: "fold_value_v2"})
+    counts, comments, symbols = bridge._own_annotations_at_open(db, written)
+    assert counts == {"comments": 0, "function_comments": 0, "analyst_symbols": 1}
+    assert comments == {} and symbols == {0x401000: "fold_value_v2"}
+
+    block = _existing_block(bridge, monkeypatch, db, {
+        "path": str(export), "comments": 1, "function_comments": 0,
+        "analyst_symbols": 1, "placeholder_symbols": 0, "own_at_open": counts,
+        "written_by_this_bridge": {k: written[k] for k in (
+            "kind", "filename", "target_id", "saved_at")}}, str(export))
+    assert block["provenance_hint"] is not None
+    assert "1 comment(s), 0 function doc(s), 0 analyst symbol(s)" in block["provenance_hint"]
+    assert block["own_at_open"] == counts
+    assert block["present_at_open"]["comments"] == 1
     text = _render_target_info_text_with_annotations(
         {"selector": "demod.bndb", "existing_annotations": block})
-    assert ("opened from a database this bridge exported from /ro/demod at "
-            "2026-10-15T20:00:00+00:00") in text, text
-    assert "predate this run" not in text
+    assert f"opened from a file this bridge exported from {raw_path}" in text, text
+    assert "that says who wrote the file, not who wrote its annotations" in text
+    assert "own work, not inherited" not in text
+    assert "predate this run" in text
+
+    # With nothing in it but this bridge's own verified rename, nothing is
+    # inherited, so no hint.
+    clean = _AnnotatedDatabaseView(str(export), symbols={0x401000: "fold_value_v2"})
+    counts, _, _ = bridge._own_annotations_at_open(clean, written)
+    block = _existing_block(bridge, monkeypatch, clean, {
+        "path": str(export), "comments": 0, "function_comments": 0,
+        "analyst_symbols": 1, "placeholder_symbols": 0, "own_at_open": counts,
+        "written_by_this_bridge": {"kind": "export"}}, str(export))
+    assert block["provenance_hint"] is None
+
+    # A symbol renamed again by someone else (or by `py exec`) is not a match.
+    renamed = _AnnotatedDatabaseView(str(export), symbols={0x401000: "other_name"})
+    assert bridge._own_annotations_at_open(renamed, written)[0]["analyst_symbols"] == 0
+
+
+def test_an_in_place_save_is_remembered_as_this_bridges_file_1036(monkeypatch, tmp_path):
+    """Review round 1, finding 4: a database view saved over its own file
+    recorded nothing, so closing and reopening it lost the evidence. The
+    in-place save carries the view's ledger, seeded entries included."""
+    bridge = _load_bridge(monkeypatch)
+    database = tmp_path / "demod.bndb"
+    database.write_bytes(b"BNDB v1")
+    view = _FakeFileBV(str(database), session_id="1")
+    _register_views(bridge, view)
+    manager = bridge.TargetManager()
+    manager.refresh()
+    manager.seed_session_ledger(view, {("address", 0x401100): "mine"}, {0x401000: "f_v2"})
+    database.write_bytes(b"BNDB v2, saved in place")
+    manager.note_database(view, str(database))
+    manager.forget(view)
+    bridge._headless_views.clear()
+
+    written = manager.written_by_this_bridge(database)
+    assert written is not None
+    assert written["comments"] == {("address", 0x401100): "mine"}
+    assert written["symbols"] == {0x401000: "f_v2"}
+    assert manager.recorded_database(view) is None       # not a restart identity
+    database.write_bytes(b"rewritten by someone else since")
+    assert manager.written_by_this_bridge(database) is None
 
 
 def test_an_explicit_database_is_judged_against_the_raw_file_bn_recorded_1036(
@@ -4758,6 +4931,34 @@ def test_start_headless_rewrites_registry_after_preload(monkeypatch, tmp_path):
     payload = json.loads(registry.read_text())
     assert payload["binaries"] == ["/proj/foo.so"]
     bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("opened", [True, False])
+def test_a_preload_associates_its_project_root_1036(monkeypatch, tmp_path, opened):
+    """Review round 1, finding 3: a `bn-agent <binary>` preload judged cache
+    ownership by its cwd's project but never associated that project with the
+    bridge, so its next save wrote `project_roots: []` and the same project's
+    next start no longer restored the entry. A successful preload now records
+    the root as a runtime load does; a failed one records nothing."""
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    bridge._headless_views.clear()
+    project = tmp_path / "proj"
+    (project / ".git").mkdir(parents=True)
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(bridge.BinaryNinjaBridge, "start",
+                        lambda self: self._shutdown_event.set())
+    monkeypatch.setattr(bridge, "_stop_bridge", lambda: None)
+    monkeypatch.setattr(bridge.TargetManager, "refresh", lambda self: [])
+    monkeypatch.setattr(bridge, "_preload_binary",
+                        lambda path, quick, prefer_bndb=True, instance_id=None:
+                        object() if opened else None)
+
+    bridge.start_headless(binaries=[str(project / "demod")], instance_id="preload1")
+
+    payload = json.loads((tmp_path / "cache" / "instances" / "preload1.json").read_text())
+    assert payload.get("project_roots", []) == ([str(project)] if opened else [])
+    assert bridge._bridge._project_roots == ({str(project)} if opened else set())
 
 
 @pytest.mark.parametrize(
@@ -6300,6 +6501,8 @@ def test_save_path_preserves_target_identity(monkeypatch, tmp_path):
     # the target itself still saves and restarts from.
     assert result == {"ok": True, "saved": True, "path": str(out.resolve()),
                       "export": True, "default_save_path": orig + ".bndb",
+                      "default_cache_fallback": str(bridge._cache_bndb_path(orig)),
+                      "default_cache_fallback_refused": False,
                       "restart_path": orig, "restart_path_is_database": False}
     assert out.exists()
     assert bv.created_with == str(out.resolve())   # the copy WAS written
