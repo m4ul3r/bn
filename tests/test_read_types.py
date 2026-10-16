@@ -1677,9 +1677,10 @@ def test_preview_parse_imports_nothing_and_names_what_bn_refused_1012(monkeypatc
     failure = refused.value
     assert failure.status == "unsupported"
     assert failure.message.startswith(
-        "not previewed: needs timespec, pid_t, ns::Lib from libc_x86_64.so.6 ")
+        "not previewed: Binary Ninja refused to parse this without importing")
+    assert "timespec, pid_t, ns::Lib (libc_x86_64.so.6) -- a by-name match" in failure.message
     assert "Nothing was imported" in failure.message
-    assert failure.observed["library_types"] == ["timespec", "pid_t", "ns::Lib"]
+    assert failure.observed["library_name_matches"] == ["timespec", "pid_t", "ns::Lib"]
     assert failure.observed["imported"] is False
 
 
@@ -1700,8 +1701,8 @@ def test_preview_import_refusal_only_converts_bns_import_refusal_1012(monkeypatc
         failure = me._preview_import_refusal(bv, "struct S { mystery_t m; };", refusal)
     finally:
         me._PREVIEW_PARSE.reset(token)
-    assert "no name in the text matched one by lookup" in failure.message
-    assert failure.observed["library_types"] == []
+    assert "No name in the text matched a loaded type library by lookup" in failure.message
+    assert failure.observed["library_name_matches"] == []
 
 
 def test_live_imports_are_recognized_and_named_by_type_id_guid_1012(monkeypatch):

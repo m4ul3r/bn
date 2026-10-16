@@ -335,31 +335,40 @@ def _library_name_matches(bv, text: str) -> list[tuple[str, str]]:
     return found
 
 
+def _library_match_text(matches: list[tuple[str, str]]) -> str:
+    """``pid_t, FILE (libc_x86_64.so.6)`` for name matches grouped by library."""
+    by_library: dict[str, list[str]] = {}
+    for name, library in matches:
+        by_library.setdefault(library, []).append(name)
+    return "; ".join(f"{', '.join(names)} ({library})" for library, names in by_library.items())
+
+
 def _preview_import_refusal(bv, text: str, exc: BaseException, *,
                             requested: dict[str, Any] | None = None) -> OperationFailure | None:
     """The preview refusal for a parse BN declined because it would import, or
     None for any other parse error (#1012 item 1). Nothing was imported: the
-    parse ran with `import_dependencies=False`."""
+    parse ran with `import_dependencies=False`.
+
+    BN's refusal names no type, so the message names none as required: it lists
+    the by-name matches (`library_name_matches`) as matches only -- a member
+    named `FILE` matches libc's `FILE` without being a type use (#1012 review r1)."""
     if not _PREVIEW_PARSE.get() or _UNIMPORTED_LIBRARY_DIAGNOSTIC not in str(exc):
         return None
     matches = _library_name_matches(bv, text)
-    by_library: dict[str, list[str]] = {}
-    for name, library in matches:
-        by_library.setdefault(library, []).append(name)
-    if by_library:
-        needs = "; ".join(f"{', '.join(names)} from {library}" for library, names in by_library.items())
-        named = f"needs {needs} (names in the text that the view lacks and a type library defines)"
+    if matches:
+        named = (" Names in the text that the view lacks and a loaded type library defines: "
+                 f"{_library_match_text(matches)} -- a by-name match, so an identifier that "
+                 "only shares a library type's name is listed too.")
     else:
-        named = ("needs type-library or type-archive types the view does not have yet "
-                 "(no name in the text matched one by lookup)")
+        named = " No name in the text matched a loaded type library by lookup."
     return OperationFailure(
         "unsupported",
-        f"not previewed: {named}. Binary Ninja imports such a type while it parses, and no "
-        "undo removes an import, so the preview parsed without importing, and Binary Ninja "
-        "refused the parse. Nothing was imported. Run without --preview to apply it; the "
-        "import stays in the view.",
+        "not previewed: Binary Ninja refused to parse this without importing a type-library "
+        f"or type-archive type the view does not have yet.{named} Nothing was imported: a "
+        "preview parses with import_dependencies=False, because no undo removes an import. "
+        "Run without --preview to apply it; the import stays in the view.",
         requested=requested,
-        observed={"library_types": [name for name, _ in matches],
+        observed={"library_name_matches": [name for name, _ in matches],
                   "libraries": {name: library for name, library in matches},
                   "imported": False},
     )
@@ -1222,10 +1231,10 @@ def _unrevertible_label(ctx, bv, op: dict[str, Any], *, fn=None) -> str | None:
     except OperationFailure as exc:
         if (exc.observed or {}).get("imported") is not False:
             raise
-        needs = (exc.observed or {}).get("library_types") or []
-        return (f"{label} (its prototype also needs "
-                + (", ".join(needs) if needs else "a type-library type")
-                + ", which a preview does not import)")
+        matches = (exc.observed or {}).get("library_name_matches") or []
+        return (f"{label} (its prototype needs a type-library type the view does not have "
+                "yet, which a preview does not import"
+                + (f"; name matches: {', '.join(matches)}" if matches else "") + ")")
     if str(fn.type) == str(expected_type):
         return None
     return label
@@ -2676,12 +2685,15 @@ def refuse_quick_view(bv, *, requested: dict[str, Any],
 
 @contextlib.contextmanager
 def _import_outcome(ctx, selector, preview: bool, *, exclusive=None, direct: bool = False):
-    """Share one retained-ID outcome across a request, including direct previews.
+    """Share one retained-ID outcome across a request, preview or live,
+    including the direct paths (standalone `function create`, Go rename, class
+    apply-types) that bypass the batch engine (#1012 review r1: a live direct
+    path skipped tracking, so its analysis-side imports went unreported).
 
     The caller holds its write gate; only the two type snapshots take the target
     lock. A nested engine call keeps this request's baseline and finalizer.
     """
-    if _IMPORT_TRACE.get() is not None or (direct and not preview):
+    if _IMPORT_TRACE.get() is not None:
         yield lambda result: result
         return
     token = _PREVIEW_PARSE.set(bool(preview))
@@ -4866,16 +4878,21 @@ def _import_referenced_library_types(bv, type_objs, *, apply: bool = True) -> li
     return missing
 
 
-def _preview_library_refusal(names) -> str:
-    """Why a `--preview` of a declaration naming library types is refused.
-    It advises nothing but the live run: any declare it printed would itself
-    need those types, or overwrite a user type of the name it picked."""
+def _preview_library_refusal(bv, names) -> str:
+    """Why a `--preview` of a declaration is refused when its parsed types refer
+    to type-library types the view lacks. This is the path where BN's parse
+    itself succeeded without importing (a tag only pointed at, e.g. `struct
+    timespec*`); the names are the parsed types' own references, not text
+    matches. It advises nothing but the live run: any declare it printed would
+    itself need those types, or overwrite a user type of the name it picked."""
+    matches = [(name, str(getattr(found[0], "name", "") or "<unnamed library>"))
+               for name in names if (found := _library_type(bv, name)) is not None]
     return (
-        f"Cannot --preview this declaration: it names type-library type(s) the view does not "
-        f"have yet ({', '.join(names)}), and Binary Ninja imports them while it parses the "
-        f"declaration -- an import no undo reverts, and removing one stops Binary Ninja from "
-        f"ever importing it again. Run the declare without --preview: it imports them and "
-        f"lists them as `imported_from_library`."
+        "not previewed: the declaration's types refer to type-library type(s) the view "
+        "does not have yet. The live declare imports them with the library types they "
+        f"depend on: {_library_match_text(matches) or ', '.join(names)}. No undo removes an "
+        "import, so the preview stopped before importing. Nothing was imported. Run the "
+        "declare without --preview: it imports them and lists them as `imported_from_library`."
     )
 
 
@@ -5561,16 +5578,17 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
             bv.define_user_type(name, type_obj)
         # #993 item 2: BN imports a library type the parser needed BY VALUE and
         # leaves one only pointed at dangling; import both on purpose (the
-        # batch reports what came in). A preview imports nothing: one that
-        # needs a library type is refused before it starts, and this backstop
-        # refuses any the pre-check did not foresee.
+        # batch reports what came in). A preview imports nothing: its parse runs
+        # with import_dependencies=False, which BN refuses for most library
+        # uses; one it parses anyway (a tag only pointed at) is refused here.
         previewing = _PREVIEW_PARSE.get()
         needed = _import_referenced_library_types(
             bv, [type_obj for _, type_obj in named_types], apply=not previewing)
         if previewing and needed:
             raise OperationFailure(
-                "unsupported", _preview_library_refusal(needed),
-                requested=_operation_requested(ctx, op), observed={"library_types": needed})
+                "unsupported", _preview_library_refusal(bv, needed),
+                requested=_operation_requested(ctx, op),
+                observed={"library_types": needed, "imported": False})
     # Read back only once everything is defined: a type rendered while a name it
     # uses was still missing (`void (*)(Leaf*)` before `struct Leaf` lands) reads
     # differently afterwards, and verification compares against the final view.
