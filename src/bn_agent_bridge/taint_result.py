@@ -34,6 +34,9 @@ Unified diagnostics schema (attached to a zero-sink forward result under
       # --- #562 honesty gate (folded in) ---
       "safe_to_report_all_clear": bool,
       "all_clear_reason": str,
+      # #1041 item 1: on an all-clear from a buffer-filling call:/arg: seed,
+      # what the source-function gate does not cover; [] otherwise.
+      "all_clear_caveats": [str],
     }
 
 Reconciliation notes:

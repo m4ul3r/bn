@@ -6670,8 +6670,9 @@ class TaintEngine:
                                         reason="buffer_not_keyed",
                                     ))
                 if kind == "arg":
-                    # #1041 item 1 gate (#1050 review round 4): this arg is a
-                    # buffer the model says the call fills.
+                    # #1041 item 1 gate (#1050 review rounds 4-5): this arg is a
+                    # buffer the model says the call fills; the gate checks only
+                    # unresolved indirect calls in THIS function, not syscalls.
                     _, _fm = lookup_model(self.models, callee)
                     _idx = int(src["index"])
                     if any(str(s.get("to") or "") in (f"*arg:{_idx}", f"*iovec:{_idx}")
@@ -6868,9 +6869,9 @@ class TaintEngine:
                                 f"the modeled run (arg:{_mx + 1}+) are not "
                                 f"seeded. scanf_arity_residual"
                             )
-                # #1041 item 1 gate (#1050 review round 4): the model fills a
-                # buffer, so an unresolved indirect call reachable from the
-                # receive is an unchecked consumer of it.
+                # #1041 item 1 gate (#1050 review rounds 4-5): the model fills a
+                # buffer, so an unresolved indirect call in THIS function that
+                # can run after the receive is an unchecked consumer of it.
                 if any(str(sd.get("to") or "").startswith(("*arg:", "*iovec:"))
                        for sd in src_defs):
                     self._buffer_seeded = True
