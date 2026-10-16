@@ -44,6 +44,10 @@ brittle across compilers/optimisation.
 | `loop_escape_index.c`  | a loop-carried escape makes the helper that runs before it opaque on the next trip; an indexed byte of a memset buffer walks the buffer's writers beside the index. `loop_escape_index_o1.c` rebuilds it at -O1 |
 | `bw_loop_frontier.c`   | a memory-chain proof cut (300 unrelated calls) keeps the loop-carried escaped call `compose` named, like the uncut control (#1034 item 3) |
 | `bw_wide_load.c`       | loads are walked through the writers of the loaded bytes, never the pointer (#1041 item 2): the upper half of a wider field store is the input it came from, not the caller's malloc; a field stored on one path only, or overwritten through a second pointer, is a `field_load_unresolved` frontier. `bw_wide_load_o2.c` rebuilds it at -O2 (`sx.q([m + 0xc].d)` operands) |
+| `bw_slot_identity.c`   | slot identity is exact (#1053 review 1): a store through the low 32 bits of `slot` is not a store to `[slot]`, so the strcpy through the full reload is a may-writer and the slice is incomplete; the full-slot control stays complete. Built at -O2 |
+| `bw_fill_offset.c`     | a source fills a field only over its extent (#1053 review 2): `recv(fd, p->hdr, 8)` does not produce `p->len`; with no store the length is a `field_load_unresolved` frontier, with `p->len = n` it is `n` |
+| `bw_stash_overwrite.c` | `memcpy(&stash, &otherptr, 8)` forgets the remembered `&buf` (#1053 review 3): the later `strcpy(stash, ..)` is an opaque frontier, never a writer or `source` origin of `buf` |
+| `bw_global_load.c`     | a fixed-address load of a writable global nothing in the function wrote is a `field_load_unresolved` frontier (#1053 review 4) |
 
 ## `EXPECTED.json` schema
 

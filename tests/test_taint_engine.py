@@ -9897,11 +9897,14 @@ def test_backward_unresolved_origin_withholds_completeness_915(models):
     assert leaf["buffer"] == "cmd"
 
 
-def test_backward_unresolved_origin_without_a_leaf_withholds_completeness_915(models):
-    # The same gate end to end on the one shape that still ends with
-    # `origin.kind == "unresolved"` and NO leaf: a definition that reads no
-    # SSA variable and is neither a constant nor an address-of (a global load
-    # the memory walk cannot key). Before, this was "complete".
+@pytest.mark.parametrize("writable", [True, None, False])
+def test_backward_fixed_global_load_reaching_entry_is_a_frontier(models, writable):
+    # #1053 review 4: `x = [0x601040].q` with nothing in the function writing
+    # the global holds whatever was stored before the function ran -- a
+    # `field_load_unresolved` frontier naming the address, unless the address
+    # is read-only data (the binary's own bytes). Unknown storage is not
+    # read-only. Before, the load was dropped and only the origin-unresolved
+    # gate (#915) withheld completeness.
     x = FVar("x", ident=78); x1 = FSSA(x, 1)
     load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x#1 = [0x601040].q", writes=[x1],
                   src=FExpr("MLIL_LOAD_SSA", "[0x601040].q", reads=[],
@@ -9912,16 +9915,18 @@ def test_backward_unresolved_origin_without_a_leaf_withholds_completeness_915(mo
                   params=[FExpr("MLIL_VAR_SSA", "x#1", reads=[x1]),
                           FExpr("MLIL_CONST_PTR", "0x710", constant=0x710)])
     func = FFunc("run_global", 0x10, FSSAFunc([load, sink]), params=[])
-    result = te.TaintEngine(FBV({0xa10: "popen"}), models).backward(
-        func, [te.parse_locator("arg:popen:0")])
-    sl = result["slices"][0]
-    assert sl["origin"]["kind"] == "unresolved", sl["origin"]
-    assert sl["metrics"]["traverses_unresolved"] is True
-    assert result["leaves"] == [], result["leaves"]
-    diag = result["diagnostics"]
-    assert diag["safe_to_report_complete_slice"] is False, diag
-    assert diag["frontier"]["unresolved"] == 1, diag
-    assert "origin.kind == 'unresolved'" in diag["complete_slice_reason"], diag
+    bv = FBV({0xa10: "popen"})
+    if writable is not None:
+        bv.is_offset_writable = lambda addr: writable
+    result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
+    fields = [lf for lf in result["leaves"] if lf["kind"] == "field_load_unresolved"]
+    if writable is False:
+        assert not fields, result["leaves"]
+    else:
+        assert fields and fields[0]["base"] == "0x601040", result["leaves"]
+        assert "global holds what was stored before" in fields[0]["detail"]
+        assert result["slices"][0]["origin"]["kind"] == "field_load_unresolved"
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 def test_backward_gate_counts_unresolved_origins_even_without_a_leaf_915():

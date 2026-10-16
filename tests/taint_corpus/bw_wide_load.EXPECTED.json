@@ -33,7 +33,7 @@
         }
       ],
       "leaf_details_contain": [
-        "what the caller left"
+        "stored before this function ran"
       ],
       "complete_slice": false
     },

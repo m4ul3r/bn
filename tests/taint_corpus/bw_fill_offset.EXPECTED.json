@@ -1,0 +1,45 @@
+{
+  "description": "recv into p->hdr does not produce p->len: without a store the length is a field frontier, never a recv source; with `p->len = n` the length is n. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline"
+  ],
+  "backward": [
+    {
+      "function": "fill_other_field_nostore",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "fill_other_field",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "step_reasons_contain": [
+        "reaching store to field"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": true
+    }
+  ]
+}

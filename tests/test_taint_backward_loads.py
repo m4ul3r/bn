@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 from test_taint_engine import (
+    _B_MEMCPY,
     _B_MEMSET,
     _B_NAMES,
     _B_STRCPY,
@@ -23,8 +24,8 @@ from test_taint_engine import (
     te,
 )
 
-_READ_U32, _MEMCPY = 0xa10, 0xa20
-_NAMES = {_READ_U32: "read_u32", _MEMCPY: "memcpy"}
+_READ_U32, _MEMCPY, _RECV = 0xa10, 0xa20, 0xa30
+_NAMES = {_READ_U32: "read_u32", _MEMCPY: "memcpy", _RECV: "recv"}
 
 
 class _FieldProgram:
@@ -70,6 +71,19 @@ class _FieldProgram:
         i, a = self._at()
         ins = FInstr(i, a, "MLIL_MEM_PHI", "phi")
         ins.src_memory = list(versions)
+        self.mem += 1
+        ins.dest_memory = self.mem
+        self.mem_defs[self.mem] = ins
+        self.instrs.append(ins)
+        return ins
+
+    def call(self, target, params):
+        """A memory-defining call, e.g. ``recv(fd, <dest>, <len>, 0)``."""
+        i, a = self._at()
+        reads = [r for p in params for r in p.vars_read]
+        ins = FInstr(i, a, "MLIL_CALL_SSA", f"{_NAMES[target]}(...)", reads=reads,
+                     dest=FExpr("MLIL_CONST_PTR", hex(target), constant=target), params=params)
+        ins.src_memory = self.mem
         self.mem += 1
         ins.dest_memory = self.mem
         self.mem_defs[self.mem] = ins
@@ -141,7 +155,7 @@ def test_field_stored_on_one_path_only_is_a_frontier():
     result, origins, reasons, fields = p.run()
     assert {"kind": "call", "callee": "read_u32"} in origins or any(
         "reaching store" in r for r in reasons)
-    assert fields and "what the caller left" in fields[0]["detail"], fields
+    assert fields and "stored before this function ran" in fields[0]["detail"], fields
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
@@ -180,6 +194,46 @@ def test_struct_field_offsets_key_the_loaded_slot(store_offset, covers):
     assert result["diagnostics"]["safe_to_report_complete_slice"] is covers
 
 
+@pytest.mark.parametrize("dest_off, length, effect", [
+    (0, 8, "disjoint"),      # recv(fd, p->hdr, 8): bytes [0,8); the field is [8,12)
+    (8, 4, "cover"),
+    (4, 8, "cover"),
+    (10, 4, "partial"),      # [10,14) writes the field's upper half only
+    (0, None, "may"),        # an unknown length may reach the field
+])
+def test_source_fill_writes_a_field_only_over_its_extent(dest_off, length, effect):
+    # #1053 review 2: a source that fills ANOTHER part of the same object is
+    # not the loaded field's producer -- comparing only the base named recv as
+    # the origin of a complete slice.
+    p = _FieldProgram()
+    n = FVar("len", ident=9)
+    size = (FExpr("MLIL_CONST", hex(length), constant=length) if length is not None
+            else FExpr("MLIL_VAR_SSA", "len#0", reads=[FSSA(n, 0)]))
+    dest = p.addr(p.m0, dest_off) if dest_off else FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0])
+    p.call(_RECV, [FExpr("MLIL_VAR_SSA", "fd", reads=[]), dest, size,
+                   FExpr("MLIL_CONST", "0", constant=0)])
+    p.sink(p.load(p.addr(p.m0, 8), 4))
+    result, origins, reasons, fields = p.run()
+    named = {"kind": "source", "callee": "recv"} in origins or any("source recv" in r for r in reasons)
+    assert named is (effect != "disjoint"), (origins, reasons)
+    assert bool(fields) is (effect != "cover"), fields
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (effect == "cover")
+
+
+def test_disjoint_source_fill_keeps_the_earlier_field_store():
+    # `p->len = t; recv(fd, p->hdr, 8); memcpy(.., p->len)`: the length is t.
+    p = _FieldProgram()
+    p.store(p.addr(p.m0, 8), 4)
+    p.call(_RECV, [FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                   FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0]),
+                   FExpr("MLIL_CONST", "0x8", constant=8), FExpr("MLIL_CONST", "0", constant=0)])
+    p.sink(p.load(p.addr(p.m0, 8), 4))
+    result, origins, _, fields = p.run()
+    assert origins == [{"kind": "call", "callee": "read_u32"}], origins
+    assert not fields
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
 # --- stash identity (#1034 items 1 and 2) -------------------------------------
 
 _SLOT, _SLOT2, _OTHER = 0x404000, 0x404008, 0x405000
@@ -195,6 +249,66 @@ def _reload(slot, mem, size=None):
 def _memset_buf(pg, buf):
     pg.call(_B_MEMSET, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
                        FExpr("MLIL_CONST", "64", constant=64)])
+
+
+@pytest.mark.parametrize("narrowed", [False, True])
+def test_stash_through_a_narrowed_slot_address_is_not_the_slot(narrowed):
+    # #1053 review 1: `*(char **)(uint32_t)slot = buf; strcpy(*slot, ..)`
+    # stores through `slot#0.edi` and reloads `[slot#0]`. Equal value widths
+    # do not make the addresses equal; the strcpy need not write buf.
+    slot = FVar("slot", ident=21)
+    slot0 = FSSA(slot, 0)
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram(params=[slot])
+    dest = (FExpr("MLIL_VAR_SSA_FIELD", "slot#0.edi", reads=[slot0]) if narrowed
+            else FExpr("MLIL_VAR_SSA", "slot#0", reads=[slot0]))
+    dest.size = 8
+    pg.store(dest, _addr_of(buf), reads=[slot0]).size = 8
+    reload = FExpr("MLIL_LOAD_SSA", "[slot#0].q", reads=[slot0],
+                   src=FExpr("MLIL_VAR_SSA", "slot#0", reads=[slot0]), src_memory=pg.mem)
+    reload.size = 8
+    pg.call(_B_STRCPY, [reload, _cstr(0x700)])
+    pg.sink(buf)
+    result, reasons, leaves = _bw(pg.func())
+    assert any("buf written by strcpy" in r for r in reasons) is not narrowed, reasons
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is not narrowed
+    assert bool(leaves) is narrowed
+
+
+@pytest.mark.parametrize("between, kept", [
+    ("memcpy_over_slot", False),
+    ("memcpy_elsewhere", True),
+    ("unmodeled_call", False),
+    ("store_through_pointer", False),
+])
+def test_remembered_stash_dies_at_every_possible_overwrite(between, kept):
+    # #1053 review 3: `stash = buf; memcpy(&stash, &otherptr, 8); strcpy(stash,
+    # ..)` -- the remembered slot survived the modeled overwrite and named
+    # strcpy a writer (and getenv the source) of buf. Any write that may reach
+    # the slot forgets it; a write provably elsewhere does not.
+    buf = FVar("buf", typ="char[64]")
+    ptr = FVar("ptr", ident=22)
+    pg = _BufProgram(params=[ptr])
+    _memset_buf(pg, buf)
+    pg.store(_cstr(_SLOT), _addr_of(buf))
+    if between.startswith("memcpy"):
+        pg.call(_B_MEMCPY, [_cstr(_SLOT if between == "memcpy_over_slot" else _SLOT2),
+                            _cstr(_OTHER), FExpr("MLIL_CONST", "8", constant=8)])
+    elif between == "unmodeled_call":
+        pg.call(next(k for k, v in _B_NAMES.items() if v == "run"), [])
+    else:
+        p0 = FSSA(ptr, 0)
+        pg.store(FExpr("MLIL_VAR_SSA", "ptr#0", reads=[p0]), FExpr("MLIL_CONST", "0", constant=0),
+                 reads=[p0])
+    pg.call(_B_STRCPY, [_reload(_SLOT, pg.mem, 8), _cstr(0x700)])
+    pg.sink(buf)
+    result, reasons, leaves = _bw(pg.func())
+    assert any("buf written by strcpy" in r for r in reasons) is kept, reasons
+    assert any(lf.get("callee") == "strcpy" for lf in leaves) is not kept, leaves
+    if kept:
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    else:
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 @pytest.mark.parametrize("shape", ["held_copy", "overwrite", "restore"])
