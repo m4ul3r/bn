@@ -37,7 +37,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 from . import il_format
 from . import read_xrefs
 from .bridge_state import analysis_unavailable
-from ._shared import OperationFailure, _parse_address, _validate_count
+from ._shared import OperationFailure, _validate_count
 from .elf_dynamic import ElfDynamicInfo, parse_elf_dynamic
 
 _STRING_TYPE_NAMES: dict[int, str] = {
@@ -1452,20 +1452,48 @@ def _data_var_row(bv, dv, psz: int) -> dict[str, Any]:
     return row
 
 
-def _data_vars(ctx, selector: str | None, *, start, end, limit=None):
-    """Typed data variables in the half-open address window [start, end).
+def _data_vars(ctx, selector: str | None, *, start=None, end=None, at=None, limit=None):
+    """Typed data variables in the half-open address window [start, end), or
+    the one that starts at ``at``.
 
     Seeks the window via ``get_next_data_var_after`` instead of scanning every
     data var in the view (the py_exec predecessor was O(all data vars) per
     call), and reports an honest ``has_more`` when the row cap truncated the
     window -- page by re-issuing with ``start`` = last row's address + 1.
+
+    Every operand takes an address, a symbol name or a rendered ``data_<hex>``
+    (#1042 item 2), through the shared resolver; each name that resolved is
+    listed in ``resolved_symbols``. ``at`` is the one-variable question
+    ("what is ``sock_path``?") that used to need a hand-built two-address
+    window: the window is ``[at, at + 1)``, so it answers with the variable
+    that STARTS there, and an empty answer says so rather than reading as a
+    view with no data.
     """
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     if limit is None:
         limit = _DATA_VARS_DEFAULT_LIMIT
+    has_at = at not in (None, "")
+    has_window = start not in (None, "") or end not in (None, "")
+    if has_at == has_window or (has_window and (start in (None, "") or end in (None, ""))):
+        raise OperationFailure(
+            "invalid_request",
+            "data vars takes either `at` or both `start` and `end`",
+        )
     bv = ctx._resolve_view(selector)
-    lo = _parse_address(start)
-    hi = _parse_address(end)
+    resolved_symbols: list[dict[str, Any]] = []
+
+    def _operand(value):
+        address, resolved = ctx._resolve_address_operand(bv, value)
+        if resolved:
+            resolved_symbols.append(resolved)
+        return address
+
+    if has_at:
+        lo = _operand(at)
+        hi = lo + 1
+    else:
+        lo = _operand(start)
+        hi = _operand(end)
     if hi <= lo:
         raise OperationFailure(
             "invalid_request",
@@ -1487,10 +1515,15 @@ def _data_vars(ctx, selector: str | None, *, start, end, limit=None):
         rows.append(_data_var_row(bv, dv, psz))
         dv = bv.get_next_data_var_after(int(dv.address))
     # #275: `items` is the universal data container, `kind` the discriminator.
-    return {"kind": "data_vars", "items": rows, "has_more": has_more}
+    result: dict[str, Any] = {"kind": "data_vars", "items": rows, "has_more": has_more}
+    if has_at:
+        result["at"] = hex(lo)
+    if resolved_symbols:
+        result["resolved_symbols"] = resolved_symbols
+    return result
 
 
-def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
+def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None, query=None):
     """Every *named* DataSymbol as address + name -- includes internal symbols
     the exports list omits, so a renamed data global stays addressable.
 
@@ -1555,6 +1588,13 @@ def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
     # from "this binary has no data symbols" -- the silent-empty failure mode.
     symbols = bv.get_symbols_of_type(sym_type)
     named = [sym for sym in symbols if getattr(sym, "name", "")]
+    if query not in (None, ""):
+        # #1042 item 2: a case-insensitive substring of the name (or the raw
+        # name), filtered BEFORE paging so `total` counts the matches.
+        needle = str(query).lower()
+        named = [sym for sym in named
+                 if needle in str(sym.name).lower()
+                 or needle in str(getattr(sym, "raw_name", "") or "").lower()]
     start, stop = _page_window(len(named), offset=offset, limit=limit)
     syms = [
         # `a`/`n` stay terse on purpose: #682 item 2 names the `cfg` line/edge
@@ -1565,8 +1605,11 @@ def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
     # #275: `items` is the universal data container and `kind` the discriminator.
     # This used to hand-roll a byte-identical envelope under the name `syms`,
     # which every generic consumer (and the paging footer) has to special-case.
-    return _paged_envelope(kind="data_symbols", items=syms, total=len(named),
-                           offset=offset, limit=limit)
+    result = _paged_envelope(kind="data_symbols", items=syms, total=len(named),
+                             offset=offset, limit=limit)
+    if query not in (None, ""):
+        result["query"] = str(query)
+    return result
 
 
 def _ascii_render(data: bytes) -> str:
@@ -1583,7 +1626,10 @@ _READ_MAX = 100_000
 
 def _read(ctx, selector: str | None, address, length: int):
     bv = ctx._resolve_view(selector)
-    addr = _parse_address(address)
+    # #1042 item 2: `bn read sock_path 8` -- a symbol name, or the
+    # `data_<hex>` a decompile printed, resolves through the one shared
+    # resolver `xrefs` uses, and the result says how it resolved.
+    addr, resolved = ctx._resolve_address_operand(bv, address)
     if length < 0:
         raise RuntimeError(f"read length must be non-negative, got {length}")
     requested_length = length
@@ -1608,6 +1654,8 @@ def _read(ctx, selector: str | None, address, length: int):
         "hex": data.hex(),
         "ascii": _ascii_render(data),
     }
+    if resolved:
+        result["resolved_symbol"] = resolved
     notes: list[str] = []
     if capped:
         result["capped"] = True

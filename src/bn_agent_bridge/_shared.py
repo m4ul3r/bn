@@ -116,7 +116,7 @@ _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
         "previous_instructions", "next_instructions", "disasm_context_reason",
         "hlil_statement", "hlil_statement_reason", "pre_branch_condition",
         "callee_variadic", "call_index", "within_query", "decompile_excerpt",
-        "also_in",
+        "also_in", "arity",
     ),
 }
 
@@ -580,10 +580,104 @@ def _normalize_prototype(proto: str) -> str:
     collapses whitespace. Without this, a valid edit on a function BN tags
     ``__pure`` (common on accessors) reads back as a textual mismatch and is
     reported ``verification_failed`` + reverted, even though the requested type
-    landed (#199)."""
+    landed (#199). A requested ``__noreturn`` change is NOT judged here: the
+    prototype verifier checks it on its own, against BN's ``can_return`` (#966)."""
     stripped = _CONVENTION_RE.sub("", proto)
     stripped = _ATTRIBUTE_RE.sub("", stripped)
     return " ".join(stripped.split())
+
+
+def _split_qualified_name(name: str) -> list[str]:
+    """Split a ``::``-qualified C++ name into its components, splitting ONLY at
+    bracket depth 0 so template arguments are not torn apart -- e.g.
+    ``__alloc_traits<std::allocator<char> >::pointer`` ->
+    ``['__alloc_traits<std::allocator<char> >', 'pointer']``, not three pieces
+    (#200)."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        elif depth <= 0 and name[i:i + 2] == "::":
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def _lookup_named_type(bv, base: str):
+    """Resolve a (possibly ``::``-qualified) type name to a BN Type, or None.
+
+    BN keys namespaced types by a multi-component ``QualifiedName``, NOT the raw
+    ``::``-joined string -- ``get_type_by_name("ns::Foo")`` coerces to a SINGLE
+    component and misses a type registered as ``['ns','Foo']``. So try the raw
+    string first (flat / single-component names), then a depth-aware
+    ``QualifiedName`` split for the namespaced case (#200, verified live on real
+    recovered C++ types)."""
+    try:
+        named = bv.get_type_by_name(base)
+    except Exception:
+        named = None
+    if named is not None:
+        return named
+    if "::" not in base:
+        return None
+    try:
+        return bv.get_type_by_name(bn.QualifiedName(_split_qualified_name(base)))
+    except Exception:
+        return None
+
+
+def _type_class_name(t: Any) -> str:
+    """String name of a BN ``Type.type_class`` (enum on real BN, plain string on
+    the unit fakes), so callers can duck-type without importing ``TypeClass``."""
+    tc = getattr(t, "type_class", None)
+    return str(getattr(tc, "name", None) or (str(tc) if tc is not None else ""))
+
+
+def _named_type_references(type_obj) -> list[str]:
+    """Names of the named types *type_obj* refers to (through pointers, arrays,
+    members, parameters and return values), in first-seen order. A reference is
+    a leaf: the referenced type's own references are not followed.
+
+    No visited set: a type tree can only loop back through a named reference,
+    which is a leaf here, so the walk is finite without one. The first version
+    tracked visited wrappers by `id()`; BN hands out temporary wrappers whose
+    ids Python reuses, so later members were skipped and only the first of
+    several pointer-reached library types was found (#993 review round 2)."""
+    names: list[str] = []
+    stack = [type_obj]
+    while stack:
+        current = stack.pop()
+        if current is None:
+            continue
+        if "NamedTypeReference" in _type_class_name(current):
+            name = str(getattr(current, "name", "") or "")
+            if name and name not in names:
+                names.append(name)
+            continue
+        children = []
+        for attr in ("target", "element_type", "return_value"):
+            try:
+                children.append(getattr(current, attr, None))
+            except Exception:
+                continue
+        for attr in ("members", "parameters"):
+            try:
+                children.extend(getattr(item, "type", None) for item in getattr(current, attr, None) or [])
+            except Exception:
+                continue
+        stack.extend(reversed(children))
+    return names
 
 
 def _parse_address(value: Any) -> int:
@@ -598,6 +692,26 @@ def _parse_address(value: Any) -> int:
         raise ValueError(
             f"{value!r} is not a valid address; expected a decimal or 0x-prefixed hex value"
         ) from None
+
+
+# The two auto-name spellings BN renders for an address with no symbol of its
+# own: `data_<hex>` for an unnamed data variable and `sub_<hex>` for a function
+# (#1042 item 1). Both spell the address they sit at. `j_sub_<hex>` is NOT one:
+# BN names a thunk after the function it JUMPS to, so the hex is the target's
+# address, not the thunk's -- resolving it to the address it spells would land
+# on the wrong function.
+_PLACEHOLDER_NAME_RE = re.compile(r"(data|sub)_([0-9a-fA-F]+)")
+
+
+def _placeholder_address(value: Any) -> tuple[str, int] | None:
+    """``(prefix, address)`` for a rendered ``data_<hex>``/``sub_<hex>`` name,
+    else None. Only the SPELLING is read here; whether a symbol already owns the
+    name, and whether the address is real, is the caller's check -- a name a
+    symbol carries always means that symbol."""
+    match = _PLACEHOLDER_NAME_RE.fullmatch(str(value).strip())
+    if match is None:
+        return None
+    return match.group(1), int(match.group(2), 16)
 
 
 def _artifact_summary(value: Any) -> dict[str, Any]:

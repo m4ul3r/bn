@@ -10,6 +10,7 @@ import inspect
 import re
 import os
 import platform
+import sys
 import shutil
 import threading
 import tempfile
@@ -312,13 +313,18 @@ def _require_text(op: str, value: Any, payload: Any) -> str:
     return value
 
 
-def _require_decompile(value: Any, payload: Any) -> str:
-    text = _require_text("decompile", value, payload)
-    warnings_value = payload.get("warnings") if isinstance(payload, dict) else []
+_DECOMPILE_PLACEHOLDER_MESSAGE = (
+    "decompile incomplete placeholder detected; retry with "
+    "force_analysis=True and verify the resulting body"
+)
+
+
+def _is_decompile_placeholder(payload: dict[str, Any]) -> bool:
+    warnings_value = payload.get("warnings")
     warnings_text = " ".join(
         str(warning).lower() for warning in (warnings_value or [])
     )
-    incomplete = bool(payload.get("analysis_skipped")) or any(
+    return bool(payload.get("analysis_skipped")) or any(
         marker in warnings_text
         for marker in (
             "incomplete stub",
@@ -326,14 +332,95 @@ def _require_decompile(value: Any, payload: Any) -> str:
             "taking too long to analyze",
         )
     )
-    if incomplete:
+
+
+def _require_decompile(value: Any, payload: Any) -> str:
+    text = _require_text("decompile", value, payload)
+    if _is_decompile_placeholder(payload):
         raise BnError(
-            "decompile incomplete placeholder detected; retry with "
-            "force_analysis=True and verify the resulting body",
+            _DECOMPILE_PLACEHOLDER_MESSAGE,
             returncode=0,
             argv=("decompile",),
         )
     return text
+
+
+def _check_max_chars(max_chars: int | None) -> None:
+    if max_chars is not None and (
+        not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars < 1
+    ):
+        raise ValueError("max_chars must be a positive integer or None")
+
+
+def _bounded_text(text: str, max_chars: int | None) -> tuple[str, dict[str, int] | None]:
+    """`text` cut to `max_chars`, and the cut as `{returned_chars, total_chars}`.
+
+    A two-handler loop returned 107k and 95k characters with nothing to bound
+    them (#1039 item 4); a cut is always disclosed, never silent."""
+    if max_chars is None or len(text) <= max_chars:
+        return text, None
+    return text[:max_chars], {"returned_chars": max_chars, "total_chars": len(text)}
+
+
+def _require_decompile_batch(
+    identifiers: Sequence[str], payload: Any, max_chars: int | None
+) -> list[dict[str, Any]]:
+    """One row per requested identifier, in order, or a raise.
+
+    A row the bridge marks `ok` must carry the single-function text contract;
+    an analysis placeholder becomes a failed row with `decompile()`'s own
+    refusal as its error, so one skipped function does not sink the batch.
+    Each successful row gains `text` (bounded by `max_chars`, with `truncated`
+    when cut); a cut row's nested `decompiled.text` is cut the same way, so no
+    returned row carries more than `max_chars` of body. `payload` is not
+    mutated."""
+    def malformed(detail: str) -> BnError:
+        return BnError(
+            f"decompile_batch contract violation: {detail}",
+            returncode=0,
+            argv=("decompile_batch",),
+        )
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("functions"), list):
+        raise malformed("expected a payload['functions'] list")
+    rows = payload["functions"]
+    if len(rows) != len(identifiers):
+        raise malformed(f"{len(rows)} rows for {len(identifiers)} identifiers")
+    result: list[dict[str, Any]] = []
+    for requested, row in zip(identifiers, rows):
+        if not isinstance(row, dict) or row.get("identifier") != requested:
+            raise malformed(f"row for {requested!r} is missing or out of order")
+        ok = row.get("ok")
+        if not isinstance(ok, bool):
+            raise malformed(f"row for {requested!r} has no boolean ok")
+        out = dict(row)
+        if not ok:
+            if not isinstance(row.get("error"), str):
+                raise malformed(f"failed row for {requested!r} has no error text")
+            result.append(out)
+            continue
+        decompiled = row.get("decompiled")
+        text_value = decompiled.get("text") if isinstance(decompiled, dict) else None
+        try:
+            text = _require_text("decompile", text_value, decompiled)
+        except BnError as exc:
+            raise malformed(f"row for {requested!r}: {exc}") from exc
+        # Bound BEFORE deciding the row's verdict: a placeholder row carries a
+        # body too, and returning it whole broke the `max_chars` promise on
+        # exactly the rows nobody expects to be large (#1043 review 2).
+        bounded, truncated = _bounded_text(text, max_chars)
+        if truncated is not None:
+            out["truncated"] = truncated
+            # The nested body is the same text; a row that kept it whole would
+            # still flood a transcript when printed. The full body stays on
+            # `last.payload`, which is not mutated here.
+            out["decompiled"] = {**decompiled, "text": bounded}
+        if _is_decompile_placeholder(decompiled):
+            out.update(ok=False, error=_DECOMPILE_PLACEHOLDER_MESSAGE)
+        else:
+            out["text"] = bounded
+        result.append(out)
+    return result
 
 
 def _require_callsites(value: Any, payload: Any) -> list[dict[str, Any]]:
@@ -552,7 +639,7 @@ def _validate_page(
     payload: Any,
     *,
     requested_offset: int,
-    requested_limit: int,
+    requested_limit: int | None,
     previous_total: Any = _UNSEEN,
 ) -> tuple[list[Any], bool, int | None]:
     """Reject a page that cannot be trusted to advance a collection.
@@ -585,7 +672,7 @@ def _validate_page(
             returncode=0,
             argv=(op,),
         )
-    if len(items) > requested_limit:
+    if requested_limit is not None and len(items) > requested_limit:
         raise BnError(
             f"malformed {op} page: returned {len(items)} items for requested "
             f"limit {requested_limit}",
@@ -784,6 +871,8 @@ _STRING_FILTERS = frozenset(
         "no_crt",
         "regex",
         "probable_format_strings",
+        # #1039 item 3: per-row referencing functions, as `strings --with-xrefs`.
+        "with_xrefs",
     }
 )
 _IMPORT_FILTERS = frozenset({"query", "regex", "offset", "include_got"})
@@ -895,6 +984,9 @@ class Result:
     notes: tuple[str, ...]
     argv: tuple[str, ...]
     backend: Backend
+    # #1039 item 4: `{returned_chars, total_chars}` when `decompile(max_chars=)`
+    # cut the returned text; None when nothing was cut.
+    truncated: dict[str, int] | None = None
 
     @property
     def total(self) -> int | None:
@@ -959,6 +1051,25 @@ class Result:
         return {str(k): str(v) for k, v in optional.items() if isinstance(k, str)}
 
 
+def _is_decompile_batch(payload: Any) -> bool:
+    """The multi-identifier `decompile` envelope (its failures are rows)."""
+    return (
+        isinstance(payload, dict)
+        and payload.get("kind") == "decompile_batch"
+        and isinstance(payload.get("functions"), list)
+    )
+
+
+def _accepts_json_body(predicate: Any, body: str) -> bool:
+    """Whether a failed run's `--out` body parses and satisfies `predicate`."""
+    if not body.strip():
+        return False
+    try:
+        return bool(predicate(json.loads(body)))
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return False
+
+
 def _unwrap(payload: Any) -> Any:
     if isinstance(payload, dict):
         items = payload.get("items")
@@ -1020,6 +1131,22 @@ def _load_native_client(
     return Client(instance=instance, target=target, timeout=timeout)
 
 
+_ANNOUNCED_BACKEND_NOTES: set[str] = set()
+
+
+def _announce_backend(note: str) -> None:
+    """Print an auto backend fallback once per kernel process (#1039 item 1).
+
+    Printed rather than warned: an eval cell shows stdout, and `warnings`
+    filters can swallow a repeat in ways that differ by harness. Once per
+    distinct note, because `scoped()` builds a session per call and a loop of
+    scopes must not repeat it."""
+    if note in _ANNOUNCED_BACKEND_NOTES:
+        return
+    _ANNOUNCED_BACKEND_NOTES.add(note)
+    print(f"bn_kernel: backend=cli ({note})")
+
+
 class Session:
     """An explicit instance/target binding for retained Python kernels."""
 
@@ -1071,8 +1198,10 @@ class Session:
                 configured_cache = os.fsdecode(configured_cache)
             os.environ[_ENV_CACHE_DIR] = configured_cache
 
+        requested = "requested (backend= or BN_BACKEND)"
         if backend == "cli":
             self.backend: Backend = "cli"
+            self.backend_reason = requested
             _register_session(self)
             return
         try:
@@ -1085,9 +1214,28 @@ class Session:
                     returncode=127,
                     argv=("native",),
                 ) from exc
+            # #1039 item 1: the fallback costs one bn subprocess per curated
+            # read, so a silent one turned a 100-function loop into a cell
+            # timeout. Disclose it -- and only what was observed: this
+            # interpreter's import failure, not a guess at the cause.
             self.backend = "cli"
+            self.backend_reason = (
+                f"auto: `from bn import Client` failed in this interpreter "
+                f"({sys.executable}): {exc}"
+            )
+            _announce_backend(
+                self.backend_reason
+                + ". Each curated read runs one bn subprocess; for the "
+                "in-process native backend, install bn into "
+                "this interpreter and create a new session. backend='cli' "
+                "chooses this backend without the notice."
+            )
         else:
             self.backend = "native"
+            self.backend_reason = (
+                "auto: bn is importable in this interpreter"
+                if backend == "auto" else requested
+            )
         _register_session(self)
 
     @property
@@ -1153,6 +1301,7 @@ class Session:
         raw: bool = False,
         unwrap: bool = True,
         budget: float | None,
+        accept_failed_body: Any = None,
         **flags: Any,
     ) -> Any:
         """Spawn bn with an ALREADY-RESOLVED end-to-end budget.
@@ -1160,13 +1309,30 @@ class Session:
         `budget` has had BN_REQUEST_TIMEOUT applied exactly once by the caller;
         `None` means the override disabled the deadline. A paginating caller passes
         its shrinking remainder here so the env value is not re-applied per page.
+
+        `accept_failed_body(payload) -> bool` admits an exit-2 run whose `--out`
+        body is the complete result the command reports failures INSIDE (the
+        multi-identifier `decompile`, which exits 2 when any row failed). Any
+        other failure -- no body, unparsable JSON, a body the predicate rejects
+        -- raises exactly as without it.
+
+        A literal `"--"` in `args` ends the options: every generated option
+        (`flags`, `--format`, `--out`) goes before it and the operands after it
+        stay literal, so an identifier such as `-x` or `--help` reaches the
+        command as an operand instead of being parsed as an option.
         """
         self.last = None
 
         executable = _bn_executable()
-        argv = self._root_argv()
-        argv.extend(str(arg) for arg in args)
-        argv.extend(_flags(flags))
+        words = [str(arg) for arg in args]
+        boundary = words.index("--") if "--" in words else len(words)
+        operands = words[boundary:]
+        options = self._root_argv()
+        options.extend(words[:boundary])
+        options.extend(_flags(flags))
+        # What errors and `last.argv` report: the command as spawned, minus the
+        # private `--format`/`--out` pair.
+        argv = [*options, *operands]
         output_format = "text" if raw else "json"
 
         temporary = tempfile.TemporaryFile(mode="w+b")
@@ -1189,11 +1355,12 @@ class Session:
             try:
                 process = await asyncio.create_subprocess_exec(
                     executable,
-                    *argv,
+                    *options,
                     "--format",
                     output_format,
                     "--out",
                     str(output_path),
+                    *operands,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     pass_fds=(output_fd,),
@@ -1223,7 +1390,14 @@ class Session:
 
             stdout_text = stdout_bytes.decode(errors="replace").strip()
             stderr_text = stderr_bytes.decode(errors="replace").strip()
-            if process.returncode:
+            temporary.seek(0)
+            body = temporary.read().decode(encoding="utf-8", errors="replace")
+            if process.returncode and not (
+                process.returncode == 2
+                and accept_failed_body is not None
+                and not raw
+                and _accepts_json_body(accept_failed_body, body)
+            ):
                 error_type = _EXIT_ERRORS.get(process.returncode, BnError)
                 message = (
                     stderr_text
@@ -1236,8 +1410,6 @@ class Session:
                     returncode=process.returncode,
                     argv=argv,
                 )
-            temporary.seek(0)
-            body = temporary.read().decode(encoding="utf-8", errors="replace")
         finally:
             temporary.close()
 
@@ -1347,15 +1519,24 @@ class Session:
     async def all(
         self,
         *args: str,
-        page: int = 500,
+        page: int | None = None,
         limit: int | None = None,
         timeout: float | None = None,
         **flags: Any,
     ) -> list[dict[str, Any]]:
-        """Collect a paged CLI read without printing or spilling its rows."""
+        """Collect a paged CLI read without printing or spilling its rows.
+
+        `page=None` (the default) asks for everything still wanted in ONE bn
+        subprocess: the remaining `limit`, or -- for `limit=None` -- no
+        `--limit` at all, which the CLI's `--out` export answers uncapped. A
+        page that still reports `has_more` is followed from its end like any
+        other, so `total`/`has_more` are checked exactly as before; paging 500
+        rows per subprocess cost 18 processes for 8.9k functions (#1039 item 4).
+        An explicit `page=N` keeps the bounded per-request size.
+        """
         self.last = None
 
-        if page < 1:
+        if page is not None and page < 1:
             raise ValueError("page must be at least 1")
         if limit is not None and limit < 0:
             raise ValueError("limit must be non-negative")
@@ -1458,7 +1639,11 @@ class Session:
 
         while True:
             remaining = None if limit is None else limit - len(items)
-            page_size = page if remaining is None else min(page, remaining)
+            page_size = (
+                remaining if page is None
+                else page if remaining is None
+                else min(page, remaining)
+            )
             timeout_remaining = None
             if deadline is not None:
                 timeout_remaining = deadline - time.monotonic()
@@ -2027,8 +2212,16 @@ class Session:
         addresses: bool = False,
         force_analysis: bool = False,
         include_annotations: bool = False,
+        max_chars: int | None = None,
         timeout: float | None = None,
     ) -> str:
+        """Pseudo-C for one function; `max_chars` bounds the RETURNED text.
+
+        A cut is disclosed on `last`: `last.truncated` holds
+        `{returned_chars, total_chars}`, a note says so, and `last.payload`
+        keeps the complete response."""
+        self.last = None
+        _check_max_chars(max_chars)
         if self.backend == "native":
             value = await self._native_request(
                 "decompile",
@@ -2050,7 +2243,130 @@ class Session:
                 timeout=timeout,
             )
         payload = self.last.payload if self.last is not None else None
-        return self._validated(_require_decompile, value, payload)
+        text = self._validated(_require_decompile, value, payload)
+        bounded, truncated = _bounded_text(text, max_chars)
+        if truncated is not None and self.last is not None:
+            self.last = Result(
+                bounded,
+                self.last.payload,
+                (
+                    *self.last.notes,
+                    (
+                        f"decompile: returned the first {truncated['returned_chars']} "
+                        f"of {truncated['total_chars']} characters (max_chars); "
+                        "last.payload holds the full text"
+                    ),
+                ),
+                self.last.argv,
+                self.last.backend,
+                truncated,
+            )
+        return bounded
+
+    async def decompile_many(
+        self,
+        identifiers: Sequence[str],
+        *,
+        addresses: bool = False,
+        force_analysis: bool = False,
+        include_annotations: bool = False,
+        max_chars: int | None = None,
+        timeout: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Decompile several functions in ONE bridge round trip (#1039 item 1).
+
+        Returns one row per identifier, in order: the bridge's
+        `{identifier, ok, decompiled | error}` plus, for a successful row,
+        `text` (cut to `max_chars`, with `truncated` when cut). An identifier
+        that does not resolve, whose body is an analysis placeholder, or that
+        is empty or whitespace-only is an `ok: False` row rather than an
+        abort. A blank identifier names no function, so it is answered here and
+        never sent; every other identifier goes to the bridge in one request on
+        either backend, and `last.payload` is that request's batch envelope.
+        """
+        self.last = None
+        _check_max_chars(max_chars)
+        if isinstance(identifiers, str):
+            raise ValueError(
+                "decompile_many takes a sequence of identifiers, not one string; "
+                "use decompile() for a single function"
+            )
+        # A Sequence has a caller-defined order to answer in; a mapping (its
+        # values would be dropped), a set (no order) or a one-shot iterator is
+        # refused before anything is sent (#1043 review 3).
+        if isinstance(identifiers, (bytes, bytearray)) or not isinstance(
+            identifiers, Sequence
+        ):
+            raise ValueError(
+                "identifiers must be a non-empty sequence of strings (a list or "
+                f"tuple), not {type(identifiers).__name__}"
+            )
+        names = list(identifiers)
+        if not names or any(not isinstance(name, str) for name in names):
+            raise ValueError("identifiers must be a non-empty sequence of strings")
+        sent = [name for name in names if name.strip()]
+        shared = {
+            "addresses": addresses,
+            "force_analysis": force_analysis,
+            "include_annotations": include_annotations,
+        }
+        if not sent:
+            payload: Any = {
+                "kind": "decompile_batch", "requested": 0, "resolved": 0,
+                "functions": [],
+            }
+        elif self.backend == "native":
+            payload = await self._native_request(
+                "decompile_batch", {"identifiers": sent, **shared}, timeout=timeout
+            )
+        else:
+            # The CLI answers a LONE identifier with the single-function shape
+            # and reports its failure as an exit code it shares with transport
+            # errors. Asking for it twice gets the batch envelope -- and the
+            # failed-row semantics the native backend has -- at the cost of a
+            # second render of that one function; the duplicate row is dropped.
+            wire = sent * 2 if len(sent) == 1 else sent
+            payload = await self._run_resolved(
+                # `--`: an identifier like `-x` or `--help` stays an operand and
+                # becomes its own failed row, as on the native backend.
+                "decompile", "--", *wire, unwrap=False,
+                budget=_resolve_budget(self.timeout if timeout is None else timeout),
+                accept_failed_body=_is_decompile_batch,
+                **shared,
+            )
+            if len(sent) == 1 and _is_decompile_batch(payload) and len(
+                payload["functions"]
+            ) == 2:
+                first = payload["functions"][0]
+                payload = {
+                    **payload,
+                    "requested": 1,
+                    "resolved": int(isinstance(first, dict) and first.get("ok") is True),
+                    "functions": [first],
+                }
+        answered = iter(
+            self._validated(_require_decompile_batch, sent, payload, max_chars)
+        )
+        rows = [
+            next(answered) if name.strip() else {
+                "identifier": name,
+                "ok": False,
+                "error": "empty identifier: it names no function, so it was not sent",
+            }
+            for name in names
+        ]
+        blank = len(names) - len(sent)
+        notes = () if self.last is None else self.last.notes
+        if blank:
+            notes = (*notes, f"{blank} blank identifier(s) answered locally, not sent")
+        self.last = Result(
+            rows,
+            payload,
+            notes,
+            self.last.argv if self.last is not None else ("decompile_batch",),
+            self.last.backend if self.last is not None else self.backend,
+        )
+        return rows
 
     async def disasm(
         self,

@@ -224,7 +224,8 @@ def _struct_field_delete(args: argparse.Namespace) -> int:
          args=[
              preview_arg("Apply the type, capture diffs, then revert without committing"),
              *mutation_output_args(),
-             arg("address", help="Address of the data variable (hex 0x.. or decimal)"),
+             arg("address", help="Address of the data variable (hex 0x.. or decimal), or a "
+                                 "data symbol name / rendered data_<hex> name"),
              arg("new_type",
                  help="C type to bind at the address, e.g. 'uint32_t', 'char*', or a "
                       "declared struct/array like 'cmd_entry[257]'. Declare named "

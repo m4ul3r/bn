@@ -1113,8 +1113,27 @@ def _function_create(ctx, selector: str | None, address, preview: bool, *,
         raise
 
 
+def _session_ledger(ctx, bv) -> dict[tuple[str, int], str]:
+    """The comments this bridge wrote and verified on *bv* (#977's ledger),
+    or an empty one when it cannot be read: nothing is then claimed."""
+    try:
+        return ctx.targets.session_annotations(bv)
+    except Exception:  # noqa: BLE001 - no ledger means nothing is marked
+        return {}
+
+
+def _written_this_session(ledger: dict[tuple[str, int], str], scope: str,
+                          address: int, body: str) -> bool:
+    """#676 item 4: True when THIS bridge wrote and verified exactly *body* at
+    this (scope, address) -- location AND body, as the decompile mark does
+    (#977). False means unknown, never "someone else wrote it": a comment set
+    through `py exec`, by a GUI user, or before a restart has no ledger entry."""
+    return ledger.get((scope, int(address))) == body
+
+
 def _get_comment(ctx, selector: str | None, address, function):
     bv = ctx._resolve_view(selector)
+    ledger = _session_ledger(ctx, bv)
     if function and address is not None:
         raise RuntimeError(
             "Pass --address or --function, not both: they target different locations."
@@ -1139,13 +1158,18 @@ def _get_comment(ctx, selector: str | None, address, function):
             funcs = bv.get_functions_containing(addr)
             if not any(int(f.start) == int(fn.start) for f in funcs):
                 continue
-            comments.append({"address": hex(int(addr)), "comment": text})
+            comments.append({
+                "address": hex(int(addr)), "comment": text,
+                "written_this_session": _written_this_session(ledger, "address", addr, text),
+            })
         function_doc = str(getattr(fn, "comment", "") or "")
         return {
             "function": fn.name,
             "address": hex(fn.start),
             "function_doc": function_doc,
             "has_function_doc": bool(function_doc),
+            "function_doc_written_this_session": bool(function_doc) and _written_this_session(
+                ledger, "function_doc", fn.start, function_doc),
             "comments": comments,
             "comment_count": len(comments),
             "has_comment": bool(comments),
@@ -1166,6 +1190,8 @@ def _get_comment(ctx, selector: str | None, address, function):
         "address": hex(comment_address),
         "comment": comment or "",
         "has_comment": bool(comment),
+        "written_this_session": bool(comment) and _written_this_session(
+            ledger, "address", comment_address, comment),
     }
 
 
@@ -1192,6 +1218,7 @@ def _list_comments(
             f"unknown comment scope {scope!r}; expected one of {', '.join(_COMMENT_SCOPES)}",
         )
     bv = ctx._resolve_view(selector)
+    ledger = _session_ledger(ctx, bv)
     needle = query.lower() if query else None
     items = []
     if scope in ("all", "address"):
@@ -1211,6 +1238,7 @@ def _list_comments(
                     il_format._display_name(owner) if owner is not None else None),
                 "comment": text,
                 "scope": "address",
+                "written_this_session": _written_this_session(ledger, "address", addr, text),
             })
     if scope in ("all", "function"):
         # #643: function documentation comments (`fn.comment`, written by
@@ -1232,6 +1260,8 @@ def _list_comments(
                 "function_display_name": il_format._display_name(fn),
                 "comment": doc,
                 "scope": "function_doc",
+                "written_this_session": _written_this_session(
+                    ledger, "function_doc", fn.start, doc),
             })
     # Address-ordered so paging is stable across the two stores; at a shared
     # address the function doc sorts first (it describes the whole function).
@@ -1262,12 +1292,16 @@ def _normalize_py_result(ctx, value: Any) -> tuple[Any, list[str]]:
 # in-process code execution, i.e. complete compromise of the bridge user. It runs
 # unconditionally: the bridge trusts whoever can reach its owner-only socket
 # (peercred + 0o600 socket / 0o700 dir) to run arbitrary code as themselves.
-def _py_exec(ctx, selector: str | None, script: str):
-    bv = ctx._resolve_view(selector)
+def _py_exec(ctx, selector: str | None, script: str, *, untargeted: bool = False):
+    # #1035 item 2: `--no-target` resolves nothing, so a snippet can run with
+    # no target open at all -- the one state a GUI first-run modal shows in.
+    bv = None if untargeted else ctx._resolve_view(selector)
     stdout = io.StringIO()
     explicitly_dirty = False
 
     def modified() -> bool:
+        if bv is None:
+            return False
         try:
             return bool(getattr(bv.file, "modified", False))
         except Exception:
@@ -1275,6 +1309,10 @@ def _py_exec(ctx, selector: str | None, script: str):
 
     def mark_dirty() -> None:
         nonlocal explicitly_dirty
+        if bv is None:
+            raise RuntimeError(
+                "mark_dirty() needs a target: this snippet ran with --no-target "
+                "(bv is None); rerun it with -t <selector>")
         explicitly_dirty = True
 
     before_modified = modified()
