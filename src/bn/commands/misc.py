@@ -65,7 +65,13 @@ def _strings_count_text(value: Any) -> str:
     line = f"Total strings: {_stated_count(value, 'count')}"
     dropped = _nonnegative_count(value, "filtered")
     if dropped:
-        line += f" ({dropped} filtered out by the active filters)"
+        line += f" ({dropped} filtered out by the active filters"
+        # #1037 item 2: how many of those a --query dropped as metadata noise.
+        noise = _nonnegative_count(value, "noise_dropped")
+        if noise:
+            line += (f"; {noise} of them in code bytes or linker metadata, "
+                     f"listed with --include-noise")
+        line += ")"
     elif _field_skewed("filtered"):
         # The same wording the listing surface uses, so one payload cannot be
         # described two ways depending on which flag the caller passed.
@@ -105,6 +111,10 @@ def _strings_count_text(value: Any) -> str:
                  help="Annotate each listed string with the functions that reference "
                       "it (code refs; first 8 per row plus the total), so a filtered "
                       "string set maps to its users in one call"),
+             arg("--include-noise", action="store_true", default=False,
+                 help="With --query, keep matches in code bytes and linker metadata "
+                      "(.dynstr import names, .symtab, .text, ...); they are dropped "
+                      "from a --query by default, and the listing counts them"),
          ],
          estimable=True)
 def _strings(args: argparse.Namespace) -> int:
@@ -116,6 +126,7 @@ def _strings(args: argparse.Namespace) -> int:
         "no_crt": args.no_crt,
         "regex": bool(args.regex),
         "probable_format_strings": bool(args.probable_format_strings),
+        "include_noise": bool(args.include_noise),
     }
     if args.count:
         _refuse_count_only_slices(args, command="strings")
@@ -160,6 +171,8 @@ def _strings(args: argparse.Namespace) -> int:
         paged_spill=True,
         stem="strings",
         regex_hint_query=args.query,
+        # #1037 review: the clipped row's `bn read` must run as printed.
+        route_rendered_commands=True,
     )
 
 
@@ -231,7 +244,11 @@ def _go_functions_count_text(value: Any) -> str:
                    help="Treat --query as a case-insensitive regex (alternation for sink families)"),
                arg("--include-got", action="store_true", default=False,
                    help="Include GOT-slot (address) entries that duplicate a PLT import "
-                        "(collapsed by default)")],
+                        "(collapsed by default)"),
+               arg("--with-callers", action="store_true", default=False,
+                   help="Annotate each listed import with the functions that call it "
+                        "(BN's recorded code refs; first 8 per row plus the total), so "
+                        "an import set maps to its callers in one call")],
          estimable=True)
 def _imports(args: argparse.Namespace) -> int:
     query = getattr(args, "query", None)
@@ -264,6 +281,7 @@ def _imports(args: argparse.Namespace) -> int:
     if not summary_mode:
         params["offset"] = args.offset
         params["limit"] = _effective_limit(args)
+        params["with_callers"] = bool(args.with_callers)
     return _call(
         args,
         "imports",

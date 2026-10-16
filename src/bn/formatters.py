@@ -2261,8 +2261,46 @@ def _render_name_address_rows(value: Any, *, mangled: bool = False) -> str:
             label = _DUPLICATE_START_ROW_LABELS.get(
                 duplicate_start, _escape_control_chars(duplicate_start))
             line += f"  [duplicate start: {label}]"
+        # #1037 item 5 `imports --with-callers`: the calling functions, capped
+        # by the bridge, with the stated total naming what the cap left out.
+        if _field_declared(item, "callers"):
+            line += _import_callers_suffix(item, mangled=mangled)
         lines.append(line)
     return "\n".join(lines)
+
+
+def _capped_function_names(functions: list[Any], total: int, *, mangled: bool) -> str:
+    """A capped list of function identities as text, with `(+N more)` when the
+    stated *total* exceeds it. #978: the demangled display name, as every other
+    function-name surface, unless *mangled*. Overloads share a display name, so
+    a name that repeats in the list gets its address -- copying it back must
+    name ONE function. Every read goes through the text choke point, so a
+    non-text name is disclosed rather than silently dropped."""
+    functions = [fn for fn in functions if isinstance(fn, dict)]
+    shown = [((None if mangled else _text_value(fn, "display_name"))
+              or _text_value(fn, "name")) for fn in functions]
+    repeated = {name for name in shown if name and shown.count(name) > 1}
+    names = []
+    for fn, name in zip(functions, shown):
+        if not name:
+            names.append(_escape_control_chars(_text_value(fn, "address") or "?"))
+            continue
+        label = f"{name} @ {fn.get('address', '?')}" if name in repeated else name
+        names.append(_escape_control_chars(label))
+    text = ", ".join(names) if names else "0 functions"
+    if total > len(names):
+        text += f" (+{total - len(names)} more)"
+    return text
+
+
+def _import_callers_suffix(item: dict[str, Any], *, mangled: bool = False) -> str:
+    """The `[callers: ...]` tail of one `imports --with-callers` row (#1037)."""
+    unreadable = _text_value(item, "callers_note")
+    if unreadable:
+        return f"  [callers unknown: {_escape_control_chars(unreadable)}]"
+    text = _capped_function_names(_field_list(item, "callers"),
+                                  _nonnegative_count(item, "caller_count"), mangled=mangled)
+    return f"  [callers: {text}]"
 
 
 @_discloses
@@ -2300,13 +2338,30 @@ def _render_name_address_list_text(value: Any, *, mangled: bool = False) -> str:
     if unattributed:
         needed = ", ".join(_escape_control_chars(str(lib))
                            for lib in _field_list(value, "needed_libraries"))
-        note = (f"// {unattributed} import(s) carry no library (no symbol version names one); "
-                f"this target needs: {needed or '?'} (also in `bn target info`)")
+        # #1037 item 6: disclosure only, with the bridge's reason -- which
+        # says "unversioned" only when the symbol version table was read.
+        why = _text_value(value, "unattributed_note") or "no symbol version names one"
+        note = f"// {unattributed} import(s) carry no library ({_escape_control_chars(why)})"
+        if needed:
+            note += f"; this binary needs (DT_NEEDED): {needed} (also in `bn target info`)"
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    # #1037 item 5: rows whose 0 callers is BN's recorded refs only. Counted
+    # off the rows shown, so a collected listing counts every collected row.
+    unrecorded = sum(1 for item in _field_list(value, "items")
+                     if isinstance(item, dict) and _is_zero(item.get("code_ref_count")))
+    if unrecorded:
+        note = (f"// {unrecorded} import(s) show no recorded code refs; `bn xrefs <import>` "
+                "also scans function LLIL for calls BN did not record")
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     for dynamic_note in _dynamic_section_notes(value):
         note = f"// dynamic section: {dynamic_note}"
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     return body
+
+
+def _is_zero(value: Any) -> bool:
+    """A measured zero: the int 0, not False, not null (unmeasured)."""
+    return value == 0 and not isinstance(value, bool) and isinstance(value, int)
 
 
 def _render_mangled_name_address_list_text(value: Any) -> str:
@@ -3095,6 +3150,11 @@ def _render_xrefs_text(value: Any, limit: int | None = None, *, mangled: bool = 
             "empty or short result is NOT proof there are no callers"
             + (f" ({note})" if note else "")
         )
+    # #1037 item 11: a 0-reference answer on a binary with C++ exception tables.
+    unreferenced_note = _text_value(value, "unreferenced_note")
+    if unreferenced_note:
+        lines.append("")
+        lines.append(f"note: {_escape_control_chars(unreferenced_note)}")
     return "\n".join(lines)
 
 
@@ -4187,7 +4247,8 @@ def _render_message_lens_text(value: Any) -> str:
 
 
 @_discloses
-def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None) -> str:
+def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None,
+                        *, route_rows: bool = False) -> str:
     """Render an --all-instances fan-out (#169 L1): a header per instance, then
     that instance's result rendered by the command's own text renderer (or a
     fallback), and an ``error:`` line for instances that couldn't be reached/
@@ -4230,7 +4291,14 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
             inner = r.get("result")
             if inner_renderer is not None:
                 try:
-                    lines.append(inner_renderer(inner))
+                    if route_rows:
+                        # Commands a row's renderer prints carry THIS row's
+                        # instance and target (#1037 review).
+                        with command_routing(target=r.get("target"),
+                                             instance=r.get("instance")):
+                            lines.append(inner_renderer(inner))
+                    else:
+                        lines.append(inner_renderer(inner))
                 except BridgeError:
                     # A `BridgeError` is not a render failure: it is this CLI
                     # declaring it cannot TRUST the reply, and the documented
@@ -5745,15 +5813,20 @@ def _render_imports_summary_text(value: Any) -> str:
         lines.append("needed libraries (DT_NEEDED):")
         for lib in needed:
             lines.append(f"  {lib}")
-    # #969: per-import library attribution (ELF symbol versioning), aggregated.
-    # Shown only when at least one import IS attributed: a lone
-    # "(unattributed)" row restates the total and says nothing.
+    # #969: per-import library attribution (BN namespace or ELF symbol
+    # version), aggregated. Shown only when at least one import IS attributed:
+    # a lone "(unattributed)" row restates the total and says nothing.
     by_library = _field_dict(value, "by_library")
     if any(lib != "(unattributed)" for lib in by_library):
         lines.append("")
-        lines.append("by library (symbol version requirements):")
+        lines.append("by library (BN namespace or symbol version requirement):")
         for lib, count in sorted(by_library.items(), key=lambda x: -_int_or_default(x[1])):
             lines.append(f"  {_fmt_count(count):>5}  {_escape_control_chars(lib)}")
+    # #1037 item 6: why the rest are null -- stated also when EVERY import is.
+    unattributed_note = _text_value(value, "unattributed_note")
+    if unattributed_note:
+        lines.append("")
+        lines.append(f"unattributed: {_escape_control_chars(unattributed_note)}")
     notes = _dynamic_section_notes(value)
     if notes:
         lines.append("")
@@ -5775,6 +5848,45 @@ def _render_imports_summary_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+# #1037 review: the routing a command THIS renderer prints must carry, set by
+# the CLI around the render (`command_routing`) -- never recovered by scanning
+# rendered text, which holds bytes from the target: a literal `bn read ...`
+# string was rewritten in place, and a stray target backtick swallowed the
+# generated command's delimiter.
+_COMMAND_ROUTING: contextvars.ContextVar[tuple[str | None, str | None]] = (
+    contextvars.ContextVar("bn_command_routing", default=(None, None)))
+
+
+@contextlib.contextmanager
+def command_routing(*, target: str | None, instance: str | None) -> Iterator[None]:
+    """Bind the `-i`/`-t` that commands printed by a renderer must carry."""
+    token = _COMMAND_ROUTING.set((None if target is None else str(target),
+                                  None if instance is None else str(instance)))
+    try:
+        yield
+    finally:
+        _COMMAND_ROUTING.reset(token)
+
+
+def _bn_command(*words: str) -> str:
+    """A runnable `bn ...` command line for *words*, carrying the routing bound
+    by `command_routing` (none outside it)."""
+    target, instance = _COMMAND_ROUTING.get()
+    flags: list[str] = []
+    if instance:
+        flags += ["-i", shlex.quote(instance)]
+    if target:
+        flags += (["-t", shlex.quote(target)] if not target.startswith("-")
+                  else [shlex.quote(f"--target={target}")])
+    return " ".join(["bn", *flags, *(shlex.quote(w) for w in words)])
+
+
+# #1037 item 1: the characters of one string value a text row shows. One
+# `strings --query` matched inside five 16 KB blobs and printed all of them in
+# one turn; the size note came after the flood. JSON keeps the value whole.
+_STRING_VALUE_CLIP = 200
+
+
 def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
     """Render a BARE list of string rows. ``mangled`` names `--with-xrefs`
     functions by their raw names instead of display names (#978)."""
@@ -5792,7 +5904,20 @@ def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
         length = item.get("length", "?")
         chars = item.get("chars")
         string_type = item.get("type", "")
-        rendered = json.dumps(item.get("value", ""), ensure_ascii=True)
+        text = item.get("value", "")
+        clipped = ""
+        if isinstance(text, str) and len(text) > _STRING_VALUE_CLIP:
+            # The tail names the exact bytes: `length` is the stored byte span.
+            # Carries this invocation's -i/-t: printed bare, it failed with
+            # several targets open (#1037 review).
+            if isinstance(length, int) and not isinstance(length, bool):
+                command = _bn_command("read", str(address), str(length), "--encoding", "escaped")
+            else:
+                command = _bn_command("read", str(address), "--encoding", "escaped")
+            clipped = (f" … (+{len(text) - _STRING_VALUE_CLIP} chars; full value: "
+                       f"--format json or `{command}`)")
+            text = text[:_STRING_VALUE_CLIP]
+        rendered = json.dumps(text, ensure_ascii=True) + clipped
         if chars is not None and isinstance(length, int) and chars != length:
             size = f"chars={chars} bytes={length}"
         elif chars is not None:
@@ -5805,10 +5930,13 @@ def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
         # re-reading the JSON. Absent on a plain strings dump.
         directives = _field_list(item, "format_directives")
         if directives:
-            refs = item.get("code_refs")
+            refs = item.get("code_ref_count")
             suffix = f"  [fmt: {' '.join(str(d) for d in directives)}"
-            if isinstance(refs, int):
-                suffix += f"; code_refs={refs}"
+            if not _field_declared(item, "xref_functions"):
+                if isinstance(refs, int) and not isinstance(refs, bool):
+                    suffix += f"; code_refs={refs}"
+                elif _text_value(item, "code_ref_note"):
+                    suffix += "; code_refs unknown"
             suffix += "]"
             row += suffix
         # #968 --with-xrefs: the functions that reference this string, capped
@@ -5821,26 +5949,14 @@ def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
 
 def _string_xref_suffix(item: dict[str, Any], *, mangled: bool = False) -> str:
     """The `[xrefs: ...]` tail of one `strings --with-xrefs` row (#968)."""
-    functions = [fn for fn in _field_list(item, "xref_functions") if isinstance(fn, dict)]
-    # #978: the demangled display name, as every other function-name surface,
-    # unless --mangled. Overloads share a display name, so a name that repeats
-    # in this list gets its address -- copying it back must name ONE function.
-    # Every read goes through the text choke point, so a non-text name is
-    # disclosed rather than silently dropped.
-    shown = [((None if mangled else _text_value(fn, "display_name"))
-              or _text_value(fn, "name")) for fn in functions]
-    repeated = {name for name in shown if name and shown.count(name) > 1}
-    names = []
-    for fn, name in zip(functions, shown):
-        if not name:
-            names.append(_escape_control_chars(_text_value(fn, "address") or "?"))
-            continue
-        label = f"{name} @ {fn.get('address', '?')}" if name in repeated else name
-        names.append(_escape_control_chars(label))
-    total = _nonnegative_count(item, "xref_function_count")
-    text = ", ".join(names) if names else "0 functions"
-    if total > len(names):
-        text += f" (+{total - len(names)} more)"
+    code_unmeasured = _text_value(item, "code_ref_note")
+    if code_unmeasured:
+        # A failed enumeration is not "0 functions" (#1037 review).
+        text = f"functions unknown ({_escape_control_chars(code_unmeasured)})"
+    else:
+        text = _capped_function_names(_field_list(item, "xref_functions"),
+                                      _nonnegative_count(item, "xref_function_count"),
+                                      mangled=mangled)
     # An unmeasured count arrives as null with a note: say so, never a zero.
     unmeasured = _text_value(item, "data_ref_note")
     if unmeasured:
@@ -5882,6 +5998,32 @@ def _strings_listing_text(value: Any, *, narrowed: bool, mangled: bool = False) 
         elif _field_skewed("filtered"):
             note = ("// the payload's filtered-string count is not a number that "
                     "can be read (use --format json)")
+            body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+        # #1037 item 2: a --query drops matches in code bytes / linker
+        # metadata; say how many (of the filtered count above) and where.
+        noise_dropped = _nonnegative_count(value, "noise_dropped")
+        if noise_dropped:
+            named = ", ".join(_escape_control_chars(str(n))
+                              for n in _field_list(value, "noise_dropped_sections"))
+            where = f" (in {named})" if named else ""
+            note = (f"// {noise_dropped} of them matched in code bytes or linker "
+                    f"metadata{where} and were dropped; add --include-noise to list them")
+            body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+        elif _field_skewed("noise_dropped"):
+            note = ("// the payload's dropped-noise count is not a number that "
+                    "can be read (use --format json)")
+            body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+        # #1037 item 11: a 0-reference row on a binary with C++ exception
+        # tables. Counted off the rows shown, so a collected listing counts
+        # every collected row; the note itself is a fact about the binary.
+        unreferenced = sum(
+            1 for row in _field_list(value, "items")
+            if isinstance(row, dict) and _is_zero(row.get("code_ref_count"))
+            and _is_zero(row.get("data_ref_count")))
+        unreferenced_note = _text_value(value, "unreferenced_note")
+        if unreferenced and unreferenced_note:
+            note = (f"// {unreferenced} listed string(s) show no references: "
+                    f"{_escape_control_chars(unreferenced_note)}")
             body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
         # M-12: the "narrow your noisy dump" tip names the sections that actually
         # contributed code / linker-metadata noise to THIS listing (the bridge

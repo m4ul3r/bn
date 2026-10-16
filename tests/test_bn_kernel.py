@@ -1084,7 +1084,7 @@ def test_all_zero_limit_empty_page_undeclared_kind_omits_row_fields(monkeypatch,
 def test_all_zero_limit_empty_page_declared_kind_keeps_row_fields(monkeypatch, tmp_path):
     """A declared kind's row_fields tuple is populated even with zero rows, so
     the empty-probe path must still surface it."""
-    from bn_agent_bridge._shared import _annotate_row_fields, _DECLARED_ROW_FIELDS
+    from bn_agent_bridge._shared import _annotate_row_fields, _DECLARED_ROW_FIELDS, _OPTIONAL_ROW_FIELDS
 
     raw = {
         "kind": "sections",
@@ -1096,7 +1096,7 @@ def test_all_zero_limit_empty_page_declared_kind_keeps_row_fields(monkeypatch, t
         "has_more": False,
     }
     page = _annotate_row_fields(dict(raw))
-    assert page["row_fields"] == list(_DECLARED_ROW_FIELDS["sections"])
+    assert page["row_fields"] == [f for f in _DECLARED_ROW_FIELDS["sections"] if f not in _OPTIONAL_ROW_FIELDS["sections"]]
 
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, _payload_script(page))))
     session = bn_kernel.Session(backend="cli")
@@ -1104,7 +1104,7 @@ def test_all_zero_limit_empty_page_declared_kind_keeps_row_fields(monkeypatch, t
     rows = _run(session.all("sections", limit=0))
 
     assert rows == []
-    assert session.last.payload["row_fields"] == list(_DECLARED_ROW_FIELDS["sections"])
+    assert session.last.payload["row_fields"] == [f for f in _DECLARED_ROW_FIELDS["sections"] if f not in _OPTIONAL_ROW_FIELDS["sections"]]
 
 
 @pytest.mark.parametrize(
@@ -2929,6 +2929,26 @@ def test_result_exposes_the_row_field_hint_from_the_payload():
         value="listing", payload="listing", notes=(), argv=("disasm",), backend="cli",
     )
     assert text_payload.row_fields is None
+
+
+def test_kernel_collection_restates_row_fields_over_collected_pages_1037():
+    """#1037 item 3, kernel side: the collected envelope promises only keys
+    every collected row carries, and `.row_fields_optional` exposes the rest
+    with their conditions."""
+    from bn_agent_bridge._shared import _annotate_row_fields
+
+    rows = [{"address": "0x1", "name": "recv", "raw_name": "recv", "kind": "function",
+             "library": None, "namespace": "", "provenance": "relocation", "hint": 1},
+            {"address": "0x2", "name": "send", "raw_name": "send", "kind": "function",
+             "library": None, "namespace": ""}]
+    pages = [_annotate_row_fields({"kind": "imports", "items": [row]}) for row in rows]
+    aggregate = dict(pages[0])
+    bn_kernel._restate_row_fields(aggregate, pages, rows)
+    result = bn_kernel.Result(value=rows, payload=aggregate, notes=(), argv=("imports",),
+                              backend="cli")
+    assert result.row_fields == ["address", "name", "raw_name", "kind", "library", "namespace"]
+    assert result.row_fields_optional["hint"] == "present on some rows of this page only"
+    assert result.row_fields_optional["provenance"].startswith("imports recovered")
 
 
 # --- `Session.last is None` after a failed operation ----------------------

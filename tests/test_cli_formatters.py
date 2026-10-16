@@ -2352,6 +2352,11 @@ _PROBE_EXCLUSIONS = {
         "renderers to use INSTEAD of an inline shape test, so excluding it is "
         "not a hole: the guard that matters fires on the renderer calling it, "
         "which is itself probed"),
+    "command_routing": (
+        "takes-no-payload",
+        "a context manager the CLI enters around a render to bind the -i/-t that "
+        "commands the renderer prints must carry (#1037 review); it reads no "
+        "payload and renders nothing"),
     "_slice_text_lines": (
         "takes-more-than-a-payload",
         "its first argument is ALREADY-RENDERED TEXT plus a required line range, "
@@ -4456,14 +4461,16 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
     # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
+    # #1037 adds the strings listing's `noise_dropped` and the imports row's
+    # `caller_count` (the zero-reference tallies are counted off the rows).
     # #1037 item 9 adds the `function search` exact-matches-first count.
     # #1037 adds the `evidence function --callee` header's `excluded` count; the
     # recorded context carries a `callee_filter`, whose header always states the
     # paging, so `_render_function_evidence_text(offset)` is now checked below
     # instead of skipped as unstated.
-    assert len(sites) == 65, (
+    assert len(sites) == 67, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 65. A "
+        "count helper, not 67. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4618,6 +4625,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # `tests/test_cli_misc.py::test_strings_with_xrefs_forwards_flag_and_renders_functions_968`.
         "_string_xref_suffix(data_ref_count) [not a payload renderer]",
         "_string_xref_suffix(xref_function_count) [not a payload renderer]",
+        # #1037 item 5: the `imports --with-callers` row fragment, reached only
+        # through `_render_name_address_rows`; pinned by
+        # `tests/test_cli_misc.py::test_imports_text_names_callers_and_export_attribution_1037`.
+        "_import_callers_suffix(caller_count) [not a payload renderer]",
         # Both live NESTED under `existing_annotations`, so a top-level probe
         # cannot open the presence gate that states them. Covered by name in
         # `test_render_orient_states_the_analyst_split_without_fabricating_it`,
@@ -4659,6 +4670,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # and dedicated string-count / noise-tip tests cover both output contexts.
         "_strings_listing_text(filtered) [not a payload renderer]",
         "_strings_listing_text(noise_strings) [not a payload renderer]",
+        # #1037 item 2, the same listing body; pinned by
+        # `tests/test_cli_misc.py::test_strings_query_text_counts_dropped_metadata_noise_1037`.
+        "_strings_listing_text(noise_dropped) [not a payload renderer]",
     ]), sorted(not_stated)
 
 
@@ -7347,6 +7361,9 @@ _STRING_SHAPE_GUARDS = {
     ("_render_read_escaped_text", "hex_str", 0): "reaches_the_output",
     ("_render_read_text", "hex_str", 0): "reaches_the_output",
     ("_render_sections_text", "n", 0): "reaches_the_output",
+    # #1037 item 1: the clip only shortens a string value; any other shape is
+    # rendered whole by the json.dumps that follows.
+    ("_render_strings_rows", "text", 0): "reaches_the_output",
     ("_render_trace_frontiers", "reason", 0): "reaches_the_output",
     ("_render_type_info_text", "decl", 0): "reaches_the_output",
     ("_render_type_info_text", "layout", 0): "reaches_the_output",
@@ -10213,14 +10230,17 @@ def test_imports_text_points_unattributed_rows_at_needed_libraries_969():
         "library_unattributed": 1, "needed_libraries": ["libc.so.6", "libz.so.1"],
     })
     assert "0x1000  printf [libc.so.6]" in out
+    # A payload without the bridge's reason (an older bridge) keeps the
+    # original #969 wording.
     assert ("// 1 import(s) carry no library (no symbol version names one); "
-            "this target needs: libc.so.6, libz.so.1") in out
+            "this binary needs (DT_NEEDED): libc.so.6, libz.so.1") in out
 
     summary = _render_imports_summary_text({
         "total_symbols": 3, "needed_libraries": ["libc.so.6"],
         "by_library": {"libc.so.6": 2, "(unattributed)": 1},
     })
-    assert "by library (symbol version requirements):\n      2  libc.so.6\n      1  (unattributed)" in summary
+    assert ("by library (BN namespace or symbol version requirement):\n      2  libc.so.6\n"
+            "      1  (unattributed)") in summary
     # Nothing attributed: the section would only restate the total.
     assert "by library" not in _render_imports_summary_text(
         {"total_symbols": 3, "by_library": {"(unattributed)": 3}})

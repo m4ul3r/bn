@@ -79,6 +79,12 @@ class ElfDynamicInfo:
     # this file, so that part is skipped rather than guessed. Empty when the
     # whole answer was read.
     notes: list[str] = field(default_factory=list)
+    # Why the per-symbol version table was NOT read, or None when it was (or
+    # the file has none: DT_VERSYM/DT_VERNEED absent, so no import carries a
+    # version requirement). Only None lets a reader call a symbol missing from
+    # `import_libraries` "unversioned" (#1037 review round 3: a refused
+    # DT_SYMENT left the map empty while every import WAS versioned).
+    versions_unread: str | None = "the dynamic section was not parsed"
 
 
 class _Elf:
@@ -191,6 +197,7 @@ def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
     info = ElfDynamicInfo(notes=elf.notes)
     strtab = elf.file_offset(tags[_DT_STRTAB]) if _DT_STRTAB in tags else None
     if strtab is None:
+        info.versions_unread = "the dynamic string table is not in the file"
         if _DT_STRTAB in tags:
             elf.notes.append("DT_STRTAB is outside the file's loaded segments; "
                              "library names were not read")
@@ -212,7 +219,8 @@ def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
     info.soname = dynstr(tags[_DT_SONAME]) if _DT_SONAME in tags else None
     info.rpath = dynstr(tags[_DT_RPATH]) if _DT_RPATH in tags else None
     info.runpath = dynstr(tags[_DT_RUNPATH]) if _DT_RUNPATH in tags else None
-    info.import_libraries = _versioned_import_libraries(elf, tags, dynstr)
+    info.import_libraries, info.versions_unread = _versioned_import_libraries(
+        elf, tags, dynstr)
     return info
 
 
@@ -338,12 +346,22 @@ def _verneed_files(elf: _Elf, tags: dict[int, int], dynstr) -> dict[int, str]:
     return files
 
 
-def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr) -> dict[str, str]:
-    if _DT_VERSYM not in tags or _DT_SYMTAB not in tags:
-        return {}
+def _versioned_import_libraries(elf: _Elf, tags: dict[int, int],
+                                dynstr) -> tuple[dict[str, str], str | None]:
+    """``(name -> library, why the version table was not read)``; the reason
+    is None when it was read, or when the file declares no version table."""
+    if _DT_VERSYM not in tags and _DT_VERNEED not in tags:
+        return {}, None
+    if _DT_VERSYM not in tags:
+        return {}, "the file declares version requirements without a symbol version table"
+    if _DT_SYMTAB not in tags:
+        # #1037 review round 5: name the table that is actually missing.
+        return {}, "the file declares symbol versions without a dynamic symbol table"
     files = _verneed_files(elf, tags, dynstr)
     if not files:
-        return {}
+        if _DT_VERNEED in tags:
+            return {}, "the version-requirement table (DT_VERNEED) could not be read"
+        return {}, None
     # DT_SYMENT is fixed by the ABI (sizeof(ElfN_Sym)); the loader ignores it,
     # so a file can carry any value and still run. Any other value is refused,
     # never used as a stride or a read size.
@@ -352,21 +370,21 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr) -> dict
     if syment != expected:
         elf.notes.append(f"DT_SYMENT {syment} is not the ABI symbol size {expected}; "
                          "per-import library attribution was skipped")
-        return {}
+        return {}, f"DT_SYMENT {syment} is not the ABI symbol size {expected}"
     count = _symbol_count(elf, tags)
     symtab = elf.file_offset(tags[_DT_SYMTAB])
     versym = elf.file_offset(tags[_DT_VERSYM])
     if not count or symtab is None or versym is None:
-        return {}
+        return {}, "the dynamic symbol table, its size or its version table could not be located"
     if count > _MAX_SYMBOLS or not elf.fits(symtab, count * syment) \
             or not elf.fits(versym, count * 2):
         elf.notes.append(f"the dynamic symbol table ({count} symbols) does not fit in "
                          "the file; per-import library attribution was skipped")
-        return {}
+        return {}, "the dynamic symbol table does not fit in the file"
     symbols = elf.bytes_at(symtab, count * syment)
     versions = elf.bytes_at(versym, count * 2)
     if symbols is None or versions is None:
-        return {}
+        return {}, "the dynamic symbol table could not be read"
     version_of = struct.unpack(f"{elf.endian}{count}H", versions)
     # st_name is the first field of both Elf32_Sym and Elf64_Sym. Definedness
     # is not consulted: a version index that names a verneed entry IS the
@@ -387,4 +405,4 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr) -> dict
         if attributed.setdefault(name, library) != library:
             del attributed[name]
             conflicted.add(name)
-    return attributed
+    return attributed, None

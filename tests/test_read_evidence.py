@@ -7712,3 +7712,41 @@ def test_evidence_card_header_publishes_both_function_names_1017(monkeypatch):
     assert _render_function_evidence_text(card).splitlines()[0] == f"demo::relay @ {hex(fn.start)}"
     assert _render_function_evidence_text(card, mangled=True).splitlines()[0] == (
         f"_ZN4demo5relayEi @ {hex(fn.start)}")
+
+
+def test_strings_query_drops_metadata_noise_and_counts_it_1037(monkeypatch):
+    """#1037 item 2: `--query sock` listed the `.dynstr` import name `socket`
+    beside the literal, and a regex sweep grew to 1066 rows of mangled names.
+    A query drops the code-byte / linker-metadata tier and counts what it
+    dropped; `--section` or `include_noise` keeps it, and every row says which
+    section it sits in."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _StringsBV()
+    bv.strings.append(_FakeString(0x452200, "widget ready"))
+
+    out = read_misc._strings(_strings_ctx(bv), None, query="widget", offset=0, limit=10)
+    assert [(i["value"], i["section"]) for i in out["items"]] == [("widget ready", ".rodata")]
+    assert (out["noise_dropped"], out["noise_dropped_sections"]) == (2, [".dynstr"])
+    assert out["total"] == 1 and out["filtered"] == len(bv.strings) - 1
+
+    counted = read_misc._strings(_strings_ctx(bv), None, query="widget", offset=0, limit=10,
+                                 count_only=True)
+    assert (counted["count"], counted["noise_dropped"]) == (1, 2)
+
+    kept = read_misc._strings(_strings_ctx(bv), None, query="widget", offset=0, limit=10,
+                              include_noise=True)
+    assert [i["value"] for i in kept["items"]] == [
+        "widget ready", "libwidget.so.1", "WIDGET_UpdateCertificate"]
+    assert "noise_dropped" not in kept
+
+    pinned = read_misc._strings(_strings_ctx(bv), None, query="widget", offset=0, limit=10,
+                                section=".dynstr")
+    assert [i["section"] for i in pinned["items"]] == [".dynstr", ".dynstr"]
+    assert "noise_dropped" not in pinned
+
+    # An unqueried dump keeps ranking the noise last rather than dropping it,
+    # and an address no section claims reports a null section.
+    dump = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=50)
+    assert "noise_dropped" not in dump and dump["total"] == len(bv.strings)
+    assert {i["value"]: i["section"] for i in dump["items"]}["@8\t@"] is None

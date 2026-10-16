@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,10 @@ from _cli_helpers import *  # noqa: F401,F403
 # two copies of a hang guard drift and the stale one is the copy nobody is
 # looking at when the reader regresses.
 from test_cli_types import _must_not_hang
+
+
+NOTE = ("no library attributed: bn names a library only from a symbol-version "
+        "requirement it could match; the loader picks it at run time from DT_NEEDED")
 
 
 def test_evidence_init_routes_and_renders_sections(fake_transport, capsys):
@@ -1180,7 +1185,7 @@ def test_strings_probable_format_text_shows_directives_and_refs(fake_transport, 
         "items": [{
             "address": "0x1000", "length": 7, "chars": 7, "type": "ascii",
             "value": "%s: %d\n", "format_directives": ["%s", "%d"],
-            "directive_count": 2, "code_refs": 3,
+            "directive_count": 2, "code_ref_count": 3,
         }],
         "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
     }}})
@@ -1191,6 +1196,56 @@ def test_strings_probable_format_text_shows_directives_and_refs(fake_transport, 
     assert "fmt: %s %d" in out
     assert "code_refs=3" in out
 
+
+def test_strings_text_clips_long_values_and_the_printed_read_parses_1037(fake_transport, capsys):
+    """#1037 item 1: a 16000-character value flooded one turn. Text clips it at
+    200 characters and names the rest with a `bn read` that the CLI accepts
+    as printed (address, byte length, escaped encoding); JSON keeps it whole."""
+    value = "key=value;" * 1600
+    result = {"kind": "strings", "items": [{
+        "address": "0x402020", "length": 16000, "chars": 16000, "type": "ascii",
+        "value": value, "section": ".rodata"}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}
+    calls = fake_transport({"strings": {"ok": True, "result": result},
+                            "read": {"ok": True, "result": {"address": "0x402020"}}})
+    # #1037 review finding 4: with several targets open, the command printed
+    # without the invocation's routing exited 2. It carries -i/-t now.
+    assert bn.cli.main(["-i", "inst-a", "strings", "-t", "demod", "--format", "text"]) == 0
+    row = capsys.readouterr().out.splitlines()[0]
+    assert json.dumps(value[:200]) in row and value[:201] not in row
+    tail = row.split(" … (+15800 chars; full value: --format json or `", 1)[1]
+    printed = shlex.split(tail.rstrip("`)"))
+    assert printed == ["bn", "-i", "inst-a", "-t", "demod", "read", "0x402020", "16000",
+                       "--encoding", "escaped"]
+    # Run as printed: it reaches the same instance and target.
+    assert bn.cli.main(printed[1:]) == 0
+    sent = calls[-1]
+    assert (sent["op"], sent["instance_id"], sent["target"]) == ("read", "inst-a", "demod")
+    assert (sent["params"]["address"], sent["params"]["length"]) == ("0x402020", 16000)
+    capsys.readouterr()
+
+    fake_transport({"strings": {"ok": True, "result": result}})
+    assert bn.cli.main(["strings", "--target", "active", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["items"][0]["value"] == value
+
+
+def test_strings_query_text_counts_dropped_metadata_noise_1037(fake_transport, capsys):
+    calls = fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings",
+        "items": [{"address": "0x405ea1", "length": 9, "chars": 9, "type": "ascii",
+                   "value": "demo.sock", "section": ".rodata"}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+        "filtered": 3, "noise_dropped": 1, "noise_dropped_sections": [".dynstr"],
+        "noise_strings": 0, "noise_sections": [], "data_sections": [".rodata"],
+    }}})
+    assert bn.cli.main(["strings", "--target", "active", "--query", "sock",
+                        "--format", "text"]) == 0
+    out = capsys.readouterr().out
+    assert ("// 1 of them matched in code bytes or linker metadata (in .dynstr) and were "
+            "dropped; add --include-noise to list them") in out
+    assert calls[-1]["params"]["include_noise"] is False
+    bn.cli.main(["strings", "--target", "active", "--query", "sock", "--include-noise"])
+    assert calls[-1]["params"]["include_noise"] is True
 
 
 
@@ -3533,6 +3588,148 @@ def test_estimate_output_is_not_advertised_on_mutations_or_side_effecting_comman
     assert conflicting.value.code == 2
     assert "not allowed with argument" in capsys.readouterr().err
     assert not calls
+
+
+def test_imports_text_names_callers_and_discloses_unversioned_imports_1037(fake_transport, capsys):
+    """#1037 items 5 and 6: `--with-callers` prints each import's capped callers
+    with the full count; an unreadable ref list is unknown, never 0; and a
+    null library says why and names DT_NEEDED as the only source of the list."""
+    calls = fake_transport({"imports": {"ok": True, "result": {
+        "kind": "imports",
+        "items": [
+            {"name": "Registry::get", "raw_name": "_ZN8Registry3getEv", "address": "0x401140",
+             "kind": "function", "library": None, "namespace": "",
+             "library_note": "no library attributed: bn names a library only from a symbol-version requirement it could match; the loader picks it at run time from DT_NEEDED",
+             "code_ref_count": 9, "caller_count": 9,
+             "callers": [{"address": hex(0x401200 + i * 0x10), "name": f"start_{i}",
+                          "display_name": f"start_{i}"} for i in range(8)]},
+            {"name": "puts", "raw_name": "puts", "address": "0x401150", "kind": "function",
+             "library": "libc.so.6", "library_source": "symbol-version", "namespace": "",
+             "code_ref_count": 0, "caller_count": 0, "callers": []},
+            {"name": "dup", "raw_name": "dup", "address": "0x401160", "kind": "function",
+             "library": "libc.so.6", "library_source": "symbol-version", "namespace": "",
+             "code_ref_count": None, "caller_count": None, "callers": [],
+             "callers_note": "code refs could not be read: RuntimeError: gone"},
+        ],
+        "total": 3, "offset": 0, "limit": 100, "returned": 3, "has_more": False,
+        "library_unattributed": 1, "needed_libraries": ["libreg.so", "libc.so.6"],
+        "unattributed_note": "no library attributed: bn names a library only from a symbol-version requirement it could match; the loader picks it at run time from DT_NEEDED",
+        "callers_cap": 8,
+    }}})
+    assert bn.cli.main(["imports", "--target", "active", "--with-callers"]) == 0
+    out = capsys.readouterr().out
+    assert ("0x401140  Registry::get (raw: _ZN8Registry3getEv)  "
+            "[callers: start_0, start_1, start_2, start_3, start_4, start_5, start_6, "
+            "start_7 (+1 more)]") in out
+    assert "0x401150  puts [libc.so.6]  [callers: 0 functions]" in out
+    assert ("0x401160  dup [libc.so.6]  "
+            "[callers unknown: code refs could not be read: RuntimeError: gone]") in out
+    assert (f"// 1 import(s) carry no library ({NOTE}); this binary needs (DT_NEEDED): "
+            "libreg.so, libc.so.6") in out
+    # Counted off the rows: only `puts` is a measured zero.
+    assert "// 1 import(s) show no recorded code refs" in out
+    assert calls[-1]["params"]["with_callers"] is True
+    assert "sysroot" not in calls[-1]["params"]
+
+
+def test_strings_text_states_the_landing_pad_note_1037(fake_transport, capsys):
+    """#1037 item 11: a 0-reference row on a binary with `.gcc_except_table`
+    says why 0 may not mean unused; the xrefs card says the same."""
+    note = ("this binary has .gcc_except_table: C++ catch blocks are entered through "
+            "landing pads that only that table points at, and BN does not analyse a "
+            "landing pad no function contains, so references from such code are not "
+            "counted; 0 references does not show the address is unused")
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings",
+        "items": [{"address": "0x402015", "length": 12, "chars": 12, "type": "ascii",
+                   "value": "catch failed", "section": ".rodata", "code_ref_count": 0,
+                   "data_ref_count": 0, "xref_function_count": 0, "xref_functions": []}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+        "unreferenced_strings": 1, "unreferenced_note": note,
+    }}})
+    assert bn.cli.main(["strings", "--target", "active", "--with-xrefs"]) == 0
+    assert f"// 1 listed string(s) show no references: {note}" in capsys.readouterr().out
+
+    fake_transport({"xrefs": {"ok": True, "result": {
+        "kind": "xrefs", "address": "0x402015", "items": [], "total": 0, "offset": 0,
+        "limit": 100, "returned": 0, "has_more": False, "code_ref_count": 0,
+        "data_ref_count": 0, "caller_function_count": 0, "unreferenced_note": note}}})
+    assert bn.cli.main(["xrefs", "--target", "active", "0x402015"]) == 0
+    assert f"note: {note}" in capsys.readouterr().out
+
+
+def test_imports_summary_text_states_why_imports_are_unattributed_1037(fake_transport, capsys):
+    """#1037 review: the summary must say why imports carry no library even when
+    none is attributed, and name DT_NEEDED as the source of the needed list."""
+    fake_transport({"imports": {"ok": True, "result": {
+        "kind": "imports_summary", "total_symbols": 1,
+        "needed_libraries": ["libA.so", "libc.so.6"],
+        "by_library": {"(unattributed)": 1},
+        "unattributed_note": "no library attributed: bn names a library only from a symbol-version requirement it could match; the loader picks it at run time from DT_NEEDED",
+        "namespaces": {"(none)": 1}, "by_kind": {"function": 1},
+    }}})
+    assert bn.cli.main(["imports", "--target", "active", "--summary"]) == 0
+    out = capsys.readouterr().out
+    assert "needed libraries (DT_NEEDED):\n  libA.so\n  libc.so.6" in out
+    assert f"unattributed: {NOTE}" in out
+
+
+def test_strings_all_targets_routes_each_rows_printed_read_to_its_target_1037(
+        fake_transport, capsys):
+    """#1037 review finding 4, fan-out face: each target's clipped row prints a
+    `bn read` bound to THAT target."""
+    value = "x" * 300
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "tgt-a"}, {"target_id": "tgt-b"}]},
+        "strings": {"ok": True, "result": {"kind": "strings", "items": [{
+            "address": "0x5000", "length": 300, "chars": 300, "type": "ascii",
+            "value": value, "section": ".rodata"}],
+            "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}},
+    })
+    assert bn.cli.main(["strings", "--all-targets"]) == 0
+    out = capsys.readouterr().out
+    assert "`bn -t tgt-a read 0x5000 300 --encoding escaped`" in out
+    assert "`bn -t tgt-b read 0x5000 300 --encoding escaped`" in out
+
+
+def test_routing_never_rewrites_target_strings_1037(fake_transport, capsys):
+    """#1037 review round 2, finding 5: the routing pass scanned rendered text,
+    so a target literal `bn read 0x1234 4` was shown rewritten (chars unchanged),
+    and a stray target backtick paired with the generated command's delimiter
+    and left that command unrouted. Only bn's own command carries routing now."""
+    literal = "literal `bn read 0x1234 4` end"
+    stray = "`bn read 0x1000 5 " + "y" * 300
+    fake_transport({"strings": {"ok": True, "result": {"kind": "strings", "items": [
+        {"address": "0x6000", "length": 30, "chars": 30, "type": "ascii",
+         "value": literal, "section": ".rodata"},
+        {"address": "0x7000", "length": len(stray), "chars": len(stray), "type": "ascii",
+         "value": stray, "section": ".rodata"}],
+        "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": False}}})
+    assert bn.cli.main(["-i", "inst-a", "strings", "-t", "demod"]) == 0
+    first, second = capsys.readouterr().out.splitlines()[:2]
+    assert json.dumps(literal) in first and "-t demod" not in first
+    assert second.startswith('0x7000  chars=318  ascii  "`bn read 0x1000 5 yyy')
+    assert second.endswith(
+        "full value: --format json or `bn -i inst-a -t demod read 0x7000 318 --encoding escaped`)")
+
+
+def test_imports_footer_states_the_bridges_reason_not_a_fixed_claim_1037(fake_transport, capsys):
+    """#1037 review round 3: the footer said "unversioned import" whatever the
+    bridge knew; it now states the bridge's reason."""
+    note = f"{NOTE}; symbol versions were not read: DT_SYMENT 32 is not the ABI symbol size 24"
+    fake_transport({"imports": {"ok": True, "result": {
+        "kind": "imports",
+        "items": [{"name": "puts", "raw_name": "puts", "address": "0x401030",
+                   "kind": "function", "library": None, "namespace": "",
+                   "library_note": note}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+        "library_unattributed": 1, "needed_libraries": ["libc.so.6"],
+        "unattributed_note": note,
+    }}})
+    assert bn.cli.main(["imports", "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    assert f"// 1 import(s) carry no library ({note}); this binary needs (DT_NEEDED): libc.so.6" in out
+    assert "unversioned" not in out
 
 
 # --- #1042 item 2: names for address operands ----------------------------------

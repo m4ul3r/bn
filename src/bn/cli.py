@@ -25,6 +25,7 @@ from .formatters import (
     _render_fanout_text,
     _render_mutation_summary_text,
     _render_mutation_text,
+    command_routing,
 )
 from .output import (estimate_output_result, render_envelope, render_error, render_value,
                      write_output_result)
@@ -1731,6 +1732,8 @@ _COUNT_SLICE_FLAGS: tuple[tuple[str, str, Any], ...] = (
     ("summary", "--summary", False),
     # #968: a per-row enrichment; a count has no rows to enrich.
     ("with_xrefs", "--with-xrefs", False),
+    # #1037 item 5: the same per-row enrichment for imports.
+    ("with_callers", "--with-callers", False),
 )
 
 
@@ -2373,6 +2376,9 @@ def _call(
     # result, so the output names which bridge answered.
     stamp_instance: bool = False,
     contextual_hints: bool = False,
+    # Bind the `bn ...` commands the TEXT renderer itself prints to this
+    # invocation's -i/-t (per row under a fan-out), so they run as printed.
+    route_rendered_commands: bool = False,
 ) -> int:
     _require_nonempty_instance(args)
     # THE BOUNDARY (#101/#715/#716). Every transform a handler hands this call is
@@ -2419,6 +2425,7 @@ def _call(
             text_renderer=text_renderer,
             timeout_kwargs=timeout_kwargs,
             stem=stem,
+            route_rendered_commands=route_rendered_commands,
         )
 
     target = _resolve_target(
@@ -2543,7 +2550,11 @@ def _call(
     # flags that exit 2).
     slice_hint = _slice_hint_for_args(args, fmt)
     if text_renderer is not None and fmt == "text":
-        result = text_renderer(result)
+        if route_rendered_commands:
+            with command_routing(target=target, instance=getattr(args, "instance", None)):
+                result = text_renderer(result)
+        else:
+            result = text_renderer(result)
     spilled = _render_result(
         result,
         fmt=fmt,
@@ -2599,6 +2610,7 @@ def _fanout_call(
     text_renderer: Callable[[Any], str] | None,
     timeout_kwargs: dict[str, Any],
     stem: str,
+    route_rendered_commands: bool = False,
 ) -> int:
     """Run *op* across every running bridge instance (``--all-instances``) and/or
     every open target in each instance (``--all-targets``), and aggregate (#169 L1).
@@ -2802,7 +2814,8 @@ def _fanout_call(
     fmt = _resolve_output_format(args)
     rendered: Any = result
     if fmt == "text":
-        rendered = _render_fanout_text(result, inner_renderer=text_renderer)
+        rendered = _render_fanout_text(result, inner_renderer=text_renderer,
+                                       route_rows=route_rendered_commands)
     _render_result(
         rendered, fmt=fmt, out_path=args.out, stem=stem or "fanout",
         spill_label="fanout", spill_context=result, paged=True,

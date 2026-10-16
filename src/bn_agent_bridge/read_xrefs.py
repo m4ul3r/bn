@@ -56,8 +56,43 @@ _IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
 ]
 
 
+# #1037 item 11: the neutral limit a zero-reference answer carries on a binary
+# with C++ exception tables. Stated, never inferred per address: the bridge does
+# not look for landing pads, so it cannot say any one string or function is
+# reached from one.
+_LANDING_PAD_NOTE = (
+    "this binary has .gcc_except_table: C++ catch blocks are entered through "
+    "landing pads that only that table points at, and BN does not analyse a "
+    "landing pad no function contains, so references from such code are not "
+    "counted; 0 references does not show the address is unused"
+)
+
+
+def _landing_pad_note(bv) -> str | None:
+    """The landing-pad limit when *bv* carries `.gcc_except_table`, else None."""
+    try:
+        sections = getattr(bv, "sections", None) or {}
+        names = [str(name) for name in sections]
+    except Exception:  # noqa: BLE001 - no section list means no claim to make
+        return None
+    return _LANDING_PAD_NOTE if any(n.startswith(".gcc_except_table") for n in names) else None
+
+
 def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int | None = None,
            fn_pointer_scan: bool = False):
+    result = _xrefs_unnoted(ctx, selector, identifier, offset=offset, limit=limit,
+                            fn_pointer_scan=fn_pointer_scan)
+    if (isinstance(result, dict) and result.get("kind") == "xrefs"
+            and result.get("code_ref_count") == 0 and result.get("data_ref_count") == 0
+            and not result.get("truncated")):
+        note = _landing_pad_note(ctx._resolve_view(selector))
+        if note:
+            result["unreferenced_note"] = note
+    return result
+
+
+def _xrefs_unnoted(ctx, selector: str | None, identifier, *, offset: int = 0,
+                   limit: int | None = None, fn_pointer_scan: bool = False):
     bv = ctx._resolve_view(selector)
     require_analysis(bv, "Cross-references")
     offset = _validate_count(offset, label="offset", minimum=0)
