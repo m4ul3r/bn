@@ -1115,43 +1115,105 @@ class TaintEngine:
 
     def _const_ptr_storage(self, addr: int) -> str:
         """Storage class of the constant address *addr* a writer operand points
-        at: ``"readonly"`` (a string literal in ``.rodata``/code -- the bytes
-        are established by the binary), ``"writable"`` (a ``.data``/``.bss``
-        global any function may have filled -- NOT a literal, round 3 P1) or
-        ``"unknown"`` (a view with neither section semantics nor segment
-        permissions for the address: the unit fakes). Section semantics first
-        (``get_sections_at``), then segment permissions."""
-        secs = []
+        at: ``"writable"`` (a global any function may have filled -- NOT a
+        literal, round 3 P1) when BN maps it in a writable segment or a
+        section says read-write; ``"readonly"`` ONLY when it lies in a segment
+        mapped without write permission (BN's segment flags follow the ELF
+        PT_LOAD). Section names and semantics do not make bytes immutable:
+        ``.data.rel.ro`` sits in a writable segment when the binary is linked
+        without RELRO, and RELRO-protected data is writable in the file's
+        segments too -- a known precision cost (#1053 review 5). ``"unknown"``
+        with no segment at the address (not mapped, no segment info, the unit
+        fakes)."""
         getsecs = getattr(self.bv, "get_sections_at", None)
         if getsecs is not None:
             try:
                 secs = list(getsecs(int(addr)) or [])
             except Exception:
                 secs = []
-        verdicts: set[str] = set()
-        for sec in secs:
-            sem = getattr(sec, "semantics", None)
-            try:
-                sem_i = int(sem)
-            except (TypeError, ValueError):
-                sem_i = {"ReadOnlyCodeSectionSemantics": 1, "ReadOnlyDataSectionSemantics": 2,
-                         "ReadWriteDataSectionSemantics": 3}.get(
-                    str(getattr(sem, "name", sem)), 0)
-            if sem_i in (1, 2):
-                verdicts.add("readonly")
-            elif sem_i == 3:
-                verdicts.add("writable")
-        if "writable" in verdicts:
-            return "writable"
-        if "readonly" in verdicts:
-            return "readonly"
-        fn = getattr(self.bv, "is_offset_writable", None)
-        if fn is None:
+            for sec in secs:
+                sem = getattr(sec, "semantics", None)
+                name = str(getattr(sem, "name", sem))
+                try:
+                    rw = int(sem) == 3
+                except (TypeError, ValueError):
+                    rw = name == "ReadWriteDataSectionSemantics"
+                if rw:
+                    return "writable"
+        seg = self._segment_at(addr)
+        if seg is None:
             return "unknown"
+        return "writable" if getattr(seg, "writable", True) else "readonly"
+
+    def _segment_at(self, addr: int) -> Any | None:
+        getseg = getattr(self.bv, "get_segment_at", None)
+        if getseg is None:
+            return None
         try:
-            return "writable" if fn(int(addr)) else "readonly"
+            return getseg(int(addr))
         except Exception:
-            return "unknown"
+            return None
+
+    def _bytes_immutable(self, lo: int, hi: int) -> bool:
+        """Do the bytes ``[lo, hi)`` all lie in segments BN maps without write
+        permission? A gap (unmapped bytes), a writable segment or a segment
+        with no extent answers False."""
+        if lo < 0 or hi <= lo:
+            return False
+        for _ in range(64):
+            seg = self._segment_at(lo)
+            if seg is None or getattr(seg, "writable", True):
+                return False
+            try:
+                end = int(seg.end)
+            except (TypeError, ValueError, AttributeError):
+                return False
+            if end <= lo:
+                return False
+            if end >= hi:
+                return True
+            lo = end
+        return False
+
+    @staticmethod
+    def _address_value_ranges(expr: Any) -> list[tuple[int, int]] | None:
+        """The addresses *expr* can take, as inclusive ``(first, last)``
+        ranges from BN's possible values -- a constant, a signed/unsigned
+        range or a small set -- else None (undetermined, a lookup table, too
+        many values): an address BN cannot bound proves nothing about the
+        bytes it reads (#1053 review 5)."""
+        pvs = getattr(expr, "possible_values", None)
+        kind = str(getattr(getattr(pvs, "type", None), "name", ""))
+        try:
+            if kind in ("ConstantValue", "ConstantPointerValue"):
+                v = int(pvs.value)
+                return [(v, v)]
+            if kind in ("UnsignedRangeValue", "SignedRangeValue"):
+                out = [(int(r.start), int(r.end)) for r in pvs.ranges]
+                return out if out and all(a <= b for a, b in out) else None
+            if kind == "InSetOfValues":
+                vals = sorted(int(x) for x in pvs.values)
+                return [(v, v) for v in vals] if 0 < len(vals) <= 4096 else None
+        except Exception:
+            return None
+        return None
+
+    def _load_reads_immutable(self, load: Any, fixed: int | None = None) -> bool:
+        """Is every byte the LOAD *load* can read -- at every address BN's
+        possible values allow (or exactly *fixed*) -- in read-only segments?
+        Only then are the loaded bytes the binary's own: a constant table
+        base in ``.rodata`` says nothing about where an unbounded index or
+        offset lands (a mutable global after the table), and a read-only
+        section in a writable segment is not immutable (#1053 review 5)."""
+        try:
+            size = int(getattr(load, "size", None))
+        except (TypeError, ValueError):
+            return False
+        if size <= 0:
+            return False
+        ranges = [(fixed, fixed)] if fixed is not None else \
+            self._address_value_ranges(getattr(load, "src", None))
+        return bool(ranges) and all(self._bytes_immutable(a, b + size) for a, b in ranges)
 
     # -- memory-SSA load/store correlation (Phase 3C) ---------------------
     # BN's memory SSA is a single global chain (a load's `src_memory` def is the
@@ -7676,30 +7738,36 @@ class TaintEngine:
             fixed = self._gconst_addr(la)
             gaps: list[str] = []
             _, consts = self._address_terms(addr)
-            kinds = [self._const_ptr_storage(c) for c in consts]
-            if fixed is None and addr_reads and consts \
-                    and all(k in ("readonly", "writable") for k in kinds):
-                # `tbl[i]`: an element of a global table at a variable index
-                # -- even when `[(i << 3) + tbl]` keys as an exact slot on the
-                # scaled index (#1053 review 4). A read-only table's bytes are
-                # literals; a writable one's are a `global` frontier. The
-                # index picks which bytes, so it stays in the slice.
-                for c, k in zip(consts, kinds):
-                    if k == "writable":
-                        _global_leaf(at, hex(c), c, "the loaded address")
+            table = fixed is None and bool(addr_reads) and bool(consts)
+            if table:
+                # `tbl[i]`: a constant table at a variable index or offset --
+                # even when `[(i << 3) + tbl]` keys as an exact slot on the
+                # scaled index (#1053 review 4). The index picks the bytes, so
+                # it stays in the slice. The bytes are the binary's own only
+                # when BN bounds the load's address and every byte it can
+                # read lies in a non-writable segment: a read-only table base
+                # says nothing about where an unbounded index lands (#1053
+                # review 5).
                 for r in addr_reads:
                     walk(r, d + 1, lmv)
-                return
+                if self._load_reads_immutable(load):
+                    return
             if la is None:
-                if not addr_reads and consts and all(k == "readonly" for k in kinds):
+                if not addr_reads and self._load_reads_immutable(load):
                     return      # read-only data: the bytes are the binary's own
-                # `[host + i]`: as for a pointer operand of a fill, the pointer
-                # and the index are walked (they lead to the buffer and pick
-                # the bytes) -- but no store can be matched to the bytes.
-                for r in addr_reads:
-                    walk(r, d + 1, lmv)
-                gaps.append("its address is not exactly a base plus a constant offset, "
-                            "so no store can be matched to it")
+                if table:
+                    gaps.append("it reads a constant table at a variable index or offset, "
+                                "and BN's possible values for the address do not keep "
+                                "every byte read inside non-writable segments")
+                else:
+                    # `[host + i]`: as for a pointer operand of a fill, the
+                    # pointer and the index are walked (they lead to the buffer
+                    # and pick the bytes) -- but no store can be matched to
+                    # the bytes.
+                    for r in addr_reads:
+                        walk(r, d + 1, lmv)
+                    gaps.append("its address is not exactly a base plus a constant offset, "
+                                "so no store can be matched to it")
             else:
                 for w in self._load_writers(ssaf, load, la):
                     kind = w[0]
@@ -7727,8 +7795,8 @@ class TaintEngine:
                     elif kind == "opaque":
                         gaps.append(f"`{w[1]}` may have written them")
                     elif kind == "entry":
-                        if fixed is not None and self._const_ptr_storage(fixed) == "readonly":
-                            continue    # read-only data: the binary's own bytes
+                        if fixed is not None and self._load_reads_immutable(load, fixed):
+                            continue    # read-only segment: the binary's own bytes
                         gaps.append(
                             f"on some path nothing in this function wrote them (the "
                             f"{'global' if fixed is not None else 'object'} "

@@ -53,7 +53,10 @@ brittle across compilers/optimisation.
 | `bw_frame_append.c`    | strncat (appends at dst + strlen) and the strncpy control both leave a field inside the string a frontier: no call's write extent is trusted |
 | `bw_frame_strtok.c`    | strtok rewrites the delimiter its model never names: a possible writer of the length field. Built at -O2 |
 | `bw_call_planted.c`   | a call handed `&buf` may retain or plant a pointer into it (#1053 review 4): after `strtok_r(buf, ",", &g_save)` or `strtol(buf, &end, 10)` a reload of the saved pointer -- with or without an explicit stash -- is a may-alias, so the strcpy through it is a frontier. `bw_call_planted_o2.c` rebuilds it at -O2 |
-| `bw_readonly_index.c`  | `malloc(readonly_sizes[i & 3])`: a bounded index into a read-only table keeps `i` as the origin of a complete slice (base's verdict). `bw_readonly_index_o2.c` rebuilds it at -O2 |
+| `bw_readonly_index.c`  | `malloc(readonly_sizes[i & 3])`: every address BN allows for the load lies in the read-only table, so `i` is the origin of a complete slice (base's -O0 verdict). `bw_readonly_index_o2.c` rebuilds it at -O2 |
+| `bw_table_bounds.c`    | a read-only table base does not make the load read-only (#1053 review 5): an unchecked byte offset and unmasked `long`/`int` indices may reach the mutable global after the table and stay `field_load_unresolved` frontiers; masked and compare-bounded indices stay complete. `bw_table_bounds_o2.c` rebuilds it at -O2 |
+| `bw_table_relro.c`     | section semantics do not prove immutability: a `.data.rel.ro` table in a PIE linked with `-z norelro` is in a writable segment, and a function writes its first entry, so the masked load is a frontier. `bw_table_relro_o2.c` rebuilds it at -O2 |
+| `bw_call_planted_store_init.c` | the planting call isolated (N1): the buffer is filled by plain stores, strtol is the only call before the reload of its end pointer (global or local slot), and the strcpy through it is a frontier. `bw_call_planted_store_init_o2.c` rebuilds it at -O2 |
 
 ## `EXPECTED.json` schema
 
