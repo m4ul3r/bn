@@ -16,6 +16,7 @@ from test_taint_engine import (
     FVar,
     _addr_of,
     _BufProgram,
+    _vphi,
     _bw,
     _cstr,
 )
@@ -62,8 +63,9 @@ def test_store_proven_region_from_the_sink_offset_933(gap, sink_off, unproven):
     if unproven is None:
         assert complete is True and aol == [], result["leaves"]
         assert result["slices"][0]["origin"]["kind"] == "constant"
-        assert any("offset 0x4 of local buffer s" in a and "(#933)" in a
-                   for a in result["assumptions"]), result["assumptions"]
+        assert any("bytes [0x4, 0x44) of s" in a and "before offset 0x4" in a
+                   and "NUL terminator" in a for a in result["assumptions"]), \
+            result["assumptions"]
     else:
         assert complete is False
         [leaf] = aol
@@ -213,3 +215,164 @@ def test_pointee_to_return_rule_after_an_escape_is_a_may_alias_s2(held_buf):
     result, _, aol = _bw(pg.func(), extra_names=_NAMES)
     assert any(l.get("callee") == "strcpy" for l in aol) is held_buf, aol
     assert result["diagnostics"]["safe_to_report_complete_slice"] is not held_buf
+
+
+# --- round 1: the consumer's demand, returned pointers, pointer objects -----
+
+_B_FGETS, _B_MALLOC = 0x982, 0x983
+_B_NAMES.update({_B_FGETS: "fgets", _B_MALLOC: "malloc"})
+
+
+def _set_ptr(pg, dst, text, src, reads=()):
+    i, a = pg._next()
+    pg.instrs.append(FInstr(i, a, "MLIL_SET_VAR_SSA", text, writes=[dst], reads=list(reads), src=src))
+
+
+def _ssa_ref(v):
+    e = FExpr("MLIL_VAR_SSA", f"{v.var.name}#{v.version}", reads=[v])
+    e.size = 8
+    return e
+
+
+def _const(n):
+    return FExpr("MLIL_CONST", hex(n), constant=n)
+
+
+def _sink_ssa(pg, v):
+    return pg.call(_B_POPEN, [FExpr("MLIL_VAR_SSA", f"{v.var.name}#{v.version}", reads=[v]),
+                              _cstr(0x710)], reads=[v])
+
+
+@pytest.mark.parametrize("shape", ["minus", "phi", "loop"])
+def test_demand_is_the_consumers_not_the_definitions_r1(shape):
+    # `p = b + 8; popen(p - 8)`: the sink reads from offset 0, and only
+    # [8, 16) is stored -- incomplete. Rebuilding the region from `p`'s own
+    # definition narrowed it to [8, 16) and claimed a complete slice. A phi
+    # whose arms disagree (`k ? &b[8] : &b[0]`) and a loop cursor moving back
+    # from &b[8] are no single offset either: the whole object is consumed.
+    # Each definition the walk reaches alone points into the stored bytes.
+    b = FVar("b", typ="char[0x10]")
+    pg = _BufProgram()
+    pg.aliased_store(b, 8, 0x41).size = 8
+    p1, p2, p3 = FSSA(FVar("p"), 1), FSSA(FVar("p"), 2), FSSA(FVar("p"), 3)
+    _set_ptr(pg, p1, "p#1 = &b:8", _field_addr(b, 8))
+    if shape == "minus":
+        _set_ptr(pg, p2, "p#2 = p#1 - 8",
+                 FExpr("MLIL_SUB", "p#1 - 8", reads=[p1], left=_ssa_ref(p1), right=_const(8)),
+                 reads=[p1])
+        sink_v = p2
+    elif shape == "phi":
+        # p#3 = phi(&b[8], &b[0xc]); p#4 = p#3 - 4; p#5 = phi(p#3, p#4):
+        # each definition alone points into the stored [8, 16).
+        _set_ptr(pg, p2, "p#2 = &b:0xc", _field_addr(b, 0xc))
+        p3, phi = _vphi(FVar("p"), 3, [p1, p2], *pg._next())
+        pg.instrs.append(phi)
+        p4 = FSSA(FVar("p"), 4)
+        _set_ptr(pg, p4, "p#4 = p#3 - 4",
+                 FExpr("MLIL_SUB", "p#3 - 4", reads=[p3], left=_ssa_ref(p3), right=_const(4)),
+                 reads=[p3])
+        sink_v, phi2 = _vphi(FVar("p"), 5, [p3, p4], *pg._next())
+        pg.instrs.append(phi2)
+    else:
+        # p#2 = phi(p#1, p#3); p#3 = p#2 - 1 (the back edge)
+        p2, phi = _vphi(FVar("p"), 2, [p1, p3], *pg._next())
+        pg.instrs.append(phi)
+        _set_ptr(pg, p3, "p#3 = p#2 - 1",
+                 FExpr("MLIL_SUB", "p#2 - 1", reads=[p2], left=_ssa_ref(p2), right=_const(1)),
+                 reads=[p2])
+        sink_v = p2
+    _sink_ssa(pg, sink_v)
+    result, _, aol = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = aol
+    assert leaf["region"] == {"offset": 0, "size": 0x10} and leaf["unproven"] == [[0, 8]], leaf
+
+
+def test_demand_narrows_through_arithmetic_on_a_whole_object_pointer_r1():
+    # The inverse: `p = (char *)&s; popen(p + 4)` reads from offset 4, so the
+    # stores proving [4, 0x44) are enough -- the leading `id` is not demanded.
+    s = FVar("s", typ="char[0x44]")
+    pg = _BufProgram()
+    _qword_stores(pg, s, range(4, 0x44, 8))
+    p1, p2 = FSSA(FVar("p"), 1), FSSA(FVar("p"), 2)
+    _set_ptr(pg, p1, "p#1 = &s", _addr_of(s))
+    _set_ptr(pg, p2, "p#2 = p#1 + 4",
+             FExpr("MLIL_ADD", "p#1 + 4", reads=[p1], left=_ssa_ref(p1), right=_const(4)),
+             reads=[p1])
+    _sink_ssa(pg, p2)
+    result, _, aol = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True, result["leaves"]
+    assert any("bytes [0x4, 0x44) of s" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def test_offset_zero_proof_discloses_the_object_boundary_r1():
+    # A whole-object proof at offset 0 rests on the same end-of-object
+    # assumption as a member's: it is disclosed, and says the bytes do not
+    # establish a terminator.
+    buf = FVar("buf", typ="char[0x40]")
+    pg = _BufProgram()
+    pg.whole_store(buf, 0x41)
+    pg.sink(buf)
+    result, _, aol = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    [a] = [a for a in result["assumptions"] if "(#933)" in a]
+    assert "bytes [0x0, 0x40) of buf" in a and "NUL terminator" in a and "before offset" not in a, a
+
+
+def test_pointer_returned_into_a_local_checks_the_local_r1():
+    # `p = fgets(c, 64, f); write(1, p, 64)`: fgets returns `c`, so the
+    # consumer reads c -- whose bytes no call proves. The modeled source stays
+    # the origin; the slice is incomplete with c's leaf naming fgets.
+    f = FVar("f", ident=51); f0 = FSSA(f, 0)
+    c = FVar("c", typ="char[0x40]")
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[f])
+    pg.call(_B_FGETS, [_addr_of(c), _const(0x40), FExpr("MLIL_VAR_SSA", "f#0", reads=[f0])],
+            reads=[f0], writes=[p1])
+    _sink_ssa(pg, p1)
+    result, _, aol = _bw(pg.func())
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "fgets"}
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = aol
+    assert leaf["buffer"] == "c" and leaf["calls"] == ["fgets"], leaf
+
+    # An integer return (a count) is not read through: nothing changes.
+    n1 = FSSA(FVar("n", typ="int64_t"), 1)
+    pg2 = _BufProgram(params=[f])
+    pg2.call(_B_FGETS, [_addr_of(c), _const(0x40), FExpr("MLIL_VAR_SSA", "f#0", reads=[f0])],
+             reads=[f0], writes=[n1])
+    _sink_ssa(pg2, n1)
+    result2, _, aol2 = _bw(pg2.func())
+    assert aol2 == [] and result2["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
+@pytest.mark.parametrize("root", ["malloc", "parameter"])
+def test_pointer_object_walks_its_writers_and_fails_closed_r1(root):
+    # `b = malloc(64); strcpy(b, host); popen(b)` -- and the same with `b` a
+    # parameter: no local is behind `b`, so the object's extent and earlier
+    # bytes are unknown. Its writers are walked (strcpy and `host` stay in
+    # the slice), and a `pointer_object_unresolved` leaf blocks completeness.
+    host = FVar("host", ident=11); host0 = FSSA(host, 0)
+    b = FVar("b", ident=12, typ="char*")
+    params = [host] if root == "malloc" else [host, b]
+    pg = _BufProgram(params=params)
+    if root == "malloc":
+        bv = FSSA(b, 1)
+        pg.call(_B_MALLOC, [_const(0x40)], writes=[bv])
+    else:
+        bv = FSSA(b, 0)
+    pg.call(_B_STRCPY, [FExpr("MLIL_VAR_SSA", f"b#{bv.version}", reads=[bv]),
+                        FExpr("MLIL_VAR_SSA", "host#0", reads=[host0])], reads=[bv, host0])
+    _sink_ssa(pg, bv)
+    result, reasons, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    ptr = [lf for lf in result["leaves"] if lf["kind"] == "pointer_object_unresolved"]
+    assert [lf.get("calls") for lf in ptr] == [["strcpy"]], ptr
+    assert any("the object b#" in r and "written by strcpy" in r for r in reasons), reasons
+    # The writer's input is walked: `host` is a parameter origin (for the
+    # parameter root, `b` itself is reached first and ranks equal).
+    want = "host#0" if root == "malloc" else "b#0"
+    assert result["slices"][0]["origin"]["var"] == want, result["slices"][0]["origin"]
+    assert any(st.get("il_text", "").startswith("strcpy") or "strcpy" in st.get("reason", "")
+               for st in result["slices"][0]["slice"]), result["slices"][0]["slice"]
+    assert "`bn callsites strcpy --within 0x10`" in ptr[0]["detail"], ptr[0]["detail"]

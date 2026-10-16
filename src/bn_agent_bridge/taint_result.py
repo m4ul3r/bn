@@ -83,6 +83,11 @@ BLOCKING_LEAF_KINDS = frozenset({
     # memory chain longer than the walk budget. The sink consumes the bytes,
     # not the pointer, so a slice that stops at the address-of is NOT complete.
     "address_of_local_unresolved",
+    # #931 round 1: a backward slice reached a pointer with no local behind it
+    # -- a call's return or a parameter -- that a consumer reads through. The
+    # object's extent and earlier contents are unknown to the walk, so nothing
+    # proves the bytes the consumer reads; its writers here stay in the slice.
+    "pointer_object_unresolved",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -417,7 +422,7 @@ def backward_diagnostics(
     # frontier a user can act on by re-running with a narrower sink.
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered",
                   "indirect_call_unresolved", "field_load_unresolved",
-                  "address_of_local_unresolved")
+                  "address_of_local_unresolved", "pointer_object_unresolved")
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
@@ -500,7 +505,8 @@ def backward_diagnostics(
                 f", or re-run `bn taint forward -f {buffer_leaf['function']} "
                 f"--source {source}` on the buffer")
         call_leaf = next((lf for lf in unresolved_leaves
-                          if lf.get("kind") == "address_of_local_unresolved"
+                          if lf.get("kind") in ("address_of_local_unresolved",
+                                                "pointer_object_unresolved")
                           and isinstance(lf.get("function"), str)
                           and any(isinstance(c, str) and c and not c.startswith("__builtin_")
                                   for c in lf.get("calls") or [])), None)

@@ -15,14 +15,17 @@
       "origin_kinds": [
         "parameter"
       ],
-      "complete_slice": true,
-      "forbid_leaves": [
-        {
-          "kind": "address_of_local_unresolved"
-        }
-      ],
+      "complete_slice": false,
       "step_reasons_contain": [
         "written by strcpy"
+      ],
+      "leaves": [
+        {
+          "kind": "pointer_object_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "which is no local of this function"
       ]
     },
     {

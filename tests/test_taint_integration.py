@@ -309,10 +309,12 @@ def test_backward_frontier_advice_runs_as_printed(tmp_path, shared_bn):
     """#1033 item 6: every command a backward leaf or next_action prints runs
     as printed -- the forward run names its function and buffer, the global
     leaf's inspection names the global, and (#931) the call-fill disclosure's
-    `callsites` shows the strcpy -- with a second target open."""
+    `callsites` shows the strcpy, for a local buffer and for a heap object
+    (round 1) -- with a second target open."""
     src = tmp_path / "advice.c"
     src.write_text("""
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 char g_host[64];
 __attribute__((noinline)) void cond_fill(int c, const char *x) {
@@ -326,14 +328,22 @@ __attribute__((noinline)) void from_global(void) {
     sprintf(cmd, "%s", g_host);
     popen(cmd, "r");
 }
-int main(int argc, char **argv) { cond_fill(argc, argv[0]); from_global(); return 0; }
+__attribute__((noinline)) void heap_fill(const char *host) {
+    char *b = malloc(64);
+    strcpy(b, host);
+    popen(b, "r");
+}
+int main(int argc, char **argv) {
+    cond_fill(argc, argv[0]); from_global(); heap_fill(argv[0]); return 0;
+}
 """)
     first, second = tmp_path / "advice one", tmp_path / "advice two"
     _compile(src, first, ["-fno-inline"])
     shutil.copy2(first, second)
     target = shared_bn.load(first, copy=False)
     shared_bn.load(second, copy=False)
-    for fn, verbs in (("cond_fill", ("forward", "callsites")), ("from_global", ("xrefs",))):
+    for fn, verbs in (("cond_fill", ("forward", "callsites")), ("from_global", ("xrefs",)),
+                      ("heap_fill", ("callsites",))):
         result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
                           "--sink", "arg:popen:0")
         assert not result["diagnostics"]["safe_to_report_complete_slice"], result
@@ -345,6 +355,7 @@ int main(int argc, char **argv) { cond_fill(argc, argv[0]); from_global(); retur
         outputs = _run_diagnostic_commands(shared_bn, prose)
         if "forward" in verbs:
             assert any(out.startswith("forward taint in cond_fill") for out in outputs), outputs
+        if "callsites" in verbs:
             assert any("callee: strcpy" in out for out in outputs), outputs
 
 
