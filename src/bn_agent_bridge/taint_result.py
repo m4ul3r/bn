@@ -83,6 +83,12 @@ BLOCKING_LEAF_KINDS = frozenset({
     # pointer it receives is not worked out; what it does with the bytes is
     # unchecked, so an empty reached_sinks is not an all-clear.
     "indirect_call_unchecked",
+    # #1050 review round 8: a scanf-family call whose fully read constant
+    # format writes more destinations than BN recovered arguments for. The
+    # missing ones (typically forwarded incoming pointers left in their
+    # argument registers) were never seeded, so an empty result is no
+    # all-clear.
+    "format_destination_unrecovered",
     # #810: a backward ascent followed only the first N caller sites of a
     # parameter-origin slice; origins reachable only from the dropped callers are
     # absent from the result. Same class as the other frontier leaves: the walk
@@ -332,6 +338,17 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                 "callees by hand. Pinning a target with --resolve-map makes the walk "
                 "descend into it with the arguments taint reaches, which does not show "
                 "that the target receives this buffer")
+    short = [lf for lf in leaves if lf.get("kind") == "format_destination_unrecovered"]
+    if short and all(lf.get("kind") in ("format_destination_unrecovered", "format_unchecked",
+                                         "indirect_call_unchecked") for lf in leaves):
+        at = ", ".join(sorted({str(lf.get("address")) for lf in short}))
+        seed = (f" ({command_template(forward(fn, 'param:N'))} for a pointer this "
+                f"function forwards)" if fn else "")
+        disasm = f" (`bn disasm {shlex.quote(fn)}`)" if fn else ""
+        return ("no sink reached, but a scanf-family call's format writes destinations "
+                f"Binary Ninja did not recover as arguments ({at}), so they were never "
+                f"seeded -- read that call's disassembly{disasm} to find which pointers "
+                f"it passes, and seed each one{seed}")
     unchecked = [lf for lf in leaves if lf.get("kind") == "format_unchecked"]
     if unchecked and len(unchecked) == len(leaves):
         at = ", ".join(sorted({str(lf.get("address")) for lf in unchecked}))

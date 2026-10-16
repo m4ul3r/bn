@@ -735,3 +735,57 @@ def test_an_unreadable_format_still_seeds_the_modeled_run_1050(models):
 
     assert [lf["arg_index"] for lf in result["leaves"]
             if lf["kind"] == "source_seed_misanchored"] == [2]
+
+
+def test_a_format_needing_more_destinations_than_recovered_withholds_the_all_clear_1050(models):
+    """#1050 review round 8: `scanf("%15s %15s %15s", a, b, c)` where `b` and
+    `c` are forwarded incoming pointers left in their argument registers, and
+    BN's MLIL lists only the format and `a`. The two lost destinations are
+    disclosed by count -- never guessed -- and the all-clear withheld."""
+    a = FVar("a", typ="char[0x10]")
+    call = _ext_call(0, 0x10, "scanf(fmt, &a)", 0x900,
+                     [FExpr("MLIL_CONST_PTR", "fmt", constant=0x5000), _addr_of(a)])
+    func = FFunc("fwd", 0x10, FSSAFunc([call]), params=[])
+    bv = FBVStr({0x900: "scanf"}, strings={0x5000: "%15s %15s %15s"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:scanf")])
+
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "format_destination_unrecovered"]
+    assert (leaf["destinations"], leaf["recovered"], leaf["missing"]) == (3, 1, 2)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+class _PrefixStringView(FBVStr):
+    """BN's ASCII string at the format stops at a non-ASCII literal byte; the
+    raw bytes run on to the real terminator."""
+
+    def __init__(self, addr_names, blob):
+        super().__init__(addr_names, strings={})
+        self._blob = blob
+
+    def get_ascii_string_at(self, addr, min_length=1):
+        if int(addr) != 0x5000:
+            return None
+        return type("S", (), {"value": self._blob.split(b"\xe9", 1)[0].decode()})()
+
+    def read(self, addr, length):
+        off = int(addr) - 0x5000
+        return self._blob[off:off + length] if 0 <= off < len(self._blob) else b""
+
+
+@pytest.mark.parametrize("pad", [600, 5000], ids=["nul-in-window", "no-nul-in-window"])
+def test_a_format_prefix_without_its_terminator_never_trims_destinations_1050(models, pad):
+    """#1050 review round 8: two bounded conversions separated by a non-ASCII
+    literal and padding. A prefix that did not reach the NUL is not the format:
+    the second destination stays seeded, and its command sink is found."""
+    a, b = FVar("a", typ="char[0x10]"), FVar("b", typ="char[0x10]")
+    blob = b"%15s\xe9" + b"A" * pad + b"%15s\x00"
+    scan = _ext_call(0, 0x10, "scanf(fmt, &a, &b)", 0x900,
+                     [FExpr("MLIL_CONST_PTR", "fmt", constant=0x5000), _addr_of(a), _addr_of(b)])
+    run = _ext_call(1, 0x14, "system(&b)", 0x901, [_addr_of(b)])
+    func = FFunc("two", 0x10, FSSAFunc([scan, run]), params=[])
+    bv = _PrefixStringView({0x900: "scanf", 0x901: "system"}, blob)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:scanf")])
+
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"]
+    unchecked = [lf for lf in result["leaves"] if lf["kind"] == "format_unchecked"]
+    assert bool(unchecked) == (pad == 5000)   # unterminated within the read: unreadable

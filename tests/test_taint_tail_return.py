@@ -141,8 +141,8 @@ class _Reg:
 
 class _LLIL:
     """`x2 = x0` (``kind="read"``), `x0 = 7` (``"write"``), `w0 = 7` (a
-    zero-extending 32-bit write, ``"wwrite"``), `ret` (``"ret"``) or
-    `call(...)` (``"call"``)."""
+    zero-extending 32-bit write, ``"wwrite"``), `ret` (``"ret"``),
+    `call(...)` (``"call"``) or a jump-table `jump(x1)` (``"jump"``)."""
 
     def __init__(self, index, kind):
         self.instr_index = index
@@ -151,6 +151,8 @@ class _LLIL:
             self.operation, self.operands = _Op("LLIL_CALL"), []
         elif kind == "ret":
             self.operation, self.operands = _Op("LLIL_RET"), []
+        elif kind == "jump":
+            self.operation, self.operands = _Op("LLIL_JUMP_TO"), []
         else:
             dest = {"read": "x2", "write": "x0", "wwrite": "w0"}[kind]
             self.operation = _Op("LLIL_SET_REG")
@@ -176,13 +178,21 @@ class _Arch:
 
 
 class _LLILBlock:
-    def __init__(self, start, end):
+    def __init__(self, start, end, undetermined=False):
         self.start, self.end, self.outgoing_edges = start, end, []
+        self.has_undetermined_outgoing_edges = undetermined
 
 
-def _dropped_result_program(after, *, value_returning=False):
+class _Edge:
+    def __init__(self, target):
+        self.target = target
+
+
+def _dropped_result_program(after, *, value_returning=False, cases=(), undetermined=False):
     """main(n): `wrap(n)` -- an MLIL call with NO result -- whose LLIL is
-    followed by *after* (a list of `_LLIL` kinds)."""
+    followed by *after* (a list of `_LLIL` kinds). *cases* are further blocks
+    (lists of kinds), each a known successor of the call's block -- a jump
+    table's cases; *undetermined* marks that block's edges as unknown to BN."""
     n, p = FVar("n"), FVar("p")
     ns = FSSA(n, 0)
     callee = FFunc("wrap", 0x2000, FSSAFunc([
@@ -193,9 +203,16 @@ def _dropped_result_program(after, *, value_returning=False):
         FInstr(0, 0x1010, "MLIL_CALL_SSA", "wrap(n)", reads=[ns], writes=[],
                params=[_value(ns)], dest=_const(0x2000)), *rets]), params=[n])
     llil = [_LLIL(0, "call"), *[_LLIL(i + 1, k) for i, k in enumerate(after)]]
-    block = _LLILBlock(0, len(llil))
-    for ins in llil:
-        ins.il_basic_block = block
+    block = _LLILBlock(0, len(llil), undetermined)
+    blocks = [block]
+    for kinds in cases:
+        start = len(llil)
+        llil += [_LLIL(start + i, k) for i, k in enumerate(kinds)]
+        blocks.append(_LLILBlock(start, len(llil)))
+        block.outgoing_edges.append(_Edge(blocks[-1]))
+    for b in blocks:
+        for ins in llil[b.start:b.end]:
+            ins.il_basic_block = b
     main.llil = llil
     main.get_low_level_il_at = lambda addr: llil[0] if addr == 0x1010 else None
     main.calling_convention = type("CC", (), {"int_return_reg": "x0",
@@ -238,3 +255,35 @@ def test_returning_straight_after_the_call_from_a_value_function_reads_it_1034()
     result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
 
     assert [lf["return_register"] for lf in _dropped(result)] == ["x0"]
+
+
+def test_a_read_in_a_known_jump_table_case_is_a_frontier_1050():
+    """#1050 review round 8: `bl wrap; ...; br x1` into a dense switch whose
+    case 1 does `mov x2, x0` before the copy. The jump is no end of the path:
+    BN's known CFG edges are followed."""
+    main, bv, models = _dropped_result_program(
+        ["jump"], cases=[["call", "read"], ["read", "call"], ["write", "ret"]])
+    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
+
+    [leaf] = _dropped(result)
+    assert (leaf["return_register"], leaf["return_register_use"]) == ("x0", "read")
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_jump_table_cases_that_never_read_it_are_no_frontier_1050():
+    main, bv, models = _dropped_result_program(
+        ["jump"], cases=[["call", "read"], ["write", "read"], ["ret"]])
+    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
+
+    assert _dropped(result) == []
+
+
+@pytest.mark.parametrize("undetermined", [True, False], ids=["undetermined-edges", "no-edges"])
+def test_a_jump_bn_could_not_resolve_is_a_possible_read_1050(undetermined):
+    """Fails closed: where control goes is unknown, so a read cannot be ruled
+    out -- with BN's undetermined-edge flag, or a jump with no edges at all."""
+    main, bv, models = _dropped_result_program(["jump"], undetermined=undetermined)
+    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
+
+    [leaf] = _dropped(result)
+    assert leaf["return_register_use"] == "undetermined_control_flow"

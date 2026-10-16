@@ -1220,26 +1220,36 @@ class TaintEngine:
         in writable `.data` is merely its initial value, which any code may
         overwrite before the call (`strcpy(fmt, "%s")`), so it is no constant
         (#1050 review finding 1). The same storage test the backward walk uses
-        for literal operands (`_const_ptr_storage`)."""
+        for literal operands (`_const_ptr_storage`).
+
+        A format is known only when its terminating NUL was seen (#1050
+        review round 8): BN's ASCII string stops at the first non-ASCII byte,
+        and a bounded read can end mid-format, and either prefix silently drops
+        later conversions. A string BN returns is accepted only when the byte
+        right after it is NUL; the raw read must find the NUL within its window.
+        Anything else is unreadable (None)."""
         addr = self._const_ptr_addr(ssaf, expr)
         if addr is None or self._const_ptr_storage(addr) == "writable":
             return None
+        read = getattr(self.bv, "read", None)
         getstr = getattr(self.bv, "get_ascii_string_at", None)
         if getstr is not None:
             try:
                 s = getstr(int(addr), 1)
                 val = getattr(s, "value", None)
                 if val is not None:
-                    return str(val)
+                    text = str(val)
+                    width = len(text.encode("latin-1", "replace"))
+                    if read is None or read(int(addr) + width, 1) == b"\x00":
+                        return text
             except Exception:
                 pass
-        read = getattr(self.bv, "read", None)
         if read is not None:
             try:
-                raw = read(int(addr), 512)
-                if raw:
-                    nul = raw.find(b"\x00")
-                    return raw[: nul if nul >= 0 else len(raw)].decode("latin-1", "replace")
+                raw = read(int(addr), 4096)
+                nul = raw.find(b"\x00") if raw else -1
+                if nul >= 0:
+                    return raw[:nul].decode("latin-1", "replace")
             except Exception:
                 pass
         return None
@@ -3419,6 +3429,34 @@ class TaintEngine:
             return None
         return int(first) + sum(1 for s in specs if not s.suppressed)
 
+    def _format_destination_shortfall(self, ins: Any, callee: str, model: Any,
+                                      params: list[Any], dest_end: int | None) -> dict | None:
+        """A blocking `format_destination_unrecovered` leaf when the call's fully
+        read constant format writes more destinations than BN recovered
+        arguments for (#1050 review round 8): a forwarded incoming pointer left
+        in its argument register is passed, yet BN's MLIL call does not list it,
+        so it was never seeded. The missing arguments are not guessed and the
+        model range is not widened; the gap is disclosed by count."""
+        if dest_end is None or dest_end <= len(params):
+            return None
+        first = int(((model or {}).get("sink") or {}).get("first_dest") or 0)
+        missing = dest_end - len(params)
+        at = hex(int(getattr(ins, "address", 0)))
+        return {
+            "kind": "format_destination_unrecovered",
+            "address": at,
+            "callee": str(callee),
+            "il_text": str(ins),
+            "destinations": dest_end - first,
+            "recovered": max(0, len(params) - first),
+            "missing": missing,
+            "detail": (
+                f"{self._prose_name(callee)}() at {at}: its constant format writes "
+                f"{dest_end - first} destination(s) but Binary Ninja recovered only "
+                f"{max(0, len(params) - first)} of those arguments, so {missing} "
+                f"destination(s) were not seeded -- what they receive is unchecked"),
+        }
+
     def _unchecked_indirect_calls(self, instrs: list[Any], fills: list[Any], callee: str,
                                   add_leaf: Any) -> None:
         """#1041 item 1 gate (#1050 review rounds 4-5): a blocking leaf at every
@@ -4469,33 +4507,44 @@ class TaintEngine:
         it -- so the caller uses a value BN dropped, and whatever the callee
         returned is not followed. The callee's shape is not predicted; the fact
         is read off the caller's LLIL (:meth:`_return_register_read_after`)."""
-        reg = self._return_register_read_after(caller_fn, ins, caller_instrs)
-        if reg is None:
+        found = self._return_register_read_after(caller_fn, ins, caller_instrs)
+        if found is None:
             return None
+        reg, seen = found
+        use = (f"the caller's machine code reads the return register {reg} after it"
+               if seen else
+               f"after it the caller's machine code reaches control flow Binary Ninja "
+               f"could not determine, which may read the return register {reg}")
         call_at = hex(int(getattr(ins, "address", 0)))
         fn_at = hex(int(getattr(caller_fn, "start", 0)))
         leaf = self._frontier_leaf(
             ins, callee_fn, tainted_args,
             f"tainted arg(s) {sorted(tainted_args)} passed to "
             f"{self._prose_function(callee_fn)} at {call_at}: Binary Ninja's IL gives the "
-            f"call no result, but the caller's machine code reads the return register "
-            f"{reg} after it, so the value the callee returns is not followed -- read the "
-            f"call site with `bn disasm {fn_at}`")
+            f"call no result, but {use}, so the value the callee returns is not followed "
+            f"-- read the call site with `bn disasm {fn_at}`")
         leaf["cause"] = "return_value_unrecovered"
         leaf["return_register"] = reg
+        leaf["return_register_use"] = "read" if seen else "undetermined_control_flow"
         return leaf
 
     def _return_register_read_after(self, caller_fn: Any, ins: Any,
-                                    caller_instrs: list | None) -> str | None:
-        """The calling convention's integer return register when the caller's
-        LLIL, on some path after the call at *ins*, reads it before anything
-        writes all of it; else None (also whenever the view cannot answer).
+                                    caller_instrs: list | None) -> tuple[str, bool] | None:
+        """``(register, True)`` -- the calling convention's integer return
+        register -- when the caller's LLIL, on some path after the call at
+        *ins*, reads it before anything writes all of it; ``(register, False)``
+        when such a path reaches control flow BN could not determine; else None
+        (also whenever the view cannot answer).
 
         Another call clobbers it (end of that path). A partial write without
         an implicit extension (`al`) does not end the path; `w0`/`eax` writes
         zero-extend and do. Falling off a return counts as a read only when the
         caller's MLIL returns carry a value -- a void caller's `ret` uses
-        nothing."""
+        nothing. A jump is no end: the scan continues along the block's CFG
+        edges as BN gives them (a jump table's known cases, #1050 review round
+        8), and a block whose outgoing edges BN could not determine -- or a
+        jump with none at all -- counts as a read, since what runs there is
+        unknown."""
         try:
             cc = getattr(caller_fn, "calling_convention", None) \
                 or self.bv.platform.default_calling_convention
@@ -4546,7 +4595,7 @@ class TaintEngine:
                 hit = got & full_ret
                 if hit:
                     return sorted(hit)[0]
-                if "CALL" in opn or opn in ("LLIL_TAILCALL", "LLIL_JUMP", "LLIL_JUMP_TO"):
+                if "CALL" in opn or opn == "LLIL_TAILCALL":
                     return True
                 if opn == "LLIL_RET":
                     return sorted(full_ret)[0] if value_returning else True
@@ -4560,13 +4609,24 @@ class TaintEngine:
                                 return True
             return None
 
+        unknown_read = (min(full_ret), False)
+
+        def open_end(b: Any) -> bool:
+            """BN cannot say where control goes after block *b*."""
+            if getattr(b, "has_undetermined_outgoing_edges", False):
+                return True
+            return (op_name(llil[int(b.end) - 1]) in ("LLIL_JUMP", "LLIL_JUMP_TO")
+                    and not list(b.outgoing_edges))
+
         try:
             block = call_llil.il_basic_block
             first = scan(int(call_llil.instr_index) + 1, int(block.end))
             if isinstance(first, str):
-                return first
+                return first, True
             if first is True:
                 return None
+            if open_end(block):
+                return unknown_read
             seen = {int(block.start)}
             work = [block]
             while work:
@@ -4577,8 +4637,10 @@ class TaintEngine:
                     seen.add(int(t.start))
                     r = scan(int(t.start), int(t.end))
                     if isinstance(r, str):
-                        return r
+                        return r, True
                     if r is None:
+                        if open_end(t):
+                            return unknown_read
                         work.append(t)
         except Exception:  # noqa: BLE001 - a view without blocks proves nothing
             return None
@@ -6880,6 +6942,9 @@ class TaintEngine:
                 for c in calls:
                     params = self._call_params(c)
                     dest_end = self._format_destination_end(ssaf, model, params)
+                    short = self._format_destination_shortfall(c, callee, model, params, dest_end)
+                    if short is not None:
+                        add_leaf(short)
                     for sd in src_defs:
                         to = str(sd.get("to") or "")
                         if to == "ret" or to == "*ret":
