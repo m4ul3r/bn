@@ -23,6 +23,10 @@ from _cli_helpers import *  # noqa: F401,F403
 from test_cli_types import _must_not_hang
 
 
+NOTE = ("no library attributed: bn names a library only from a symbol-version "
+        "requirement it could match; the loader picks it at run time from DT_NEEDED")
+
+
 def test_evidence_init_routes_and_renders_sections(fake_transport, capsys):
     calls = fake_transport({
         "init_arrays": {
@@ -3563,8 +3567,7 @@ def test_imports_text_names_callers_and_discloses_unversioned_imports_1037(fake_
         "items": [
             {"name": "Registry::get", "raw_name": "_ZN8Registry3getEv", "address": "0x401140",
              "kind": "function", "library": None, "namespace": "",
-             "library_note": "unversioned import: the loader picks the library at run time "
-                             "from the DT_NEEDED list",
+             "library_note": "no library attributed: bn names a library only from a symbol-version requirement it could match; the loader picks it at run time from DT_NEEDED",
              "code_ref_count": 9, "caller_count": 9,
              "callers": [{"address": hex(0x401200 + i * 0x10), "name": f"start_{i}",
                           "display_name": f"start_{i}"} for i in range(8)]},
@@ -3578,8 +3581,7 @@ def test_imports_text_names_callers_and_discloses_unversioned_imports_1037(fake_
         ],
         "total": 3, "offset": 0, "limit": 100, "returned": 3, "has_more": False,
         "library_unattributed": 1, "needed_libraries": ["libreg.so", "libc.so.6"],
-        "unattributed_note": "unversioned import: the loader picks the library at run time "
-                             "from the DT_NEEDED list",
+        "unattributed_note": "no library attributed: bn names a library only from a symbol-version requirement it could match; the loader picks it at run time from DT_NEEDED",
         "callers_cap": 8,
     }}})
     assert bn.cli.main(["imports", "--target", "active", "--with-callers"]) == 0
@@ -3590,8 +3592,7 @@ def test_imports_text_names_callers_and_discloses_unversioned_imports_1037(fake_
     assert "0x401150  puts [libc.so.6]  [callers: 0 functions]" in out
     assert ("0x401160  dup [libc.so.6]  "
             "[callers unknown: code refs could not be read: RuntimeError: gone]") in out
-    assert ("// 1 import(s) carry no library (unversioned import: the loader picks the "
-            "library at run time from the DT_NEEDED list); this binary needs (DT_NEEDED): "
+    assert (f"// 1 import(s) carry no library ({NOTE}); this binary needs (DT_NEEDED): "
             "libreg.so, libc.so.6") in out
     # Counted off the rows: only `puts` is a measured zero.
     assert "// 1 import(s) show no recorded code refs" in out
@@ -3632,15 +3633,13 @@ def test_imports_summary_text_states_why_imports_are_unattributed_1037(fake_tran
         "kind": "imports_summary", "total_symbols": 1,
         "needed_libraries": ["libA.so", "libc.so.6"],
         "by_library": {"(unattributed)": 1},
-        "unattributed_note": "unversioned import: the loader picks the library at run time "
-                             "from the DT_NEEDED list",
+        "unattributed_note": "no library attributed: bn names a library only from a symbol-version requirement it could match; the loader picks it at run time from DT_NEEDED",
         "namespaces": {"(none)": 1}, "by_kind": {"function": 1},
     }}})
     assert bn.cli.main(["imports", "--target", "active", "--summary"]) == 0
     out = capsys.readouterr().out
     assert "needed libraries (DT_NEEDED):\n  libA.so\n  libc.so.6" in out
-    assert ("unattributed: unversioned import: the loader picks the library at run time "
-            "from the DT_NEEDED list") in out
+    assert f"unattributed: {NOTE}" in out
 
 
 def test_strings_all_targets_routes_each_rows_printed_read_to_its_target_1037(
@@ -3685,8 +3684,7 @@ def test_routing_never_rewrites_target_strings_1037(fake_transport, capsys):
 def test_imports_footer_states_the_bridges_reason_not_a_fixed_claim_1037(fake_transport, capsys):
     """#1037 review round 3: the footer said "unversioned import" whatever the
     bridge knew; it now states the bridge's reason."""
-    note = ("symbol versions were not read (DT_SYMENT 32 is not the ABI symbol size 24); "
-            "no library is attributed")
+    note = f"{NOTE}; symbol versions were not read: DT_SYMENT 32 is not the ABI symbol size 24"
     fake_transport({"imports": {"ok": True, "result": {
         "kind": "imports",
         "items": [{"name": "puts", "raw_name": "puts", "address": "0x401030",

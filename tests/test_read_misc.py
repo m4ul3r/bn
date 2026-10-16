@@ -20,6 +20,10 @@ from _bridge_fakes import *  # noqa: F401,F403
 # --- I2: strings filtering ---
 
 
+NOTE = ("no library attributed: bn names a library only from a symbol-version "
+        "requirement it could match; the loader picks it at run time from DT_NEEDED")
+
+
 def test_list_envelopes_carry_kind(monkeypatch):
     # #275: every generic-list read carries a `kind` discriminator (strings shown
     # here; the registry-driven conformance test covers the rest).
@@ -1064,8 +1068,8 @@ def test_imports_unversioned_rows_disclose_why_library_is_null_1037(monkeypatch,
     for name in ("_ZNSo3putEc", "__gmon_start__"):
         assert rows[name]["library"] is None and "library_source" not in rows[name]
         assert rows[name]["library_note"] == (
-            "unversioned import: the loader picks the library at run time from the "
-            "DT_NEEDED list")
+            "no library attributed: bn names a library only from a symbol-version "
+            "requirement it could match; the loader picks it at run time from DT_NEEDED")
     assert listed["needed_libraries"] == ["libc.so.6", "libstdc++.so.6"]
     assert not {"needed_library_files", "library_unattributed_reasons"} & set(listed)
     assert summary["unattributed_note"] == rows["__gmon_start__"]["library_note"]
@@ -1090,8 +1094,8 @@ def test_imports_do_not_call_a_symbol_unversioned_when_versions_were_not_read_10
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     listed = instance._imports(None)
-    expected = ("symbol versions were not read (DT_SYMENT 32 is not the ABI symbol size "
-                "24); no library is attributed")
+    expected = (f"{NOTE}; symbol versions were not read: DT_SYMENT 32 is not the ABI "
+                "symbol size 24")
     assert {row["library_note"] for row in listed["items"]} == {expected}
     assert listed["unattributed_note"] == expected
     assert any("DT_SYMENT 32" in note for note in listed["dynamic_section_notes"])
@@ -2332,3 +2336,53 @@ def test_data_symbols_surfaces_a_lookup_failure_instead_of_reporting_none(monkey
 
     with pytest.raises(RuntimeError, match="core symbol table unavailable"):
         instance._data_symbols(None)
+
+
+def _patch_versym(image, index, value):
+    """Set `.gnu.version` entry *index* of a `_build_elf` image to *value*."""
+    import struct
+
+    from test_elf_dynamic import _BASE, _dynamic_entries_at
+
+    rows, _fmt = _dynamic_entries_at(image)
+    versym = next(value_ for _at, tag, value_ in rows if tag == 0x6FFFFFF0) - _BASE
+    out = bytearray(image)
+    struct.pack_into("<H", out, versym + 2 * index, value)
+    return bytes(out)
+
+
+@pytest.mark.parametrize("shape", ["unknown_index", "two_versions", "versym_without_verneed"])
+def test_unattributed_imports_get_the_neutral_note_never_unversioned_1037(monkeypatch, shape):
+    """#1037 review round 4: three valid or edge-case shapes left an import
+    unattributed and bn called it "unversioned": a version index naming no
+    requirement entry, one name required at two versions from two libraries,
+    and a DT_VERSYM with no DT_VERNEED. The note now states what bn does."""
+    from test_elf_dynamic import _build_elf
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    needed = ("libc.so.6", "libstdc++.so.6")
+    if shape == "unknown_index":
+        image = _patch_versym(_build_elf(needed=needed, symbols=(
+            ("printf", "libc.so.6"), ("_ZNSo3putEc", "libstdc++.so.6"),
+            ("__gmon_start__", None))), 2, 9)   # `_ZNSo3putEc` -> no such index
+    elif shape == "two_versions":
+        image = _build_elf(needed=needed, symbols=(
+            ("printf", "libc.so.6"), ("printf", "libstdc++.so.6"),
+            ("_ZNSo3putEc", "libstdc++.so.6"), ("__gmon_start__", None)))
+    else:
+        image = _build_elf(needed=needed, symbols=(
+            ("printf", None), ("_ZNSo3putEc", None), ("__gmon_start__", None)))
+    bv = _versioned_import_bv(fake_bn, image=image)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._imports(None)
+    nulls = [row for row in listed["items"] if row["library"] is None]
+    expected_null = {"unknown_index": "_ZNSo3putEc", "two_versions": "printf",
+                     "versym_without_verneed": "printf"}[shape]
+    assert expected_null in {row["name"] for row in nulls}
+    assert {row["library_note"] for row in nulls} == {NOTE}
+    assert listed["unattributed_note"] == NOTE
+    assert instance._imports(None, summary=True)["unattributed_note"] == NOTE
+    assert "unversioned" not in json.dumps(listed)

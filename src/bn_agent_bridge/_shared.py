@@ -140,7 +140,7 @@ _OPTIONAL_ROW_FIELDS: dict[str, dict[str, str]] = {
     },
     "imports": {
         "library_source": "rows whose library is attributed",
-        "library_note": "unversioned imports of a target with DT_NEEDED: why "
+        "library_note": "null-library imports of a target with DT_NEEDED: why "
                         "library is null",
         "provenance": "imports recovered from a relocation with no import symbol",
         "code_ref_count": "--with-callers",

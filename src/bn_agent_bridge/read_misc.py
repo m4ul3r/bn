@@ -925,7 +925,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         emitted_names.add(raw_name)
         relocation_recovered += 1
     # #1037 item 6: say where every attributed library came from, and why an
-    # unversioned import has none.
+    # import has none.
     unattributed_note = _unattributed_note(elf_info)
     _note_unversioned_imports(items, needed_libraries, unattributed_note)
     # #450: filter the survey to matching imports so a sink/source sweep
@@ -1000,8 +1000,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     if unattributed and needed_libraries:
         result["library_unattributed"] = unattributed
         result["needed_libraries"] = needed_libraries
-        # #1037 item 6: why they are null -- "unversioned" only when the
-        # version table was read (review round 3).
+        # #1037 item 6: the neutral note on why they are null.
         result["unattributed_note"] = unattributed_note
     # Why attribution may be partial: a dynamic-section structure that was out
     # of range for the file and skipped rather than read (#987 review).
@@ -1035,21 +1034,23 @@ def _note_unversioned_imports(items: list[dict[str, Any]], needed_libraries: lis
             item["library_note"] = note
 
 
-# Why an unversioned import's `library` is null (#1037 item 6).
-UNVERSIONED_IMPORT_NOTE = ("unversioned import: the loader picks the library at run "
-                           "time from the DT_NEEDED list")
+# Why a null-library import has no library (#1037 item 6). A statement about
+# what bn does, never about the symbol: two review rounds showed that calling
+# a row "unversioned" predicts what the version metadata means (an index that
+# names no requirement, one name required from two libraries, a DT_VERSYM with
+# no DT_VERNEED all leave a row unattributed without making it unversioned).
+UNATTRIBUTED_IMPORT_NOTE = ("no library attributed: bn names a library only from a "
+                            "symbol-version requirement it could match; the loader "
+                            "picks it at run time from DT_NEEDED")
 
 
 def _unattributed_note(elf_info: ElfDynamicInfo | None) -> str:
-    """Why a null-library import has no library. "Unversioned" only when the
-    symbol version table WAS read (or the file has none): an import absent
-    from an unread table is not shown to be unversioned (#1037 review round 3,
-    a refused DT_SYMENT on a file whose imports all carry versions)."""
-    reason = ("the ELF dynamic section was not read" if elf_info is None
-              else elf_info.versions_unread)
-    if reason is None:
-        return UNVERSIONED_IMPORT_NOTE
-    return f"symbol versions were not read ({reason}); no library is attributed"
+    """The neutral note, plus the parser's recorded reason for not reading the
+    symbol versions when there is one. The absence of a reason claims nothing."""
+    reason = elf_info.versions_unread if elf_info is not None else None
+    if reason:
+        return f"{UNATTRIBUTED_IMPORT_NOTE}; symbol versions were not read: {reason}"
+    return UNATTRIBUTED_IMPORT_NOTE
 
 
 # #1037 item 5: the most calling functions one `imports --with-callers` row
@@ -1182,7 +1183,7 @@ def _imports_build_summary(
     }
     # #1037 item 6: why "(unattributed)" rows are null, also when every row is.
     if by_library.get("(unattributed)") and needed_libraries:
-        summary["unattributed_note"] = unattributed_note or UNVERSIONED_IMPORT_NOTE
+        summary["unattributed_note"] = unattributed_note or UNATTRIBUTED_IMPORT_NOTE
     return summary
 
 
