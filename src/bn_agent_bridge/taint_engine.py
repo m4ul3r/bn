@@ -131,10 +131,14 @@ _POINTER_LEAF = "pointer_object_unresolved"
 _POINTER_NOUN = "the object"
 
 # The backward leaf kind for stores that cover a consumed region the walk
-# cannot bound: the demand reaches outside the object, its offset is not one
-# constant, or the object's extent is BN's own recovery rather than debug info
-# or a user-applied type (round 2). The stores are reported as facts.
+# cannot bound: the demand reaches outside the object, or its offset is not
+# one constant (round 2). The stores are reported as facts.
 _EXTENT_LEAF = "object_extent_unknown"
+
+# The backward leaf kind for a consumed region every byte of which stores the
+# walk can see write on every path: a fact, never a certified proof -- it rests
+# on BN's recovery of the object's extent (round 3).
+_PROOF_LEAF = "region_store_proof_not_certified"
 
 # `_follow_input`'s default demand: the writer consumes the operand itself as
 # a pointer, at offset 0 of what it points to.
@@ -2283,22 +2287,6 @@ class TaintEngine:
             return None
         lo, hi = spans[0]
         return stated if hi - lo == stated else None
-
-    @staticmethod
-    def _extent_trusted(func: Any, v: Any) -> bool:
-        """Is local *v*'s extent something BN did not infer? BN marks a
-        variable whose type came from debug info (DWARF locals) or was applied
-        by a user as user-defined (``Function.is_var_user_defined``); an
-        auto-recovered stack variable is not, and may be a fragment of the real
-        object -- BN splits a stack object it has no type for (round 2). An
-        unanswerable question is an untrusted extent."""
-        check = getattr(func, "is_var_user_defined", None)
-        if check is None:
-            return False
-        try:
-            return bool(check(getattr(v, "var", v)))
-        except Exception:
-            return False
 
     def _var_byte_size(self, v: Any) -> int | None:
         """Byte size of local *v* (a Variable / SSAVariable) from its type, or
@@ -7797,14 +7785,6 @@ class TaintEngine:
             # object, else over the whole object (they are reported, but they
             # prove nothing about bytes outside it or at an unknown offset).
             lo, hi = (d_lo, d_hi) if d_lo is not None and not outside else (0, end)
-            # An exact read (a load, a by-name field read) consumes exactly its
-            # bytes; anything else -- a pointer handed to a consumer -- is taken
-            # to read within the object, to its end.
-            exact = region is not None and region[1] is not None and not region[2]
-            # Only an extent BN did not infer bounds the object: debug info or a
-            # user-applied type. An auto-recovered stack variable may be a
-            # fragment of the real object (round 2).
-            trusted = size is not None and self._extent_trusted(func, local)
             bkey = (var_key(local), int(mv), d_lo, d_hi, value_demand is not None)
             if bkey in visited_bufs:
                 return
@@ -7816,7 +7796,6 @@ class TaintEngine:
                 "region": {"offset": d_lo,
                            "size": (d_hi - d_lo) if d_lo is not None and d_hi is not None
                            and d_hi < _REGION_OPEN else None},
-                "extent": "debug_or_user" if trusted else "inferred",
                 "unproven": None if res["unproven"] is None else
                 [[a, b if b < _REGION_OPEN else None] for a, b in res["unproven"]],
             }
@@ -7843,45 +7822,37 @@ class TaintEngine:
                     f"pointer arithmetic with `bn il {fn_ref} --view mlil`",
                     kind=_EXTENT_LEAF, cause="outside_object", **facts)
                 _set_origin({"kind": _EXTENT_LEAF, "buffer": label})
-            elif res["covered"] and d_lo is not None and trusted:
-                if not exact:
-                    # The proof rests on the object boundary: disclose it on
-                    # every such result, offset zero included (round 1).
-                    before = (f"; the bytes before offset {lo:#x} are taken as not read "
-                              f"through that pointer" if lo > 0 else "")
-                    end_txt = f"{hi:#x}" if hi < _REGION_OPEN else "its end"
-                    self._bw_assume(
-                        f"local buffer {label} is consumed through a pointer at "
-                        f"{hex(int(getattr(defn, 'address', 0) or 0))}: stores prove "
-                        f"bytes [{lo:#x}, {end_txt}) of {label}, and the slice takes "
-                        f"the reader to stay within {label}{before}. Per-object byte "
-                        f"coverage does not establish a NUL terminator or account for "
-                        f"a read past the end of {label} (#933)")
-            elif res["covered"]:
-                # The stores cover the bytes as the walk sees the object, but
-                # the demand or the object is not established: the stores are
-                # reported as facts and prove nothing (round 2).
-                if d_lo is None:
-                    cause = "offset_unknown"
-                    why = (f"the consumer's offset into {label} is not one constant on "
-                           f"every path (a moving cursor, phi arms that disagree, or a "
-                           f"pointer reloaded from memory), so it may read outside "
-                           f"{label}")
-                else:
-                    cause = "inferred_extent"
-                    why = (f"{label}'s extent ({end:#x} bytes) is BN's own recovery, "
-                           f"not debug info or a user-applied type, and a recovered "
-                           f"stack variable may be a fragment of the larger object "
-                           f"the consumer reads")
+            elif res["covered"] and d_lo is None:
                 _buffer_leaf(
                     defn, label,
-                    f"stores the walk can see write bytes [{lo:#x}, "
-                    f"{(f'{hi:#x}' if hi < _REGION_OPEN else 'end')}) of local buffer "
-                    f"{label}, but {why}; those stores are facts, not a proof, so the "
-                    f"slice is NOT complete -- inspect the object with "
-                    f"`bn il {fn_ref} --view mlil`, or apply its real type and re-run",
-                    kind=_EXTENT_LEAF, cause=cause, **facts)
+                    f"stores the walk can see write every byte of local buffer {label}, "
+                    f"but the consumer's offset into it is not one constant on every "
+                    f"path (a moving cursor, phi arms that disagree, or a pointer "
+                    f"reloaded from memory), so it may read outside {label}; those "
+                    f"stores are facts, not a proof, so the slice is NOT complete -- "
+                    f"inspect the pointer arithmetic with `bn il {fn_ref} --view mlil`",
+                    kind=_EXTENT_LEAF, cause="offset_unknown", **facts)
                 _set_origin({"kind": _EXTENT_LEAF, "buffer": label})
+            elif res["covered"]:
+                # Stores the walk can see write every consumed byte on every
+                # path. That is reported as a fact and never certifies the
+                # slice (#931/#933 round 3): the object's extent rests on BN's
+                # variable recovery, which a name-only rename marks
+                # user-defined, and three review rounds forged a store proof.
+                span = f"[{lo:#x}, {hi:#x})" if hi < _REGION_OPEN else f"[{lo:#x}, end)"
+                _buffer_leaf(
+                    defn, label,
+                    f"stores the walk can see write every byte of {span} of local "
+                    f"buffer {label} on every path, but a region proof from stores is "
+                    f"not certified: it rests on BN's recovery of the object's extent "
+                    f"and of the consumer's offset, so the slice is NOT complete -- "
+                    f"check by hand that the consumer reads only those bytes and that "
+                    f"{label} is the whole object (`bn il {fn_ref} --view mlil` shows "
+                    f"the stores and the pointer arithmetic)",
+                    kind=_PROOF_LEAF,
+                    stores_cover=[lo, hi if hi < _REGION_OPEN else None], **facts)
+                # The origin stays what the writers established (a stored
+                # constant, a parameter): the stores are facts, the leaf blocks.
             else:
                 r_lo, r_hi = res["region"]
                 span = (f"bytes [{r_lo:#x}, {r_hi:#x})" if r_hi < _REGION_OPEN
@@ -7929,7 +7900,6 @@ class TaintEngine:
                     region={"offset": r_lo,
                             "size": (r_hi - r_lo) if r_hi < _REGION_OPEN else None},
                     unproven=[[a, b if b < _REGION_OPEN else None] for a, b in gaps],
-                    extent=facts["extent"],
                     **({"calls": list(dict.fromkeys(w[7] for w in calls))} if calls else {}))
                 # Classified like `field_load_unresolved`: the origin names the
                 # stop and the leaf is the one frontier entry, so the frontier
@@ -8028,6 +7998,15 @@ class TaintEngine:
                 locs = _arg_locals([p])
                 for loc in locs:
                     _walk_local_buffer(defn, loc, d, mv, (None, None, True))
+                # A constant address of writable storage (`fgets(g_buf, ..)`,
+                # `fgets(g_req.cmd, ..)`) has no SSA reads to follow: it is the
+                # same `global` frontier as consuming that global directly
+                # (round 3). Read-only storage stays a literal.
+                for addr in self._address_terms(p)[1]:
+                    if self._const_ptr_storage(addr) == "writable":
+                        _global_leaf(defn, var_label(v), addr,
+                                     f"the pointer {var_label(v)} returned by "
+                                     f"{self._prose_name(name)}")
                 if not locs:
                     for r in expr_reads(p):
                         walk(r, d + 1, mv, (p, None))

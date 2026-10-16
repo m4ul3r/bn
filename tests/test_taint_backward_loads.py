@@ -25,6 +25,7 @@ from test_taint_engine import (
     _BufProgram,
     _bw,
     _cstr,
+    _store_proof_only,
     te,
 )
 
@@ -386,10 +387,8 @@ def test_remembered_stash_dies_at_every_possible_overwrite(between, kept):
     result, reasons, leaves = _bw(pg.func())
     assert any("buf written by strcpy" in r for r in reasons) is kept, reasons
     assert any(lf.get("callee") == "strcpy" for lf in leaves) is not kept, leaves
-    if kept:
-        assert result["diagnostics"]["safe_to_report_complete_slice"] is True
-    else:
-        assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert _store_proof_only(result) is kept, result["leaves"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 @pytest.mark.parametrize("shape", ["held_copy", "overwrite", "restore"])
@@ -416,7 +415,7 @@ def test_stale_stash_never_becomes_a_writer_of_the_buffer(shape):
     pg.sink(buf)
     result, reasons, _ = _bw(pg.func())
     assert not any("buf written by strcpy" in r for r in reasons), reasons
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    assert _store_proof_only(result), result["leaves"]
     assert result["slices"][0]["origin"]["kind"] == "constant", result["slices"][0]["origin"]
 
 

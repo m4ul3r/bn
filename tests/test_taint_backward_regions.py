@@ -18,6 +18,7 @@ from test_taint_engine import (
     _BufProgram,
     _bw,
     _cstr,
+    _store_proof_only,
     _vphi,
 )
 
@@ -61,11 +62,11 @@ def test_store_proven_region_from_the_sink_offset_933(gap, sink_off, unproven):
     result, _, aol = _bw(pg.func())
     complete = result["diagnostics"]["safe_to_report_complete_slice"]
     if unproven is None:
-        assert complete is True and aol == [], result["leaves"]
+        # Every consumed byte is stored: a fact, never certification (#931
+        # round 3). The member's region is reported; `id` is not demanded.
+        assert _store_proof_only(result) and aol == [], result["leaves"]
+        assert result["leaves"][0]["stores_cover"] == [4, 0x44], result["leaves"]
         assert result["slices"][0]["origin"]["kind"] == "constant"
-        assert any("bytes [0x4, 0x44) of s" in a and "before offset 0x4" in a
-                   and "NUL terminator" in a for a in result["assumptions"]), \
-            result["assumptions"]
     else:
         assert complete is False
         [leaf] = aol
@@ -90,7 +91,8 @@ def test_trailing_member_is_part_of_the_consumed_region_933():
 @pytest.mark.parametrize("via_pointer", [False, True])
 def test_store_proven_load_region_931(via_pointer):
     # `*(int *)&buf[8] = n; malloc(*(int *)&buf[8])`: the load reads [8, 12),
-    # and the 4-byte store there proves exactly those bytes -- the rest of the
+    # and the 4-byte store there covers exactly those bytes (a fact: no store
+    # proof certifies a slice, #931 round 3) -- the rest of the
     # buffer is not consumed. A 2-byte store leaves [10, 12) unproven. Through
     # `p = &buf; p->len` the pointer is the address, not data: walking it as a
     # value must not demand the whole buffer again.
@@ -118,9 +120,12 @@ def test_store_proven_load_region_931(via_pointer):
         pg.instrs.append(FInstr(i, a, "MLIL_SET_VAR_SSA", "x#1 = [&buf:0x8].d", writes=[x1], src=ld))
         pg.call(_B_POPEN, [FExpr("MLIL_VAR_SSA", "x#1", reads=[x1]), _cstr(0x710)], reads=[x1])
         result, _, aol = _bw(pg.func())
-        assert result["diagnostics"]["safe_to_report_complete_slice"] is complete, result["leaves"]
+        assert _store_proof_only(result) is complete, result["leaves"]
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is False
         assert result["slices"][0]["origin"]["kind"] == "parameter", result["slices"][0]["origin"]
-        if not complete:
+        if complete:
+            assert result["leaves"][0]["stores_cover"] == [8, 12], result["leaves"]
+        else:
             assert aol[0]["unproven"] == [[10, 12]], aol
 
 
@@ -155,13 +160,17 @@ _RUN = [_llil_store("rbp#1", -0x40 + 8 * k, 8) for k in range(8)]
 ])
 def test_builtin_fill_counts_only_when_its_llil_stores_say_so_931(stores, length, covered):
     # BN outlines inline stores as `__builtin_memset(&buf, 0, 0x40)`. Its
-    # length is trusted only when the call's own LLIL is one contiguous store
-    # run of exactly that length from one base -- what BN actually lifted.
+    # length counts as stores only when the call's own LLIL is one contiguous
+    # store run of exactly that length from one base -- what BN actually
+    # lifted. Covered bytes are a fact; no store proof certifies (round 3).
     result, reasons, aol = _bw(_builtin_memset_program(stores, length).func(),
                                extra_names=_NAMES)
     assert any("written by __builtin_memset" in r for r in reasons), reasons
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is covered, result["leaves"]
-    if not covered:
+    assert _store_proof_only(result) is covered, result["leaves"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    if covered:
+        assert result["leaves"][0]["stores_cover"] == [0, 0x40], result["leaves"]
+    else:
         assert aol[0]["calls"] == ["__builtin_memset"], aol
         # No `bn callsites` for a synthetic builtin: BN has no symbol to list.
         assert "callsites" not in aol[0]["detail"], aol[0]["detail"]
@@ -214,7 +223,7 @@ def test_pointee_to_return_rule_after_an_escape_is_a_may_alias_s2(held_buf):
     _sink_at(pg, _addr_of(buf))
     result, _, aol = _bw(pg.func(), extra_names=_NAMES)
     assert any(l.get("callee") == "strcpy" for l in aol) is held_buf, aol
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is not held_buf
+    assert _store_proof_only(result) is not held_buf, result["leaves"]
 
 
 # --- round 1: the consumer's demand, returned pointers, pointer objects -----
@@ -290,7 +299,8 @@ def test_demand_is_the_consumers_not_the_definitions_r1(shape):
 
 def test_demand_narrows_through_arithmetic_on_a_whole_object_pointer_r1():
     # The inverse: `p = (char *)&s; popen(p + 4)` reads from offset 4, so the
-    # stores proving [4, 0x44) are enough -- the leading `id` is not demanded.
+    # stores covering [4, 0x44) cover the demand -- the leading `id` is not
+    # demanded. A fact, not a certified proof (round 3).
     s = FVar("s", typ="char[0x44]")
     pg = _BufProgram()
     _qword_stores(pg, s, range(4, 0x44, 8))
@@ -301,22 +311,30 @@ def test_demand_narrows_through_arithmetic_on_a_whole_object_pointer_r1():
              reads=[p1])
     _sink_ssa(pg, p2)
     result, _, aol = _bw(pg.func())
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is True, result["leaves"]
-    assert any("bytes [0x4, 0x44) of s" in a for a in result["assumptions"]), result["assumptions"]
+    assert _store_proof_only(result), result["leaves"]
+    assert result["leaves"][0]["stores_cover"] == [4, 0x44], result["leaves"]
 
 
-def test_offset_zero_proof_discloses_the_object_boundary_r1():
-    # A whole-object proof at offset 0 rests on the same end-of-object
-    # assumption as a member's: it is disclosed, and says the bytes do not
-    # establish a terminator.
+def test_store_proof_is_a_fact_never_certification_r3():
+    # #931 round 3: stores the walk can see write every byte of the whole,
+    # debug-typed buffer -- the region is reported (`stores_cover`), but a
+    # region proof from stores never certifies the slice: it rests on BN's
+    # recovery of the object (a name-only rename made an inferred fragment
+    # look authoritative). The writer's origin stays; `next_action` says how
+    # to check by hand, with a command that names the function.
     buf = FVar("buf", typ="char[0x40]")
     pg = _BufProgram()
     pg.whole_store(buf, 0x41)
     pg.sink(buf)
     result, _, aol = _bw(pg.func())
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
-    [a] = [a for a in result["assumptions"] if "(#933)" in a]
-    assert "bytes [0x0, 0x40) of buf" in a and "NUL terminator" in a and "before offset" not in a, a
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    [leaf] = result["leaves"]
+    assert leaf["kind"] == "region_store_proof_not_certified" and aol == [], leaf
+    assert leaf["stores_cover"] == [0, 0x40] and leaf["unproven"] == [], leaf
+    assert result["slices"][0]["origin"]["kind"] == "constant", result["slices"][0]["origin"]
+    assert "`bn il 0x10 --view mlil`" in result["diagnostics"]["next_action"], \
+        result["diagnostics"]["next_action"]
+    assert not any("(#933)" in a for a in result["assumptions"]), result["assumptions"]
 
 
 def test_pointer_returned_into_a_local_checks_the_local_r1():
@@ -385,7 +403,7 @@ def test_demand_is_the_selected_operand_not_another_argument_r2():
     # query selects the SOURCE (arg 1), which reads from offset 0 -- [0, 8)
     # is unproven. Anchoring the demand on the first argument that reads `p`
     # (the destination, at offset 8) claimed a complete slice. The
-    # destination query reads [8, 16) and is complete.
+    # destination query reads [8, 16), which the stores cover.
     b = FVar("b", typ="char[16]")
     p1 = FSSA(FVar("p", typ="char*"), 1)
     pg = _BufProgram()
@@ -399,7 +417,8 @@ def test_demand_is_the_selected_operand_not_another_argument_r2():
     assert src["diagnostics"]["safe_to_report_complete_slice"] is False, src
     assert [lf["unproven"] for lf in aol] == [[[0, 8]]], aol
     dst, _, aol2 = _bw(pg.func(), sink="arg:strcpy:0")
-    assert dst["diagnostics"]["safe_to_report_complete_slice"] is True, dst["leaves"]
+    assert _store_proof_only(dst), dst["leaves"]
+    assert dst["leaves"][0]["stores_cover"] == [8, 16], dst["leaves"]
 
 
 @pytest.mark.parametrize("delta, where", [(-12, "0x8 bytes before it"),
@@ -424,22 +443,6 @@ def test_demand_outside_the_object_fails_closed_r2(delta, where):
     [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "object_extent_unknown"]
     assert leaf["cause"] == "outside_object" and where in leaf["detail"], leaf
     assert leaf["region"]["offset"] == 4 + delta, leaf
-
-
-def test_inferred_extent_is_no_proof_r2():
-    # The same whole-object stores, but BN recovered the local itself (no
-    # debug info, no user type): it may be a fragment of the object the
-    # consumer reads. The stores are reported as facts; nothing is proven.
-    buf = FVar("buf", typ="char[0x40]")
-    pg = _BufProgram()
-    pg.whole_store(buf, 0x41)
-    pg.sink(buf)
-    result, _, _ = _bw(pg.func(inferred_vars=[buf]))
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
-    [leaf] = result["leaves"]
-    assert leaf["kind"] == "object_extent_unknown" and leaf["cause"] == "inferred_extent", leaf
-    assert leaf["extent"] == "inferred" and leaf["unproven"] == [], leaf
-    assert not any("(#933)" in a for a in result["assumptions"]), result["assumptions"]
 
 
 def test_unknown_offset_is_no_proof_r2():
@@ -486,3 +489,28 @@ def test_returned_pointer_over_an_external_object_r2(root):
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
     ptr = [lf for lf in result["leaves"] if lf["kind"] == "pointer_object_unresolved"]
     assert any(lf["pointer"] == f"b#{bv.version}" for lf in ptr), result["leaves"]
+
+
+# --- round 3: returned pointers over writable globals -----------------------
+
+@pytest.mark.parametrize("addr", [0x404040, 0x404064])     # a buffer, a struct member
+def test_returned_pointer_over_a_writable_global_r3(addr):
+    # `p = fgets(g_buf, 64, f); write(1, p, 64)` -- and the same through
+    # `g_req.cmd`: the argument is a constant address with no SSA reads, so
+    # the returned-object walk followed nothing and the slice was complete
+    # with `source:fgets`. It is the same `global` frontier as consuming the
+    # global directly; the source stays the origin.
+    from test_taint_engine import FBVStorage, te
+    f = FVar("f", ident=51); f0 = FSSA(f, 0)
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[f])
+    pg.call(_B_FGETS, [_cstr(addr), _const(0x40), FExpr("MLIL_VAR_SSA", "f#0", reads=[f0])],
+            reads=[f0], writes=[p1])
+    _sink_ssa(pg, p1)
+    bv = FBVStorage(_B_NAMES, ro=[(0x700, 0x800)], rw=[(0x404000, 0x405000)])
+    result = te.TaintEngine(bv, te.load_models()).backward(pg.func(), [te.parse_locator("arg:popen:0")])
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "fgets"}, result["slices"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    glob = [lf for lf in result["leaves"] if lf.get("global")]
+    assert [lf["global"] for lf in glob] == [hex(addr)], result["leaves"]
+    assert f"`bn xrefs {hex(addr)}`" in glob[0]["detail"], glob[0]["detail"]

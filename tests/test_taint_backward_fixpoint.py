@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from test_taint_engine import (
-    FVar, FExpr, _BufProgram, _addr_of, _cstr, _bw,
+    FVar, FExpr, _BufProgram, _addr_of, _cstr, _bw, _store_proof_only,
     _B_STRCPY, _B_READ, _B_MEMSET, _B_NAMES, te,
 )
 
@@ -28,7 +28,9 @@ def test_loop_exit_coverage_950(reverse, initialized, writer):
     pg.phi(*(reversed(arms) if reverse else arms))
     pg.sink(buf)
     result, _, leaves = _bw(pg.func())
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is initialized
+    # Initialized by a store: the best a buffer reaches is the uncertified
+    # store proof (#931 round 3).
+    assert _store_proof_only(result) is initialized
     assert bool(leaves) is not initialized
 
 
@@ -45,7 +47,8 @@ def test_loop_carried_escape_951(escape):
     sink = pg.sink(buf)
     sink.src_memory = header.dest_memory
     result, reasons, leaves = _bw(pg.func())
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is not escape
+    assert _store_proof_only(result) is not escape
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
     assert any(l.get("callee") == "compose" for l in leaves) is escape
 
 
@@ -126,7 +129,8 @@ def test_nested_loop_escape_reaches_inner_call(escape, reverse):
     sink = pg.sink(buf)
     sink.src_memory = 2
     result, _, leaves = _bw(pg.func())
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is not escape
+    assert _store_proof_only(result) is not escape
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
     assert any(l.get("callee") == "compose" for l in leaves) is escape
     assert not result["stats"]["truncated"]
 
@@ -141,7 +145,7 @@ def test_future_stash_does_not_invent_an_earlier_buffer_writer():
     pg.sink(buf)
     result, reasons, leaves = _bw(pg.func())
     assert not any("written by strcpy" in reason for reason in reasons)
-    assert result["diagnostics"]["safe_to_report_complete_slice"]
+    assert _store_proof_only(result), result["leaves"]
     assert not leaves
 
 

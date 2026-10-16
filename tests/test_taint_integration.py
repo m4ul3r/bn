@@ -367,7 +367,51 @@ int main(int argc, char **argv) {
         if "callsites" in verbs:
             assert any("callee: strcpy" in out for out in outputs), outputs
         if "il" in verbs:
-            assert any("rax - 0xc" in out or "- 0xc" in out for out in outputs), outputs
+            assert any("- 0xc" in out for out in outputs), outputs
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_renamed_stack_fragment_is_never_a_store_proof(tmp_path, shared_bn, opt):
+    """#931/#933 review round 3: without debug info BN splits a stack array
+    into fragments; a name-only `bn local rename` makes a fragment
+    user-defined without any type claim. Neither that nor anything else turns
+    a store proof into a complete slice: `char b[32]` with only 16 bytes
+    stored, and a 16-byte array whose upper half `read` overwrites, are
+    incomplete before and after the rename, the stores reported as facts."""
+    src = tmp_path / "fragment.c"
+    src.write_text("""
+#include <stdio.h>
+#include <unistd.h>
+__attribute__((noinline)) void rename_fragment(void) {
+    char b[32]; __builtin_memcpy(b, "abcdefghijklmnop", 16); popen(b, "r");
+}
+__attribute__((noinline)) void upper_half_read(int fd) {
+    char b[16]; __builtin_memcpy(b, "abcdefghijklmno", 16); read(fd, b + 8, 8);
+    popen(b, "r");
+}
+int main(void) { return 0; }
+""")
+    binary = tmp_path / "fragment"
+    _compile(src, binary, [opt, "-g0", "-fno-inline", "-U_FORTIFY_SOURCE"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gate(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
+                          "--sink", "arg:popen:0")
+        return result["diagnostics"]["safe_to_report_complete_slice"], result["leaves"]
+
+    for fn in ("rename_fragment", "upper_half_read"):
+        complete, _ = gate(fn)
+        assert complete is False
+        locals_ = _bn_json(shared_bn, "-t", target, "local", "list", fn)["items"]
+        stack = [lc for lc in locals_ if ":local:stack:" in lc["local_id"]
+                 and not lc["name"].startswith("__")]
+        assert stack, locals_
+        _bn_json(shared_bn, "-t", target, "local", "rename", fn, stack[0]["name"], "cmdbuf")
+        complete, leaves = gate(fn)
+        assert complete is False, leaves
+        assert leaves, leaves
+
 
 
 def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):

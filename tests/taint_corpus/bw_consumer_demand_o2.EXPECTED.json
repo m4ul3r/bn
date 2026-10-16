@@ -52,20 +52,14 @@
       "origin_kinds": [
         "call"
       ],
-      "complete_slice": true,
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
-          "kind": "address_of_local_unresolved"
-        },
-        {
-          "kind": "pointer_object_unresolved"
-        },
-        {
-          "kind": "object_extent_unknown"
+          "kind": "region_store_proof_not_certified"
         }
       ],
-      "assumptions_contain": [
-        "Per-object byte coverage does not establish a NUL terminator"
+      "leaf_details_contain": [
+        "a region proof from stores is not certified"
       ]
     },
     {
@@ -74,20 +68,14 @@
       "origin_kinds": [
         "call"
       ],
-      "complete_slice": true,
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
-          "kind": "address_of_local_unresolved"
-        },
-        {
-          "kind": "pointer_object_unresolved"
-        },
-        {
-          "kind": "object_extent_unknown"
+          "kind": "region_store_proof_not_certified"
         }
       ],
-      "assumptions_contain": [
-        "Per-object byte coverage does not establish a NUL terminator"
+      "leaf_details_contain": [
+        "a region proof from stores is not certified"
       ]
     },
     {
@@ -166,20 +154,14 @@
       "origin_kinds": [
         "parameter"
       ],
-      "complete_slice": true,
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
-          "kind": "address_of_local_unresolved"
-        },
-        {
-          "kind": "pointer_object_unresolved"
-        },
-        {
-          "kind": "object_extent_unknown"
+          "kind": "region_store_proof_not_certified"
         }
       ],
-      "assumptions_contain": [
-        "Per-object byte coverage does not establish a NUL terminator"
+      "leaf_details_contain": [
+        "a region proof from stores is not certified"
       ]
     },
     {

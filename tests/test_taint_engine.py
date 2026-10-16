@@ -171,7 +171,7 @@ class FSite:
 
 class FFunc:
     def __init__(self, name, start, ssa, params=(), symbol_type="FunctionSymbol",
-                 is_thunk=False, caller_sites=(), inferred_vars=()):
+                 is_thunk=False, caller_sites=()):
         self.name = name
         self.start = start
         self.mlil = FMLIL(ssa)
@@ -179,12 +179,6 @@ class FFunc:
         self.symbol = FSym(symbol_type)
         self.is_thunk = is_thunk
         self.caller_sites = list(caller_sites)
-        # Locals whose extent BN only inferred (no debug info, no user type);
-        # every other local is debug-typed, as in the corpus's `-g` builds.
-        self.inferred_vars = {getattr(v, "name", v) for v in inferred_vars}
-
-    def is_var_user_defined(self, var):
-        return getattr(var, "name", var) not in self.inferred_vars
 
 
 class FBV:
@@ -10269,6 +10263,16 @@ def _bw(func, extra_names=None, sink="arg:popen:0"):
     return result, reasons, aol
 
 
+def _store_proof_only(result):
+    """#931 round 3: stores the walk can see cover every consumed byte -- the
+    strongest outcome a local buffer can reach. It is a fact, never a
+    certified proof: the slice is incomplete and its only frontier is the
+    `region_store_proof_not_certified` leaf."""
+    leaves = result["leaves"]
+    return (result["diagnostics"]["safe_to_report_complete_slice"] is False and bool(leaves)
+            and all(lf["kind"] == "region_store_proof_not_certified" for lf in leaves))
+
+
 def _only_call_fill_leaves(result, aol, *calls):
     """#931: the only frontier is the disclosure that no call's write extent
     proves the consumed bytes initialised -- naming exactly *calls* -- and the
@@ -10340,11 +10344,11 @@ def test_backward_uncovered_memory_phi_arm_is_a_frontier_928():
     assert diag["safe_to_report_complete_slice"] is False and diag["frontier"]["unresolved"] == 1, diag
 
 
-def test_backward_covered_memory_phi_arms_stay_complete_928():
+def test_backward_covered_memory_phi_arms_are_store_proven_928():
     # Guard: a whole-buffer store on EVERY arm (`if (a) dst = x; else dst = y`)
-    # is covered -- no frontier, the slice is complete. A call fill on one
-    # arm proves nothing there (#931), so the same phi with snprintf on the
-    # else arm leaves the whole buffer unproven.
+    # covers the buffer -- the only frontier is the uncertified store proof
+    # (#931 round 3). A call fill on one arm proves nothing there, so the same
+    # phi with snprintf on the else arm leaves the whole buffer unproven.
     dst = FVar("dst", typ="char[0x80]")
     pg = _BufProgram()
     pg.whole_store(dst, 1)
@@ -10355,7 +10359,7 @@ def test_backward_covered_memory_phi_arms_stay_complete_928():
     result, reasons, aol = _bw(pg.func())
     assert aol == [], result["leaves"]
     assert result["slices"][0]["origin"]["kind"] == "constant", result["slices"][0]["origin"]
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    assert _store_proof_only(result), result["leaves"]
 
     pg2 = _BufProgram()
     pg2.whole_store(dst, 1)
@@ -10802,7 +10806,7 @@ def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
     pg2.sink(cmd)
     result2, reasons2, aol2 = _bw(pg2.func())
     assert aol2 == [] and not any("may write" in r for r in reasons2), (result2["leaves"], reasons2)
-    assert result2["diagnostics"]["safe_to_report_complete_slice"] is True, result2["diagnostics"]
+    assert _store_proof_only(result2), result2["leaves"]
 
 
 def test_backward_modeled_call_reloading_the_escape_slot_is_a_fill_928r3():
@@ -10887,7 +10891,7 @@ def test_backward_constant_offset_store_does_not_cover_a_path_928r3():
     pg2.instrs.append(whole)
     pg2.sink(buf)
     result2, _, aol2 = _bw(pg2.func())
-    assert aol2 == [] and result2["diagnostics"]["safe_to_report_complete_slice"] is True, result2
+    assert aol2 == [] and _store_proof_only(result2), result2
 
 
 def test_backward_memset_and_bzero_are_literal_fills_928r3():
@@ -11254,7 +11258,7 @@ def test_backward_coverage_is_by_bytes_not_by_writer_kind_928r4():
     pg.whole_store(buf)
     pg.sink(buf)
     result, reasons, aol = _bw(pg.func())
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    assert aol == [] and _store_proof_only(result), result
     pg = _BufProgram(params=[fd])
     conditional_read(pg)
     pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
@@ -11392,5 +11396,5 @@ def test_benign_model_handed_the_buffer_is_disclosed_928r4():
     pg2.call(_B_MY_FILL, [_addr_of(buf), FExpr("MLIL_VAR_SSA", "host#0", reads=[host0])], reads=[host0])
     pg2.sink(buf)
     result2 = te.TaintEngine(FBV(_B_NAMES), models).backward(pg2.func(), [te.parse_locator("arg:popen:0")])
-    assert result2["diagnostics"]["safe_to_report_complete_slice"] is True, result2["diagnostics"]
+    assert _store_proof_only(result2), result2["leaves"]
     assert any("passed to my_fill" in a for a in result2["assumptions"]), result2["assumptions"]

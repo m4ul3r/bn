@@ -89,10 +89,13 @@ BLOCKING_LEAF_KINDS = frozenset({
     # proves the bytes the consumer reads; its writers here stay in the slice.
     "pointer_object_unresolved",
     # #931/#933 round 2: stores cover a consumed region the walk cannot bound
-    # -- the consumer reads outside the object, at an offset that is not one
-    # constant, or the object's extent is BN's own recovery (no debug info or
-    # user-applied type). The stores are reported as facts, not a proof.
+    # -- the consumer reads outside the object or at an offset that is not
+    # one constant. The stores are reported as facts, not a proof.
     "object_extent_unknown",
+    # #931/#933 round 3: stores cover every consumed byte on every path. That
+    # is reported (`stores_cover`) but never certifies the slice: the proof
+    # rests on BN's recovery of the object's extent.
+    "region_store_proof_not_certified",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -428,7 +431,7 @@ def backward_diagnostics(
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered",
                   "indirect_call_unresolved", "field_load_unresolved",
                   "address_of_local_unresolved", "pointer_object_unresolved",
-                  "object_extent_unknown")
+                  "object_extent_unknown", "region_store_proof_not_certified")
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
@@ -524,6 +527,16 @@ def backward_diagnostics(
                 "by hand that the call's destination and length cover the bytes the "
                 f"sink reads: `bn callsites {shlex.quote(callee)} --within "
                 f"{call_leaf['function']}` prints it with its arguments")
+        proof_leaf = next((lf for lf in unresolved_leaves
+                           if lf.get("kind") == "region_store_proof_not_certified"
+                           and isinstance(lf.get("function"), str)), None)
+        if proof_leaf is not None:
+            next_action += (
+                ". Stores cover the consumed bytes, but a store proof is reported, "
+                "not certified (#931): check by hand that the consumer reads only "
+                "those bytes of the whole object -- "
+                f"`bn il {proof_leaf['function']} --view mlil` shows the stores and "
+                "the pointer arithmetic")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
                for lf in unresolved_leaves):
             next_action += (

@@ -73,16 +73,16 @@
       "function": "direct_member",
       "sink": "arg:popen:0",
       "origin_kinds": [
-        "object_extent_unknown"
+        "call"
       ],
       "complete_slice": false,
       "leaves": [
         {
-          "kind": "object_extent_unknown"
+          "kind": "region_store_proof_not_certified"
         }
       ],
       "leaf_details_contain": [
-        "is BN's own recovery"
+        "a region proof from stores is not certified"
       ]
     },
     {
