@@ -7182,12 +7182,13 @@ def test_raw_string_notes_go_on_each_call_line_that_shows_the_address_1038():
 
     found = {0x400c98: entry("a", 0x400af8), 0x400ca0: entry("c", 0x400b10),
              0x400ca8: entry("d", 0x400b28), 0x400760: entry("ABC", 0x400b2c, string=False)}
-    text = "\n".join([
+    source = [
         "    if (strcmp(arg1, 0x400c98))",
         "    {",
         "        if (strcmp(arg1, 0x400ca0))  // checked",
         "        x1 = memcmp(arg1, 0x400760, 0x10);",
-    ])
+    ]
+    text = "\n".join(source)
     # No IL here, so each note anchors on its call's own address; 0x400b28's
     # line is not in this text, so that string stays unmarked.
     func = types.SimpleNamespace(get_llil_at=lambda address: None)
