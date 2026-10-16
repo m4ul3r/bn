@@ -1031,7 +1031,7 @@ def _mirrors_auto_symbol(bv, address: str, name: str) -> bool:
 _ANNOTATION_SAMPLE_LIMIT = 20
 
 
-def _annotation_summary(ctx, bv, *, population: dict[str, list] | None = None) -> dict[str, Any]:
+def _annotation_summary(ctx, bv) -> dict[str, Any]:
     """Count annotations ALREADY present in the view (#561).
 
     On a cached/shared BNDB, inherited comments/names can bias analysis and let
@@ -1043,17 +1043,7 @@ def _annotation_summary(ctx, bv, *, population: dict[str, list] | None = None) -
     thousands of loader placeholders -- while every COUNT stays exact, because
     ``bn_kernel.assert_unannotated`` refuses on them (#793 review).
     Address-comment counts include both the global map and each function's local
-    map; function-doc comments have their own count.
-
-    *population*, when given, receives every annotation the counts count --
-    the SAME entries, classified by the same rules in the same walk -- as
-    identities: ``comments`` ``(store, address, text)`` with store ``address``
-    (the global map) or ``local`` (a function's own map), ``function_comments``
-    ``(start, raw doc)``, ``analyst_symbols`` ``(address text or None, name)``.
-    A caller that credits some of them to this bridge judges exactly the
-    population the counts describe, never a differently filtered one (#1036)."""
-    if population is not None:
-        population.update(comments=[], function_comments=[], analyst_symbols=[])
+    map; function-doc comments have their own count."""
     comments = 0
     comment_locations: list[dict[str, Any]] = []
     # #861 review: this read is deliberately NOT guarded. It used to be wrapped
@@ -1069,10 +1059,6 @@ def _annotation_summary(ctx, bv, *, population: dict[str, list] | None = None) -
     address_comments = getattr(bv, "address_comments", None)
     if address_comments is not None:
         comments = len(address_comments)
-        if population is not None:
-            population["comments"].extend(
-                ("address", address, str(text))
-                for address, text in dict(address_comments).items())
         # #861: cheap insurance, NOT a reproduced hazard. Against BN 6.1
         # `BinaryView.address_comments` builds and returns a FRESH local dict on
         # every access, so a mid-walk `RuntimeError: dictionary changed size
@@ -1099,9 +1085,6 @@ def _annotation_summary(ctx, bv, *, population: dict[str, list] | None = None) -
         # are read through ONE rule rather than one snapshot and one live walk.
         local_comments = dict(getattr(fn, "comments", {}) or {})
         comments += len(local_comments)
-        if population is not None:
-            population["comments"].extend(
-                ("local", address, str(text)) for address, text in local_comments.items())
         for address, text in local_comments.items():
             if len(comment_locations) >= _ANNOTATION_SAMPLE_LIMIT:
                 break
@@ -1113,12 +1096,9 @@ def _annotation_summary(ctx, bv, *, population: dict[str, list] | None = None) -
                 }
             )
         try:
-            raw_doc = str(getattr(fn, "comment", "") or "")
-            text = raw_doc.strip()
+            text = str(getattr(fn, "comment", "") or "").strip()
             if text:
                 function_comments += 1
-                if population is not None:
-                    population["function_comments"].append((getattr(fn, "start", None), raw_doc))
                 if len(function_comment_locations) < _ANNOTATION_SAMPLE_LIMIT:
                     function_comment_locations.append(
                         {
@@ -1204,8 +1184,6 @@ def _annotation_summary(ctx, bv, *, population: dict[str, list] | None = None) -
                 )
         else:
             analyst_symbols += 1
-            if population is not None:
-                population["analyst_symbols"].append((address, name))
             if (len(analyst_symbol_locations) < _ANNOTATION_SAMPLE_LIMIT
                     and address is not None):
                 analyst_symbol_locations.append({"name": name, "address": address})
@@ -1340,8 +1318,10 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
     held when opened (also published as ``present_at_open``), never this
     session's own renames -- before or after a ``save`` re-homes the view. A
     database this bridge itself saved or exported, and still the very file it
-    wrote, inherited nothing either: it gets no hint and publishes
-    ``written_by_this_bridge`` instead (#1036 item 5). For
+    wrote, is disclosed as ``written_by_this_bridge`` -- a fact about the
+    FILE only: its annotations stay "may predate this run" like any other
+    database's, because who wrote a file is not who wrote what is in it
+    (#1036 item 5; per-annotation attribution failed three review rounds). For
     a view the bridge did not open (a GUI tab), the flags are
     derived from *filename* and the hint from the current ANALYST counts (not
     the raw non-auto count -- the loader's own placeholders made a pristine view
@@ -1359,29 +1339,17 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
         flags = _database_flags(filename)
     from_database = flags["opened_from_database"]
     own_save = opened.get("written_by_this_bridge") if opened is not None else None
-    own_at_open = opened.get("own_at_open") if opened is not None else None
-    unmatched_at_open = opened.get("unmatched_at_open") if opened is not None else None
-    judged = isinstance(own_at_open, dict) and isinstance(unmatched_at_open, dict)
     try:
         annotations = _annotation_summary(ctx, bv)
     except Exception as exc:
         unavailable = _annotations_unavailable(exc, filename=filename)
         unavailable.update(flags)
         return unavailable
-    kinds = ("comments", "function_comments", "analyst_symbols")
     if opened_known:
         present_at_open = ({k: v for k, v in opened.items() if k in OPENED_ANNOTATION_COUNTS}
                            if opened else {})
         inherited = present_at_open
-        if judged:
-            # #1036 item 5, review round 2: the hint is withheld only when
-            # EVERY annotation measured at open was positively matched to this
-            # bridge's own verified writes. Own and unmatched were split from
-            # the one measured population (`_match_own_annotations`), so no
-            # differently filtered count is ever subtracted from another.
-            present = any(unmatched_at_open.get(key, 0) for key in kinds)
-        else:
-            present = opened is not None
+        present = opened is not None
     else:
         inherited = annotations
         present = from_database or bool(
@@ -1400,15 +1368,6 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
             )
         else:
             restored = f" (database {source})"
-        own_note = ""
-        if judged:
-            total = sum(int(inherited.get(key, 0)) for key in kinds)
-            matched = sum(int(own_at_open.get(key, 0)) for key in kinds)
-            unmatched = sum(int(unmatched_at_open.get(key, 0)) for key in kinds)
-            own_note = (
-                f"; of these {total} annotation(s), {matched} positively matched "
-                f"this bridge's own verified writes and {unmatched} did not"
-            )
         hint = (
             f"existing BNDB annotations may predate this run: "
             f"{inherited['comments']} comment(s), "
@@ -1417,7 +1376,6 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
             + ("present when the database was opened "
                if opened_known else "already present ")
             + f"({inherited['placeholder_symbols']} loader placeholder(s) excluded)"
-            + own_note
             + (restored if from_database else "")
             + " -- do not over-credit current-run analysis"
         )
@@ -1427,8 +1385,6 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
         "source_verified": source_verified,
         **({"present_at_open": present_at_open} if opened is not None else {}),
         **({"written_by_this_bridge": own_save} if own_save is not None else {}),
-        **({"own_at_open": own_at_open, "unmatched_at_open": unmatched_at_open}
-           if judged else {}),
         "provenance_hint": hint,
     }
 

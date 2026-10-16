@@ -4159,9 +4159,6 @@ _GO_RENAME_NON_COUNT_READS = {
     "preview_skipped",
     # #966: deletion outcomes are a listing, not a go-rename count.
     "function_deletions",
-    # #1036 review round 2: the bridge's plain-save refusal, passed through to
-    # the compact status; a disclosure, not a count.
-    "save_refusal",
 }
 
 
@@ -4311,10 +4308,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
     # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
-    # #1036 adds the three `own_at_open` counts of `_own_save_lines`.
-    assert len(sites) == 66, (
+    assert len(sites) == 63, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 66. A "
+        "count helper, not 63. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4382,11 +4378,6 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # list and `--count` renderers both append, like the line above.
         "_mangled_only_note(mangled_only_matches) [not a payload renderer]",
         "_operation_row_text(count) [not a payload renderer]",
-        # #1036: a fragment helper under `existing_annotations`, covered by
-        # `test_an_exported_inherited_comment_stays_inherited_1036`.
-        "_own_save_lines(analyst_symbols) [not a payload renderer]",
-        "_own_save_lines(comments) [not a payload renderer]",
-        "_own_save_lines(function_comments) [not a payload renderer]",
         "_paging_footer(offset) [not a payload renderer]",
         "_paging_footer(returned) [not a payload renderer]",
         "_paging_footer(total) [not a payload renderer]",

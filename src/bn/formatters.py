@@ -1972,8 +1972,7 @@ def _database_flags_fragment(annotations: Any) -> str:
 def _own_save_lines(annotations: Any) -> list[str]:
     """The line saying the database this view opened is a FILE this bridge
     saved or exported (and still the file it wrote) -- which says who wrote
-    the file, not who wrote its annotations -- and, when the session ledger
-    accounts for some of them, how many (#1036 item 5)."""
+    the file, not who wrote its annotations (#1036 item 5)."""
     own = _field_dict(annotations, "written_by_this_bridge")
     if not own:
         return []
@@ -1983,19 +1982,6 @@ def _own_save_lines(annotations: Any) -> list[str]:
     when = f" at {saved_at}" if saved_at else ""
     lines = [(f"opened from a file this bridge {kind} from {source}{when}; that says who "
               "wrote the file, not who wrote its annotations")]
-    mine = _field_dict(annotations, "own_at_open")
-    rest = _field_dict(annotations, "unmatched_at_open")
-    if mine:
-        # Review round 2: one measured population, split two ways -- what this
-        # bridge's own verified writes positively match, and what they do not.
-        lines.append(
-            "annotations at open positively matched to this bridge's own verified "
-            f"writes: {_stated_count(mine, 'comments')} comment(s), "
-            f"{_stated_count(mine, 'function_comments')} function doc(s), "
-            f"{_stated_count(mine, 'analyst_symbols')} analyst symbol(s); not matched: "
-            f"{_stated_count(rest, 'comments')} comment(s), "
-            f"{_stated_count(rest, 'function_comments')} function doc(s), "
-            f"{_stated_count(rest, 'analyst_symbols')} analyst symbol(s)")
     return lines
 
 
@@ -6458,7 +6444,6 @@ def _build_mutation_summary(
     preview_skipped: Sequence[dict[str, Any]] = (),
     reverted: int = 0,
     function_deletions: Sequence[dict[str, Any]] = (),
-    save_refusal: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -6630,13 +6615,6 @@ def _build_mutation_summary(
         # the counts above say nothing about the ops it skipped. Conditional
         # like the keys above: a preview that covered every op has none.
         summary["preview_skipped"] = list(preview_skipped)
-    if save_refusal and committed:
-        # #1036 review round 2: the bridge found that a plain `bn save` of this
-        # target would be refused right now (its default destination is not
-        # writable and the cache fallback holds another run's database), so
-        # the status must not present that save as the next step. Conditional
-        # like the keys above.
-        summary["save_refusal"] = dict(save_refusal)
     return summary
 
 
@@ -6797,8 +6775,6 @@ def _mutation_summary(value: Any) -> Any:
         # no-failure-row path, and a container there printed as a repr.
         message=_text_value(value, "message"),
         proto_residue=bool(value.get("prototype_user_type_residue")),
-        save_refusal=(_field_dict(value, "save_refusal")
-                      if _field_declared(value, "save_refusal") else None),
         unusable=bool(unreadable),
         # The public reference quotes the no-rows phrase verbatim as the
         # meaning "this op reports through its own counters instead", so an
@@ -7100,8 +7076,6 @@ def _go_rename_summary(value: Any) -> Any:
         rolled_back=rolled_back,
         message=_text_value(value, "message"),
         default_error="go rename failed",
-        save_refusal=(_field_dict(value, "save_refusal")
-                      if _field_declared(value, "save_refusal") else None),
     )
     # Preserve operation-count semantics while exposing the scan buckets.
     # The user-named wire counter includes apply-time skips; its overlap is
@@ -7287,24 +7261,12 @@ def _render_mutation_summary_text(value: Any, *,
     if (save_command is not None and value.get("committed") is True
             and value.get("dirty_after") is True):
         # #1036 item 5: a committed change left the target dirty, so saving
-        # is the next step; the command is routed like the mutation was.
-        command = save_command()
-        refusal = _field_dict(value, "save_refusal")
-        if refusal:
-            # Review round 2: the bridge judged, with the save's own refusal
-            # rule, that this plain save is refused right now -- so it is not
-            # offered as the step that persists the change.
-            line += (
-                f"\nnext: a plain `{command}` is refused here: "
-                f"{_text_value(refusal, 'default_save_path') or '<unknown>'} is not "
-                "writable and its cache fallback "
-                f"{_text_value(refusal, 'cache_fallback') or '<unknown>'} holds a "
-                "database this target was not loaded from. Keep this work with "
-                f"`{command} PATH` (template: PATH is a new .bndb file you choose; "
-                "that writes an export, not this target's own database)")
-        else:
-            line += (f"\nnext: `{command}` persists it "
-                     "(unsaved work is lost on close or session stop)")
+        # is the next step; the command is routed like the mutation was. It
+        # claims nothing about the outcome: the save's own gates (open-target
+        # collision, cache fallback) decide, and its output says why and what
+        # to do (predicting them failed review round 3 in both directions).
+        line += (f"\nnext: `{save_command()}` to persist it; if it is refused, "
+                 "its output says why and what to do")
     return line
 
 
@@ -7435,16 +7397,6 @@ def _render_mutation_text(value: Any) -> str:
                 if preview and item.get("diff"):
                     lines.append(str(item["diff"]))
 
-    refusal = _field_dict(value, "save_refusal")
-    if refusal and committed:
-        # #1036 review round 2: the detail view says what the compact status
-        # says -- a plain `bn save` of this target is refused right now.
-        lines.extend(["", (
-            "note: a plain `bn save` is refused here: "
-            f"{_text_value(refusal, 'default_save_path') or '<unknown>'} is not writable and "
-            f"its cache fallback {_text_value(refusal, 'cache_fallback') or '<unknown>'} "
-            "holds a database this target was not loaded from; a save to an explicit "
-            "path you choose (an export) is not refused")])
     return "\n".join(lines).rstrip() + "\n"
 
 

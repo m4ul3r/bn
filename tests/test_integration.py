@@ -2714,15 +2714,15 @@ class TestSidecarContentValidation:
         assert back["targets"][0]["source_verified"] is True, back["targets"]
         assert shared_bn.run("close", str(sidecar)).returncode == 0
 
-    def test_an_export_reloads_paired_and_credits_only_the_ledgers_writes_1036(
+    def test_an_export_reloads_paired_and_still_warns_about_its_annotations_1036(
             self, shared_bn, tmp_path):
         """#1036 items 4-5 on real BN: `save <path>` is an export that says so;
         loading it back keeps `-t prog` on the raw view and verifies the copy
-        against the raw file BN recorded in it (no sibling exists). Only the
-        writes the session ledger shows this bridge verified are its own: a
-        comment set outside the ledger (here through `py exec`, as an earlier
-        run's would be) stays inherited, also after the source view closed
-        (review round 1, blocker and finding 4)."""
+        against the raw file BN recorded in it (no sibling exists). The copy is
+        disclosed as a file this bridge wrote, and -- per-annotation
+        attribution having been dropped after three review rounds -- its
+        annotations, even this bridge's own rename, stay "may predate this
+        run"; so does a reload after the source view closed."""
         prog = tmp_path / "ro" / "prog"
         prog.parent.mkdir()
         prog.write_bytes(Path(HELLO_BINARY).read_bytes())
@@ -2746,42 +2746,19 @@ class TestSidecarContentValidation:
         assert annotations["restored_from_cache"] is False, annotations
         assert annotations["source_verified"] is True, annotations
         assert annotations["written_by_this_bridge"]["kind"] == "export", annotations
-        assert annotations["own_at_open"]["analyst_symbols"] == 1, annotations
-        assert annotations["provenance_hint"] is None, annotations
+        assert "own_at_open" not in annotations, annotations
+        assert "may predate this run" in (annotations["provenance_hint"] or ""), annotations
         shown = shared_bn.run("-t", "prog.bndb", "target", "info")
         assert "opened from a file this bridge exported from" in shown.stdout, shown.stdout
         assert shared_bn.run("close", str(export)).returncode == 0
 
-        planted = shared_bn.run(
-            "-t", "prog", "py", "exec", "bv.set_comment_at(bv.entry_point, 'planted')")
-        assert planted.returncode == 0, planted.stdout + planted.stderr
-        # Review round 2's counterexample: a rename outside this bridge's ledger
-        # (`py exec`, as an earlier run's would be) plus this bridge's own
-        # rename of a DIFFERENT function to a placeholder-shaped name, which the
-        # analyst count excludes and so must not offset the other.
-        prior = shared_bn.run(
-            "-t", "prog", "py", "exec",
-            "next(f for f in bv.functions if f.name == 'main').name = 'prior_process_name'")
-        assert prior.returncode == 0, prior.stdout + prior.stderr
-        start = shared_bn.json(
-            "-t", "prog", "py", "exec",
-            "result = hex(next(f.start for f in bv.functions if f.name == 'greet_v2'))")["result"]
-        placeholder = f"sub_{int(start, 16):x}"
-        renamed = shared_bn.run("-t", "prog", "rename", "greet_v2", placeholder)
-        assert renamed.returncode == 0, renamed.stdout + renamed.stderr
         second = tmp_path / "out" / "prog2.bndb"
         assert shared_bn.json("-t", "prog", "save", str(second))["export"] is True
         assert shared_bn.run("close", str(prog)).returncode == 0
         shared_bn.load(second, copy=False)
         annotations = shared_bn.json("target", "info")["existing_annotations"]
         assert annotations["written_by_this_bridge"]["kind"] == "export", annotations
-        assert annotations["own_at_open"] == {
-            "comments": 0, "function_comments": 0, "analyst_symbols": 0}, annotations
-        assert annotations["unmatched_at_open"] == {
-            "comments": 1, "function_comments": 0, "analyst_symbols": 1}, annotations
-        hint = annotations["provenance_hint"]
-        assert hint and "1 comment(s), 0 function doc(s), 1 analyst symbol(s)" in hint, hint
-        assert "0 positively matched" in hint, hint
+        assert "may predate this run" in (annotations["provenance_hint"] or ""), annotations
 
 
 class TestRestartReopensAStaleDatabaseLoudly:

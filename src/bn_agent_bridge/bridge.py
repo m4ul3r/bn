@@ -779,12 +779,10 @@ class TargetManager:
         # so nothing that reads the restart identity can see an export.
         self._exports: dict[str, dict[str, tuple[int, int, int, int] | None]] = {}
         # Written path -> what this bridge wrote there: the file identity right
-        # after the write, the view it came from, when, and a copy of that
-        # view's session ledgers at that moment (#1036 item 5). Keyed by FILE,
-        # not by view, so it outlives closing the source view and covers a
-        # database saved in place. It says who wrote the FILE; whether a given
-        # annotation in it is this bridge's own is judged entry by entry
-        # against the copied ledgers, never from the file fact alone.
+        # after the write, the view it came from, and when (#1036 item 5).
+        # Keyed by FILE, not by view, so it outlives closing the source view
+        # and covers a database saved in place. Provenance of the FILE only:
+        # it never says who wrote an annotation inside it.
         self._written_files: dict[str, dict[str, Any]] = {}
         # Stable view_id -> the comments THIS bridge wrote and verified, keyed
         # (scope, address) -> body, scope "address" (a global address comment)
@@ -796,11 +794,6 @@ class TargetManager:
         # shares a location or a spelling with one is never credited to this
         # session.
         self._session_annotations: dict[str, dict[tuple[str, int], str]] = {}
-        # Stable view_id -> {address: name} of the function/data renames this
-        # bridge verified (`rename_symbol`), the symbol half of the same ledger:
-        # a reloaded database credits a symbol to this bridge only when its
-        # name at that address is one this bridge set (#1036 item 5).
-        self._session_symbols: dict[str, dict[int, str]] = {}
         # The manager that took this one's ledger over in a GUI bridge restart
         # (`succeed`). A request the old bridge admitted can still commit -- or
         # save, or close -- after the handover; its ledger change is forwarded
@@ -839,9 +832,6 @@ class TargetManager:
                 vid: dict(ledger)
                 for vid, ledger in predecessor._session_annotations.items()
             }
-            self._session_symbols = {
-                vid: dict(ledger) for vid, ledger in predecessor._session_symbols.items()
-            }
             predecessor._successor = self
 
     def _stable_view_id(self, bv) -> str | None:
@@ -867,55 +857,41 @@ class TargetManager:
             successor.clear_dirty(bv)
 
     def note_session_annotations(self, bv, results) -> None:
-        """Record the comments and symbol renames a committed mutation verified
-        on *bv* (#977, #1036 item 5).
+        """Record the comments a committed mutation verified on *bv* (#977).
 
         Only ``verified`` rows count: a ``noop`` set means the body was already
         stored, which is exactly the inherited case the redaction exists for.
         A verified delete forgets the location."""
         entries: list[tuple[tuple[str, int], str | None]] = []
-        renames: list[tuple[int, str]] = []
         for row in results or []:
             if not isinstance(row, dict) or row.get("status") != "verified":
                 continue
             op_name = row.get("op")
-            if op_name not in ("set_comment", "delete_comment", "rename_symbol"):
+            if op_name not in ("set_comment", "delete_comment"):
                 continue
             try:
                 address = int(str(row.get("address")), 16)
             except (TypeError, ValueError):
-                continue
-            if op_name == "rename_symbol":
-                name = row.get("new_name")
-                if isinstance(name, str) and name:
-                    renames.append((address, name))
                 continue
             scope = "function_doc" if row.get("scope") == "function_doc" else "address"
             body = None
             if op_name == "set_comment":
                 body = str((row.get("requested") or {}).get("comment") or "")
             entries.append(((scope, address), body or None))
-        if not entries and not renames:
+        if not entries:
             return
-        self.seed_session_ledger(bv, dict(entries), dict(renames))
-
-    def seed_session_ledger(self, bv, comments: dict[tuple[str, int], str | None],
-                            symbols: dict[int, str]) -> None:
-        """Merge verified writes into *bv*'s session ledgers (None deletes)."""
         with self._lock:
             vid = self._stable_view_id(bv)
             if vid is not None:
                 ledger = self._session_annotations.setdefault(vid, {})
-                for key, body in comments.items():
+                for key, body in entries:
                     if body is None:
                         ledger.pop(key, None)
                     else:
                         ledger[key] = body
-                if symbols:
-                    self._session_symbols.setdefault(vid, {}).update(symbols)
             successor = self._successor
         if successor is not None:
-            successor.seed_session_ledger(bv, comments, symbols)
+            successor.note_session_annotations(bv, results)
 
     def session_annotations(self, bv) -> dict[tuple[str, int], str]:
         """The comments this bridge wrote on *bv*, keyed by (scope, address)."""
@@ -991,8 +967,6 @@ class TargetManager:
                 "filename": record.filename if record is not None else (live or None),
                 "target_id": record.target_id() if record is not None else None,
                 "saved_at": stamp,
-                "comments": dict(self._session_annotations.get(vid, {})) if vid else {},
-                "symbols": dict(self._session_symbols.get(vid, {})) if vid else {},
             }
             while len(self._written_files) > self._WRITTEN_FILES_LIMIT:
                 del self._written_files[next(iter(self._written_files))]
@@ -1019,17 +993,16 @@ class TargetManager:
         rewritten by anyone else since is not claimed. Independent of whether
         the view it was saved from is still open. None otherwise.
 
-        A copy of the record, including the session ledgers copied at the
-        save: it says who wrote the FILE, and only those ledgers can say which
-        annotations in it are this bridge's own."""
+        ``{kind, filename, target_id, saved_at}``: who wrote the FILE, never
+        who wrote an annotation inside it."""
         current = _file_identity(str(path))
         if current is None:
             return None
         with self._lock:
             for recorded, written in self._written_files.items():
                 if written["identity"] == current and _same_file(recorded, str(path)):
-                    return {**written, "comments": dict(written["comments"]),
-                            "symbols": dict(written["symbols"])}
+                    return {key: value for key, value in written.items()
+                            if key != "identity"}
         return None
 
     def open_target_for_path(self, path: str, *, exclude) -> dict[str, Any] | None:
@@ -1096,7 +1069,6 @@ class TargetManager:
                 self._database_paths.pop(vid, None)
                 self._database_identities.pop(vid, None)
                 self._exports.pop(vid, None)
-                self._session_symbols.pop(vid, None)
                 self._session_annotations.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
@@ -1488,10 +1460,6 @@ class TargetManager:
                 }
                 self._exports = {
                     vid: paths for vid, paths in self._exports.items() if vid in alive
-                }
-                self._session_symbols = {
-                    vid: ledger for vid, ledger in self._session_symbols.items()
-                    if vid in alive
                 }
                 self._session_annotations = {
                     vid: ledger for vid, ledger in self._session_annotations.items()
@@ -2622,11 +2590,6 @@ class BinaryNinjaBridge:
                         if spec.selector is not None:
                             params = {**params, "target": pinned}
                 result = self._dispatch_on_main(op, params, target)
-                if isinstance(result, dict) and result.get("committed") is True:
-                    self._attach_save_refusal(
-                        result,
-                        spec.selector(params, target)
-                        if spec is not None and spec.selector is not None else target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
             # When the failure carries an unclearable has_user_type residue, the
@@ -3282,13 +3245,11 @@ class BinaryNinjaBridge:
             #
             # #1036 item 5: a database THIS bridge saved or exported, and still
             # the very file it wrote, is disclosed as such -- a fact about the
-            # FILE. Which of its measured annotations are this bridge's own is
-            # judged one by one against the session ledgers copied at that
-            # save, within the same population the counts measure.
+            # FILE only; its annotations stay "may predate this run".
             database = load_path if load_path.suffix == ".bndb" else None
             written = (self.targets.written_by_this_bridge(load_path)
                        if database is not None else None)
-            opened_known, opened_record, own_ledger = _opened_annotation_record(
+            opened_known, opened_record = _opened_annotation_record(
                 bv, database, written)
             if substitute is not None and opened_record is not None:
                 annotation_note = _opened_annotation_note(
@@ -3314,11 +3275,6 @@ class BinaryNinjaBridge:
                 if opened_known:
                     _opened_annotations[view_session_key(bv)] = opened_record
                 targets = self.targets.refresh()
-                if own_ledger is not None:
-                    # The new view's ledgers start with what this bridge
-                    # verified and the file still holds, so `comment list` and
-                    # decompile mark those as this session's like the hint does.
-                    self.targets.seed_session_ledger(bv, *own_ledger)
                 loaded_target = self._loaded_target_row(targets, bv)
                 if loaded_target and loaded_target.get("selector_reason"):
                     notes.append(
@@ -3966,41 +3922,6 @@ class BinaryNinjaBridge:
         self._stamp_cache_writer(saved, result)
         _disclose_open_target_collision(self.targets, bv, saved, result)
         return result
-
-    def _plain_save_refusal(self, bv) -> dict[str, Any] | None:
-        """What a plain `bn save` of *bv* would be refused with RIGHT NOW, or
-        None: its default destination's directory is not writable (so the
-        save falls back to the shared cache) AND that cache entry holds work
-        this target did not load -- the exact refusal `_save_database` raises,
-        judged by the same `_cache_holds_other_work` on the current state of
-        the file system. A writable default, or a free or own cache entry,
-        is None: that save is not refused."""
-        filename = str(getattr(getattr(bv, "file", None), "filename", "") or "")
-        if not filename:
-            return None
-        default = filename if filename.endswith(".bndb") else f"{filename}.bndb"
-        if _destination_writable(default):
-            return None
-        identity = _recorded_source_identity(bv)
-        cache_path = str(_cache_bndb_path(filename, identity.sha256 if identity else None))
-        if not self._cache_holds_other_work(bv, cache_path, filename):
-            return None
-        return {"default_save_path": default, "cache_fallback": cache_path}
-
-    def _attach_save_refusal(self, result: dict[str, Any], selector: Any) -> None:
-        """#1036 review round 2: a committed mutation whose target a plain
-        save would refuse says so (`save_refusal`), so the text status never
-        prints a known-refused `bn save` as the step that persists it.
-        Best-effort: an unanswerable probe adds nothing."""
-        try:
-            bv = self.targets.resolve(selector)
-            if not self.targets.is_dirty(bv):
-                return
-            refusal = self._plain_save_refusal(bv)
-        except Exception:  # noqa: BLE001 - advice, never a failure of the write
-            return
-        if refusal is not None:
-            result["save_refusal"] = refusal
 
     def _cache_holds_other_work(self, bv, cache_path: str, filename: str) -> bool:
         """Does the cache entry at *cache_path* exist and hold a database this
@@ -6851,17 +6772,6 @@ def _valid_process_identity(process: Any) -> bool:
             and isinstance(ticks, int) and not isinstance(ticks, bool) and ticks >= 0)
 
 
-def _destination_writable(path: str) -> bool:
-    """Could a database be written at *path* now: its directory exists and is
-    writable, and an existing file there is writable too (`os.access`, which
-    also answers for a read-only mount)."""
-    target = Path(path)
-    parent = target.parent
-    if not parent.is_dir() or not os.access(parent, os.W_OK):
-        return False
-    return not target.exists() or os.access(target, os.W_OK)
-
-
 def _instance_option(instance_id: str | None) -> str:
     """The `-i` argument a printed command needs to reach this bridge, shell-
     quoted; attached (`--instance=<id>`) when the id starts with `-`. Empty for
@@ -7024,97 +6934,30 @@ def _sidecar_note(choice: _SidecarChoice, resolved: Path, who: str | None = None
 
 def _opened_annotation_record(bv, database: Path | None,
                               written: dict[str, Any] | None = None
-                              ) -> tuple[bool, dict[str, Any] | None,
-                                         tuple[dict, dict] | None]:
+                              ) -> tuple[bool, dict[str, Any] | None]:
     """What *bv* carried as the bridge opened it, for `_opened_annotations`
-    (#973): ``(known, record, own ledger)``. A raw open inherits nothing --
-    ``(True, None, None)``; a database open records its counts and path;
-    ``(False, None, None)`` when those counts cannot be read, so the hint
-    falls back to the current counts rather than claim a clean inheritance
-    it never measured.
+    (#973): ``(known, record)``. A raw open inherits nothing -- ``(True,
+    None)``; a database open records its counts and path; ``(False, None)``
+    when those counts cannot be read, so the hint falls back to the current
+    counts rather than claim a clean inheritance it never measured.
 
-    With *written* (what this bridge wrote at *database*, `written_by_this_
-    bridge`), the record also says which of the MEASURED annotations this
-    bridge's own verified writes account for (`_match_own_annotations`),
-    and the third value is the matched ledger entries to seed the view with."""
+    *written* (`written_by_this_bridge` for *database*) is recorded as the
+    FILE fact it is: who wrote the file, never who wrote its annotations
+    (#1036 item 5)."""
     if database is None:
-        return True, None, None
-    population: dict[str, list] = {}
+        return True, None
     try:
-        summary = read_listing._annotation_summary(None, bv, population=population)
+        summary = read_listing._annotation_summary(None, bv)
     except Exception:  # noqa: BLE001 - unmeasured is "unknown", never zero
-        return False, None, None
+        return False, None
     record: dict[str, Any] = {
         "path": str(database),
         **{key: summary[key] for key in read_listing.OPENED_ANNOTATION_COUNTS},
     }
-    if written is None:
-        return True, record, None
-    own, unmatched, comments, symbols = _match_own_annotations(population, written)
-    record["written_by_this_bridge"] = {
-        key: written[key] for key in ("kind", "filename", "target_id", "saved_at")}
-    record["own_at_open"] = own
-    record["unmatched_at_open"] = unmatched
-    return True, record, (comments, symbols)
-
-
-def _match_own_annotations(population: dict[str, list], written: dict[str, Any]
-                           ) -> tuple[dict[str, int], dict[str, int],
-                                      dict[tuple[str, int], str], dict[int, str]]:
-    """Split the annotations `_annotation_summary` MEASURED (*population*:
-    the very entries its counts count, by the same rules) into those this
-    bridge's own verified writes positively account for and the rest.
-
-    An entry is this bridge's own only when the session ledgers copied at
-    the save that wrote the file (*written*) hold the same thing at the same
-    place: a global address comment with that exact body, a function doc
-    with that exact raw text, an analyst symbol with that exact name. A
-    function-local comment is never one (this bridge writes only the global
-    map), and a ledger entry that matches more than one measured entry
-    credits none of them. Nothing outside *population* is ever counted, so
-    an own write the counts excluded (a placeholder-shaped rename, a
-    whitespace-only doc) cannot offset an inherited one (#1036 review round
-    2). Returns ``(own counts, unmatched counts, matched comments, matched
-    symbols)``; per kind, own + unmatched is the measured count."""
-    ledger_comments: dict[tuple[str, int], str] = written.get("comments", {})
-    ledger_symbols: dict[int, str] = written.get("symbols", {})
-
-    def as_int(value: Any) -> int | None:
-        try:
-            return int(value, 16) if isinstance(value, str) else int(value)
-        except (TypeError, ValueError):
-            return None
-
-    candidates: dict[str, list[tuple[Any, Any] | None]] = {
-        "comments": [], "function_comments": [], "analyst_symbols": []}
-    for store, address, text in population.get("comments", []):
-        key = ("address", as_int(address))
-        candidates["comments"].append(
-            (key, text) if store == "address" and ledger_comments.get(key) == text else None)
-    for start, raw_doc in population.get("function_comments", []):
-        key = ("function_doc", as_int(start))
-        candidates["function_comments"].append(
-            (key, raw_doc) if ledger_comments.get(key) == raw_doc else None)
-    for address, name in population.get("analyst_symbols", []):
-        key = as_int(address)
-        candidates["analyst_symbols"].append(
-            (key, name) if key is not None and ledger_symbols.get(key) == name else None)
-    own: dict[str, int] = {}
-    unmatched: dict[str, int] = {}
-    comments: dict[tuple[str, int], str] = {}
-    symbols: dict[int, str] = {}
-    for kind, rows in candidates.items():
-        hits = [row for row in rows if row is not None]
-        repeated = {key for key, _ in hits if [k for k, _ in hits].count(key) > 1}
-        credited = [(key, value) for key, value in hits if key not in repeated]
-        own[kind] = len(credited)
-        unmatched[kind] = len(rows) - len(credited)
-        for key, value in credited:
-            if kind == "analyst_symbols":
-                symbols[key] = value
-            else:
-                comments[key] = value
-    return own, unmatched, comments, symbols
+    if written is not None:
+        record["written_by_this_bridge"] = {
+            key: written.get(key) for key in ("kind", "filename", "target_id", "saved_at")}
+    return True, record
 
 
 def _opened_annotation_note(record: dict[str, Any], *, restored: bool = False) -> str | None:
@@ -7336,7 +7179,7 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True,
             _quick_loaded_views.discard(bv)
         if bndb_unanalyzed:
             _unanalyzed_views.add(bv)
-        opened_known, opened_record, _own = _opened_annotation_record(
+        opened_known, opened_record = _opened_annotation_record(
             bv, load_path if load_path.suffix == ".bndb" else None)
         if substitute is not None and opened_record is not None:
             annotation_note = _opened_annotation_note(
