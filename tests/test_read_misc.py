@@ -791,6 +791,9 @@ def test_imports_recovers_relocation_only_external_symbol(monkeypatch):
             "raw_name": "dispatch_record",
             "kind": "function",
             "provenance": "relocation",
+            # #1037 item 6: every null-library row says why.
+            "library_note": NOTE.replace("the loader picks it at run time from DT_NEEDED",
+                                         "this target lists no DT_NEEDED libraries"),
         }
     ]
     assert result["relocation_recovered"] == 1
@@ -1024,8 +1027,10 @@ def test_imports_without_raw_parent_keep_null_library_969(monkeypatch):
 
     listed = instance._imports(None)
     assert listed["items"][0]["library"] is None
-    # No DT_NEEDED to point at: nothing to disclose.
-    assert "library_unattributed" not in listed
+    # No DT_NEEDED to point at: the row is still disclosed, and the note says
+    # the list is empty rather than pointing at it (#1037 review round 5).
+    assert listed["library_unattributed"] == 1
+    assert listed["unattributed_note"].endswith("this target lists no DT_NEEDED libraries")
 
 
 def test_imports_unversioned_rows_disclose_why_library_is_null_1037(monkeypatch, tmp_path):
@@ -2386,3 +2391,35 @@ def test_unattributed_imports_get_the_neutral_note_never_unversioned_1037(monkey
     assert listed["unattributed_note"] == NOTE
     assert instance._imports(None, summary=True)["unattributed_note"] == NOTE
     assert "unversioned" not in json.dumps(listed)
+
+
+def test_unattributed_imports_on_a_target_with_no_dt_needed_say_so_1037(monkeypatch):
+    """#1037 review round 5: a shared object built without default libraries
+    that calls one unresolved function has no DT_NEEDED entry. Its null row
+    still gets the note, which must not point at an empty DT_NEEDED list."""
+    from test_elf_dynamic import _build_elf
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    image = _build_elf(needed=(), symbols=(("ext_call", None),))
+    sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "ext_call")
+    sym.short_name, sym.namespace = "ext_call", "BNINTERNALNAMESPACE"
+    bv = _FakeBV(symbols=[sym])
+    bv.parent_view = types.SimpleNamespace(
+        start=0, length=len(image), read=lambda offset, size: image[offset:offset + size])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    expected = ("no library attributed: bn names a library only from a symbol-version "
+                "requirement it could match; this target lists no DT_NEEDED libraries")
+    listed = instance._imports(None)
+    assert listed["items"][0]["library"] is None
+    assert listed["items"][0]["library_note"] == expected
+    assert (listed["library_unattributed"], listed["needed_libraries"],
+            listed["unattributed_note"]) == (1, [], expected)
+    assert instance._imports(None, summary=True)["unattributed_note"] == expected
+
+    from bn.formatters import _render_name_address_list_text
+    text = _render_name_address_list_text(listed)
+    assert f"// 1 import(s) carry no library ({expected})" in text
+    assert "DT_NEEDED):" not in text

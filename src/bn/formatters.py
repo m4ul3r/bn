@@ -2216,8 +2216,9 @@ def _render_name_address_list_text(value: Any, *, mangled: bool = False) -> str:
         # #1037 item 6: disclosure only, with the bridge's reason -- which
         # says "unversioned" only when the symbol version table was read.
         why = _text_value(value, "unattributed_note") or "no symbol version names one"
-        note = (f"// {unattributed} import(s) carry no library ({_escape_control_chars(why)}); "
-                f"this binary needs (DT_NEEDED): {needed or '?'} (also in `bn target info`)")
+        note = f"// {unattributed} import(s) carry no library ({_escape_control_chars(why)})"
+        if needed:
+            note += f"; this binary needs (DT_NEEDED): {needed} (also in `bn target info`)"
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     # #1037 item 5: rows whose 0 callers is BN's recorded refs only. Counted
     # off the rows shown, so a collected listing counts every collected row.

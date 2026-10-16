@@ -352,8 +352,11 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int],
     is None when it was read, or when the file declares no version table."""
     if _DT_VERSYM not in tags and _DT_VERNEED not in tags:
         return {}, None
-    if _DT_VERSYM not in tags or _DT_SYMTAB not in tags:
+    if _DT_VERSYM not in tags:
         return {}, "the file declares version requirements without a symbol version table"
+    if _DT_SYMTAB not in tags:
+        # #1037 review round 5: name the table that is actually missing.
+        return {}, "the file declares symbol versions without a dynamic symbol table"
     files = _verneed_files(elf, tags, dynstr)
     if not files:
         if _DT_VERNEED in tags:

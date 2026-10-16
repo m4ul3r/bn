@@ -926,7 +926,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         relocation_recovered += 1
     # #1037 item 6: say where every attributed library came from, and why an
     # import has none.
-    unattributed_note = _unattributed_note(elf_info)
+    unattributed_note = _unattributed_note(elf_info, needed_libraries)
     _note_unversioned_imports(items, needed_libraries, unattributed_note)
     # #450: filter the survey to matching imports so a sink/source sweep
     # (`--query 'system|execve|popen' --regex`) doesn't need full paging + external
@@ -997,7 +997,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     # listing, with the DT_NEEDED list beside it -- so `library: null` points at
     # the answer instead of reading as "no dependency".
     unattributed = sum(1 for item in items if not item["library"])
-    if unattributed and needed_libraries:
+    if unattributed:
         result["library_unattributed"] = unattributed
         result["needed_libraries"] = needed_libraries
         # #1037 item 6: the neutral note on why they are null.
@@ -1030,7 +1030,7 @@ def _note_unversioned_imports(items: list[dict[str, Any]], needed_libraries: lis
             item["library_source"] = ("namespace" if namespace
                                       and namespace not in _BN_SENTINEL_NAMESPACES
                                       else "symbol-version")
-        elif needed_libraries:
+        else:
             item["library_note"] = note
 
 
@@ -1044,13 +1044,21 @@ UNATTRIBUTED_IMPORT_NOTE = ("no library attributed: bn names a library only from
                             "picks it at run time from DT_NEEDED")
 
 
-def _unattributed_note(elf_info: ElfDynamicInfo | None) -> str:
+# The same note for a target with no DT_NEEDED entry, where "the loader picks
+# it from DT_NEEDED" would point at a list that is empty (#1037 review round 5).
+NO_NEEDED_IMPORT_NOTE = ("no library attributed: bn names a library only from a "
+                         "symbol-version requirement it could match; this target "
+                         "lists no DT_NEEDED libraries")
+
+
+def _unattributed_note(elf_info: ElfDynamicInfo | None, needed_libraries: list[str]) -> str:
     """The neutral note, plus the parser's recorded reason for not reading the
     symbol versions when there is one. The absence of a reason claims nothing."""
+    note = UNATTRIBUTED_IMPORT_NOTE if needed_libraries else NO_NEEDED_IMPORT_NOTE
     reason = elf_info.versions_unread if elf_info is not None else None
     if reason:
-        return f"{UNATTRIBUTED_IMPORT_NOTE}; symbol versions were not read: {reason}"
-    return UNATTRIBUTED_IMPORT_NOTE
+        return f"{note}; symbol versions were not read: {reason}"
+    return note
 
 
 # #1037 item 5: the most calling functions one `imports --with-callers` row
@@ -1182,8 +1190,9 @@ def _imports_build_summary(
         "by_kind": dict(sorted(by_kind.items(), key=lambda x: -x[1])),
     }
     # #1037 item 6: why "(unattributed)" rows are null, also when every row is.
-    if by_library.get("(unattributed)") and needed_libraries:
-        summary["unattributed_note"] = unattributed_note or UNATTRIBUTED_IMPORT_NOTE
+    if by_library.get("(unattributed)"):
+        summary["unattributed_note"] = unattributed_note or (
+            UNATTRIBUTED_IMPORT_NOTE if needed_libraries else NO_NEEDED_IMPORT_NOTE)
     return summary
 
 

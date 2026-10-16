@@ -335,3 +335,16 @@ def test_file_size_bounds_reads_even_when_the_reader_could_serve_more():
     image = _build_elf(needed=("libc.so.6",), symbols=_SYMBOLS)
     info = _parse(image, file_size=200)
     assert info is None or info.import_libraries == {}
+
+
+def test_versions_unread_names_the_missing_dynamic_symbol_table_1037():
+    """#1037 review round 5: one condition covered a missing DT_VERSYM and a
+    missing DT_SYMTAB, and always named the version table. With only the
+    DT_SYMTAB declaration removed, the reason names the symbol table."""
+    image = bytearray(_build_elf(needed=("libc.so.6",), symbols=_SYMBOLS))
+    rows, fmt = _dynamic_entries_at(bytes(image))
+    at, _tag, value = next(row for row in rows if row[1] == 6)   # DT_SYMTAB
+    struct.pack_into(fmt, image, at, 21, value)                   # -> DT_DEBUG
+    info = _parse(bytes(image))
+    assert info.versions_unread == (
+        "the file declares symbol versions without a dynamic symbol table")
