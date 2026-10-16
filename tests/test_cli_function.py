@@ -910,6 +910,44 @@ def test_evidence_function_routes_and_renders_calls(fake_transport, capsys):
     assert "r0" not in output
 
 
+def test_evidence_function_forwards_callee_filters_and_text_switches_1037(fake_transport, capsys):
+    calls = fake_transport({"function_evidence": {"ok": True, "result": {
+        "function": {"name": "session_close", "address": "0x402000"},
+        "thunk": {"is_candidate": False},
+        "total_calls": 44, "matched_calls": 1, "offset": 0, "limit": None,
+        "callee_filter": {"callee": ["log_line"], "exclude_callee": ["operator delete", "0x401038"],
+                          "excluded": 43},
+        "calls": [{"address": "0x402020", "operation": "LLIL_CALL", "direct": True,
+                   "target": {"raw": "0x401040", "normalized": "0x401040",
+                              "function": {"name": "log_line", "address": "0x401040"}},
+                   "hlil_statement": "log_line(\"closing\")",
+                   "arguments": [{"text": "\"closing\""}],
+                   "arity_witnesses": {"library": {"status": "unavailable",
+                                                   "reason": "no_library_entry"}}}],
+    }}})
+
+    rc = bn.cli.main(["evidence", "function", "--target", "active", "session_close",
+                      "--callee", "log_line", "--exclude-callee", "operator delete",
+                      "--exclude-callee", "0x401038", "--compact"])
+    assert rc == 0
+    assert calls[-1]["params"] == {
+        "identifier": "session_close", "context": 2, "offset": 0,
+        "callee": ["log_line"], "exclude_callee": ["operator delete", "0x401038"],
+    }
+    out = capsys.readouterr().out
+    assert "calls: 1 of 1 matching the callee filter (of 44 total; 43 excluded)" in out
+    assert "- 0x402020  direct  log_line @ 0x401040  (\"closing\")" in out
+    assert "hlil:" not in out
+
+    # Default text hides the non-contradiction witness row; -v prints it.
+    assert bn.cli.main(["evidence", "function", "--target", "active", "session_close"]) == 0
+    assert "callee" not in calls[-1]["params"] and "exclude_callee" not in calls[-1]["params"]
+    out = capsys.readouterr().out
+    assert "witnesses:" not in out and "1 hidden; --verbose shows all" in out
+    assert bn.cli.main(["evidence", "function", "--target", "active", "session_close", "-v"]) == 0
+    assert "  witnesses: library=unavailable (no_library_entry)" in capsys.readouterr().out
+
+
 def test_evidence_table_record_mode_threads_params_and_renders(fake_transport, capsys):
     # #455: --record-size/--ptr-fields route to record-aware mode and render the
     # {row, base, fields} shape.

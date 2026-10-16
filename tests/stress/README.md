@@ -27,6 +27,7 @@ make -C tests/fixtures clean
 | `classes_stripped_x86_64` | the same C++ PIE built with `-s`: synthesized slot-array vtable symbols must recover the same object heads and slot contents without phantom secondaries (#935) |
 | `canary_x86_64`        | a stack-protected buffer: frame-map canary evidence and slot-to-canary distances |
 | `vcalls_x86_64`        | a C++ binary whose virtual methods are reached only through vtable slots (`callsites` data-ref notes, vtable address points, #998) |
+| `statics_x86_64`       | a C++ static member BN types with a leading `this` its callers never set, and a recovered class type the view does not define (`proto get` notes, #1013) |
 
 The paired class-lens regression checks slot addresses against each view's raw
 words. Across the symbolized/stripped views, local and null slots, object heads,
