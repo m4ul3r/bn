@@ -66,7 +66,8 @@ from .proc_identity import identity_payload
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
 from .target_hint import (
-    LISTED_SELECTOR_LEAD, format_multi_target_hint, open_target_lines, target_row,
+    LISTED_SELECTOR_LEAD, format_multi_target_hint, instance_option, open_target_lines,
+    target_row,
 )
 from .version import VERSION, build_id_for_file, build_id_for_package
 
@@ -2886,7 +2887,7 @@ class BinaryNinjaBridge:
         # status` invocation that can reliably name it back.
         if not self.instance_id:
             return None
-        return f"bn -i {self.instance_id} session status {job_id}"
+        return f"bn {instance_option(self.instance_id)} session status {job_id}"
 
 
     def _open_view(self, load_path: Path):

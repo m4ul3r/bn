@@ -20,11 +20,16 @@ One open target can be selected implicitly. With several open targets, pass `-t 
 
 Every alias counts equally, so opening a view never moves a selector onto it: a selector that matches two views is refused with both listed. The one exception is the save round trip: after `bn save` on a raw view and `bn load` of that `.bndb`, the raw view's own name and path still mean the raw view (the database answers to its `.bndb` name) — only while that `.bndb` is still the file this bridge wrote and not loaded as unverified; a replaced database makes the name ambiguous again. A bare `bn close <name>` (no `/`, no such file in the cwd) closes only the target whose file name is exactly `<name>`; use `-t` for any other selector. `bn close -t foo` (and `bn target close foo`) refuses when `foo` names `foo.bndb` only through its `.bndb`-stripped name — including after `bn load foo` opened the adjacent `foo.bndb` — and prints the command to run with the target's listed selector.
 
-Complete runnable refusal rows are provided for top-level refusals, `close`,
-`target close`, and batched decompile **text** errors. Fan-out per-instance
-errors and structured JSON/ndjson batch errors still carry raw `-t` fragment
-rows, as on base; those are not runnable commands and remain a follow-up.
-The shared renderer shell-quotes filename metadata even on those raw rows.
+Every listing row in a refusal is a complete command: top-level refusals,
+`close`, `target close`, batched decompile errors (text and JSON/ndjson), and
+the per-instance errors of `--all-instances`/`--all-targets`, which are spelled
+as the single call to that instance. A value starting with `-` is attached
+(`--target=<sel>`, `--instance=<id>`, `--instance-id=<id>`). The raw
+`Open targets:` rows mark the active target with a trailing `(active)`.
+
+With several bridges running, a bare command routes to the one associated with
+this project root and says so on stderr. `bn instance list --mine` lists only
+those (and the project's sticky pin).
 
 Instance routing is `-i` → `BN_INSTANCE` → project sticky pin → sole/unique project-associated live instance → auto-spawn. Target routing is `-t` → `BN_TARGET` → project sticky pin → single-open auto-pick; for `batch apply`, a manifest `"target"` wins over ambient defaults but loses to explicit `-t`. `BN_TARGET` is an ambient default, not an explicit command-line selection. A bare destructive `bn close` ignores the ambient target and closes only the sole open view or refuses with a target list; use `-t`, a path, or `--all` deliberately. An empty `BN_TARGET` or empty sticky target is refused when a command would use it. A valid ambient target can affect a bare `bn save`, so pass `-t` for the database you intend to write.
 

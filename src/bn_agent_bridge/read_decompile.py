@@ -2124,6 +2124,10 @@ def _decompile_batch(
     paid the analysis cost for them. The row carries the error text so the
     miss is visible per-identifier rather than as one collapsed failure.
     """
+    # The target is not per identifier: resolve it once, so a refusal (several
+    # targets open, an unknown selector) fails the request with its listing
+    # rather than repeating it as N per-row errors (#1033 item 1).
+    ctx._resolve_view(selector)
     rows: list[dict[str, Any]] = []
     for identifier in identifiers:
         try:

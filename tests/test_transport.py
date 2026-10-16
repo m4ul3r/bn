@@ -1218,7 +1218,7 @@ def test_send_request_truncated_reply_from_a_dead_bridge_blames_the_crash(tmp_pa
         transport._send_request_to_instance(instance, "ping", timeout=5.0)
     message = str(excinfo.value)
     assert "no longer running" in message
-    assert "truncated by a crash" in message
+    assert "cut short by the process exiting" in message
     assert "not a protocol error" in message
     assert f"after {len(truncated)} bytes" in message
     # Discriminating: the diagnosis must not still read as a malformed-protocol
@@ -1279,7 +1279,7 @@ def test_a_bridge_that_crashed_mid_reply_is_not_called_still_running_595(tmp_pat
         transport._send_request_to_instance(instance, "ping", timeout=5.0)
     message = str(excinfo.value)
     assert "no longer running" in message
-    assert "truncated by a crash" in message
+    assert "cut short by the process exiting" in message
     assert "still running" not in message
     assert "bn doctor" not in message
 
@@ -2105,7 +2105,7 @@ def test_spawn_instance_starts_new_instance_when_other_instances_exist(monkeypat
     inst = spawn_instance("newid")
 
     assert inst.instance_id == "newid"
-    assert popen_calls[0]["cmd"] == ["bn-agent", "--instance-id", "newid"]
+    assert popen_calls[0]["cmd"] == ["bn-agent", "--instance-id=newid"]
 
 
 def test_spawn_instance_reports_exit_code_and_log_when_child_dies(monkeypatch, tmp_path):
@@ -4097,7 +4097,7 @@ def test_auto_spawn_never_picks_a_hidden_instance_id(tmp_path, monkeypatch):
     spawned: list[str] = []
 
     def fake_popen(cmd, **kwargs):
-        spawned.append(cmd[-1])
+        spawned.append(cmd[-1].removeprefix("--instance-id="))
         raise AssertionError("stop here: the chosen id is what matters")
 
     monkeypatch.setattr(transport.subprocess, "Popen", fake_popen)

@@ -8,7 +8,7 @@ import re
 import shlex
 from typing import Any, Callable, Iterator, Sequence
 
-from .target_hint import open_target_lines, target_row
+from .target_hint import instance_option, open_target_lines, target_row
 from .transport import BridgeError
 
 # FAILED_MUTATION_STATUSES is DEFINED in `mutation_statuses`, a stdlib-only leaf
@@ -1513,7 +1513,8 @@ def _render_session_start_text(value: Any) -> str:
         lines.append(f"project association error: {association_error}")
         lines.append(
             f"hint: bare `bn` commands from this checkout won't route to this "
-            f"session; pass -i {value.get('instance_id', '<id>')}"
+            f"session; pass "
+            f"{instance_option(str(value['instance_id'])) if value.get('instance_id') else '-i <id>'}"
         )
     if value.get("reload_capture_failed"):
         lines.append("")

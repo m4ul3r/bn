@@ -39,6 +39,7 @@ from .paths import (
 )
 from .proc_identity import PinUnavailable, identity_verdict, pin_process
 from .socket_evidence import path_has_bound_socket
+from .target_hint import instance_id_option, instance_option
 from .wire_limits import batch_apply_max_bytes
 
 
@@ -423,30 +424,54 @@ class BridgeProcessSignal:
         return None
 
 
+def _registry_left_behind(instance: BridgeInstance) -> bool:
+    """Whether *instance*'s own registry entry is still on disk.
+
+    A clean shutdown (`session stop`, `restart`, the idle reaper) removes the
+    entry before the process exits; a process that dies without running its
+    shutdown cannot. An entry that now names another pid belongs to a
+    successor, so it is not this process's (#1035 item 1).
+    """
+    try:
+        recorded = json.loads(instance.registry_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(recorded, dict) and recorded.get("pid") == instance.pid
+
+
+def _exit_evidence(instance: BridgeInstance, *, running: bool) -> str:
+    """What the process state and the registry show, without guessing a cause."""
+    left = _registry_left_behind(instance)
+    if running:
+        if left:
+            return ("The process is still running but closed the connection "
+                    "without replying.")
+        return ("The process is still running but has removed its registry "
+                "entry, which a clean shutdown (such as `bn session stop`) does "
+                "first: it is shutting down and did not finish this request.")
+    if left:
+        return ("The process is no longer running and left its registry entry "
+                "behind, so it exited without a clean shutdown (a crash, a kill "
+                "signal or the OOM killer).")
+    return ("The process is no longer running and its registry entry is gone. A "
+            "clean shutdown (such as `bn session stop`) removes it; after an "
+            "unclean exit only `bn instance gc` does.")
+
+
 def _empty_response_error(instance: BridgeInstance, op: str | None) -> BridgeError:
     """Explain a connection that accepted the request but replied with nothing.
 
-    This is the symptom of the bridge process dying mid-request -- the dispatch
-    layer catches every Python exception, so an empty reply means the *process*
-    went away (segfault or OOM during native analysis), not a handler error.
+    The dispatch layer catches every Python exception, so an empty reply means
+    the process went away or is going away. Whether that was a deliberate stop
+    or an unclean exit is read from the registry, not assumed (#1035 item 1).
     Surface the pid, liveness, and log path instead of a bare one-liner.
     """
     op_label = f"op '{op}'" if op else "the request"
     parts = [
         f"Binary Ninja bridge returned an empty response for {op_label} "
-        f"(instance {instance_selector(instance)}, pid {instance.pid})."
+        f"(instance {instance_selector(instance)}, pid {instance.pid}).",
+        _exit_evidence(instance, running=_process_running(instance.pid)),
     ]
-    if _process_running(instance.pid):
-        parts.append(
-            "The process is still running but closed the connection without "
-            "replying -- a worker thread likely hit a native fault."
-        )
-    else:
-        parts.append(
-            "The process is no longer running -- it most likely crashed or was "
-            "OOM-killed (large or complex binaries can exhaust memory during "
-            "update_analysis_and_wait)."
-        )
     parts.extend(_bridge_recovery_advice(instance))
     return BridgeError(" ".join(parts))
 
@@ -493,8 +518,9 @@ def _unparseable_response_error(
         )
     else:
         parts.append(
-            "The process is no longer running, so the reply was truncated by a crash "
-            "or OOM kill -- this is a dead bridge, not a protocol error."
+            "The reply was cut short by the process exiting -- this is a dead "
+            "bridge, not a protocol error. "
+            + _exit_evidence(instance, running=False)
         )
     parts.extend(_bridge_recovery_advice(instance))
     return BridgeError(" ".join(parts))
@@ -1487,7 +1513,7 @@ def choose_instance(
             )
         raise BridgeError(instance_not_found_message(
             instance_id,
-            f"Start one with: bn session start /path/to/binary --instance-id {instance_id}",
+            f"Start one with: bn session start /path/to/binary {instance_id_option(instance_id)}",
         ))
     if len(instances) == 1:
         if instances[0].instance_id and _resolve_from_project_roots(instances) is None:
@@ -1496,6 +1522,7 @@ def choose_instance(
     if instances:
         associated = _resolve_from_project_roots(instances)
         if associated is not None:
+            _note_associated_instance(associated, len(instances) - 1)
             return associated
         raise _multiple_instances_error(instances)
     if auto_start:
@@ -2164,7 +2191,9 @@ def _spawn_instance_unlocked(
             log_start = log_path.stat().st_size
     log_file = open(log_path, "a" if keep_log else "w")  # noqa: SIM115
 
-    cmd = _find_bn_agent() + ["--instance-id", instance_id]
+    # Attached, never `--instance-id <id>`: an id starting with `-` would be
+    # read by bn-agent's parser as the next option (#1033 item 4).
+    cmd = _find_bn_agent() + [f"--instance-id={instance_id}"]
     # From the Popen below this call OWNS the child until it hands back the
     # instance that child registered. Every other exit -- a refused registry, an
     # early exit, the registration timeout, but ALSO an exception escaping the
@@ -2425,6 +2454,30 @@ def _note_unassociated_instance(instance: BridgeInstance) -> None:
         root = "this directory"
     print(
         f"note: using the only running instance {selector} (not associated with "
-        f"{root}); pass -i {selector} to make that explicit",
+        f"{root}); pass {instance_option(selector)} to make that explicit",
         file=sys.stderr,
     )
+
+
+def _note_associated_instance(instance: BridgeInstance, others: int) -> None:
+    """Say on stderr, once per process, that the project association picked a
+    bridge while others run (#1036 item 7): a shell that lost its
+    `BN_INSTANCE` otherwise routes silently, and nothing in a result names
+    which of several bridges answered."""
+    selector = instance_selector(instance)
+    if selector in _associated_noted:
+        return
+    _associated_noted.add(selector)
+    try:
+        root = str(project_root())
+    except OSError:
+        root = "this directory"
+    noun = "instance is" if others == 1 else "instances are"
+    print(
+        f"note: using instance {selector}, associated with {root}; {others} other "
+        f"{noun} running. Pass {instance_option(selector)} to make that explicit",
+        file=sys.stderr,
+    )
+
+
+_associated_noted: set[str] = set()

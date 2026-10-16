@@ -3499,7 +3499,10 @@ def test_the_reading_reference_documents_the_multi_identifier_decompile_676():
 
     class _NoView:
         def _resolve_view(self, selector):
-            raise RuntimeError("no view in this test")
+            return object()
+
+        def _find_function(self, bv, identifier, contained=False):
+            raise RuntimeError("no function in this test")
 
     envelope = read_decompile._decompile_batch(_NoView(), None, ["a"])
     container = next(k for k, v in envelope.items() if isinstance(v, list))
