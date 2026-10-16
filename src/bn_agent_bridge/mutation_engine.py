@@ -5853,7 +5853,9 @@ def _verify_function_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _class_apply_types_plan(ctx, selector: str | None, name: str, *,
+                            size_from_allocation: bool = False,
+                            ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """#993 item 3: the batch `class apply-types` runs, and what it covers.
 
     Typing a class for named virtual calls took one declaration and one
@@ -5864,17 +5866,25 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
     `--preview` or on a failure, revert as one mutation:
 
     * the instance struct is DECLARED when the view has none (sized from the
-      class card's ``size`` when one was recovered, padding after the vptr), or
-      its offset-0 member is retyped when it exists, keeping that member's name;
+      class card's ``size`` when one was recovered, or -- only when the caller
+      opts in with *size_from_allocation* -- from the one allocation request
+      every shown construction site agrees on, padding after the vptr), or its
+      offset-0 member is retyped when it exists, keeping that member's name;
       nothing when it already holds the typed vptr;
-    * `this` is retyped on each of the class's own methods that has a parameter
-      of that name. A thunk, or a method without one (a static member, or a
-      stripped build where BN did not name it), is skipped and listed, never
-      guessed at.
+    * the object parameter is retyped on the class's own methods: a parameter
+      named `this` wherever BN has one, else -- #1040.1, a stripped build names
+      none -- parameter 0, keeping its name, on the class's constructors and
+      destructors and on the targets of its OWN vtable slots. A slot whose
+      target is also a slot of a base's vtable is inherited and left alone, and
+      when a base's vtable cannot be decoded here no slot counts as the class's
+      own. A thunk, or any other method without a `this` (a static member, a
+      non-virtual method of a stripped build), is skipped and counted, never
+      guessed at. Every retype is verified by the engine's readback.
 
     Refuses when the class has no primary vtable or BN defined no VTable type
     for it: then there is no table type for the vptr to point at."""
     from . import read_class
+    from .read_evidence import _function_thunk_summary
     card = read_class._class_show(ctx, selector, name)
     requested = {"op": "class_apply_types", "name": name}
     if card.get("ambiguous"):
@@ -5900,27 +5910,34 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
     vtable_type = read_class._bn_vtable_type_name(bv, slot_start)
     instance = _lookup_named_type(bv, cls)
     if vtable_type is None:
+        type_names = sorted(_view_type_names(bv) or ())
         if instance is None:
             # The struct-show note names a derived class's table when BN made
             # only those (an abstract base), with the caveat that borrowing one
             # is a choice this command does not make for the caller.
-            note = ctx._class_vtable_note(cls, sorted(_view_type_names(bv) or ()))
+            note = ctx._class_vtable_note(cls, type_names)
         else:
             # #993 review: that note says the struct does not exist and offers
             # a declare that would replace it; this one is about the vptr only.
-            derived = sorted(n for n in _view_type_names(bv) or ()
+            derived = sorted(n for n in type_names
                              if n.startswith(f"{cls}::") and n.endswith("::VTable"))
             note = (f" BN made VTable types only for classes derived from {cls} "
                     f"({', '.join(derived[:3])}); their leading slots are {cls}'s virtuals, but "
                     f"their `this` types belong to the derived class. To borrow one, retype the "
                     f"vptr yourself: bn struct field set {cls} 0x0 <member> 'struct `{derived[0]}`*'."
                     if derived else "")
+        # #1035.5: a view where BN made no VTable type for ANY class (its RTTI
+        # analysis named nothing -- the non-PIE builds) says so, so the refusal
+        # is not read as something about this one class.
+        none_at_all = ("" if any(n.endswith("::VTable") for n in type_names) else
+                       " This view has no `<Class>::VTable` type for any class: Binary Ninja's "
+                       "RTTI analysis created none here.")
         raise OperationFailure(
             "invalid_request",
             f"Binary Ninja defined no `<Class>::VTable` type at {cls}'s slot array "
             f"({hex(slot_start)}), so there is no table type of its own for the vptr to point "
-            "at." + (note or " Declare one with `bn types declare`, then type the vptr with "
-                     "`bn struct field set`."),
+            "at." + none_at_all + (note or " Declare one with `bn types declare`, then type the "
+                                   "vptr with `bn struct field set`."),
             requested=requested,
         )
     vptr_type = f"struct `{vtable_type}`*"
@@ -5931,6 +5948,12 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
         width = int(str(size.get("value")), 16) if size.get("value") else 0
     except ValueError:
         width = 0
+    size_value = size.get("value") if width else None
+    size_source = card.get("size_source")
+    allocation_sites: list[str] = []
+    if size_from_allocation:
+        width, allocation_sites = _allocation_size_for(card, cls, instance, ptr, requested)
+        size_value, size_source = hex(width), "allocation_request"
     vptr_before: dict[str, str] | None = None
     if instance is None:
         body = f"struct `{vtable_type}`* vtable;"
@@ -5992,56 +6015,166 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
             if first is not None:
                 vptr_before = {"field_name": str(getattr(first, "name", "")),
                                "field_type": str(getattr(first, "type", ""))}
-    retyped: list[dict[str, str]] = []
+    retyped: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
     seen: set[int] = set()
+    # #1040.1: which slot targets are the class's OWN -- in its primary vtable,
+    # and not a slot of any base's vtable (that one is inherited, and its
+    # object parameter is the base's). A base whose vtable cannot be decoded
+    # here leaves every slot unproven.
+    slot_targets = read_class._slot_target_addresses(vtable)
+    base_targets, unreadable_bases = read_class._base_vtable_targets(ctx, bv, card)
+    slot_array = (slot_start, slot_start + ptr * len(vtable.get("slots") or []))
+    by_address: dict[int, dict[str, Any]] = {}
     for method in card.get("methods") or []:
         try:
-            address = int(str(method.get("address")), 16)
+            by_address.setdefault(int(str(method.get("address")), 16), method)
         except ValueError:
             continue
-        if address in seen:
-            continue
-        seen.add(address)
-        row = {"address": hex(address), "name": str(method.get("demangled") or method.get("mangled") or "")}
-        if (method.get("thunk") or {}).get("is_candidate"):
-            skipped.append({**row, "reason": "thunk"})
-            continue
-        fn = bv.get_function_at(address)
-        params = list(getattr(fn, "parameter_vars", None) or []) if fn is not None else []
-        if not any(str(getattr(var, "name", "")) == "this" for var in params):
-            skipped.append({**row, "reason": "no parameter named `this`"})
-            continue
-        operations.append({"op": "local_retype", "function": hex(address), "variable": "this",
-                           "new_type": f"struct `{cls}`*"})
-        retyped.append(row)
-    # #993 review: a vtable slot that is not one of the class's own methods --
-    # inherited, or every slot of a stripped build, whose card has no methods
-    # -- is not retyped (its `this` may be a base's), but it is listed.
+    candidates = list(by_address.items())
     for slot in vtable.get("slots") or []:
         target = (slot or {}).get("method") or {}
         try:
             address = int(str(target.get("address")), 16)
         except ValueError:
             continue
+        if address not in by_address:
+            candidates.append((address, {"address": hex(address), "demangled": str(
+                target.get("display_name") or target.get("name") or ""), "slot_only": True}))
+    for address, method in candidates:
         if address in seen:
             continue
         seen.add(address)
-        skipped.append({"address": hex(address),
-                        "name": str(target.get("display_name") or target.get("name") or ""),
-                        "reason": "vtable slot that is not one of the class's own methods "
-                                  "(inherited, or unnamed in a stripped build)"})
+        row = {"address": hex(address), "name": str(method.get("demangled") or method.get("mangled") or "")}
+        fn = bv.get_function_at(address)
+        thunk = method.get("thunk")
+        if thunk is None and fn is not None:
+            thunk = _function_thunk_summary(ctx, bv, fn)
+        if (thunk or {}).get("is_candidate"):
+            skipped.append({**row, "reason": "thunk"})
+            continue
+        params = list(getattr(fn, "parameter_vars", None) or []) if fn is not None else []
+        slot_only = bool(method.get("slot_only"))
+        if not slot_only and any(str(getattr(var, "name", "")) == "this" for var in params):
+            operations.append({"op": "local_retype", "function": hex(address), "variable": "this",
+                               "new_type": f"struct `{cls}`*"})
+            retyped.append({**row, "variable": "this", "basis": "named `this`"})
+            continue
+        owner = read_class._classify_function(fn)[1] if slot_only and fn is not None else None
+        kind = method.get("kind")
+        if kind in ("ctor", "dtor"):
+            basis = "constructor" if kind == "ctor" else "destructor"
+        elif owner is not None:
+            # A slot whose function BN (or the user) named as ANOTHER class's
+            # method -- an inherited slot, or a body folded with that class's.
+            skipped.append({**row, "reason": f"named as a method of {owner}"})
+            continue
+        elif address not in slot_targets:
+            skipped.append({**row, "reason": "no parameter named `this`, and not a vtable slot, "
+                                             "constructor or destructor"})
+            continue
+        elif address in base_targets:
+            skipped.append({**row, "reason": "inherited: also a slot of a base's vtable"})
+            continue
+        elif unreadable_bases:
+            skipped.append({**row, "reason": "a base's vtable is not decodable here "
+                                             f"({', '.join(unreadable_bases)}), so an inherited "
+                                             "slot cannot be told from an override"})
+            continue
+        else:
+            basis = "own vtable slot"
+        if not params:
+            skipped.append({**row, "reason": "BN gives the function no parameters"})
+            continue
+        param0 = params[0]
+        operations.append({"op": "local_retype", "function": hex(address),
+                           "variable": vars_mod._local_id(fn, param0, is_parameter=True),
+                           "new_type": f"struct `{cls}`*"})
+        retyped.append({**row, "variable": str(getattr(param0, "name", "")), "basis": basis,
+                        **_other_data_refs(bv, address, slot_array)})
+    # #1040.1: parameter 0 is the ABI's first argument. On x86-64 SysV a method
+    # returning a class by value receives its return slot there and `this`
+    # second; nothing in a stripped body says which methods do, so the plan
+    # states it rather than guess.
+    arch = str(getattr(getattr(bv, "arch", None), "name", "") or "")
+    caveat = ("parameter 0 is the first argument; on x86-64 a virtual method that returns a "
+              "class by value takes its return slot there and `this` second -- check the "
+              "decompile of any slot target that writes through parameter 0 before reading it"
+              if arch == "x86_64" and any(r.get("basis") == "own vtable slot" for r in retyped)
+              else None)
     plan = {
         "class": cls,
         "vtable_type": vtable_type,
         "instance_struct": struct_action,
-        "size": size.get("value") if width else None,
-        "size_source": card.get("size_source"),
+        "size": size_value,
+        "size_source": size_source,
+        **({"size_sites": allocation_sites} if allocation_sites else {}),
         "retyped_methods": retyped,
         "skipped_methods": skipped,
+        **({"parameter0_caveat": caveat} if caveat else {}),
         **({"vptr_member_before": vptr_before} if vptr_before else {}),
     }
     return operations, plan
+
+
+def _other_data_refs(bv, address: int, slot_array: tuple[int, int]) -> dict[str, int]:
+    """#1040.1: how many data locations OUTSIDE this class's slot array BN says
+    hold *address* -- a derived class's vtable, or a copy folded with another
+    class's method. A count, not a verdict; absent when there are none."""
+    getter = getattr(bv, "get_data_refs", None)
+    if not callable(getter):
+        return {}
+    try:
+        refs = [int(r) for r in getter(address)]
+    except Exception:
+        return {}
+    others = sum(1 for r in refs if not slot_array[0] <= r < slot_array[1])
+    return {"other_data_refs": others} if others else {}
+
+
+def _allocation_size_for(card: dict[str, Any], cls: str, instance, ptr: int,
+                         requested: dict[str, Any]) -> tuple[int, list[str]]:
+    """#1018.2, opt-in: the width `--size-from-allocation` declares the struct
+    with -- the ONE allocation request every shown construction site of the
+    class agrees on -- and those sites. Refuses rather than choose: a struct
+    already exists, no site carries a request, the sites disagree, or the site
+    listing was capped so unshown sites could disagree."""
+    if instance is not None:
+        raise OperationFailure(
+            "invalid_request",
+            f"{cls} already has a struct, and --size-from-allocation only sizes a struct this "
+            "command declares; resize it with `bn types declare` instead.",
+            requested=requested)
+    instances = card.get("instances") or {}
+    sites = [s for s in instances.get("construction_sites") or []
+             if isinstance(s, dict) and isinstance(s.get("allocation_request"), int)]
+    if instances.get("construction_sites_truncated"):
+        raise OperationFailure(
+            "invalid_request",
+            f"{cls}'s construction-site listing is capped, so sites bn did not read could "
+            "disagree; --size-from-allocation needs every site.",
+            requested=requested)
+    values = sorted({int(s["allocation_request"]) for s in sites})
+    if not values:
+        raise OperationFailure(
+            "invalid_request",
+            f"no construction site of {cls} receives a constant global operator new "
+            "allocation as its first argument, so there is no allocation request to size from.",
+            requested=requested)
+    if len(values) > 1:
+        listed = "; ".join(f"{s['address']}: {hex(int(s['allocation_request']))}" for s in sites)
+        raise OperationFailure(
+            "invalid_request",
+            f"{cls}'s construction sites request different sizes ({listed}); an allocation is "
+            "per site, so --size-from-allocation picks none.",
+            requested=requested)
+    if values[0] < ptr:
+        raise OperationFailure(
+            "invalid_request",
+            f"{cls}'s construction sites request {hex(values[0])} bytes, less than the "
+            f"{ptr}-byte vptr.",
+            requested=requested)
+    return values[0], [str(s["address"]) for s in sites]
 
 
 def _is_pointer_to(type_obj, name: str) -> bool:

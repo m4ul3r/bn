@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -32,6 +33,7 @@ PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
 CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
 CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
+CLASSES_NOPIE_STRIPPED_BINARY = FIXTURES_DIR / "classes_nopie_stripped_x86_64"
 VCALLS_BINARY = FIXTURES_DIR / "vcalls_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
@@ -1425,17 +1427,111 @@ class TestTypeStringsAndInheritance:
 
     def test_class_apply_types_stripped_rerun_is_a_noop(self, shared_bn):
         """#993 review: a re-run on a stripped build, where nothing is left to
-        write, is a clean noop rather than an exit-3 refusal, and the vtable's
-        slot functions are listed as skipped."""
+        write, changes nothing and exits 0 rather than refusing; #1040.1: the
+        first run retyped parameter 0 of the class's own slots."""
         shared_bn.load(CLASSES_STRIPPED_BINARY)
-        first = shared_bn.json("class", "apply-types", "svc::Codec", "--summary")
+        first = shared_bn.json("class", "apply-types", "svc::AuditHandler", "--summary")
         assert first["committed"] is True and first["failed_count"] == 0, first
-        assert first["class_apply_types"]["skipped_methods"], first
-        again = shared_bn.run("class", "apply-types", "svc::Codec", "--format", "json", "--summary")
+        assert first["class_apply_types"]["retyped_methods"], first
+        again = shared_bn.run("class", "apply-types", "svc::AuditHandler", "--format", "json", "--summary")
         assert again.returncode == 0, again.stdout + again.stderr
         summary = json.loads(again.stdout)
-        assert summary["noop_count"] == 1 and summary["dirty_after"] is False, summary
+        assert summary["changed_count"] == 0 and summary["dirty_after"] is False, summary
         assert summary["class_apply_types"]["instance_struct"] == "unchanged", summary
+
+    def test_class_apply_types_retypes_parameter_0_on_a_stripped_build_1040(self, shared_bn):
+        """#1040.1: a stripped build names no parameter `this`, so every method
+        was skipped. Parameter 0 of the class's own slots (and destructors) is
+        retyped under its own name and read back; the slot inherited from the
+        base's vtable (`name()`, which AuditHandler does not override) is left
+        alone, and so is `flush()`, which never reads `this`, so BN gives it no
+        parameter at all. Skips are counted, not listed, in the text."""
+        shared_bn.load(CLASSES_STRIPPED_BINARY)
+        card = shared_bn.json("class", "show", "svc::AuditHandler")
+        slots = [s["method"]["address"] for s in card["vtable"]["slots"]]
+        base = shared_bn.json("class", "show", "svc::EchoHandler")
+        base_slots = {s["method"]["address"] for s in base["vtable"]["slots"]}
+        inherited = set(slots) & base_slots
+        assert len(inherited) == 1, (slots, base["vtable"]["slots"])
+
+        text = shared_bn.run("class", "apply-types", "svc::AuditHandler", "--preview")
+        assert text.returncode == 0, text.stdout + text.stderr
+        assert "\nobject parameter retyped: 3 method(s) (3 by parameter 0" in text.stdout, text.stdout
+        assert ("\nskipped: 2 method(s) -- 1 inherited: also a slot of a base's vtable; "
+                "1 BN gives the function no parameters") in text.stdout, text.stdout
+        assert next(iter(inherited)) not in text.stdout
+        live = shared_bn.json("class", "apply-types", "svc::AuditHandler")
+        rows = live["class_apply_types"]["retyped_methods"]
+        assert len(rows) == 3 and not inherited & {r["address"] for r in rows}, rows
+        for row in rows:
+            params = {v["name"]: v["type"] for v in shared_bn.json("local", "list", row["address"])["items"]
+                      if v["is_parameter"]}
+            assert row["variable"] != "this" and params[row["variable"]] == "struct svc::AuditHandler*", (
+                row, params)
+
+    def test_destructor_slots_are_suggested_and_the_manifest_applies_as_printed_1040(
+            self, shared_bn, tmp_path):
+        """#1040.2: the card states what each unnamed slot does and marks the
+        destructor shapes; the command it prints emits a manifest that `batch
+        apply` takes as is, after which the lens lists both as destructors."""
+        shared_bn.load(CLASSES_STRIPPED_BINARY)
+        card = shared_bn.run("class", "show", "svc::AuditHandler")
+        assert card.returncode == 0, card.stderr
+        assert "likely D1 (complete-object destructor)" in card.stdout, card.stdout
+        assert "likely D0 (deleting destructor)" in card.stdout, card.stdout
+        hint = next(line for line in card.stdout.splitlines() if "--emit-renames" in line)
+        command = shlex.split(hint.split("`")[1])
+        assert command[0] == "bn", hint
+        emitted = shared_bn.run(*command[1:])
+        assert emitted.returncode == 0, emitted.stdout + emitted.stderr
+        manifest = json.loads(emitted.stdout)
+        assert [op["new_name"] for op in manifest["ops"]] == ["svc::AuditHandler::~AuditHandler"] * 2
+        path = tmp_path / "renames.json"
+        path.write_text(emitted.stdout, encoding="utf-8")
+        applied = shared_bn.run("batch", "apply", str(path))
+        assert applied.returncode == 0, applied.stdout + applied.stderr
+        after = shared_bn.json("class", "show", "svc::AuditHandler")
+        assert sorted(m["address"] for m in after["methods"] if m["kind"] == "dtor") == sorted(
+            op["identifier"] for op in manifest["ops"])
+        none = shared_bn.run("class", "show", "svc::AuditHandler", "--emit-renames")
+        assert none.returncode == 2 and none.stdout.startswith("no renames:"), none.stdout
+
+    def test_non_pie_stripped_build_lists_its_classes_1035(self, shared_bn):
+        """#1035.5: in a stripped non-PIE build BN's RTTI analysis names no
+        typeinfo (the ABI's class-typeinfo vtables are copy-relocated), so the
+        lens listed no domain class. The typeinfo found from the bytes lists
+        them, with their vtables, and `--local` folds out the library classes
+        whose objects are only copies here."""
+        shared_bn.load(CLASSES_NOPIE_STRIPPED_BINARY)
+        listing = shared_bn.json("class", "list", "--local", "--vtable-budget", "5")
+        rows = {row["name"]: row for row in listing["items"]}
+        assert {"svc::Handler", "svc::EchoHandler", "svc::AuditHandler", "svc::Codec"} <= set(rows), rows
+        assert rows["svc::AuditHandler"]["bases"] == ["svc::EchoHandler"], rows["svc::AuditHandler"]
+        assert rows["svc::AuditHandler"]["vtable_status"] == "recovered", rows["svc::AuditHandler"]
+        assert not any(name.startswith(("std::exception", "std::runtime_error", "__cxxabiv1::"))
+                       for name in rows), sorted(rows)
+        assert listing["imported_suppressed"] >= 2, listing
+        card = shared_bn.json("class", "show", "svc::AuditHandler")
+        assert card["typeinfo"]["source"] == "abi_scan", card["typeinfo"]
+        assert len(card["vtable"]["slots"]) == 5, card["vtable"]
+
+    def test_construction_sites_carry_their_own_allocation_request_1018(self, shared_bn):
+        """#1018.2: the allocation is per site. `make()` constructs a Dispatcher
+        into `operator new(0x40)`; AudioDisp's constructor constructs its base
+        into its own `this`, so that site carries none. The card's size stays
+        unknown; `--size-from-allocation` is the opt-in that uses the request."""
+        shared_bn.load(VCALLS_BINARY)
+        card = shared_bn.json("class", "show", "vc::Dispatcher")
+        sites = {s["function"]: s for s in card["instances"]["construction_sites"]}
+        assert sites["vc::make"]["allocation_request"] == 0x40, sites
+        assert sites["vc::make"]["allocator"] == "_Znwm", sites
+        assert "allocation_request" not in sites["vc::AudioDisp::AudioDisp"], sites
+        assert card["size"] is None and card["size_reason"] == "no_defined_type", card
+        sized = shared_bn.json("class", "apply-types", "vc::Dispatcher", "--size-from-allocation",
+                               "--preview", "--summary")
+        plan = sized["class_apply_types"]
+        assert plan["size"] == "0x40" and plan["size_source"] == "allocation_request", plan
+        assert plan["size_sites"] == [sites["vc::make"]["address"]], plan
 
     def test_qualified_prototype_preview_and_display_name_999(self, shared_bn, tmp_path):
         """#999 on BN's real parser: a `::`-qualified type in backticks and a
@@ -6328,8 +6424,8 @@ if original is not None:
 import binaryninja as bn
 from bn_agent_bridge import mutation_engine as engine
 original = engine._class_apply_types_plan
-def observed_plan(ctx, selector, name, _original=original):
-    operations, plan = _original(ctx, selector, name)
+def observed_plan(ctx, selector, name, _original=original, **options):
+    operations, plan = _original(ctx, selector, name, **options)
     assert not operations, 'fixture must exercise the direct noop return'
     if {retained!r}:
         ctx._resolve_view(selector).define_user_type('RetainedClass1031', bn.Type.int(4))

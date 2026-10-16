@@ -5125,7 +5125,8 @@ class BinaryNinjaBridge:
                     pass
             return result
 
-    def _class_apply_types(self, selector, name: str, *, preview: bool = False):
+    def _class_apply_types(self, selector, name: str, *, preview: bool = False,
+                           size_from_allocation: bool = False):
         """#993 item 3: plan the class's typing ops (read_class's card, under the
         read lock) and apply them as ONE mutation, holding the write gate across
         both so no other writer can change the class between plan and apply."""
@@ -5133,7 +5134,8 @@ class BinaryNinjaBridge:
             self.ctx, selector, preview, exclusive=self._target_lock.write, direct=True
         ) as finish:
             with self._target_lock.read():
-                operations, plan = mutation_engine._class_apply_types_plan(self.ctx, selector, name)
+                operations, plan = mutation_engine._class_apply_types_plan(
+                    self.ctx, selector, name, size_from_allocation=size_from_allocation)
             if not operations:
                 return finish(mutation_engine._class_apply_types_noop(plan, preview=preview))
             result = self._mutation(selector, preview, operations, gate_held=True)
@@ -5486,12 +5488,21 @@ def _bind_structured_il(bridge, params, target):
 
 @op("class_list", lock="read")
 def _bind_class_list(bridge, params, target):
+    prefixes = params.get("vendor_prefixes") or []
+    if not isinstance(prefixes, list) or not all(isinstance(p, str) for p in prefixes):
+        raise ValueError("class_list: vendor_prefixes must be a list of namespace names")
+    budget = params.get("vtable_budget")
+    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float))):
+        raise ValueError("class_list: vtable_budget must be a number of seconds")
     return bridge._class_list(
         target,
         query=params.get("query"),
         include_all=_validate_bool(params.get("include_all"), label="include_all", default=False),
         no_stl=_validate_bool(params.get("no_stl"), label="no_stl", default=False),
         no_vendor=_validate_bool(params.get("no_vendor"), label="no_vendor", default=False),
+        vendor_prefixes=prefixes,
+        local_only=_validate_bool(params.get("local_only"), label="local_only", default=False),
+        vtable_budget=budget,
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
@@ -5510,6 +5521,8 @@ def _bind_class_apply_types(bridge, params, target):
     return bridge._class_apply_types(
         target, str(params["name"]),
         preview=_validate_bool(params.get("preview"), label="preview", default=False),
+        size_from_allocation=_validate_bool(params.get("size_from_allocation"),
+                                            label="size_from_allocation", default=False),
     )
 
 

@@ -2681,6 +2681,84 @@ def test_class_show_invokes_op(monkeypatch):
     assert captured["params"]["name"] == "net::Session"
 
 
+def _class_list_params(monkeypatch, *argv):
+    captured = {}
+
+    def fake_call(args, op, params, **kwargs):
+        captured.update(op=op, params=params)
+        return 0
+
+    import bn.commands.cpp_class as cpp_class
+    monkeypatch.setattr(cpp_class, "_call", fake_call)
+    from bn.cli import build_parser
+    args = build_parser().parse_args(["class", "list", *argv])
+    assert args.handler(args) == 0
+    assert captured["op"] == "class_list"
+    return captured["params"]
+
+
+def test_class_list_no_vendor_sends_the_named_namespaces_1040(monkeypatch):
+    params = _class_list_params(monkeypatch, "--no-vendor", "Poco, acme,")
+    assert params["no_vendor"] is True
+    assert params["vendor_prefixes"] == ["Poco", "acme"]
+    bare = _class_list_params(monkeypatch, "--no-vendor")
+    assert bare["no_vendor"] is True and "vendor_prefixes" not in bare
+    absent = _class_list_params(monkeypatch)
+    assert "no_vendor" not in absent and "vendor_prefixes" not in absent
+
+
+@pytest.mark.parametrize("spelling", ["--all", "--include-hidden"])
+def test_class_list_include_hidden_and_its_old_spelling_1040(monkeypatch, spelling):
+    assert _class_list_params(monkeypatch, spelling)["include_all"] is True
+
+
+def test_class_list_local_and_vtable_budget_are_forwarded_1040(monkeypatch):
+    params = _class_list_params(monkeypatch, "--local", "--vtable-budget", "2.5")
+    assert params["local_only"] is True and params["vtable_budget"] == 2.5
+    plain = _class_list_params(monkeypatch)
+    assert "local_only" not in plain and "vtable_budget" not in plain
+
+
+_RENAMES_CARD = {"name": "app::Worker", "suggested_renames": {"ops": [
+    {"op": "rename_symbol", "identifier": "0x1100", "new_name": "app::Worker::~Worker"},
+    {"op": "rename_symbol", "identifier": "0x1200", "new_name": "app::Worker::~Worker"},
+]}}
+
+
+def test_class_show_emit_renames_prints_a_batch_manifest_1040(fake_transport, capsys):
+    calls = fake_transport({"class_show": {"ok": True, "result": _RENAMES_CARD}})
+    rc = bn.cli.main(["class", "show", "-t", "worker.bin", "app::Worker", "--emit-renames"])
+    assert rc == 0
+    manifest = json.loads(capsys.readouterr().out)
+    assert manifest == {"target": "worker.bin", "ops": _RENAMES_CARD["suggested_renames"]["ops"]}
+    assert calls[0]["params"] == {"name": "app::Worker"}
+
+
+def test_class_show_emit_renames_omits_an_ambient_target_1040(fake_transport, capsys, monkeypatch):
+    monkeypatch.setenv("BN_TARGET", "worker.bin")
+    calls = fake_transport({"class_show": {"ok": True, "result": _RENAMES_CARD}})
+    assert bn.cli.main(["class", "show", "app::Worker", "--emit-renames"]) == 0
+    manifest = json.loads(capsys.readouterr().out)
+    assert "target" not in manifest
+    assert manifest["ops"] == _RENAMES_CARD["suggested_renames"]["ops"]
+    assert calls[0]["target"] == "worker.bin"
+
+
+@pytest.mark.parametrize("card, reason", [
+    ({"name": "app::Worker"}, "no unnamed vtable slot of app::Worker fits the destructor shape"),
+    ({"name": "app::Worker", "suggested_renames": {"ops": []}}, "fits the destructor shape"),
+    ({"ambiguous": True, "query": "Worker",
+      "matches": [{"name": "a::Worker"}, {"name": "b::Worker"}]}, "a::Worker, b::Worker"),
+])
+def test_class_show_emit_renames_without_suggestions_exits_2_1040(
+        fake_transport, capsys, card, reason):
+    fake_transport({"class_show": {"ok": True, "result": card}})
+    rc = bn.cli.main(["class", "show", "-t", "worker.bin", "Worker", "--emit-renames"])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert out.startswith("no renames: ") and reason in out
+
+
 def test_admin_text_renderer_failure_becomes_clean_error(monkeypatch, capsys):
     # Admin commands build their result locally and render it WITHOUT going
     # through _call, so they must apply the SAME malformed-result guard _call has

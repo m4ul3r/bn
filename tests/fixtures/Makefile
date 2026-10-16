@@ -23,7 +23,7 @@ SRCDIR  := src
 # integration lane reads); tests that only exercise the *build* pass a tmp dir
 # so a unit-only run leaves no working-tree side effects.
 OUTDIR  ?= .
-NAMES   := hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64 dispatch_table_x86_64 classes_x86_64 classes_stripped_x86_64 canary_x86_64 vcalls_x86_64
+NAMES   := hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64 dispatch_table_x86_64 classes_x86_64 classes_stripped_x86_64 classes_nopie_stripped_x86_64 canary_x86_64 vcalls_x86_64
 BINS    := $(addprefix $(OUTDIR)/,$(NAMES))
 # The bridge prefers an adjacent <binary>.bndb over the binary it caches, so a
 # sidecar left behind by an earlier build silently shadows the fresh one.
@@ -44,6 +44,13 @@ $(OUTDIR)/%_x86_64: $(SRCDIR)/%.cpp
 $(OUTDIR)/classes_stripped_x86_64: $(SRCDIR)/classes.cpp
 	@mkdir -p $(OUTDIR)
 	$(CXX) $(CXXFLAGS) -s -o $@ $<
+
+# The same source as a stripped NON-PIE executable (#1035.5): the ABI's
+# `__cxxabiv1::__*class_type_info` vtables are COPY-relocated into it, so BN's
+# RTTI analysis names no typeinfo and the lens must find them from the bytes.
+$(OUTDIR)/classes_nopie_stripped_x86_64: $(SRCDIR)/classes.cpp
+	@mkdir -p $(OUTDIR)
+	$(CXX) $(CXXFLAGS) -fno-pie -no-pie -s -o $@ $<
 
 # The one fixture that needs a stack canary: `local list --frame` must find it.
 # Appended after -fno-stack-protector, so it wins.

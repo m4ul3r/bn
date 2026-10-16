@@ -1202,6 +1202,20 @@ def test_class_list_malformed_slot_count_is_disclosed_per_row(slots):
     assert "malformed" not in clean
 
 
+def test_class_list_states_an_unreadable_shared_base_count_as_unknown_1040():
+    """#1040.4: the shared-base count rides one row's base; an unreadable one
+    prints `?` on THAT row and is disclosed, never a confident number, and the
+    next row's readable count is unaffected."""
+    from bn.formatters import _render_class_list_text
+    bad = {"name": "app::A", "method_count": 0, "has_vtable": True,
+           "bases": ["std::Trait<int>"], "base_sole_base_of": "many"}
+    good = {**bad, "name": "app::B", "base_sole_base_of": 12}
+    text = _render_class_list_text({"items": [bad, good]})
+    assert "app::A  methods=0  vtable  size=?  [?]  : std::Trait<int> (only base of ? classes here)" in text
+    assert ": std::Trait<int> (only base of 12 classes here)" in text
+    assert "malformed base_sole_base_of field" in text
+
+
 def test_class_list_keeps_completed_rows_when_later_recovery_expires(
         monkeypatch, rtti_only_list_ctx):
     ctx, bv = rtti_only_list_ctx
@@ -1389,9 +1403,8 @@ def test_vtable_layout_stops_at_unmapped_slot():
 
 
 class _SizeCtx:
-    def __init__(self, type_width=None, new_size=None):
+    def __init__(self, type_width=None):
         self._type_width = type_width
-        self._new_size = new_size
 
     def _find_type(self, bv, name):
         if self._type_width is None:
@@ -1400,21 +1413,11 @@ class _SizeCtx:
             width = self._type_width
         return name, _T()
 
-    def _operator_new_size_at_ctor(self, bv, record):
-        return self._new_size  # (size, addr) or None
-
 
 def test_size_prefers_bn_type_width():
     rec = {"name": "net::Session", "methods": [], "vtable": None}
     out = read_class._object_size(_SizeCtx(type_width=0xD0), object(), rec)
     assert out == {"value": "0xd0", "source": "bn_type"}
-
-
-def test_size_from_operator_new_when_no_type():
-    rec = {"name": "net::Session", "methods": []}
-    out = read_class._object_size(_SizeCtx(new_size=(0xD0, 0x443abc)), object(), rec)
-    assert out["value"] == "0xd0" and out["source"] == "operator_new"
-    assert out["at"] == "0x443abc"
 
 
 class _EnrichCtx(_SizeCtx):
@@ -1455,14 +1458,15 @@ def test_class_card_for_a_sizeless_class_is_unchanged_817():
 
 
 def test_class_record_states_where_the_size_came_from_817():
-    """#817: `class show` reported `size: null` with no `size_source` and no note
-    that the ctor-new path is a permanent stub, so a miss was indistinguishable
-    from a search that tried both paths. Provenance is now always readable in one
-    place, and the miss names the stub."""
+    """#817: `class show` reported `size: null` with no `size_source` and no
+    reason, so a miss read the same as a search that came up empty. Provenance is
+    now always readable in one place: the size comes only from a type BN
+    defines (#1018.2 keeps allocations on the construction sites), so the miss
+    says no type is defined."""
     missed = read_class._enrich(_EnrichCtx(), object(), {"name": "net::Session", "methods": []})
     assert missed["size"] is None
     assert missed["size_source"] == "unavailable"
-    assert missed["size_reason"] == "operator_new_recovery_unimplemented"
+    assert missed["size_reason"] == "no_defined_type"
 
     hit = read_class._enrich(_EnrichCtx(type_width=0xD0), object(),
                              {"name": "net::Session", "methods": []})
@@ -1472,12 +1476,11 @@ def test_class_record_states_where_the_size_came_from_817():
 
 def test_size_survives_find_type_raising():
     # Real ctx._find_type RAISES on a missing type; _object_size must treat that
-    # as "no type" and fall through, not propagate the exception.
+    # as "no type", not propagate the exception.
     class _RaisingCtx(_SizeCtx):
         def _find_type(self, bv, name):
             raise RuntimeError("Type not found: " + name)
-    out = read_class._object_size(_RaisingCtx(new_size=(0x40, 0x1000)), object(), {"name": "X", "methods": []})
-    assert out["value"] == "0x40" and out["source"] == "operator_new"
+    assert read_class._object_size(_RaisingCtx(), object(), {"name": "X", "methods": []}) is None
 
 
 class _RttiCtx:
@@ -1565,21 +1568,27 @@ def test_rtti_infers_no_base_without_hint():
 
 
 class _InstCtx:
-    def __init__(self, ctor_sites, vtable_data_refs):
+    def __init__(self, ctor_sites, vtable_data_refs, allocations=None):
         self._ctor_sites = ctor_sites          # list of dicts
         self._vtable_data_refs = vtable_data_refs
+        self._allocations = allocations or {}  # {site address: request dict}
+        self.allocation_reads: list[int] = []
 
     def _ctor_construction_sites(self, bv, record):
-        return list(self._ctor_sites)
+        return [dict(site) for site in self._ctor_sites]
 
     def _global_vtable_stores(self, bv, record):
         return list(self._vtable_data_refs)
 
+    def _allocation_request_at(self, bv, address):
+        self.allocation_reads.append(address)
+        return self._allocations.get(address)
+
 
 def test_instances_collects_construction_and_global_stores():
     sites = [
-        {"address": "0x443abc", "function": "net::open", "kind": "new", "size": "0xd0"},
-        {"address": "0x4500a0", "function": "main", "kind": "stack", "size": None},
+        {"address": "0x443abc", "function": "net::open", "kind": "new"},
+        {"address": "0x4500a0", "function": "main", "kind": "stack"},
     ]
     globals_ = [{"symbol": "g_session", "address": "0x4cabcd"}]
     ctx = _InstCtx(sites, globals_)
@@ -1589,10 +1598,24 @@ def test_instances_collects_construction_and_global_stores():
     assert out["stored_globals"][0]["symbol"] == "g_session"
 
 
+def test_allocation_requests_are_read_per_shown_site_only_1018():
+    """#1018.2: the allocation is a fact about ONE site: it lands on that site's
+    row, a site with none carries no key (never a class-level size), and only the
+    sites the cap shows pay for the IL read."""
+    sites = [{"address": hex(a), "function": "factory", "kind": "ctor-call"}
+             for a in (0x30, 0x10, 0x20)]
+    request = {"allocation_request": 0x38, "allocator": "_Znwm", "allocation_at": "0xc"}
+    ctx = _InstCtx(sites, [], allocations={0x10: request})
+    out = read_class._instances(ctx, object(), {"name": "W", "vtable": None, "methods": []}, cap=2)
+    assert ctx.allocation_reads == [0x10, 0x20]
+    first, second = out["construction_sites"]
+    assert first["allocation_request"] == 0x38 and first["allocator"] == "_Znwm"
+    assert "allocation_request" not in second
+
 
 def test_construction_sites_have_stable_numeric_order_before_capping():
     sites = [
-        {"address": address, "function": "factory", "kind": "ctor-call", "size": None}
+        {"address": address, "function": "factory", "kind": "ctor-call"}
         for address in ("0x100", "0x20", "0x8")
     ]
     rec = {"name": "Widget", "vtable": None, "methods": []}
@@ -1602,6 +1625,7 @@ def test_construction_sites_have_stable_numeric_order_before_capping():
     assert [row["address"] for row in forward["construction_sites"]] == ["0x8", "0x20"]
     assert forward["construction_sites_total"] == backward["construction_sites_total"] == 3
     assert forward["construction_sites_truncated"] is True
+
 
 def test_class_show_assembles_full_record():
     bv = _make_registry_bv()
@@ -1819,7 +1843,7 @@ def test_render_class_show_text_matches_mock_shape():
     assert "class net::Session" in text and "size 0xd0" in text and "base: net::Endpoint" in text
     assert "vtable [0] 0x40e8b0  onData" in text
     assert "vtable [1] 0x0  __cxa_pure_virtual" in text
-    assert "instances: new @ 0x443abc (size 0xd0) ; stored -> g_session @ 0x4cabcd" in text
+    assert "instances: new @ 0x443abc ; stored -> g_session @ 0x4cabcd" in text
 
 
 def test_render_class_show_lists_non_virtual_methods_and_empty_vtable_note():
@@ -1931,7 +1955,7 @@ def test_render_class_list_text_shows_suppression_counts_309():
         "library_suppressed": 3, "vendor_suppressed": 1,
     }
     out = _render_class_list_text(value)
-    assert "2 construction-vtable artifacts (--all to show)" in out
+    assert "2 construction-vtable artifacts (--include-hidden to show)" in out
     assert "1 thunk" in out
     assert "3 library/STL" in out
     assert "1 vendored" in out
@@ -2573,7 +2597,7 @@ def test_instances_reports_exact_totals_and_truncation_flag_at_cap():
     # exactly 128 with no total and no flag, so a capped scan was
     # indistinguishable from a complete one.
     sites = [{"address": hex(0x443000 + i * 16), "function": f"caller{i}",
-              "kind": "ctor-call", "size": None} for i in range(400)]
+              "kind": "ctor-call"} for i in range(400)]
     globals_ = [{"symbol": f"g_slot{i}", "address": hex(0x4c0000 + i * 8)}
                 for i in range(400)]
     ctx = _InstCtx(sites, globals_)
@@ -2590,8 +2614,7 @@ def test_instances_reports_exact_totals_and_truncation_flag_at_cap():
 
 def test_instances_reports_exact_totals_without_truncation():
     # The uncapped shape: real totals, no truncation claimed.
-    ctx = _InstCtx([{"address": "0x443abc", "function": "main",
-                     "kind": "ctor-call", "size": None}],
+    ctx = _InstCtx([{"address": "0x443abc", "function": "main", "kind": "ctor-call"}],
                    [{"symbol": "g_session", "address": "0x4cabcd"}])
     rec = {"name": "net::Session", "vtable": {"address": "0x9000"}, "methods": []}
     out = read_class._instances(ctx, object(), rec)
@@ -3227,7 +3250,7 @@ def test_class_show_unknown_name_still_misses_byte_identically_675(monkeypatch):
         read_class._class_show(ctx, None, "net::Sesion")     # typo of net::Session
     assert str(exc.value) == (
         "No class named 'net::Sesion'. Did you mean: net::Session, net::Pool? Run "
-        "`bn class list` (add --all for name-only clusters) to discover available "
+        "`bn class list` (add --include-hidden for name-only clusters) to discover available "
         "classes."
     )
 
@@ -3450,7 +3473,7 @@ def test_class_list_declared_count_and_rows_describe_ONE_population_675(monkeypa
         "the hidden count must count the rows `--all` lists, not the type table: "
         f"{default['declared_suppressed']} counted vs {len(listed)} listed")
     assert counted["declared_suppressed"] == len(listed)
-    assert ("1 user-declared class type (--all to show)"
+    assert ("1 user-declared class type (--include-hidden to show)"
             in _render_class_list_text(default))
 
     # Same identity under the flags that fold rows out AFTER the confidence gate.
@@ -3492,7 +3515,7 @@ def test_filtered_declared_classes_are_disclosed_on_the_default_listing_675(monk
     assert listing["library_suppressed"] == 1
     assert listing["vendor_suppressed"] == 1
     text = _render_class_list_text(listing)
-    assert "1 user-declared class type (--all to show)" in text
+    assert "1 user-declared class type (--include-hidden to show)" in text
     assert "1 library/STL" in text and "1 vendored" in text
 
     expanded = read_class._class_list(
@@ -3757,7 +3780,7 @@ def test_every_DECLARED_class_type_is_LISTED_and_RESOLVES_675(monkeypatch):
     # The count describes the same set the rows do, under every flag.
     default = read_class._class_list(ctx, None)
     assert default["declared_suppressed"] == len(declared), default["declared_suppressed"]
-    assert ("10 user-declared class types (--all to show)"
+    assert ("10 user-declared class types (--include-hidden to show)"
             in _render_class_list_text(default))
 
 
@@ -3993,7 +4016,7 @@ def test_only_types_the_USER_declared_are_classes_of_the_lens_675(monkeypatch):
     `bv.types` is every type BN has, including the ones IT imported. Measured on a
     stock system ELF with ZERO user declarations: 53 types, 25 structure-kind (the
     ELF format structs, `FILE`, the libc `_IO_*` family), so the lens rendered
-    `classes: 0 shown of 0 (hidden: 25 declared class types (--all to show))`
+    `classes: 0 shown of 0 (hidden: 25 declared class types (--include-hidden to show))`
     directly above its own note saying the target has no C++ type evidence, and
     `class show <an ELF format struct>` answered a class card whose note asserts
     absent RTTI about a type that can never carry any. On a C++ target the same
@@ -4022,7 +4045,7 @@ def test_only_types_the_USER_declared_are_classes_of_the_lens_675(monkeypatch):
 
     default = read_class._class_list(ctx, None)
     assert default["declared_suppressed"] == 1
-    assert ("1 user-declared class type (--all to show)"
+    assert ("1 user-declared class type (--include-hidden to show)"
             in _render_class_list_text(default))
 
     for imported in ("Elf64_Header", "_IO_FILE", "net::Session::VTable"):
@@ -4084,7 +4107,7 @@ def test_an_unreadable_declared_SET_is_disclosed_not_reported_as_zero_675(monkey
         listing = read_class._class_list(ctx, None)
         assert listing["declared_suppressed"] == "unreadable", label
         text = _render_class_list_text(listing)
-        assert "? user-declared class types (--all to show)" in text, label
+        assert "? user-declared class types (--include-hidden to show)" in text, label
         # `?` IS the disclosure. The generic malformed-payload sentence beside it
         # would say the response's rows or counts may be missing or partial,
         # which reads as a corrupt answer rather than this documented state
@@ -4148,7 +4171,7 @@ def test_ONE_unreadable_declaration_unmeasures_the_count_and_its_own_miss_675(mo
     assert default["declared_suppressed"] == "unreadable", (
         f"a count that excludes an unreadable declaration is not measured: "
         f"{default['declared_suppressed']}")
-    assert ("? user-declared class types (--all to show)"
+    assert ("? user-declared class types (--include-hidden to show)"
             in _render_class_list_text(default))
     assert read_class._class_list(
         ctx, None, count_only=True)["declared_suppressed"] == "unreadable"
@@ -5227,3 +5250,535 @@ def test_untyped_vtt_does_not_own_adjacent_same_class_object_945(monkeypatch, pt
     assert not any(ref["address"] == "0xa040" for ref in refs)
     assert card["instances"]["stored_globals_total"] == 3
     assert any("extent is unknown" in note for note in card["notes"])
+
+
+# --- #1035.5: the ABI typeinfo scan (non-PIE builds BN's RTTI analysis skips) ---
+
+_SI_ABI_VTABLE = "_ZTVN10__cxxabiv120__si_class_type_infoE"
+_ABI_TYPES = {"N3app6WorkerE": "app::Worker", "N3app4BaseE": "app::Base"}
+
+
+def _abi_demangle(arch, name):
+    """`bn.demangle_gnu3` stand-in: the full parse (`_Z1f<enc>`) accepts only a
+    known encoding, while the lenient `_ZTI<enc>` names whatever it is given --
+    the gap the full parse exists to close."""
+    enc = name[4:]
+    if name.startswith("_Z1f"):
+        return (("type", enc) if enc in _ABI_TYPES else None), None
+    if name.startswith("_ZTI"):
+        return None, [f"typeinfo_for_{_ABI_TYPES.get(enc, 'junk')}"]
+    raise AssertionError(name)
+
+
+class _AbiScanBV:
+    """A non-PIE view: the si ABI vtable COPY-relocated to 0x6000 (a local data
+    symbol plus the import alias at the same address), two si typeinfo objects
+    in .data.rel.ro -- Base, which BN named, and Worker, which it did not --
+    a typeinfo whose name string only the lenient demangle accepts, and a
+    vtable whose word[1] is Worker's typeinfo."""
+
+    def __init__(self):
+        self.arch = types.SimpleNamespace(name="x86_64", address_size=8)
+        self.functions = []
+        self.abi = _Sym(_SI_ABI_VTABLE, "vtable for __cxxabiv1::__si_class_type_info",
+                        0x6000, "SymbolType.DataSymbol")
+        self.abi_alias = _Sym(_SI_ABI_VTABLE, "vtable for __cxxabiv1::__si_class_type_info",
+                              0x6000, "SymbolType.ImportedDataSymbol")
+        self.base_ti = _Sym("_ZTIN3app4BaseE", "typeinfo for app::Base", 0x8000)
+        self._symbols = [self.abi, self.abi_alias, self.base_ti]
+        words = [
+            0x6010, 0x8100,          # 0x8000 typeinfo for app::Base (named)
+            0x6010, 0x8110, 0x8000,  # 0x8010 Worker: no symbol; base = app::Base
+            0x6010, 0x8120,          # 0x8028 a typeinfo whose name is garbage
+            0,                       # 0x8038
+            0, 0x8010, 0x1000,       # 0x8040 Worker's vtable: ott 0, typeinfo, slot
+        ]
+        strings = bytearray(0x40)
+        for at, text in ((0x00, b"N3app4BaseE"), (0x10, b"*N3app6WorkerE"), (0x20, b"9junkjunk")):
+            strings[at:at + len(text)] = text
+        self._memory = {0x8000: b"".join(w.to_bytes(8, "little") for w in words),
+                        0x8100: bytes(strings)}
+        sem = lambda name: types.SimpleNamespace(name=name)  # noqa: E731
+        self.sections = {
+            ".data.rel.ro": types.SimpleNamespace(start=0x8000, end=0x8058,
+                                                  semantics=sem("ReadWriteDataSectionSemantics")),
+            ".rodata": types.SimpleNamespace(start=0x8100, end=0x8140,
+                                             semantics=sem("ReadOnlyDataSectionSemantics")),
+            ".extern": types.SimpleNamespace(start=0x6000, end=0x6100,
+                                             semantics=sem("ExternalSectionSemantics")),
+        }
+        self.data_refs: dict[int, list[int]] = {}
+
+    def read(self, address, length):
+        for base, blob in self._memory.items():
+            if base <= address < base + len(blob):
+                return blob[address - base:address - base + length]
+        return b""
+
+    def get_symbols_by_name(self, raw):
+        return [self.abi] if raw == _SI_ABI_VTABLE else []
+
+    def get_symbols(self, address=None, length=None):
+        if address is None:
+            return list(self._symbols)
+        return [s for s in self._symbols if address <= s.address < address + length]
+
+    def get_symbol_at(self, address):
+        return next((s for s in self._symbols if s.address == address), None)
+
+    def get_function_at(self, address):
+        return None
+
+    def get_data_refs(self, address):
+        return list(self.data_refs.get(address, []))
+
+
+@pytest.fixture
+def abi_scan_view(monkeypatch):
+    monkeypatch.setattr(read_class, "bn", types.SimpleNamespace(demangle_gnu3=_abi_demangle))
+    bv = _AbiScanBV()
+    ctx = seam.BridgeContext(None)
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+    return ctx, bv
+
+
+def test_abi_scan_finds_the_typeinfo_bn_did_not_name_1035(abi_scan_view):
+    ctx, bv = abi_scan_view
+    scan = read_class._abi_rtti_scan(ctx, bv)
+    # Base already has a symbol (left to it); the garbage name is refused by the
+    # full parse even though the lenient `_ZTI` demangle would have named it.
+    assert set(scan.typeinfo) == {0x8010}
+    assert scan.typeinfo[0x8010] == ("app::Worker", "si", "N3app6WorkerE", 0x8110)
+    assert scan.undemangled == 1
+    assert scan.truncated is False
+    assert read_class._scanned_typeinfo_refs(ctx, bv, 0x8010) == (0x8048,)
+    # The seam answers for an address no symbol names, through the scan.
+    assert ctx._typeinfo_name_at(bv, 0x8010) == "app::Worker"
+    assert ctx._typeinfo_name_at(bv, 0x8028) is None
+
+    registry = read_class._build_class_registry(ctx, bv)
+    worker = registry["app::Worker"]
+    assert worker["confidence"] == "rtti"
+    assert worker["typeinfo"] == {"address": "0x8010", "symbol": "_ZTIN3app6WorkerE",
+                                  "source": "abi_scan"}
+    assert worker["typeinfo_name"]["address"] == "0x8110"
+    assert worker["typeinfo_abi"] == "si"
+    assert worker["imported"] is False
+    # A symbolized typeinfo keeps its symbol, not a scan provenance.
+    assert "source" not in registry["app::Base"]["typeinfo"]
+    assert not any("junk" in name for name in registry)
+    # The copy-relocated ABI vtable is someone else's object.
+    abi = registry["__cxxabiv1::__si_class_type_info"]
+    assert abi["vtable"]["imported"] is True and abi["imported"] is True
+
+
+def test_abi_scan_needs_an_abi_vtable_symbol_1035(abi_scan_view):
+    ctx, bv = abi_scan_view
+    bv.get_symbols_by_name = lambda raw: []
+    scan = read_class._abi_rtti_scan(ctx, bv)
+    assert scan.typeinfo == {} and scan.undemangled == 0
+    assert "app::Worker" not in read_class._build_class_registry(ctx, bv)
+
+
+def test_abi_scan_byte_cap_is_disclosed_as_truncated_1035(monkeypatch, abi_scan_view):
+    ctx, bv = abi_scan_view
+    # Only the first two words of .data.rel.ro fit: Worker's object is past the cap.
+    monkeypatch.setattr(read_class, "_ABI_SCAN_MAX_BYTES", 0x10)
+    scan = read_class._abi_rtti_scan(ctx, bv)
+    assert scan.truncated is True
+    assert scan.typeinfo == {}
+
+
+def test_vtable_backwalk_walks_scanned_refs_after_bns_own_1035(monkeypatch, abi_scan_view):
+    """BN makes no data refs from words it never typed, and can report SOME refs
+    to a scanned typeinfo (a derived record's base pointer) while missing the
+    vtable's word[1] -- seen on an AArch64 non-PIE build. The scanned words are
+    walked after BN's own, once each."""
+    ctx, bv = abi_scan_view
+    walked = []
+
+    def layout_for(_bv, vt_addr):
+        walked.append(vt_addr)
+        return {"address": hex(vt_addr), "slots": [{"index": 0}], "total": 1}
+
+    monkeypatch.setattr(ctx, "_vtable_layout_for", layout_for)
+    monkeypatch.setattr(read_class, "_classify_backwalk_candidate",
+                        lambda *a, **k: (0, None, None))
+    recovered = read_class._recover_vtables_from_typeinfo(ctx, bv, 0x8010)
+    assert walked == [0x8040]
+    assert recovered["primary"]["address"] == "0x8040"
+    walked.clear()
+    bv.data_refs[0x8010] = [0x9008, 0x8048]
+    read_class._recover_vtables_from_typeinfo(ctx, bv, 0x8010)
+    assert walked == [0x9000, 0x8040]
+
+
+# --- #1040.3: what the class list hides, and how it says so ---
+
+def _list_rec(name, *, vtable=True, typeinfo=None, methods=(), imported_rtti=False):
+    rec = {"name": name, "methods": [dict(m) for m in methods],
+           "vtable": {"address": "0x9000"} if vtable else None,
+           "typeinfo": {"address": typeinfo} if typeinfo else None,
+           "typeinfo_name": None, "size": None, "bases": [], "instances": [],
+           "confidence": "rtti", "aliases": [], "typeinfo_abi": None}
+    if imported_rtti:
+        for key in ("vtable", "typeinfo"):
+            if rec[key] is not None:
+                rec[key]["imported"] = True
+    rec["imported"] = read_class._record_is_imported(rec)
+    return rec
+
+
+@pytest.fixture
+def filter_list(monkeypatch):
+    registry = {r["name"]: r for r in (
+        _list_rec("void (int)", vtable=False, typeinfo="0x9300"),
+        _list_rec("ext::Imported", typeinfo="0x9400", imported_rtti=True,
+                  methods=[{"address": "0x1000", "kind": "method", "imported": True}]),
+        _list_rec("app::Local", typeinfo="0x9500", imported_rtti=True,
+                  methods=[{"address": "0x1100", "kind": "method", "imported": True},
+                           {"address": "0x1200", "kind": "method"}]),
+        _list_rec("acme::X"),
+        _list_rec("acmecorp::Y"),
+        _list_rec("boost::any"),
+    )}
+    monkeypatch.setattr(read_class, "_build_class_registry",
+                        lambda ctx, bv, query=None: {k: dict(v) for k, v in registry.items()})
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return object()
+
+        def _bases_for(self, bv, rec):
+            return []
+
+    return lambda **kw: read_class._class_list(_Ctx(), None, **kw)
+
+
+def test_class_list_hides_non_class_rtti_by_default_1040(filter_list):
+    default = filter_list()
+    assert "void (int)" not in [r["name"] for r in default["items"]]
+    assert default["non_class_rtti_suppressed"] == 1
+    shown = filter_list(include_all=True)
+    row = next(r for r in shown["items"] if r["name"] == "void (int)")
+    assert row["artifact"] is True
+    assert shown["non_class_rtti_suppressed"] == 0
+    from bn.formatters import _render_class_list_text
+    assert "1 non-class RTTI artifact (--include-hidden to show)" in _render_class_list_text(default)
+
+
+def test_class_list_local_only_hides_records_with_nothing_defined_here_1040(filter_list):
+    everything = {r["name"]: r for r in filter_list()["items"]}
+    assert everything["ext::Imported"]["imported"] is True
+    assert everything["app::Local"]["imported"] is False     # one local method
+    local = filter_list(local_only=True)
+    names = [r["name"] for r in local["items"]]
+    assert "ext::Imported" not in names and "app::Local" in names
+    assert local["imported_suppressed"] == 1 and local["local_only"] is True
+    from bn.formatters import _render_class_list_text
+    assert "1 defined in another module" in _render_class_list_text(local)
+    text = _render_class_list_text(filter_list(query=None))
+    assert "ext::Imported" in text and "[defined in another module]" in text
+
+
+def test_class_list_vendor_prefixes_fold_named_namespaces_1040(filter_list):
+    out = filter_list(vendor_prefixes=["acme"])
+    names = [r["name"] for r in out["items"]]
+    # A named prefix implies --no-vendor (boost goes too), and matches a whole
+    # top-level component only.
+    assert "acme::X" not in names and "boost::any" not in names
+    assert "acmecorp::Y" in names
+    assert out["vendor_suppressed"] == 2
+    assert out["no_vendor"] is True and out["vendor_prefixes"] == ["acme"]
+    plain = filter_list(no_vendor=True)
+    assert "acme::X" in [r["name"] for r in plain["items"]]
+    assert plain["vendor_suppressed"] == 1
+
+
+@pytest.mark.parametrize("budget", [0, -1, 31, 30.5, "x", float("nan")])
+def test_class_list_refuses_a_vtable_budget_outside_its_range_1040(filter_list, budget):
+    with pytest.raises(read_class.OperationFailure) as exc:
+        filter_list(vtable_budget=budget)
+    assert exc.value.status == "invalid_request"
+
+
+@pytest.mark.parametrize("budget", [2.5, 30])
+def test_class_list_echoes_the_vtable_budget_it_ran_with_1040(filter_list, budget):
+    assert filter_list(vtable_budget=budget)["vtable_recovery_budget_seconds"] == budget
+    assert (filter_list()["vtable_recovery_budget_seconds"]
+            == read_class._CLASS_LIST_VTABLE_BUDGET_SECONDS)
+
+
+def test_record_is_imported_boundaries_1040():
+    f = read_class._record_is_imported
+    imp = {"address": "0x1", "imported": True}
+    assert f({"vtable": dict(imp), "typeinfo": dict(imp), "methods": []}) is True
+    assert f({"vtable": dict(imp), "methods": [{"imported": True}, {"address": "0x2"}]}) is False
+    assert f({"vtable": dict(imp), "typeinfo": {"address": "0x3"}, "methods": []}) is False
+    assert f({"methods": [{"imported": True}]}) is True          # import stubs only
+    assert f({"vtable": None, "typeinfo": None, "methods": []}) is False   # says nothing
+
+
+def test_is_import_or_copy_sees_a_copy_relocation_1040():
+    local = _Sym("_ZTVN3ext4BaseE", "vtable for ext::Base", 0x6000, "SymbolType.DataSymbol")
+    alias = _Sym("_ZTVN3ext4BaseE", "vtable for ext::Base", 0x6000, "SymbolType.ImportedDataSymbol")
+    other = _Sym("_ZTVN3app4MineE", "vtable for app::Mine", 0x6100, "SymbolType.DataSymbol")
+
+    class _BV:
+        def __init__(self, syms):
+            self.syms = syms
+
+        def get_symbols(self, address, length):
+            return [s for s in self.syms if address <= s.address < address + length]
+
+    f = read_class._is_import_or_copy
+    assert f(_BV([local, alias, other]), local) is True       # copy relocation
+    assert f(_BV([local, alias, other]), other) is False      # its neighbour is not
+    assert f(_BV([local]), local) is False
+    assert f(_BV([alias]), alias) is True                      # the import itself
+    scanned = read_class._ScannedSymbol(0x6000, "_ZTIN3ext4BaseE", "typeinfo for ext::Base")
+    assert f(_BV([local, alias]), scanned) is False            # a scan names no import
+
+
+# --- #1040.4: a library base many classes name as their only base ---
+
+def test_class_list_counts_a_shared_library_sole_base_1040(monkeypatch):
+    bases = {}
+    words = {}
+    registry = {}
+    plan = [("app::A", "std::exception", 0xe000), ("app::B", "std::exception", 0xe000),
+            ("app::C", "std::exception", 0xe000),
+            ("app::D", "app::Core", 0xe100), ("app::E", "app::Core", 0xe100),
+            ("app::F", "app::Core", 0xe100),
+            ("app::G", "std::runtime_error", 0xe200)]
+    for index, (name, base, base_ti) in enumerate(plan):
+        ti = 0xd000 + index * 0x20
+        rec = _list_rec(name, typeinfo=hex(ti))
+        rec["typeinfo_abi"] = "si"
+        registry[name] = rec
+        bases[name] = [{"name": base, "address": hex(base_ti), "kind": "public"}]
+        words[ti + 16] = base_ti
+    # An imported typeinfo naming the same base is not this binary's statement.
+    rec = _list_rec("app::H", typeinfo="0xd800", imported_rtti=True)
+    rec["typeinfo_abi"] = "si"
+    registry["app::H"] = rec
+    bases["app::H"] = [{"name": "std::exception", "address": "0xe000", "kind": "public"}]
+    words[0xd810] = 0xe000
+    monkeypatch.setattr(read_class, "_build_class_registry",
+                        lambda ctx, bv, query=None: {k: dict(v) for k, v in registry.items()})
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return object()
+
+        def _bases_for(self, bv, rec):
+            return [dict(b) for b in bases[rec["name"]]]
+
+        def _pointer_size(self, bv):
+            return 8
+
+        def _read_pointer_value(self, bv, addr, *, size=None):
+            return words.get(addr, 0)
+
+    out = read_class._class_list(_Ctx(), None)
+    rows = {r["name"]: r for r in out["items"]}
+    for name in ("app::A", "app::B", "app::C"):
+        assert rows[name]["base_sole_base_of"] == 3, name
+    for name in ("app::D", "app::E", "app::F", "app::G"):
+        assert "base_sole_base_of" not in rows[name], name
+    from bn.formatters import _render_class_list_text
+    text = _render_class_list_text(out)
+    assert "std::exception (only base of 3 classes here)" in text
+    assert "app::Core (only base of" not in text
+
+
+# --- #1040.2: facts and destructor suggestions for unnamed vtable slots ---
+
+def _slot_rec(*addresses, named=()):
+    slots = []
+    for index, address in enumerate(addresses):
+        slot = {"index": index, "method": {"address": hex(address)}}
+        if address not in named:
+            slot["unnamed"] = True
+        slots.append(slot)
+    return {"name": "app::Worker", "vtable": {"slots": slots}}
+
+
+def _describe(monkeypatch, rec, facts, ancestors=("app::Base",)):
+    read = []
+
+    def slot_body_facts(ctx, bv, address, ptr):
+        read.append(address)
+        return facts[address]
+
+    monkeypatch.setattr(read_class, "_slot_body_facts", slot_body_facts)
+    monkeypatch.setattr(read_class, "_rtti_ancestors", lambda ctx, bv, r: set(ancestors))
+    ctx = types.SimpleNamespace(_pointer_size=lambda bv: 8)
+    read_class._describe_unnamed_slots(ctx, object(), rec)
+    return {int(s["method"]["address"], 16): s for s in rec["vtable"]["slots"]}, read
+
+
+def _facts(writes=(), calls=(), delete=False):
+    return {"read": True,
+            "writes_address_points": [{"address_point": hex(0x9010 + i), "class": c}
+                                      for i, c in enumerate(writes)],
+            "calls": [{"address": hex(a), "name": hex(a), "tail": False} for a in calls],
+            "calls_operator_delete": delete}
+
+
+def test_unnamed_slots_suggest_d1_and_d0_with_a_manifest_1040(monkeypatch):
+    rec = _slot_rec(0x1000, 0x1100, 0x1200, 0x1300, named=(0x1000,))
+    slots, read = _describe(monkeypatch, rec, {
+        0x1100: _facts(writes=["app::Base"]),                   # ancestor's AP, no delete
+        0x1200: _facts(calls=[0x1100, 0x5000], delete=True),    # delete + calls the D1
+        0x1300: _facts(calls=[0x5000], delete=True),            # delete alone: not D0
+    })
+    assert 0x1000 not in read                                   # named slot is not read
+    assert "body" not in slots[0x1000]
+    assert slots[0x1100]["suggestion"] == "D1"
+    assert slots[0x1200]["suggestion"] == "D0"
+    assert not slots[0x1300].get("suggestion")
+    assert slots[0x1300]["body"]["calls_operator_delete"] is True
+    assert rec["suggested_renames"] == {"ops": [
+        {"op": "rename_symbol", "identifier": "0x1100", "new_name": "app::Worker::~Worker"},
+        {"op": "rename_symbol", "identifier": "0x1200", "new_name": "app::Worker::~Worker"},
+    ]}
+
+
+def test_unnamed_slot_d1_needs_this_class_or_an_ancestors_address_point_1040(monkeypatch):
+    rec = _slot_rec(0x1100, 0x1200, 0x1300)
+    slots, _ = _describe(monkeypatch, rec, {
+        0x1100: _facts(writes=["other::Thing"]),                # a stranger's AP
+        0x1200: _facts(calls=[0x1100], delete=True),            # calls a non-D1
+        0x1300: _facts(writes=["app::Worker"], delete=True),    # own AP + delete: D0
+    }, ancestors=())
+    assert not slots[0x1100].get("suggestion")
+    assert not slots[0x1200].get("suggestion")
+    assert slots[0x1300]["suggestion"] == "D0"
+    assert [op["identifier"] for op in rec["suggested_renames"]["ops"]] == ["0x1300"]
+
+
+def test_two_d1_shaped_slots_are_both_withheld_1040(monkeypatch):
+    """Two D1 shapes: neither is offered, and a slot whose only D0 evidence is
+    calling one of them is not offered either -- the D1 it leans on is exactly
+    what could not be told apart. A slot that writes the address point itself
+    still stands on its own."""
+    rec = _slot_rec(0x1100, 0x1400, 0x1200, 0x1300)
+    slots, _ = _describe(monkeypatch, rec, {
+        0x1100: _facts(writes=["app::Worker"]),
+        0x1400: _facts(writes=["app::Base"]),
+        0x1200: _facts(writes=["app::Worker"], delete=True),
+        0x1300: _facts(calls=[0x1100], delete=True),
+    })
+    for address in (0x1100, 0x1400):
+        assert slots[address]["suggestion"] is None
+        assert slots[address]["suggestion_withheld"] == "2 slots fit the D1 shape"
+    assert slots[0x1200]["suggestion"] == "D0"
+    assert not slots[0x1300].get("suggestion")
+    assert [op["identifier"] for op in rec["suggested_renames"]["ops"]] == ["0x1200"]
+
+
+def test_unreadable_slot_bodies_suggest_nothing_1040(monkeypatch):
+    rec = _slot_rec(0x1100, 0x1200)
+    slots, _ = _describe(monkeypatch, rec, {
+        0x1100: {"read": False, "reason": "no_mlil"},
+        0x1200: {"read": False, "reason": "body_too_large"},
+    })
+    assert all(not s.get("suggestion") for s in slots.values())
+    assert "suggested_renames" not in rec
+
+
+def test_destructor_name_drops_template_arguments_1040(monkeypatch):
+    rec = _slot_rec(0x1100)
+    rec["name"] = "app::Box<int>"
+    _describe(monkeypatch, rec, {0x1100: _facts(writes=["app::Box<int>"])})
+    assert rec["suggested_renames"]["ops"][0]["new_name"] == "app::Box<int>::~Box"
+
+
+# --- #1018.2: the allocation feeding a constructor call, from SSA def-use ---
+
+def _il(op, **fields):
+    return types.SimpleNamespace(operation=types.SimpleNamespace(name=op), **fields)
+
+
+def _alloc_fixture(*, allocator="_Znwm", size=_il("MLIL_CONST", constant=0x38),
+                   copies=0, param_src=None, ctor_op="MLIL_CALL_SSA"):
+    new_call = _il("MLIL_CALL_SSA", output=["rax_1"],
+                   dest=_il("MLIL_CONST_PTR", constant=0x4000),
+                   params=[size], address=0x2010)
+    defs = {"rax_1": new_call}
+    var = "rax_1"
+    for hop in range(copies):
+        copy = f"copy_{hop}"
+        defs[copy] = _il("MLIL_SET_VAR_SSA", src=_il("MLIL_VAR_SSA", src=var))
+        var = copy
+    if param_src is not None:
+        defs["arg"] = _il("MLIL_SET_VAR_SSA", src=param_src)
+        var = "arg"
+    ssa = types.SimpleNamespace(get_ssa_var_definition=lambda v: defs.get(v))
+    ctor_call = _il(ctor_op, params=[_il("MLIL_VAR_SSA", src=var)], function=ssa)
+    func = types.SimpleNamespace(get_llil_at=lambda addr: (
+        types.SimpleNamespace(mlil=types.SimpleNamespace(ssa_form=ctor_call))
+        if addr == 0x2020 else None))
+    bv = types.SimpleNamespace(get_symbol_at=lambda a: (
+        types.SimpleNamespace(raw_name=allocator) if a == 0x4000 else None))
+    return bv, func
+
+
+_ALLOCATION = {"allocation_request": 0x38, "allocator": "_Znwm", "allocation_at": "0x2010"}
+
+
+def test_allocation_feeding_a_constructor_call_1018():
+    bv, func = _alloc_fixture()
+    assert seam._allocation_feeding_call(bv, func, 0x2020) == _ALLOCATION
+    bv, func = _alloc_fixture(copies=1)
+    assert seam._allocation_feeding_call(bv, func, 0x2020) == _ALLOCATION
+    bv, func = _alloc_fixture(ctor_op="MLIL_TAILCALL_SSA")
+    assert seam._allocation_feeding_call(bv, func, 0x2020) == _ALLOCATION
+    assert seam._allocation_feeding_call(bv, func, 0x2030) is None   # no call there
+
+
+def test_allocation_follows_at_most_four_copies_1018():
+    bv, func = _alloc_fixture(copies=4)
+    assert seam._allocation_feeding_call(bv, func, 0x2020) == _ALLOCATION
+    bv, func = _alloc_fixture(copies=5)
+    assert seam._allocation_feeding_call(bv, func, 0x2020) is None
+
+
+@pytest.mark.parametrize("allocator", ["_Znam", "_Znwj", "_Znaj", "_ZnwmRKSt9nothrow_t",
+                                       "_ZnwmSt11align_val_t",
+                                       "_ZnwmSt11align_val_tRKSt9nothrow_t"])
+def test_allocation_accepts_every_global_operator_new_1018(allocator):
+    bv, func = _alloc_fixture(allocator=allocator)
+    assert seam._allocation_feeding_call(bv, func, 0x2020)["allocator"] == allocator
+
+
+@pytest.mark.parametrize("variant", [
+    {"allocator": "_ZN3FoonwEm"},                 # class-specific operator new
+    {"allocator": "_ZnwmPv"},                     # placement new
+    {"allocator": "malloc"},
+    {"size": _il("MLIL_VAR_SSA", src="n")},       # non-constant size
+    {"param_src": _il("MLIL_ADD", left=_il("MLIL_VAR_SSA", src="rax_1"),
+                      right=_il("MLIL_CONST", constant=8))},   # new + 8: not the new's value
+    {"ctor_op": "MLIL_CALL_UNTYPED_SSA"},
+])
+def test_allocation_refuses_what_is_not_a_global_new_result_1018(variant):
+    bv, func = _alloc_fixture(**variant)
+    assert seam._allocation_feeding_call(bv, func, 0x2020) is None
+
+
+def test_allocation_requires_the_argument_to_be_the_new_calls_output_1018():
+    bv, func = _alloc_fixture()
+    ctor = func.get_llil_at(0x2020).mlil.ssa_form
+    ctor.function.get_ssa_var_definition("rax_1").output = ["rdx_1"]
+    assert seam._allocation_feeding_call(bv, func, 0x2020) is None
+
+
+def test_allocation_request_at_tries_each_containing_function_1018():
+    bv, func = _alloc_fixture()
+    empty = types.SimpleNamespace(get_llil_at=lambda addr: None)
+    bv.get_functions_containing = lambda addr: [empty, func]
+    ctx = seam.BridgeContext(None)
+    assert ctx._allocation_request_at(bv, 0x2020) == _ALLOCATION
+    bv.get_functions_containing = lambda addr: [empty]
+    assert ctx._allocation_request_at(bv, 0x2020) is None

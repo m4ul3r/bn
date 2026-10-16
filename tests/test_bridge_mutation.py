@@ -7098,7 +7098,8 @@ def test_class_apply_types_plan_builds_the_typing_batch(monkeypatch):
     assert plan["instance_struct"] == "declared" and plan["size"] == "0x20"
     assert [m["name"] for m in plan["retyped_methods"]] == ["demo::Widget::run"]
     assert plan["skipped_methods"] == [
-        {"address": "0x401260", "name": "demo::Widget::make", "reason": "no parameter named `this`"},
+        {"address": "0x401260", "name": "demo::Widget::make",
+         "reason": "no parameter named `this`, and not a vtable slot, constructor or destructor"},
         {"address": "0x4012a0", "name": "demo::Widget::stub", "reason": "thunk"}]
 
     vt_name = "demo::Base::demo::Widget::VTable"
@@ -7161,9 +7162,9 @@ def test_class_apply_types_plan_builds_the_typing_batch(monkeypatch):
         me._class_apply_types_plan(instance.ctx, None, "Widget")
     assert "not a struct" in excinfo.value.message
 
-    # A stripped card: no methods, slots only. Nothing is left to write once
-    # the struct is typed -- an empty plan, not a refusal -- and every slot
-    # function is listed as skipped.
+    # A stripped card whose slot target BN gave no function: nothing is left to
+    # write once the struct is typed -- an empty plan, not a refusal -- and the
+    # slot is counted as skipped.
     card["methods"] = []
     card["vtable"] = {"address": "0x404000", "slots": [
         {"index": 0, "method": {"address": "0x401300", "display_name": "sub_401300"}},
@@ -7186,6 +7187,69 @@ def test_class_apply_types_plan_builds_the_typing_batch(monkeypatch):
     assert "no table type of its own" in excinfo.value.message
     assert "No struct named" not in excinfo.value.message
     assert "demo::Widget::demo::Leaf::VTable" in excinfo.value.message
+
+
+def test_class_apply_types_retypes_parameter_0_of_the_classs_own_methods_1040(monkeypatch):
+    """#1040.1: a stripped build names no parameter `this`, so the plan retypes
+    parameter 0 -- under its own name -- of the class's constructors and
+    destructors and of the targets of its OWN vtable slots. A slot a base's
+    vtable also holds is inherited, a slot named as another class's method is
+    not this class's, a non-virtual method is not proven to take `this`, and
+    when a base's vtable is unreadable no slot is proven the class's own."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    def fn(address, name):
+        func = _FakeFunction(address, name)
+        func.parameter_vars = [_FakeVariable(name="arg1", storage=5, var_type="int64_t",
+                                             identifier=address, source_type="RegisterVariableSourceType")]
+        return func
+
+    funcs = [fn(0x401100, "demo::Widget::Widget"), fn(0x401150, "demo::Widget::helper"),
+             fn(0x401200, "sub_401200"), fn(0x401300, "sub_401300"),
+             fn(0x401400, "demo::Other::poll"), fn(0x401500, "sub_401500")]
+    bv = _FakeBV(functions=funcs, arch=_FakeArch(address_size=8))
+    bv.types["demo::Widget"] = _FakeType("struct demo::Widget", width=8, members=[])
+    slot_targets = (0x401200, 0x401300, 0x401400, 0x401500)
+    card = {"name": "demo::Widget", "bases": [{"name": "demo::Base", "address": "0x405000"}],
+            "vtable": {"address": "0x404000", "slots": [
+                {"index": i, "method": {"address": hex(a), "display_name": f"sub_{a:x}"}}
+                for i, a in enumerate(slot_targets)]},
+            "methods": [
+                {"address": "0x401100", "demangled": "demo::Widget::Widget", "kind": "ctor"},
+                {"address": "0x401150", "demangled": "demo::Widget::helper", "kind": "method"},
+                {"address": "0x401500", "demangled": "demo::Widget::~Widget", "kind": "dtor"},
+            ]}
+    base = {"targets": {0x401300}, "unreadable": []}
+    monkeypatch.setattr(bridge.read_class, "_class_show", lambda ctx, selector, name: dict(card))
+    monkeypatch.setattr(bridge.read_class, "_bn_vtable_type_name", lambda view, start: "demo::Widget::VTable")
+    monkeypatch.setattr(bridge.read_class, "_base_vtable_targets",
+                        lambda ctx, view, c: (set(base["targets"]), list(base["unreadable"])))
+    monkeypatch.setattr(bridge.read_evidence, "_function_thunk_summary",
+                        lambda ctx, view, func: {"is_candidate": False})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    retypes = [op for op in operations if op["op"] == "local_retype"]
+    assert [op["function"] for op in retypes] == ["0x401100", "0x401500", "0x401200"]
+    assert all(op["variable"].startswith(op["function"]) and ":param:" in op["variable"]
+               and op["new_type"] == "struct `demo::Widget`*" for op in retypes), retypes
+    assert [(m["variable"], m["basis"]) for m in plan["retyped_methods"]] == [
+        ("arg1", "constructor"), ("arg1", "destructor"), ("arg1", "own vtable slot")]
+    assert {m["address"]: m["reason"] for m in plan["skipped_methods"]} == {
+        "0x401150": "no parameter named `this`, and not a vtable slot, constructor or destructor",
+        "0x401300": "inherited: also a slot of a base's vtable",
+        "0x401400": "named as a method of demo::Other",
+    }
+
+    base["targets"], base["unreadable"] = set(), ["demo::Base"]
+    operations, plan = me._class_apply_types_plan(instance.ctx, None, "Widget")
+    assert [op["function"] for op in operations if op["op"] == "local_retype"] == ["0x401100", "0x401500"]
+    unproven = {m["address"] for m in plan["skipped_methods"]
+                if "is not decodable here (demo::Base)" in m["reason"]}
+    assert unproven == {"0x401200", "0x401300"}
+
 
 
 @pytest.mark.parametrize("preview", [False, True])
