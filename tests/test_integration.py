@@ -6481,17 +6481,17 @@ _ZTV4Impl:
 .globl _ZTI5Short
 .type _ZTI5Short,@object
 _ZTI5Short:
- .quad 0,_ZTS5Short
+ .quad _ZTVN10__cxxabiv117__class_type_infoE+16,_ZTS5Short
 .size _ZTI5Short,16
 .globl _ZTI8Abstract
 .type _ZTI8Abstract,@object
 _ZTI8Abstract:
- .quad 0,_ZTS8Abstract
+ .quad _ZTVN10__cxxabiv117__class_type_infoE+16,_ZTS8Abstract
 .size _ZTI8Abstract,16
 .globl _ZTI4Impl
 .type _ZTI4Impl,@object
 _ZTI4Impl:
- .quad 0,_ZTS4Impl
+ .quad _ZTVN10__cxxabiv117__class_type_infoE+16,_ZTS4Impl
 .size _ZTI4Impl,16
 .section .rodata
 _ZTS5Short: .asciz "5Short"
@@ -6555,7 +6555,7 @@ class TestEvidenceVtableLabels1017:
             "                  if s.type.name == 'DataSymbol') for n in names}\n")["result"]
 
     def test_surface_labels_come_from_symbol_extents_only(self, shared_bn, tmp_path):
-        binary = self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM)
+        binary = self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM, compiler="c++")
         shared_bn.load(binary)
         sym = self._symbols(shared_bn, "_ZTV5Short", "registry", "_ZTV4Impl")
         out = self._json(shared_bn, "evidence", "surface")
@@ -6583,7 +6583,7 @@ class TestEvidenceVtableLabels1017:
             hex(sym["_ZTV4Impl"] + 16)}
 
     def test_stripped_surface_has_no_labels_and_says_why(self, shared_bn, tmp_path):
-        binary = self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM)
+        binary = self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM, compiler="c++")
         stripped = tmp_path / "layout-stripped"
         result = subprocess.run(["strip", "-o", str(stripped), str(binary)],
                                 capture_output=True, text=True)
@@ -6598,18 +6598,42 @@ class TestEvidenceVtableLabels1017:
         text = shared_bn.run("evidence", "surface").stdout
         assert "vtable labels: none -- no .symtab (stripped)" in text
 
-    def test_a_function_named_like_typeinfo_does_not_restart_slots_1046(self, shared_bn,
-                                                                         tmp_path):
-        """#1046 review: an STT_FUNC alias `_ZTI5Decoy = first` equals the first
-        slot's value. `second` and `third` are primary slots 1 and 2 all the same."""
-        source = _VTABLE_LAYOUT_ASM.replace(
-            ".section .data.rel.ro",
-            ".globl _ZTI5Decoy\n.type _ZTI5Decoy,@function\n.set _ZTI5Decoy,short_a\n"
-            ".section .data.rel.ro", 1)
-        binary = self._build(tmp_path, "decoy", source)
+    @pytest.mark.parametrize("decoy", ["func_alias", "object_alias_over_code",
+                                       "record_without_rtti_vptr"])
+    def test_a_decoy_typeinfo_does_not_restart_slots_1046(self, shared_bn, tmp_path, decoy):
+        """#1046 review rounds 1 and 2: `_ZTI5Decoy` sits where `first` (slot 0
+        of `_ZTV5Short`) points -- a FUNC alias of `short_a`; an OBJECT alias
+        over 16 bytes of code (`ret`, padding, a pointer to "5Decoy") in a
+        section not flagged executable; or a data record with a matching name
+        but no RTTI vptr. None is typeinfo: `second` stays primary slot 1."""
+        prelude = {
+            "func_alias": ".globl _ZTI5Decoy\n.type _ZTI5Decoy,@function\n"
+                          ".set _ZTI5Decoy,short_a\n",
+            "object_alias_over_code": ".section .rodata\n.p2align 4\n"
+                                      ".globl first\n.type first,@function\nfirst:\n ret\n"
+                                      " .zero 7\n .quad _ZTS5Decoy\n.size first,16\n"
+                                      ".globl _ZTI5Decoy\n.set _ZTI5Decoy,first\n"
+                                      ".type _ZTI5Decoy,@object\n.size _ZTI5Decoy,16\n"
+                                      "_ZTS5Decoy: .asciz \"5Decoy\"\n",
+            "record_without_rtti_vptr": ".section .rodata\n.p2align 4\n"
+                                        ".globl _ZTI5Decoy\n.type _ZTI5Decoy,@object\n"
+                                        "_ZTI5Decoy:\n .quad 0x4142434445464748, _ZTS5Decoy\n"
+                                        ".size _ZTI5Decoy,16\n"
+                                        "_ZTS5Decoy: .asciz \"5Decoy\"\n",
+        }[decoy]
+        source = _VTABLE_LAYOUT_ASM.replace(".section .data.rel.ro",
+                                            prelude + ".section .data.rel.ro", 1)
+        if decoy != "func_alias":
+            # `first` (or the record) is slot 0 of Short, in place of short_a.
+            source = source.replace("_ZTV5Short:\n .quad 0,_ZTI5Short,short_a,short_b",
+                                    "_ZTV5Short:\n .quad 0,_ZTI5Short,_ZTI5Decoy,short_b")
+        flags = ["-Wl,-z,noseparate-code"] if decoy == "object_alias_over_code" else []
+        binary = self._build(tmp_path, "decoy", source, *flags, compiler="c++")
         kinds = subprocess.run(["readelf", "-Ws", str(binary)], capture_output=True, text=True)
-        assert any(line.split()[3:4] == ["FUNC"] and line.endswith(" _ZTI5Decoy")
-                   for line in kinds.stdout.splitlines()), kinds.stdout
+        decoy_rows = [line.split() for line in kinds.stdout.splitlines()
+                      if line.endswith(" _ZTI5Decoy")]
+        assert decoy_rows and decoy_rows[0][3] == (
+            "FUNC" if decoy == "func_alias" else "OBJECT"), kinds.stdout
         shared_bn.load(binary)
         vtable = self._symbols(shared_bn, "_ZTV5Short")["_ZTV5Short"]
         out = self._json(shared_bn, "callsites", "short_b")
@@ -6619,10 +6643,37 @@ class TestEvidenceVtableLabels1017:
         row, = [r for r in rows if r["address"] == hex(vtable + 24)]
         assert (row["slot"], row["offset_to_top"], row["slot_address_point"]) == (
             1, 0, hex(vtable + 16))
-        surface = self._json(shared_bn, "evidence", "surface")
-        label, = [obj for t in surface["candidate_tables"] for obj in t["elf_vtables"]
-                  if obj["object"] == "_ZTV5Short"]
-        assert (label["slot"], label["offset_to_top"]) == (0, 0)
+
+    def test_relocatable_object_gets_no_labels_and_says_why_1046(self, shared_bn, tmp_path):
+        """#1046 review round 2: in an ET_REL object `st_value` is a section
+        offset; BN placed `g_ops` where `_ZTV5Shape`'s value pointed, and the
+        table was labelled and hidden as Shape's vtable."""
+        source = (
+            "static int a(int x) { return x + 1; } static int b(int x) { return x + 2; }\n"
+            "static int c(int x) { return x + 3; } static int d(int x) { return x + 4; }\n"
+            "int (*g_ops[6])(int) = { a, b, c, d, a, b };\n"
+            "struct Shape { virtual ~Shape(); virtual int area(); virtual int sides(); };\n"
+            "Shape::~Shape() {} int Shape::area() { return 1; } int Shape::sides() { return 0; }\n")
+        obj = self._build(tmp_path, "rel.o", source, "-c", "-O1", "-fno-toplevel-reorder",
+                          "-ffunction-sections", "-fdata-sections", compiler="c++",
+                          suffix=".cpp")
+        header = subprocess.run(["readelf", "-h", str(obj)], capture_output=True, text=True)
+        assert "REL (Relocatable file)" in header.stdout
+        shared_bn.load(obj)
+        out = self._json(shared_bn, "evidence", "surface", "--hide-vtables")
+        assert out["summary"]["vtable_labels"]["status"] == "relocatable"
+        assert "ET_REL" in out["summary"]["vtable_labels"]["reason"]
+        assert out["summary"]["vtable_tables_hidden"] == 0
+        # No census, so no table carries a label field at all.
+        assert out["candidate_tables"]
+        assert all("elf_vtables" not in t for t in out["candidate_tables"])
+        assert any(w.startswith("--hide-vtables hid nothing: a relocatable object")
+                   for w in out["warnings"])
+        callsites = self._json(shared_bn, "callsites", "_ZN5Shape4areaEv")
+        assert callsites["callee_data_ref_vtables"] == []
+        assert callsites["callee_data_ref_objects"] == []
+        if callsites["callee_data_refs"]:
+            assert callsites["callee_data_ref_census"]["status"] == "relocatable"
 
     def test_secondary_and_construction_tables_get_slots(self, shared_bn, tmp_path):
         import shlex
@@ -6678,7 +6729,7 @@ class TestEvidenceVtableLabels1017:
             "    bv.remove_user_function(f)\n"
             "bv.update_analysis_and_wait()\n")["result"]
         assert set(starts) == {"open_step", "close_step"}
-        shared_bn.load(self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM))
+        shared_bn.load(self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM, compiler="c++"))
         out = self._json(shared_bn, "evidence", "surface", "-t", steps)
         rows = {int(c["address"], 16): c for c in out["missing_function_candidates"]}
         for name, offset in (("open_step", "8"), ("close_step", "0x10")):

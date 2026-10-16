@@ -448,11 +448,12 @@ def _elf_vtable_census(bv) -> dict[str, Any]:
     `evidence surface` (#1017, #1018): no header, filler or nearest-symbol
     rule, so an anonymous table right after a vtable stays outside it.
     ``status`` is ``ok`` or why nothing was read -- ``unavailable``,
-    ``not_elf``, ``no_sections``, ``malformed`` or ``over_budget`` -- and
-    ``reason`` says it in words. A malformed, unreadable or over-budget table
-    voids the whole census, because an unread table can hide an overlapping
-    object. A defined object whose shape bounds nothing (zero or header-only
-    size, not OBJECT, absolute/common, outside its section) is kept with
+    ``not_elf``, ``relocatable`` (ET_REL), ``no_sections``, ``malformed`` or
+    ``over_budget`` -- and ``reason`` says it in words. A malformed,
+    unreadable or over-budget table voids the whole census, because an unread
+    table can hide an overlapping object. A defined object whose shape bounds
+    nothing (zero or header-only size, not OBJECT, absolute/common, outside
+    its section) is kept with
     ``supported: False`` and a ``reason``; each consumer decides what that
     costs it. ``symtab`` says whether an ``SHT_SYMTAB`` was read: without one
     only ``.dynsym`` exports are visible. Rows appear once per symbol table,
@@ -477,6 +478,17 @@ def _elf_vtable_census(bv) -> dict[str, Any]:
             return refuse("malformed", "unsupported ELF class or byte order")
         elf.is64 = ident[4] == 2
         elf.endian = "<" if ident[5] == 1 else ">"
+        e_type = elf.unpack("H", 16)
+        if e_type is None:
+            return refuse("malformed", "unreadable ELF header")
+        if e_type[0] == 1:
+            # #1046 review: in ET_REL `st_value` is an offset into the
+            # symbol's own section, not an address, and BN places sections
+            # at addresses of its choosing; mapping one to the other is not
+            # attempted, so no extent is claimed at all.
+            return refuse("relocatable", (
+                "a relocatable object (ET_REL): symbol values are offsets into their "
+                "sections, not addresses, so no vtable extent is mapped"))
         shoff = elf.unpack("Q" if elf.is64 else "I", 40 if elf.is64 else 32)
         counts = elf.unpack("HH", 58 if elf.is64 else 46)
         if shoff is None or counts is None:
@@ -604,11 +616,44 @@ def _census_summary(census: dict[str, Any] | None) -> dict[str, Any] | None:
     return summary
 
 
+#: The Itanium ABI classes every class typeinfo object is an instance of; a
+#: `_ZTI` object's first word is the address point of one of their vtables.
+_RTTI_TYPEINFO_VTABLES = frozenset({
+    "_ZTVN10__cxxabiv117__class_type_infoE",
+    "_ZTVN10__cxxabiv120__si_class_type_infoE",
+    "_ZTVN10__cxxabiv121__vmi_class_type_infoE",
+})
+
+
+def _rtti_vptr(bv, value: int, ptr: int) -> bool:
+    """Is *value* the address point (object start + two words) of one of the
+    ``__cxxabiv1`` class-typeinfo vtables, by BN's own symbol there? BN names
+    the imported ones (an extern the loader relocates the word to) and a
+    statically linked copy alike."""
+    head = value - 2 * ptr
+    try:
+        getter = getattr(bv, "get_symbols_at", None)
+        symbols = list(getter(head) or []) if callable(getter) else []
+        if not symbols:
+            single = bv.get_symbol_at(head)
+            symbols = [single] if single is not None else []
+    except Exception:
+        return False
+    for sym in symbols:
+        raw = str(getattr(sym, "raw_name", "") or "").split("@", 1)[0]
+        if raw in _RTTI_TYPEINFO_VTABLES:
+            return True
+    return False
+
+
 def _typeinfo_verified(bv, census: dict[str, Any], address: int) -> bool:
-    """Is *address* a defined ``_ZTI`` OBJECT whose bytes have the typeinfo
-    shape: its second word points at a NUL-terminated name equal to the
-    symbol's own suffix (``_ZTI5Short`` -> ``5Short``, or GCC's ``*5Short``
-    for an internal-linkage type)? Cached per census."""
+    """Is *address* a defined ``_ZTI`` OBJECT with the Itanium typeinfo shape,
+    read from its own bytes: its first word is a ``__cxxabiv1`` class-typeinfo
+    vtable's address point (see ``_rtti_vptr``), and its second word points at
+    a NUL-terminated name equal to the symbol's own suffix (``_ZTI5Short`` ->
+    ``5Short``, or GCC's ``*5Short`` for an internal-linkage type)? A name
+    pointer alone proves nothing (#1046 review): code or a data record can
+    carry one. Cached per census."""
     names = (census.get("typeinfo") or {}).get(address)
     if not names:
         return False
@@ -619,9 +664,9 @@ def _typeinfo_verified(bv, census: dict[str, Any], address: int) -> bool:
     order = "little" if census.get("endian") == "<" else "big"
     ok = False
     try:
-        word = bytes(bv.read(address + ptr, ptr) or b"")
-        if len(word) == ptr:
-            name_at = int.from_bytes(word, order)
+        words = bytes(bv.read(address, 2 * ptr) or b"")
+        if len(words) == 2 * ptr and _rtti_vptr(bv, int.from_bytes(words[:ptr], order), ptr):
+            name_at = int.from_bytes(words[ptr:], order)
             for name in names:
                 want = name[4:].encode()
                 got = bytes(bv.read(name_at, len(want) + 2) or b"")

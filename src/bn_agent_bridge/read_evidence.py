@@ -1943,32 +1943,48 @@ def _constant_stores(func) -> list[tuple[int, int, str]]:
 
 class _VtableIndex:
     """The census's sized ``_ZTV``/``_ZTC`` objects sorted by start, with a
-    prefix maximum of their ends, so the objects overlapping one pointer run
-    are found by bisection instead of a scan of every object (#1046 review).
-    Labels are looked up once per object."""
+    segment tree of their ends, so the objects overlapping one pointer run are
+    found in O(log n) per object reported -- however the extents nest -- not
+    by a scan of every object (#1046 review). Labels are looked up once per
+    object."""
 
     def __init__(self, bv, census: dict[str, Any], objects: list[dict[str, Any]]):
         self.bv = bv
         self.census = census
         self.objects = sorted(objects, key=lambda o: (o["start"], o["raw_name"]))
         self._starts = [o["start"] for o in self.objects]
-        self._max_end: list[int] = []
-        best = -1
-        for obj in self.objects:
-            best = max(best, obj["start"] + obj["size"])
-            self._max_end.append(best)
+        size = 1
+        while size < len(self.objects):
+            size *= 2
+        self._leaves = size
+        # _tree[node] = the greatest end among the objects under that node.
+        self._tree = [-1] * (2 * size)
+        for k, obj in enumerate(self.objects):
+            self._tree[size + k] = obj["start"] + obj["size"]
+        for node in range(size - 1, 0, -1):
+            self._tree[node] = max(self._tree[2 * node], self._tree[2 * node + 1])
         self._labels: dict[tuple[str, int], str] = {}
 
     def overlapping(self, lo: int, hi: int) -> list[dict[str, Any]]:
-        """Objects with ``start < hi`` and ``start + size > lo``, by start."""
-        k = bisect.bisect_left(self._starts, hi) - 1
-        found = []
-        while k >= 0 and self._max_end[k] > lo:
-            obj = self.objects[k]
-            if obj["start"] + obj["size"] > lo:
-                found.append(obj)
-            k -= 1
-        found.reverse()
+        """Objects with ``start < hi`` and ``start + size > lo``, by start:
+        among the objects starting before *hi*, descend only into subtrees
+        whose greatest end passes *lo*."""
+        limit = bisect.bisect_left(self._starts, hi)
+        found: list[dict[str, Any]] = []
+        if not limit:
+            return found
+        stack = [(1, 0, self._leaves)]
+        while stack:
+            node, first, last = stack.pop()
+            if first >= limit or self._tree[node] <= lo:
+                continue
+            if last - first == 1:
+                found.append(self.objects[first])
+                continue
+            middle = (first + last) // 2
+            # Right child first, so the stack yields left-to-right order.
+            stack.append((2 * node + 1, middle, last))
+            stack.append((2 * node, first, middle))
         return found
 
     def label(self, obj: dict[str, Any]) -> str:

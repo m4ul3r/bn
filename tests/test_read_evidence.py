@@ -3167,7 +3167,8 @@ def _vtable_census(objects, typeinfo=(("_ZTI5Short", 0x9000),), *, status="ok", 
 
 class _VtableSurfBV(_SurfBV):
     """`_SurfBV`'s 4-pointer run at 0x1000, preceded by an Itanium header
-    `[0, &typeinfo 0x9000]` at 0xff0; the typeinfo's name pointer leads to
+    `[0, &typeinfo 0x9000]` at 0xff0; the typeinfo record's vptr is BN's
+    `__class_type_info` vtable address point and its name pointer leads to
     `5Short`."""
 
     def read(self, addr, n):
@@ -3175,11 +3176,18 @@ class _VtableSurfBV(_SurfBV):
         if addr == 0xff0:
             header = (0).to_bytes(8, "little") + (0x9000).to_bytes(8, "little")
             return (header + super().read(0x1000, max(0, n - 16)))[:n]
-        if addr == 0x9008:
-            return (0x9100).to_bytes(8, "little")[:n]
+        if addr == 0x9000:
+            # A typeinfo record: `__class_type_info` vtable address point, name.
+            return ((0x7010).to_bytes(8, "little") + (0x9100).to_bytes(8, "little"))[:n]
         if addr == 0x9100:
             return b"5Short\0".ljust(n, b"\0")[:n]
         return super().read(addr, n)
+
+    def get_symbol_at(self, addr):
+        if int(addr) == 0x7000:
+            return types.SimpleNamespace(raw_name="_ZTVN10__cxxabiv117__class_type_infoE",
+                                         type="ExternalSymbol")
+        return None
 
 
 def _vtable_surface(monkeypatch, census, **kwargs):
@@ -3262,6 +3270,33 @@ def test_vtable_index_finds_exactly_the_overlapping_objects_1046(monkeypatch):
                                   if o["start"] < hi and o["start"] + o["size"] > lo)
     for lo in range(0x0e00, 0x1400, 0x18):
         assert sorted(names(lo, lo + 0x50)) == brute(lo, lo + 0x50)
+
+
+def test_vtable_index_nesting_does_not_walk_the_whole_prefix_1046(monkeypatch):
+    """#1046 review round 2: one extent enclosing 9,000 disjoint objects made
+    every lookup walk back through the whole prefix. The tree visits only
+    subtrees whose greatest end reaches the run."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    objects = [{"raw_name": f"_ZTV{i}", "start": 0x10000 + 0x40 * i, "size": 0x30,
+                "kind": "vtable"} for i in range(9000)]
+    objects.append({"raw_name": "_ZTVBig", "start": 0x100, "size": 0x400000, "kind": "vtable"})
+    index = re._VtableIndex(None, _vtable_census([]), objects)
+    visits = []
+
+    class _Counting(list):
+        def __getitem__(self, key):
+            visits.append(key)
+            return list.__getitem__(self, key)
+
+    index._tree = _Counting(index._tree)
+    for i in range(0, 9000, 97):
+        lo = 0x10000 + 0x40 * i
+        visits.clear()
+        names = [o["raw_name"] for o in index.overlapping(lo, lo + 8)]
+        assert names == ["_ZTVBig", f"_ZTV{i}"]
+        # Two objects reported: a few root-to-leaf paths, never the prefix.
+        assert len(visits) < 120, (i, len(visits))
 
 
 class _TwoRunSurfBV(_VtableSurfBV):

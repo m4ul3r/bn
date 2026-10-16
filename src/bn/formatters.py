@@ -3525,9 +3525,10 @@ def _render_compact_call_row(call: dict[str, Any], *, mangled: bool,
     """`evidence function --compact` (#1037): one line per call -- address,
     direct/indirect, target, argument texts with what each resolves to -- plus
     the operation when it is not a plain call, the argument source and
-    confidence (how far the list can be trusted), and a short tag for each
-    diagnostic the full row explains in its own line. Only the IL lines and
-    the instruction context are left out (#1046 review)."""
+    confidence (how far the list can be trusted), and a tag carrying the facts
+    of each diagnostic the full row explains in its own line (counts, library,
+    variadic format and its confidence). Only the IL lines, the instruction
+    context and the diagnostics' advice prose are left out (#1046 review)."""
     target = _field_dict(call, "target")
     shown_target = _render_target_line(target, mangled=mangled) if target else "?"
     direct = "direct" if call.get("direct") else "indirect"
@@ -3543,15 +3544,40 @@ def _render_compact_call_row(call: dict[str, Any], *, mangled: bool,
     if trust:
         tags.append(f"[args: {trust}]")
     if call.get("arity_unknown"):
-        tags.append("[arity: unknown]")
+        # No recovered prototype: the list is BN's register guess.
+        saturated = ", saturates the ABI argument registers" if call.get(
+            "abi_register_saturated") else ""
+        tags.append(f"[arity: unknown, no recovered prototype{saturated}]")
+    declared = call.get("declared_arity")
+    declared_n = declared if isinstance(declared, int) and not isinstance(declared, bool) else None
     if call.get("arity_mismatch"):
-        tags.append("[arity: mismatch]")
+        tags.append("[arity: mismatch" + (f", prototype declares {declared_n}"
+                                          if declared_n is not None else "") + "]")
     if call.get("prototype_unverified"):
-        tags.append("[arity: unverified]")
-    if call.get("callee_unresolved"):
+        library = call.get("library_arity")
+        library_n = library if isinstance(library, int) and not isinstance(library, bool) else None
+        source = _text_value(call, "library_source") or "a type library"
+        detail = (f", prototype declares {declared_n} but {_escape_control_chars(source)} "
+                  f"declares {library_n}"
+                  if declared_n is not None and library_n is not None
+                  else ", disagrees with an attached type library")
+        tags.append(f"[arity: unverified{detail}]")
+    if call.get("callee_unresolved") and not call.get("arity_unknown"):
+        tags.append("[target unresolved, no signature to check against]")
+    elif call.get("callee_unresolved"):
         tags.append("[target unresolved]")
-    if _field_dict(call, "variadic").get("under_recovered"):
-        tags.append("[variadic: under-recovered]")
+    variadic = _field_dict(call, "variadic")
+    if variadic.get("is_variadic"):
+        # #1046 review: the variadic diagnostic is its own (heuristic) fact,
+        # separate from the recovered argument list; keep it and its marker.
+        conf = (_text_value(variadic, "confidence") or "").strip()
+        mark = f", count: {conf}" if conf else ""
+        if variadic.get("under_recovered") and variadic.get("warning"):
+            tags.append(f"[variadic: under-recovered{mark}]")
+        elif variadic.get("format_string") is not None:
+            tags.append(f"[variadic: {variadic.get('callee', '?')} "
+                        f"format={variadic['format_string']!r} "
+                        f"conversions={variadic.get('format_conversions')}{mark}]")
     if contradicts:
         tags.append("[witness: contradiction]")
     row = f"- {call.get('address', '<unknown>')}  {kind}  {shown_target}  ({arg_text})"

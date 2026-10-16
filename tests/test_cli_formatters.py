@@ -5906,10 +5906,11 @@ def test_render_evidence_function_compact_rows_1037():
     rows = [line for line in lines if line.startswith("- ")]
     assert rows == [
         "- 0x402010  direct  operator delete @ 0x401030  (ctx, 0x18) "
-        "[args: hlil inferred] [arity: mismatch] [witness: contradiction]",
+        "[args: hlil inferred] [arity: mismatch, prototype declares 1] [witness: contradiction]",
         "- 0x402020  direct  log_line @ 0x401040  (0x402000 -> \"ready\" [.rodata]) "
         "[args: hlil recovered] [variadic: under-recovered]",
-        "- 0x402030  indirect  ?  () [arity: unknown] [target unresolved]",
+        "- 0x402030  indirect  ?  () [arity: unknown, no recovered prototype] "
+        "[target unresolved]",
         "- 0x402040  direct LLIL_TAILCALL  helper @ 0x401050  (arg1) [args: mlil heuristic]",
     ]
     # The contradiction keeps its compared counts under its row.
@@ -5929,6 +5930,53 @@ def test_render_evidence_function_compact_rows_1037():
     # --mangled reaches the compact target too.
     raw = _render_function_evidence_text(card, compact=True, mangled=True)
     assert "- 0x402010  direct  _ZdlPv @ 0x401030  (ctx, 0x18)" in raw
+
+
+def test_render_evidence_function_compact_keeps_every_non_il_fact_1046():
+    """#1046 review round 2: the variadic format evidence (with its heuristic
+    marker), the declared and library counts and register saturation are
+    facts, not IL; compact keeps each of them."""
+    from bn.formatters import _render_function_evidence_text
+    calls = [
+        {"address": "0x402010", "operation": "LLIL_CALL", "direct": True,
+         "target": {"raw": "0x401030", "normalized": "0x401030", "status": "function",
+                    "function": {"name": "__printf_chk", "address": "0x401030"}},
+         "argument_source": "hlil", "argument_confidence": "recovered",
+         "arguments": [{"text": "2"}, {"text": "\"open %d\\n\""}, {"text": "x"}],
+         "variadic": {"is_variadic": True, "callee": "__printf_chk",
+                      "format_string": "open %d\n", "format_conversions": 1,
+                      "confidence": "heuristic"}},
+        {"address": "0x402020", "operation": "LLIL_CALL", "direct": True,
+         "target": {"raw": "0x401040", "normalized": "0x401040", "status": "function",
+                    "function": {"name": "frob", "address": "0x401040"}},
+         "argument_source": "hlil", "argument_confidence": "inferred",
+         "arguments": [{"text": "a"}], "prototype_unverified": True,
+         "declared_arity": 1, "library_arity": 3, "library_source": "libfrob"},
+        {"address": "0x402030", "operation": "LLIL_CALL", "direct": True,
+         "target": {"raw": "0x401050", "normalized": "0x401050", "status": "function",
+                    "function": {"name": "sub_401050", "address": "0x401050"}},
+         "argument_source": "hlil", "argument_confidence": "inferred",
+         "arguments": [{"text": f"x{i}"} for i in range(6)],
+         "arity_unknown": True, "abi_register_saturated": True},
+        {"address": "0x402040", "operation": "LLIL_CALL", "direct": False,
+         "callee_unresolved": True, "argument_source": "llil",
+         "argument_confidence": "heuristic", "arguments": [{"text": "x0"}]},
+    ]
+    card = {"function": {"name": "f", "address": "0x402000"}, "thunk": {"is_candidate": False},
+            "total_calls": 4, "matched_calls": 4, "offset": 0, "limit": None, "calls": calls}
+    rows = [ln for ln in _render_function_evidence_text(card, compact=True).splitlines()
+            if ln.startswith("- ")]
+    assert rows[0].endswith("[args: hlil recovered] [variadic: __printf_chk "
+                            "format='open %d\\n' conversions=1, count: heuristic]")
+    assert rows[1].endswith("[args: hlil inferred] [arity: unverified, prototype declares 1 "
+                            "but libfrob declares 3]")
+    assert rows[2].endswith("[arity: unknown, no recovered prototype, saturates the ABI "
+                            "argument registers]")
+    assert rows[3].endswith("[args: llil heuristic] [target unresolved, no signature to "
+                            "check against]")
+    # The full card states the same facts in its own lines.
+    full = _render_function_evidence_text(card)
+    assert "variadic: __printf_chk [count: heuristic] format='open %d\\n' conversions=1" in full
 
 
 def test_render_evidence_function_witness_lines_default_to_contradictions_1037():

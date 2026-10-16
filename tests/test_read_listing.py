@@ -2192,7 +2192,7 @@ def test_callee_vtable_hint_rejects_hostile_section_count_without_large_reads(mo
     result = bridge.read_listing._callee_data_refs(bridge.BinaryNinjaBridge().ctx, bv, 0x5000)
     assert result["callee_data_refs"] == ["0x401018"]
     assert result["callee_data_ref_vtables"] == []
-    assert reads == [16, 8, 4]
+    assert reads == [16, 2, 8, 4]   # ident, e_type, e_shoff, e_shentsize/e_shnum
 
 
 @pytest.mark.parametrize("ptr,endian", [(8, "<"), (8, ">"), (4, "<"), (4, ">")])
@@ -2377,13 +2377,20 @@ def test_callee_vtable_actual_registry_must_resolve_exact_canonical_object(monke
     assert result["callee_data_ref_vtables"] == []
 
 
+#: Where the test images' BN symbol for `__cxxabiv1::__class_type_info`'s
+#: vtable sits; a typeinfo record's first word is its address point (+16).
+_RTTI_VTABLE = 0x7000
+
+
 def _elf_vtable_image(symbols, *, symtab=True, data_words=(), endian="<", typeinfo=(),
-                      size=0x200, section_flags=2):
+                      size=0x200, section_flags=2, e_type=2):
     """A 64-bit ELF whose one PROGBITS section maps 0x4000..0x4000+*size* and
     holds *data_words*, with *symbols* ``(name, value, size, info, shndx)`` in a
     ``.symtab`` (or, with ``symtab=False``, only a ``.dynsym``). Each
-    ``(address, name)`` in *typeinfo* writes a typeinfo record there: a null
-    vptr word, then a pointer to *name* stored 0x40 bytes later."""
+    ``(address, name[, vptr])`` in *typeinfo* writes a typeinfo record there:
+    the vptr word (by default the `__class_type_info` vtable's address point,
+    which BN names at ``_RTTI_VTABLE``), then a pointer to *name* stored 0x40
+    bytes later."""
     import struct
     from types import SimpleNamespace
 
@@ -2402,14 +2409,16 @@ def _elf_vtable_image(symbols, *, symtab=True, data_words=(), endian="<", typein
 
     image = bytearray(b"".join(word.to_bytes(8, order, signed=word < 0)
                                for word in data_words).ljust(size, b"\0"))
-    for address, name in typeinfo:
+    for address, name, *vptr in typeinfo:
         at = address - 0x4000
-        image[at:at + 16] = bytes(8) + (address + 0x40).to_bytes(8, order)
+        first = vptr[0] if vptr else _RTTI_VTABLE + 16
+        image[at:at + 16] = first.to_bytes(8, order) + (address + 0x40).to_bytes(8, order)
         image[at + 0x40:at + 0x41 + len(name)] = name.encode() + b"\0"
     body = append(bytes(image))
     strtab = append(strings)
     symbol_bytes = append(b"".join(struct.pack(endian + "IBBHQQ", *row) for row in rows))
     data[:16] = b"\x7fELF\x02" + (b"\x01" if endian == "<" else b"\x02") + bytes(10)
+    struct.pack_into(endian + "H", data, 16, e_type)
     struct.pack_into(endian + "Q", data, 40, 64)
     struct.pack_into(endian + "HH", data, 58, 64, 4)
     sections = [
@@ -2432,7 +2441,10 @@ def _elf_vtable_image(symbols, *, symtab=True, data_words=(), endian="<", typein
     return SimpleNamespace(
         parent_view=SimpleNamespace(start=0, length=len(data),
                                     read=lambda off, n: bytes(data[off:off + n])),
-        image_base=0, original_image_base=0, address_size=8, read=read, reads=reads)
+        image_base=0, original_image_base=0, address_size=8, read=read, reads=reads,
+        get_symbol_at=lambda address: SimpleNamespace(
+            raw_name="_ZTVN10__cxxabiv117__class_type_infoE", type="ExternalSymbol")
+        if address == _RTTI_VTABLE else None)
 
 
 _OBJECT = 0x11  # STB_GLOBAL | STT_OBJECT
@@ -2550,7 +2562,8 @@ def test_callee_data_refs_label_construction_vtable_slots_1018(monkeypatch):
 
 
 @pytest.mark.parametrize("decoy", ["func_alias", "name_mismatch", "executable_section",
-                                   "header_at_object_start"])
+                                   "header_at_object_start", "code_alias_with_name",
+                                   "record_without_rtti_vptr"])
 def test_vtable_slot_ignores_a_typeinfo_address_that_is_not_typeinfo_1046(monkeypatch, decoy):
     """#1046 review: `_ZTV5Short` is `[0, &_ZTI5Short, first, second, third]`.
     A pointer that merely equals some `_ZTI…` symbol must not restart slot
@@ -2574,6 +2587,15 @@ def test_vtable_slot_ignores_a_typeinfo_address_that_is_not_typeinfo_1046(monkey
         symbols.append(("_ZTI5Decoy", first, 0x10, _OBJECT, 1))
         typeinfo.append((first, "5Decoy"))
         flags = 6   # SHF_ALLOC | SHF_EXECINSTR: no typeinfo lives there
+    elif decoy == "code_alias_with_name":
+        # Round 2: an OBJECT alias over `first`'s bytes -- `ret`, padding, then
+        # a pointer to "5Decoy" -- in a section not flagged executable.
+        symbols.append(("_ZTI5Decoy", first, 0x10, _OBJECT, 1))
+        typeinfo.append((first, "5Decoy", 0xc3))
+    elif decoy == "record_without_rtti_vptr":
+        # Round 2: a data record `{not-an-RTTI-vptr, &"5Decoy"}`.
+        symbols.append(("_ZTI5Decoy", first, 0x10, _OBJECT, 1))
+        typeinfo.append((first, "5Decoy", 0x4142434445464748))
     else:
         words = [0x4080, first, first + 0x10, first + 0x20]
         symbols[0] = ("_ZTV5Short", 0x4000, 0x20, _OBJECT, 1)
@@ -2614,3 +2636,21 @@ def test_vtable_slot_budget_is_not_reported_as_a_missing_header_1046(monkeypatch
     far = rl._vtable_slot(bv, census, 0x4000, 0x10f00, 0x4000 + 0x10800)
     assert far["slot"] is None and far["slot_unknown_reason"] == "over_read_budget"
     assert max(length for _, length in bv.reads) <= rl._VTABLE_SLOT_READ_BYTES
+
+
+def test_relocatable_objects_get_no_vtable_extents_1046(monkeypatch):
+    """#1046 review round 2: in ET_REL `st_value` is a section offset, not an
+    address; the census refuses rather than label a table BN put elsewhere."""
+    bridge = _load_bridge(monkeypatch)
+    rl = bridge.read_listing
+    bv = _elf_vtable_image([("_ZTV5Shape", 0x4000, 0x30, _OBJECT, 1),
+                            ("_ZTI5Shape", 0x4100, 0x10, _OBJECT, 1)],
+                           data_words=[0, 0x4100, 0x5000, 0x5010],
+                           typeinfo=[(0x4100, "5Shape")], e_type=1)
+    census = rl._elf_vtable_census(bv)
+    assert census["status"] == "relocatable" and census["objects"] == []
+    assert "ET_REL" in rl._census_summary(census)["reason"]
+    assert rl._vtable_slot(bv, census, 0x4000, 0x30, 0x4010)["slot_unknown_reason"] == "no_census"
+    executable = rl._elf_vtable_census(_elf_vtable_image(
+        [("_ZTV5Shape", 0x4000, 0x30, _OBJECT, 1)], e_type=3))
+    assert executable["status"] == "ok"
