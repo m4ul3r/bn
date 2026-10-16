@@ -6773,7 +6773,15 @@ def test_forward_recvmsg_arg_seed_nudges_to_buffer_306(models):
     bv = FBV({0x2000: "recvmsg"})
     engine = te.TaintEngine(bv, models)
     result = engine.forward(func, [te.parse_locator("arg:recvmsg:1")])
-    assert any("msg_iov" in a and "var:<buf>" in a for a in result["assumptions"])
+    # No iovec is built here, so `call:recvmsg` would seed nothing: the nudge
+    # does not offer it, and points at the filled buffer as a template (#1050
+    # review finding 5).
+    nudge = [a for a in result["assumptions"] if "msg_iov" in a]
+    assert nudge and "call:recvmsg cannot resolve its buffer" in nudge[0], nudge
+    assert "--source call:recvmsg`" not in nudge[0]
+    assert "template, fill in the UPPER-CASE words: `bn taint forward -f 0x10 --source var:VAR`" in nudge[0]
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "source_seed_misanchored"]
+    assert leaf["suggested_source"] is None
 
 
 def test_forward_non_recvmsg_arg_seed_has_no_nudge_306(models):
@@ -8655,9 +8663,11 @@ def test_scanf_arity_at_the_modeled_run_stays_clear_851(models):
     # is left unseeded and the run must not pay the residual disclosure -- an
     # unconditional assumption would be a permanent false alarm on every
     # well-covered scanf, which is its own defect.
+    # The format is a readable constant with no width-less %s, so the #1041
+    # item 4 format gate has nothing to withhold on either.
     func = _scanf_arity_func(4)
-    result = te.TaintEngine(FBV({0x900: "scanf"}), models).forward(
-        func, [te.parse_locator("call:scanf")])
+    result = te.TaintEngine(FBVStr({0x900: "scanf"}, strings={0x700: "%d %d %d %d"}),
+                            models).forward(func, [te.parse_locator("call:scanf")])
     assert not any("scanf_arity_residual" in s for s in result["assumptions"]), result["assumptions"]
     diag = result.get("diagnostics") or {}
     assert diag.get("safe_to_report_all_clear") is True, diag
@@ -8695,8 +8705,8 @@ def test_sscanf_arity_residual_withholds_all_clear_851(models):
 def test_sscanf_arity_at_the_modeled_run_stays_clear_851(models):
     # Boundary twin for the propagator path: four destinations IS *arg:2..5.
     func = _sscanf_arity_func(4)
-    result = te.TaintEngine(FBV({0x901: "sscanf"}), models).forward(
-        func, [te.parse_locator("param:0")])
+    result = te.TaintEngine(FBVStr({0x901: "sscanf"}, strings={0x700: "%d %d %d %d"}),
+                            models).forward(func, [te.parse_locator("param:0")])
     assert not any("scanf_arity_residual" in s for s in result["assumptions"]), result["assumptions"]
     diag = result.get("diagnostics") or {}
     assert diag.get("safe_to_report_all_clear") is True, diag
@@ -9371,8 +9381,8 @@ def test_fully_analysed_run_stays_complete_811(models):
     # The must-not-fire twin: an ordinary run must not pay the disclosure, or
     # every clean result would carry a permanent incompleteness warning.
     func = _scanf_arity_func(4)
-    result = te.TaintEngine(FBV({0x900: "scanf"}), models).forward(
-        func, [te.parse_locator("call:scanf")])
+    result = te.TaintEngine(FBVStr({0x900: "scanf"}, strings={0x700: "%d %d %d %d"}),
+                            models).forward(func, [te.parse_locator("call:scanf")])
     assert result["stats"]["analysis_incomplete"] is False, result["stats"]
     assert (result.get("diagnostics") or {}).get("safe_to_report_all_clear") is True
 
@@ -10563,6 +10573,11 @@ def _strtok_reset_program(*, conditional: bool):
     if conditional:
         guarded = FBlock(1, 2, [entry])          # `if (mode)` arm holding the clean call
         join = FBlock(2, 5, [entry])             # NULL call, sink, return: entry dominates, the arm does not
+        # The edges establish the path facts the caveats state (#1050 review
+        # round 3): the arm runs between the tainted call and the NULL call.
+        entry.outgoing_edges = [_FEdge(guarded), _FEdge(join)]
+        guarded.outgoing_edges = [_FEdge(join)]
+        join.outgoing_edges = []
         tainted.il_basic_block = entry
         clean.il_basic_block = guarded
         for i in (cont, sink, ret):
@@ -10628,7 +10643,11 @@ def test_strtok_clean_reset_without_block_info_is_not_a_kill_928():
     result = te.TaintEngine(FBV({STRTOK: "strtok", SYS: "system"}), te.load_models()).forward(
         func, [te.parse_locator("param:0")])
     assert [s["sink"]["callee"] for s in result["reached_sinks"]] == ["system"], result["reached_sinks"]
-    assert any("not on every path from the tainted call" in a for a in result["assumptions"]), \
+    # Without block information the path relation is unknown, so the caveat
+    # names the clean call neutrally rather than asserting a reset path
+    # (#1050 review round 3).
+    assert any("was not shown to lie on every path from the tainted call" in a
+               and "reachability unknown" in a for a in result["assumptions"]), \
         result["assumptions"]
 
 
@@ -11275,7 +11294,10 @@ def test_strtok_priming_reset_before_a_loop_does_not_kill_the_back_edge_928r4():
     sinks = [(s["sink"]["callee"], s["sink"]["class"]) for s in result["reached_sinks"]]
     assert sinks == [("system", "command_injection")], result["reached_sinks"]
     cont = [a for a in result["assumptions"] if "continues the tokenizer state" in a]
-    assert cont and "not on every path from the tainted call" in cont[0], result["assumptions"]
+    # The priming reset runs before the loop: it is on NO path from the tainted
+    # call back to the NULL call, so the caveat must not name it a partial
+    # reset (#1050 review round 3).
+    assert cont and "clean strtok @ 0x10" not in cont[0], result["assumptions"]
 
     # Guard: the reset at the TOP of the body lies on every path from the
     # tainted call back to the NULL call -- a precise kill. The loop can exit

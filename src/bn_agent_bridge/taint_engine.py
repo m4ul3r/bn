@@ -52,11 +52,12 @@ from .taint_il import (  # noqa: F401
 from .taint_locators import (  # noqa: F401
     parse_locator, _locator_index, format_locator, var_label_of,
     node_label, _instr_dict, _render_source, _make_signature,
-    derive_flow_facts,
+    derive_flow_facts, normalize_resolve_map,
 )
 from .taint_result import (  # noqa: F401
     BLOCKING_LEAF_KINDS,
     backward_diagnostics,
+    command_template,
     forward_zero_diagnostics,
     indirect_pointer_slot_leaf,
     misanchored_recv_leaf,
@@ -69,7 +70,12 @@ from . import taint_il as _taint_il_mod  # noqa: F401
 from . import taint_locators as _taint_locators_mod  # noqa: F401
 from . import taint_models as _taint_models_mod  # noqa: F401
 from . import taint_result as _taint_result_mod  # noqa: F401
-from .il_format import _display_name, _variadic_determination
+from .il_format import (
+    _display_name,
+    _format_specs,
+    _variadic_determination,
+    unbounded_scanf_strings,
+)
 from .taint_models import _model_copy_roles
 
 
@@ -145,6 +151,11 @@ class _BufferSeed:
 # engine
 # --------------------------------------------------------------------------
 
+# The `resolve_map` default: no map was supplied. A distinct object, because a
+# supplied JSON `null` document is invalid, not an omission.
+_NO_RESOLVE_MAP: Any = object()
+
+
 class TaintEngine:
     def __init__(
         self,
@@ -153,7 +164,9 @@ class TaintEngine:
         *,
         find_variable: Any = None,
         unknown_call_policy: str = "conservative",
-        resolve_map: dict[str, Any] | None = None,
+        resolve_map: Any = _NO_RESOLVE_MAP,
+        resolve_map_origin: str = "--resolve-map",
+        find_function: Any = None,
         max_iters: int = 256,
         max_depth: int = 64,
         mangled: bool = False,
@@ -162,8 +175,15 @@ class TaintEngine:
         self.models = models
         self._find_variable = find_variable
         self.unknown_call_policy = unknown_call_policy
-        # agent-supplied indirect-call resolution: {call_addr_hex: [target_addr, ...]}
-        self.resolve_map = resolve_map or {}
+        # agent-supplied indirect-call resolution, validated here -- once, naming
+        # the file -- rather than when the walk first needs it (#1041 item 3):
+        # {call_address: [target_address, ...]}. `find_function` resolves a
+        # target spelled as a function name exactly as `-f` does. Only an
+        # OMITTED map is empty: a supplied document of any other shape, JSON
+        # `null` included, is refused by name (#1050 review rounds 1-2).
+        self.resolve_map = normalize_resolve_map(
+            {} if resolve_map is _NO_RESOLVE_MAP else resolve_map,
+            origin=resolve_map_origin, find_function=find_function)
         self.max_iters = max_iters
         self.max_depth = max_depth
         self.mangled = mangled
@@ -1201,26 +1221,42 @@ class TaintEngine:
     def _const_format_string(self, ssaf: Any, expr: Any) -> str | None:
         """If *expr* points at a NUL-terminated constant string in the binary,
         return its text; else None (unknown/non-constant format -> stay
-        conservative and treat every vararg as live)."""
+        conservative and treat every vararg as live).
+
+        Only bytes in read-only storage are the format the call sees: a string
+        in writable `.data` is merely its initial value, which any code may
+        overwrite before the call (`strcpy(fmt, "%s")`), so it is no constant
+        (#1050 review finding 1). The same storage test the backward walk uses
+        for literal operands (`_const_ptr_storage`).
+
+        A format is known only when its terminating NUL was seen (#1050
+        review round 8): BN's ASCII string stops at the first non-ASCII byte,
+        and a bounded read can end mid-format, and either prefix silently drops
+        later conversions. A string BN returns is accepted only when the byte
+        right after it is NUL; the raw read must find the NUL within its window.
+        Anything else is unreadable (None)."""
         addr = self._const_ptr_addr(ssaf, expr)
-        if addr is None:
+        if addr is None or self._const_ptr_storage(addr) == "writable":
             return None
+        read = getattr(self.bv, "read", None)
         getstr = getattr(self.bv, "get_ascii_string_at", None)
         if getstr is not None:
             try:
                 s = getstr(int(addr), 1)
                 val = getattr(s, "value", None)
                 if val is not None:
-                    return str(val)
+                    text = str(val)
+                    width = len(text.encode("latin-1", "replace"))
+                    if read is None or read(int(addr) + width, 1) == b"\x00":
+                        return text
             except Exception:
                 pass
-        read = getattr(self.bv, "read", None)
         if read is not None:
             try:
-                raw = read(int(addr), 512)
-                if raw:
-                    nul = raw.find(b"\x00")
-                    return raw[: nul if nul >= 0 else len(raw)].decode("latin-1", "replace")
+                raw = read(int(addr), 4096)
+                nul = raw.find(b"\x00") if raw else -1
+                if nul >= 0:
+                    return raw[:nul].decode("latin-1", "replace")
             except Exception:
                 pass
         return None
@@ -1917,9 +1953,11 @@ class TaintEngine:
         source block before the reset is a path (round 4 P2: a priming
         reset before a loop DOMINATES the `strtok(NULL)` yet the tainted
         call at the bottom of the body reaches it around the back-edge).
-        None when the view exposes no block / edge information -- an answer
-        the caller must treat as "reachable", never as a kill. An *avoid*
-        instruction without block information is ignored (it proves no cut)."""
+        None when the view exposes no block / edge information, or when a
+        block the search leaves has successors Binary Ninja could not
+        determine (a computed jump): an answer the caller must treat as
+        "reachable", never as a kill. An *avoid* instruction without block
+        information is ignored (it proves no cut)."""
         def _idx(i: Any) -> int | None:
             try:
                 return int(getattr(i, "instr_index"))
@@ -1950,7 +1988,13 @@ class TaintEngine:
             seen: set[tuple[int, int]] = set()
             work = [sb]
             while work:
-                for edge in list(work.pop().outgoing_edges):
+                block = work.pop()
+                # A block BN marks with undetermined outgoing edges (a register-
+                # indirect jump) may continue anywhere; its enumerated edges are
+                # not all of them, so they cannot prove disconnection.
+                if getattr(block, "has_undetermined_outgoing_edges", False) is True:
+                    return None
+                for edge in list(block.outgoing_edges):
                     t = getattr(edge, "target", None)
                     if t is None:
                         return None     # an undetermined successor: unproven
@@ -2866,9 +2910,9 @@ class TaintEngine:
         resolution. Returns ``([], None)`` for a direct call or no resolution."""
         if const_target(getattr(ins, "dest", None)) is not None:
             return [], None
-        mapped = self.resolve_map.get(hex(int(getattr(ins, "address", 0))))
+        mapped = self.resolve_map.get(int(getattr(ins, "address", 0)))
         if mapped:
-            return [int(x, 16) if isinstance(x, str) else int(x) for x in mapped], "agent-map"
+            return list(mapped), "agent-map"
         cands = self._call_targets_from_pvs(
             getattr(getattr(ins, "dest", None), "possible_values", None))
         return (cands, "value-set") if cands else ([], None)
@@ -3028,8 +3072,51 @@ class TaintEngine:
         # any multi-source / param / var request are unchanged (no `by_source`).
         callsite_addrs = self._attributable_callsites(func, sources)
         if not callsite_addrs:
-            return self._forward_run(func, sources, max_depth=max_depth)
+            result = self._forward_run(func, sources, max_depth=max_depth)
+            if len(sources) > 1 and result["reached_sinks"]:
+                self._attribute_sources(func, sources, result, max_depth=max_depth)
+            return result
         return self._forward_attributed(func, sources, callsite_addrs, max_depth=max_depth)
+
+    def _attribute_sources(self, func: Any, sources: list[dict[str, Any]],
+                           result: dict[str, Any], *, max_depth: int) -> None:
+        """#1041 item 6: name which --source reaches each flow of a run with
+        several sources -- by outcome, not from the taint graph.
+
+        The graph records only the first parent that tainted a node, so the
+        source its rendered path starts from is not proof of the flow's
+        provenance: an argument a callee stores aside could be named for a sink
+        it never reached (#1050 review finding 3). Instead each source is run
+        on its own, and a flow lists as `source_candidates` every source whose
+        solo run reaches the same sink (callee, address, argument). The
+        signature names a source only when exactly one does; otherwise it keeps
+        `multiple`. A finding that is not attributed to --source at all (an
+        unconditional sink, `?`) is left as it is."""
+        reached: dict[tuple, list[str]] = {}
+        for src in sources:
+            try:
+                solo = self._forward_run(func, [src], max_depth=max_depth)
+            except TaintError:
+                continue   # seeds nothing on its own: it reaches nothing alone
+            loc = _render_source(self._describe_locator(src))
+            for f in solo["reached_sinks"]:
+                s = f.get("sink") or {}
+                key = (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+                if loc not in reached.setdefault(key, []):
+                    reached[key].append(loc)
+        for f in result["reached_sinks"]:
+            sig = f.get("signature") or {}
+            if sig.get("source") != "multiple":
+                continue
+            s = f.get("sink") or {}
+            candidates = reached.get(
+                (s.get("callee"), s.get("address"), s.get("tainted_arg_index")), [])
+            f["source_candidates"] = candidates
+            if len(candidates) == 1:
+                f["signature"] = _make_signature(
+                    candidates[0], sig.get("chain") or [], sig.get("sink_class"),
+                    sig.get("sink_callee"), display=self._display_for_name,
+                    symbol=self._raw_symbol_for)
 
     def _forward_run(self, func: Any, sources: list[dict[str, Any]], *, max_depth: int,
                      only_callsite_addr: int | None = None) -> dict[str, Any]:
@@ -3065,6 +3152,9 @@ class TaintEngine:
         # unexplained empty result. Only the top run's ret/arg/call sources touch
         # this -- descended callees are seeded with synthetic param: locators.
         self._seed_callsites = 0
+        # #1041 item 1: a call:/arg: source seeded a buffer its model fills, so
+        # an all-clear carries the receive-family caveat (#1050 review round 5).
+        self._buffer_seeded = False
 
         try:
             sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
@@ -3148,10 +3238,10 @@ class TaintEngine:
         # factual frontier diagnostic (NOT a verdict) explaining where the seed
         # went and why the frontier stopped.
         if not unique_findings:
-            result["diagnostics"] = self._forward_zero_diagnostics(sub)
+            result["diagnostics"] = self._forward_zero_diagnostics(sub, func)
         return result
 
-    def _forward_zero_diagnostics(self, sub: dict[str, Any]) -> dict[str, Any]:
+    def _forward_zero_diagnostics(self, sub: dict[str, Any], func: Any) -> dict[str, Any]:
         """Frontier diagnostics for a zero-sink forward run (#559).
 
         Purely descriptive: seed reach (matched source callsites, tainted SSA
@@ -3168,7 +3258,9 @@ class TaintEngine:
             sub, seed_callsites=int(getattr(self, "_seed_callsites", 0)),
             truncated=bool(getattr(self, "_truncated", False)),
             truncation_cause=sorted(getattr(self, "_truncation_causes", set())),
-            analysis_incomplete=bool(getattr(self, "_analysis_incomplete", ())))
+            analysis_incomplete=bool(getattr(self, "_analysis_incomplete", ())),
+            buffer_seed=bool(getattr(self, "_buffer_seeded", False)),
+            function=hex(int(func.start)))
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
         """Distinct call addresses to attribute a single ret/arg source across.
@@ -3344,7 +3436,9 @@ class TaintEngine:
                 union_sub,
                 seed_callsites=len(callsite_addrs),
                 truncated=truncated, truncation_cause=sorted(truncation_causes),
-                analysis_incomplete=bool(incomplete_funcs))
+                analysis_incomplete=bool(incomplete_funcs),
+                buffer_seed=bool(getattr(self, "_buffer_seeded", False)),
+                function=hex(int(func.start)))
             out["diagnostics"]["last_use_by_source"] = {
                 a: d.get("last_use") for a, d in per_source_diag.items()
             }
@@ -3659,7 +3753,7 @@ class TaintEngine:
 
     def _register_indirect_buffer_slot(self, ssaf, ptr_expr, callsite, callee, idx,
                                        buffer_slots, add_assumption,
-                                       add_leaf=None, recv_buffer_covered=False) -> None:
+                                       add_leaf=None, recv_buffer_covered=False) -> bool:
         """When a buffer source's pointer is an indirect load `[slot]`, register the
         slot so a later re-load of it can be correlated forward (#193 Part 1). If the
         slot can't be named, fall back to today's honest "may be missed" caveat. When
@@ -3674,9 +3768,13 @@ class TaintEngine:
         mechanism -- exactly like the recv-buffer case. ``recv_buffer_covered`` is
         set by the ``arg:`` caller when it already emits a recv-buffer misanchored
         leaf for this (callee, idx), so the leaf is not double-counted there; the
-        ``*arg:`` (call: preset) caller has no such leaf and passes False."""
+        ``*arg:`` (call: preset) caller has no such leaf and passes False.
+
+        Returns True when the pointer IS an indirect load, i.e. this helper owns
+        the disclosure for it (an immediate or a deferred leaf); False when it did
+        nothing, so the caller must disclose the unkeyed buffer itself."""
         if not self._arg_ptr_is_indirect_load(ssaf, ptr_expr):
-            return
+            return False
         pending = (
             f"source {callee} arg{idx} buffer pointer is loaded indirectly (from a "
             f"global/struct slot); the seed anchors to the pointer value, not the "
@@ -3698,7 +3796,7 @@ class TaintEngine:
             add_assumption(pending)
             if pending_leaf is not None:
                 add_leaf(pending_leaf)
-            return
+            return True
         recv_node = None
         for r in expr_reads(ptr_expr):
             recv_node = (var_key(r), getattr(r, "version", None))
@@ -3708,6 +3806,98 @@ class TaintEngine:
             "callee": callee, "idx": idx, "recv_node": recv_node, "pending": pending,
             "pending_leaf": pending_leaf,
         }
+        return True
+
+    def _format_destination_shortfall(self, ins: Any, ssaf: Any, callee: str, model: Any,
+                                      params: list[Any]) -> dict | None:
+        """A blocking `format_destination_unrecovered` leaf when the call's fully
+        read constant format writes more destinations than BN recovered
+        arguments for (#1050 review round 8): a forwarded incoming pointer left
+        in its argument register is passed, yet BN's MLIL call does not list it,
+        so it was never seeded. The missing arguments are not guessed and the
+        model range is not widened; the gap is disclosed by count. It only
+        adds a leaf, never removes a seed (round 9 removed destination
+        trimming). The constant-format test checks only the format's START
+        address: a format whose suffix lies in writable storage can be
+        under-counted, which then yields no leaf, as on base."""
+        sink = (model or {}).get("sink") or {}
+        fa, first = sink.get("format_arg"), sink.get("first_dest")
+        if fa is None or first is None or int(fa) >= len(params):
+            return None
+        fmt = self._const_format_string(ssaf, params[int(fa)])
+        if fmt is None:
+            return None
+        specs = _format_specs(fmt, is_scanf=True)
+        if any(s.positional for s in specs):
+            return None
+        first = int(first)
+        dest_end = first + sum(1 for s in specs if not s.suppressed)
+        if dest_end <= len(params):
+            return None
+        missing = dest_end - len(params)
+        at = hex(int(getattr(ins, "address", 0)))
+        return {
+            "kind": "format_destination_unrecovered",
+            "address": at,
+            "callee": str(callee),
+            "il_text": str(ins),
+            "destinations": dest_end - first,
+            "recovered": max(0, len(params) - first),
+            "missing": missing,
+            "detail": (
+                f"{self._prose_name(callee)}() at {at}: its constant format writes "
+                f"{dest_end - first} destination(s) but Binary Ninja recovered only "
+                f"{max(0, len(params) - first)} of those arguments, so {missing} "
+                f"destination(s) were not seeded -- what they receive is unchecked"),
+        }
+
+    def _unchecked_indirect_calls(self, instrs: list[Any], fills: list[Any], callee: str,
+                                  add_leaf: Any) -> None:
+        """#1041 item 1 gate (#1050 review rounds 4-5): a blocking leaf at every
+        unresolved indirect call in the SOURCE function that can run after a
+        call that fills a buffer.
+
+        Which pointer such a callback receives is NOT worked out -- aliasing is
+        left out. The rule is an outcome instead: a filled buffer exists, an
+        unresolved indirect call in this function can run after it, so whatever
+        that call does with the bytes is unchecked, and the run is not an
+        all-clear -- whether or not the buffer was keyed and whether or not a
+        slot reload correlated. Unknown reachability counts as reachable. A call
+        is resolved when it is direct, mapped by `--resolve-map`, or pinned by
+        its value set -- the same resolution the walk descends with.
+
+        Its scope is this function only: indirect calls inside callees the walk
+        enters, mapped or value-set targets, and transfers BN lifts as an MLIL
+        `jump` are not gated (the receive-family all-clear caveat says so). A
+        system call is not a function-pointer call and is never gated (#1050
+        review round 5). The cost: an unrelated unresolved indirect call after
+        a receive also withholds the all-clear."""
+        for ins in instrs:
+            if not self._is_call(ins) or "SYSCALL" in op_name(ins) \
+                    or any(ins is f for f in fills):
+                continue
+            if self._resolve_direct_target(ins) is not None:
+                continue
+            cands, _via = self._indirect_call_resolution(ins)
+            if cands:
+                continue
+            if not any(self._reaches_avoiding(f, ins, []) is not False for f in fills):
+                continue
+            at = hex(int(getattr(ins, "address", 0)))
+            add_leaf({
+                "kind": "indirect_call_unchecked",
+                "address": at,
+                "callee": str(callee),
+                "fills": sorted(hex(int(getattr(f, "address", 0))) for f in fills),
+                "il_text": str(ins),
+                "detail": (
+                    f"the indirect call at {at} can run after {self._prose_name(callee)} fills a "
+                    f"buffer, and bn did not resolve its callee: indirect calls that may "
+                    f"receive this buffer are not followed -- their callees are unchecked. "
+                    f"Pinning the target with --resolve-map makes the walk descend into it "
+                    f"with the arguments taint reaches; it does not show that the target "
+                    f"receives this buffer"),
+            })
 
     def _as_single_ssa_var(self, expr: Any) -> Any | None:
         """The lone SSA variable an expression reads, but ONLY when the
@@ -4518,7 +4708,8 @@ class TaintEngine:
                 "recovered_params": n_params, "dropped_args": sorted(dropped),
                 "stack_dropped_args": [i for i in sorted(dropped) if cc is not None and i >= len(arg_regs)],
                 "cause": "varargs_not_followed", "callee_variadic": True,
-                "note": self._varargs_tail_note(self._prose_function(callee_fn), n_params, dropped),
+                "note": self._varargs_tail_note(self._prose_function(callee_fn), n_params, dropped,
+                                                hex(int(getattr(callee_fn, "start", 0)))),
             }
         try:
             cc = (getattr(callee_fn, "calling_convention", None)
@@ -4580,20 +4771,25 @@ class TaintEngine:
         }
 
     @staticmethod
-    def _varargs_tail_note(name: str, n_params: int, idxs: list) -> str:
+    def _varargs_tail_note(name: str, n_params: int, idxs: list, at: str) -> str:
         """The #948 disclosure for taint landing in a determined-variadic
         callee's `...` tail: a tracking limit, stated with the observed counts,
-        and never a prototype repair."""
+        and never a prototype repair. No `param:N` names a vararg, so the seed
+        inside the callee is a template (#1033 item 6)."""
+        seed = command_template(f"bn taint forward -f {at} --source var:VAR")
         return (f"tainted arg(s) {sorted(idxs)} passed to {name} land in its variadic "
                 f"tail: {name} is declared variadic (`...`) with {n_params} named "
                 f"parameter(s), and taint is mapped only onto named parameters, so the "
                 f"flow into its varargs was NOT followed. This is a tracking limit, not "
                 f"a signature defect -- the prototype is already variadic and "
                 f"redeclaring it changes nothing. Inspect how {name} consumes its "
-                f"va_list (e.g. a v*printf call), or seed `bn taint forward` inside it.")
+                f"va_list (e.g. a v*printf call), or seed taint inside it from the "
+                f"value it reads ({seed}).")
 
     def _descend(self, ins: Any, callee_fn: Any, tainted_args: dict, why: dict,
-                 depth: int, max_depth: int, *, via: str | None = None) -> dict[str, Any]:
+                 depth: int, max_depth: int, *, via: str | None = None,
+                 caller_instrs: list | None = None,
+                 caller_fn: Any = None) -> dict[str, Any]:
         """Recurse into a (direct or resolved-indirect) internal callee and return
         its findings with a caller-side path prefix prepended, plus whether it
         propagates taint to its return.
@@ -4619,7 +4815,8 @@ class TaintEngine:
                 # #948: every tainted arg is in a correctly-variadic tail.
                 leaf.update(cause="varargs_not_followed", callee_variadic=True,
                             note=self._varargs_tail_note(
-                                self._prose_function(callee_fn), n_params, list(tainted_args)))
+                                self._prose_function(callee_fn), n_params, list(tainted_args),
+                                hex(int(getattr(callee_fn, "start", 0)))))
                 out["assumptions"].append(
                     f"tainted args to {self._prose_function(callee_fn)} land in its variadic tail, which "
                     f"is not followed; conservative")
@@ -4685,7 +4882,81 @@ class TaintEngine:
         out["reached_return"] = sub["reached_return"]
         out["out_params"] = sub.get("out_params", frozenset())
         out["out_param_elems"] = sub.get("out_param_elems", frozenset())
+        if not sub["reached_return"]:
+            lost = self._valueless_return_leaf(ins, callee_fn, tainted_args, caller_instrs)
+            if lost is not None:
+                out["leaves"].append(lost)
+        if not ssa_writes(ins) and "TAILCALL" not in op_name(ins):
+            out["leaves"].append(self._dropped_result_leaf(ins, callee_fn, tainted_args,
+                                                           caller_fn))
         return out
+
+    def _dropped_result_leaf(self, ins: Any, callee_fn: Any, tainted_args: dict,
+                             caller_fn: Any) -> dict[str, Any]:
+        """#1034 item 5, at the call site (#1050 review round 9): BN's MLIL gives
+        a descended call with tainted arguments NO result, so whatever the
+        callee returns is not followed. Whether the caller uses the return
+        register is not checked -- two rounds of LLIL scanning each missed a
+        read (a jump table, a loop back edge) -- so every such call is a
+        blocking frontier. The cost: a void callee that receives tainted
+        arguments withholds the all-clear too."""
+        call_at = hex(int(getattr(ins, "address", 0)))
+        fn_at = hex(int(getattr(caller_fn, "start", 0) if caller_fn is not None
+                        else getattr(ins, "address", 0)))
+        leaf = self._frontier_leaf(
+            ins, callee_fn, tainted_args,
+            f"tainted arg(s) {sorted(tainted_args)} passed to "
+            f"{self._prose_function(callee_fn)} at {call_at}: Binary Ninja recovered no "
+            f"result for this call; bn does not check whether the caller uses the return "
+            f"register -- check the disassembly after the call with `bn disasm {fn_at}`")
+        leaf["cause"] = "return_value_unrecovered"
+        return leaf
+
+    def _valueless_return_leaf(self, ins: Any, callee_fn: Any, tainted_args: dict,
+                               caller_instrs: list | None) -> dict[str, Any] | None:
+        """#1034 item 5: a frontier where BN's recovered IL cannot say whether a
+        tainted argument reaches the callee's return.
+
+        On AArch64 `long ident(long v) { return v; }` is a bare `ret` that leaves
+        x0 unchanged, and BN recovers it as `return` with no operand. Taint then
+        found no tainted return and the caller's flow vanished into a confident
+        all-clear, though the x86-64 build of the same source reports the sinks.
+        No guess about the register is made here; two facts BN itself reports
+        are compared after the walk: every return of the callee carries no value,
+        while the call site consumes one -- BN gave the call an output, or it is
+        a tail call from a function whose own returns carry a value. Then the
+        flow is unknown, and a frontier says so instead of a clean result."""
+        try:
+            callee_instrs = self._instrs(self._ssa_func(callee_fn))
+        except TaintError:
+            return None
+        rets = [i for i in callee_instrs if op_name(i) == "MLIL_RET"]
+
+        def operands(ret: Any) -> list:
+            srcs = getattr(ret, "src", None)
+            if not isinstance(srcs, (list, tuple)):
+                srcs = [] if srcs is None else [srcs]
+            return list(srcs)
+
+        if not rets or any(operands(r) for r in rets):
+            return None
+        if ssa_writes(ins):
+            consumer = "the call's result is used"
+        elif "TAILCALL" in op_name(ins) and any(
+                op_name(i) == "MLIL_RET" and operands(i) for i in caller_instrs or []):
+            consumer = "it is tail-called by a function that returns a value"
+        else:
+            return None
+        at = hex(int(getattr(callee_fn, "start", 0)))
+        leaf = self._frontier_leaf(
+            ins, callee_fn, tainted_args,
+            f"tainted arg(s) {sorted(tainted_args)} passed to "
+            f"{self._prose_function(callee_fn)}, whose returns Binary Ninja recovered "
+            f"with no value, while {consumer}: whether the arguments reach that value "
+            f"is unknown (a register the body leaves unchanged is not modeled) -- read "
+            f"the body with `bn disasm {at}`")
+        leaf["cause"] = "return_value_unrecovered"
+        return leaf
 
     def _unrecovered_arg_frontier(self, ins: Any, tainted: set) -> dict[str, Any] | None:
         """Honest frontier for the #381 silent drop. When a tainted value sits in
@@ -4851,17 +5122,46 @@ class TaintEngine:
         processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
         out_params: set[int] = set()         # this func's params whose pointee got tainted
         out_param_elems: set = set()         # (param_idx, field) descriptor-array elems filled (#319b)
-        # Static-state tokenizers (`continuation` models, e.g. strtok): the most
-        # recent call in THIS function whose `null_arg` was tainted, keyed by
-        # model key -> (tainted node, call address, call instruction). A later `strtok(NULL, ..)`
-        # reads that state, not an argument, so without it every token after
-        # the first silently dropped taint -- no leaf, no assumption.
-        continuation_state: dict[str, tuple] = {}
-        # model key -> [(addr, call instruction)] of the CLEAN non-NULL calls
-        # seen after the tainted one (address order): together they kill the
-        # continuation only when they lie on every path from the tainted call
-        # to the `strtok(NULL)` (`_reaches_avoiding`).
-        clean_resets: dict[str, list[tuple]] = {}
+        # Static-state tokenizers (`continuation` models, e.g. strtok): every
+        # call SITE in THIS function whose `null_arg` was tainted, keyed by
+        # (model key, IL index) -> (tainted node, call address, call
+        # instruction). A later `strtok(NULL, ..)` reads that state, not an
+        # argument, so without it every token after the first silently dropped
+        # taint -- no leaf, no assumption. The set only grows, and a new site
+        # forces another fixpoint pass (#932): an optimised lift can list the
+        # continuation BEFORE the initializer that arms it, and a pass that
+        # discovered state without revisiting left that continuation unarmed.
+        continuation_state: dict[tuple[str, int], tuple] = {}
+        # model key -> every non-NULL call of a continuation model in this
+        # function, collected up front so the reset test does not depend on IL
+        # order. A candidate is a clean reset while its string is untainted
+        # (taint only grows, so it can stop being one, never become one again);
+        # clean resets kill a continuation only when they lie on EVERY path from
+        # the tainted call to the `strtok(NULL)` (`_reaches_avoiding`).
+        reset_candidates: dict[str, list[tuple]] = {}
+        for _cand in instrs:
+            if not self._is_call(_cand):
+                continue
+            _cname = self._callee_name(self._resolve_direct_target(_cand))
+            _ckey, _cmodel = lookup_model(self.models, _cname)
+            _co = (_cmodel or {}).get("continuation")
+            if _co is None:
+                continue
+            _ci = int(_co.get("null_arg", 0))
+            _cp = self._call_params(_cand)
+            if _ci < len(_cp) and self._int_const(_cp[_ci]) != 0:
+                reset_candidates.setdefault(_ckey or _cname or "?", []).append(
+                    (int(getattr(_cand, "address", 0)), _cand, _cp, _ci))
+
+        def clean_resets(ckey: str) -> list[tuple]:
+            return [(a, rins) for a, rins, rparams, ci in reset_candidates.get(ckey, [])
+                    if self._token_hit_node(ssaf, rparams, f"*arg:{ci}", tainted) is None]
+        # (continuation call, state site) -> the facts its caveat is written from
+        # once the fixpoint has converged.
+        continuations: dict[tuple, tuple] = {}
+
+        def ins_key(i: Any) -> int:
+            return int(getattr(i, "instr_index", getattr(i, "address", 0)))
         reached_return = False
 
         def add_assumption(msg: str) -> None:
@@ -5145,6 +5445,94 @@ class TaintEngine:
                              "callee_variadic": variadic, "recovery_advice": advice,
                              "class_from": "recovered_args" if argidx < len(params) else "model"}
 
+            def format_gated_sink(sink: dict[str, Any]) -> bool:
+                """#1041 item 4: a scanf-family `%s`/`%[` conversion with no
+                width writes an input token of any length into its destination.
+                Armed only by what the CONSTANT format says -- never guessed
+                from a format the engine cannot read, which is disclosed instead
+                -- and, when the model names `tainted_args` (sscanf's input
+                string), only while that input is tainted. Without them the
+                input is a stream or stdin and the sink is unconditional, like
+                gets(): each named destination is injected as an unconditional
+                root, so flows out of it are not attributed to --source."""
+                fa, first = int(sink["format_arg"]), int(sink["first_dest"])
+                prose = self._prose_name(mkey or name or "?")
+                gate_hit: list = []
+                gate_idx = None
+                for gi in sink.get("tainted_args") or []:
+                    if gi < len(params):
+                        gate_hit = arg_taint(params[gi])
+                        if gate_hit:
+                            gate_idx = gi
+                            break
+                if sink.get("tainted_args") and not gate_hit:
+                    return False
+                if fa >= len(params):
+                    return False
+                usig = (addr, "format") if site_taddr is None else (addr, "format", site_taddr)
+                if usig in recorded_sinks:
+                    return False
+                fmt = self._const_format_string(ssaf, params[fa])
+                convs = unbounded_scanf_strings(fmt) if fmt is not None else None
+                if convs is None:
+                    # The conversions are unknown, so whether this call writes
+                    # an unbounded token is unknown: a frontier the claim gate
+                    # withholds on, never a silent "no sink" (#1050 review
+                    # finding 4). Its conversions are not guessed.
+                    recorded_sinks.add(usig)
+                    why_not = ("is not a constant string in read-only data" if fmt is None
+                               else "uses POSIX %n$ positions")
+                    leaf = {
+                        "kind": "format_unchecked",
+                        "address": hex(addr),
+                        "callee": str(mkey or name or "?"),
+                        "format_arg": fa,
+                        "reason": "positional" if fmt is not None else "not_constant",
+                        "detail": (f"{prose}() at {hex(addr)}: its format (arg{fa}) {why_not}, "
+                                   f"so its conversions could not be checked for a width-less "
+                                   f"%s/%[ -- whether it writes an unbounded token is unknown"),
+                    }
+                    if leaf not in leaves:
+                        leaves.append(leaf)
+                    return False
+                if not convs:
+                    recorded_sinks.add(usig)
+                    return False
+                recorded_sinks.add(usig)
+                dests = [{"conversion": spec, "dest_arg": first + k} for k, spec in convs]
+                listed = ", ".join(f"{d['conversion']} into arg{d['dest_arg']}" for d in dests)
+                eff = {**sink, "format_conversions": dests,
+                       "detail": (f"width-less conversion(s) in the constant format write an "
+                                  f"input token of unbounded length: {listed}")}
+                if gate_idx is not None:
+                    findings.append(_tag_unconditional_flow(
+                        self._make_finding(ins, mkey or name, gate_idx, eff, gate_hit, why),
+                        gate_hit))
+                    return False
+                hit_nodes = []
+                grew = False
+                for d in dests:
+                    di = d["dest_arg"]
+                    dest = (self._buffer_target(ssaf, params[di]) if di < len(params) else None)
+                    if dest is not None:
+                        node, lbl = (dest[0], None), dest[1]
+                    else:
+                        node = (("name", f"{mkey or name}_arg{di}@{hex(addr)}"), None)
+                        lbl = var_label_of(node)
+                    if taint_node(node, lbl, ins,
+                                  f"{mkey or name}(): width-less {d['conversion']} reads an "
+                                  f"unbounded token", []):
+                        grew = True
+                    unconditional_roots.add(node)
+                    hit_nodes.append(node)
+                add_assumption(
+                    f"{prose}(): unconditional {sink.get('class') or '?'} sink at {hex(addr)} "
+                    f"independently of --source ({listed}; the finding does not require any "
+                    f"tracked taint to reach this call)")
+                findings.append(_tag_unconditional_flow(
+                    self._make_finding(ins, mkey or name, None, eff, hit_nodes, why), hit_nodes))
+                return grew
+
             sink = model.get("sink")
             # opt-in sinks (e.g. file_write) stay silent unless their gate was
             # enabled for this run; still a "modeled" call, so no fallback noise.
@@ -5156,6 +5544,10 @@ class TaintEngine:
                 _gate = sink.get("gate") or sink.get("class")
                 if _gate not in self._enabled_sink_classes:
                     sink = None
+            if sink is not None and sink.get("format_arg") is not None:
+                if format_gated_sink(sink):
+                    changed = True
+                sink = None
             if sink is not None:
                 # #615/review F3: an unconditional sink is one whose arming fields
                 # are BOTH empty -- no `tainted_args` and no `len_arg` -- independent
@@ -5474,9 +5866,11 @@ class TaintEngine:
                 ckey = mkey or name or "?"
                 if cidx < len(params):
                     if self._int_const(params[cidx]) == 0:
-                        st = continuation_state.get(ckey)
-                        if st is not None:
-                            st_node, st_addr, st_ins = st
+                        resets = clean_resets(ckey)
+                        for (state_key, _site), (st_node, st_addr, st_ins) in list(
+                                continuation_state.items()):
+                            if state_key != ckey:
+                                continue
                             # A clean non-NULL call resets libc's state -- but
                             # it kills the continuation only when the clean
                             # calls lie on EVERY path from the tainted call to
@@ -5486,40 +5880,34 @@ class TaintEngine:
                             # call yet the tainted call at the bottom of the
                             # body reaches it around the back-edge (round 4
                             # P2) -- so the test is reachability with the
-                            # resets removed, not dominance.
-                            resets = clean_resets.get(ckey) or []
-                            killed = bool(resets) and self._reaches_avoiding(
+                            # resets removed, not dominance. It runs with NO
+                            # resets too (#932): every tainted site is state now,
+                            # not just the latest in IL order, so a site that
+                            # cannot reach this call at all must not arm it. A
+                            # view without block information answers None and
+                            # stays armed.
+                            killed = self._reaches_avoiding(
                                 st_ins, ins, [rins for _, rins in resets]) is False
-                            if not killed:
-                                for rule in model.get("propagates") or []:
-                                    if _try_arg_index(str(rule.get("from") or "")) != cidx:
-                                        continue
-                                    if apply_token(rule.get("to"), [st_node]):
-                                        changed = True
-                                partial = ""
-                                if resets:
-                                    partial = (
-                                        f"; a clean {self._prose_name(name or mkey)} @ "
-                                        f"{', '.join(hex(ra) for ra, _ in resets)} resets "
-                                        f"the state on SOME path but not on every path "
-                                        f"from the tainted call to this one, so the tainted "
-                                        f"line continues on the others")
-                                add_assumption(
-                                    f"{self._prose_name(name or mkey)}(NULL, ...) @ {hex(addr)} continues the "
-                                    f"tokenizer state of the tainted {self._prose_name(name or mkey)} call @ "
-                                    f"{hex(st_addr)}: modeled flow-insensitively (the most "
-                                    f"recent tainted {self._prose_name(name or mkey)} in this function), not by "
-                                    f"control flow; a continuation of a buffer tokenized in "
-                                    f"ANOTHER function is not followed{partial}")
+                            if killed:
+                                continue
+                            for rule in model.get("propagates") or []:
+                                if _try_arg_index(str(rule.get("from") or "")) != cidx:
+                                    continue
+                                if apply_token(rule.get("to"), [st_node]):
+                                    changed = True
+                            # Disclosed after convergence, from the FINAL taint:
+                            # which calls are clean resets changes across passes,
+                            # and a caveat written mid-fixpoint kept naming a
+                            # site "clean" that a later pass tainted (round 1
+                            # finding 7).
+                            continuations[(ins_key(ins), state_key, _site)] = (
+                                name or mkey, ckey, addr, st_addr, st_ins, ins)
                     else:
                         hit = self._token_hit_node(ssaf, params, f"*arg:{cidx}", tainted)
-                        if hit is not None:
-                            continuation_state[ckey] = (hit, addr, ins)
-                            # Resets recorded before this (address-ordered)
-                            # tainted call cannot kill what it re-arms.
-                            clean_resets.pop(ckey, None)
-                        elif not any(ra == addr for ra, _ in clean_resets.get(ckey) or []):
-                            clean_resets.setdefault(ckey, []).append((addr, ins))
+                        state_key = (ckey, int(getattr(ins, "instr_index", addr)))
+                        if hit is not None and state_key not in continuation_state:
+                            continuation_state[state_key] = (hit, addr, ins)
+                            changed = True
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
                 frm = rule.get("from")
@@ -5821,9 +6209,9 @@ class TaintEngine:
                     if target is not None:
                         candidates, via = [target], None
                     else:
-                        mapped = self.resolve_map.get(hex(int(getattr(ins, "address", 0))))
+                        mapped = self.resolve_map.get(int(getattr(ins, "address", 0)))
                         if mapped:
-                            candidates = [int(x, 16) if isinstance(x, str) else int(x) for x in mapped]
+                            candidates = list(mapped)
                             via = "agent-map"
                         else:
                             candidates = self._call_targets_from_pvs(
@@ -5937,7 +6325,8 @@ class TaintEngine:
                             if mchanged:
                                 changed = True
                         if descend_internal:
-                            d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth, via=via)
+                            d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth,
+                                              via=via, caller_instrs=instrs, caller_fn=func)
                             # Round-3 blocker: `_descend`'s rebuild strips per-finding
                             # taint-graph context, so a finding's provenance can only be
                             # re-checked HERE, against the CALLER's own why-chain, using
@@ -6327,6 +6716,51 @@ class TaintEngine:
             self._truncated = True
             self._truncation_causes.add("fixpoint_exhausted")
 
+        # The in-function continuations the fixpoint followed, written from the
+        # converged taint, one caveat per (continuation, arming site). A clean
+        # call is named as a partial reset only when it provably lies on a path
+        # from the tainted call to this one -- a clean `strtok` that runs BEFORE
+        # the tainted call is on no such path (#1050 review round 3). One whose
+        # path relation is unknown (no block information, or successors BN
+        # could not determine) is named neutrally.
+        def on_path(src: Any, dsts: list[Any],
+                    resets: list[tuple]) -> tuple[list[int], list[int]]:
+            proven: list[int] = []
+            unknown: list[int] = []
+            for ra, rins in resets:
+                into = self._reaches_avoiding(src, rins, [])
+                out = [self._reaches_avoiding(rins, d, []) for d in dsts]
+                if into is True and any(o is True for o in out):
+                    proven.append(ra)
+                elif into is not False and any(o is not False for o in out):
+                    unknown.append(ra)
+            return proven, unknown
+
+        def reset_clause(name: str, proven: list[int], unknown: list[int], what: str) -> str:
+            parts = []
+            if proven:
+                parts.append(f"a clean {name} @ {', '.join(hex(a) for a in proven)} resets "
+                             f"the state on SOME path but not on every path {what}")
+            if unknown:
+                parts.append(f"a clean {name} @ {', '.join(hex(a) for a in unknown)} was not "
+                             f"shown to lie on every path {what} (reachability unknown: no "
+                             f"block information, or successors Binary Ninja could not "
+                             f"determine)")
+            return "; ".join(parts)
+
+        for (_ck, _sk, _site), (cname, ckey, addr, st_addr, st_ins, cins) in sorted(
+                continuations.items(), key=lambda kv: kv[0]):
+            proven, unknown = on_path(st_ins, [cins], clean_resets(ckey))
+            clause = reset_clause(self._prose_name(cname), proven, unknown,
+                                  "from the tainted call to this one")
+            partial = f"; {clause}, so the tainted line is kept" if clause else ""
+            add_assumption(
+                f"{self._prose_name(cname)}(NULL, ...) @ {hex(addr)} continues the "
+                f"tokenizer state of the tainted {self._prose_name(cname)} call @ "
+                f"{hex(st_addr)}, which reaches it on a path with no clean "
+                f"reset; a continuation of a buffer tokenized in "
+                f"ANOTHER function is not followed{partial}")
+
         # A tokenizer's static state still tainted when this function returns:
         # a `strtok(NULL, ..)` in a CALLER or a CALLEE continues it, and the
         # continuation model is per function, so that flow is not followed. The
@@ -6334,8 +6768,8 @@ class TaintEngine:
         # was the M-15 hole one call deeper (PR-928 review P2). Disclosed under
         # a marker the zero-sink gate withholds the all-clear on.
         rets = [i for i in instrs if op_name(i) == "MLIL_RET"]
-        for ckey, (_, st_addr, st_ins) in continuation_state.items():
-            resets = clean_resets.get(ckey) or []
+        for (ckey, _site), (_, st_addr, st_ins) in continuation_state.items():
+            resets = clean_resets(ckey)
             # The state is clean at return only when the clean resets lie on
             # EVERY path from the tainted call to every return (the same
             # reachability test as the in-function continuation, round 4 P2);
@@ -6345,18 +6779,20 @@ class TaintEngine:
                     self._reaches_avoiding(st_ins, r, [rins for _, rins in resets]) is False
                     for r in rets):
                 continue
-            partial = ""
-            if resets:
-                partial = (f" (a clean {self._prose_name(ckey)} @ "
-                           f"{', '.join(hex(ra) for ra, _ in resets)} resets it on some "
-                           f"path but not on every path to a return)")
+            proven, unknown = on_path(st_ins, rets, resets)
+            clause = reset_clause(self._prose_name(ckey), proven, unknown, "to a return")
+            partial = f" ({clause})" if clause else ""
+            # #1033 item 6: which function continues the tokenizer is not known
+            # here, so the seed inside it is a template, not a command.
+            reseed = command_template(
+                f"bn taint forward -f FUNCTION --source {shlex.quote('ret:' + ckey)}")
             add_assumption(
                 f"tokenizer_state_escapes @ {hex(st_addr)}: the static tokenizer "
                 f"state of {self._prose_name(ckey)} is tainted by the {self._prose_name(ckey)} call @ {hex(st_addr)} when "
                 f"{self._prose_function(func)} returns{partial}; a {self._prose_name(ckey)}(NULL, ...) continuation in "
                 f"ANOTHER function (a caller or a callee) is not followed, so a 'no "
-                f"sinks reached' result is NOT an all-clear -- seed `bn taint forward` "
-                f"inside the function that continues the tokenizer")
+                f"sinks reached' result is NOT an all-clear -- seed the tokens inside "
+                f"the function that continues the tokenizer ({reseed})")
 
         # #193 Part 1 honesty: for each registered recv-buffer slot that the fixpoint
         # did NOT correlate to a re-load, emit the deferred "may be missed" caveat --
@@ -6567,14 +7003,38 @@ class TaintEngine:
                 # false all-clear. Nudge the user to seed the filled buffer var so
                 # the silent miss becomes actionable.
                 if kind == "arg" and (callee or "").split("@", 1)[0].lstrip("_") in _RECVMSG_FAMILY:
+                    _fn = hex(int(func.start))
+                    _var_seed = command_template(f"bn taint forward -f {_fn} --source var:VAR")
+                    # #1050 review finding 5: offer `call:` only when the engine's
+                    # own iovec resolver -- the one a call: run uses -- finds a
+                    # buffer to seed here. A msghdr built elsewhere (a parameter)
+                    # leaves call: with nothing to seed, and that command failed.
+                    _, _rm = lookup_model(self.models, callee)
+                    _hdr = next((int(t.rsplit(":", 1)[1])
+                                 for t in (str(s.get("to") or "")
+                                           for s in (_rm or {}).get("sources") or [])
+                                 if t.startswith("*iovec:") and t.rsplit(":", 1)[1].isdigit()),
+                                None)
+                    # Exactly the call: path's own criterion for seeding an
+                    # iovec buffer: a keyed buffer, or a pointer value to taint.
+                    _resolves = _hdr is not None and any(
+                        self._buffer_target(ssaf, b) is not None or expr_reads(b)
+                        for c in calls for b in self._recvmsg_iov_buffers(ssaf, instrs, c, _hdr))
+                    if _resolves:
+                        _how = (f"Use `bn taint forward -f {_fn} --source "
+                                f"{shlex.quote('call:' + str(callee))}`, which resolves the iovec "
+                                f"buffer from the msg_iov/iov_base setup here, or seed the filled "
+                                f"buffer directly ({_var_seed}).")
+                    else:
+                        _how = (f"The iovec is not built in this function, so call:{callee} "
+                                f"cannot resolve its buffer either; seed the filled buffer "
+                                f"directly ({_var_seed}), or run taint from the caller that "
+                                f"builds the iovec.")
                     add_assumption(
                         f"{self._prose_name(callee)} writes the received bytes to the scatter-gather iov "
                         f"buffer(s) (msghdr->msg_iov[i].iov_base; for recvmmsg, per msgvec "
                         f"entry), not the header pointer this --source seeds; the payload "
-                        f"taint is NOT followed from here. Use --source call:{callee}, which "
-                        f"resolves the iovec buffer from the msg_iov/iov_base setup "
-                        f"automatically, or seed the filled buffer directly (--source "
-                        f"var:<buf>) when the iovec is built dynamically."
+                        f"taint is NOT followed from here. {_how}"
                     )
                     # #562: structured leaf so JSON `leaves` is non-empty and the
                     # claim gate withholds an all-clear. An arg:recvmsg:N seed
@@ -6585,6 +7045,7 @@ class TaintEngine:
                         callee=str(callee),
                         arg_index=int(src.get("index", 1)),
                         reason="msghdr_not_payload",
+                        call_resolves_iovec=_resolves,
                     ))
                 if kind == "ret":
                     # A ret: source on a function whose model also fills an
@@ -6693,6 +7154,16 @@ class TaintEngine:
                                         address=hex(int(getattr(c, "address", 0))),
                                         reason="buffer_not_keyed",
                                     ))
+                if kind == "arg":
+                    # #1041 item 1 gate (#1050 review rounds 4-5): this arg is a
+                    # buffer the model says the call fills; the gate checks only
+                    # unresolved indirect calls in THIS function, not syscalls.
+                    _, _fm = lookup_model(self.models, callee)
+                    _idx = int(src["index"])
+                    if any(str(s.get("to") or "") in (f"*arg:{_idx}", f"*iovec:{_idx}")
+                           for s in (_fm or {}).get("sources") or []):
+                        self._buffer_seeded = True
+                        self._unchecked_indirect_calls(instrs, calls, callee, add_leaf)
                 if kind == "ret" and not ret_seeded:
                     # T3: callsites of `callee` exist but NONE consume its return
                     # value (a void or discarded return), so a ret: source has
@@ -6736,6 +7207,9 @@ class TaintEngine:
                     )
                 for c in calls:
                     params = self._call_params(c)
+                    short = self._format_destination_shortfall(c, ssaf, callee, model, params)
+                    if short is not None:
+                        add_leaf(short)
                     for sd in src_defs:
                         to = str(sd.get("to") or "")
                         if to == "ret" or to == "*ret":
@@ -6815,8 +7289,9 @@ class TaintEngine:
                                     f"not be statically resolved -- likely a dynamically-built "
                                     f"iovec or a receive-helper whose caller passes the out-buffer "
                                     f"(#452). The payload taint is NOT followed from here; seed the "
-                                    f"filled buffer directly (--source var:<buf>) or, for a helper, "
-                                    f"seed the buffer the caller passes in.")
+                                    f"filled buffer directly "
+                                    f"({command_template(f'bn taint forward -f {hex(int(func.start))} --source var:VAR')}) "
+                                    f"or, for a helper, seed the buffer the caller passes in.")
                         elif to.startswith("*arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):
@@ -6832,12 +7307,23 @@ class TaintEngine:
                                                       f"source: {callee} arg{idx} (call: preset)", []):
                                             seeded = True
                                     # #562: no recv-buffer leaf fires on the call:
-                                    # preset path, so the indirect-slot leaf is the
-                                    # only thing that can withhold the all-clear here.
-                                    self._register_indirect_buffer_slot(
+                                    # preset path. The indirect-slot helper owns an
+                                    # indirect-load pointer (its slot may correlate
+                                    # forward, #193, so it decides post-fixpoint);
+                                    # every other unkeyable destination -- e.g.
+                                    # `c->buf + have`, a field load plus an offset --
+                                    # left only the pointer seeded, so disclose it as
+                                    # the arg: path does (#1041 item 1). A constant
+                                    # NULL destination receives nothing.
+                                    owned = self._register_indirect_buffer_slot(
                                         ssaf, params[idx], c, callee, idx, buffer_slots,
                                         add_assumption, add_leaf=add_leaf,
                                         recv_buffer_covered=False)
+                                    if not owned and self._int_const(params[idx]) != 0:
+                                        add_leaf(misanchored_recv_leaf(
+                                            callee=str(callee), arg_index=idx,
+                                            address=hex(int(getattr(c, "address", 0))),
+                                            reason="buffer_not_keyed", seed="call"))
                         elif to.startswith("arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):
@@ -6871,6 +7357,13 @@ class TaintEngine:
                                 f"the modeled run (arg:{_mx + 1}+) are not "
                                 f"seeded. scanf_arity_residual"
                             )
+                # #1041 item 1 gate (#1050 review rounds 4-5): the model fills a
+                # buffer, so an unresolved indirect call in THIS function that
+                # can run after the receive is an unchecked consumer of it.
+                if any(str(sd.get("to") or "").startswith(("*arg:", "*iovec:"))
+                       for sd in src_defs):
+                    self._buffer_seeded = True
+                    self._unchecked_indirect_calls(instrs, calls, callee, add_leaf)
             else:
                 raise TaintError(f"unknown source kind: {kind}")
         return seeded
@@ -6947,6 +7440,7 @@ class TaintEngine:
                 "class": sink.get("class"),
                 "detail": sink.get("detail"),
                 **({"format_constant": sink["format_constant"]} if sink.get("format_constant") is not None else {}),
+                **({"format_conversions": sink["format_conversions"]} if sink.get("format_conversions") else {}),
                 **({"source_bound": sink["source_bound"]} if sink.get("source_bound") else {}),
                 **({"via": sink["via"]} if sink.get("via") else {}),
                 # A model-declared argument was dropped, whether the tainted

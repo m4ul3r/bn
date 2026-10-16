@@ -1,0 +1,10 @@
+{
+  "description": "#1041 item 1: a call:recv seed whose buffer is a struct field plus an offset is a source_seed_misanchored frontier that also discloses that indirect calls which may receive this buffer (the callback here) are not followed; never an all-clear. Following the callback was narrowed to disclosure after #1050 review round 3.",
+  "lang": "c",
+  "cflags": ["-O2"],
+  "forward": [
+    {"function": "pump_cb", "source": "call:recv",
+     "leaves": [{"kind": "source_seed_misanchored"}],
+     "all_clear": false}
+  ]
+}

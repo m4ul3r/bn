@@ -10359,6 +10359,60 @@ def test_failed_import_preview_counts_reverted_siblings_and_all_kept_types_1012(
     assert "kept library imports (a rollback cannot remove them): passwd, __uid_t" in text
 
 
+# --------------------------------------------------------------------------
+# #1041 item 6: taint output volume
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("name", "elided"), [
+    ("std::_Hashtable<std::string, std::pair<std::string const, int>>::clear",
+     "std::_Hashtable<…>::clear"),
+    ("std::operator<< <std::char_traits<char> >", "std::operator<< <…>"),
+    ("cmp::operator<(cmp const&)", "cmp::operator<(cmp const&)"),
+    ("Widget::operator->()", "Widget::operator->()"),
+    ("broken<int", "broken<int"),                  # unbalanced: untouched
+    ("call:recv → <memory store>", "call:recv → <memory store>"),  # a placeholder, not a template
+])
+def test_compact_flow_line_elides_template_arguments_1041(name, elided):
+    from bn.formatters import _elide_template_args
+    assert _elide_template_args(name) == elided
+
+
+def test_compact_flow_line_keeps_full_names_under_mangled_1041():
+    from bn.formatters import _render_flow_line
+    sig = {"rendered": "call:recv → _ZN3fooIiE3barEv → [alloc_size] _Znam",
+           "rendered_display": "call:recv → foo<int>::bar() → [alloc_size] operator new[]"}
+    flow = {"sink": {"class": "alloc_size", "callee": "Znam", "address": "0x10",
+                     "tainted_arg_index": 0}, "signature": sig, "metrics": {}}
+    assert "foo<…>::bar()" in _render_flow_line(flow)
+    assert "_ZN3fooIiE3barEv" in _render_flow_line(flow, mangled=True)
+
+
+def test_taint_models_text_caps_callsite_rows_and_counts_the_rest_1041():
+    from bn.formatters import _render_taint_models_text
+    rows = [{"address": hex(0x1000 + i), "function": f"f{i}"} for i in range(25)]
+    value = {"sinks_by_class": {"alloc_size": [
+        {"symbol": "Znwm", "tainted_args": [0], "present": True,
+         "callsite_count": 25, "callsites": rows}]}}
+
+    capped = _render_taint_models_text(value, callsite_limit=10).splitlines()
+    assert sum(1 for ln in capped if ln.strip().startswith("0x")) == 10
+    assert any("+15 more callsite(s)" in ln for ln in capped)
+    every = _render_taint_models_text(value, callsite_limit=0).splitlines()
+    assert sum(1 for ln in every if ln.strip().startswith("0x")) == 25
+    assert not any("more callsite" in ln for ln in every)
+
+
+def test_compact_flow_line_lists_candidate_sources_of_a_multiple_flow_1050():
+    from bn.formatters import _render_flow_line
+    flow = {"sink": {"class": "overflow_len", "callee": "memcpy", "address": "0x14",
+                     "tainted_arg_index": 2},
+            "signature": {"rendered": "multiple → [overflow_len] memcpy"},
+            "metrics": {}, "source_candidates": ["param:0", "param:1"]}
+    assert "(reached by each of: param:0, param:1)" in _render_flow_line(flow)
+    flow["source_candidates"] = ["param:1"]
+    assert "reached by each of" not in _render_flow_line(flow)
+
+
 def test_mutation_text_says_how_a_placeholder_name_resolved_1048():
     """#1048 review: `rename data_420010 g_live` printed only counts; the compact
     line and the verbose op row now carry the resolution note."""
