@@ -5645,7 +5645,10 @@ class TestBatchPreviewImports1012:
         "struct_field_set", "set_prototype", "local_retype", "data_retype",
     ])
     @pytest.mark.parametrize("batched", [False, True])
-    def test_every_type_parser_discloses_kept_imports(self, shared_bn, tmp_path, kind, batched):
+    def test_every_type_parser_previews_without_importing(self, shared_bn, tmp_path, kind, batched):
+        """#1012 items 1-2: every type-string parser previews with
+        `import_dependencies=False`: the op is refused naming the library type,
+        no type id changes, and a batched sibling is reverted."""
         shared_bn.load(ADD_BINARY)
         address = shared_bn.json("function", "info", "add")["function"]["address"]
         shared_bn.json("types", "declare", "struct PreviewSlot { int a; int b; };")
@@ -5675,17 +5678,21 @@ class TestBatchPreviewImports1012:
         assert response.returncode == 3, response.stdout + response.stderr
         result = json.loads(response.stdout)
         after = dict(json.loads(shared_bn.run("py", "exec", "--code", probe).stdout))
-        imported = {name for type_id, name in after.items() if type_id not in before}
-        assert "passwd" in imported, result
-        assert set(result["kept_library_imports"]) == imported, result
-        assert set(result["results"][-1]["imported_from_library"]) == imported, result
-        assert result["results"][-1]["status"] == "unsupported", result
+        assert after == before, result
+        assert "kept_library_imports" not in result, result
+        row = result["results"][-1]
+        assert row["status"] == "unsupported", result
+        assert "not previewed: needs passwd from" in row["message"], result
+        assert "imported_from_library" not in row, result
         if batched:
             assert result["results"][0]["status"] == "reverted", result
-            assert "imported_from_library" not in result["results"][0], result
 
-    def test_snapshot_import_belongs_to_unattempted_later_declare(self, shared_bn, tmp_path):
+    def test_snapshot_parse_of_a_later_declare_imports_nothing(self, shared_bn, tmp_path):
+        """The pre-apply snapshot parses a later declare; under a preview that
+        parse imports nothing either, so an earlier failure keeps no types."""
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         manifest = tmp_path / "late.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "set_comment", "function": "missing_function", "comment": "x"},
@@ -5693,42 +5700,45 @@ class TestBatchPreviewImports1012:
         response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
         assert response.returncode == 3, response.stdout + response.stderr
         result = json.loads(response.stdout)
-        assert "timespec" in result["kept_library_imports"], result
-        assert "imported_from_library" not in result["results"][0], result
-        assert "timespec" in result["results"][1]["imported_from_library"], result
-        assert result["results"][1]["parse_performed"] is True, result
-        assert result["results"][1]["status"] == "unsupported", result
+        assert "kept_library_imports" not in result, result
+        assert all("imported_from_library" not in row for row in result["results"]), result
+        assert result["results"][1]["status"] == "not_attempted", result
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
 
-    def test_skipped_auto_prototype_parse_is_an_importing_step(self, shared_bn, tmp_path):
+    def test_skipped_auto_prototype_needing_a_library_type_imports_nothing(self, shared_bn, tmp_path):
+        """An AUTO prototype the preview leaves out anyway (has_user_type pin)
+        no longer imports while it is checked: it stays `not_previewed`, says
+        it needs `passwd`, and the sibling previews at exit 0."""
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         manifest = tmp_path / "auto.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "set_prototype", "identifier": "add", "prototype": "int add(struct passwd* p)"},
             {"op": "set_comment", "function": "mul", "comment": "preview only"}]}))
         response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
-        assert response.returncode == 3, response.stdout + response.stderr
+        assert response.returncode == 0, response.stdout + response.stderr
         result = json.loads(response.stdout)
-        assert "passwd" in result["kept_library_imports"], result
-        assert result["results"][0]["status"] == "unsupported", result
-        assert result["results"][0]["parse_performed"] is True, result
-        assert result["results"][1]["status"] == "reverted", result
+        assert "kept_library_imports" not in result, result
+        assert result["results"][0]["status"] == "not_previewed", result
+        assert "needs passwd, which a preview does not import" in result["results"][0]["message"], result
+        assert result["results"][1]["status"] == "verified", result
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
         assert shared_bn.json("proto", "get", "add")["function"]["name"] == "add"
 
-    def test_preflight_import_survives_later_preflight_error_honestly(self, shared_bn, tmp_path):
+    def test_preflight_library_need_then_later_preflight_error_imports_nothing(self, shared_bn, tmp_path):
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         manifest = tmp_path / "preflight.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "set_prototype", "identifier": "add", "prototype": "int add(struct passwd* p)"},
             {"op": "set_prototype", "identifier": "missing", "prototype": "int missing(int x)"}]}))
         response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
         assert response.returncode == 3, response.stdout + response.stderr
-        result = json.loads(response.stdout)
-        assert "passwd" in result["kept_library_imports"], result
-        assert result["results"][0]["status"] == "unsupported", result
-        assert result["results"][0]["parse_performed"] is True, result
-        assert "imported_from_library" not in result["results"][1], result
-        assert "Function not found: missing" in result["results"][1]["message"], result
-        assert result["results"][1]["status"] == "unsupported", result
+        assert "Function not found: missing" in response.stdout + response.stderr
+        assert "kept_library_imports" not in response.stdout, response.stdout
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
 
     @pytest.mark.parametrize("kind", ["function", "data"])
     @pytest.mark.parametrize("user_type", [False, True])
@@ -5753,19 +5763,24 @@ class TestBatchPreviewImports1012:
         assert shared_bn.json("function", "info", "add")["function"]["name"] == "add"
         assert shared_bn.run("function", "info", "preview_sum").returncode == 2
 
-    def test_import_warning_preserves_the_real_declaration_failure(self, shared_bn):
+    def test_library_refusal_comes_before_any_import_1012(self, shared_bn):
+        """A declaration that needs a library type and also collides with a
+        builtin: the preview stops at BN's refusal to import, imports nothing,
+        and names the library type."""
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         response = shared_bn.run(
             "types", "declare",
             "struct ImportThenFail { rusage r; }; struct uint32_t { int x; };",
             "--preview", "--format", "json")
         assert response.returncode == 3, response.stdout + response.stderr
         result = json.loads(response.stdout)
-        assert "rusage" in result["kept_library_imports"], result
+        assert "kept_library_imports" not in result, result
         row = result["results"][0]
         assert row["status"] == "unsupported", result
-        assert "uint32_t" in row["message"], result
-        assert "a preview cannot undo an import" in row["message"], result
+        assert "rusage" in row["message"] and "Nothing was imported" in row["message"], result
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
 
     def test_rename_advice_runs_with_an_earlier_noop(self, shared_bn, tmp_path):
         shared_bn.load(ADD_BINARY)
@@ -5856,18 +5871,19 @@ def test_importing_auto_prototype_retains_irreversible_refusal_1031(shared_bn, s
     response = shared_bn.run(*args)
     assert response.returncode == 3, response.stdout + response.stderr
     result = json.loads(response.stdout)
-    assert "passwd" in result["kept_library_imports"], result
-    message = result["first_error"] if summary else result["results"][0]["message"]
+    # Nothing was imported, so this is the plain AUTO-prototype refusal envelope
+    # (the same shape as one that never needed a library type).
+    assert result["ok"] is False and result["status"] == "unsupported", result
+    assert "kept_library_imports" not in json.dumps(result), result
+    message = result["error"]
     assert "has_user_type" in message and "cleanly reverted" in message, result
-    assert "a preview cannot undo an import" in message, result
-    if not summary:
-        assert "has_user_type" in result["message"], result
+    assert "needs passwd, which a preview does not import" in message, result
     flag = shared_bn.run("py", "exec", "--code",
                          "print(bv.get_functions_by_name('mul')[0].has_user_type)")
     assert flag.returncode == 0 and flag.stdout.strip() == "False", flag.stdout + flag.stderr
 
 
-@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize("preview", [False])
 @pytest.mark.parametrize("interface", ["cli", "wire"])
 def test_analysis_exception_discloses_kept_imports_without_replacing_error_1031(
         shared_bn, preview, interface):
