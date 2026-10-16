@@ -7514,6 +7514,17 @@ class TaintEngine:
                     walk(r, d + 1, lmv)
                 return
             la = self._mem_access_slot(ssaf, load)
+            root = self._addr_base_var(ssaf, addr)
+            if la is not None and is_ssa_var(root):
+                try:
+                    rdef = ssaf.get_ssa_var_definition(root)
+                except Exception:
+                    rdef = None
+                if op_name(rdef) == "MLIL_VAR_PHI":
+                    # A loop cursor (`[key_1#3].b`, key_1 = phi(key, key + 1)):
+                    # the address moves each trip, so no store can be matched
+                    # to it; walk the cursor (it leads to the buffer) instead.
+                    la = None
             gaps: list[str] = []
             found = False
             if la is None:
