@@ -1,0 +1,10 @@
+{
+  "description": "#1041 item 1 / #1050 review finding 6: a call:recv seed whose buffer is a struct field plus an offset is a source_seed_misanchored frontier, and the callback handed the same pointer is an indirect_call_unresolved frontier; never an all-clear.",
+  "lang": "c",
+  "cflags": ["-O2"],
+  "forward": [
+    {"function": "pump_cb", "source": "call:recv",
+     "leaves": [{"kind": "source_seed_misanchored"}, {"kind": "indirect_call_unresolved"}],
+     "all_clear": false}
+  ]
+}

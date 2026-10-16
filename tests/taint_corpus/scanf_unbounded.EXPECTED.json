@@ -1,12 +1,16 @@
 {
-  "description": "#1041 item 4: a scanf-family %s / %[ conversion with no field width is an overflow_unbounded sink. fscanf's input is a stream, so it fires unconditionally like gets() (no --source attribution); sscanf fires only while its input string (arg 0) is tainted. A width (%63[^\\n]) or an untainted constant input string is never a sink. Built with glibc's default C99 spellings (__isoc99_*).",
+  "description": "#1041 item 4: a scanf-family %s / %[ conversion with no field width is an overflow_unbounded sink. fscanf's input is a stream, so it fires unconditionally like gets() (no --source attribution); sscanf fires only while its input string (arg 0) is tainted. A width (%63[^\\n]) or an untainted constant input string is never a sink. A format in writable storage (a global another path rewrites) or with %n$ positions is not guessed either way: it is a format_unchecked frontier that withholds the all-clear (#1050 review findings 1 and 4). Built with glibc's default C99 spellings (__isoc99_*).",
   "lang": "c",
   "forward": [
     {"function": "load_line", "source": "param:0",
      "sinks": [{"callee": "__isoc99_fscanf", "class": "overflow_unbounded", "arg": null}],
      "assumptions_contain": ["unconditional overflow_unbounded sink", "%[ into arg2"]},
     {"function": "parse_reply", "source": "call:read",
-     "sinks": [{"callee": "__isoc99_sscanf", "class": "overflow_unbounded", "arg": 0}]}
+     "sinks": [{"callee": "__isoc99_sscanf", "class": "overflow_unbounded", "arg": 0}]},
+    {"function": "parse_mutable", "source": "param:0",
+     "leaves": [{"kind": "format_unchecked"}], "all_clear": false},
+    {"function": "parse_positional", "source": "param:0",
+     "leaves": [{"kind": "format_unchecked"}], "all_clear": false}
   ],
   "negative": [
     {"function": "load_line_bounded", "source": "param:0",

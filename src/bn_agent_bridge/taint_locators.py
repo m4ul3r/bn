@@ -292,12 +292,6 @@ def derive_flow_facts(*, direction: str,
                 chain.append(str(c))
         srcs = sources or []
         source = srcs[0] if len(srcs) == 1 else ("multiple" if len(srcs) > 1 else "?")
-        # #1041 item 6: with several sources, the one this flow's rendered path
-        # starts from (the engine records it on the first step). Only a source
-        # the run actually declared is named; anything else stays `multiple`.
-        root = steps[0].get("source") if steps else None
-        if len(srcs) > 1 and root in {_render_source(s) for s in srcs}:
-            source = root
         sink_class = (sink or {}).get("class")
         step_addrs = {s.get("address") for s in steps}
         traverses = any(lf.get("address") in step_addrs

@@ -166,7 +166,8 @@ class TaintEngine:
         # {call_address: [target_address, ...]}. `find_function` resolves a
         # target spelled as a function name exactly as `-f` does.
         self.resolve_map = normalize_resolve_map(
-            resolve_map or {}, origin=resolve_map_origin, find_function=find_function)
+            {} if resolve_map is None else resolve_map,
+            origin=resolve_map_origin, find_function=find_function)
         self.max_iters = max_iters
         self.max_depth = max_depth
         self.mangled = mangled
@@ -1201,9 +1202,15 @@ class TaintEngine:
     def _const_format_string(self, ssaf: Any, expr: Any) -> str | None:
         """If *expr* points at a NUL-terminated constant string in the binary,
         return its text; else None (unknown/non-constant format -> stay
-        conservative and treat every vararg as live)."""
+        conservative and treat every vararg as live).
+
+        Only bytes in read-only storage are the format the call sees: a string
+        in writable `.data` is merely its initial value, which any code may
+        overwrite before the call (`strcpy(fmt, "%s")`), so it is no constant
+        (#1050 review finding 1). The same storage test the backward walk uses
+        for literal operands (`_const_ptr_storage`)."""
         addr = self._const_ptr_addr(ssaf, expr)
-        if addr is None:
+        if addr is None or self._const_ptr_storage(addr) == "writable":
             return None
         getstr = getattr(self.bv, "get_ascii_string_at", None)
         if getstr is not None:
@@ -1617,9 +1624,11 @@ class TaintEngine:
         source block before the reset is a path (round 4 P2: a priming
         reset before a loop DOMINATES the `strtok(NULL)` yet the tainted
         call at the bottom of the body reaches it around the back-edge).
-        None when the view exposes no block / edge information -- an answer
-        the caller must treat as "reachable", never as a kill. An *avoid*
-        instruction without block information is ignored (it proves no cut)."""
+        None when the view exposes no block / edge information, or when a
+        block the search leaves has successors Binary Ninja could not
+        determine (a computed jump): an answer the caller must treat as
+        "reachable", never as a kill. An *avoid* instruction without block
+        information is ignored (it proves no cut)."""
         def _idx(i: Any) -> int | None:
             try:
                 return int(getattr(i, "instr_index"))
@@ -1650,7 +1659,13 @@ class TaintEngine:
             seen: set[tuple[int, int]] = set()
             work = [sb]
             while work:
-                for edge in list(work.pop().outgoing_edges):
+                block = work.pop()
+                # A block BN marks with undetermined outgoing edges (a register-
+                # indirect jump) may continue anywhere; its enumerated edges are
+                # not all of them, so they cannot prove disconnection.
+                if getattr(block, "has_undetermined_outgoing_edges", False) is True:
+                    return None
+                for edge in list(block.outgoing_edges):
                     t = getattr(edge, "target", None)
                     if t is None:
                         return None     # an undetermined successor: unproven
@@ -2633,8 +2648,51 @@ class TaintEngine:
         # any multi-source / param / var request are unchanged (no `by_source`).
         callsite_addrs = self._attributable_callsites(func, sources)
         if not callsite_addrs:
-            return self._forward_run(func, sources, max_depth=max_depth)
+            result = self._forward_run(func, sources, max_depth=max_depth)
+            if len(sources) > 1 and result["reached_sinks"]:
+                self._attribute_sources(func, sources, result, max_depth=max_depth)
+            return result
         return self._forward_attributed(func, sources, callsite_addrs, max_depth=max_depth)
+
+    def _attribute_sources(self, func: Any, sources: list[dict[str, Any]],
+                           result: dict[str, Any], *, max_depth: int) -> None:
+        """#1041 item 6: name which --source reaches each flow of a run with
+        several sources -- by outcome, not from the taint graph.
+
+        The graph records only the first parent that tainted a node, so the
+        source its rendered path starts from is not proof of the flow's
+        provenance: an argument a callee stores aside could be named for a sink
+        it never reached (#1050 review finding 3). Instead each source is run
+        on its own, and a flow lists as `source_candidates` every source whose
+        solo run reaches the same sink (callee, address, argument). The
+        signature names a source only when exactly one does; otherwise it keeps
+        `multiple`. A finding that is not attributed to --source at all (an
+        unconditional sink, `?`) is left as it is."""
+        reached: dict[tuple, list[str]] = {}
+        for src in sources:
+            try:
+                solo = self._forward_run(func, [src], max_depth=max_depth)
+            except TaintError:
+                continue   # seeds nothing on its own: it reaches nothing alone
+            loc = _render_source(self._describe_locator(src))
+            for f in solo["reached_sinks"]:
+                s = f.get("sink") or {}
+                key = (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+                if loc not in reached.setdefault(key, []):
+                    reached[key].append(loc)
+        for f in result["reached_sinks"]:
+            sig = f.get("signature") or {}
+            if sig.get("source") != "multiple":
+                continue
+            s = f.get("sink") or {}
+            candidates = reached.get(
+                (s.get("callee"), s.get("address"), s.get("tainted_arg_index")), [])
+            f["source_candidates"] = candidates
+            if len(candidates) == 1:
+                f["signature"] = _make_signature(
+                    candidates[0], sig.get("chain") or [], sig.get("sink_class"),
+                    sig.get("sink_callee"), display=self._display_for_name,
+                    symbol=self._raw_symbol_for)
 
     def _forward_run(self, func: Any, sources: list[dict[str, Any]], *, max_depth: int,
                      only_callsite_addr: int | None = None) -> dict[str, Any]:
@@ -3320,6 +3378,27 @@ class TaintEngine:
             "pending_leaf": pending_leaf,
         }
         return True
+
+    def _seed_pointer_value(self, ssaf: Any, ptr_expr: Any, callsite: Any,
+                            taint_node: Any, reason: str) -> bool:
+        """Seed the POINTER value of a buffer argument the engine could not key.
+
+        Each variable the argument reads is seeded, and so is the root of its
+        pure-copy chain (`_canonical_ssa_var`): compiled code hands the call a
+        register copy (`x1 = buf; recv(fd, x1, ..)`) and every later use -- a
+        callback given the same pointer (`x0 = buf; g_cb(x0)`) -- reads another
+        copy of the same root. A pure copy is equality, so the root is that
+        same pointer, and the callback is then disclosed as the frontier it is
+        instead of vanishing (#1041 item 1, #1050 review finding 6). A pointer
+        re-derived afresh (`c->buf + have` loaded again) is NOT proven equal
+        and is not seeded. Returns whether anything was newly seeded."""
+        seeded = False
+        for r in expr_reads(ptr_expr):
+            for v in (r, self._canonical_ssa_var(ssaf, r)):
+                if taint_node((var_key(v), getattr(v, "version", None)), var_label(v),
+                              callsite, reason, []):
+                    seeded = True
+        return seeded
 
     def _as_single_ssa_var(self, expr: Any) -> Any | None:
         """The lone SSA variable an expression reads, but ONLY when the
@@ -4272,9 +4351,6 @@ class TaintEngine:
             note = f"[{via}-resolved] " + note
         prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)],
                                   callee=getattr(callee_fn, "name", None)))
-        root = self._root_source(first_hit, why)
-        if root:
-            prefix[0].setdefault("source", root)
         out["handoff_node"] = [n for i in sorted(valid) for n in tainted_args[i]]
         for f in sub["findings"]:
             rebuilt = {"sink": f["sink"], "path": prefix + f["path"]}
@@ -4556,6 +4632,12 @@ class TaintEngine:
         def clean_resets(ckey: str) -> list[tuple]:
             return [(a, rins) for a, rins, rparams, ci in reset_candidates.get(ckey, [])
                     if self._token_hit_node(ssaf, rparams, f"*arg:{ci}", tainted) is None]
+        # (continuation call, state site) -> the facts its caveat is written from
+        # once the fixpoint has converged.
+        continuations: dict[tuple, tuple] = {}
+
+        def ins_key(i: Any) -> int:
+            return int(getattr(i, "instr_index", getattr(i, "address", 0)))
         reached_return = False
 
         def add_assumption(msg: str) -> None:
@@ -4615,15 +4697,8 @@ class TaintEngine:
         # local to this run, so a descended callee's run keeps its own.
         buffer_slots: dict = {}
         correlated_slots: set = set()
-        # #1041 item 6: the top run records which locator seeded each node, so
-        # a flow of a run with several --source flags names its own source
-        # instead of `multiple` (a descended callee's seeds are synthetic).
-        seed_sources: dict | None = {} if top else None
         seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption,
-                                    buffer_slots, leaves, seed_sources)
-        for _node, _locator in (seed_sources or {}).items():
-            if _node in why:
-                why[_node]["source"] = _locator
+                                    buffer_slots, leaves)
         if not seeded:
             if top:
                 raise TaintError("no taint sources resolved; check --source locator")
@@ -4876,12 +4951,25 @@ class TaintEngine:
                 fmt = self._const_format_string(ssaf, params[fa])
                 convs = unbounded_scanf_strings(fmt) if fmt is not None else None
                 if convs is None:
+                    # The conversions are unknown, so whether this call writes
+                    # an unbounded token is unknown: a frontier the claim gate
+                    # withholds on, never a silent "no sink" (#1050 review
+                    # finding 4). Its conversions are not guessed.
                     recorded_sinks.add(usig)
-                    why_not = ("is not a constant string" if fmt is None
+                    why_not = ("is not a constant string in read-only data" if fmt is None
                                else "uses POSIX %n$ positions")
-                    add_assumption(
-                        f"{prose}() at {hex(addr)}: its format (arg{fa}) {why_not}, so "
-                        f"its conversions were not checked for a width-less %s/%[")
+                    leaf = {
+                        "kind": "format_unchecked",
+                        "address": hex(addr),
+                        "callee": str(mkey or name or "?"),
+                        "format_arg": fa,
+                        "reason": "positional" if fmt is not None else "not_constant",
+                        "detail": (f"{prose}() at {hex(addr)}: its format (arg{fa}) {why_not}, "
+                                   f"so its conversions could not be checked for a width-less "
+                                   f"%s/%[ -- whether it writes an unbounded token is unknown"),
+                    }
+                    if leaf not in leaves:
+                        leaves.append(leaf)
                     return False
                 if not convs:
                     recorded_sinks.add(usig)
@@ -5283,20 +5371,13 @@ class TaintEngine:
                                     continue
                                 if apply_token(rule.get("to"), [st_node]):
                                     changed = True
-                            partial = ""
-                            if resets:
-                                partial = (
-                                    f"; a clean {self._prose_name(name or mkey)} @ "
-                                    f"{', '.join(hex(ra) for ra, _ in resets)} resets "
-                                    f"the state on SOME path but not on every path "
-                                    f"from the tainted call to this one, so the tainted "
-                                    f"line continues on the others")
-                            add_assumption(
-                                f"{self._prose_name(name or mkey)}(NULL, ...) @ {hex(addr)} continues the "
-                                f"tokenizer state of the tainted {self._prose_name(name or mkey)} call @ "
-                                f"{hex(st_addr)}, which reaches it on a path with no clean "
-                                f"reset; a continuation of a buffer tokenized in "
-                                f"ANOTHER function is not followed{partial}")
+                            # Disclosed after convergence, from the FINAL taint:
+                            # which calls are clean resets changes across passes,
+                            # and a caveat written mid-fixpoint kept naming a
+                            # site "clean" that a later pass tainted (round 1
+                            # finding 7).
+                            continuations[(ins_key(ins), state_key, _site)] = (
+                                name or mkey, ckey, addr, st_addr)
                     else:
                         hit = self._token_hit_node(ssaf, params, f"*arg:{cidx}", tainted)
                         state_key = (ckey, int(getattr(ins, "instr_index", addr)))
@@ -6111,6 +6192,27 @@ class TaintEngine:
             self._truncated = True
             self._truncation_causes.add("fixpoint_exhausted")
 
+        # The in-function continuations the fixpoint followed, written from the
+        # converged taint: the clean resets named are the ones still clean now,
+        # one caveat per (continuation, arming site).
+        for (_ck, _sk, _site), (cname, ckey, addr, st_addr) in sorted(
+                continuations.items(), key=lambda kv: kv[0]):
+            resets = clean_resets(ckey)
+            partial = ""
+            if resets:
+                partial = (
+                    f"; a clean {self._prose_name(cname)} @ "
+                    f"{', '.join(hex(ra) for ra, _ in resets)} resets "
+                    f"the state on SOME path but not on every path "
+                    f"from the tainted call to this one, so the tainted "
+                    f"line continues on the others")
+            add_assumption(
+                f"{self._prose_name(cname)}(NULL, ...) @ {hex(addr)} continues the "
+                f"tokenizer state of the tainted {self._prose_name(cname)} call @ "
+                f"{hex(st_addr)}, which reaches it on a path with no clean "
+                f"reset; a continuation of a buffer tokenized in "
+                f"ANOTHER function is not followed{partial}")
+
         # A tokenizer's static state still tainted when this function returns:
         # a `strtok(NULL, ..)` in a CALLER or a CALLEE continues it, and the
         # continuation model is per function, so that flow is not followed. The
@@ -6308,10 +6410,7 @@ class TaintEngine:
             f"parameter {idx} not found on {self._prose_function(func)}{have}: {advice}")
 
     def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption,
-                      buffer_slots=None, leaves=None, seed_sources=None) -> bool:
-        """Seed every source locator. ``seed_sources``, when given, maps each
-        node a source seeded to that source's locator, so a flow of a
-        several-source run can name which source it starts from (#1041 item 6)."""
+                      buffer_slots=None, leaves=None) -> bool:
         if buffer_slots is None:
             buffer_slots = {}
         if leaves is None:
@@ -6324,19 +6423,8 @@ class TaintEngine:
             if leaf and leaf not in leaves:
                 leaves.append(leaf)
 
-        def recording(taint: Any, locator: str) -> Any:
-            def tag(node, label, ins, reason, parents):
-                if taint(node, label, ins, reason, parents):
-                    seed_sources.setdefault(node, locator)
-                    return True
-                return False
-            return tag
-
-        seed_node = taint_node
         seeded = False
         for src in sources:
-            if seed_sources is not None:
-                taint_node = recording(seed_node, format_locator(src))
             kind = src.get("kind")
             if kind == "param":
                 idx = int(src["index"])
@@ -6370,16 +6458,37 @@ class TaintEngine:
                 # the silent miss becomes actionable.
                 if kind == "arg" and (callee or "").split("@", 1)[0].lstrip("_") in _RECVMSG_FAMILY:
                     _fn = hex(int(func.start))
+                    _var_seed = command_template(f"bn taint forward -f {_fn} --source var:VAR")
+                    # #1050 review finding 5: offer `call:` only when the engine's
+                    # own iovec resolver -- the one a call: run uses -- finds a
+                    # buffer to seed here. A msghdr built elsewhere (a parameter)
+                    # leaves call: with nothing to seed, and that command failed.
+                    _, _rm = lookup_model(self.models, callee)
+                    _hdr = next((int(t.rsplit(":", 1)[1])
+                                 for t in (str(s.get("to") or "")
+                                           for s in (_rm or {}).get("sources") or [])
+                                 if t.startswith("*iovec:") and t.rsplit(":", 1)[1].isdigit()),
+                                None)
+                    # Exactly the call: path's own criterion for seeding an
+                    # iovec buffer: a keyed buffer, or a pointer value to taint.
+                    _resolves = _hdr is not None and any(
+                        self._buffer_target(ssaf, b) is not None or expr_reads(b)
+                        for c in calls for b in self._recvmsg_iov_buffers(ssaf, instrs, c, _hdr))
+                    if _resolves:
+                        _how = (f"Use `bn taint forward -f {_fn} --source "
+                                f"{shlex.quote('call:' + str(callee))}`, which resolves the iovec "
+                                f"buffer from the msg_iov/iov_base setup here, or seed the filled "
+                                f"buffer directly ({_var_seed}).")
+                    else:
+                        _how = (f"The iovec is not built in this function, so call:{callee} "
+                                f"cannot resolve its buffer either; seed the filled buffer "
+                                f"directly ({_var_seed}), or run taint from the caller that "
+                                f"builds the iovec.")
                     add_assumption(
                         f"{self._prose_name(callee)} writes the received bytes to the scatter-gather iov "
                         f"buffer(s) (msghdr->msg_iov[i].iov_base; for recvmmsg, per msgvec "
                         f"entry), not the header pointer this --source seeds; the payload "
-                        f"taint is NOT followed from here. Use "
-                        f"`bn taint forward -f {_fn} --source {shlex.quote('call:' + str(callee))}`, "
-                        f"which resolves the iovec buffer from the msg_iov/iov_base setup "
-                        f"automatically, or seed the filled buffer directly when the iovec "
-                        f"is built dynamically "
-                        f"({command_template(f'bn taint forward -f {_fn} --source var:VAR')})."
+                        f"taint is NOT followed from here. {_how}"
                     )
                     # #562: structured leaf so JSON `leaves` is non-empty and the
                     # claim gate withholds an all-clear. An arg:recvmsg:N seed
@@ -6390,6 +6499,7 @@ class TaintEngine:
                         callee=str(callee),
                         arg_index=int(src.get("index", 1)),
                         reason="msghdr_not_payload",
+                        call_resolves_iovec=_resolves,
                     ))
                 if kind == "ret":
                     # A ret: source on a function whose model also fills an
@@ -6456,11 +6566,10 @@ class TaintEngine:
                                     seeded = True
                             else:
                                 ptr_seeded = False
-                                for r in expr_reads(params[idx]):
-                                    if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
-                                                  f"source: {callee} arg{idx}", []):
-                                        seeded = True
-                                        ptr_seeded = True
+                                if self._seed_pointer_value(ssaf, params[idx], c, taint_node,
+                                                            f"source: {callee} arg{idx}"):
+                                    seeded = True
+                                    ptr_seeded = True
                                 # #562: a recv-family arg seed that tainted only the
                                 # pointer value (buffer not keyed) is the arg:recv:1
                                 # false-all-clear shape -- emit a structured leaf so
@@ -6633,10 +6742,10 @@ class TaintEngine:
                                                   f"source: {callee} fills arg{idx} buffer (call: preset)", []):
                                         seeded = True
                                 else:
-                                    for r in expr_reads(params[idx]):
-                                        if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
-                                                      f"source: {callee} arg{idx} (call: preset)", []):
-                                            seeded = True
+                                    if self._seed_pointer_value(
+                                            ssaf, params[idx], c, taint_node,
+                                            f"source: {callee} arg{idx} (call: preset)"):
+                                        seeded = True
                                     # #562: no recv-buffer leaf fires on the call:
                                     # preset path. The indirect-slot helper owns an
                                     # indirect-load pointer (its slot may correlate
@@ -6751,9 +6860,6 @@ class TaintEngine:
             last["callee"] = callee
         else:
             path.append(_instr_dict(ins, reason=reason, tainted=tainted_labels, callee=callee))
-        root = self._root_source(hit_nodes[0], why)
-        if root:
-            path[0].setdefault("source", root)
         return {
             "sink": {
                 "callee": callee,
@@ -6860,22 +6966,6 @@ class TaintEngine:
             cur = parents[0] if parents else None
         chain.reverse()
         return chain
-
-    @staticmethod
-    def _root_source(node, why) -> str | None:
-        """#1041 item 6: the --source the rendered chain of *node* starts from --
-        the locator the top run recorded on the seed node at the end of the
-        parents[0] walk `_reconstruct_path` renders. None for a root no
-        declared source seeded (a descended callee's synthetic seed)."""
-        seen = set()
-        cur = node
-        while cur is not None and cur in why and cur not in seen:
-            seen.add(cur)
-            parents = why[cur].get("parents") or []
-            if not parents:
-                return why[cur].get("source")
-            cur = parents[0]
-        return None
 
     # -- backward ---------------------------------------------------------
 

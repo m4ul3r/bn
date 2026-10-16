@@ -44,9 +44,24 @@ __attribute__((noinline)) int parse_constant(int fd) {
     return code + consume(name) + msg[0];
 }
 
+/* The format is a writable global another path rewrites (#1050 review finding
+ * 1): its initial bytes are not the format the call sees, in either direction. */
+char g_fmt[8] = "%5s";
+__attribute__((noinline)) int parse_mutable(const char *in, char *dst, int mode) {
+    if (mode)
+        strcpy(g_fmt, "%s");
+    return sscanf(in, g_fmt, dst);
+}
+
+/* POSIX positions do not consume arguments in order (#1050 review finding 4). */
+__attribute__((noinline)) int parse_positional(const char *in, char *dst) {
+    return sscanf(in, "%1$s", dst);
+}
+
 int consume(const char *s) { return (int)strlen(s); }
 
 int main(int argc, char **argv) {
-    (void)argv;
-    return load_line(stdin) + load_line_bounded(stdin) + parse_reply(argc) + parse_constant(argc);
+    char d[64];
+    return load_line(stdin) + load_line_bounded(stdin) + parse_reply(argc) + parse_constant(argc)
+        + parse_mutable(argv[0], d, argc) + parse_positional(argv[0], d);
 }

@@ -70,6 +70,11 @@ BLOCKING_LEAF_KINDS = frozenset({
     # flow-sensitively (only when taint actually reaches such an instruction),
     # so a function that merely CONTAINS unlifted ops does not block the gate.
     "unlifted_instruction_reached",
+    # #1041 item 4 / #1050 review finding 4: a scanf-family call whose format
+    # is not a read-only constant (or uses %n$ positions) may write an
+    # unbounded token; its conversions could not be checked, so an empty
+    # reached_sinks past it is not an all-clear.
+    "format_unchecked",
     # #810: a backward ascent followed only the first N caller sites of a
     # parameter-origin slice; origins reachable only from the dropped callers are
     # absent from the result. Same class as the other frontier leaves: the walk
@@ -289,7 +294,17 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                 "result here means the seed was wrong, not that the path is clean")
         if reseed:
             run = (f"`{forward(fn, reseed)}`" if fn else f"--source {reseed}")
-            return f"{head}; reseed with {run}, which keys the payload"
+            return (f"{head}; reseed with {run}, which seeds the iovec buffer this "
+                    f"function builds")
+        if any(lf.get("reason") == "msghdr_not_payload" for lf in misanchored):
+            # #1050 review finding 5: call:recvmsg resolves the iovec only when
+            # this function builds it; here it does not, so that reseed would
+            # seed nothing and is not offered.
+            seed = (f" ({command_template(forward(fn, 'var:VAR'))})" if fn else "")
+            return (f"{head}. The iovec is not built in this function, so "
+                    f"call:recvmsg cannot resolve its buffer either; seed the filled "
+                    f"buffer directly{seed}, or run taint from the caller that builds "
+                    f"the iovec")
         if fn:
             return (f"{head}. Reseeding with arg: or call: keys the same pointer and "
                     f"fails the same way; seed a value read from the buffer instead "
@@ -298,6 +313,12 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         return (f"{head}. Reseeding with arg: or call: keys the same pointer and "
                 f"fails the same way; seed a value read from the buffer (var:) or "
                 f"the consuming parser's parameter (param:) instead")
+    unchecked = [lf for lf in leaves if lf.get("kind") == "format_unchecked"]
+    if unchecked and len(unchecked) == len(leaves):
+        at = ", ".join(sorted({str(lf.get("address")) for lf in unchecked}))
+        return ("no sink reached, but a scanf-family call's format could not be read as "
+                f"a read-only constant ({at}), so whether it writes an unbounded token "
+                "is unknown -- inspect that call's format operand")
     if unmodeled_reached and not ext_no_model and all(
             lf.get("cause") == "varargs_not_followed" for lf in unresolved):
         # #948: every unresolved frontier is taint entering the `...` tail of a
@@ -620,6 +641,7 @@ def misanchored_recv_leaf(
     address: str | None = None,
     reason: str = "buffer_not_keyed",
     seed: str = "arg",
+    call_resolves_iovec: bool = True,
 ) -> dict[str, Any]:
     """Structured leaf for a seed that tainted a buffer POINTER but did not key
     the FILLED buffer as a stable taint location (#306/#562 dogfood footgun), so
@@ -631,10 +653,13 @@ def misanchored_recv_leaf(
     ``seed`` names the locator kind that produced it: ``arg`` (an
     ``arg:<callee>:N`` source) or ``call`` (the ``call:<callee>`` preset, whose
     modeled ``*arg:N`` output could not be keyed, #1041 item 1). Only the
-    recvmsg header case has a reseed that keys more: ``call:`` resolves the
-    iovec payload. For ``buffer_not_keyed`` both locators resolve the buffer
-    through the same pointer, so ``call:`` would fail the same way and is never
-    suggested (``suggested_source`` is None)."""
+    recvmsg header case has a reseed that keys more -- ``call:`` resolves the
+    iovec payload -- and only when the engine's own iovec resolver found and
+    keyed a buffer at this call (``call_resolves_iovec``, #1050 review finding
+    5); otherwise that reseed seeds nothing and is not suggested. For
+    ``buffer_not_keyed`` both locators resolve the buffer through the same
+    pointer, so ``call:`` would fail the same way and is never suggested
+    (``suggested_source`` is None)."""
     base = (callee or "").split("@", 1)[0].lstrip("_")
     locator = f"call:{base}" if seed == "call" else f"arg:{base}:{arg_index}"
     suggest: str | None
@@ -643,10 +668,16 @@ def misanchored_recv_leaf(
             f"arg:{base}:{arg_index} seeds the msghdr*/msgvec pointer, not the "
             f"scatter-gather payload at msg_iov[i].iov_base -- buffer content is "
             f"NOT followed from this seed ({reason})")
-        suggest = f"call:{base}"
-        note = (f"NOT an all-clear -- reseed with --source {suggest}; empty "
-                f"reached_sinks with this leaf means the seed was wrong, not that "
-                f"the path is clean")
+        if call_resolves_iovec:
+            suggest = f"call:{base}"
+            note = (f"NOT an all-clear -- reseed with --source {suggest}; empty "
+                    f"reached_sinks with this leaf means the seed was wrong, not that "
+                    f"the path is clean")
+        else:
+            suggest = None
+            note = (f"NOT an all-clear -- the iovec is not built in this function, so "
+                    f"call:{base} cannot resolve its buffer either; seed the filled "
+                    f"buffer with var:, or run taint from the caller that builds it")
     else:
         detail = (
             f"{locator} could not key the buffer arg {arg_index} points at as a "

@@ -97,7 +97,7 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
             models,
             find_variable=_find_variable,
             unknown_call_policy=str(params.get("unknown_call", "conservative")),
-            resolve_map=params.get("resolve_map") or {},
+            resolve_map=params.get("resolve_map"),
             resolve_map_origin=(f"--resolve-map {_map_path}" if _map_path
                                 else "--resolve-map"),
             find_function=lambda name: int(ctx._find_function(bv, name).start),

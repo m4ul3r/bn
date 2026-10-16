@@ -38,7 +38,10 @@ brittle across compilers/optimisation.
 | `bw_global_operand.c`  | a `CONST_PTR` fill operand is a literal only in read-only storage: `sprintf(cmd, "%s", g_host)` from a `.bss` array is a frontier leaf with origin `global` (`complete_slice: false`); the `.rodata` literal twin is complete |
 | `bw_offset_address.c`  | an address built on a buffer at a VARIABLE offset is that buffer: `popen(line + off)` and `strcpy(buf, &other[i])` walk the `read` that filled it beside the offset; `g_hosts[i]` (a `.bss` array element) is a `global` frontier leaf. `bw_offset_address_o1.c` rebuilds it at -O1 |
 | `bw_byte_coverage.c`   | coverage by bytes, not by writer kind: a `read` through a pointer that may point at another local, a one-byte indexed terminator, an escape of `&buf` and a copy at a constant offset each leave the bare path a frontier (`complete_slice: false`); a copy at offset 0 covers. `bw_byte_coverage_o1.c` rebuilds it at -O1 |
-| `scanf_unbounded.c`    | a width-less `%s` / `%[` scanf conversion is an `overflow_unbounded` sink: `fscanf` (stream input) fires unconditionally like `gets`, `sscanf` only while its input string is tainted; a width (`%63[^\n]`) or a constant input string is not a sink (#1041 item 4) |
+| `scanf_unbounded.c`    | a width-less `%s` / `%[` scanf conversion is an `overflow_unbounded` sink: `fscanf` (stream input) fires unconditionally like `gets`, `sscanf` only while its input string is tainted; a width (`%63[^\n]`) or a constant input string is not a sink; a format in writable storage or with `%n$` positions is a `format_unchecked` frontier, never a guess (#1041 item 4) |
+| `strtok_undetermined.c` | a register-indirect jump BN cannot resolve follows the tainted `strtok`; undetermined successors never prove the `strtok(NULL)` unreachable, so the continuation still reaches `system()` (x86-64 inline asm) |
+| `recv_member_callback.c` | `call:recv` into `c->buf + have` (not keyable) is a `source_seed_misanchored` frontier, and the callback handed the same pointer is an `indirect_call_unresolved` frontier (#1041 item 1) |
+| `strtok_fixpoint.c`    | an irreducible tokenizer loop with unused-return `strtok(line)` initializers: every tainted `strtok` that reaches the `strtok(NULL)` arms it whatever the IL order (#932); `_o1`/`_o2` rebuild it |
 
 ## `EXPECTED.json` schema
 

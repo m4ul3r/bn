@@ -9952,3 +9952,14 @@ def test_taint_models_text_caps_callsite_rows_and_counts_the_rest_1041():
     every = _render_taint_models_text(value, callsite_limit=0).splitlines()
     assert sum(1 for ln in every if ln.strip().startswith("0x")) == 25
     assert not any("more callsite" in ln for ln in every)
+
+
+def test_compact_flow_line_lists_candidate_sources_of_a_multiple_flow_1050():
+    from bn.formatters import _render_flow_line
+    flow = {"sink": {"class": "overflow_len", "callee": "memcpy", "address": "0x14",
+                     "tainted_arg_index": 2},
+            "signature": {"rendered": "multiple → [overflow_len] memcpy"},
+            "metrics": {}, "source_candidates": ["param:0", "param:1"]}
+    assert "(reached by each of: param:0, param:1)" in _render_flow_line(flow)
+    flow["source_candidates"] = ["param:1"]
+    assert "reached by each of" not in _render_flow_line(flow)

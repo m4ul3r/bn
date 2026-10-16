@@ -138,6 +138,42 @@ def test_call_preset_null_destination_receives_nothing_1041(models):
     assert _misanchored(result) == []
 
 
+def _callback_program():
+    """`p#1 = buf#1 + have`, `x1 = p#1; recv(fd, x1, ..)`, `x0 = p#1; fp(x0)`:
+    the callback receives a second register copy of the same unkeyed pointer
+    (the #1050 review finding 6 AArch64 shape)."""
+    c, fd, have, buf, p, x1, x0 = (FVar(s) for s in ("c", "fd", "have", "buf", "p", "x1", "x0"))
+    c0, fd0, have0 = FSSA(c, 0), FSSA(fd, 0), FSSA(have, 0)
+    buf1, p1, x11, x01 = FSSA(buf, 1), FSSA(p, 1), FSSA(x1, 1), FSSA(x0, 1)
+    instrs = [
+        FInstr(0, 0x1000, "MLIL_SET_VAR_SSA", "buf#1 = [c#0 + 8]", reads=[c0], writes=[buf1],
+               src=_field_load(c0, 8)),
+        FInstr(1, 0x1004, "MLIL_SET_VAR_SSA", "p#1 = buf#1 + have#0", reads=[buf1, have0],
+               writes=[p1], src=FExpr("MLIL_ADD", "buf#1 + have#0", reads=[buf1, have0],
+                                      left=_var(buf1), right=_var(have0))),
+        FInstr(2, 0x1008, "MLIL_SET_VAR_SSA", "x1#1 = p#1", reads=[p1], writes=[x11],
+               src=_var(p1)),
+        FInstr(3, 0x100c, "MLIL_CALL_SSA", "recv(fd#0, x1#1, 0x40, 0)", reads=[x11],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[_var(fd0), _var(x11), _const(0x40), _const(0)]),
+        FInstr(4, 0x1010, "MLIL_SET_VAR_SSA", "x0#1 = p#1", reads=[p1], writes=[x01],
+               src=_var(p1)),
+        FInstr(5, 0x1014, "MLIL_CALL_SSA", "fp(x0#1)", reads=[x01],
+               dest=FExpr("MLIL_VAR_SSA", "fp#1"), params=[_var(x01)]),
+    ]
+    return FFunc("pump_cb", 0x1000, FSSAFunc(instrs), params=[c, fd, have])
+
+
+@pytest.mark.parametrize("source", ["call:recv", "arg:recv:1"])
+def test_callback_given_the_same_unkeyed_pointer_is_a_frontier_1041(models, source):
+    result = _engine(models).forward(_callback_program(), [te.parse_locator(source)])
+
+    kinds = [lf["kind"] for lf in result["leaves"]]
+    assert "source_seed_misanchored" in kinds
+    assert any(lf["kind"] == "indirect_call_unresolved" and lf["address"] == "0x1014"
+               for lf in result["leaves"]), result["leaves"]
+
+
 # --------------------------------------------------------------------------
 # #1041 item 3: --resolve-map is validated when it is loaded
 # --------------------------------------------------------------------------
@@ -262,13 +298,32 @@ def test_sscanf_bounded_or_untainted_is_not_a_sink_1041(models, fmt, input_taint
     assert _format_sinks(result) == []
 
 
-def test_sscanf_unreadable_format_is_disclosed_not_guessed_1041(models):
-    func, bv = _sscanf_program(None)
+class _WritableStrings(FBVStr):
+    """The format string sits in writable `.data` (`char g_fmt[] = "%s"`)."""
+
+    def is_offset_writable(self, addr):
+        return True
+
+
+@pytest.mark.parametrize(("fmt", "writable", "reason"), [
+    (None, False, "not_constant"),       # a format passed in
+    ("%1$s", False, "positional"),       # positions do not consume in order
+    ("%5s", True, "not_constant"),       # initial bytes of a mutable global
+    ("%s", True, "not_constant"),        # ... in either direction
+])
+def test_unchecked_format_is_a_blocking_frontier_not_a_guess_1050(models, fmt, writable, reason):
+    """#1050 review findings 1 and 4: a format bn cannot read as a read-only
+    constant is never guessed -- not as bounded (no all-clear) and not as
+    `%s` (no finding) -- and withholds the all-clear."""
+    func, bv = _sscanf_program(fmt)
+    if writable:
+        bv = _WritableStrings(bv._names, strings=bv._strings)
     result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:read")])
 
     assert _format_sinks(result) == []
-    assert any("is not a constant string" in a and "width-less" in a
-               for a in result["assumptions"]), result["assumptions"]
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "format_unchecked"]
+    assert (leaf["reason"], leaf["format_arg"]) == (reason, 1)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def test_format_gated_sink_is_listed_with_its_condition_1041():
@@ -288,11 +343,13 @@ def test_format_arg_without_first_dest_is_refused_1041():
 # #932: discovering tokenizer state is part of fixpoint convergence
 # --------------------------------------------------------------------------
 
-def _continuation_before_initializer(*, back_edge: bool):
+def _continuation_before_initializer(*, back_edge: bool, undetermined: bool = False):
     """tok(line#0): { x = strtok(NULL, " "); system(x) } then `strtok(&line, " ")`
     with its return unused -- the IL lists the continuation FIRST. With a
     back-edge from the initializer's block to the continuation's, the
-    initializer arms it on the next iteration; without one it never can."""
+    initializer arms it on the next iteration; without one it never can.
+    ``undetermined``: the initializer's block ends in a register-indirect jump
+    BN could not resolve -- no enumerated edges, `has_undetermined_outgoing_edges`."""
     line = FVar("line", typ="char[0x40]")
     x = FSSA(FVar("x"), 1)
     STRTOK, SYS = 0x900, 0x901
@@ -305,11 +362,54 @@ def _continuation_before_initializer(*, back_edge: bool):
     head, tail, exit_ = FBlock(0, 2), FBlock(2, 3), FBlock(3, 4)
     head.outgoing_edges = [_FEdge(tail)]
     tail.outgoing_edges = [_FEdge(head), _FEdge(exit_)] if back_edge else [_FEdge(exit_)]
+    if undetermined:
+        tail.outgoing_edges = []
+        tail.has_undetermined_outgoing_edges = True
     exit_.outgoing_edges = []
     for ins, block in ((cont, head), (sink, head), (init, tail), (ret, exit_)):
         ins.il_basic_block = block
     func = FFunc("tok", 0x10, FSSAFunc([cont, sink, init, ret]), params=[line])
     return func, FBV({STRTOK: "strtok", SYS: "system"})
+
+
+def test_undetermined_successors_never_prove_disconnection_1050(models):
+    """#1050 review finding 2: a computed jump after the tainted strtok may
+    resume at the continuation; BN enumerates no edges for it, which is not
+    proof that it cannot."""
+    func, bv = _continuation_before_initializer(back_edge=False, undetermined=True)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+
+    sinks = [(s["sink"]["callee"], s["sink"]["class"]) for s in result["reached_sinks"]]
+    assert sinks == [("system", "command_injection")], result["assumptions"]
+
+
+def test_reset_disclosure_is_written_from_converged_taint_1050(models):
+    """#1050 review finding 7: `strtok(&line)`, `x = strtok(NULL)`, then
+    `memcpy(&other, &line)` taints `other`, then `strtok(&other)`. On the first
+    pass `strtok(&other)` still looked clean; the final caveats must not name
+    it a clean reset, nor repeat the continuation with and without that clause."""
+    line, other = FVar("line", typ="char[0x40]"), FVar("other", typ="char[0x40]")
+    x = FSSA(FVar("x"), 1)
+    STRTOK, SYS, MEMCPY = 0x900, 0x901, 0x902
+    instrs = [
+        _ext_call(0, 0x10, 'strtok(&line, " ")', STRTOK, [_addr_of(line), _cstr(0x700)]),
+        _ext_call(1, 0x14, 'x#1 = strtok(nullptr, " ")', STRTOK,
+                  [FExpr("MLIL_CONST", "0", constant=0), _cstr(0x700)], writes=[x]),
+        _ext_call(2, 0x18, "system(x#1)", SYS, [FExpr("MLIL_VAR_SSA", "x#1", reads=[x])],
+                  reads=[x]),
+        _ext_call(3, 0x1c, "memcpy(&other, &line, 0x40)", MEMCPY,
+                  [_addr_of(other), _addr_of(line), _const(0x40)]),
+        _ext_call(4, 0x20, 'strtok(&other, " ")', STRTOK, [_addr_of(other), _cstr(0x700)]),
+    ]
+    func = FFunc("tok", 0x10, FSSAFunc(instrs), params=[line])
+    bv = FBV({STRTOK: "strtok", SYS: "system", MEMCPY: "memcpy"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+
+    cont = [a for a in result["assumptions"] if "continues the tokenizer state" in a]
+    # One caveat per arming site (0x10, and 0x20 once `other` is tainted), and
+    # none still calls 0x20 a clean reset.
+    assert sorted(a.split(" call @ ")[1].split(",")[0] for a in cont) == ["0x10", "0x20"], cont
+    assert not any("clean strtok @ 0x20" in a for a in cont), cont
 
 
 def test_state_discovered_after_its_continuation_is_revisited_932(models):
@@ -354,3 +454,63 @@ def test_each_flow_names_the_source_it_starts_from_1041(models):
 
     named = {s["sink"]["address"]: s["signature"]["source"] for s in result["reached_sinks"]}
     assert named == {"0x10": "param:0", "0x14": "param:1"}
+
+
+def _two_sources_program():
+    """`two_sources(first, second)` calls `helper(first, second)`; helper stores
+    `first` to a global and uses only `second` as a memcpy length (#1050 review
+    finding 3). `both(a)` passes `a` as both lengths of one memcpy pair."""
+    q, r = FVar("q"), FVar("r")
+    q0, r0 = FSSA(q, 0), FSSA(r, 0)
+    MEMCPY, HELPER = 0x901, 0x2000
+    helper = FFunc("helper", HELPER, FSSAFunc([
+        FInstr(0, 0x2000, "MLIL_STORE_SSA", "[0x6100].q = q#0", reads=[q0],
+               dest=FExpr("MLIL_CONST_PTR", "0x6100", constant=0x6100), src=_var(q0)),
+        _ext_call(1, 0x2004, "memcpy(0x6000, 0x7000, r#0)", MEMCPY,
+                  [_const(0x6000), _const(0x7000), _var(r0)], reads=[r0]),
+    ]), params=[q, r])
+    first, second = FVar("first"), FVar("second")
+    f0, s0 = FSSA(first, 0), FSSA(second, 0)
+    caller = FFunc("two_sources", 0x1000, FSSAFunc([
+        FInstr(0, 0x1000, "MLIL_CALL_SSA", "helper(first#0, second#0)", reads=[f0, s0],
+               dest=FExpr("MLIL_CONST_PTR", hex(HELPER), constant=HELPER),
+               params=[_var(f0), _var(s0)]),
+    ]), params=[first, second])
+    return caller, FBV({MEMCPY: "memcpy"}, funcs={HELPER: helper})
+
+
+def test_a_callee_flow_names_only_the_source_that_reaches_it_1050(models):
+    caller, bv = _two_sources_program()
+    result = te.TaintEngine(bv, models).forward(
+        caller, [te.parse_locator("param:0"), te.parse_locator("param:1")])
+
+    [flow] = result["reached_sinks"]
+    assert flow["signature"]["source"] == "param:1"
+    assert flow["source_candidates"] == ["param:1"]
+
+
+def test_a_flow_each_source_reaches_alone_stays_multiple_1050(models):
+    """`n = a + b; memcpy(.., .., n)`: either source alone reaches the sink, so
+    neither is THE source; both are listed as candidates."""
+    a, b, n = FVar("a"), FVar("b"), FVar("n")
+    a0, b0, n1 = FSSA(a, 0), FSSA(b, 0), FSSA(n, 1)
+    MEMCPY = 0x901
+    func = FFunc("f", 0x10, FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "n#1 = a#0 + b#0", reads=[a0, b0], writes=[n1]),
+        _ext_call(1, 0x14, "memcpy(0x6000, 0x7000, n#1)", MEMCPY,
+                  [_const(0x6000), _const(0x7000), _var(n1)], reads=[n1]),
+    ]), params=[a, b])
+    result = te.TaintEngine(FBV({MEMCPY: "memcpy"}), models).forward(
+        func, [te.parse_locator("param:0"), te.parse_locator("param:1")])
+
+    [flow] = result["reached_sinks"]
+    assert flow["signature"]["source"] == "multiple"
+    assert flow["source_candidates"] == ["param:0", "param:1"]
+
+
+@pytest.mark.parametrize("doc", [[], False, 0, ""])
+def test_a_false_y_resolve_map_document_is_refused_1050(models, doc):
+    """#1050 review finding 8: only an absent map defaults to empty."""
+    _dispatch, bv = _dispatch_program()
+    with pytest.raises(te.TaintError, match="--resolve-map m.json"):
+        te.TaintEngine(bv, models, resolve_map=doc, resolve_map_origin="--resolve-map m.json")
