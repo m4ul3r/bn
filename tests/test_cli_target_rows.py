@@ -228,34 +228,101 @@ def test_the_trace_il_hint_runs_for_a_dash_function_name_1033_7(tmp_path):
 # --- #1035 item 1: a deliberate stop is not reported as a crash ---------------
 
 
-def _instance(tmp_path: Path) -> BridgeInstance:
+def _handle(registry_path: Path, *, token: str = "t", pid: int = 4242,
+            meta: dict | None = None) -> BridgeInstance:
     return BridgeInstance(
-        pid=4242, socket_path=tmp_path / "x.sock", registry_path=tmp_path / "x.json",
-        plugin_name="bn_agent_bridge", plugin_version="0", started_at=None, meta={},
-        instance_token="t", instance_id="x",
+        pid=pid, socket_path=registry_path.with_suffix(".sock"), registry_path=registry_path,
+        plugin_name="bn_agent_bridge", plugin_version="0", started_at=None,
+        meta=meta or {}, instance_token=token, instance_id=registry_path.stem,
     )
 
 
-@pytest.mark.parametrize(("registry_pid", "running", "says", "never"), [
-    (None, False, "registry entry is gone", ("crash", "OOM")),
-    (9999, False, "registry entry is gone", ("crash", "OOM")),   # a successor's entry
-    (4242, False, "without a clean shutdown", ("session stop",)),
-    (None, True, "shutting down", ("crash", "fault")),
-    (4242, True, "closed the connection without replying", ("crash", "fault")),
+_CLAIMS = ("crash", "OOM", "fault", "shutting down", "clean shutdown", "session stop")
+
+
+@pytest.mark.parametrize(("record", "found"), [
+    (None, "no stop record was found"),
+    ("{not json", "could not be read"),
+    ("[]", "could not be read"),
+    (json.dumps({"instance_token": "successor", "reason": "shutdown_request"}),
+     "belongs to another bridge"),
 ])
-def test_empty_reply_reads_the_registry_not_a_guess_1035_1(
-    monkeypatch, tmp_path, registry_pid, running, says, never,
+@pytest.mark.parametrize("running", [True, False])
+def test_without_this_bridges_stop_record_no_cause_is_claimed_1035_1(
+    monkeypatch, tmp_path, record, found, running,
 ):
+    """Review round 1: registry absence, a corrupt record or one a successor
+    wrote is not evidence of why the bridge closed the connection."""
     from bn import transport
 
-    inst = _instance(tmp_path)
-    if registry_pid is not None:
-        inst.registry_path.write_text(json.dumps({"pid": registry_pid}))
+    handle = _handle(tmp_path / "x.json")
+    if record is not None:
+        handle.registry_path.with_suffix(".stopped").write_text(record)
     monkeypatch.setattr(transport, "_process_running", lambda pid: running)
-    message = str(transport._empty_response_error(inst, "refresh"))
-    assert says in message
-    for word in never:
-        assert word not in message
+    message = str(transport._empty_response_error(handle, "refresh"))
+    assert found in message and "reason it closed the connection is unknown" in message
+    assert ("still running" if running else "no longer running") in message
+    for claim in _CLAIMS:
+        assert claim not in message
+
+
+def test_a_bridge_stop_writes_the_record_the_diagnosis_reads_1035_1(monkeypatch, tmp_path):
+    """The real bridge teardown writes the witness; the CLI claims a stop only
+    from a record carrying the token of the bridge it was talking to."""
+    from _bridge_fakes import _load_bridge
+    from bn import transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    bridge = module.BinaryNinjaBridge(instance_id="sx")
+    bridge.start()
+    ours = _handle(bridge.registry_path, token=bridge.instance_token, pid=os.getpid())
+    try:
+        assert "no stop record was found" in str(transport._empty_response_error(ours, "x"))
+        module._bind_shutdown(bridge, {}, None)
+    finally:
+        bridge.stop()
+    record = json.loads(bridge.registry_path.with_suffix(".stopped").read_text())
+    assert (record["instance_token"], record["reason"]) == (bridge.instance_token,
+                                                           "shutdown_request")
+    message = str(transport._empty_response_error(ours, "refresh"))
+    assert "clean shutdown (a shutdown request" in message
+    stale = _handle(bridge.registry_path, token="another-bridge", pid=os.getpid())
+    assert "belongs to another bridge" in str(transport._empty_response_error(stale, "x"))
+    # `bn instance gc` reaps the record once no registry of that name remains.
+    summary = transport.gc_instances()
+    assert summary["stop_records_removed"] == 1
+    assert not bridge.registry_path.with_suffix(".stopped").exists()
+
+
+def test_a_reused_pid_is_not_reported_as_the_running_bridge_1035_1(tmp_path):
+    """Review round 1: liveness is the recorded identity, not the pid number."""
+    from bn import transport
+    from bn.proc_identity import identity_payload
+
+    live = identity_payload()
+    if not live:
+        pytest.skip("this host records no process identity")
+    proven = _handle(tmp_path / "x.json", pid=os.getpid(), meta=live)
+    reused = _handle(tmp_path / "x.json", pid=os.getpid(),
+                     meta={**live, "pid_start_ticks": live["pid_start_ticks"] + 1})
+    assert "still running" in str(transport._empty_response_error(proven, "x"))
+    assert "no longer running" in str(transport._empty_response_error(reused, "x"))
+
+
+def test_unreachable_instance_stop_advice_pastes_for_a_dash_id_1033_4(tmp_path):
+    """Review round 1: the lifecycle-only refusal's `session stop` must parse."""
+    import dataclasses
+
+    from bn import transport
+
+    handle = dataclasses.replace(_handle(tmp_path / "-t0116-parent.json", pid=os.getpid()),
+                                 unreachable=True)
+    with pytest.raises(BridgeError) as excinfo:
+        transport._send_request_to_instance(handle, "ping", timeout=1.0)
+    command = re.search(r"stop it with `(bn [^`]+)`", str(excinfo.value)).group(1)
+    parsed = _parse(_paste(command, tmp_path))
+    assert (parsed._command_path, parsed.instance_id) == (("session", "stop"), "-t0116-parent")
 
 
 # --- #1036 item 7: project routing is disclosed; instance list --mine ---------
@@ -286,6 +353,23 @@ def test_project_association_pick_is_disclosed_once_1036_7(monkeypatch, capsys, 
     assert "2 other instances are running" in err
     pasted = re.search(r"Pass (\S+) to make", err).group(1)
     assert _parse([pasted, "target", "list"]).instance == "-mine"
+
+
+def test_association_pick_under_the_spawn_lock_is_disclosed_1036_7(
+    monkeypatch, capsys, tmp_path,
+):
+    """Review round 1: the auto-spawn recheck selects by association too."""
+    from bn import transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    instances_dir().mkdir(parents=True, exist_ok=True)
+    root = str(tmp_path)
+    monkeypatch.setattr(transport, "project_root", lambda: Path(root))
+    fleet = [_registered("mine", [root]), _registered("other", [])]
+    monkeypatch.setattr(transport, "list_instances", lambda **k: fleet)
+    monkeypatch.setattr(transport, "_associated_noted", set())
+    assert transport._auto_spawn_locked(timeout=5.0).instance_id == "mine"
+    assert "note: using instance mine, associated with" in capsys.readouterr().err
 
 
 def test_instance_list_mine_keeps_associated_and_pinned_1036_7(monkeypatch, capsys, tmp_path):

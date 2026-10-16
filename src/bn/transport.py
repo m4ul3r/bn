@@ -39,7 +39,7 @@ from .paths import (
 )
 from .proc_identity import PinUnavailable, identity_verdict, pin_process
 from .socket_evidence import path_has_bound_socket
-from .target_hint import instance_id_option, instance_option
+from .target_hint import instance_id_option, instance_option, positional_selector
 from .wire_limits import batch_apply_max_bytes
 
 
@@ -424,53 +424,79 @@ class BridgeProcessSignal:
         return None
 
 
-def _registry_left_behind(instance: BridgeInstance) -> bool:
-    """Whether *instance*'s own registry entry is still on disk.
+_STOP_REASONS = {
+    "shutdown_request": "a shutdown request, which `bn session stop` and `restart` send",
+    "idle_timeout": "the BN_IDLE_TIMEOUT idle reaper",
+}
 
-    A clean shutdown (`session stop`, `restart`, the idle reaper) removes the
-    entry before the process exits; a process that dies without running its
-    shutdown cannot. An entry that now names another pid belongs to a
-    successor, so it is not this process's (#1035 item 1).
+
+def _stop_record(instance: BridgeInstance) -> tuple[str, dict[str, Any] | None]:
+    """The stop record the bridge's own teardown wrote, judged against *instance*.
+
+    Returns ``("matched", record)`` only when the record names this bridge by
+    its ``instance_token``; otherwise ``"absent"``, ``"unreadable"`` or
+    ``"other"`` (a record a predecessor or successor of the same id left),
+    none of which says anything about why this bridge closed (#1035 item 1).
     """
+    path = instance.registry_path.with_suffix(".stopped")
     try:
-        recorded = json.loads(instance.registry_path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "absent", None
     except (OSError, ValueError):
-        return False
-    return isinstance(recorded, dict) and recorded.get("pid") == instance.pid
+        return "unreadable", None
+    if not isinstance(record, dict):
+        return "unreadable", None
+    token = instance.instance_token
+    if isinstance(token, str) and token and record.get("instance_token") == token:
+        return "matched", record
+    return "other", None
+
+
+def _bridge_running(instance: BridgeInstance) -> bool:
+    """Whether *instance*'s own process is still running: not exited, and the
+    pid still carries the identity the registry recorded -- a reused pid is
+    not the bridge (#1035 review)."""
+    return (_process_running(instance.pid)
+            and identity_verdict(instance.meta, instance.pid) != "mismatch")
 
 
 def _exit_evidence(instance: BridgeInstance, *, running: bool) -> str:
-    """What the process state and the registry show, without guessing a cause."""
-    left = _registry_left_behind(instance)
-    if running:
-        if left:
-            return ("The process is still running but closed the connection "
-                    "without replying.")
-        return ("The process is still running but has removed its registry "
-                "entry, which a clean shutdown (such as `bn session stop`) does "
-                "first: it is shutting down and did not finish this request.")
-    if left:
-        return ("The process is no longer running and left its registry entry "
-                "behind, so it exited without a clean shutdown (a crash, a kill "
-                "signal or the OOM killer).")
-    return ("The process is no longer running and its registry entry is gone. A "
-            "clean shutdown (such as `bn session stop`) removes it; after an "
-            "unclean exit only `bn instance gc` does.")
+    """What the process state and the bridge's stop record show. A cause is
+    named only from a stop record this bridge wrote; nothing is inferred
+    from a missing or foreign one."""
+    state = ("The process is still running" if running
+             else "The process is no longer running")
+    verdict, record = _stop_record(instance)
+    if verdict == "matched":
+        reason = str(record.get("reason"))
+        cause = _STOP_REASONS.get(reason, f"reason: {reason}")
+        when = record.get("stopped_at")
+        return (f"{state}. Its stop record shows a clean shutdown ({cause})"
+                + (f" at {when}" if isinstance(when, str) else "")
+                + " that did not finish this request.")
+    found = {
+        "absent": "no stop record was found for it",
+        "unreadable": "its stop record could not be read",
+        "other": "the stop record at its path belongs to another bridge",
+    }[verdict]
+    return f"{state}, and {found}, so the reason it closed the connection is unknown."
 
 
 def _empty_response_error(instance: BridgeInstance, op: str | None) -> BridgeError:
     """Explain a connection that accepted the request but replied with nothing.
 
     The dispatch layer catches every Python exception, so an empty reply means
-    the process went away or is going away. Whether that was a deliberate stop
-    or an unclean exit is read from the registry, not assumed (#1035 item 1).
-    Surface the pid, liveness, and log path instead of a bare one-liner.
+    the process went away or is going away. A deliberate stop is reported only
+    from the stop record the bridge's teardown writes, never assumed or
+    inferred (#1035 item 1). Surface the pid, liveness, and log path instead of
+    a bare one-liner.
     """
     op_label = f"op '{op}'" if op else "the request"
     parts = [
         f"Binary Ninja bridge returned an empty response for {op_label} "
         f"(instance {instance_selector(instance)}, pid {instance.pid}).",
-        _exit_evidence(instance, running=_process_running(instance.pid)),
+        _exit_evidence(instance, running=_bridge_running(instance)),
     ]
     parts.extend(_bridge_recovery_advice(instance))
     return BridgeError(" ".join(parts))
@@ -510,7 +536,7 @@ def _unparseable_response_error(
         f"(instance {instance_selector(instance)}, pid {instance.pid}): "
         f"the connection closed after {received} bytes ({type(exc).__name__}: {exc})."
     ]
-    if _process_running(instance.pid):
+    if _bridge_running(instance):
         parts.append(
             "The process is still running, so the reply is malformed rather than "
             "cut short -- a bridge older or newer than this CLI is the usual cause; "
@@ -1086,7 +1112,7 @@ def gc_instances() -> dict[str, Any]:
 
     Returns a summary: ``live_instances``, ``registries_purged`` (dead
     registries the liveness sweep removed), ``logs_removed``,
-    ``sockets_removed``, ``last_used_removed``, and ``removed`` (the list of
+    ``sockets_removed``, ``last_used_removed``, ``stop_records_removed``, and ``removed`` (the list of
     removed paths, the purged registries included -- reporting those as a
     count alone hid a destructive action behind a number).
     """
@@ -1097,6 +1123,7 @@ def gc_instances() -> dict[str, Any]:
         "logs_removed": 0,
         "sockets_removed": 0,
         "last_used_removed": 0,
+        "stop_records_removed": 0,
         "removed": [],
     }
     # Serialize against spawns. A spawn creates ``<id>.log`` + ``<id>.sock``
@@ -1135,7 +1162,10 @@ def gc_instances() -> dict[str, Any]:
             # ``.log`` beside it: nothing in this tree writes one, but a host
             # running a build that does accumulates them and `gc` is their
             # only reaper (#733 F6).
-            suffix = next((s for s in (".log", ".sock", ".last_used")
+            # A ``.stopped`` record (#1035 item 1) is reaped on the same
+            # evidence: it outlives its bridge on purpose, for a client whose
+            # request the teardown cut off, and nothing else removes it.
+            suffix = next((s for s in (".log", ".sock", ".last_used", ".stopped")
                            if entry.name.endswith(s)), None)
             if suffix is None or entry.name.removesuffix(suffix) in live_ids:
                 continue
@@ -1157,7 +1187,8 @@ def gc_instances() -> dict[str, Any]:
                 summary["removed"].append(str(entry))
                 summary[{".log": "logs_removed",
                          ".sock": "sockets_removed",
-                         ".last_used": "last_used_removed"}[suffix]] += 1
+                         ".last_used": "last_used_removed",
+                         ".stopped": "stop_records_removed"}[suffix]] += 1
     return summary
 
 
@@ -1464,10 +1495,14 @@ def _auto_spawn_locked(timeout: float | None = SPAWN_LOCK_TIMEOUT) -> BridgeInst
         remaining = _remaining_deadline(deadline, "auto-starting a bridge")
         instances = list_instances(timeout=remaining)
         if len(instances) == 1:
+            if instances[0].instance_id and _resolve_from_project_roots(instances) is None:
+                _note_unassociated_instance(instances[0])
             return instances[0]
         if instances:
             associated = _resolve_from_project_roots(instances)
             if associated is not None:
+                # The same selection choose_instance discloses (#1036 item 7).
+                _note_associated_instance(associated, len(instances) - 1)
                 return associated
             raise _multiple_instances_error(instances)
         remaining = _remaining_deadline(deadline, "auto-starting a bridge")
@@ -1650,7 +1685,7 @@ def _send_request_to_instance(
             f"{instance_selector(instance)!r} (pid {instance.pid}) resolved for "
             f"lifecycle commands only: its recorded socket is either gone or not "
             f"one this cache can vouch for, so nothing may be dispatched to it "
-            f"-- stop it with `bn session stop {instance_selector(instance)}`"
+            f"-- stop it with `bn session stop {positional_selector(instance_selector(instance))}`"
         )
     expected_identity = _instance_identity(instance)
     # #853: `or {}` defaults an ABSENT params (None) and nothing else. A present

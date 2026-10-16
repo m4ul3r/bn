@@ -1913,6 +1913,10 @@ class BinaryNinjaBridge:
         # The one-shot arm that keeps a second stop() from deleting a successor's
         # files (#799).
         self._instance_state_released: bool = False
+        # Why stop() ran, recorded in the stop record it writes (#1035 item 1):
+        # set by the `shutdown` op and the idle reaper; None for any other
+        # teardown (interrupt, atexit, GUI restart).
+        self._stop_reason: str | None = None
         self._target_lock = _ReadWriteLock()
         # Serializes write operations. Long chunked writers can hold this gate
         # while releasing _target_lock between chunks so reads stay responsive.
@@ -2190,6 +2194,10 @@ class BinaryNinjaBridge:
             self._stopped = True
             self._refuse_queued_load_jobs_locked()
             server = self._server
+            # Before the drain and before any file is released, so a client
+            # whose request this teardown cuts off finds the record (#1035 item 1).
+            if server is not None and not self._instance_state_released:
+                self._write_stop_record_locked()
         # Stop accepting connections, but retain the bind and discovery files
         # throughout the drain. Already accepted readers will refuse new work.
         if server is not None:
@@ -2236,6 +2244,36 @@ class BinaryNinjaBridge:
             with contextlib.suppress(RuntimeError):
                 thread.join(timeout=load_join_timeout)
         return verdict
+
+    def _write_stop_record_locked(self) -> None:
+        """Record that THIS bridge ran its clean teardown. Caller MUST hold
+        _teardown_lock and the bind (#799: no successor can own these paths).
+
+        The record is the positive witness a client's empty-reply diagnosis
+        needs (#1035 item 1): only stop() writes it, a crash or kill cannot,
+        and it names this bridge by `instance_token`, so a record a successor
+        or a predecessor left at the same path is never read as this one's.
+        Best-effort: a teardown must never fail because it could not write it.
+        `bn instance gc` reaps it once no registry of that name remains.
+        """
+        record = {
+            "instance_id": self.instance_id,
+            "instance_token": self.instance_token,
+            "pid": os.getpid(),
+            "reason": self._stop_reason or "teardown",
+            "stopped_at": datetime.now(timezone.utc).isoformat(),
+        }
+        path = self.registry_path.with_suffix(".stopped")
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(record))
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001 - best-effort; a teardown must not fail here
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    Path(tmp).unlink()
 
     def _release_own_instance_state_locked(self):
         """Remove this bridge's discovery files. Caller MUST hold _teardown_lock.
@@ -2616,6 +2654,7 @@ class BinaryNinjaBridge:
                         f"BN Agent Bridge idle for >= {timeout}s (BN_IDLE_TIMEOUT); "
                         "self-shutting down to reclaim memory"
                     )
+                    self._stop_reason = "idle_timeout"
                     self._shutdown_event.set()
                     return
 
@@ -5258,6 +5297,7 @@ def _bind_shutdown(bridge, params, target):
         )
     with bridge._request_state_lock:
         bridge._shutting_down = True
+    bridge._stop_reason = "shutdown_request"
     bridge._shutdown_event.set()
     return {"shutting_down": True}
 
