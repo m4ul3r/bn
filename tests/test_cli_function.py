@@ -3682,3 +3682,25 @@ def test_function_search_text_says_exact_matches_lead_1037(fake_transport, capsy
     out = capsys.readouterr().out
     assert out.index("main") < out.index("__libc_start_main")
     assert "// 1 exact name match is listed first, then the other matches by address" in out
+
+
+@pytest.mark.parametrize("flags, sent", [([], None), (["--sort", "address"], "address")])
+def test_function_search_forwards_an_explicit_sort_even_when_it_is_address_1048(
+        fake_transport, flags, sent):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "search_functions": {"ok": True, "result": {
+            "kind": "functions", "total": 0, "offset": 0, "limit": 100, "returned": 0,
+            "has_more": False, "items": []}},
+    })
+    bn.cli.main(["function", "search", "main", *flags])
+    assert calls[1]["params"].get("sort") == sent
+
+
+def test_function_search_count_still_accepts_an_explicit_address_sort_1048(fake_transport):
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "search_functions": {"ok": True, "result": {"kind": "functions", "count": 1,
+                                                    "total": 1}},
+    })
+    assert bn.cli.main(["function", "search", "main", "--count", "--sort", "address"]) == 0

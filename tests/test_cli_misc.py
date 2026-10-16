@@ -3625,3 +3625,20 @@ def test_the_resolver_miss_prints_a_data_symbols_command_that_runs_1042(
     })
     assert bn.cli.main(argv[1:]) == 0
     assert calls[-1]["op"] == "data_symbols" and calls[-1]["params"]["query"] == "g it's"
+
+
+def test_raw_byte_out_summary_states_the_resolved_address_not_the_name_1048(
+        fake_transport, capsys, tmp_path):
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "read": {"ok": True, "result": {
+            "address": "0x420018", "length": 2, "hex": "c80c", "ascii": "..",
+            "resolved_symbol": {"name": "sock_path", "kind": "data", "address": "0x420018"}}},
+    })
+    out = tmp_path / "ptr.bin"
+    assert bn.cli.main(["read", "sock_path", "2", "--encoding", "bytes",
+                        "--out", str(out), "--format", "json"]) == 0
+    summary = json.loads(capsys.readouterr().out)["summary"]
+    assert summary["address"] == "0x420018"
+    assert summary["resolved_symbol"]["name"] == "sock_path"
+    assert out.read_bytes() == b"\xc8\x0c"

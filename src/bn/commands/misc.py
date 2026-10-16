@@ -691,7 +691,13 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
             partial_fields["requested_length"] = result["requested_length"]
         note = str(result.get("note") or f"partial read: {len(data)} bytes returned")
         print(f"note: {note}", file=sys.stderr)
-    summary = {"kind": "bytes", "address": address, "length": len(data), **partial_fields}
+    # #1042 review: `address` is the ADDRESS the bytes were read from -- the
+    # bridge's resolved hex -- never the name the caller typed; that name is in
+    # `resolved_symbol` below.
+    resolved_address = result.get("address")
+    summary = {"kind": "bytes",
+               "address": resolved_address if isinstance(resolved_address, str) else address,
+               "length": len(data), **partial_fields}
     # #1042 item 2: stdout IS the payload here, so how a name resolved goes to
     # stderr, beside the partial-read note, and into the --out summary.
     resolved_notes = _render_resolved_symbol_notes(result)

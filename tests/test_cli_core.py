@@ -364,6 +364,52 @@ def test_no_default_page_note_when_the_caller_chose_or_nothing_was_cut_1037(
     assert "default --limit" not in capsys.readouterr().err
 
 
+def test_fanout_rows_the_default_page_cut_short_each_get_a_stderr_note_1037(
+        capsys, fake_transport, monkeypatch):
+    """#1048 review: `--all-targets` returned through the fan-out path before the
+    single-target note, so a truncated JSON survey had an empty stderr."""
+    def page(total, returned):
+        return {"kind": "imports", "total": total, "offset": 0, "limit": 100,
+                "returned": returned, "has_more": returned < total,
+                "items": [{"name": f"imp_{i}", "address": hex(0x1000 + i)}
+                          for i in range(returned)]}
+
+    fake_transport({"list_targets": {"ok": True, "result": [
+        {"target_id": "1:1:1", "selector": "small"},
+        {"target_id": "1:2:2", "selector": "big"}]}})
+    listed = bn.cli.send_request
+    pages = {"1:1:1": page(14, 14), "1:2:2": page(120, 100)}
+    asked: list = []
+
+    def send(op, *, target=None, **kwargs):
+        if op != "imports":
+            return listed(op, target=target, **kwargs)
+        asked.append((target, kwargs.get("params")))
+        return {"ok": True, "result": pages[target]}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    assert bn.cli.main(["imports", "--all-targets", "--format", "json"]) == 0
+
+    err = capsys.readouterr().err.splitlines()
+    notes = [line for line in err if "default --limit 100" in line]
+    assert notes == [
+        "note: target 1:2:2: the default --limit 100 cut this page "
+        "short (100 of 120); rerun with --offset 100, a larger --limit, or --out "
+        "FILE for every row"], err
+    assert sorted(target for target, _ in asked) == ["1:1:1", "1:2:2"]
+    assert all(params["limit"] == 100 for _, params in asked)
+
+
+def test_abbreviated_routing_option_does_not_bend_the_exports_hint_1037(capsys):
+    """#1048 review nit: `--targ exports` is the abbreviated `--target`, so its
+    value is not the command path; the printed command must parse."""
+    hint = _parser_hint(capsys, ["--targ", "exports", "exports", "--estimate-output"])
+    argv = _printed_command(hint)
+    assert argv == ["--targ", "exports", "exports", "list", "--estimate-output"]
+    ns = bn.cli.build_parser().parse_args(argv)
+    assert ns.estimate_output is True and ns._command_path == ("exports", "list")
+
+
 def test_local_list_text_is_slim(fake_transport, capsys):
     fake_transport({
         "list_locals": {

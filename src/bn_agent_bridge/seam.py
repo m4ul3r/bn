@@ -1005,9 +1005,15 @@ class BridgeContext:
                 raise
         text = str(value).strip()
         symbols = self._find_symbols_by_name(bv, text, case_sensitive=True) if text else []
-        data = [s for s in symbols if "Function" not in _symbol_kind(s)]
+        # #1042 review: an import is several symbols under one name -- the GOT
+        # slot (`ImportAddressSymbol`), the PLT stub (a function symbol) and
+        # BN's `.extern` placeholder (`ExternalSymbol`). Only the slot is
+        # addressable data; the placeholder ranks last, so `read puts 8` reads
+        # the slot instead of refusing two "data" addresses.
+        external = [s for s in symbols if _symbol_kind(s) == "ExternalSymbol"]
+        data = [s for s in symbols if "Function" not in _symbol_kind(s) and s not in external]
         functions = [s for s in symbols if "Function" in _symbol_kind(s)]
-        for kind, group in (("data", data), ("function", functions)):
+        for kind, group in (("data", data), ("function", functions), ("data", external)):
             addresses = {int(s.address) for s in group}
             if len(addresses) > 1:
                 raise RuntimeError(_format_ambiguous_symbol_error(text, group))

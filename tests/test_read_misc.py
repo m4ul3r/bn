@@ -2350,3 +2350,21 @@ def test_data_symbols_query_filters_before_paging_1042(monkeypatch):
     assert [row["n"] for row in late["items"]] == [
         "g_slot_14", "g_slot_140", "g_slot_141", "g_slot_142", "g_slot_143"]
     assert late["total"] == 11 and late["has_more"] is True
+
+
+def test_an_import_name_reads_its_got_slot_not_the_extern_placeholder_1048(monkeypatch):
+    """#1048 review: `read puts 8` refused as ambiguous between the GOT slot
+    (ImportAddressSymbol) and BN's `.extern` placeholder (ExternalSymbol)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _named_data_bv(
+        fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x2014, "puts"),
+        fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x2080, "puts"),
+    )
+    assert instance.ctx._resolve_address_operand(bv, "puts") == (
+        0x2014, {"name": "puts", "kind": "data", "address": "0x2014"})
+    # With no slot at all, the placeholder is still a reachable answer.
+    only_extern = _named_data_bv(
+        fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x2080, "puts"))
+    assert instance.ctx._resolve_address_operand(only_extern, "puts")[0] == 0x2080

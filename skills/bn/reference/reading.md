@@ -9,7 +9,7 @@ bn target list [--format json]                       # open targets + their sele
 bn function list [--count] [--min-address 0x401000 --max-address 0x40ffff]
 bn function list [--sort {address|size|name}] [--reverse] [--min-size 64] [--mangled]
 bn function list [--named | --unnamed]               # meaningful names vs BN's auto sub_* (import thunks in neither)
-bn function search attachment [--count]              # --count here = MATCHES, not the whole-binary total; exact name matches list first
+bn function search attachment [--count]              # --count here = MATCHES, not the whole-binary total; with no --sort, exact name matches list first (an explicit --sort, even address, is plain order)
 bn function search main --exact                      # only the function named exactly `main` (case-insensitive), not every *main* substring
 bn function search --regex 'attach|detach|follow'
 bn function search <q> [--sort … --reverse --min-size N --mangled]

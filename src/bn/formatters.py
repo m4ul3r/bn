@@ -5941,6 +5941,10 @@ def _operation_row(item: dict[str, Any]) -> tuple[str, list[str]]:
     token = _SKEWED_FIELDS.set([])
     try:
         row = _operation_row_text(item)
+        # #1042 review: an op that resolved a name (`data_<hex>`, a data
+        # symbol) says how, in the row it describes.
+        for note in _resolved_symbol_notes(item):
+            row += f"  ({note.removeprefix('note: ')})"
         unreadable = sorted(_SKEWED_FIELDS.get() or ())
     finally:
         _SKEWED_FIELDS.reset(token)
@@ -6378,6 +6382,7 @@ def _build_mutation_summary(
     preview_skipped: Sequence[dict[str, Any]] = (),
     reverted: int = 0,
     function_deletions: Sequence[dict[str, Any]] = (),
+    resolved_symbols: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """The ONE compact-status schema every mutation summary emits (#685).
 
@@ -6549,6 +6554,11 @@ def _build_mutation_summary(
         # the counts above say nothing about the ops it skipped. Conditional
         # like the keys above: a preview that covered every op has none.
         summary["preview_skipped"] = list(preview_skipped)
+    if resolved_symbols:
+        # #1042 review: how a name an op was given became an address (a
+        # rendered `data_<hex>`, a data symbol name), so the compact status says
+        # it as `read`/`xrefs` do. Conditional like the keys above.
+        summary["resolved_symbols"] = list(resolved_symbols)
     return summary
 
 
@@ -6761,6 +6771,8 @@ def _mutation_summary(value: Any) -> Any:
         ],
         preview_skipped=[row for row in _row_list(value, "preview_skipped")
                          if isinstance(row, dict)],
+        resolved_symbols=[_field_dict(r, "resolved_symbol") for r in results
+                          if _field_dict(r, "resolved_symbol")],
     )
 
 
@@ -7191,6 +7203,9 @@ def _render_mutation_summary_text(value: Any) -> str:
                  "before closing.")
     if value.get("first_error"):
         line += f"\nfirst_error: {value['first_error']}"
+    # #1042 review: the same `note: resolved …` lines `read`/`xrefs` print.
+    for note in _resolved_symbol_notes(value):
+        line += f"\n{note}"
     return line
 
 

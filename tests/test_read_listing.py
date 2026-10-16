@@ -2425,3 +2425,17 @@ def test_search_does_not_announce_an_order_when_every_match_is_exact_1037(monkey
     _view(monkeypatch, instance, [_FakeFunction(0x4008c0, "main")])
 
     assert "exact_matches_first" not in instance._search_functions(None, "main")
+
+
+def test_an_explicit_address_sort_is_plain_ascending_address_order_1048(monkeypatch):
+    """#1048 review blocker: `--sort address` asked for ascending address order,
+    and the exact-first rerank overrode it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _view(monkeypatch, instance, _main_population())
+
+    result = instance._search_functions(None, "main", sort="address")
+
+    assert [row["address"] for row in result["items"]] == [
+        "0x4007f0", "0x4008c0", "0x400900", "0x400a00"]
+    assert "exact_matches_first" not in result

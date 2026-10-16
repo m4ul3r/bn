@@ -157,9 +157,10 @@ def _function_list(args: argparse.Namespace) -> int:
                  help="Alias for the positional query (matches `strings --query` / `types --query`)"),
              arg("--count", action="store_true", default=False,
                  help="Show match count instead of listing"),
-             arg("--sort", choices=["address", "size", "name"], default="address",
-                 help="Order results ascending by address (default), size, or name "
-                      "(the name the text shows: demangled, or raw under --mangled)"),
+             arg("--sort", choices=["address", "size", "name"], default=None,
+                 help="Order results ascending by address, size, or name (the name the "
+                      "text shows: demangled, or raw under --mangled). Omitted: exact "
+                      "name matches first, then address order"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
                  help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
              demangle_compat_arg(),
@@ -224,7 +225,10 @@ def _function_search(args: argparse.Namespace) -> int:
     limit = _effective_limit(args)
     if limit is not None:
         params["limit"] = limit
-    if args.sort != "address":
+    # #1037 item 9 review: an EXPLICIT `--sort address` is forwarded, so the
+    # bridge keeps plain ascending address order; only an omitted --sort gets
+    # the exact-name-first default order.
+    if args.sort is not None:
         params["sort"] = args.sort
     if args.reverse:
         params["reverse"] = True

@@ -291,12 +291,24 @@ class BnArgumentParser(argparse.ArgumentParser):
         return parsed
 
 
+def _option_action(parser: argparse.ArgumentParser, token: str) -> argparse.Action | None:
+    """The action argparse binds *token* to on *parser*: an exact option
+    string, or -- as argparse's `allow_abbrev` does -- the one option a `--`
+    prefix abbreviates. None for anything else, an ambiguous prefix included."""
+    exact = parser._option_string_actions.get(token)
+    if exact is not None or not token.startswith("--") or not parser.allow_abbrev:
+        return exact
+    matches = {id(action): action for option, action in parser._option_string_actions.items()
+               if option.startswith(token)}
+    return next(iter(matches.values())) if len(matches) == 1 else None
+
+
 def _option_takes_value(parsers: tuple[argparse.ArgumentParser, ...], token: str) -> bool:
     """Whether *token* is an option that consumes the NEXT argv token."""
     if not token.startswith("-") or "=" in token:
         return False
     for parser in parsers:
-        action = parser._option_string_actions.get(token)
+        action = _option_action(parser, token)
         if action is not None:
             return action.nargs != 0
     return False
@@ -328,13 +340,13 @@ def _unrecognized_arguments_hint(
         token, switch = argv[index], argv[index - 1]
         if token not in extras or token.startswith("-"):
             continue
-        action = selected._option_string_actions.get(switch)
+        action = _option_action(selected, switch)
         if action is None or action.nargs != 0:
             continue
         if index >= 2 and _option_takes_value(parsers, argv[index - 2]):
             continue   # `switch` is itself the value of the option before it
         query = selected._option_string_actions.get("--query")
-        if (switch == "--regex" and query is not None
+        if (action.dest == "regex" and query is not None
                 and getattr(parsed, query.dest, None) is None
                 and getattr(parsed, "query", None) is None):
             fixed = [*argv[:index - 1], "--query", token, switch, *argv[index + 1:]]
@@ -1736,9 +1748,12 @@ def _refuse_count_only_slices(args: argparse.Namespace, *, command: str,
     over. One helper rather than two, so the next aggregate inherits the
     refusal instead of re-deriving which flags are meaningless.
     """
+    # None is "not given" for every flag: `function search --sort` defaults to
+    # None so its handler can tell an explicit `--sort address` from the
+    # default order (#1037 item 9).
     offenders = [
         flag for attr, flag, unset in _COUNT_SLICE_FLAGS
-        if flag != mode and getattr(args, attr, unset) != unset
+        if flag != mode and getattr(args, attr, unset) not in (unset, None)
     ]
     if offenders:
         # The noun follows the MODE rather than being hard-coded to "count":
@@ -2657,6 +2672,9 @@ def _fanout_call(
         for tsel in plan["tsels"]:
             units.append(("work", (iid, tsel)))
 
+    # Default-page notes per executed (instance, target), for stderr (#1037.4).
+    page_notes: dict[tuple[Any, Any], str] = {}
+
     def _run_one(item: tuple[Any, Any]) -> dict[str, Any]:
         iid, tsel = item
         row: dict[str, Any] = {"instance": iid}
@@ -2678,6 +2696,12 @@ def _fanout_call(
             )
             row.update({"target": target, "ok": True,
                         _RESULT_ROW_KEY: unwrap_result(response, op)})
+            # #1037 item 4 review: the default-page note for THIS row, decided
+            # from the same reply (the helper is pure), kept beside the rows
+            # rather than in them so the fan-out envelope keeps its shape.
+            note = _default_page_note(args, unwrap_result(response, op))
+            if note:
+                page_notes[(iid, target)] = note
         except BridgeError as exc:
             row.update({"target": tsel, "ok": False, "error": str(exc)})
         # Per-row wall-clock so an agent can see WHERE a broad survey spent its
@@ -2735,6 +2759,17 @@ def _fanout_call(
         # dumping every instance's rows.
         estimate_only=bool(getattr(args, "estimate_output", False)),
     )
+    # #1037 item 4 review: a fan-out is the bulk-listing surface, so each
+    # successful row the DEFAULT page cut short gets the same stderr note as a
+    # single-target read, naming the row it describes.
+    if not getattr(args, "estimate_output", False):
+        for row in rows:
+            note = page_notes.get((row.get("instance"), row.get("target")))
+            if note:
+                where = ", ".join(part for part in (
+                    f"instance {row['instance']}" if row.get("instance") else "",
+                    f"target {row.get('target')}") if part)
+                print(note.replace("note: ", f"note: {where}: ", 1), file=sys.stderr)
     # Exit non-zero when EVERY instance failed, so a scripted consumer keying on
     # the exit code doesn't read a total failure as success (#169 L1 review). A
     # partial success stays 0; callers inspect the per-instance `ok` rows.

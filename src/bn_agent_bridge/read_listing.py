@@ -1880,13 +1880,19 @@ def _search_functions(
     offset: int = 0,
     limit: int | None = None,
     count_only: bool = False,
-    sort: str = "address",
+    sort: str | None = None,
     reverse: bool = False,
     mangled: bool = False,
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     min_size = _validate_count(min_size, label="min_size", minimum=1, allow_none=True)
+    # #1037 item 9 review: an omitted sort is the DEFAULT order (address, with
+    # exact name matches first); an explicit `sort="address"` is plain
+    # ascending address order and is never reranked.
+    default_order = sort is None
+    if default_order:
+        sort = "address"
     bv = ctx._resolve_view(selector)
     if regex:
         try:
@@ -1986,7 +1992,7 @@ def _search_functions(
     sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0],
                                        mangled=mangled, name_of=lambda pair: pair[1])
     exact_first = 0
-    if sort == "address" and not reverse and not (regex or exact):
+    if default_order and not reverse and not (regex or exact):
         # #1037 item 9: `function search main` listed `__libc_start_main` before
         # `main`, and on a large binary the exact name sat among 69 substring
         # hits. Under the DEFAULT order an exact (case-insensitive) name match is
