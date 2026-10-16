@@ -3156,38 +3156,23 @@ def test_hidden_surface_counts_function_entries_apart_from_interior_slots_1017(m
     assert table["interior_functions"] == [{"address": "0x2020", "name": "dispatch"}]
 
 
-def _vtable_census(objects, typeinfo=(("_ZTI5Short", 0x9000),), *, status="ok", symtab=True):
+def _vtable_census(objects, *, status="ok", symtab=True):
     return {"status": status, "reason": None if status == "ok" else "unreadable",
             "objects": [{"raw_name": name, "start": start, "size": size, "kind": kind,
                          "table": ".symtab", "supported": True, "reason": None}
                         for name, start, size, kind in objects],
-            "typeinfo": {address: {name} for name, address in typeinfo},
             "symtab": symtab, "pointer_size": 8, "endian": "<"}
 
 
 class _VtableSurfBV(_SurfBV):
     """`_SurfBV`'s 4-pointer run at 0x1000, preceded by an Itanium header
-    `[0, &typeinfo 0x9000]` at 0xff0; the typeinfo record's vptr is BN's
-    `__class_type_info` vtable address point and its name pointer leads to
-    `5Short`."""
+    `[0, &typeinfo 0x9000]` at 0xff0."""
 
     def read(self, addr, n):
-        addr, n = int(addr), int(n)
-        if addr == 0xff0:
+        if int(addr) == 0xff0:
             header = (0).to_bytes(8, "little") + (0x9000).to_bytes(8, "little")
-            return (header + super().read(0x1000, max(0, n - 16)))[:n]
-        if addr == 0x9000:
-            # A typeinfo record: `__class_type_info` vtable address point, name.
-            return ((0x7010).to_bytes(8, "little") + (0x9100).to_bytes(8, "little"))[:n]
-        if addr == 0x9100:
-            return b"5Short\0".ljust(n, b"\0")[:n]
+            return (header + super().read(0x1000, max(0, int(n) - 16)))[:int(n)]
         return super().read(addr, n)
-
-    def get_symbol_at(self, addr):
-        if int(addr) == 0x7000:
-            return types.SimpleNamespace(raw_name="_ZTVN10__cxxabiv117__class_type_infoE",
-                                         type="ExternalSymbol")
-        return None
 
 
 def _vtable_surface(monkeypatch, census, **kwargs):
@@ -3213,8 +3198,7 @@ def test_hidden_surface_labels_entries_inside_an_elf_vtable_extent_1017(monkeypa
     assert table["elf_vtables"] == [{
         "object": "_ZTV5Short", "label": "_ZTV5Short", "kind": "vtable",
         "object_address": "0xff0", "size": 0x20, "first_entry": "0x1000",
-        "entries_inside": 2, "slot": 0, "slot_address_point": "0x1000", "offset_to_top": 0,
-        "slot_unknown_reason": None}]
+        "entries_inside": 2}]
     assert table["entries_outside_elf_vtables"] == 2
     assert table["extends_past_elf_vtable"] is True
     assert out["summary"]["vtable_labels"]["status"] == "ok"
@@ -3259,7 +3243,7 @@ def test_vtable_index_finds_exactly_the_overlapping_objects_1046(monkeypatch):
     objects = [{"raw_name": f"_ZTV{i}", "start": 0x1000 + 0x40 * i, "size": 0x30,
                 "kind": "vtable"} for i in range(9000)]
     objects.append({"raw_name": "_ZTVBig", "start": 0x0f00, "size": 0x200, "kind": "vtable"})
-    index = re._VtableIndex(None, _vtable_census([]), objects)
+    index = re._VtableIndex(None, objects)
     names = lambda lo, hi: [o["raw_name"] for o in index.overlapping(lo, hi)]
     assert names(0x1000, 0x1008) == ["_ZTVBig", "_ZTV0"]
     assert names(0x1030, 0x1040) == ["_ZTVBig"]          # _ZTV0 ends at 0x1030
@@ -3281,7 +3265,7 @@ def test_vtable_index_nesting_does_not_walk_the_whole_prefix_1046(monkeypatch):
     objects = [{"raw_name": f"_ZTV{i}", "start": 0x10000 + 0x40 * i, "size": 0x30,
                 "kind": "vtable"} for i in range(9000)]
     objects.append({"raw_name": "_ZTVBig", "start": 0x100, "size": 0x400000, "kind": "vtable"})
-    index = re._VtableIndex(None, _vtable_census([]), objects)
+    index = re._VtableIndex(None, objects)
     visits = []
 
     class _Counting(list):
@@ -3306,7 +3290,7 @@ class _TwoRunSurfBV(_VtableSurfBV):
 
 @pytest.mark.parametrize("hide", [False, True])
 def test_hidden_surface_labels_only_the_tables_it_shows_1046(monkeypatch, hide):
-    """#1046 review: a run past --max-tables gets no label or slot reads, and
+    """#1046 review: a run past --max-tables gets no label lookup, and
     --hide-vtables decides from coverage alone."""
     bridge = _load_bridge(monkeypatch)
     re = bridge.read_evidence
@@ -3314,10 +3298,9 @@ def test_hidden_surface_labels_only_the_tables_it_shows_1046(monkeypatch, hide):
     census = _vtable_census([("_ZTV5Short", 0xff0, 0x30, "vtable"),
                              ("_ZTV4Next", 0x1020, 0x30, "vtable")])
     monkeypatch.setattr(re.read_listing, "_elf_vtable_census", lambda bv: census)
-    slot_reads = []
-    real_slot = re.read_listing._vtable_slot
-    monkeypatch.setattr(re.read_listing, "_vtable_slot",
-                        lambda *a, **k: slot_reads.append(a[2]) or real_slot(*a, **k))
+    lookups = []
+    monkeypatch.setattr(re.read_listing, "_vtable_object_label",
+                        lambda bv, obj: lookups.append(obj["start"]) or obj["raw_name"])
     bv = _TwoRunSurfBV()
 
     class _Ctx:
@@ -3328,12 +3311,12 @@ def test_hidden_surface_labels_only_the_tables_it_shows_1046(monkeypatch, hide):
     out = re._hidden_surface(_Ctx(), None, max_tables=1, hide_vtables=hide)
     if hide:
         # Both runs lie wholly inside the two objects: hidden, never labelled.
-        assert out["candidate_tables"] == [] and slot_reads == []
+        assert out["candidate_tables"] == [] and lookups == []
         assert out["summary"]["vtable_tables_hidden"] == 2
     else:
         shown, = out["candidate_tables"]
         assert shown["address"] == "0x1000"
-        assert slot_reads == [0xff0]            # only the shown table's object
+        assert lookups == [0xff0]               # only the shown table's object
         assert out["summary"]["candidate_tables_total"] == 2
 
 

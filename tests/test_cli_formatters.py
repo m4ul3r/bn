@@ -1281,45 +1281,16 @@ def test_render_surface_labels_a_table_by_elf_vtable_extent_1017():
     out = _render_surface_text(_surface_value(
         elf_vtables=[{"object": "_ZTV5Short", "label": "vtable for Short",
                       "kind": "vtable", "object_address": "0x403d10", "size": 32,
-                      "first_entry": "0x403d20", "entries_inside": 2, "slot": 0,
-                      "slot_address_point": "0x403d20", "offset_to_top": 0}],
+                      "first_entry": "0x403d20", "entries_inside": 2}],
         entries_outside_elf_vtables=3, extends_past_elf_vtable=True))
     lines = out.splitlines()
     row = lines.index(next(ln for ln in lines if ln.startswith("  0x403d20 ")))
     assert lines[row + 1] == ("    in vtable for Short (_ZTV5Short @ 0x403d10, 32 bytes): "
-                              "2 entries from slot 0")
+                              "2 entries from 0x403d20")
     assert lines[row + 2].startswith("    3 entries outside every ELF vtable object -- "
                                      "the run continues past the object's st_size")
     # A complete .symtab read needs no census note.
     assert "vtable labels:" not in out
-
-
-def test_render_surface_names_a_secondary_table_and_an_undecoded_slot_1017():
-    from bn.formatters import _render_surface_text
-    obj = {"object": "_ZTV1D", "label": "vtable for D", "kind": "vtable",
-           "object_address": "0x404940", "size": 168, "entries_inside": 3}
-    secondary = _render_surface_text(_surface_value(
-        elf_vtables=[{**obj, "slot": 0, "slot_address_point": "0x404998",
-                      "offset_to_top": -16}], entries_outside_elf_vtables=0))
-    assert ("3 entries from slot 0 of the secondary table at address point 0x404998 "
-            "(offset-to-top -16)") in secondary
-    assert "outside every ELF vtable object" not in secondary
-    # #1046 review: a budget refusal is not a missing header, and says so.
-    reasons = {
-        "over_read_budget": "slot unknown: not read: no header in the bytes read before "
-                            "the entry, and earlier bytes are past the read budget",
-        "no_verified_header": "slot unknown: no verified typeinfo header precedes it",
-    }
-    for code, text in reasons.items():
-        undecoded = _render_surface_text(_surface_value(
-            elf_vtables=[{**obj, "slot": None, "slot_address_point": None,
-                          "offset_to_top": None, "slot_unknown_reason": code}],
-            entries_outside_elf_vtables=0))
-        assert f"3 entries ({text}" in undecoded
-    budget = _render_surface_text(_surface_value(
-        elf_vtables=[{**obj, "slot": None, "slot_unknown_reason": "over_read_budget"}],
-        entries_outside_elf_vtables=0))
-    assert "precedes" not in budget
 
 
 @pytest.mark.parametrize("census,expected", [
@@ -1393,55 +1364,36 @@ def test_render_surface_store_lines_and_routed_verify_command():
     assert "malformed stored_to_total field" in skewed
 
 
-def test_callsites_note_states_slots_and_construction_vtables_1018():
+def test_callsites_note_names_construction_vtables_by_extent_1018():
     from bn.formatters import _callsites_data_ref_note
     named = {"address": "0x404ba8", "class_name": "Square", "vtable_address": "0x404b88",
-             "address_point": "0x404b98", "slot": 2, "slot_address_point": "0x404b98",
-             "offset_to_top": 0, "evidence": "elf_symbol_size"}
-    secondary = {**named, "address": "0x404bb0", "slot": 1,
-                 "slot_address_point": "0x404ba8", "offset_to_top": -8}
+             "address_point": "0x404b98", "evidence": "elf_symbol_size"}
     ztc = {"address": "0x404a38", "evidence": "elf_symbol_size", "objects": [
         {"object": "_ZTC1D0_1B", "label": "construction vtable for B-in-D",
-         "kind": "construction_vtable", "object_address": "0x404a20", "size": 112,
-         "slot": 0, "slot_address_point": "0x404a38", "offset_to_top": 0}]}
+         "kind": "construction_vtable", "object_address": "0x404a20", "size": 112}]}
     overlap = {"address": "0x404c00", "evidence": "elf_symbol_size", "objects": [
-        {**ztc["objects"][0], "slot": None},
+        ztc["objects"][0],
         {"object": "_ZTV5Alias", "label": "vtable for Alias", "kind": "vtable",
-         "object_address": "0x404a20", "size": 512, "slot": None}]}
+         "object_address": "0x404a20", "size": 512}]}
     note = _callsites_data_ref_note(
-        5, ["0x404ba8", "0x404bb0", "0x404a38", "0x404c00", "0x405000"],
-        [named, secondary], [ztc, overlap],
+        4, ["0x404ba8", "0x404a38", "0x404c00", "0x405000"],
+        [named], [ztc, overlap],
         {"status": "ok", "symtab": True, "objects": 3, "reason": None})
     lines = note.splitlines()
-    assert lines[1] == ("  0x404ba8: slot 2 of the named vtable for Square (primary address "
+    assert lines[1] == ("  0x404ba8: inside the named vtable for Square (primary address "
                         "point 0x404b98); inspect its class layout with `bn class show -- Square`")
-    assert lines[2].startswith("  0x404bb0: slot 1 of the secondary table at address point "
-                               "0x404ba8 (offset-to-top -8) of the named vtable for Square")
-    assert lines[3] == ("  0x404a38: inside construction vtable for B-in-D (_ZTC1D0_1B @ "
-                        "0x404a20, 112 bytes; slot 0) by ELF symbol size; class navigation is "
+    assert lines[2] == ("  0x404a38: inside construction vtable for B-in-D (_ZTC1D0_1B @ "
+                        "0x404a20, 112 bytes) by ELF symbol size; class navigation is "
                         "not proven, so inspect references to this data location with "
                         "`bn xrefs 0x404a38` (not a virtual-caller list)")
-    assert lines[4].startswith("  0x404c00: inside overlapping ELF objects construction vtable "
-                               "for B-in-D (_ZTC1D0_1B @ 0x404a20, 112 bytes; slot unknown), vtable for Alias")
-    assert lines[5].startswith("  0x405000: table identity unknown")
-    assert len(lines) == 6
+    assert lines[3].startswith("  0x404c00: inside overlapping ELF objects construction vtable "
+                               "for B-in-D (_ZTC1D0_1B @ 0x404a20, 112 bytes), vtable for Alias")
+    assert lines[4].startswith("  0x405000: table identity unknown")
+    assert len(lines) == 5
+    # No slot number is claimed for any row (#1046: split out after three rounds).
+    assert "slot" not in note
     # Every printed command is one of the two runnable forms.
     assert {cmd.split()[1] for cmd in re.findall(r"`(bn [^`]+)`", note)} == {"class", "xrefs"}
-
-
-def test_callsites_note_says_why_a_named_slot_is_unknown_1046():
-    """#1046 review: an entry past the slot read budget says so, and is not
-    described as having no typeinfo header."""
-    from bn.formatters import _callsites_data_ref_note
-    row = {"address": "0x420a40", "class_name": "Huge", "vtable_address": "0x410000",
-           "address_point": "0x410010", "slot": None, "slot_address_point": None,
-           "offset_to_top": None, "slot_unknown_reason": "over_read_budget",
-           "evidence": "elf_symbol_size"}
-    note = _callsites_data_ref_note(1, ["0x420a40"], [row], [], None)
-    line = note.splitlines()[1]
-    assert line.startswith("  0x420a40: inside the named vtable for Huge (primary address "
-                           "point 0x410010; slot unknown: not read:")
-    assert "precedes" not in line and "`bn class show -- Huge`" in line
 
 
 @pytest.mark.parametrize("census,shown", [

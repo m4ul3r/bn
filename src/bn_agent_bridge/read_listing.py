@@ -434,15 +434,13 @@ _ELF_CENSUS_MAX_SYMBOLS = 65536
 _ELF_CENSUS_MAX_BYTES = 4 * 1024 * 1024
 #: Raw-name prefixes of the Itanium objects whose extents the census reports.
 _ELF_VTABLE_KINDS = {b"_ZTV": "vtable", b"_ZTC": "construction_vtable"}
-#: Bytes of one vtable object read to find the header that governs an entry.
-_VTABLE_SLOT_READ_BYTES = 64 * 1024
 _VTABLE_LABEL_RE = re.compile(r"^_?(construction[ _]vtable|vtable)[ _]for[ _](.+)$")
 
 
 def _elf_vtable_census(bv) -> dict[str, Any]:
     """Every defined ``_ZTV``/``_ZTC`` object in the ELF symbol tables of the
     file BN loaded, as ``[start, start + st_size)`` in BN's (possibly rebased)
-    address space, plus the defined ``_ZTI`` typeinfo OBJECTs (start -> names).
+    address space.
 
     This is the one source of vtable identity and extent for `callsites` and
     `evidence surface` (#1017, #1018): no header, filler or nearest-symbol
@@ -462,7 +460,7 @@ def _elf_vtable_census(bv) -> dict[str, Any]:
     from .elf_dynamic import _Elf
 
     def refuse(status: str, reason: str) -> dict[str, Any]:
-        return {"status": status, "reason": reason, "objects": [], "typeinfo": {},
+        return {"status": status, "reason": reason, "objects": [],
                 "symtab": False, "pointer_size": None, "endian": None}
 
     raw = getattr(bv, "parent_view", None)
@@ -513,7 +511,6 @@ def _elf_vtable_census(bv) -> dict[str, Any]:
         bias = int(image_base) - int(original_base) if (
             image_base is not None and original_base is not None) else 0
         objects: list[dict[str, Any]] = []
-        typeinfo: dict[int, set[str]] = {}
         saw_symtab = False
         for section in sections:
             if section[1] not in (2, 11):  # SHT_SYMTAB / SHT_DYNSYM
@@ -559,17 +556,6 @@ def _elf_vtable_census(bv) -> dict[str, Any]:
                     continue  # undefined imports are known non-definitions
                 prefix = strings[name_off:name_off + 4]
                 value = row[4] if elf.is64 else row[1]
-                if prefix == b"_ZTI":
-                    # #1046 review: only a defined, sized OBJECT in a loaded,
-                    # non-executable, file-backed section can be a typeinfo
-                    # record; an STT_FUNC alias named `_ZTI…` is not one.
-                    owner = sections[index] if index < count else None
-                    if (owner is not None and info & 15 == 1 and extent >= 2 * ptr
-                            and owner[1] == 1 and owner[2] & 2 and not owner[2] & 4
-                            and owner[3] <= value < value + extent <= owner[3] + owner[5]):
-                        typeinfo.setdefault(value + bias, set()).add(
-                            strings[name_off:end].decode("utf-8", errors="strict"))
-                    continue
                 kind = _ELF_VTABLE_KINDS.get(prefix)
                 if kind is None:
                     continue
@@ -591,7 +577,7 @@ def _elf_vtable_census(bv) -> dict[str, Any]:
                 objects.append({"raw_name": name, "start": value + bias, "size": extent,
                                 "kind": kind, "table": table,
                                 "supported": reason is None, "reason": reason})
-        return {"status": "ok", "reason": None, "objects": objects, "typeinfo": typeinfo,
+        return {"status": "ok", "reason": None, "objects": objects,
                 "symtab": saw_symtab, "pointer_size": ptr, "endian": elf.endian}
     except UnicodeDecodeError:
         return refuse("malformed", "a vtable symbol name is not UTF-8")
@@ -614,127 +600,6 @@ def _census_summary(census: dict[str, Any] | None) -> dict[str, Any] | None:
         reason = "the ELF symbol tables define no sized _ZTV/_ZTC object"
     summary["reason"] = reason
     return summary
-
-
-#: The Itanium ABI classes every class typeinfo object is an instance of; a
-#: `_ZTI` object's first word is the address point of one of their vtables.
-_RTTI_TYPEINFO_VTABLES = frozenset({
-    "_ZTVN10__cxxabiv117__class_type_infoE",
-    "_ZTVN10__cxxabiv120__si_class_type_infoE",
-    "_ZTVN10__cxxabiv121__vmi_class_type_infoE",
-})
-
-
-def _rtti_vptr(bv, value: int, ptr: int) -> bool:
-    """Is *value* the address point (object start + two words) of one of the
-    ``__cxxabiv1`` class-typeinfo vtables, by BN's own symbol there? BN names
-    the imported ones (an extern the loader relocates the word to) and a
-    statically linked copy alike."""
-    head = value - 2 * ptr
-    try:
-        getter = getattr(bv, "get_symbols_at", None)
-        symbols = list(getter(head) or []) if callable(getter) else []
-        if not symbols:
-            single = bv.get_symbol_at(head)
-            symbols = [single] if single is not None else []
-    except Exception:
-        return False
-    for sym in symbols:
-        raw = str(getattr(sym, "raw_name", "") or "").split("@", 1)[0]
-        if raw in _RTTI_TYPEINFO_VTABLES:
-            return True
-    return False
-
-
-def _typeinfo_verified(bv, census: dict[str, Any], address: int) -> bool:
-    """Is *address* a defined ``_ZTI`` OBJECT with the Itanium typeinfo shape,
-    read from its own bytes: its first word is a ``__cxxabiv1`` class-typeinfo
-    vtable's address point (see ``_rtti_vptr``), and its second word points at
-    a NUL-terminated name equal to the symbol's own suffix (``_ZTI5Short`` ->
-    ``5Short``, or GCC's ``*5Short`` for an internal-linkage type)? A name
-    pointer alone proves nothing (#1046 review): code or a data record can
-    carry one. Cached per census."""
-    names = (census.get("typeinfo") or {}).get(address)
-    if not names:
-        return False
-    cache = census.setdefault("typeinfo_verified", {})
-    if address in cache:
-        return cache[address]
-    ptr = census["pointer_size"]
-    order = "little" if census.get("endian") == "<" else "big"
-    ok = False
-    try:
-        words = bytes(bv.read(address, 2 * ptr) or b"")
-        if len(words) == 2 * ptr and _rtti_vptr(bv, int.from_bytes(words[:ptr], order), ptr):
-            name_at = int.from_bytes(words[ptr:], order)
-            for name in names:
-                want = name[4:].encode()
-                got = bytes(bv.read(name_at, len(want) + 2) or b"")
-                if got[:len(want) + 1] == want + b"\0" or got == b"*" + want + b"\0":
-                    ok = True
-                    break
-    except Exception:
-        ok = False
-    cache[address] = ok
-    return ok
-
-
-def _vtable_slot(bv, census: dict[str, Any], start: int, size: int,
-                 address: int) -> dict[str, Any]:
-    """Where *address* sits inside the ELF vtable object ``[start, start+size)``.
-
-    ``slot`` counts words from the nearest preceding address point: the word
-    after a pointer to a verified typeinfo OBJECT (see ``_typeinfo_verified``)
-    whose offset-to-top word also lies inside the object. ``offset_to_top`` is
-    that word (0 for a primary table, nonzero for a secondary one in the same
-    group). When no slot is given, ``slot_unknown_reason`` says why --
-    ``no_census``, ``outside_object``, ``unaligned``, ``unreadable``,
-    ``over_read_budget`` (no header in the bytes read before the entry; earlier
-    ones were not read) or ``no_verified_header``. No slot number is guessed
-    from the object start, and a read budget is never reported as a missing
-    header."""
-    def unknown(reason: str) -> dict[str, Any]:
-        return {"slot": None, "slot_address_point": None, "offset_to_top": None,
-                "slot_unknown_reason": reason}
-
-    ptr = census.get("pointer_size")
-    if not ptr or census.get("status") != "ok":
-        return unknown("no_census")
-    if not start <= address < start + size:
-        return unknown("outside_object")
-    if (address - start) % ptr:
-        return unknown("unaligned")
-    # Read at most the budget immediately before the entry; the nearest
-    # header is the one that governs it.
-    lo = max(start, address - (_VTABLE_SLOT_READ_BYTES // ptr) * ptr)
-    span = address - lo
-    try:
-        data = bytes(bv.read(lo, span) or b"") if span else b""
-    except Exception:
-        return unknown("unreadable")
-    if len(data) < span:
-        return unknown("unreadable")
-    order = "little" if census.get("endian") == "<" else "big"
-    for i in range(span // ptr - 1, -1, -1):
-        at = lo + i * ptr
-        if at - ptr < start:   # the offset-to-top word must be in the object too
-            break
-        if not _typeinfo_verified(bv, census, int.from_bytes(data[i * ptr:(i + 1) * ptr], order)):
-            continue
-        if i:
-            ott_bytes = data[(i - 1) * ptr:i * ptr]
-        else:
-            try:
-                ott_bytes = bytes(bv.read(at - ptr, ptr) or b"")
-            except Exception:
-                return unknown("unreadable")
-            if len(ott_bytes) < ptr:
-                return unknown("unreadable")
-        point = at + ptr
-        return {"slot": (address - point) // ptr, "slot_address_point": hex(point),
-                "offset_to_top": int.from_bytes(ott_bytes, order, signed=True),
-                "slot_unknown_reason": None}
-    return unknown("over_read_budget" if lo > start else "no_verified_header")
 
 
 def _vtable_object_label(bv, obj: dict[str, Any]) -> str:
@@ -825,7 +690,6 @@ def _callee_vtable_refs(ctx, bv, refs: list[int],
                             bv, start, extent, class_match[1], ptr, endian)
                     entry = {"address": hex(ref), "class_name": class_match[1],
                              "vtable_address": hex(start), "address_point": address_points[key],
-                             **_vtable_slot(bv, census, start, extent, ref),
                              "evidence": "elf_symbol_size"}
                     candidates = matches.setdefault(ref, [])
                     if entry not in candidates:
@@ -844,7 +708,7 @@ def _callee_vtable_refs(ctx, bv, refs: list[int],
 def _elf_object_refs(bv, census: dict[str, Any] | None,
                      refs: list[int]) -> list[dict[str, Any]]:
     """For each of *refs* inside one or more sized ELF ``_ZTV``/``_ZTC``
-    objects: those objects, their labels and the entry's slot. A fact about
+    objects: those objects and their labels. A fact about
     symbol extents only -- it proves no class navigation (that is
     ``callee_data_ref_vtables``), and overlapping objects are all listed."""
     objects = _supported_vtable_objects(census)
@@ -855,8 +719,7 @@ def _elf_object_refs(bv, census: dict[str, Any] | None,
             continue
         rows.append({"address": hex(ref), "evidence": "elf_symbol_size", "objects": [
             {"object": obj["raw_name"], "label": _vtable_object_label(bv, obj),
-             "kind": obj["kind"], "object_address": hex(obj["start"]), "size": obj["size"],
-             **_vtable_slot(bv, census, obj["start"], obj["size"], ref)}
+             "kind": obj["kind"], "object_address": hex(obj["start"]), "size": obj["size"]}
             for obj in inside]})
     return rows
 

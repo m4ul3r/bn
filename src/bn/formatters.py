@@ -3760,17 +3760,8 @@ def _surface_vtable_lines(table: dict[str, Any]) -> list[str]:
         raw = _escape_control_chars(str(obj.get("object", "?")))
         where = f"{raw} @ {obj.get('object_address', '?')}, {obj.get('size', '?')} bytes"
         inside = obj.get("entries_inside", "?")
-        slot = obj.get("slot")
-        if isinstance(slot, int) and not isinstance(slot, bool):
-            ott = obj.get("offset_to_top")
-            point = obj.get("slot_address_point", "?")
-            table_note = (f" of the secondary table at address point {point} "
-                          f"(offset-to-top {ott})"
-                          if isinstance(ott, int) and ott else "")
-            slots = f"{inside} entr{'y' if inside == 1 else 'ies'} from slot {slot}{table_note}"
-        else:
-            slots = (f"{inside} entr{'y' if inside == 1 else 'ies'} "
-                     f"({_slot_unknown_text(obj)})")
+        first = _text_value(obj, "first_entry")
+        slots = f"{inside} entr{'y' if inside == 1 else 'ies'}" + (f" from {first}" if first else "")
         lines.append(f"    in {label} ({where}): {slots}")
     outside = table.get("entries_outside_elf_vtables")
     if lines and isinstance(outside, int) and not isinstance(outside, bool) and outside > 0:
@@ -4471,41 +4462,6 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
     return body
 
 
-#: `slot_unknown_reason` codes (#1046 review): why the bridge gave no slot.
-_SLOT_UNKNOWN_TEXT = {
-    "no_census": "the ELF symbol tables were not read",
-    "outside_object": "the entry lies outside the object",
-    "unaligned": "the entry is not pointer-aligned in the object",
-    "unreadable": "the object's bytes could not be read",
-    "over_read_budget": ("not read: no header in the bytes read before the entry, and "
-                         "earlier bytes are past the read budget"),
-    "no_verified_header": ("no verified typeinfo header precedes it in the object: no "
-                           "pointer to a defined _ZTI object whose name matches"),
-}
-
-
-def _slot_unknown_text(row: dict[str, Any]) -> str:
-    """`slot unknown: <why>`, from the bridge's `slot_unknown_reason` code."""
-    code = _text_value(row, "slot_unknown_reason")
-    if not code:
-        return "slot unknown"
-    why = _SLOT_UNKNOWN_TEXT.get(code, _escape_control_chars(code))
-    return f"slot unknown: {why}"
-
-
-def _vtable_slot_phrase(row: dict[str, Any]) -> str | None:
-    """`slot N` (of a secondary table when its offset-to-top is nonzero), from the
-    slot the bridge counted off a decoded typeinfo header; None when it had none."""
-    slot = row.get("slot")
-    if isinstance(slot, bool) or not isinstance(slot, int):
-        return None
-    ott = row.get("offset_to_top")
-    if isinstance(ott, int) and not isinstance(ott, bool) and ott:
-        return (f"slot {slot} of the secondary table at address point "
-                f"{row.get('slot_address_point', '?')} (offset-to-top {ott})")
-    return f"slot {slot}"
-
-
 def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = None,
                              raw_objects: Any = None, raw_census: Any = None) -> str | None:
     """Data storage is not a recovered indirect caller; offer bounded next reads."""
@@ -4520,10 +4476,7 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
         class_name = _text_value(row, "class_name")
         address_point = _text_value(row, "address_point")
         if address and class_name and (address_point or row.get("address_point") is None):
-            known[address] = {"class_name": class_name, "address_point": address_point,
-                              "slot": _vtable_slot_phrase(row),
-                              "slot_unknown": (None if row.get("slot_unknown_reason") is None
-                                               else _slot_unknown_text(row))}
+            known[address] = {"class_name": class_name, "address_point": address_point}
     # #1018 item 1: sized ELF `_ZTV`/`_ZTC` objects holding a location whose
     # class navigation is not proven -- a label from the symbol extent only.
     objects: dict[str, list[str]] = {}
@@ -4537,9 +4490,8 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
                 continue
             label = _escape_control_chars(str(obj.get("label") or obj.get("object") or "?"))
             raw = _escape_control_chars(str(obj.get("object", "?")))
-            slot = _vtable_slot_phrase(obj) or _slot_unknown_text(obj)
             labels.append(f"{label} ({raw} @ {obj.get('object_address', '?')}, "
-                          f"{obj.get('size', '?')} bytes; {slot})")
+                          f"{obj.get('size', '?')} bytes)")
         if address and labels:
             objects[address] = labels
     lines = [f"note: the callee's address is stored in {raw_count} data location(s); "
@@ -4551,10 +4503,7 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
             cls = str(row["class_name"])
             point = row["address_point"]
             point_note = f"primary address point {point}" if point else "primary address point not decoded"
-            where = f"{row['slot']} of the named vtable" if row["slot"] else "inside the named vtable"
-            if not row["slot"] and row["slot_unknown"]:
-                point_note += f"; {row['slot_unknown']}"
-            lines.append(f"  {ref}: {where} for {_escape_control_chars(cls)} "
+            lines.append(f"  {ref}: inside the named vtable for {_escape_control_chars(cls)} "
                          f"({point_note}); "
                          f"inspect its class layout with `bn class show -- {shlex.quote(cls)}`")
         elif ref in objects:

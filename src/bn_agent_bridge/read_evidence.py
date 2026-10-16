@@ -1357,7 +1357,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
     img_hi = int(getattr(bv, "end", 0) or 0) or (img_lo + (1 << 48))
     warnings: list[str] = []
     census = read_listing._elf_vtable_census(bv)
-    vtable_index = _VtableIndex(bv, census, read_listing._supported_vtable_objects(census))
+    vtable_index = _VtableIndex(bv, read_listing._supported_vtable_objects(census))
     vtable_tables_hidden = 0
 
     def containing(addr: int) -> list[Any]:
@@ -1527,7 +1527,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
                 return
             labelled = census["status"] == "ok"
             if hide_vtables and labelled:
-                # Coverage only (no labels or slot reads): enough to decide.
+                # Coverage only (no label lookups): enough to decide.
                 cover = _run_vtable_labels(vtable_index, run_addr, len(run_vals), ps,
                                            detail=False)
                 if cover["entries_outside_elf_vtables"] == 0:
@@ -1540,7 +1540,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             if len(candidate_tables) >= max_tables:
                 tables_over_cap += 1   # #653.5: disclose the total, not a silent prefix
                 return
-            # #1046 review: labels (and their slot reads) only for shown tables.
+            # #1046 review: labels only for shown tables.
             labels = (_run_vtable_labels(vtable_index, run_addr, len(run_vals), ps)
                       if labelled else None)
             # Normalize each pointer before the miss count so a Thumb pointer
@@ -1948,9 +1948,8 @@ class _VtableIndex:
     by a scan of every object (#1046 review). Labels are looked up once per
     object."""
 
-    def __init__(self, bv, census: dict[str, Any], objects: list[dict[str, Any]]):
+    def __init__(self, bv, objects: list[dict[str, Any]]):
         self.bv = bv
-        self.census = census
         self.objects = sorted(objects, key=lambda o: (o["start"], o["raw_name"]))
         self._starts = [o["start"] for o in self.objects]
         size = 1
@@ -2002,7 +2001,7 @@ def _run_vtable_labels(index: _VtableIndex, run_addr: int, count: int, ptr: int,
     the end of an object it started in: the scanner merged that vtable with
     whatever follows it. No header or filler rule, so a registry record or
     function table outside every object is never labelled. Without *detail*
-    only the coverage counts are computed (no label or slot reads), which is
+    only the coverage counts are computed (no label lookups), which is
     all `--hide-vtables` needs to decide on a run that will not be shown."""
     end = run_addr + count * ptr
     spans: list[tuple[int, int]] = []
@@ -2025,8 +2024,6 @@ def _run_vtable_labels(index: _VtableIndex, run_addr: int, count: int, ptr: int,
             "size": obj["size"],
             "first_entry": hex(first_entry),
             "entries_inside": last - first,
-            **read_listing._vtable_slot(index.bv, index.census, obj["start"], obj["size"],
-                                        first_entry),
         })
     covered = 0
     reach = 0
