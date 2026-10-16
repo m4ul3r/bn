@@ -162,7 +162,7 @@ def test_class_apply_types_summary_states_the_plan():
     text = _render_mutation_summary_text(summary)
     assert ("\nclass: demo::Widget  vptr: struct `demo::Base::demo::Widget::VTable`*  "
             "instance struct: declared (size unknown: only the vptr is declared)") in text
-    assert "\nobject parameter retyped: 1 method(s)\n" in text
+    assert "\nthis retyped: 1 method(s)\n" in text
     assert ("\nskipped: 3 method(s) -- 2 thunk; 1 inherited: also a slot of a base's vtable "
             "(`--format json` lists each)") in text
     assert "sub_401280" not in text
@@ -172,24 +172,21 @@ def test_class_apply_types_summary_states_the_plan():
         "results": [{"op": "types_declare", "status": "verified"}]}))
     assert "instance struct: declared (size 0x20)" in sized and "\nskipped:" not in sized
     # The count is what each retype's row says happened: an already-typed
-    # parameter is `noop`, not "retyped"; parameter-0 retypes are counted.
+    # `this` is `noop`, not "retyped"; a skipped row's check is printed.
     rerun = _render_mutation_summary_text(_mutation_summary({
         "success": True, "committed": True, "rolled_back": False,
         "class_apply_types": {**plan, "instance_struct": "vptr_retyped",
                               "vptr_member_before": {"field_name": "vptr", "field_type": "void*"},
-                              "retyped_methods": [{"address": "0x401200", "name": "a", "variable": "this",
-                                                   "status": "noop"},
-                                                  {"address": "0x401220", "name": "b", "variable": "arg1",
+                              "retyped_methods": [{"address": "0x401200", "name": "a", "status": "noop"},
+                                                  {"address": "0x401220", "name": "b",
                                                    "status": "verified"}],
                               "skipped_methods": [{"address": "0x401300", "name": "c",
-                                                   "reason": "slot target, parameter 0 not retyped "
-                                                             "(no address-point store)",
+                                                   "reason": "no parameter named `this`",
                                                    "check": "bn proto get 0x401300"}]},
         "results": [{"op": "struct_field_set", "status": "verified"},
                     {"op": "local_retype", "status": "noop"}, {"op": "local_retype", "status": "verified"}]}))
     assert "instance struct: vptr_retyped (was void* vptr)" in rerun
-    assert ("\nobject parameter retyped: 1 method(s), already typed: 1 (1 by parameter 0: its body "
-            "stores this class's vtable address point into it)") in rerun
+    assert "\nthis retyped: 1 method(s), already typed: 1\n" in rerun
     assert "read its prototype: `bn proto get 0x401300`" in rerun
     # A rolled-back run's retypes are `reverted`: none of them is "retyped".
     reverted = _render_mutation_summary_text(_mutation_summary({
@@ -198,7 +195,7 @@ def test_class_apply_types_summary_states_the_plan():
             {"address": "0x401200", "name": "a", "status": "reverted"}]},
         "results": [{"op": "local_retype", "status": "reverted"},
                     {"op": "local_retype", "status": "invalid_request", "message": "bad"}]}))
-    assert "\nobject parameter retyped: 0 method(s), not applied: 1" in reverted
+    assert "\nthis retyped: 0 method(s), not applied: 1" in reverted
 
 
 def test_rolled_back_declare_names_the_library_imports_it_kept():

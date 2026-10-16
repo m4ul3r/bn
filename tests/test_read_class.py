@@ -5360,90 +5360,64 @@ def abi_scan_view(monkeypatch):
     return ctx, bv
 
 
-@pytest.mark.parametrize("encoding, expected", [
-    ("N3app6WorkerE", "app::Worker"), ("*N3app6WorkerE", "app::Worker"), ("6Worker", "Worker"),
-    ("N12_GLOBAL__N_13FooE", "(anonymous namespace)::Foo"),
-    ("N3adv4TailEi", None), ("N5probe6WidgetEv", None), ("N3app6WidgetEgarbage", None),
-    ("N3app3BoxIiEE", None), ("St9exception", None), ("N6WorkerE", None), ("N03appE", None),
-    ("9junkjunk", None), ("N3ap6WorkerE", None), ("Z4mainEUliE_", None), ("i", None), ("", None),
-])
-def test_typeinfo_names_parse_only_as_one_plain_class_1049(encoding, expected):
-    """#1049 review: BN's demangler normalised a class followed by a `void`
-    marker into that class. The scan's own parser accepts a source-name or a
-    nested name of source-names that consumes the WHOLE string, and nothing
-    else (templates, substitutions, local names are not named)."""
-    assert read_class._parse_class_encoding(encoding)[0] == expected
+_SCAN_CANDIDATES = {0x8010, 0x8028, 0x8058, 0x8070, 0x8088, 0x80a0, 0x80b8, 0x80d0, 0x80e8,
+                    0x8100, 0x8118, 0x8130}
 
 
-def test_imported_base_names_may_use_the_std_prefix_only_for_imports_1049():
-    assert read_class._parse_class_encoding("St13runtime_error", allow_std=True)[0] == "std::runtime_error"
-    assert read_class._parse_class_encoding("i", allow_std=True)[0] is None
-
-
-def test_abi_scan_names_only_plain_classes_with_validated_bases_1049(abi_scan_view):
-    """Accepted: Worker (base Base, which BN named) and FromStd (base the
-    imported `std::runtime_error` typeinfo). Every counterexample from both
-    review rounds is given no class name and counted by reason."""
+def test_typeinfo_scan_lists_raw_candidates_and_names_no_class_1049(abi_scan_view):
+    """#1049 review round 3: the scan only lists candidates -- every aligned
+    word equal to an ABI class-typeinfo address point where BN named nothing,
+    with its layout and raw name string. None becomes a class (no row, no card,
+    no typeinfo answer), whatever its name string or base word looks like."""
     ctx, bv = abi_scan_view
-    scan = read_class._abi_rtti_scan(ctx, bv)
-    assert set(scan.typeinfo) == {0x8010, 0x8130}
-    assert scan.typeinfo[0x8010] == ("app::Worker", "si", "N3app6WorkerE", 0x8420, (0x8000,))
-    assert scan.rejected == {"bad_source_name": 1, "not_a_plain_class_name": 2, "invalid_base": 7}
-    assert {hex(a) for a, _, r in scan.samples if r == "invalid_base"} == {
-        "0x8070", "0x80a0", "0x80b8", "0x80d0", "0x80e8", "0x8100", "0x8118"}
+    scan = read_class._typeinfo_scan(ctx, bv)
+    assert {address for address, _, _ in scan.candidates} == _SCAN_CANDIDATES
+    assert (0x8010, "si", "*N3app6WorkerE") in scan.candidates
     assert scan.truncated is False
-    assert read_class._scanned_typeinfo_refs(ctx, bv, 0x8010) == (0x8048,)
-    # The seam answers for an address no symbol names, through the scan.
-    assert ctx._typeinfo_name_at(bv, 0x8010) == "app::Worker"
-    assert ctx._typeinfo_name_at(bv, 0x8070) is None
-
+    assert ctx._typeinfo_name_at(bv, 0x8010) is None
     registry = read_class._build_class_registry(ctx, bv)
-    worker = registry["app::Worker"]
-    # Labelled by provenance, never as symbol-backed RTTI.
-    assert worker["confidence"] == "typeinfo-scan"
-    assert worker["typeinfo"] == {"address": "0x8010", "symbol": "_ZTIN3app6WorkerE",
-                                  "source": "typeinfo-scan"}
-    assert worker["typeinfo_name"]["address"] == "0x8420"
-    assert worker["typeinfo_abi"] == "si"
-    assert worker["imported"] is False
     assert registry["app::Base"]["confidence"] == "rtti"
-    assert "source" not in registry["app::Base"]["typeinfo"]
-    for invented in ("junk", "Phantom", "Ghost", "Suffix", "FromFunc", "FromRejected",
-                     "FromInt", "SelfBase", "CycA", "CycB"):
-        assert not any(invented in name for name in registry), invented
-    abi = registry["__cxxabiv1::__si_class_type_info"]
-    assert abi["vtable"]["imported"] is True and abi["imported"] is True
+    for name in ("Worker", "junk", "Phantom", "Ghost", "Suffix", "FromFunc", "FromRejected",
+                 "FromInt", "SelfBase", "CycA", "CycB", "FromStd"):
+        assert not any(name in key for key in registry), name
+    with pytest.raises(read_class.OperationFailure):
+        read_class._class_show(ctx, None, "app::Worker")
 
 
-def test_class_list_discloses_the_candidates_it_gave_no_name_1049(monkeypatch, abi_scan_view):
+def test_class_list_discloses_the_raw_candidates_1049(monkeypatch, abi_scan_view):
     from bn.formatters import _render_class_list_text
     ctx, bv = abi_scan_view
     monkeypatch.setattr(ctx, "_bases_for", lambda bv, rec: [])
     listing = read_class._class_list(ctx, None, count_only=True)
-    assert listing["typeinfo_scan_unnamed"] == 10
-    assert {s["name_string"] for s in listing["typeinfo_scan_unnamed_samples"]} >= {
-        "N3adv7PhantomEi", "N3app6SuffixEv", "N3app8FromFuncE"}
-    assert "! typeinfo scan: 10 candidate record(s) given no class name" in _render_class_list_text(listing)
+    assert listing["typeinfo_scan_candidates"] == 12
+    row = next(r for r in listing["typeinfo_scan_listing"] if r["address"] == "0x8010")
+    assert row == {"address": "0x8010", "layout": "si", "name_string": "*N3app6WorkerE",
+                   "reason": "word[0] is the address point of __cxxabiv1::__si_class_type_info; "
+                             "Binary Ninja put no typeinfo symbol here"}
+    assert ("! typeinfo byte scan: 12 candidate typeinfo record(s) Binary Ninja named nothing at; "
+            "no class row comes from them") in _render_class_list_text(listing)
     # A count no value reads out of is stated as unknown, never as a number.
-    skewed = _render_class_list_text({**listing, "typeinfo_scan_unnamed": "ten"})
-    assert "! typeinfo scan: ? candidate record(s) given no class name" in skewed
+    skewed = _render_class_list_text({**listing, "typeinfo_scan_candidates": "twelve"})
+    assert "! typeinfo byte scan: ? candidate" in skewed
 
 
 def test_abi_scan_needs_an_abi_vtable_symbol_1035(abi_scan_view):
     ctx, bv = abi_scan_view
     bv.get_symbols_by_name = lambda raw: []
-    scan = read_class._abi_rtti_scan(ctx, bv)
-    assert scan.typeinfo == {} and scan.rejected == {}
-    assert "app::Worker" not in read_class._build_class_registry(ctx, bv)
+    assert read_class._typeinfo_scan(ctx, bv).candidates == ()
 
 
 def test_abi_scan_byte_cap_is_disclosed_as_truncated_1035(monkeypatch, abi_scan_view):
+    from bn.formatters import _render_class_list_text
     ctx, bv = abi_scan_view
-    # Only the first two words of .data.rel.ro fit: Worker's object is past the cap.
+    # Only the first two words of .data.rel.ro fit: BN's named Base record.
     monkeypatch.setattr(read_class, "_ABI_SCAN_MAX_BYTES", 0x10)
-    scan = read_class._abi_rtti_scan(ctx, bv)
-    assert scan.truncated is True
-    assert scan.typeinfo == {}
+    monkeypatch.setattr(ctx, "_bases_for", lambda bv, rec: [])
+    scan = read_class._typeinfo_scan(ctx, bv)
+    assert scan.truncated is True and scan.candidates == ()
+    counted = read_class._class_list(ctx, None, count_only=True)
+    assert counted["abi_scan_truncated"] is True
+    assert "byte scan stopped at its data cap" in _render_class_list_text(counted)
 
 
 def test_a_rename_does_not_rerun_the_byte_scan_but_written_data_does_1049(
@@ -5463,55 +5437,16 @@ def test_a_rename_does_not_rerun_the_byte_scan_but_written_data_does_1049(
         for notifier in notifiers:
             getattr(notifier, event)(bv)
 
-    assert set(read_class._abi_rtti_scan(ctx, bv).typeinfo) == {0x8010, 0x8130}
+    assert len(read_class._typeinfo_scan(ctx, bv).candidates) == 12
     assert len(raw_scans) == 1
-    # BN names Worker's typeinfo: the symbol half sees it, the bytes are not re-read.
+    # BN names Worker's typeinfo: the symbol half drops it, the bytes are not re-read.
     bv._symbols.append(_Sym("_ZTIN3app6WorkerE", "typeinfo for app::Worker", 0x8010))
     fire("symbol_added")
-    assert set(read_class._abi_rtti_scan(ctx, bv).typeinfo) == {0x8130}
+    assert len(read_class._typeinfo_scan(ctx, bv).candidates) == 11
     assert len(raw_scans) == 1
     fire("data_written")
-    read_class._abi_rtti_scan(ctx, bv)
+    read_class._typeinfo_scan(ctx, bv)
     assert len(raw_scans) == 2
-
-
-def test_a_truncated_scan_is_disclosed_on_counts_and_misses_1049(monkeypatch, abi_scan_view):
-    """#1049 review: the cap was disclosed on the listing only; a count and a
-    `No class named` miss read as complete answers."""
-    from bn.formatters import _render_class_list_text
-    ctx, bv = abi_scan_view
-    monkeypatch.setattr(read_class, "_ABI_SCAN_MAX_BYTES", 0x10)
-    monkeypatch.setattr(ctx, "_bases_for", lambda bv, rec: [])
-    counted = read_class._class_list(ctx, None, count_only=True)
-    assert counted["abi_scan_truncated"] is True
-    assert "byte scan stopped at its data cap" in _render_class_list_text(counted)
-    with pytest.raises(read_class.OperationFailure) as miss:
-        read_class._class_show(ctx, None, "app::Worker")
-    assert "byte scan stopped at its data cap" in str(miss.value)
-
-
-def test_vtable_backwalk_walks_scanned_refs_after_bns_own_1035(monkeypatch, abi_scan_view):
-    """BN makes no data refs from words it never typed, and can report SOME refs
-    to a scanned typeinfo (a derived record's base pointer) while missing the
-    vtable's word[1] -- seen on an AArch64 non-PIE build. The scanned words are
-    walked after BN's own, once each."""
-    ctx, bv = abi_scan_view
-    walked = []
-
-    def layout_for(_bv, vt_addr):
-        walked.append(vt_addr)
-        return {"address": hex(vt_addr), "slots": [{"index": 0}], "total": 1}
-
-    monkeypatch.setattr(ctx, "_vtable_layout_for", layout_for)
-    monkeypatch.setattr(read_class, "_classify_backwalk_candidate",
-                        lambda *a, **k: (0, None, None))
-    recovered = read_class._recover_vtables_from_typeinfo(ctx, bv, 0x8010)
-    assert walked == [0x8040]
-    assert recovered["primary"]["address"] == "0x8040"
-    walked.clear()
-    bv.data_refs[0x8010] = [0x9008, 0x8048]
-    read_class._recover_vtables_from_typeinfo(ctx, bv, 0x8010)
-    assert walked == [0x9000, 0x8040]
 
 
 # --- #1040.3: what the class list hides, and how it says so ---
@@ -5637,8 +5572,6 @@ def test_is_import_or_copy_sees_a_copy_relocation_1040():
     assert f(_BV([local, alias, other]), other) is False      # its neighbour is not
     assert f(_BV([local]), local) is False
     assert f(_BV([alias]), alias) is True                      # the import itself
-    scanned = read_class._ScannedSymbol(0x6000, "_ZTIN3ext4BaseE", "typeinfo for ext::Base")
-    assert f(_BV([local, alias]), scanned) is False            # a scan names no import
 
 
 # --- #1040.4: a library base many classes name as their only base ---

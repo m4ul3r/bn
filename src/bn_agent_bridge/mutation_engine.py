@@ -5867,27 +5867,14 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
       class card's ``size`` when one was recovered, padding after the vptr),
       or its offset-0 member is retyped when it exists, keeping that member's
       name; nothing when it already holds the typed vptr;
-    * the object parameter is retyped on the class's own methods: a parameter
-      named `this` on a method the card lists under the class, else -- #1040.1,
-      a stripped build names none -- parameter 0, keeping its name, of a
-      function whose OWN body stores this class's vtable address point at
-      offset 0 of BN's parameter-0 variable (a constructor's or destructor's
-      vptr store, read from its MLIL; #1049 review). That store is direct
-      evidence that parameter 0 points at an object of the class, whatever the
-      ABI does with return buffers; nothing about a slot's position or name
-      is. Candidates are the card's methods, its vtable's slot targets and
-      every function with a code reference to the address point. A function
-      that also stores another class's address point there (a derived
-      constructor with an inlined base one) is skipped, naming both; one
-      whose parameter 0 is already a pointer to another struct is left alone;
-      a class known only through the typeinfo byte scan gets no parameter
-      retypes. Slot targets without the store are listed, not retyped. Every
-      retype is verified by the engine's readback.
+    * `this` is retyped on each of the class's own methods that has a parameter
+      of that name. A thunk, or a method without one (a static member, or a
+      stripped build where BN did not name it), is skipped and listed, never
+      guessed at. Each skipped row carries a `bn proto get` check (#1049).
 
     Refuses when the class has no primary vtable or BN defined no VTable type
     for it: then there is no table type for the vptr to point at."""
     from . import read_class
-    from .read_evidence import _function_thunk_summary
     card = read_class._class_show(ctx, selector, name)
     requested = {"op": "class_apply_types", "name": name}
     if card.get("ambiguous"):
@@ -6014,95 +6001,51 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
             if first is not None:
                 vptr_before = {"field_name": str(getattr(first, "name", "")),
                                "field_type": str(getattr(first, "type", ""))}
-    retyped: list[dict[str, Any]] = []
+    retyped: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
-    own_ap = slot_start
-    scan_identity = card.get("confidence") == read_class._SCAN_PROVENANCE
-    by_address: dict[int, dict[str, Any]] = {}
+    seen: set[int] = set()
+
+    def skip(address: int, name: str, reason: str) -> None:
+        # #1049: every skipped row carries the read to make before typing it
+        # by hand; nothing here establishes what its parameters are.
+        skipped.append({"address": hex(address), "name": name, "reason": reason,
+                        "check": f"bn proto get {hex(address)}"})
+
     for method in card.get("methods") or []:
         try:
-            by_address.setdefault(int(str(method.get("address")), 16), method)
+            address = int(str(method.get("address")), 16)
         except ValueError:
             continue
-    slot_targets: list[int] = []
+        if address in seen:
+            continue
+        seen.add(address)
+        row = {"address": hex(address), "name": str(method.get("demangled") or method.get("mangled") or "")}
+        if (method.get("thunk") or {}).get("is_candidate"):
+            skip(address, row["name"], "thunk")
+            continue
+        fn = bv.get_function_at(address)
+        params = list(getattr(fn, "parameter_vars", None) or []) if fn is not None else []
+        if not any(str(getattr(var, "name", "")) == "this" for var in params):
+            skip(address, row["name"], "no parameter named `this`")
+            continue
+        operations.append({"op": "local_retype", "function": hex(address), "variable": "this",
+                           "new_type": f"struct `{cls}`*"})
+        retyped.append(row)
+    # #993 review: a vtable slot that is not one of the class's own methods --
+    # inherited, or every slot of a stripped build, whose card has no methods
+    # -- is not retyped (its `this` may be a base's), but it is listed.
     for slot in vtable.get("slots") or []:
         target = (slot or {}).get("method") or {}
         try:
             address = int(str(target.get("address")), 16)
         except ValueError:
             continue
-        slot_targets.append(address)
-        by_address.setdefault(address, {"address": hex(address), "demangled": str(
-            target.get("display_name") or target.get("name") or ""), "slot_only": True})
-    storers, storers_truncated = _address_point_referrers(bv, own_ap)
-    for address in storers:
-        fn = bv.get_function_at(address)
-        by_address.setdefault(address, {"address": hex(address), "demangled": str(
-            getattr(fn, "name", "") or ""), "ref_only": True})
-    for address, method in by_address.items():
-        row = {"address": hex(address), "name": str(method.get("demangled") or method.get("mangled") or "")}
-        fn = bv.get_function_at(address)
-        thunk = method.get("thunk")
-        if thunk is None and fn is not None:
-            thunk = _function_thunk_summary(ctx, bv, fn)
-        if (thunk or {}).get("is_candidate"):
-            skipped.append({**row, "reason": "thunk"})
+        if address in seen:
             continue
-        params = list(getattr(fn, "parameter_vars", None) or []) if fn is not None else []
-        card_method = not (method.get("slot_only") or method.get("ref_only"))
-        if card_method and any(str(getattr(var, "name", "")) == "this" for var in params):
-            operations.append({"op": "local_retype", "function": hex(address), "variable": "this",
-                               "new_type": f"struct `{cls}`*"})
-            retyped.append({**row, "variable": "this", "basis": "named `this`"})
-            continue
-        if scan_identity:
-            skipped.append({**row, "reason": "class identity comes from the typeinfo byte scan; "
-                                             "parameter 0 not retyped"})
-            continue
-        if fn is None:
-            skipped.append({**row, "reason": "no function at this address"})
-            continue
-        stores = read_class._param0_address_point_stores(fn)
-        if stores is None:
-            skipped.append({**row, "reason": "IL unavailable or body too large to read; "
-                                             "parameter 0 not retyped"})
-            continue
-        if own_ap not in stores:
-            if method.get("ref_only"):
-                continue   # references the address point, but never stores it into parameter 0
-            if address in slot_targets:
-                skipped.append({**row, "reason": "slot target, parameter 0 not retyped "
-                                                 "(no address-point store)",
-                                "check": f"bn proto get {hex(address)}"})
-            else:
-                skipped.append({**row, "reason": "no parameter named `this`, and no address-point "
-                                                 "store into parameter 0"})
-            continue
-        others = sorted({name for name in (read_class._address_point_class(ctx, bv, value, ptr)
-                                           for value in stores if value != own_ap) if name})
-        if others:
-            skipped.append({**row, "reason": "stores the vtable address points of "
-                                             f"{', '.join([cls, *others])} into parameter 0"})
-            continue
-        param0 = params[0]
-        current = str(getattr(param0, "type", "") or "")
-        # Only a single pointer to another struct counts (a user's or an
-        # earlier apply-types'); BN's own `struct X::VTable**` does not.
-        held = re.fullmatch(r"(?:struct|class) `?([^*`]+?)`?\s*\*", current)
-        if held and held.group(1) != cls:
-            skipped.append({**row, "reason": f"parameter 0 is already typed `{current}`"})
-            continue
-        basis = "stores the class's vtable address point into parameter 0"
-        if held:
-            # An earlier run's type: nothing to write, so a stripped re-run
-            # plans no op and takes the direct noop return.
-            retyped.append({**row, "variable": str(getattr(param0, "name", "")), "basis": basis,
-                            "status": "noop"})
-            continue
-        operations.append({"op": "local_retype", "function": hex(address),
-                           "variable": vars_mod._local_id(fn, param0, is_parameter=True),
-                           "new_type": f"struct `{cls}`*"})
-        retyped.append({**row, "variable": str(getattr(param0, "name", "")), "basis": basis})
+        seen.add(address)
+        skip(address, str(target.get("display_name") or target.get("name") or ""),
+             "vtable slot that is not one of the class's own methods "
+             "(inherited, or unnamed in a stripped build)")
     plan = {
         "class": cls,
         "vtable_type": vtable_type,
@@ -6111,34 +6054,9 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
         "size_source": size_source,
         "retyped_methods": retyped,
         "skipped_methods": skipped,
-        **({"address_point_refs_truncated": True} if storers_truncated else {}),
         **({"vptr_member_before": vptr_before} if vptr_before else {}),
     }
     return operations, plan
-
-
-#: #1040.1: how many functions referring to the address point are read.
-_ADDRESS_POINT_REFERRERS_MAX = 256
-
-
-def _address_point_referrers(bv, address_point: int) -> tuple[list[int], bool]:
-    """The start addresses of the functions with a code reference to
-    *address_point* -- where a constructor or destructor stores the vptr --
-    in address order, at most :data:`_ADDRESS_POINT_REFERRERS_MAX`, and
-    whether that cap cut the list."""
-    getter = getattr(bv, "get_code_refs", None)
-    if not callable(getter):
-        return [], False
-    starts: set[int] = set()
-    try:
-        for ref in getter(address_point):
-            func = getattr(ref, "function", None)
-            if func is not None:
-                starts.add(int(func.start))
-    except Exception:
-        return [], False
-    ordered = sorted(starts)
-    return ordered[:_ADDRESS_POINT_REFERRERS_MAX], len(ordered) > _ADDRESS_POINT_REFERRERS_MAX
 
 
 def _is_pointer_to(type_obj, name: str) -> bool:
@@ -6189,29 +6107,25 @@ def _replaceable_vptr_slot(bv, type_obj, ptr: int) -> bool:
 def _with_class_apply_types_plan(result: Any, plan: dict[str, Any]) -> Any:
     """Attach *plan* to the batch result, each retyped method stamped with its
     own row's status (`verified`, or `noop` when `this` already had the type),
-    so `this retyped:` counts what changed rather than what was planned. A
-    method the plan already settled (parameter 0 already this class's pointer,
-    so no op was planned) keeps its `noop` and takes no row."""
+    so `this retyped:` counts what changed rather than what was planned."""
     if not isinstance(result, dict):
         return result
-    rows = iter([row for row in result.get("results") or []
-                 if isinstance(row, dict) and row.get("op") == "local_retype"])
+    rows = [row for row in result.get("results") or []
+            if isinstance(row, dict) and row.get("op") == "local_retype"]
     plan = dict(plan)
-    stamped = []
-    for method in plan.get("retyped_methods") or []:
-        row = None if "status" in method else next(rows, None)
-        stamped.append({**method, "status": row.get("status")} if row is not None else dict(method))
-    plan["retyped_methods"] = stamped
+    plan["retyped_methods"] = [
+        {**method, "status": rows[index].get("status")} if index < len(rows) else dict(method)
+        for index, method in enumerate(plan.get("retyped_methods") or [])
+    ]
     result["class_apply_types"] = plan
     return result
 
 
 def _class_apply_types_noop(plan: dict[str, Any], *, preview: bool) -> dict[str, Any]:
     """The result of a `class apply-types` with nothing left to write: the
-    struct already holds the typed vptr, no method has a `this` to retype and
-    every parameter-0 retype is already in place (a re-run on a stripped
-    build). One `noop` row, like any all-noop batch, so it exits 0 rather than
-    being refused (#993 review)."""
+    struct already holds the typed vptr and no method has a `this` to retype
+    (a re-run on a stripped build). One `noop` row, like any all-noop batch,
+    so it exits 0 rather than being refused (#993 review)."""
     return {
         "preview": preview,
         "success": True,

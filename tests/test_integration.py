@@ -1427,57 +1427,38 @@ class TestTypeStringsAndInheritance:
 
     def test_class_apply_types_stripped_rerun_is_a_noop(self, shared_bn):
         """#993 review: a re-run on a stripped build, where nothing is left to
-        write, changes nothing and exits 0 rather than refusing; #1040.1: the
-        first run retyped parameter 0 of the destructor that stores the class's
-        address point."""
+        write, changes nothing and exits 0 rather than refusing."""
         shared_bn.load(CLASSES_STRIPPED_BINARY)
         first = shared_bn.json("class", "apply-types", "svc::AuditHandler", "--summary")
         assert first["committed"] is True and first["failed_count"] == 0, first
-        assert first["class_apply_types"]["retyped_methods"], first
         again = shared_bn.run("class", "apply-types", "svc::AuditHandler", "--format", "json", "--summary")
         assert again.returncode == 0, again.stdout + again.stderr
         summary = json.loads(again.stdout)
         assert summary["changed_count"] == 0 and summary["dirty_after"] is False, summary
         assert summary["class_apply_types"]["instance_struct"] == "unchanged", summary
 
-    def test_class_apply_types_retypes_parameter_0_only_where_the_address_point_is_stored_1049(
-            self, shared_bn):
-        """#1040.1 / #1049 review: on a stripped build, parameter 0 is retyped
-        only on a function whose own body stores this class's vtable address
-        point at offset 0 of parameter 0 -- here the complete-object destructor;
-        the other code that refers to the address point stores it elsewhere.
-        The other slot targets (the inherited `name()`, `handle()`, `flush()`,
-        the deleting destructor that calls the complete one) are listed and the
-        batch writes none of them; the printed `bn proto get` runs as printed.
-        (BN's own analysis then carries the new type into the deleting
-        destructor, which passes its argument straight to the retyped one: a
-        propagation, not a write of this command.)"""
+    def test_class_apply_types_writes_no_parameter_0_on_a_stripped_build_1049(self, shared_bn):
+        """#1049 review round 3: parameter-0 retypes were withdrawn. On a
+        stripped build BN names no parameter `this`, so the batch writes no
+        local retype -- not even on the complete-object destructor, whose card
+        row still states that it writes the address point `into parameter 0`.
+        Every slot is listed with a `bn proto get` check that runs as printed."""
         shared_bn.load(CLASSES_STRIPPED_BINARY)
-        card = shared_bn.json("class", "show", "svc::AuditHandler")
-        slots = [s["method"]["address"] for s in card["vtable"]["slots"]]
-        storing = [s["method"]["address"] for s in card["vtable"]["slots"]
-                   if any(w.get("into_parameter0") for w in (s.get("body") or {}).get("writes_address_points", []))]
-        assert len(storing) == 1, card["vtable"]["slots"]
+        card = shared_bn.run("class", "show", "svc::AuditHandler")
+        assert "vtable address point into parameter 0" in card.stdout, card.stdout
 
         text = shared_bn.run("class", "apply-types", "svc::AuditHandler", "--preview")
         assert text.returncode == 0, text.stdout + text.stderr
-        assert "\nobject parameter retyped: 1 method(s) (1 by parameter 0: its body stores" in text.stdout, text.stdout
-        assert ("4 slot target, parameter 0 not retyped (no address-point store)") in text.stdout, text.stdout
+        assert "\nthis retyped: 0 method(s)" in text.stdout, text.stdout
         check = re.search(r"read its prototype: `(bn proto get 0x[0-9a-f]+)`", text.stdout).group(1)
         ran = shared_bn.run(*shlex.split(check)[1:])
         assert ran.returncode == 0, ran.stdout + ran.stderr
 
         live = shared_bn.json("class", "apply-types", "svc::AuditHandler")
-        rows = live["class_apply_types"]["retyped_methods"]
-        assert [r["address"] for r in rows] == storing, rows
-        written = [(r.get("requested") or {}).get("function") for r in live["results"]
-                   if r.get("op") == "local_retype"]
-        assert written == storing, live["results"]
-        listed = {m["address"] for m in live["class_apply_types"]["skipped_methods"]
-                  if m["reason"] == "slot target, parameter 0 not retyped (no address-point store)"}
-        assert listed == set(slots) - set(storing), live["class_apply_types"]["skipped_methods"]
-        params = [v for v in shared_bn.json("local", "list", storing[0])["items"] if v["is_parameter"]]
-        assert params[0]["type"] == "struct svc::AuditHandler*", params
+        written = [r for r in live["results"] if r.get("op") == "local_retype"]
+        assert written == [], live["results"]
+        skipped = live["class_apply_types"]["skipped_methods"]
+        assert skipped and all(m["check"] == f"bn proto get {m['address']}" for m in skipped), skipped
 
     def test_unnamed_slots_print_body_facts_and_no_role_1040(self, shared_bn):
         """#1040.2: the card states what each unnamed slot's body does -- the
@@ -1492,25 +1473,20 @@ class TestTypeStringsAndInheritance:
         assert "likely" not in card.stdout and "--emit-renames" not in card.stdout
         assert shared_bn.run("class", "show", "svc::AuditHandler", "--emit-renames").returncode == 2
 
-    def test_non_pie_stripped_build_lists_its_classes_1035(self, shared_bn):
-        """#1035.5: in a stripped non-PIE build BN's RTTI analysis names no
-        typeinfo (the ABI's class-typeinfo vtables are copy-relocated), so the
-        lens listed no domain class. The typeinfo found from the bytes lists
-        them, with their vtables, and `--local` folds out the library classes
-        whose objects are only copies here."""
+    def test_non_pie_stripped_build_lists_raw_typeinfo_candidates_only_1049(self, shared_bn):
+        """#1035.5 / #1049 review round 3: in a stripped non-PIE build BN's RTTI
+        analysis names no typeinfo (the ABI's class-typeinfo vtables are
+        copy-relocated). The byte scan lists the candidate records -- address
+        and raw name string -- and no class row or card comes from them."""
         shared_bn.load(CLASSES_NOPIE_STRIPPED_BINARY)
-        listing = shared_bn.json("class", "list", "--local", "--vtable-budget", "5")
-        rows = {row["name"]: row for row in listing["items"]}
-        assert {"svc::Handler", "svc::EchoHandler", "svc::AuditHandler", "svc::Codec"} <= set(rows), rows
-        assert rows["svc::AuditHandler"]["bases"] == ["svc::EchoHandler"], rows["svc::AuditHandler"]
-        assert rows["svc::AuditHandler"]["vtable_status"] == "recovered", rows["svc::AuditHandler"]
-        assert not any(name.startswith(("std::exception", "std::runtime_error", "__cxxabiv1::"))
-                       for name in rows), sorted(rows)
-        assert listing["imported_suppressed"] >= 2, listing
-        card = shared_bn.json("class", "show", "svc::AuditHandler")
-        assert card["typeinfo"]["source"] == "typeinfo-scan", card["typeinfo"]
-        assert card["confidence"] == "typeinfo-scan", card
-        assert len(card["vtable"]["slots"]) == 5, card["vtable"]
+        listing = shared_bn.json("class", "list", "--local")
+        assert not any(row["name"].startswith("svc::") for row in listing["items"]), listing["items"]
+        names = {row["name_string"] for row in listing["typeinfo_scan_listing"]}
+        assert {"N3svc7HandlerE", "N3svc12AuditHandlerE"} <= names, names
+        assert listing["typeinfo_scan_candidates"] >= len(names)
+        text = shared_bn.run("class", "list", "--local")
+        assert "no class row comes from them" in text.stdout, text.stdout
+        assert shared_bn.run("class", "show", "svc::AuditHandler").returncode != 0
 
     def test_construction_sites_carry_their_own_allocation_request_1018(self, shared_bn):
         """#1018.2: the allocation is per site. `make()` constructs a Dispatcher

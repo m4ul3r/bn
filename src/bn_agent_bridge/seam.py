@@ -1652,11 +1652,9 @@ class BridgeContext:
         imported class's ``.got`` neighbour is commonly another class's
         ``_ZTV`` slot, and accepting it reported that vtable as an RTTI base."""
         sym = bv.get_symbol_at(address) if hasattr(bv, "get_symbol_at") else None
-        from . import read_class
         if sym is None:
-            # #1035.5: a typeinfo object BN put no symbol on (its RTTI analysis
-            # names none in a non-PIE executable) answers through the ABI scan.
-            return read_class._scanned_typeinfo_class(self, bv, address)
+            return None
+        from . import read_class
         kind, cls = read_class._rtti_kind_and_class(sym)
         return cls if kind == "typeinfo" else None
 

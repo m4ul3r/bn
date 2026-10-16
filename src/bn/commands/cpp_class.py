@@ -113,9 +113,7 @@ def _class_show(args: argparse.Namespace) -> int:
 
 @command("class", "apply-types",
          help="Type a C++ class for named virtual calls: its instance struct's vptr as BN's "
-              "<Class>::VTable* and the object parameter (`this`, or on a stripped build "
-              "parameter 0 of each function whose own body stores the class's vtable address "
-              "point into it), as one verified mutation",
+              "<Class>::VTable* and `this` on its methods, as one verified mutation",
          target=True, fmt="json",
          see_also=("class show", "struct show", "local retype"),
          args=[preview_arg(), *mutation_output_args(), arg("name")])

@@ -4311,7 +4311,7 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #1040 adds three: the class listing's `non_class_rtti_suppressed` and
     # `imported_suppressed` hidden shares, and a row's `base_sole_base_of`.
     # #1049 review round 2 drops the apply-types plan's per-method
-    # `other_data_refs` and adds the class listing's `typeinfo_scan_unnamed`.
+    # `other_data_refs` and adds the class listing's `typeinfo_scan_candidates`.
     assert len(sites) == 67, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
         "count helper, not 67. A "
@@ -4467,9 +4467,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "_string_xref_suffix(xref_function_count) [not a payload renderer]",
         # #1049 review round 2: a class-listing fragment called from the count
         # line and the listing, not a payload renderer. Covered by name in
-        # `tests/test_read_class.py::test_class_list_discloses_the_candidates_it_gave_no_name_1049`,
+        # `tests/test_read_class.py::test_class_list_discloses_the_raw_candidates_1049`,
         # which asserts `?` for a count no value reads out of.
-        "_typeinfo_scan_unnamed_note(typeinfo_scan_unnamed) [not a payload renderer]",
+        "_typeinfo_scan_candidates_note(typeinfo_scan_candidates) [not a payload renderer]",
         # Both live NESTED under `existing_annotations`, so a top-level probe
         # cannot open the presence gate that states them. Covered by name in
         # `test_render_orient_states_the_analyst_split_without_fabricating_it`,
