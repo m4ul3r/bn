@@ -22,6 +22,7 @@ import secrets
 import shlex
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -29,12 +30,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from .paths import (
     bridge_registry_path, bridge_socket_path, cache_home, default_cache_home,
-    ensure_private_dir, instances_dir, project_root,
+    ensure_private_dir, instances_dir, project_root, stop_record_path,
     validate_instance_id as _paths_validate_instance_id,
 )
 from .proc_identity import PinUnavailable, identity_verdict, pin_process
@@ -427,30 +429,88 @@ class BridgeProcessSignal:
 _STOP_REASONS = {
     "shutdown_request": "a shutdown request, which `bn session stop` and `restart` send",
     "idle_timeout": "the BN_IDLE_TIMEOUT idle reaper",
+    "teardown": "no shutdown request or idle timeout recorded",
 }
+_STOP_RECORD_MAX_BYTES = 64 * 1024
+
+
+def _iso_time(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_stop_record(record: Any) -> bool:
+    """Whether *record* has the exact shape the bridge's stop() writes. A
+    record that does not is not evidence of anything (#1035 review round 2)."""
+    if not isinstance(record, dict):
+        return False
+    if not all(isinstance(record.get(key), str) and record[key]
+               for key in ("instance_id", "instance_token", "bind_token")):
+        return False
+    if not (_count(record.get("pid")) and record["pid"] > 0):
+        return False
+    reason = record.get("reason")
+    if (not isinstance(reason, str) or reason not in _STOP_REASONS
+            or not _iso_time(record.get("began_at"))):
+        return False
+    if record.get("state") == "stopping":
+        return True
+    return (record.get("state") == "stopped"
+            and _iso_time(record.get("completed_at"))
+            and isinstance(record.get("requests_drained"), bool)
+            and _count(record.get("unfinished_requests")))
+
+
+def _read_stop_record(path: Path) -> Any:
+    """The JSON at *path*, read without blocking: only a regular file, never
+    through a symlink, and bounded. Raises FileNotFoundError when absent and
+    OSError/ValueError when it cannot be read as a record."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("not a regular file")
+        data = os.read(fd, _STOP_RECORD_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > _STOP_RECORD_MAX_BYTES:
+        raise ValueError("stop record too large")
+    return json.loads(data.decode("utf-8"))
 
 
 def _stop_record(instance: BridgeInstance) -> tuple[str, dict[str, Any] | None]:
     """The stop record the bridge's own teardown wrote, judged against *instance*.
 
-    Returns ``("matched", record)`` only when the record names this bridge by
-    its ``instance_token``; otherwise ``"absent"``, ``"unreadable"`` or
-    ``"other"`` (a record a predecessor or successor of the same id left),
-    none of which says anything about why this bridge closed (#1035 item 1).
+    Returns ``("matched", record)`` only for a well-formed record naming this
+    bind: its ``instance_token``, the registry's ``bind_token`` and its pid.
+    Otherwise ``"absent"``, ``"unreadable"`` (a file that cannot be read or does
+    not have the record's shape) or ``"unmatched"`` (another bridge's, or an
+    earlier bind's), none of which says anything about why this bridge closed
+    (#1035 item 1).
     """
-    path = instance.registry_path.with_suffix(".stopped")
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = _read_stop_record(stop_record_path(instance.registry_path))
     except FileNotFoundError:
         return "absent", None
     except (OSError, ValueError):
         return "unreadable", None
-    if not isinstance(record, dict):
+    if not _valid_stop_record(record):
         return "unreadable", None
     token = instance.instance_token
-    if isinstance(token, str) and token and record.get("instance_token") == token:
+    bind = instance.meta.get("bind_token") if isinstance(instance.meta, dict) else None
+    if (isinstance(token, str) and token and record["instance_token"] == token
+            and isinstance(bind, str) and bind and record["bind_token"] == bind
+            and record["pid"] == instance.pid):
         return "matched", record
-    return "other", None
+    return "unmatched", None
 
 
 def _bridge_running(instance: BridgeInstance) -> bool:
@@ -462,23 +522,28 @@ def _bridge_running(instance: BridgeInstance) -> bool:
 
 
 def _exit_evidence(instance: BridgeInstance, *, running: bool) -> str:
-    """What the process state and the bridge's stop record show. A cause is
-    named only from a stop record this bridge wrote; nothing is inferred
-    from a missing or foreign one."""
+    """What the process state and the bridge's stop record show, no more.
+
+    Only a ``stopped`` record says a teardown completed; a ``stopping`` one
+    says a stop began and nothing about how it ended. Nothing is inferred
+    from a missing, unreadable or unmatched record."""
     state = ("The process is still running" if running
              else "The process is no longer running")
     verdict, record = _stop_record(instance)
     if verdict == "matched":
-        reason = str(record.get("reason"))
-        cause = _STOP_REASONS.get(reason, f"reason: {reason}")
-        when = record.get("stopped_at")
-        return (f"{state}. Its stop record shows a clean shutdown ({cause})"
-                + (f" at {when}" if isinstance(when, str) else "")
-                + " that did not finish this request.")
+        cause = _STOP_REASONS[record["reason"]]
+        if record["state"] == "stopped":
+            left = record["unfinished_requests"]
+            return (f"{state}. Its stop record shows a completed teardown ({cause}): "
+                    f"begun at {record['began_at']}, finished at {record['completed_at']} "
+                    f"with {left} request{'' if left == 1 else 's'} still in flight.")
+        return (f"{state}. Its stop record shows a shutdown ({cause}) began at "
+                f"{record['began_at']}, but not that the teardown completed, so why "
+                "this connection closed is unknown.")
     found = {
         "absent": "no stop record was found for it",
-        "unreadable": "its stop record could not be read",
-        "other": "the stop record at its path belongs to another bridge",
+        "unreadable": "its stop record could not be read as one",
+        "unmatched": "the stop record at its path is not this bridge's",
     }[verdict]
     return f"{state}, and {found}, so the reason it closed the connection is unknown."
 

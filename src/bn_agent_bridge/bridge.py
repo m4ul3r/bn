@@ -60,7 +60,7 @@ from ._shared import (
 from .op_registry import REGISTRY, op
 from .paths import (
     PLUGIN_NAME, bridge_registry_path, bridge_socket_path, cache_home, ensure_private_dir,
-    instances_dir, project_root,
+    instances_dir, project_root, stop_record_path,
 )
 from .proc_identity import identity_payload
 from .seam import BridgeContext
@@ -1917,6 +1917,10 @@ class BinaryNinjaBridge:
         # set by the `shutdown` op and the idle reaper; None for any other
         # teardown (interrupt, atexit, GUI restart).
         self._stop_reason: str | None = None
+        # Set by each start() that binds; published in the registry and in the
+        # stop record, so a record is matched to one bind (#1035 review round 2).
+        self.bind_token: str | None = None
+        self._stop_record: dict[str, Any] = {}
         self._target_lock = _ReadWriteLock()
         # Serializes write operations. Long chunked writers can hold this gate
         # while releasing _target_lock between chunks so reads stay responsive.
@@ -2114,6 +2118,19 @@ class BinaryNinjaBridge:
             # socket file the rollback already removed, and the registry and the log
             # belong to the spawn.
             self._instance_state_released = False
+            # Names THIS bind in the registry and in its stop record, so the
+            # record a previous bind of this same object left cannot explain a
+            # later one (#1035 review round 2): `instance_token` lives as long
+            # as the object, a bind only until its stop().
+            self.bind_token = str(uuid.uuid4())
+            self._stop_reason = None
+            # And an older record at this bind's path -- an earlier bind's of
+            # this object or a predecessor's -- is removed: from the bind to
+            # its release these paths are this bind's (#799), and a record that
+            # predates it must not be left to explain how it ends.
+            if self.instance_id is not None:
+                with contextlib.suppress(OSError):
+                    stop_record_path(self.registry_path).unlink()
             with self._request_state_lock:
                 self._shutting_down = False
             # #612: tighten the freshly-bound socket to owner-only. Even with the
@@ -2194,10 +2211,10 @@ class BinaryNinjaBridge:
             self._stopped = True
             self._refuse_queued_load_jobs_locked()
             server = self._server
-            # Before the drain and before any file is released, so a client
-            # whose request this teardown cuts off finds the record (#1035 item 1).
-            if server is not None and not self._instance_state_released:
-                self._write_stop_record_locked()
+            # Phase one, before the drain and before any file is released: a
+            # stop BEGAN. It claims nothing about completion (#1035 item 1).
+            recording = (server is not None and not self._instance_state_released
+                         and self._write_stop_record_locked("stopping"))
         # Stop accepting connections, but retain the bind and discovery files
         # throughout the drain. Already accepted readers will refuse new work.
         if server is not None:
@@ -2232,6 +2249,12 @@ class BinaryNinjaBridge:
             if self._server is server:
                 self._release_own_instance_state_locked()
                 self._server = None
+                # Phase two, only once admission stopped, the drain ended and
+                # the discovery files are released: the teardown COMPLETED,
+                # with the drain's own verdict. Rewrites only this bind's phase
+                # one; a successor that bound since writes its own at its stop.
+                if recording:
+                    self._write_stop_record_locked("stopped", verdict)
             else:
                 server = None
         # Unlink BEFORE releasing the bind. Nothing below unlinks any path.
@@ -2245,25 +2268,48 @@ class BinaryNinjaBridge:
                 thread.join(timeout=load_join_timeout)
         return verdict
 
-    def _write_stop_record_locked(self) -> None:
-        """Record that THIS bridge ran its clean teardown. Caller MUST hold
-        _teardown_lock and the bind (#799: no successor can own these paths).
+    def _write_stop_record_locked(
+        self, state: str, verdict: dict[str, Any] | None = None,
+    ) -> bool:
+        """Write this bind's stop record; whether it was written. Caller MUST
+        hold _teardown_lock.
 
         The record is the positive witness a client's empty-reply diagnosis
-        needs (#1035 item 1): only stop() writes it, a crash or kill cannot,
-        and it names this bridge by `instance_token`, so a record a successor
-        or a predecessor left at the same path is never read as this one's.
-        Best-effort: a teardown must never fail because it could not write it.
-        `bn instance gc` reaps it once no registry of that name remains.
+        reads (#1035 item 1), in two phases: ``stopping`` when stop() begins,
+        rewritten as ``stopped`` only after the drain ended and the discovery
+        files were released, carrying the drain's verdict. A crash or kill
+        writes neither, and one during the teardown leaves ``stopping``, which
+        claims only that a stop began. It names this bind by `instance_token`,
+        `bind_token` and pid, so a record a predecessor, a successor or an
+        earlier bind of this object left is never read as this one's.
+
+        Named instances only: the GUI's fixed pair lives outside the instances
+        directory `bn instance gc` sweeps, so a record there would never be
+        reaped. Best-effort: a teardown must never fail because of it.
         """
-        record = {
-            "instance_id": self.instance_id,
-            "instance_token": self.instance_token,
-            "pid": os.getpid(),
-            "reason": self._stop_reason or "teardown",
-            "stopped_at": datetime.now(timezone.utc).isoformat(),
-        }
-        path = self.registry_path.with_suffix(".stopped")
+        if self.instance_id is None or self.bind_token is None:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        if state == "stopping":
+            self._stop_record = {
+                "instance_id": self.instance_id,
+                "instance_token": self.instance_token,
+                "bind_token": self.bind_token,
+                "pid": os.getpid(),
+                "reason": self._stop_reason or "teardown",
+                "state": "stopping",
+                "began_at": now,
+            }
+            record = self._stop_record
+        else:
+            record = {
+                **self._stop_record,
+                "state": "stopped",
+                "completed_at": now,
+                "requests_drained": bool((verdict or {}).get("requests_drained")),
+                "unfinished_requests": int((verdict or {}).get("unfinished_requests") or 0),
+            }
+        path = stop_record_path(self.registry_path)
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
@@ -2274,6 +2320,8 @@ class BinaryNinjaBridge:
             if tmp is not None:
                 with contextlib.suppress(OSError):
                     Path(tmp).unlink()
+            return False
+        return True
 
     def _release_own_instance_state_locked(self):
         """Remove this bridge's discovery files. Caller MUST hold _teardown_lock.
@@ -2420,6 +2468,8 @@ class BinaryNinjaBridge:
         if self.instance_id is not None:
             payload["instance_id"] = self.instance_id
         payload["instance_token"] = self.instance_token
+        if self.bind_token is not None:
+            payload["bind_token"] = self.bind_token
         # #80: record the open binaries so `bn instance list` can show what each
         # instance holds without an N-instance `target list` round-trip -- the
         # biggest usability win for the many-bridges case. Best-effort: a registry

@@ -31,11 +31,15 @@ With several bridges running, a bare command routes to the one associated with
 this project root and says so on stderr. `bn instance list --mine` lists only
 those (and the project's sticky pin).
 
-A bridge that shuts down cleanly (`session stop`/`restart`, the idle reaper)
-writes `<id>.stopped` in the instances directory first. When a request gets an
-empty reply, bn reports a clean shutdown only if that record names the bridge it
-was talking to; otherwise it says no matching stop record was found and names
-no cause. `bn instance gc` removes stop records whose bridge is gone.
+A named bridge (`session start`, `bn-agent`) that begins to stop writes
+`<id>.stopped` in the instances directory with state `stopping`, and rewrites it
+as `stopped` once its requests are drained and its socket and registry are
+removed. When a request gets an empty reply, bn reports a completed teardown
+only from a `stopped` record of the same bridge start (instance token, bind
+token, pid). A `stopping` record is reported as a stop that began, with
+completion unknown. A missing, unreadable or unmatched record is reported as
+such, and no cause is named. `bn instance gc` removes stop records whose bridge
+is gone; the GUI bridge writes none.
 
 Instance routing is `-i` → `BN_INSTANCE` → project sticky pin → sole/unique project-associated live instance → auto-spawn. Target routing is `-t` → `BN_TARGET` → project sticky pin → single-open auto-pick; for `batch apply`, a manifest `"target"` wins over ambient defaults but loses to explicit `-t`. `BN_TARGET` is an ambient default, not an explicit command-line selection. A bare destructive `bn close` ignores the ambient target and closes only the sole open view or refuses with a target list; use `-t`, a path, or `--all` deliberately. An empty `BN_TARGET` or empty sticky target is refused when a command would use it. A valid ambient target can affect a bare `bn save`, so pass `-t` for the database you intend to write.
 

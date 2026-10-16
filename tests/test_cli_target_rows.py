@@ -9,6 +9,7 @@ the stub received is parsed back with the real CLI parser.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -233,66 +234,235 @@ def _handle(registry_path: Path, *, token: str = "t", pid: int = 4242,
     return BridgeInstance(
         pid=pid, socket_path=registry_path.with_suffix(".sock"), registry_path=registry_path,
         plugin_name="bn_agent_bridge", plugin_version="0", started_at=None,
-        meta=meta or {}, instance_token=token, instance_id=registry_path.stem,
+        meta={"bind_token": "b", **(meta or {})}, instance_token=token,
+        instance_id=registry_path.stem,
     )
 
 
-_CLAIMS = ("crash", "OOM", "fault", "shutting down", "clean shutdown", "session stop")
+def _record(**over) -> dict:
+    """A well-formed `stopped` record for `_handle()`'s bind."""
+    return {"instance_id": "x", "instance_token": "t", "bind_token": "b", "pid": 4242,
+            "reason": "shutdown_request", "state": "stopped",
+            "began_at": "2026-10-16T09:00:00+00:00",
+            "completed_at": "2026-10-16T09:00:02+00:00",
+            "requests_drained": False, "unfinished_requests": 1, **over}
+
+
+def _diagnose(handle: BridgeInstance, record: object = None) -> str:
+    from bn import transport
+    from bn.paths import stop_record_path
+
+    if record is not None:
+        stop_record_path(handle.registry_path).write_text(
+            record if isinstance(record, str) else json.dumps(record))
+    return str(transport._empty_response_error(handle, "refresh"))
+
+
+_CLAIMS = ("crash", "OOM", "fault", "shutting down", "clean", "completed", "began")
 
 
 @pytest.mark.parametrize(("record", "found"), [
     (None, "no stop record was found"),
-    ("{not json", "could not be read"),
-    ("[]", "could not be read"),
-    (json.dumps({"instance_token": "successor", "reason": "shutdown_request"}),
-     "belongs to another bridge"),
+    ("{not json", "could not be read as one"),
+    ("[]", "could not be read as one"),
+    (_record(instance_token="successor"), "is not this bridge's"),
+    (_record(bind_token="earlier-bind"), "is not this bridge's"),
+    (_record(pid=9999), "is not this bridge's"),
 ])
 @pytest.mark.parametrize("running", [True, False])
-def test_without_this_bridges_stop_record_no_cause_is_claimed_1035_1(
+def test_without_this_binds_stop_record_no_cause_is_claimed_1035_1(
     monkeypatch, tmp_path, record, found, running,
 ):
-    """Review round 1: registry absence, a corrupt record or one a successor
-    wrote is not evidence of why the bridge closed the connection."""
+    """Registry absence, a corrupt record or another bridge's or bind's record
+    is not evidence of why the bridge closed the connection."""
     from bn import transport
 
-    handle = _handle(tmp_path / "x.json")
-    if record is not None:
-        handle.registry_path.with_suffix(".stopped").write_text(record)
     monkeypatch.setattr(transport, "_process_running", lambda pid: running)
-    message = str(transport._empty_response_error(handle, "refresh"))
+    message = _diagnose(_handle(tmp_path / "x.json"), record)
     assert found in message and "reason it closed the connection is unknown" in message
     assert ("still running" if running else "no longer running") in message
     for claim in _CLAIMS:
         assert claim not in message
 
 
-def test_a_bridge_stop_writes_the_record_the_diagnosis_reads_1035_1(monkeypatch, tmp_path):
-    """The real bridge teardown writes the witness; the CLI claims a stop only
-    from a record carrying the token of the bridge it was talking to."""
-    from _bridge_fakes import _load_bridge
+@pytest.mark.parametrize("record", [
+    {key: value for key, value in _record().items() if key != "bind_token"},
+    _record(reason=[]), _record(reason="made_up"), _record(began_at={}),
+    _record(began_at="yesterday"), _record(pid="bad"), _record(pid=True),
+    _record(state="done"), _record(completed_at=None), _record(unfinished_requests=True),
+    _record(requests_drained="no"), _record(instance_id=None),
+])
+def test_a_malformed_record_with_this_binds_token_is_not_a_witness_1035_1(
+    monkeypatch, tmp_path, record,
+):
+    """Review round 2: only the exact shape stop() writes counts."""
     from bn import transport
+
+    monkeypatch.setattr(transport, "_process_running", lambda pid: False)
+    message = _diagnose(_handle(tmp_path / "x.json"), record)
+    assert "could not be read as one" in message
+    for claim in _CLAIMS:
+        assert claim not in message
+
+
+def test_only_a_stopped_record_reports_a_completed_teardown_1035_1(monkeypatch, tmp_path):
+    """Review round 2: `stopping` proves a stop began, not that it completed."""
+    from bn import transport
+
+    monkeypatch.setattr(transport, "_process_running", lambda pid: False)
+    handle = _handle(tmp_path / "x.json")
+    done = _diagnose(handle, _record())
+    assert "shows a completed teardown (a shutdown request" in done
+    assert "1 request still in flight" in done
+    begun = _diagnose(handle, {key: value for key, value in _record(state="stopping").items()
+                               if key not in ("completed_at", "requests_drained",
+                                              "unfinished_requests")})
+    assert "began at 2026-10-16T09:00:00+00:00, but not that the teardown completed" in begun
+    assert "completed teardown" not in begun and "clean" not in begun
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory", "symlink"])
+def test_a_non_regular_record_path_is_unreadable_without_blocking_1035_1(tmp_path, kind):
+    """Review round 2: a FIFO at the record path must not hang the diagnosis."""
+    import threading
+
+    from bn.paths import stop_record_path
+
+    handle = _handle(tmp_path / "x.json")
+    path = stop_record_path(handle.registry_path)
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        (tmp_path / "real.json").write_text(json.dumps(_record()))
+        path.symlink_to(tmp_path / "real.json")
+    out: list[str] = []
+    worker = threading.Thread(target=lambda: out.append(_diagnose(handle)), daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert out, "the diagnosis blocked on the record path"
+    assert "could not be read as one" in out[0]
+
+
+def test_distinct_ids_get_distinct_record_paths_1035_1(tmp_path):
+    """Review round 2: `...` and `....json` are both valid ids."""
+    from bn.paths import stop_record_path
+
+    assert (stop_record_path(tmp_path / "....json")
+            != stop_record_path(tmp_path / "....json.json"))
+
+
+def _started(module, instance_id: str):
+    bridge = module.BinaryNinjaBridge(instance_id=instance_id)
+    bridge.start()
+    meta = json.loads(bridge.registry_path.read_text())
+    handle = BridgeInstance(
+        pid=meta["pid"], socket_path=bridge.socket_path, registry_path=bridge.registry_path,
+        plugin_name="bn_agent_bridge", plugin_version="0", started_at=None, meta=meta,
+        instance_token=meta["instance_token"], instance_id=instance_id,
+    )
+    return bridge, handle
+
+
+def test_a_bridge_stop_writes_the_record_the_diagnosis_reads_1035_1(monkeypatch, tmp_path):
+    """The real teardown writes the witness in two phases; the CLI matches it to
+    the handle discovery produced from the real registry."""
+    from _bridge_fakes import _load_bridge
+
+    from bn import transport
+    from bn.paths import stop_record_path
 
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     module = _load_bridge(monkeypatch)
-    bridge = module.BinaryNinjaBridge(instance_id="sx")
-    bridge.start()
-    ours = _handle(bridge.registry_path, token=bridge.instance_token, pid=os.getpid())
+    bridge, ours = _started(module, "sx")
     try:
         assert "no stop record was found" in str(transport._empty_response_error(ours, "x"))
         module._bind_shutdown(bridge, {}, None)
     finally:
         bridge.stop()
-    record = json.loads(bridge.registry_path.with_suffix(".stopped").read_text())
-    assert (record["instance_token"], record["reason"]) == (bridge.instance_token,
-                                                           "shutdown_request")
-    message = str(transport._empty_response_error(ours, "refresh"))
-    assert "clean shutdown (a shutdown request" in message
+    record = json.loads(stop_record_path(bridge.registry_path).read_text())
+    assert (record["state"], record["reason"], record["bind_token"]) == (
+        "stopped", "shutdown_request", ours.meta["bind_token"])
+    assert "completed teardown (a shutdown request" in str(
+        transport._empty_response_error(ours, "refresh"))
     stale = _handle(bridge.registry_path, token="another-bridge", pid=os.getpid())
-    assert "belongs to another bridge" in str(transport._empty_response_error(stale, "x"))
+    assert "is not this bridge's" in str(transport._empty_response_error(stale, "x"))
     # `bn instance gc` reaps the record once no registry of that name remains.
-    summary = transport.gc_instances()
-    assert summary["stop_records_removed"] == 1
-    assert not bridge.registry_path.with_suffix(".stopped").exists()
+    assert transport.gc_instances()["stop_records_removed"] == 1
+    assert not stop_record_path(bridge.registry_path).exists()
+
+
+def test_a_teardown_interrupted_after_it_began_claims_no_completion_1035_1(
+    monkeypatch, tmp_path,
+):
+    """Review round 2 blocker: a bridge that dies between the phases leaves a
+    `stopping` record, which reports only that a stop began."""
+    from _bridge_fakes import _load_bridge
+
+    from bn import transport
+    from bn.paths import stop_record_path
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    bridge, ours = _started(module, "sx")
+    module._bind_shutdown(bridge, {}, None)
+    with monkeypatch.context() as patch:
+        def interrupted():
+            raise RuntimeError("died during teardown")
+
+        patch.setattr(bridge, "_release_own_instance_state_locked", interrupted)
+        with pytest.raises(RuntimeError, match="died during teardown"):
+            bridge.stop()
+    try:
+        assert json.loads(stop_record_path(bridge.registry_path).read_text())["state"] == (
+            "stopping")
+        message = str(transport._empty_response_error(ours, "refresh"))
+        assert "but not that the teardown completed" in message
+        assert "completed teardown" not in message
+    finally:
+        bridge.stop()
+
+
+def test_a_rebind_does_not_inherit_the_previous_binds_record_1035_1(monkeypatch, tmp_path):
+    """Review round 2 blocker: `start(); stop(); start()` on one object."""
+    from _bridge_fakes import _load_bridge
+
+    from bn import transport
+    from bn.paths import stop_record_path
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    bridge, first = _started(module, "sx")
+    bridge.stop()
+    earlier = stop_record_path(bridge.registry_path).read_text()
+    bridge.start()
+    try:
+        second = dataclasses.replace(first, meta={**first.meta, "bind_token": bridge.bind_token})
+        assert first.meta["bind_token"] != bridge.bind_token
+        # The new bind removed the earlier record ...
+        for handle in (first, second):
+            assert "no stop record was found" in str(
+                transport._empty_response_error(handle, "x"))
+        # ... and one put back is not this bind's.
+        stop_record_path(bridge.registry_path).write_text(earlier)
+        assert "is not this bridge's" in str(transport._empty_response_error(second, "x"))
+    finally:
+        bridge.stop()
+
+
+def test_the_gui_bridge_writes_no_record_outside_the_gc_scan_1035_1(monkeypatch, tmp_path):
+    """Review round 2 nit: the fixed pair is not in the instances directory."""
+    from _bridge_fakes import _load_bridge
+
+    from bn.paths import stop_record_path
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    gui = module.BinaryNinjaBridge()
+    gui.bind_token = "b"
+    assert gui._write_stop_record_locked("stopping") is False
+    assert not stop_record_path(gui.registry_path).exists()
 
 
 def test_a_reused_pid_is_not_reported_as_the_running_bridge_1035_1(tmp_path):
