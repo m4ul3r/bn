@@ -3554,63 +3554,46 @@ def test_estimate_output_is_not_advertised_on_mutations_or_side_effecting_comman
     assert not calls
 
 
-def test_imports_text_names_callers_and_export_attribution_1037(fake_transport, capsys, tmp_path):
+def test_imports_text_names_callers_and_discloses_unversioned_imports_1037(fake_transport, capsys):
     """#1037 items 5 and 6: `--with-callers` prints each import's capped callers
-    with the full count, and an attribution read from a needed library's export
-    table is marked and names the file it came from. `--sysroot` reaches the
-    bridge as an absolute path; a missing directory is refused before sending."""
+    with the full count; an unreadable ref list is unknown, never 0; and a
+    null library says why and names DT_NEEDED as the only source of the list."""
     calls = fake_transport({"imports": {"ok": True, "result": {
         "kind": "imports",
         "items": [
             {"name": "Registry::get", "raw_name": "_ZN8Registry3getEv", "address": "0x401140",
-             "kind": "function", "library": "libreg.so", "library_source": "needed-exports",
-             "namespace": "", "code_ref_count": 9, "caller_count": 9,
+             "kind": "function", "library": None, "namespace": "",
+             "library_note": "unversioned import: the loader picks the library at run time "
+                             "from the DT_NEEDED list",
+             "code_ref_count": 9, "caller_count": 9,
              "callers": [{"address": hex(0x401200 + i * 0x10), "name": f"start_{i}",
                           "display_name": f"start_{i}"} for i in range(8)]},
             {"name": "puts", "raw_name": "puts", "address": "0x401150", "kind": "function",
              "library": "libc.so.6", "library_source": "symbol-version", "namespace": "",
              "code_ref_count": 0, "caller_count": 0, "callers": []},
             {"name": "dup", "raw_name": "dup", "address": "0x401160", "kind": "function",
-             "library": None, "namespace": "", "exporting_libraries": ["libreg.so", "libx.so"],
-             "library_note": "exported by more than one needed library",
+             "library": "libc.so.6", "library_source": "symbol-version", "namespace": "",
              "code_ref_count": None, "caller_count": None, "callers": [],
              "callers_note": "code refs could not be read: RuntimeError: gone"},
         ],
         "total": 3, "offset": 0, "limit": 100, "returned": 3, "has_more": False,
-        "library_unattributed": 1, "needed_libraries": ["libreg.so", "libx.so", "libc.so.6"],
-        "library_unattributed_reasons": {"exported by more than one needed library": 1},
-        "needed_library_files": [
-            {"library": "libreg.so", "path": "/srv/app/libreg.so", "reason": None},
-            {"library": "libx.so", "path": "/srv/app/libx.so", "reason": None},
-            {"library": "libc.so.6", "path": None,
-             "reason": "not found in the search directories"}],
+        "library_unattributed": 1, "needed_libraries": ["libreg.so", "libc.so.6"],
         "callers_cap": 8,
     }}})
-    assert bn.cli.main(["imports", "--target", "active", "--with-callers",
-                        "--sysroot", str(tmp_path)]) == 0
+    assert bn.cli.main(["imports", "--target", "active", "--with-callers"]) == 0
     out = capsys.readouterr().out
-    assert ("0x401140  Registry::get [libreg.so via exports] (raw: _ZN8Registry3getEv)  "
+    assert ("0x401140  Registry::get (raw: _ZN8Registry3getEv)  "
             "[callers: start_0, start_1, start_2, start_3, start_4, start_5, start_6, "
             "start_7 (+1 more)]") in out
     assert "0x401150  puts [libc.so.6]  [callers: 0 functions]" in out
-    # #1037 review: an ambiguous name stays null and names its exporters
-    # neutrally; an unreadable ref list is unknown, not "0 functions".
-    assert ("0x401160  dup [library unknown; exported by libreg.so, libx.so]  "
+    assert ("0x401160  dup [libc.so.6]  "
             "[callers unknown: code refs could not be read: RuntimeError: gone]") in out
-    assert ("// 1 import(s) carry no library (1 exported by more than one needed "
-            "library); this target needs: libreg.so, libx.so, libc.so.6") in out
-    assert ("files read: libreg.so=/srv/app/libreg.so, libx.so=/srv/app/libx.so;") in out
-    assert ("// needed libraries not read: libc.so.6 (not found in the search "
-            "directories)") in out
+    assert ("// 1 import(s) carry no library (unversioned import: the loader picks the "
+            "library at run time); this binary needs (DT_NEEDED): libreg.so, libc.so.6") in out
     # Counted off the rows: only `puts` is a measured zero.
     assert "// 1 import(s) show no recorded code refs" in out
-    params = calls[-1]["params"]
-    assert (params["with_callers"], params["sysroot"]) == (True, str(tmp_path.resolve()))
-
-    sent = len(calls)
-    assert bn.cli.main(["imports", "--target", "active", "--sysroot",
-                        str(tmp_path / "missing")]) == 2
-    assert len(calls) == sent
+    assert calls[-1]["params"]["with_callers"] is True
+    assert "sysroot" not in calls[-1]["params"]
 
 
 def test_strings_text_states_the_landing_pad_note_1037(fake_transport, capsys):
@@ -3639,28 +3622,22 @@ def test_strings_text_states_the_landing_pad_note_1037(fake_transport, capsys):
     assert f"note: {note}" in capsys.readouterr().out
 
 
-def test_imports_summary_text_names_every_attribution_source_1037(fake_transport, capsys):
-    """#1037 review finding 7: the summary labelled every library "symbol
-    version requirements", although some came from export files, and dropped
-    the files read."""
+def test_imports_summary_text_states_why_imports_are_unattributed_1037(fake_transport, capsys):
+    """#1037 review: the summary must say why imports carry no library even when
+    none is attributed, and name DT_NEEDED as the source of the needed list."""
     fake_transport({"imports": {"ok": True, "result": {
-        "kind": "imports_summary", "total_symbols": 4,
+        "kind": "imports_summary", "total_symbols": 1,
         "needed_libraries": ["libA.so", "libc.so.6"],
-        "by_library": {"libA.so": 2, "libc.so.6": 1, "(unattributed)": 1},
-        "by_library_source": {"needed-exports": 2, "symbol-version": 1},
-        "library_unattributed_reasons": {"exported by more than one needed library": 1},
-        "needed_library_files": [
-            {"library": "libA.so", "path": "/srv/app/libA.so", "reason": None},
-            {"library": "libc.so.6", "path": None, "reason": "not found in the search directories"}],
-        "namespaces": {"(none)": 4}, "by_kind": {"function": 4},
+        "by_library": {"(unattributed)": 1},
+        "unattributed_note": "unversioned import: the loader picks the library at run time "
+                             "from the DT_NEEDED list",
+        "namespaces": {"(none)": 1}, "by_kind": {"function": 1},
     }}})
     assert bn.cli.main(["imports", "--target", "active", "--summary"]) == 0
     out = capsys.readouterr().out
-    assert "symbol version requirements" not in out
-    assert "by library:" in out
-    assert "      2  needed-exports" in out and "      1  symbol-version" in out
-    assert "      1  exported by more than one needed library" in out
-    assert "files read: libA.so=/srv/app/libA.so" in out
+    assert "needed libraries (DT_NEEDED):\n  libA.so\n  libc.so.6" in out
+    assert ("unattributed: unversioned import: the loader picks the library at run time "
+            "from the DT_NEEDED list") in out
 
 
 def test_strings_all_targets_routes_each_rows_printed_read_to_its_target_1037(
@@ -3679,3 +3656,24 @@ def test_strings_all_targets_routes_each_rows_printed_read_to_its_target_1037(
     out = capsys.readouterr().out
     assert "`bn -t tgt-a read 0x5000 300 --encoding escaped`" in out
     assert "`bn -t tgt-b read 0x5000 300 --encoding escaped`" in out
+
+
+def test_routing_never_rewrites_target_strings_1037(fake_transport, capsys):
+    """#1037 review round 2, finding 5: the routing pass scanned rendered text,
+    so a target literal `bn read 0x1234 4` was shown rewritten (chars unchanged),
+    and a stray target backtick paired with the generated command's delimiter
+    and left that command unrouted. Only bn's own command carries routing now."""
+    literal = "literal `bn read 0x1234 4` end"
+    stray = "`bn read 0x1000 5 " + "y" * 300
+    fake_transport({"strings": {"ok": True, "result": {"kind": "strings", "items": [
+        {"address": "0x6000", "length": 30, "chars": 30, "type": "ascii",
+         "value": literal, "section": ".rodata"},
+        {"address": "0x7000", "length": len(stray), "chars": len(stray), "type": "ascii",
+         "value": stray, "section": ".rodata"}],
+        "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": False}}})
+    assert bn.cli.main(["-i", "inst-a", "strings", "-t", "demod"]) == 0
+    first, second = capsys.readouterr().out.splitlines()[:2]
+    assert json.dumps(literal) in first and "-t demod" not in first
+    assert second.startswith('0x7000  chars=318  ascii  "`bn read 0x1000 5 yyy')
+    assert second.endswith(
+        "full value: --format json or `bn -i inst-a -t demod read 0x7000 318 --encoding escaped`)")

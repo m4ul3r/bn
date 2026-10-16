@@ -94,7 +94,7 @@ _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "imports": (
         "address", "name", "raw_name", "kind", "library", "namespace",
-        "library_source", "library_note", "exporting_libraries", "provenance",
+        "library_source", "library_note", "provenance",
         "code_ref_count", "caller_count", "callers", "callers_note",
     ),
     "exports": (
@@ -140,10 +140,8 @@ _OPTIONAL_ROW_FIELDS: dict[str, dict[str, str]] = {
     },
     "imports": {
         "library_source": "rows whose library is attributed",
-        "library_note": "unattributed rows the needed-library lookup ran for: why "
+        "library_note": "unversioned imports of a target with DT_NEEDED: why "
                         "library is null",
-        "exporting_libraries": "unattributed rows some needed library read defines "
-                               "(no claim which one the loader binds)",
         "provenance": "imports recovered from a relocation with no import symbol",
         "code_ref_count": "--with-callers",
         "caller_count": "--with-callers",

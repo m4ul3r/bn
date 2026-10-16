@@ -171,7 +171,7 @@ def _strings(args: argparse.Namespace) -> int:
         stem="strings",
         regex_hint_query=args.query,
         # #1037 review: the clipped row's `bn read` must run as printed.
-        contextual_text_hints=True,
+        route_rendered_commands=True,
     )
 
 
@@ -247,20 +247,11 @@ def _go_functions_count_text(value: Any) -> str:
                arg("--with-callers", action="store_true", default=False,
                    help="Annotate each listed import with the functions that call it "
                         "(BN's recorded code refs; first 8 per row plus the total), so "
-                        "an import set maps to its callers in one call"),
-               arg("--sysroot", default=None,
-                   help="Directory holding the target's root filesystem: needed "
-                        "libraries are also looked up under it (DT_RUNPATH entries, "
-                        "lib, usr/lib, ...) to attribute unversioned imports")],
+                        "an import set maps to its callers in one call")],
          estimable=True)
 def _imports(args: argparse.Namespace) -> int:
     query = getattr(args, "query", None)
     regex = bool(getattr(args, "regex", False))
-    # Resolved here: the bridge reads it, and a relative path means the
-    # invoking shell's cwd, not the bridge's.
-    sysroot = str(Path(args.sysroot).resolve()) if args.sysroot else None
-    if sysroot is not None and not Path(sysroot).is_dir():
-        raise BridgeError(f"--sysroot {args.sysroot!r} is not a directory")
     if args.count:
         # #767: --summary and the paging flags vanished silently here while
         # `go functions` refused the same combination at the parser; refuse by
@@ -270,7 +261,7 @@ def _imports(args: argparse.Namespace) -> int:
             args,
             "imports",
             {"count_only": True, "include_got": bool(args.include_got),
-             "query": query, "regex": regex, "sysroot": sysroot},
+             "query": query, "regex": regex},
             require_target=True,
             text_renderer=_imports_count_text,
             stem="imports-count",
@@ -285,7 +276,7 @@ def _imports(args: argparse.Namespace) -> int:
     # full list (often 500+ entries on firmware libs) pages bridge-side like
     # strings/function list, returning a {items, total, ...} envelope (#122).
     params = {"summary": summary_mode, "include_got": bool(args.include_got),
-              "query": query, "regex": regex, "sysroot": sysroot}
+              "query": query, "regex": regex}
     if not summary_mode:
         params["offset"] = args.offset
         params["limit"] = _effective_limit(args)

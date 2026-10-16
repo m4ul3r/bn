@@ -1024,62 +1024,51 @@ def test_imports_without_raw_parent_keep_null_library_969(monkeypatch):
     assert "library_unattributed" not in listed
 
 
-def test_imports_attribute_unversioned_from_needed_library_exports_1037(monkeypatch, tmp_path):
-    """#1037 item 6: an unversioned import gets a library only when exactly one
-    needed library bn READ defines it, and every needed library before it was
-    read -- here `libreg.so` beside the binary -- marked `needed-exports`.
-    Otherwise it stays null with the reason; nothing is guessed from the name."""
-    from test_elf_dynamic import _build_elf, _library
+def test_imports_unversioned_rows_disclose_why_library_is_null_1037(monkeypatch, tmp_path):
+    """#1037 item 6, disclosure only: an unversioned import keeps `library:
+    null` with the reason, and bn reads no file but the target -- even with a
+    needed library that exports the name sitting beside the binary. Two review
+    rounds showed a lookup in the needed libraries names the wrong file."""
+    import builtins
+
+    from test_elf_dynamic import _build_elf
 
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fake_bn = sys.modules["binaryninja"]
-    image = _build_elf(needed=("libreg.so", "libc.so.6", "libstdc++.so.6"), symbols=(
+    image = _build_elf(needed=("libc.so.6", "libstdc++.so.6"), symbols=(
         ("printf", "libc.so.6"), ("_ZNSo3putEc", None), ("__gmon_start__", None)))
     binary = tmp_path / "regd"
     binary.write_bytes(image)
-    # `_ZNSo3putEc` is exported by libstdc++, which is NOT on disk: it stays
-    # null. libreg.so does not define it, so nothing names it.
-    (tmp_path / "libreg.so").write_bytes(_library(["_ZNSo3putEc_not", "printf"]))
+    (tmp_path / "libstdc++.so.6").write_bytes(image)
     bv = _versioned_import_bv(fake_bn, image=image)
     bv.file = types.SimpleNamespace(original_filename=str(binary), filename=str(binary))
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    real_open = builtins.open
+    opened: list[str] = []
 
-    rows = {i["name"]: i for i in instance._imports(None)["items"]}
+    def tracking_open(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    listed = instance._imports(None)
+    summary = instance._imports(None, summary=True)
+    monkeypatch.setattr(builtins, "open", real_open)
+
+    assert not [path for path in opened if path.startswith(str(tmp_path))]
+    rows = {i["name"]: i for i in listed["items"]}
     assert (rows["printf"]["library"], rows["printf"]["library_source"]) == (
         "libc.so.6", "symbol-version")
-    assert rows["_ZNSo3putEc"]["library"] is None and "library_source" not in rows["_ZNSo3putEc"]
-    assert rows["_ZNSo3putEc"]["library_note"] == (
-        "not exported by the needed libraries read; some needed libraries could not be read")
-
-    (tmp_path / "libreg.so").write_bytes(_library(["_ZNSo3putEc"]))
-    listed = instance._imports(None)
-    rows = {i["name"]: i for i in listed["items"]}
-    assert (rows["_ZNSo3putEc"]["library"], rows["_ZNSo3putEc"]["library_source"]) == (
-        "libreg.so", "needed-exports")
-    assert rows["__gmon_start__"]["library"] is None
-    assert listed["needed_library_files"] == [
-        {"library": "libreg.so", "path": str(tmp_path / "libreg.so"), "reason": None},
-        {"library": "libc.so.6", "path": None,
-         "reason": "not found in the search directories"},
-        {"library": "libstdc++.so.6", "path": None,
-         "reason": "not found in the search directories"},
-    ]
-    assert listed["library_unattributed_reasons"] == {
-        "not exported by the needed libraries read; some needed libraries could not be read": 1}
-
-    # Two needed libraries define it: null, both named, no claim which binds.
-    (tmp_path / "libc.so.6").write_bytes(_library(["_ZNSo3putEc"]))
-    rows = {i["name"]: i for i in instance._imports(None)["items"]}
-    assert rows["_ZNSo3putEc"]["library"] is None
-    assert rows["_ZNSo3putEc"]["exporting_libraries"] == ["libreg.so", "libc.so.6"]
-    assert rows["_ZNSo3putEc"]["library_note"] == "exported by more than one needed library"
-
-    # #1037 review finding 7: `--summary` carries the same evidence.
-    (tmp_path / "libc.so.6").unlink()
-    summary = instance._imports(None, summary=True)
-    assert summary["by_library_source"] == {"needed-exports": 1, "symbol-version": 1}
-    assert summary["needed_library_files"][0]["path"] == str(tmp_path / "libreg.so")
+    assert "library_note" not in rows["printf"]
+    for name in ("_ZNSo3putEc", "__gmon_start__"):
+        assert rows[name]["library"] is None and "library_source" not in rows[name]
+        assert rows[name]["library_note"] == (
+            "unversioned import: the loader picks the library at run time from the "
+            "DT_NEEDED list")
+    assert listed["needed_libraries"] == ["libc.so.6", "libstdc++.so.6"]
+    assert not {"needed_library_files", "library_unattributed_reasons"} & set(listed)
+    assert summary["unattributed_note"] == rows["__gmon_start__"]["library_note"]
 
 
 def test_imports_with_callers_names_capped_calling_functions_1037(monkeypatch):

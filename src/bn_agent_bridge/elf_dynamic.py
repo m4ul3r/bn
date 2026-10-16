@@ -28,7 +28,6 @@ reader for an out-of-range window.
 """
 from __future__ import annotations
 
-import os
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -76,22 +75,6 @@ class ElfDynamicInfo:
     # Dynamic symbol name -> the verneed library its version binds it to. Only
     # names with ONE library: a name versioned against two is not attributed.
     import_libraries: dict[str, str] = field(default_factory=dict)
-    # The file's ABI identity -- (EI_CLASS, EI_DATA, e_machine, EI_OSABI with
-    # GNU folded into SYSV, as glibc accepts either) -- and e_flags, so a
-    # library read for attribution can be checked against the binary it is read
-    # for (#1037 item 6 review: an x32 ELF32 and an ELF64 share EM_X86_64, and
-    # a big-endian ARM file shares EM_ARM with a little-endian one).
-    abi: tuple[int, int, int, int] | None = None
-    flags: int | None = None
-    # Names this file's dynamic symbol table DEFINES and exports to other
-    # modules (global/weak/unique binding, default/protected visibility),
-    # mapped to whether ONE of those definitions is unversioned or the default
-    # version (`foo@@V2`, versym hidden bit clear); False when every definition
-    # is a nondefault version (`foo@V1`), which an unversioned reference does
-    # not simply bind to. Only filled when `parse_elf_dynamic(...,
-    # with_exports=True)`; None when the table could not be read, so "exports
-    # nothing" is never a guess.
-    exports: dict[str, bool] | None = None
     # Why part of the dynamic section was not parsed: a value out of range for
     # this file, so that part is skipped rather than guessed. Empty when the
     # whole answer was read.
@@ -145,32 +128,24 @@ class _Elf:
         return data[:end].decode("utf-8", errors="replace")
 
 
-def parse_elf_dynamic(read: Reader, file_size: int, *,
-                      with_exports: bool = False) -> ElfDynamicInfo | None:
+def parse_elf_dynamic(read: Reader, file_size: int) -> ElfDynamicInfo | None:
     """The dynamic-section facts of the ELF file *read* serves (*file_size*
     bytes long), or ``None`` when it is not an ELF, carries no PT_DYNAMIC (a
-    static binary), or its headers are out of range for the file.
-    *with_exports* also reads the names the file defines for other modules
-    (``ElfDynamicInfo.exports``), which a shared library read for import
-    attribution needs (#1037 item 6)."""
+    static binary), or its headers are out of range for the file."""
     if file_size <= 0:
         return None
     try:
-        return _parse(read, int(file_size), with_exports=with_exports)
+        return _parse(read, int(file_size))
     except (struct.error, ValueError, OverflowError):
         return None
 
 
-def _parse(read: Reader, file_size: int, *, with_exports: bool = False) -> ElfDynamicInfo | None:
+def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
     probe = _Elf(read, file_size, False, "<")
     ident = probe.bytes_at(0, 16)
     if ident is None or ident[:4] != b"\x7fELF" or ident[4] not in (1, 2) or ident[5] not in (1, 2):
         return None
     elf = _Elf(read, file_size, ident[4] == 2, "<" if ident[5] == 1 else ">")
-    machine = elf.unpack("H", 0x12)
-    flags = elf.unpack("I", 0x30 if elf.is64 else 0x24)
-    osabi = 0 if ident[7] == 3 else ident[7]
-    abi = (ident[4], ident[5], machine[0], osabi) if machine else None
     # e_phoff, then (past e_shoff/e_flags/e_ehsize) e_phentsize and e_phnum.
     phoff = elf.unpack("Q" if elf.is64 else "I", 0x20 if elf.is64 else 0x1C)
     counts = elf.unpack("HH", 0x36 if elf.is64 else 0x2A)
@@ -213,7 +188,7 @@ def _parse(read: Reader, file_size: int, *, with_exports: bool = False) -> ElfDy
             needed_offsets.append(value)
         else:
             tags.setdefault(tag, value)
-    info = ElfDynamicInfo(notes=elf.notes, abi=abi, flags=flags[0] if flags else None)
+    info = ElfDynamicInfo(notes=elf.notes)
     strtab = elf.file_offset(tags[_DT_STRTAB]) if _DT_STRTAB in tags else None
     if strtab is None:
         if _DT_STRTAB in tags:
@@ -238,8 +213,6 @@ def _parse(read: Reader, file_size: int, *, with_exports: bool = False) -> ElfDy
     info.rpath = dynstr(tags[_DT_RPATH]) if _DT_RPATH in tags else None
     info.runpath = dynstr(tags[_DT_RUNPATH]) if _DT_RUNPATH in tags else None
     info.import_libraries = _versioned_import_libraries(elf, tags, dynstr)
-    if with_exports:
-        info.exports = _defined_exports(elf, tags, dynstr)
     return info
 
 
@@ -365,12 +338,12 @@ def _verneed_files(elf: _Elf, tags: dict[int, int], dynstr) -> dict[int, str]:
     return files
 
 
-def _dynamic_symbols(elf: _Elf, tags: dict[int, int], purpose: str) -> tuple[bytes, int, int] | None:
-    """The raw dynamic symbol table as ``(bytes, count, entry size)``, or None
-    when it cannot be read. Every bound is checked here, once, for both readers
-    below; *purpose* names what a refusal skipped."""
-    if _DT_SYMTAB not in tags:
-        return None
+def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr) -> dict[str, str]:
+    if _DT_VERSYM not in tags or _DT_SYMTAB not in tags:
+        return {}
+    files = _verneed_files(elf, tags, dynstr)
+    if not files:
+        return {}
     # DT_SYMENT is fixed by the ABI (sizeof(ElfN_Sym)); the loader ignores it,
     # so a file can carry any value and still run. Any other value is refused,
     # never used as a stride or a read size.
@@ -378,37 +351,21 @@ def _dynamic_symbols(elf: _Elf, tags: dict[int, int], purpose: str) -> tuple[byt
     syment = tags.get(_DT_SYMENT, expected)
     if syment != expected:
         elf.notes.append(f"DT_SYMENT {syment} is not the ABI symbol size {expected}; "
-                         f"{purpose} was skipped")
-        return None
+                         "per-import library attribution was skipped")
+        return {}
     count = _symbol_count(elf, tags)
     symtab = elf.file_offset(tags[_DT_SYMTAB])
-    if not count or symtab is None:
-        return None
-    if count > _MAX_SYMBOLS or not elf.fits(symtab, count * syment):
-        elf.notes.append(f"the dynamic symbol table ({count} symbols) does not fit in "
-                         f"the file; {purpose} was skipped")
-        return None
-    symbols = elf.bytes_at(symtab, count * syment)
-    return (symbols, count, syment) if symbols is not None else None
-
-
-def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr) -> dict[str, str]:
-    if _DT_VERSYM not in tags or _DT_SYMTAB not in tags:
-        return {}
-    files = _verneed_files(elf, tags, dynstr)
-    if not files:
-        return {}
-    table = _dynamic_symbols(elf, tags, "per-import library attribution")
     versym = elf.file_offset(tags[_DT_VERSYM])
-    if table is None or versym is None:
+    if not count or symtab is None or versym is None:
         return {}
-    symbols, count, syment = table
-    if not elf.fits(versym, count * 2):
+    if count > _MAX_SYMBOLS or not elf.fits(symtab, count * syment) \
+            or not elf.fits(versym, count * 2):
         elf.notes.append(f"the dynamic symbol table ({count} symbols) does not fit in "
                          "the file; per-import library attribution was skipped")
         return {}
+    symbols = elf.bytes_at(symtab, count * syment)
     versions = elf.bytes_at(versym, count * 2)
-    if versions is None:
+    if symbols is None or versions is None:
         return {}
     version_of = struct.unpack(f"{elf.endian}{count}H", versions)
     # st_name is the first field of both Elf32_Sym and Elf64_Sym. Definedness
@@ -431,303 +388,3 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr) -> dict
             del attributed[name]
             conflicted.add(name)
     return attributed
-
-
-_STB_GLOBAL, _STB_WEAK, _STB_GNU_UNIQUE = 1, 2, 10
-_STT_SECTION, _STT_FILE = 3, 4
-_STV_DEFAULT, _STV_PROTECTED = 0, 3
-_SHN_UNDEF = 0
-
-
-def _defined_exports(elf: _Elf, tags: dict[int, int], dynstr) -> dict[str, bool] | None:
-    """Names the dynamic symbol table defines for other modules to bind to:
-    a defined (``st_shndx != SHN_UNDEF``) symbol with global, weak or unique
-    binding and default or protected visibility -- the symbols the dynamic
-    linker can resolve another module's undefined reference against -- each
-    mapped to whether one of its definitions is unversioned or the default
-    version (see ``ElfDynamicInfo.exports``). None when the table, or the
-    DT_VERSYM table it declares, could not be read."""
-    table = _dynamic_symbols(elf, tags, "reading the exported symbols")
-    if table is None:
-        return None
-    symbols, count, syment = table
-    versions: tuple[int, ...] | None = None
-    if _DT_VERSYM in tags:
-        versym = elf.file_offset(tags[_DT_VERSYM])
-        data = elf.bytes_at(versym, count * 2) if versym is not None else None
-        if data is None:
-            # Without it a nondefault `foo@V1` reads like a plain `foo`.
-            elf.notes.append("DT_VERSYM does not fit in the file; the exported "
-                             "symbols were not read")
-            return None
-        versions = struct.unpack(f"{elf.endian}{count}H", data)
-    # Elf64_Sym: name I, info B, other B, shndx H, value Q, size Q.
-    # Elf32_Sym: name I, value I, size I, info B, other B, shndx H.
-    fmt = elf.endian + ("IBBH" if elf.is64 else "IIIBBH")
-    names: dict[str, bool] = {}
-    for index in range(1, count):
-        fields = struct.unpack_from(fmt, symbols, index * syment)
-        if elf.is64:
-            name_index, info, other, shndx = fields
-        else:
-            name_index, _value, _size, info, other, shndx = fields
-        binding, kind = info >> 4, info & 0xF
-        if shndx == _SHN_UNDEF or binding not in (_STB_GLOBAL, _STB_WEAK, _STB_GNU_UNIQUE):
-            continue
-        if kind in (_STT_SECTION, _STT_FILE) or (other & 3) not in (_STV_DEFAULT, _STV_PROTECTED):
-            continue
-        default = True
-        if versions is not None:
-            version = versions[index]
-            if version & 0x7FFF == 0:
-                continue  # VER_NDX_LOCAL: not visible to other modules
-            # VER_NDX_GLOBAL (1) is unversioned; an index >= 2 is a verdef
-            # version, the default one unless the hidden bit marks it `foo@V`.
-            default = not version & 0x8000
-        name = dynstr(name_index)
-        if name:
-            names[name] = names.get(name, False) or default
-    return names
-
-
-# ---------------------------------------------------------------------------
-# #1037 item 6: naming the library of an UNVERSIONED import from the needed
-# libraries' own export tables. A symbol version names its library (above); an
-# import with no version names nothing, and on a C++ binary linked against its
-# own libraries that was every symbol from them.
-#
-# This does NOT re-implement the dynamic loader's binding rules (search
-# scopes, version matching, interposition): a library is named only when the
-# files bn read leave no choice, and every other case is left null with the
-# reason and the exporters it saw. Review of the first version found three
-# ways a "first definition in load order" rule names the wrong file: a
-# nondefault `foo@V1` the loader skips, an ELF32/ELF64 (or big/little-endian)
-# file that shares e_machine with the target, and a sysroot symlink that
-# resolves to a HOST library.
-
-
-@dataclass
-class LibraryFile:
-    library: str            # the DT_NEEDED entry
-    path: str | None        # the file read for it, symlinks resolved
-    reason: str | None      # why no file was read (path is None)
-    exports: dict[str, bool] | None = None
-
-
-@dataclass
-class ExportVerdict:
-    library: str | None                  # named only when unambiguous
-    exporting: list[str]                 # needed libraries read that define it
-    note: str | None                     # why `library` is None
-
-
-# The reasons an import is left without a library, worded for a reader.
-NOT_EXPORTED = "not exported by any needed library read"
-NOT_EXPORTED_SOME_UNREAD = ("not exported by the needed libraries read; "
-                            "some needed libraries could not be read")
-SEVERAL_EXPORTERS = "exported by more than one needed library"
-NONDEFAULT_ONLY = "exported only under a nondefault symbol version"
-UNREAD_BEFORE = "a needed library before its exporter could not be read"
-
-
-@dataclass
-class NeededExports:
-    # Each DT_NEEDED entry in load order, with the file read for it.
-    files: list[LibraryFile] = field(default_factory=list)
-
-    def verdict(self, name: str) -> ExportVerdict:
-        """Name the library of *name* only when exactly one needed library that
-        was read defines it, that definition is unversioned or the default
-        version, and every needed library BEFORE it in DT_NEEDED order was read
-        (an unread earlier one could define it too). Otherwise None, with the
-        reason and the libraries read that define it -- which claims nothing
-        about which one the loader binds."""
-        exporting = [f for f in self.files if f.exports is not None and name in f.exports]
-        names = [f.library for f in exporting]
-        if not exporting:
-            unread = any(f.exports is None for f in self.files)
-            return ExportVerdict(None, [], NOT_EXPORTED_SOME_UNREAD if unread else NOT_EXPORTED)
-        if len(exporting) > 1:
-            return ExportVerdict(None, names, SEVERAL_EXPORTERS)
-        only = exporting[0]
-        if not only.exports[name]:
-            return ExportVerdict(None, names, NONDEFAULT_ONLY)
-        before = self.files[:self.files.index(only)]
-        if any(f.exports is None for f in before):
-            return ExportVerdict(None, names, UNREAD_BEFORE)
-        return ExportVerdict(only.library, names, None)
-
-
-def read_elf_file(path: str, *, with_exports: bool = True) -> ElfDynamicInfo | None:
-    """`parse_elf_dynamic` over a file on disk; None when it cannot be opened."""
-    try:
-        with open(path, "rb") as handle:
-            size = os.fstat(handle.fileno()).st_size
-
-            def read(offset: int, length: int) -> bytes:
-                handle.seek(offset)
-                return handle.read(length)
-
-            return parse_elf_dynamic(read, size, with_exports=with_exports)
-    except OSError:
-        return None
-
-
-def library_search_dirs(*, binary_path: str | None, runpath: str | None,
-                        rpath: str | None, sysroot: str | None) -> list[str]:
-    """The directories searched for a needed library, in order: the binary's
-    DT_RUNPATH (else DT_RPATH) entries, the binary's own directory, then the
-    sysroot's library directories.
-
-    `$ORIGIN` is the binary's directory. An absolute entry names a path on the
-    TARGET's filesystem, so it is read under *sysroot* and skipped without one:
-    the same path on this machine is a host library, not the target's. A
-    relative entry depends on the loader's working directory and is skipped."""
-    origin = os.path.dirname(os.path.abspath(binary_path)) if binary_path else None
-    dirs: list[str] = []
-    for entry in (runpath if runpath is not None else rpath or "").split(":"):
-        if not entry:
-            continue
-        if "$ORIGIN" in entry or "${ORIGIN}" in entry:
-            if origin is None:
-                continue
-            dirs.append(entry.replace("${ORIGIN}", origin).replace("$ORIGIN", origin))
-        elif entry.startswith("/") and sysroot:
-            dirs.append(os.path.join(sysroot, entry.lstrip("/")))
-    if origin is not None:
-        dirs.append(origin)
-    if sysroot:
-        for base in ("lib", "lib64", "usr/lib", "usr/lib64"):
-            root = os.path.join(sysroot, base)
-            dirs.append(root)
-            try:
-                children = sorted(os.listdir(root))
-            except OSError:
-                continue
-            dirs.extend(os.path.join(root, child) for child in children
-                        if "-linux-" in child and os.path.isdir(os.path.join(root, child)))
-    seen: set[str] = set()
-    return [d for d in (os.path.normpath(d) for d in dirs) if not (d in seen or seen.add(d))]
-
-
-class _Unusable(Exception):
-    """A candidate path that names a file bn must not read for the target."""
-
-
-_MAX_SYMLINKS = 40
-
-
-def resolve_target_path(path: str, sysroot: str | None) -> str | None:
-    """The real file *path* names on the TARGET's filesystem, or None when it
-    does not exist; raises `_Unusable` when bn cannot tell which file that is.
-
-    Under *sysroot*, every symlink is resolved relative to the sysroot root, as
-    the target's loader sees it: an absolute link target is re-rooted at the
-    sysroot, and a link (or `..`) that climbs above the root is refused rather
-    than followed to a host file. Outside a sysroot (an `$ORIGIN` directory
-    with no --sysroot), the target's root is unknown, so an absolute link in
-    the library file's own chain is refused instead of being read as a host
-    path."""
-    if sysroot:
-        root = os.path.normpath(os.path.abspath(sysroot))
-        full = os.path.normpath(os.path.abspath(path))
-        if full == root or full.startswith(root + os.sep):
-            return _resolve_rooted(root, os.path.relpath(full, root))
-    current = os.path.abspath(path)
-    for _ in range(_MAX_SYMLINKS):
-        if not os.path.islink(current):
-            break
-        link = os.readlink(current)
-        if os.path.isabs(link):
-            raise _Unusable("absolute symlink, and no --sysroot names the target's root")
-        current = os.path.normpath(os.path.join(os.path.dirname(current), link))
-    else:
-        raise _Unusable("too many levels of symlinks")
-    real = os.path.realpath(current)
-    return real if os.path.isfile(real) else None
-
-
-def _resolve_rooted(root: str, relative: str) -> str | None:
-    pending = [part for part in relative.split(os.sep) if part]
-    resolved: list[str] = []
-    links = 0
-    while pending:
-        part = pending.pop(0)
-        if part == ".":
-            continue
-        if part == "..":
-            if not resolved:
-                raise _Unusable("symlink resolves outside the sysroot")
-            resolved.pop()
-            continue
-        candidate = os.path.join(root, *resolved, part)
-        if os.path.islink(candidate):
-            links += 1
-            if links > _MAX_SYMLINKS:
-                raise _Unusable("too many levels of symlinks")
-            link = os.readlink(candidate)
-            parts = [p for p in link.split("/") if p]
-            if link.startswith("/"):
-                resolved = []
-            pending = parts + pending
-            continue
-        if not os.path.lexists(candidate):
-            return None
-        resolved.append(part)
-    full = os.path.join(root, *resolved)
-    return full if os.path.isfile(full) else None
-
-
-def needed_export_libraries(needed: list[str], search_dirs: list[str], *,
-                            abi: tuple[int, int, int, int] | None, flags: int | None,
-                            sysroot: str | None = None,
-                            reader: Callable[[str], ElfDynamicInfo | None] = read_elf_file,
-                            ) -> NeededExports:
-    """Read the export table of each DT_NEEDED library bn can find.
-
-    Each name is looked up in *search_dirs*. A file whose ELF class, data
-    encoding, machine or OS ABI differs from the binary's (*abi*) is not the
-    target's library, and the search goes on, as the loader's does. A file that
-    matches those but carries different e_flags, a path bn cannot resolve on
-    the target's filesystem, or an unreadable export table stops the search for
-    that library: it is recorded as not read, with the reason."""
-    result = NeededExports()
-    for library in needed:
-        result.files.append(_find_library(library, search_dirs, abi=abi, flags=flags,
-                                          sysroot=sysroot, reader=reader))
-    return result
-
-
-def _find_library(library: str, search_dirs: list[str], *,
-                  abi: tuple[int, int, int, int] | None, flags: int | None,
-                  sysroot: str | None, reader) -> LibraryFile:
-    if abi is None:
-        return LibraryFile(library, None, "the binary's ELF identity could not be read")
-    if "/" in library:
-        # The loader uses a DT_NEEDED with a slash as a path. Only an absolute
-        # one under a sysroot names a file this machine can read for the target.
-        candidates = [os.path.join(sysroot, library.lstrip("/"))] \
-            if sysroot and library.startswith("/") else []
-    else:
-        candidates = [os.path.join(d, library) for d in search_dirs]
-    for candidate in candidates:
-        try:
-            path = resolve_target_path(candidate, sysroot)
-        except _Unusable as exc:
-            return LibraryFile(library, None, f"{candidate}: {exc}")
-        except OSError as exc:
-            return LibraryFile(library, None, f"{candidate}: {exc.strerror or exc}")
-        if path is None:
-            continue
-        info = reader(path)
-        if info is None or info.abi != abi:
-            continue
-        if info.flags != flags:
-            return LibraryFile(library, None,
-                               f"{path}: e_flags {info.flags:#x} differ from the binary's "
-                               f"{flags:#x}" if info.flags is not None and flags is not None
-                               else f"{path}: e_flags could not be compared")
-        if info.exports is None:
-            return LibraryFile(library, None, f"{path}: its export table could not be read")
-        return LibraryFile(library, path, None, info.exports)
-    return LibraryFile(library, None, "not found in the search directories")

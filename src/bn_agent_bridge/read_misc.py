@@ -25,7 +25,6 @@ Import direction is one-way: this module imports ``read_xrefs``,
 """
 from __future__ import annotations
 
-import os
 import re
 from bisect import bisect_right
 from typing import Any
@@ -39,13 +38,7 @@ from . import il_format
 from . import read_xrefs
 from .bridge_state import analysis_unavailable
 from ._shared import OperationFailure, _parse_address, _validate_count
-from .elf_dynamic import (
-    ElfDynamicInfo,
-    NeededExports,
-    library_search_dirs,
-    needed_export_libraries,
-    parse_elf_dynamic,
-)
+from .elf_dynamic import ElfDynamicInfo, parse_elf_dynamic
 
 _STRING_TYPE_NAMES: dict[int, str] = {
     0: "ascii",
@@ -793,8 +786,7 @@ def _callable_import_slot_names(bv) -> set[str]:
 def _imports(ctx, selector: str | None, *, summary: bool = False,
              query: str | None = None, regex: bool = False,
              offset: int = 0, limit: int | None = None, count_only: bool = False,
-             include_got: bool = False, with_callers: bool = False,
-             sysroot: str | None = None):
+             include_got: bool = False, with_callers: bool = False):
     # Guard paging the same way the sibling list ops do, so a raw-socket /
     # py exec caller passing a negative offset/limit gets a clean
     # invalid_request instead of a silent Python negative-index slice (#68).
@@ -932,10 +924,9 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         )
         emitted_names.add(raw_name)
         relocation_recovered += 1
-    # #1037 item 6: say where every attributed library came from, and give an
-    # unversioned import the library the loader would bind it to when the
-    # needed libraries can be read from disk.
-    needed_exports = _attribute_from_needed_exports(bv, items, elf_info, sysroot)
+    # #1037 item 6: say where every attributed library came from, and why an
+    # unversioned import has none.
+    _note_unversioned_imports(items, needed_libraries)
     # #450: filter the survey to matching imports so a sink/source sweep
     # (`--query 'system|execve|popen' --regex`) doesn't need full paging + external
     # jq. Matches name / raw_name / library / namespace, mirroring strings/sections.
@@ -971,7 +962,6 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         # Summary aggregates the whole import set; paging would distort the
         # counts, so it always reflects every symbol regardless of offset/limit.
         result = _imports_build_summary(items, needed_libraries)
-        _attach_attribution_evidence(result, items, needed_exports)
         if elf_info is not None and elf_info.notes:
             result["dynamic_section_notes"] = list(elf_info.notes)
         if self_defined_excluded:
@@ -1009,7 +999,6 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     if unattributed and needed_libraries:
         result["library_unattributed"] = unattributed
         result["needed_libraries"] = needed_libraries
-    _attach_attribution_evidence(result, items, needed_exports)
     # Why attribution may be partial: a dynamic-section structure that was out
     # of range for the file and skipped rather than read (#987 review).
     if elf_info is not None and elf_info.notes:
@@ -1019,83 +1008,32 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     return result
 
 
-def _view_binary_path(bv) -> str | None:
-    """The on-disk path of the binary *bv* was loaded from, or None. A view
-    opened from a database names the `.bndb`; its original file is what the
-    loader's `$ORIGIN` means."""
-    file = getattr(bv, "file", None)
-    for attr in ("original_filename", "filename"):
-        try:
-            path = getattr(file, attr, None)
-        except Exception:  # noqa: BLE001 - an unreadable attribute is no path
-            path = None
-        if isinstance(path, str) and path and not path.endswith(".bndb") \
-                and os.path.isfile(path):
-            return path
-    return None
+def _note_unversioned_imports(items: list[dict[str, Any]],
+                               needed_libraries: list[str]) -> None:
+    """Stamp `library_source` on attributed rows, and say why the rest are null
+    (#1037 item 6).
 
-
-def _attribute_from_needed_exports(bv, items: list[dict[str, Any]],
-                                   elf_info: ElfDynamicInfo | None,
-                                   sysroot: str | None) -> NeededExports | None:
-    """Stamp `library_source` on attributed rows, and look the rest up in the
-    needed libraries' export tables (#1037 item 6).
-
-    Sources: `namespace` (BN's own per-library namespace), `symbol-version`
-    (the verneed entry the symbol's version names, #969) and `needed-exports`
-    (exactly one needed library read defines it at its default version, and
-    every needed library before it was read; see `NeededExports.verdict`). A
-    row the lookup leaves null carries `library_note` with the reason and, when
-    any library read defines the name, `exporting_libraries` -- a neutral list
-    that claims nothing about which one the loader binds. Returns what was
-    read, or None when no row needed it or the target has no DT_NEEDED list."""
-    unattributed = []
+    Sources: `namespace` (BN's own per-library namespace) and `symbol-version`
+    (the verneed entry the symbol's version names, #969). An import with no
+    version names no library in this file: the dynamic loader chooses one at
+    run time from the DT_NEEDED list (and what those libraries load), which bn
+    does not model -- two review rounds of reading the needed libraries'
+    export tables each found new loader rules that named the wrong file. Such
+    a row keeps `library: null` with `library_note`; bn reads no file other
+    than the target."""
     for item in items:
         namespace = item.get("namespace") or ""
         if item.get("library"):
             item["library_source"] = ("namespace" if namespace
                                       and namespace not in _BN_SENTINEL_NAMESPACES
                                       else "symbol-version")
-        else:
-            unattributed.append(item)
-    if not unattributed or elf_info is None or not elf_info.needed:
-        return None
-    search_dirs = library_search_dirs(
-        binary_path=_view_binary_path(bv), runpath=elf_info.runpath,
-        rpath=elf_info.rpath, sysroot=sysroot)
-    found = needed_export_libraries(elf_info.needed, search_dirs, abi=elf_info.abi,
-                                    flags=elf_info.flags, sysroot=sysroot)
-    for item in unattributed:
-        raw_name = str(item.get("raw_name") or "")
-        verdict = found.verdict(raw_name.split("@", 1)[0])
-        if verdict.library:
-            item["library"] = verdict.library
-            item["library_source"] = "needed-exports"
-            continue
-        item["library_note"] = verdict.note
-        if verdict.exporting:
-            item["exporting_libraries"] = verdict.exporting
-    return found
+        elif needed_libraries:
+            item["library_note"] = UNVERSIONED_IMPORT_NOTE
 
 
-def _attach_attribution_evidence(result: dict[str, Any], items: list[dict[str, Any]],
-                                 found: NeededExports | None) -> None:
-    """What the needed-library lookup read and why rows stayed null, counted
-    over the whole listing (not the page), for the listing and `--summary`."""
-    if found is None:
-        return
-    # Which file each needed library was read from, symlinks resolved; null
-    # with the reason when none was read.
-    result["needed_library_files"] = [
-        {"library": f.library, "path": f.path, "reason": f.reason} for f in found.files]
-    reasons: dict[str, int] = {}
-    for item in items:
-        note = item.get("library_note")
-        if not item.get("library") and isinstance(note, str):
-            reasons[note] = reasons.get(note, 0) + 1
-    if reasons:
-        result["library_unattributed_reasons"] = dict(
-            sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])))
+# Why an unversioned import's `library` is null (#1037 item 6).
+UNVERSIONED_IMPORT_NOTE = ("unversioned import: the loader picks the library at run "
+                           "time from the DT_NEEDED list")
 
 
 # #1037 item 5: the most calling functions one `imports --with-callers` row
@@ -1214,7 +1152,7 @@ def _imports_build_summary(
         source = item.get("library_source")
         if item.get("library") and isinstance(source, str):
             by_source[source] = by_source.get(source, 0) + 1
-    return {
+    summary = {
         # #275: a keyed aggregate, not a flat collection -- keeps its namespaces/
         # by_kind maps but carries a `kind` discriminator like every other read.
         "kind": "imports_summary",
@@ -1225,6 +1163,10 @@ def _imports_build_summary(
         "namespaces": dict(sorted(namespaces.items(), key=lambda x: -x[1])),
         "by_kind": dict(sorted(by_kind.items(), key=lambda x: -x[1])),
     }
+    # #1037 item 6: why "(unattributed)" rows are null, also when every row is.
+    if by_library.get("(unattributed)") and needed_libraries:
+        summary["unattributed_note"] = UNVERSIONED_IMPORT_NOTE
+    return summary
 
 
 def _sections(ctx, selector: str | None, *, query: str | None = None,

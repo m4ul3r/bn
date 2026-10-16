@@ -2208,6 +2208,11 @@ _PROBE_EXCLUSIONS = {
         "renderers to use INSTEAD of an inline shape test, so excluding it is "
         "not a hole: the guard that matters fires on the renderer calling it, "
         "which is itself probed"),
+    "command_routing": (
+        "takes-no-payload",
+        "a context manager the CLI enters around a render to bind the -i/-t that "
+        "commands the renderer prints must carry (#1037 review); it reads no "
+        "payload and renders nothing"),
     "_slice_text_lines": (
         "takes-more-than-a-payload",
         "its first argument is ALREADY-RENDERED TEXT plus a required line range, "
@@ -9797,14 +9802,15 @@ def test_imports_text_points_unattributed_rows_at_needed_libraries_969():
         "library_unattributed": 1, "needed_libraries": ["libc.so.6", "libz.so.1"],
     })
     assert "0x1000  printf [libc.so.6]" in out
-    assert ("// 1 import(s) carry no library (no symbol version names one); "
-            "this target needs: libc.so.6, libz.so.1") in out
+    assert ("// 1 import(s) carry no library (unversioned import: the loader picks the "
+            "library at run time); this binary needs (DT_NEEDED): libc.so.6, libz.so.1") in out
 
     summary = _render_imports_summary_text({
         "total_symbols": 3, "needed_libraries": ["libc.so.6"],
         "by_library": {"libc.so.6": 2, "(unattributed)": 1},
     })
-    assert "by library:\n      2  libc.so.6\n      1  (unattributed)" in summary
+    assert ("by library (BN namespace or symbol version requirement):\n      2  libc.so.6\n"
+            "      1  (unattributed)") in summary
     # Nothing attributed: the section would only restate the total.
     assert "by library" not in _render_imports_summary_text(
         {"total_symbols": 3, "by_library": {"(unattributed)": 3}})
