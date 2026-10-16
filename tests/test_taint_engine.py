@@ -9901,35 +9901,30 @@ def test_backward_unresolved_origin_withholds_completeness_915(models):
     assert leaf["buffer"] == "cmd"
 
 
-@pytest.mark.parametrize("storage", ["writable", None, "readonly", "ro_section_rw_segment"])
-def test_backward_fixed_global_load_reaching_entry_is_a_frontier(models, storage):
+@pytest.mark.parametrize("writable", [True, None, False])
+def test_backward_fixed_global_load_reaching_entry_is_a_frontier(models, writable):
     # #1053 review 4: `x = [0x601040].q` with nothing in the function writing
     # the global holds whatever was stored before the function ran -- a
-    # `field_load_unresolved` frontier naming the address, unless every loaded
-    # byte is in a segment mapped without write permission (the binary's own
-    # bytes). No segment information is not read-only, and neither is a
-    # read-only section inside a writable segment (#1053 review 5: `.data.rel.ro`
-    # linked without RELRO).
+    # `field_load_unresolved` frontier naming the address, unless the address
+    # is read-only data (the binary's own bytes). Unknown storage is not
+    # read-only. Before, the load was dropped and only the origin-unresolved
+    # gate (#915) withheld completeness.
     x = FVar("x", ident=78); x1 = FSSA(x, 1)
-    src = FExpr("MLIL_LOAD_SSA", "[0x601040].q", reads=[],
-                src=FExpr("MLIL_CONST_PTR", "0x601040", constant=0x601040), src_memory=0)
-    src.size = 8
-    load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x#1 = [0x601040].q", writes=[x1], src=src)
+    load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x#1 = [0x601040].q", writes=[x1],
+                  src=FExpr("MLIL_LOAD_SSA", "[0x601040].q", reads=[],
+                            src=FExpr("MLIL_CONST_PTR", "0x601040", constant=0x601040),
+                            src_memory=0))
     sink = FInstr(1, 0x14, "MLIL_CALL_SSA", "popen(x#1, \"r\")", reads=[x1], writes=[],
                   dest=FExpr("MLIL_CONST_PTR", "0xa10", constant=0xa10),
                   params=[FExpr("MLIL_VAR_SSA", "x#1", reads=[x1]),
                           FExpr("MLIL_CONST_PTR", "0x710", constant=0x710)])
     func = FFunc("run_global", 0x10, FSSAFunc([load, sink]), params=[])
     bv = FBV({0xa10: "popen"})
-    if storage is not None:
-        seg = types.SimpleNamespace(start=0x601000, end=0x602000,
-                              writable=storage != "readonly")
-        bv.get_segment_at = lambda addr: seg if seg.start <= addr < seg.end else None
-    if storage == "ro_section_rw_segment":
-        bv.get_sections_at = lambda addr: [types.SimpleNamespace(semantics=2)]
+    if writable is not None:
+        bv.is_offset_writable = lambda addr: writable
     result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
     fields = [lf for lf in result["leaves"] if lf["kind"] == "field_load_unresolved"]
-    if storage == "readonly":
+    if writable is False:
         assert not fields, result["leaves"]
     else:
         assert fields and fields[0]["base"] == "0x601040", result["leaves"]

@@ -1,5 +1,5 @@
 {
-  "description": "A bounded index into a read-only table keeps the index as the origin (base's verdict). Analyze only.",
+  "description": "A bounded index into a read-only table is a field_load_unresolved frontier: the table path that took its bytes as the binary's own was removed (#1053 review 6), a precision cost -- base was complete at -O0 through its old pointer walk. Analyze only.",
   "lang": "c",
   "cflags": [
     "-fno-inline",
@@ -10,14 +10,15 @@
       "function": "readonly_index",
       "sink": "arg:malloc:0",
       "origin_kinds": [
+        "field_load_unresolved",
         "parameter"
       ],
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
           "kind": "field_load_unresolved"
         }
-      ],
-      "complete_slice": true
+      ]
     }
   ]
 }

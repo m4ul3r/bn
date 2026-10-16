@@ -115,21 +115,18 @@ class _FieldProgram:
                                           FExpr("MLIL_VAR_SSA", "s", reads=[]),
                                           FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]))
 
-    def run(self, *, segments=None, ro_sections=()):
-        """*segments*: ``[(start, end, writable)]`` BN segments; None leaves the
-        view with no segment information. *ro_sections*: ``[(start, end)]``
-        ranges whose section semantics say read-only data."""
+    def run(self, *, writable=None, segment_writable=None):
+        """*writable*: ``bv.is_offset_writable``'s answer. *segment_writable*:
+        a BN segment over 0x402000..0x403000 with that write flag (None: no
+        segment information)."""
         func = FFunc("f", 0x10, FSSAFunc(self.instrs, mem_defs=self.mem_defs),
                      params=[self.m, self.n, self.src])
         bv = FBV(_NAMES)
-        if segments is not None:
-            def get_segment_at(addr):
-                return next((SimpleNamespace(start=lo, end=hi, writable=w)
-                             for lo, hi, w in segments if lo <= addr < hi), None)
-            bv.get_segment_at = get_segment_at
-        if ro_sections:
-            bv.get_sections_at = lambda addr: [
-                SimpleNamespace(semantics=2) for lo, hi in ro_sections if lo <= addr < hi]
+        if writable is not None:
+            bv.is_offset_writable = lambda addr: writable
+        if segment_writable is not None:
+            seg = SimpleNamespace(start=0x402000, end=0x403000, writable=segment_writable)
+            bv.get_segment_at = lambda addr: seg if seg.start <= addr < seg.end else None
         result = te.TaintEngine(bv, te.load_models()).backward(
             func, [te.parse_locator("arg:memcpy:2")])
         origins = [sl["origin"] for sl in result["slices"]]
@@ -138,28 +135,16 @@ class _FieldProgram:
         return result, origins, reasons, fields
 
 
-_TABLE, _TABLE_END = 0x402020, 0x402040          # four 8-byte entries
-_RODATA = (0x402000, 0x403000, False)
-_DATA_AFTER = (0x403000, 0x404000, True)          # a mutable global after the table
-
-
-def _pvs_range(lo, hi):
-    return SimpleNamespace(type=SimpleNamespace(name="UnsignedRangeValue"),
-                           ranges=[SimpleNamespace(start=lo, end=hi, step=8)])
-
-
-@pytest.mark.parametrize("case, complete", [
-    ("bounded_in_rodata", True),          # `readonly_sizes[i & 3]`: base's verdict (#1053 r4)
-    ("undetermined", False),              # an unchecked offset: BN cannot bound it (r5)
-    ("range_reaches_data", False),        # an unmasked index reaching the mutable global (r5)
-    ("rodata_section_in_rw_segment", False),  # `.data.rel.ro`, no RELRO (r5)
-    ("no_segments", False),               # no segment information
-])
-def test_constant_table_load_is_read_only_only_when_every_byte_is(case, complete):
-    # `rdx#1 = n#0 << 3; [rdx#1 + 0x402020].q` keys as an exact slot on the
-    # scaled index. Its bytes are the binary's own only when BN bounds the
-    # load's address and every byte it can read lies in a non-writable
-    # segment (#1053 review 5); the index stays in the slice either way.
+@pytest.mark.parametrize("writable", [False, True])
+def test_constant_table_at_a_scaled_index_is_a_frontier_with_the_index(writable):
+    # `malloc(readonly_sizes[i & 3])` lifts to `rdx#1 = n#0 << 3;
+    # [rdx#1 + 0x402020].q`, which keys as an exact slot on the scaled index.
+    # The index picks the bytes and stays in the slice (#1053 review 4). The
+    # bytes are never the binary's own: even a bounded load wholly inside a
+    # non-writable segment may read entries the loader wrote (an IFUNC symbol
+    # relocation under TEXTREL, an IRELATIVE entry) -- #1053 review 6 removed
+    # that claim. A read-only table is a `field_load_unresolved` frontier; a
+    # writable one a `global` frontier.
     p = _FieldProgram()
     rdx1 = FSSA(FVar("rdx", ident=6), 1)
     scaled = FExpr("MLIL_LSL", "n#0 << 3", reads=[p.n0])
@@ -169,23 +154,20 @@ def test_constant_table_load_is_read_only_only_when_every_byte_is(case, complete
     p.instrs.append(FInstr(i, a, "MLIL_SET_VAR_SSA", "rdx#1 = n#0 << 3", reads=[p.n0],
                            writes=[rdx1], src=scaled))
     addr = FExpr("MLIL_ADD", "rdx#1 + 0x402020", reads=[rdx1])
-    addr.left, addr.right = FExpr("MLIL_VAR_SSA", "rdx#1", reads=[rdx1]), _cstr(_TABLE)
-    addr.possible_values = {
-        "bounded_in_rodata": _pvs_range(_TABLE, _TABLE_END - 8),
-        "undetermined": SimpleNamespace(type=SimpleNamespace(name="UndeterminedValue")),
-        "range_reaches_data": _pvs_range(_TABLE, 0x403ff8),
-        "rodata_section_in_rw_segment": _pvs_range(_TABLE, _TABLE_END - 8),
-        "no_segments": _pvs_range(_TABLE, _TABLE_END - 8),
-    }[case]
-    segments = {
-        "rodata_section_in_rw_segment": [(0x402000, 0x403000, True)],
-        "no_segments": None,
-    }.get(case, [_RODATA, _DATA_AFTER])
+    addr.left, addr.right = FExpr("MLIL_VAR_SSA", "rdx#1", reads=[rdx1]), _cstr(0x402020)
+    # BN bounds the address to the four 8-byte entries.
+    addr.possible_values = SimpleNamespace(
+        type=SimpleNamespace(name="UnsignedRangeValue"),
+        ranges=[SimpleNamespace(start=0x402020, end=0x402038, step=8)])
     p.sink(p.load(addr, 8))
-    result, origins, _, fields = p.run(segments=segments, ro_sections=[(0x402000, 0x403000)])
+    result, origins, _, fields = p.run(writable=writable, segment_writable=writable)
     assert {"kind": "parameter", "index": 1, "var": "n#0"} in origins, origins
-    assert bool(fields) is not complete, fields
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete
+    if writable:
+        assert not fields, fields
+        assert any(lf.get("global") == "0x402020" for lf in result["leaves"]), result["leaves"]
+    else:
+        assert fields and "constant table" in fields[0]["detail"], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 def _sx(inner):

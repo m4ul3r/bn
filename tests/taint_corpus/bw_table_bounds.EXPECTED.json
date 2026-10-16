@@ -1,5 +1,5 @@
 {
-  "description": "A constant table at a variable index or byte offset is the binary's own bytes only when BN bounds every address the load can take inside read-only segments: the unchecked offset and the unmasked indices may reach the mutable global after the table and stay frontiers; masked and compare-bounded indices stay complete. Analyze only.",
+  "description": "Constant-table loads are frontiers whatever the index: an unchecked byte offset, unmasked long/int indices that may reach the mutable global after the table, and (a precision cost since #1053 review 6) masked and compare-bounded indices. The index stays in the slice. Analyze only.",
   "lang": "c",
   "cflags": [
     "-fno-inline",
@@ -53,40 +53,43 @@
       "function": "masked",
       "sink": "arg:malloc:0",
       "origin_kinds": [
+        "field_load_unresolved",
         "parameter"
       ],
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
           "kind": "field_load_unresolved"
         }
-      ],
-      "complete_slice": true
+      ]
     },
     {
       "function": "cmp_bounded_u",
       "sink": "arg:malloc:0",
       "origin_kinds": [
+        "field_load_unresolved",
         "parameter"
       ],
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
           "kind": "field_load_unresolved"
         }
-      ],
-      "complete_slice": true
+      ]
     },
     {
       "function": "cmp_bounded_s",
       "sink": "arg:malloc:0",
       "origin_kinds": [
+        "field_load_unresolved",
         "parameter"
       ],
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
           "kind": "field_load_unresolved"
         }
-      ],
-      "complete_slice": true
+      ]
     }
   ]
 }

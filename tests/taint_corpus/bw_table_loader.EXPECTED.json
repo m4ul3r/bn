@@ -1,0 +1,42 @@
+{
+  "description": "Loader-written bytes in a non-writable segment: .rodata tables in a PIE linked with -z notext whose entries the loader writes (a local IFUNC's IRELATIVE result, an external symbol's R_X86_64_64 under DT_TEXTREL). A masked index stays inside each table, yet each load is a frontier. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline",
+    "-fno-builtin",
+    "-U_FORTIFY_SOURCE",
+    "-fPIE",
+    "-pie",
+    "-Wl,-z,notext"
+  ],
+  "backward": [
+    {
+      "function": "resolver_entry",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "parameter"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "external_entry",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "parameter"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    }
+  ]
+}
