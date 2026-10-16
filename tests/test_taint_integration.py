@@ -474,7 +474,15 @@ int main(int argc, char **argv) {
     assert _run_or_check_template(shared_bn, _forward_prose(header))[0] >= 1
 
 
-def test_aarch64_identity_tail_wrapper_is_a_frontier_not_an_all_clear(tmp_path, shared_bn):
+@pytest.mark.parametrize("flags", [
+    # The PR's original build.
+    ["-O2", "-g", "-fno-stack-protector", "-fno-builtin", "-foptimize-sibling-calls", "-no-pie"],
+    # Compiler defaults (stack protector on): BN gives the wrapper call NO
+    # result, so only the call-site check sees `mov x2, x0` (#1050 re-dogfood).
+    ["-O2", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0"],
+    ["-O2", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0", "-no-pie"],
+], ids=["no-stack-protector", "compiler-default", "compiler-default-no-pie"])
+def test_aarch64_identity_tail_wrapper_is_a_frontier_not_an_all_clear(tmp_path, shared_bn, flags):
     """#1034 item 5: BN recovers the AArch64 `ident` (a bare `ret`) with a
     valueless return; the flow it carried is a frontier, never an all-clear."""
     cc = shutil.which("aarch64-linux-gnu-gcc")
@@ -502,8 +510,7 @@ int main(int argc, char **argv) {
 """)
     binary = tmp_path / "tail_ident_a64"
     built = subprocess.run(
-        [cc, "-O2", "-g", "-fno-stack-protector", "-fno-builtin", "-foptimize-sibling-calls",
-         "-no-pie", str(src), "-o", str(binary)],
+        [cc, *flags, str(src), "-o", str(binary)],
         capture_output=True, text=True, timeout=120.0)
     if built.returncode != 0:
         raise FixtureBuildError(f"aarch64 build failed: {built.stderr.strip()}")

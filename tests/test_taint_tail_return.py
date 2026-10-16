@@ -121,3 +121,120 @@ def test_recovered_or_unconsumed_return_is_no_frontier_1034(kind, wrapper_return
     result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
 
     assert _valueless_leaves(result) == []
+
+
+# --------------------------------------------------------------------------
+# #1034 item 5 at the call site (re-dogfood of #1050): BN gives a call with
+# tainted arguments no result, and the caller's machine code reads the
+# return register after it. Judged on the caller's LLIL, not the callee.
+# --------------------------------------------------------------------------
+
+class _Op:
+    def __init__(self, name):
+        self.name = name
+
+
+class _Reg:
+    def __init__(self, name):
+        self.name = name
+
+
+class _LLIL:
+    """`x2 = x0` (``kind="read"``), `x0 = 7` (``"write"``), `w0 = 7` (a
+    zero-extending 32-bit write, ``"wwrite"``), `ret` (``"ret"``) or
+    `call(...)` (``"call"``)."""
+
+    def __init__(self, index, kind):
+        self.instr_index = index
+        self.il_basic_block = None
+        if kind == "call":
+            self.operation, self.operands = _Op("LLIL_CALL"), []
+        elif kind == "ret":
+            self.operation, self.operands = _Op("LLIL_RET"), []
+        else:
+            dest = {"read": "x2", "write": "x0", "wwrite": "w0"}[kind]
+            self.operation = _Op("LLIL_SET_REG")
+            self.dest = _Reg(dest)
+            if kind == "read":
+                src = type("R", (), {"operation": _Op("LLIL_REG"), "operands": [],
+                                     "src": _Reg("x0")})()
+            else:
+                src = type("C", (), {"operation": _Op("LLIL_CONST"), "operands": []})()
+            self.src = src
+            self.operands = [self.dest, src]
+
+
+class _RegInfo:
+    def __init__(self, full, extend=0):
+        self.full_width_reg, self.extend = full, extend
+
+
+class _Arch:
+    def __init__(self):
+        self.regs = {"x0": _RegInfo("x0"), "w0": _RegInfo("x0", extend=1),
+                     "x2": _RegInfo("x2"), "x1": _RegInfo("x1")}
+
+
+class _LLILBlock:
+    def __init__(self, start, end):
+        self.start, self.end, self.outgoing_edges = start, end, []
+
+
+def _dropped_result_program(after, *, value_returning=False):
+    """main(n): `wrap(n)` -- an MLIL call with NO result -- whose LLIL is
+    followed by *after* (a list of `_LLIL` kinds)."""
+    n, p = FVar("n"), FVar("p")
+    ns = FSSA(n, 0)
+    callee = FFunc("wrap", 0x2000, FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_RET", "return", reads=[], src=[])]), params=[p])
+    rets = ([FInstr(1, 0x1020, "MLIL_RET", "return 0", reads=[],
+                    src=[FExpr("MLIL_CONST", "0", constant=0)])] if value_returning else [])
+    main = FFunc("main", 0x1000, FSSAFunc([
+        FInstr(0, 0x1010, "MLIL_CALL_SSA", "wrap(n)", reads=[ns], writes=[],
+               params=[_value(ns)], dest=_const(0x2000)), *rets]), params=[n])
+    llil = [_LLIL(0, "call"), *[_LLIL(i + 1, k) for i, k in enumerate(after)]]
+    block = _LLILBlock(0, len(llil))
+    for ins in llil:
+        ins.il_basic_block = block
+    main.llil = llil
+    main.get_low_level_il_at = lambda addr: llil[0] if addr == 0x1010 else None
+    main.calling_convention = type("CC", (), {"int_return_reg": "x0",
+                                               "high_int_return_reg": "x1"})()
+    main.arch = _Arch()
+    return main, FBV({}, {0x1000: main, 0x2000: callee}), te.load_models()
+
+
+def _dropped(result):
+    return [lf for lf in result["leaves"] if lf.get("return_register")]
+
+
+def test_a_dropped_result_the_caller_reads_is_a_frontier_1034():
+    """The compiler-default AArch64 `tail.c`: `bl wrap; mov x2, x0; bl copy`
+    while BN gives `wrap` no output and the copy a literal length."""
+    main, bv, models = _dropped_result_program(["read", "call"])
+    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
+
+    [leaf] = _dropped(result)
+    assert (leaf["cause"], leaf["return_register"], leaf["address"]) == (
+        "return_value_unrecovered", "x0", "0x1010")
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize(("after", "value_returning"), [
+    (["write", "read"], False),    # x0 overwritten before the read: not the result
+    (["wwrite", "read"], False),   # w0 zero-extends: a full write of x0
+    (["call", "read"], False),     # another call clobbers x0 first
+    (["ret"], False),              # a void caller's `ret` uses nothing
+])
+def test_a_result_the_caller_does_not_use_is_no_frontier_1034(after, value_returning):
+    main, bv, models = _dropped_result_program(after, value_returning=value_returning)
+    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
+
+    assert _dropped(result) == []
+
+
+def test_returning_straight_after_the_call_from_a_value_function_reads_it_1034():
+    main, bv, models = _dropped_result_program(["ret"], value_returning=True)
+    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
+
+    assert [lf["return_register"] for lf in _dropped(result)] == ["x0"]

@@ -705,3 +705,33 @@ def test_a_supplied_null_resolve_map_is_refused_1050(models):
     _dispatch, bv = _dispatch_program()
     with pytest.raises(te.TaintError, match="--resolve-map m.json: expected a JSON object"):
         te.TaintEngine(bv, models, resolve_map=None, resolve_map_origin="--resolve-map m.json")
+
+
+def _scanf_stale_arg(fmt):
+    """`scanf(fmt, &b, x2#1)`: BN recovered a third argument from a stale
+    register (the stack-guard address on AArch64) that `"%s"` never writes."""
+    b, x2 = FVar("b", typ="char[0x10]"), FSSA(FVar("x2"), 1)
+    fmt_arg = (FExpr("MLIL_CONST_PTR", repr(fmt), constant=0x5000) if fmt is not None
+               else FExpr("MLIL_VAR_SSA", "fmt#0", reads=[FSSA(FVar("fmt"), 0)]))
+    call = _ext_call(0, 0x10, "scanf(fmt, &b, x2#1)", 0x900,
+                     [fmt_arg, _addr_of(b), FExpr("MLIL_VAR_SSA", "x2#1", reads=[x2])])
+    func = FFunc("scan_s", 0x10, FSSAFunc([call]), params=[])
+    return func, FBVStr({0x900: "scanf"}, strings={0x5000: fmt} if fmt else {})
+
+
+def test_a_stale_argument_the_format_never_writes_is_not_a_destination_1050(models):
+    """#1050 re-dogfood: the call: preset seeded *arg:1..4 by the model, and
+    the #1041 item 1 leaf then called the stale arg 2 an unkeyed buffer. The
+    constant format says only arg 1 is written."""
+    func, bv = _scanf_stale_arg("%s")
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:scanf")])
+
+    assert not any(lf["kind"] == "source_seed_misanchored" for lf in result["leaves"])
+
+
+def test_an_unreadable_format_still_seeds_the_modeled_run_1050(models):
+    func, bv = _scanf_stale_arg(None)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:scanf")])
+
+    assert [lf["arg_index"] for lf in result["leaves"]
+            if lf["kind"] == "source_seed_misanchored"] == [2]
