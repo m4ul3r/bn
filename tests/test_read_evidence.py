@@ -2720,6 +2720,120 @@ def test_function_evidence_paged_read_defers_decompile_622(monkeypatch):
     assert full["warnings"] == []
 
 
+def _callee_filter_bridge_1037(monkeypatch):
+    """A bridge whose `dispatch` makes six calls: three to the two `operator
+    delete` overloads (raw `_ZdlPv` / `_ZdlPvm`, both DISPLAYED as `operator
+    delete`), one to `log_line`, one to a resolved target with no function
+    entry, and one indirect call with no target at all."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def to(name, display, addr):
+        return {"raw": hex(addr), "normalized": hex(addr), "status": "function",
+                "function": {"name": name, "display_name": display, "address": hex(addr)}}
+
+    fake_calls = [
+        {"address": "0x402000", "callee": "d0", "target": to("_ZdlPv", "operator delete", 0x401030)},
+        {"address": "0x402010", "callee": "log", "target": to("log_line", "log_line", 0x401040)},
+        {"address": "0x402020", "callee": "d1", "target": to("_ZdlPvm", "operator delete", 0x401038)},
+        {"address": "0x402030", "callee": "mapped",
+         "target": {"raw": "0x405000", "normalized": "0x405000", "status": "mapped",
+                    "function": None}},
+        {"address": "0x402040", "callee": "indirect", "target": None},
+        {"address": "0x402050", "callee": "d2", "target": to("_ZdlPv", "operator delete", 0x401030)},
+    ]
+    calls_mod = importlib.import_module(f"{bridge.read_evidence.__package__}.read_call_evidence")
+    monkeypatch.setattr(calls_mod, "_function_call_evidence",
+                        lambda ctx, bv, func, context: [dict(c) for c in fake_calls])
+    monkeypatch.setattr(instance.ctx, "_resolve_view",
+                        lambda sel: _FakeBV(functions=[_FakeFunction(0x402000, "dispatch")]))
+    monkeypatch.setattr(instance.ctx, "_find_function",
+                        lambda bv, ident, **kw: _FakeFunction(0x402000, "dispatch"))
+    monkeypatch.setattr(bridge.il_format, "_function_metadata", lambda f: {})
+    monkeypatch.setattr(bridge.il_format, "_render_warnings", lambda t: [])
+    decompiles: list = []
+    monkeypatch.setattr(bridge.il_format, "_decompile_text",
+                        lambda bv, f: (decompiles.append(1), "")[1])
+    return bridge, instance, decompiles
+
+
+def test_function_evidence_callee_filter_matches_names_and_addresses_1037(monkeypatch):
+    """#1037: `--callee`/`--exclude-callee` match a call's resolved target by
+    exact raw name, display name or address; a call without a resolved target
+    function is never matched by --callee and never removed by --exclude-callee."""
+    bridge, instance, decompiles = _callee_filter_bridge_1037(monkeypatch)
+
+    def names(**kw):
+        res = instance._function_evidence("active", "dispatch", context=0, **kw)
+        return [c["callee"] for c in res["calls"]], res
+
+    # Display name covers both overloads.
+    got, res = names(callees=["operator delete"])
+    assert got == ["d0", "d1", "d2"]
+    assert res["total_calls"] == 6 and res["matched_calls"] == 3
+    assert res["callee_filter"] == {"callee": ["operator delete"], "exclude_callee": [],
+                                    "excluded": 3}
+    # Filtering alone keeps the full-fidelity decompile.
+    assert decompiles and "decompile_deferred" not in res
+    # Raw name is exact: `_ZdlPv` does not match `_ZdlPvm`.
+    assert names(callees=["_ZdlPv"])[0] == ["d0", "d2"]
+    # Address, hex or decimal, of the target function.
+    assert names(callees=["0x401038"])[0] == ["d1"]
+    assert names(callees=[str(0x401040)])[0] == ["log"]
+    # Repeatable include is a union.
+    assert names(callees=["log_line", "_ZdlPvm"])[0] == ["log", "d1"]
+    # Unresolved targets: never matched by include (even by their raw address) ...
+    assert names(callees=["0x405000"])[0] == []
+    # ... and kept by exclude.
+    got, res = names(exclude_callees=["operator delete"])
+    assert got == ["log", "mapped", "indirect"]
+    assert res["matched_calls"] == 3 and res["callee_filter"]["excluded"] == 3
+    assert names(exclude_callees=["_ZdlPvm", "0x401040"])[0] == ["d0", "mapped", "indirect", "d2"]
+    # Include and exclude compose.
+    got, res = names(callees=["operator delete"], exclude_callees=["_ZdlPvm"])
+    assert got == ["d0", "d2"] and res["callee_filter"]["excluded"] == 4
+    # Nothing matched: an honest zero, not an error.
+    got, res = names(callees=["missing_fn"])
+    assert got == [] and res["matched_calls"] == 0 and res["has_more"] is False
+    assert res["callee_filter"]["excluded"] == 6
+    # No filter: no `callee_filter` key.
+    assert "callee_filter" not in names()[1]
+
+
+def test_function_evidence_callee_filter_runs_before_window_and_page_1037(monkeypatch):
+    bridge, instance, _ = _callee_filter_bridge_1037(monkeypatch)
+    page = instance._function_evidence("active", "dispatch", context=0,
+                                       callees=["operator delete"], limit=2)
+    assert [c["callee"] for c in page["calls"]] == ["d0", "d1"]
+    assert page["matched_calls"] == 3 and page["total_calls"] == 6
+    assert page["returned"] == 2 and page["has_more"] is True
+    rest = instance._function_evidence("active", "dispatch", context=0,
+                                       callees=["operator delete"], offset=2, limit=2)
+    assert [c["callee"] for c in rest["calls"]] == ["d2"] and rest["has_more"] is False
+    win = instance._function_evidence("active", "dispatch", context=0,
+                                      exclude_callees=["operator delete"],
+                                      address_window=(0x402010, 0x402040))
+    assert [c["callee"] for c in win["calls"]] == ["log", "mapped"]
+    assert win["matched_calls"] == 2 and win["callee_filter"]["excluded"] == 3
+
+
+def test_function_evidence_binder_validates_callee_params_1037(monkeypatch):
+    bridge, instance, _ = _callee_filter_bridge_1037(monkeypatch)
+    ok = bridge._bind_function_evidence(
+        instance, {"identifier": "dispatch", "context": 0, "callee": ["_ZdlPvm"],
+                   "exclude_callee": None}, "active")
+    assert [c["callee"] for c in ok["calls"]] == ["d1"]
+    assert ok["callee_filter"]["exclude_callee"] == []
+    for key in ("callee", "exclude_callee"):
+        for bad in ("operator delete", [""], ["  "], [3], {"a": 1}, [None]):
+            with pytest.raises(bridge.OperationFailure) as exc:
+                bridge._bind_function_evidence(
+                    instance, {"identifier": "dispatch", key: bad}, "active")
+            assert exc.value.status == "invalid_request"
+            assert key in exc.value.message
+
+
+
 def test_parse_field_spec_467(monkeypatch):
     # #467: name:type@offset typed field specs (scalars + char[N]).
     bridge = _load_bridge(monkeypatch)
@@ -3006,6 +3120,204 @@ def test_hidden_surface_computed_goto_labels_use_containing_function_1017(
     assert all(row["provenance"] == "table:0x1000"
                for row in out["missing_function_candidates"])
     assert out["summary"]["missing_function_candidates"] == len(missing_labels)
+    # #1017 item 3: BN puts every recovered label inside one function body, so
+    # none of them is an entry, and the table says which function holds them.
+    assert table["resolved_entries"] == 0
+    assert table["resolved_interior"] == len(labels) - len(missing_labels)
+    assert table["interior_functions"] == [{"address": "0x2000", "name": "dispatch"}]
+    assert table["interior_functions_total"] == 1
+
+
+def test_hidden_surface_counts_function_entries_apart_from_interior_slots_1017(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+
+    class _MixedBV(_SurfBV):
+        _VALS = [0x2000, 0x2010, 0x2024, 0]
+
+        def get_functions_containing(self, addr):
+            if int(addr) in (0x2000, 0x2010):
+                return [types.SimpleNamespace(start=int(addr), name=f"sub_{int(addr):x}")]
+            if int(addr) == 0x2024:
+                return [types.SimpleNamespace(start=0x2020, name="dispatch")]
+            return []
+
+    bv = _MixedBV()
+
+    class _Ctx:
+        def _resolve_view(self, selector): return bv
+        def _pointer_size(self, view): return 8
+        def _byteorder(self, view): return "little"
+
+    table, = re._hidden_surface(_Ctx(), None)["candidate_tables"]
+    assert (table["resolved_functions"], table["resolved_entries"],
+            table["resolved_interior"]) == (3, 2, 1)
+    assert table["interior_functions"] == [{"address": "0x2020", "name": "dispatch"}]
+
+
+def _vtable_census(objects, *, status="ok", symtab=True):
+    return {"status": status, "reason": None if status == "ok" else "unreadable",
+            "objects": [{"raw_name": name, "start": start, "size": size, "kind": kind,
+                         "table": ".symtab", "supported": True, "reason": None}
+                        for name, start, size, kind in objects],
+            "symtab": symtab, "pointer_size": 8, "endian": "<"}
+
+
+class _VtableSurfBV(_SurfBV):
+    """`_SurfBV`'s 4-pointer run at 0x1000, preceded by an Itanium header
+    `[0, &typeinfo 0x9000]` at 0xff0."""
+
+    def read(self, addr, n):
+        if int(addr) == 0xff0:
+            header = (0).to_bytes(8, "little") + (0x9000).to_bytes(8, "little")
+            return (header + super().read(0x1000, max(0, int(n) - 16)))[:int(n)]
+        return super().read(addr, n)
+
+
+def _vtable_surface(monkeypatch, census, **kwargs):
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    monkeypatch.setattr(re.read_listing, "_elf_vtable_census", lambda bv: census)
+    bv = _VtableSurfBV()
+
+    class _Ctx:
+        def _resolve_view(self, selector): return bv
+        def _pointer_size(self, view): return 8
+        def _byteorder(self, view): return "little"
+
+    return re._hidden_surface(_Ctx(), None, **kwargs)
+
+
+def test_hidden_surface_labels_entries_inside_an_elf_vtable_extent_1017(monkeypatch):
+    """`_ZTV5Short` covers the header and the first two entries of the run; the
+    two after its st_size (a table the scanner merged) stay unlabelled."""
+    out = _vtable_surface(monkeypatch, _vtable_census([("_ZTV5Short", 0xff0, 0x20, "vtable")]))
+    table, = out["candidate_tables"]
+    assert table["elf_vtables"] == [{
+        "object": "_ZTV5Short", "label": "_ZTV5Short", "kind": "vtable",
+        "object_address": "0xff0", "size": 0x20, "first_entry": "0x1000",
+        "entries_inside": 2}]
+    assert table["entries_outside_elf_vtables"] == 2
+    assert table["extends_past_elf_vtable"] is True
+    assert out["summary"]["vtable_labels"]["status"] == "ok"
+    assert "vtable_tables_hidden" not in out["summary"]
+
+
+def test_hidden_surface_leaves_a_header_shaped_record_outside_objects_unlabelled_1017(monkeypatch):
+    """A registry record `{0, &typeid(T), fn, fn, fn}` has the Itanium header
+    shape but no `_ZTV` symbol covers it: no label, every entry outside."""
+    out = _vtable_surface(monkeypatch, _vtable_census([("_ZTV5Other", 0x5000, 0x30, "vtable")]))
+    table, = out["candidate_tables"]
+    assert table["elf_vtables"] == []
+    assert table["entries_outside_elf_vtables"] == 4
+    assert table["extends_past_elf_vtable"] is False
+
+
+@pytest.mark.parametrize("size,hidden", [(0x30, True), (0x20, False)])
+def test_hidden_surface_hide_vtables_drops_only_whole_vtable_runs_1017(monkeypatch, size, hidden):
+    out = _vtable_surface(monkeypatch, _vtable_census([("_ZTV5Short", 0xff0, size, "vtable")]),
+                          hide_vtables=True)
+    assert len(out["candidate_tables"]) == (0 if hidden else 1)
+    assert out["summary"]["vtable_tables_hidden"] == (1 if hidden else 0)
+    # A hidden table's function-less slots are still candidates.
+    assert {c["address"] for c in out["missing_function_candidates"]} == {"0x2020", "0x4000"}
+
+
+def test_hidden_surface_without_a_census_has_no_labels_and_says_so_1017(monkeypatch):
+    out = _vtable_surface(monkeypatch, _vtable_census([], status="unavailable"),
+                          hide_vtables=True)
+    table, = out["candidate_tables"]
+    assert "elf_vtables" not in table
+    assert out["summary"]["vtable_labels"] == {"status": "unavailable", "symtab": True,
+                                               "objects": 0, "reason": "unreadable"}
+    assert "--hide-vtables hid nothing: unreadable" in out["warnings"]
+
+
+def test_vtable_index_finds_exactly_the_overlapping_objects_1046(monkeypatch):
+    """#1046 review: interval lookup, not a scan of every object -- including
+    an object that encloses others and one that ends where a run starts."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    objects = [{"raw_name": f"_ZTV{i}", "start": 0x1000 + 0x40 * i, "size": 0x30,
+                "kind": "vtable"} for i in range(9000)]
+    objects.append({"raw_name": "_ZTVBig", "start": 0x0f00, "size": 0x200, "kind": "vtable"})
+    index = re._VtableIndex(None, objects)
+    names = lambda lo, hi: [o["raw_name"] for o in index.overlapping(lo, hi)]
+    assert names(0x1000, 0x1008) == ["_ZTVBig", "_ZTV0"]
+    assert names(0x1030, 0x1040) == ["_ZTVBig"]          # _ZTV0 ends at 0x1030
+    assert names(0x1038, 0x1048) == ["_ZTVBig", "_ZTV1"]
+    assert names(0x1000 + 0x40 * 8999, 0x1000 + 0x40 * 9000) == ["_ZTV8999"]
+    assert names(0x0, 0x0f00) == []
+    brute = lambda lo, hi: sorted(o["raw_name"] for o in objects
+                                  if o["start"] < hi and o["start"] + o["size"] > lo)
+    for lo in range(0x0e00, 0x1400, 0x18):
+        assert sorted(names(lo, lo + 0x50)) == brute(lo, lo + 0x50)
+
+
+def test_vtable_index_nesting_does_not_walk_the_whole_prefix_1046(monkeypatch):
+    """#1046 review round 2: one extent enclosing 9,000 disjoint objects made
+    every lookup walk back through the whole prefix. The tree visits only
+    subtrees whose greatest end reaches the run."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    objects = [{"raw_name": f"_ZTV{i}", "start": 0x10000 + 0x40 * i, "size": 0x30,
+                "kind": "vtable"} for i in range(9000)]
+    objects.append({"raw_name": "_ZTVBig", "start": 0x100, "size": 0x400000, "kind": "vtable"})
+    index = re._VtableIndex(None, objects)
+    visits = []
+
+    class _Counting(list):
+        def __getitem__(self, key):
+            visits.append(key)
+            return list.__getitem__(self, key)
+
+    index._tree = _Counting(index._tree)
+    for i in range(0, 9000, 97):
+        lo = 0x10000 + 0x40 * i
+        visits.clear()
+        names = [o["raw_name"] for o in index.overlapping(lo, lo + 8)]
+        assert names == ["_ZTVBig", f"_ZTV{i}"]
+        # Two objects reported: a few root-to-leaf paths, never the prefix.
+        assert len(visits) < 120, (i, len(visits))
+
+
+class _TwoRunSurfBV(_VtableSurfBV):
+    """Two pointer runs: 0x1000 (4 entries) and 0x1030 (3 entries)."""
+    _VALS = [0x2000, 0x2010, 0x2020, 0x4000, 0, 0, 0x2000, 0x2010, 0x2020, 0]
+
+
+@pytest.mark.parametrize("hide", [False, True])
+def test_hidden_surface_labels_only_the_tables_it_shows_1046(monkeypatch, hide):
+    """#1046 review: a run past --max-tables gets no label lookup, and
+    --hide-vtables decides from coverage alone."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    census = _vtable_census([("_ZTV5Short", 0xff0, 0x30, "vtable"),
+                             ("_ZTV4Next", 0x1020, 0x30, "vtable")])
+    monkeypatch.setattr(re.read_listing, "_elf_vtable_census", lambda bv: census)
+    lookups = []
+    monkeypatch.setattr(re.read_listing, "_vtable_object_label",
+                        lambda bv, obj: lookups.append(obj["start"]) or obj["raw_name"])
+    bv = _TwoRunSurfBV()
+
+    class _Ctx:
+        def _resolve_view(self, selector): return bv
+        def _pointer_size(self, view): return 8
+        def _byteorder(self, view): return "little"
+
+    out = re._hidden_surface(_Ctx(), None, max_tables=1, hide_vtables=hide)
+    if hide:
+        # Both runs lie wholly inside the two objects: hidden, never labelled.
+        assert out["candidate_tables"] == [] and lookups == []
+        assert out["summary"]["vtable_tables_hidden"] == 2
+    else:
+        shown, = out["candidate_tables"]
+        assert shown["address"] == "0x1000"
+        assert lookups == [0xff0]               # only the shown table's object
+        assert out["summary"]["candidate_tables_total"] == 2
 
 
 def test_hidden_surface_segment_fallback_503(monkeypatch):
@@ -3272,6 +3584,35 @@ def test_hidden_surface_code_referenced_handler_is_a_candidate_967(monkeypatch):
     assert handler["referenced_from_total"] == 2
     assert handler["code_likely"] is True
     assert out["summary"]["missing_function_candidates"] == 1
+
+
+def test_hidden_surface_code_ref_candidate_says_where_its_address_is_stored(monkeypatch):
+    """#1017 (code_ref comment): the referencing function's MLIL stores the
+    handler's address into `[arg1 + 0x10]`; the row reports that store, and
+    only stores whose value is this candidate's address."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _CodeRefSurfBV()
+    install = bv._refs[0x2020][0][1]
+    install.mlil = types.SimpleNamespace(instructions=[
+        _il("MLIL_STORE", dest="arg1", src=_il("MLIL_CONST", constant=7), address=0x2108),
+        _il("MLIL_STORE", dest="arg1 + 0x10", src=_il("MLIL_CONST_PTR", constant=0x2020),
+            address=0x2110),
+        _il("MLIL_STORE_STRUCT", dest="arg2", offset=0x18,
+            src=_il("MLIL_CONST_PTR", constant=0x2020), address=0x2114),
+        _il("MLIL_SET_VAR", src=_il("MLIL_CONST_PTR", constant=0x2020), address=0x2118),
+    ])
+    out = re._hidden_surface(_pie_ctx(bv), None)
+    handler, = out["missing_function_candidates"]
+    assert handler["stored_to"] == [
+        {"function": "install", "address": "0x2110", "destination": "[arg1 + 0x10]"},
+        {"function": "install", "address": "0x2114", "destination": "[arg2 + 0x18]"}]
+    assert handler["stored_to_total"] == 2
+    # No MLIL (or no matching store): the row carries no store claim at all.
+    del install.mlil
+    plain, = re._hidden_surface(_pie_ctx(bv), None)["missing_function_candidates"]
+    assert "stored_to" not in plain
 
 
 def test_hidden_surface_code_ref_probe_cap_is_disclosed_967(monkeypatch):
@@ -6728,7 +7069,7 @@ def test_orient_hint_is_null_when_only_loader_placeholders_are_present(monkeypat
     """
     bridge = _load_bridge(monkeypatch)
     inst = bridge.BinaryNinjaBridge()
-    # A non-`.bndb` filename, so `analysis_cache_restored` cannot drive the hint.
+    # A non-`.bndb` filename, so `opened_from_database` cannot drive the hint.
     monkeypatch.setattr(inst, "_target_info",
                         lambda sel: {"basename": "netsvcd", "filename": "/opt/netsvcd",
                                      "analyzed": True, "analysis_state": "full"})
@@ -6753,7 +7094,7 @@ def test_orient_hint_is_null_when_only_loader_placeholders_are_present(monkeypat
     assert ea["user_symbols"] == 2
     assert ea["analyst_symbols"] == 0
     assert ea["placeholder_symbols"] == 2
-    assert ea["analysis_cache_restored"] is False
+    assert ea["opened_from_database"] is False
     assert ea["provenance_hint"] is None
 
     bv._symbols = [*bv._symbols, _NamedSym("parse_header", 0x401200)]
@@ -6781,7 +7122,7 @@ def test_orient_surfaces_existing_annotations(monkeypatch):
     d = inst._orient_digest(None)
     ea = d["existing_annotations"]
     assert ea["comments"] == 1
-    assert ea["analysis_cache_restored"] is True
+    assert ea["opened_from_database"] is True
     assert "predate this run" in ea["provenance_hint"]
 
 

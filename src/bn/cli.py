@@ -11,6 +11,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import functools
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -63,6 +64,7 @@ from .transport import (  # noqa: F401
     validate_instance_id,
     wait_for_teardown,
 )
+from .target_hint import instance_option, respell_for_option
 from .version import VERSION, build_id_for_file, build_id_for_package  # noqa: F401
 
 
@@ -127,6 +129,7 @@ def _requested_output_format(argv: list[str]) -> str | None:
 
 
 _OUT_FORMAT_BY_SUFFIX = {".json": "json", ".ndjson": "ndjson"}
+_ROUTING_FLAGS = ("-i", "--instance", "-t", "--target")
 
 
 class _RecordExplicitFormat(argparse.Action):
@@ -278,16 +281,106 @@ class BnArgumentParser(argparse.ArgumentParser):
         args: Any = None,
         namespace: Any = None,
     ) -> argparse.Namespace:
-        parsed, extras = self.parse_known_args(args, namespace)
+        argv = list(sys.argv[1:] if args is None else args)
+        parsed, extras = self.parse_known_args(argv, namespace)
         if extras:
             # Route unrecognized arguments to the most-specific subcommand parser
             # so the usage/error text reflects the command the user actually ran,
             # not the bare root parser. Each subparser records itself as `_parser`.
             selected_parser = getattr(parsed, "_parser", self)
-            selected_parser.error(
-                f"unrecognized arguments: {' '.join(extras)}"
-            )
+            message = f"unrecognized arguments: {' '.join(extras)}"
+            hint = _unrecognized_arguments_hint(self, selected_parser, parsed, argv, extras)
+            selected_parser.error(f"{message}\n{hint}" if hint else message)
         return parsed
+
+
+def _option_action(parser: argparse.ArgumentParser, token: str) -> argparse.Action | None:
+    """The action argparse binds *token* to on *parser*: an exact option
+    string, or -- as argparse's `allow_abbrev` does -- the one option a `--`
+    prefix abbreviates. None for anything else, an ambiguous prefix included."""
+    exact = parser._option_string_actions.get(token)
+    if exact is not None or not token.startswith("--") or not parser.allow_abbrev:
+        return exact
+    matches = {id(action): action for option, action in parser._option_string_actions.items()
+               if option.startswith(token)}
+    return next(iter(matches.values())) if len(matches) == 1 else None
+
+
+def _option_takes_value(parsers: tuple[argparse.ArgumentParser, ...], token: str) -> bool:
+    """Whether *token* is an option that consumes the NEXT argv token."""
+    if not token.startswith("-") or "=" in token:
+        return False
+    for parser in parsers:
+        action = _option_action(parser, token)
+        if action is not None:
+            return action.nargs != 0
+    return False
+
+
+def _unrecognized_arguments_hint(
+    root: argparse.ArgumentParser,
+    selected: argparse.ArgumentParser,
+    parsed: argparse.Namespace,
+    argv: list[str],
+    extras: list[str],
+) -> str | None:
+    """A targeted line under argparse's `unrecognized arguments` (#1042 item 4,
+    #1037 item 10), for two argument shapes whose bare refusal names the wrong
+    token. None when neither applies.
+
+    * A value after a SWITCH (`strings --regex 'a|b'`): argparse rejects the
+      value, not the switch, so the error reads as a bad pattern. Name the
+      switch; when the command takes `--query` and none was given, print the
+      corrected command.
+    * `--estimate-output` on a dual-role node (`exports`, `types`): the flag is
+      withheld there on purpose (#796 r2, see `_group_paths`), so say so, and
+      print the alias subcommand form when the node has one (`exports list`).
+
+    Printed commands are this argv with the one change applied, so they keep
+    every other option the caller passed."""
+    parsers = (selected, root)
+    for index in range(1, len(argv)):
+        token, switch = argv[index], argv[index - 1]
+        if token not in extras or token.startswith("-"):
+            continue
+        action = _option_action(selected, switch)
+        if action is None or action.nargs != 0:
+            continue
+        if index >= 2 and _option_takes_value(parsers, argv[index - 2]):
+            continue   # `switch` is itself the value of the option before it
+        query = selected._option_string_actions.get("--query")
+        if (action.dest == "regex" and query is not None
+                and getattr(parsed, query.dest, None) is None
+                and getattr(parsed, "query", None) is None):
+            fixed = [*argv[:index - 1], "--query", token, switch, *argv[index + 1:]]
+            return (f"{switch} is a switch and takes no value; pass the pattern "
+                    f"with --query: {shlex.join(['bn', *fixed])}")
+        return f"{switch} is a switch and takes no value; {token!r} is left over"
+    path = tuple(getattr(parsed, "_command_path", ()) or ())
+    if "--estimate-output" in extras and path and path in _group_paths():
+        node = next((spec for spec in _COMMANDS if spec["path"] == path), None)
+        # The alias leaf is the child that takes the node's own arguments (the
+        # one registration list `exports`/`exports list` share), so the printed
+        # command keeps every option the caller already passed valid.
+        alias = next((spec["path"][-1] for spec in _COMMANDS
+                      if node is not None and spec["path"][:-1] == path
+                      and spec["args"] == node["args"] and spec.get("estimable")),
+                     None)
+        label = " ".join(path)
+        lead = (f"--estimate-output is not accepted on `bn {label}` itself: it is also "
+                f"a command group, and a flag there would reach its subcommands too")
+        if alias is None:
+            return f"{lead}."
+        for index in range(len(argv) - len(path) + 1):
+            if argv[index:index + len(path)] != list(path):
+                continue
+            if index and _option_takes_value(parsers, argv[index - 1]):
+                continue
+            at = index + len(path)
+            fixed = [*argv[:at], alias, *argv[at:]]
+            return f"{lead}; use the `{label} {alias}` form: {shlex.join(['bn', *fixed])}"
+        return f"{lead}; use `bn {label} {alias} --estimate-output`."
+    return None
 
 
 def _resolve_out_path(value: str) -> Path:
@@ -1658,9 +1751,12 @@ def _refuse_count_only_slices(args: argparse.Namespace, *, command: str,
     over. One helper rather than two, so the next aggregate inherits the
     refusal instead of re-deriving which flags are meaningless.
     """
+    # None is "not given" for every flag: `function search --sort` defaults to
+    # None so its handler can tell an explicit `--sort address` from the
+    # default order (#1037 item 9).
     offenders = [
         flag for attr, flag, unset in _COUNT_SLICE_FLAGS
-        if flag != mode and getattr(args, attr, unset) != unset
+        if flag != mode and getattr(args, attr, unset) not in (unset, None)
     ]
     if offenders:
         # The noun follows the MODE rather than being hard-coded to "count":
@@ -2089,6 +2185,8 @@ def _mutate(
         # --format controls the MEDIUM, --verbose/--summary the DETAIL. An explicit
         # --format still wins, and an --out extension is still inferred downstream.
         setattr(args, "format", "text")
+    summary_text = functools.partial(
+        _render_mutation_summary_text, save_command=lambda: _save_command(args))
     return _call(
         args,
         op,
@@ -2097,7 +2195,12 @@ def _mutate(
         # A mutation with a richer detail view of its own (e.g. `go rename`'s
         # per-candidate breakdown) supplies it via *detail_renderer*; the compact
         # status line stays shared so #645's default is identical everywhere.
-        text_renderer=(_render_mutation_summary_text if compact
+        # #1036 item 5: the compact status names the save that persists a
+        # committed dirty change, routed like this invocation (resolved lazily:
+        # an implicit target is only known once the request routes). The same
+        # renderer serves the spill path below, so the advice does not depend
+        # on payload size (review round 2).
+        text_renderer=(summary_text if compact
                        else (detail_renderer or _render_mutation_text)),
         # #715: the exit code is computed on the ORIGINAL result, before any
         # transform runs, so it cannot see the `measured` flag `_mutation_summary`
@@ -2123,9 +2226,27 @@ def _mutate(
         # transform (#693 item 4), so this transform sees the bridge's payload
         # and never its own output -- idempotence is not required of it.
         spill_status=(summary_transform or _mutation_summary),
-        spill_status_renderer=_render_mutation_summary_text,
+        spill_status_renderer=summary_text,
         **call_kwargs,
     )
+
+
+def _save_command(args: argparse.Namespace) -> str:
+    """The `bn save` that persists the target this invocation acted on: its
+    own `-i`/`-t` routing, quoted, so it runs as printed (a bare `bn save`
+    is refused once several targets are open)."""
+    from .target_hint import target_option
+
+    parts = ["bn"]
+    instance = getattr(args, "instance", None)
+    if isinstance(instance, str) and instance.strip():
+        parts.append(shlex.quote(f"--instance={instance}") if instance.startswith("-")
+                     else f"-i {shlex.quote(instance)}")
+    target = getattr(args, "_resolved_target", None) or getattr(args, "target", None)
+    if isinstance(target, str) and target.strip():
+        parts.append(target_option(target))
+    parts.append("save")
+    return " ".join(parts)
 
 
 def _contextualize_diagnostic_hints(
@@ -2151,14 +2272,23 @@ def _contextualize_diagnostic_hints(
         # Routing flags are accepted at root/group/leaf level. Skip their values
         # when identifying the registry path: an instance may itself be named
         # "il" or "session". Keep the original shell text for the actual edit.
+        # A glued `-iX`/`-tX` counts as routing only BEFORE the leaf command,
+        # where no positional can stand: after it, a locator such as a function
+        # named `-th x` is an operand, not a target flag (#1033 item 7).
+        leaves = {spec["path"] for spec in _COMMANDS}
         path: tuple[str, ...] = ()
+        glued: list[str] = []
         index = 0
         while index < len(words):
             word = words[index]
-            if word in ("-i", "--instance", "-t", "--target"):
+            if word in _ROUTING_FLAGS:
                 index += 2
                 continue
-            if word.startswith(("--instance=", "--target=", "-i", "-t")):
+            if word.startswith(("--instance=", "--target=")):
+                index += 1
+                continue
+            if path not in leaves and word.startswith(("-i", "-t")):
+                glued.append(word)
                 index += 1
                 continue
             candidate = (*path, word)
@@ -2170,11 +2300,15 @@ def _contextualize_diagnostic_hints(
             return match.group(0)
         flags = []
         options = words[:words.index("--")] if "--" in words else words
-        if instance and not any(word.startswith(("--instance=", "-i"))
-                                or word == "--instance" for word in options):
-            flags.append(f"-i {shlex.quote(instance)}")
-        if target and not any(word.startswith(("--target=", "-t"))
-                              or word == "--target" for word in options):
+
+        def routed(long: str) -> bool:
+            return (any(word in (f"--{long}", f"-{long[0]}") or word.startswith(f"--{long}=")
+                        for word in options)
+                    or any(word.startswith(f"-{long[0]}") for word in glued))
+
+        if instance and not routed("instance"):
+            flags.append(instance_option(instance))
+        if target and not routed("target"):
             flags.append(f"-t {shlex.quote(target)}" if not target.startswith("-")
                          else shlex.quote(f"--target={target}"))
         if not flags:
@@ -2292,6 +2426,9 @@ def _call(
         require_target=require_target,
         allow_implicit_target=allow_implicit_target,
     )
+    # The selector this request actually routed with (an implicit sole
+    # target resolves to its target_id), for advice printed after it.
+    args._resolved_target = target
     # One end-to-end deadline for this call, resolved exactly once (#694 item
     # 8). Without it, the literal request below and the regex-fallback retry
     # further down each re-resolve BN_REQUEST_TIMEOUT from scratch, so a single
@@ -2445,6 +2582,10 @@ def _call(
         note = truncation_note(spill_context)
         if note:
             print(note, file=sys.stderr)
+    if not estimate_only:
+        page_note = _default_page_note(args, spill_context)
+        if page_note:
+            print(page_note, file=sys.stderr)
     return exit_code
 
 
@@ -2574,10 +2715,15 @@ def _fanout_call(
         if plan.get("auto"):
             auto_expanded.append(iid)
         if "error" in plan:
-            units.append(("error", {"instance": iid, "ok": False, "error": plan["error"]}))
+            units.append(("error", {"instance": iid, "ok": False,
+                                    "error": _target_hint_message(args, plan["error"],
+                                                                  fanout=True, instance=iid)}))
             continue
         for tsel in plan["tsels"]:
             units.append(("work", (iid, tsel)))
+
+    # Default-page notes per executed (instance, target), for stderr (#1037.4).
+    page_notes: dict[tuple[Any, Any], str] = {}
 
     def _run_one(item: tuple[Any, Any]) -> dict[str, Any]:
         iid, tsel = item
@@ -2600,8 +2746,17 @@ def _fanout_call(
             )
             row.update({"target": target, "ok": True,
                         _RESULT_ROW_KEY: unwrap_result(response, op)})
+            # #1037 item 4 review: the default-page note for THIS row, decided
+            # from the same reply (the helper is pure), kept beside the rows
+            # rather than in them so the fan-out envelope keeps its shape.
+            note = _default_page_note(args, unwrap_result(response, op))
+            if note:
+                page_notes[(iid, target)] = note
         except BridgeError as exc:
-            row.update({"target": tsel, "ok": False, "error": str(exc)})
+            # The row's error is a refusal for ONE (instance, target) call, so
+            # its listing rows are respelled as that call (#1033 item 1).
+            row.update({"target": tsel, "ok": False,
+                        "error": _target_hint_message(args, str(exc), fanout=True, instance=iid)})
         # Per-row wall-clock so an agent can see WHERE a broad survey spent its
         # time, not just that it felt slow (#417).
         row["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
@@ -2657,6 +2812,17 @@ def _fanout_call(
         # dumping every instance's rows.
         estimate_only=bool(getattr(args, "estimate_output", False)),
     )
+    # #1037 item 4 review: a fan-out is the bulk-listing surface, so each
+    # successful row the DEFAULT page cut short gets the same stderr note as a
+    # single-target read, naming the row it describes.
+    if not getattr(args, "estimate_output", False):
+        for row in rows:
+            note = page_notes.get((row.get("instance"), row.get("target")))
+            if note:
+                where = ", ".join(part for part in (
+                    f"instance {row['instance']}" if row.get("instance") else "",
+                    f"target {row.get('target')}") if part)
+                print(note.replace("note: ", f"note: {where}: ", 1), file=sys.stderr)
     # Exit non-zero when EVERY instance failed, so a scripted consumer keying on
     # the exit code doesn't read a total failure as success (#169 L1 review). A
     # partial success stays 0; callers inspect the per-instance `ok` rows.
@@ -2802,7 +2968,46 @@ def _effective_limit(args: argparse.Namespace) -> int | None:
     "not set"), not 100."""
     if getattr(args, "limit", None) is not None:
         return args.limit
-    return None if getattr(args, "out", None) else 100
+    if getattr(args, "out", None):
+        return None
+    # #1037 item 4: remember that the page size was OURS, not the caller's, so
+    # `_call` can say so on stderr when it truncated (`_default_page_note`).
+    args._default_page_limit = _DEFAULT_PAGE_LIMIT
+    return _DEFAULT_PAGE_LIMIT
+
+
+_DEFAULT_PAGE_LIMIT = 100
+
+
+def _default_page_note(args: argparse.Namespace, result: Any) -> str | None:
+    """The stderr line for a page the DEFAULT limit cut short (#1037 item 4).
+
+    The `// showing N of TOTAL` footer is on stdout, so `bn imports | grep recv`
+    filters it away and `--format json` carries only `has_more` -- an agent
+    read 100 imports as the binary's whole import table. stderr survives both,
+    so the note goes there in every format. It fires only when the caller gave
+    no `--limit` (and no `--out`, which uncaps) and the bridge says more rows
+    exist; an explicit `--limit` is the caller's own choice and stays quiet."""
+    limit = getattr(args, "_default_page_limit", None)
+    if limit is None or not isinstance(result, dict) or result.get("has_more") is not True:
+        return None
+    returned, total, offset = (result.get(key) for key in ("returned", "total", "offset"))
+    if not _is_count(returned):
+        items = result.get("items")
+        returned = len(items) if isinstance(items, list) else None
+    offset = offset if _is_count(offset) else 0
+    if returned is None:
+        shown = "a partial page"
+        resume = "--offset with a larger --limit"
+    else:
+        shown = f"{returned} of {total}" if _is_count(total) else f"{returned} (more exist)"
+        resume = f"--offset {offset + returned}"
+    return (f"note: the default --limit {limit} cut this page short ({shown}); "
+            f"rerun with {resume}, a larger --limit, or --out FILE for every row")
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _add_function_address_args(parser: argparse.ArgumentParser) -> None:
@@ -3113,15 +3318,37 @@ def _target_hint_argv(args: argparse.Namespace, root: argparse.ArgumentParser) -
     return [*routing, *path, *options, *(["--"] if operands else []), *operands]
 
 
-def _target_hint_message(args: argparse.Namespace, message: str) -> str:
-    """Use the same parsed replay command for raised and per-item refusals."""
+def _target_hint_message(
+    args: argparse.Namespace, message: str, *, fanout: bool = False, instance: Any = None,
+) -> str:
+    """Use the same parsed replay command for raised and per-item refusals.
+
+    *fanout* respells an `--all-instances`/`--all-targets` row as the single
+    call that row stands for: routed to that row's *instance* (when it has
+    one), without the fan-out flags (#1033 item 1)."""
     if tuple(getattr(args, "_command_path", ())) == ("target", "close"):
         return message
     argv = getattr(args, "_target_hint_argv", None)
     if argv is None:
         return message
-    from .target_hint import respell_for_option
+    if fanout:
+        argv = _single_call_argv(argv, None if instance is None else str(instance))
     return respell_for_option(message, argv)
+
+
+def _single_call_argv(argv: list[str], instance: str | None) -> list[str]:
+    """*argv* (from `_target_hint_argv`) without the fan-out flags, routed to
+    *instance* when one is given."""
+    if instance is not None:
+        if argv[:1] == ["-i"]:
+            argv = argv[2:]
+        elif argv and argv[0].startswith("--instance="):
+            argv = argv[1:]
+    end = argv.index("--") if "--" in argv else len(argv)
+    options = [word for word in argv[:end] if word not in ("--all-instances", "--all-targets")]
+    routing = ([] if instance is None else
+               [f"--instance={instance}"] if instance.startswith("-") else ["-i", instance])
+    return [*routing, *options, *argv[end:]]
 
 
 def main(argv: list[str] | None = None) -> int:

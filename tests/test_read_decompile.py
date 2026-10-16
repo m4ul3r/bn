@@ -7349,3 +7349,119 @@ def test_the_values_refusal_prints_an_il_command_that_parses_1033(monkeypatch):
     [command] = re.findall(r"`bn ([^`]+)`", str(raised.value))
     args = cli.build_parser().parse_args(shlex.split(command))
     assert (args.identifier, args.view, args.ssa) == ("0x4008c0", "mlil", True)
+
+
+# --- #1042 item 3: function_info_batch --------------------------------------
+
+
+def test_function_info_batch_keeps_a_miss_in_place_at_the_bridge_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "handle"),
+                            _FakeFunction(0x402000, "parse_file")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_info_batch(None, ["handle", "nosuchfn", "0x402000"])
+
+    assert result["kind"] == "function_info_batch"
+    assert [row["identifier"] for row in result["functions"]] == [
+        "handle", "nosuchfn", "0x402000"]
+    assert [row["ok"] for row in result["functions"]] == [True, False, True]
+    assert result["functions"][2]["info"]["function"]["name"] == "parse_file"
+    assert "nosuchfn" in result["functions"][1]["error"]
+    assert (result["requested"], result["resolved"]) == (3, 2)
+
+
+class _ProtoType:
+    """A function type whose rendering names `ns::Cls` (#1013)."""
+
+    def __init__(self, parameters, rendered="int64_t(struct ns::Cls* this)"):
+        self.parameters = parameters
+        self.return_value = types.SimpleNamespace(type_class="IntegerTypeClass")
+        self._rendered = rendered
+
+    def __str__(self):
+        return self._rendered
+
+
+def _cls_pointer():
+    return types.SimpleNamespace(
+        type_class="PointerTypeClass",
+        target=types.SimpleNamespace(type_class="NamedTypeReferenceClass", name="ns::Cls"))
+
+
+def _call_site(start, *, op="MLIL_CALL_SSA", dest_op="MLIL_CONST_PTR", arg=None, addr=0x500):
+    call = types.SimpleNamespace(
+        operation=op, address=addr,
+        dest=types.SimpleNamespace(operation=dest_op, constant=start),
+        params=[arg] if arg is not None else [])
+    caller = types.SimpleNamespace(mlil=types.SimpleNamespace(
+        ssa_form=types.SimpleNamespace(instructions=[call])))
+    return types.SimpleNamespace(function=caller, address=addr)
+
+
+def _ssa_reg(version):
+    return types.SimpleNamespace(operation="MLIL_VAR_SSA", src=types.SimpleNamespace(
+        version=version, var=types.SimpleNamespace(
+            source_type=types.SimpleNamespace(name="RegisterVariableSourceType"), storage=7)))
+
+
+def _proto_instance(monkeypatch, parameters, sites, *, defined=False):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _cxx_function(0x401000, "_ZN2ns3Cls3getEv", "ns::Cls::get")
+    fn.set_auto_type(_ProtoType(parameters))
+    fn.caller_sites = sites
+    bv = _FakeBV(functions=[fn])
+    bv.arch.get_reg_name = lambda storage: "rdi"
+    if defined:
+        bv.types["ns::Cls"] = object()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.read_decompile.bn, "demangle_gnu3",
+                        lambda arch, name: (None, []), raising=False)
+    return instance
+
+
+def test_proto_get_counts_call_sites_passing_the_callers_entry_value_1013(monkeypatch):
+    sites = [
+        _call_site(0x401000, arg=_ssa_reg(0)),                       # entry rdi#0
+        _call_site(0x401000, arg=_ssa_reg(1)),                       # rdi the caller set
+        _call_site(0x401000, op="MLIL_TAILCALL_SSA", arg=_ssa_reg(0)),
+        _call_site(0x401000, dest_op="MLIL_VAR_SSA", arg=_ssa_reg(0)),  # indirect: skipped
+        _call_site(0x402000, arg=_ssa_reg(0)),                       # a different callee
+    ]
+    param = types.SimpleNamespace(name="this", type=_cls_pointer())
+    got = _proto_instance(monkeypatch, [param], sites)._get_prototype("active", "0x401000")
+    assert got["first_argument_entry_value"] == {
+        "direct_call_sites": 5, "checked": 3, "entry_value": 2,
+        "registers": ["rdi"], "truncated": False}
+    note = got["first_argument_entry_value_note"]
+    assert note.startswith("At 2 of 3 direct call sites the first argument is the "
+                           "caller's own entry value of rdi (SSA version 0)")
+    assert "static" not in note
+    assert "implicit_object_note" in got
+
+
+def test_proto_get_entry_value_scan_is_capped_and_needs_a_parameter_1013(monkeypatch):
+    sites = [_call_site(0x401000, arg=_ssa_reg(0)) for _ in range(40)]
+    param = types.SimpleNamespace(name="this", type=_cls_pointer())
+    got = _proto_instance(monkeypatch, [param], sites)._get_prototype("active", "0x401000")
+    fact = got["first_argument_entry_value"]
+    assert fact["checked"] == 32 and fact["truncated"] is True
+    assert "Only the first 32 of 40 call sites were inspected." in got[
+        "first_argument_entry_value_note"]
+    none = _proto_instance(monkeypatch, [], sites)._get_prototype("active", "0x401000")
+    assert "first_argument_entry_value" not in none
+
+
+def test_proto_get_flags_undefined_named_types_with_a_declare_command_1013(monkeypatch):
+    param = types.SimpleNamespace(name="this", type=_cls_pointer())
+    got = _proto_instance(monkeypatch, [param], [])._get_prototype("active", "0x401000")
+    assert got["undefined_types"] == [
+        {"name": "ns::Cls", "declare_command": "bn types declare 'struct `ns::Cls`;'"}]
+    note = got["undefined_type_note"]
+    assert "run `bn types declare 'struct `ns::Cls`;'` first" in note
+    assert "`this` is a keyword the parser rejects as a parameter name" in note
+    assert "spell a `::`-qualified name in backticks" in note
+    defined = _proto_instance(monkeypatch, [param], [], defined=True)
+    assert "undefined_types" not in defined._get_prototype("active", "0x401000")

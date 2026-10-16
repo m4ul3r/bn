@@ -28,6 +28,7 @@ from ..formatters import (
     _render_read_escaped_text,
     _render_read_text,
     _render_sections_text,
+    _render_resolved_symbol_notes,
     _render_strings_narrowed_mangled_text,
     _render_strings_narrowed_text,
     _render_strings_mangled_text,
@@ -368,26 +369,48 @@ def _sections(args: argparse.Namespace) -> int:
 
 
 @command("data", "vars",
-         help="Typed data variables in the half-open address window [start, end)",
+         help="Typed data variables in the half-open address window [start, end), "
+              "or the one variable at --at",
          target=True,
          prefer_when="you want BN's typed view of a data region (widths, decoded values, "
                      "pointer targets), not raw bytes; `read` gives the raw bytes",
          see_also=("read", "sections", "data symbols"),
          args=[
-             arg("--start", required=True,
-                 help="Window start address, inclusive (hex 0x.. or decimal)"),
-             arg("--end", required=True,
-                 help="Window end address, exclusive (hex 0x.. or decimal)"),
+             arg("--end", default=None, metavar="ADDR|NAME",
+                 help="Window end, exclusive (hex 0x.., decimal or a symbol name); "
+                      "needs --start"),
              arg("--limit", type=_positive_int, default=None, metavar="N",
                  help="Maximum rows to return (default 400); when truncated the result "
                       "sets has_more and text mode prints a --start resume hint"),
          ],
+         mutex_groups=[
+             # #1042 item 2: `--at NAME` is the one-variable question ("what does
+             # sock_path point at?") that used to need a hand-built window.
+             mutex(True,
+                   arg("--at", default=None, metavar="ADDR|NAME",
+                       help="The data variable that starts at this address, symbol name "
+                            "or rendered data_<hex> name"),
+                   arg("--start", default=None, metavar="ADDR|NAME",
+                       help="Window start, inclusive (hex 0x.., decimal or a symbol "
+                            "name); needs --end")),
+         ],
          estimable=True)
 def _data_vars(args: argparse.Namespace) -> int:
+    if args.at is not None and args.end is not None:
+        raise BridgeError("data vars --at takes no --end: it names one variable")
+    if args.start is not None and args.end is None:
+        raise BridgeError("data vars --start needs --end (or pass --at for one variable)")
+    if args.end is not None and args.start is None:
+        raise BridgeError("data vars --end needs --start (or pass --at for one variable)")
+    params: dict[str, Any] = {"limit": args.limit}
+    if args.at is not None:
+        params["at"] = args.at
+    else:
+        params.update(start=args.start, end=args.end)
     return _call(
         args,
         "data_vars",
-        {"start": args.start, "end": args.end, "limit": args.limit},
+        params,
         require_target=True,
         text_renderer=_render_data_vars_text,
         stem="data-vars",
@@ -403,6 +426,8 @@ def _data_vars(args: argparse.Namespace) -> int:
          prefer_when="you need addressable data globals (including renamed/internal ones); "
                      "`exports` filters definitions by global/weak binding, not loader visibility",
          see_also=("exports", "data vars"),
+         args=[arg("--query", default=None,
+                   help="Only symbols whose name contains this text (case-insensitive)")],
          estimable=True)
 def _data_symbols(args: argparse.Namespace) -> int:
     # #682 item 1: paged like every sibling list read. This command used to
@@ -421,10 +446,13 @@ def _data_symbols(args: argparse.Namespace) -> int:
     # The token is deliberately not `0`: a caller-visible zero already means
     # "the schema, not the rows" everywhere else in this repo.
     limit = _effective_limit(args)
+    params: dict[str, Any] = {"offset": args.offset, "limit": "all" if limit is None else limit}
+    if args.query:
+        params["query"] = args.query
     return _call(
         args,
         "data_symbols",
-        {"offset": args.offset, "limit": "all" if limit is None else limit},
+        params,
         require_target=True,
         text_renderer=_render_data_symbols_text,
         page_label="data symbols",
@@ -585,7 +613,8 @@ def _bundle_function(args: argparse.Namespace) -> int:
 @command("read", help="Read raw bytes at an address", target=True,
          args=[
              arg("address", nargs="?",
-                 help="Address to read from (hex 0x.. or decimal)"),
+                 help="Address to read from (hex 0x.. or decimal), or a symbol name / "
+                      "rendered data_<hex> name, resolved like `xrefs` resolves it"),
              arg("length_pos", nargs="?", metavar="length", type=_int_or_hex,
                  help="Number of bytes to read (same as --length: `bn read ADDR LEN`)"),
              arg("--address", dest="address_flag", default=None,
@@ -662,7 +691,20 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
             partial_fields["requested_length"] = result["requested_length"]
         note = str(result.get("note") or f"partial read: {len(data)} bytes returned")
         print(f"note: {note}", file=sys.stderr)
-    summary = {"kind": "bytes", "address": address, "length": len(data), **partial_fields}
+    # #1042 review: `address` is the ADDRESS the bytes were read from -- the
+    # bridge's resolved hex -- never the name the caller typed; that name is in
+    # `resolved_symbol` below.
+    resolved_address = result.get("address")
+    summary = {"kind": "bytes",
+               "address": resolved_address if isinstance(resolved_address, str) else address,
+               "length": len(data), **partial_fields}
+    # #1042 item 2: stdout IS the payload here, so how a name resolved goes to
+    # stderr, beside the partial-read note, and into the --out summary.
+    resolved_notes = _render_resolved_symbol_notes(result)
+    if resolved_notes:
+        print(resolved_notes, file=sys.stderr)
+    if isinstance(result.get("resolved_symbol"), dict):
+        summary["resolved_symbol"] = result["resolved_symbol"]
     if getattr(args, "estimate_output", False):
         # #796: this is `read`'s SECOND emit path, and the flag has to mean the
         # same thing on it. `_call` -> `_render_result` implements the preflight
@@ -698,7 +740,10 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
 
 @command("py", "exec", help="Execute a Python snippet", target=True,
          args=[arg("code_pos", nargs="?", metavar="CODE",
-                   help="Inline Python code (positional; same as --code)")],
+                   help="Inline Python code (positional; same as --code)"),
+               arg("--no-target", action="store_true",
+                   help="Run with `bv` = None, without resolving a target: works with no "
+                        "target open, e.g. to close a GUI first-run dialog")],
          mutex_groups=[
              mutex(False,
                    arg("--script", type=Path, help="Read Python code from a file"),
@@ -734,6 +779,21 @@ def _py_exec(args: argparse.Namespace) -> int:
             "or use --code / --script FILE / --stdin"
         )
 
+    if getattr(args, "no_target", False):
+        # #1035 item 2: no target is resolved, so nothing can refuse for want
+        # of one. An explicit -t contradicts the flag; an ambient one (pin,
+        # BN_TARGET) is simply not used.
+        if getattr(args, "target", None) is not None and not getattr(args, "_sticky_target", False):
+            raise BridgeError("py exec: pass -t/--target or --no-target, not both")
+        args.target = None
+        return _call(
+            args,
+            "py_exec_untargeted",
+            {"script": script},
+            require_target=False,
+            text_renderer=_render_py_exec_text,
+            stem="py-exec",
+        )
     return _call(
         args,
         "py_exec",

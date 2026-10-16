@@ -9,6 +9,7 @@ the ``bn.cli`` module at call time -- ``cli.send_request(...)`` rather than a
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import json
 import os
@@ -17,6 +18,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -40,12 +42,43 @@ from ..formatters import (
     _render_target_list_text,
     _render_target_use_text,
 )
+from ..paths import project_root
+from ..target_hint import instance_option, target_option
 from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, unwrap_result
 
 # An ACK starts teardown, not process exit: BN still releases views and native
 # workers. Give that work room on a loaded host before considering pinned signals.
 _SHUTDOWN_TEARDOWN_TIMEOUT = 30.0
 _SIGNAL_TEARDOWN_TIMEOUT = 5.0
+# #1036 item 6: a foreground `session start` of a large binary can block for
+# minutes; one stderr line this often says it is still working.
+_START_PROGRESS_INTERVAL = 30.0
+# How often `session status <job> --wait` polls the bridge.
+_STATUS_WAIT_INTERVAL = 2.0
+
+
+@contextlib.contextmanager
+def _still_loading_notice(path: str, interval: float):
+    """Print ``bn: still loading <path> (<N>s)`` on stderr every *interval*
+    seconds while the body runs, so a long foreground load is visibly alive
+    (#1036 item 6). Stderr only: stdout stays the command's result."""
+    done = threading.Event()
+    started = time.monotonic()
+
+    def tick() -> None:
+        while not done.wait(interval):
+            print(
+                f"bn: still loading {path} ({int(time.monotonic() - started)}s); "
+                "`session start --detach` returns at once instead",
+                file=sys.stderr, flush=True)
+
+    thread = threading.Thread(target=tick, name="bn-start-progress", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join()
 
 
 @command("capabilities",
@@ -283,6 +316,12 @@ def _doctor(args: argparse.Namespace) -> int:
         "engine_source_build_id": source_engine_id,
         "engine_install_build_id": install_engine_id,
         "instances": instances,
+        # #1039 item 2: the value the bn-kernel bootstrap needs as `skill_dir`
+        # after a kernel reset, from the default skill roots `skill install` uses.
+        "bn_kernel_skill_dirs": _current_skill_dirs(
+            [root / "bn-kernel" for root in _default_skill_install_roots()],
+            cli.skills_source_dir() / "bn-kernel",
+        ),
     }
     cli._emit_result(args, result, text_renderer=_render_doctor_text, stem="doctor")
     # #620(c): a doctor report that never fails exit code hides unreachable
@@ -434,8 +473,11 @@ def _existing_install_state(source: Path, dest: Path, *, mode: str) -> tuple[str
     of a reinstall onto a new checkout) or `existing` (any other directory or
     file, including one that cannot be read). Only `up_to_date` is an install
     that needs nothing; reporting the others as "already installed" left every
-    link pointing at the previous tree with exit 0 (#1002).
+    link pointing at the previous tree with exit 0 (#1002). Judged on
+    `_install_path(dest)`, the entry an install would write, so the state check
+    and the plan never inspect two different locations (#1035 item 4).
     """
+    dest = _install_path(dest)
     if _is_install_source(source, dest):
         return "up_to_date", f"is the install source {source} itself"
     if dest.is_symlink():
@@ -469,6 +511,7 @@ def _is_install_source(source: Path, dest: Path) -> bool:
     """Whether `dest` is the install source itself, reached through a symlinked
     ancestor -- a skills root linked to the checkout's own `skills/`. Nothing
     can be installed there and nothing needs to be, `--force` included."""
+    dest = _install_path(dest)
     return not dest.is_symlink() and dest.exists() and dest.resolve() == source.resolve()
 
 
@@ -518,16 +561,24 @@ FORCE_NOTE = ("--force replaces only what it can remove and proves is this "
 
 
 def _install_path(dest: Path) -> Path:
-    """The path an install at `dest` works on, decided without touching disk.
+    """The path an install at `dest` works on, decided before anything is written.
 
-    Ancestors are resolved -- so `store/missing/..` is `store`, not a directory
-    that only exists once something has created `missing` -- while a symlink AT
-    `dest` stays the link it is: it is unlinked, never followed, so its own
-    location is what gets replaced and what the path rules must judge. Planning
-    and acting on this one path is what keeps a spelling from naming two
-    different directories either side of a `mkdir`.
+    The parent is resolved with filesystem semantics -- so `store/missing/..`
+    is `store`, and `store/link/..` is the parent of the link's TARGET, exactly
+    where the kernel would land -- and the final entry is appended unresolved:
+    a symlink AT `dest` stays the link it is, unlinked and never followed, so
+    its own location is what gets replaced and what the path rules must judge.
+    Asking `dest.is_symlink()` of the raw spelling instead missed a link that a
+    canceled nonexistent component hides from `lstat` (`store/missing/../x`
+    fails with ENOENT while `store/x` is a link), and resolving the whole path
+    then followed that link to its target (#1035 item 4). A final `..` names a
+    directory, never an entry, so that spelling resolves whole. Planning and
+    acting on this one path is what keeps a spelling from naming two different
+    directories either side of a `mkdir`.
     """
-    return dest.parent.resolve() / dest.name if dest.is_symlink() else dest.resolve()
+    if dest.name in ("", ".."):
+        return dest.resolve()
+    return dest.parent.resolve() / dest.name
 
 
 def _never_an_install_destination(dest: Path, source: Path) -> str | None:
@@ -865,6 +916,22 @@ def _skill_install(args: argparse.Namespace) -> int:
         "force_note": FORCE_NOTE,
         "force_plan": force_plan,
         "force_ready": all(row["allowed"] for row in force_plan),
+        # A forced run has already acted on its preflight; the renderer must not
+        # restate it as a pending dry run (#1035 install comment 1).
+        "forced": bool(args.force),
+        # #1035 install comment 2, narrowed under the split rule (#1043 review
+        # 3): the refused run's arguments plus `--force`, never a claim about
+        # which executable to run them with.
+        "force_args": (
+            _forced_skill_install_args(args)
+            if not args.force and not_updated_destinations
+            and all(row["allowed"] for row in force_plan)
+            else None
+        ),
+        "bn_kernel_skill_dirs": _current_skill_dirs(
+            [dest for source, dest in install_plan if source.name == "bn-kernel"],
+            skills_root / "bn-kernel",
+        ),
     }
     if explicit_refusal:
         result.update(ok=False, error="Skill install refused; no destinations changed.")
@@ -883,6 +950,50 @@ def _skill_install(args: argparse.Namespace) -> int:
         return 2
     cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
     return 1 if not_updated_destinations else 0
+
+
+def _forced_skill_install_args(args: argparse.Namespace) -> list[str]:
+    """The refused run's own arguments plus `--force`, after the program name.
+
+    Rebuilt from the parsed arguments: `--dest` keeps the caller's spelling (a
+    relative path reruns from the same directory; normalising it could change
+    which entry a `..` names), a value starting with `-` takes the `=` form so
+    it cannot parse as an option, and `--out` keeps the requested receipt,
+    already absolute. Deliberately NO program name: the executable decides
+    which checkout's skills get installed, and which one ran (a PATH `bn`, a
+    console script, `python -m bn`, a wrapper setting PYTHONPATH) is not
+    something this process can prove -- three review rounds of provenance
+    checks each printed a command that installed another checkout (#1043).
+    The caller reruns its own invocation with these arguments."""
+    argv = ["skill", "install"]
+    if args.dest is not None:
+        dest = str(args.dest)
+        argv.extend([f"--dest={dest}"] if dest.startswith("-") else ["--dest", dest])
+    if args.mode != "symlink":
+        argv.extend(["--mode", args.mode])
+    if args.format != "text":
+        argv.extend(["--format", args.format])
+    if getattr(args, "out", None) is not None:
+        argv.extend(["--out", str(args.out)])
+    argv.append("--force")
+    return argv
+
+
+def _current_skill_dirs(dests: list[Path], source: Path) -> list[str]:
+    """Absolute install entries among `dests` that hold this build of `source`.
+
+    A link to `source` or a copy matching it, in either mode; a stale link into
+    an older checkout or a foreign directory is excluded, as its files are not
+    this build's. The path is the install entry itself (`_install_path`), so it
+    reads the same from any working directory -- the bn-kernel bootstrap needs
+    exactly this value as `skill_dir` after a kernel reset (#1039 item 2)."""
+    dirs: list[str] = []
+    for dest in dests:
+        entry = str(_install_path(dest))
+        state = _existing_install_state(source, dest, mode="symlink")
+        if entry not in dirs and state is not None and state[0] in ("up_to_date", "other_mode"):
+            dirs.append(entry)
+    return dirs
 
 
 def _default_skill_install_roots() -> list[Path]:
@@ -940,16 +1051,21 @@ def _session_start(args: argparse.Namespace) -> int:
     for binary in binaries:
         resolved = str(Path(binary).expanduser().resolve())
         try:
-            resp = cli.send_request(
-                "load_binary_async" if detached else "load_binary",
-                params={
-                    "path": resolved,
-                    "prefer_bndb": prefer_bndb,
-                    "quick": quick,
-                    "workdir": workdir,
-                },
-                instance_id=instance.instance_id,
+            notice = (
+                contextlib.nullcontext() if detached
+                else _still_loading_notice(resolved, _START_PROGRESS_INTERVAL)
             )
+            with notice:
+                resp = cli.send_request(
+                    "load_binary_async" if detached else "load_binary",
+                    params={
+                        "path": resolved,
+                        "prefer_bndb": prefer_bndb,
+                        "quick": quick,
+                        "workdir": workdir,
+                    },
+                    instance_id=instance.instance_id,
+                )
             item = unwrap_result(
                 resp, "load_binary_async" if detached else "load_binary")
             valid = (
@@ -1047,11 +1163,28 @@ def _session_start(args: argparse.Namespace) -> int:
     return 1 if failures or association_error else 0
 
 
+def _positive_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    if not (value > 0 and value != float("inf")):
+        raise argparse.ArgumentTypeError(f"must be a positive number of seconds: {text!r}")
+    return value
+
+
 @command(
     "session",
     "status",
     help="Poll detached binary load jobs",
-    args=[arg("job_id", nargs="?", help="Optional detached load job ID")],
+    args=[
+        arg("job_id", nargs="?", help="Optional detached load job ID"),
+        arg("--wait", action="store_true",
+            help="Block until the named job finishes; exit 0 when it loaded, 1 when it "
+                 "failed or --timeout passed first"),
+        arg("--timeout", dest="wait_timeout", type=_positive_seconds, default=None,
+            help="With --wait: give up after this many seconds (default: no limit)"),
+    ],
 )
 def _session_status(args: argparse.Namespace) -> int:
     instance_id = getattr(args, "instance", None)
@@ -1059,20 +1192,49 @@ def _session_status(args: argparse.Namespace) -> int:
         raise BridgeError(
             "session status requires -i/--instance <id> from session start"
         )
-    response = cli.send_request(
-        "load_status",
-        params={"job_id": getattr(args, "job_id", None)},
-        instance_id=instance_id,
-    )
-    result = unwrap_result(response, "load_status")
-    if not isinstance(result, dict):
-        raise BridgeError("malformed load_status response")
+    job_id = getattr(args, "job_id", None)
+    wait = bool(getattr(args, "wait", False))
+    timeout = getattr(args, "wait_timeout", None)
+    if timeout is not None and not wait:
+        raise BridgeError("session status: --timeout applies only with --wait")
+    if wait and not job_id:
+        raise BridgeError(
+            "session status --wait needs a job id: the one `session start --detach` "
+            "printed, or one listed by `session status` without --wait"
+        )
+    started = time.monotonic()
+    while True:
+        response = cli.send_request(
+            "load_status",
+            params={"job_id": job_id},
+            instance_id=instance_id,
+        )
+        result = unwrap_result(response, "load_status")
+        if not isinstance(result, dict):
+            raise BridgeError("malformed load_status response")
+        # #1036 item 6: the bridge's own `terminal` verdict decides, never a
+        # state string re-derived here.
+        if not wait or result.get("terminal") is True:
+            break
+        elapsed = time.monotonic() - started
+        if timeout is not None and elapsed >= timeout:
+            result["waited"] = {"seconds": round(elapsed, 1), "timed_out": True}
+            break
+        pause = _STATUS_WAIT_INTERVAL
+        if timeout is not None:
+            pause = min(pause, max(timeout - elapsed, 0.0))
+        time.sleep(pause)
+    if wait and "waited" not in result:
+        result["waited"] = {"seconds": round(time.monotonic() - started, 1),
+                            "timed_out": False}
     cli._emit_result(
         args,
         result,
         text_renderer=_render_session_status_text,
         stem="session-status",
     )
+    if wait:
+        return 0 if result.get("succeeded") is True else 1
     return 0
 
 
@@ -1507,7 +1669,7 @@ def _refuse_unverified_unsaved_state(
     raise BridgeError(
         f"session {verb}: cannot verify whether instance {instance_id} has "
         f"unsaved changes ({failure}); no shutdown was sent.\n"
-        f"Retry once `bn -i {shlex.quote(str(instance_id))} target list` answers, "
+        f"Retry once `bn {instance_option(str(instance_id))} target list` answers, "
         f"or pass --discard-unsaved to {verb} anyway and discard any unsaved changes."
     )
 
@@ -1543,12 +1705,15 @@ def _unsaved_targets_or_refuse(
         f"unsaved changes; a {verb} would discard them."
     ]
     lines.extend(
-        f"  -t {shlex.quote(str(entry['selector'] or ''))}  {entry['path'] or ''}"
+        f"  {target_option(str(entry['selector'] or ''))}  {shlex.quote(str(entry['path'] or ''))}"
         for entry in unsaved
     )
     lines.append("Save first:")
+    # `--target=`/`--instance=` for a value starting with `-`, which a bare
+    # `-t`/`-i` would read as the next option (#1033 item 5).
     lines.extend(
-        f"  bn -i {shlex.quote(str(instance_id))} -t {shlex.quote(str(entry['selector'] or ''))} save"
+        f"  bn {instance_option(str(instance_id))} "
+        f"{target_option(str(entry['selector'] or ''))} save"
         for entry in unsaved
     )
     lines.append(f"Or pass --discard-unsaved to {verb} anyway and discard them.")
@@ -1816,7 +1981,10 @@ def _session_list(args: argparse.Namespace) -> int:
     return 0
 
 
-@command("instance", "list", help="List running bridge instances (alias for `session list`)")
+@command("instance", "list", help="List running bridge instances (alias for `session list`)",
+         args=[arg("--mine", action="store_true", default=False,
+                   help="Only instances associated with this project root (the ones "
+                        "a bare command can route to) and the project's sticky pin")])
 def _instance_list(args: argparse.Namespace) -> int:
     # `instance list` ignores the selector entirely, but an explicit empty one is
     # still a caller mistake and is refused everywhere else in the CLI (#694).
@@ -1825,6 +1993,14 @@ def _instance_list(args: argparse.Namespace) -> int:
     # answers "which instance has libfoo.so?" from the registry alone, and #80
     # made round-trip-freedom that command's design contract.
     result: Any = _running_instances_result()
+    if args.mine:
+        # #1036 item 7: on a shared host the full list is every agent's bridge.
+        # Same association test the router uses, read from the same registry.
+        root = str(project_root())
+        result["items"] = [entry for entry in result["items"]
+                           if entry.get("sticky") or root in entry.get("project_roots", ())]
+        result["project_root"] = root
+        result["total_rss_mb"] = round(sum(entry["rss_mb"] or 0 for entry in result["items"]), 1)
     cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="instance-list")
     return 0
 

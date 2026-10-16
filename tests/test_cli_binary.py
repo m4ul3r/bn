@@ -414,7 +414,7 @@ def test_target_info_command_text_carries_the_annotation_block(fake_transport, c
                 "existing_annotations": {
                     "comments": 2, "function_comments": 1, "user_symbols": 3,
                     "analyst_symbols": 0, "placeholder_symbols": 0,
-                    "analysis_cache_restored": True,
+                    "opened_from_database": True, "restored_from_cache": False,
                     "provenance_hint": "a prior session wrote these",
                 },
             },
@@ -443,13 +443,13 @@ def test_target_info_text_renders_existing_annotations():
         "existing_annotations": {
             "comments": 8, "function_comments": 3, "user_symbols": 12,
             "analyst_symbols": 5, "placeholder_symbols": 7,
-            "analysis_cache_restored": True,
+            "opened_from_database": True, "restored_from_cache": True,
             "provenance_hint": "existing BNDB annotations may predate this run",
         },
     })
     assert "existing annotations: comments=8, function-docs=3, user-symbols=12" in annotated
     assert "analyst-symbols=5, placeholders=7" in annotated
-    assert "cache-restored=True" in annotated
+    assert "opened-from-database=True, restored-from-cache=True" in annotated
     assert "predate this run" in annotated
 
     # An unreadable count keeps the line and says so, rather than rendering a
@@ -458,7 +458,7 @@ def test_target_info_text_renders_existing_annotations():
     unreadable = _render_target_info_text_with_annotations({
         "selector": "shared.bndb", "existing_annotations": {
             "comments": "many", "function_comments": 3, "user_symbols": 12,
-            "analysis_cache_restored": True,
+            "opened_from_database": True,
         },
     })
     assert "comments=?, function-docs=3, user-symbols=12" in unreadable
@@ -467,7 +467,7 @@ def test_target_info_text_renders_existing_annotations():
     unavailable = _render_target_info_text_with_annotations({
         "selector": "shared.bndb", "existing_annotations": {
             "unavailable": "annotation counts unavailable: view is dead",
-            "analysis_cache_restored": True,
+            "opened_from_database": True,
         },
     })
     assert "existing annotations: unavailable" in unavailable
@@ -488,16 +488,18 @@ def test_text_faces_print_the_source_verified_verdict():
 
     def block(**extra):
         return {"comments": 1, "function_comments": 0, "user_symbols": 2,
-                "analysis_cache_restored": True, **extra}
+                "opened_from_database": True, "restored_from_cache": False, **extra}
 
     for verdict, printed in ((True, "true"), (False, "false"), (None, "unknown")):
         info = _render_target_info_text_with_annotations({
             "selector": "shared.bndb", "existing_annotations": block(source_verified=verdict)})
-        assert f"cache-restored=True, source-verified={printed}" in info, info
+        assert ("opened-from-database=True, restored-from-cache=False, "
+                f"source-verified={printed}") in info, info
         orient = _render_orient_text({
             "target": {"selector": "shared.bndb"},
             "existing_annotations": block(source_verified=verdict)})
-        assert f"cache-restored=True, source-verified={printed}" in orient, orient
+        assert ("opened-from-database=True, restored-from-cache=False, "
+                f"source-verified={printed}") in orient, orient
 
     legacy = _render_target_info_text_with_annotations({
         "selector": "shared.bndb", "existing_annotations": block()})

@@ -1200,12 +1200,12 @@ def test_send_request_unparseable_reply_is_attributed_to_json_not_encoding(tmp_p
     assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
 
 
-def test_send_request_truncated_reply_from_a_dead_bridge_blames_the_crash(tmp_path, monkeypatch):
+def test_send_request_truncated_reply_from_a_dead_bridge_names_the_dead_process(tmp_path, monkeypatch):
     # #595: a bridge that dies mid-write closes cleanly -- recv() returns b""
     # and raises nothing -- so the mid-response OSError guard cannot fire and
     # the truncated bytes reach json.loads. The old message said "returned
     # invalid JSON", sending the reader after a protocol bug. It must name the
-    # dead process instead.
+    # dead process instead -- as observed, with no cause (#1035 round 4).
     import bn.transport as transport
 
     instance = _make_instance(tmp_path)
@@ -1218,19 +1218,16 @@ def test_send_request_truncated_reply_from_a_dead_bridge_blames_the_crash(tmp_pa
         transport._send_request_to_instance(instance, "ping", timeout=5.0)
     message = str(excinfo.value)
     assert "no longer running" in message
-    assert "truncated by a crash" in message
-    assert "not a protocol error" in message
+    assert "reason it closed the connection is unknown" in message
     assert f"after {len(truncated)} bytes" in message
-    # Discriminating: the diagnosis must not still read as a malformed-protocol
-    # claim, which is the whole defect.
     assert "invalid JSON" not in message
     assert "still running" not in message
+    assert "crash" not in message
 
 
-def test_send_request_unparseable_reply_from_a_live_bridge_blames_version_skew(tmp_path, monkeypatch):
-    # #595 negative control: the same parse failure from a process that IS
-    # alive is a genuinely malformed reply, and must not be misreported as a
-    # crash. Liveness is the only discriminator, so both arms need coverage.
+def test_send_request_unparseable_reply_from_a_live_bridge_guesses_no_cause(tmp_path, monkeypatch):
+    # #595 negative control: a live process is not called dead. #1035 round 4:
+    # nor is a version mismatch guessed -- nothing measured one.
     import bn.transport as transport
 
     instance = _make_instance(tmp_path)
@@ -1242,9 +1239,9 @@ def test_send_request_unparseable_reply_from_a_live_bridge_blames_version_skew(t
         transport._send_request_to_instance(instance, "ping", timeout=5.0)
     message = str(excinfo.value)
     assert "still running" in message
-    assert "malformed" in message
-    assert "bn doctor" in message
-    assert "crash" not in message
+    assert "reason it closed the connection is unknown" in message
+    for guess in ("crash", "malformed", "older or newer", "bn doctor"):
+        assert guess not in message
 
 
 def _state_transitions_to_zombie(monkeypatch, transport):
@@ -1279,7 +1276,7 @@ def test_a_bridge_that_crashed_mid_reply_is_not_called_still_running_595(tmp_pat
         transport._send_request_to_instance(instance, "ping", timeout=5.0)
     message = str(excinfo.value)
     assert "no longer running" in message
-    assert "truncated by a crash" in message
+    assert "reason it closed the connection is unknown" in message
     assert "still running" not in message
     assert "bn doctor" not in message
 
@@ -2105,7 +2102,7 @@ def test_spawn_instance_starts_new_instance_when_other_instances_exist(monkeypat
     inst = spawn_instance("newid")
 
     assert inst.instance_id == "newid"
-    assert popen_calls[0]["cmd"] == ["bn-agent", "--instance-id", "newid"]
+    assert popen_calls[0]["cmd"] == ["bn-agent", "--instance-id=newid"]
 
 
 def test_spawn_instance_reports_exit_code_and_log_when_child_dies(monkeypatch, tmp_path):
@@ -4097,7 +4094,7 @@ def test_auto_spawn_never_picks_a_hidden_instance_id(tmp_path, monkeypatch):
     spawned: list[str] = []
 
     def fake_popen(cmd, **kwargs):
-        spawned.append(cmd[-1])
+        spawned.append(cmd[-1].removeprefix("--instance-id="))
         raise AssertionError("stop here: the chosen id is what matters")
 
     monkeypatch.setattr(transport.subprocess, "Popen", fake_popen)
