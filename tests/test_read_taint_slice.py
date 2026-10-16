@@ -4,7 +4,10 @@ from __future__ import annotations
 import shlex
 import types
 
+import pytest
 from _bridge_fakes import _load_bridge
+
+import bn.cli
 
 
 def _op(name):
@@ -286,16 +289,18 @@ def test_out_of_range_message_for_a_declared_variadic_callee_948(monkeypatch):
     assert "already declared variadic" not in rts._out_of_range_arg_msg(func, 1, 1)
 
 
-def test_out_of_range_hints_quote_function_locators(monkeypatch):
+@pytest.mark.parametrize("name", ["handle space$'symbol", "-th x"])
+def test_out_of_range_hints_quote_function_locators(monkeypatch, name):
+    """The printed `bn il` must parse back to the function, including a name
+    starting with `-`, which only works after `--` (#1033 item 7)."""
     rts = _load_bridge(monkeypatch).read_taint_slice
-    name = "handle space$'symbol"
     func = _func([], arg_regs=("x0", "x1", "x2", "x3"), name=name)
     for arg in (1, 4):
         msg = rts._out_of_range_arg_msg(func, arg, 1)
         command = msg.split("`bn ", 1)[1].split("`", 1)[0]
-        assert shlex.split("bn " + command) == [
-            "bn", "il", name, "--view", "llil", "--ssa",
-        ]
+        parsed = bn.cli.build_parser().parse_args(shlex.split(command))
+        assert (parsed._command_path, parsed.identifier, parsed.view, parsed.ssa) == (
+            ("il",), name, "llil", True)
 
 
 def test_truncation_note_prose_when_indirect_call_unresolvable(monkeypatch):
@@ -384,7 +389,11 @@ def test_backward_slice_result_includes_frontiers(monkeypatch):
     # End-to-end: `_backward_slice` result carries a top-level `frontiers` roll-up
     # derived from the trace's terminal steps (#552).
     from _bridge_fakes import (
-        _FakeBV, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn, _FakeSSAVariable,
+        _FakeBV,
+        _FakeFunction,
+        _FakeMLILFunction,
+        _FakeMLILInsn,
+        _FakeSSAVariable,
     )
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -484,7 +493,11 @@ def test_stack_passed_parameter_frontier_has_no_register_959(monkeypatch):
 def test_backward_slice_assumptions_nonempty_when_truncated(monkeypatch):
     # #671: `assumptions` names the depth cap when the walk hits max_depth.
     from _bridge_fakes import (
-        _FakeBV, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn, _FakeSSAVariable,
+        _FakeBV,
+        _FakeFunction,
+        _FakeMLILFunction,
+        _FakeMLILInsn,
+        _FakeSSAVariable,
     )
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -514,7 +527,7 @@ def test_intra_mode_out_param_fill_not_mislabeled_undefined(monkeypatch):
     # #672: a value that bottoms out at a local whose address was passed into
     # a call must be labeled `out_param_not_followed` (naming the callee) in
     # INTRA mode too, not the misleading `undefined_or_global`.
-    from _bridge_fakes import _FakeSSAVariable, _FakeSSAFunction
+    from _bridge_fakes import _FakeSSAFunction, _FakeSSAVariable
     rts = _load_bridge(monkeypatch).read_taint_slice
 
     local_var = object()  # sentinel local; no `identifier`, hashable by identity
@@ -538,7 +551,7 @@ def test_intra_mode_out_param_fill_not_mislabeled_undefined(monkeypatch):
 
 def test_interprocedural_mode_out_param_fill_reason_unchanged(monkeypatch):
     # Interprocedural mode keeps its existing, distinctly-named reason.
-    from _bridge_fakes import _FakeSSAVariable, _FakeSSAFunction
+    from _bridge_fakes import _FakeSSAFunction, _FakeSSAVariable
     rts = _load_bridge(monkeypatch).read_taint_slice
 
     local_var = object()  # sentinel local; hashable by identity
@@ -561,7 +574,11 @@ def test_backward_slice_assumptions_nonempty_when_ip_depth_exhausted(monkeypatch
     # #671 (round-2): `assumptions` must name the `--ip-depth` cap, not just
     # `--max-depth`, when a crossable call boundary is stopped by the budget.
     from _bridge_fakes import (
-        _FakeBV, _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn,
+        _FakeBV,
+        _FakeConstPtr,
+        _FakeFunction,
+        _FakeMLILFunction,
+        _FakeMLILInsn,
         _FakeSSAVariable,
     )
     bridge = _load_bridge(monkeypatch)
@@ -618,7 +635,11 @@ def test_build_backward_trace_call_depth_guard_marks_boundary_not_dangling_cross
     # _MAX_CALL_DEPTH` as a PRE-condition, so the boundary itself is marked
     # `call_depth_exhausted` instead.
     from _bridge_fakes import (
-        _FakeBV, _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn,
+        _FakeBV,
+        _FakeConstPtr,
+        _FakeFunction,
+        _FakeMLILFunction,
+        _FakeMLILInsn,
         _FakeSSAVariable,
     )
     bridge = _load_bridge(monkeypatch)
@@ -700,8 +721,13 @@ def test_output_pointer_hint_names_callee_not_param_name(monkeypatch):
     # callee, not the callee's PARAMETER name -- the same confusion the header
     # fix closes, in the one remaining internal consumer of `arg_label["name"]`.
     import types as _types
+
     from _bridge_fakes import (
-        _FakeBV, _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn,
+        _FakeBV,
+        _FakeConstPtr,
+        _FakeFunction,
+        _FakeMLILFunction,
+        _FakeMLILInsn,
         _FakeSSAVariable,
     )
     bridge = _load_bridge(monkeypatch)
@@ -737,8 +763,13 @@ def test_backward_slice_states_the_callee_structurally_755(monkeypatch):
     resolvable callee" from "this bridge never computed one" -- the ambiguity that
     let two different calls in one function look identical."""
     import types as _types
+
     from _bridge_fakes import (
-        _FakeBV, _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn,
+        _FakeBV,
+        _FakeConstPtr,
+        _FakeFunction,
+        _FakeMLILFunction,
+        _FakeMLILInsn,
         _FakeSSAVariable,
     )
     bridge = _load_bridge(monkeypatch)
@@ -771,7 +802,11 @@ def test_backward_slice_assumptions_nonempty_for_unfollowed_out_param(monkeypatc
     # `_trace_assumptions`'s out-param branch (read_taint_slice.py:965-972),
     # which the direct `_build_backward_trace` tests never reach.
     from _bridge_fakes import (
-        _FakeBV, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn, _FakeSSAVariable,
+        _FakeBV,
+        _FakeFunction,
+        _FakeMLILFunction,
+        _FakeMLILInsn,
+        _FakeSSAVariable,
     )
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

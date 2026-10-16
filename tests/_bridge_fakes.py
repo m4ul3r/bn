@@ -877,7 +877,7 @@ class _FakeBV:
                 return hit
         return self.types.get(str(name))
 
-    def parse_type_string(self, text):
+    def parse_type_string(self, text, **_):
         # BN returns (Type, QualifiedName): the type carries NO declarator name,
         # which is handed back separately (and is empty for an anonymous
         # prototype). Function.type's string branch relies on exactly this.
@@ -1323,12 +1323,30 @@ def _install_fake_pseudo_c(monkeypatch, bridge, func, batches):
 
     `batches` is a list of line-batches; each line is an (address, text) pair,
     mirroring how a LinearViewCursor returns LinearDisassemblyLine objects.
+    *text* is either a string -- tokenised as BN does a plain line: code, then
+    a `CommentToken` from its first `//` -- or a list of (token type, text)
+    pairs when a test needs exact tokens (a literal holding `//`).
     """
+
+    class _FakeToken:
+        def __init__(self, kind, text):
+            self.type = types.SimpleNamespace(name=kind)
+            self._text = text
+
+        def __str__(self):
+            return self._text
 
     class _FakeContents:
         def __init__(self, address, text):
             self.address = address
-            self._text = text
+            if isinstance(text, list):
+                self.tokens = [_FakeToken(kind, part) for kind, part in text]
+            else:
+                code, sep, comment = text.partition("//")
+                self.tokens = [_FakeToken("TextToken", code)]
+                if sep:
+                    self.tokens.append(_FakeToken("CommentToken", sep + comment))
+            self._text = "".join(str(t) for t in self.tokens)
 
         def __str__(self):
             return self._text
@@ -1903,7 +1921,7 @@ def _struct_set_instance(monkeypatch, occupied_offsets):
         members=[_FakeStructMember(off, name) for off, name in occupied_offsets])
 
     class _BV:
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             return _FakeType("int32_t"), None
 
         def get_type_by_name(self, n):

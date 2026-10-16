@@ -1,0 +1,40 @@
+{
+  "description": "A store through a narrowed slot address is not a store to the full slot: truncated_slot's strcpy is a may-writer and the slice is incomplete; full_slot stays complete. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline",
+    "-fno-builtin"
+  ],
+  "backward": [
+    {
+      "function": "truncated_slot",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "full_slot",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": true
+    }
+  ]
+}

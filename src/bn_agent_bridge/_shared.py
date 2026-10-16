@@ -79,19 +79,23 @@ def _json_response(
 # left for a populated read to surface (#694 item 9). A zero-hit page is
 # EXACTLY the case where there is no row to infer the schema from, so leaving
 # an optional key out here means the one time in-band schema discovery is the
-# only source of truth, it lies.
+# only source of truth, it lies. Such a key is ALSO named in
+# `_OPTIONAL_ROW_FIELDS` with the condition that sets it (#1037 item 3).
 _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
     "functions": (
         "address", "name", "raw_name", "display_name", "size", "size_known",
         "imported", "auto_named", "basic_block_count",
     ),
     "strings": (
-        "address", "value", "chars", "length", "type",
-        "format_directives", "directive_count", "code_refs",
+        "address", "value", "chars", "length", "type", "section",
+        "format_directives", "directive_count", "code_ref_count",
+        "code_ref_note", "data_ref_count", "data_ref_note",
+        "xref_function_count", "xref_functions",
     ),
     "imports": (
         "address", "name", "raw_name", "kind", "library", "namespace",
-        "provenance",
+        "library_source", "library_note", "provenance",
+        "code_ref_count", "caller_count", "callers", "callers_note",
     ),
     "exports": (
         "address", "name", "raw_name", "display_name", "kind", "binding",
@@ -112,20 +116,77 @@ _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
         "previous_instructions", "next_instructions", "disasm_context_reason",
         "hlil_statement", "hlil_statement_reason", "pre_branch_condition",
         "callee_variadic", "call_index", "within_query", "decompile_excerpt",
-        "also_in",
+        "also_in", "arity",
     ),
 }
 
+# #1037 item 3: the declared keys a row carries only under a condition, with
+# that condition. `row_fields` used to list them beside the keys every row
+# carries, with no marker, so an agent read `code_refs` as `None` on every row
+# of a plain `strings` pull (and nearly concluded nothing referenced any string)
+# or hit a `KeyError` on `provenance`. Now `row_fields` names only keys EVERY
+# row of the page carries, and these go to `row_fields_optional`.
+_OPTIONAL_ROW_FIELDS: dict[str, dict[str, str]] = {
+    "strings": {
+        "format_directives": "--probable-format-strings",
+        "directive_count": "--probable-format-strings",
+        "code_ref_count": "--with-xrefs or --probable-format-strings",
+        "code_ref_note": "--with-xrefs or --probable-format-strings, when the code "
+                         "refs could not be read (code_ref_count is null)",
+        "data_ref_count": "--with-xrefs",
+        "data_ref_note": "--with-xrefs, when the data refs could not be read",
+        "xref_function_count": "--with-xrefs",
+        "xref_functions": "--with-xrefs",
+    },
+    "imports": {
+        "library_source": "rows whose library is attributed",
+        "library_note": "null-library imports of a target with DT_NEEDED: why "
+                        "library is null",
+        "provenance": "imports recovered from a relocation with no import symbol",
+        "code_ref_count": "--with-callers",
+        "caller_count": "--with-callers",
+        "callers": "--with-callers",
+        "callers_note": "--with-callers, when the code refs could not be read",
+    },
+    "sections": {
+        "readable": "sections backed by a segment",
+        "writable": "sections backed by a segment",
+        "executable": "sections backed by a segment",
+        "writable_executable": "sections backed by a segment",
+        "permission_source": "sections backed by a segment",
+    },
+    "xrefs": {
+        "function_pointer": "data refs found by the function-pointer scan",
+        "thumb_pointer": "Thumb-tagged function-pointer scan hits",
+    },
+    "callsites": {
+        "callee_variadic": "variadic callees",
+        "decompile_excerpt": "rows whose HLIL statement is null",
+    },
+}
+
+# Condition named for a key some rows of a populated page carry and others do
+# not, when no declaration says why.
+_OBSERVED_OPTIONAL = "present on some rows of this page only"
+
 
 def _annotate_row_fields(result: Any) -> Any:
-    """Attach `row_fields` to a collection envelope, in place.
+    """Attach `row_fields` (and `row_fields_optional`) to a collection envelope.
 
     Applied once at the dispatch boundary so every collection read -- current and
     future, CLI and native -- carries the hint without a second catalog for the
-    CLI or the kernel to re-declare. Declared keys lead (a stable documented
-    order), then any key an actual row carries, so an undeclared `kind` still
-    self-describes from its rows. Non-collection results are returned untouched:
-    a row hint on `decompile` text would be a lie.
+    CLI or the kernel to re-declare. Non-collection results are returned
+    untouched: a row hint on `decompile` text would be a lie.
+
+    `row_fields` names keys EVERY row of the page carries, so `row[f]` cannot
+    raise for any of them (#1037 item 3). A populated page derives that from its
+    own rows -- declared order first, then any other key -- so the claim is a
+    check of the rows actually returned, not a prediction. An empty page has no
+    rows to check, so it falls back to the declaration minus its conditional
+    keys. `row_fields_optional` maps every other key the kind can carry to the
+    condition that sets it: the declared conditional keys, plus any key that a
+    populated page carries on some rows and not others. It is omitted when
+    there is none.
     """
     if not isinstance(result, dict) or "row_fields" in result:
         return result
@@ -133,18 +194,41 @@ def _annotate_row_fields(result: Any) -> Any:
     items = result.get("items")
     if not isinstance(kind, str) or not isinstance(items, list):
         return result
-    fields = list(_DECLARED_ROW_FIELDS.get(kind, ()))
-    seen = set(fields)
-    for row in items:
-        if not isinstance(row, dict):
-            # Not a row collection (e.g. a list of strings): no field hint.
-            return result
-        for key in row:
-            if key not in seen:
-                seen.add(key)
-                fields.append(key)
-    if fields:
+    declared = list(_DECLARED_ROW_FIELDS.get(kind, ()))
+    conditions = dict(_OPTIONAL_ROW_FIELDS.get(kind, {}))
+    if not items:
+        fields = [key for key in declared if key not in conditions]
+        optional = {key: conditions[key] for key in declared if key in conditions}
+    else:
+        seen = list(declared)
+        known = set(seen)
+        counts: dict[str, int] = {}
+        for row in items:
+            if not isinstance(row, dict):
+                # Not a row collection (e.g. a list of strings): no field hint.
+                return result
+            for key in row:
+                counts[key] = counts.get(key, 0) + 1
+                if key not in known:
+                    known.add(key)
+                    seen.append(key)
+        fields = [key for key in seen
+                  if counts.get(key) == len(items) and key not in conditions]
+        # A declared conditional key stays optional even when every row of
+        # THIS page happens to carry it: a one-row probe (`limit=0`) or a page
+        # of relocation-recovered imports would otherwise promise it on rows
+        # the next page does not have. A declared key that is neither
+        # conditional nor on any row contradicts the page, so it is not
+        # claimed at all.
+        optional = {
+            key: conditions.get(key, _OBSERVED_OPTIONAL)
+            for key in seen
+            if key not in fields and (key in conditions or key in counts)
+        }
+    if fields or optional:
         result["row_fields"] = fields
+    if optional:
+        result["row_fields_optional"] = optional
     return result
 
 
@@ -496,10 +580,104 @@ def _normalize_prototype(proto: str) -> str:
     collapses whitespace. Without this, a valid edit on a function BN tags
     ``__pure`` (common on accessors) reads back as a textual mismatch and is
     reported ``verification_failed`` + reverted, even though the requested type
-    landed (#199)."""
+    landed (#199). A requested ``__noreturn`` change is NOT judged here: the
+    prototype verifier checks it on its own, against BN's ``can_return`` (#966)."""
     stripped = _CONVENTION_RE.sub("", proto)
     stripped = _ATTRIBUTE_RE.sub("", stripped)
     return " ".join(stripped.split())
+
+
+def _split_qualified_name(name: str) -> list[str]:
+    """Split a ``::``-qualified C++ name into its components, splitting ONLY at
+    bracket depth 0 so template arguments are not torn apart -- e.g.
+    ``__alloc_traits<std::allocator<char> >::pointer`` ->
+    ``['__alloc_traits<std::allocator<char> >', 'pointer']``, not three pieces
+    (#200)."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        elif depth <= 0 and name[i:i + 2] == "::":
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def _lookup_named_type(bv, base: str):
+    """Resolve a (possibly ``::``-qualified) type name to a BN Type, or None.
+
+    BN keys namespaced types by a multi-component ``QualifiedName``, NOT the raw
+    ``::``-joined string -- ``get_type_by_name("ns::Foo")`` coerces to a SINGLE
+    component and misses a type registered as ``['ns','Foo']``. So try the raw
+    string first (flat / single-component names), then a depth-aware
+    ``QualifiedName`` split for the namespaced case (#200, verified live on real
+    recovered C++ types)."""
+    try:
+        named = bv.get_type_by_name(base)
+    except Exception:
+        named = None
+    if named is not None:
+        return named
+    if "::" not in base:
+        return None
+    try:
+        return bv.get_type_by_name(bn.QualifiedName(_split_qualified_name(base)))
+    except Exception:
+        return None
+
+
+def _type_class_name(t: Any) -> str:
+    """String name of a BN ``Type.type_class`` (enum on real BN, plain string on
+    the unit fakes), so callers can duck-type without importing ``TypeClass``."""
+    tc = getattr(t, "type_class", None)
+    return str(getattr(tc, "name", None) or (str(tc) if tc is not None else ""))
+
+
+def _named_type_references(type_obj) -> list[str]:
+    """Names of the named types *type_obj* refers to (through pointers, arrays,
+    members, parameters and return values), in first-seen order. A reference is
+    a leaf: the referenced type's own references are not followed.
+
+    No visited set: a type tree can only loop back through a named reference,
+    which is a leaf here, so the walk is finite without one. The first version
+    tracked visited wrappers by `id()`; BN hands out temporary wrappers whose
+    ids Python reuses, so later members were skipped and only the first of
+    several pointer-reached library types was found (#993 review round 2)."""
+    names: list[str] = []
+    stack = [type_obj]
+    while stack:
+        current = stack.pop()
+        if current is None:
+            continue
+        if "NamedTypeReference" in _type_class_name(current):
+            name = str(getattr(current, "name", "") or "")
+            if name and name not in names:
+                names.append(name)
+            continue
+        children = []
+        for attr in ("target", "element_type", "return_value"):
+            try:
+                children.append(getattr(current, attr, None))
+            except Exception:
+                continue
+        for attr in ("members", "parameters"):
+            try:
+                children.extend(getattr(item, "type", None) for item in getattr(current, attr, None) or [])
+            except Exception:
+                continue
+        stack.extend(reversed(children))
+    return names
 
 
 def _parse_address(value: Any) -> int:
@@ -514,6 +692,26 @@ def _parse_address(value: Any) -> int:
         raise ValueError(
             f"{value!r} is not a valid address; expected a decimal or 0x-prefixed hex value"
         ) from None
+
+
+# The two auto-name spellings BN renders for an address with no symbol of its
+# own: `data_<hex>` for an unnamed data variable and `sub_<hex>` for a function
+# (#1042 item 1). Both spell the address they sit at. `j_sub_<hex>` is NOT one:
+# BN names a thunk after the function it JUMPS to, so the hex is the target's
+# address, not the thunk's -- resolving it to the address it spells would land
+# on the wrong function.
+_PLACEHOLDER_NAME_RE = re.compile(r"(data|sub)_([0-9a-fA-F]+)")
+
+
+def _placeholder_address(value: Any) -> tuple[str, int] | None:
+    """``(prefix, address)`` for a rendered ``data_<hex>``/``sub_<hex>`` name,
+    else None. Only the SPELLING is read here; whether a symbol already owns the
+    name, and whether the address is real, is the caller's check -- a name a
+    symbol carries always means that symbol."""
+    match = _PLACEHOLDER_NAME_RE.fullmatch(str(value).strip())
+    if match is None:
+        return None
+    return match.group(1), int(match.group(2), 16)
 
 
 def _artifact_summary(value: Any) -> dict[str, Any]:

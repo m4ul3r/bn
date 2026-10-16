@@ -1,0 +1,63 @@
+{
+  "description": "stash_must_paths at -O1; ptr_copy_load's allocation folds away and is not pinned. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-O1",
+    "-fno-inline"
+  ],
+  "backward": [
+    {
+      "function": "dowhile_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "dowhile_stash_strcpy",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "branch_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "escape_after_loop",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "call"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    }
+  ]
+}

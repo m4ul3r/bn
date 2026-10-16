@@ -1,0 +1,108 @@
+{
+  "description": "A call handed &buf starts an escape epoch: a pointer it planted is a may-alias, so the strcpy through it is a frontier. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline",
+    "-fno-builtin",
+    "-U_FORTIFY_SOURCE",
+    "-std=c11"
+  ],
+  "backward": [
+    {
+      "function": "epoch_strtok_r",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "noescape_strtok_r",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "late_load_strtok_r",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "epoch_strtol",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "noescape_strtol",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "epoch_strtol_local",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ],
+      "complete_slice": false
+    }
+  ]
+}

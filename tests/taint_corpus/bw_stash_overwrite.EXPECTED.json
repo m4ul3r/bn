@@ -1,0 +1,32 @@
+{
+  "description": "memcpy over the stash slot forgets the remembered &buf: strcpy through the reload is an opaque frontier, never a named writer or the getenv source of buf. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline",
+    "-fno-builtin"
+  ],
+  "backward": [
+    {
+      "function": "overwritten_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ],
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ],
+      "complete_slice": false
+    }
+  ]
+}

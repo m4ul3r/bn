@@ -108,7 +108,9 @@ def _require_row_fields(op: str, page: dict[str, Any]) -> None:
     the schema, not the rows" request is a one-row PROBE at the wire level.
     The probed row proves the schema; without a well-formed `row_fields` the
     caller has no way to know what columns to expect once it does ask for
-    real rows.
+    real rows. `row_fields` names the keys every row carries; the conditional
+    ones are in `row_fields_optional` (`{field: condition}`, #1037 item 3),
+    which is optional but must be well-formed when present.
     """
     row_fields = page.get("row_fields")
     if not isinstance(row_fields, list) or not all(
@@ -118,6 +120,55 @@ def _require_row_fields(op: str, page: dict[str, Any]) -> None:
             f"malformed {op} page: a limit=0 metadata page must publish "
             f"row_fields as a list of strings (got {row_fields!r})"
         )
+    optional = page.get("row_fields_optional")
+    if "row_fields_optional" in page and not (
+        isinstance(optional, dict)
+        and all(isinstance(k, str) and isinstance(v, str) for k, v in optional.items())
+    ):
+        raise BridgeError(
+            f"malformed {op} page: row_fields_optional must map field names to "
+            f"condition strings (got {optional!r})"
+        )
+
+
+# Condition named for a key some collected rows carry and others do not, when
+# no page declared why (mirrors the bridge's `_OBSERVED_OPTIONAL`).
+_OBSERVED_OPTIONAL = "present on some rows of this page only"
+
+
+def _restate_row_fields(aggregate: dict[str, Any], pages: list[dict[str, Any]],
+                        items: list[Any]) -> None:
+    """Make the collected envelope's `row_fields` true of EVERY collected row.
+
+    Each page's `row_fields` is checked against that page only, so the first
+    page's list -- which the aggregate copies -- can name a key a later page's
+    rows lack (#1037 item 3). Union what the pages declared, keep in
+    `row_fields` only the keys every collected row carries and no page called
+    conditional, and move the rest to `row_fields_optional`."""
+    if "row_fields" not in aggregate:
+        return
+    ordered: list[str] = []
+    optional: dict[str, str] = {}
+    for page in pages:
+        for field in page.get("row_fields") or []:
+            if isinstance(field, str) and field not in ordered:
+                ordered.append(field)
+        declared = page.get("row_fields_optional")
+        if isinstance(declared, dict):
+            for field, condition in declared.items():
+                if isinstance(field, str):
+                    optional.setdefault(field, str(condition))
+    rows = [row for row in items if isinstance(row, dict)]
+    fields = [field for field in ordered
+              if field not in optional and all(field in row for row in rows)]
+    for field in ordered:
+        if field not in fields and field not in optional and any(field in row for row in rows):
+            optional[field] = _OBSERVED_OPTIONAL
+    aggregate["row_fields"] = fields
+    if optional:
+        aggregate["row_fields_optional"] = optional
+    else:
+        aggregate.pop("row_fields_optional", None)
 
 
 class Client:
@@ -256,6 +307,7 @@ class Client:
         aggregate: dict[str, Any] | None = None
         bridge_has_more = False
         seen_total: Any = _UNSEEN
+        pages: list[dict[str, Any]] = []
         while True:
             remaining = None if limit is None else limit - len(items)
             request_limit = page_size if remaining is None else min(page_size, remaining)
@@ -298,6 +350,7 @@ class Client:
 
             if aggregate is None:
                 aggregate = dict(page)
+            pages.append(page)
             items.extend(page_items)
             offset += len(page_items)
 
@@ -311,6 +364,7 @@ class Client:
         aggregate["offset"] = initial_offset
         aggregate["returned"] = len(items)
         aggregate["total"] = seen_total
+        _restate_row_fields(aggregate, pages, items)
         # Callsites rescans from row zero through offset + limit on every page.
         # Its final coverage is cumulative, not additive or implied by has_more:
         # even a terminal page can have incomplete caller enumeration. Replace

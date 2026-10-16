@@ -1,0 +1,29 @@
+{
+  "description": "A .data.rel.ro table in a PIE linked without RELRO is in a writable segment, and a function writes its first entry: section semantics do not make the loaded entry immutable. Analyze only. -O2.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline",
+    "-fno-builtin",
+    "-U_FORTIFY_SOURCE",
+    "-fPIE",
+    "-pie",
+    "-Wl,-z,norelro"
+  ],
+  "backward": [
+    {
+      "function": "relocated",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "parameter"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    }
+  ]
+}

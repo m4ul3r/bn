@@ -346,7 +346,7 @@ def test_collect_zero_limit_empty_page_undeclared_kind_omits_row_fields(monkeypa
 def test_collect_zero_limit_empty_page_declared_kind_keeps_row_fields(monkeypatch):
     """A declared kind's row_fields tuple is populated even with zero rows, so
     the empty-probe path must still surface it."""
-    from bn_agent_bridge._shared import _annotate_row_fields, _DECLARED_ROW_FIELDS
+    from bn_agent_bridge._shared import _annotate_row_fields, _DECLARED_ROW_FIELDS, _OPTIONAL_ROW_FIELDS
 
     raw = {
         "kind": "sections",
@@ -358,7 +358,7 @@ def test_collect_zero_limit_empty_page_declared_kind_keeps_row_fields(monkeypatc
         "has_more": False,
     }
     page = _annotate_row_fields(dict(raw))
-    assert page["row_fields"] == list(_DECLARED_ROW_FIELDS["sections"])
+    assert page["row_fields"] == [f for f in _DECLARED_ROW_FIELDS["sections"] if f not in _OPTIONAL_ROW_FIELDS["sections"]]
 
     monkeypatch.setattr(
         client_module,
@@ -368,7 +368,7 @@ def test_collect_zero_limit_empty_page_declared_kind_keeps_row_fields(monkeypatc
 
     result = Client().collect("sections", limit=0)
 
-    assert result["row_fields"] == list(_DECLARED_ROW_FIELDS["sections"])
+    assert result["row_fields"] == [f for f in _DECLARED_ROW_FIELDS["sections"] if f not in _OPTIONAL_ROW_FIELDS["sections"]]
 
 
 @pytest.mark.parametrize(
@@ -832,3 +832,26 @@ def test_collect_accepts_a_capped_callsites_scan_completing_on_the_final_page(
 
     assert [item["id"] for item in aggregate["items"]] == [1, 2]
     assert aggregate["total"] == 2
+
+
+def test_collect_restates_row_fields_over_every_collected_page_1037(monkeypatch):
+    """#1037 item 3: each page's `row_fields` holds for that page only, and the
+    aggregate copied page one's. A key every row of page one carries but page
+    two lacks must not stay promised for the collected rows."""
+    from bn_agent_bridge._shared import _annotate_row_fields
+
+    rows = [{"name": "a", "start": 1, "hint": "x"}, {"name": "b", "start": 2}]
+
+    def reply(op, *, params, **kwargs):
+        start, size = params["offset"], params["limit"]
+        page = {"kind": "segments_demo", "items": rows[start:start + size], "offset": start,
+                "limit": size, "returned": len(rows[start:start + size]),
+                "has_more": start + size < len(rows), "total": len(rows)}
+        return {"result": _annotate_row_fields(page)}
+
+    monkeypatch.setattr(client_module, "send_request", reply)
+    result = Client(timeout=3).collect("segments_demo", page_size=1)
+
+    assert result["items"] == rows
+    assert result["row_fields"] == ["name", "start"]
+    assert result["row_fields_optional"] == {"hint": "present on some rows of this page only"}

@@ -1,0 +1,63 @@
+{
+  "description": "bw_wide_load at -O2: the lengths are sx.q([m + 0xc].d) operands of the sink's argument, and the 8-byte store at +8 covers them. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline"
+  ],
+  "backward": [
+    {
+      "function": "deser",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved"
+      ],
+      "forbid_origin_kinds": [
+        "call"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false,
+      "step_reasons_contain": [
+        "reaching store to field"
+      ]
+    },
+    {
+      "function": "half_set",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "stored before this function ran"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "two_ptrs",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "address_of_local_unresolved",
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "cannot prove disjoint"
+      ],
+      "complete_slice": false
+    }
+  ]
+}

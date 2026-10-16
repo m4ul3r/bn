@@ -32,6 +32,7 @@ imports ``read_xrefs`` but ``read_xrefs`` NEVER imports this module.
 """
 from __future__ import annotations
 
+import bisect
 import re
 from typing import Any
 
@@ -41,6 +42,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
     bn = None  # type: ignore[assignment]
 
 from . import il_format
+from . import read_listing
 from . import read_xrefs
 from ._shared import OperationFailure, _parse_address, _validate_count
 
@@ -1314,7 +1316,8 @@ _STRONG_DECODE_DEPTH = 8
 
 def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
                     max_tables: int = 64, max_candidates: int = 128,
-                    max_scan_bytes: int = 16_000_000) -> dict[str, Any]:
+                    max_scan_bytes: int = 16_000_000,
+                    hide_vtables: bool = False) -> dict[str, Any]:
     """#503: enumerate the HIDDEN code surface a passive `function list` misses -- code
     reachable through data, not direct calls. READ-ONLY: it reports addresses BN did not
     turn into functions, it does NOT create them (that stays the agent's separate write).
@@ -1332,7 +1335,12 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         run length -- the real code-vs-data signal on RISC firmware) and a ``code_likely``
         classification (aligned + a long clean run). Still candidates to CONFIRM with
         `disasm`, NOT asserted functions -- but ``code_likely`` is the high-confidence subset
-        to start with."""
+        to start with.
+
+    Each candidate table also says which defined ELF ``_ZTV``/``_ZTC`` objects
+    its entries lie in (``elf_vtables``, from the symbol's ``st_size`` only) and
+    how many lie outside every such object; ``hide_vtables`` drops the tables
+    lying wholly inside them (#1017)."""
     if table_min_run < 2:
         raise OperationFailure("invalid_request", "table-min-run must be >= 2")
     bv = ctx._resolve_view(selector)
@@ -1348,12 +1356,18 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
     img_lo = int(getattr(bv, "start", 0) or 0)
     img_hi = int(getattr(bv, "end", 0) or 0) or (img_lo + (1 << 48))
     warnings: list[str] = []
+    census = read_listing._elf_vtable_census(bv)
+    vtable_index = _VtableIndex(bv, read_listing._supported_vtable_objects(census))
+    vtable_tables_hidden = 0
+
+    def containing(addr: int) -> list[Any]:
+        try:
+            return list(bv.get_functions_containing(addr) or [])
+        except Exception:
+            return []
 
     def has_fn(addr: int) -> bool:
-        try:
-            return bool(bv.get_functions_containing(addr))
-        except Exception:
-            return False
+        return bool(containing(addr))
 
     def exec_target(addr: int) -> bool:
         try:
@@ -1508,28 +1522,70 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         run: list[int] = []
 
         def flush(run_addr: int, run_vals: list[int]) -> None:
-            nonlocal tables_over_cap
+            nonlocal tables_over_cap, vtable_tables_hidden
             if len(run_vals) < table_min_run:
                 return
+            labelled = census["status"] == "ok"
+            if hide_vtables and labelled:
+                # Coverage only (no label lookups): enough to decide.
+                cover = _run_vtable_labels(vtable_index, run_addr, len(run_vals), ps,
+                                           detail=False)
+                if cover["entries_outside_elf_vtables"] == 0:
+                    # Hidden from the table list only: a slot BN has no function
+                    # for is still a missing-function candidate below.
+                    vtable_tables_hidden += 1
+                    for v in run_vals:
+                        note_missing(v, f"table:{hex(run_addr)}")
+                    return
             if len(candidate_tables) >= max_tables:
                 tables_over_cap += 1   # #653.5: disclose the total, not a silent prefix
                 return
+            # #1046 review: labels only for shown tables.
+            labels = (_run_vtable_labels(vtable_index, run_addr, len(run_vals), ps)
+                      if labelled else None)
             # Normalize each pointer before the miss count so a Thumb pointer
             # (stored as addr|1) is checked at its real even entry -- matching what
             # note_missing already does (#530). Without this, every Thumb slot counts
             # as missing (over-reports missing, under-reports resolved) on ARM/Thumb.
-            miss = sum(1 for v in run_vals if not has_fn(norm_ptr(v)))
+            #
+            # #1017 item 3: BN's function list says whether a resolved slot is a
+            # function ENTRY or an address inside a function body (the labels of a
+            # computed goto all sit inside one dispatcher). Count both, so
+            # `resolved_functions` cannot be read as that many entries.
+            miss = entries = interior_slots = 0
+            interior: dict[int, str] = {}
+            for v in run_vals:
+                norm = norm_ptr(v)
+                fns = containing(norm)
+                if not fns:
+                    miss += 1
+                    continue
+                starts = {_as_int(getattr(fn, "start", None)) for fn in fns}
+                if norm in starts:
+                    entries += 1
+                elif -1 not in starts:
+                    interior_slots += 1
+                    for fn in fns:
+                        interior.setdefault(int(fn.start), str(getattr(fn, "name", "") or "?"))
             for v in run_vals:
                 note_missing(v, f"table:{hex(run_addr)}")
-            candidate_tables.append({
+            row = {
                 "address": hex(run_addr),
                 "section": str(name),
                 "entries": len(run_vals),        # the TRUE slot count
                 "resolved_functions": len(run_vals) - miss,
                 "missing_functions": miss,
+                "resolved_entries": entries,
+                "resolved_interior": interior_slots,
+                "interior_functions": [{"address": hex(a), "name": n}
+                                       for a, n in sorted(interior.items())[:4]],
+                "interior_functions_total": len(interior),
                 "slots": [hex(v) for v in run_vals[:32]],
                 "slots_truncated": len(run_vals) > 32,   # `slots` shows the first 32
-            })
+            }
+            if labels is not None:
+                row.update(labels)
+            candidate_tables.append(row)
 
         run_start = start
         off = 0
@@ -1562,6 +1618,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
     # `adrp x0, page; add x0, x0, #off` pair starts from), measured as the one
     # false lead on an aarch64 libstdc++.
     code_ref_scan = _CodeRefScan(bv, has_fn, exec_target, max_probes=_MAX_CODE_REF_PROBES)
+    stores_by_function: dict[Any, list[tuple[int, int, str]]] = {}
     for addr, sites in code_ref_scan:
         if norm_ptr(addr) in missing:
             continue        # already nominated by an init/table pointer: keep that lead
@@ -1574,6 +1631,21 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             row["referenced_from"] = [{"address": hex(site), "function": fn}
                                       for site, fn in sites[:_MAX_CODE_REF_SITES]]
             row["referenced_from_total"] = len(sites)
+            # #1017 (code_ref comment): where the referencing functions store
+            # the address itself -- BN's own MLIL `[dest] = <address>`. A
+            # fact about the store, not a guess at what the field is.
+            stored = []
+            for func in code_ref_scan.site_functions(addr, sites[:_MAX_CODE_REF_SITES]):
+                key = _function_key(func)
+                if key not in stores_by_function:
+                    stores_by_function[key] = _constant_stores(func)
+                name = str(getattr(func, "name", "") or "?")
+                stored.extend({"function": name, "address": hex(at), "destination": dest}
+                              for at, value, dest in stores_by_function[key]
+                              if value in (addr, norm_ptr(addr)))
+            if stored:
+                row["stored_to"] = stored[:_MAX_CODE_REF_SITES]
+                row["stored_to_total"] = len(stored)
     if code_ref_scan.capped:
         warnings.append(
             f"code-referenced address scan stopped after {_MAX_CODE_REF_PROBES} data "
@@ -1590,6 +1662,9 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             f"data scan capped at {max_scan_bytes} bytes; regions (or their tails) beyond "
             "the budget were not scanned -- on a monolithic image the pointer tables often "
             "sit in the TAIL, so raise --max-scan-bytes to cover the whole image")
+    vtable_labels = read_listing._census_summary(census)
+    if hide_vtables and not vtable_index.objects:
+        warnings.append(f"--hide-vtables hid nothing: {vtable_labels['reason']}")
     tables_total = len(candidate_tables) + tables_over_cap
     candidates_total = len(missing) + len(missing_over_cap)
     if len(candidate_tables) >= max_tables:
@@ -1606,11 +1681,12 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             "over-reports here -- lean on `aligned` and each table's resolved/missing ratio, and "
             "confirm with disasm")
 
-    return {
+    candidates = sorted(missing.values(), key=lambda m: m["address"])
+    result: dict[str, Any] = {
         "kind": "hidden_surface",
         "init_sections": init_sections,
         "candidate_tables": candidate_tables,
-        "missing_function_candidates": sorted(missing.values(), key=lambda m: m["address"]),
+        "missing_function_candidates": candidates,
         "summary": {
             "init_sections": len(init_sections),
             "candidate_tables": len(candidate_tables),
@@ -1620,9 +1696,22 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             "missing_function_candidates_total": candidates_total,
             # the high-confidence subset (aligned + long clean decode run) -- start here.
             "code_likely_candidates": sum(1 for m in missing.values() if m["code_likely"]),
+            # #1017: the ELF vtable census behind each table's `elf_vtables`.
+            "vtable_labels": vtable_labels,
+            **({"vtable_tables_hidden": vtable_tables_hidden} if hide_vtables else {}),
         },
         "warnings": warnings,
     }
+    if candidates:
+        # #1033: the verify step as a command, for the candidate listed first
+        # (code-likely ones lead). A prose field, so the CLI binds it to the
+        # invocation's -i/-t routing before it is printed.
+        first = next((m for m in candidates if m["code_likely"]), candidates[0])["address"]
+        result["next_action"] = (
+            f"verify with `bn disasm {first} --linear 16` (the first candidate; use the "
+            "same form for the others -- a candidate lies outside every function, so "
+            "plain `disasm <addr>` refuses it), then `function create`")
+    return result
 
 
 def _code_regions(bv) -> list[tuple[int, int]]:
@@ -1728,6 +1817,13 @@ _MAX_CODE_REF_PROBES = 20_000
 _MAX_CODE_REF_SITES = 4
 
 
+def _function_key(func) -> Any:
+    """A BN function's identity: its start. BN hands out a fresh Python wrapper
+    per reference, so neither ``id()`` nor ``==`` on wrappers dedupes them."""
+    start = getattr(func, "start", None)
+    return ("start", int(start)) if isinstance(start, int) else ("object", id(func))
+
+
 class _CodeRefScan:
     """#967: iterate ``(address, [(site, function name), ...])`` for every
     function-less, code-referenced address in a code region, sites sorted. After
@@ -1745,6 +1841,17 @@ class _CodeRefScan:
         self.capped = False
         self.region_walk_failures = 0
         self.code_ref_failures = 0
+        self._site_functions: dict[int, dict[int, Any]] = {}
+
+    def site_functions(self, addr: int, sites: list[tuple[int, str]]) -> list[Any]:
+        """The BN functions holding *sites* of *addr*, once each, in site order."""
+        by_site = self._site_functions.get(addr, {})
+        found: dict[Any, Any] = {}
+        for site, _name in sites:
+            func = by_site.get(site)
+            if func is not None:
+                found.setdefault(_function_key(func), func)
+        return list(found.values())
 
     def _data_var_starts(self, start: int, end: int):
         """Addresses of BN's data variables in ``[start, end)``, in order."""
@@ -1793,8 +1900,10 @@ class _CodeRefScan:
                     if page_aligned and read_xrefs._is_spurious_adrp_pagebase(bv, ref, addr):
                         continue
                     func = getattr(ref, "function", None)
-                    sites.append((int(getattr(ref, "address", 0) or 0),
-                                  str(getattr(func, "name", "") or "?")))
+                    site = int(getattr(ref, "address", 0) or 0)
+                    sites.append((site, str(getattr(func, "name", "") or "?")))
+                    if func is not None:
+                        self._site_functions.setdefault(addr, {}).setdefault(site, func)
                 if sites:
                     yield addr, sorted(sites)
 
@@ -1804,6 +1913,130 @@ def _as_int(v: Any) -> int:
         return int(str(v), 16) if isinstance(v, str) and v.lower().startswith("0x") else int(v)
     except (TypeError, ValueError):
         return -1
+
+
+def _constant_stores(func) -> list[tuple[int, int, str]]:
+    """``(address, value, "[destination]")`` for every MLIL store in *func* whose
+    stored value is a constant: BN's own `[arg1 + 0x10].q = 0x4008e0`. Empty
+    when BN has no MLIL for it."""
+    try:
+        instructions = list(func.mlil.instructions)
+    except Exception:
+        return []
+    stores = []
+    for ins in instructions:
+        op = _op(ins)
+        if op not in ("MLIL_STORE", "MLIL_STORE_STRUCT"):
+            continue
+        value = _vc_const(getattr(ins, "src", None))
+        if value is None:
+            continue
+        dest = getattr(ins, "dest", None)
+        if op == "MLIL_STORE_STRUCT":
+            offset = _as_int(getattr(ins, "offset", None))
+            where = f"[{dest} + {hex(offset)}]" if offset > 0 else f"[{dest}]"
+        else:
+            where = f"[{dest}]"
+        stores.append((_as_int(getattr(ins, "address", None)), value, where))
+    return stores
+
+
+class _VtableIndex:
+    """The census's sized ``_ZTV``/``_ZTC`` objects sorted by start, with a
+    segment tree of their ends, so the objects overlapping one pointer run are
+    found in O(log n) per object reported -- however the extents nest -- not
+    by a scan of every object (#1046 review). Labels are looked up once per
+    object."""
+
+    def __init__(self, bv, objects: list[dict[str, Any]]):
+        self.bv = bv
+        self.objects = sorted(objects, key=lambda o: (o["start"], o["raw_name"]))
+        self._starts = [o["start"] for o in self.objects]
+        size = 1
+        while size < len(self.objects):
+            size *= 2
+        self._leaves = size
+        # _tree[node] = the greatest end among the objects under that node.
+        self._tree = [-1] * (2 * size)
+        for k, obj in enumerate(self.objects):
+            self._tree[size + k] = obj["start"] + obj["size"]
+        for node in range(size - 1, 0, -1):
+            self._tree[node] = max(self._tree[2 * node], self._tree[2 * node + 1])
+        self._labels: dict[tuple[str, int], str] = {}
+
+    def overlapping(self, lo: int, hi: int) -> list[dict[str, Any]]:
+        """Objects with ``start < hi`` and ``start + size > lo``, by start:
+        among the objects starting before *hi*, descend only into subtrees
+        whose greatest end passes *lo*."""
+        limit = bisect.bisect_left(self._starts, hi)
+        found: list[dict[str, Any]] = []
+        if not limit:
+            return found
+        stack = [(1, 0, self._leaves)]
+        while stack:
+            node, first, last = stack.pop()
+            if first >= limit or self._tree[node] <= lo:
+                continue
+            if last - first == 1:
+                found.append(self.objects[first])
+                continue
+            middle = (first + last) // 2
+            # Right child first, so the stack yields left-to-right order.
+            stack.append((2 * node + 1, middle, last))
+            stack.append((2 * node, first, middle))
+        return found
+
+    def label(self, obj: dict[str, Any]) -> str:
+        key = (obj["raw_name"], obj["start"])
+        if key not in self._labels:
+            self._labels[key] = read_listing._vtable_object_label(self.bv, obj)
+        return self._labels[key]
+
+
+def _run_vtable_labels(index: _VtableIndex, run_addr: int, count: int, ptr: int, *,
+                       detail: bool = True) -> dict[str, Any]:
+    """#1017 item 1: the defined ELF ``_ZTV``/``_ZTC`` objects a pointer run's
+    entries lie in, by symbol ``st_size`` only, and how many entries lie outside
+    all of them. ``extends_past_elf_vtable`` flags a run whose last entry is past
+    the end of an object it started in: the scanner merged that vtable with
+    whatever follows it. No header or filler rule, so a registry record or
+    function table outside every object is never labelled. Without *detail*
+    only the coverage counts are computed (no label lookups), which is
+    all `--hide-vtables` needs to decide on a run that will not be shown."""
+    end = run_addr + count * ptr
+    spans: list[tuple[int, int]] = []
+    rows = []
+    for obj in index.overlapping(run_addr, end):
+        lo, hi = max(run_addr, obj["start"]), min(end, obj["start"] + obj["size"])
+        first = -(-(lo - run_addr) // ptr)
+        last = -(-(hi - run_addr) // ptr)
+        if first >= last:
+            continue
+        spans.append((first, last))
+        if not detail:
+            continue
+        first_entry = run_addr + first * ptr
+        rows.append({
+            "object": obj["raw_name"],
+            "label": index.label(obj),
+            "kind": obj["kind"],
+            "object_address": hex(obj["start"]),
+            "size": obj["size"],
+            "first_entry": hex(first_entry),
+            "entries_inside": last - first,
+        })
+    covered = 0
+    reach = 0
+    for first, last in sorted(spans):
+        first = max(first, reach)
+        if last > first:
+            covered += last - first
+            reach = last
+    return {
+        "elf_vtables": rows,
+        "entries_outside_elf_vtables": count - covered,
+        "extends_past_elf_vtable": bool(spans) and 0 < reach < count,
+    }
 
 
 def _section_name_at(bv, addr: int) -> str | None:

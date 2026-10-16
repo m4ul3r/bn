@@ -622,10 +622,22 @@ def backward_diagnostics(
         next_action = _truncation_hint(truncation_cause)
     elif unresolved_n:
         unresolved_leaves = [lf for lf in leaves or [] if lf.get("kind") in UNRESOLVED]
+        # The forward run is printed only for a buffer a leaf names together
+        # with its function, so it runs as printed (#1033 item 6); a global
+        # has no `var:` selector.
+        buffer_leaf = next((lf for lf in unresolved_leaves
+                            if lf.get("kind") == "address_of_local_unresolved"
+                            and isinstance(lf.get("buffer"), str) and lf.get("buffer")
+                            and isinstance(lf.get("function"), str) and not lf.get("global")),
+                           None)
         next_action = (
             "the walk bottomed out at an unresolved definition; inspect the frontier "
-            "leaves and argument consumption, seed inside the producing function, "
-            "or re-run `bn taint forward --source var:<buf>` on the buffer")
+            "leaves and argument consumption, or seed inside the producing function")
+        if buffer_leaf is not None:
+            source = shlex.quote(f"var:{buffer_leaf['buffer']}")
+            next_action += (
+                f", or re-run `bn taint forward -f {buffer_leaf['function']} "
+                f"--source {source}` on the buffer")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
                for lf in unresolved_leaves):
             next_action += (

@@ -1,0 +1,33 @@
+{
+  "description": "A loop-carried escape makes the helper that runs before it an opaque writer on the next trip; an indexed byte of a memset buffer is the buffer's contents (memset step) selected by the index parameter. Analyze only.",
+  "lang": "c",
+  "backward": [
+    {
+      "function": "escape_loop",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "helper"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "idx_pick",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "step_reasons_contain": [
+        "written by memset"
+      ],
+      "expect_crossed": "idx_pick"
+    }
+  ]
+}
