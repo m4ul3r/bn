@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import re
 import struct
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 
@@ -46,6 +47,7 @@ from ._shared import (
     is_imported_function,
     is_placeholder_symbol_name,
 )
+from .paths import cache_home
 from .bridge_state import (
     _opened_annotations,
     _quick_loaded_views,
@@ -1406,6 +1408,34 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     }
 
 
+# The counts `_opened_annotations` records for a database open (#973); the
+# record's other keys (its path, `written_by_this_bridge`) are not counts.
+OPENED_ANNOTATION_COUNTS = (
+    "comments", "function_comments", "analyst_symbols", "placeholder_symbols")
+
+
+def is_cache_database(path: Any) -> bool:
+    """Is *path* a database in bn's SHARED cache (``<cache>/bndb/``), the
+    directory every instance using one BN_CACHE_DIR reads and writes?"""
+    if not path:
+        return False
+    try:
+        return Path(path).resolve().parent == (cache_home() / "bndb").resolve()
+    except Exception:  # noqa: BLE001 - an unresolvable path is not a cache entry
+        return False
+
+
+def _database_flags(filename: str) -> dict[str, bool]:
+    """``opened_from_database`` (the view's file is a `.bndb`) and
+    ``restored_from_cache`` (that `.bndb` is an entry of the shared cache),
+    for a view whose open this bridge did not record (#1036 item 5)."""
+    opened = str(filename or "").endswith(".bndb")
+    return {
+        "opened_from_database": opened,
+        "restored_from_cache": opened and is_cache_database(filename),
+    }
+
+
 def _annotations_unavailable(exc: BaseException, *, filename: str = "") -> dict[str, Any]:
     """The degrade marker for annotation counts nobody could read (#733 F2/#793).
 
@@ -1418,7 +1448,7 @@ def _annotations_unavailable(exc: BaseException, *, filename: str = "") -> dict[
     """
     return {
         "unavailable": f"annotation counts unavailable: {exc}",
-        "analysis_cache_restored": str(filename or "").endswith(".bndb"),
+        **_database_flags(filename),
     }
 
 
@@ -1429,7 +1459,7 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
     ONE builder for the two surfaces that answer "can I trust this view as
     pristine?" -- `target info` (#793) and the orient digest. #793 was filed on
     the two of them DISAGREEING: the digest published ``existing_annotations``
-    (with ``analysis_cache_restored`` and ``provenance_hint``) while `target
+    (with its database flags and ``provenance_hint``) while `target
     info` -- the command every agent runs first -- had no annotation key at all,
     so the same cached target read annotated on one surface and clean on the
     other. Both now publish this block under the same key, from here.
@@ -1439,20 +1469,29 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
     view it already holds); a resolution failure degrades to
     ``_annotations_unavailable`` in the caller. *source_verified* is the load's
     verdict on the database (preferred over the raw path, or named explicitly
-    and judged against its sibling raw file) -- checked against the file's
+    and judged against its raw file) -- checked against the file's
     content (True), restored unverified or naming other bytes (False), or no
-    database was judged (None) -- published beside the flag and spelled out in the hint,
+    database was judged (None) -- published beside the flags and spelled out in the hint,
     so a later reader is not left with the one-shot load note. The COUNTS are
     always the view's current ones: ``bn_kernel.assert_unannotated`` gates on
     them.
+
+    Two flags, because one meant two things (#1036 item 5): ``opened_from_database``
+    -- the view was opened from any `.bndb` -- and ``restored_from_cache`` -- that
+    `.bndb` is an entry of the shared cache, which another run may have written.
 
     The hint is about INHERITANCE, so for a view this bridge opened it is
     judged from what the view held at open (`_opened_annotations`, #973): a
     raw open inherited nothing and gets no hint, however much this session has
     annotated since; a database open gets one naming the counts the database
     held when opened (also published as ``present_at_open``), never this
-    session's own renames -- before or after a ``save`` re-homes the view. For
-    a view the bridge did not open (a GUI tab), ``analysis_cache_restored`` is
+    session's own renames -- before or after a ``save`` re-homes the view. A
+    database this bridge itself saved or exported, and still the very file it
+    wrote, is disclosed as ``written_by_this_bridge`` -- a fact about the
+    FILE only: its annotations stay "may predate this run" like any other
+    database's, because who wrote a file is not who wrote what is in it
+    (#1036 item 5; per-annotation attribution failed three review rounds). For
+    a view the bridge did not open (a GUI tab), the flags are
     derived from *filename* and the hint from the current ANALYST counts (not
     the raw non-auto count -- the loader's own placeholders made a pristine view
     hint that its entirely-current-run analysis may predate the run, #733 F2).
@@ -1460,36 +1499,44 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
     opened_key = view_session_key(bv)
     opened_known = opened_key in _opened_annotations
     opened = _opened_annotations.get(opened_key)
-    analysis_cache_restored = (
-        opened is not None if opened_known else str(filename or "").endswith(".bndb")
-    )
+    if opened_known:
+        flags = {
+            "opened_from_database": opened is not None,
+            "restored_from_cache": opened is not None and is_cache_database(opened.get("path")),
+        }
+    else:
+        flags = _database_flags(filename)
+    from_database = flags["opened_from_database"]
+    own_save = opened.get("written_by_this_bridge") if opened is not None else None
     try:
         annotations = _annotation_summary(ctx, bv)
     except Exception as exc:
         unavailable = _annotations_unavailable(exc, filename=filename)
-        if opened_known:
-            unavailable["analysis_cache_restored"] = analysis_cache_restored
+        unavailable.update(flags)
         return unavailable
     if opened_known:
-        inherited = opened or {}
+        present_at_open = ({k: v for k, v in opened.items() if k in OPENED_ANNOTATION_COUNTS}
+                           if opened else {})
+        inherited = present_at_open
         present = opened is not None
     else:
         inherited = annotations
-        present = analysis_cache_restored or bool(
+        present = from_database or bool(
             annotations["comments"] + annotations["function_comments"]
             + annotations["analyst_symbols"]
         )
     hint = None
     if present:
+        source = "restored from the shared cache" if flags["restored_from_cache"] else "opened"
         if source_verified is True:
-            restored = " (analysis cache restored from a .bndb verified against the raw file's content)"
+            restored = f" (database {source}, verified against the raw file's content)"
         elif source_verified is False:
             restored = (
-                " (analysis cache restored from a .bndb whose provenance is UNVERIFIED: "
+                f" (database {source}; its provenance is UNVERIFIED: "
                 "it may describe other bytes than the raw file)"
             )
         else:
-            restored = " (analysis cache restored from a .bndb)"
+            restored = f" (database {source})"
         hint = (
             f"existing BNDB annotations may predate this run: "
             f"{inherited['comments']} comment(s), "
@@ -1498,15 +1545,15 @@ def _existing_annotations(ctx, bv, *, filename: str = "",
             + ("present when the database was opened "
                if opened_known else "already present ")
             + f"({inherited['placeholder_symbols']} loader placeholder(s) excluded)"
-            + (restored if analysis_cache_restored else "")
+            + (restored if from_database else "")
             + " -- do not over-credit current-run analysis"
         )
     return {
         **annotations,
-        "analysis_cache_restored": analysis_cache_restored,
+        **flags,
         "source_verified": source_verified,
-        **({"present_at_open": {k: v for k, v in opened.items() if k != "path"}}
-           if opened is not None else {}),
+        **({"present_at_open": present_at_open} if opened is not None else {}),
+        **({"written_by_this_bridge": own_save} if own_save is not None else {}),
         "provenance_hint": hint,
     }
 

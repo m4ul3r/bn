@@ -2562,18 +2562,53 @@ class TestLoadCacheBndbRestore:
             _session_stop(inst)
             inst = None
 
-            # Reload from the still-read-only mount: must restore the cache copy.
+            # Reload from the still-read-only mount: the same project restores
+            # the cache copy (#318), and the note says whose it is (#1036).
             info2 = _session_start(str(prog))
             inst = info2["instance_id"]
+            notes2 = info2["loaded"][0]["notes"]
+            assert any(n.startswith(f"restored cached database {cache_file}") for n in notes2), notes2
             search = _bn("--instance", inst, "function", "search", "RO318_MARKER", "--format", "json")
             names = [i["name"] for i in json.loads(search.stdout).get("items", [])]
             assert "RO318_MARKER" in names, f"annotation lost on reload (blank): {names}"
+            _session_stop(inst)
+            inst = None
+
+            # #1036 item 1: another project's start loads the raw bytes, and the
+            # command its note prints restores the entry when run as printed.
+            elsewhere = tmp_path / "other-project"
+            elsewhere.mkdir()
+            started = subprocess.run(
+                [*_BN_CLI, "session", "start", "--format", "json", str(prog)],
+                capture_output=True, text=True, timeout=_SESSION_START_TIMEOUT,
+                env=_env(), cwd=elsewhere)
+            assert started.returncode == 0, started.stderr
+            info3 = json.loads(started.stdout)
+            inst = info3["instance_id"]
+            loaded = info3["loaded"][0]
+            assert loaded["path"] == str(prog), loaded
+            [skipped] = [n for n in loaded["notes"]
+                         if n.startswith(f"did not restore the cached database {cache_file}")]
+            command = skipped.rsplit("`", 2)[1]
+            env = _env()
+            env["PATH"] = f"{Path(_BN_CLI[0]).parent}{os.pathsep}{env.get('PATH', '')}"
+            restored = subprocess.run(
+                ["sh", "-c", command], capture_output=True, text=True,
+                timeout=_SESSION_START_TIMEOUT, env=env, cwd=elsewhere)
+            assert restored.returncode == 0, f"{command}: {restored.stdout}\n{restored.stderr}"
+            search = _bn("--instance", inst, "-t", cache_file.name, "function", "search",
+                         "RO318_MARKER", "--format", "json")
+            names = [i["name"] for i in json.loads(search.stdout).get("items", [])]
+            assert "RO318_MARKER" in names, f"{search.stdout}\n{search.stderr}"
         finally:
             if inst:
                 _session_stop(inst)
             ro.chmod(0o700)
             if cache_file is not None and cache_file.exists():
                 cache_file.unlink()
+                writer = cache_file.with_name(cache_file.name + ".writer.json")
+                if writer.exists():
+                    writer.unlink()
 
 
 class TestSidecarContentValidation:
@@ -2806,6 +2841,52 @@ class TestSidecarContentValidation:
         assert not any("requested explicitly" in n for n in back["notes"]), back["notes"]
         assert back["targets"][0]["source_verified"] is True, back["targets"]
         assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+    def test_an_export_reloads_paired_and_still_warns_about_its_annotations_1036(
+            self, shared_bn, tmp_path):
+        """#1036 items 4-5 on real BN: `save <path>` is an export that says so;
+        loading it back keeps `-t prog` on the raw view and verifies the copy
+        against the raw file BN recorded in it (no sibling exists). The copy is
+        disclosed as a file this bridge wrote, and -- per-annotation
+        attribution having been dropped after three review rounds -- its
+        annotations, even this bridge's own rename, stay "may predate this
+        run"; so does a reload after the source view closed."""
+        prog = tmp_path / "ro" / "prog"
+        prog.parent.mkdir()
+        prog.write_bytes(Path(HELLO_BINARY).read_bytes())
+        prog.chmod(0o755)
+        export = tmp_path / "out" / "prog.bndb"
+        export.parent.mkdir()
+        shared_bn.load(prog, copy=False)
+        renamed = shared_bn.run("rename", "greet", "greet_v2", "--format", "json")
+        assert renamed.returncode == 0, renamed.stdout + renamed.stderr
+
+        saved = shared_bn.json("save", str(export))
+        assert saved["export"] is True and saved["restart_path"] == str(prog), saved
+
+        shared_bn.load(export, copy=False)
+        raw = shared_bn.json("-t", "prog", "target", "info")
+        assert raw["filename"] == str(prog), raw
+        assert raw["exports"] == [str(export)] and raw["database_path"] is None, raw
+        db = shared_bn.json("-t", "prog.bndb", "target", "info")
+        annotations = db["existing_annotations"]
+        assert annotations["opened_from_database"] is True, annotations
+        assert annotations["restored_from_cache"] is False, annotations
+        assert annotations["source_verified"] is True, annotations
+        assert annotations["written_by_this_bridge"]["kind"] == "export", annotations
+        assert "own_at_open" not in annotations, annotations
+        assert "may predate this run" in (annotations["provenance_hint"] or ""), annotations
+        shown = shared_bn.run("-t", "prog.bndb", "target", "info")
+        assert "opened from a file this bridge exported from" in shown.stdout, shown.stdout
+        assert shared_bn.run("close", str(export)).returncode == 0
+
+        second = tmp_path / "out" / "prog2.bndb"
+        assert shared_bn.json("-t", "prog", "save", str(second))["export"] is True
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        shared_bn.load(second, copy=False)
+        annotations = shared_bn.json("target", "info")["existing_annotations"]
+        assert annotations["written_by_this_bridge"]["kind"] == "export", annotations
+        assert "may predate this run" in (annotations["provenance_hint"] or ""), annotations
 
 
 class TestRestartReopensAStaleDatabaseLoudly:

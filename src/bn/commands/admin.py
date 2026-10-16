@@ -9,6 +9,7 @@ the ``bn.cli`` module at call time -- ``cli.send_request(...)`` rather than a
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import json
 import os
@@ -17,6 +18,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -48,6 +50,35 @@ from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, u
 # workers. Give that work room on a loaded host before considering pinned signals.
 _SHUTDOWN_TEARDOWN_TIMEOUT = 30.0
 _SIGNAL_TEARDOWN_TIMEOUT = 5.0
+# #1036 item 6: a foreground `session start` of a large binary can block for
+# minutes; one stderr line this often says it is still working.
+_START_PROGRESS_INTERVAL = 30.0
+# How often `session status <job> --wait` polls the bridge.
+_STATUS_WAIT_INTERVAL = 2.0
+
+
+@contextlib.contextmanager
+def _still_loading_notice(path: str, interval: float):
+    """Print ``bn: still loading <path> (<N>s)`` on stderr every *interval*
+    seconds while the body runs, so a long foreground load is visibly alive
+    (#1036 item 6). Stderr only: stdout stays the command's result."""
+    done = threading.Event()
+    started = time.monotonic()
+
+    def tick() -> None:
+        while not done.wait(interval):
+            print(
+                f"bn: still loading {path} ({int(time.monotonic() - started)}s); "
+                "`session start --detach` returns at once instead",
+                file=sys.stderr, flush=True)
+
+    thread = threading.Thread(target=tick, name="bn-start-progress", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join()
 
 
 @command("capabilities",
@@ -1020,16 +1051,21 @@ def _session_start(args: argparse.Namespace) -> int:
     for binary in binaries:
         resolved = str(Path(binary).expanduser().resolve())
         try:
-            resp = cli.send_request(
-                "load_binary_async" if detached else "load_binary",
-                params={
-                    "path": resolved,
-                    "prefer_bndb": prefer_bndb,
-                    "quick": quick,
-                    "workdir": workdir,
-                },
-                instance_id=instance.instance_id,
+            notice = (
+                contextlib.nullcontext() if detached
+                else _still_loading_notice(resolved, _START_PROGRESS_INTERVAL)
             )
+            with notice:
+                resp = cli.send_request(
+                    "load_binary_async" if detached else "load_binary",
+                    params={
+                        "path": resolved,
+                        "prefer_bndb": prefer_bndb,
+                        "quick": quick,
+                        "workdir": workdir,
+                    },
+                    instance_id=instance.instance_id,
+                )
             item = unwrap_result(
                 resp, "load_binary_async" if detached else "load_binary")
             valid = (
@@ -1127,11 +1163,28 @@ def _session_start(args: argparse.Namespace) -> int:
     return 1 if failures or association_error else 0
 
 
+def _positive_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    if not (value > 0 and value != float("inf")):
+        raise argparse.ArgumentTypeError(f"must be a positive number of seconds: {text!r}")
+    return value
+
+
 @command(
     "session",
     "status",
     help="Poll detached binary load jobs",
-    args=[arg("job_id", nargs="?", help="Optional detached load job ID")],
+    args=[
+        arg("job_id", nargs="?", help="Optional detached load job ID"),
+        arg("--wait", action="store_true",
+            help="Block until the named job finishes; exit 0 when it loaded, 1 when it "
+                 "failed or --timeout passed first"),
+        arg("--timeout", dest="wait_timeout", type=_positive_seconds, default=None,
+            help="With --wait: give up after this many seconds (default: no limit)"),
+    ],
 )
 def _session_status(args: argparse.Namespace) -> int:
     instance_id = getattr(args, "instance", None)
@@ -1139,20 +1192,49 @@ def _session_status(args: argparse.Namespace) -> int:
         raise BridgeError(
             "session status requires -i/--instance <id> from session start"
         )
-    response = cli.send_request(
-        "load_status",
-        params={"job_id": getattr(args, "job_id", None)},
-        instance_id=instance_id,
-    )
-    result = unwrap_result(response, "load_status")
-    if not isinstance(result, dict):
-        raise BridgeError("malformed load_status response")
+    job_id = getattr(args, "job_id", None)
+    wait = bool(getattr(args, "wait", False))
+    timeout = getattr(args, "wait_timeout", None)
+    if timeout is not None and not wait:
+        raise BridgeError("session status: --timeout applies only with --wait")
+    if wait and not job_id:
+        raise BridgeError(
+            "session status --wait needs a job id: the one `session start --detach` "
+            "printed, or one listed by `session status` without --wait"
+        )
+    started = time.monotonic()
+    while True:
+        response = cli.send_request(
+            "load_status",
+            params={"job_id": job_id},
+            instance_id=instance_id,
+        )
+        result = unwrap_result(response, "load_status")
+        if not isinstance(result, dict):
+            raise BridgeError("malformed load_status response")
+        # #1036 item 6: the bridge's own `terminal` verdict decides, never a
+        # state string re-derived here.
+        if not wait or result.get("terminal") is True:
+            break
+        elapsed = time.monotonic() - started
+        if timeout is not None and elapsed >= timeout:
+            result["waited"] = {"seconds": round(elapsed, 1), "timed_out": True}
+            break
+        pause = _STATUS_WAIT_INTERVAL
+        if timeout is not None:
+            pause = min(pause, max(timeout - elapsed, 0.0))
+        time.sleep(pause)
+    if wait and "waited" not in result:
+        result["waited"] = {"seconds": round(time.monotonic() - started, 1),
+                            "timed_out": False}
     cli._emit_result(
         args,
         result,
         text_renderer=_render_session_status_text,
         stem="session-status",
     )
+    if wait:
+        return 0 if result.get("succeeded") is True else 1
     return 0
 
 

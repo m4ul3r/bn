@@ -4793,7 +4793,10 @@ def test_the_function_count_line_never_states_a_count_it_could_not_read():
 # per-ROW method count, which the round-6 repair walked past -- it rendered a
 # flag as a quantity and a container as a Python repr, undisclosed, in the
 # very renderer the round-6 major was filed against. Now `_stated_count`.
-_RAW_COUNT_SPELLINGS = 38
+# 38 -> 37 (#1036 item 5): `_render_orient_text`'s
+# `ea.get('analysis_cache_restored', False)` matched as a count spelling
+# (`False == 0`); the split database flags now read through `_flag_field`.
+_RAW_COUNT_SPELLINGS = 37
 
 
 def test_the_raw_count_residue_is_exactly_this_big():
@@ -6129,11 +6132,13 @@ def test_render_orient_shows_existing_annotations():
     value = {"kind": "orient_digest", "target": {"basename": "shared.bndb"},
              "analyzed": True, "analysis_state": "full", "function_count": 10,
              "existing_annotations": {"comments": 8, "function_comments": 3, "user_symbols": 12,
-                                      "analysis_cache_restored": True,
+                                      "opened_from_database": True,
+                                      "restored_from_cache": True,
                                       "provenance_hint": "existing BNDB annotations may predate this run"}}
     out = _render_orient_text(value)
     assert "existing annotations: comments=8" in out
-    assert "user-symbols=12" in out and "cache-restored=True" in out
+    assert "user-symbols=12" in out
+    assert "opened-from-database=True, restored-from-cache=True" in out
     assert "predate this run" in out
 
 
@@ -6149,18 +6154,18 @@ def test_render_orient_states_the_analyst_split_without_fabricating_it():
     full = _render_orient_text({**base, "existing_annotations": {
         "comments": 0, "function_comments": 0, "user_symbols": 612,
         "analyst_symbols": 0, "placeholder_symbols": 612,
-        "analysis_cache_restored": False}})
+        "opened_from_database": False}})
     assert "analyst-symbols=0, placeholders=612" in full
 
     older = _render_orient_text({**base, "existing_annotations": {
         "comments": 0, "function_comments": 0, "user_symbols": 540,
-        "analysis_cache_restored": False}})
+        "opened_from_database": False}})
     assert "analyst-symbols" not in older
     assert "user-symbols=540" in older
 
     half = _render_orient_text({**base, "existing_annotations": {
         "comments": 0, "function_comments": 0, "user_symbols": 612,
-        "analyst_symbols": 3, "analysis_cache_restored": False}})
+        "analyst_symbols": 3, "opened_from_database": False}})
     # The sibling was never claimed, so it is omitted -- not printed as a
     # confident `placeholders=0`, and not as a bare `None`.
     assert "analyst-symbols=3," in half and "placeholders" not in half
@@ -6168,13 +6173,13 @@ def test_render_orient_states_the_analyst_split_without_fabricating_it():
     unreadable_analyst = _render_orient_text({**base, "existing_annotations": {
         "comments": 0, "function_comments": 0, "user_symbols": 612,
         "analyst_symbols": "many", "placeholder_symbols": 612,
-        "analysis_cache_restored": False}})
+        "opened_from_database": False}})
     assert "analyst-symbols=?" in unreadable_analyst
 
     unreadable = _render_orient_text({**base, "existing_annotations": {
         "comments": 0, "function_comments": 0, "user_symbols": 612,
         "analyst_symbols": 3, "placeholder_symbols": "many",
-        "analysis_cache_restored": False}})
+        "opened_from_database": False}})
     assert "placeholders=?" in unreadable
 
 
@@ -6228,6 +6233,70 @@ def test_render_session_status_terminal_job_drops_the_poll_command():
     out = _render_session_status_text(value)
     assert "poll:" not in out
     assert "target: s.bndb" in out
+
+
+def test_detached_status_lists_each_jobs_own_target_and_its_notes():
+    """#1035 item 3 and #1036 item 2. A finished job's `result.targets` is every
+    view open when it finished, so the second of two jobs listed the first
+    binary's target too, as if one binary loaded as another; and the load's
+    notes (a skipped cache entry, inherited counts) were JSON-only, so a
+    detached start never showed them in text."""
+    import shlex
+
+    from bn.formatters import _render_session_status_text
+
+    first = {"selector": "vt", "target_id": "9:1:1"}
+    second = {"selector": "-vt stripped", "target_id": "9:2:2"}
+    value = {"kind": "load_jobs", "count": 2, "items": [
+        {"job_id": "a1", "state": "complete", "path": "/w/vt",
+         "result": {"target": first, "targets": [first],
+                    "notes": ["did not restore the cached database /c/bndb/vt.0011.bndb"]}},
+        {"job_id": "b2", "state": "complete", "path": "/w/-vt stripped",
+         "result": {"target": second, "targets": [first, second], "analyzed": False}},
+    ]}
+
+    out = _render_session_status_text(value)
+    second_job = out.split("b2  complete")[1]
+    assert "9:1:1" not in second_job, out
+    assert "/w/-vt stripped  [not analyzed]" in out, out
+    assert "  note: did not restore the cached database /c/bndb/vt.0011.bndb" in out, out
+    # #1033 item 3: the selector advice pastes as printed.
+    for line in out.splitlines():
+        if "(pass " in line:
+            advice = line.split("(pass ", 1)[1].split(";", 1)[0]
+            argv = shlex.split(advice)
+            assert len(argv) in (1, 2) and argv[-1].endswith(("vt", "vt stripped")), argv
+    assert "(pass --target='-vt stripped';" in out, out
+
+
+def test_detached_start_prints_the_wait_command():
+    """#1036 item 6: the blocking poll, printed beside the poll command."""
+    from bn.formatters import _render_session_start_text
+
+    out = _render_session_start_text({
+        "instance_id": "w1", "pid": 1, "socket_path": "/s", "detached": True,
+        "loaded": [{"path": "/w/big", "job_id": "j9", "state": "queued",
+                    "status_command": "bn -i w1 session status j9"}],
+    })
+    assert "  wait: bn -i w1 session status j9 --wait" in out, out
+
+
+def test_save_text_says_an_export_is_not_the_targets_database():
+    """#1036 item 5: `saved: <path>` alone did not say the file was a copy, nor
+    where the target itself still saves and restarts from."""
+    from bn.formatters import _render_save_text
+
+    out = _render_save_text({
+        "ok": True, "saved": True, "path": "/out/demod.bndb", "export": True,
+        "default_save_path": "/ro/demod.bndb", "restart_path": "/ro/demod",
+        "restart_path_is_database": False,
+    })
+    assert out.splitlines()[0] == "saved: /out/demod.bndb"
+    assert "an export, not this target's own database" in out
+    assert "a plain `bn save` writes /ro/demod.bndb" in out
+    assert "reopens /ro/demod (the raw file, without this analysis)" in out
+    plain = _render_save_text({"ok": True, "saved": True, "path": "/ro/demod.bndb"})
+    assert plain == "saved: /ro/demod.bndb"
 
 
 def test_render_session_start_text_surfaces_reload_capture_failure():

@@ -11,6 +11,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import functools
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -2184,6 +2185,8 @@ def _mutate(
         # --format controls the MEDIUM, --verbose/--summary the DETAIL. An explicit
         # --format still wins, and an --out extension is still inferred downstream.
         setattr(args, "format", "text")
+    summary_text = functools.partial(
+        _render_mutation_summary_text, save_command=lambda: _save_command(args))
     return _call(
         args,
         op,
@@ -2192,7 +2195,12 @@ def _mutate(
         # A mutation with a richer detail view of its own (e.g. `go rename`'s
         # per-candidate breakdown) supplies it via *detail_renderer*; the compact
         # status line stays shared so #645's default is identical everywhere.
-        text_renderer=(_render_mutation_summary_text if compact
+        # #1036 item 5: the compact status names the save that persists a
+        # committed dirty change, routed like this invocation (resolved lazily:
+        # an implicit target is only known once the request routes). The same
+        # renderer serves the spill path below, so the advice does not depend
+        # on payload size (review round 2).
+        text_renderer=(summary_text if compact
                        else (detail_renderer or _render_mutation_text)),
         # #715: the exit code is computed on the ORIGINAL result, before any
         # transform runs, so it cannot see the `measured` flag `_mutation_summary`
@@ -2218,9 +2226,27 @@ def _mutate(
         # transform (#693 item 4), so this transform sees the bridge's payload
         # and never its own output -- idempotence is not required of it.
         spill_status=(summary_transform or _mutation_summary),
-        spill_status_renderer=_render_mutation_summary_text,
+        spill_status_renderer=summary_text,
         **call_kwargs,
     )
+
+
+def _save_command(args: argparse.Namespace) -> str:
+    """The `bn save` that persists the target this invocation acted on: its
+    own `-i`/`-t` routing, quoted, so it runs as printed (a bare `bn save`
+    is refused once several targets are open)."""
+    from .target_hint import target_option
+
+    parts = ["bn"]
+    instance = getattr(args, "instance", None)
+    if isinstance(instance, str) and instance.strip():
+        parts.append(shlex.quote(f"--instance={instance}") if instance.startswith("-")
+                     else f"-i {shlex.quote(instance)}")
+    target = getattr(args, "_resolved_target", None) or getattr(args, "target", None)
+    if isinstance(target, str) and target.strip():
+        parts.append(target_option(target))
+    parts.append("save")
+    return " ".join(parts)
 
 
 def _contextualize_diagnostic_hints(
@@ -2396,6 +2422,9 @@ def _call(
         require_target=require_target,
         allow_implicit_target=allow_implicit_target,
     )
+    # The selector this request actually routed with (an implicit sole
+    # target resolves to its target_id), for advice printed after it.
+    args._resolved_target = target
     # One end-to-end deadline for this call, resolved exactly once (#694 item
     # 8). Without it, the literal request below and the regex-fallback retry
     # further down each re-resolve BN_REQUEST_TIMEOUT from scratch, so a single

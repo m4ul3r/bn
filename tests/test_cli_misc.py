@@ -83,6 +83,28 @@ def test_py_exec_accepts_inline_code(fake_transport):
     assert "out_path" not in calls[-1]["params"]
 
 
+def test_py_exec_no_target_sends_the_untargeted_op_without_a_target_1035(
+        monkeypatch, fake_transport, capsys):
+    """#1035 item 2: `--no-target` resolves no target -- an ambient pin or
+    BN_TARGET is not used -- and an explicit `-t` beside it is an error."""
+    calls = fake_transport({"py_exec_untargeted": {
+        "ok": True, "result": {"stdout": "", "result": True}}})
+    monkeypatch.setenv("BN_TARGET", "demod")
+
+    rc = bn.cli.main(["py", "exec", "--no-target", "result = bv is None"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "py_exec_untargeted"
+    assert calls[-1]["target"] is None
+    assert calls[-1]["params"] == {"script": "result = bv is None"}
+
+    before = len(calls)
+    rc = bn.cli.main(["py", "exec", "--no-target", "-t", "demod", "result = 1"])
+    assert rc == 2
+    assert "pass -t/--target or --no-target, not both" in capsys.readouterr().err
+    assert len(calls) == before
+
+
 def test_py_exec_dash_reads_stdin(monkeypatch, fake_transport):
     # #312: standardize the stdin idiom with `batch apply -`: a positional "-"
     # reads the script from stdin (alongside the explicit --stdin flag).

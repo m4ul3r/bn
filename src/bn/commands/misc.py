@@ -740,7 +740,10 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
 
 @command("py", "exec", help="Execute a Python snippet", target=True,
          args=[arg("code_pos", nargs="?", metavar="CODE",
-                   help="Inline Python code (positional; same as --code)")],
+                   help="Inline Python code (positional; same as --code)"),
+               arg("--no-target", action="store_true",
+                   help="Run with `bv` = None, without resolving a target: works with no "
+                        "target open, e.g. to close a GUI first-run dialog")],
          mutex_groups=[
              mutex(False,
                    arg("--script", type=Path, help="Read Python code from a file"),
@@ -776,6 +779,21 @@ def _py_exec(args: argparse.Namespace) -> int:
             "or use --code / --script FILE / --stdin"
         )
 
+    if getattr(args, "no_target", False):
+        # #1035 item 2: no target is resolved, so nothing can refuse for want
+        # of one. An explicit -t contradicts the flag; an ambient one (pin,
+        # BN_TARGET) is simply not used.
+        if getattr(args, "target", None) is not None and not getattr(args, "_sticky_target", False):
+            raise BridgeError("py exec: pass -t/--target or --no-target, not both")
+        args.target = None
+        return _call(
+            args,
+            "py_exec_untargeted",
+            {"script": script},
+            require_target=False,
+            text_renderer=_render_py_exec_text,
+            stem="py-exec",
+        )
     return _call(
         args,
         "py_exec",

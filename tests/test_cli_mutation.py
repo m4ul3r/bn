@@ -1938,6 +1938,72 @@ def test_function_create_without_overlap_grows_no_overlap_disclosure(fake_transp
         "mutation: committed  changed=1  verified=1  noop=0  failed=0  dirty_after=True")
 
 
+@pytest.mark.parametrize("argv,expected", [
+    (["--target", "123:1:7"], "bn -t 123:1:7 save"),
+    (["-i", "worker 1", "--target", "-vt stripped"], "bn -i 'worker 1' --target='-vt stripped' save"),
+])
+def test_a_dirty_committed_mutation_names_the_save_that_persists_it_1036(
+        fake_transport, capsys, argv, expected):
+    """#1036 item 5: `dirty_after=True` with no hint that saving is next. The
+    compact line now ends with the save command, routed like the mutation
+    itself, and that command parses as printed; a preview (nothing committed)
+    gets no hint."""
+    import shlex
+
+    result = _split_create_result()
+    del result["results"][0]["overlaps"]
+    del result["results"][0]["note"]
+    fake_transport({"function_create": {"ok": True, "result": result}})
+
+    assert bn.cli.main(["function", "create", *argv, "0x401a44"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1].startswith(f"next: `{expected}` to persist it"), lines
+    printed = shlex.split(lines[1].split("`")[1])
+    parsed = bn.cli.build_parser().parse_args(printed[1:])
+    assert parsed.target == argv[-1]
+
+    preview = {**result, "committed": False, "preview": True}
+    fake_transport({"function_create": {"ok": True, "result": preview}})
+    bn.cli.main(["function", "create", "--target", "123:1:7", "--preview", "0x401a44"])
+    assert "next:" not in capsys.readouterr().out
+
+
+def test_the_save_hint_claims_no_outcome_1036(fake_transport, capsys):
+    """Review round 3 (narrowed after three rounds): a hint that PREDICTED the
+    save's outcome was wrong both ways -- it promised persistence that the
+    open-target collision gate then refused, and predicted a cache refusal
+    for a read-only sibling that BN replaced and saved fine. The line names
+    the routed save and defers to that save's own output; it never says the
+    save persists or is refused."""
+    result = _split_create_result()
+    del result["results"][0]["overlaps"]
+    del result["results"][0]["note"]
+    fake_transport({"function_create": {"ok": True, "result": result}})
+
+    assert bn.cli.main(["function", "create", "--target", "123:1:7", "0x401a44"]) == 0
+    next_line = capsys.readouterr().out.splitlines()[1]
+    assert next_line == ("next: `bn -t 123:1:7 save` to persist it; if it is refused, "
+                         "its output says why and what to do"), next_line
+
+
+def test_a_spilled_mutation_status_keeps_the_save_hint_1036(
+        fake_transport, capsys, monkeypatch):
+    """Review round 2, finding 4: under `BN_SPILL_TOKENS` the status printed by
+    the spill path had no `next:` line, so whether the advice appeared
+    depended on payload size."""
+    result = _split_create_result()
+    del result["results"][0]["overlaps"]
+    del result["results"][0]["note"]
+    fake_transport({"function_create": {"ok": True, "result": result}})
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1")
+
+    assert bn.cli.main(["function", "create", "--target", "123:1:7", "--verbose",
+                        "0x401a44"]) == 0
+    captured = capsys.readouterr()
+    assert "spill" in (captured.out + captured.err).lower()
+    assert "next: `bn -t 123:1:7 save` to persist it" in captured.out, captured.out
+
+
 def test_render_target_line_shows_symbol_and_string_for_mapped_targets():
     # ILX #4: mapped non-function targets should surface symbol/string + section,
     # not just bare hex.
