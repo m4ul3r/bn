@@ -1,0 +1,95 @@
+{
+  "description": "Constant-table loads are frontiers whatever the index: an unchecked byte offset, unmasked long/int indices that may reach the mutable global after the table, and (a precision cost since #1053 review 6) masked and compare-bounded indices. The index stays in the slice. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline",
+    "-fno-builtin",
+    "-U_FORTIFY_SOURCE"
+  ],
+  "backward": [
+    {
+      "function": "byte_offset",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "parameter"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "unmasked_long",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "parameter"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "unmasked_int",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "parameter"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "masked",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "cmp_bounded_u",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "cmp_bounded_s",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ]
+    }
+  ]
+}

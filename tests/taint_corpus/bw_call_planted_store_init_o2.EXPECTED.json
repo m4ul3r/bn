@@ -1,0 +1,44 @@
+{
+  "description": "The planting call isolated: the buffer is filled by plain stores, so strtol is the only call before the reload, and the strcpy through the pointer it may have left is a frontier. Analyze only. -O2.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline",
+    "-fno-builtin",
+    "-U_FORTIFY_SOURCE"
+  ],
+  "backward": [
+    {
+      "function": "store_init_global_end",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "store_init_local_end",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ],
+      "complete_slice": false
+    }
+  ]
+}

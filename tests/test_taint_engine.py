@@ -562,7 +562,7 @@ def test_backward_narrow_store_does_not_mask_wider_tainted_writer(models):
     # #562/F1: a recent narrow UNTAINTED store that only PARTIALLY overlaps the
     # loaded range must NOT be reported as the reaching writer -- the slice must
     # keep walking to the wider tainted store underneath. Regression for the
-    # width-aware `_reaching_writer`: stopping on "overlap" (not just "cover")
+    # width-aware backward load walk: stopping on "overlap" (not just "cover")
     # masked the real writer and reported the narrow store's constant as origin.
     MALLOC, READ_U32, MEMCPY = 0xa00, 0xa10, 0xa20
     h = FVar("h", ident=80); t = FVar("t", ident=81); x = FVar("x", ident=82)
@@ -4632,9 +4632,12 @@ def test_backward_unresolved_field_load_emits_leaf(models):
     assert any(sl["origin"]["kind"] == "field_load_unresolved" for sl in result["slices"])
 
 
-def test_backward_field_load_recovers_source_call(models):
+def test_backward_field_load_names_source_call_without_certifying_it(models):
     # The buffer is filled by a modeled source (read) writing *arg:1; the load of
-    # that buffer must recover the source, not dead-end (#158).
+    # that buffer must name the source, not dead-end (#158). No model proves
+    # which bytes a call wrote -- or that it wrote nothing else (#1053 review
+    # rounds 1-3) -- so the source is a possible producer and the field stays a
+    # frontier, not a certified origin of a complete slice.
     READ, MEMCPY = 0xb00, 0xb20
     h = FVar("h", ident=44); x = FVar("x", ident=45)
     h1 = FSSA(h, 1); x1 = FSSA(x, 1)
@@ -4663,13 +4666,15 @@ def test_backward_field_load_recovers_source_call(models):
     result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
     origins = [(sl["origin"]["kind"], sl["origin"].get("callee")) for sl in result["slices"]]
     assert ("source", "read") in origins, origins
-    assert not any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
+    assert any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
-def test_backward_stack_buffer_load_keeps_prior_behavior(models):
-    # A plain stack-buffer byte load (base is neither allocator nor parameter)
-    # with no in-scope store/source must NOT become field_load_unresolved -- the
-    # #158 path must not over-trigger on ordinary stack loads.
+def test_backward_unwritten_stack_buffer_load_is_a_local_buffer_frontier(models):
+    # A byte loaded from a stack buffer is the buffer's CONTENTS: the slice
+    # walks the buffer's writers (not the #158 field-load path), and with no
+    # writer at all the bytes are whatever the stack held -- a frontier, not
+    # a complete slice.
     buf = FVar("buf", typ="char[0x40]"); x = FVar("x", ident=60)
     x1 = FSSA(x, 1)
     load_src = FExpr("MLIL_LOAD_SSA", "[&buf]", reads=[], src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
@@ -4688,7 +4693,9 @@ def test_backward_stack_buffer_load_keeps_prior_behavior(models):
     result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
     assert result["slices"]
     assert not any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
-    assert {sl["origin"]["kind"] for sl in result["slices"]} <= {"entry", "unresolved"}
+    assert any(l["kind"] == "address_of_local_unresolved" and l["buffer"] == "buf"
+               for l in result["leaves"])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 # --------------------------------------------------------------------------
@@ -9894,11 +9901,15 @@ def test_backward_unresolved_origin_withholds_completeness_915(models):
     assert leaf["buffer"] == "cmd"
 
 
-def test_backward_unresolved_origin_without_a_leaf_withholds_completeness_915(models):
-    # The same gate end to end on the one shape that still ends with
-    # `origin.kind == "unresolved"` and NO leaf: a definition that reads no
-    # SSA variable and is neither a constant nor an address-of (a global load
-    # the memory walk cannot key). Before, this was "complete".
+@pytest.mark.parametrize("writable", [True, None, False])
+def test_backward_fixed_global_load_reaching_entry_is_a_frontier(models, writable):
+    # #1053 review 4: `x = [0x601040].q` with nothing in the function writing
+    # the global holds whatever was stored before the function ran -- a
+    # `field_load_unresolved` frontier naming the address, whatever the
+    # storage: read-only storage does not prove the file supplied the bytes
+    # (`.data.rel.ro` without RELRO is writable; the loader may write a
+    # non-writable segment -- #1053 reviews 5-6). Before, the load was dropped
+    # and only the origin-unresolved gate (#915) withheld completeness.
     x = FVar("x", ident=78); x1 = FSSA(x, 1)
     load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x#1 = [0x601040].q", writes=[x1],
                   src=FExpr("MLIL_LOAD_SSA", "[0x601040].q", reads=[],
@@ -9909,16 +9920,41 @@ def test_backward_unresolved_origin_without_a_leaf_withholds_completeness_915(mo
                   params=[FExpr("MLIL_VAR_SSA", "x#1", reads=[x1]),
                           FExpr("MLIL_CONST_PTR", "0x710", constant=0x710)])
     func = FFunc("run_global", 0x10, FSSAFunc([load, sink]), params=[])
-    result = te.TaintEngine(FBV({0xa10: "popen"}), models).backward(
-        func, [te.parse_locator("arg:popen:0")])
-    sl = result["slices"][0]
-    assert sl["origin"]["kind"] == "unresolved", sl["origin"]
-    assert sl["metrics"]["traverses_unresolved"] is True
-    assert result["leaves"] == [], result["leaves"]
-    diag = result["diagnostics"]
-    assert diag["safe_to_report_complete_slice"] is False, diag
-    assert diag["frontier"]["unresolved"] == 1, diag
-    assert "origin.kind == 'unresolved'" in diag["complete_slice_reason"], diag
+    bv = FBV({0xa10: "popen"})
+    if writable is not None:
+        bv.is_offset_writable = lambda addr: writable
+    result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
+    fields = [lf for lf in result["leaves"] if lf["kind"] == "field_load_unresolved"]
+    assert fields and fields[0]["base"] == "0x601040", result["leaves"]
+    assert "global holds what was stored before" in fields[0]["detail"]
+    assert result["slices"][0]["origin"]["kind"] == "field_load_unresolved"
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_backward_fixed_global_in_read_only_section_of_writable_segment_is_a_frontier(models):
+    # #1053 review 6 follow-up: a fixed global in `.data.rel.ro` of a PIE
+    # linked with `-z norelro` -- BN's section semantics say read-only data,
+    # but the segment is writable and another function writes the global.
+    # `x = [0x403148].q` reaching the function's entry is the stored value
+    # from before the call, a frontier, as base's origin-unresolved gate left
+    # it. (On real BN this load is usually folded to a constant before the
+    # walk sees it; the walk must not add the read-only exemption itself.)
+    x = FVar("x", ident=79); x1 = FSSA(x, 1)
+    src = FExpr("MLIL_LOAD_SSA", "[0x403148].q", reads=[],
+                src=FExpr("MLIL_CONST_PTR", "0x403148", constant=0x403148), src_memory=0)
+    src.size = 8
+    load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x#1 = [0x403148].q", writes=[x1], src=src)
+    sink = FInstr(1, 0x14, "MLIL_CALL_SSA", "malloc(x#1)", reads=[x1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0xa10", constant=0xa10),
+                  params=[FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])])
+    func = FFunc("fixed_global", 0x10, FSSAFunc([load, sink]), params=[])
+    bv = FBV({0xa10: "malloc"})
+    bv.get_sections_at = lambda addr: [types.SimpleNamespace(semantics=2)]  # ReadOnlyData
+    bv.is_offset_writable = lambda addr: True                              # RW PT_LOAD
+    result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:malloc:0")])
+    fields = [lf for lf in result["leaves"] if lf["kind"] == "field_load_unresolved"]
+    assert fields and fields[0]["base"] == "0x403148", result["leaves"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 def test_backward_gate_counts_unresolved_origins_even_without_a_leaf_915():
@@ -10136,6 +10172,21 @@ class _BufProgram:
         ins.src_memory = self.mem
         self.mem += 1
         ins.dest_memory = self.mem
+        self.mem_defs[self.mem] = ins
+        self.instrs.append(ins)
+        return ins
+
+    def whole_store(self, buf, value=0):
+        """`buf @ mem#k -> mem#k+1 = value`: MLIL_SET_VAR_ALIASED, a store of
+        the WHOLE address-taken local by name -- it covers the buffer and,
+        being no call, starts no escape epoch (#1053 review 4)."""
+        i, a = self._next()
+        dst = FSSA(buf, self.mem + 1)
+        ins = FInstr(i, a, "MLIL_SET_VAR_ALIASED",
+                     f"{buf.name} @ mem#{self.mem} -> mem#{self.mem + 1} = {value}",
+                     writes=[dst], dest=dst, src=FExpr("MLIL_CONST", str(value), constant=value))
+        ins.ssa_memory_version = self.mem
+        self.mem += 1
         self.mem_defs[self.mem] = ins
         self.instrs.append(ins)
         return ins
@@ -10605,7 +10656,11 @@ def test_backward_indexed_loop_store_is_a_writer_of_the_buffer_928():
     pg = _BufProgram(params=[host])
     pg.store(FExpr("MLIL_ADD", "&cmd + i#1", left=_addr_of(cmd),
                    right=FExpr("MLIL_VAR_SSA", "i#1", reads=[i1])),
-             FExpr("MLIL_LOAD_SSA", "[host#0 + i#1].b", reads=[host0, i1]), reads=[host0, i1])
+             FExpr("MLIL_LOAD_SSA", "[host#0 + i#1].b", reads=[host0, i1],
+                   src=FExpr("MLIL_ADD", "host#0 + i#1", reads=[host0, i1],
+                             left=FExpr("MLIL_VAR_SSA", "host#0", reads=[host0]),
+                             right=FExpr("MLIL_VAR_SSA", "i#1", reads=[i1]))),
+             reads=[host0, i1])
     pg.phi(0, 1)
     pg.sink(cmd)
     result, reasons, aol = _bw(pg.func())
@@ -10699,9 +10754,11 @@ def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
     # The stored VALUE is walked too: the parameter is in the slice.
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}
 
-    # Guard: the same reload BEFORE any escape cannot alias the buffer.
+    # Guard: the same reload BEFORE any escape cannot alias the buffer. The
+    # buffer is initialized by a store, not a call: a call handed &cmd starts
+    # an escape epoch of its own (#1053 review 4).
     pg2 = _BufProgram(params=[host])
-    pg2.call(_B_SNPRINTF, [_addr_of(cmd), FExpr("MLIL_CONST", "0x80", constant=0x80), _cstr(0x700)])
+    pg2.whole_store(cmd)
     pg2.instrs.append(FInstr(*pg2._next(), "MLIL_SET_VAR_SSA", "q#1 = [0x404058].q", writes=[q1],
                              src=FExpr("MLIL_LOAD_SSA", "[0x404058].q", reads=[],
                                        src=FExpr("MLIL_CONST_PTR", "0x404058", constant=0x404058))))
@@ -10710,7 +10767,7 @@ def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
     pg2.sink(cmd)
     result2, reasons2, aol2 = _bw(pg2.func())
     assert aol2 == [] and not any("may write" in r for r in reasons2), (result2["leaves"], reasons2)
-    assert result2["slices"][0]["origin"] == {"kind": "call", "callee": "snprintf"}
+    assert result2["diagnostics"]["safe_to_report_complete_slice"] is True, result2["diagnostics"]
 
 
 def test_backward_modeled_call_reloading_the_escape_slot_is_a_fill_928r3():
