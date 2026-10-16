@@ -9802,8 +9802,10 @@ def test_imports_text_points_unattributed_rows_at_needed_libraries_969():
         "library_unattributed": 1, "needed_libraries": ["libc.so.6", "libz.so.1"],
     })
     assert "0x1000  printf [libc.so.6]" in out
-    assert ("// 1 import(s) carry no library (unversioned import: the loader picks the "
-            "library at run time); this binary needs (DT_NEEDED): libc.so.6, libz.so.1") in out
+    # A payload without the bridge's reason (an older bridge) keeps the
+    # original #969 wording.
+    assert ("// 1 import(s) carry no library (no symbol version names one); "
+            "this binary needs (DT_NEEDED): libc.so.6, libz.so.1") in out
 
     summary = _render_imports_summary_text({
         "total_symbols": 3, "needed_libraries": ["libc.so.6"],

@@ -926,7 +926,8 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         relocation_recovered += 1
     # #1037 item 6: say where every attributed library came from, and why an
     # unversioned import has none.
-    _note_unversioned_imports(items, needed_libraries)
+    unattributed_note = _unattributed_note(elf_info)
+    _note_unversioned_imports(items, needed_libraries, unattributed_note)
     # #450: filter the survey to matching imports so a sink/source sweep
     # (`--query 'system|execve|popen' --regex`) doesn't need full paging + external
     # jq. Matches name / raw_name / library / namespace, mirroring strings/sections.
@@ -961,7 +962,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     if summary:
         # Summary aggregates the whole import set; paging would distort the
         # counts, so it always reflects every symbol regardless of offset/limit.
-        result = _imports_build_summary(items, needed_libraries)
+        result = _imports_build_summary(items, needed_libraries, unattributed_note)
         if elf_info is not None and elf_info.notes:
             result["dynamic_section_notes"] = list(elf_info.notes)
         if self_defined_excluded:
@@ -999,6 +1000,9 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     if unattributed and needed_libraries:
         result["library_unattributed"] = unattributed
         result["needed_libraries"] = needed_libraries
+        # #1037 item 6: why they are null -- "unversioned" only when the
+        # version table was read (review round 3).
+        result["unattributed_note"] = unattributed_note
     # Why attribution may be partial: a dynamic-section structure that was out
     # of range for the file and skipped rather than read (#987 review).
     if elf_info is not None and elf_info.notes:
@@ -1008,8 +1012,8 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     return result
 
 
-def _note_unversioned_imports(items: list[dict[str, Any]],
-                               needed_libraries: list[str]) -> None:
+def _note_unversioned_imports(items: list[dict[str, Any]], needed_libraries: list[str],
+                               note: str) -> None:
     """Stamp `library_source` on attributed rows, and say why the rest are null
     (#1037 item 6).
 
@@ -1019,8 +1023,8 @@ def _note_unversioned_imports(items: list[dict[str, Any]],
     run time from the DT_NEEDED list (and what those libraries load), which bn
     does not model -- two review rounds of reading the needed libraries'
     export tables each found new loader rules that named the wrong file. Such
-    a row keeps `library: null` with `library_note`; bn reads no file other
-    than the target."""
+    a row keeps `library: null` with `library_note` (*note*, from
+    `_unattributed_note`); bn reads no file other than the target."""
     for item in items:
         namespace = item.get("namespace") or ""
         if item.get("library"):
@@ -1028,12 +1032,24 @@ def _note_unversioned_imports(items: list[dict[str, Any]],
                                       and namespace not in _BN_SENTINEL_NAMESPACES
                                       else "symbol-version")
         elif needed_libraries:
-            item["library_note"] = UNVERSIONED_IMPORT_NOTE
+            item["library_note"] = note
 
 
 # Why an unversioned import's `library` is null (#1037 item 6).
 UNVERSIONED_IMPORT_NOTE = ("unversioned import: the loader picks the library at run "
                            "time from the DT_NEEDED list")
+
+
+def _unattributed_note(elf_info: ElfDynamicInfo | None) -> str:
+    """Why a null-library import has no library. "Unversioned" only when the
+    symbol version table WAS read (or the file has none): an import absent
+    from an unread table is not shown to be unversioned (#1037 review round 3,
+    a refused DT_SYMENT on a file whose imports all carry versions)."""
+    reason = ("the ELF dynamic section was not read" if elf_info is None
+              else elf_info.versions_unread)
+    if reason is None:
+        return UNVERSIONED_IMPORT_NOTE
+    return f"symbol versions were not read ({reason}); no library is attributed"
 
 
 # #1037 item 5: the most calling functions one `imports --with-callers` row
@@ -1130,7 +1146,8 @@ def _exports(ctx, selector: str | None, *, offset: int = 0, limit: int | None = 
 
 
 def _imports_build_summary(
-    items: list[dict], needed_libraries: list[str] | None = None
+    items: list[dict], needed_libraries: list[str] | None = None,
+    unattributed_note: str | None = None,
 ) -> dict[str, Any]:
     # "namespaces" groups BN's symbol namespace (sentinels on standard ELF),
     # not a per-shared-object breakdown. The real dependency list is
@@ -1165,7 +1182,7 @@ def _imports_build_summary(
     }
     # #1037 item 6: why "(unattributed)" rows are null, also when every row is.
     if by_library.get("(unattributed)") and needed_libraries:
-        summary["unattributed_note"] = UNVERSIONED_IMPORT_NOTE
+        summary["unattributed_note"] = unattributed_note or UNVERSIONED_IMPORT_NOTE
     return summary
 
 

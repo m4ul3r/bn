@@ -3578,6 +3578,8 @@ def test_imports_text_names_callers_and_discloses_unversioned_imports_1037(fake_
         ],
         "total": 3, "offset": 0, "limit": 100, "returned": 3, "has_more": False,
         "library_unattributed": 1, "needed_libraries": ["libreg.so", "libc.so.6"],
+        "unattributed_note": "unversioned import: the loader picks the library at run time "
+                             "from the DT_NEEDED list",
         "callers_cap": 8,
     }}})
     assert bn.cli.main(["imports", "--target", "active", "--with-callers"]) == 0
@@ -3589,7 +3591,8 @@ def test_imports_text_names_callers_and_discloses_unversioned_imports_1037(fake_
     assert ("0x401160  dup [libc.so.6]  "
             "[callers unknown: code refs could not be read: RuntimeError: gone]") in out
     assert ("// 1 import(s) carry no library (unversioned import: the loader picks the "
-            "library at run time); this binary needs (DT_NEEDED): libreg.so, libc.so.6") in out
+            "library at run time from the DT_NEEDED list); this binary needs (DT_NEEDED): "
+            "libreg.so, libc.so.6") in out
     # Counted off the rows: only `puts` is a measured zero.
     assert "// 1 import(s) show no recorded code refs" in out
     assert calls[-1]["params"]["with_callers"] is True
@@ -3677,3 +3680,23 @@ def test_routing_never_rewrites_target_strings_1037(fake_transport, capsys):
     assert second.startswith('0x7000  chars=318  ascii  "`bn read 0x1000 5 yyy')
     assert second.endswith(
         "full value: --format json or `bn -i inst-a -t demod read 0x7000 318 --encoding escaped`)")
+
+
+def test_imports_footer_states_the_bridges_reason_not_a_fixed_claim_1037(fake_transport, capsys):
+    """#1037 review round 3: the footer said "unversioned import" whatever the
+    bridge knew; it now states the bridge's reason."""
+    note = ("symbol versions were not read (DT_SYMENT 32 is not the ABI symbol size 24); "
+            "no library is attributed")
+    fake_transport({"imports": {"ok": True, "result": {
+        "kind": "imports",
+        "items": [{"name": "puts", "raw_name": "puts", "address": "0x401030",
+                   "kind": "function", "library": None, "namespace": "",
+                   "library_note": note}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+        "library_unattributed": 1, "needed_libraries": ["libc.so.6"],
+        "unattributed_note": note,
+    }}})
+    assert bn.cli.main(["imports", "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    assert f"// 1 import(s) carry no library ({note}); this binary needs (DT_NEEDED): libc.so.6" in out
+    assert "unversioned" not in out

@@ -2213,11 +2213,11 @@ def _render_name_address_list_text(value: Any, *, mangled: bool = False) -> str:
     if unattributed:
         needed = ", ".join(_escape_control_chars(str(lib))
                            for lib in _field_list(value, "needed_libraries"))
-        # #1037 item 6: disclosure only. bn reads no needed library, so it
-        # names none for an unversioned import.
-        note = (f"// {unattributed} import(s) carry no library (unversioned import: the "
-                f"loader picks the library at run time); this binary needs (DT_NEEDED): "
-                f"{needed or '?'} (also in `bn target info`)")
+        # #1037 item 6: disclosure only, with the bridge's reason -- which
+        # says "unversioned" only when the symbol version table was read.
+        why = _text_value(value, "unattributed_note") or "no symbol version names one"
+        note = (f"// {unattributed} import(s) carry no library ({_escape_control_chars(why)}); "
+                f"this binary needs (DT_NEEDED): {needed or '?'} (also in `bn target info`)")
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     # #1037 item 5: rows whose 0 callers is BN's recorded refs only. Counted
     # off the rows shown, so a collected listing counts every collected row.

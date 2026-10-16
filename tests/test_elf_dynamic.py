@@ -265,6 +265,17 @@ def test_non_abi_dt_syment_skips_attribution_with_a_note(is64, syment):
     # The rest of the dynamic section is still read.
     assert (info.needed, info.soname) == (["libc.so.6"], "libw.so.1")
     assert any("DT_SYMENT" in note for note in info.notes), info.notes
+    # #1037 review round 3: the empty map is "not read", never "unversioned".
+    assert info.versions_unread and "DT_SYMENT" in info.versions_unread
+
+
+@pytest.mark.parametrize("symbols, expected", [
+    (_SYMBOLS, None),                              # version table read
+    ((("puts", None), ("free", None)), None),      # no version table at all
+])
+def test_versions_unread_is_none_only_when_the_versions_are_established(symbols, expected):
+    info = _parse(_build_elf(needed=("libc.so.6",), symbols=symbols))
+    assert info.versions_unread is expected
 
 
 def test_huge_dt_strsz_reads_only_up_to_the_end_of_the_file():

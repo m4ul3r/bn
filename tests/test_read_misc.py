@@ -1071,6 +1071,34 @@ def test_imports_unversioned_rows_disclose_why_library_is_null_1037(monkeypatch,
     assert summary["unattributed_note"] == rows["__gmon_start__"]["library_note"]
 
 
+def test_imports_do_not_call_a_symbol_unversioned_when_versions_were_not_read_1037(
+        monkeypatch):
+    """#1037 review round 3: patching only DT_SYMENT (24 -> 32) leaves a file
+    that runs and whose imports ALL carry versions (`printf@GLIBC_2.17`), but bn
+    refuses the table. The rows then said "unversioned import" beside a
+    dynamic-section note that version attribution was skipped. The note must
+    say the versions were not read, in the listing and in `--summary`."""
+    from test_elf_dynamic import _build_elf, _set_dynamic_tag
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    image = _set_dynamic_tag(_build_elf(needed=("libc.so.6", "libstdc++.so.6"), symbols=(
+        ("printf", "libc.so.6"), ("_ZNSo3putEc", "libstdc++.so.6"),
+        ("__gmon_start__", None))), 11, 32)
+    bv = _versioned_import_bv(fake_bn, image=image)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._imports(None)
+    expected = ("symbol versions were not read (DT_SYMENT 32 is not the ABI symbol size "
+                "24); no library is attributed")
+    assert {row["library_note"] for row in listed["items"]} == {expected}
+    assert listed["unattributed_note"] == expected
+    assert any("DT_SYMENT 32" in note for note in listed["dynamic_section_notes"])
+    assert instance._imports(None, summary=True)["unattributed_note"] == expected
+    assert "unversioned" not in json.dumps(listed)
+
+
 def test_imports_with_callers_names_capped_calling_functions_1037(monkeypatch):
     """#1037 item 5: one call maps every listed import to its callers, capped
     per row with the full count beside it, like `strings --with-xrefs`."""
