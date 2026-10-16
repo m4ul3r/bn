@@ -1,7 +1,7 @@
-/* Remembered stash slots survive only writes proven not to reach them (#1053 round 2):
- * a framed write through the proven &buf, or to another exact address. strtol and
- * asprintf (no frame), a store through an unpinned pointer, memmove over the slot and a
- * partial memcpy forget it. Analyze only. */
+/* Remembered stash slots are forgotten at every call (#1053 rounds 1-3): no model
+ * enumerates a call's memory writes. strtol, asprintf, memmove and a partial memcpy
+ * really rewrite the slot; the controls (two fills, a memset through the stash, an
+ * adjacent memset) lose the remembered slot too -- conservatively. Analyze only. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>

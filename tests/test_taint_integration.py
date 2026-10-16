@@ -374,10 +374,11 @@ def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, share
 
 
 def test_modeled_write_with_an_unrecovered_pointer_is_a_possible_writer(tmp_path, shared_bn):
-    """#1053 round 2: when BN recovers `recv(fd)` only, the model's output
-    pointer is missing from the call. That is no proof recv wrote nothing:
-    the field stored before it and the stash slot it overwrites must stay
-    unproven, never an older store's constant/parameter or a named writer."""
+    """#1053 rounds 2-3: no call is proof that it did not write a field --
+    with full recovery recv is a possible writer named in the slice, and when
+    BN recovers `recv(fd)` only, the missing output pointer proves even less.
+    Neither may turn the older store's parameter into a complete slice, and
+    the stash slot recv may rewrite must never make strcpy a named writer."""
     src = tmp_path / "recovery.c"
     src.write_text("""
 #include <stdio.h>
@@ -410,7 +411,9 @@ int main(void) { return 0; }
         return _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn, "--sink", sink)
 
     full = query("field_omitted", "arg:memcpy:2")
-    assert {"kind": "source", "callee": "recv"} in [sl["origin"] for sl in full["slices"]], full
+    assert full["diagnostics"]["safe_to_report_complete_slice"] is False, full["diagnostics"]
+    full_reasons = [st.get("reason", "") for sl in full["slices"] for st in sl["slice"]]
+    assert any("field may be filled by source recv" in r for r in full_reasons), full_reasons
     _bn_json(shared_bn, "-t", target, "proto", "set", "recv", "int64_t recv(int fd)")
     field = query("field_omitted", "arg:memcpy:2")
     assert field["diagnostics"]["safe_to_report_complete_slice"] is False, field["diagnostics"]

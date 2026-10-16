@@ -1,8 +1,8 @@
-/* A modeled call proves it did NOT write a field only from a declared `write_frame`
- * whose pointers all appear in the call (#1053 round 2). recv's frame bounds its write
- * to [buf, buf+len); recvmsg, readv, getline, stat, sscanf, asprintf and strtol declare
- * no frame, and strncat's frame is open-ended from dst (it appends at dst + strlen).
- * Analyze only. */
+/* No call is proof that a field was not written (#1053 rounds 1-3): models describe
+ * taint flows, not every memory write -- recvmsg, readv, getline, stat, sscanf, asprintf,
+ * strtol and strncat all write memory their models never bound, and even recv's count
+ * is not a complete write effect (a failing call sets errno). Every call leaves the
+ * field a frontier; a modeled source is named as a possible producer. Analyze only. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>

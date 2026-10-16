@@ -138,9 +138,8 @@ def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
 # "unmodeled external" fallback (`_comment_benign` in taint_models.json). An
 # entry whose only keys are `_comment*` annotations is that same marker.
 _MODEL_ROLE_KEYS = ("sink", "sources", "propagates", "varargs", "continuation",
-                    "writes", "return_bound", "arity_capped", "destinations_unmodeled",
-                    "write_frame")
-# The roles that move or fill bytes. The others are ANNOTATIONS of a flow
+                    "writes", "return_bound", "arity_capped", "destinations_unmodeled")
+# The roles that move or fill bytes. The other three are ANNOTATIONS of a flow
 # model (a return bound, an arity cap, a destination disclosure): an overlay
 # entry made of annotations alone is merged INTO the existing model of the same
 # name, never a replacement for it -- `{"read": {"return_bound": ..}}` used to
@@ -295,26 +294,6 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
             _fail(f"`{flag}` must be `true` -- `{model[flag]!r}` declares nothing yet "
                   f"would count as an active model; drop the key or use {{}} to mark "
                   f"{name} benign")
-    if "write_frame" in model:
-        # A memory-effect declaration: the callee writes nothing outside these
-        # pointees. The backward walk trusts it to prove a call did NOT write
-        # bytes, so a malformed entry must not be read as a narrower frame.
-        wf = model["write_frame"]
-        if not isinstance(wf, list):
-            _fail("`write_frame` must be a list of `*arg:N` tokens or "
-                  "{\"to\": \"*arg:N\", \"len_arg\": M} objects (every pointee the callee "
-                  "may write; [] for a callee that writes no memory); omit it when the "
-                  "callee's writes are not fully known")
-        for e in wf:
-            tok, la = (e, None) if isinstance(e, str) else (
-                (e.get("to"), e.get("len_arg")) if isinstance(e, dict) else (None, None))
-            if not (isinstance(tok, str) and tok.startswith("*arg:") and _try_arg_index(tok) is not None):
-                _fail(f"`write_frame` entry {e!r} must be a `*arg:N` token or an object "
-                      f"with a `*arg:N` `to`")
-            if isinstance(e, dict) and (not _is_int(la) or la < 0):
-                _fail(f"`write_frame` entry {e!r} needs a non-negative integer `len_arg` "
-                      f"(the argument counting the bytes written); use a bare `*arg:N` "
-                      f"when the extent is unknown")
 
 
 def _is_annotation_only(model: Any) -> bool:

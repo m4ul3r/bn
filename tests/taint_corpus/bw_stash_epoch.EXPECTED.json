@@ -1,5 +1,5 @@
 {
-  "description": "Stash identity is flow-sensitive (#1034 item 1): a pointer loaded before the escape, an overwritten slot and a restored slot are not &buf, so their strcpy never becomes a writer or the getenv source of buf; the direct stash is. Analyze only.",
+  "description": "Stash identity is flow-sensitive (#1034 item 1): a pointer loaded before the escape, an overwritten slot and a restored slot are never &buf, so their strcpy is never a writer or the getenv source of buf. In `direct`, getenv runs between the stash and the reload and may write any memory, so the slot is forgotten and strcpy is a frontier too. Analyze only.",
   "lang": "c",
   "cflags": [
     "-fno-inline"
@@ -51,17 +51,18 @@
       "function": "direct",
       "sink": "arg:popen:0",
       "origin_kinds": [
+        "address_of_local_unresolved",
         "source"
       ],
-      "step_reasons_contain": [
-        "buf written by strcpy"
-      ],
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
           "kind": "address_of_local_unresolved"
         }
       ],
-      "complete_slice": true
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ]
     }
   ]
 }

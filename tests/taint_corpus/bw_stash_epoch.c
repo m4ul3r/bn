@@ -1,7 +1,9 @@
 /* Stash identity is flow-sensitive (#1034 item 1). `stash` starts out pointing
  * at another buffer; only `direct` really writes `buf` through it. The other
  * three write through a pointer that is NOT &buf, so their getenv bytes must
- * never become the origin of a complete slice of `buf`. Analyze only. */
+ * never become the origin of a complete slice of `buf`. In `direct` the getenv
+ * call between the stash and the reload may write any memory, so the slot is
+ * forgotten there too. Analyze only. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,7 +44,7 @@ __attribute__((noinline)) void restore(void) {
     popen(buf, "r");
 }
 
-/* Control: the reload IS &buf, so strcpy writes it. */
+/* The reload IS &buf, but getenv runs before it and may rewrite the slot. */
 __attribute__((noinline)) void direct(void) {
     char buf[64];
     memset(buf, 0, sizeof buf);

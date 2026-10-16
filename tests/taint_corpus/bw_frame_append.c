@@ -1,5 +1,6 @@
-/* strncat appends at dst + strlen(dst): its count is not [dst, dst+n) geometry (#1053
- * round 2). The strncpy control writes exactly [0,3). Analyze only. */
+/* strncat appends at dst + strlen(dst), so its count is no destination geometry; no
+ * call's write extent is trusted, so the strncpy control is a possible writer as well
+ * (#1053 rounds 2-3). Analyze only. */
 #include <stdint.h>
 #include <string.h>
 struct cat {

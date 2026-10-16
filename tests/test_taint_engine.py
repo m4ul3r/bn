@@ -4632,9 +4632,12 @@ def test_backward_unresolved_field_load_emits_leaf(models):
     assert any(sl["origin"]["kind"] == "field_load_unresolved" for sl in result["slices"])
 
 
-def test_backward_field_load_recovers_source_call(models):
+def test_backward_field_load_names_source_call_without_certifying_it(models):
     # The buffer is filled by a modeled source (read) writing *arg:1; the load of
-    # that buffer must recover the source, not dead-end (#158).
+    # that buffer must name the source, not dead-end (#158). No model proves
+    # which bytes a call wrote -- or that it wrote nothing else (#1053 review
+    # rounds 1-3) -- so the source is a possible producer and the field stays a
+    # frontier, not a certified origin of a complete slice.
     READ, MEMCPY = 0xb00, 0xb20
     h = FVar("h", ident=44); x = FVar("x", ident=45)
     h1 = FSSA(h, 1); x1 = FSSA(x, 1)
@@ -4663,7 +4666,8 @@ def test_backward_field_load_recovers_source_call(models):
     result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
     origins = [(sl["origin"]["kind"], sl["origin"].get("callee")) for sl in result["slices"]]
     assert ("source", "read") in origins, origins
-    assert not any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
+    assert any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 def test_backward_unwritten_stack_buffer_load_is_a_local_buffer_frontier(models):

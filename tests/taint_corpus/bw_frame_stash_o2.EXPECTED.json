@@ -1,5 +1,5 @@
 {
-  "description": "Stash slots are forgotten at every write that may reach them and kept across writes proven elsewhere (through the proven &buf, to another exact address). Analyze only. -O2.",
+  "description": "Remembered stash slots are forgotten at every call (no model enumerates a call's memory writes) and at every store that may reach them; a reload with no remembered or proven &buf is an opaque frontier, never a named writer. Analyze only. -O2.",
   "lang": "c",
   "cflags": [
     "-O2",
@@ -28,12 +28,12 @@
       "origin_kinds": [
         "parameter"
       ],
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
           "kind": "address_of_local_unresolved"
         }
-      ],
-      "complete_slice": true
+      ]
     },
     {
       "function": "ctl_snprintf",
@@ -52,27 +52,35 @@
       "function": "keep_adjacent",
       "sink": "arg:popen:0",
       "origin_kinds": [
+        "address_of_local_unresolved",
         "parameter"
       ],
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
           "kind": "address_of_local_unresolved"
         }
       ],
-      "complete_slice": true
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ]
     },
     {
       "function": "repeated_stash",
       "sink": "arg:popen:0",
       "origin_kinds": [
+        "address_of_local_unresolved",
         "parameter"
       ],
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
           "kind": "address_of_local_unresolved"
         }
       ],
-      "complete_slice": true
+      "forbid_step_reasons_contain": [
+        "buf written by strcpy"
+      ]
     },
     {
       "function": "kill_strtol",

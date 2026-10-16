@@ -1,4 +1,4 @@
-/* strtok writes the delimiter it finds; its model declares no write frame, so it is a
+/* strtok writes the delimiter it finds, a memory write its model never names: a
  * possible writer of the length field (#1053 round 2). Built at -O2. Analyze only. */
 #include <string.h>
 #include <stdint.h>

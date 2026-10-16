@@ -26,10 +26,10 @@ from test_taint_engine import (
     te,
 )
 
-_READ_U32, _MEMCPY, _RECV, _STRTOK, _STAT, _STRNCAT, _STRNCPY = (
-    0xa10, 0xa20, 0xa30, 0xa40, 0xa50, 0xa60, 0xa70)
+_READ_U32, _MEMCPY, _RECV, _STRTOK, _STAT, _STRNCAT, _STRNCPY, _GETENV = (
+    0xa10, 0xa20, 0xa30, 0xa40, 0xa50, 0xa60, 0xa70, 0xa80)
 _NAMES = {_READ_U32: "read_u32", _MEMCPY: "memcpy", _RECV: "recv", _STRTOK: "strtok",
-          _STAT: "stat", _STRNCAT: "strncat", _STRNCPY: "strncpy"}
+          _STAT: "stat", _STRNCAT: "strncat", _STRNCPY: "strncpy", _GETENV: "getenv"}
 
 
 class _FieldProgram:
@@ -198,76 +198,50 @@ def test_struct_field_offsets_key_the_loaded_slot(store_offset, covers):
     assert result["diagnostics"]["safe_to_report_complete_slice"] is covers
 
 
-@pytest.mark.parametrize("dest_off, length, effect", [
-    (0, 8, "disjoint"),      # recv(fd, p->hdr, 8): bytes [0,8); the field is [8,12)
-    (8, 4, "cover"),
-    (4, 8, "cover"),
-    (10, 4, "partial"),      # [10,14) writes the field's upper half only
-    (0, None, "may"),        # an unknown length may reach the field
+@pytest.mark.parametrize("between", [
+    "recv_disjoint",          # recv(fd, p->hdr, 8): payload [0,8), the field is [8,12)
+    "recv_covering",          # recv(fd, p, 12)
+    "recv_zero_count",        # a zero-count read still sets errno, which p may be (round 3)
+    "recv_pointer_unrecovered",  # BN recovered `recv(fd)` only (round 2)
+    "getenv",                 # ISO C allows getenv to copy into an internal buffer (round 3)
+    "strtok",                 # rewrites the delimiter; its model names no output
+    "stat",                   # sink-only model, yet it fills *arg:1
+    "strncat",                # appends at dst + strlen(dst)
+    "strncpy",                # writes [dst, dst+3), but no model proves its complete effect
 ])
-def test_source_fill_writes_a_field_only_over_its_extent(dest_off, length, effect):
-    # #1053 review 2: a source that fills ANOTHER part of the same object is
-    # not the loaded field's producer -- comparing only the base named recv as
-    # the origin of a complete slice.
-    p = _FieldProgram()
-    n = FVar("len", ident=9)
-    size = (FExpr("MLIL_CONST", hex(length), constant=length) if length is not None
-            else FExpr("MLIL_VAR_SSA", "len#0", reads=[FSSA(n, 0)]))
-    dest = p.addr(p.m0, dest_off) if dest_off else FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0])
-    p.call(_RECV, [FExpr("MLIL_VAR_SSA", "fd", reads=[]), dest, size,
-                   FExpr("MLIL_CONST", "0", constant=0)])
-    p.sink(p.load(p.addr(p.m0, 8), 4))
-    result, origins, reasons, fields = p.run()
-    named = {"kind": "source", "callee": "recv"} in origins or any("source recv" in r for r in reasons)
-    assert named is (effect != "disjoint"), (origins, reasons)
-    assert bool(fields) is (effect != "cover"), fields
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is (effect == "cover")
-
-
-def test_disjoint_source_fill_keeps_the_earlier_field_store():
-    # `p->len = t; recv(fd, p->hdr, 8); memcpy(.., p->len)`: the length is t.
-    p = _FieldProgram()
-    p.store(p.addr(p.m0, 8), 4)
-    p.call(_RECV, [FExpr("MLIL_VAR_SSA", "fd", reads=[]),
-                   FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0]),
-                   FExpr("MLIL_CONST", "0x8", constant=8), FExpr("MLIL_CONST", "0", constant=0)])
-    p.sink(p.load(p.addr(p.m0, 8), 4))
-    result, origins, _, fields = p.run()
-    assert origins == [{"kind": "call", "callee": "read_u32"}], origins
-    assert not fields
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
-
-
-@pytest.mark.parametrize("between, proven", [
-    ("recv_pointer_unrecovered", False),   # BN recovered `recv(fd)` only
-    ("strtok", False),                     # no write frame: a taint flow is not one
-    ("stat", False),                       # sink-only model, yet it fills *arg:1
-    ("strncat", False),                    # appends at dst + strlen(dst), not [dst, dst+n)
-    ("strncpy", True),                     # writes exactly [dst, dst+3)
-])
-def test_modeled_call_is_passed_only_by_a_complete_write_frame(between, proven):
-    # #1053 round 2: `p->len = t; <call>; memcpy(.., p->len)`. A call proves it
-    # did not write the field only by a declared write frame whose pointers are
-    # all present and whose extents are destination-relative constants.
+def test_no_call_is_proof_that_a_field_was_not_written(between):
+    # #1053 review rounds 1-3: `p->len = t; <call>; memcpy(.., p->len)`. No
+    # model enumerates every memory write its callee performs, so every call
+    # may have written the field: the earlier store is walked (t stays a
+    # candidate), a modeled source is named, and the slice is not complete.
     p = _FieldProgram()
     p.store(p.addr(p.m0, 8), 4)
     m = FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0])
     src = FExpr("MLIL_VAR_SSA", "src#0", reads=[p.src0])
-    three = FExpr("MLIL_CONST", "3", constant=3)
+    fd = FExpr("MLIL_VAR_SSA", "fd", reads=[])
+
+    def const(n):
+        return FExpr("MLIL_CONST", hex(n), constant=n)
+
     target, params = {
-        "recv_pointer_unrecovered": (_RECV, [FExpr("MLIL_VAR_SSA", "fd", reads=[])]),
+        "recv_disjoint": (_RECV, [fd, m, const(8), const(0)]),
+        "recv_covering": (_RECV, [fd, m, const(12), const(0)]),
+        "recv_zero_count": (_RECV, [fd, p.addr(p.m0, 8), const(0), const(0)]),
+        "recv_pointer_unrecovered": (_RECV, [fd]),
+        "getenv": (_GETENV, [_cstr(0x700)]),
         "strtok": (_STRTOK, [m, _cstr(0x700)]),
         "stat": (_STAT, [_cstr(0x700), m]),
-        "strncat": (_STRNCAT, [m, src, three]),
-        "strncpy": (_STRNCPY, [m, src, three]),
+        "strncat": (_STRNCAT, [m, src, const(3)]),
+        "strncpy": (_STRNCPY, [m, src, const(3)]),
     }[between]
     p.call(target, params)
     p.sink(p.load(p.addr(p.m0, 8), 4))
-    result, origins, _, fields = p.run()
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is proven, result["diagnostics"]
-    assert bool(fields) is not proven, fields
-    if proven:
-        assert origins == [{"kind": "call", "callee": "read_u32"}], origins
+    result, _, reasons, fields = p.run()
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
+    assert fields, result["leaves"]
+    if target == _RECV:
+        assert any("field may be filled by source recv" in r for r in reasons), reasons
+        assert any("reaching store to field" in r for r in reasons), reasons
 
 
 # --- stash identity (#1034 items 1 and 2) -------------------------------------
@@ -313,39 +287,49 @@ def test_stash_through_a_narrowed_slot_address_is_not_the_slot(narrowed):
 
 @pytest.mark.parametrize("between, kept", [
     ("memcpy_over_slot", False),
-    ("memcpy_elsewhere", True),
-    ("memset_through_proven_buf", True),   # `stash = buf; memset(stash, ..)` (round 2)
-    ("read_pointer_unrecovered", False),   # `read(fd)`: the frame's pointer is missing
-    ("frameless_model", False),            # snprintf declares no write frame (%n)
+    ("memcpy_elsewhere", False),           # no model proves a call's complete effect
+    ("memset_through_proven_buf", False),  # round 2's framed pass, reverted in round 3
+    ("read_zero_count", False),            # a failing read still writes errno (round 3)
+    ("read_pointer_unrecovered", False),
+    ("snprintf_elsewhere", False),
     ("unmodeled_call", False),
     ("store_through_pointer", False),
+    ("store_elsewhere", True),             # a STORE to another exact address
+    ("store_through_proven_buf", True),    # a STORE through a reload proven to be &buf
 ])
 def test_remembered_stash_dies_at_every_possible_overwrite(between, kept):
-    # #1053 review 3: `stash = buf; memcpy(&stash, &otherptr, 8); strcpy(stash,
-    # ..)` -- the remembered slot survived the modeled overwrite and named
-    # strcpy a writer (and getenv the source) of buf. Any write that may reach
-    # the slot forgets it; a write provably elsewhere does not.
+    # #1053 review rounds 1-3: `stash = buf; memcpy(&stash, &otherptr, 8);
+    # strcpy(stash, ..)` -- the remembered slot survived the overwrite and
+    # named strcpy a writer (and getenv the source) of buf. No model proves
+    # what a call does not write, so every call forgets the slot; a store is
+    # judged by its exact address and width.
     buf = FVar("buf", typ="char[64]")
     ptr = FVar("ptr", ident=22)
     pg = _BufProgram(params=[ptr])
     _memset_buf(pg, buf)
     pg.store(_cstr(_SLOT), _addr_of(buf))
+    zero, eight = FExpr("MLIL_CONST", "0", constant=0), FExpr("MLIL_CONST", "8", constant=8)
     if between.startswith("memcpy"):
         pg.call(_B_MEMCPY, [_cstr(_SLOT if between == "memcpy_over_slot" else _SLOT2),
-                            _cstr(_OTHER), FExpr("MLIL_CONST", "8", constant=8)])
+                            _cstr(_OTHER), eight])
     elif between == "memset_through_proven_buf":
-        pg.call(_B_MEMSET, [_reload(_SLOT, pg.mem, 8), FExpr("MLIL_CONST", "0", constant=0),
+        pg.call(_B_MEMSET, [_reload(_SLOT, pg.mem, 8), zero,
                             FExpr("MLIL_CONST", "64", constant=64)])
+    elif between == "read_zero_count":
+        pg.call(_B_READ, [zero, _cstr(_SLOT2), zero])
     elif between == "read_pointer_unrecovered":
-        pg.call(_B_READ, [FExpr("MLIL_CONST", "0", constant=0)])
-    elif between == "frameless_model":
-        pg.call(_B_SNPRINTF, [_cstr(_SLOT2), FExpr("MLIL_CONST", "8", constant=8), _cstr(0x700)])
+        pg.call(_B_READ, [zero])
+    elif between == "snprintf_elsewhere":
+        pg.call(_B_SNPRINTF, [_cstr(_SLOT2), eight, _cstr(0x700)])
     elif between == "unmodeled_call":
         pg.call(next(k for k, v in _B_NAMES.items() if v == "run"), [])
-    else:
+    elif between == "store_through_pointer":
         p0 = FSSA(ptr, 0)
-        pg.store(FExpr("MLIL_VAR_SSA", "ptr#0", reads=[p0]), FExpr("MLIL_CONST", "0", constant=0),
-                 reads=[p0])
+        pg.store(FExpr("MLIL_VAR_SSA", "ptr#0", reads=[p0]), zero, reads=[p0])
+    elif between == "store_elsewhere":
+        pg.store(_cstr(_SLOT2), zero)
+    else:
+        pg.store(_reload(_SLOT, pg.mem, 8), zero).size = 1
     pg.call(_B_STRCPY, [_reload(_SLOT, pg.mem, 8), _cstr(0x700)])
     pg.sink(buf)
     result, reasons, leaves = _bw(pg.func())

@@ -1,5 +1,6 @@
-/* A source fills a field only over its extent (#1053 review 2): recv writes p->hdr,
- * bytes [0,8); the memcpy length is p->len at [8,12). Built at -O2. Analyze only. */
+/* recv is never certified as a field's producer (#1053 review 2): recv writes p->hdr,
+ * bytes [0,8), yet no call's write extent is trusted, so p->len at [8,12) stays a
+ * frontier with or without an earlier store. Built at -O2. Analyze only. */
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
