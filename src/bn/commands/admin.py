@@ -886,10 +886,14 @@ def _skill_install(args: argparse.Namespace) -> int:
         # A forced run has already acted on its preflight; the renderer must not
         # restate it as a pending dry run (#1035 install comment 1).
         "forced": bool(args.force),
-        **_forced_rerun(
-            args,
-            applies=not args.force and bool(not_updated_destinations)
-            and all(row["allowed"] for row in force_plan),
+        # #1035 install comment 2, narrowed under the split rule (#1043 review
+        # 3): the refused run's arguments plus `--force`, never a claim about
+        # which executable to run them with.
+        "force_args": (
+            _forced_skill_install_args(args)
+            if not args.force and not_updated_destinations
+            and all(row["allowed"] for row in force_plan)
+            else None
         ),
         "bn_kernel_skill_dirs": _current_skill_dirs(
             [dest for source, dest in install_plan if source.name == "bn-kernel"],
@@ -915,57 +919,19 @@ def _skill_install(args: argparse.Namespace) -> int:
     return 1 if not_updated_destinations else 0
 
 
-def _bn_invocation() -> list[str] | None:
-    """The words that provably run THIS bn, or None.
+def _forced_skill_install_args(args: argparse.Namespace) -> list[str]:
+    """The refused run's own arguments plus `--force`, after the program name.
 
-    The executable decides which checkout's skills get installed, so a rerun
-    must not name a different `bn` than the one that produced it (#1043
-    review). Claimed only for a `bn` console script the kernel executed --
-    `sys.argv[0]` itself, whose `#!` names this very interpreter (unresolved:
-    two venvs share a resolved base interpreter but not their packages) --
-    and only when `PYTHONPATH` does not supply the imported `bn` package, as
-    a wrapper can set it for one launch. Then it is `bn` when PATH resolves
-    to that very file, else its absolute path. Any other launch (`python -m
-    bn`, a `PYTHONPATH` wrapper, an `env` shebang, ...) selected its package
-    through state this process cannot restate, so no command is claimed: a
-    reconstructed one can install a different checkout."""
-    launched = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
-    if launched is None or launched.name != "bn" or not os.access(launched, os.X_OK):
-        return None
-    launched = launched.absolute()
-    try:
-        with launched.open("rb") as handle:
-            first = handle.readline(4096).decode(errors="replace")
-    except OSError:
-        return None
-    interpreter = first[2:].strip() if first.startswith("#!") else ""
-    if not interpreter or os.path.normpath(interpreter) != os.path.normpath(
-        os.path.abspath(sys.executable)
-    ):
-        return None
-    package_root = Path(cli.__file__).resolve().parent.parent
-    for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
-        if entry and Path(entry).resolve() == package_root:
-            return None
-    on_path = shutil.which("bn")
-    if on_path is not None and Path(on_path).resolve() == launched.resolve():
-        return ["bn"]
-    return [str(launched)]
-
-
-def _forced_rerun(args: argparse.Namespace, *, applies: bool) -> dict[str, str | None]:
-    """The refused run's own arguments plus `--force` (#1035 install comment 2).
-
-    `force_arguments` is the subcommand and its options, rebuilt from the
-    parsed arguments: `--dest` keeps the caller's spelling (a relative path
-    reruns from the same directory; normalising it could change which entry a
-    `..` names), a value starting with `-` takes the `=` form so it cannot
-    parse as an option, and `--out` keeps the requested receipt, already
-    absolute. `force_command` prefixes them with the entry point only when
-    `_bn_invocation` can prove which one ran; otherwise it is None and the
-    caller reruns its own invocation with these arguments."""
-    if not applies:
-        return {"force_command": None, "force_arguments": None}
+    Rebuilt from the parsed arguments: `--dest` keeps the caller's spelling (a
+    relative path reruns from the same directory; normalising it could change
+    which entry a `..` names), a value starting with `-` takes the `=` form so
+    it cannot parse as an option, and `--out` keeps the requested receipt,
+    already absolute. Deliberately NO program name: the executable decides
+    which checkout's skills get installed, and which one ran (a PATH `bn`, a
+    console script, `python -m bn`, a wrapper setting PYTHONPATH) is not
+    something this process can prove -- three review rounds of provenance
+    checks each printed a command that installed another checkout (#1043).
+    The caller reruns its own invocation with these arguments."""
     argv = ["skill", "install"]
     if args.dest is not None:
         dest = str(args.dest)
@@ -977,11 +943,7 @@ def _forced_rerun(args: argparse.Namespace, *, applies: bool) -> dict[str, str |
     if getattr(args, "out", None) is not None:
         argv.extend(["--out", str(args.out)])
     argv.append("--force")
-    invocation = _bn_invocation()
-    return {
-        "force_command": None if invocation is None else shlex.join([*invocation, *argv]),
-        "force_arguments": shlex.join(argv),
-    }
+    return argv
 
 
 def _current_skill_dirs(dests: list[Path], source: Path) -> list[str]:

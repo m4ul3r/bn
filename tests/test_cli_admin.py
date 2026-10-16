@@ -5935,32 +5935,29 @@ def test_skill_install_through_a_canceled_missing_component_judges_the_entry(
     assert _install_disk_snapshot(tmp_path) == before
 
 
-def _entry_point(directory, monkeypatch, *, on_path=True, interpreter=None):
-    """Make this process look launched as the console script `<directory>/bn`
-    (its `#!` naming this interpreter unless told otherwise), optionally the
-    `bn` that PATH resolves to; return that path."""
-    import sys
+_RERUN_LEAD = ("To replace them, rerun with the same bn invocation you just used, "
+               "adding --force: ")
 
-    directory.mkdir(parents=True, exist_ok=True)
-    launcher = directory / "bn"
-    launcher.write_text(f"#!{interpreter or sys.executable}\nraise SystemExit(0)\n")
-    launcher.chmod(0o755)
-    monkeypatch.setattr("sys.argv", [str(launcher)])
-    monkeypatch.delenv("PYTHONPATH", raising=False)
-    if on_path:
-        monkeypatch.setenv("PATH", str(directory))
-    return launcher
+
+def _printed_rerun(err):
+    """The `bn …` template from a refusal's text, split into words."""
+    import shlex
+
+    [template] = [line[len(_RERUN_LEAD):] for line in err.splitlines()
+                  if line.startswith(_RERUN_LEAD)]
+    words = shlex.split(template)
+    assert words[0] == "bn"
+    return words
 
 
 def test_skill_install_refusal_prints_a_rerun_that_works_as_printed(
     tmp_path, monkeypatch, capsys
 ):
-    """#1035 install comments: the unforced refusal prints the complete forced
-    command, and the forced run that follows does not end on a dry-run line."""
-    import shlex
-
+    """#1035 install comments: the unforced refusal prints the refused
+    arguments plus `--force` with the instruction to reuse the caller's own
+    invocation, and the forced run that follows does not end on a dry-run line.
+    Following it here means this process's own entry, `bn.cli.main`."""
     source, _ = _one_skill_source(tmp_path, monkeypatch)
-    _entry_point(tmp_path / "bin", monkeypatch)
     store = tmp_path / "my store"
     store.mkdir()
     monkeypatch.chdir(tmp_path)
@@ -5968,12 +5965,10 @@ def test_skill_install_refusal_prints_a_rerun_that_works_as_printed(
     capsys.readouterr()
 
     assert bn.cli.main(["skill", "install", "--dest", "my store", "--mode", "copy"]) == 2
-    err = capsys.readouterr().err
-    [command] = [line.split(": ", 1)[1] for line in err.splitlines()
-                 if line.startswith("Rerun with --force to replace them: ")]
-    argv = shlex.split(command)
-    assert argv[0] == "bn"
-    assert bn.cli.main(argv[1:]) == 0
+    words = _printed_rerun(capsys.readouterr().err)
+    assert words[1:] == ["skill", "install", "--dest", "my store", "--mode", "copy",
+                         "--force"]
+    assert bn.cli.main(words[1:]) == 0
     out = capsys.readouterr().out
     entry = store / source.name
     assert not entry.is_symlink()
@@ -5987,95 +5982,64 @@ def test_skill_install_refusal_prints_a_rerun_that_works_as_printed(
     assert bn.cli.main(["skill", "install", "--dest", "my store", "--mode", "copy",
                         "--format", "json"]) == 0
     current = json.loads(capsys.readouterr().out)
-    assert current["force_command"] is None
+    assert current["force_args"] is None
     assert current["forced"] is False
 
 
 def test_skill_install_rerun_keeps_a_dash_leading_dest_an_option_value(
     tmp_path, monkeypatch, capsys
 ):
-    import shlex
-
     source, _ = _one_skill_source(tmp_path, monkeypatch)
-    _entry_point(tmp_path / "bin", monkeypatch)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "-store").mkdir()
     assert bn.cli.main(["skill", "install", "--dest=-store", "--mode", "copy"]) == 0
     capsys.readouterr()
     assert bn.cli.main(["skill", "install", "--dest=-store", "--format", "json"]) == 2
-    command = json.loads(capsys.readouterr().out)["force_command"]
-    assert shlex.split(command) == [
-        "bn", "skill", "install", "--dest=-store", "--format", "json", "--force",
+    force_args = json.loads(capsys.readouterr().out)["force_args"]
+    assert force_args == [
+        "skill", "install", "--dest=-store", "--format", "json", "--force",
     ]
-    assert bn.cli.main(shlex.split(command)[1:]) == 0
+    assert bn.cli.main(force_args) == 0
     assert (tmp_path / "-store" / source.name).is_symlink()
 
 
-def test_skill_install_rerun_names_only_a_proven_entry_point(tmp_path, monkeypatch):
-    """The executable decides which checkout's skills a rerun installs. A
-    command is claimed only for the console script that ran this interpreter
-    and package (#1043 review findings 3 and round-2 3); otherwise none."""
-    import shlex
-    from pathlib import Path
-
-    from bn.commands import admin
-
-    args = bn.cli.build_parser().parse_args(["skill", "install", "--mode", "copy"])
-
-    def rerun():
-        return admin._forced_rerun(args, applies=True)
-
-    expected_arguments = "skill install --mode copy --force"
-    other = _entry_point(tmp_path / "other-checkout", monkeypatch)
-    this = _entry_point(tmp_path / "this-checkout", monkeypatch, on_path=False)
-    assert other != this
-    assert shlex.split(rerun()["force_command"]) == [str(this), *expected_arguments.split()]
-
-    # The `bn` on PATH IS this entry point: the short spelling is the same file.
-    monkeypatch.setenv("PATH", str(this.parent))
-    assert rerun()["force_command"] == f"bn {expected_arguments}"
-
-    # No proof, no command -- only the arguments to append to the caller's own
-    # invocation:
-    # - `python -m bn` has no `bn` executable of its own;
-    monkeypatch.setattr("sys.argv", [str(tmp_path / "__main__.py")])
-    assert rerun() == {"force_command": None, "force_arguments": expected_arguments}
-    # - a console script of ANOTHER interpreter (another venv) imports another bn;
-    _entry_point(tmp_path / "other-venv", monkeypatch, interpreter=tmp_path / "py")
-    assert rerun()["force_command"] is None
-    # - a wrapper that supplied this package through PYTHONPATH for one launch.
-    _entry_point(tmp_path / "this-checkout", monkeypatch)
-    monkeypatch.setenv("PYTHONPATH", str(Path(bn.cli.__file__).resolve().parent.parent))
-    assert rerun()["force_command"] is None
-    assert rerun()["force_arguments"] == expected_arguments
-
-
-def test_skill_install_rerun_without_a_proven_entry_point_prints_arguments(
-    tmp_path, monkeypatch, capsys
+@pytest.mark.parametrize("launch", ["absolute_console_script", "module", "path_bn"])
+def test_skill_install_rerun_never_claims_which_bn_to_run(
+    tmp_path, monkeypatch, capsys, launch
 ):
-    """`python -m bn`: the refusal prints the arguments with the instruction to
-    reuse the caller's own invocation, and following it exactly works."""
-    import shlex
+    """#1043 review 3 (split rule): which executable ran -- and so which
+    checkout a rerun installs -- cannot be proven, so no launch gets a command
+    naming an entry point. Every launch gets the same `bn …` template under the
+    same-invocation instruction, and JSON has `force_args`, no `force_command`."""
+    import sys
 
-    source, _ = _one_skill_source(tmp_path, monkeypatch)
-    monkeypatch.setattr("sys.argv", [str(tmp_path / "__main__.py")])
-    store = tmp_path / "my store"
+    _one_skill_source(tmp_path, monkeypatch)
+    launcher = tmp_path / "venv" / "bin" / "bn"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(f"#!{sys.executable}\n")
+    launcher.chmod(0o755)
+    argv0 = {"absolute_console_script": launcher, "module": tmp_path / "__main__.py",
+             "path_bn": launcher}[launch]
+    monkeypatch.setattr("sys.argv", [str(argv0)])
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setenv("PATH", str(launcher.parent if launch == "path_bn" else tmp_path))
+    store = tmp_path / "store"
     store.mkdir()
     monkeypatch.chdir(tmp_path)
-    assert bn.cli.main(["skill", "install", "--dest", "my store"]) == 0
+    assert bn.cli.main(["skill", "install", "--dest", "store"]) == 0
     capsys.readouterr()
 
-    assert bn.cli.main(["skill", "install", "--dest", "my store", "--mode", "copy"]) == 2
+    assert bn.cli.main(["skill", "install", "--dest", "store", "--mode", "copy"]) == 2
     err = capsys.readouterr().err
-    lead = ("To replace them, rerun with the same bn invocation you just used, "
-            "adding --force: <your bn invocation> ")
-    [arguments] = [line[len(lead):] for line in err.splitlines() if line.startswith(lead)]
-    assert "Rerun with --force to replace them:" not in err
-    # "The same bn invocation" here is this process's own entry, bn.cli.main.
-    assert bn.cli.main(shlex.split(arguments)) == 0
-    entry = store / source.name
-    assert not entry.is_symlink()
-    assert (entry / "SKILL.md").read_bytes() == (source / "SKILL.md").read_bytes()
+    assert _printed_rerun(err)[1:] == [
+        "skill", "install", "--dest", "store", "--mode", "copy", "--force",
+    ]
+    assert str(launcher) not in err and "-m bn" not in err
+    assert bn.cli.main(["skill", "install", "--dest", "store", "--mode", "copy",
+                        "--format", "json"]) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert "force_command" not in result
+    assert result["force_args"][-1] == "--force"
 
 
 def test_skill_install_rerun_keeps_the_requested_out_receipt(
@@ -6083,10 +6047,7 @@ def test_skill_install_rerun_keeps_the_requested_out_receipt(
 ):
     """#1043 review finding 4: the original request plus `--force` includes its
     `--out`, so the forced run writes the receipt the caller asked for."""
-    import shlex
-
     source, _ = _one_skill_source(tmp_path, monkeypatch)
-    _entry_point(tmp_path / "bin", monkeypatch)
     store = tmp_path / "my store"
     store.mkdir()
     monkeypatch.chdir(tmp_path)
@@ -6096,13 +6057,11 @@ def test_skill_install_rerun_keeps_the_requested_out_receipt(
     receipt = tmp_path / "receipt dir" / "install.json"
     receipt.parent.mkdir()
     assert bn.cli.main(["skill", "install", "--dest", "my store", "--mode", "copy",
-                        "--format", "json", "--out", "receipt dir/install.json"]) == 2
-    command = json.loads(capsys.readouterr().out)["force_command"]
+                        "--out", "receipt dir/install.json"]) == 2
+    words = _printed_rerun(capsys.readouterr().err)
     assert not receipt.exists()
-    argv = shlex.split(command)
-    assert argv[0] == "bn"
-    assert argv[argv.index("--out") + 1] == str(receipt)
-    assert bn.cli.main(argv[1:]) == 0
+    assert words[words.index("--out") + 1] == str(receipt)
+    assert bn.cli.main(words[1:]) == 0
     assert json.loads(receipt.read_text())["installed"] is True
     assert not (store / source.name).is_symlink()
 

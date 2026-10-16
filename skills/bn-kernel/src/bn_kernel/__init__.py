@@ -2219,6 +2219,16 @@ class Session:
                 "decompile_many takes a sequence of identifiers, not one string; "
                 "use decompile() for a single function"
             )
+        # A Sequence has a caller-defined order to answer in; a mapping (its
+        # values would be dropped), a set (no order) or a one-shot iterator is
+        # refused before anything is sent (#1043 review 3).
+        if isinstance(identifiers, (bytes, bytearray)) or not isinstance(
+            identifiers, Sequence
+        ):
+            raise ValueError(
+                "identifiers must be a non-empty sequence of strings (a list or "
+                f"tuple), not {type(identifiers).__name__}"
+            )
         names = list(identifiers)
         if not names or any(not isinstance(name, str) for name in names):
             raise ValueError("identifiers must be a non-empty sequence of strings")

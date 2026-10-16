@@ -4436,3 +4436,33 @@ def test_decompile_many_bounds_placeholder_rows_too():
     assert small["ok"] is False and "truncated" not in small
     assert small["decompiled"]["text"] == "/* stub */"
     assert session.last.payload["functions"][0]["decompiled"]["text"] == body
+
+
+@pytest.mark.parametrize(
+    "identifiers",
+    [{"main": "x"}, {"main"}, iter(["main"]), (n for n in ["main"]), b"main"],
+    ids=["mapping", "set", "iterator", "generator", "bytes"],
+)
+def test_decompile_many_refuses_non_sequences_before_sending(identifiers):
+    """#1043 review 3, finding 2: only an ordered Sequence of strings has an
+    order to answer in; anything else is refused before any request."""
+    session = bn_kernel.Session(instance="worker", target="sample", backend="native")
+    sent = []
+
+    class BatchClient:
+        def request(self, op, params=None):
+            sent.append(params)
+            raise AssertionError("must not be sent")
+
+    session._client = BatchClient()
+    with pytest.raises(ValueError, match="sequence of strings"):
+        _run(session.decompile_many(identifiers))
+    assert sent == []
+    assert session.last is None
+
+    # Lists and tuples remain the supported spellings.
+    session._client = type("C", (), {"request": lambda self, op, params=None: {
+        "kind": "decompile_batch",
+        "functions": [_batch_row(n, "void f() {}") for n in params["identifiers"]],
+    }})()
+    assert [r["ok"] for r in _run(session.decompile_many(("main", "aux")))] == [True, True]
