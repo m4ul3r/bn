@@ -40,8 +40,8 @@ bn dataflow defuse <fn> --var <name|local_id|name#version>   # SSA def site + us
                                                     # reported as a `hint: call ... call-model truncation`
 bn dataflow callgraph <fn> [--direction {callees|callers|both}]   # resolved edges; indirect targets via value-set
 bn dataflow values <fn> --at 0x401234                # value-set (possible values) at an instruction
-bn taint models [--role {source|sink|propagator}] [--class overflow_len] [--present] [--callsites [--all-sites]] [--mangled]   # known sources/sinks; --present needs a target; --callsites lists real calls by application callers (stub/inline rows counted, shown with --all-sites), named by demangled caller unless --mangled
-bn taint forward -f <fn> --source param:0 [--sink-class recv_overflow]   # untrusted data source→sink across calls (methodology → the `bn-vr` skill)
+bn taint models [--role {source|sink|propagator}] [--class overflow_len] [--present] [--callsites [--all-sites]] [--callsite-limit N] [--mangled]   # known sources/sinks; --present needs a target; --callsites lists real calls by application callers (stub/inline rows counted, shown with --all-sites), named by demangled caller unless --mangled; text prints 10 rows per model and counts the rest (--callsite-limit 0 = all)
+bn taint forward -f <fn> --source param:0 [--sink-class recv_overflow]   # untrusted data source→sink across calls (methodology → the `bn-vr` skill); with several --source flags each flow names the source it starts from; advice that bn cannot complete is printed as a `template` with UPPER-CASE blanks
 bn taint backward -f <fn> --sink arg:memcpy:2         # slice a sink's args back to their origin (`bounded: true` = provably bounded)
 bn function cfg <fn> [--view {asm|mlil|hlil}]        # basic-block graph: blocks, their instructions, and the typed edges between them
 bn function structured-il <fn>                       # flat per-instruction list: op plus vars_read/vars_written, no block partitioning

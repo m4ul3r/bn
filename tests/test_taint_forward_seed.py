@@ -12,14 +12,32 @@ import re
 import shlex
 
 import pytest
-
-from test_taint_engine import (  # noqa: F401 -- `models` is a fixture
-    FBV, FBVStr, FBlock, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar, _FEdge, _addr_of, _cstr,
-    _ext_call, _slot_recv_func, models, te,
+from test_taint_engine import (
+    FBV,
+    FSSA,
+    FBlock,
+    FBVStr,
+    FExpr,
+    FFunc,
+    FInstr,
+    FSSAFunc,
+    FVar,
+    _addr_of,
+    _cstr,
+    _ext_call,
+    _FEdge,
+    _slot_recv_func,
+    te,
 )
+
 from bn_agent_bridge import il_format
 from bn_agent_bridge.read_taint_models import build_catalog
 from bn_agent_bridge.taint_models import _validate_model_interior
+
+
+@pytest.fixture
+def models():
+    return te.load_models()
 
 
 def _var(ssa, text=None):
@@ -164,7 +182,7 @@ def test_resolve_map_target_names_and_any_hex_case_resolve_1041(models, rmap):
     (["0x70c"], "JSON object"),
 ])
 def test_resolve_map_refusal_names_the_file_and_entry_before_the_walk_1041(models, rmap, named):
-    dispatch, bv = _dispatch_program()
+    _dispatch, bv = _dispatch_program()
 
     with pytest.raises(te.TaintError) as refused:
         te.TaintEngine(bv, models, resolve_map=rmap, find_function=_find,
