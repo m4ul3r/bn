@@ -52,12 +52,12 @@
         "address_of_local_unresolved",
         "call"
       ],
-      "forbid_leaf_details_contain": [
-        "touch"
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
       ],
-      "forbid_step_reasons_contain": [
-        "touch"
-      ]
+      "complete_slice": false
     }
   ]
 }

@@ -10152,6 +10152,21 @@ class _BufProgram:
         self.instrs.append(ins)
         return ins
 
+    def whole_store(self, buf, value=0):
+        """`buf @ mem#k -> mem#k+1 = value`: MLIL_SET_VAR_ALIASED, a store of
+        the WHOLE address-taken local by name -- it covers the buffer and,
+        being no call, starts no escape epoch (#1053 review 4)."""
+        i, a = self._next()
+        dst = FSSA(buf, self.mem + 1)
+        ins = FInstr(i, a, "MLIL_SET_VAR_ALIASED",
+                     f"{buf.name} @ mem#{self.mem} -> mem#{self.mem + 1} = {value}",
+                     writes=[dst], dest=dst, src=FExpr("MLIL_CONST", str(value), constant=value))
+        ins.ssa_memory_version = self.mem
+        self.mem += 1
+        self.mem_defs[self.mem] = ins
+        self.instrs.append(ins)
+        return ins
+
     def aliased_store(self, buf, offset, value):
         """`buf[offset] @ mem#k -> mem#k+1 = value`: MLIL_SET_VAR_ALIASED_FIELD,
         which carries NO src_memory/dest_memory -- only ssa_memory_version."""
@@ -10715,9 +10730,11 @@ def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
     # The stored VALUE is walked too: the parameter is in the slice.
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}
 
-    # Guard: the same reload BEFORE any escape cannot alias the buffer.
+    # Guard: the same reload BEFORE any escape cannot alias the buffer. The
+    # buffer is initialized by a store, not a call: a call handed &cmd starts
+    # an escape epoch of its own (#1053 review 4).
     pg2 = _BufProgram(params=[host])
-    pg2.call(_B_SNPRINTF, [_addr_of(cmd), FExpr("MLIL_CONST", "0x80", constant=0x80), _cstr(0x700)])
+    pg2.whole_store(cmd)
     pg2.instrs.append(FInstr(*pg2._next(), "MLIL_SET_VAR_SSA", "q#1 = [0x404058].q", writes=[q1],
                              src=FExpr("MLIL_LOAD_SSA", "[0x404058].q", reads=[],
                                        src=FExpr("MLIL_CONST_PTR", "0x404058", constant=0x404058))))
@@ -10726,7 +10743,7 @@ def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
     pg2.sink(cmd)
     result2, reasons2, aol2 = _bw(pg2.func())
     assert aol2 == [] and not any("may write" in r for r in reasons2), (result2["leaves"], reasons2)
-    assert result2["slices"][0]["origin"] == {"kind": "call", "callee": "snprintf"}
+    assert result2["diagnostics"]["safe_to_report_complete_slice"] is True, result2["diagnostics"]
 
 
 def test_backward_modeled_call_reloading_the_escape_slot_is_a_fill_928r3():

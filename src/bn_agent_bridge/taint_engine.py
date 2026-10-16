@@ -2183,6 +2183,11 @@ class TaintEngine:
                 if c in held:
                     return "yes" if self._pointer_width(getattr(expr, "size", None)) else "maybe"
             return "maybe" if esc_at(mv) else "no"
+        if op in ("MLIL_VAR_ALIASED", "MLIL_VAR_ALIASED_FIELD"):
+            # A read of an address-taken local BY NAME (`p = end` after
+            # `strtol(buf, &end, 10)`) is a memory read: a call handed both
+            # may have planted a pointer into the buffer there (#1053 review 4).
+            return "maybe" if escaped else "no"
         if "CONST" in op or "EXTERN_PTR" in op or "IMPORT" in op:
             return "no"
         if is_ssa_var(expr):
@@ -2606,6 +2611,13 @@ class TaintEngine:
                         esc = True
                 elif self._is_call(defn):
                     cov = _call_writer(defn, esc) or cov
+                    # A call handed a pointer that may alias the buffer may
+                    # RETAIN or PLANT it (strtok_r's save pointer, strtol's
+                    # end pointer): from here on any reload is a may-alias,
+                    # exactly as after a store of `&buf` (#1053 review 4).
+                    yes, maybe = _params_touching(self._call_params(defn), esc)
+                    if yes or maybe:
+                        esc = True
                     # Any call may overwrite a remembered slot: no model
                     # enumerates every memory write of its callee (#1053
                     # review rounds 2-3), so a remembered stash never
@@ -7663,21 +7675,24 @@ class TaintEngine:
             la = self._mem_access_slot(ssaf, load, exact=True)
             fixed = self._gconst_addr(la)
             gaps: list[str] = []
+            _, consts = self._address_terms(addr)
+            kinds = [self._const_ptr_storage(c) for c in consts]
+            if fixed is None and addr_reads and consts \
+                    and all(k in ("readonly", "writable") for k in kinds):
+                # `tbl[i]`: an element of a global table at a variable index
+                # -- even when `[(i << 3) + tbl]` keys as an exact slot on the
+                # scaled index (#1053 review 4). A read-only table's bytes are
+                # literals; a writable one's are a `global` frontier. The
+                # index picks which bytes, so it stays in the slice.
+                for c, k in zip(consts, kinds):
+                    if k == "writable":
+                        _global_leaf(at, hex(c), c, "the loaded address")
+                for r in addr_reads:
+                    walk(r, d + 1, lmv)
+                return
             if la is None:
-                _, consts = self._address_terms(addr)
-                kinds = [self._const_ptr_storage(c) for c in consts]
                 if not addr_reads and consts and all(k == "readonly" for k in kinds):
                     return      # read-only data: the bytes are the binary's own
-                if addr_reads and consts and all(k in ("readonly", "writable") for k in kinds):
-                    # `tbl[i]`: an element of a global at a variable index. A
-                    # read-only table's bytes are literals; a writable one's
-                    # are a `global` frontier. The index picks which bytes.
-                    for c, k in zip(consts, kinds):
-                        if k == "writable":
-                            _global_leaf(at, hex(c), c, "the loaded address")
-                    for r in addr_reads:
-                        walk(r, d + 1, lmv)
-                    return
                 # `[host + i]`: as for a pointer operand of a fill, the pointer
                 # and the index are walked (they lead to the buffer and pick
                 # the bytes) -- but no store can be matched to the bytes.

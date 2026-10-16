@@ -1,5 +1,5 @@
 {
-  "description": "A reload that may still hold the stash's previous target (first do-while trip, untaken branch) never certifies the buffer; an escape after a finished loop does not make the loop's earlier call a writer (the literal strcpy lowers to a short strncpy, so coverage itself stays unproven). Analyze only.",
+  "description": "A reload that may still hold the stash's previous target (first do-while trip, untaken branch) never certifies the buffer; the strcpy that fills buf before the loop is itself handed &buf, so it starts the escape and the loop's unmodeled call is a possible writer (#1053 review 4) (the literal strcpy lowers to a short strncpy, so coverage itself stays unproven). Analyze only.",
   "lang": "c",
   "cflags": [
     "-fno-inline"
@@ -51,12 +51,12 @@
         "address_of_local_unresolved",
         "call"
       ],
-      "forbid_leaf_details_contain": [
-        "touch"
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
       ],
-      "forbid_step_reasons_contain": [
-        "touch"
-      ]
+      "complete_slice": false
     },
     {
       "function": "ptr_copy_load",

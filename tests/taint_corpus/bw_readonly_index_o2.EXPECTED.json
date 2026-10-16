@@ -1,0 +1,24 @@
+{
+  "description": "A bounded index into a read-only table keeps the index as the origin (base's verdict). Analyze only. -O2.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline",
+    "-fno-builtin"
+  ],
+  "backward": [
+    {
+      "function": "readonly_index",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": true
+    }
+  ]
+}

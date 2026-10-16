@@ -113,15 +113,42 @@ class _FieldProgram:
                                           FExpr("MLIL_VAR_SSA", "s", reads=[]),
                                           FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]))
 
-    def run(self):
+    def run(self, *, writable=None):
         func = FFunc("f", 0x10, FSSAFunc(self.instrs, mem_defs=self.mem_defs),
                      params=[self.m, self.n, self.src])
-        result = te.TaintEngine(FBV(_NAMES), te.load_models()).backward(
+        bv = FBV(_NAMES)
+        if writable is not None:
+            bv.is_offset_writable = lambda addr: writable
+        result = te.TaintEngine(bv, te.load_models()).backward(
             func, [te.parse_locator("arg:memcpy:2")])
         origins = [sl["origin"] for sl in result["slices"]]
         reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
         fields = [lf for lf in result["leaves"] if lf["kind"] == "field_load_unresolved"]
         return result, origins, reasons, fields
+
+
+@pytest.mark.parametrize("writable", [False, True])
+def test_constant_table_at_a_scaled_index_keeps_the_index(writable):
+    # #1053 review 4: `malloc(readonly_sizes[i & 3])` lifts to
+    # `rdx#1 = rax#3 << 3; [rdx#1 + 0x402020].q`, which keys as an exact slot
+    # on the scaled-index SSA value. A read-only table's entries are the
+    # binary's own bytes: the index is the slice's origin, as on base. A
+    # writable table is a frontier.
+    p = _FieldProgram()
+    rdx1 = FSSA(FVar("rdx", ident=6), 1)
+    scaled = FExpr("MLIL_LSL", "n#0 << 3", reads=[p.n0])
+    scaled.left = FExpr("MLIL_VAR_SSA", "n#0", reads=[p.n0])
+    scaled.right = FExpr("MLIL_CONST", "3", constant=3)
+    i, a = p._at()
+    p.instrs.append(FInstr(i, a, "MLIL_SET_VAR_SSA", "rdx#1 = n#0 << 3", reads=[p.n0],
+                           writes=[rdx1], src=scaled))
+    addr = FExpr("MLIL_ADD", "rdx#1 + 0x402020", reads=[rdx1])
+    addr.left, addr.right = FExpr("MLIL_VAR_SSA", "rdx#1", reads=[rdx1]), _cstr(0x402020)
+    p.sink(p.load(addr, 8))
+    result, origins, _, fields = p.run(writable=writable)
+    assert {"kind": "parameter", "index": 1, "var": "n#0"} in origins or writable, origins
+    assert not fields, fields
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is (not writable)
 
 
 def _sx(inner):
@@ -256,9 +283,10 @@ def _reload(slot, mem, size=None):
     return ld
 
 
-def _memset_buf(pg, buf):
-    pg.call(_B_MEMSET, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
-                       FExpr("MLIL_CONST", "64", constant=64)])
+def _init_buf(pg, buf):
+    """Initialize the whole buffer by a STORE: a call handed &buf would itself
+    start an escape epoch (#1053 review 4) and change what these tests probe."""
+    pg.whole_store(buf)
 
 
 @pytest.mark.parametrize("narrowed", [False, True])
@@ -306,7 +334,7 @@ def test_remembered_stash_dies_at_every_possible_overwrite(between, kept):
     buf = FVar("buf", typ="char[64]")
     ptr = FVar("ptr", ident=22)
     pg = _BufProgram(params=[ptr])
-    _memset_buf(pg, buf)
+    _init_buf(pg, buf)
     pg.store(_cstr(_SLOT), _addr_of(buf))
     zero, eight = FExpr("MLIL_CONST", "0", constant=0), FExpr("MLIL_CONST", "8", constant=8)
     if between.startswith("memcpy"):
@@ -349,7 +377,7 @@ def test_stale_stash_never_becomes_a_writer_of_the_buffer(shape):
     # definite writer of `buf`, let alone a source of a complete slice.
     buf = FVar("buf", typ="char[64]")
     pg = _BufProgram()
-    _memset_buf(pg, buf)
+    _init_buf(pg, buf)
     old = _reload(_SLOT, pg.mem)
     pg.store(_cstr(_SLOT), _addr_of(buf))
     if shape == "held_copy":
@@ -366,7 +394,26 @@ def test_stale_stash_never_becomes_a_writer_of_the_buffer(shape):
     result, reasons, _ = _bw(pg.func())
     assert not any("buf written by strcpy" in r for r in reasons), reasons
     assert result["diagnostics"]["safe_to_report_complete_slice"] is True
-    assert result["slices"][0]["origin"] == {"kind": "call", "callee": "memset"}
+    assert result["slices"][0]["origin"]["kind"] == "constant", result["slices"][0]["origin"]
+
+
+@pytest.mark.parametrize("explicit_escape", [False, True])
+def test_call_handed_the_buffer_may_plant_a_pointer_to_it(explicit_escape):
+    # #1053 review 4: `strtok_r(buf, ",", &g_save)` saves buf + 2; `p = g_save;
+    # [stash = buf;] strcpy(p, host); popen(buf)`. A call handed &buf may
+    # retain or plant it, so a later reload is a may-alias of buf and the
+    # strcpy through it a frontier -- never an unrelated pointer.
+    buf = FVar("buf", typ="char[64]")
+    pg = _BufProgram()
+    pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
+    planted = _reload(_SLOT2, pg.mem, 8)
+    if explicit_escape:
+        pg.store(_cstr(_SLOT), _addr_of(buf))
+    pg.call(_B_STRCPY, [planted, _cstr(0x704)])
+    pg.sink(buf)
+    result, reasons, leaves = _bw(pg.func())
+    assert any(lf.get("callee") == "strcpy" for lf in leaves), (leaves, reasons)
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 @pytest.mark.parametrize("reload_size, covered", [(8, True), (4, False)])
@@ -409,7 +456,7 @@ def test_discovery_cut_keeps_loop_carried_escaped_call_frontier():
     unknown = next(k for k, v in _B_NAMES.items() if v == "run")
     for _ in range(300):
         pg.call(unknown, [])
-    _memset_buf(pg, buf)
+    _init_buf(pg, buf)
     before = pg.mem
     header = pg.phi(before, before + 3)
     compose = pg.call(next(k for k, v in _B_NAMES.items() if v == "compose"), [])
