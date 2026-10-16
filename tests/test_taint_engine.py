@@ -9905,10 +9905,11 @@ def test_backward_unresolved_origin_withholds_completeness_915(models):
 def test_backward_fixed_global_load_reaching_entry_is_a_frontier(models, writable):
     # #1053 review 4: `x = [0x601040].q` with nothing in the function writing
     # the global holds whatever was stored before the function ran -- a
-    # `field_load_unresolved` frontier naming the address, unless the address
-    # is read-only data (the binary's own bytes). Unknown storage is not
-    # read-only. Before, the load was dropped and only the origin-unresolved
-    # gate (#915) withheld completeness.
+    # `field_load_unresolved` frontier naming the address, whatever the
+    # storage: read-only storage does not prove the file supplied the bytes
+    # (`.data.rel.ro` without RELRO is writable; the loader may write a
+    # non-writable segment -- #1053 reviews 5-6). Before, the load was dropped
+    # and only the origin-unresolved gate (#915) withheld completeness.
     x = FVar("x", ident=78); x1 = FSSA(x, 1)
     load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x#1 = [0x601040].q", writes=[x1],
                   src=FExpr("MLIL_LOAD_SSA", "[0x601040].q", reads=[],
@@ -9924,12 +9925,35 @@ def test_backward_fixed_global_load_reaching_entry_is_a_frontier(models, writabl
         bv.is_offset_writable = lambda addr: writable
     result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
     fields = [lf for lf in result["leaves"] if lf["kind"] == "field_load_unresolved"]
-    if writable is False:
-        assert not fields, result["leaves"]
-    else:
-        assert fields and fields[0]["base"] == "0x601040", result["leaves"]
-        assert "global holds what was stored before" in fields[0]["detail"]
-        assert result["slices"][0]["origin"]["kind"] == "field_load_unresolved"
+    assert fields and fields[0]["base"] == "0x601040", result["leaves"]
+    assert "global holds what was stored before" in fields[0]["detail"]
+    assert result["slices"][0]["origin"]["kind"] == "field_load_unresolved"
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_backward_fixed_global_in_read_only_section_of_writable_segment_is_a_frontier(models):
+    # #1053 review 6 follow-up: a fixed global in `.data.rel.ro` of a PIE
+    # linked with `-z norelro` -- BN's section semantics say read-only data,
+    # but the segment is writable and another function writes the global.
+    # `x = [0x403148].q` reaching the function's entry is the stored value
+    # from before the call, a frontier, as base's origin-unresolved gate left
+    # it. (On real BN this load is usually folded to a constant before the
+    # walk sees it; the walk must not add the read-only exemption itself.)
+    x = FVar("x", ident=79); x1 = FSSA(x, 1)
+    src = FExpr("MLIL_LOAD_SSA", "[0x403148].q", reads=[],
+                src=FExpr("MLIL_CONST_PTR", "0x403148", constant=0x403148), src_memory=0)
+    src.size = 8
+    load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x#1 = [0x403148].q", writes=[x1], src=src)
+    sink = FInstr(1, 0x14, "MLIL_CALL_SSA", "malloc(x#1)", reads=[x1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0xa10", constant=0xa10),
+                  params=[FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])])
+    func = FFunc("fixed_global", 0x10, FSSAFunc([load, sink]), params=[])
+    bv = FBV({0xa10: "malloc"})
+    bv.get_sections_at = lambda addr: [types.SimpleNamespace(semantics=2)]  # ReadOnlyData
+    bv.is_offset_writable = lambda addr: True                              # RW PT_LOAD
+    result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:malloc:0")])
+    fields = [lf for lf in result["leaves"] if lf["kind"] == "field_load_unresolved"]
+    assert fields and fields[0]["base"] == "0x403148", result["leaves"]
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 

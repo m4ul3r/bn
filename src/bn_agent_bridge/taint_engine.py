@@ -7697,11 +7697,12 @@ class TaintEngine:
                 gaps.append("it reads a constant table at a variable index or offset, "
                             "and the walk does not prove which bytes the table held")
             elif la is None:
-                if not addr_reads and consts and all(k == "readonly" for k in kinds):
-                    return      # read-only data: the bytes are the binary's own
                 # `[host + i]`: as for a pointer operand of a fill, the pointer
                 # and the index are walked (they lead to the buffer and pick
-                # the bytes) -- but no store can be matched to the bytes.
+                # the bytes) -- but no store can be matched to the bytes. A
+                # constant address in read-only storage is no exception: the
+                # storage class does not prove the file supplied the bytes
+                # (#1053 reviews 5-6).
                 for r in addr_reads:
                     walk(r, d + 1, lmv)
                 gaps.append("its address is not exactly a base plus a constant offset, "
@@ -7733,8 +7734,9 @@ class TaintEngine:
                     elif kind == "opaque":
                         gaps.append(f"`{w[1]}` may have written them")
                     elif kind == "entry":
-                        if fixed is not None and self._const_ptr_storage(fixed) == "readonly":
-                            continue    # read-only data: the binary's own bytes
+                        # Read-only storage is no exception: `.data.rel.ro`
+                        # without RELRO is writable, and the loader may write a
+                        # non-writable segment (#1053 reviews 5-6).
                         gaps.append(
                             f"on some path nothing in this function wrote them (the "
                             f"{'global' if fixed is not None else 'object'} "
