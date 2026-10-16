@@ -3386,6 +3386,47 @@ class TaintEngine:
         }
         return True
 
+    def _unchecked_indirect_calls(self, instrs: list[Any], fills: list[Any], callee: str,
+                                  add_leaf: Any) -> None:
+        """#1041 item 1 gate (#1050 review round 4): a blocking leaf at every
+        indirect call reachable from a call that fills a buffer whose callee
+        bn did not resolve.
+
+        Which pointer such a callback receives is NOT worked out -- aliasing is
+        the part left out after three review rounds. The rule is an outcome
+        instead: a filled buffer exists, an unresolved indirect call can run
+        after it, so whatever that call does with the bytes is unchecked, and
+        the run is not an all-clear. That holds whether or not the buffer was
+        keyed and whether or not a slot reload correlated (a correlated reload
+        of the field is not the alias a saved copy hands to the callback).
+        Unknown reachability counts as reachable. A call is resolved when it is
+        direct, mapped by `--resolve-map`, or pinned by its value set -- the
+        same resolution the walk descends with. The cost: an unrelated
+        unresolved indirect call after a receive also withholds the all-clear."""
+        for ins in instrs:
+            if not self._is_call(ins) or any(ins is f for f in fills):
+                continue
+            if self._resolve_direct_target(ins) is not None:
+                continue
+            cands, _via = self._indirect_call_resolution(ins)
+            if cands:
+                continue
+            if not any(self._reaches_avoiding(f, ins, []) is not False for f in fills):
+                continue
+            at = hex(int(getattr(ins, "address", 0)))
+            add_leaf({
+                "kind": "indirect_call_unchecked",
+                "address": at,
+                "callee": str(callee),
+                "fills": sorted(hex(int(getattr(f, "address", 0))) for f in fills),
+                "il_text": str(ins),
+                "detail": (
+                    f"the indirect call at {at} can run after {self._prose_name(callee)} fills a "
+                    f"buffer, and bn did not resolve its callee: indirect calls that may "
+                    f"receive this buffer are not followed -- their callees are unchecked "
+                    f"(pin the target with --resolve-map to follow it)"),
+            })
+
     def _as_single_ssa_var(self, expr: Any) -> Any | None:
         """The lone SSA variable an expression reads, but ONLY when the
         expression is a bare var read (MLIL_VAR_SSA / an SSAVariable) -- not
@@ -6183,7 +6224,8 @@ class TaintEngine:
         # call is named as a partial reset only when it provably lies on a path
         # from the tainted call to this one -- a clean `strtok` that runs BEFORE
         # the tainted call is on no such path (#1050 review round 3). One whose
-        # path relation is unknown (no block information) is named neutrally.
+        # path relation is unknown (no block information, or successors BN
+        # could not determine) is named neutrally.
         def on_path(src: Any, dsts: list[Any],
                     resets: list[tuple]) -> tuple[list[int], list[int]]:
             proven: list[int] = []
@@ -6204,7 +6246,9 @@ class TaintEngine:
                              f"the state on SOME path but not on every path {what}")
             if unknown:
                 parts.append(f"a clean {name} @ {', '.join(hex(a) for a in unknown)} was not "
-                             f"shown to lie on every path {what} (no block information)")
+                             f"shown to lie on every path {what} (reachability unknown: no "
+                             f"block information, or successors Binary Ninja could not "
+                             f"determine)")
             return "; ".join(parts)
 
         for (_ck, _sk, _site), (cname, ckey, addr, st_addr, st_ins, cins) in sorted(
@@ -6613,6 +6657,14 @@ class TaintEngine:
                                         address=hex(int(getattr(c, "address", 0))),
                                         reason="buffer_not_keyed",
                                     ))
+                if kind == "arg":
+                    # #1041 item 1 gate (#1050 review round 4): this arg is a
+                    # buffer the model says the call fills.
+                    _, _fm = lookup_model(self.models, callee)
+                    _idx = int(src["index"])
+                    if any(str(s.get("to") or "") in (f"*arg:{_idx}", f"*iovec:{_idx}")
+                           for s in (_fm or {}).get("sources") or []):
+                        self._unchecked_indirect_calls(instrs, calls, callee, add_leaf)
                 if kind == "ret" and not ret_seeded:
                     # T3: callsites of `callee` exist but NONE consume its return
                     # value (a void or discarded return), so a ret: source has
@@ -6803,6 +6855,12 @@ class TaintEngine:
                                 f"the modeled run (arg:{_mx + 1}+) are not "
                                 f"seeded. scanf_arity_residual"
                             )
+                # #1041 item 1 gate (#1050 review round 4): the model fills a
+                # buffer, so an unresolved indirect call reachable from the
+                # receive is an unchecked consumer of it.
+                if any(str(sd.get("to") or "").startswith(("*arg:", "*iovec:"))
+                       for sd in src_defs):
+                    self._unchecked_indirect_calls(instrs, calls, callee, add_leaf)
             else:
                 raise TaintError(f"unknown source kind: {kind}")
         return seeded

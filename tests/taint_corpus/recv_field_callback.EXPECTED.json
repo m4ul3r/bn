@@ -1,0 +1,14 @@
+{
+  "description": "#1050 review round 4: an unresolved indirect callback reachable from a receive withholds the all-clear with an indirect_call_unchecked leaf, for both call:recv (whose correlated field reload once let it report an all-clear) and arg:recv:1. The control without a callback keeps the call:recv all-clear.",
+  "lang": "c",
+  "cflags": ["-O2", "-fno-builtin"],
+  "forward": [
+    {"function": "field_cb_copy", "source": "call:recv",
+     "leaves": [{"kind": "indirect_call_unchecked"}], "all_clear": false},
+    {"function": "field_cb_copy", "source": "arg:recv:1",
+     "leaves": [{"kind": "indirect_call_unchecked"}], "all_clear": false}
+  ],
+  "negative": [
+    {"function": "field_no_cb", "source": "call:recv", "all_clear": true}
+  ]
+}

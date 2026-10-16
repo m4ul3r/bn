@@ -14,6 +14,7 @@ import shlex
 import pytest
 from test_taint_engine import (
     FBV,
+    FPVS,
     FSSA,
     FBlock,
     FBVStr,
@@ -220,6 +221,78 @@ def test_a_use_that_only_runs_before_the_receive_stays_clean_1050(models, source
 
     assert result["reached_sinks"] == []
     assert not any(lf["kind"] == "indirect_call_unresolved" for lf in result["leaves"])
+
+
+def _field_cb_copy(*, callback="after", resolved=False):
+    """The #1050 review round 4 `field_cb_copy` shape: `p = c->buf`, `recv(fd,
+    p, ..)`, the field reloaded for a harmless `puts(c->buf)` (which correlates
+    with the receive's slot), then the saved `p` handed to `fp(p)`.
+    ``callback``: ``after`` the receive, ``before`` it, or ``none``.
+    ``resolved``: the indirect call carries a value set pinning its target."""
+    c, fd, p, q = FVar("c"), FVar("fd"), FVar("p"), FVar("q")
+    c0, fd0, p1, q1 = FSSA(c, 0), FSSA(fd, 0), FSSA(p, 1), FSSA(q, 1)
+    pvs = FPVS("ConstantPointerValue", value=0x3000) if resolved else None
+    cb = FInstr(0, 0x1014, "MLIL_CALL_SSA", "fp(p#1)", reads=[p1],
+                dest=FExpr("MLIL_VAR_SSA", "fp#1", possible_values=pvs), params=[_var(p1)])
+    body = [
+        FInstr(0, 0x1000, "MLIL_SET_VAR_SSA", "p#1 = [c#0 + 8]", reads=[c0], writes=[p1],
+               src=_field_load(c0, 8)),
+        FInstr(0, 0x1004, "MLIL_CALL_SSA", "recv(fd#0, p#1, 0x40, 0)", reads=[p1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[_var(fd0), _var(p1), _const(0x40), _const(0)]),
+        FInstr(0, 0x1008, "MLIL_SET_VAR_SSA", "q#1 = [c#0 + 8]", reads=[c0], writes=[q1],
+               src=_field_load(c0, 8)),
+        FInstr(0, 0x100c, "MLIL_CALL_SSA", "puts(q#1)", reads=[q1],
+               dest=FExpr("MLIL_CONST_PTR", "0x903", constant=0x903), params=[_var(q1)]),
+    ]
+    if callback == "after":
+        body.append(cb)
+    elif callback == "before":
+        body.insert(0, cb)
+    body.append(FInstr(0, 0x1020, "MLIL_RET", "return"))
+    block = FBlock(0, len(body))
+    block.outgoing_edges = []
+    for k, ins in enumerate(body):
+        ins.instr_index = k
+        ins.il_basic_block = block
+    func = FFunc("field_cb_copy", 0x1000, FSSAFunc(body), params=[c, fd])
+    target = FFunc("handler", 0x3000, FSSAFunc([FInstr(0, 0x3000, "MLIL_RET", "return")]),
+                   params=[FVar("b")])
+    return func, FBV({0x900: "recv", 0x903: "puts"}, funcs={0x3000: target})
+
+
+def _unchecked(result):
+    return [lf for lf in result["leaves"] if lf["kind"] == "indirect_call_unchecked"]
+
+
+@pytest.mark.parametrize("source", ["call:recv", "arg:recv:1"])
+def test_an_unresolved_callback_after_a_receive_withholds_the_all_clear_1050(models, source):
+    """#1050 review round 4: a correlated slot reload once let `call:recv`
+    report an all-clear while the saved pointer went to an unchecked callback.
+    The gate claims nothing about aliasing: an unresolved indirect call
+    reachable from the receive is a blocking leaf, keyed buffer or not."""
+    func, bv = _field_cb_copy()
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator(source)])
+
+    [leaf] = _unchecked(result)
+    assert leaf["address"] == "0x1014"
+    assert ("indirect calls that may receive this buffer are not followed -- their "
+            "callees are unchecked") in leaf["detail"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize("variant", [
+    {"callback": "none"},                    # the correlated slot control
+    {"callback": "before"},                  # runs before the receive, no path back
+    {"callback": "after", "resolved": True},  # its target is pinned and followed
+])
+def test_no_unchecked_callback_keeps_the_correlated_slot_all_clear_1050(models, variant):
+    func, bv = _field_cb_copy(**variant)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:recv")])
+
+    assert _unchecked(result) == []
+    if variant["callback"] == "none":
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
 
 
 # --------------------------------------------------------------------------

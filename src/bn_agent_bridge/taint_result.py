@@ -75,6 +75,11 @@ BLOCKING_LEAF_KINDS = frozenset({
     # unbounded token; its conversions could not be checked, so an empty
     # reached_sinks past it is not an all-clear.
     "format_unchecked",
+    # #1041 item 1 gate (#1050 review round 4): an indirect call whose callee
+    # bn did not resolve can run after a call that fills a buffer. Which
+    # pointer it receives is not worked out; what it does with the bytes is
+    # unchecked, so an empty reached_sinks is not an all-clear.
+    "indirect_call_unchecked",
     # #810: a backward ascent followed only the first N caller sites of a
     # parameter-origin slice; origins reachable only from the dropped callers are
     # absent from the result. Same class as the other frontier leaves: the walk
@@ -315,6 +320,14 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         return (f"{head}. Reseeding with arg: or call: keys the same pointer and "
                 f"fails the same way; seed a value read from the buffer (var:) or "
                 f"the consuming parser's parameter (param:) instead")
+    callbacks = [lf for lf in leaves if lf.get("kind") == "indirect_call_unchecked"]
+    if callbacks and all(lf.get("kind") in ("indirect_call_unchecked", "format_unchecked")
+                         for lf in leaves):
+        at = ", ".join(sorted({str(lf.get("address")) for lf in callbacks}))
+        return ("no sink reached, but indirect calls that may receive this buffer are "
+                f"not followed -- their callees are unchecked ({at}); resolve those "
+                "targets (a value set, or --resolve-map) and re-run, or audit the "
+                "callees by hand")
     unchecked = [lf for lf in leaves if lf.get("kind") == "format_unchecked"]
     if unchecked and len(unchecked) == len(leaves):
         at = ", ".join(sorted({str(lf.get("address")) for lf in unchecked}))

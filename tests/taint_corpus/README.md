@@ -42,6 +42,7 @@ brittle across compilers/optimisation.
 | `strtok_undetermined.c` | a register-indirect jump BN cannot resolve follows the tainted `strtok`; undetermined successors never prove the `strtok(NULL)` unreachable, so the continuation still reaches `system()` (x86-64 inline asm) |
 | `recv_member_callback.c` | `call:recv` into `c->buf + have` (not keyable) is a `source_seed_misanchored` frontier whose detail discloses that indirect calls which may receive the buffer are not followed; the callback itself is not claimed as a frontier (#1041 item 1, narrowed to disclosure) |
 | `recv_member_order.c`  | `system(p)` that runs before `recv(fd, p, ..)` into an unkeyed buffer is not a flow, for both `call:` and `arg:` seeds (#1050 review round 2) |
+| `recv_field_callback.c` | an unresolved indirect callback reachable from a receive is an `indirect_call_unchecked` frontier that withholds the all-clear, even when a field reload correlated with the receive's slot (`call:recv`); without a callback the correlated control keeps its all-clear (#1050 review round 4) |
 | `strtok_fixpoint.c`    | an irreducible tokenizer loop with unused-return `strtok(line)` initializers: every tainted `strtok` that reaches the `strtok(NULL)` arms it whatever the IL order (#932); `_o1`/`_o2` rebuild it |
 
 ## `EXPECTED.json` schema

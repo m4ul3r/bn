@@ -10596,7 +10596,8 @@ def test_strtok_clean_reset_without_block_info_is_not_a_kill_928():
     # names the clean call neutrally rather than asserting a reset path
     # (#1050 review round 3).
     assert any("was not shown to lie on every path from the tainted call" in a
-               for a in result["assumptions"]), result["assumptions"]
+               and "reachability unknown" in a for a in result["assumptions"]), \
+        result["assumptions"]
 
 
 def test_backward_diagnostics_name_the_memory_chain_cut_928():
