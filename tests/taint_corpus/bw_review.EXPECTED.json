@@ -2,7 +2,7 @@
   "description": "Future stashes do not invent earlier writers; wide copies use target element widths; literal-copy controls disclose whole-object precision loss",
   "lang": "c",
   "backward": [
-    {"function": "future_stash", "sink": "arg:popen:0", "origin_kinds": ["call"], "forbid_origin_kinds": ["source"], "step_reasons_contain": ["written by memset"], "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true},
+    {"function": "future_stash", "sink": "arg:popen:0", "origin_kinds": ["address_of_local_unresolved", "call"], "forbid_origin_kinds": ["source"], "step_reasons_contain": ["written by memset"], "forbid_step_reasons_contain": ["buf written by strcpy"], "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
     {"function": "wide_full", "sink": "arg:popen:0", "origin_kinds": ["parameter"], "forbid_leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": true},
     {"function": "wide_short", "sink": "arg:popen:0", "origin_kinds": ["parameter"], "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},
     {"function": "strcpy_literal", "sink": "arg:popen:0", "origin_kinds": ["address_of_local_unresolved"], "leaves": [{"kind": "address_of_local_unresolved"}], "complete_slice": false},

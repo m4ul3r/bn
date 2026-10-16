@@ -1,0 +1,9 @@
+{
+  "description": "#1050 review finding 2: a register-indirect jump BN cannot resolve follows the tainted strtok; its missing edges do not prove the strtok(NULL) unreachable, so the continuation still reaches system().",
+  "lang": "c",
+  "cflags": ["-O1", "-fno-builtin"],
+  "forward": [
+    {"function": "tok_jump", "source": "param:0",
+     "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}]}
+  ]
+}

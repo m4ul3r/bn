@@ -495,6 +495,50 @@ def test_list_comments_query_finds_todo_in_a_function_doc_643(monkeypatch):
     assert instance._list_comments("active", query="TODO", scope="address")["total"] == 0
 
 
+def test_comment_rows_mark_what_this_bridge_wrote_676(monkeypatch):
+    """#676 item 4 (decision D5): `comment list`/`get` rows carry
+    `written_this_session` from the #977 ledger -- location AND body, as the
+    decompile mark judges it. A comment the ledger does not hold (a database's,
+    a `py exec` write, a body changed since) is `false`: unknown, not someone
+    else's."""
+    from bn.formatters import _render_comment_list_text, _render_comment_text
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _scope_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx.targets, "session_annotations", lambda view: {
+        ("address", 0x1120): "request fds arrive from the client",
+        # Same location, different body: the stored one is not this session's.
+        ("address", 0x1180): "an earlier body this session wrote",
+        ("function_doc", 0x2000): "argv walker",
+    })
+
+    rows = {(i["address"], i["scope"]): i["written_this_session"]
+            for i in instance._list_comments("active")["items"]}
+    assert rows == {
+        ("0x1000", "function_doc"): False,
+        ("0x1120", "address"): True,
+        ("0x1180", "address"): False,
+        ("0x2000", "function_doc"): True,
+    }
+    listing = _render_comment_list_text(instance._list_comments("active"))
+    assert "0x1120  handle_request  [this session] request fds" in listing, listing
+    assert "0x1180  handle_request  maps the client" in listing, listing
+    assert "[doc] [this session] argv walker" in listing, listing
+
+    bv.get_comment_at = lambda addr: bv.address_comments.get(addr, "")
+    single = instance._get_comment("active", "0x1120", None)
+    assert single["written_this_session"] is True
+    # The single-comment text stays the bare, byte-preserving body.
+    assert _render_comment_text(single) == "request fds arrive from the client"
+
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda view, name: bv.functions[0])
+    whole = instance._get_comment("active", None, "handle_request")
+    assert whole["function_doc_written_this_session"] is False
+    assert [c["written_this_session"] for c in whole["comments"]] == [True, False]
+
+
 def test_list_comments_rejects_unknown_scope_643(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

@@ -265,6 +265,17 @@ def test_non_abi_dt_syment_skips_attribution_with_a_note(is64, syment):
     # The rest of the dynamic section is still read.
     assert (info.needed, info.soname) == (["libc.so.6"], "libw.so.1")
     assert any("DT_SYMENT" in note for note in info.notes), info.notes
+    # #1037 review round 3: the empty map is "not read", never "unversioned".
+    assert info.versions_unread and "DT_SYMENT" in info.versions_unread
+
+
+@pytest.mark.parametrize("symbols, expected", [
+    (_SYMBOLS, None),                              # version table read
+    ((("puts", None), ("free", None)), None),      # no version table at all
+])
+def test_versions_unread_is_none_only_when_the_versions_are_established(symbols, expected):
+    info = _parse(_build_elf(needed=("libc.so.6",), symbols=symbols))
+    assert info.versions_unread is expected
 
 
 def test_huge_dt_strsz_reads_only_up_to_the_end_of_the_file():
@@ -324,3 +335,16 @@ def test_file_size_bounds_reads_even_when_the_reader_could_serve_more():
     image = _build_elf(needed=("libc.so.6",), symbols=_SYMBOLS)
     info = _parse(image, file_size=200)
     assert info is None or info.import_libraries == {}
+
+
+def test_versions_unread_names_the_missing_dynamic_symbol_table_1037():
+    """#1037 review round 5: one condition covered a missing DT_VERSYM and a
+    missing DT_SYMTAB, and always named the version table. With only the
+    DT_SYMTAB declaration removed, the reason names the symbol table."""
+    image = bytearray(_build_elf(needed=("libc.so.6",), symbols=_SYMBOLS))
+    rows, fmt = _dynamic_entries_at(bytes(image))
+    at, _tag, value = next(row for row in rows if row[1] == 6)   # DT_SYMTAB
+    struct.pack_into(fmt, image, at, 21, value)                   # -> DT_DEBUG
+    info = _parse(bytes(image))
+    assert info.versions_unread == (
+        "the file declares symbol versions without a dynamic symbol table")

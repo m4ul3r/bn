@@ -1383,9 +1383,48 @@ def _arity_witness_counts(calls: list[dict[str, Any]]) -> dict[str, dict[str, in
     return counts
 
 
+def _callee_selector_keys(selectors: list[str]) -> list[tuple[str, int | None]]:
+    """Each `--callee`/`--exclude-callee` selector as (name, address-or-None):
+    the string is always tried as an exact name, and also as an address when it
+    parses as one (hex 0x.. or decimal)."""
+    keys: list[tuple[str, int | None]] = []
+    for selector in selectors:
+        try:
+            address: int | None = _parse_address(selector)
+        except ValueError:
+            address = None
+        keys.append((selector, address))
+    return keys
+
+
+def _call_matches_callee(call: dict[str, Any], keys: list[tuple[str, int | None]]) -> bool:
+    """Does this call's RESOLVED target function match any selector? Exact raw
+    `name` or `display_name` (so `operator delete` matches every overload that
+    displays that way), or the target function's entry / normalized target
+    address. A call with no resolved target function never matches."""
+    target = call.get("target")
+    fn_entry = target.get("function") if isinstance(target, dict) else None
+    if not isinstance(fn_entry, dict):
+        return False
+    names = {n for n in (fn_entry.get("name"), fn_entry.get("display_name"))
+             if isinstance(n, str) and n}
+    addresses: set[int] = set()
+    for raw in (fn_entry.get("address"), target.get("normalized")):
+        if raw is None:
+            continue
+        try:
+            addresses.add(_parse_address(raw))
+        except ValueError:
+            pass
+    return any(name in names or (address is not None and address in addresses)
+               for name, address in keys)
+
+
 def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 2,
                        offset: int = 0, limit: int | None = None,
-                       address_window: tuple[int, int] | None = None):
+                       address_window: tuple[int, int] | None = None,
+                       callees: list[str] | None = None,
+                       exclude_callees: list[str] | None = None):
     # #827 item 8: the same shared validation (and wording) every other paged read
     # uses. A raw-socket / `py exec` client reaches this handler directly, so the
     # bridge re-enforces the CLI's argparse contract (`_positive_int` /
@@ -1451,6 +1490,24 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
     # see no change.
     if slicing:
         calls.sort(key=lambda c: int(str(c.get("address", "0x0")), 16))
+    # #1037: the callee filter narrows the call set BEFORE the window and the
+    # page, so `matched_calls`/`has_more` page over the calls that were asked
+    # for. Warnings and witness counts above stay over the FULL set. Filtering
+    # alone does not defer the decompile: it does not shrink the decompile.
+    callee_filter: dict[str, Any] | None = None
+    if callees is not None or exclude_callees is not None:
+        before = len(calls)
+        if callees is not None:
+            include_keys = _callee_selector_keys(callees)
+            calls = [c for c in calls if _call_matches_callee(c, include_keys)]
+        if exclude_callees is not None:
+            exclude_keys = _callee_selector_keys(exclude_callees)
+            calls = [c for c in calls if not _call_matches_callee(c, exclude_keys)]
+        callee_filter = {
+            "callee": list(callees or []),
+            "exclude_callee": list(exclude_callees or []),
+            "excluded": before - len(calls),
+        }
     if address_window is not None:
         lo, hi = address_window
         calls = [c for c in calls if lo <= int(str(c.get("address", "0x0")), 16) < hi]
@@ -1499,6 +1556,9 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         # `warnings`, and falls back to stating the flag itself when that list
         # arrived absent, empty or skewed.
         result["decompile_deferred"] = True
+    if callee_filter is not None:
+        # #1037: additive, present only when a callee filter was given.
+        result["callee_filter"] = callee_filter
     # #626: annotate a mid-function (interior) request the same way the decompile
     # READs do (#193 Part 4). Inlined via the seam's `_containment_meta` rather
     # than importing read_decompile's `_annotate_containment`, to keep the

@@ -20,6 +20,7 @@ import pytest
 from _bridge_fakes import *  # noqa: F401,F403
 
 read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+call_arity = importlib.import_module("bn_agent_bridge.call_arity")
 read_evidence = importlib.import_module("bn_agent_bridge.read_evidence")
 
 
@@ -5821,7 +5822,7 @@ def _arity_case(monkeypatch, setup, *, rendered, raw_name, kind="ImportedFunctio
             parameters=[types.SimpleNamespace(name=p) for p in params],
             has_variable_arguments=variadic), [name])
 
-    monkeypatch.setattr(read_decompile, "bn", types.SimpleNamespace(demangle_gnu3=demangle))
+    monkeypatch.setattr(call_arity, "bn", types.SimpleNamespace(demangle_gnu3=demangle))
     return bv, func
 
 
@@ -6340,7 +6341,7 @@ def _select_then_call_case(monkeypatch):
 
 def test_call_arity_sees_an_argument_a_select_computes_right_before_the_call_1000(monkeypatch):
     bv, func = _select_then_call_case(monkeypatch)
-    [row] = read_decompile._call_arity_findings(bv, func)
+    [row] = call_arity._call_arity_findings(bv, func)
     assert (row["rendered"], row["expected"]) == (2, 3)
     # Both arms are read: `w3` feeds the clamp arm, so it is no argument.
     assert row["evidence"][-1] == "the call site writes x0, x1, x2 just before it"
@@ -6369,7 +6370,7 @@ def test_registers_only_the_select_condition_reads_are_not_arguments_1000(monkey
     bv, func = _arity_case(monkeypatch, [], rendered=3, raw_name="ext")
     func.llil = types.SimpleNamespace(
         basic_blocks=[head, low, high, _Block(9, [call], [low, high])])
-    assert read_decompile._call_arity_findings(bv, func) == []
+    assert call_arity._call_arity_findings(bv, func) == []
 
 
 def test_call_arity_note_names_each_dropped_register_and_its_value_1000(monkeypatch):
@@ -6381,13 +6382,13 @@ def test_call_arity_note_names_each_dropped_register_and_its_value_1000(monkeypa
         rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
         signature=(["this", "", ""], False),
     )
-    [row] = read_decompile._call_arity_findings(bv, func)
+    [row] = call_arity._call_arity_findings(bv, func)
     assert read_decompile._arity_line_note(row) == \
         "/* bn: +2 args not rendered: x1 = [sp].q, x2 = 0x30 */"
     # An excess names the counts instead: there is no register to point at.
     bv, func = _arity_case(monkeypatch, [], rendered=3, raw_name="_ZN4demo6Widget5resetEv",
                            signature=(["this"], False))
-    [row] = read_decompile._call_arity_findings(bv, func)
+    [row] = call_arity._call_arity_findings(bv, func)
     assert read_decompile._arity_line_note(row) == "/* bn: renders 3 args, signature takes 1 */"
 
 
@@ -6402,7 +6403,7 @@ def test_call_arity_note_never_names_a_register_overwritten_before_the_call_1000
         rendered=1, raw_name="_ZN4demo6String6appendEPKcm",
         signature=(["this", "", ""], False),
     )
-    [row] = read_decompile._call_arity_findings(bv, func)
+    [row] = call_arity._call_arity_findings(bv, func)
     assert row["missing"] == [("x1", None), ("x2", None)]
     assert read_decompile._arity_line_note(row) == "/* bn: +2 args not rendered: x1, x2 */"
 
@@ -6427,11 +6428,11 @@ def test_window_values_follow_copies_and_name_parameters_1000():
         get_reg_value_at=reg_value,
         parameter_vars=[_param_var(n, r, 4) for n, r in (("arg3", "x2"), ("arg4", "x3"))])
     bv = types.SimpleNamespace(arch=arch)
-    values = read_decompile._window_values(bv, func, window, set())
+    values = call_arity._window_values(bv, func, window, set())
     assert (values["x2"], values["x3"]) == ("arg4", "arg3")
     # Without dataflow, a register the window itself overwrites is not a value.
     func.get_reg_value_at = lambda address, reg: None
-    values = read_decompile._window_values(bv, func, window, set())
+    values = call_arity._window_values(bv, func, window, set())
     assert (values["x2"], values["x3"]) == (None, None)
 
 
@@ -6455,12 +6456,12 @@ def test_window_values_keep_the_width_a_narrow_copy_reads_1000():
     window[0].address = 0x400850
     func = _entry_func({"x1": "x1"}, [_param_var("arg2", "x1", 8)])
     bv = types.SimpleNamespace(arch=arch)
-    values = read_decompile._window_values(bv, func, window, set())
+    values = call_arity._window_values(bv, func, window, set())
     assert values["x0"] == "(uint32_t)arg2"
     assert values["x2"] == "arg2"
     # A 32-bit parameter read through w1 is the whole value.
     func = _entry_func({"x1": "x1"}, [_param_var("arg2", "x1", 4)])
-    assert read_decompile._window_values(bv, func, window, set())["x0"] == "arg2"
+    assert call_arity._window_values(bv, func, window, set())["x0"] == "arg2"
 
 
 def test_window_values_treat_split_and_intrinsic_writes_as_clobbers_1000():
@@ -6481,7 +6482,7 @@ def test_window_values_treat_split_and_intrinsic_writes_as_clobbers_1000():
     window[0].address = 0x400900
     bv = types.SimpleNamespace(arch=arch)
     func = _entry_func({"x0": "x0"}, [_param_var("arg1", "x0", 8)])
-    values = read_decompile._window_values(bv, func, window, set())
+    values = call_arity._window_values(bv, func, window, set())
     # x5 has no name and is rewritten later: unknown, not `x5`.
     assert values["x1"] is None
     assert values["x2"] is None  # x0 holds the intrinsic's result, not arg1
@@ -6492,7 +6493,7 @@ def test_window_values_treat_split_and_intrinsic_writes_as_clobbers_1000():
 def test_call_arity_summary_says_which_calls_carry_the_inline_note_1000(monkeypatch):
     bv, func = _arity_case(monkeypatch, [], rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
                            signature=(["this", "", ""], False), calls=2)
-    findings = read_decompile._call_arity_findings(bv, func)
+    findings = call_arity._call_arity_findings(bv, func)
     full = read_decompile._call_arity_warning(bv, func, findings, {0x401040, 0x401048})
     assert full["code"] == "arity"
     assert full["summary"] == ("2 call(s) render the wrong argument count, marked inline: "
@@ -6577,6 +6578,101 @@ def test_a_note_leaves_stored_comments_redacted_and_session_ones_marked_1000(mon
     assert [row["code"] for row in result["warning_rows"]] == ["arity"]
     # `warnings` keeps the sentence shape every other read op uses.
     assert result["warnings"] == [result["warning_rows"][0]["detail"]]
+
+
+def _scanned_decompile(monkeypatch, lines, arity_rows, comments):
+    """Run `_decompile` over a fake Pseudo-C render and return (result, the
+    text the string scanner was given)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x401111, "probe")
+    function.basic_blocks = [_FakeBasicBlock(0x401111, 0x401130)]
+    bv = _FakeBV(functions=[function], comments=comments)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    _install_fake_pseudo_c(monkeypatch, bridge, function, [lines])
+    monkeypatch.setattr(bridge.read_decompile, "_call_arity_findings",
+                        lambda bv, func: arity_rows)
+    scanned = []
+    monkeypatch.setattr(bridge.read_decompile, "_raw_string_pointer_findings",
+                        lambda bv, func, text: scanned.append(text) or {})
+    return instance._decompile("active", "probe"), scanned[0]
+
+
+def test_a_hidden_stored_comment_is_not_string_evidence_1045(monkeypatch):
+    # #1045 review round 4 (cm2b-x86): an inherited comment `see 0x402010`,
+    # hidden by default, made `&data_402010` a raw address in the scanner's
+    # eyes, bypassing the placeholder's `char *` requirement: "GHI" and
+    # `data retype` advice appeared where base printed nothing.
+    result, scanned = _scanned_decompile(monkeypatch, [
+        (0x401111, "  uint64_t probe(char* arg1)"),
+        (0x401111, "{  // see 0x402010"),
+        (0x401115, "    return two(arg1, &data_402010);"),
+        (0x401111, "}"),
+    ], [], {0x401111: "see 0x402010"})
+    assert "<annotation redacted>" in result["text"]
+    assert "&data_402010" in scanned and "0x402010" not in scanned
+
+
+def test_a_bn_note_is_not_string_evidence_1045(monkeypatch):
+    # #1045 review round 4 (cm3-arm): the recovered `x1 = 0x400760` in the
+    # arity note supplied the raw hex that made the unrelated `idx(&data_400760)`
+    # a string. The note stays; the scanner sees the code only.
+    row = {"address": 0x400718, "target": 0x400510, "label": "two @ 0x400510",
+           "rendered": 1, "expected": 2, "shape": "shortfall",
+           "evidence": ("the demangled signature takes 2",), "missing": [("x1", "0x400760")]}
+    result, scanned = _scanned_decompile(monkeypatch, [
+        (0x401111, "  uint64_t probe(int64_t arg1)"),
+        (0x401111, "{"),
+        (0x400718, "    return two(arg1) + idx(&data_400760);"),
+        (0x401111, "}"),
+    ], [row], {})
+    assert "x1 = 0x400760 */" in result["text"]
+    assert "&data_400760" in scanned and "0x400760" not in scanned
+
+
+_NO_PARAMS_ROW = {"address": 0x400830, "target": 0x400700, "label": "strcmp @ 0x400700",
+                  "rendered": 2, "expected": 2, "shape": "no_parameters",
+                  "evidence": ("its prototype declares no parameters",), "missing": []}
+
+
+def test_a_literal_holding_a_bn_note_marker_stays_scanner_input_1045(monkeypatch):
+    # #1045 review round 5 (AArch64): `printf("/* bn: %d", strcmp(p, "a"))`.
+    # Deleting `/* bn: ... */` by regex started inside the format literal and
+    # took the raw `0x400868` with it, losing base's "a". BN's tokens keep the
+    # literal a StringToken; the scanner reads them before any note is added.
+    result, scanned = _scanned_decompile(monkeypatch, [
+        (0x401111, "  int64_t probe(int64_t arg1)"),
+        (0x401111, "{"),
+        (0x400830, [("TextToken", "    return __printf_chk(2, "), ("BraceToken", '"'),
+                    ("StringToken", "/* bn: %d"), ("BraceToken", '"'),
+                    ("TextToken", ", (uint64_t)strcmp(arg1, "),
+                    ("PossibleAddressToken", "0x400868"), ("TextToken", "));")]),
+        (0x401111, "}"),
+    ], [_NO_PARAMS_ROW], {})
+    assert '__printf_chk(2, "/* bn: %d", (uint64_t)strcmp(arg1, 0x400868));' in scanned
+    assert "BN's guess */" in result["text"] and "BN's guess" not in scanned
+
+
+def test_a_literal_holding_a_url_is_code_not_a_comment_1045(monkeypatch):
+    # #1045 review round 5 (AArch64): BN renders `"<a href="http://x">"`
+    # unescaped, and the regex read its `//` as a line comment: both raw
+    # operands were lost and the arity note landed inside the literal.
+    literal_line = [("TextToken", "    return strcmp("), ("BraceToken", '"'),
+                    ("StringToken", '<a href="http://x">'), ("BraceToken", '"'),
+                    ("TextToken", ", "), ("PossibleAddressToken", "0x400808"),
+                    ("TextToken", ") + strcmp(arg1, "), ("PossibleAddressToken", "0x400828"),
+                    ("TextToken", ");")]
+    row = dict(_NO_PARAMS_ROW, address=0x4007c0)
+    result, scanned = _scanned_decompile(monkeypatch, [
+        (0x401111, "  uint64_t probe(int64_t arg1)"),
+        (0x401111, "{"),
+        (0x4007c0, literal_line),
+        (0x401111, "}"),
+    ], [row], {})
+    code = "".join(text for _kind, text in literal_line)
+    assert code in scanned and "0x400808" in scanned and "0x400828" in scanned
+    # The note follows the whole statement, not the `//` inside the literal.
+    assert f"{code}  /* bn: prototype declares no params" in result["text"]
 
 
 def _var(name):
@@ -6671,9 +6767,12 @@ def test_a_jump_reading_a_data_table_names_the_steps_and_their_limits_1000():
     # xrefs: the writes of a table filled at run time.
     assert "`bn xrefs 0x420010`" in detail and "filled at run time" in detail
     assert "base address only" in detail
-    # evidence table: only a static table, and it says what relative entries mean.
+    # evidence table: only a static table, read as absolute pointers or, with
+    # the decode #1027 added, as int32 offsets from the table (#1033 item 9).
     assert "`bn evidence table 0x420010`" in detail
-    assert "added to the table base 0x420010" in detail and "reads as zeros" in detail
+    assert ("`bn evidence table 0x420010 --decode relative-int32 --base 0x420010`"
+            in detail) and "reads as zeros" in detail
+    assert "`bn evidence table <address> --decode relative-int32 --base <address>`" in detail
     assert "`bn disasm <target> --linear 16`" in detail
     # A target with no data address (a stack array, a register) names none.
     bv, func = _jump_case(dest=_var("arg2"))
@@ -6841,7 +6940,8 @@ def test_a_short_literal_to_an_untyped_libc_import_is_named_994(kwargs):
     bv, func = _libc_string_view(b"C\0", **kwargs)
     note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
     assert note is not None and '0x661bd8 = "C" (call at 0x51c884)' in note["detail"]
-    assert note["strings"] == [{"address": "0x661bd8", "value": "C", "call": "0x51c884"}]
+    assert note["strings"] == [{"address": "0x661bd8", "value": "C", "call": "0x51c884",
+                                "inline": False}]
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -7013,3 +7113,355 @@ def test_jump_table_guidance_uses_generic_symbol_and_address_placeholders_1019()
     assert "bn xrefs <symbol>" in detail
     assert "bn evidence table <address>" in detail
     assert not re.search(r"\b(?:data_[0-9a-f]+|a\.1)\b", detail)
+
+
+# ---------------------------------------------------------------------------
+# #1038 / #1033: decompile, callsites and disasm frictions on stripped
+# AArch64 daemons. Fakes reuse the arity / string helpers above.
+# ---------------------------------------------------------------------------
+
+
+def _no_parameter_case(monkeypatch, setup, *, rendered, adjustment=None, variadic=None):
+    """`socket(1, 2, 0, guard, 0)`: an import whose prototype is `int64_t
+    socket()` -- what BN gives an import its type library has no entry for."""
+    bv, func = _arity_case(monkeypatch, setup, rendered=rendered, raw_name="socket")
+    callee = types.SimpleNamespace(
+        name="socket", is_thunk=True, start=0x400e00,
+        type=types.SimpleNamespace(
+            parameters=[],
+            has_variable_arguments=types.SimpleNamespace(value=bool(variadic),
+                                                         confidence=255 if variadic else 0)))
+    bv.get_function_at = lambda a: callee if a == 0x400e00 else None
+    func.get_call_type_adjustment = lambda address: adjustment
+    return bv, func
+
+
+def test_a_no_parameter_prototype_marks_its_rendered_args_as_bns_guess_1038(monkeypatch):
+    bv, func = _no_parameter_case(
+        monkeypatch,
+        [_set_reg("w2", _const(0)), _set_reg("w1", _const(2)), _set_reg("w0", _const(1))],
+        rendered=5)
+    [row] = call_arity._call_arity_findings(bv, func)
+    assert row["shape"] == "no_parameters" and row["missing"] == []
+    assert read_decompile._arity_line_note(row) == \
+        "/* bn: prototype declares no params; the 5 args shown are BN's guess */"
+    warning = read_decompile._call_arity_warning(bv, func, [row], {row["address"]})
+    assert "socket 5 guessed @ 0x401040" in warning["summary"]
+    # It claims no count: nothing here knows what the callee takes.
+    [call] = warning["calls"]
+    assert call["shape"] == "no_parameters" and call["expected"] is None
+    assert "the call site writes x0, x1, x2 just before it" in warning["detail"]
+    assert "`bn callsites 0x400e00 --within 0x401000 --context 4`" in warning["detail"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    # BN or the analyst typed this call itself: that type is what HLIL renders.
+    {"adjustment": object()},
+    # BN determined the callee variadic: a `...` takes what the call passes.
+    {"variadic": True},
+    # Nothing rendered: nothing guessed.
+    {"rendered": 0},
+], ids=["call-type-adjustment", "variadic", "none-rendered"])
+def test_a_no_parameter_prototype_is_not_reported_when_the_args_are_not_a_guess_1038(
+        monkeypatch, kwargs):
+    rendered = kwargs.pop("rendered", 3)
+    bv, func = _no_parameter_case(monkeypatch, [], rendered=rendered, **kwargs)
+    assert call_arity._call_arity_findings(bv, func) == []
+
+
+def test_a_dropped_register_bn_knows_as_a_constant_pointer_is_named_1038(monkeypatch):
+    # `adrp x1, 0x400000; add x1, x1, #0x8e0`: the add reads the register the
+    # adrp wrote, so the window walk cannot name it -- BN's dataflow can. x2
+    # is set before the window (an earlier block), so only dataflow knows it.
+    bv, func = _arity_case(
+        monkeypatch,
+        [_set_reg("x1", _const(0x400000)),
+         _set_reg("x1", _op("LLIL_ADD", left=_reg("x1"), right=_const(0x8e0)))],
+        rendered=1, raw_name="_ZN8Registry11set_handlerEPFvPKciE",
+        signature=(["this", "", ""], False))
+    values = {"x1": ("ConstantPointerValue", 0x4008e0), "x2": ("ConstantValue", 0x30)}
+
+    def reg_value(address, reg):
+        kind, value = values.get(reg, ("UndeterminedValue", 0))
+        return types.SimpleNamespace(type=types.SimpleNamespace(name=kind), value=value)
+
+    func.get_reg_value_at = reg_value
+    names = {0x4008e0: "on_packet", 0x30: "vector_30"}
+    symbol_at = bv.get_symbol_at
+    bv.get_symbol_at = lambda a: (types.SimpleNamespace(short_name=names[a]) if a in names
+                                  else symbol_at(a))
+    [row] = call_arity._call_arity_findings(bv, func)
+    # A constant that is not a pointer is never named, even when a symbol
+    # happens to sit at that number.
+    assert row["missing"] == [("x1", "0x4008e0 (on_packet)"), ("x2", "0x30")]
+
+
+def _hlil_node(kind, address, text="", **children):
+    node = type(kind, (), {"__str__": lambda self: text})()
+    node.address, node.expr_index = address, id(node)
+    for name, child in children.items():
+        setattr(node, name, child)
+        child.parent = node
+    return node
+
+
+def _call_insn(root, address):
+    return types.SimpleNamespace(address=address, hlils=[root])
+
+
+def test_a_call_note_anchors_on_the_line_of_its_statement_1038():
+    il_format = read_decompile.il_format
+    # `int32_t fd = socket(...)`: the line is the assignment, at the next
+    # instruction, not the call.
+    call = _hlil_node("HighLevelILCall", 0x400bc4)
+    _hlil_node("HighLevelILBlock", 0x400b90,
+               src=_hlil_node("HighLevelILVarInit", 0x400bc8, src=call))
+    assert il_format._hlil_statement_address(_call_insn(call, 0x400bc4)) == 0x400bc8
+    # `if (strcmp(arg1, 0x400c98))`: the line is the `if`.
+    cond_call = _hlil_node("HighLevelILCall", 0x400af8)
+    one_line_body = _hlil_node("HighLevelILCall", 0x400b40)
+    _hlil_node("HighLevelILBlock", 0x400ae0,
+               s=_hlil_node("HighLevelILIf", 0x400b00,
+                            condition=_hlil_node("HighLevelILNot", 0x400af8, src=cond_call),
+                            true=one_line_body))
+    assert il_format._hlil_statement_address(_call_insn(cond_call, 0x400af8)) == 0x400b00
+    # A one-statement body hangs off the `if` with no block: it is its own line.
+    assert il_format._hlil_statement_address(_call_insn(one_line_body, 0x400b40)) == 0x400b40
+
+
+def test_raw_string_notes_go_on_each_call_line_that_shows_the_address_1038():
+    found = {0x400c98: ("a", [0x400af8]), 0x400ca0: ("c", [0x400b10]),
+             0x400ca8: ("d", [0x400b28])}
+    source = [
+        "    if (strcmp(arg1, 0x400c98))",
+        "    {",
+        "        if (strcmp(arg1, 0x400ca0))  // checked",
+        "        x1 = 3;",
+    ]
+    text = "\n".join(source)
+    # No IL here, so each note anchors on its call's own address; 0x400b28's
+    # line is not in this text, so that string stays unmarked.
+    func = types.SimpleNamespace(get_llil_at=lambda address: None)
+    parts = [(line.partition("  //")[0], "// checked" if "//" in line else "") for line in source]
+    noted, inline = read_decompile._place_string_notes(
+        func, text, [0x400af8, 0x400af8, 0x400b10, 0x400b2c], parts, found)
+    lines = noted.split("\n")
+    assert lines[0] == '    if (strcmp(arg1, 0x400c98))  /* bn: 0x400c98 = "a" */'
+    # Before a trailing `//` comment, so annotation redaction still matches it.
+    assert lines[2] == '        if (strcmp(arg1, 0x400ca0))  /* bn: 0x400ca0 = "c" */  // checked'
+    assert lines[3] == "        x1 = 3;"
+    assert inline == {0x400c98, 0x400ca0}
+    note = read_decompile._raw_string_pointer_note(None, func, noted, found, inline)
+    assert "2 marked inline" in note["summary"] and "+1 more (--explain lists all)" in note["summary"]
+    # Every value is in the detail, not two and a count.
+    assert all(f'= "{v}"' in note["detail"] for v in "acd")
+    assert [s["inline"] for s in note["strings"]] == [True, True, False]
+
+
+def test_a_string_note_rests_on_its_own_call_not_another_call_of_the_same_address_1045():
+    # #1045 review round 3: `memcmp(p, words, 16) + strcmp(p, words)` -- one
+    # call that qualifies made every call of the address a string, and the
+    # warning cited the memcmp. Each call is now judged on its own (by the
+    # unchanged base rule): "a" passed to the untyped `memcmp` is below the
+    # three-character minimum, to `strcmp` (a C library `char *`) it is not.
+    bv, func = _libc_string_view(b"a\0", name="strcmp")
+    symbols = {0x401100: types.SimpleNamespace(raw_name="strcmp",
+                                               type=types.SimpleNamespace(
+                                                   name="ImportedFunctionSymbol")),
+               0x401200: types.SimpleNamespace(raw_name="memcmp",
+                                               type=types.SimpleNamespace(
+                                                   name="ImportedFunctionSymbol"))}
+    bv.get_symbol_at = symbols.get
+    [strcmp_call] = func.mlil.instructions
+    memcmp_call = _op("MLIL_CALL", dest=_op("MLIL_CONST_PTR", constant=0x401200),
+                      params=[_op("MLIL_VAR"), _op("MLIL_CONST_PTR", constant=0x661bd8)])
+    memcmp_call.address = 0x51c870
+    func.mlil.instructions = [memcmp_call, strcmp_call]
+    text = "    return memcmp(arg1, 0x661bd8, 0x10) + strcmp(arg1, 0x661bd8);"
+    found = read_decompile._raw_string_pointer_findings(bv, func, text)
+    assert found == {0x661bd8: ("a", [0x51c884])}
+    note = read_decompile._raw_string_pointer_note(bv, func, text, found)
+    assert note["strings"][0]["call"] == "0x51c884"
+
+
+def test_disasm_names_a_branch_target_the_view_names_1038():
+    il_format = read_decompile.il_format
+
+    class _Tok(types.SimpleNamespace):
+        def __str__(self):
+            return self.text
+
+    def tok(kind, text, value=0):
+        return _Tok(type=types.SimpleNamespace(name=kind), value=value, text=text)
+
+    names = {0x400880: "socket", 0x400000: "__elf_header"}
+    bv = types.SimpleNamespace(
+        get_symbol_at=lambda a: types.SimpleNamespace(short_name=names[a]) if a in names else None,
+        get_function_at=lambda a: None)
+
+    def arch_for(targets):
+        return types.SimpleNamespace(get_instruction_info=lambda data, addr: types.SimpleNamespace(
+            branches=[types.SimpleNamespace(target=t) for t in targets]))
+
+    call = [tok("InstructionToken", "bl"), tok("TextToken", "      "),
+            tok("PossibleAddressToken", "0x400880", 0x400880)]
+    assert il_format._token_text(bv, arch_for([0x400880]), b"", 0x400bc4, call) == \
+        "bl      0x400880 <socket>"
+    # An `adrp` page that equals a symbol's address is no branch destination.
+    page = [tok("InstructionToken", "adrp"), tok("TextToken", "    "),
+            tok("RegisterToken", "x1"), tok("OperandSeparatorToken", ", "),
+            tok("PossibleAddressToken", "0x400000", 0x400000)]
+    assert il_format._token_text(bv, arch_for([]), b"", 0x40090c, page) == "adrp    x1, 0x400000"
+    # A local branch target the view never named stays bare.
+    local = [tok("InstructionToken", "b"), tok("TextToken", "       "),
+             tok("PossibleAddressToken", "0x400c24", 0x400c24)]
+    assert il_format._token_text(bv, arch_for([0x400c24]), b"", 0x400c58, local) == \
+        "b       0x400c24"
+
+
+def test_a_tail_call_has_an_hlil_statement_and_its_guard_1038():
+    il_format = read_decompile.il_format
+    tail = _hlil_node("HighLevelILTailcall", 0x400b8c, "return fold_value(arg2, arg1) __tailcall")
+    _hlil_node("HighLevelILBlock", 0x400b70,
+               s=_hlil_node("HighLevelILIf", 0x400b7c,
+                            condition=_hlil_node("HighLevelILCmpSgt", 0x400b7c, "arg1 s> 2"),
+                            true=tail))
+    insn = _call_insn(tail, 0x400b8c)
+    assert il_format._hlil_call_roots(insn) == [tail]
+    assert il_format._hlil_statement_localization(insn) == (
+        "return fold_value(arg2, arg1) __tailcall", None)
+    assert il_format._hlil_pre_branch_condition(insn) == "arg1 s> 2"
+
+
+def test_the_values_refusal_prints_an_il_command_that_parses_1033(monkeypatch):
+    import re
+    import shlex
+
+    from bn import cli
+
+    func = types.SimpleNamespace(name="main", start=0x4008c0)
+    ctx = types.SimpleNamespace(_resolve_view=lambda selector: object(),
+                                _find_function=lambda bv, ident, contained: func)
+    monkeypatch.setattr(read_decompile.il_format, "_il_function_for",
+                        lambda *a, **k: types.SimpleNamespace(instructions=[]))
+    with pytest.raises(read_decompile.OperationFailure) as raised:
+        read_decompile._possible_values(ctx, None, "main", "0x1")
+    [command] = re.findall(r"`bn ([^`]+)`", str(raised.value))
+    args = cli.build_parser().parse_args(shlex.split(command))
+    assert (args.identifier, args.view, args.ssa) == ("0x4008c0", "mlil", True)
+
+
+# --- #1042 item 3: function_info_batch --------------------------------------
+
+
+def test_function_info_batch_keeps_a_miss_in_place_at_the_bridge_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "handle"),
+                            _FakeFunction(0x402000, "parse_file")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_info_batch(None, ["handle", "nosuchfn", "0x402000"])
+
+    assert result["kind"] == "function_info_batch"
+    assert [row["identifier"] for row in result["functions"]] == [
+        "handle", "nosuchfn", "0x402000"]
+    assert [row["ok"] for row in result["functions"]] == [True, False, True]
+    assert result["functions"][2]["info"]["function"]["name"] == "parse_file"
+    assert "nosuchfn" in result["functions"][1]["error"]
+    assert (result["requested"], result["resolved"]) == (3, 2)
+
+
+class _ProtoType:
+    """A function type whose rendering names `ns::Cls` (#1013)."""
+
+    def __init__(self, parameters, rendered="int64_t(struct ns::Cls* this)"):
+        self.parameters = parameters
+        self.return_value = types.SimpleNamespace(type_class="IntegerTypeClass")
+        self._rendered = rendered
+
+    def __str__(self):
+        return self._rendered
+
+
+def _cls_pointer():
+    return types.SimpleNamespace(
+        type_class="PointerTypeClass",
+        target=types.SimpleNamespace(type_class="NamedTypeReferenceClass", name="ns::Cls"))
+
+
+def _call_site(start, *, op="MLIL_CALL_SSA", dest_op="MLIL_CONST_PTR", arg=None, addr=0x500):
+    call = types.SimpleNamespace(
+        operation=op, address=addr,
+        dest=types.SimpleNamespace(operation=dest_op, constant=start),
+        params=[arg] if arg is not None else [])
+    caller = types.SimpleNamespace(mlil=types.SimpleNamespace(
+        ssa_form=types.SimpleNamespace(instructions=[call])))
+    return types.SimpleNamespace(function=caller, address=addr)
+
+
+def _ssa_reg(version):
+    return types.SimpleNamespace(operation="MLIL_VAR_SSA", src=types.SimpleNamespace(
+        version=version, var=types.SimpleNamespace(
+            source_type=types.SimpleNamespace(name="RegisterVariableSourceType"), storage=7)))
+
+
+def _proto_instance(monkeypatch, parameters, sites, *, defined=False):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _cxx_function(0x401000, "_ZN2ns3Cls3getEv", "ns::Cls::get")
+    fn.set_auto_type(_ProtoType(parameters))
+    fn.caller_sites = sites
+    bv = _FakeBV(functions=[fn])
+    bv.arch.get_reg_name = lambda storage: "rdi"
+    if defined:
+        bv.types["ns::Cls"] = object()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.read_decompile.bn, "demangle_gnu3",
+                        lambda arch, name: (None, []), raising=False)
+    return instance
+
+
+def test_proto_get_counts_call_sites_passing_the_callers_entry_value_1013(monkeypatch):
+    sites = [
+        _call_site(0x401000, arg=_ssa_reg(0)),                       # entry rdi#0
+        _call_site(0x401000, arg=_ssa_reg(1)),                       # rdi the caller set
+        _call_site(0x401000, op="MLIL_TAILCALL_SSA", arg=_ssa_reg(0)),
+        _call_site(0x401000, dest_op="MLIL_VAR_SSA", arg=_ssa_reg(0)),  # indirect: skipped
+        _call_site(0x402000, arg=_ssa_reg(0)),                       # a different callee
+    ]
+    param = types.SimpleNamespace(name="this", type=_cls_pointer())
+    got = _proto_instance(monkeypatch, [param], sites)._get_prototype("active", "0x401000")
+    assert got["first_argument_entry_value"] == {
+        "direct_call_sites": 5, "checked": 3, "entry_value": 2,
+        "registers": ["rdi"], "truncated": False}
+    note = got["first_argument_entry_value_note"]
+    assert note.startswith("At 2 of 3 direct call sites the first argument is the "
+                           "caller's own entry value of rdi (SSA version 0)")
+    assert "static" not in note
+    assert "implicit_object_note" in got
+
+
+def test_proto_get_entry_value_scan_is_capped_and_needs_a_parameter_1013(monkeypatch):
+    sites = [_call_site(0x401000, arg=_ssa_reg(0)) for _ in range(40)]
+    param = types.SimpleNamespace(name="this", type=_cls_pointer())
+    got = _proto_instance(monkeypatch, [param], sites)._get_prototype("active", "0x401000")
+    fact = got["first_argument_entry_value"]
+    assert fact["checked"] == 32 and fact["truncated"] is True
+    assert "Only the first 32 of 40 call sites were inspected." in got[
+        "first_argument_entry_value_note"]
+    none = _proto_instance(monkeypatch, [], sites)._get_prototype("active", "0x401000")
+    assert "first_argument_entry_value" not in none
+
+
+def test_proto_get_flags_undefined_named_types_with_a_declare_command_1013(monkeypatch):
+    param = types.SimpleNamespace(name="this", type=_cls_pointer())
+    got = _proto_instance(monkeypatch, [param], [])._get_prototype("active", "0x401000")
+    assert got["undefined_types"] == [
+        {"name": "ns::Cls", "declare_command": "bn types declare 'struct `ns::Cls`;'"}]
+    note = got["undefined_type_note"]
+    assert "run `bn types declare 'struct `ns::Cls`;'` first" in note
+    assert "`this` is a keyword the parser rejects as a parameter name" in note
+    assert "spell a `::`-qualified name in backticks" in note
+    defined = _proto_instance(monkeypatch, [param], [], defined=True)
+    assert "undefined_types" not in defined._get_prototype("active", "0x401000")

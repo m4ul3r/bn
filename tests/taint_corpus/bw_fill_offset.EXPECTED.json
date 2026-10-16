@@ -1,0 +1,40 @@
+{
+  "description": "recv into p->hdr is not certified as the producer of p->len: no call's write extent is trusted, so recv is a possible writer and the length is a field frontier, with or without the earlier `p->len = n` store (base's verdict). Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline"
+  ],
+  "backward": [
+    {
+      "function": "fill_other_field_nostore",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "source"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "fill_other_field",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ]
+    }
+  ]
+}

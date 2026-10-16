@@ -455,6 +455,34 @@ def test_render_callgraph_indirect_unresolved():
     assert "UNRESOLVED (UndeterminedValue)" in text
 
 
+def test_render_callgraph_groups_direct_callees_and_callers_by_target_1037():
+    # #1037 item 8: a constructor's 55 rows were 12 of one `operator delete`.
+    # Text gives each distinct callee one row with its count and first sites,
+    # in its demangled name; --per-site keeps every site; indirect calls stay
+    # one row per site (each has its own expression and resolution).
+    delete = {"address": "0x400700", "name": "_ZdlPv", "display_name": "operator delete"}
+    sites = [f"0x4010{n:02x}" for n in range(0, 0x50, 0x10)]
+    value = {
+        "function": {"name": "_ZN4demo6WidgetC2Ev", "display_name": "demo::Widget::Widget",
+                     "address": "0x401000"},
+        "callees": [{"call_addr": s, "kind": "direct", "target": delete} for s in sites]
+        + [{"call_addr": "0x401060", "kind": "indirect", "dest_expr": "x8", "resolved": [],
+            "resolution_detail": "UndeterminedValue"}],
+        "callers": [{"call_addr": "0x402010", "caller": {"name": "main", "address": "0x402000"}},
+                    {"call_addr": "0x402030", "caller": {"name": "main", "address": "0x402000"}}],
+    }
+    text = _render_callgraph_text(value)
+    assert text.splitlines()[0] == "demo::Widget::Widget @ 0x401000"
+    assert "callees (6 sites, 1 distinct direct; --per-site lists each site):" in text
+    assert ("  direct -> operator delete @ 0x400700  x5  at 0x401000, 0x401010, 0x401020, "
+            "+2 more") in text
+    assert "  0x401060  indirect [x8]  UNRESOLVED (UndeterminedValue)" in text
+    assert "  main @ 0x402000  x2  at 0x402010, 0x402030" in text
+    per_site = _render_callgraph_text(value, per_site=True)
+    assert per_site.count("direct -> operator delete @ 0x400700") == 5
+    assert "_ZdlPv" in _render_callgraph_text(value, mangled=True)
+
+
 def test_render_structured_il_text():
     value = {"function": {"name": "f", "address": "0x1"}, "view": "mlil", "ssa": True,
              "instructions": [{"il_index": 0, "address": "0x1", "op": "MLIL_SET_VAR_SSA",
@@ -957,3 +985,19 @@ def test_render_taint_forward_header_names_the_call_locator_callee():
         "soundness": "may-analysis (intraprocedural, MVP)",
     }
     assert "sources: call:recv" in _render_taint_text(value)
+
+
+def test_taint_forward_forwards_a_null_resolve_map_as_present(monkeypatch, capsys, tmp_path):
+    # #1050 review round 2: the bridge refuses a supplied `null` map by name,
+    # so the CLI must send it as present, not drop it as though no flag was given.
+    rmap = tmp_path / "null.json"
+    rmap.write_text("null")
+    fake, calls = _fake({"taint": {"direction": "forward", "function": {"name": "p", "address": "0x1"},
+                                   "sources": [], "reached_sinks": [], "leaves": [],
+                                   "assumptions": [], "soundness": "x"}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    bn.cli.main(["taint", "forward", "-f", "dispatch", "--source", "param:1",
+                 "--resolve-map", str(rmap), "--target", "active"])
+    params = [c for c in calls if c["op"] == "taint"][0]["params"]
+    assert "resolve_map" in params and params["resolve_map"] is None
+    assert params["resolve_map_path"] == str(rmap)

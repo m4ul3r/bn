@@ -1004,7 +1004,7 @@ def test_op_set_prototype_hands_bn_the_parsed_type_999(monkeypatch):
             super().set_user_type(str(value))
 
     class _PrototypeBV(_FakeBV):
-        def parse_type_string(self, declaration):
+        def parse_type_string(self, declaration, **_):
             return parsed, None
 
     fn = _SetterFunction()
@@ -1088,7 +1088,7 @@ def test_op_set_prototype_hints_to_declare_unknown_struct(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
 
     class _UnknownTypeBV(_FakeBV):
-        def parse_type_string(self, declaration):
+        def parse_type_string(self, declaration, **_):
             raise SyntaxError("unexpected token 'GarbageHazardRuntime'")
 
     fn = _FakeFunction(0x401000, "handler")
@@ -1126,7 +1126,7 @@ def test_proto_set_this_parameter_suggests_only_free_self_1013(
     fn = _FakeFunction(0x401000, "run")
     bv = _FakeBV(functions=[fn], types_={"Widget": _FakeType("struct Widget")})
 
-    def reject(text):
+    def reject(text, **_):
         raise SyntaxError("error: string.hpp:1:29 invalid parameter name: "
                           "'this' is a keyword\n"
                           "error: string.hpp:1:16 unknown type name 'Widget'")
@@ -1162,7 +1162,7 @@ def test_proto_set_nested_template_parse_failure_is_invalid_request_1013(
             _FakeType("struct demo::Box<std::pair<int, demo::Node> >::Value"),
     })
 
-    def reject(text):
+    def reject(text, **_):
         raise SyntaxError("error: string.hpp:1:19 expected unqualified-id")
 
     def broken_fallback(view, text):
@@ -1193,7 +1193,7 @@ def test_named_type_fallback_exception_preserves_original_parse_error_1013(monke
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
 
-    def reject(text):
+    def reject(text, **_):
         raise SyntaxError("error: string.hpp:1:1 unknown type name 'nosuch'")
 
     def broken_fallback(view, text):
@@ -1220,7 +1220,7 @@ def test_proto_set_accepts_namespaced_named_function_fallback_1026(monkeypatch):
     callback = _FakeType("int32_t(int32_t value)", type_class="FunctionTypeClass")
     bv = _FakeBV(qualified_types_={("ns", "Callback"): callback})
 
-    def reject(text):
+    def reject(text, **_):
         raise SyntaxError("error: string.hpp:1:1 unknown type name 'ns'")
 
     monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
@@ -1245,7 +1245,7 @@ def test_proto_set_display_name_does_not_shadow_type_hint_1026(monkeypatch, prot
         "ns::Cls::methods": _FakeType("struct ns::Cls::methods"),
     })
 
-    def reject(text):
+    def reject(text, **_):
         raise SyntaxError("error: string.hpp:1:20 use of undeclared identifier 'ns'")
 
     monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
@@ -1453,7 +1453,7 @@ def test_op_set_prototype_registers_restore_for_preview(monkeypatch):
             super().set_user_type(value if isinstance(value, str) else str(value))
 
     class _PrototypeBV(_FakeBV):
-        def parse_type_string(self, declaration):
+        def parse_type_string(self, declaration, **_):
             return _FakeType("void(uint32_t* p)", type_class="FunctionTypeClass"), None
 
     fn = _SetterFunction()
@@ -1486,7 +1486,7 @@ def test_op_set_prototype_no_restore_when_unchanged(monkeypatch):
             super().set_user_type(value if isinstance(value, str) else str(value))
 
     class _PrototypeBV(_FakeBV):
-        def parse_type_string(self, declaration):
+        def parse_type_string(self, declaration, **_):
             return _FakeType("int32_t(int32_t* arg1)", type_class="FunctionTypeClass"), None
 
     fn = _SetterFunction()
@@ -1945,7 +1945,7 @@ def test_verify_prototype_passes_with_implicit_calling_convention(monkeypatch):
             super().set_user_type('int32_t __convention("cdecl")(char const* path)')
 
     class _ConventionBV(_FakeBV):
-        def parse_type_string(self, declaration):
+        def parse_type_string(self, declaration, **_):
             # parse_type_string returns WITHOUT convention.
             return _FakeType("int32_t(char const* path)", type_class="FunctionTypeClass"), None
 
@@ -1984,7 +1984,7 @@ def test_verify_prototype_still_fails_on_real_mismatch(monkeypatch):
             super().set_user_type("void*(int32_t x)")
 
     class _MismatchBV(_FakeBV):
-        def parse_type_string(self, declaration):
+        def parse_type_string(self, declaration, **_):
             return _FakeType("int32_t(char const* path)", type_class="FunctionTypeClass"), None
 
     fn = _MismatchFunction()
@@ -2022,7 +2022,7 @@ def test_verify_prototype_passes_when_bn_infers_pure_attribute(monkeypatch):
             super().set_user_type("void(void* self) __pure")
 
     class _PureBV(_FakeBV):
-        def parse_type_string(self, declaration):
+        def parse_type_string(self, declaration, **_):
             # parse_type_string returns the requested type WITHOUT __pure.
             return _FakeType("void(void* self)", type_class="FunctionTypeClass"), None
 
@@ -2042,6 +2042,70 @@ def test_verify_prototype_passes_when_bn_infers_pure_attribute(monkeypatch):
     verified = instance._verify_operation(bv, result)
     assert verified["status"] == "verified"
     assert "__pure" in verified["observed"]["prototype"]
+
+
+class _CanReturn:
+    """BN's BoolWithConfidence shape for `Function.can_return`."""
+
+    def __init__(self, value):
+        self.value = value
+
+
+def _noreturn_verification(monkeypatch, *, before, requested, parsed, lands):
+    """Apply then verify a prototype on a fake function whose `can_return`
+    after the edit is *lands* (None: the edit leaves it as it was)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _Function(_FakeFunction):
+        def __init__(self):
+            super().__init__(0x401200, "fatal_error", before)
+            self.can_return = _CanReturn("__noreturn" not in before)
+
+        def set_user_type(self, value):
+            super().set_user_type(value)
+            if lands is not None:
+                self.can_return = _CanReturn(lands)
+
+    class _BV(_FakeBV):
+        def parse_type_string(self, declaration, **_):
+            parsed_type = _FakeType(parsed, type_class="FunctionTypeClass")
+            parsed_type.can_return = _CanReturn("__noreturn" not in parsed)
+            return parsed_type, None
+
+    bv = _BV(functions=[_Function()])
+    result = instance._op_set_prototype(
+        bv, {"op": "set_prototype", "identifier": "fatal_error", "prototype": requested})
+    return instance._verify_operation(bv, result)
+
+
+def test_requested_noreturn_that_never_lands_fails_verification_966(monkeypatch):
+    """`_normalize_prototype` strips `__noreturn` from both sides (#199), so a
+    requested `__noreturn` the function never took verified anyway. The change
+    is now judged by BN's effective `can_return` after reanalysis."""
+    kwargs = dict(before="void(int32_t code)", requested="void fatal_error(int code) __noreturn",
+                  parsed="void(int32_t code) __noreturn")
+    missed = _noreturn_verification(monkeypatch, lands=None, **kwargs)
+    assert missed["status"] == "verification_failed", missed
+    assert "requests __noreturn, but the function can still return" in missed["message"]
+    assert missed["observed"]["can_return"] is True
+    landed = _noreturn_verification(monkeypatch, lands=False, **kwargs)
+    assert landed["status"] == "verified" and landed["observed"]["can_return"] is False
+
+
+def test_dropping_noreturn_is_verified_by_can_return_966(monkeypatch):
+    """Clearing `__noreturn` is a requested change too; a prototype that does
+    not change the attribute is not judged on it (BN may re-infer it, #199)."""
+    kwargs = dict(before="void(int32_t code) __noreturn", requested="void fatal_error(int code)",
+                  parsed="void(int32_t code)")
+    stuck = _noreturn_verification(monkeypatch, lands=None, **kwargs)
+    assert stuck["status"] == "verification_failed", stuck
+    assert "drops __noreturn, but the function still cannot return" in stuck["message"]
+    assert _noreturn_verification(monkeypatch, lands=True, **kwargs)["status"] == "verified"
+    unchanged = _noreturn_verification(
+        monkeypatch, before="int32_t(int32_t code)", requested="int fatal_error(int value)",
+        parsed="int32_t(int32_t value)", lands=False)
+    assert unchanged["status"] == "verified", unchanged
 
 
 def test_batch_apply_binder_rejects_nonboolean_preview(monkeypatch):
@@ -2101,7 +2165,7 @@ def test_parse_concrete_type_rejects_inline_bitfield(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
 
     class _BV:
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             raise AssertionError("bitfield must be rejected before parse")
 
     with pytest.raises(bridge.OperationFailure) as exc:
@@ -2120,7 +2184,7 @@ def test_parse_concrete_type_rejects_dropped_pointer(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
 
     class _BV:
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             return _FakeType("struct", type_class="StructureTypeClass"), None
 
     with pytest.raises(bridge.OperationFailure) as exc:
@@ -2138,7 +2202,7 @@ def test_parse_concrete_type_accepts_real_pointer(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
 
     class _BV:
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             return _FakeType("char*", type_class="PointerTypeClass"), None
 
     parsed, _ = bridge.mutation_engine._parse_concrete_type(
@@ -2589,7 +2653,7 @@ def test_struct_field_set_no_overwrite_refuses_interior_overlap(monkeypatch):
     occupied_type = types.SimpleNamespace(members=[big])
 
     class _BV:
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             return types.SimpleNamespace(width=4), None   # a 4-byte field
 
         def get_type_by_name(self, n):
@@ -2631,7 +2695,7 @@ def test_struct_field_set_overwrite_narrower_retype_reusing_removed_name_succeed
     occupied_type = types.SimpleNamespace(members=[wide])
 
     class _BV:
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             return types.SimpleNamespace(width=4), None   # a 4-byte field
 
         def get_type_by_name(self, n):
@@ -2673,7 +2737,7 @@ def test_struct_field_set_names_every_member_the_overwrite_removes(monkeypatch):
     ])
 
     class _BV:
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             return types.SimpleNamespace(width=8), None
 
         def get_type_by_name(self, n):
@@ -2707,7 +2771,7 @@ def test_struct_field_set_overwrite_minting_surviving_duplicate_refused(monkeypa
     occupied_type = types.SimpleNamespace(members=[a, b])
 
     class _BV:
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             return types.SimpleNamespace(width=4), None
 
         def get_type_by_name(self, n):
@@ -2741,7 +2805,7 @@ def test_struct_field_set_retype_under_own_name_succeeds_with_fresh_member_objec
                     types.SimpleNamespace(offset=8, name="field", type=types.SimpleNamespace(width=4))]
 
     class _BV:
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             return types.SimpleNamespace(width=8), None
 
         def get_type_by_name(self, n):
@@ -3048,7 +3112,7 @@ def _typedef_alias_bv(*, alias_name="AliasRec", tag="InnerRec"):
         def get_type_by_name(self, n):
             return {alias_name: alias, tag: underlying}.get(n)
 
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             return _FakeType("uint32_t", width=4), None
 
         def define_user_type(self, name, b):
@@ -3161,7 +3225,7 @@ def test_prototype_matches_ignoring_param_names(monkeypatch):
     assert not me._prototype_matches_ignoring_param_names(
         bv_returning(expected_va), observed_va, "int32_t(char const*, ...)")
     # unparseable expected -> False (caller falls back to the string compare)
-    def _boom(s):
+    def _boom(s, **_):
         raise ValueError("bad")
     assert not me._prototype_matches_ignoring_param_names(
         types.SimpleNamespace(parse_type_string=_boom), observed, "garbage")
@@ -4185,7 +4249,7 @@ def test_preview_reports_an_unparseable_prototype_as_a_parse_error_999(monkeypat
     preview", so every attempt to find the bad spelling was a live one."""
     bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
 
-    def reject(text):
+    def reject(text, **_):
         raise SyntaxError("error: string.hpp:1:11 unknown type name 'nosuch'")
 
     monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
@@ -4222,7 +4286,7 @@ def test_preview_parse_checks_a_prototype_beside_a_rename_999(monkeypatch):
     that it parses, so a typo previewed as exit 0 and failed only on commit."""
     bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
 
-    def reject(text):
+    def reject(text, **_):
         raise SyntaxError("error: string.hpp:1:11 unknown type name 'nosuch'")
 
     monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
@@ -4503,7 +4567,7 @@ def test_preview_parse_error_after_rename_is_not_skipped_1013(monkeypatch):
     bridge, instance, bv, auto_fn, applied = _skip_preview_fixture(monkeypatch)
     earlier = {"op": "rename_symbol", "identifier": "other", "new_name": "renamed"}
 
-    def reject(text):
+    def reject(text, **_):
         assert applied == [earlier], "prototype parsed against the pre-rename view"
         raise SyntaxError("error: string.hpp:1:11 unknown type name 'nosuch'")
 
@@ -4545,7 +4609,7 @@ def test_a_prototype_parse_error_quotes_what_was_typed_999(monkeypatch, bn_colum
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def reject(text):
+    def reject(text, **_):
         raise SyntaxError(f"error: string.hpp:1:{bn_column} invalid parameter name: "
                           "'this' is a keyword")
 
@@ -4565,7 +4629,7 @@ def test_a_parse_error_column_on_the_name_line_is_translated_999(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def reject(text):
+    def reject(text, **_):
         raise SyntaxError("error: string.hpp:2:19 expected ')' "
                           "error: string.hpp:1:3 note")
 
@@ -4609,7 +4673,7 @@ def test_prototype_parse_failures_get_the_hint_for_their_cause_999(monkeypatch, 
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def reject(text):
+    def reject(text, **_):
         raise SyntaxError(detail)
 
     monkeypatch.setattr(bv, "parse_type_string", reject, raising=False)
@@ -5183,7 +5247,7 @@ class _DataVarBV(_FakeMutationBV):
     def is_valid_offset(self, address):
         return self._mapped
 
-    def parse_type_string(self, text):
+    def parse_type_string(self, text, **_):
         return _FakeType(str(text)), None
 
     def get_data_var_at(self, address):
@@ -5287,7 +5351,7 @@ def test_data_retype_undeclared_type_is_clean_error_649(monkeypatch):
     declare`, not a traceback."""
     bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("void")})
 
-    def _boom(text):
+    def _boom(text, **_):
         raise RuntimeError("error: unknown type name 'cmd_help_entry'")
 
     bv.parse_type_string = _boom
@@ -7022,7 +7086,7 @@ def test_a_raising_mapped_probe_is_indeterminate_not_invalid_890(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv, _fn = _tag_comment_bv()
 
-    def _boom(addr):
+    def _boom(addr, **_):
         raise RuntimeError("offset probe unavailable")
 
     bv.is_valid_offset = _boom
@@ -7323,3 +7387,103 @@ def test_unattempted_plain_declaration_discloses_snapshot_parse(monkeypatch):
     assert row["parse_performed"] is True, result
     assert "imported_from_library" not in row, result
     assert not result.get("kept_library_imports"), result
+
+
+# --- #1042 items 1-2: rendered placeholder names and symbol names as targets --
+
+
+def _stripped_rename_bv(**kwargs):
+    """A stripped view: `sub_401000` is the function's own auto name, and the
+    global at 0x460000 has no symbol at all -- the decompile prints it as
+    `data_460000`."""
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("int32_t")},
+                    functions=[_FakeFunction(0x401000, "sub_401000")], **kwargs)
+    for fn in bv.functions:
+        fn.view = bv
+    return bv
+
+
+def test_batch_rename_of_a_rendered_data_placeholder_lands_1042(monkeypatch):
+    bv = _stripped_rename_bv()
+    bridge, instance = _data_retype_instance(monkeypatch, bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "rename_symbol", "identifier": "data_460000", "new_name": "g_live",
+         "kind": "data"},
+        {"op": "rename_symbol", "identifier": "0x401000", "new_name": "fold_value"},
+    ])
+
+    assert result["success"] is True, result
+    assert [row["status"] for row in result["results"]] == ["verified", "verified"]
+    row = result["results"][0]
+    assert row["address"] == "0x460000" and row["before_name"] is None
+    assert row["resolved_symbol"] == {"name": "data_460000", "kind": "placeholder",
+                                      "address": "0x460000"}
+    # Readback, not the row's claim: the symbol is on the view now.
+    assert bv.get_symbol_at(0x460000).name == "g_live"
+
+
+def test_placeholder_rename_needs_the_kind_its_prefix_names_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+    bv = _stripped_rename_bv()
+    resolve = instance.ctx._resolve_rename_target
+
+    # A renamed function is still reachable by the auto name it USED to show,
+    # because no symbol carries that name any more.
+    bv.functions[0].name = bv.functions[0].raw_name = "fold_value"
+    target = resolve(bv, "sub_401000", "function")
+    assert target["address"] == 0x401000 and target["before_name"] == "fold_value"
+    assert target["resolved_symbol"]["kind"] == "placeholder"
+
+    # No function STARTS at the spelled address: a miss, under the prefix the
+    # batch's renamed-reference explainer reads.
+    with pytest.raises(bridge.OperationFailure) as no_fn:
+        resolve(bv, "sub_401004", "function")
+    assert me._is_resolver_miss(no_fn.value.message, "sub_401004")
+    assert "no function starts at the address it spells (0x401004)" in no_fn.value.message
+
+    # `sub_` never names data and `data_` never names a function.
+    for identifier, kind in (("data_460000", "function"), ("sub_401000", "data")):
+        with pytest.raises(bridge.OperationFailure):
+            resolve(bv, identifier, kind)
+
+    # A thunk's `j_sub_<hex>` spells its jump TARGET, not its own address.
+    with pytest.raises(bridge.OperationFailure) as thunk:
+        resolve(bv, "j_sub_401000", "auto")
+    assert thunk.value.message == "Symbol not found: j_sub_401000"
+
+
+def test_unmapped_data_placeholder_rename_says_why_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _stripped_rename_bv(mapped=False)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance.ctx._resolve_rename_target(bv, "data_460000", "data")
+    assert exc.value.message.startswith("Symbol not found: data_460000.")
+    assert "not mapped" in exc.value.message
+
+
+def test_data_retype_takes_a_data_symbol_name_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fake_bn = sys.modules["binaryninja"]
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("void")},
+                    symbols=[fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x460000, "g_table")])
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "data_retype", "address": "g_table", "new_type": "uint32_t[4]"}])
+
+    assert result["success"] is True, result
+    row = result["results"][0]
+    assert row["status"] == "verified" and row["address"] == "0x460000"
+    assert row["resolved_symbol"]["kind"] == "data"
+    assert str(bv.get_data_var_at(0x460000).type) == "uint32_t[4]"
+
+    missed = instance._mutation("active", False, [
+        {"op": "data_retype", "address": "g_tabel", "new_type": "uint32_t[4]"}])
+    assert missed["success"] is False
+    assert missed["results"][-1]["message"].startswith("Symbol not found: g_tabel.")

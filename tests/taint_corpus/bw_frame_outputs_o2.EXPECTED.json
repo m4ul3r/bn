@@ -1,0 +1,227 @@
+{
+  "description": "Field loads past calls: no model proves what a call did not write, so every call leaves the field a frontier; a modeled source (recv, getline) is named as a possible producer. Analyze only. -O2.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline",
+    "-fno-builtin",
+    "-fno-strict-aliasing",
+    "-U_FORTIFY_SOURCE"
+  ],
+  "backward": [
+    {
+      "function": "fill_varlen",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "source",
+        "field_load_unresolved"
+      ],
+      "step_reasons_contain": [
+        "field may be filled by source recv"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "fill_union_cover",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "fill_union_short",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "constant",
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "fill_overlap",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "fill_overlap_tail",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "om_recvmsg",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "source",
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "om_readv",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "source",
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "om_getline",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "source",
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "om_stat",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "source",
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "om_sscanf",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "source",
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "om_strncat",
+      "sink": "arg:memcpy:2",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "source",
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "om_asprintf",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "source",
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "om_strtol",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "field_load_unresolved",
+        "source",
+        "parameter"
+      ],
+      "forbid_origin_kinds": [
+        "constant"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "complete_slice": false
+    }
+  ]
+}

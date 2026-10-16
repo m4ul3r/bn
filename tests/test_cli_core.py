@@ -268,6 +268,148 @@ def test_unrecognized_argument_at_root_routes_to_root_usage(capsys):
     assert "bn: error: unrecognized arguments: --bogus" in stderr
 
 
+def _parser_hint(capsys, argv: list[str]) -> str:
+    """The last stderr line argparse printed for *argv* -- the targeted hint."""
+    with pytest.raises(SystemExit) as exc_info:
+        bn.cli.build_parser().parse_args(argv)
+    assert exc_info.value.code == 2
+    return capsys.readouterr().err.rstrip().splitlines()[-1]
+
+
+def _printed_command(hint: str) -> list[str]:
+    """The `bn ...` command a hint ends with, as argv for `bn.cli.main`."""
+    import shlex
+
+    return shlex.split(hint.rsplit(": bn ", 1)[1])
+
+
+def test_a_value_after_regex_names_the_switch_and_prints_the_fix_1042(capsys, fake_transport):
+    """#1042 item 4: `strings --regex 'a|b|c'` rejected the PATTERN, which read
+    as a bad regex. The hint names the switch and prints the corrected command,
+    which is then run exactly as printed."""
+    hint = _parser_hint(capsys, ["-t", "demo", "strings", "--regex", "a|b c", "--with-xrefs"])
+    assert hint.startswith("--regex is a switch and takes no value")
+
+    argv = _printed_command(hint)
+    assert argv == ["-t", "demo", "strings", "--query", "a|b c", "--regex", "--with-xrefs"]
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "strings": {"ok": True, "result": {
+            "kind": "strings", "items": [], "total": 0, "offset": 0, "limit": 100,
+            "returned": 0, "has_more": False}}})
+    assert bn.cli.main(argv) == 0
+    params = calls[-1]["params"]
+    assert params["query"] == "a|b c" and params["regex"] is True and params["with_xrefs"] is True
+
+    # Another switch with a stray value is named too, but nothing is guessed
+    # about where the value belongs.
+    other = _parser_hint(capsys, ["strings", "--with-xrefs", "stray"])
+    assert other == "--with-xrefs is a switch and takes no value; 'stray' is left over"
+
+
+def test_estimate_output_on_a_dual_role_node_prints_the_alias_form_1037(capsys):
+    """#1037 item 10: the flag is withheld on `exports` on purpose (#796 r2);
+    the refusal now says so and prints the `exports list` form, which parses
+    with the flag set."""
+    hint = _parser_hint(capsys, ["-t", "exports", "exports", "--estimate-output"])
+    assert "not accepted on `bn exports` itself" in hint
+
+    argv = _printed_command(hint)
+    # The `-t exports` VALUE is not mistaken for the command path.
+    assert argv == ["-t", "exports", "exports", "list", "--estimate-output"]
+    ns = bn.cli.build_parser().parse_args(argv)
+    assert ns.estimate_output is True and ns._command_path == ("exports", "list")
+
+    # `types` has no alias leaf: the refusal explains, and prints no command.
+    types_hint = _parser_hint(capsys, ["types", "--estimate-output"])
+    assert "not accepted on `bn types` itself" in types_hint and "bn types " not in types_hint
+
+
+def _paged_function_list(total: int, returned: int, offset: int = 0) -> dict:
+    return {"ok": True, "result": {
+        "kind": "functions", "total": total, "offset": offset, "limit": 100,
+        "returned": returned, "has_more": offset + returned < total,
+        "items": [{"name": f"sub_{0x401000 + i:x}", "address": hex(0x401000 + i)}
+                  for i in range(returned)]}}
+
+
+@pytest.mark.parametrize("fmt", ["text", "json", "ndjson"])
+def test_default_page_truncation_is_noted_on_stderr_in_every_format_1037(
+        capsys, fake_transport, fmt):
+    """#1037 item 4: the footer is on stdout, so a pipe filters it away and
+    JSON carries only `has_more`. The note goes to stderr in every format."""
+    fake_transport({"list_targets": {"ok": True, "result": [
+        {"target_id": "1:1:1", "selector": "demo"}]},
+        "list_functions": _paged_function_list(total=397, returned=100)})
+
+    assert bn.cli.main(["function", "list", "--format", fmt]) == 0
+
+    err = capsys.readouterr().err
+    assert "note: the default --limit 100 cut this page short (100 of 397)" in err
+    assert "--offset 100" in err
+
+
+@pytest.mark.parametrize("argv, envelope", [
+    # The caller chose the page size: their own --limit is not a surprise.
+    (["function", "list", "--limit", "100"], _paged_function_list(total=397, returned=100)),
+    # The default did not truncate anything.
+    (["function", "list"], _paged_function_list(total=42, returned=42)),
+])
+def test_no_default_page_note_when_the_caller_chose_or_nothing_was_cut_1037(
+        capsys, fake_transport, argv, envelope):
+    fake_transport({"list_targets": {"ok": True, "result": [
+        {"target_id": "1:1:1", "selector": "demo"}]}, "list_functions": envelope})
+
+    assert bn.cli.main(argv) == 0
+    assert "default --limit" not in capsys.readouterr().err
+
+
+def test_fanout_rows_the_default_page_cut_short_each_get_a_stderr_note_1037(
+        capsys, fake_transport, monkeypatch):
+    """#1048 review: `--all-targets` returned through the fan-out path before the
+    single-target note, so a truncated JSON survey had an empty stderr."""
+    def page(total, returned):
+        return {"kind": "imports", "total": total, "offset": 0, "limit": 100,
+                "returned": returned, "has_more": returned < total,
+                "items": [{"name": f"imp_{i}", "address": hex(0x1000 + i)}
+                          for i in range(returned)]}
+
+    fake_transport({"list_targets": {"ok": True, "result": [
+        {"target_id": "1:1:1", "selector": "small"},
+        {"target_id": "1:2:2", "selector": "big"}]}})
+    listed = bn.cli.send_request
+    pages = {"1:1:1": page(14, 14), "1:2:2": page(120, 100)}
+    asked: list = []
+
+    def send(op, *, target=None, **kwargs):
+        if op != "imports":
+            return listed(op, target=target, **kwargs)
+        asked.append((target, kwargs.get("params")))
+        return {"ok": True, "result": pages[target]}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    assert bn.cli.main(["imports", "--all-targets", "--format", "json"]) == 0
+
+    err = capsys.readouterr().err.splitlines()
+    notes = [line for line in err if "default --limit 100" in line]
+    assert notes == [
+        "note: target 1:2:2: the default --limit 100 cut this page "
+        "short (100 of 120); rerun with --offset 100, a larger --limit, or --out "
+        "FILE for every row"], err
+    assert sorted(target for target, _ in asked) == ["1:1:1", "1:2:2"]
+    assert all(params["limit"] == 100 for _, params in asked)
+
+
+def test_abbreviated_routing_option_does_not_bend_the_exports_hint_1037(capsys):
+    """#1048 review nit: `--targ exports` is the abbreviated `--target`, so its
+    value is not the command path; the printed command must parse."""
+    hint = _parser_hint(capsys, ["--targ", "exports", "exports", "--estimate-output"])
+    argv = _printed_command(hint)
+    assert argv == ["--targ", "exports", "exports", "list", "--estimate-output"]
+    ns = bn.cli.build_parser().parse_args(argv)
+    assert ns.estimate_output is True and ns._command_path == ("exports", "list")
+
+
 def test_local_list_text_is_slim(fake_transport, capsys):
     fake_transport({
         "list_locals": {

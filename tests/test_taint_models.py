@@ -711,6 +711,23 @@ def test_taint_answers_disclose_the_view_analysis_state_811(monkeypatch):
     assert result["partial"] is False, result
 
 
+def test_taint_op_refuses_a_supplied_null_resolve_map_1050():
+    # #1050 review round 2: `--resolve-map` naming a file that holds JSON
+    # `null` reaches the bridge as a present `resolve_map: None`. That is a
+    # supplied document of the wrong shape, refused with the file name -- not
+    # the omitted option, which the same request without the key still is.
+    import pytest
+
+    class _Ctx(_CtxWithBV):
+        def _find_function(self, bv, name):
+            return object()
+
+    request = {"function": "handler", "sources": ["param:0"]}
+    with pytest.raises(rts.OperationFailure, match="--resolve-map maps/null.json"):
+        rts._taint_op(_Ctx(_BVPlain()), "active",
+                      dict(request, resolve_map=None, resolve_map_path="maps/null.json"))
+
+
 def test_present_self_stub_labeled_non_audit_560():
     # A code ref located inside the modeled symbol's OWN body (a self-tailcall
     # stub) is non-audit, distinct from an import thunk.

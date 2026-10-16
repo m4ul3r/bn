@@ -1,0 +1,28 @@
+{
+  "description": "n + mutable_length: the writable global's bytes are whatever was stored before the call, a field_load_unresolved frontier. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-inline",
+    "-fno-builtin"
+  ],
+  "backward": [
+    {
+      "function": "global_and_n",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "parameter",
+        "field_load_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "global holds what was stored before"
+      ],
+      "complete_slice": false
+    }
+  ]
+}

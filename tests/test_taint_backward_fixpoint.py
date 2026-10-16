@@ -36,7 +36,7 @@ def test_loop_exit_coverage_950(reverse, initialized, writer):
 def test_loop_carried_escape_951(escape):
     buf = FVar("buf", typ="char[64]")
     pg = _BufProgram()
-    pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
+    pg.whole_store(buf)     # a call handed &buf would itself start an escape (#1053 r4)
     header = pg.phi(1, 4)
     # Use an existing unknown target name, with no pointer argument.
     unknown = next(k for k, v in _B_NAMES.items() if v == "compose")
@@ -109,7 +109,7 @@ def test_loop_carried_stash_is_not_a_definite_destination():
 def test_nested_loop_escape_reaches_inner_call(escape, reverse):
     buf = FVar("buf", typ="char[64]")
     pg = _BufProgram()
-    pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
+    pg.whole_store(buf)
     pg.phi(*([6, 1] if reverse else [1, 6]))
     pg.phi(*([5, 2] if reverse else [2, 5]))
     pg.call(next(k for k, v in _B_NAMES.items() if v == "compose"), [])
@@ -126,8 +126,7 @@ def test_nested_loop_escape_reaches_inner_call(escape, reverse):
 def test_future_stash_does_not_invent_an_earlier_buffer_writer():
     buf = FVar("buf", typ="char[64]")
     pg = _BufProgram()
-    pg.call(_B_MEMSET, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
-                       FExpr("MLIL_CONST", "64", constant=64)])
+    pg.whole_store(buf)     # a call handed &buf would itself start an escape (#1053 r4)
     reload = FExpr("MLIL_LOAD_SSA", "[stash]", src=_cstr(0x404000), src_memory=pg.mem)
     pg.call(_B_STRCPY, [reload, _cstr(0x700)])
     pg.store(_cstr(0x404000), _addr_of(buf))

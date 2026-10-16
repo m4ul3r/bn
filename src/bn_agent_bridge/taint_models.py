@@ -150,7 +150,7 @@ _FLOW_ROLE_KEYS = ("sink", "sources", "propagates", "varargs", "continuation", "
 # fields (`detail`, `optional`, `gate`) are not flagged: they arm nothing, and
 # the docstring's promise that unknown keys beside a role are left alone
 # covers an annotation such as `{"propagates": [...], "detail": "wrapper"}`.
-_SINK_ARMING_KEYS = ("class", "tainted_args", "len_arg", "buf_arg")
+_SINK_ARMING_KEYS = ("class", "tainted_args", "len_arg", "buf_arg", "format_arg")
 
 
 def _effective_keys(model: Any) -> list[str]:
@@ -228,8 +228,20 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
         ba = sink.get("buf_arg")
         if ba is not None and (not _is_int(ba) or ba < 0):
             _fail("`sink.buf_arg` must be a non-negative integer argument index")
-        if ta is None and la is None:
-            _fail("`sink` requires `tainted_args` or `len_arg` (nothing arms the sink)")
+        # #1041 item 4: a FORMAT-GATED sink (scanf's width-less %s) arms on the
+        # constant format at `format_arg`; `first_dest` is the argument the first
+        # assigning conversion writes.
+        fa = sink.get("format_arg")
+        if fa is not None:
+            if not _is_int(fa) or fa < 0:
+                _fail("`sink.format_arg` must be a non-negative integer argument index")
+            fd = sink.get("first_dest")
+            if not _is_int(fd) or fd <= fa:
+                _fail("`sink.format_arg` needs an integer `first_dest` after it (the "
+                      "argument the first assigning conversion writes)")
+        if ta is None and la is None and fa is None:
+            _fail("`sink` requires `tainted_args`, `len_arg` or `format_arg` "
+                  "(nothing arms the sink)")
     for key in ("sources", "propagates"):
         if key in model:
             seq = model[key]

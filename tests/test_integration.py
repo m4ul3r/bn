@@ -35,6 +35,7 @@ CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
 CLASSES_NOPIE_STRIPPED_BINARY = FIXTURES_DIR / "classes_nopie_stripped_x86_64"
 VCALLS_BINARY = FIXTURES_DIR / "vcalls_x86_64"
+STATICS_BINARY = FIXTURES_DIR / "statics_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -1211,22 +1212,56 @@ class TestTypeStringsAndInheritance:
         assert fresh["declared_types"]["created_by_reference"] == ["Leaf993"], fresh
         assert shared_bn.json("types", "show", "Leaf993")["layout"] == "struct Leaf993 // size=0x0"
 
+    def test_noreturn_prototype_sets_can_return_and_previews_restore_it_966(self, shared_bn):
+        """#966 (D13): `can_return` is set through `proto set ... __noreturn`
+        and verified by BN's effective `can_return` after reanalysis. A preview
+        and a live clear both work on a function with a user prototype, and
+        the preview restores the previous value."""
+        shared_bn.load(HELLO_BINARY)
+        probe = "print(bool(bv.get_functions_by_name('greet')[0].can_return))"
+
+        def can_return():
+            return shared_bn.run("py", "exec", "--code", probe).stdout.strip().splitlines()[-1]
+
+        assert can_return() == "True"
+        marked = shared_bn.json("proto", "set", "greet", "int greet(char const* who) __noreturn")
+        row = marked["results"][0]
+        assert row["status"] == "verified", row
+        assert row["observed"]["can_return"] is False, row
+        assert can_return() == "False"
+        preview = shared_bn.json("proto", "set", "greet", "int greet(char const* who)", "--preview")
+        assert preview["results"][0]["status"] == "verified", preview
+        assert preview["results"][0]["observed"]["can_return"] is True, preview
+        assert can_return() == "False"
+        cleared = shared_bn.json("proto", "set", "greet", "int greet(char const* who)")
+        assert cleared["results"][0]["observed"]["can_return"] is True, cleared
+        assert can_return() == "True"
+
     def test_preview_needing_a_library_type_is_refused_and_imports_nothing(self, tmp_path, shared_bn):
-        """#993 item 2 (round 3): parsing a declaration that uses a library type
-        makes BN import it, undo cannot revert that, and modelling the import
-        under a preview failed three reviews. A preview that would need a
-        library type the view lacks is refused, naming it, and the view's type
-        list is untouched -- a single declare, and a batch whose later op uses
-        the type. Once the type is in the view, the same batch previews."""
+        """#993 item 2 / #1012 item 1: parsing a declaration that uses a
+        library type makes BN import it, and undo cannot revert that. A preview
+        parses with BN's own `import_dependencies=False`, so BN refuses the
+        parse instead of importing; the preview is refused naming the library
+        type, and the view's type list is untouched -- a single declare, and a
+        batch whose later op uses the type. Once the type is in the view, the
+        same batch previews."""
         shared_bn.load(HELLO_BINARY)
         probe = "print(sorted(str(n) for n in bv.type_names))"
         before = shared_bn.run("py", "exec", "--code", probe).stdout
         refused = shared_bn.run("types", "declare", "struct Stamp993 { struct timespec ts; int y; };", "--preview")
         assert refused.returncode == 3, refused.stdout + refused.stderr
-        assert "Cannot --preview" in refused.stderr + refused.stdout
-        assert "timespec" in refused.stderr + refused.stdout
+        # By value: BN refuses the parse itself.
+        assert "not previewed: Binary Ninja refused to parse this without importing" in refused.stdout
+        assert "timespec (libc" in refused.stdout
+        # Only pointed at: the parse succeeds without importing, and the
+        # declaration is refused one step later, naming the parsed references
+        # (#1012 review r1: this path still printed the old wording).
         pointer = shared_bn.run("types", "declare", "struct Ptr993 { struct tms* p; };", "--preview")
-        assert pointer.returncode == 3 and "tms" in pointer.stderr + pointer.stdout, pointer.stderr
+        assert pointer.returncode == 3, pointer.stdout + pointer.stderr
+        assert ("not previewed: the declaration's types refer to type-library type(s) the view "
+                "does not have yet. The live declare imports them with the library types they "
+                "depend on: tms") in pointer.stdout, pointer.stdout
+        assert "Nothing was imported" in pointer.stdout, pointer.stdout
         manifest = tmp_path / "batch.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "types_declare", "declaration": "struct Px993 { struct timeval tv; int64_t pad; };"},
@@ -1248,38 +1283,95 @@ class TestTypeStringsAndInheritance:
         assert again.returncode == 0, again.stdout + again.stderr
         assert json.loads(again.stdout)["verified_count"] == 2, again.stdout
 
-    def test_preview_that_imported_fails_and_names_every_import(self, shared_bn):
-        """#993 review round 4: untagged library names, a macro hiding the
-        tag, and a user typedef standing in for a library name are not caught
-        up front, and BN imported while the preview reported `verified`, exit
-        0. The preview now judges by what BN did -- new type ids, so a renamed
-        import is counted too -- and fails (`unsupported`, exit 3) listing
-        every import as kept. A preview that verifies changed no type id."""
+    def test_untagged_and_macro_hidden_library_uses_preview_without_importing(self, shared_bn):
+        """#1012 item 1: untagged library names and a macro hiding the tag
+        used to import during the preview and then fail with the imports kept.
+        The preview parse now imports nothing: it is refused (exit 3) naming
+        the library type, and no type id changes. A user typedef standing in
+        for a library name (`sigset_t`) is the user's own type, so that
+        declaration previews, again without a new id."""
         shared_bn.load(HELLO_BINARY)
         ids = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", ids).stdout
         shapes = [
             ("struct U1_993 { rusage r; };", "rusage"),
             ("struct U2_993 { timespec* p; };", "timespec"),
             ("struct U3_993 { pthread_mutex_t m; };", "pthread_mutex_t"),
+            ("struct U5_993 { pid_t p; FILE* f; };", "pid_t, FILE"),
             ("#define TAGGED(x) struct x\nstruct U4_993 { TAGGED(tms) t; };", "tms"),
         ]
-        for declaration, library_type in shapes:
+        for declaration, library_types in shapes:
             res = shared_bn.run("types", "declare", declaration, "--preview", "--format", "json", "--summary")
             assert res.returncode == 3, (declaration, res.stdout, res.stderr)
             summary = json.loads(res.stdout)
             assert summary["ok"] is False and summary["verified_count"] == 0, summary
-            assert library_type in summary["kept_library_imports"], summary
-            assert "Run the declare without --preview" in summary["first_error"], summary
-        # The reviewed shape as ONE declaration: the user typedef and its use
-        # parse together, and BN imports libc's `sigset_t` (and `__sigset_t`)
-        # while parsing -- the preview must fail and name both (review round 5).
+            assert "not previewed: Binary Ninja refused to parse this without importing" in summary["first_error"], summary
+            assert f"{library_types} (libc" in summary["first_error"], summary
+            assert "Nothing was imported" in summary["first_error"], summary
+            assert "kept_library_imports" not in summary, summary
+        local = shared_bn.json("types", "declare", "typedef int sigset_t; struct Local993 { sigset_t s; };",
+                               "--preview", "--summary")
+        assert local["ok"] is True and local["verified_count"] == 1, local
+        assert shared_bn.run("py", "exec", "--code", ids).stdout == before
+
+    def test_preview_refusal_lists_name_matches_not_required_types_1012(self, shared_bn):
+        """#1012 review r1: `int FILE;` is an ordinary member, yet the refusal
+        said the declaration `needs pid_t, FILE`. BN's refusal names no type, so
+        the preview lists by-name matches as matches and claims no dependency;
+        the live run imports only what BN actually needed."""
+        shared_bn.load(HELLO_BINARY)
+        declaration = "struct MixedHint { pid_t p; int FILE; };"
+        res = shared_bn.run("types", "declare", declaration, "--preview", "--format", "json")
+        assert res.returncode == 3, res.stdout + res.stderr
+        row = json.loads(res.stdout)["results"][0]
+        assert "needs" not in row["message"], row
+        assert "pid_t, FILE (libc" in row["message"] and "a by-name match" in row["message"], row
+        assert row["observed"]["library_name_matches"] == ["pid_t", "FILE"], row
+        assert "library_types" not in row["observed"], row
+        live = shared_bn.json("types", "declare", declaration, "--summary")
+        assert sorted(live["declared_types"]["imported_from_library"]) == ["__pid_t", "pid_t"], live
+
+    def test_type_string_previews_import_nothing_1012(self, tmp_path, shared_bn):
+        """#1012 item 2: `struct field set`, `proto set`, `local retype` and
+        `data retype` previews imported the library types their type string
+        named. They now parse without importing: a preview that needs one is
+        refused naming it, and a prototype the preview leaves out anyway (no
+        user prototype yet) is `not_previewed` without importing, so its
+        sibling still previews at exit 0."""
+        shared_bn.load(HELLO_BINARY)
+        ids = "print(sorted(bv.type_container.type_ids))"
+        shared_bn.json("types", "declare", "struct Ex1012 { int a; int b; int c; int d; int e; };")
+        shared_bn.json("proto", "set", "main", "int main(int argc, char** argv)")
         before = shared_bn.run("py", "exec", "--code", ids).stdout
-        local = shared_bn.run("types", "declare", "typedef int sigset_t; struct Local993 { sigset_t s; };",
-                              "--preview", "--format", "json", "--summary")
-        summary = json.loads(local.stdout)
-        assert before != shared_bn.run("py", "exec", "--code", ids).stdout, "BN imported nothing"
-        assert local.returncode == 3 and summary["verified_count"] == 0, summary
-        assert {"sigset_t", "__sigset_t"} <= set(summary["kept_library_imports"]), summary
+        local_id = next(row["local_id"] for row in shared_bn.json("local", "list", "main")["items"]
+                        if row["name"] == "argc")
+        data = shared_bn.run("py", "exec", "--code",
+                             "print(hex(bv.sections['.data'].start))").stdout.strip().splitlines()[-1]
+        main = shared_bn.run("py", "exec", "--code",
+                             "print(hex(bv.get_functions_by_name('main')[0].start))").stdout.strip().splitlines()[-1]
+        commands = [
+            (("struct", "field", "set", "Ex1012", "0x10", "t", "struct tm"), "tm"),
+            (("proto", "set", "main", "int main(pid_t argc, char** argv)"), "pid_t"),
+            (("local", "retype", "main", local_id, "pid_t"), "pid_t"),
+            (("data", "retype", data, "pid_t"), "pid_t"),
+        ]
+        for args, library_type in commands:
+            res = shared_bn.run(*args, "--preview", "--format", "json", "--summary")
+            assert res.returncode == 3, (args, res.stdout, res.stderr)
+            summary = json.loads(res.stdout)
+            assert "not previewed: Binary Ninja refused to parse this without importing" in summary["first_error"], summary
+            assert f"{library_type} (libc" in summary["first_error"], summary
+            assert "kept_library_imports" not in summary, summary
+        manifest = tmp_path / "batch.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "set_comment", "address": main, "comment": "preview1012"},
+            {"op": "set_prototype", "identifier": "puts", "prototype": "int puts(pid_t s)"}]}))
+        batch = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert batch.returncode == 0, batch.stdout + batch.stderr
+        rows = json.loads(batch.stdout)["results"]
+        assert [row["status"] for row in rows] == ["verified", "not_previewed"], rows
+        assert "which a preview does not import; name matches: pid_t" in rows[1]["message"], rows[1]
+        assert shared_bn.run("py", "exec", "--code", ids).stdout == before
 
     def test_member_names_like_library_types_preview_normally(self, shared_bn):
         """#993 review round 4: the bare-identifier pre-check treated member
@@ -1671,6 +1763,41 @@ class TestPrototypeRecovery:
         assert "this" in got["prototype"], got
         note = got["implicit_object_note"]
         assert "implicit object parameter" not in note, got
+
+    def test_static_member_callers_pass_their_entry_value_1013(self, shared_bn):
+        """`reg::Registry::get` is static; BN still gives it a `this`. Both
+        callers pass their own entry `rdi` (SSA version 0); `set_handler`'s
+        callers pass the returned object."""
+        shared_bn.load(STATICS_BINARY)
+        got = shared_bn.json("proto", "get", "reg::Registry::get")
+        fact = got["first_argument_entry_value"]
+        assert fact["checked"] == 2 and fact["entry_value"] == 2, got
+        assert fact["registers"] == ["rdi"] and fact["truncated"] is False, got
+        assert "implicit_object_note" in got, got
+        text = shared_bn.run("proto", "get", "reg::Registry::get")
+        assert ("note: At 2 of 2 direct call sites the first argument is the caller's "
+                "own entry value of rdi (SSA version 0)") in text.stdout, text.stdout
+        member = shared_bn.json("proto", "get", "reg::Registry::set_handler")
+        assert member["first_argument_entry_value"]["entry_value"] == 0, member
+
+    def test_undefined_type_declare_command_runs_as_printed_1013(self, shared_bn):
+        shared_bn.load(STATICS_BINARY)
+        got = shared_bn.json("proto", "get", "reg::Registry::get")
+        [row] = got["undefined_types"]
+        assert row["name"] == "reg::Registry", got
+        command = row["declare_command"]
+        assert command == "bn types declare 'struct `reg::Registry`;'", got
+        assert f"`{command}`" in shared_bn.run("proto", "get", "reg::Registry::get").stdout
+        prototype = "int64_t get(struct `reg::Registry`* self)"
+        refused = shared_bn.run("proto", "set", "reg::Registry::get", prototype)
+        assert "Reference to unknown type" in refused.stdout + refused.stderr, refused
+        argv = shlex.split(command)
+        assert argv[0] == "bn", argv
+        declared = shared_bn.run(*argv[1:])
+        assert declared.returncode == 0, declared.stdout + declared.stderr
+        committed = shared_bn.json("proto", "set", "reg::Registry::get", prototype)
+        assert committed["results"][0]["status"] == "verified", committed
+        assert "undefined_types" not in shared_bn.json("proto", "get", "reg::Registry::get")
 
 
 class TestDisasmLinear:
@@ -2501,18 +2628,53 @@ class TestLoadCacheBndbRestore:
             _session_stop(inst)
             inst = None
 
-            # Reload from the still-read-only mount: must restore the cache copy.
+            # Reload from the still-read-only mount: the same project restores
+            # the cache copy (#318), and the note says whose it is (#1036).
             info2 = _session_start(str(prog))
             inst = info2["instance_id"]
+            notes2 = info2["loaded"][0]["notes"]
+            assert any(n.startswith(f"restored cached database {cache_file}") for n in notes2), notes2
             search = _bn("--instance", inst, "function", "search", "RO318_MARKER", "--format", "json")
             names = [i["name"] for i in json.loads(search.stdout).get("items", [])]
             assert "RO318_MARKER" in names, f"annotation lost on reload (blank): {names}"
+            _session_stop(inst)
+            inst = None
+
+            # #1036 item 1: another project's start loads the raw bytes, and the
+            # command its note prints restores the entry when run as printed.
+            elsewhere = tmp_path / "other-project"
+            elsewhere.mkdir()
+            started = subprocess.run(
+                [*_BN_CLI, "session", "start", "--format", "json", str(prog)],
+                capture_output=True, text=True, timeout=_SESSION_START_TIMEOUT,
+                env=_env(), cwd=elsewhere)
+            assert started.returncode == 0, started.stderr
+            info3 = json.loads(started.stdout)
+            inst = info3["instance_id"]
+            loaded = info3["loaded"][0]
+            assert loaded["path"] == str(prog), loaded
+            [skipped] = [n for n in loaded["notes"]
+                         if n.startswith(f"did not restore the cached database {cache_file}")]
+            command = skipped.rsplit("`", 2)[1]
+            env = _env()
+            env["PATH"] = f"{Path(_BN_CLI[0]).parent}{os.pathsep}{env.get('PATH', '')}"
+            restored = subprocess.run(
+                ["sh", "-c", command], capture_output=True, text=True,
+                timeout=_SESSION_START_TIMEOUT, env=env, cwd=elsewhere)
+            assert restored.returncode == 0, f"{command}: {restored.stdout}\n{restored.stderr}"
+            search = _bn("--instance", inst, "-t", cache_file.name, "function", "search",
+                         "RO318_MARKER", "--format", "json")
+            names = [i["name"] for i in json.loads(search.stdout).get("items", [])]
+            assert "RO318_MARKER" in names, f"{search.stdout}\n{search.stderr}"
         finally:
             if inst:
                 _session_stop(inst)
             ro.chmod(0o700)
             if cache_file is not None and cache_file.exists():
                 cache_file.unlink()
+                writer = cache_file.with_name(cache_file.name + ".writer.json")
+                if writer.exists():
+                    writer.unlink()
 
 
 class TestSidecarContentValidation:
@@ -2745,6 +2907,52 @@ class TestSidecarContentValidation:
         assert not any("requested explicitly" in n for n in back["notes"]), back["notes"]
         assert back["targets"][0]["source_verified"] is True, back["targets"]
         assert shared_bn.run("close", str(sidecar)).returncode == 0
+
+    def test_an_export_reloads_paired_and_still_warns_about_its_annotations_1036(
+            self, shared_bn, tmp_path):
+        """#1036 items 4-5 on real BN: `save <path>` is an export that says so;
+        loading it back keeps `-t prog` on the raw view and verifies the copy
+        against the raw file BN recorded in it (no sibling exists). The copy is
+        disclosed as a file this bridge wrote, and -- per-annotation
+        attribution having been dropped after three review rounds -- its
+        annotations, even this bridge's own rename, stay "may predate this
+        run"; so does a reload after the source view closed."""
+        prog = tmp_path / "ro" / "prog"
+        prog.parent.mkdir()
+        prog.write_bytes(Path(HELLO_BINARY).read_bytes())
+        prog.chmod(0o755)
+        export = tmp_path / "out" / "prog.bndb"
+        export.parent.mkdir()
+        shared_bn.load(prog, copy=False)
+        renamed = shared_bn.run("rename", "greet", "greet_v2", "--format", "json")
+        assert renamed.returncode == 0, renamed.stdout + renamed.stderr
+
+        saved = shared_bn.json("save", str(export))
+        assert saved["export"] is True and saved["restart_path"] == str(prog), saved
+
+        shared_bn.load(export, copy=False)
+        raw = shared_bn.json("-t", "prog", "target", "info")
+        assert raw["filename"] == str(prog), raw
+        assert raw["exports"] == [str(export)] and raw["database_path"] is None, raw
+        db = shared_bn.json("-t", "prog.bndb", "target", "info")
+        annotations = db["existing_annotations"]
+        assert annotations["opened_from_database"] is True, annotations
+        assert annotations["restored_from_cache"] is False, annotations
+        assert annotations["source_verified"] is True, annotations
+        assert annotations["written_by_this_bridge"]["kind"] == "export", annotations
+        assert "own_at_open" not in annotations, annotations
+        assert "may predate this run" in (annotations["provenance_hint"] or ""), annotations
+        shown = shared_bn.run("-t", "prog.bndb", "target", "info")
+        assert "opened from a file this bridge exported from" in shown.stdout, shown.stdout
+        assert shared_bn.run("close", str(export)).returncode == 0
+
+        second = tmp_path / "out" / "prog2.bndb"
+        assert shared_bn.json("-t", "prog", "save", str(second))["export"] is True
+        assert shared_bn.run("close", str(prog)).returncode == 0
+        shared_bn.load(second, copy=False)
+        annotations = shared_bn.json("target", "info")["existing_annotations"]
+        assert annotations["written_by_this_bridge"]["kind"] == "export", annotations
+        assert "may predate this run" in (annotations["provenance_hint"] or ""), annotations
 
 
 class TestRestartReopensAStaleDatabaseLoudly:
@@ -3232,15 +3440,20 @@ class TestFunctionDeleteRepair966:
                             "TAIL"), 16)
         warning = shared_bn.run("decompile", "build_widget")
         assert warning.returncode == 0, f"{warning.stdout}\n{warning.stderr}"
+        # Printed with this call's routing (`-i`, and the target the call
+        # resolved), so it runs as printed (#1045 review).
+        printed = re.search(rf"`bn -i {shared_bn.instance_id} -t (\S+) function delete "
+                            rf"{hex(split)}`", warning.stdout)
+        assert printed is not None, warning.stdout
         repair_command = f"bn function delete {hex(split)}"
-        assert f"`{repair_command}`" in warning.stdout
         assert "no clean undo; --preview refuses" in warning.stdout
 
         preview = shared_bn.run("function", "delete", hex(split), "--preview", "--format", "json")
         assert preview.returncode == 3, f"{preview.stdout}\n{preview.stderr}"
         assert _py_line(shared_bn, f"print('ENTRY=' + str(bv.get_function_at({split}) is not None))", "ENTRY") == "True"
 
-        deleted = shared_bn.run(*repair_command.split()[1:], "--format", "json")
+        deleted = shared_bn.run("-t", printed.group(1), *repair_command.split()[1:],
+                                "--format", "json")
         assert deleted.returncode == 0, f"{deleted.stdout}\n{deleted.stderr}"
         result = json.loads(deleted.stdout)
         observed = result["results"][0]["observed"]
@@ -5014,8 +5227,10 @@ class TestStructLayoutAssistance903:
         untyped = shared_bn.json("decompile", "handle")
         hint = next((w for w in untyped["warnings"] if "struct layout candidate" in w), None)
         assert hint is not None, untyped
-        for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth", "bn proto set"):
+        # The printed command carries this call's routing (#1045 review).
+        for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth"):
             assert witness in hint
+        assert re.search(rf"`bn -i {shared_bn.instance_id} -t \S+ proto set ", hint), hint
         assert shared_bn.json("proto", "get", "handle") == before
         # Text prints the one-line summary; the full sentence is --explain's.
         text_result = shared_bn.run("decompile", "handle", "--explain")
@@ -5500,6 +5715,114 @@ class TestShortLiteralBehindDataName994:
         assert strings[0]["strings"][0]["address"] == hex(int(match.group(1), 16))
 
 
+_CM2B_SOURCE = """
+static const int words3[4] = {0x00494847, 7, 8, 9};
+__attribute__((noinline)) int two(void *o, const void *p) { const int *q = p; return q[1] + *(char *)o; }
+__attribute__((noinline)) int probe(void *o) { return two(o, words3); }
+int main(int c, char **v) { return probe(v[0]); }
+"""
+_CM3_LIB_SOURCE = "int two(void *o, const void *p) { return *(const char *)o + *(const char *)p; }\n"
+_CM3_SOURCE = """
+extern int two(void *o, const void *p);
+static const int words4[4] = {0x004c4b4a, 7, 8, 9};
+__attribute__((noinline)) int idx(const int *w) { return w[1] + w[2]; }
+__attribute__((noinline)) int arity_pair(void *o) { return two(o, words4) + idx(words4); }
+int main(int c, char **v) { return arity_pair(v[0]); }
+"""
+
+
+def _build(compiler: str, out: Path, *args: str) -> None:
+    cc = shutil.which(compiler)
+    if cc is None:
+        refuse_silent_skip(f"{compiler} not available, so the #1045 string-evidence lane did not run")
+    built = subprocess.run([cc, *args, "-o", str(out)], capture_output=True, text=True, timeout=120)
+    assert built.returncode == 0, built.stderr
+
+
+class TestStringScanSeesCodeOnly1045:
+    """#1045 review round 4: the (base) raw-string scanner was handed bn's own
+    notes and the analyst's stored comments, so a hex address in either made
+    a `&data_…` placeholder look like a raw address and skip the placeholder's
+    `char *` requirement. Base printed no string in both cases."""
+
+    def test_a_hidden_inherited_comment_is_not_string_evidence_cm2b_x86(
+            self, shared_bn, tmp_path):
+        src = tmp_path / "cm2b.c"
+        src.write_text(_CM2B_SOURCE)
+        binary = tmp_path / "cm2b"
+        _build("cc", binary, "-O1", "-fno-builtin", "-no-pie", "-s", str(src))
+        shared_bn.load(binary, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        probe = shared_bn.json("py", "exec", (
+            "probe = [f for f in bv.functions if len(f.callees) == 1 and "
+            "any('&data_' in str(i) for i in f.hlil.instructions)][0]\n"
+            "data = [int(t, 16) for t in __import__('re').findall(r'data_([0-9a-f]+)', str(probe.hlil))][0]\n"
+            "probe.set_comment_at(probe.start, 'see ' + hex(data))\n"
+            "result = [hex(probe.start), hex(data)]"))["result"]
+        result = shared_bn.json("decompile", probe[0])
+        assert f"&data_{int(probe[1], 16):x}" in result["text"], result["text"]
+        assert "<annotation redacted>" in result["text"]
+        assert "string" not in [row["code"] for row in result["warning_rows"]], result["warning_rows"]
+
+    def test_a_recovered_arity_value_is_not_string_evidence_cm3_arm(self, shared_bn, tmp_path):
+        lib_src, src = tmp_path / "libtwo.c", tmp_path / "cm3.c"
+        lib_src.write_text(_CM3_LIB_SOURCE)
+        src.write_text(_CM3_SOURCE)
+        _build("aarch64-linux-gnu-gcc", tmp_path / "libtwo.so", "-O2", "-shared", "-fPIC",
+               str(lib_src))
+        binary = tmp_path / "cm3"
+        _build("aarch64-linux-gnu-gcc", binary, "-O2", "-fno-builtin", "-no-pie", "-s", str(src),
+               f"-L{tmp_path}", "-ltwo")
+        shared_bn.load(binary, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        narrowed = shared_bn.run("proto", "set", "two", "int64_t two(int64_t arg1)")
+        assert narrowed.returncode == 0, narrowed.stdout + narrowed.stderr
+        caller = shared_bn.json("py", "exec", (
+            "result = hex([f for f in bv.functions if any(c.name == 'two' for c in f.callees)][0].start)"
+        ))["result"]
+        result = shared_bn.json("decompile", caller)
+        # The premise: the recovered value is in the arity note, beside the
+        # unrelated placeholder operand the base rule leaves alone.
+        match = re.search(r"x1 = (0x[0-9a-f]+) \*/", result["text"])
+        assert match, result["text"]
+        assert f"&data_{int(match.group(1), 16):x}" in result["text"], result["text"]
+        assert "string" not in [row["code"] for row in result["warning_rows"]], result["warning_rows"]
+
+    def _decompile_probe(self, shared_bn, tmp_path, source):
+        src = tmp_path / "probe.c"
+        src.write_text(source)
+        binary = tmp_path / "probe"
+        _build("aarch64-linux-gnu-gcc", binary, "-O2", "-fno-builtin", str(src))
+        shared_bn.load(binary, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        return shared_bn.json("decompile", "probe")
+
+    def test_a_literal_holding_a_bn_note_marker_keeps_the_raw_operand(self, shared_bn, tmp_path):
+        # Round 5: a regex delete of `/* bn: ... */` started inside the format
+        # literal and took the raw `strcmp` operand with it; base names "a".
+        result = self._decompile_probe(shared_bn, tmp_path, (
+            "#include <stdio.h>\n#include <string.h>\n"
+            "__attribute__((noinline)) int probe(const char *p) "
+            '{ return printf("/* bn: %d", strcmp(p, "a")); }\n'
+            "int main(int c, char **v) { return probe(v[0]); }\n"))
+        assert '"/* bn: %d"' in result["text"], result["text"]
+        [row] = [row for row in result["warning_rows"] if row["code"] == "string"]
+        assert [s["value"] for s in row["strings"]] == ["a"], row
+        assert row["strings"][0]["inline"] is True, row
+
+    def test_a_literal_holding_a_url_keeps_both_raw_operands(self, shared_bn, tmp_path):
+        # Round 5: BN renders the embedded quotes unescaped, and the regex read
+        # the URL's `//` as a comment: both operands were lost and the arity
+        # notes landed inside the literal. Base names "abc" and "x".
+        result = self._decompile_probe(shared_bn, tmp_path, (
+            "#include <string.h>\n"
+            "__attribute__((noinline)) int probe(const char *s) "
+            '{ return strcmp("<a href=\\"http://x\\">", "abc") + strcmp(s, "x"); }\n'
+            "int main(int c, char **v) { return probe(v[0]); }\n"))
+        [line] = [line for line in result["text"].splitlines() if "http://x" in line]
+        assert '"<a href="http://x">", 0x' in line, line  # the literal is intact
+        assert line.index("/* bn:") > line.index("http://x"), line
+        [row] = [row for row in result["warning_rows"] if row["code"] == "string"]
+        assert sorted(s["value"] for s in row["strings"]) == ["abc", "x"], row
+
+
 class TestOffsetTypeLookup1000:
     """#1000 item 4 (review round 8): a type BN keys by a multi-part qualified
     name -- every type a library or the demangler supplies -- is not found by
@@ -5612,7 +5935,10 @@ class TestBatchPreviewImports1012:
         "struct_field_set", "set_prototype", "local_retype", "data_retype",
     ])
     @pytest.mark.parametrize("batched", [False, True])
-    def test_every_type_parser_discloses_kept_imports(self, shared_bn, tmp_path, kind, batched):
+    def test_every_type_parser_previews_without_importing(self, shared_bn, tmp_path, kind, batched):
+        """#1012 items 1-2: every type-string parser previews with
+        `import_dependencies=False`: the op is refused naming the library type,
+        no type id changes, and a batched sibling is reverted."""
         shared_bn.load(ADD_BINARY)
         address = shared_bn.json("function", "info", "add")["function"]["address"]
         shared_bn.json("types", "declare", "struct PreviewSlot { int a; int b; };")
@@ -5642,17 +5968,22 @@ class TestBatchPreviewImports1012:
         assert response.returncode == 3, response.stdout + response.stderr
         result = json.loads(response.stdout)
         after = dict(json.loads(shared_bn.run("py", "exec", "--code", probe).stdout))
-        imported = {name for type_id, name in after.items() if type_id not in before}
-        assert "passwd" in imported, result
-        assert set(result["kept_library_imports"]) == imported, result
-        assert set(result["results"][-1]["imported_from_library"]) == imported, result
-        assert result["results"][-1]["status"] == "unsupported", result
+        assert after == before, result
+        assert "kept_library_imports" not in result, result
+        row = result["results"][-1]
+        assert row["status"] == "unsupported", result
+        assert "not previewed: Binary Ninja refused to parse this without importing" in row["message"], result
+        assert "passwd (libc" in row["message"], result
+        assert "imported_from_library" not in row, result
         if batched:
             assert result["results"][0]["status"] == "reverted", result
-            assert "imported_from_library" not in result["results"][0], result
 
-    def test_snapshot_import_belongs_to_unattempted_later_declare(self, shared_bn, tmp_path):
+    def test_snapshot_parse_of_a_later_declare_imports_nothing(self, shared_bn, tmp_path):
+        """The pre-apply snapshot parses a later declare; under a preview that
+        parse imports nothing either, so an earlier failure keeps no types."""
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         manifest = tmp_path / "late.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "set_comment", "function": "missing_function", "comment": "x"},
@@ -5660,42 +5991,45 @@ class TestBatchPreviewImports1012:
         response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
         assert response.returncode == 3, response.stdout + response.stderr
         result = json.loads(response.stdout)
-        assert "timespec" in result["kept_library_imports"], result
-        assert "imported_from_library" not in result["results"][0], result
-        assert "timespec" in result["results"][1]["imported_from_library"], result
-        assert result["results"][1]["parse_performed"] is True, result
-        assert result["results"][1]["status"] == "unsupported", result
+        assert "kept_library_imports" not in result, result
+        assert all("imported_from_library" not in row for row in result["results"]), result
+        assert result["results"][1]["status"] == "not_attempted", result
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
 
-    def test_skipped_auto_prototype_parse_is_an_importing_step(self, shared_bn, tmp_path):
+    def test_skipped_auto_prototype_needing_a_library_type_imports_nothing(self, shared_bn, tmp_path):
+        """An AUTO prototype the preview leaves out anyway (has_user_type pin)
+        no longer imports while it is checked: it stays `not_previewed`, says
+        it needs `passwd`, and the sibling previews at exit 0."""
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         manifest = tmp_path / "auto.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "set_prototype", "identifier": "add", "prototype": "int add(struct passwd* p)"},
             {"op": "set_comment", "function": "mul", "comment": "preview only"}]}))
         response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
-        assert response.returncode == 3, response.stdout + response.stderr
+        assert response.returncode == 0, response.stdout + response.stderr
         result = json.loads(response.stdout)
-        assert "passwd" in result["kept_library_imports"], result
-        assert result["results"][0]["status"] == "unsupported", result
-        assert result["results"][0]["parse_performed"] is True, result
-        assert result["results"][1]["status"] == "reverted", result
+        assert "kept_library_imports" not in result, result
+        assert result["results"][0]["status"] == "not_previewed", result
+        assert "which a preview does not import; name matches: passwd" in result["results"][0]["message"], result
+        assert result["results"][1]["status"] == "verified", result
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
         assert shared_bn.json("proto", "get", "add")["function"]["name"] == "add"
 
-    def test_preflight_import_survives_later_preflight_error_honestly(self, shared_bn, tmp_path):
+    def test_preflight_library_need_then_later_preflight_error_imports_nothing(self, shared_bn, tmp_path):
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         manifest = tmp_path / "preflight.json"
         manifest.write_text(json.dumps({"ops": [
             {"op": "set_prototype", "identifier": "add", "prototype": "int add(struct passwd* p)"},
             {"op": "set_prototype", "identifier": "missing", "prototype": "int missing(int x)"}]}))
         response = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
         assert response.returncode == 3, response.stdout + response.stderr
-        result = json.loads(response.stdout)
-        assert "passwd" in result["kept_library_imports"], result
-        assert result["results"][0]["status"] == "unsupported", result
-        assert result["results"][0]["parse_performed"] is True, result
-        assert "imported_from_library" not in result["results"][1], result
-        assert "Function not found: missing" in result["results"][1]["message"], result
-        assert result["results"][1]["status"] == "unsupported", result
+        assert "Function not found: missing" in response.stdout + response.stderr
+        assert "kept_library_imports" not in response.stdout, response.stdout
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
 
     @pytest.mark.parametrize("kind", ["function", "data"])
     @pytest.mark.parametrize("user_type", [False, True])
@@ -5720,19 +6054,24 @@ class TestBatchPreviewImports1012:
         assert shared_bn.json("function", "info", "add")["function"]["name"] == "add"
         assert shared_bn.run("function", "info", "preview_sum").returncode == 2
 
-    def test_import_warning_preserves_the_real_declaration_failure(self, shared_bn):
+    def test_library_refusal_comes_before_any_import_1012(self, shared_bn):
+        """A declaration that needs a library type and also collides with a
+        builtin: the preview stops at BN's refusal to import, imports nothing,
+        and names the library type."""
         shared_bn.load(ADD_BINARY)
+        probe = "print(sorted(bv.type_container.type_ids))"
+        before = shared_bn.run("py", "exec", "--code", probe).stdout
         response = shared_bn.run(
             "types", "declare",
             "struct ImportThenFail { rusage r; }; struct uint32_t { int x; };",
             "--preview", "--format", "json")
         assert response.returncode == 3, response.stdout + response.stderr
         result = json.loads(response.stdout)
-        assert "rusage" in result["kept_library_imports"], result
+        assert "kept_library_imports" not in result, result
         row = result["results"][0]
         assert row["status"] == "unsupported", result
-        assert "uint32_t" in row["message"], result
-        assert "a preview cannot undo an import" in row["message"], result
+        assert "rusage" in row["message"] and "Nothing was imported" in row["message"], result
+        assert shared_bn.run("py", "exec", "--code", probe).stdout == before
 
     def test_rename_advice_runs_with_an_earlier_noop(self, shared_bn, tmp_path):
         shared_bn.load(ADD_BINARY)
@@ -5823,12 +6162,13 @@ def test_importing_auto_prototype_retains_irreversible_refusal_1031(shared_bn, s
     response = shared_bn.run(*args)
     assert response.returncode == 3, response.stdout + response.stderr
     result = json.loads(response.stdout)
-    assert "passwd" in result["kept_library_imports"], result
-    message = result["first_error"] if summary else result["results"][0]["message"]
+    # Nothing was imported, so this is the plain AUTO-prototype refusal envelope
+    # (the same shape as one that never needed a library type).
+    assert result["ok"] is False and result["status"] == "unsupported", result
+    assert "kept_library_imports" not in json.dumps(result), result
+    message = result["error"]
     assert "has_user_type" in message and "cleanly reverted" in message, result
-    assert "a preview cannot undo an import" in message, result
-    if not summary:
-        assert "has_user_type" in result["message"], result
+    assert "which a preview does not import; name matches: passwd" in message, result
     flag = shared_bn.run("py", "exec", "--code",
                          "print(bv.get_functions_by_name('mul')[0].has_user_type)")
     assert flag.returncode == 0 and flag.stdout.strip() == "False", flag.stdout + flag.stderr
@@ -5842,18 +6182,26 @@ def test_analysis_exception_discloses_kept_imports_without_replacing_error_1031(
     probe = ("import json\nprint(json.dumps({str(i): str(bv.get_type_name_by_id(i)) "
              "for i in bv.type_container.type_ids}))")
     before = json.loads(shared_bn.run("py", "exec", "--code", probe).stdout)
+    # The failing analysis also imports `timespec` before it raises. A preview
+    # parse imports nothing any more (#1012 item 1), so the preview case gets
+    # its retained import only from this analysis-side import; the live case
+    # has already imported it while parsing. Either way the original exception
+    # and the retained-type disclosure must both survive (#1012 review r1).
     injected = shared_bn.run("py", "exec", "--code", """
 import binaryninja as bn
 original = bn.BinaryView.update_analysis_and_wait
 def fail_once(view, _original=original):
     bn.BinaryView.update_analysis_and_wait = _original
+    library = next(lib for lib in view.type_libraries if lib.get_named_type('timespec') is not None)
+    view.import_library_type('timespec', library)
     raise RuntimeError('synthetic SDK analysis failure')
 fail_once._review_original = original
 bn.BinaryView.update_analysis_and_wait = fail_once
 """)
     assert injected.returncode == 0, injected.stdout + injected.stderr
     try:
-        declaration = "struct Exceptional1031 { timespec* p; };"
+        declaration = ("struct Exceptional1031 { int x; };" if preview
+                       else "struct Exceptional1031 { timespec* p; };")
         if interface == "cli":
             args = ["types", "declare", declaration, "--format", "json"]
             if preview:
@@ -6238,6 +6586,44 @@ result = state
         assert tracked < control * max_ratio, (samples, wall_samples, max_ratio)
 
 
+def test_live_import_from_unattached_platform_library_is_named_1012(shared_bn):
+    """#1012 item 2: the live classifier knew only attached libraries and BN's
+    lookup record, so an import from the platform's unattached `SYSCALLS`
+    library went unreported on a committed run. An import is now recognized by
+    the guid in its type id, which BN resolves to the library it names."""
+    shared_bn.load(ADD_BINARY)
+    address = shared_bn.run("py", "exec", "--code", "print(hex(bv.start))").stdout.strip().splitlines()[-1]
+    try:
+        injected = shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+library = next(library for library in bv.platform.type_libraries
+               if library.name == 'SYSCALLS')
+assert library not in bv.type_libraries
+original = bn.BinaryView.set_comment_at
+def import_once(view, *args, _original=original, _library=library, **kwargs):
+    bn.BinaryView.set_comment_at = _original
+    assert view.import_library_type('ipc_perm', _library) is not None
+    return _original(view, *args, **kwargs)
+import_once._review_platform_original = original
+bn.BinaryView.set_comment_at = import_once
+""")
+        assert injected.returncode == 0, injected.stdout + injected.stderr
+        response = shared_bn.run("comment", "set", address, "live platform import 1012", "--format", "json")
+    finally:
+        shared_bn.run("py", "exec", "--code", """
+import binaryninja as bn
+original = getattr(bn.BinaryView.set_comment_at, '_review_platform_original', None)
+if original is not None:
+    bn.BinaryView.set_comment_at = original
+""")
+    assert response.returncode == 0, response.stdout + response.stderr
+    result = json.loads(response.stdout)
+    assert result["committed"] is True, result
+    assert "ipc_perm" in result["results"][0]["imported_from_library"], result
+    assert result["library_sources"]["ipc_perm"] == "SYSCALLS", result
+    assert set(result["library_sources"].values()) == {"SYSCALLS"}, result
+
+
 class TestDirectPreviewRetainedTypes1031:
     """Direct mutation entry points obey the same final-ID rule as batches."""
 
@@ -6265,11 +6651,12 @@ print(json.dumps({
         assert result["kept_library_imports"] == sorted(names), result
         assert result["unattributed_library_imports"] == sorted(names), result
 
-    @pytest.mark.parametrize("syscall", [True, False], ids=["syscall-residue", "preexisting-types-clean"])
-    def test_standalone_function_create_preview(self, shared_bn, tmp_path, syscall):
-        # The public round-four reproducer: the second .text syscall stub is
-        # deliberately unreferenced and lacks a symbol after strip. Obtain its
-        # address before stripping rather than depending on compiler layout.
+    @staticmethod
+    def _load_syscall_stubs(shared_bn, tmp_path) -> int:
+        """Build and load the public round-four reproducer; return the address
+        of its second .text syscall stub, deliberately unreferenced and without
+        a symbol after strip. The address is taken before stripping rather than
+        depending on compiler layout."""
         source = tmp_path / "stubs.c"
         source.write_text("""
 __attribute__((section(".text"), used, aligned(16)))
@@ -6289,10 +6676,36 @@ int main(int c, char **v) { (void)v; return c; }
         addresses = {parts[2]: int(parts[0], 16)
                      for line in symbols.stdout.splitlines()
                      if len(parts := line.split()) == 3}
-        address = addresses["stub_blob"] + 11
         stripped = subprocess.run(["strip", str(binary)], capture_output=True, text=True)
         assert stripped.returncode == 0, stripped.stderr
         shared_bn.load(binary, copy=False)
+        return addresses["stub_blob"] + 11
+
+    def test_live_standalone_function_create_reports_its_imports_1012(self, shared_bn, tmp_path):
+        """#1012 review r1: a LIVE standalone `function create` bypassed the
+        request-level outcome, so the five SYSCALLS types its analysis imported
+        went unreported. They are now listed, unattributed (defined during the
+        reanalysis, not on the create's own thread), with their library."""
+        address = self._load_syscall_stubs(shared_bn, tmp_path)
+        before = self._state(shared_bn)
+        assert hex(address) not in before["functions"], before
+        response = shared_bn.run("function", "create", hex(address), "--format", "json")
+        assert response.returncode == 0, response.stdout + response.stderr
+        result = json.loads(response.stdout)
+        assert result["committed"] is True, result
+        after = self._state(shared_bn)
+        imported = sorted(name for type_id, name in after["ids"].items()
+                          if type_id not in before["ids"])
+        assert imported == ["__kernel_long_t", "__kernel_ulong_t", "__u16", "__u32", "sysinfo"], imported
+        reported = set(result.get("unattributed_library_imports") or [])
+        for row in result["results"]:
+            reported |= set(row.get("imported_from_library") or [])
+        assert reported == set(imported), result
+        assert result["library_sources"] == {name: "SYSCALLS" for name in imported}, result
+
+    @pytest.mark.parametrize("syscall", [True, False], ids=["syscall-residue", "preexisting-types-clean"])
+    def test_standalone_function_create_preview(self, shared_bn, tmp_path, syscall):
+        address = self._load_syscall_stubs(shared_bn, tmp_path)
         if not syscall:
             # The identical fresh target is clean when its syscall types already
             # exist: pre-existing IDs must not turn a reversible preview into a failure.
@@ -6485,3 +6898,372 @@ def test_diagnostic_recovery_and_target_commands_run_as_printed(tmp_path):
         assert instance_id not in {row["instance_id"] for row in stopped}
     finally:
         _session_stop(instance_id)
+
+
+class TestAddressOperandNames1042:
+    """#1042 items 1-2 on BN's own symbol table: whether a stripped view has a
+    symbol behind `data_<hex>` / `sub_<hex>` is BN's call, and the mocked fakes
+    can only model it. The dispatch fixture has a named data table (`table`)
+    and a `.bss` buffer (`g_out`) that a stripped copy renders as `data_<hex>`."""
+
+    def _table_address(self, shared_bn) -> str:
+        rows = shared_bn.json("data", "symbols", "--query", "table")["items"]
+        return next(row["a"] for row in rows if row["n"] == "table")
+
+    def test_read_and_data_vars_take_a_data_symbol_name(self, shared_bn):
+        shared_bn.load(DISPATCH_BINARY)
+        address = self._table_address(shared_bn)
+
+        by_name = shared_bn.json("read", "table", "16")
+        assert by_name["resolved_symbol"] == {"name": "table", "kind": "data",
+                                              "address": address}
+        assert by_name["hex"] == shared_bn.json("read", address, "16")["hex"]
+
+        at = shared_bn.json("data", "vars", "--at", "table")
+        assert [row["address"] for row in at["items"]] == [address]
+
+        text = shared_bn.run("read", "table", "8")
+        assert text.returncode == 0, text.stderr
+        assert text.stdout.startswith(f"note: resolved 'table' as a data symbol @ {address}\n")
+
+    def test_stripped_placeholders_resolve_and_rename(self, shared_bn, tmp_path):
+        stripped = tmp_path / "dispatch_stripped"
+        build = subprocess.run(["strip", "-o", str(stripped), str(DISPATCH_BINARY)],
+                               capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        nm = subprocess.run(["nm", str(DISPATCH_BINARY)], capture_output=True, text=True)
+        g_out = next(int(line.split()[0], 16) for line in nm.stdout.splitlines()
+                     if line.endswith(" g_out"))
+        shared_bn.load(stripped, copy=False)
+        placeholder = f"data_{g_out:x}"
+
+        read = shared_bn.json("read", placeholder, "4")
+        assert read["address"] == hex(g_out)
+        assert read["resolved_symbol"]["kind"] == "placeholder"
+        xrefs = shared_bn.json("xrefs", placeholder)
+        assert xrefs["resolved_symbol"]["kind"] == "placeholder" and xrefs["total"] > 0
+
+        # The batch that used to roll back on `Symbol not found: data_<hex>`.
+        function = next(f for f in shared_bn.json("function", "list", "--limit", "500")["items"]
+                        if f["name"].startswith("sub_"))
+        manifest = tmp_path / "rename.json"
+        manifest.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": placeholder, "new_name": "g_out",
+             "kind": "data"},
+            {"op": "rename_symbol", "identifier": function["name"], "new_name": "h_first"},
+        ]}), encoding="utf-8")
+        result = shared_bn.run("batch", "apply", str(manifest), "--preview", "--format", "json")
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        rows = json.loads(result.stdout)["results"]
+        assert [row["status"] for row in rows] == ["verified", "verified"], rows
+        assert rows[0]["address"] == hex(g_out)
+        assert rows[0]["resolved_symbol"]["kind"] == "placeholder"
+
+
+_VTABLE_LAYOUT_ASM = r"""
+.text
+.macro fn name, value
+.globl \name
+.type \name,@function
+\name:
+ mov $\value,%eax
+ ret
+.size \name,.-\name
+.endm
+fn short_a, 1
+fn short_b, 2
+fn op_c, 3
+fn op_d, 4
+fn op_e, 5
+fn rec_a, 6
+fn rec_b, 7
+fn rec_c, 8
+fn impl_d1, 9
+fn impl_d0, 10
+fn impl_a, 11
+fn impl_b, 12
+.globl main
+.type main,@function
+main:
+ xor %eax,%eax
+ ret
+.size main,.-main
+.section .data.rel.ro,"aw",@progbits
+.p2align 3
+/* A vtable whose symbol covers two slots, then an anonymous function table
+   with no header between them: the pointer run merges the two. */
+.globl _ZTV5Short
+.type _ZTV5Short,@object
+_ZTV5Short:
+ .quad 0,_ZTI5Short,short_a,short_b
+.size _ZTV5Short,32
+ops:
+ .quad op_c,op_d,op_e
+ .quad 0
+/* A registry record with the Itanium header shape and no _ZTV symbol. */
+.globl registry
+.type registry,@object
+registry:
+ .quad 0,_ZTI5Short,rec_a,rec_b,rec_c
+.size registry,40
+ .quad 0
+/* An all-pure abstract class's vtable, all filler, right before Impl's. */
+.globl _ZTV8Abstract
+.type _ZTV8Abstract,@object
+_ZTV8Abstract:
+ .quad 0,_ZTI8Abstract,0,0
+.size _ZTV8Abstract,32
+.globl _ZTV4Impl
+.type _ZTV4Impl,@object
+_ZTV4Impl:
+ .quad 0,_ZTI4Impl,impl_d1,impl_d0,impl_a,impl_b
+.size _ZTV4Impl,48
+.globl _ZTI5Short
+.type _ZTI5Short,@object
+_ZTI5Short:
+ .quad 0,_ZTS5Short
+.size _ZTI5Short,16
+.globl _ZTI8Abstract
+.type _ZTI8Abstract,@object
+_ZTI8Abstract:
+ .quad 0,_ZTS8Abstract
+.size _ZTI8Abstract,16
+.globl _ZTI4Impl
+.type _ZTI4Impl,@object
+_ZTI4Impl:
+ .quad 0,_ZTS4Impl
+.size _ZTI4Impl,16
+.section .rodata
+_ZTS5Short: .asciz "5Short"
+_ZTS8Abstract: .asciz "8Abstract"
+_ZTS4Impl: .asciz "4Impl"
+.section .note.GNU-stack,"",@progbits
+"""
+
+_VIRTUAL_BASES_CPP = """
+struct V { long v = 1; virtual ~V() {} virtual int vf() { return 1; } };
+struct B : virtual V { long b = 2; virtual int bf() { return 2; } int vf() override { return 3; } };
+struct C : virtual V { long c = 3; virtual int cf() { return 4; } };
+struct D : B, C { long d = 4; int bf() override { return 5; } int cf() override { return 6; } };
+int main(int argc, char **) { B *b = new D; C *c = new D; return b->bf() + c->cf() + argc; }
+"""
+
+_HANDLER_STORE_C = """
+#include <stdio.h>
+#include <stdlib.h>
+struct steps { long id; void (*on_open)(int); void (*on_close)(int); };
+static void open_step(int x) { printf("open %d\\n", x); }
+static void close_step(int x) { printf("close %d\\n", x); }
+__attribute__((noinline)) void steps_init(struct steps *s) {
+  s->id = 7; s->on_open = open_step; s->on_close = close_step;
+}
+int main(int argc, char **argv) {
+  struct steps *s = malloc(sizeof *s);
+  steps_init(s);
+  if (argc > 3) s->on_open(argc);
+  return (int)s->id;
+}
+"""
+
+
+class TestEvidenceVtableLabels1017:
+    """#1017 items 1 and 3, the #1017 `code_ref` store comment, #1018 item 1 and
+    the #1033 surface footer, on real builds: vtable labels and slots come only
+    from a defined ELF `_ZTV`/`_ZTC` object's `st_size`, so every #1006
+    counterexample (a merged following table, a registry record, all-pure
+    filler before a real vtable) is labelled by what the symbols say."""
+
+    def _json(self, shared_bn, *args):
+        res = shared_bn.run(*args, "--format", "json")
+        assert res.returncode == 0, (res.stdout, res.stderr)
+        return json.loads(res.stdout)
+
+    def _build(self, tmp_path, name, source, *flags, compiler="cc", suffix=".s"):
+        src = tmp_path / f"{name}{suffix}"
+        src.write_text(source)
+        binary = tmp_path / name
+        build = subprocess.run([compiler, *flags, "-o", str(binary), str(src)],
+                               capture_output=True, text=True)
+        assert build.returncode == 0, build.stderr
+        return binary
+
+    def _symbols(self, shared_bn, *names):
+        return shared_bn.json(
+            "py", "exec",
+            f"names = {list(names)!r}\n"
+            "result = {n: next(s.address for s in bv.get_symbols_by_raw_name(n)\n"
+            "                  if s.type.name == 'DataSymbol') for n in names}\n")["result"]
+
+    def test_surface_labels_come_from_symbol_extents_only(self, shared_bn, tmp_path):
+        binary = self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM)
+        shared_bn.load(binary)
+        sym = self._symbols(shared_bn, "_ZTV5Short", "registry", "_ZTV4Impl")
+        out = self._json(shared_bn, "evidence", "surface")
+        tables = {t["address"]: t for t in out["candidate_tables"]}
+        short = tables[hex(sym["_ZTV5Short"] + 16)]
+        assert short["entries"] == 5
+        label, = short["elf_vtables"]
+        assert (label["object"], label["entries_inside"]) == ("_ZTV5Short", 2)
+        assert label["first_entry"] == hex(sym["_ZTV5Short"] + 16)
+        assert short["entries_outside_elf_vtables"] == 3
+        assert short["extends_past_elf_vtable"] is True
+        record = tables[hex(sym["registry"] + 16)]
+        assert record["elf_vtables"] == [] and record["entries_outside_elf_vtables"] == 3
+        impl = tables[hex(sym["_ZTV4Impl"] + 16)]
+        label, = impl["elf_vtables"]
+        assert (label["label"], label["entries_inside"]) == ("vtable for Impl", 4)
+        assert impl["entries_outside_elf_vtables"] == 0
+        text = shared_bn.run("evidence", "surface").stdout
+        assert "    in vtable for Short (_ZTV5Short @ " in text
+        assert "3 entries outside every ELF vtable object -- the run continues past" in text
+
+        hidden = self._json(shared_bn, "evidence", "surface", "--hide-vtables")
+        assert hidden["summary"]["vtable_tables_hidden"] == 1
+        assert {t["address"] for t in hidden["candidate_tables"]} == set(tables) - {
+            hex(sym["_ZTV4Impl"] + 16)}
+
+    def test_stripped_surface_has_no_labels_and_says_why(self, shared_bn, tmp_path):
+        binary = self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM)
+        stripped = tmp_path / "layout-stripped"
+        result = subprocess.run(["strip", "-o", str(stripped), str(binary)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        shared_bn.load(stripped)
+        out = self._json(shared_bn, "evidence", "surface", "--hide-vtables")
+        assert out["candidate_tables"]
+        assert all(t["elf_vtables"] == [] for t in out["candidate_tables"])
+        assert out["summary"]["vtable_tables_hidden"] == 0
+        assert "no .symtab (stripped)" in out["summary"]["vtable_labels"]["reason"]
+        assert any(w.startswith("--hide-vtables hid nothing: no .symtab") for w in out["warnings"])
+        text = shared_bn.run("evidence", "surface").stdout
+        assert "vtable labels: none -- no .symtab (stripped)" in text
+
+    def test_relocatable_object_gets_no_labels_and_says_why_1046(self, shared_bn, tmp_path):
+        """#1046 review round 2: in an ET_REL object `st_value` is a section
+        offset; BN placed `g_ops` where `_ZTV5Shape`'s value pointed, and the
+        table was labelled and hidden as Shape's vtable."""
+        source = (
+            "static int a(int x) { return x + 1; } static int b(int x) { return x + 2; }\n"
+            "static int c(int x) { return x + 3; } static int d(int x) { return x + 4; }\n"
+            "int (*g_ops[6])(int) = { a, b, c, d, a, b };\n"
+            "struct Shape { virtual ~Shape(); virtual int area(); virtual int sides(); };\n"
+            "Shape::~Shape() {} int Shape::area() { return 1; } int Shape::sides() { return 0; }\n")
+        obj = self._build(tmp_path, "rel.o", source, "-c", "-O1", "-fno-toplevel-reorder",
+                          "-ffunction-sections", "-fdata-sections", compiler="c++",
+                          suffix=".cpp")
+        header = subprocess.run(["readelf", "-h", str(obj)], capture_output=True, text=True)
+        assert "REL (Relocatable file)" in header.stdout
+        shared_bn.load(obj)
+        out = self._json(shared_bn, "evidence", "surface", "--hide-vtables")
+        assert out["summary"]["vtable_labels"]["status"] == "relocatable"
+        assert "ET_REL" in out["summary"]["vtable_labels"]["reason"]
+        assert out["summary"]["vtable_tables_hidden"] == 0
+        # No census, so no table carries a label field at all.
+        assert out["candidate_tables"]
+        assert all("elf_vtables" not in t for t in out["candidate_tables"])
+        assert any(w.startswith("--hide-vtables hid nothing: a relocatable object")
+                   for w in out["warnings"])
+        callsites = self._json(shared_bn, "callsites", "_ZN5Shape4areaEv")
+        assert callsites["callee_data_ref_vtables"] == []
+        assert callsites["callee_data_ref_objects"] == []
+        if callsites["callee_data_refs"]:
+            assert callsites["callee_data_ref_census"]["status"] == "relocatable"
+
+    def test_construction_vtables_are_labelled_by_extent(self, shared_bn, tmp_path):
+        import shlex
+
+        binary = self._build(tmp_path, "vbases", _VIRTUAL_BASES_CPP, "-O0",
+                             compiler="c++", suffix=".cpp")
+        shared_bn.load(binary)
+        out = self._json(shared_bn, "evidence", "surface")
+        # D's primary and secondary tables all lie in `_ZTV1D`'s extent.
+        assert sum(1 for t in out["candidate_tables"] for obj in t["elf_vtables"]
+                   if obj["object"] == "_ZTV1D") >= 2, out["candidate_tables"]
+        # A function stored in B-in-D's construction vtable: its callsites note
+        # names the _ZTC object, and keeps a runnable xrefs command.
+        ztc = self._symbols(shared_bn, "_ZTC1D0_1B")["_ZTC1D0_1B"]
+        found = shared_bn.json(
+            "py", "exec",
+            f"start = {ztc}\n"
+            "words = [bv.read_int(start + i * 8, 8, False) for i in range(8)]\n"
+            "result = [(hex(start + i * 8), hex(w)) for i, w in enumerate(words)\n"
+            "          if bv.get_function_at(w) is not None]\n")["result"]
+        slot_address, callee = found[0]
+        callsites = self._json(shared_bn, "callsites", callee)
+        row = next(r for r in callsites["callee_data_ref_objects"] if r["address"] == slot_address)
+        obj, = row["objects"]
+        assert obj["kind"] == "construction_vtable" and obj["object"] == "_ZTC1D0_1B"
+        assert obj["label"] == "construction vtable for B-in-D"
+        assert "slot" not in obj
+        text = shared_bn.run("callsites", callee).stdout
+        line = next(ln for ln in text.splitlines() if ln.startswith(f"  {slot_address}:"))
+        assert "construction vtable for B-in-D (_ZTC1D0_1B @ " in line and "slot" not in line
+        command, = re.findall(r"`(bn [^`]+)`", line)
+        result = shared_bn.run(*shlex.split(command)[1:])
+        assert result.returncode == 0, (command, result.stderr)
+
+    def test_code_ref_store_and_footer_command_run_as_printed(self, shared_bn, tmp_path):
+        """The footer's verify command runs exactly as printed -- with a second
+        target open, so it must carry this invocation's routing (#1046 review)."""
+        import shlex
+
+        from conftest import _BN_CLI
+
+        binary = self._build(tmp_path, "steps", _HANDLER_STORE_C, "-O1",
+                             compiler="cc", suffix=".c")
+        steps = shared_bn.load(binary)
+        # BN made functions of both handlers; remove them so they are the
+        # function-less, code-referenced addresses the surface reports.
+        starts = shared_bn.json(
+            "py", "exec",
+            "fs = [f for f in bv.functions if f.name in ('open_step', 'close_step')]\n"
+            "result = {f.name: f.start for f in fs}\n"
+            "for f in fs:\n"
+            "    bv.remove_user_function(f)\n"
+            "bv.update_analysis_and_wait()\n")["result"]
+        assert set(starts) == {"open_step", "close_step"}
+        shared_bn.load(self._build(tmp_path, "layout", _VTABLE_LAYOUT_ASM))
+        out = self._json(shared_bn, "evidence", "surface", "-t", steps)
+        rows = {int(c["address"], 16): c for c in out["missing_function_candidates"]}
+        for name, offset in (("open_step", "8"), ("close_step", "0x10")):
+            stored = rows[starts[name]]["stored_to"]
+            assert {(s["function"], s["destination"]) for s in stored} == {
+                ("steps_init", f"[arg1 + {offset}]")}, stored
+            assert rows[starts[name]]["stored_to_total"] == len(stored)
+        text = shared_bn.run("evidence", "surface", "-t", steps).stdout
+        assert "    stored to [arg1 + 0x10] in steps_init @ " in text
+        command, = re.findall(r"verify with `(bn [^`]+)`", text)
+        # Exactly as printed: no routing added by this harness.
+        result = subprocess.run([*_BN_CLI, *shlex.split(command)[1:]], capture_output=True,
+                                text=True, timeout=60, env=shared_bn.env())
+        assert result.returncode == 0, (command, result.stderr)
+        # The first listed candidate: code-likely ones lead, else address order.
+        cands = out["missing_function_candidates"]
+        first = int(next((c for c in cands if c["code_likely"]), cands[0])["address"], 16)
+        assert result.stdout.startswith(
+            f"// bn: linear disassembly of 16 units from {hex(first)} ")
+
+    def test_evidence_function_callee_filter_1037(self, shared_bn, tmp_path):
+        """#1037 item 7: `operator new` names every `_Znwm` call by its display
+        name; excluding it leaves exactly the other calls, and paging follows."""
+        binary = self._build(tmp_path, "vbases", _VIRTUAL_BASES_CPP, "-O0",
+                             compiler="c++", suffix=".cpp")
+        shared_bn.load(binary)
+        full = self._json(shared_bn, "evidence", "function", "main")
+        names = [((c.get("target") or {}).get("function") or {}).get("name") for c in full["calls"]]
+        news = sum(1 for n in names if n == "_Znwm")
+        assert news == 2, names
+        kept = self._json(shared_bn, "evidence", "function", "main",
+                          "--exclude-callee", "operator new")
+        assert kept["total_calls"] == full["total_calls"]
+        assert kept["matched_calls"] == full["total_calls"] - news
+        assert kept["callee_filter"]["excluded"] == news
+        assert all(((c.get("target") or {}).get("function") or {}).get("name") != "_Znwm"
+                   for c in kept["calls"])
+        only = self._json(shared_bn, "evidence", "function", "main", "--callee", "_Znwm",
+                          "--limit", "1")
+        assert only["matched_calls"] == news and only["returned"] == 1 and only["has_more"]
+        text = shared_bn.run("evidence", "function", "main", "--callee", "operator new",
+                             "--compact").stdout
+        rows = [ln for ln in text.splitlines() if ln.startswith("- ")]
+        assert len(rows) == news and all("operator new @ " in row for row in rows)

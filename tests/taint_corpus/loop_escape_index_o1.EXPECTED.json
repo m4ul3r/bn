@@ -1,0 +1,26 @@
+{
+  "description": "loop_escape_index at -O1; idx_pick's load folds away and is not pinned. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-O1",
+    "-fno-inline"
+  ],
+  "backward": [
+    {
+      "function": "escape_loop",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "helper"
+      ],
+      "complete_slice": false
+    }
+  ]
+}

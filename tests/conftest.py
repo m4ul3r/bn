@@ -69,6 +69,7 @@ REQUIRED_INTEGRATION_FIXTURES = (
     "classes_nopie_stripped_x86_64",  # same source, non-PIE + stripped: BN names no RTTI (#1035.5)
     "canary_x86_64",
     "vcalls_x86_64",    # C++ (src/vcalls.cpp): vtable-slot callers, address points (#998)
+    "statics_x86_64",   # C++ (src/statics.cpp): a static member BN gives a `this` (#1013)
 )
 
 _BUILD_LOCK_NAME = ".build.lock"

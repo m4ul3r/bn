@@ -1,0 +1,45 @@
+{
+  "description": "stash_pointer_width at -O1: snprintf folds into short stores, so neither function covers the buffer; the narrowed reload's stores are may-alias stores, the full-width reload's are stores into buf. copied_epoch's sink folds away and is not pinned. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-O1",
+    "-fno-inline",
+    "-fno-builtin",
+    "-fno-strict-aliasing"
+  ],
+  "backward": [
+    {
+      "function": "truncated_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "stores through a pointer the walk cannot resolve"
+      ],
+      "forbid_step_reasons_contain": [
+        "store into local buffer buf"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "full_stash",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "step_reasons_contain": [
+        "store into local buffer buf"
+      ],
+      "forbid_leaf_details_contain": [
+        "stores through a pointer the walk cannot resolve"
+      ],
+      "complete_slice": false
+    }
+  ]
+}
