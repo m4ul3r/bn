@@ -4461,6 +4461,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # #865 adds the per-row arity witness's `witness_arity`/`declared_arity`.
     # #1012 adds the reverted sibling count to compact mutation text.
     # #1018 adds the recovered vtable's per-row slot count, distinct from methods.
+    # #1040 adds three: the class listing's `non_class_rtti_suppressed` and
+    # `imported_suppressed` hidden shares, and a row's `base_sole_base_of`.
+    # #1049 review round 2 drops the apply-types plan's per-method
+    # `other_data_refs` and adds the class listing's `typeinfo_scan_candidates`.
     # #1037 adds the strings listing's `noise_dropped` and the imports row's
     # `caller_count` (the zero-reference tallies are counted off the rows).
     # #1037 item 9 adds the `function search` exact-matches-first count.
@@ -4468,9 +4472,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # recorded context carries a `callee_filter`, whose header always states the
     # paging, so `_render_function_evidence_text(offset)` is now checked below
     # instead of skipped as unstated.
-    assert len(sites) == 67, (
+    # Merged with #1037: 63 + #1040/#1049's four + #1037's four.
+    assert len(sites) == 71, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 67. A "
+        "count helper, not 71. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4572,6 +4577,9 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # Another row-level count; refusal and intentional unknown are exercised
         # in test_class_list_malformed_slot_count_is_disclosed_per_row in test_read_class.
         "_render_class_list_text(vtable_slot_count) [count not stated in this context]",
+        # #1040.4: a row-level count again; its `?` refusal is exercised in
+        # test_class_list_states_an_unreadable_shared_base_count_as_unknown_1040.
+        "_render_class_list_text(base_sole_base_of) [count not stated in this context]",
         # #812: all three live NESTED under the diagnostics block's `frontier`
         # container, so a top-level probe never reaches the read that states
         # them -- the same shape as the `existing_annotations` pair below, not a
@@ -4625,6 +4633,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # `tests/test_cli_misc.py::test_strings_with_xrefs_forwards_flag_and_renders_functions_968`.
         "_string_xref_suffix(data_ref_count) [not a payload renderer]",
         "_string_xref_suffix(xref_function_count) [not a payload renderer]",
+        # #1049 review round 2: a class-listing fragment called from the count
+        # line and the listing, not a payload renderer. Covered by name in
+        # `tests/test_read_class.py::test_class_list_discloses_the_raw_candidates_1049`,
+        # which asserts `?` for a count no value reads out of.
+        "_typeinfo_scan_candidates_note(typeinfo_scan_candidates) [not a payload renderer]",
         # #1037 item 5: the `imports --with-callers` row fragment, reached only
         # through `_render_name_address_rows`; pinned by
         # `tests/test_cli_misc.py::test_imports_text_names_callers_and_export_attribution_1037`.
@@ -10161,11 +10174,11 @@ def test_render_class_list_text_discloses_declared_types_folded_out_675():
 
     one = _render_class_list_text({
         "kind": "classes", "items": [], "total": 0, "declared_suppressed": 1})
-    assert "1 user-declared class type (--all to show)" in one
+    assert "1 user-declared class type (--include-hidden to show)" in one
 
     two = _render_class_list_text({
         "kind": "classes", "items": [], "total": 0, "declared_suppressed": 2})
-    assert "2 user-declared class types (--all to show)" in two
+    assert "2 user-declared class types (--include-hidden to show)" in two
 
     none = _render_class_list_text({
         "kind": "classes", "items": [], "total": 0, "declared_suppressed": 0})
@@ -10175,7 +10188,7 @@ def test_render_class_list_text_discloses_declared_types_folded_out_675():
     # reads as "the lens looked and found none" (#619).
     skewed = _render_class_list_text({
         "kind": "classes", "items": [], "total": 0, "declared_suppressed": "lots"})
-    assert "? user-declared class types (--all to show)" in skewed
+    assert "? user-declared class types (--include-hidden to show)" in skewed
 
     # ... but the ADVICE is only advice when it is still actionable. An `--all`
     # run whose declared set could not be read still has to state the unknown,
@@ -10185,7 +10198,7 @@ def test_render_class_list_text_discloses_declared_types_folded_out_675():
         "kind": "classes", "items": [], "total": 0,
         "include_all": True, "declared_suppressed": "lots"})
     assert "? user-declared class types" in skewed_all
-    assert "(--all to show)" not in skewed_all, skewed_all
+    assert "(--include-hidden to show)" not in skewed_all, skewed_all
 
 
 def test_class_list_keeps_both_hidden_share_disclosures_after_integration():
@@ -10198,7 +10211,7 @@ def test_class_list_keeps_both_hidden_share_disclosures_after_integration():
         "declared_suppressed": 2,
     })
     assert "? library/STL" in out
-    assert "2 user-declared class types (--all to show)" in out
+    assert "2 user-declared class types (--include-hidden to show)" in out
     assert "malformed library_suppressed field" in out
     assert "malformed declared_suppressed field" not in out
 

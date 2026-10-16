@@ -143,12 +143,21 @@ class _ViewChangeState(_NotificationBase):
 
     def __init__(self):
         self.generation = 0
-        self.values: dict[str, tuple[int, Any]] = {}
+        # #1049 review: what a memo of the view's BYTES depends on -- written
+        # data, a rebase, the segment/section map -- moves only this counter
+        # besides `generation`, so a rename does not invalidate a byte scan.
+        self.data_generation = 0
+        self.values: dict[str, tuple[Any, Any]] = {}
         self.lock = threading.Lock()
 
     def _changed(self):
         with self.lock:
             self.generation += 1
+
+    def _bytes_changed(self):
+        with self.lock:
+            self.generation += 1
+            self.data_generation += 1
 
     def symbol_added(self, *_args):
         self._changed()
@@ -178,7 +187,31 @@ class _ViewChangeState(_NotificationBase):
         self._changed()
 
     def data_written(self, *_args):
-        self._changed()
+        self._bytes_changed()
+
+    def data_inserted(self, *_args):
+        self._bytes_changed()
+
+    def data_removed(self, *_args):
+        self._bytes_changed()
+
+    def segment_added(self, *_args):
+        self._bytes_changed()
+
+    def segment_removed(self, *_args):
+        self._bytes_changed()
+
+    def segment_updated(self, *_args):
+        self._bytes_changed()
+
+    def section_added(self, *_args):
+        self._bytes_changed()
+
+    def section_removed(self, *_args):
+        self._bytes_changed()
+
+    def section_updated(self, *_args):
+        self._bytes_changed()
 
     def type_defined(self, *_args):
         self._changed()
@@ -187,7 +220,29 @@ class _ViewChangeState(_NotificationBase):
         self._changed()
 
     def rebased(self, *_args):
-        self._changed()
+        self._bytes_changed()
+
+
+def _view_data_memo(bv, slot: str, key: Any, build):
+    """Memoise ``build()`` -- a value derived from *bv*'s BYTES alone, plus a
+    caller-supplied *key* naming every other input -- across symbol, function
+    and type changes, and rebuild it only when the data generation (written
+    or moved bytes, the segment/section map) or *key* changes. Same soundness
+    rule as :func:`_view_memo`: with no notification surface nothing is cached,
+    and a value built while the data moved is not stored."""
+    state = _view_state(bv)
+    if state is None:
+        return build()
+    with state.lock:
+        stamp = (state.data_generation, key)
+        cached = state.values.get(slot)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    value = build()
+    with state.lock:
+        if state.data_generation == stamp[0]:
+            state.values[slot] = (stamp, value)
+    return value
 
 
 # Keyed weakly by the view: the state (and every memo it holds) dies with the
@@ -291,6 +346,59 @@ def _view_memo_clear(bv, slot: str) -> None:
         return
     with state.lock:
         state.values.pop(slot, None)
+
+
+# #1018.2: the replaceable global allocation functions -- `operator new` and
+# `operator new[]` for a `size_t` of either width, with the nothrow and
+# aligned overloads. A class-specific or placement `operator new` has another
+# mangling and is not read.
+_GLOBAL_OPERATOR_NEW_RE = re.compile(
+    r"^_Zn[wa][mj](?:RKSt9nothrow_t|St11align_val_t(?:RKSt9nothrow_t)?)?$")
+_ALLOCATION_COPY_HOPS = 4
+
+
+def _il_op(instr) -> str:
+    return str(getattr(getattr(instr, "operation", None), "name", "") or "")
+
+
+def _call_target_name(bv, call) -> str | None:
+    dest = getattr(call, "dest", None)
+    if _il_op(dest) not in ("MLIL_CONST_PTR", "MLIL_CONST", "MLIL_IMPORT"):
+        return None
+    sym = bv.get_symbol_at(int(dest.constant))
+    return str(getattr(sym, "raw_name", "") or "") if sym is not None else None
+
+
+def _allocation_feeding_call(bv, func, call_addr: int) -> dict[str, Any] | None:
+    """The constant global ``operator new`` whose result is the first argument
+    of the call at *call_addr* in *func*, through BN's SSA def-use (see
+    ``BridgeContext._allocation_request_at``)."""
+    llil = func.get_llil_at(call_addr)
+    mlil = getattr(llil, "mlil", None) if llil is not None else None
+    call = getattr(mlil, "ssa_form", None) if mlil is not None else None
+    if _il_op(call) not in ("MLIL_CALL_SSA", "MLIL_TAILCALL_SSA"):
+        return None
+    params = list(getattr(call, "params", None) or [])
+    if not params or _il_op(params[0]) != "MLIL_VAR_SSA":
+        return None
+    ssa = call.function
+    var = params[0].src
+    for _ in range(_ALLOCATION_COPY_HOPS + 1):
+        definition = ssa.get_ssa_var_definition(var)
+        op = _il_op(definition)
+        if op == "MLIL_SET_VAR_SSA" and _il_op(definition.src) == "MLIL_VAR_SSA":
+            var = definition.src.src
+            continue
+        if op != "MLIL_CALL_SSA" or var not in list(definition.output or []):
+            return None
+        allocator = _call_target_name(bv, definition)
+        args = list(definition.params or [])
+        if (not allocator or not _GLOBAL_OPERATOR_NEW_RE.match(allocator)
+                or not args or _il_op(args[0]) not in ("MLIL_CONST", "MLIL_CONST_PTR")):
+            return None
+        return {"allocation_request": int(args[0].constant), "allocator": allocator,
+                "allocation_at": hex(int(definition.address))}
+    return None
 
 
 class _NameIndex:
@@ -1641,12 +1749,33 @@ class BridgeContext:
             self, bv, start, entries=entries, stride_size=stride
         )
 
-    def _operator_new_size_at_ctor(self, bv, record):
-        """(size, addr) of the operator-new allocation feeding a ctor's ``this``,
-        else None. TODO(#205 Task 9): implement against live BN — backward-slice
-        the ctor call's arg0 to its ``operator new(N)`` allocation and read N.
-        Returns None for now (honest "unknown"); the BN-type-width path in
-        _object_size still yields real sizes when a type is defined."""
+    def _allocation_request_at(self, bv, call_addr):
+        """#1018.2: the allocation whose result a constructor call at *call_addr*
+        receives as its first argument, or None.
+
+        Read from BN's own SSA def-use at that one call: the first argument must
+        be the OUTPUT of a call to a global ``operator new`` / ``new[]``
+        (``_Znwm``/``_Znwj``/``_Znam``/``_Znaj``, nothrow and aligned forms) whose
+        size argument is a constant, reached through nothing but plain copies.
+        What it reports is that allocation -- the bytes this site asked for --
+        and nothing about the class: the object a site constructs may be a base
+        subobject, or an ICF-folded constructor shared with another class.
+        Returns ``{"allocation_request": N, "allocator": <symbol>,
+        "allocation_at": <hex>}``."""
+        getter = getattr(bv, "get_functions_containing", None)
+        if not callable(getter):
+            return None
+        try:
+            functions = list(getter(int(call_addr)) or [])
+        except Exception:
+            return None
+        for func in functions:
+            try:
+                found = _allocation_feeding_call(bv, func, int(call_addr))
+            except Exception:
+                found = None
+            if found is not None:
+                return found
         return None
 
     def _read_u32(self, bv, address):
@@ -1727,10 +1856,10 @@ class BridgeContext:
 
     def _ctor_construction_sites(self, bv, record, *, cap=None):
         """Where this class is constructed: each ctor's inbound call sites, from
-        code xrefs. This is sound (no arg recovery needed). Classifying the
-        `this` storage (new/stack/global) and recovering the operator-new size
-        needs MLIL arg recovery that BN often does not expose at these sites, so
-        it is left as a best-effort gap: kind is "ctor-call" and size is None.
+        code xrefs. This is sound (no arg recovery needed). The allocation a
+        shown site constructs into is added by `read_class._instances` through
+        :meth:`_allocation_request_at` (#1018.2); the storage kind (stack,
+        global, a base subobject) is not classified, so kind is "ctor-call".
 
         ``cap`` is OPTIONAL and no longer used by `_instances` (#822): a reader
         that caps its own scan cannot report the exact total of what it hid, so
@@ -1761,7 +1890,6 @@ class BridgeContext:
                     "address": hex(ra),
                     "function": str(cname) if cname else None,
                     "kind": "ctor-call",
-                    "size": None,
                 })
                 if cap is not None and len(sites) >= cap:
                     return sites
