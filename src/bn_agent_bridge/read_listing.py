@@ -429,7 +429,214 @@ def _callee_vtable_named_refs(ctx, bv, candidates: list[dict[str, Any]],
     return result
 
 
-def _callee_vtable_refs(ctx, bv, refs: list[int]) -> list[dict[str, Any]]:
+#: Bounds on the ELF vtable census: section headers, symbols, and symbol plus
+#: string table bytes read per request.
+_ELF_CENSUS_MAX_SECTIONS = 4096
+_ELF_CENSUS_MAX_SYMBOLS = 65536
+_ELF_CENSUS_MAX_BYTES = 4 * 1024 * 1024
+#: Raw-name prefixes of the Itanium objects whose extents the census reports.
+_ELF_VTABLE_KINDS = {b"_ZTV": "vtable", b"_ZTC": "construction_vtable"}
+_VTABLE_LABEL_RE = re.compile(r"^_?(construction[ _]vtable|vtable)[ _]for[ _](.+)$")
+
+
+def _elf_vtable_census(bv) -> dict[str, Any]:
+    """Every defined ``_ZTV``/``_ZTC`` object in the ELF symbol tables of the
+    file BN loaded, as ``[start, start + st_size)`` in BN's (possibly rebased)
+    address space.
+
+    This is the one source of vtable identity and extent for `callsites` and
+    `evidence surface` (#1017, #1018): no header, filler or nearest-symbol
+    rule, so an anonymous table right after a vtable stays outside it.
+    ``status`` is ``ok`` or why nothing was read -- ``unavailable``,
+    ``not_elf``, ``relocatable`` (ET_REL), ``no_sections``, ``malformed`` or
+    ``over_budget`` -- and ``reason`` says it in words. A malformed,
+    unreadable or over-budget table voids the whole census, because an unread
+    table can hide an overlapping object. A defined object whose shape bounds
+    nothing (zero or header-only size, not OBJECT, absolute/common, outside
+    its section) is kept with
+    ``supported: False`` and a ``reason``; each consumer decides what that
+    costs it. ``symtab`` says whether an ``SHT_SYMTAB`` was read: without one
+    only ``.dynsym`` exports are visible. Rows appear once per symbol table,
+    so an exported object can appear twice.
+    """
+    from .elf_dynamic import _Elf
+
+    def refuse(status: str, reason: str) -> dict[str, Any]:
+        return {"status": status, "reason": reason, "objects": [],
+                "symtab": False, "pointer_size": None, "endian": None}
+
+    raw = getattr(bv, "parent_view", None)
+    if raw is None:
+        return refuse("unavailable", "BN has no raw file view to read ELF symbol tables from")
+    try:
+        base = int(getattr(raw, "start", 0))
+        elf = _Elf(lambda off, size: raw.read(base + off, size), int(raw.length), False, "<")
+        ident = elf.bytes_at(0, 16)
+        if not ident or ident[:4] != b"\x7fELF":
+            return refuse("not_elf", "the file is not ELF")
+        if ident[4] not in (1, 2) or ident[5] not in (1, 2):
+            return refuse("malformed", "unsupported ELF class or byte order")
+        elf.is64 = ident[4] == 2
+        elf.endian = "<" if ident[5] == 1 else ">"
+        e_type = elf.unpack("H", 16)
+        if e_type is None:
+            return refuse("malformed", "unreadable ELF header")
+        if e_type[0] == 1:
+            # #1046 review: in ET_REL `st_value` is an offset into the
+            # symbol's own section, not an address, and BN places sections
+            # at addresses of its choosing; mapping one to the other is not
+            # attempted, so no extent is claimed at all.
+            return refuse("relocatable", (
+                "a relocatable object (ET_REL): symbol values are offsets into their "
+                "sections, not addresses, so no vtable extent is mapped"))
+        shoff = elf.unpack("Q" if elf.is64 else "I", 40 if elf.is64 else 32)
+        counts = elf.unpack("HH", 58 if elf.is64 else 46)
+        if shoff is None or counts is None:
+            return refuse("malformed", "unreadable ELF header")
+        stride, count = counts
+        if stride != (64 if elf.is64 else 40):
+            return refuse("malformed", "unexpected ELF section header size")
+        if count == 0:
+            return refuse("no_sections", "the ELF file has no section headers, so no symbol table")
+        if count > _ELF_CENSUS_MAX_SECTIONS:
+            return refuse("over_budget", f"more than {_ELF_CENSUS_MAX_SECTIONS} ELF sections")
+        headers = elf.bytes_at(shoff[0], stride * count)
+        if headers is None:
+            return refuse("malformed", "unreadable ELF section headers")
+        fmt = elf.endian + ("IIQQQQIIQQ" if elf.is64 else "IIIIIIIIII")
+        sections = list(struct.iter_unpack(fmt, headers))
+        budget, symbols_left = _ELF_CENSUS_MAX_BYTES, _ELF_CENSUS_MAX_SYMBOLS
+        ptr = 8 if elf.is64 else 4
+        # Use the loader's documented relocation delta once for every extent.
+        image_base = getattr(bv, "image_base", None)
+        original_base = getattr(bv, "original_image_base", None)
+        bias = int(image_base) - int(original_base) if (
+            image_base is not None and original_base is not None) else 0
+        objects: list[dict[str, Any]] = []
+        saw_symtab = False
+        for section in sections:
+            if section[1] not in (2, 11):  # SHT_SYMTAB / SHT_DYNSYM
+                continue
+            table = ".symtab" if section[1] == 2 else ".dynsym"
+            saw_symtab = saw_symtab or section[1] == 2
+            off, size, link, entry_size = section[4], section[5], section[6], section[9]
+            expected = 24 if elf.is64 else 16
+            if entry_size != expected or size % expected or link >= count:
+                return refuse("malformed", f"malformed {table} header")
+            strings_section = sections[link]
+            string_size = strings_section[5]
+            n = size // expected
+            if strings_section[1] != 3:
+                return refuse("malformed", f"{table} is not linked to a string table")
+            if n > symbols_left or size + string_size > budget:
+                return refuse("over_budget", (
+                    f"symbol tables exceed {_ELF_CENSUS_MAX_SYMBOLS} symbols or "
+                    f"{_ELF_CENSUS_MAX_BYTES} bytes"))
+            symbols_left -= n
+            budget -= size + string_size
+            symbols = elf.bytes_at(off, size)
+            strings = elf.bytes_at(strings_section[4], string_size)
+            if symbols is None or strings is None:
+                return refuse("unavailable", f"{table} or its string table could not be read")
+            symfmt = elf.endian + ("IBBHQQ" if elf.is64 else "IIIBBH")
+            for row in struct.iter_unpack(symfmt, symbols):
+                name_off = row[0]
+                # An unreadable name can hide another overlapping class.
+                if not 0 <= name_off < len(strings):
+                    return refuse("malformed", f"a {table} name lies outside its string table")
+                end = strings.find(b"\0", name_off, min(len(strings), name_off + 4096))
+                if end < 0:
+                    return refuse("malformed", f"an unterminated {table} name")
+                info, index, extent = (row[1], row[3], row[5]) if elf.is64 else (row[3], row[5], row[2])
+                # Validate every index before type filtering: a non-object or
+                # unnamed row must not conceal an unsupported extended index.
+                if index == 0xffff or (0 < index < 0xff00 and index >= count):
+                    return refuse("malformed", f"a {table} section index is not decoded")
+                if index >= 0xff00 and index not in (0xfff1, 0xfff2):
+                    return refuse("malformed", f"a {table} section index is not decoded")
+                if index == 0:
+                    continue  # undefined imports are known non-definitions
+                prefix = strings[name_off:name_off + 4]
+                value = row[4] if elf.is64 else row[1]
+                kind = _ELF_VTABLE_KINDS.get(prefix)
+                if kind is None:
+                    continue
+                name = strings[name_off:end].decode("utf-8", errors="strict")
+                limit = 1 << (ptr * 8)
+                reason = None
+                if index >= count:
+                    reason = "absolute or common symbol"
+                elif info & 15 != 1:
+                    reason = "not an OBJECT symbol"
+                elif extent <= 2 * ptr:
+                    reason = "its size covers no slot"
+                else:
+                    owner = sections[index]
+                    if owner[1] != 1 or not owner[2] & 2 or not (
+                            owner[3] <= value < value + extent <= owner[3] + owner[5] <= limit
+                            and owner[4] + owner[5] <= int(raw.length)):
+                        reason = "its extent lies outside a loaded section"
+                objects.append({"raw_name": name, "start": value + bias, "size": extent,
+                                "kind": kind, "table": table,
+                                "supported": reason is None, "reason": reason})
+        return {"status": "ok", "reason": None, "objects": objects,
+                "symtab": saw_symtab, "pointer_size": ptr, "endian": elf.endian}
+    except UnicodeDecodeError:
+        return refuse("malformed", "a vtable symbol name is not UTF-8")
+    except Exception:
+        return refuse("unavailable", "reading the ELF symbol tables raised")
+
+
+def _census_summary(census: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The census status a payload carries, without its object list."""
+    if census is None:
+        return None
+    supported = {(o["raw_name"], o["start"], o["size"])
+                 for o in census["objects"] if o["supported"]}
+    summary = {"status": census["status"], "symtab": census["symtab"], "objects": len(supported)}
+    reason = census["reason"]
+    if census["status"] == "ok" and not census["symtab"]:
+        reason = ("no .symtab (stripped): only vtables exported in .dynsym have a "
+                  "known extent; local and hidden ones are unlabelled")
+    elif census["status"] == "ok" and not supported:
+        reason = "the ELF symbol tables define no sized _ZTV/_ZTC object"
+    summary["reason"] = reason
+    return summary
+
+
+def _vtable_object_label(bv, obj: dict[str, Any]) -> str:
+    """``vtable for X`` / ``construction vtable for B-in-D`` from BN's own
+    demangling of the symbol at the object start, else the raw ELF name."""
+    getter = getattr(bv, "get_symbols_by_raw_name", None)
+    try:
+        symbols = list(getter(obj["raw_name"]) or []) if callable(getter) else []
+    except Exception:
+        symbols = []
+    for sym in symbols:
+        try:
+            if int(sym.address) != obj["start"]:
+                continue
+        except (AttributeError, TypeError, ValueError):
+            continue
+        match = _VTABLE_LABEL_RE.fullmatch(str(getattr(sym, "short_name", "") or ""))
+        if match:
+            return f"{match[1].replace('_', ' ')} for {match[2]}"
+    return obj["raw_name"]
+
+
+def _supported_vtable_objects(census: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The census objects with a usable extent, once each, by start."""
+    if not census or census["status"] != "ok":
+        return []
+    seen: dict[tuple[str, int, int], dict[str, Any]] = {}
+    for obj in census["objects"]:
+        if obj["supported"]:
+            seen.setdefault((obj["raw_name"], obj["start"], obj["size"]), obj)
+    return sorted(seen.values(), key=lambda o: (o["start"], o["raw_name"]))
+
+
+def _callee_vtable_refs(ctx, bv, refs: list[int],
+                        census: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Confirm membership only from a defined ELF _ZTV object's st_size.
 
     No nearest-symbol or function-pointer-run inference: an anonymous table
@@ -438,128 +645,61 @@ def _callee_vtable_refs(ctx, bv, refs: list[int]) -> list[dict[str, Any]]:
     """
     if not refs:
         return []
-    from .elf_dynamic import _Elf
-
-    raw = getattr(bv, "parent_view", None)
     getter = getattr(bv, "get_symbols_by_raw_name", None)
-    if raw is None or not callable(getter):
+    if getattr(bv, "parent_view", None) is None or not callable(getter):
+        return []
+    if census is None:
+        census = _elf_vtable_census(bv)
+    if census["status"] != "ok":
         return []
     try:
-        base = int(getattr(raw, "start", 0))
-        elf = _Elf(lambda off, size: raw.read(base + off, size), int(raw.length), False, "<")
-        ident = elf.bytes_at(0, 16)
-        if not ident or ident[:4] != b"\x7fELF" or ident[4] not in (1, 2) or ident[5] not in (1, 2):
+        vtables = [obj for obj in census["objects"] if obj["kind"] == "vtable"]
+        # Every defined _ZTV, including zero-size linker aliases, must be
+        # resolved; dropping an unsupported shape would falsely prove uniqueness.
+        if any(not obj["supported"] for obj in vtables):
             return []
-        elf.is64 = ident[4] == 2
-        elf.endian = "<" if ident[5] == 1 else ">"
-        shoff = elf.unpack("Q" if elf.is64 else "I", 40 if elf.is64 else 32)
-        counts = elf.unpack("HH", 58 if elf.is64 else 46)
-        if shoff is None or counts is None:
-            return []
-        stride, count = counts
-        if stride != (64 if elf.is64 else 40) or not 0 < count <= 4096:
-            return []
-        headers = elf.bytes_at(shoff[0], stride * count)
-        if headers is None:
-            return []
-        fmt = elf.endian + ("IIQQQQIIQQ" if elf.is64 else "IIIIIIIIII")
-        sections = list(struct.iter_unpack(fmt, headers))
-        budget, symbols_left = 4 * 1024 * 1024, 65536
+        ptr, endian = census["pointer_size"], census["endian"]
         matches: dict[int, list[dict[str, Any]]] = {}
         extents: dict[int, int] = {}
         address_points: dict[tuple[int, int, str], str | None] = {}
-        ptr = 8 if elf.is64 else 4
         marker = re.compile(r"^_?vtable[ _]for[ _](.+)$")
-        # Use the loader's documented relocation delta once for every extent.
-        image_base = getattr(bv, "image_base", None)
-        original_base = getattr(bv, "original_image_base", None)
-        bias = int(image_base) - int(original_base) if (
-            image_base is not None and original_base is not None) else 0
-        for section in sections:
-            if section[1] not in (2, 11):  # SHT_SYMTAB / SHT_DYNSYM
+        for obj in vtables:
+            name, start, extent = obj["raw_name"], obj["start"], obj["size"]
+            extents[start] = extent
+            relevant_refs = [ref for ref in refs if start + 2 * ptr <= ref < start + extent]
+            if not relevant_refs:
                 continue
-            off, size, link, entry_size = section[4], section[5], section[6], section[9]
-            expected = 24 if elf.is64 else 16
-            if entry_size != expected or size % expected or link >= count:
+            local_identity_found = False
+            local_symbols = getter(name)
+            if len(local_symbols) > 65536:
                 return []
-            strings_section = sections[link]
-            string_size = strings_section[5]
-            n = size // expected
-            if strings_section[1] != 3 or n > symbols_left or size + string_size > budget:
-                return []
-            symbols_left -= n
-            budget -= size + string_size
-            symbols = elf.bytes_at(off, size)
-            strings = elf.bytes_at(strings_section[4], string_size)
-            if symbols is None or strings is None:
-                return []
-            symfmt = elf.endian + ("IBBHQQ" if elf.is64 else "IIIBBH")
-            for row in struct.iter_unpack(symfmt, symbols):
-                name_off = row[0]
-                # An unreadable name can hide another overlapping class.
-                if not 0 <= name_off < len(strings):
-                    return []
-                end = strings.find(b"\0", name_off, min(len(strings), name_off + 4096))
-                if end < 0:
-                    return []
-                info, index, extent = (row[1], row[3], row[5]) if elf.is64 else (row[3], row[5], row[2])
-                # Validate every index before type filtering: a non-object or
-                # unnamed row must not conceal an unsupported extended index.
-                if index == 0xffff or (0 < index < 0xff00 and index >= count):
-                    return []
-                if index >= 0xff00 and index not in (0xfff1, 0xfff2):
-                    return []
-                if strings[name_off:name_off + 4] != b"_ZTV" or index == 0:
+            for sym in local_symbols:
+                if int(sym.address) != start:
                     continue
-                # Undefined imports are known non-definitions. Every defined
-                # _ZTV, including zero-size linker aliases, must be resolved;
-                # dropping an unsupported shape would falsely prove uniqueness.
-                if index >= count or info & 15 != 1 or extent <= 2 * ptr:
-                    return []
-                value = row[4] if elf.is64 else row[1]
-                owner = sections[index]
-                limit = 1 << (ptr * 8)
-                if owner[1] != 1 or not owner[2] & 2 or not (
-                        owner[3] <= value < value + extent <= owner[3] + owner[5] <= limit
-                        and owner[4] + owner[5] <= int(raw.length)):
-                    return []
-                name = strings[name_off:end].decode("utf-8", errors="strict")
-                start = value + bias
-                extents[start] = extent
-                relevant_refs = [ref for ref in refs if start + 2 * ptr <= ref < start + extent]
-                if not relevant_refs:
+                symbol_type = getattr(sym, "type", None)
+                type_name = str(getattr(symbol_type, "name", symbol_type)).rsplit(".", 1)[-1]
+                if type_name in {"ImportAddressSymbol", "ImportedDataSymbol",
+                                 "ImportedFunctionSymbol", "ExternalSymbol"}:
                     continue
-                local_identity_found = False
-                local_symbols = getter(name)
-                if len(local_symbols) > 65536:
-                    return []
-                for sym in local_symbols:
-                    if int(sym.address) != start:
-                        continue
-                    symbol_type = getattr(sym, "type", None)
-                    type_name = str(getattr(symbol_type, "name", symbol_type)).rsplit(".", 1)[-1]
-                    if type_name in {"ImportAddressSymbol", "ImportedDataSymbol",
-                                     "ImportedFunctionSymbol", "ExternalSymbol"}:
-                        continue
-                    class_match = marker.fullmatch(str(getattr(sym, "short_name", "") or ""))
-                    if not class_match:
-                        continue
-                    local_identity_found = True
-                    for ref in relevant_refs:
-                        key = (start, extent, class_match[1])
-                        if key not in address_points:
-                            address_points[key] = _callee_vtable_address_point(
-                                bv, start, extent, class_match[1], ptr, elf.endian)
-                        entry = {"address": hex(ref), "class_name": class_match[1],
-                                 "vtable_address": hex(start), "address_point": address_points[key],
-                                 "evidence": "elf_symbol_size"}
-                        candidates = matches.setdefault(ref, [])
-                        if entry not in candidates:
-                            candidates.append(entry)
-                # A relevant ELF object whose local class identity is unreadable
-                # can conceal an overlapping alias just like an unread table.
-                if not local_identity_found:
-                    return []
+                class_match = marker.fullmatch(str(getattr(sym, "short_name", "") or ""))
+                if not class_match:
+                    continue
+                local_identity_found = True
+                for ref in relevant_refs:
+                    key = (start, extent, class_match[1])
+                    if key not in address_points:
+                        address_points[key] = _callee_vtable_address_point(
+                            bv, start, extent, class_match[1], ptr, endian)
+                    entry = {"address": hex(ref), "class_name": class_match[1],
+                             "vtable_address": hex(start), "address_point": address_points[key],
+                             "evidence": "elf_symbol_size"}
+                    candidates = matches.setdefault(ref, [])
+                    if entry not in candidates:
+                        candidates.append(entry)
+            # A relevant ELF object whose local class identity is unreadable
+            # can conceal an overlapping alias just like an unread table.
+            if not local_identity_found:
+                return []
         # Conflicting overlapping symbol extents do not establish one class.
         candidates = [matches[ref][0] for ref in refs if len(matches.get(ref, [])) == 1]
         return _callee_vtable_named_refs(ctx, bv, candidates, extents)
@@ -567,11 +707,33 @@ def _callee_vtable_refs(ctx, bv, refs: list[int]) -> list[dict[str, Any]]:
         return []
 
 
+def _elf_object_refs(bv, census: dict[str, Any] | None,
+                     refs: list[int]) -> list[dict[str, Any]]:
+    """For each of *refs* inside one or more sized ELF ``_ZTV``/``_ZTC``
+    objects: those objects and their labels. A fact about
+    symbol extents only -- it proves no class navigation (that is
+    ``callee_data_ref_vtables``), and overlapping objects are all listed."""
+    objects = _supported_vtable_objects(census)
+    rows = []
+    for ref in refs:
+        inside = [obj for obj in objects if obj["start"] <= ref < obj["start"] + obj["size"]]
+        if not inside:
+            continue
+        rows.append({"address": hex(ref), "evidence": "elf_symbol_size", "objects": [
+            {"object": obj["raw_name"], "label": _vtable_object_label(bv, obj),
+             "kind": obj["kind"], "object_address": hex(obj["start"]), "size": obj["size"]}
+            for obj in inside]})
+    return rows
+
+
 def _callee_data_refs(ctx, bv, address: int) -> dict[str, Any]:
     """``callee_data_ref_count`` and the first ``_CALLEE_DATA_REFS_LISTED``
     ``callee_data_refs`` (hex) of BN's data refs to *address*; the count is
     None when BN cannot list them. ``callee_data_ref_vtables`` annotates only
-    listed locations whose membership has a section-backed ELF symbol extent."""
+    listed locations whose class navigation is proven from a section-backed
+    ELF symbol extent; ``callee_data_ref_objects`` names the sized ELF vtable
+    objects (``_ZTV`` and ``_ZTC``) holding the other listed locations, and
+    ``callee_data_ref_census`` says why none could be read."""
     getter = getattr(bv, "get_data_refs", None)
     try:
         refs = sorted({int(r) for r in getter(address)}) if callable(getter) else None
@@ -579,11 +741,18 @@ def _callee_data_refs(ctx, bv, address: int) -> dict[str, Any]:
         refs = None
     if refs is None:
         return {"callee_data_ref_count": None, "callee_data_refs": [],
-                "callee_data_ref_vtables": []}
+                "callee_data_ref_vtables": [], "callee_data_ref_objects": [],
+                "callee_data_ref_census": None}
     listed = refs[:_CALLEE_DATA_REFS_LISTED]
+    census = _elf_vtable_census(bv) if listed else None
+    vtables = _callee_vtable_refs(ctx, bv, listed, census)
+    named = {row["address"] for row in vtables}
     return {"callee_data_ref_count": len(refs),
             "callee_data_refs": [hex(r) for r in listed],
-            "callee_data_ref_vtables": _callee_vtable_refs(ctx, bv, listed)}
+            "callee_data_ref_vtables": vtables,
+            "callee_data_ref_objects": _elf_object_refs(
+                bv, census, [r for r in listed if hex(r) not in named]),
+            "callee_data_ref_census": _census_summary(census)}
 
 
 def _other_containing_functions(ctx, bv, call_addr: str, func) -> list[dict[str, str]]:
@@ -1927,13 +2096,19 @@ def _search_functions(
     offset: int = 0,
     limit: int | None = None,
     count_only: bool = False,
-    sort: str = "address",
+    sort: str | None = None,
     reverse: bool = False,
     mangled: bool = False,
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     min_size = _validate_count(min_size, label="min_size", minimum=1, allow_none=True)
+    # #1037 item 9 review: an omitted sort is the DEFAULT order (address, with
+    # exact name matches first); an explicit `sort="address"` is plain
+    # ascending address order and is never reranked.
+    default_order = sort is None
+    if default_order:
+        sort = "address"
     bv = ctx._resolve_view(selector)
     if regex:
         try:
@@ -2032,6 +2207,26 @@ def _search_functions(
         return _disclose_collapsed_starts(result, collapsed_starts, unresolved_starts)
     sizes = _order_function_population(matched, sort, reverse, function_of=lambda pair: pair[0],
                                        mangled=mangled, name_of=lambda pair: pair[1])
+    exact_first = 0
+    if default_order and not reverse and not (regex or exact):
+        # #1037 item 9: `function search main` listed `__libc_start_main` before
+        # `main`, and on a large binary the exact name sat among 69 substring
+        # hits. Under the DEFAULT order an exact (case-insensitive) name match is
+        # moved to the front -- stably, so both groups keep address order -- and
+        # the envelope counts them so the text can say why the order changed. An
+        # explicit `--sort` is left exactly as asked.
+        needle = query.lower()
+
+        def is_exact(pair) -> bool:
+            fn, display = pair
+            forms = ((str(fn.name), str(getattr(fn, "raw_name", fn.name)))
+                     if mangled else (display,))
+            return any(form.lower() == needle for form in forms if form)
+
+        ranked = [pair for pair in matched if is_exact(pair)]
+        if ranked and len(ranked) < len(matched):
+            matched[:] = ranked + [pair for pair in matched if not is_exact(pair)]
+            exact_first = len(ranked)
     start, stop = read_misc._page_window(len(matched), offset=offset, limit=limit)
     # Same per-row labels as `function list`: one record of a collided start
     # must not read differently depending on which command returned it.
@@ -2049,5 +2244,7 @@ def _search_functions(
         kind="functions", items=items, total=len(matched), offset=offset, limit=limit,
     )
     result.update(hint)
+    if exact_first:
+        result["exact_matches_first"] = exact_first
     result.update(_analysis_state_fields(bv))
     return _project_page_fields(_disclose_collapsed_starts(result, collapsed_starts, unresolved_starts))

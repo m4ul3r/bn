@@ -910,6 +910,44 @@ def test_evidence_function_routes_and_renders_calls(fake_transport, capsys):
     assert "r0" not in output
 
 
+def test_evidence_function_forwards_callee_filters_and_text_switches_1037(fake_transport, capsys):
+    calls = fake_transport({"function_evidence": {"ok": True, "result": {
+        "function": {"name": "session_close", "address": "0x402000"},
+        "thunk": {"is_candidate": False},
+        "total_calls": 44, "matched_calls": 1, "offset": 0, "limit": None,
+        "callee_filter": {"callee": ["log_line"], "exclude_callee": ["operator delete", "0x401038"],
+                          "excluded": 43},
+        "calls": [{"address": "0x402020", "operation": "LLIL_CALL", "direct": True,
+                   "target": {"raw": "0x401040", "normalized": "0x401040",
+                              "function": {"name": "log_line", "address": "0x401040"}},
+                   "hlil_statement": "log_line(\"closing\")",
+                   "arguments": [{"text": "\"closing\""}],
+                   "arity_witnesses": {"library": {"status": "unavailable",
+                                                   "reason": "no_library_entry"}}}],
+    }}})
+
+    rc = bn.cli.main(["evidence", "function", "--target", "active", "session_close",
+                      "--callee", "log_line", "--exclude-callee", "operator delete",
+                      "--exclude-callee", "0x401038", "--compact"])
+    assert rc == 0
+    assert calls[-1]["params"] == {
+        "identifier": "session_close", "context": 2, "offset": 0,
+        "callee": ["log_line"], "exclude_callee": ["operator delete", "0x401038"],
+    }
+    out = capsys.readouterr().out
+    assert "calls: 1 of 1 matching the callee filter (of 44 total; 43 excluded)" in out
+    assert "- 0x402020  direct  log_line @ 0x401040  (\"closing\")" in out
+    assert "hlil:" not in out
+
+    # Default text hides the non-contradiction witness row; -v prints it.
+    assert bn.cli.main(["evidence", "function", "--target", "active", "session_close"]) == 0
+    assert "callee" not in calls[-1]["params"] and "exclude_callee" not in calls[-1]["params"]
+    out = capsys.readouterr().out
+    assert "witnesses:" not in out and "1 hidden; --verbose shows all" in out
+    assert bn.cli.main(["evidence", "function", "--target", "active", "session_close", "-v"]) == 0
+    assert "  witnesses: library=unavailable (no_library_entry)" in capsys.readouterr().out
+
+
 def test_evidence_table_record_mode_threads_params_and_renders(fake_transport, capsys):
     # #455: --record-size/--ptr-fields route to record-aware mode and render the
     # {row, base, fields} shape.
@@ -3499,7 +3537,10 @@ def test_the_reading_reference_documents_the_multi_identifier_decompile_676():
 
     class _NoView:
         def _resolve_view(self, selector):
-            raise RuntimeError("no view in this test")
+            return object()
+
+        def _find_function(self, bv, identifier, contained=False):
+            raise RuntimeError("no function in this test")
 
     envelope = read_decompile._decompile_batch(_NoView(), None, ["a"])
     container = next(k for k, v in envelope.items() if isinstance(v, list))
@@ -3596,3 +3637,111 @@ def test_batch_decompile_refusal_rows_replay_all_operands(monkeypatch, tmp_path,
         assert calls[-1][0] == expected
         assert calls[-1][1]["identifiers"] == identifiers
         assert calls[-1][2] == "-demo"
+
+
+# ---------------------------------------------------------------------------
+# #1042 item 3: `bn function info a b c` -- the decompile batch shape
+# ---------------------------------------------------------------------------
+
+
+def _info_row(name: str, address: str) -> dict:
+    return {"identifier": name, "ok": True, "info": {
+        "function": {"name": name, "address": address, "raw_name": name,
+                     "display_name": name},
+        "prototype": f"int32_t {name}()", "parameters": [], "locals": [],
+        "xref_count": 1}}
+
+
+def test_function_info_several_identifiers_is_one_request_with_rows_in_place_1042(
+        fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "function_info_batch": {"ok": True, "result": {
+            "kind": "function_info_batch", "requested": 3, "resolved": 2, "functions": [
+                _info_row("pick_mode", "0x400ae0"),
+                {"identifier": "nosuch", "ok": False, "error": "Function not found: nosuch"},
+                _info_row("fold_value", "0x400b60"),
+            ]}},
+    })
+
+    code = bn.cli.main(["function", "info", "pick_mode", "nosuch", "fold_value", "--blocks"])
+
+    assert code == 2, "a NAMED identifier that missed fails the run"
+    assert [c["op"] for c in calls] == ["list_targets", "function_info_batch"]
+    assert calls[1]["params"] == {"identifiers": ["pick_mode", "nosuch", "fold_value"],
+                                  "blocks": True}
+    out = capsys.readouterr().out
+    assert out.index("pick_mode @ 0x400ae0") < out.index("error: Function not found: nosuch") \
+        < out.index("fold_value @ 0x400b60")
+    assert out.rstrip().endswith("2 of 3 resolved")
+
+
+def test_function_info_one_identifier_keeps_the_singular_op_1042(fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "function_info": {"ok": True, "result": _info_row("main", "0x4008c0")["info"]},
+    })
+
+    assert bn.cli.main(["function", "info", "main"]) == 0
+    assert [c["op"] for c in calls] == ["list_targets", "function_info"]
+    assert calls[1]["params"] == {"identifier": "main", "blocks": False}
+
+
+# ---------------------------------------------------------------------------
+# #1037 item 9: filtered counts are labelled as filtered
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flags, label", [
+    ([], "Total functions: 28"),
+    (["--named"], "Named functions: 16"),
+    (["--unnamed"], "Unnamed (sub_*) functions: 16"),
+    (["--min-size", "64"], "Matching functions: 16"),
+])
+def test_function_list_count_label_names_the_filter_1037(fake_transport, capsys, flags, label):
+    total = 28 if not flags else 16
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "list_functions": {"ok": True, "result": {"kind": "functions", "count": total,
+                                                  "total": total}},
+    })
+
+    assert bn.cli.main(["function", "list", "--count", *flags]) == 0
+    assert capsys.readouterr().out.strip() == label
+
+
+def test_function_search_text_says_exact_matches_lead_1037(fake_transport, capsys):
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "search_functions": {"ok": True, "result": {
+            "kind": "functions", "total": 2, "offset": 0, "limit": 100, "returned": 2,
+            "has_more": False, "exact_matches_first": 1, "items": [
+                {"name": "main", "address": "0x4008c0"},
+                {"name": "__libc_start_main", "address": "0x4007f0"}]}},
+    })
+    assert bn.cli.main(["function", "search", "main"]) == 0
+    out = capsys.readouterr().out
+    assert out.index("main") < out.index("__libc_start_main")
+    assert "// 1 exact name match is listed first, then the other matches by address" in out
+
+
+@pytest.mark.parametrize("flags, sent", [([], None), (["--sort", "address"], "address")])
+def test_function_search_forwards_an_explicit_sort_even_when_it_is_address_1048(
+        fake_transport, flags, sent):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "search_functions": {"ok": True, "result": {
+            "kind": "functions", "total": 0, "offset": 0, "limit": 100, "returned": 0,
+            "has_more": False, "items": []}},
+    })
+    bn.cli.main(["function", "search", "main", *flags])
+    assert calls[1]["params"].get("sort") == sent
+
+
+def test_function_search_count_still_accepts_an_explicit_address_sort_1048(fake_transport):
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo"}]},
+        "search_functions": {"ok": True, "result": {"kind": "functions", "count": 1,
+                                                    "total": 1}},
+    })
+    assert bn.cli.main(["function", "search", "main", "--count", "--sort", "address"]) == 0

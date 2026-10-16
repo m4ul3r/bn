@@ -877,7 +877,7 @@ class _FakeBV:
                 return hit
         return self.types.get(str(name))
 
-    def parse_type_string(self, text):
+    def parse_type_string(self, text, **_):
         # BN returns (Type, QualifiedName): the type carries NO declarator name,
         # which is handed back separately (and is empty for an anonymous
         # prototype). Function.type's string branch relies on exactly this.
@@ -1903,7 +1903,7 @@ def _struct_set_instance(monkeypatch, occupied_offsets):
         members=[_FakeStructMember(off, name) for off, name in occupied_offsets])
 
     class _BV:
-        def parse_type_string(self, s):
+        def parse_type_string(self, s, **_):
             return _FakeType("int32_t"), None
 
         def get_type_by_name(self, n):

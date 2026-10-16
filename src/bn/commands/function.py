@@ -98,12 +98,24 @@ def _function_list(args: argparse.Namespace) -> int:
         # without a word; refuse them by name instead.
         _refuse_count_only_slices(args, command="function list")
         params["count_only"] = True
+        # #1037 item 9: a filtered count must not wear the whole-binary label
+        # (`Total functions: 16` beside `Total functions: 28`), the trap #653.1
+        # closed for `function search`.
+        if getattr(args, "named", None) is True:
+            label = "Named functions"
+        elif getattr(args, "named", None) is False:
+            label = "Unnamed (sub_*) functions"
+        elif any(params.get(key) is not None
+                 for key in ("min_address", "max_address", "min_size")):
+            label = "Matching functions"
+        else:
+            label = "Total functions"
         return _call(
             args,
             "list_functions",
             params,
             require_target=True,
-            text_renderer=_render_function_count_text,
+            text_renderer=lambda value: _render_function_count_text(value, label=label),
             stem="function-count",
         )
     # Bridge-authoritative paging: send the real limit/offset so the bridge
@@ -145,9 +157,10 @@ def _function_list(args: argparse.Namespace) -> int:
                  help="Alias for the positional query (matches `strings --query` / `types --query`)"),
              arg("--count", action="store_true", default=False,
                  help="Show match count instead of listing"),
-             arg("--sort", choices=["address", "size", "name"], default="address",
-                 help="Order results ascending by address (default), size, or name "
-                      "(the name the text shows: demangled, or raw under --mangled)"),
+             arg("--sort", choices=["address", "size", "name"], default=None,
+                 help="Order results ascending by address, size, or name (the name the "
+                      "text shows: demangled, or raw under --mangled). Omitted: exact "
+                      "name matches first, then address order"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
                  help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
              demangle_compat_arg(),
@@ -212,7 +225,10 @@ def _function_search(args: argparse.Namespace) -> int:
     limit = _effective_limit(args)
     if limit is not None:
         params["limit"] = limit
-    if args.sort != "address":
+    # #1037 item 9 review: an EXPLICIT `--sort address` is forwarded, so the
+    # bridge keeps plain ascending address order; only an omitted --sort gets
+    # the exact-name-first default order.
+    if args.sort is not None:
         params["sort"] = args.sort
     if args.reverse:
         params["reverse"] = True
@@ -231,7 +247,11 @@ def _function_search(args: argparse.Namespace) -> int:
 
 
 @command("function", "info", help="Show function prototype and variables", target=True,
-         args=[arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
+         args=[arg("identifier", nargs="+", metavar="IDENTIFIER",
+                   help="Function name or entry address (hex 0x.. or decimal). Several "
+                        "may be given: each is answered in one round trip, and one that "
+                        "does not resolve becomes a failed row rather than aborting "
+                        "the rest."),
                arg("--verbose", "-v", action="store_true", default=False,
                    help="Show full parameter and local variable details"),
                mangled_arg(), demangle_compat_arg(),
@@ -247,12 +267,25 @@ def _function_search(args: argparse.Namespace) -> int:
 def _function_info(args: argparse.Namespace) -> int:
     verbose = getattr(args, "verbose", False)
     mangled = getattr(args, "mangled", False)
+
+    def render_one(value: Any) -> str:
+        return _render_function_info_text(value, verbose=verbose, mangled=mangled)
+
+    identifiers = list(args.identifier)
+    shared = {"blocks": bool(getattr(args, "blocks", False))}
+    if len(identifiers) > 1:
+        # #1042 item 3: the `decompile f1 f2` batch shape -- one row per
+        # identifier, a miss in place, exit 2 when any identifier missed.
+        return _decompile_many(args, identifiers, shared, render_one,
+                               op="function_info_batch", payload="info",
+                               stem="function-info-batch")
+    # ONE identifier keeps the single-function shape, as `decompile` does.
     return _call(
         args,
         "function_info",
-        {"identifier": args.identifier, "blocks": bool(getattr(args, "blocks", False))},
+        {"identifier": identifiers[0], **shared},
         require_target=True,
-        text_renderer=lambda v: _render_function_info_text(v, verbose=verbose, mangled=mangled),
+        text_renderer=render_one,
         stem="function-info",
     )
 
@@ -345,6 +378,10 @@ def _decompile_many(
     identifiers: list[str],
     shared: dict[str, Any],
     render_one: Callable[[Any], str],
+    *,
+    op: str = "decompile_batch",
+    payload: str = "decompiled",
+    stem: str = "decompile-batch",
 ) -> int:
     """`bn decompile f1 f2 f3` -- several functions, ONE round trip (#676 item 5).
 
@@ -354,6 +391,10 @@ def _decompile_many(
     NAMED by the caller, so one that does not resolve is a mistake in the
     request, and reporting success would hide a typo behind two functions that
     happened to work.
+
+    `function info f1 f2` (#1042 item 3) is the same batch over the
+    `function_info_batch` op: *op* names the batch op, *payload* the key each
+    ok row carries its single-function result under.
     """
     def _render_batch_text(value: Any) -> str:
         if not isinstance(value, dict):
@@ -377,14 +418,13 @@ def _decompile_many(
                 continue
             name = _text_value(row, "identifier") or "<unnamed>"
             if row.get("ok"):
-                chunks.append(f"===== {name} =====\n{render_one(row.get('decompiled'))}")
+                chunks.append(f"===== {name} =====\n{render_one(row.get(payload))}")
             else:
                 # A failed row is rendered IN PLACE, not summarised at the end:
                 # the caller asked for these in order, and a miss that only
                 # appears in a trailing tally reads as if that function had
                 # been skipped rather than attempted.
                 reason = _text_value(row, "error") or "did not resolve"
-                reason = cli._target_hint_message(args, reason)
                 chunks.append(f"===== {name} =====\nerror: {reason}")
         # Stated, not derived from len(chunks): the tally is a headline a
         # caller acts on, so an unreadable counter must print `?` rather than
@@ -392,6 +432,14 @@ def _decompile_many(
         resolved = _stated_count(value, "resolved")
         requested = _stated_count(value, "requested")
         return "\n\n".join(chunks) + f"\n\n{resolved} of {requested} resolved"
+
+    def _respell_row_errors(value: Any) -> Any:
+        # A failed row's error can carry a target listing; respell it as the
+        # command that was run in JSON/ndjson too, not only in text (#1033 item 1).
+        for row in (_field_list(value, "functions") or []) if isinstance(value, dict) else []:
+            if isinstance(row, dict) and isinstance(row.get("error"), str):
+                row["error"] = cli._target_hint_message(args, row["error"])
+        return value
 
     def _batch_exit_code(value: Any) -> int:
         if not isinstance(value, dict):
@@ -403,12 +451,13 @@ def _decompile_many(
 
     return _call(
         args,
-        "decompile_batch",
+        op,
         {"identifiers": identifiers, **shared},
         require_target=True,
         text_renderer=_render_batch_text,
         result_exit_code=_batch_exit_code,
-        stem="decompile-batch",
+        result_transform=_respell_row_errors,
+        stem=stem,
     )
 
 
@@ -952,6 +1001,18 @@ def _callsites(args: argparse.Namespace) -> int:
                  help="Skip the first OFFSET call-evidence records (pagination, with --limit)"),
              arg("--address-window", dest="address_window", default=None, metavar="A:B",
                  help="Only calls whose address is in [A, B) (hex 0x.. or decimal), e.g. 0x402000:0x402200"),
+             arg("--callee", dest="callee", action="append", default=None, metavar="NAME|ADDR",
+                 help="Only calls whose resolved callee matches: exact raw or display name, or "
+                      "the callee's address (repeatable; unresolved/indirect calls never match)"),
+             arg("--exclude-callee", dest="exclude_callee", action="append", default=None,
+                 metavar="NAME|ADDR",
+                 help="Drop calls whose resolved callee matches (same rule as --callee; "
+                      "repeatable; unresolved/indirect calls are kept)"),
+             arg("--compact", action="store_true", default=False,
+                 help="One line per call: address, kind, target, resolved arguments, the "
+                      "argument source/confidence, and short tags (witness lines as usual)"),
+             arg("--verbose", "-v", action="store_true", default=False,
+                 help="Print every per-row arity witness line (default: contradictions only)"),
              mangled_arg(),
          ],
          estimable=True)
@@ -963,13 +1024,18 @@ def _evidence_function(args: argparse.Namespace) -> int:
     params["offset"] = args.offset
     if args.address_window:
         params["address_window"] = args.address_window
+    # #1037: forwarded only when given, so an unfiltered request is unchanged.
+    if args.callee:
+        params["callee"] = list(args.callee)
+    if args.exclude_callee:
+        params["exclude_callee"] = list(args.exclude_callee)
     return _call(
         args,
         "function_evidence",
         params,
         require_target=True,
         text_renderer=lambda value: _resolution_note(value) + _render_function_evidence_text(
-            value, mangled=args.mangled),
+            value, mangled=args.mangled, verbose=args.verbose, compact=args.compact),
         stem="function-evidence",
     )
 
@@ -1145,19 +1211,28 @@ def _evidence_virtual_call(args: argparse.Namespace) -> int:
                  help="Cap on reported missing-function candidates (disclosed when hit)"),
              arg("--max-scan-bytes", dest="max_scan_bytes", type=_positive_int, default=16_000_000,
                  help="Cap on total data bytes scanned for pointer tables (disclosed when hit)"),
+             arg("--hide-vtables", dest="hide_vtables", action="store_true", default=False,
+                 help="Hide candidate tables whose every entry lies inside a defined ELF "
+                      "_ZTV/_ZTC vtable object (by its symbol size); their missing slots "
+                      "stay listed as candidates"),
          ],
          estimable=True)
 def _evidence_surface(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {
+        "table_min_run": args.table_min_run,
+        "max_tables": args.max_tables,
+        "max_candidates": args.max_candidates,
+        "max_scan_bytes": args.max_scan_bytes,
+    }
+    if args.hide_vtables:
+        params["hide_vtables"] = True
     return _call(
         args,
         "hidden_surface",
-        {
-            "table_min_run": args.table_min_run,
-            "max_tables": args.max_tables,
-            "max_candidates": args.max_candidates,
-            "max_scan_bytes": args.max_scan_bytes,
-        },
+        params,
         require_target=True,
+        # #1046 review: the verify command in `next_action` carries -i/-t.
+        contextual_hints=True,
         text_renderer=_render_surface_text,
         stem="evidence-surface",
     )

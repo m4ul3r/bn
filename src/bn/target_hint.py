@@ -59,17 +59,39 @@ def positional_selector(selector: str) -> str:
     return f"-- {quoted}" if selector.startswith("-") else quoted
 
 
+def instance_option(instance_id: str) -> str:
+    """The root `-i` argument for *instance_id*, shell-quoted; attached as
+    `--instance=<id>` when the id starts with `-` (#1033 item 4)."""
+    quoted = shlex.quote(instance_id)
+    return f"--instance={quoted}" if instance_id.startswith("-") else f"-i {quoted}"
+
+
+def instance_id_option(instance_id: str) -> str:
+    """The `session start --instance-id` argument for *instance_id*, attached
+    when the id starts with `-` (#1033 item 4)."""
+    quoted = shlex.quote(instance_id)
+    sep = "=" if instance_id.startswith("-") else " "
+    return f"--instance-id{sep}{quoted}"
+
+
+# The active row's marker is a trailing `(active)`, not a leading `*`: a
+# leading `*` in a pasted raw row is a glob, which a populated directory
+# expands into a file name the shell then runs as the command (#1033 item 2).
+# A trailing `(` is a shell syntax error, so a pasted active row runs nothing.
+ACTIVE_SUFFIX = "  (active)"
+
+
 def target_row(target: dict[str, Any]) -> str:
     """One listing row, indent and active marker included."""
-    marker = "*" if target.get("active") else " "
     selector = str(target.get("selector", ""))
     if any(ord(char) < 32 or 127 <= ord(char) < 160 for char in selector):
         selector = str(target.get("target_id") or selector)
     return (
-        f"  {marker} {target_option(selector)}"
+        f"    {target_option(selector)}"
         f"  view_id={target.get('view_id', '')}"
         f"  target_id={target.get('target_id', '')}"
         f"  {shlex.quote(_escape_controls(str(target.get('filename', ''))))}"
+        + (ACTIVE_SUFFIX if target.get("active") else "")
     )
 
 
@@ -95,7 +117,7 @@ def format_multi_target_hint(
     return "\n".join([headline, SELECT_HINT_LINE, *open_target_lines(targets, row=row)])
 
 
-_ROW_START = re.compile(r"^  ([* ]) (?:-t |--target=)")
+_ROW_START = re.compile(r"^    (?:-t |--target=)")
 
 
 def _parse_row(text: str) -> tuple[bool, str, str] | None:
@@ -118,7 +140,8 @@ def _parse_row(text: str) -> tuple[bool, str, str] | None:
     metadata = rest[lexer.instream.tell():].strip()
     if not metadata.startswith("view_id="):
         return None
-    return start.group(1) == "*", selector, metadata
+    active = metadata.endswith(ACTIVE_SUFFIX)
+    return active, selector, metadata.removesuffix(ACTIVE_SUFFIX) if active else metadata
 
 
 def respell_for_positional(message: str, command: str) -> str:

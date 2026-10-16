@@ -20,11 +20,21 @@ One open target can be selected implicitly. With several open targets, pass `-t 
 
 Every alias counts equally, so opening a view never moves a selector onto it: a selector that matches two views is refused with both listed. The one exception is the save round trip: after `bn save` on a raw view — to its default location or to an explicit `bn save <path>` export — and `bn load` of that `.bndb`, the raw view's own name and path still mean the raw view (the database answers to its `.bndb` name) — only while that `.bndb` is still the file this bridge wrote and not loaded as unverified; a replaced database makes the name ambiguous again. A bare `bn close <name>` (no `/`, no such file in the cwd) closes only the target whose file name is exactly `<name>`; use `-t` for any other selector. `bn close -t foo` (and `bn target close foo`) refuses when `foo` names `foo.bndb` only through its `.bndb`-stripped name — including after `bn load foo` opened the adjacent `foo.bndb` — and prints the command to run with the target's listed selector.
 
-Complete runnable refusal rows are provided for top-level refusals, `close`,
-`target close`, and batched decompile **text** errors. Fan-out per-instance
-errors and structured JSON/ndjson batch errors still carry raw `-t` fragment
-rows, as on base; those are not runnable commands and remain a follow-up.
-The shared renderer shell-quotes filename metadata even on those raw rows.
+Every listing row in a refusal is a complete command: top-level refusals,
+`close`, `target close`, batched decompile errors (text and JSON/ndjson), and
+the per-instance errors of `--all-instances`/`--all-targets`, which are spelled
+as the single call to that instance. A value starting with `-` is attached
+(`--target=<sel>`, `--instance=<id>`, `--instance-id=<id>`). The raw
+`Open targets:` rows mark the active target with a trailing `(active)`.
+
+With several bridges running, a bare command routes to the one associated with
+this project root and says so on stderr. `bn instance list --mine` lists only
+those (and the project's sticky pin).
+
+When a request gets an empty or cut-off reply, bn reports what it observed --
+whether the bridge process is still running, and whether its registry entry is
+present, absent, or could not be read -- and names no cause: a stop, a crash, a
+kill or a malformed reply can each leave either state.
 
 Instance routing is `-i` → `BN_INSTANCE` → project sticky pin → sole/unique project-associated live instance → auto-spawn. Target routing is `-t` → `BN_TARGET` → project sticky pin → single-open auto-pick; for `batch apply`, a manifest `"target"` wins over ambient defaults but loses to explicit `-t`. `BN_TARGET` is an ambient default, not an explicit command-line selection. A bare destructive `bn close` ignores the ambient target and closes only the sole open view or refuses with a target list; use `-t`, a path, or `--all` deliberately. An empty `BN_TARGET` or empty sticky target is refused when a command would use it. A valid ambient target can affect a bare `bn save`, so pass `-t` for the database you intend to write.
 
@@ -125,6 +135,8 @@ Copy installs write `.bn-copy-install.json` with `{"format":"bn-copy-install-v1"
 For a refusal naming the skills root itself as a link, use its printed `Recovery command` to unlink only that skills-root link and create a new directory at that path, then rerun the same install command. Do not move directories within the target checkout. Ancestor links such as `~/.claude` may hold unrelated settings: never unlink those for recovery; choose a new `--dest` outside the linked tree or inspect the configuration manually. Copy preparation writes ownership before finalizing source directory modes, supports readable read-only sources, and cleans up a failed marker write without removing the previous destination. Ownership metadata is excluded from the engine fingerprint.
 
 The per-destination force verdict is the forced run's own preflight with writes disabled, including current destinations that may block the run. Normal skill JSON always publishes `force_plan` and `force_ready`, even when every destination is current. Plan rows carry normalized `destination_id` values; text joins rows only when both entry identity and advice agree. Displayed roots with different remedies retain their own rows, even when they reach the same entry. An explicit `--dest` refusal publishes the whole plan with `ok: false` and `error`, exits 2, and writes no install or `--out` artifact; path-blocked rows use `state: "blocked"`. If configured spilling puts the plan in a cache artifact, this install command's stdout envelope still preserves `ok: false` and the error. Other artifact envelopes are unchanged: their `ok` describes file-write success, including mutation `--out` files. Successful installs recompute the plan against the resulting disk state. A forced run lists every preflight refusal before writing anything. Filesystem races or write errors after preflight may still leave earlier destinations installed. `bn instance gc` removes dead registry residue, not live bridges.
+
+The installation entry is the requested name under its parent as the filesystem resolves that parent: `store/missing/..` is `store`, and `store/link/..` is the parent of the link's target. The state check, the plan and `destination_id` all judge that entry, so a symlink at the end is never followed to its source. When an unforced run leaves a destination not updated and the forced preflight is ready, it prints `To replace them, rerun with the same bn invocation you just used, adding --force: bn skill install … --force`. The `bn …` part is a template: the refused run's own `--dest`, `--mode`, `--format` and `--out` plus `--force`, spelled with `bn`. Run it with the same executable or wrapper you just used, from the same directory: the executable decides which checkout's skills get installed, and bn does not claim to know which one ran. JSON carries the arguments after the program name as the list `force_args` (null when no rerun applies). A forced run reports what it installed and does not restate its preflight. `skill install` and `bn doctor` print `bn-kernel skill_dir: <dir>` for each root that holds this build of the bn-kernel skill (`bn_kernel_skill_dirs` in JSON): the value its bootstrap needs after a kernel reset.
 
 ## Python escape hatch
 

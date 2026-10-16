@@ -3192,7 +3192,9 @@ def _estimate_required_flags(leaf_parser):
 
     Derived from the parser rather than listed per command: `taint forward`
     needs `--source`, `evidence virtual-call` needs `--at`, and a command that
-    grows a new required option must either be fillable or say so."""
+    grows a new required option must either be fillable or say so. A REQUIRED
+    mutually exclusive group (`data vars --at | --start`) needs one member: the
+    first fillable one is used."""
     argv, unfillable = [], []
     for action in leaf_parser._actions:
         if not action.option_strings or not action.required:
@@ -3201,6 +3203,14 @@ def _estimate_required_flags(leaf_parser):
             unfillable.append(action.dest)
             continue
         argv += [action.option_strings[0], _ESTIMATE_ARG_VALUES[action.dest]]
+    for group in leaf_parser._mutually_exclusive_groups:
+        if not group.required:
+            continue
+        member = next((a for a in group._group_actions if a.dest in _ESTIMATE_ARG_VALUES), None)
+        if member is None:
+            unfillable.append("|".join(a.dest for a in group._group_actions))
+            continue
+        argv += [member.option_strings[0], _ESTIMATE_ARG_VALUES[member.dest]]
     return argv, unfillable
 
 
@@ -3523,3 +3533,134 @@ def test_estimate_output_is_not_advertised_on_mutations_or_side_effecting_comman
     assert conflicting.value.code == 2
     assert "not allowed with argument" in capsys.readouterr().err
     assert not calls
+
+
+# --- #1042 item 2: names for address operands ----------------------------------
+
+
+def test_data_vars_at_a_name_sends_at_and_prints_the_resolution_1042(fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_vars": {"ok": True, "result": {
+            "kind": "data_vars", "has_more": False, "at": "0x420018",
+            "resolved_symbols": [{"name": "sock_path", "kind": "data", "address": "0x420018"}],
+            "items": [{"address": "0x420018", "name": "sock_path", "type": "char const*",
+                       "width": 8, "pointer": "0x400cc8", "pointer_string": "demo.sock",
+                       "section": ".data"}]}},
+    })
+
+    assert bn.cli.main(["data", "vars", "--at", "sock_path"]) == 0
+
+    assert calls[1]["params"] == {"at": "sock_path", "limit": None}
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "note: resolved 'sock_path' as a data symbol @ 0x420018"
+    assert '-> 0x400cc8 "demo.sock"' in lines[2]
+
+
+@pytest.mark.parametrize("argv, message", [
+    (["data", "vars", "--start", "0x2000"], "--start needs --end"),
+    (["data", "vars", "--at", "g_x", "--end", "0x10"], "--at takes no --end"),
+])
+def test_data_vars_refuses_a_half_window_before_sending_1042(fake_transport, capsys, argv, message):
+    calls = fake_transport({})
+    assert bn.cli.main(argv) == 2
+    assert message in capsys.readouterr().err
+    assert calls == []
+
+
+def test_data_vars_at_with_no_variable_names_the_address_1042(fake_transport, capsys):
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_vars": {"ok": True, "result": {"kind": "data_vars", "has_more": False,
+                                             "at": "0x420019", "items": []}},
+    })
+    assert bn.cli.main(["data", "vars", "--at", "0x420019"]) == 0
+    assert capsys.readouterr().out.strip() == "none: no typed data variable starts at 0x420019"
+
+
+def test_read_by_placeholder_name_prints_how_it_resolved_1042(fake_transport, capsys):
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "read": {"ok": True, "result": {
+            "address": "0x420010", "length": 4, "hex": "01000000", "ascii": "....",
+            "resolved_symbol": {"name": "data_420010", "kind": "placeholder",
+                                "address": "0x420010"}}},
+    })
+    assert bn.cli.main(["read", "data_420010", "4"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("note: resolved 'data_420010' as the address its name spells "
+                          "(no symbol has that name) @ 0x420010\n")
+    assert "00420010: 01 00 00 00" in out
+
+
+def test_raw_byte_read_puts_the_resolution_on_stderr_not_in_the_payload_1042(
+        fake_transport, capsysbinary):
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "read": {"ok": True, "result": {
+            "address": "0x420018", "length": 2, "hex": "c80c", "ascii": "..",
+            "resolved_symbol": {"name": "sock_path", "kind": "data", "address": "0x420018"}}},
+    })
+    assert bn.cli.main(["read", "sock_path", "2", "--encoding", "bytes"]) == 0
+    captured = capsysbinary.readouterr()
+    assert captured.out == b"\xc8\x0c"
+    assert b"resolved 'sock_path' as a data symbol @ 0x420018" in captured.err
+
+
+def test_data_symbols_forwards_query_only_when_given_1042(fake_transport, capsys):
+    envelope = {"ok": True, "result": {"kind": "data_symbols", "total": 1, "offset": 0,
+                                       "limit": 100, "returned": 1, "has_more": False,
+                                       "query": "sock", "items": [{"a": "0x420018", "n": "sock_path"}]}}
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_symbols": envelope,
+    })
+    assert bn.cli.main(["data", "symbols", "--query", "sock"]) == 0
+    assert calls[1]["params"] == {"offset": 0, "limit": 100, "query": "sock"}
+    assert "0x420018  sock_path" in capsys.readouterr().out
+
+    assert bn.cli.main(["data", "symbols"]) == 0
+    assert "query" not in calls[-1]["params"]
+
+
+def test_the_resolver_miss_prints_a_data_symbols_command_that_runs_1042(
+        monkeypatch, fake_transport, capsys):
+    """The miss names `bn data symbols --query <name>`; run it exactly as
+    printed, with a name that needs shell quoting."""
+    import shlex
+
+    from _bridge_fakes import _FakeBV, _load_bridge
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(RuntimeError) as exc:
+        instance.ctx._resolve_address_operand(_FakeBV(), "g it's")
+    printed = str(exc.value).split("`")[1]
+    argv = shlex.split(printed)
+    assert argv[:3] == ["bn", "data", "symbols"]
+
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_symbols": {"ok": True, "result": {"kind": "data_symbols", "total": 0, "offset": 0,
+                                                "limit": 100, "returned": 0, "has_more": False,
+                                                "items": []}},
+    })
+    assert bn.cli.main(argv[1:]) == 0
+    assert calls[-1]["op"] == "data_symbols" and calls[-1]["params"]["query"] == "g it's"
+
+
+def test_raw_byte_out_summary_states_the_resolved_address_not_the_name_1048(
+        fake_transport, capsys, tmp_path):
+    fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "read": {"ok": True, "result": {
+            "address": "0x420018", "length": 2, "hex": "c80c", "ascii": "..",
+            "resolved_symbol": {"name": "sock_path", "kind": "data", "address": "0x420018"}}},
+    })
+    out = tmp_path / "ptr.bin"
+    assert bn.cli.main(["read", "sock_path", "2", "--encoding", "bytes",
+                        "--out", str(out), "--format", "json"]) == 0
+    summary = json.loads(capsys.readouterr().out)["summary"]
+    assert summary["address"] == "0x420018"
+    assert summary["resolved_symbol"]["name"] == "sock_path"
+    assert out.read_bytes() == b"\xc8\x0c"
