@@ -4848,6 +4848,10 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
                    + (" (may-analysis, not a proof)" if gate else ""))
         if diag.get("all_clear_reason"):
             out.append(f"    reason: {diag['all_clear_reason']}")
+        # #1041 item 1: what an all-clear from a receive-family seed does not
+        # cover (#1050 review round 5).
+        for caveat in _field_list(diag, "all_clear_caveats"):
+            out.append(f"    not covered: {caveat}")
     if diag.get("next_action"):
         out.append(f"  next: {diag['next_action']}")
     return out

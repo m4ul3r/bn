@@ -2735,6 +2735,9 @@ class TaintEngine:
         # unexplained empty result. Only the top run's ret/arg/call sources touch
         # this -- descended callees are seeded with synthetic param: locators.
         self._seed_callsites = 0
+        # #1041 item 1: a call:/arg: source seeded a buffer its model fills, so
+        # an all-clear carries the receive-family caveat (#1050 review round 5).
+        self._buffer_seeded = False
 
         try:
             sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
@@ -2839,6 +2842,7 @@ class TaintEngine:
             truncated=bool(getattr(self, "_truncated", False)),
             truncation_cause=sorted(getattr(self, "_truncation_causes", set())),
             analysis_incomplete=bool(getattr(self, "_analysis_incomplete", ())),
+            buffer_seed=bool(getattr(self, "_buffer_seeded", False)),
             function=hex(int(func.start)))
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
@@ -3016,6 +3020,7 @@ class TaintEngine:
                 seed_callsites=len(callsite_addrs),
                 truncated=truncated, truncation_cause=sorted(truncation_causes),
                 analysis_incomplete=bool(incomplete_funcs),
+                buffer_seed=bool(getattr(self, "_buffer_seeded", False)),
                 function=hex(int(func.start)))
             out["diagnostics"]["last_use_by_source"] = {
                 a: d.get("last_use") for a, d in per_source_diag.items()
@@ -3388,23 +3393,28 @@ class TaintEngine:
 
     def _unchecked_indirect_calls(self, instrs: list[Any], fills: list[Any], callee: str,
                                   add_leaf: Any) -> None:
-        """#1041 item 1 gate (#1050 review round 4): a blocking leaf at every
-        indirect call reachable from a call that fills a buffer whose callee
-        bn did not resolve.
+        """#1041 item 1 gate (#1050 review rounds 4-5): a blocking leaf at every
+        unresolved indirect call in the SOURCE function that can run after a
+        call that fills a buffer.
 
         Which pointer such a callback receives is NOT worked out -- aliasing is
-        the part left out after three review rounds. The rule is an outcome
-        instead: a filled buffer exists, an unresolved indirect call can run
-        after it, so whatever that call does with the bytes is unchecked, and
-        the run is not an all-clear. That holds whether or not the buffer was
-        keyed and whether or not a slot reload correlated (a correlated reload
-        of the field is not the alias a saved copy hands to the callback).
-        Unknown reachability counts as reachable. A call is resolved when it is
-        direct, mapped by `--resolve-map`, or pinned by its value set -- the
-        same resolution the walk descends with. The cost: an unrelated
-        unresolved indirect call after a receive also withholds the all-clear."""
+        left out. The rule is an outcome instead: a filled buffer exists, an
+        unresolved indirect call in this function can run after it, so whatever
+        that call does with the bytes is unchecked, and the run is not an
+        all-clear -- whether or not the buffer was keyed and whether or not a
+        slot reload correlated. Unknown reachability counts as reachable. A call
+        is resolved when it is direct, mapped by `--resolve-map`, or pinned by
+        its value set -- the same resolution the walk descends with.
+
+        Its scope is this function only: indirect calls inside callees the walk
+        enters, mapped or value-set targets, and transfers BN lifts as an MLIL
+        `jump` are not gated (the receive-family all-clear caveat says so). A
+        system call is not a function-pointer call and is never gated (#1050
+        review round 5). The cost: an unrelated unresolved indirect call after
+        a receive also withholds the all-clear."""
         for ins in instrs:
-            if not self._is_call(ins) or any(ins is f for f in fills):
+            if not self._is_call(ins) or "SYSCALL" in op_name(ins) \
+                    or any(ins is f for f in fills):
                 continue
             if self._resolve_direct_target(ins) is not None:
                 continue
@@ -3423,8 +3433,10 @@ class TaintEngine:
                 "detail": (
                     f"the indirect call at {at} can run after {self._prose_name(callee)} fills a "
                     f"buffer, and bn did not resolve its callee: indirect calls that may "
-                    f"receive this buffer are not followed -- their callees are unchecked "
-                    f"(pin the target with --resolve-map to follow it)"),
+                    f"receive this buffer are not followed -- their callees are unchecked. "
+                    f"Pinning the target with --resolve-map makes the walk descend into it "
+                    f"with the arguments taint reaches; it does not show that the target "
+                    f"receives this buffer"),
             })
 
     def _as_single_ssa_var(self, expr: Any) -> Any | None:
@@ -6664,6 +6676,7 @@ class TaintEngine:
                     _idx = int(src["index"])
                     if any(str(s.get("to") or "") in (f"*arg:{_idx}", f"*iovec:{_idx}")
                            for s in (_fm or {}).get("sources") or []):
+                        self._buffer_seeded = True
                         self._unchecked_indirect_calls(instrs, calls, callee, add_leaf)
                 if kind == "ret" and not ret_seeded:
                     # T3: callsites of `callee` exist but NONE consume its return
@@ -6860,6 +6873,7 @@ class TaintEngine:
                 # receive is an unchecked consumer of it.
                 if any(str(sd.get("to") or "").startswith(("*arg:", "*iovec:"))
                        for sd in src_defs):
+                    self._buffer_seeded = True
                     self._unchecked_indirect_calls(instrs, calls, callee, add_leaf)
             else:
                 raise TaintError(f"unknown source kind: {kind}")

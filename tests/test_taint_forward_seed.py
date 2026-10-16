@@ -227,13 +227,17 @@ def _field_cb_copy(*, callback="after", resolved=False):
     """The #1050 review round 4 `field_cb_copy` shape: `p = c->buf`, `recv(fd,
     p, ..)`, the field reloaded for a harmless `puts(c->buf)` (which correlates
     with the receive's slot), then the saved `p` handed to `fp(p)`.
-    ``callback``: ``after`` the receive, ``before`` it, or ``none``.
+    ``callback``: ``after`` the receive, ``before`` it, ``none``, or
+    ``syscall`` (a process-ID system call after the receive instead).
     ``resolved``: the indirect call carries a value set pinning its target."""
     c, fd, p, q = FVar("c"), FVar("fd"), FVar("p"), FVar("q")
     c0, fd0, p1, q1 = FSSA(c, 0), FSSA(fd, 0), FSSA(p, 1), FSSA(q, 1)
     pvs = FPVS("ConstantPointerValue", value=0x3000) if resolved else None
     cb = FInstr(0, 0x1014, "MLIL_CALL_SSA", "fp(p#1)", reads=[p1],
                 dest=FExpr("MLIL_VAR_SSA", "fp#1", possible_values=pvs), params=[_var(p1)])
+    if callback == "syscall":
+        cb = FInstr(0, 0x1014, "MLIL_SYSCALL_SSA", "syscall(sys_getpid)",
+                    params=[_const(0x27)])
     body = [
         FInstr(0, 0x1000, "MLIL_SET_VAR_SSA", "p#1 = [c#0 + 8]", reads=[c0], writes=[p1],
                src=_field_load(c0, 8)),
@@ -245,7 +249,7 @@ def _field_cb_copy(*, callback="after", resolved=False):
         FInstr(0, 0x100c, "MLIL_CALL_SSA", "puts(q#1)", reads=[q1],
                dest=FExpr("MLIL_CONST_PTR", "0x903", constant=0x903), params=[_var(q1)]),
     ]
-    if callback == "after":
+    if callback in ("after", "syscall"):
         body.append(cb)
     elif callback == "before":
         body.insert(0, cb)
@@ -278,6 +282,9 @@ def test_an_unresolved_callback_after_a_receive_withholds_the_all_clear_1050(mod
     assert leaf["address"] == "0x1014"
     assert ("indirect calls that may receive this buffer are not followed -- their "
             "callees are unchecked") in leaf["detail"]
+    # #1050 review round 5: pinning a target follows the call, not the buffer.
+    assert "it does not show that the target receives this buffer" in leaf["detail"]
+    assert "to follow it" not in leaf["detail"]
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
@@ -285,14 +292,40 @@ def test_an_unresolved_callback_after_a_receive_withholds_the_all_clear_1050(mod
     {"callback": "none"},                    # the correlated slot control
     {"callback": "before"},                  # runs before the receive, no path back
     {"callback": "after", "resolved": True},  # its target is pinned and followed
+    {"callback": "syscall"},                 # a system call is no function pointer
 ])
 def test_no_unchecked_callback_keeps_the_correlated_slot_all_clear_1050(models, variant):
     func, bv = _field_cb_copy(**variant)
     result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:recv")])
 
     assert _unchecked(result) == []
-    if variant["callback"] == "none":
+    if variant["callback"] in ("none", "syscall"):
         assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
+
+
+def test_a_receive_family_all_clear_says_what_it_does_not_cover_1050(models):
+    """#1050 review round 5: the gate covers the source function only, so an
+    all-clear from a buffer-filling seed carries the caveat, in JSON and text."""
+    from bn.formatters import _render_forward_diagnostics
+    func, bv = _field_cb_copy(callback="none")
+    diag = te.TaintEngine(bv, models).forward(func, [te.parse_locator("call:recv")])["diagnostics"]
+
+    assert diag["safe_to_report_all_clear"] is True
+    assert diag["all_clear_caveats"] == [te._taint_result_mod.RECEIVE_ALL_CLEAR_CAVEAT]
+    assert any(line.strip().startswith("not covered: the all-clear does not cover other "
+                                       "copies of the receive buffer's pointer")
+               for line in _render_forward_diagnostics(diag))
+
+
+@pytest.mark.parametrize("source", ["arg:recv:0", "param:1"])
+def test_a_scalar_seed_all_clear_carries_no_receive_caveat_1050(models, source):
+    """`arg:recv:0` seeds the descriptor, not the filled buffer; `param:1` is
+    no receive at all."""
+    func, bv = _field_cb_copy(callback="none")
+    diag = te.TaintEngine(bv, models).forward(func, [te.parse_locator(source)])["diagnostics"]
+
+    assert diag["safe_to_report_all_clear"] is True, diag
+    assert diag["all_clear_caveats"] == []
 
 
 # --------------------------------------------------------------------------

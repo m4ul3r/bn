@@ -26,7 +26,18 @@ __attribute__((noinline)) int field_no_cb(struct conn *c) {
     return 0;
 }
 
+/* A process-ID system call after the receive is no function-pointer call: it is
+ * not gated (#1050 review round 5). x86-64 inline `syscall`. */
+__attribute__((noinline)) long field_syscall(struct conn *c) {
+    char *p = c->buf;
+    long pid;
+    recv(c->fd, p, 64, 0);
+    __asm__ volatile("syscall" : "=a"(pid) : "a"(39L) : "rcx", "r11", "memory");
+    puts(c->buf);
+    return pid;
+}
+
 int main(int argc, char **argv) {
     struct conn c = {argc, argv[0]};
-    return field_cb_copy(&c) + field_no_cb(&c);
+    return field_cb_copy(&c) + field_no_cb(&c) + (int)field_syscall(&c);
 }

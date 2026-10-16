@@ -325,9 +325,10 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                          for lf in leaves):
         at = ", ".join(sorted({str(lf.get("address")) for lf in callbacks}))
         return ("no sink reached, but indirect calls that may receive this buffer are "
-                f"not followed -- their callees are unchecked ({at}); resolve those "
-                "targets (a value set, or --resolve-map) and re-run, or audit the "
-                "callees by hand")
+                f"not followed -- their callees are unchecked ({at}); audit those "
+                "callees by hand. Pinning a target with --resolve-map makes the walk "
+                "descend into it with the arguments taint reaches, which does not show "
+                "that the target receives this buffer")
     unchecked = [lf for lf in leaves if lf.get("kind") == "format_unchecked"]
     if unchecked and len(unchecked) == len(leaves):
         at = ", ".join(sorted({str(lf.get("address")) for lf in unchecked}))
@@ -391,11 +392,22 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
             "propagated use or widen `--max-depth`")
 
 
+# #1041 item 1, narrowed after #1050 review round 5: the source-function gate
+# (`indirect_call_unchecked`) is the only callback check; full coverage of the
+# filled buffer needs alias analysis and is left out. Every all-clear from a
+# buffer-filling seed says what it does not cover.
+RECEIVE_ALL_CLEAR_CAVEAT = (
+    "the all-clear does not cover other copies of the receive buffer's pointer, "
+    "indirect calls inside callees, --resolve-map or value-set targets, or computed "
+    "jumps; check them by seeding the buffer with a var: source, or by hand")
+
+
 def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
                              truncated: bool = False,
                              truncation_cause: list[str] | None = None,
                              analysis_incomplete: bool = False,
-                             function: str | None = None) -> dict[str, Any]:
+                             function: str | None = None,
+                             buffer_seed: bool = False) -> dict[str, Any]:
     """Frontier diagnostics + honesty gate for a zero-sink forward run (#559/#562).
 
     Purely descriptive: seed reach (matched source callsites, tainted SSA
@@ -408,7 +420,9 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     follow" / "the seed did not key the buffer" vs "nothing flows".
 
     ``function`` is the analysed function's address, used to fill in the
-    commands the next action prints (#1033 item 6)."""
+    commands the next action prints (#1033 item 6). ``buffer_seed`` says a
+    ``call:``/``arg:`` source seeded a buffer its model fills (a receive-family
+    seed): an all-clear then carries :data:`RECEIVE_ALL_CLEAR_CAVEAT`."""
     diag = sub.get("diag") or {}
     leaves = sub.get("leaves") or []
     assumptions = sub.get("assumptions") or []
@@ -464,6 +478,9 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
         # #562 honesty gate, folded into the single diagnostics block.
         "safe_to_report_all_clear": safe,
         "all_clear_reason": reason,
+        # #1041 item 1 (#1050 review round 5): what an all-clear from a
+        # buffer-filling (receive-family) seed does NOT cover. Empty otherwise.
+        "all_clear_caveats": [RECEIVE_ALL_CLEAR_CAVEAT] if safe and buffer_seed else [],
     }
 
 
