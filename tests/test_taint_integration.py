@@ -308,7 +308,8 @@ int main(void) { handle(); return 0; }
 def test_backward_frontier_advice_runs_as_printed(tmp_path, shared_bn):
     """#1033 item 6: every command a backward leaf or next_action prints runs
     as printed -- the forward run names its function and buffer, the global
-    leaf's inspection names the global -- with a second target open."""
+    leaf's inspection names the global, and (#931) the call-fill disclosure's
+    `callsites` shows the strcpy -- with a second target open."""
     src = tmp_path / "advice.c"
     src.write_text("""
 #include <stdio.h>
@@ -332,17 +333,19 @@ int main(int argc, char **argv) { cond_fill(argc, argv[0]); from_global(); retur
     shutil.copy2(first, second)
     target = shared_bn.load(first, copy=False)
     shared_bn.load(second, copy=False)
-    for fn, verb in (("cond_fill", "forward"), ("from_global", "xrefs")):
+    for fn, verbs in (("cond_fill", ("forward", "callsites")), ("from_global", ("xrefs",))):
         result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
                           "--sink", "arg:popen:0")
         assert not result["diagnostics"]["safe_to_report_complete_slice"], result
         prose = " ".join([str(lf.get("detail") or "") for lf in result["leaves"]]
                          + [result["diagnostics"]["next_action"]])
         commands = re.findall(r"`(bn [^`]+)`", prose)
-        assert any(verb in shlex.split(c) for c in commands), prose
+        for verb in verbs:
+            assert any(verb in shlex.split(c) for c in commands), prose
         outputs = _run_diagnostic_commands(shared_bn, prose)
-        if verb == "forward":
+        if "forward" in verbs:
             assert any(out.startswith("forward taint in cond_fill") for out in outputs), outputs
+            assert any("callee: strcpy" in out for out in outputs), outputs
 
 
 def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):

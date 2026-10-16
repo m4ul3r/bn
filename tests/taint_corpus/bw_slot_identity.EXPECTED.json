@@ -29,12 +29,15 @@
       "origin_kinds": [
         "parameter"
       ],
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
           "kind": "address_of_local_unresolved"
         }
       ],
-      "complete_slice": true
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
     }
   ]
 }

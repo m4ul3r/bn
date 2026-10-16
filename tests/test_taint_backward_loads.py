@@ -328,8 +328,12 @@ def test_stash_through_a_narrowed_slot_address_is_not_the_slot(narrowed):
     pg.sink(buf)
     result, reasons, leaves = _bw(pg.func())
     assert any("buf written by strcpy" in r for r in reasons) is not narrowed, reasons
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is not narrowed
-    assert bool(leaves) is narrowed
+    # A definite writer is a named fill; no call's extent proves the bytes
+    # (#931), so the slice is incomplete either way -- but only the narrowed
+    # stash leaves strcpy an opaque possible writer.
+    assert any(lf.get("callee") == "strcpy" for lf in leaves) is narrowed, leaves
+    assert any(lf.get("calls") == ["strcpy"] for lf in leaves) is not narrowed, leaves
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 @pytest.mark.parametrize("between, kept", [
@@ -446,8 +450,9 @@ def test_stash_reload_is_the_buffer_only_at_pointer_width(reload_size, covered):
     pg.sink(buf)
     result, reasons, leaves = _bw(pg.func())
     assert any("buf written by strcpy" in r for r in reasons) is covered, reasons
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is covered
-    assert bool(leaves) is not covered
+    assert any(lf.get("callee") == "strcpy" for lf in leaves) is not covered, leaves
+    assert any(lf.get("calls") == ["strcpy"] for lf in leaves) is covered, leaves
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 def test_zero_extended_stash_reload_is_a_may_alias_store():

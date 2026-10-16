@@ -1,0 +1,121 @@
+{
+  "description": "#1053 review S1/S2: pointers into a store-initialized buffer carried in a struct field or returned by strsep/strtok_r are possible writers. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline",
+    "-fno-builtin",
+    "-U_FORTIFY_SOURCE",
+    "-std=c11"
+  ],
+  "backward": [
+    {
+      "function": "si_struct_write",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ]
+    },
+    {
+      "function": "si_struct_in",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ]
+    },
+    {
+      "function": "si_struct_in_strtok",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ]
+    },
+    {
+      "function": "si_strsep",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ]
+    },
+    {
+      "function": "strsep_ret",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ]
+    },
+    {
+      "function": "cont_strtok_r_restore",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "strcpy"
+      ]
+    },
+    {
+      "function": "si_control",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "constant"
+      ],
+      "complete_slice": true,
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    }
+  ]
+}

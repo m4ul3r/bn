@@ -15,7 +15,7 @@ def test_loop_exit_coverage_950(reverse, initialized, writer):
     buf = FVar("buf", typ="char[64]")
     pg = _BufProgram()
     if initialized:
-        pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
+        pg.whole_store(buf)
     entry = pg.mem
     header = pg.phi(entry, entry + 3)
     params = ([_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
@@ -49,17 +49,25 @@ def test_loop_carried_escape_951(escape):
     assert any(l.get("callee") == "compose" for l in leaves) is escape
 
 
-@pytest.mark.parametrize("length", [0, 1, 63, 64])
-def test_constant_fill_extent_931(length):
+@pytest.mark.parametrize("writer", [_B_MEMSET, _B_READ])
+@pytest.mark.parametrize("length", [0, 1, 63, 64, 65])
+def test_call_fill_never_proves_initialisation_931(writer, length):
+    # A requested length is not the bytes a call delivered (a short read, a
+    # failing call): even a full-size memset or read at offset 0 leaves the
+    # buffer unproven, disclosed with the call and the consumed region.
     buf = FVar("buf", typ="char[64]")
     pg = _BufProgram()
-    pg.call(_B_MEMSET, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
-                       FExpr("MLIL_CONST", str(length), constant=length)])
+    n = FExpr("MLIL_CONST", str(length), constant=length)
+    pg.call(writer, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0), n]
+            if writer == _B_MEMSET else [FExpr("MLIL_CONST", "0", constant=0), _addr_of(buf), n])
     pg.sink(buf)
     result, reasons, leaves = _bw(pg.func())
-    assert any("written by memset" in r for r in reasons)
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is (length == 64)
-    assert bool(leaves) is (length < 64)
+    name = _B_NAMES[writer]
+    assert any(f"written by {name}" in r for r in reasons)
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    [leaf] = leaves
+    assert leaf["calls"] == [name] and leaf["region"] == {"offset": 0, "size": 64}, leaf
+    assert leaf["unproven"] == [[0, 64]], leaf
 
 
 @pytest.mark.parametrize("budget", [1, 5, 12])
@@ -153,25 +161,3 @@ def test_discovery_cut_keeps_nearby_escaped_call_frontier():
     assert not result["diagnostics"]["safe_to_report_complete_slice"]
     assert any(l.get("callee") == "compose" and l["address"] == hex(near.address)
                for l in leaves)
-
-
-@pytest.mark.parametrize("name", ["wmemcpy", "wmemmove", "__wmemcpy_chk", "__wmemmove_chk"])
-@pytest.mark.parametrize("element_size", [2, 4])
-@pytest.mark.parametrize("written_bytes", [0, 32, 64])
-def test_wide_fill_count_uses_callee_element_width(monkeypatch, name, element_size, written_bytes):
-    from types import SimpleNamespace
-
-    buf = FVar("buf", typ="char[64]")
-    pg = _BufProgram()
-    pg.call(_B_READ, [_addr_of(buf), _cstr(0x700),
-                     FExpr("MLIL_CONST", str(written_bytes // element_size),
-                           constant=written_bytes // element_size)])
-    pg.sink(buf)
-    original = te.function_at
-    callee = SimpleNamespace(name=name, parameter_vars=[
-        SimpleNamespace(type=SimpleNamespace(target=SimpleNamespace(width=element_size)))])
-    monkeypatch.setattr(te, "function_at",
-                        lambda bv, addr: callee if addr == _B_READ else original(bv, addr))
-    result, reasons, leaves = _bw(pg.func(), extra_names={_B_READ: name})
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is (written_bytes == 64)
-    assert bool(leaves) is (written_bytes < 64)

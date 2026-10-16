@@ -9974,7 +9974,9 @@ def test_backward_gate_counts_unresolved_origins_even_without_a_leaf_915():
 def test_backward_follows_modeled_fill_of_address_of_local_915(models):
     # The slice continues THROUGH the modeled out-param write: snprintf fills
     # `cmd` from its varargs, so popen's argument originates at ctx#0 --
-    # parameter 0 -- and the step list says which call wrote the buffer.
+    # parameter 0 -- and the step list says which call wrote the buffer. No
+    # call's write extent proves the bytes initialised (#931): the leaf names
+    # the call, the consumed region and the command that shows its arguments.
     func, bv = _popen_of_local_program(fill="snprintf")
     result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
     assert result["slices"], result
@@ -9982,8 +9984,12 @@ def test_backward_follows_modeled_fill_of_address_of_local_915(models):
     assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "ctx#0"}, sl["origin"]
     reasons = [st.get("reason", "") for st in sl["slice"]]
     assert any("local buffer cmd written by snprintf" in r for r in reasons), reasons
-    assert not [l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"], result["leaves"]
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is True, result["diagnostics"]
+    [leaf] = [l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"]
+    assert leaf["calls"] == ["snprintf"] and leaf["unproven"] == [[0, leaf["region"]["size"]]], leaf
+    assert "`bn callsites snprintf --within 0x10`" in leaf["detail"], leaf["detail"]
+    assert "`bn callsites snprintf --within 0x10`" in result["diagnostics"]["next_action"], \
+        result["diagnostics"]["next_action"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
 
 
 def test_backward_unmodeled_writer_of_address_of_local_is_a_frontier_915(models):
@@ -10257,6 +10263,16 @@ def _bw(func, extra_names=None, sink="arg:popen:0"):
     return result, reasons, aol
 
 
+def _only_call_fill_leaves(result, aol, *calls):
+    """#931: the only frontier is the disclosure that no call's write extent
+    proves the consumed bytes initialised -- naming exactly *calls* -- and the
+    slice is therefore not complete."""
+    assert aol and all(l.get("calls") for l in aol), result["leaves"]
+    assert len(aol) == len(result["leaves"]), result["leaves"]
+    assert {c for l in aol for c in l["calls"]} == set(calls), aol
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
+
+
 def test_backward_aliased_terminator_store_does_not_break_the_writer_chain_928():
     # Mythos P1: `strcpy(cmd, host); cmd[100] = 0; strcat(cmd, " -c 1");
     # popen(cmd)` -- the terminator lifts to MLIL_SET_VAR_ALIASED_FIELD with no
@@ -10278,8 +10294,7 @@ def test_backward_aliased_terminator_store_does_not_break_the_writer_chain_928()
     assert any("store into local buffer cmd" in r for r in reasons), reasons
     assert any("written by strcpy" in r for r in reasons), reasons
     assert any("written by strcat" in r for r in reasons), reasons
-    assert aol == [], aol
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is True, result["diagnostics"]
+    _only_call_fill_leaves(result, aol, "strcpy", "strcat")
 
 
 def test_backward_source_fill_outranks_a_later_literal_terminator_928():
@@ -10297,7 +10312,7 @@ def test_backward_source_fill_outranks_a_later_literal_terminator_928():
     result, reasons, aol = _bw(pg.func())
     assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
     assert any("written by read" in r for r in reasons), reasons
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    _only_call_fill_leaves(result, aol, "read", "strcat")
 
 
 def test_backward_uncovered_memory_phi_arm_is_a_frontier_928():
@@ -10320,19 +10335,31 @@ def test_backward_uncovered_memory_phi_arm_is_a_frontier_928():
 
 
 def test_backward_covered_memory_phi_arms_stay_complete_928():
-    # Guard: a fill on EVERY arm (`if (a) snprintf(..."x") else snprintf(..."y")`)
-    # is covered -- no frontier, the slice is complete.
+    # Guard: a whole-buffer store on EVERY arm (`if (a) dst = x; else dst = y`)
+    # is covered -- no frontier, the slice is complete. A call fill on one
+    # arm proves nothing there (#931), so the same phi with snprintf on the
+    # else arm leaves the whole buffer unproven.
     dst = FVar("dst", typ="char[0x80]")
     pg = _BufProgram()
-    pg.call(_B_SNPRINTF, [_addr_of(dst), FExpr("MLIL_CONST", "0x80", constant=0x80), _cstr(0x700)])
-    other = pg.call(_B_SNPRINTF, [_addr_of(dst), FExpr("MLIL_CONST", "0x80", constant=0x80), _cstr(0x708)])
-    other.src_memory = 0   # the else arm also starts from the entry state
+    pg.whole_store(dst, 1)
+    other = pg.whole_store(dst, 2)
+    other.ssa_memory_version = 0   # the else arm also starts from the entry state
     pg.phi(1, 2)
     pg.sink(dst)
     result, reasons, aol = _bw(pg.func())
     assert aol == [], result["leaves"]
-    assert result["slices"][0]["origin"] == {"kind": "call", "callee": "snprintf"}
+    assert result["slices"][0]["origin"]["kind"] == "constant", result["slices"][0]["origin"]
     assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+
+    pg2 = _BufProgram()
+    pg2.whole_store(dst, 1)
+    fill = pg2.call(_B_SNPRINTF, [_addr_of(dst), FExpr("MLIL_CONST", "0x80", constant=0x80), _cstr(0x708)])
+    fill.src_memory = 0
+    pg2.phi(1, 2)
+    pg2.sink(dst)
+    result2, _, aol2 = _bw(pg2.func())
+    _only_call_fill_leaves(result2, aol2, "snprintf")
+    assert aol2[0]["unproven"] == [[0, 0x80]], aol2
 
 
 def test_backward_memory_chain_budget_is_disclosed_as_truncation_928():
@@ -10377,7 +10404,9 @@ def test_backward_address_of_operand_of_a_fill_is_a_buffer_not_a_literal_928():
     pg2.call(_B_STRCPY, [_addr_of(cmd), _addr_of(other)])
     pg2.sink(cmd)
     result2, _, aol2 = _bw(pg2.func())
-    assert [l["buffer"] for l in aol2] == ["other"], result2["leaves"]
+    assert {l["buffer"] for l in aol2} == {"cmd", "other"}, result2["leaves"]
+    assert any(l["buffer"] == "other" and "no writer of the buffer was found" in l["detail"]
+               for l in aol2), aol2
     assert result2["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
@@ -10391,7 +10420,7 @@ def test_backward_uninterpretable_fill_operand_is_a_frontier_928():
                               src=FExpr("MLIL_CONST_PTR", "0x601040", constant=0x601040))])
     pg.sink(cmd)
     result, reasons, aol = _bw(pg.func())
-    assert len(aol) == 1 and "neither a literal nor a local" in aol[0]["detail"], result["leaves"]
+    assert any("neither a literal nor a local" in l["detail"] for l in aol), result["leaves"]
     assert result["slices"][0]["origin"]["kind"] == "address_of_local_unresolved"
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
@@ -10413,9 +10442,9 @@ def test_backward_nested_buffer_is_read_at_the_copy_not_the_sink_928():
     pg.sink(dst)
     result, reasons, aol = _bw(pg.func())
     sl = result["slices"][0]
-    assert sl["origin"] == {"kind": "call", "callee": "snprintf"}, sl["origin"]
+    assert "input" not in str(sl["origin"]), sl["origin"]
     assert hex(late.address) not in [st.get("address") for st in sl["slice"]], sl["slice"]
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    _only_call_fill_leaves(result, aol, "snprintf", "strcpy")
 
 
 def test_backward_escaped_buffer_address_makes_later_unmodeled_calls_opaque_928():
@@ -10439,7 +10468,7 @@ def test_backward_escaped_buffer_address_makes_later_unmodeled_calls_opaque_928(
     # Round 4 P2: the escape writes no byte of cmd and the call after it is
     # not handed &cmd -- neither covers the path, so the 1-byte `cmd[0] = 0`
     # leaves the buffer unproven there too: a second, distinct frontier.
-    assert any("nothing is proven to write the whole buffer" in l["detail"] for l in aol), aol
+    assert any("no plain store the walk can see writes" in l["detail"] for l in aol), aol
     assert result["slices"][0]["origin"] == {
         "kind": "address_of_local_unresolved", "buffer": "cmd", "callee": "fill_global"}
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
@@ -10456,7 +10485,7 @@ def test_backward_escaped_buffer_address_makes_later_unmodeled_calls_opaque_928(
     result2, reasons2, aol2 = _bw(pg2.func())
     assert not any(l.get("callee") for l in aol2), result2["leaves"]
     assert not any("snprintf" in r for r in reasons2), reasons2
-    assert [l["detail"] for l in aol2 if "nothing is proven to write the whole buffer" in l["detail"]], aol2
+    assert [l["detail"] for l in aol2 if "no plain store the walk can see writes" in l["detail"]], aol2
 
 
 def test_backward_folded_address_of_sink_operand_is_seeded_928():
@@ -10474,7 +10503,7 @@ def test_backward_folded_address_of_sink_operand_is_seeded_928():
     assert sl["sink"]["seed"] == "&cmd", sl["sink"]
     assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "ctx#0"}, sl["origin"]
     assert any("written by snprintf" in r for r in reasons), reasons
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    _only_call_fill_leaves(result, aol, "snprintf")
 
     # An address expression that is NOT a local's address still cannot seed.
     pg2 = _BufProgram(params=[ctx])
@@ -10507,7 +10536,7 @@ def test_backward_caller_ascent_follows_a_folded_address_of_argument_928():
     assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}, sl["origin"]
     assert any("written by snprintf" in r for r in reasons), reasons
     assert not any("trackable scalar" in a for a in result["assumptions"]), result["assumptions"]
-    assert aol == [], result["leaves"]
+    _only_call_fill_leaves(result, aol, "snprintf")
 
 
 def test_strtok_state_left_tainted_at_return_withholds_all_clear_928():
@@ -10738,7 +10767,7 @@ def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
     host = FVar("host", ident=11); host0 = FSSA(host, 0)
     cmd = FVar("cmd", typ="char[0x80]"); q = FVar("q"); q1 = FSSA(q, 1)
     pg = _BufProgram(params=[host])
-    pg.call(_B_SNPRINTF, [_addr_of(cmd), FExpr("MLIL_CONST", "0x80", constant=0x80), _cstr(0x700)])
+    pg.whole_store(cmd)
     pg.store(FExpr("MLIL_CONST_PTR", "0x404050", constant=0x404050), _addr_of(cmd))
     i0, a0 = pg._next()
     pg.instrs.append(FInstr(i0, a0, "MLIL_SET_VAR_SSA", "q#1 = [0x404058].q", writes=[q1],
@@ -10781,7 +10810,8 @@ def test_backward_modeled_call_reloading_the_escape_slot_is_a_fill_928r3():
     pg.aliased_store(cmd, 0, 0)
     pg.store(FExpr("MLIL_CONST_PTR", "0x404018", constant=0x404018), _addr_of(cmd))
     # The reload reads the memory the escape store defined: the store reaching
-    # it wrote &cmd, so it is a must-alias of &cmd + 0 and the fill covers.
+    # it wrote &cmd, so it is a must-alias of &cmd + 0 and strcpy is a named
+    # writer (its write extent still proves nothing, #931).
     reload = FExpr("MLIL_LOAD_SSA", "[0x404018].q", reads=[], src_memory=pg.mem,
                    src=FExpr("MLIL_CONST_PTR", "0x404018", constant=0x404018))
     pg.call(_B_STRCPY, [reload,
@@ -10790,7 +10820,7 @@ def test_backward_modeled_call_reloading_the_escape_slot_is_a_fill_928r3():
     result, reasons, aol = _bw(pg.func())
     assert any("local buffer cmd written by strcpy" in r for r in reasons), reasons
     assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}, result["slices"][0]["origin"]
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    _only_call_fill_leaves(result, aol, "strcpy")
 
 
 def test_backward_modeled_out_arg_unresolvable_while_escaped_is_opaque_928r3():
@@ -10813,7 +10843,7 @@ def test_backward_modeled_out_arg_unresolvable_while_escaped_is_opaque_928r3():
     assert len(opq) == 1 and "cannot resolve" in opq[0]["detail"], result["leaves"]
     # A may-alias out-arg covers nothing (round 4 P2): the bare 1-byte
     # terminator leaves the path unproven, a distinct frontier.
-    assert any("nothing is proven to write the whole buffer" in l["detail"] for l in aol), aol
+    assert any("no plain store the walk can see writes" in l["detail"] for l in aol), aol
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
@@ -10938,17 +10968,20 @@ def test_backward_const_ptr_into_writable_storage_is_not_a_literal_928r3():
     assert sl["origin"] == {"kind": "global", "address": "0x404040", "buffer": "cmd"}, sl["origin"]
     assert sl["metrics"]["traverses_unresolved"] is True
     aol = [l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"]
-    assert len(aol) == 1 and aol[0]["global"] == "0x404040" and "writable storage" in aol[0]["detail"], result["leaves"]
+    glob = [l for l in aol if l.get("global")]
+    assert len(glob) == 1 and glob[0]["global"] == "0x404040" and "writable storage" in glob[0]["detail"], result["leaves"]
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
 
-    # Guard: the same call with both operands in read-only storage is literal.
+    # Guard: the same call with both operands in read-only storage is literal:
+    # no global leaf, only the disclosure that snprintf proves no byte (#931).
     pg2 = _BufProgram()
     pg2.call(_B_SNPRINTF, [_addr_of(cmd), FExpr("MLIL_CONST", "0x80", constant=0x80),
                            _cstr(0x700), _cstr(0x710)])
     pg2.sink(cmd)
     result2 = te.TaintEngine(bv, te.load_models()).backward(pg2.func(), [te.parse_locator("arg:popen:0")])
-    assert result2["slices"][0]["origin"] == {"kind": "call", "callee": "snprintf"}
-    assert result2["leaves"] == [] and result2["diagnostics"]["safe_to_report_complete_slice"] is True
+    assert not any(l.get("global") for l in result2["leaves"]), result2["leaves"]
+    _only_call_fill_leaves(result2, [l for l in result2["leaves"]
+                                     if l["kind"] == "address_of_local_unresolved"], "snprintf")
 
 
 def test_backward_fill_outranks_a_terminator_and_names_a_tainted_length_928r3():
@@ -11129,13 +11162,15 @@ def test_backward_writable_global_element_is_a_leaf_928r4():
     bv = FBVStorage(_B_NAMES, ro=[(0x700, 0x800)], rw=[(0x404000, 0x405000)])
     result = te.TaintEngine(bv, te.load_models()).backward(pg.func(), [te.parse_locator("arg:popen:0")])
     aol = [l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"]
-    assert len(aol) == 1 and aol[0]["global"] == "0x4040a0" and "writable storage" in aol[0]["detail"], aol
+    glob = [l for l in aol if l.get("global")]
+    assert len(glob) == 1 and glob[0]["global"] == "0x4040a0" and "writable storage" in glob[0]["detail"], aol
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
 
-    # Guard: the same element of a READ-ONLY table is bytes the binary fixed.
+    # Guard: the same element of a READ-ONLY table is bytes the binary fixed:
+    # no global leaf (snprintf still proves no byte of cmd, #931).
     bv_ro = FBVStorage(_B_NAMES, ro=[(0x700, 0x800), (0x404000, 0x405000)])
     result2 = te.TaintEngine(bv_ro, te.load_models()).backward(pg.func(), [te.parse_locator("arg:popen:0")])
-    assert result2["leaves"] == [], result2["leaves"]
+    _only_call_fill_leaves(result2, result2["leaves"], "snprintf")
 
 
 def _two_locals_phi_program():
@@ -11162,7 +11197,7 @@ def test_backward_coverage_is_by_bytes_not_by_writer_kind_928r4():
     # step is in the slice) but covers nothing.
     result, reasons, aol = _bw(_two_locals_phi_program().func())
     assert any("local buffer a written by read" in r for r in reasons), reasons
-    assert len(aol) == 1 and "nothing is proven to write the whole buffer" in aol[0]["detail"], aol
+    assert len(aol) == 1 and "no plain store the walk can see writes" in aol[0]["detail"], aol
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
     fd, fd0 = _var("fd", 0, ident=12)
@@ -11206,13 +11241,20 @@ def test_backward_coverage_is_by_bytes_not_by_writer_kind_928r4():
     assert any("local buffer buf written by strcpy" in r for r in reasons), reasons
     assert len(aol) == 1 and "on at least one path" in aol[0]["detail"], aol
 
-    # Guard: the same strcpy at offset 0 covers its path.
+    # Guard: a whole-buffer store covers its path; the same strcpy at offset
+    # 0 does not -- no call's write extent is proof (#931).
+    pg = _BufProgram(params=[fd])
+    conditional_read(pg)
+    pg.whole_store(buf)
+    pg.sink(buf)
+    result, reasons, aol = _bw(pg.func())
+    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
     pg = _BufProgram(params=[fd])
     conditional_read(pg)
     pg.call(_B_STRCPY, [_addr_of(buf), _cstr(0x700)])
     pg.sink(buf)
     result, reasons, aol = _bw(pg.func())
-    assert aol == [] and result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    _only_call_fill_leaves(result, aol, "strcpy", "read")
 
 
 class _FEdge:
@@ -11338,10 +11380,9 @@ def test_benign_model_handed_the_buffer_is_disclosed_928r4():
     assert any("passed to my_fill" in a and "whose model is {}" in a for a in result["assumptions"]), \
         result["assumptions"]
 
-    # Beside a covering memset the slice is complete -- and says what it trusts.
+    # Beside a covering store the slice is complete -- and says what it trusts.
     pg2 = _BufProgram(params=[host])
-    pg2.call(_B_MEMSET, [_addr_of(buf), FExpr("MLIL_CONST", "0", constant=0),
-                         FExpr("MLIL_CONST", "0x40", constant=0x40)])
+    pg2.whole_store(buf)
     pg2.call(_B_MY_FILL, [_addr_of(buf), FExpr("MLIL_VAR_SSA", "host#0", reads=[host0])], reads=[host0])
     pg2.sink(buf)
     result2 = te.TaintEngine(FBV(_B_NAMES), models).backward(pg2.func(), [te.parse_locator("arg:popen:0")])

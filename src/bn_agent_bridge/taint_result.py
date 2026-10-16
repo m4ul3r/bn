@@ -499,6 +499,19 @@ def backward_diagnostics(
             next_action += (
                 f", or re-run `bn taint forward -f {buffer_leaf['function']} "
                 f"--source {source}` on the buffer")
+        call_leaf = next((lf for lf in unresolved_leaves
+                          if lf.get("kind") == "address_of_local_unresolved"
+                          and isinstance(lf.get("function"), str)
+                          and any(isinstance(c, str) and c and not c.startswith("__builtin_")
+                                  for c in lf.get("calls") or [])), None)
+        if call_leaf is not None:
+            callee = next(c for c in call_leaf["calls"]
+                          if isinstance(c, str) and c and not c.startswith("__builtin_"))
+            next_action += (
+                ". No call's write extent proves a buffer initialised (#931); check "
+                "by hand that the call's destination and length cover the bytes the "
+                f"sink reads: `bn callsites {shlex.quote(callee)} --within "
+                f"{call_leaf['function']}` prints it with its arguments")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
                for lf in unresolved_leaves):
             next_action += (
