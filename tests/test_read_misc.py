@@ -20,6 +20,10 @@ from _bridge_fakes import *  # noqa: F401,F403
 # --- I2: strings filtering ---
 
 
+NOTE = ("no library attributed: bn names a library only from a symbol-version "
+        "requirement it could match; the loader picks it at run time from DT_NEEDED")
+
+
 def test_list_envelopes_carry_kind(monkeypatch):
     # #275: every generic-list read carries a `kind` discriminator (strings shown
     # here; the registry-driven conformance test covers the rest).
@@ -309,7 +313,7 @@ def test_strings_probable_format_annotates_directives_and_code_refs(monkeypatch)
     # excluded from the directive list.
     assert entry["format_directives"] == ["%s", "%d"]
     assert entry["directive_count"] == 2
-    assert entry["code_refs"] == 2
+    assert entry["code_ref_count"] == 2
 
 
 def test_strings_probable_format_recovers_flags_width_precision_length(monkeypatch):
@@ -341,7 +345,7 @@ def test_strings_probable_format_keeps_indirect_zero_xref_candidate(monkeypatch)
 
     entry = result["items"][0]
     assert entry["format_directives"] == ["%d"]
-    assert entry["code_refs"] == 0
+    assert entry["code_ref_count"] == 0
 
 
 # --- #814: strings paging builds rows for the returned page only ---
@@ -422,7 +426,7 @@ def test_strings_probable_format_counts_code_refs_for_the_page_only(monkeypatch)
     assert result["returned"] == 15 and result["has_more"] is True
     # ...the page still carries its enrichment (directives + code_refs)...
     assert [item["format_directives"] for item in result["items"]] == [["%d", "%d"]] * 15
-    assert [item["code_refs"] for item in result["items"]] == [1] * 15
+    assert [item["code_ref_count"] for item in result["items"]] == [1] * 15
     # ...and the xref helper ran for the page only.
     assert len(calls) <= 16, (
         f"_code_ref_count ran {len(calls)}x for a 15-row page of 2000 survivors"
@@ -451,7 +455,8 @@ def test_strings_query_filter_pages_without_building_the_rest(monkeypatch):
     counted = instance._strings(None, query="err", offset=0, limit=10, count_only=True)
     # #795: the count envelope also states how many candidates the filter dropped
     # (1000 scanned - 500 kept), so the denominator needs no second invocation.
-    assert counted == {"kind": "strings", "count": 500, "total": 500, "filtered": 500}
+    assert counted == {"kind": "strings", "count": 500, "total": 500, "filtered": 500,
+                       "noise_dropped": 0}
     # ...and the LIST envelope carries the same disclosed number.
     assert result["filtered"] == 500
 
@@ -500,7 +505,7 @@ def test_strings_page_rows_keep_their_parsed_fields(monkeypatch):
     result = instance._strings(None, query=None, offset=0, limit=1)
 
     assert result["items"] == [{"address": hex(0x1000), "length": 12, "chars": 2,
-                               "type": "utf16", "value": "hi"}]
+                               "type": "utf16", "value": "hi", "section": None}]
     assert [i["type"] for i in instance._strings(None, query=None, offset=0, limit=10)["items"]] == \
         ["utf16", "ascii"]
 
@@ -786,6 +791,9 @@ def test_imports_recovers_relocation_only_external_symbol(monkeypatch):
             "raw_name": "dispatch_record",
             "kind": "function",
             "provenance": "relocation",
+            # #1037 item 6: every null-library row says why.
+            "library_note": NOTE.replace("the loader picks it at run time from DT_NEEDED",
+                                         "this target lists no DT_NEEDED libraries"),
         }
     ]
     assert result["relocation_recovered"] == 1
@@ -1019,8 +1027,141 @@ def test_imports_without_raw_parent_keep_null_library_969(monkeypatch):
 
     listed = instance._imports(None)
     assert listed["items"][0]["library"] is None
-    # No DT_NEEDED to point at: nothing to disclose.
-    assert "library_unattributed" not in listed
+    # No DT_NEEDED to point at: the row is still disclosed, and the note says
+    # the list is empty rather than pointing at it (#1037 review round 5).
+    assert listed["library_unattributed"] == 1
+    assert listed["unattributed_note"].endswith("this target lists no DT_NEEDED libraries")
+
+
+def test_imports_unversioned_rows_disclose_why_library_is_null_1037(monkeypatch, tmp_path):
+    """#1037 item 6, disclosure only: an unversioned import keeps `library:
+    null` with the reason, and bn reads no file but the target -- even with a
+    needed library that exports the name sitting beside the binary. Two review
+    rounds showed a lookup in the needed libraries names the wrong file."""
+    import builtins
+
+    from test_elf_dynamic import _build_elf
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    image = _build_elf(needed=("libc.so.6", "libstdc++.so.6"), symbols=(
+        ("printf", "libc.so.6"), ("_ZNSo3putEc", None), ("__gmon_start__", None)))
+    binary = tmp_path / "regd"
+    binary.write_bytes(image)
+    (tmp_path / "libstdc++.so.6").write_bytes(image)
+    bv = _versioned_import_bv(fake_bn, image=image)
+    bv.file = types.SimpleNamespace(original_filename=str(binary), filename=str(binary))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    real_open = builtins.open
+    opened: list[str] = []
+
+    def tracking_open(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    listed = instance._imports(None)
+    summary = instance._imports(None, summary=True)
+    monkeypatch.setattr(builtins, "open", real_open)
+
+    assert not [path for path in opened if path.startswith(str(tmp_path))]
+    rows = {i["name"]: i for i in listed["items"]}
+    assert (rows["printf"]["library"], rows["printf"]["library_source"]) == (
+        "libc.so.6", "symbol-version")
+    assert "library_note" not in rows["printf"]
+    for name in ("_ZNSo3putEc", "__gmon_start__"):
+        assert rows[name]["library"] is None and "library_source" not in rows[name]
+        assert rows[name]["library_note"] == (
+            "no library attributed: bn names a library only from a symbol-version "
+            "requirement it could match; the loader picks it at run time from DT_NEEDED")
+    assert listed["needed_libraries"] == ["libc.so.6", "libstdc++.so.6"]
+    assert not {"needed_library_files", "library_unattributed_reasons"} & set(listed)
+    assert summary["unattributed_note"] == rows["__gmon_start__"]["library_note"]
+
+
+def test_imports_do_not_call_a_symbol_unversioned_when_versions_were_not_read_1037(
+        monkeypatch):
+    """#1037 review round 3: patching only DT_SYMENT (24 -> 32) leaves a file
+    that runs and whose imports ALL carry versions (`printf@GLIBC_2.17`), but bn
+    refuses the table. The rows then said "unversioned import" beside a
+    dynamic-section note that version attribution was skipped. The note must
+    say the versions were not read, in the listing and in `--summary`."""
+    from test_elf_dynamic import _build_elf, _set_dynamic_tag
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    image = _set_dynamic_tag(_build_elf(needed=("libc.so.6", "libstdc++.so.6"), symbols=(
+        ("printf", "libc.so.6"), ("_ZNSo3putEc", "libstdc++.so.6"),
+        ("__gmon_start__", None))), 11, 32)
+    bv = _versioned_import_bv(fake_bn, image=image)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._imports(None)
+    expected = (f"{NOTE}; symbol versions were not read: DT_SYMENT 32 is not the ABI "
+                "symbol size 24")
+    assert {row["library_note"] for row in listed["items"]} == {expected}
+    assert listed["unattributed_note"] == expected
+    assert any("DT_SYMENT 32" in note for note in listed["dynamic_section_notes"])
+    assert instance._imports(None, summary=True)["unattributed_note"] == expected
+    assert "unversioned" not in json.dumps(listed)
+
+
+def test_imports_with_callers_names_capped_calling_functions_1037(monkeypatch):
+    """#1037 item 5: one call maps every listed import to its callers, capped
+    per row with the full count beside it, like `strings --with-xrefs`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    syms = []
+    for address, name in ((0x1000, "recv"), (0x1010, "accept")):
+        sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, address, name)
+        sym.short_name = name
+        sym.namespace = ""
+        syms.append(sym)
+    callers = [_FakeFunction(0x3000 + i * 0x40, f"handler_{i}") for i in range(10)]
+    bv = _FakeBV(symbols=syms, code_refs={
+        0x1000: [_FakeCodeRef(fn.start + 4, fn) for fn in callers]
+        + [_FakeCodeRef(callers[0].start + 8, callers[0])],
+    })
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._imports(None, with_callers=True)
+    rows = {i["name"]: i for i in listed["items"]}
+    assert rows["recv"]["code_ref_count"] == 11
+    assert rows["recv"]["caller_count"] == 10
+    assert [fn["name"] for fn in rows["recv"]["callers"]] == [fn.name for fn in callers[:8]]
+    assert (rows["accept"]["caller_count"], rows["accept"]["callers"]) == (0, [])
+    # No per-page tally: a collected listing would copy page one's (#1037 review).
+    assert "callers_unrecorded" not in listed
+    assert "callers" not in instance._imports(None)["items"][0]
+
+
+def test_imports_with_callers_reports_an_unreadable_ref_list_as_unknown_1037(monkeypatch):
+    """#1037 review finding 5: a failed code-ref enumeration read as 0 callers."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "recv")
+    sym.short_name = "recv"
+    sym.namespace = ""
+    bv = _FakeBV(symbols=[sym])
+
+    def broken(address):
+        raise RuntimeError("code refs unavailable")
+
+    bv.get_code_refs = broken
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    row = instance._imports(None, with_callers=True)["items"][0]
+    assert (row["code_ref_count"], row["caller_count"], row["callers"]) == (None, None, [])
+    assert row["callers_note"] == "code refs could not be read: RuntimeError: code refs unavailable"
+
+    bv.strings = [_FakeStringRef(0x2000, 5, "hello")]
+    srow = instance._strings(None, query=None, offset=0, limit=10, with_xrefs=True)["items"][0]
+    assert (srow["code_ref_count"], srow["xref_function_count"]) == (None, None)
+    assert srow["code_ref_note"].startswith("code refs could not be read")
+
 
 
 # --- read: raw bytes at an address ---
@@ -2200,3 +2341,253 @@ def test_data_symbols_surfaces_a_lookup_failure_instead_of_reporting_none(monkey
 
     with pytest.raises(RuntimeError, match="core symbol table unavailable"):
         instance._data_symbols(None)
+
+
+def _patch_versym(image, index, value):
+    """Set `.gnu.version` entry *index* of a `_build_elf` image to *value*."""
+    import struct
+
+    from test_elf_dynamic import _BASE, _dynamic_entries_at
+
+    rows, _fmt = _dynamic_entries_at(image)
+    versym = next(value_ for _at, tag, value_ in rows if tag == 0x6FFFFFF0) - _BASE
+    out = bytearray(image)
+    struct.pack_into("<H", out, versym + 2 * index, value)
+    return bytes(out)
+
+
+@pytest.mark.parametrize("shape", ["unknown_index", "two_versions", "versym_without_verneed"])
+def test_unattributed_imports_get_the_neutral_note_never_unversioned_1037(monkeypatch, shape):
+    """#1037 review round 4: three valid or edge-case shapes left an import
+    unattributed and bn called it "unversioned": a version index naming no
+    requirement entry, one name required at two versions from two libraries,
+    and a DT_VERSYM with no DT_VERNEED. The note now states what bn does."""
+    from test_elf_dynamic import _build_elf
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    needed = ("libc.so.6", "libstdc++.so.6")
+    if shape == "unknown_index":
+        image = _patch_versym(_build_elf(needed=needed, symbols=(
+            ("printf", "libc.so.6"), ("_ZNSo3putEc", "libstdc++.so.6"),
+            ("__gmon_start__", None))), 2, 9)   # `_ZNSo3putEc` -> no such index
+    elif shape == "two_versions":
+        image = _build_elf(needed=needed, symbols=(
+            ("printf", "libc.so.6"), ("printf", "libstdc++.so.6"),
+            ("_ZNSo3putEc", "libstdc++.so.6"), ("__gmon_start__", None)))
+    else:
+        image = _build_elf(needed=needed, symbols=(
+            ("printf", None), ("_ZNSo3putEc", None), ("__gmon_start__", None)))
+    bv = _versioned_import_bv(fake_bn, image=image)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._imports(None)
+    nulls = [row for row in listed["items"] if row["library"] is None]
+    expected_null = {"unknown_index": "_ZNSo3putEc", "two_versions": "printf",
+                     "versym_without_verneed": "printf"}[shape]
+    assert expected_null in {row["name"] for row in nulls}
+    assert {row["library_note"] for row in nulls} == {NOTE}
+    assert listed["unattributed_note"] == NOTE
+    assert instance._imports(None, summary=True)["unattributed_note"] == NOTE
+    assert "unversioned" not in json.dumps(listed)
+
+
+def test_unattributed_imports_on_a_target_with_no_dt_needed_say_so_1037(monkeypatch):
+    """#1037 review round 5: a shared object built without default libraries
+    that calls one unresolved function has no DT_NEEDED entry. Its null row
+    still gets the note, which must not point at an empty DT_NEEDED list."""
+    from test_elf_dynamic import _build_elf
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    image = _build_elf(needed=(), symbols=(("ext_call", None),))
+    sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "ext_call")
+    sym.short_name, sym.namespace = "ext_call", "BNINTERNALNAMESPACE"
+    bv = _FakeBV(symbols=[sym])
+    bv.parent_view = types.SimpleNamespace(
+        start=0, length=len(image), read=lambda offset, size: image[offset:offset + size])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    expected = ("no library attributed: bn names a library only from a symbol-version "
+                "requirement it could match; this target lists no DT_NEEDED libraries")
+    listed = instance._imports(None)
+    assert listed["items"][0]["library"] is None
+    assert listed["items"][0]["library_note"] == expected
+    assert (listed["library_unattributed"], listed["needed_libraries"],
+            listed["unattributed_note"]) == (1, [], expected)
+    assert instance._imports(None, summary=True)["unattributed_note"] == expected
+
+    from bn.formatters import _render_name_address_list_text
+    text = _render_name_address_list_text(listed)
+    assert f"// 1 import(s) carry no library ({expected})" in text
+    assert "DT_NEEDED):" not in text
+
+
+# --- #1042 item 2: one name-to-address resolver for every address operand ----
+
+
+def _named_data_bv(*extra_symbols):
+    """`sock_path` (a pointer-typed data symbol) at 0x2018 and an unnamed int at
+    0x2010, the shape a stripped decompile prints as `data_2010`."""
+    fake_bn = sys.modules["binaryninja"]
+    ptr_t = _FakeType("char const*", width=4, type_class="PointerTypeClass")
+    int_t = _FakeType("int32_t", width=4, type_class="IntegerTypeClass", signed=True)
+    return _FakeBV(
+        arch=_FakeArch(name="x86", address_size=4),
+        data_vars={0x2010: _FakeDataVariable(0x2010, int_t),
+                   0x2018: _FakeDataVariable(0x2018, ptr_t)},
+        symbols=[fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2018, "sock_path"),
+                 *extra_symbols],
+        sections={".data": _FakeSection(".data", 0x2000, 0x2100)},
+        memory={0x2010: b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x60\x00\x00",
+                0x6000: b"demo.sock\x00"},
+    )
+
+
+def test_read_resolves_a_data_symbol_name_and_says_how_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _named_data_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._read(None, "sock_path", 4)
+
+    assert result["address"] == "0x2018" and result["hex"] == "00600000"
+    assert result["resolved_symbol"] == {"name": "sock_path", "kind": "data",
+                                         "address": "0x2018"}
+    # A number is still just an address, with nothing to disclose.
+    assert "resolved_symbol" not in instance._read(None, "0x2018", 4)
+
+
+def test_rendered_data_placeholder_resolves_only_when_no_symbol_has_the_name_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _named_data_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    spelled = instance._read(None, "data_2010", 4)
+    assert spelled["address"] == "0x2010" and spelled["hex"] == "01000000"
+    assert spelled["resolved_symbol"]["kind"] == "placeholder"
+
+    # The counterexample: a user NAMED something `data_2010`. The name means
+    # that symbol, wherever it is -- never the address the spelling encodes.
+    named = _named_data_bv(fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2018, "data_2010"))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: named)
+    owned = instance._read(None, "data_2010", 4)
+    assert owned["address"] == "0x2018"
+    assert owned["resolved_symbol"]["kind"] == "data"
+
+
+def test_unmapped_placeholder_and_unknown_name_miss_under_the_resolver_prefix_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _named_data_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError) as unmapped:
+        instance._read(None, "data_dead0", 4)
+    assert str(unmapped.value).startswith("Symbol not found: data_dead0.")
+    assert "nothing is mapped at the address it spells (0xdead0)" in str(unmapped.value)
+
+    # `sub_` claims a FUNCTION START, not merely mapped bytes.
+    with pytest.raises(RuntimeError, match="no function starts at the address it spells"):
+        instance._read(None, "sub_2010", 4)
+
+    # A malformed 0x token is a bad address, not a symbol miss.
+    with pytest.raises(ValueError, match="not a valid address"):
+        instance._read(None, "0xZZ", 4)
+
+    with pytest.raises(RuntimeError) as missing:
+        instance._read(None, "no_such_global", 4)
+    assert str(missing.value).startswith("Symbol not found: no_such_global.")
+
+
+def test_address_operand_prefers_the_data_slot_and_refuses_two_data_addresses_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    # An import is a data slot (GOT) and a stub under one spelling: a read of
+    # the name is a read of data, so the data symbol wins over the function.
+    bv = _named_data_bv(
+        fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x2014, "recv"),
+        fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1100, "recv"),
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    assert instance.ctx._resolve_address_operand(bv, "recv") == (
+        0x2014, {"name": "recv", "kind": "data", "address": "0x2014"})
+
+    # Two DATA addresses under one name is a choice the resolver will not make.
+    twice = _named_data_bv(fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2010, "sock_path"))
+    with pytest.raises(RuntimeError, match="Ambiguous symbol identifier: sock_path"):
+        instance.ctx._resolve_address_operand(twice, "sock_path")
+
+
+def test_data_vars_at_a_name_answers_the_one_variable_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _named_data_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._data_vars(None, at="sock_path")
+
+    assert [row["address"] for row in result["items"]] == ["0x2018"]
+    assert result["items"][0]["pointer"] == "0x6000"
+    assert result["items"][0]["pointer_string"] == "demo.sock"
+    assert result["at"] == "0x2018"
+    assert result["resolved_symbols"] == [{"name": "sock_path", "kind": "data",
+                                           "address": "0x2018"}]
+    # An interior address is not a variable start: the answer is empty, and
+    # names the address it looked at instead of reading as "no data here".
+    interior = instance._data_vars(None, at="0x2019")
+    assert interior["items"] == [] and interior["at"] == "0x2019"
+
+    window = instance._data_vars(None, start="data_2010", end="0x2100")
+    assert [row["address"] for row in window["items"]] == ["0x2010", "0x2018"]
+    assert [entry["kind"] for entry in window["resolved_symbols"]] == ["placeholder"]
+
+    for bad in ({}, {"at": "0x2018", "start": "0x2000", "end": "0x2100"},
+                {"start": "0x2000"}):
+        with pytest.raises(bridge.OperationFailure, match="either `at` or both"):
+            instance._data_vars(None, **bad)
+
+
+def test_data_symbols_query_filters_before_paging_1042(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(symbols=[
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000 + 8 * i, f"g_slot_{i}")
+        for i in range(150)
+    ] + [fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x3000, "Sock_Path")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    hit = instance._data_symbols(None, query="sock")
+    assert hit["items"] == [{"a": "0x3000", "n": "Sock_Path"}]
+    assert hit["total"] == 1 and hit["query"] == "sock"
+
+    # The filter runs over the WHOLE population, not the first page of it.
+    late = instance._data_symbols(None, query="g_slot_14", limit=5)
+    assert [row["n"] for row in late["items"]] == [
+        "g_slot_14", "g_slot_140", "g_slot_141", "g_slot_142", "g_slot_143"]
+    assert late["total"] == 11 and late["has_more"] is True
+
+
+def test_an_import_name_reads_its_got_slot_not_the_extern_placeholder_1048(monkeypatch):
+    """#1048 review: `read puts 8` refused as ambiguous between the GOT slot
+    (ImportAddressSymbol) and BN's `.extern` placeholder (ExternalSymbol)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _named_data_bv(
+        fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x2014, "puts"),
+        fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x2080, "puts"),
+    )
+    assert instance.ctx._resolve_address_operand(bv, "puts") == (
+        0x2014, {"name": "puts", "kind": "data", "address": "0x2014"})
+    # With no slot at all, the placeholder is still a reachable answer.
+    only_extern = _named_data_bv(
+        fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x2080, "puts"))
+    assert instance.ctx._resolve_address_operand(only_extern, "puts")[0] == 0x2080

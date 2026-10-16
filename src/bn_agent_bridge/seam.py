@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import difflib
 import re
+import shlex
 import threading
 import weakref
 from typing import Any
@@ -32,6 +33,7 @@ from ._shared import (
     _format_ambiguous_function_error,
     _format_ambiguous_symbol_error,
     _parse_address,
+    _placeholder_address,
     _symbol_type_name,
 )
 
@@ -55,6 +57,25 @@ _TYPE_CLASS_NAMES: dict[int, str] = {
 # ref), not the real body. When a name collision is only such stubs shadowing
 # one real implementation, resolution auto-picks the implementation (#122).
 _STUB_SYMBOL_TYPE_NAMES = frozenset({"ImportedFunctionSymbol", "ExternalSymbol"})
+
+
+def _symbol_kind(symbol: Any) -> str:
+    """A symbol's type as its enum-member name (``DataSymbol``,
+    ``FunctionSymbol``, ...), or ``""`` when it has none to read."""
+    kind = getattr(symbol, "type", None)
+    return str(getattr(kind, "name", None) or kind or "")
+
+
+def _address_is_mapped(bv, address: int) -> bool:
+    """Whether BN maps *address* in this view. A view with no probe, or a
+    probe that raises, cannot say no, so it does not refuse."""
+    probe = getattr(bv, "is_valid_offset", None)
+    if not callable(probe):
+        return True
+    try:
+        return bool(probe(address))
+    except Exception:  # noqa: BLE001 - an indeterminate probe is not a refusal
+        return True
 
 
 # Nested anonymous aggregates are expanded in the text layout and in the JSON
@@ -463,7 +484,7 @@ class BridgeContext:
                 f"{identifier} is a {kind} at "
                 f"{hex(int(getattr(symbol, 'address', 0)))}, not a function, so "
                 f"`function info` has nothing to report for it. Read it with "
-                f"`bn data vars --start {hex(int(getattr(symbol, 'address', 0)))}` "
+                f"`bn data vars --at {hex(int(getattr(symbol, 'address', 0)))}` "
                 f"or find it in `bn data symbols`."
             )
 
@@ -955,6 +976,73 @@ class BridgeContext:
             matches.append(symbol)
         return matches
 
+    def _resolve_address_operand(self, bv, value: Any) -> tuple[int, dict[str, Any] | None]:
+        """``(address, resolved_symbol)`` for an operand that takes an address
+        (#1042 item 2): `read`, `data vars`, `data retype`, xrefs' data fallback.
+
+        A number is an address and resolves to itself (`resolved_symbol` is
+        None). A NAME resolves through the symbol table, data symbols first --
+        these surfaces read data, and an import is a data slot and a stub under
+        one spelling -- then function symbols. Several addresses under the one
+        winning kind are refused by name rather than picked. Only when NO symbol
+        carries the name (in any case) does a rendered `data_<hex>`/`sub_<hex>`
+        placeholder resolve to the address it spells, and only if that address
+        holds what the prefix claims -- mapped bytes for `data_`, a function
+        start for `sub_`: a user may have named something `data_420010`, and
+        then that symbol is what the name means.
+
+        `resolved_symbol` is `{name, kind, address}` with `kind` one of `data`,
+        `function` or `placeholder`, so every surface can say how a name became
+        an address (`note: resolved … @ 0x…`). A miss raises with the
+        `Symbol not found: <name>` prefix the batch's resolver-miss check reads.
+        """
+        try:
+            return _parse_address(value), None
+        except ValueError:
+            # A 0x-prefixed token is an address attempt (names never start with
+            # 0x): report the malformed address, not a symbol miss.
+            if str(value).strip().lower().startswith("0x"):
+                raise
+        text = str(value).strip()
+        symbols = self._find_symbols_by_name(bv, text, case_sensitive=True) if text else []
+        # #1042 review: an import is several symbols under one name -- the GOT
+        # slot (`ImportAddressSymbol`), the PLT stub (a function symbol) and
+        # BN's `.extern` placeholder (`ExternalSymbol`). Only the slot is
+        # addressable data; the placeholder ranks last, so `read puts 8` reads
+        # the slot instead of refusing two "data" addresses.
+        external = [s for s in symbols if _symbol_kind(s) == "ExternalSymbol"]
+        data = [s for s in symbols if "Function" not in _symbol_kind(s) and s not in external]
+        functions = [s for s in symbols if "Function" in _symbol_kind(s)]
+        for kind, group in (("data", data), ("function", functions), ("data", external)):
+            addresses = {int(s.address) for s in group}
+            if len(addresses) > 1:
+                raise RuntimeError(_format_ambiguous_symbol_error(text, group))
+            if addresses:
+                address = addresses.pop()
+                return address, {"name": text, "kind": kind, "address": hex(address)}
+        spelled = _placeholder_address(text)
+        # The same "no symbol has that name" test the rename resolver applies:
+        # in ANY case, since a name lookup elsewhere folds case.
+        if spelled is not None and not self._find_symbols_by_name(bv, text, case_sensitive=False):
+            prefix, address = spelled
+            if prefix == "sub":
+                holds = bv.get_function_at(address) is not None
+                missing = "no function starts at"
+            else:
+                holds = _address_is_mapped(bv, address)
+                missing = "nothing is mapped at"
+            if holds:
+                return address, {"name": text, "kind": "placeholder", "address": hex(address)}
+            raise RuntimeError(
+                f"Symbol not found: {text}. No symbol has that name, and {missing} "
+                f"the address it spells ({hex(address)})."
+            )
+        raise RuntimeError(
+            f"Symbol not found: {text}. Pass an address (0x-prefixed hex or decimal) "
+            f"or a symbol name; `bn data symbols --query {shlex.quote(text)}` lists "
+            f"data symbol names containing it."
+        )
+
     def _resolve_rename_target(self, bv, identifier: Any, kind: str) -> dict[str, Any]:
         requested = {
             "kind": kind,
@@ -1031,6 +1119,9 @@ class BridgeContext:
                 )
 
         if kind == "function":
+            placeholder = self._placeholder_rename_target(bv, identifier, kind, requested)
+            if placeholder is not None:
+                return placeholder
             raise OperationFailure("unsupported", f"Function not found: {identifier}", requested=requested)
 
         exact_symbols = [
@@ -1071,7 +1162,60 @@ class BridgeContext:
                 requested=requested,
             )
 
+        placeholder = self._placeholder_rename_target(bv, identifier, kind, requested)
+        if placeholder is not None:
+            return placeholder
         raise OperationFailure("unsupported", f"Symbol not found: {identifier}", requested=requested)
+
+    def _placeholder_rename_target(self, bv, identifier: Any, kind: str,
+                                   requested: dict[str, Any]) -> dict[str, Any] | None:
+        """The rename target a rendered `sub_<hex>`/`data_<hex>` name spells, once
+        every name lookup has missed (#1042 item 1).
+
+        A stripped binary's decompile prints `data_420010` for a global with no
+        symbol, and an agent copies it into a rename; the name resolver found
+        nothing and the whole batch rolled back. The placeholder is a spelling of
+        an address, so it resolves the way that address would -- but only for the
+        matching kind (`sub_` names a function, `data_` a data variable), only
+        when no symbol carries the name in any case, and only when the address
+        holds what the prefix claims: a function START for `sub_`, a mapped
+        address for `data_`. Otherwise None, and the caller's miss stands; a
+        placeholder whose address fails that check says why in the miss, still
+        under the resolver's own prefix.
+        """
+        spelled = _placeholder_address(identifier)
+        if spelled is None:
+            return None
+        prefix, address = spelled
+        wanted = "function" if prefix == "sub" else "data"
+        if kind not in {"auto", wanted}:
+            return None
+        if self._find_symbols_by_name(bv, str(identifier), case_sensitive=False):
+            return None
+        resolved = {"name": str(identifier), "kind": "placeholder", "address": hex(address)}
+        if wanted == "function":
+            fn = bv.get_function_at(address)
+            if fn is None:
+                raise OperationFailure(
+                    "unsupported",
+                    f"{'Function' if kind == 'function' else 'Symbol'} not found: "
+                    f"{identifier}. No symbol has that name, and no function starts "
+                    f"at the address it spells ({hex(address)}).",
+                    requested=requested,
+                )
+            return {"kind": "function", "address": int(fn.start),
+                    "before_name": str(fn.name), "resolved_symbol": resolved}
+        if not _address_is_mapped(bv, address):
+            raise OperationFailure(
+                "unsupported",
+                f"Symbol not found: {identifier}. No symbol has that name, and the "
+                f"address it spells ({hex(address)}) is not mapped in this view.",
+                requested=requested,
+            )
+        symbol = bv.get_symbol_at(address)
+        return {"kind": "data", "address": int(address),
+                "before_name": str(symbol.name) if symbol is not None else None,
+                "resolved_symbol": resolved}
 
     def _functions_containing(self, bv, address: int):
         try:

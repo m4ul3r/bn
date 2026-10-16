@@ -1956,6 +1956,107 @@ def test_session_status_unknown_job_fails_loudly(monkeypatch, capsys):
     assert "Unknown load job: nope" in capsys.readouterr().err
 
 
+def _job_status(state: str, *, succeeded=None) -> dict:
+    terminal = state in ("complete", "failed")
+    job = {"job_id": "job123", "state": state, "path": "/tmp/s.bndb",
+           "error": "RuntimeError: Unable to open" if state == "failed" else None}
+    return {"ok": True, "result": {
+        "kind": "load_job", "job_id": "job123", "state": state, "terminal": terminal,
+        "succeeded": succeeded if terminal else None, "job": job, "items": [job],
+        "count": 1, "status_command": "bn -i worker session status job123"}}
+
+
+@pytest.mark.parametrize("final,succeeded,rc_expected", [
+    ("complete", True, 0), ("failed", False, 1)])
+def test_session_status_wait_blocks_until_the_job_is_terminal_1036(
+        monkeypatch, capsys, final, succeeded, rc_expected):
+    """#1036 item 6: every agent wrote its own poll loop, and one grepped for a
+    spelling that never matched and ran 8.5 minutes for a job done in two.
+    `--wait` polls on the bridge's own `terminal` verdict and exits 0 when the
+    job loaded, 1 when it failed."""
+    import bn.commands.admin as admin
+
+    replies = [_job_status("queued"), _job_status("running"),
+               _job_status(final, succeeded=succeeded)]
+    calls = []
+
+    def fake_send_request(op, **kwargs):
+        calls.append(op)
+        return replies[min(len(calls), len(replies)) - 1]
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(admin, "_STATUS_WAIT_INTERVAL", 0.0)
+
+    rc = bn.cli.main(["session", "status", "job123", "-i", "worker", "--wait",
+                      "--format", "json"])
+
+    assert rc == rc_expected
+    assert calls == ["load_status"] * 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["state"] == final and payload["waited"]["timed_out"] is False
+
+
+def test_session_status_wait_gives_up_at_its_timeout_1036(monkeypatch, capsys):
+    import bn.commands.admin as admin
+
+    monkeypatch.setattr(bn.cli, "send_request", lambda op, **kw: _job_status("running"))
+    monkeypatch.setattr(admin, "_STATUS_WAIT_INTERVAL", 0.01)
+
+    rc = bn.cli.main(["session", "status", "job123", "-i", "worker", "--wait",
+                      "--timeout", "0.05"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "job123  running  /tmp/s.bndb" in out
+    assert "wait: timed out after" in out
+
+
+@pytest.mark.parametrize("argv,message", [
+    (["session", "status", "-i", "worker", "--wait"], "--wait needs a job id"),
+    (["session", "status", "job123", "-i", "worker", "--timeout", "5"],
+     "--timeout applies only with --wait"),
+])
+def test_session_status_wait_refuses_what_it_cannot_wait_for(monkeypatch, capsys, argv, message):
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda op, **kw: pytest.fail("no request expected"))
+    assert bn.cli.main(argv) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_foreground_session_start_reports_a_long_load_on_stderr_1036(monkeypatch, capsys):
+    """#1036 item 6: a foreground start of a large binary printed nothing for
+    four minutes. A stderr line every interval says it is still working;
+    stdout stays the command's result."""
+    import threading
+
+    import bn.commands.admin as admin
+
+    release = threading.Event()
+    instance = types.SimpleNamespace(
+        instance_id="w1", pid=1, socket_path="/tmp/w1.sock", meta={})
+
+    def fake_send_request(op, **kwargs):
+        if op == "load_binary":
+            release.wait(0.3)
+            return {"ok": True, "result": {
+                "loaded": True, "path": kwargs["params"]["path"],
+                "targets": [{"selector": "big", "target_id": "1:1:1"}],
+                "target": {"selector": "big", "target_id": "1:1:1"}, "notes": []}}
+        return {"ok": True, "result": {"associated": [], "skipped": []}}
+
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id: instance)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(admin, "_START_PROGRESS_INTERVAL", 0.05)
+    monkeypatch.setattr(admin, "_instance_source_dir", lambda inst: None)
+
+    rc = bn.cli.main(["session", "start", "/tmp/big", "--instance-id", "w1"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "bn: still loading /tmp/big (" in captured.err
+    assert "still loading" not in captured.out
+    assert "target: big   (pass -t big; id 1:1:1)" in captured.out
+
 
 
 @pytest.mark.parametrize("flag", ["--instance", "--instance-id"])
@@ -5895,3 +5996,213 @@ def test_skill_install_through_symlink_parent_is_repeatable(
     assert repeated["installed"] is False
     assert repeated["installed_destinations"] == []
     assert _install_disk_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("mode", ["symlink", "copy"])
+def test_skill_install_through_a_canceled_missing_component_judges_the_entry(
+    tmp_path, monkeypatch, capsys, mode
+):
+    """`store/missing/..` is `store`: the state check, the plan and the published
+    `destination_id` all name the installed entry `store/sample`, never the
+    source a symlink entry points at (#1035 item 4). The #1028 counterpart --
+    an existing ancestor link before `..` -- is the test above."""
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    store = tmp_path / "store"
+    store.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert bn.cli.main(["skill", "install", "--dest", "store", "--mode", mode]) == 0
+    capsys.readouterr()
+    entry = store / source.name
+    before = _install_disk_snapshot(tmp_path)
+
+    argv = ["skill", "install", "--dest", "store/missing/..", "--mode", mode,
+            "--format", "json"]
+    assert bn.cli.main(argv) == 0
+    repeated = json.loads(capsys.readouterr().out)
+    assert repeated["installed"] is False
+    assert repeated["not_updated_destinations"] == []
+    assert [row["destination_id"] for row in repeated["force_plan"]] == [str(entry)]
+    assert _install_disk_snapshot(tmp_path) == before
+
+    # The other mode is refused, and the refusal names the entry it would
+    # replace -- not "the install source itself" after following the link.
+    other = "copy" if mode == "symlink" else "symlink"
+    argv[argv.index(mode)] = other
+    assert bn.cli.main(argv) == 2
+    refused = json.loads(capsys.readouterr().out)
+    assert [row["destination_id"] for row in refused["force_plan"]] == [str(entry)]
+    assert refused["force_plan"][0]["allowed"] is True
+    assert refused["not_updated_destinations"][0]["state"] == "other_mode"
+    assert _install_disk_snapshot(tmp_path) == before
+
+
+_RERUN_LEAD = ("To replace them, rerun with the same bn invocation you just used, "
+               "adding --force: ")
+
+
+def _printed_rerun(err):
+    """The `bn …` template from a refusal's text, split into words."""
+    import shlex
+
+    [template] = [line[len(_RERUN_LEAD):] for line in err.splitlines()
+                  if line.startswith(_RERUN_LEAD)]
+    words = shlex.split(template)
+    assert words[0] == "bn"
+    return words
+
+
+def test_skill_install_refusal_prints_a_rerun_that_works_as_printed(
+    tmp_path, monkeypatch, capsys
+):
+    """#1035 install comments: the unforced refusal prints the refused
+    arguments plus `--force` with the instruction to reuse the caller's own
+    invocation, and the forced run that follows does not end on a dry-run line.
+    Following it here means this process's own entry, `bn.cli.main`."""
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    store = tmp_path / "my store"
+    store.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert bn.cli.main(["skill", "install", "--dest", "my store"]) == 0
+    capsys.readouterr()
+
+    assert bn.cli.main(["skill", "install", "--dest", "my store", "--mode", "copy"]) == 2
+    words = _printed_rerun(capsys.readouterr().err)
+    assert words[1:] == ["skill", "install", "--dest", "my store", "--mode", "copy",
+                         "--force"]
+    assert bn.cli.main(words[1:]) == 0
+    out = capsys.readouterr().out
+    entry = store / source.name
+    assert not entry.is_symlink()
+    assert (entry / "SKILL.md").read_bytes() == (source / "SKILL.md").read_bytes()
+    assert out.startswith("Installed skills (copy):\n")
+    assert "preflight" not in out
+    assert "--force" not in out
+
+    # A forced run does not advertise itself again, and a ready plan with
+    # nothing left behind needs no rerun.
+    assert bn.cli.main(["skill", "install", "--dest", "my store", "--mode", "copy",
+                        "--format", "json"]) == 0
+    current = json.loads(capsys.readouterr().out)
+    assert current["force_args"] is None
+    assert current["forced"] is False
+
+
+def test_skill_install_rerun_keeps_a_dash_leading_dest_an_option_value(
+    tmp_path, monkeypatch, capsys
+):
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "-store").mkdir()
+    assert bn.cli.main(["skill", "install", "--dest=-store", "--mode", "copy"]) == 0
+    capsys.readouterr()
+    assert bn.cli.main(["skill", "install", "--dest=-store", "--format", "json"]) == 2
+    force_args = json.loads(capsys.readouterr().out)["force_args"]
+    assert force_args == [
+        "skill", "install", "--dest=-store", "--format", "json", "--force",
+    ]
+    assert bn.cli.main(force_args) == 0
+    assert (tmp_path / "-store" / source.name).is_symlink()
+
+
+@pytest.mark.parametrize("launch", ["absolute_console_script", "module", "path_bn"])
+def test_skill_install_rerun_never_claims_which_bn_to_run(
+    tmp_path, monkeypatch, capsys, launch
+):
+    """#1043 review 3 (split rule): which executable ran -- and so which
+    checkout a rerun installs -- cannot be proven, so no launch gets a command
+    naming an entry point. Every launch gets the same `bn …` template under the
+    same-invocation instruction, and JSON has `force_args`, no `force_command`."""
+    import sys
+
+    _one_skill_source(tmp_path, monkeypatch)
+    launcher = tmp_path / "venv" / "bin" / "bn"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(f"#!{sys.executable}\n")
+    launcher.chmod(0o755)
+    argv0 = {"absolute_console_script": launcher, "module": tmp_path / "__main__.py",
+             "path_bn": launcher}[launch]
+    monkeypatch.setattr("sys.argv", [str(argv0)])
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setenv("PATH", str(launcher.parent if launch == "path_bn" else tmp_path))
+    store = tmp_path / "store"
+    store.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert bn.cli.main(["skill", "install", "--dest", "store"]) == 0
+    capsys.readouterr()
+
+    assert bn.cli.main(["skill", "install", "--dest", "store", "--mode", "copy"]) == 2
+    err = capsys.readouterr().err
+    assert _printed_rerun(err)[1:] == [
+        "skill", "install", "--dest", "store", "--mode", "copy", "--force",
+    ]
+    assert str(launcher) not in err and "-m bn" not in err
+    assert bn.cli.main(["skill", "install", "--dest", "store", "--mode", "copy",
+                        "--format", "json"]) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert "force_command" not in result
+    assert result["force_args"][-1] == "--force"
+
+
+def test_skill_install_rerun_keeps_the_requested_out_receipt(
+    tmp_path, monkeypatch, capsys
+):
+    """#1043 review finding 4: the original request plus `--force` includes its
+    `--out`, so the forced run writes the receipt the caller asked for."""
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    store = tmp_path / "my store"
+    store.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert bn.cli.main(["skill", "install", "--dest", "my store"]) == 0
+    capsys.readouterr()
+
+    receipt = tmp_path / "receipt dir" / "install.json"
+    receipt.parent.mkdir()
+    assert bn.cli.main(["skill", "install", "--dest", "my store", "--mode", "copy",
+                        "--out", "receipt dir/install.json"]) == 2
+    words = _printed_rerun(capsys.readouterr().err)
+    assert not receipt.exists()
+    assert words[words.index("--out") + 1] == str(receipt)
+    assert bn.cli.main(words[1:]) == 0
+    assert json.loads(receipt.read_text())["installed"] is True
+    assert not (store / source.name).is_symlink()
+
+
+def test_skill_install_and_doctor_report_the_bn_kernel_skill_dir(
+    tmp_path, monkeypatch, capsys
+):
+    """#1039 item 2: the bootstrap's `skill_dir` is printed where an agent can
+    find it after a kernel reset, and only for an entry holding this build."""
+    source_root = tmp_path / "bundled-skills"
+    kernel = source_root / "bn-kernel"
+    kernel.mkdir(parents=True)
+    (kernel / "SKILL.md").write_text("---\nname: bn-kernel\n---\n")
+    (kernel / "bootstrap.py").write_text("# bootstrap\n")
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: source_root)
+    claude_root = tmp_path / "claude" / "skills"
+    claude_root.mkdir(parents=True)
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_home / "skills")
+    monkeypatch.setattr(bn.cli, "omp_config_root", lambda: tmp_path / "no-omp")
+    monkeypatch.setattr(bn.cli, "omp_agent_dir", lambda: tmp_path / "no-omp-agent")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    # A stale link into an older checkout is not this build's bootstrap.
+    old = tmp_path / "old-checkout" / "bn-kernel"
+    old.mkdir(parents=True)
+    (codex_home / "skills").mkdir()
+    (codex_home / "skills" / "bn-kernel").symlink_to(old)
+
+    expected = [f"bn-kernel skill_dir: {claude_root / 'bn-kernel'}"]
+    assert bn.cli.main(["skill", "install"]) == 1
+    lines = capsys.readouterr().out.splitlines()
+    assert [line for line in lines if line.startswith("bn-kernel skill_dir:")] == expected
+
+    assert bn.cli.main(["doctor", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["bn_kernel_skill_dirs"] == [
+        str(claude_root / "bn-kernel")
+    ]
+    assert bn.cli.main(["doctor"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert [line for line in lines if line.startswith("bn-kernel skill_dir:")] == expected

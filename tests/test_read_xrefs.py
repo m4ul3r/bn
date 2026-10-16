@@ -61,6 +61,50 @@ def test_xrefs_unmapped_but_referenced_address_returns_refs(monkeypatch):
     assert result["total"] == 1
 
 
+def test_zero_references_on_a_binary_with_exception_tables_carry_the_landing_pad_note_1037(
+        monkeypatch):
+    """#1037 item 11: ~50 catch-block log strings read `0 code, 0 data` and an
+    agent nearly called them dead: they are used only from landing pads that
+    `.gcc_except_table` alone reaches, which BN made no function for. With
+    that table present, a 0-reference answer states the limit -- on `xrefs`
+    and on `strings --with-xrefs` -- and claims nothing without it or when a
+    reference exists."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    user = _FakeFunction(0x401000, "log_ok")
+
+    def view(*, except_table):
+        sections = {".rodata": _FakeSection(".rodata", 0x402000, 0x403000)}
+        if except_table:
+            sections[".gcc_except_table"] = _FakeSection(".gcc_except_table", 0x403000, 0x403100)
+        return _FakeBV(
+            functions=[user], sections=sections,
+            strings=[_FakeStringRef(0x402000, 12, "catch failed"),
+                     _FakeStringRef(0x402010, 6, "loaded")],
+            code_refs={0x402010: [_FakeCodeRef(0x401004, user)]},
+            memory={0x402000: b"catch failed\x00", 0x402010: b"loaded\x00"})
+
+    bv = view(except_table=True)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    unused = instance._xrefs(None, "0x402000")
+    assert "landing pad" in unused["unreferenced_note"]
+    assert "unreferenced_note" not in instance._xrefs(None, "0x402010")
+    listed = instance._strings(None, query=None, offset=0, limit=10, with_xrefs=True)
+    assert "landing pad" in listed["unreferenced_note"]
+    # A fact about the binary, on every page -- even one whose rows all have
+    # references -- so a collected listing keeps it; no per-page tally rides
+    # along to be copied off page one (#1037 review finding 6).
+    second = instance._strings(None, query="loaded", offset=0, limit=10, with_xrefs=True)
+    assert "landing pad" in second["unreferenced_note"]
+    assert "unreferenced_strings" not in listed
+
+    plain = view(except_table=False)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: plain)
+    assert "unreferenced_note" not in instance._xrefs(None, "0x402000")
+    assert "unreferenced_note" not in instance._strings(None, query=None, offset=0, limit=10,
+                                                       with_xrefs=True)
+
+
 def test_xrefs_raw_address_reads_the_ref_lists_once_815(monkeypatch):
     """#815: the raw-address path probed both ref lists for emptiness and then the
     builder re-read them for the response, so a high-fan-in symbol's ref set was
@@ -2246,3 +2290,45 @@ def test_field_xrefs_rejects_invalid_paging_532(monkeypatch):
         instance._field_xrefs("active", "Hot.f", offset=-1)
     with pytest.raises(bridge.OperationFailure):
         instance._field_xrefs("active", "Hot.f", limit=0)
+
+
+def test_collected_strings_and_imports_count_every_collected_row_1037(monkeypatch):
+    """#1037 review finding 6: `all()`/`Client.collect` copied page one's
+    `unreferenced_strings` / `callers_unrecorded` onto the whole collection
+    (5 against 32 collected zero-reference rows). No per-page tally is
+    published now; the text counts the rows it is given, so a collected
+    listing states the collected count."""
+    import bn.client as client_module
+    from bn.client import Client
+    from bn.formatters import _render_name_address_list_text, _render_strings_text
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    user = _FakeFunction(0x401000, "user")
+    syms = []
+    for i in range(5):
+        sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000 + i * 0x10,
+                             f"imp_{i}")
+        sym.short_name, sym.namespace = f"imp_{i}", ""
+        syms.append(sym)
+    bv = _FakeBV(
+        functions=[user], symbols=syms,
+        sections={".rodata": _FakeSection(".rodata", 0x402000, 0x403000),
+                  ".gcc_except_table": _FakeSection(".gcc_except_table", 0x403000, 0x403100)},
+        strings=[_FakeStringRef(0x402000 + i * 0x10, 6, f"str_{i}") for i in range(5)],
+        code_refs={0x402000: [_FakeCodeRef(0x401004, user)],
+                   0x1000: [_FakeCodeRef(0x401008, user)]})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def reply(op, *, params, **kwargs):
+        result = instance._dispatch_on_main(op, dict(params), "active")
+        return {"ok": True, "result": result}
+
+    monkeypatch.setattr(client_module, "send_request", reply)
+    strings = Client(timeout=5).collect("strings", {"with_xrefs": True}, page_size=2)
+    assert len(strings["items"]) == 5
+    assert "// 4 listed string(s) show no references" in _render_strings_text(strings)
+    imports = Client(timeout=5).collect("imports", {"with_callers": True}, page_size=2)
+    assert len(imports["items"]) == 5
+    assert "// 4 import(s) show no recorded code refs" in _render_name_address_list_text(imports)
