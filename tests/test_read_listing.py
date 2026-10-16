@@ -2403,13 +2403,17 @@ def test_callsite_rows_carry_the_arity_finding_decompile_marks_1038(monkeypatch)
     # #1038 item 6: a row built from `std::filebuf::open(&f)` alone said the
     # open takes no path; the row now carries what decompile marks there.
     import importlib
+    import sys
 
     read_listing = importlib.import_module("bn_agent_bridge.read_listing")
-    read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+    call_arity = importlib.import_module("bn_agent_bridge.call_arity")
     finding = {"address": 0x401040, "target": 0x400e00, "label": "open @ 0x400e00",
                "rendered": 1, "expected": 3, "shape": "shortfall", "evidence": (),
                "missing": [("x1", "0x402000 (g_path)"), ("x2", None)]}
-    monkeypatch.setattr(read_decompile, "_call_arity_findings", lambda bv, func: [finding])
+    monkeypatch.setattr(call_arity, "_call_arity_findings", lambda bv, func: [finding])
+    # #1045 review: callsites must not depend on read_decompile (which imports
+    # read_listing): with it unimportable, the rows still get their finding.
+    monkeypatch.setitem(sys.modules, "bn_agent_bridge.read_decompile", None)
     rows = [{"call_addr": "0x401040"}, {"call_addr": "0x401080"}]
     read_listing._attach_callsite_arity(None, None, rows)
     assert rows[0]["arity"] == {

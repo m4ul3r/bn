@@ -20,6 +20,7 @@ import pytest
 from _bridge_fakes import *  # noqa: F401,F403
 
 read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+call_arity = importlib.import_module("bn_agent_bridge.call_arity")
 read_evidence = importlib.import_module("bn_agent_bridge.read_evidence")
 
 
@@ -5821,7 +5822,7 @@ def _arity_case(monkeypatch, setup, *, rendered, raw_name, kind="ImportedFunctio
             parameters=[types.SimpleNamespace(name=p) for p in params],
             has_variable_arguments=variadic), [name])
 
-    monkeypatch.setattr(read_decompile, "bn", types.SimpleNamespace(demangle_gnu3=demangle))
+    monkeypatch.setattr(call_arity, "bn", types.SimpleNamespace(demangle_gnu3=demangle))
     return bv, func
 
 
@@ -6179,14 +6180,18 @@ def _string_view(memory: bytes, *, semantics="ReadOnlyDataSectionSemantics", str
     return bv, func
 
 
-def test_raw_string_pointer_note_names_an_undefined_short_literal_970():
-    # `__ostream_insert<char>(ostream&, char const*, long)`: a `char *` there.
+def test_a_prototype_char_pointer_alone_shows_bytes_not_a_string_1045():
+    # #970's `" -n"` to `__ostream_insert<char>(ostream&, char const*, long)`:
+    # a prototype `char *` -- here a local body's, which BN may have inferred
+    # over an `int[]` -- is not string evidence (#1045 review). The bytes and
+    # their decoding are still shown, with no `data retype` advice.
     bv, func = _string_view(b" -n\0\x01\x02", param_type="char const*")
     text = "    std::__ostream_insert<char>(x0, 0x402ae0);"
-    note = read_decompile._raw_string_pointer_note(bv, func, text)
-    assert note is not None
-    assert '0x402ae0 = " -n" (call at 0x4023dc)' in note["detail"]
-    assert "bn data retype 0x402ae0 'char[4]'" in note["detail"]
+    found = read_decompile._raw_string_pointer_findings(bv, func, text)
+    assert read_decompile._raw_string_pointer_note(bv, func, text, found) is None
+    note = read_decompile._text_bytes_note(found)
+    assert '0x402ae0: 20 2d 6e 00 (ASCII " -n") (call at 0x4023dc)' in note["detail"]
+    assert "data retype" not in note["detail"] and "`bn read 0x402ae0 4`" in note["detail"]
 
 
 @pytest.mark.parametrize("memory,param_type,decoded", [
@@ -6204,7 +6209,7 @@ def test_bytes_nothing_calls_a_string_are_shown_as_bytes_and_claim_nothing_1019(
     assert read_decompile._raw_string_pointer_note(bv, func, text, found) is None
     note = read_decompile._text_bytes_note(found)
     assert f"0x402ae0: {decoded} (call at 0x4023dc)" in note["summary"]
-    assert note["code"] == "text_bytes" and "retype" not in note["detail"]
+    assert note["code"] == "text_bytes" and "data retype" not in note["detail"]
     [row] = note["bytes"]
     assert row["hex"] == memory.split(b"\0")[0].hex() and row["inline"] is False
 
@@ -6221,10 +6226,11 @@ def test_an_address_the_analyst_typed_is_not_text_1019():
 
 
 @pytest.mark.parametrize("param_type", ["char const*", "const char*", "char*"])
-def test_raw_string_pointer_note_takes_a_short_run_passed_as_char_pointer_970(param_type):
+def test_a_one_character_run_to_a_local_char_pointer_is_not_reported_1045(param_type):
+    # Below `_UNTYPED_STRING_MIN` and with no C library import to say otherwise,
+    # `{'/', 0, 0, 0}` is as likely the int 0x2f: nothing is reported.
     bv, func = _string_view(b"/\0\0\0", param_type=param_type)
-    note = read_decompile._raw_string_pointer_note(bv, func, "    put(x0, 0x402ae0);")
-    assert note is not None and '0x402ae0 = "/"' in note["detail"]
+    assert read_decompile._raw_string_pointer_findings(bv, func, "    put(x0, 0x402ae0);") == {}
 
 
 @pytest.mark.parametrize("memory,kwargs,text", [
@@ -6372,7 +6378,7 @@ def _select_then_call_case(monkeypatch):
 
 def test_call_arity_sees_an_argument_a_select_computes_right_before_the_call_1000(monkeypatch):
     bv, func = _select_then_call_case(monkeypatch)
-    [row] = read_decompile._call_arity_findings(bv, func)
+    [row] = call_arity._call_arity_findings(bv, func)
     assert (row["rendered"], row["expected"]) == (2, 3)
     # Both arms are read: `w3` feeds the clamp arm, so it is no argument.
     assert row["evidence"][-1] == "the call site writes x0, x1, x2 just before it"
@@ -6401,7 +6407,7 @@ def test_registers_only_the_select_condition_reads_are_not_arguments_1000(monkey
     bv, func = _arity_case(monkeypatch, [], rendered=3, raw_name="ext")
     func.llil = types.SimpleNamespace(
         basic_blocks=[head, low, high, _Block(9, [call], [low, high])])
-    assert read_decompile._call_arity_findings(bv, func) == []
+    assert call_arity._call_arity_findings(bv, func) == []
 
 
 def test_call_arity_note_names_each_dropped_register_and_its_value_1000(monkeypatch):
@@ -6413,13 +6419,13 @@ def test_call_arity_note_names_each_dropped_register_and_its_value_1000(monkeypa
         rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
         signature=(["this", "", ""], False),
     )
-    [row] = read_decompile._call_arity_findings(bv, func)
+    [row] = call_arity._call_arity_findings(bv, func)
     assert read_decompile._arity_line_note(row) == \
         "/* bn: +2 args not rendered: x1 = [sp].q, x2 = 0x30 */"
     # An excess names the counts instead: there is no register to point at.
     bv, func = _arity_case(monkeypatch, [], rendered=3, raw_name="_ZN4demo6Widget5resetEv",
                            signature=(["this"], False))
-    [row] = read_decompile._call_arity_findings(bv, func)
+    [row] = call_arity._call_arity_findings(bv, func)
     assert read_decompile._arity_line_note(row) == "/* bn: renders 3 args, signature takes 1 */"
 
 
@@ -6434,7 +6440,7 @@ def test_call_arity_note_never_names_a_register_overwritten_before_the_call_1000
         rendered=1, raw_name="_ZN4demo6String6appendEPKcm",
         signature=(["this", "", ""], False),
     )
-    [row] = read_decompile._call_arity_findings(bv, func)
+    [row] = call_arity._call_arity_findings(bv, func)
     assert row["missing"] == [("x1", None), ("x2", None)]
     assert read_decompile._arity_line_note(row) == "/* bn: +2 args not rendered: x1, x2 */"
 
@@ -6459,11 +6465,11 @@ def test_window_values_follow_copies_and_name_parameters_1000():
         get_reg_value_at=reg_value,
         parameter_vars=[_param_var(n, r, 4) for n, r in (("arg3", "x2"), ("arg4", "x3"))])
     bv = types.SimpleNamespace(arch=arch)
-    values = read_decompile._window_values(bv, func, window, set())
+    values = call_arity._window_values(bv, func, window, set())
     assert (values["x2"], values["x3"]) == ("arg4", "arg3")
     # Without dataflow, a register the window itself overwrites is not a value.
     func.get_reg_value_at = lambda address, reg: None
-    values = read_decompile._window_values(bv, func, window, set())
+    values = call_arity._window_values(bv, func, window, set())
     assert (values["x2"], values["x3"]) == (None, None)
 
 
@@ -6487,12 +6493,12 @@ def test_window_values_keep_the_width_a_narrow_copy_reads_1000():
     window[0].address = 0x400850
     func = _entry_func({"x1": "x1"}, [_param_var("arg2", "x1", 8)])
     bv = types.SimpleNamespace(arch=arch)
-    values = read_decompile._window_values(bv, func, window, set())
+    values = call_arity._window_values(bv, func, window, set())
     assert values["x0"] == "(uint32_t)arg2"
     assert values["x2"] == "arg2"
     # A 32-bit parameter read through w1 is the whole value.
     func = _entry_func({"x1": "x1"}, [_param_var("arg2", "x1", 4)])
-    assert read_decompile._window_values(bv, func, window, set())["x0"] == "arg2"
+    assert call_arity._window_values(bv, func, window, set())["x0"] == "arg2"
 
 
 def test_window_values_treat_split_and_intrinsic_writes_as_clobbers_1000():
@@ -6513,7 +6519,7 @@ def test_window_values_treat_split_and_intrinsic_writes_as_clobbers_1000():
     window[0].address = 0x400900
     bv = types.SimpleNamespace(arch=arch)
     func = _entry_func({"x0": "x0"}, [_param_var("arg1", "x0", 8)])
-    values = read_decompile._window_values(bv, func, window, set())
+    values = call_arity._window_values(bv, func, window, set())
     # x5 has no name and is rewritten later: unknown, not `x5`.
     assert values["x1"] is None
     assert values["x2"] is None  # x0 holds the intrinsic's result, not arg1
@@ -6524,7 +6530,7 @@ def test_window_values_treat_split_and_intrinsic_writes_as_clobbers_1000():
 def test_call_arity_summary_says_which_calls_carry_the_inline_note_1000(monkeypatch):
     bv, func = _arity_case(monkeypatch, [], rendered=1, raw_name="_ZN4demo7Archive4openEPKci",
                            signature=(["this", "", ""], False), calls=2)
-    findings = read_decompile._call_arity_findings(bv, func)
+    findings = call_arity._call_arity_findings(bv, func)
     full = read_decompile._call_arity_warning(bv, func, findings, {0x401040, 0x401048})
     assert full["code"] == "arity"
     assert full["summary"] == ("2 call(s) render the wrong argument count, marked inline: "
@@ -6903,12 +6909,48 @@ def test_a_short_literal_needs_a_char_pointer_from_somewhere_994(kwargs):
     assert read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT) is None
 
 
-def test_the_platform_type_library_types_an_untyped_import_994():
+def test_a_type_library_char_pointer_alone_is_not_a_string_1045():
+    # Only bn's C library table names a string argument: BN's type libraries
+    # are not trusted for it (its aarch64 `setlocale` takes an `int64_t*`), so
+    # a name only a type library types as `char const*` gets neutral bytes.
     library = types.SimpleNamespace(parameters=[
         types.SimpleNamespace(type="int32_t"), types.SimpleNamespace(type="char const*")])
     bv, func = _libc_string_view(b"C\0", name="locale_hook", library=library)
-    note = read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT)
-    assert note is not None and '"C"' in note["summary"]
+    found = read_decompile._raw_string_pointer_findings(bv, func, _LIBC_TEXT)
+    assert read_decompile._raw_string_pointer_note(bv, func, _LIBC_TEXT, found) is None
+    assert read_decompile._text_bytes_note(found)["bytes"][0]["decoded"] == "C"
+
+
+@pytest.mark.parametrize("kwargs", [
+    # Reviewers' x86-64 case: BN inferred `hash_bytes(char*, int32_t)` over an
+    # auto `int32_t[4]` `{0x00434241, 1, 2, 3}` -- a local, inferred `char *`.
+    {"name": "hash_bytes", "kind": "FunctionSymbol", "params": ("char*", "char*")},
+    # The same local function renamed `strcmp`: no import is involved.
+    {"name": "strcmp", "kind": "FunctionSymbol", "params": ("char*", "char*")},
+    # A genuine typed `strcmp` import the analyst re-defined as a user symbol
+    # (`define_user_symbol`, import kind kept, `auto: false`).
+    {"name": "renamed_import", "params": ("char const*", "char const*"), "auto": False},
+    {"name": "strcmp", "params": ("char const*", "char const*"), "auto": False},
+    # A mangled import whose demangled signature takes a `char const*`.
+    {"name": "_ZN4demo4findEPKc", "params": ("void*", "char const*")},
+    # BN's matched-signature copy of libc code is local, not an import.
+    {"name": "strcmp", "kind": "LibraryFunctionSymbol"},
+], ids=["inferred-local", "local-named-strcmp", "renamed-import", "user-alias-strcmp",
+        "demangled", "library-function-symbol"])
+def test_only_a_real_unrenamed_libc_import_makes_a_string_1045(kwargs):
+    # #1045 review blocker: each of these was called a string and given
+    # `bn data retype <addr> 'char[4]'`, which replaced an `int[4]`.
+    bv, func = _libc_string_view(b"ABC\0", **kwargs)
+    bv.get_data_var_at = lambda a: types.SimpleNamespace(type="int32_t[4]", auto_discovered=True)
+    text = "    if (!f(arg2, 0x661bd8))"
+    found = read_decompile._raw_string_pointer_findings(bv, func, text)
+    assert read_decompile._raw_string_pointer_note(bv, func, text, found) is None
+    note = read_decompile._text_bytes_note(found)
+    assert '0x661bd8: 41 42 43 00 (ASCII "ABC")' in note["summary"]
+    assert "data retype" not in note["detail"]
+    # The control: the same bytes to the real, auto-named `strcmp` import.
+    bv, func = _libc_string_view(b"ABC\0", name="strcmp")
+    assert read_decompile._raw_string_pointer_note(bv, func, text) is not None
 
 
 def test_a_literal_bn_renders_as_a_data_placeholder_is_named_994():
@@ -6921,18 +6963,24 @@ def test_a_literal_bn_renders_as_a_data_placeholder_is_named_994():
     assert note is not None and note["strings"][0]["value"] == "C"
 
 
-def test_a_data_placeholder_is_not_named_without_a_char_pointer_994():
+@pytest.mark.parametrize("memory,decoded", [
+    (b"ABC\0", '41 42 43 00 (ASCII "ABC")'),
+    ("’\0".encode(), 'e2 80 99 00 (UTF-8 "’")'),
+    (b"a\0", '61 00 (ASCII "a")'),
+], ids=["ascii", "utf8", "one-char"])
+def test_a_data_placeholder_without_libc_evidence_keeps_its_bytes_1045(memory, decoded):
     # On a stripped binary `&data_4008f0` is as often an `int[]` or a struct:
     # `memcmp(p, &data_..., 0x10)` with `int k[4] = {0x00434241, ..}` once read
-    # as "ABC". A raw `0x...` is shown as its bytes, never as a string (#1019
-    # item 6).
-    bv, func = _libc_string_view(b"ABC\0", name="memcmp", params=("void const*", "void const*"))
-    assert read_decompile._raw_string_pointer_findings(
-        bv, func, "    return memcmp(arg1, &data_661bd8, 0x10);") == {}
-    found = read_decompile._raw_string_pointer_findings(
-        bv, func, "    return memcmp(arg1, 0x661bd8, 0x10);")
-    assert read_decompile._raw_string_pointer_note(bv, func, "", found) is None
-    assert read_decompile._text_bytes_note(found)["bytes"][0]["decoded"] == "ABC"
+    # as "ABC" (#1019 item 6). It is never a string there, but the #1045 review
+    # found its bytes dropped outright (also for a user alias of `strcmp`):
+    # an import's operand keeps the neutral preview at any length.
+    for kwargs in ({"name": "memcmp", "params": ("void const*", "void const*")},
+                   {"name": "my_cmp", "auto": False}):
+        bv, func = _libc_string_view(memory, **kwargs)
+        text = "    return f(arg1, &data_661bd8, 0x10);"
+        found = read_decompile._raw_string_pointer_findings(bv, func, text)
+        assert read_decompile._raw_string_pointer_note(bv, func, text, found) is None
+        assert decoded in read_decompile._text_bytes_note(found)["summary"]
 
 
 def test_offset_types_resolve_by_rendered_name_like_types_show_1000():
@@ -7088,7 +7136,7 @@ def test_a_no_parameter_prototype_marks_its_rendered_args_as_bns_guess_1038(monk
         monkeypatch,
         [_set_reg("w2", _const(0)), _set_reg("w1", _const(2)), _set_reg("w0", _const(1))],
         rendered=5)
-    [row] = read_decompile._call_arity_findings(bv, func)
+    [row] = call_arity._call_arity_findings(bv, func)
     assert row["shape"] == "no_parameters" and row["missing"] == []
     assert read_decompile._arity_line_note(row) == \
         "/* bn: prototype declares no params; the 5 args shown are BN's guess */"
@@ -7113,7 +7161,7 @@ def test_a_no_parameter_prototype_is_not_reported_when_the_args_are_not_a_guess_
         monkeypatch, kwargs):
     rendered = kwargs.pop("rendered", 3)
     bv, func = _no_parameter_case(monkeypatch, [], rendered=rendered, **kwargs)
-    assert read_decompile._call_arity_findings(bv, func) == []
+    assert call_arity._call_arity_findings(bv, func) == []
 
 
 def test_a_dropped_register_bn_knows_as_a_constant_pointer_is_named_1038(monkeypatch):
@@ -7137,7 +7185,7 @@ def test_a_dropped_register_bn_knows_as_a_constant_pointer_is_named_1038(monkeyp
     symbol_at = bv.get_symbol_at
     bv.get_symbol_at = lambda a: (types.SimpleNamespace(short_name=names[a]) if a in names
                                   else symbol_at(a))
-    [row] = read_decompile._call_arity_findings(bv, func)
+    [row] = call_arity._call_arity_findings(bv, func)
     # A constant that is not a pointer is never named, even when a symbol
     # happens to sit at that number.
     assert row["missing"] == [("x1", "0x4008e0 (on_packet)"), ("x2", "0x30")]

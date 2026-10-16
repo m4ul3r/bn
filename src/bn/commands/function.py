@@ -406,6 +406,8 @@ def _decompile_many(
         "decompile_batch",
         {"identifiers": identifiers, **shared},
         require_target=True,
+        # #1045 review: the warnings print concrete `bn` commands.
+        contextual_hints=True,
         text_renderer=_render_batch_text,
         result_exit_code=_batch_exit_code,
         stem="decompile-batch",
@@ -489,6 +491,7 @@ def _decompile(args: argparse.Namespace) -> int:
             "decompile",
             {"identifier": identifiers[0], **shared},
             require_target=True,
+            contextual_hints=True,
             text_renderer=_render_decompile_text,
             stem="decompile",
         )

@@ -3165,15 +3165,20 @@ class TestFunctionDeleteRepair966:
                             "TAIL"), 16)
         warning = shared_bn.run("decompile", "build_widget")
         assert warning.returncode == 0, f"{warning.stdout}\n{warning.stderr}"
+        # Printed with this call's routing (`-i`, and the target the call
+        # resolved), so it runs as printed (#1045 review).
+        printed = re.search(rf"`bn -i {shared_bn.instance_id} -t (\S+) function delete "
+                            rf"{hex(split)}`", warning.stdout)
+        assert printed is not None, warning.stdout
         repair_command = f"bn function delete {hex(split)}"
-        assert f"`{repair_command}`" in warning.stdout
         assert "no clean undo; --preview refuses" in warning.stdout
 
         preview = shared_bn.run("function", "delete", hex(split), "--preview", "--format", "json")
         assert preview.returncode == 3, f"{preview.stdout}\n{preview.stderr}"
         assert _py_line(shared_bn, f"print('ENTRY=' + str(bv.get_function_at({split}) is not None))", "ENTRY") == "True"
 
-        deleted = shared_bn.run(*repair_command.split()[1:], "--format", "json")
+        deleted = shared_bn.run("-t", printed.group(1), *repair_command.split()[1:],
+                                "--format", "json")
         assert deleted.returncode == 0, f"{deleted.stdout}\n{deleted.stderr}"
         result = json.loads(deleted.stdout)
         observed = result["results"][0]["observed"]
@@ -4947,8 +4952,10 @@ class TestStructLayoutAssistance903:
         untyped = shared_bn.json("decompile", "handle")
         hint = next((w for w in untyped["warnings"] if "struct layout candidate" in w), None)
         assert hint is not None, untyped
-        for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth", "bn proto set"):
+        # The printed command carries this call's routing (#1045 review).
+        for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth"):
             assert witness in hint
+        assert re.search(rf"`bn -i {shared_bn.instance_id} -t \S+ proto set ", hint), hint
         assert shared_bn.json("proto", "get", "handle") == before
         # Text prints the one-line summary; the full sentence is --explain's.
         text_result = shared_bn.run("decompile", "handle", "--explain")

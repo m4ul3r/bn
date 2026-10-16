@@ -16,12 +16,15 @@ Outbound calls resolve through:
     ``_hlil_statement_text``, ``_hlil_pre_branch_condition``,
     ``_instruction_length``, ``_llil_constant_value``, ``_decompile_text`` for
     the callsite decompile excerpt);
+  * ``call_arity`` -- the arity findings ``decompile`` also renders
+    (``_call_arity_findings``, ``_arity_text``) for callsite rows (#1038 item 6);
   * ``_shared`` -- module-free helpers (``_validate_count``, ``_parse_address``,
     ``OperationFailure``).
 
-Import direction is one-way: this module imports ``il_format`` and ``_shared``
-(plus stdlib + binaryninja). It NEVER imports ``bridge`` or ``seam`` -- those
-import THIS module one-way (design spec §3.2).
+Import direction is one-way: this module imports ``il_format``, ``call_arity``
+and ``_shared`` (plus stdlib + binaryninja). It NEVER imports ``bridge``,
+``seam`` or ``read_decompile`` -- those import THIS module one-way (design
+spec §3.2).
 """
 from __future__ import annotations
 
@@ -35,6 +38,7 @@ try:
 except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
     bn = None  # type: ignore[assignment]
 
+from . import call_arity
 from . import il_format
 from . import read_misc
 from . import read_xrefs
@@ -358,10 +362,9 @@ def _attach_callsite_arity(bv, func, rows: list[dict[str, Any]]) -> None:
     read alone `std::filebuf::open(&f)` said the open takes no path. The
     finding names the unrendered registers and the value each holds at the
     call when that is known, or says the rendered arguments are BN's guess
-    (`read_decompile._call_arity_findings`). A row with no finding gets no
-    key: nothing found is not "every argument is shown"."""
-    from . import read_decompile  # lazy: read_decompile imports this module
-    findings = {row["address"]: row for row in read_decompile._call_arity_findings(bv, func)}
+    (`call_arity._call_arity_findings`, shared with `decompile`). A row with
+    no finding gets no key: nothing found is not "every argument is shown"."""
+    findings = {row["address"]: row for row in call_arity._call_arity_findings(bv, func)}
     for row in rows:
         found = findings.get(int(row["call_addr"], 16))
         if found is None:
@@ -372,7 +375,7 @@ def _attach_callsite_arity(bv, func, rows: list[dict[str, Any]]) -> None:
             "rendered": found["rendered"],
             "expected": None if no_parameters else found["expected"],
             "missing": [{"register": reg, "value": value} for reg, value in found["missing"]],
-            "note": read_decompile._arity_text(found),
+            "note": call_arity._arity_text(found),
         }
 
 
