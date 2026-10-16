@@ -9922,6 +9922,7 @@ def test_failed_import_preview_counts_reverted_siblings_and_all_kept_types_1012(
     ("cmp::operator<(cmp const&)", "cmp::operator<(cmp const&)"),
     ("Widget::operator->()", "Widget::operator->()"),
     ("broken<int", "broken<int"),                  # unbalanced: untouched
+    ("call:recv → <memory store>", "call:recv → <memory store>"),  # a placeholder, not a template
 ])
 def test_compact_flow_line_elides_template_arguments_1041(name, elided):
     from bn.formatters import _elide_template_args

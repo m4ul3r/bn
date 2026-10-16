@@ -4757,7 +4757,9 @@ def _elide_template_args(text: str) -> str:
             i = op.end()
             continue
         ch = text[i]
-        if ch == "<":
+        before = text[:i].rstrip()
+        if ch == "<" and (depth or (before and before[-1] not in "(,[{=→"
+                                    and not before.endswith(("→", "->")))):
             if depth == 0:
                 out.append("<…")
             depth += 1
