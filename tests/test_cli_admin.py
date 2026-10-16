@@ -5935,14 +5935,18 @@ def test_skill_install_through_a_canceled_missing_component_judges_the_entry(
     assert _install_disk_snapshot(tmp_path) == before
 
 
-def _entry_point(directory, monkeypatch, *, on_path=True):
-    """Make this process look launched as `<directory>/bn`, optionally the `bn`
-    that PATH resolves to; return that path."""
+def _entry_point(directory, monkeypatch, *, on_path=True, interpreter=None):
+    """Make this process look launched as the console script `<directory>/bn`
+    (its `#!` naming this interpreter unless told otherwise), optionally the
+    `bn` that PATH resolves to; return that path."""
+    import sys
+
     directory.mkdir(parents=True, exist_ok=True)
     launcher = directory / "bn"
-    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.write_text(f"#!{interpreter or sys.executable}\nraise SystemExit(0)\n")
     launcher.chmod(0o755)
     monkeypatch.setattr("sys.argv", [str(launcher)])
+    monkeypatch.delenv("PYTHONPATH", raising=False)
     if on_path:
         monkeypatch.setenv("PATH", str(directory))
     return launcher
@@ -6007,33 +6011,71 @@ def test_skill_install_rerun_keeps_a_dash_leading_dest_an_option_value(
     assert (tmp_path / "-store" / source.name).is_symlink()
 
 
-def test_skill_install_rerun_names_the_entry_point_that_ran(tmp_path, monkeypatch):
-    """The executable decides which checkout's skills a rerun installs, so a
-    `bn` that PATH resolves elsewhere must not be what the rerun names
-    (#1043 review finding 3)."""
+def test_skill_install_rerun_names_only_a_proven_entry_point(tmp_path, monkeypatch):
+    """The executable decides which checkout's skills a rerun installs. A
+    command is claimed only for the console script that ran this interpreter
+    and package (#1043 review findings 3 and round-2 3); otherwise none."""
     import shlex
-    import sys
+    from pathlib import Path
 
     from bn.commands import admin
 
     args = bn.cli.build_parser().parse_args(["skill", "install", "--mode", "copy"])
+
+    def rerun():
+        return admin._forced_rerun(args, applies=True)
+
+    expected_arguments = "skill install --mode copy --force"
     other = _entry_point(tmp_path / "other-checkout", monkeypatch)
     this = _entry_point(tmp_path / "this-checkout", monkeypatch, on_path=False)
-    assert shlex.split(admin._forced_skill_install_command(args)) == [
-        str(this), "skill", "install", "--mode", "copy", "--force",
-    ]
     assert other != this
+    assert shlex.split(rerun()["force_command"]) == [str(this), *expected_arguments.split()]
 
     # The `bn` on PATH IS this entry point: the short spelling is the same file.
     monkeypatch.setenv("PATH", str(this.parent))
-    assert shlex.split(admin._forced_skill_install_command(args))[0] == "bn"
+    assert rerun()["force_command"] == f"bn {expected_arguments}"
 
-    # `python -m bn` has no `bn` executable of its own: rerun through the same
-    # interpreter and package.
+    # No proof, no command -- only the arguments to append to the caller's own
+    # invocation:
+    # - `python -m bn` has no `bn` executable of its own;
     monkeypatch.setattr("sys.argv", [str(tmp_path / "__main__.py")])
-    assert shlex.split(admin._forced_skill_install_command(args))[:3] == [
-        sys.executable, "-m", "bn",
-    ]
+    assert rerun() == {"force_command": None, "force_arguments": expected_arguments}
+    # - a console script of ANOTHER interpreter (another venv) imports another bn;
+    _entry_point(tmp_path / "other-venv", monkeypatch, interpreter=tmp_path / "py")
+    assert rerun()["force_command"] is None
+    # - a wrapper that supplied this package through PYTHONPATH for one launch.
+    _entry_point(tmp_path / "this-checkout", monkeypatch)
+    monkeypatch.setenv("PYTHONPATH", str(Path(bn.cli.__file__).resolve().parent.parent))
+    assert rerun()["force_command"] is None
+    assert rerun()["force_arguments"] == expected_arguments
+
+
+def test_skill_install_rerun_without_a_proven_entry_point_prints_arguments(
+    tmp_path, monkeypatch, capsys
+):
+    """`python -m bn`: the refusal prints the arguments with the instruction to
+    reuse the caller's own invocation, and following it exactly works."""
+    import shlex
+
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    monkeypatch.setattr("sys.argv", [str(tmp_path / "__main__.py")])
+    store = tmp_path / "my store"
+    store.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert bn.cli.main(["skill", "install", "--dest", "my store"]) == 0
+    capsys.readouterr()
+
+    assert bn.cli.main(["skill", "install", "--dest", "my store", "--mode", "copy"]) == 2
+    err = capsys.readouterr().err
+    lead = ("To replace them, rerun with the same bn invocation you just used, "
+            "adding --force: <your bn invocation> ")
+    [arguments] = [line[len(lead):] for line in err.splitlines() if line.startswith(lead)]
+    assert "Rerun with --force to replace them:" not in err
+    # "The same bn invocation" here is this process's own entry, bn.cli.main.
+    assert bn.cli.main(shlex.split(arguments)) == 0
+    entry = store / source.name
+    assert not entry.is_symlink()
+    assert (entry / "SKILL.md").read_bytes() == (source / "SKILL.md").read_bytes()
 
 
 def test_skill_install_rerun_keeps_the_requested_out_receipt(

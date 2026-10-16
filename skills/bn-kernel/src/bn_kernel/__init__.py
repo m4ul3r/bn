@@ -405,17 +405,20 @@ def _require_decompile_batch(
             text = _require_text("decompile", text_value, decompiled)
         except BnError as exc:
             raise malformed(f"row for {requested!r}: {exc}") from exc
-        if _is_decompile_placeholder(decompiled):
-            out.update(ok=False, error=_DECOMPILE_PLACEHOLDER_MESSAGE)
-            result.append(out)
-            continue
-        out["text"], truncated = _bounded_text(text, max_chars)
+        # Bound BEFORE deciding the row's verdict: a placeholder row carries a
+        # body too, and returning it whole broke the `max_chars` promise on
+        # exactly the rows nobody expects to be large (#1043 review 2).
+        bounded, truncated = _bounded_text(text, max_chars)
         if truncated is not None:
             out["truncated"] = truncated
             # The nested body is the same text; a row that kept it whole would
             # still flood a transcript when printed. The full body stays on
             # `last.payload`, which is not mutated here.
-            out["decompiled"] = {**decompiled, "text": out["text"]}
+            out["decompiled"] = {**decompiled, "text": bounded}
+        if _is_decompile_placeholder(decompiled):
+            out.update(ok=False, error=_DECOMPILE_PLACEHOLDER_MESSAGE)
+        else:
+            out["text"] = bounded
         result.append(out)
     return result
 
@@ -2203,9 +2206,11 @@ class Session:
         Returns one row per identifier, in order: the bridge's
         `{identifier, ok, decompiled | error}` plus, for a successful row,
         `text` (cut to `max_chars`, with `truncated` when cut). An identifier
-        that does not resolve, or whose body is an analysis placeholder, is an
-        `ok: False` row rather than an abort. Both backends make one request;
-        `last.payload` is the whole batch envelope.
+        that does not resolve, whose body is an analysis placeholder, or that
+        is empty or whitespace-only is an `ok: False` row rather than an
+        abort. A blank identifier names no function, so it is answered here and
+        never sent; every other identifier goes to the bridge in one request on
+        either backend, and `last.payload` is that request's batch envelope.
         """
         self.last = None
         _check_max_chars(max_chars)
@@ -2215,16 +2220,22 @@ class Session:
                 "use decompile() for a single function"
             )
         names = list(identifiers)
-        if not names or any(not isinstance(name, str) or not name for name in names):
-            raise ValueError("identifiers must be a non-empty sequence of non-empty strings")
+        if not names or any(not isinstance(name, str) for name in names):
+            raise ValueError("identifiers must be a non-empty sequence of strings")
+        sent = [name for name in names if name.strip()]
         shared = {
             "addresses": addresses,
             "force_analysis": force_analysis,
             "include_annotations": include_annotations,
         }
-        if self.backend == "native":
+        if not sent:
+            payload: Any = {
+                "kind": "decompile_batch", "requested": 0, "resolved": 0,
+                "functions": [],
+            }
+        elif self.backend == "native":
             payload = await self._native_request(
-                "decompile_batch", {"identifiers": names, **shared}, timeout=timeout
+                "decompile_batch", {"identifiers": sent, **shared}, timeout=timeout
             )
         else:
             # The CLI answers a LONE identifier with the single-function shape
@@ -2232,7 +2243,7 @@ class Session:
             # errors. Asking for it twice gets the batch envelope -- and the
             # failed-row semantics the native backend has -- at the cost of a
             # second render of that one function; the duplicate row is dropped.
-            wire = names * 2 if len(names) == 1 else names
+            wire = sent * 2 if len(sent) == 1 else sent
             payload = await self._run_resolved(
                 # `--`: an identifier like `-x` or `--help` stays an operand and
                 # becomes its own failed row, as on the native backend.
@@ -2241,7 +2252,7 @@ class Session:
                 accept_failed_body=_is_decompile_batch,
                 **shared,
             )
-            if len(names) == 1 and _is_decompile_batch(payload) and len(
+            if len(sent) == 1 and _is_decompile_batch(payload) and len(
                 payload["functions"]
             ) == 2:
                 first = payload["functions"][0]
@@ -2251,11 +2262,28 @@ class Session:
                     "resolved": int(isinstance(first, dict) and first.get("ok") is True),
                     "functions": [first],
                 }
-        rows = self._validated(_require_decompile_batch, names, payload, max_chars)
-        if self.last is not None:
-            self.last = Result(
-                rows, payload, self.last.notes, self.last.argv, self.last.backend
-            )
+        answered = iter(
+            self._validated(_require_decompile_batch, sent, payload, max_chars)
+        )
+        rows = [
+            next(answered) if name.strip() else {
+                "identifier": name,
+                "ok": False,
+                "error": "empty identifier: it names no function, so it was not sent",
+            }
+            for name in names
+        ]
+        blank = len(names) - len(sent)
+        notes = () if self.last is None else self.last.notes
+        if blank:
+            notes = (*notes, f"{blank} blank identifier(s) answered locally, not sent")
+        self.last = Result(
+            rows,
+            payload,
+            notes,
+            self.last.argv if self.last is not None else ("decompile_batch",),
+            self.last.backend if self.last is not None else self.backend,
+        )
         return rows
 
     async def disasm(

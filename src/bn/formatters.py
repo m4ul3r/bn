@@ -7413,9 +7413,17 @@ def _render_skill_install_text(value: Any) -> str:
     if force_note and not forced:
         lines.append(force_note)
     # #1035 install comment 2: the whole rerun, not a flag to splice in by hand.
+    # A concrete command only when the entry point that ran is proven; else the
+    # arguments, to append to the caller's own invocation (#1043 review 2).
     force_command = _text_value(value, "force_command")
+    force_arguments = _text_value(value, "force_arguments")
     if force_command:
         lines.append(f"Rerun with --force to replace them: {force_command}")
+    elif force_arguments:
+        lines.append(
+            "To replace them, rerun with the same bn invocation you just used, "
+            f"adding --force: <your bn invocation> {force_arguments}"
+        )
     # #1039 item 2: the bn-kernel bootstrap's `skill_dir` after a kernel reset.
     lines.extend(
         f"bn-kernel skill_dir: {d}" for d in _field_list(value, "bn_kernel_skill_dirs")

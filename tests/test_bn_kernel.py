@@ -4363,3 +4363,76 @@ def test_decompile_many_bounds_the_nested_body_too():
     assert row["decompiled"]["warnings"] == []
     assert len(repr(row)) < 400
     assert session.last.payload["functions"][0]["decompiled"]["text"] == body
+
+
+@pytest.mark.parametrize("backend", ["native", "cli"])
+def test_decompile_many_blank_identifiers_are_rows_not_an_abort(
+    monkeypatch, tmp_path, backend
+):
+    """#1043 review 2, finding 1: an empty or whitespace-only identifier is an
+    ordered failed row; the valid identifiers around it still return."""
+    sent = []
+    if backend == "native":
+        session = bn_kernel.Session(instance="worker", target="sample", backend="native")
+
+        class BatchClient:
+            def request(self, op, params=None):
+                sent.append(list(params["identifiers"]))
+                return {"kind": "decompile_batch", "functions": [
+                    _batch_row(n, f"void {n}() {{}}") for n in params["identifiers"]
+                ]}
+
+        session._client = BatchClient()
+    else:
+        monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, _ARGPARSE_DECOMPILE)))
+        session = bn_kernel.Session(instance="worker", target="sample", backend="cli")
+
+    rows = _run(session.decompile_many(["main", "", "main", "  "]))
+
+    assert [(row["identifier"], row["ok"]) for row in rows] == [
+        ("main", True), ("", False), ("main", True), ("  ", False),
+    ]
+    assert "empty identifier" in rows[1]["error"]
+    assert any("2 blank identifier(s)" in note for note in session.last.notes)
+    if backend == "native":
+        assert sent == [["main", "main"]]
+    else:
+        argv = list(session.last.argv)
+        assert argv[argv.index("--"):] == ["--", "main", "main"]
+
+    # Nothing left to send: no request, every row still answered in order.
+    sent.clear()
+    rows = _run(session.decompile_many([""]))
+    assert [(row["identifier"], row["ok"]) for row in rows] == [("", False)]
+    assert sent == []
+
+    for bad in ([], [None], ["main", 3]):
+        with pytest.raises(ValueError, match="sequence of strings"):
+            _run(session.decompile_many(bad))
+
+
+def test_decompile_many_bounds_placeholder_rows_too():
+    """#1043 review 2, finding 2: a skipped-analysis row stays a failed row but
+    its body is bounded and the cut disclosed; `last.payload` keeps it all."""
+    body = "y" * 120_000
+    envelope = {"kind": "decompile_batch", "functions": [
+        _batch_row("big", body, analysis_skipped=True),
+        _batch_row("small", "/* stub */", analysis_skipped=True),
+    ]}
+    session = bn_kernel.Session(instance="worker", target="sample", backend="native")
+
+    class BatchClient:
+        def request(self, op, params=None):
+            return envelope
+
+    session._client = BatchClient()
+    big, small = _run(session.decompile_many(["big", "small"], max_chars=40))
+
+    assert big["ok"] is False and "force_analysis=True" in big["error"]
+    assert big["decompiled"]["text"] == "y" * 40
+    assert big["truncated"] == {"returned_chars": 40, "total_chars": 120_000}
+    assert "text" not in big
+    assert len(repr(big)) < 500
+    assert small["ok"] is False and "truncated" not in small
+    assert small["decompiled"]["text"] == "/* stub */"
+    assert session.last.payload["functions"][0]["decompiled"]["text"] == body
