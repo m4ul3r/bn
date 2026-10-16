@@ -916,15 +916,35 @@ def _skill_install(args: argparse.Namespace) -> int:
     return 1 if not_updated_destinations else 0
 
 
+def _bn_invocation() -> list[str]:
+    """The words that run THIS bn, for a printed command.
+
+    The executable decides which checkout's skills get installed, so a rerun
+    must not name a different `bn` than the one that produced it (#1043
+    review). `bn` when PATH resolves to this very entry point; otherwise this
+    entry point's absolute path; and for `python -m bn` (or any launcher that
+    is not a `bn` executable) this interpreter with `-m bn`, which imports the
+    same package this process is running."""
+    launched = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    if launched is not None and launched.name == "bn" and os.access(launched, os.X_OK):
+        launched = launched.absolute()
+        on_path = shutil.which("bn")
+        if on_path is not None and Path(on_path).resolve() == launched.resolve():
+            return ["bn"]
+        return [str(launched)]
+    return [sys.executable, "-m", "bn"]
+
+
 def _forced_skill_install_command(args: argparse.Namespace) -> str:
     """The refused run's own arguments plus `--force`, ready to paste.
 
-    Rebuilt from the parsed arguments rather than `sys.argv`, so it names `bn`
-    however this process was launched. `--dest` keeps the caller's spelling (a
-    relative path reruns from the same directory; normalising it could change
-    which entry a `..` names), and a value starting with `-` takes the `=` form
-    so it cannot parse as an option (#1035 install comment 2)."""
-    argv = ["bn", "skill", "install"]
+    Rebuilt from the parsed arguments rather than copied from `sys.argv`, and
+    led by the entry point that ran (`_bn_invocation`). `--dest` keeps the
+    caller's spelling (a relative path reruns from the same directory;
+    normalising it could change which entry a `..` names), a value starting
+    with `-` takes the `=` form so it cannot parse as an option, and `--out`
+    keeps the requested receipt, already absolute (#1035 install comment 2)."""
+    argv = [*_bn_invocation(), "skill", "install"]
     if args.dest is not None:
         dest = str(args.dest)
         argv.extend([f"--dest={dest}"] if dest.startswith("-") else ["--dest", dest])
@@ -932,6 +952,8 @@ def _forced_skill_install_command(args: argparse.Namespace) -> str:
         argv.extend(["--mode", args.mode])
     if args.format != "text":
         argv.extend(["--format", args.format])
+    if getattr(args, "out", None) is not None:
+        argv.extend(["--out", str(args.out)])
     argv.append("--force")
     return shlex.join(argv)
 

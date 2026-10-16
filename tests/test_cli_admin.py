@@ -5935,6 +5935,19 @@ def test_skill_install_through_a_canceled_missing_component_judges_the_entry(
     assert _install_disk_snapshot(tmp_path) == before
 
 
+def _entry_point(directory, monkeypatch, *, on_path=True):
+    """Make this process look launched as `<directory>/bn`, optionally the `bn`
+    that PATH resolves to; return that path."""
+    directory.mkdir(parents=True, exist_ok=True)
+    launcher = directory / "bn"
+    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr("sys.argv", [str(launcher)])
+    if on_path:
+        monkeypatch.setenv("PATH", str(directory))
+    return launcher
+
+
 def test_skill_install_refusal_prints_a_rerun_that_works_as_printed(
     tmp_path, monkeypatch, capsys
 ):
@@ -5943,6 +5956,7 @@ def test_skill_install_refusal_prints_a_rerun_that_works_as_printed(
     import shlex
 
     source, _ = _one_skill_source(tmp_path, monkeypatch)
+    _entry_point(tmp_path / "bin", monkeypatch)
     store = tmp_path / "my store"
     store.mkdir()
     monkeypatch.chdir(tmp_path)
@@ -5979,6 +5993,7 @@ def test_skill_install_rerun_keeps_a_dash_leading_dest_an_option_value(
     import shlex
 
     source, _ = _one_skill_source(tmp_path, monkeypatch)
+    _entry_point(tmp_path / "bin", monkeypatch)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "-store").mkdir()
     assert bn.cli.main(["skill", "install", "--dest=-store", "--mode", "copy"]) == 0
@@ -5990,6 +6005,64 @@ def test_skill_install_rerun_keeps_a_dash_leading_dest_an_option_value(
     ]
     assert bn.cli.main(shlex.split(command)[1:]) == 0
     assert (tmp_path / "-store" / source.name).is_symlink()
+
+
+def test_skill_install_rerun_names_the_entry_point_that_ran(tmp_path, monkeypatch):
+    """The executable decides which checkout's skills a rerun installs, so a
+    `bn` that PATH resolves elsewhere must not be what the rerun names
+    (#1043 review finding 3)."""
+    import shlex
+    import sys
+
+    from bn.commands import admin
+
+    args = bn.cli.build_parser().parse_args(["skill", "install", "--mode", "copy"])
+    other = _entry_point(tmp_path / "other-checkout", monkeypatch)
+    this = _entry_point(tmp_path / "this-checkout", monkeypatch, on_path=False)
+    assert shlex.split(admin._forced_skill_install_command(args)) == [
+        str(this), "skill", "install", "--mode", "copy", "--force",
+    ]
+    assert other != this
+
+    # The `bn` on PATH IS this entry point: the short spelling is the same file.
+    monkeypatch.setenv("PATH", str(this.parent))
+    assert shlex.split(admin._forced_skill_install_command(args))[0] == "bn"
+
+    # `python -m bn` has no `bn` executable of its own: rerun through the same
+    # interpreter and package.
+    monkeypatch.setattr("sys.argv", [str(tmp_path / "__main__.py")])
+    assert shlex.split(admin._forced_skill_install_command(args))[:3] == [
+        sys.executable, "-m", "bn",
+    ]
+
+
+def test_skill_install_rerun_keeps_the_requested_out_receipt(
+    tmp_path, monkeypatch, capsys
+):
+    """#1043 review finding 4: the original request plus `--force` includes its
+    `--out`, so the forced run writes the receipt the caller asked for."""
+    import shlex
+
+    source, _ = _one_skill_source(tmp_path, monkeypatch)
+    _entry_point(tmp_path / "bin", monkeypatch)
+    store = tmp_path / "my store"
+    store.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert bn.cli.main(["skill", "install", "--dest", "my store"]) == 0
+    capsys.readouterr()
+
+    receipt = tmp_path / "receipt dir" / "install.json"
+    receipt.parent.mkdir()
+    assert bn.cli.main(["skill", "install", "--dest", "my store", "--mode", "copy",
+                        "--format", "json", "--out", "receipt dir/install.json"]) == 2
+    command = json.loads(capsys.readouterr().out)["force_command"]
+    assert not receipt.exists()
+    argv = shlex.split(command)
+    assert argv[0] == "bn"
+    assert argv[argv.index("--out") + 1] == str(receipt)
+    assert bn.cli.main(argv[1:]) == 0
+    assert json.loads(receipt.read_text())["installed"] is True
+    assert not (store / source.name).is_symlink()
 
 
 def test_skill_install_and_doctor_report_the_bn_kernel_skill_dir(

@@ -371,7 +371,9 @@ def _require_decompile_batch(
     an analysis placeholder becomes a failed row with `decompile()`'s own
     refusal as its error, so one skipped function does not sink the batch.
     Each successful row gains `text` (bounded by `max_chars`, with `truncated`
-    when cut) beside the untouched `decompiled` payload."""
+    when cut); a cut row's nested `decompiled.text` is cut the same way, so no
+    returned row carries more than `max_chars` of body. `payload` is not
+    mutated."""
     def malformed(detail: str) -> BnError:
         return BnError(
             f"decompile_batch contract violation: {detail}",
@@ -410,6 +412,10 @@ def _require_decompile_batch(
         out["text"], truncated = _bounded_text(text, max_chars)
         if truncated is not None:
             out["truncated"] = truncated
+            # The nested body is the same text; a row that kept it whole would
+            # still flood a transcript when printed. The full body stays on
+            # `last.payload`, which is not mutated here.
+            out["decompiled"] = {**decompiled, "text": out["text"]}
         result.append(out)
     return result
 
@@ -1237,13 +1243,24 @@ class Session:
         multi-identifier `decompile`, which exits 2 when any row failed). Any
         other failure -- no body, unparsable JSON, a body the predicate rejects
         -- raises exactly as without it.
+
+        A literal `"--"` in `args` ends the options: every generated option
+        (`flags`, `--format`, `--out`) goes before it and the operands after it
+        stay literal, so an identifier such as `-x` or `--help` reaches the
+        command as an operand instead of being parsed as an option.
         """
         self.last = None
 
         executable = _bn_executable()
-        argv = self._root_argv()
-        argv.extend(str(arg) for arg in args)
-        argv.extend(_flags(flags))
+        words = [str(arg) for arg in args]
+        boundary = words.index("--") if "--" in words else len(words)
+        operands = words[boundary:]
+        options = self._root_argv()
+        options.extend(words[:boundary])
+        options.extend(_flags(flags))
+        # What errors and `last.argv` report: the command as spawned, minus the
+        # private `--format`/`--out` pair.
+        argv = [*options, *operands]
         output_format = "text" if raw else "json"
 
         temporary = tempfile.TemporaryFile(mode="w+b")
@@ -1266,11 +1283,12 @@ class Session:
             try:
                 process = await asyncio.create_subprocess_exec(
                     executable,
-                    *argv,
+                    *options,
                     "--format",
                     output_format,
                     "--out",
                     str(output_path),
+                    *operands,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     pass_fds=(output_fd,),
@@ -2216,7 +2234,9 @@ class Session:
             # second render of that one function; the duplicate row is dropped.
             wire = names * 2 if len(names) == 1 else names
             payload = await self._run_resolved(
-                "decompile", *wire, unwrap=False,
+                # `--`: an identifier like `-x` or `--help` stays an operand and
+                # becomes its own failed row, as on the native backend.
+                "decompile", "--", *wire, unwrap=False,
                 budget=_resolve_budget(self.timeout if timeout is None else timeout),
                 accept_failed_body=_is_decompile_batch,
                 **shared,

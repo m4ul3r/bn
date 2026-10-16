@@ -4256,7 +4256,7 @@ import json, sys
 argv = sys.argv[1:]
 out = argv[argv.index("--out") + 1]
 json.dump(argv, open({str(marker)!r}, "w"))
-names = argv[argv.index("decompile") + 1:argv.index("--format")]
+names = argv[argv.index("--") + 1:]
 rows = [
     {{"identifier": n, "ok": True, "decompiled": {{"text": "void " + n + "() {{}}"}}}}
     if n != "nope" else {{"identifier": n, "ok": False, "error": "not found"}}
@@ -4280,7 +4280,7 @@ sys.exit(0 if all(r["ok"] for r in rows) else 2)
     assert rows == [{"identifier": "nope", "ok": False, "error": "not found"}]
     assert session.last.payload["requested"] == 1
     argv = json.loads(marker.read_text())
-    assert argv[argv.index("decompile") + 1:argv.index("--format")] == ["nope", "nope"]
+    assert argv[argv.index("--") + 1:] == ["nope", "nope"]
 
     # Exit 2 WITHOUT a batch body is a real failure, not an empty batch.
     monkeypatch.setenv(
@@ -4290,3 +4290,76 @@ sys.exit(0 if all(r["ok"] for r in rows) else 2)
     with pytest.raises(bn_kernel.BridgeError, match="boom"):
         _run(session.decompile_many(["alpha", "beta"]))
     assert session.last is None
+
+
+_ARGPARSE_DECOMPILE = """
+import argparse, json, sys
+# Parses like the real CLI: options and a nargs="+" positional, so an
+# identifier that looks like an option is consumed as one unless it follows
+# an end-of-options `--`.
+root = argparse.ArgumentParser()
+root.add_argument("-i"); root.add_argument("-t")
+sub = root.add_subparsers(dest="cmd")
+cmd = sub.add_parser("decompile")
+cmd.add_argument("identifier", nargs="+")
+for flag in ("--addresses", "--force-analysis", "--include-annotations"):
+    cmd.add_argument(flag, action="store_true")
+cmd.add_argument("--format"); cmd.add_argument("--out")
+args = root.parse_args(sys.argv[1:])
+rows = [
+    {"identifier": n, "ok": True, "decompiled": {"text": "void " + n + "() {}"}}
+    if n == "main" else {"identifier": n, "ok": False, "error": "not found: " + n}
+    for n in args.identifier
+]
+json.dump({"kind": "decompile_batch", "requested": len(rows),
+           "resolved": sum(r["ok"] for r in rows), "functions": rows},
+          open(args.out, "w"))
+sys.exit(0 if all(r["ok"] for r in rows) else 2)
+"""
+
+
+@pytest.mark.parametrize("odd", ["-missing", "--help"])
+def test_decompile_many_cli_keeps_option_like_identifiers_literal(
+    monkeypatch, tmp_path, odd
+):
+    """#1043 review finding 1: on the CLI backend an identifier starting with
+    `-` became an option and sank the whole batch; it must be its own failed
+    row, as on the native backend."""
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, _ARGPARSE_DECOMPILE)))
+    session = bn_kernel.Session(instance="worker", target="sample", backend="cli")
+
+    rows = _run(session.decompile_many(["main", odd], addresses=True))
+
+    assert [(row["identifier"], row["ok"]) for row in rows] == [
+        ("main", True), (odd, False),
+    ]
+    assert rows[1]["error"] == f"not found: {odd}"
+    argv = list(session.last.argv)
+    assert argv[argv.index("--"):] == ["--", "main", odd]
+    assert argv.index("--addresses") < argv.index("--")
+
+    rows = _run(session.decompile_many([odd]))
+    assert rows == [{"identifier": odd, "ok": False, "error": f"not found: {odd}"}]
+
+
+def test_decompile_many_bounds_the_nested_body_too():
+    """#1043 review finding 2: a bounded row must not carry the full body under
+    `decompiled.text`; the full text stays on `last.payload`."""
+    body = "x" * 120_000
+    envelope = {
+        "kind": "decompile_batch", "requested": 1, "resolved": 1,
+        "functions": [_batch_row("big", body, warnings=[])],
+    }
+    session = bn_kernel.Session(instance="worker", target="sample", backend="native")
+
+    class BatchClient:
+        def request(self, op, params=None):
+            return envelope
+
+    session._client = BatchClient()
+    [row] = _run(session.decompile_many(["big"], max_chars=40))
+
+    assert row["text"] == row["decompiled"]["text"] == "x" * 40
+    assert row["decompiled"]["warnings"] == []
+    assert len(repr(row)) < 400
+    assert session.last.payload["functions"][0]["decompiled"]["text"] == body
