@@ -6630,6 +6630,51 @@ def test_a_bn_note_is_not_string_evidence_1045(monkeypatch):
     assert "&data_400760" in scanned and "0x400760" not in scanned
 
 
+_NO_PARAMS_ROW = {"address": 0x400830, "target": 0x400700, "label": "strcmp @ 0x400700",
+                  "rendered": 2, "expected": 2, "shape": "no_parameters",
+                  "evidence": ("its prototype declares no parameters",), "missing": []}
+
+
+def test_a_literal_holding_a_bn_note_marker_stays_scanner_input_1045(monkeypatch):
+    # #1045 review round 5 (AArch64): `printf("/* bn: %d", strcmp(p, "a"))`.
+    # Deleting `/* bn: ... */` by regex started inside the format literal and
+    # took the raw `0x400868` with it, losing base's "a". BN's tokens keep the
+    # literal a StringToken; the scanner reads them before any note is added.
+    result, scanned = _scanned_decompile(monkeypatch, [
+        (0x401111, "  int64_t probe(int64_t arg1)"),
+        (0x401111, "{"),
+        (0x400830, [("TextToken", "    return __printf_chk(2, "), ("BraceToken", '"'),
+                    ("StringToken", "/* bn: %d"), ("BraceToken", '"'),
+                    ("TextToken", ", (uint64_t)strcmp(arg1, "),
+                    ("PossibleAddressToken", "0x400868"), ("TextToken", "));")]),
+        (0x401111, "}"),
+    ], [_NO_PARAMS_ROW], {})
+    assert '__printf_chk(2, "/* bn: %d", (uint64_t)strcmp(arg1, 0x400868));' in scanned
+    assert "BN's guess */" in result["text"] and "BN's guess" not in scanned
+
+
+def test_a_literal_holding_a_url_is_code_not_a_comment_1045(monkeypatch):
+    # #1045 review round 5 (AArch64): BN renders `"<a href="http://x">"`
+    # unescaped, and the regex read its `//` as a line comment: both raw
+    # operands were lost and the arity note landed inside the literal.
+    literal_line = [("TextToken", "    return strcmp("), ("BraceToken", '"'),
+                    ("StringToken", '<a href="http://x">'), ("BraceToken", '"'),
+                    ("TextToken", ", "), ("PossibleAddressToken", "0x400808"),
+                    ("TextToken", ") + strcmp(arg1, "), ("PossibleAddressToken", "0x400828"),
+                    ("TextToken", ");")]
+    row = dict(_NO_PARAMS_ROW, address=0x4007c0)
+    result, scanned = _scanned_decompile(monkeypatch, [
+        (0x401111, "  uint64_t probe(int64_t arg1)"),
+        (0x401111, "{"),
+        (0x4007c0, literal_line),
+        (0x401111, "}"),
+    ], [row], {})
+    code = "".join(text for _kind, text in literal_line)
+    assert code in scanned and "0x400808" in scanned and "0x400828" in scanned
+    # The note follows the whole statement, not the `//` inside the literal.
+    assert f"{code}  /* bn: prototype declares no params" in result["text"]
+
+
 def _var(name):
     return _hop("HLIL_VAR", name, var=types.SimpleNamespace(name=name))
 
@@ -7197,8 +7242,9 @@ def test_raw_string_notes_go_on_each_call_line_that_shows_the_address_1038():
     # No IL here, so each note anchors on its call's own address; 0x400b28's
     # line is not in this text, so that string stays unmarked.
     func = types.SimpleNamespace(get_llil_at=lambda address: None)
+    parts = [(line.partition("  //")[0], "// checked" if "//" in line else "") for line in source]
     noted, inline = read_decompile._place_string_notes(
-        func, text, [0x400af8, 0x400af8, 0x400b10, 0x400b2c], found)
+        func, text, [0x400af8, 0x400af8, 0x400b10, 0x400b2c], parts, found)
     lines = noted.split("\n")
     assert lines[0] == '    if (strcmp(arg1, 0x400c98))  /* bn: 0x400c98 = "a" */'
     # Before a trailing `//` comment, so annotation redaction still matches it.

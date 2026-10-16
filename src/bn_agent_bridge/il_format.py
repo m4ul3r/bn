@@ -1037,40 +1037,47 @@ def _function_signature(func) -> str:
 
 # Consume literals and block comments before looking for a line-comment span,
 # so a quoted URL or a `//` inside `/* ... */` cannot start a line comment.
-# Shared by the decompile redaction (#740) and the note placement below.
+# Used by the decompile redaction (#740); note placement reads BN's tokens.
 _COMMENT_SPAN_RE = re.compile(
     r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|/\*.*?(?:\*/|\Z)|//(?P<body>[^\r\n]*)""",
     re.DOTALL,
 )
 
 
-def _code_and_comment(text: str) -> tuple[str, str]:
-    """*text* split before its trailing `//` comment (``""`` when none)."""
-    for match in _COMMENT_SPAN_RE.finditer(text):
-        if match.group("body") is not None:
-            return text[:match.start()].rstrip(), text[match.start():]
-    return text, ""
+def _token_code_and_comment(contents) -> tuple[str, str]:
+    """A rendered line's (code, trailing comment) split by BN's own tokens:
+    everything before its first `CommentToken`, and everything from it on
+    (an address in the comment is an `IntegerToken` after it). A literal's
+    bytes are a `StringToken`, so `"<a href=\\"http://x\\">"` or
+    `"/* bn: %d"` stays code however it reads (#1045 review round 5)."""
+    tokens = list(getattr(contents, "tokens", None) or [])
+    for index, token in enumerate(tokens):
+        if str(getattr(getattr(token, "type", None), "name", "")) == "CommentToken":
+            return ("".join(str(t) for t in tokens[:index]),
+                    "".join(str(t) for t in tokens[index:]))
+    return "".join(str(t) for t in tokens), ""
 
 
-def _with_line_note(text: str, note: str) -> str | None:
-    """*text* with *note* after its code and before any trailing `//` comment,
-    or None when the code part is no statement a note belongs to (it carries
-    neither a call's `(` nor BN's `jump ->`).
+def _with_line_note(code: str, comment: str, note: str) -> str | None:
+    """The line *code* + *comment* with *note* after the code and before the
+    trailing comment, or None when the code is no statement a note belongs
+    to (it carries neither a call's `(` nor BN's `jump ->`).
 
     Appending past the comment put the note INSIDE it: the stored body no
     longer matched, so the #740 redaction printed an inherited comment in full
     and a comment this session wrote lost its `[this session]` mark."""
-    code, comment = _code_and_comment(text)
     if "(" not in code and "jump ->" not in code:
         return None
-    return f"{code}  {note}" + (f"  {comment}" if comment else "")
+    comment = comment.strip()
+    return f"{code.rstrip()}  {note}" + (f"  {comment}" if comment else "")
 
 
 def _pseudo_c_text(func, *, addresses: bool = False,
                    line_notes: dict[int, list[str]] | None = None,
                    placed: set[int] | None = None,
                    jump_notes: dict[int, str] | None = None,
-                   line_addresses: list[int | None] | None = None) -> str:
+                   line_addresses: list[int | None] | None = None,
+                   line_parts: list[tuple[str, str]] | None = None) -> str:
     """Render Binary Ninja's Pseudo C for one function (GUI-equivalent).
 
     Walks the language-representation linear view a batch of lines at a
@@ -1084,8 +1091,9 @@ def _pseudo_c_text(func, *, addresses: bool = False,
     jump in several switch cases, and each copy reads the same. Each address
     placed is added to *placed*, so the caller can say which notes it could
     not attach. *line_addresses*, when given, receives each returned line's
-    address (None for a blank line), so a caller can annotate the text it
-    reads after rendering.
+    address (None for a blank line), and *line_parts* each line's (code,
+    trailing comment) as BN's tokens split them, BEFORE any bn note is added
+    -- so a caller can read the code BN rendered and add notes after it.
     """
     settings = bn.DisassemblySettings()
     # Suppress BN's built-in address column so `--addresses` controls the
@@ -1104,6 +1112,7 @@ def _pseudo_c_text(func, *, addresses: bool = False,
     cursor.seek_to_begin()
     out: list[str] = []
     out_addrs: list[int | None] = []
+    out_parts: list[tuple[str, str]] = []
     seen_content = False
     while True:
         for line in cursor.lines:
@@ -1114,6 +1123,7 @@ def _pseudo_c_text(func, *, addresses: bool = False,
                 # not on the prefixed string).
                 out.append("")
                 out_addrs.append(None)
+                out_parts.append(("", ""))
                 continue
             header = not seen_content
             if header:
@@ -1122,17 +1132,19 @@ def _pseudo_c_text(func, *, addresses: bool = False,
                 # left-justify the header to line up with them.
                 text = text.lstrip()
                 seen_content = True
+            code, comment = _token_code_and_comment(line.contents)
+            if header:
+                code = code.lstrip()
             addr = getattr(line.contents, "address", None)
             noted = None
             # Never on the signature: it carries the entry address too, so a
             # jump at a function's first instruction put its note there (#1000).
             if addr is not None and not header:
-                if jump_notes and int(addr) in jump_notes \
-                        and "jump ->" in _code_and_comment(text)[0]:
-                    noted = _with_line_note(text, jump_notes[int(addr)])
+                if jump_notes and int(addr) in jump_notes and "jump ->" in code:
+                    noted = _with_line_note(code, comment, jump_notes[int(addr)])
                 elif (line_notes and int(addr) in line_notes
                         and int(addr) not in (placed or ())):
-                    noted = _with_line_note(text, " ".join(line_notes[int(addr)]))
+                    noted = _with_line_note(code, comment, " ".join(line_notes[int(addr)]))
             if noted is not None:
                 text = noted
                 if placed is not None:
@@ -1143,16 +1155,21 @@ def _pseudo_c_text(func, *, addresses: bool = False,
             else:
                 out.append(text)
             out_addrs.append(int(addr) if addr is not None else None)
+            out_parts.append((code, comment))
         if not cursor.next():
             break
     while out and not out[0]:
         out.pop(0)
         out_addrs.pop(0)
+        out_parts.pop(0)
     while out and not out[-1]:
         out.pop()
         out_addrs.pop()
+        out_parts.pop()
     if line_addresses is not None:
         line_addresses[:] = out_addrs
+    if line_parts is not None:
+        line_parts[:] = out_parts
     return "\n".join(out)
 
 
@@ -1160,14 +1177,17 @@ def _decompile_text(bv, func, *, addresses: bool = False,
                     line_notes: dict[int, list[str]] | None = None,
                     placed: set[int] | None = None,
                     jump_notes: dict[int, str] | None = None,
-                    line_addresses: list[int | None] | None = None) -> str:
+                    line_addresses: list[int | None] | None = None,
+                    line_parts: list[tuple[str, str]] | None = None) -> str:
     """Pseudo C for a function, degrading to wrapped HLIL if it is unavailable.
-    *line_notes*/*placed*/*jump_notes*/*line_addresses* are `_pseudo_c_text`'s;
-    the HLIL fallback places none and leaves *line_addresses* empty."""
+    *line_notes*/*placed*/*jump_notes*/*line_addresses*/*line_parts* are
+    `_pseudo_c_text`'s; the HLIL fallback places none and leaves
+    *line_addresses* and *line_parts* empty."""
     marker = ""
     try:
         text = _pseudo_c_text(func, addresses=addresses, line_notes=line_notes, placed=placed,
-                              jump_notes=jump_notes, line_addresses=line_addresses)
+                              jump_notes=jump_notes, line_addresses=line_addresses,
+                              line_parts=line_parts)
     except Exception as exc:
         # Make the failure visible instead of silently returning the HLIL
         # fallback (or worse, an empty body) with ok:true.
@@ -1186,6 +1206,8 @@ def _decompile_text(bv, func, *, addresses: bool = False,
         placed.clear()  # the fallback below carries none of the notes
     if line_addresses is not None:
         line_addresses.clear()
+    if line_parts is not None:
+        line_parts.clear()
     sig = _function_signature(func)
     body = _function_text(bv, func, view="hlil", addresses=addresses)
     if addresses:

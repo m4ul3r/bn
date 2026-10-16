@@ -5511,6 +5511,42 @@ class TestStringScanSeesCodeOnly1045:
         assert f"&data_{int(match.group(1), 16):x}" in result["text"], result["text"]
         assert "string" not in [row["code"] for row in result["warning_rows"]], result["warning_rows"]
 
+    def _decompile_probe(self, shared_bn, tmp_path, source):
+        src = tmp_path / "probe.c"
+        src.write_text(source)
+        binary = tmp_path / "probe"
+        _build("aarch64-linux-gnu-gcc", binary, "-O2", "-fno-builtin", str(src))
+        shared_bn.load(binary, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        return shared_bn.json("decompile", "probe")
+
+    def test_a_literal_holding_a_bn_note_marker_keeps_the_raw_operand(self, shared_bn, tmp_path):
+        # Round 5: a regex delete of `/* bn: ... */` started inside the format
+        # literal and took the raw `strcmp` operand with it; base names "a".
+        result = self._decompile_probe(shared_bn, tmp_path, (
+            "#include <stdio.h>\n#include <string.h>\n"
+            "__attribute__((noinline)) int probe(const char *p) "
+            '{ return printf("/* bn: %d", strcmp(p, "a")); }\n'
+            "int main(int c, char **v) { return probe(v[0]); }\n"))
+        assert '"/* bn: %d"' in result["text"], result["text"]
+        [row] = [row for row in result["warning_rows"] if row["code"] == "string"]
+        assert [s["value"] for s in row["strings"]] == ["a"], row
+        assert row["strings"][0]["inline"] is True, row
+
+    def test_a_literal_holding_a_url_keeps_both_raw_operands(self, shared_bn, tmp_path):
+        # Round 5: BN renders the embedded quotes unescaped, and the regex read
+        # the URL's `//` as a comment: both operands were lost and the arity
+        # notes landed inside the literal. Base names "abc" and "x".
+        result = self._decompile_probe(shared_bn, tmp_path, (
+            "#include <string.h>\n"
+            "__attribute__((noinline)) int probe(const char *s) "
+            '{ return strcmp("<a href=\\"http://x\\">", "abc") + strcmp(s, "x"); }\n'
+            "int main(int c, char **v) { return probe(v[0]); }\n"))
+        [line] = [line for line in result["text"].splitlines() if "http://x" in line]
+        assert '"<a href="http://x">", 0x' in line, line  # the literal is intact
+        assert line.index("/* bn:") > line.index("http://x"), line
+        [row] = [row for row in result["warning_rows"] if row["code"] == "string"]
+        assert sorted(s["value"] for s in row["strings"]) == ["abc", "x"], row
+
 
 class TestOffsetTypeLookup1000:
     """#1000 item 4 (review round 8): a type BN keys by a multi-part qualified
