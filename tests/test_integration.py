@@ -5430,14 +5430,21 @@ def test_values_keeps_native_call_result_separate_from_destination_947(
 
 
 class TestShortLiteralBehindDataName994:
-    def test_setlocale_literal_rendered_as_data_name_is_named(self, shared_bn, tail_jump_binaries):
+    def test_setlocale_literal_rendered_as_data_name_keeps_its_bytes(
+            self, shared_bn, tail_jump_binaries):
+        # BN's aarch64 type library gives `setlocale(int32_t, int64_t*)`,
+        # which is not glibc's prototype, so since #1045 review round 2 the
+        # "C" is shown as its bytes and decoding, not claimed as a string.
         shared_bn.load(tail_jump_binaries["aarch64"], timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
         result = shared_bn.json("decompile", "use_c_locale")
         match = re.search(r"setlocale\(6, &data_([0-9a-f]+)\)", result["text"])
         assert match, result["text"]  # the premise: BN hides the literal as data
-        strings = [row for row in result["warning_rows"] if row["code"] == "string"]
-        assert strings and strings[0]["strings"][0]["value"] == "C", result["warning_rows"]
-        assert strings[0]["strings"][0]["address"] == hex(int(match.group(1), 16))
+        codes = [row["code"] for row in result["warning_rows"]]
+        assert "string" not in codes, result["warning_rows"]
+        [row] = [row for row in result["warning_rows"] if row["code"] == "text_bytes"]
+        assert row["bytes"][0]["decoded"] == "C"
+        assert row["bytes"][0]["address"] == hex(int(match.group(1), 16))
+        assert f'/* bn: {hex(int(match.group(1), 16))}: 43 00 (ASCII "C") */' in result["text"]
 
 
 class TestOffsetTypeLookup1000:

@@ -1115,56 +1115,54 @@ _SHORT_STRING_MAX = 64
 # reads as "A" (#985 review). Three printable bytes is #970's own `" -n"`.
 _UNTYPED_STRING_MIN = 3
 
-# Narrow `char *` parameter positions of C library functions, keyed by the
+# glibc prototypes of C library functions that take strings, keyed by the
 # `il_format._normalize_libc_name` spelling (`__isoc99_sscanf`, `strcmp@plt`
-# and `_strcmp` all land on one key). It is the ONLY evidence that makes a raw
-# address a string (#1019 item 6, #1017 item 8): a prototype -- inferred,
-# demangled, from a type library or applied by the analyst -- is not, because
-# BN infers `char *` over an `int[]` and a local function can be named
-# `strcmp`. The printf/scanf format positions are NOT repeated here: they are
-# `il_format._VARIADIC_FORMAT_FAMILY`'s, read through `_variadic_format_family`,
-# so the two tables cannot disagree.
-_LIBC_CHAR_POINTER_PARAMS: dict[str, frozenset[int]] = {
-    name: frozenset(positions) for name, positions in {
-        # comparison and search
-        "strcmp": (0, 1), "strncmp": (0, 1), "strcasecmp": (0, 1),
-        "strncasecmp": (0, 1), "strcoll": (0, 1), "strstr": (0, 1),
-        "strcasestr": (0, 1), "strspn": (0, 1), "strcspn": (0, 1),
-        "strpbrk": (0, 1), "strchr": (0,), "strrchr": (0,), "strchrnul": (0,),
-        "strlen": (0,), "strnlen": (0,), "strtok": (0, 1), "strtok_r": (0, 1),
-        "strsep": (1,), "fnmatch": (0, 1),
-        # copying and duplication
-        "strcpy": (0, 1), "strncpy": (0, 1), "stpcpy": (0, 1), "stpncpy": (0, 1),
-        "strcat": (0, 1), "strncat": (0, 1), "strlcpy": (0, 1), "strlcat": (0, 1),
-        "strdup": (0,), "strndup": (0,), "strcpy_chk": (0, 1), "strcat_chk": (0, 1),
-        "strncpy_chk": (0, 1), "stpcpy_chk": (0, 1),
-        # conversion
-        "atoi": (0,), "atol": (0,), "atoll": (0,), "atof": (0,), "strtol": (0,),
-        "strtoul": (0,), "strtoll": (0,), "strtoull": (0,), "strtod": (0,),
-        "strtof": (0,), "strtold": (0,), "strtoimax": (0,), "strtoumax": (0,),
-        # formatted I/O beyond the format family's format argument
-        "asprintf": (1,), "vprintf": (0,), "vfprintf": (1,), "vsprintf": (1,),
-        "vsnprintf": (2,), "sscanf": (0,), "err": (1,), "errx": (1,), "warn": (0,),
-        "warnx": (0,), "puts": (0,), "fputs": (0,), "perror": (0,), "strftime": (2,),
-        # environment, locale, process
-        "getenv": (0,), "secure_getenv": (0,), "setenv": (0, 1), "unsetenv": (0,),
-        "putenv": (0,), "setlocale": (1,), "newlocale": (1,), "system": (0,),
-        "popen": (0, 1), "execl": (0, 1), "execlp": (0, 1), "execle": (0, 1),
-        "execv": (0,), "execvp": (0,), "execve": (0,), "dlopen": (0,), "dlsym": (1,),
-        "bindtextdomain": (0, 1), "textdomain": (0,), "gettext": (0,),
-        "dgettext": (0, 1), "iconv_open": (0, 1), "openlog": (0,),
-        # files and paths
-        "fopen": (0, 1), "fopen64": (0, 1), "freopen": (0, 1), "fdopen": (1,),
-        "open": (0,), "open64": (0,), "openat": (1,), "creat": (0,), "access": (0,),
-        "stat": (0,), "lstat": (0,), "stat64": (0,), "lstat64": (0,), "unlink": (0,),
-        "remove": (0,), "rename": (0, 1), "mkdir": (0,), "rmdir": (0,), "chdir": (0,),
-        "chmod": (0,), "chown": (0,), "opendir": (0,), "realpath": (0,),
-        "readlink": (0,), "symlink": (0, 1), "link": (0, 1), "truncate": (0,),
-        "mkstemp": (0,), "mkdtemp": (0,), "tmpnam": (0,),
-        # networking
-        "inet_addr": (0,), "inet_aton": (0,), "inet_pton": (1,),
-        "gethostbyname": (0,), "getaddrinfo": (0, 1), "getservbyname": (0, 1),
-    }.items()
+# and `__printf_chk` land on `sscanf`, `strcmp`, `printf_chk`). One letter per
+# parameter: `s` a narrow `char *` that is a string argument, `b` a narrow
+# `char *` output buffer, `p` any other pointer, `i` an integer; `.` closes a
+# variadic list. It is the ONLY evidence that makes a raw address a string
+# (#1019 item 6, #1017 item 8), and only when the type BN actually uses at the
+# call matches it parameter by parameter (`_libc_string_parameter`). The
+# `v*printf` family is left out: `va_list` has no spelling that matches across
+# platforms.
+_LIBC_PROTOTYPES: dict[str, str] = {
+    # comparison and search
+    "strcmp": "ss", "strncmp": "ssi", "strcasecmp": "ss", "strncasecmp": "ssi",
+    "strcoll": "ss", "strstr": "ss", "strcasestr": "ss", "strspn": "ss", "strcspn": "ss",
+    "strpbrk": "ss", "strchr": "si", "strrchr": "si", "strchrnul": "si", "strlen": "s",
+    "strnlen": "si", "strtok": "ss", "strtok_r": "ssp", "strsep": "ps", "fnmatch": "ssi",
+    # copying and duplication
+    "strcpy": "bs", "strncpy": "bsi", "stpcpy": "bs", "stpncpy": "bsi", "strcat": "bs",
+    "strncat": "bsi", "strlcpy": "bsi", "strlcat": "bsi", "strdup": "s", "strndup": "si",
+    "strcpy_chk": "bsi", "strcat_chk": "bsi", "strncpy_chk": "bsii", "stpcpy_chk": "bsi",
+    # conversion
+    "atoi": "s", "atol": "s", "atoll": "s", "atof": "s", "strtol": "spi", "strtoul": "spi",
+    "strtoll": "spi", "strtoull": "spi", "strtod": "sp", "strtof": "sp", "strtold": "sp",
+    "strtoimax": "spi", "strtoumax": "spi",
+    # formatted I/O
+    "printf": "s.", "fprintf": "ps.", "sprintf": "bs.", "snprintf": "bis.", "dprintf": "is.",
+    "syslog": "is.", "scanf": "s.", "fscanf": "ps.", "sscanf": "ss.", "asprintf": "ps.",
+    "printf_chk": "is.", "fprintf_chk": "pis.", "dprintf_chk": "iis.",
+    "sprintf_chk": "biis.", "snprintf_chk": "biiis.", "syslog_chk": "iis.",
+    "err": "is.", "errx": "is.", "warn": "s.", "warnx": "s.",
+    "puts": "s", "fputs": "sp", "perror": "s", "strftime": "bisp",
+    # environment, locale, process
+    "getenv": "s", "secure_getenv": "s", "setenv": "ssi", "unsetenv": "s", "putenv": "s",
+    "setlocale": "is", "newlocale": "isp", "system": "s", "popen": "ss",
+    "execl": "ss.", "execlp": "ss.", "execle": "ss.", "execv": "sp", "execvp": "sp",
+    "execve": "spp", "dlopen": "si", "dlsym": "ps", "bindtextdomain": "ss",
+    "textdomain": "s", "gettext": "s", "dgettext": "ss", "iconv_open": "ss",
+    "openlog": "sii",
+    # files and paths
+    "fopen": "ss", "fopen64": "ss", "freopen": "ssp", "fdopen": "is", "open": "si.",
+    "open64": "si.", "openat": "isi.", "creat": "si", "access": "si", "stat": "sp",
+    "lstat": "sp", "stat64": "sp", "lstat64": "sp", "unlink": "s", "remove": "s",
+    "rename": "ss", "mkdir": "si", "rmdir": "s", "chdir": "s", "chmod": "si",
+    "chown": "sii", "opendir": "s", "realpath": "sb", "readlink": "sbi", "symlink": "ss",
+    "link": "ss", "truncate": "si", "mkstemp": "s", "mkdtemp": "s",
+    # networking
+    "inet_addr": "s", "inet_aton": "sp", "inet_pton": "isp", "gethostbyname": "s",
+    "getaddrinfo": "sspp", "getservbyname": "ss",
 }
 
 
@@ -1226,16 +1224,65 @@ _REAL_IMPORT_KINDS = frozenset({"ImportedFunctionSymbol", "ImportAddressSymbol",
                                 "ExternalSymbol"})
 
 
-def _libc_string_parameter(bv, target: int | None, index: int) -> bool:
-    """True only when the callee at *target* is a real imported function
-    BN named itself (no user rename or alias), carries no prototype the
-    analyst applied, and `_LIBC_CHAR_POINTER_PARAMS` or the printf/scanf
-    format family lists parameter *index* of its name as a narrow `char *`.
+def _type_class(t) -> str:
+    return str(getattr(getattr(t, "type_class", None), "name", ""))
 
-    Nothing else counts (#1045 review): not an inferred or demangled `char *`
-    (BN types `hash(char*, int)` over an `int[4]`), not a local function named
-    `strcmp`, not a user alias of a real import, and not BN's type library
-    (its aarch64 `setlocale` takes an `int64_t*`)."""
+
+def _resolved_type(bv, t):
+    """*t* with a named type reference (`size_t`, `FILE`) resolved through
+    the view, or None when it does not resolve."""
+    if _type_class(t) != "NamedTypeReferenceClass":
+        return t
+    try:
+        return t.target(bv)
+    except Exception:  # noqa: BLE001 - unresolved: no class to compare
+        return None
+
+
+def _parameter_letter(bv, t) -> str:
+    """The `_LIBC_PROTOTYPES` letter a parameter type *t* is: `c` a narrow
+    `char *` (matches `s` and `b`), `p` another pointer, `i` an integer, `?`
+    anything else."""
+    t = _resolved_type(bv, t)
+    kind = _type_class(t)
+    if kind == "PointerTypeClass":
+        pointee = _resolved_type(bv, getattr(t, "target", None))
+        if _type_class(pointee) == "IntegerTypeClass" and int(getattr(pointee, "width", 0)) == 1:
+            return "c"
+        return "p"
+    if kind in ("IntegerTypeClass", "EnumerationTypeClass", "BoolTypeClass"):
+        return "i"
+    return "?"
+
+
+def _effective_call_type(func, call):
+    """The function type BN uses at the MLIL *call*: the call's own type
+    adjustment when it has one, else the type of its destination -- the
+    callee's prototype through a PLT stub, the import slot's type through a
+    GOT load (`call [strcpy@GOT]`). None when it is no function type."""
+    try:
+        adjusted = func.get_call_type_adjustment(int(call.address))
+    except Exception:  # noqa: BLE001 - no adjustment API: use the destination
+        adjusted = None
+    t = adjusted if adjusted is not None else getattr(getattr(call, "dest", None),
+                                                      "expr_type", None)
+    if _type_class(t) == "PointerTypeClass":
+        t = getattr(t, "target", None)
+    return t if _type_class(t) == "FunctionTypeClass" else None
+
+
+def _libc_string_parameter(bv, func, call, target: int | None, index: int) -> bool:
+    """True only when the callee at *target* is a real imported function BN
+    named itself (no user rename or alias), `_LIBC_PROTOTYPES` lists its name
+    with a string (`s`) at parameter *index*, and the type BN actually uses at
+    this *call* (`_effective_call_type`) matches that prototype parameter by
+    parameter, variadic included.
+
+    An outcome check, not a provenance one (#1045 review round 2): whatever
+    changed the type -- `proto set`, a `local retype` of one parameter, a
+    `data retype` of the GOT slot the call loads, a call-type adjustment, BN's
+    type library, or no prototype at all (`int64_t strcmp()`) -- any
+    difference from the C library's prototype leaves the bytes neutral."""
     if target is None:
         return False
     symbol = bv.get_symbol_at(target)
@@ -1244,16 +1291,28 @@ def _libc_string_parameter(bv, target: int | None, index: int) -> bool:
     kind = str(getattr(getattr(symbol, "type", None), "name", ""))
     if kind not in _REAL_IMPORT_KINDS or not bool(getattr(symbol, "auto", False)):
         return False
-    callee = bv.get_function_at(target)
-    if callee is not None and bool(getattr(callee, "has_user_type", False)):
-        return False
     raw_name = str(getattr(symbol, "raw_name", "") or "")
     if not raw_name or raw_name.startswith("_Z"):
         return False
-    name = raw_name.split("@", 1)[0]
-    family = il_format._variadic_format_family(name)
-    return (index in _LIBC_CHAR_POINTER_PARAMS.get(il_format._normalize_libc_name(name), ())
-            or (family is not None and family[0] == index))
+    expected = _LIBC_PROTOTYPES.get(il_format._normalize_libc_name(raw_name.split("@", 1)[0]))
+    if expected is None:
+        return False
+    variadic = expected.endswith(".")
+    letters = expected.rstrip(".")
+    if index >= len(letters) or letters[index] != "s":
+        return False
+    effective = _effective_call_type(func, call)
+    if effective is None:
+        return False
+    params = list(getattr(effective, "parameters", None) or [])
+    has_varargs = getattr(effective, "has_variable_arguments", False)
+    if bool(getattr(has_varargs, "value", has_varargs)) != variadic or len(params) != len(letters):
+        return False
+    for letter, param in zip(letters, params):
+        actual = _parameter_letter(bv, getattr(param, "type", None))
+        if actual != ("c" if letter in "sb" else letter):
+            return False
+    return True
 
 
 def _raw_string_pointer_findings(bv, func, text: str) -> dict[int, dict[str, Any]]:
@@ -1269,8 +1328,9 @@ def _raw_string_pointer_findings(bv, func, text: str) -> dict[int, dict[str, Any
     Printable bytes before a NUL are weak evidence on their own: an `int[]`, a
     UTF-16 string and a struct all start that way (#985 review), and
     `memcmp(p, 0x400760, 16)` once named an `int[4]` "ABC" (#1019 item 6). So
-    only ASCII passed where `_libc_string_parameter` says a real, unrenamed,
-    untyped C library import takes a narrow `char *` is a STRING (``string:
+    only ASCII passed where `_libc_string_parameter` finds a real, unrenamed
+    C library import whose type at the call matches its glibc prototype with
+    a string there is a STRING (``string:
     True``, at any length). Everything else that decodes is reported as its
     bytes and their decoding, claiming no string (``string: False``): from
     one character when the callee is any imported function or the text is
@@ -1313,7 +1373,7 @@ def _raw_string_pointer_findings(bv, func, text: str) -> dict[int, dict[str, Any
                     continue
                 if address not in raw and address not in placeholders:
                     continue
-                libc = _libc_string_parameter(bv, target, index)
+                libc = _libc_string_parameter(bv, func, ins, target, index)
                 symbol = bv.get_symbol_at(target) if target is not None else None
                 imported = str(getattr(getattr(symbol, "type", None), "name", "")) \
                     in _REAL_IMPORT_KINDS
@@ -1418,9 +1478,11 @@ def _text_bytes_note(found: dict[int, dict[str, Any]],
         f"raw address(es) whose bytes decode as text: {len(found)} call argument(s) render "
         f"as an address holding a NUL-terminated run that decodes as printable text: "
         f"{'; '.join(rows)}. Nothing here says it is a string: bn calls one a string only "
-        "when an imported C library function it knows takes a narrow `char *` there, and "
-        "this callee is not one (an inferred or local `char *`, a renamed or retyped "
-        "import, an unknown callee), or the text is not ASCII. An `int[]`, a struct or a "
+        "when the callee is a C library import it knows, called with exactly that "
+        "function's C prototype, taking a string there. This call is not (a local or "
+        "unknown callee, a renamed import, or a type at the call -- none, inferred, "
+        "applied or library -- that differs from that prototype), or the text is not "
+        "ASCII. An `int[]`, a struct or a "
         "UTF-16 run can read the same; read the bytes yourself (`bn read "
         f"{hex(first)} {len(entry['data']) + 1}` for the first) before calling it one."
     )
