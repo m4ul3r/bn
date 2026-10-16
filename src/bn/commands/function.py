@@ -454,6 +454,8 @@ def _decompile_many(
         op,
         {"identifiers": identifiers, **shared},
         require_target=True,
+        # #1045 review: the warnings print concrete `bn` commands.
+        contextual_hints=True,
         text_renderer=_render_batch_text,
         result_exit_code=_batch_exit_code,
         result_transform=_respell_row_errors,
@@ -538,6 +540,7 @@ def _decompile(args: argparse.Namespace) -> int:
             "decompile",
             {"identifier": identifiers[0], **shared},
             require_target=True,
+            contextual_hints=True,
             text_renderer=_render_decompile_text,
             stem="decompile",
         )
@@ -977,6 +980,8 @@ def _callsites(args: argparse.Namespace) -> int:
         "callsites",
         params,
         require_target=True,
+        # #1033 item 6: the variadic note's commands carry this call's -i/-t.
+        contextual_hints=True,
         text_renderer=lambda value: _render_callsites_text(
             value,
             prefer_caller_static=bool(args.caller_static),

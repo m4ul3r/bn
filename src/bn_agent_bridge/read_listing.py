@@ -16,12 +16,15 @@ Outbound calls resolve through:
     ``_hlil_statement_text``, ``_hlil_pre_branch_condition``,
     ``_instruction_length``, ``_llil_constant_value``, ``_decompile_text`` for
     the callsite decompile excerpt);
+  * ``call_arity`` -- the arity findings ``decompile`` also renders
+    (``_call_arity_findings``, ``_arity_text``) for callsite rows (#1038 item 6);
   * ``_shared`` -- module-free helpers (``_validate_count``, ``_parse_address``,
     ``OperationFailure``).
 
-Import direction is one-way: this module imports ``il_format`` and ``_shared``
-(plus stdlib + binaryninja). It NEVER imports ``bridge`` or ``seam`` -- those
-import THIS module one-way (design spec §3.2).
+Import direction is one-way: this module imports ``il_format``, ``call_arity``
+and ``_shared`` (plus stdlib + binaryninja). It NEVER imports ``bridge``,
+``seam`` or ``read_decompile`` -- those import THIS module one-way (design
+spec §3.2).
 """
 from __future__ import annotations
 
@@ -36,6 +39,7 @@ try:
 except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
     bn = None  # type: ignore[assignment]
 
+from . import call_arity
 from . import il_format
 from . import read_misc
 from . import read_xrefs
@@ -61,28 +65,40 @@ def _callee_variadic_hint(callee) -> dict[str, Any] | None:
     text can show only the fixed argument(s), so point at the argument-recovery
     views. Returns None for a non-variadic callee. Never asserts a finding -- it
     steers, it does not judge. ``callee_imported`` is BN's symbol kind (#949), and
-    only a known printf/scanf-family callee is said to take a format string."""
+    only a known printf/scanf-family callee is said to take a format string.
+    The ``note`` names a caller, so each row gets its own
+    (`_variadic_hint_for_caller`)."""
     name = str(getattr(callee, "name", "") or "")
     family = il_format._variadic_format_family(name)
     if family is None and not il_format._function_is_variadic(callee):
         return None
     fmt_index = family[0] if family is not None else None
     is_scanf = bool(family[1]) if family is not None else False
-    imported = is_imported_function(callee)
-    kind = "an imported variadic function" if imported else "a variadic function"
-    supplied = ("a format string and additional arguments" if family is not None
-                else "variadic arguments")
     return {
         "name": il_format._normalize_libc_name(name),
-        "callee_imported": imported,
+        "callee_imported": is_imported_function(callee),
         "is_variadic": True,
         "family": "scanf" if is_scanf else ("printf" if family is not None else None),
         "format_arg_index": fmt_index,
+    }
+
+
+def _variadic_hint_for_caller(hint: dict[str, Any], caller) -> dict[str, Any]:
+    """*hint* with the note for one calling function. The commands carry the
+    caller's ADDRESS (#1033 item 6): a `<caller>` placeholder failed when
+    pasted, and a name can be an overload or need quoting; an address runs
+    as printed."""
+    kind = "an imported variadic function" if hint["callee_imported"] else "a variadic function"
+    supplied = ("a format string and additional arguments" if hint["family"] is not None
+                else "variadic arguments")
+    where = hex(int(caller.start))
+    return {
+        **hint,
         "note": (
             f"callee is {kind}; the HLIL statement may show only the fixed argument(s) "
-            f"even when ABI setup supplied {supplied}. Run `bn evidence function <caller>` "
-            "for the recovered arguments and raw ABI argument candidates, or inspect "
-            "`bn disasm <caller> --linear`."
+            f"even when ABI setup supplied {supplied}. Run `bn evidence function {where}` "
+            f"for the recovered arguments and raw ABI argument candidates, or read "
+            f"`bn disasm {where}`."
         ),
     }
 
@@ -323,7 +339,7 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
             }
         )
         if variadic_hint is not None:
-            rows[-1]["callee_variadic"] = variadic_hint
+            rows[-1]["callee_variadic"] = _variadic_hint_for_caller(variadic_hint, func)
         if hlil_statement is None:
             # #792: the statement is null (with a reason), but the callsite is
             # still visible in the decompilation. Rendering that body is by far
@@ -335,8 +351,34 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
             # `offset + limit + 1` rows must not pay a whole-function
             # decompilation for the rows paging then drops.
             rows[-1]["_excerpt_fn"] = func
+    if rows:
+        _attach_callsite_arity(bv, func, rows)
     rows.sort(key=lambda item: int(item["call_addr"], 16))
     return rows
+
+
+def _attach_callsite_arity(bv, func, rows: list[dict[str, Any]]) -> None:
+    """Give each callsite row the arity finding `decompile` marks on the same
+    call, in place (#1038 item 6): the row is built from the HLIL statement,
+    which renders exactly the arguments the callee's prototype declares, so
+    read alone `std::filebuf::open(&f)` said the open takes no path. The
+    finding names the unrendered registers and the value each holds at the
+    call when that is known, or says the rendered arguments are BN's guess
+    (`call_arity._call_arity_findings`, shared with `decompile`). A row with
+    no finding gets no key: nothing found is not "every argument is shown"."""
+    findings = {row["address"]: row for row in call_arity._call_arity_findings(bv, func)}
+    for row in rows:
+        found = findings.get(int(row["call_addr"], 16))
+        if found is None:
+            continue
+        no_parameters = found["shape"] == "no_parameters"
+        row["arity"] = {
+            "shape": found["shape"],
+            "rendered": found["rendered"],
+            "expected": None if no_parameters else found["expected"],
+            "missing": [{"register": reg, "value": value} for reg, value in found["missing"]],
+            "note": call_arity._arity_text(found),
+        }
 
 
 #: #998 item 1: how many data-ref addresses a `callsites` envelope lists;

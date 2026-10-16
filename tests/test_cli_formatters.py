@@ -752,6 +752,8 @@ def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
     # #557 + #558: text output surfaces the null-hlil reason code and the
     # variadic-callee steer.
     from bn.formatters import _render_callsites_text
+    note = ("callee is an imported variadic function; ... Run "
+            "`bn evidence function 0x500000` for the recovered arguments")
     value = {"items": [{
         "callee": {"name": "sscanf", "address": "0x461746"},
         "containing_function": {"name": "parse_line", "address": "0x500000"},
@@ -760,35 +762,35 @@ def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
         "call_instruction": {"address": "0x500010", "text": "bl sscanf"},
         "previous_instructions": [], "next_instructions": [],
         "callee_variadic": {"name": "sscanf", "is_variadic": True, "family": "scanf",
-                            "format_arg_index": 1, "note": "..."},
+                            "format_arg_index": 1, "note": note},
     }], "total": 1, "has_more": False}
     out = _render_callsites_text(value)
     assert "hlil_statement: null (no_hlil_mapping)" in out
-    assert "callee_variadic: sscanf" in out
-    assert "bn evidence function parse_line" in out
+    assert f"callee_variadic: sscanf — {note}" in out
 
 
-def test_render_callsites_variadic_hint_runs_on_the_address_of_a_demangled_caller_978():
-    # #986 review: overloads share a demangled name (`ns::put` x3), so a hint
-    # naming the caller that way runs an ambiguous command. The text NAMES the
-    # caller by its shown name but the runnable commands take its address;
-    # under --mangled the raw name is unique and is used as-is.
+def test_render_callsites_variadic_line_prints_the_bridge_note_not_a_rebuilt_command_1033():
+    # #1033 item 6: the commands are the bridge's (caller address, routed with
+    # -i/-t by `_call`); the renderer no longer builds its own from the shown
+    # name. An older bridge row without a note keeps the plain steer.
     from bn.formatters import _render_callsites_text
-    value = {"items": [{
+    row = {
         "callee": {"name": "__printf_chk", "address": "0x400700"},
         "containing_function": {"name": "_ZN2ns3putEPci", "display_name": "ns::put",
                                 "address": "0x400aa0"},
         "call_addr": "0x400ab0", "caller_static": "0x400ab4",
         "call_instruction": {"address": "0x400ab0", "text": "bl __printf_chk"},
         "previous_instructions": [], "next_instructions": [],
-        "callee_variadic": {"name": "printf_chk", "is_variadic": True},
-    }], "total": 1, "has_more": False}
-    out = _render_callsites_text(value)
-    assert "fixed args in ns::put;" in out
-    assert "`bn evidence function 0x400aa0`" in out
-    assert "`bn disasm 0x400aa0 --linear`" in out
-    raw = _render_callsites_text(value, mangled=True)
-    assert "`bn evidence function _ZN2ns3putEPci`" in raw
+        "callee_variadic": {"name": "printf_chk", "is_variadic": True,
+                            "note": "read `bn -i a -t b disasm 0x400aa0`."},
+    }
+    out = _render_callsites_text({"items": [row], "total": 1, "has_more": False})
+    assert "callee_variadic: printf_chk — read `bn -i a -t b disasm 0x400aa0`." in out
+    assert "ns::put" not in out.split("callee_variadic:", 1)[1]
+    del row["callee_variadic"]["note"]
+    out = _render_callsites_text({"items": [row], "total": 1, "has_more": False})
+    assert "callee_variadic: printf_chk — HLIL may show only fixed args in ns::put" in out
+    assert "`bn" not in out
 
 
 def test_render_callsites_shows_missing_context_reason():

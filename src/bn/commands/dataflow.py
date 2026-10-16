@@ -144,6 +144,10 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
                  help="Which edges to resolve (default: both)"),
              arg("--no-resolve-indirect", dest="resolve_indirect", action="store_false", default=True,
                  help="Skip value-set resolution of indirect call targets"),
+             arg("--per-site", action="store_true", default=False,
+                 help="Text: one row per direct call site instead of one row per distinct "
+                      "callee/caller with its count (JSON is always per site)"),
+             mangled_arg(),
          ],
          estimable=True)
 def _dataflow_callgraph(args: argparse.Namespace) -> int:
@@ -156,7 +160,8 @@ def _dataflow_callgraph(args: argparse.Namespace) -> int:
             "resolve_indirect": bool(args.resolve_indirect),
         },
         require_target=True,
-        text_renderer=lambda value: _resolution_note(value) + _render_callgraph_text(value),
+        text_renderer=lambda value: _resolution_note(value) + _render_callgraph_text(
+            value, per_site=bool(args.per_site), mangled=bool(args.mangled)),
         stem="callgraph",
     )
 
@@ -176,6 +181,8 @@ def _dataflow_values(args: argparse.Namespace) -> int:
         "possible_values",
         {"identifier": args.identifier, "at": args.at},
         require_target=True,
+        # #1033 item 8: the `--at` refusal prints a `bn il` command.
+        contextual_hints=True,
         text_renderer=lambda value: _resolution_note(value) + _render_values_text(value),
         stem="values",
     )

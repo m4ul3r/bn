@@ -3198,8 +3198,10 @@ def test_decompile_text_prints_one_short_line_per_warning_1000(fake_transport, c
             break
         detail_lines.append(line)
     assert len(detail_lines) > 1 and all(len(line) <= 122 for line in detail_lines)
-    assert " ".join(line.strip() for line in detail_lines) == _ARITY_ROW["detail"]
-    assert any("`bn callsites 0x401160 --within 0x401420 --context 4`" in line
+    # The command carries this call's `--target` (#1045 review).
+    routed = _ARITY_ROW["detail"].replace("`bn callsites", "`bn -t active callsites")
+    assert " ".join(line.strip() for line in detail_lines) == routed
+    assert any("`bn -t active callsites 0x401160 --within 0x401420 --context 4`" in line
                for line in detail_lines)
     assert "--explain:" not in out
 
@@ -3637,6 +3639,29 @@ def test_batch_decompile_refusal_rows_replay_all_operands(monkeypatch, tmp_path,
         assert calls[-1][0] == expected
         assert calls[-1][1]["identifiers"] == identifiers
         assert calls[-1][2] == "-demo"
+
+
+def test_decompile_routes_the_commands_its_warnings_print_1045(fake_transport, capsys):
+    # #1045 review: `bn proto get 0x400750` from a decompile run with two
+    # targets open exits 2 ("requires --target"). The warning prose -- text
+    # summary, --explain detail and JSON `warnings` -- carries this call's
+    # -i/-t, as trace and callsites hints do.
+    detail = ("call arity: ... Read a call's real arguments in its disassembly with "
+              "`bn callsites 0x400750 --within 0x400900 --context 4`. "
+              "`bn proto get 0x400750` shows the prototype BN has.")
+    row = {"code": "string", "summary": "1 raw address ...; define with "
+                                        "`bn data retype 0x400c98 'char[2]'`",
+           "detail": detail}
+    _decompile_with_warnings(fake_transport, [detail], [row])
+    argv = ["-i", "inst1", "decompile", "start_listener", "-t", "regd"]
+    assert bn.cli.main([*argv, "--explain"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "`bn -i inst1 -t regd data retype 0x400c98 'char[2]'`" in out
+    assert "`bn -i inst1 -t regd proto get 0x400750`" in out
+    assert "`bn -i inst1 -t regd callsites 0x400750 --within 0x400900 --context 4`" in out
+    assert bn.cli.main([*argv, "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "`bn -i inst1 -t regd proto get 0x400750`" in payload["warnings"][0]
 
 
 # ---------------------------------------------------------------------------

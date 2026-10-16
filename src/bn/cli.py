@@ -2318,7 +2318,11 @@ def _contextualize_diagnostic_hints(
     def route_prose(text: str) -> str:
         return re.sub(r"`bn ([^`]+)`", route, text)
 
-    prose_keys = {"error", "hints", "assumptions", "note", "detail", "next_action", "recovery_advice"}
+    # `summary`/`warnings` are decompile's warning prose (#1045 review): its
+    # printed `bn proto get 0x…` / `bn evidence table …` advice needs this
+    # call's routing to run with several targets open.
+    prose_keys = {"error", "hints", "assumptions", "note", "detail", "next_action",
+                  "recovery_advice", "summary", "warnings"}
 
     def visit(item: Any, *, prose: bool = False) -> None:
         if isinstance(item, dict):

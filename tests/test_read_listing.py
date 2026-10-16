@@ -2375,6 +2375,57 @@ def test_callee_vtable_actual_registry_must_resolve_exact_canonical_object(monke
     assert result["callee_data_ref_vtables"] == []
 
 
+def test_callsite_variadic_note_prints_commands_that_run_for_that_caller_1033():
+    # #1033 item 6: the note said `bn evidence function <caller>`. Each row now
+    # names its own caller by address, which runs as printed (an overloaded or
+    # quoted name would not).
+    import importlib
+    import shlex
+    from types import SimpleNamespace
+
+    from bn import cli
+
+    read_listing = importlib.import_module("bn_agent_bridge.read_listing")
+    callee = SimpleNamespace(name="__printf_chk", symbol=None,
+                             type=SimpleNamespace(has_variable_arguments=True))
+    hint = read_listing._callee_variadic_hint(callee)
+    caller = SimpleNamespace(start=0x400aa0)
+    note = read_listing._variadic_hint_for_caller(hint, caller)["note"]
+    commands = re.findall(r"`bn ([^`]+)`", note)
+    assert len(commands) == 2
+    parser = cli.build_parser()
+    for command in commands:
+        args = parser.parse_args(shlex.split(command))
+        assert args.identifier == "0x400aa0"
+
+
+def test_callsite_rows_carry_the_arity_finding_decompile_marks_1038(monkeypatch):
+    # #1038 item 6: a row built from `std::filebuf::open(&f)` alone said the
+    # open takes no path; the row now carries what decompile marks there.
+    import importlib
+    import sys
+
+    read_listing = importlib.import_module("bn_agent_bridge.read_listing")
+    call_arity = importlib.import_module("bn_agent_bridge.call_arity")
+    finding = {"address": 0x401040, "target": 0x400e00, "label": "open @ 0x400e00",
+               "rendered": 1, "expected": 3, "shape": "shortfall", "evidence": (),
+               "missing": [("x1", "0x402000 (g_path)"), ("x2", None)]}
+    monkeypatch.setattr(call_arity, "_call_arity_findings", lambda bv, func: [finding])
+    # #1045 review: callsites must not depend on read_decompile (which imports
+    # read_listing): with it unimportable, the rows still get their finding.
+    monkeypatch.setitem(sys.modules, "bn_agent_bridge.read_decompile", None)
+    rows = [{"call_addr": "0x401040"}, {"call_addr": "0x401080"}]
+    read_listing._attach_callsite_arity(None, None, rows)
+    assert rows[0]["arity"] == {
+        "shape": "shortfall", "rendered": 1, "expected": 3,
+        "missing": [{"register": "x1", "value": "0x402000 (g_path)"},
+                    {"register": "x2", "value": None}],
+        "note": "+2 args not rendered: x1 = 0x402000 (g_path), x2",
+    }
+    # No finding, no key: absence is not "every argument is shown".
+    assert "arity" not in rows[1]
+
+
 # --- #1037 item 9: an exact name match leads the default search order --------
 
 

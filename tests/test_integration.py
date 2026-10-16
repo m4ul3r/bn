@@ -3374,15 +3374,20 @@ class TestFunctionDeleteRepair966:
                             "TAIL"), 16)
         warning = shared_bn.run("decompile", "build_widget")
         assert warning.returncode == 0, f"{warning.stdout}\n{warning.stderr}"
+        # Printed with this call's routing (`-i`, and the target the call
+        # resolved), so it runs as printed (#1045 review).
+        printed = re.search(rf"`bn -i {shared_bn.instance_id} -t (\S+) function delete "
+                            rf"{hex(split)}`", warning.stdout)
+        assert printed is not None, warning.stdout
         repair_command = f"bn function delete {hex(split)}"
-        assert f"`{repair_command}`" in warning.stdout
         assert "no clean undo; --preview refuses" in warning.stdout
 
         preview = shared_bn.run("function", "delete", hex(split), "--preview", "--format", "json")
         assert preview.returncode == 3, f"{preview.stdout}\n{preview.stderr}"
         assert _py_line(shared_bn, f"print('ENTRY=' + str(bv.get_function_at({split}) is not None))", "ENTRY") == "True"
 
-        deleted = shared_bn.run(*repair_command.split()[1:], "--format", "json")
+        deleted = shared_bn.run("-t", printed.group(1), *repair_command.split()[1:],
+                                "--format", "json")
         assert deleted.returncode == 0, f"{deleted.stdout}\n{deleted.stderr}"
         result = json.loads(deleted.stdout)
         observed = result["results"][0]["observed"]
@@ -5156,8 +5161,10 @@ class TestStructLayoutAssistance903:
         untyped = shared_bn.json("decompile", "handle")
         hint = next((w for w in untyped["warnings"] if "struct layout candidate" in w), None)
         assert hint is not None, untyped
-        for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth", "bn proto set"):
+        # The printed command carries this call's routing (#1045 review).
+        for witness in ("cfg", "+0x28/8", "flags", "+0x30/4", "depth"):
             assert witness in hint
+        assert re.search(rf"`bn -i {shared_bn.instance_id} -t \S+ proto set ", hint), hint
         assert shared_bn.json("proto", "get", "handle") == before
         # Text prints the one-line summary; the full sentence is --explain's.
         text_result = shared_bn.run("decompile", "handle", "--explain")
@@ -5640,6 +5647,114 @@ class TestShortLiteralBehindDataName994:
         strings = [row for row in result["warning_rows"] if row["code"] == "string"]
         assert strings and strings[0]["strings"][0]["value"] == "C", result["warning_rows"]
         assert strings[0]["strings"][0]["address"] == hex(int(match.group(1), 16))
+
+
+_CM2B_SOURCE = """
+static const int words3[4] = {0x00494847, 7, 8, 9};
+__attribute__((noinline)) int two(void *o, const void *p) { const int *q = p; return q[1] + *(char *)o; }
+__attribute__((noinline)) int probe(void *o) { return two(o, words3); }
+int main(int c, char **v) { return probe(v[0]); }
+"""
+_CM3_LIB_SOURCE = "int two(void *o, const void *p) { return *(const char *)o + *(const char *)p; }\n"
+_CM3_SOURCE = """
+extern int two(void *o, const void *p);
+static const int words4[4] = {0x004c4b4a, 7, 8, 9};
+__attribute__((noinline)) int idx(const int *w) { return w[1] + w[2]; }
+__attribute__((noinline)) int arity_pair(void *o) { return two(o, words4) + idx(words4); }
+int main(int c, char **v) { return arity_pair(v[0]); }
+"""
+
+
+def _build(compiler: str, out: Path, *args: str) -> None:
+    cc = shutil.which(compiler)
+    if cc is None:
+        refuse_silent_skip(f"{compiler} not available, so the #1045 string-evidence lane did not run")
+    built = subprocess.run([cc, *args, "-o", str(out)], capture_output=True, text=True, timeout=120)
+    assert built.returncode == 0, built.stderr
+
+
+class TestStringScanSeesCodeOnly1045:
+    """#1045 review round 4: the (base) raw-string scanner was handed bn's own
+    notes and the analyst's stored comments, so a hex address in either made
+    a `&data_…` placeholder look like a raw address and skip the placeholder's
+    `char *` requirement. Base printed no string in both cases."""
+
+    def test_a_hidden_inherited_comment_is_not_string_evidence_cm2b_x86(
+            self, shared_bn, tmp_path):
+        src = tmp_path / "cm2b.c"
+        src.write_text(_CM2B_SOURCE)
+        binary = tmp_path / "cm2b"
+        _build("cc", binary, "-O1", "-fno-builtin", "-no-pie", "-s", str(src))
+        shared_bn.load(binary, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        probe = shared_bn.json("py", "exec", (
+            "probe = [f for f in bv.functions if len(f.callees) == 1 and "
+            "any('&data_' in str(i) for i in f.hlil.instructions)][0]\n"
+            "data = [int(t, 16) for t in __import__('re').findall(r'data_([0-9a-f]+)', str(probe.hlil))][0]\n"
+            "probe.set_comment_at(probe.start, 'see ' + hex(data))\n"
+            "result = [hex(probe.start), hex(data)]"))["result"]
+        result = shared_bn.json("decompile", probe[0])
+        assert f"&data_{int(probe[1], 16):x}" in result["text"], result["text"]
+        assert "<annotation redacted>" in result["text"]
+        assert "string" not in [row["code"] for row in result["warning_rows"]], result["warning_rows"]
+
+    def test_a_recovered_arity_value_is_not_string_evidence_cm3_arm(self, shared_bn, tmp_path):
+        lib_src, src = tmp_path / "libtwo.c", tmp_path / "cm3.c"
+        lib_src.write_text(_CM3_LIB_SOURCE)
+        src.write_text(_CM3_SOURCE)
+        _build("aarch64-linux-gnu-gcc", tmp_path / "libtwo.so", "-O2", "-shared", "-fPIC",
+               str(lib_src))
+        binary = tmp_path / "cm3"
+        _build("aarch64-linux-gnu-gcc", binary, "-O2", "-fno-builtin", "-no-pie", "-s", str(src),
+               f"-L{tmp_path}", "-ltwo")
+        shared_bn.load(binary, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        narrowed = shared_bn.run("proto", "set", "two", "int64_t two(int64_t arg1)")
+        assert narrowed.returncode == 0, narrowed.stdout + narrowed.stderr
+        caller = shared_bn.json("py", "exec", (
+            "result = hex([f for f in bv.functions if any(c.name == 'two' for c in f.callees)][0].start)"
+        ))["result"]
+        result = shared_bn.json("decompile", caller)
+        # The premise: the recovered value is in the arity note, beside the
+        # unrelated placeholder operand the base rule leaves alone.
+        match = re.search(r"x1 = (0x[0-9a-f]+) \*/", result["text"])
+        assert match, result["text"]
+        assert f"&data_{int(match.group(1), 16):x}" in result["text"], result["text"]
+        assert "string" not in [row["code"] for row in result["warning_rows"]], result["warning_rows"]
+
+    def _decompile_probe(self, shared_bn, tmp_path, source):
+        src = tmp_path / "probe.c"
+        src.write_text(source)
+        binary = tmp_path / "probe"
+        _build("aarch64-linux-gnu-gcc", binary, "-O2", "-fno-builtin", str(src))
+        shared_bn.load(binary, timeout=_CROSS_ARCH_ANALYSIS_TIMEOUT)
+        return shared_bn.json("decompile", "probe")
+
+    def test_a_literal_holding_a_bn_note_marker_keeps_the_raw_operand(self, shared_bn, tmp_path):
+        # Round 5: a regex delete of `/* bn: ... */` started inside the format
+        # literal and took the raw `strcmp` operand with it; base names "a".
+        result = self._decompile_probe(shared_bn, tmp_path, (
+            "#include <stdio.h>\n#include <string.h>\n"
+            "__attribute__((noinline)) int probe(const char *p) "
+            '{ return printf("/* bn: %d", strcmp(p, "a")); }\n'
+            "int main(int c, char **v) { return probe(v[0]); }\n"))
+        assert '"/* bn: %d"' in result["text"], result["text"]
+        [row] = [row for row in result["warning_rows"] if row["code"] == "string"]
+        assert [s["value"] for s in row["strings"]] == ["a"], row
+        assert row["strings"][0]["inline"] is True, row
+
+    def test_a_literal_holding_a_url_keeps_both_raw_operands(self, shared_bn, tmp_path):
+        # Round 5: BN renders the embedded quotes unescaped, and the regex read
+        # the URL's `//` as a comment: both operands were lost and the arity
+        # notes landed inside the literal. Base names "abc" and "x".
+        result = self._decompile_probe(shared_bn, tmp_path, (
+            "#include <string.h>\n"
+            "__attribute__((noinline)) int probe(const char *s) "
+            '{ return strcmp("<a href=\\"http://x\\">", "abc") + strcmp(s, "x"); }\n'
+            "int main(int c, char **v) { return probe(v[0]); }\n"))
+        [line] = [line for line in result["text"].splitlines() if "http://x" in line]
+        assert '"<a href="http://x">", 0x' in line, line  # the literal is intact
+        assert line.index("/* bn:") > line.index("http://x"), line
+        [row] = [row for row in result["warning_rows"] if row["code"] == "string"]
+        assert sorted(s["value"] for s in row["strings"]) == ["abc", "x"], row
 
 
 class TestOffsetTypeLookup1000:

@@ -4521,18 +4521,21 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
             lines.append(f"hlil_statement: null ({row['hlil_statement_reason']})")
         if row.get("pre_branch_condition"):
             lines.append(f"pre_branch_condition: {row['pre_branch_condition']}")
+        arity_note = _text_value(_field_dict(row, "arity"), "note")
+        if arity_note:
+            # #1038 item 6: what `decompile` marks on this call -- the arguments
+            # the statement above does not render, or that it guessed.
+            lines.append(f"arity: {arity_note}")
         variadic = _field_dict(row, "callee_variadic")
         if variadic.get("is_variadic"):
-            # #558: steer to the argument-recovery views for an imported variadic callee.
-            # #978: name the caller as the line above does; when that shown name
-            # is not the raw symbol (a demangled one, which overloads can share)
-            # the runnable command uses the caller's address, which is unique.
-            target = (containing_name if containing_name == containing.get("name")
-                      else containing.get("address", containing_name))
+            # #558: steer to the argument-recovery views for a variadic callee.
+            # #1033 item 6: the commands are the bridge's note, which names the
+            # caller by address (so it runs as printed) and carries this
+            # invocation's -i/-t once `_call` has routed it.
+            note = _text_value(variadic, "note")
             lines.append(
-                f"callee_variadic: {variadic.get('name', '?')} — HLIL may show only fixed "
-                f"args in {containing_name}; run `bn evidence function {target}` "
-                f"or `bn disasm {target} --linear`"
+                f"callee_variadic: {variadic.get('name', '?')} — "
+                + (note or f"HLIL may show only fixed args in {containing_name}")
             )
 
         call_instruction = _field_dict(row, "call_instruction")
@@ -4740,44 +4743,109 @@ def _render_defuse_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+_CALLGRAPH_SITES_SHOWN = 3
+
+
+def _callgraph_site_list(sites: list[Any]) -> str:
+    shown = ", ".join(str(s) for s in sites[:_CALLGRAPH_SITES_SHOWN])
+    more = len(sites) - _CALLGRAPH_SITES_SHOWN
+    return shown + (f", +{more} more" if more > 0 else "")
+
+
 @_discloses
-def _render_callgraph_text(value: Any) -> str:
+def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool = False) -> str:
+    """`dataflow callgraph` text. By default each distinct direct callee and
+    each distinct caller is one row with its call count and first sites
+    (#1037 item 8: a constructor's 55 rows were 12 of one `operator delete`);
+    *per_site* prints one row per call site. Indirect calls stay one row per
+    site either way: each has its own expression and resolution. Names are
+    the demangled display names unless *mangled* (#978); JSON is per site."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
-    lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
+    lines = [f"{_shown_name(fn, mangled=mangled) or '<unknown>'} @ {fn.get('address', '<unknown>')}"]
     # PRESENT, not merely declared: an explicit null CLAIMED nothing about the
     # callees, so asserting `callees (0):` from it is the same confident zero
     # this change exists to refuse. A present-and-empty list still prints the
     # row -- that is a real "we looked and found none" (#619).
     if _field_present(value, "callees"):
         callees = _field_list(value, "callees")
-        lines.append(f"callees ({len(callees)}):")
+        rows: list[Any] = []  # rendered strings, or a direct-target group key
+        groups: dict[tuple[Any, Any], list[Any]] = {}
         for c in callees:
             if not isinstance(c, dict):
-                lines.append(f"  {c!r}")
+                rows.append(f"  {c!r}")
                 continue
             if c.get("kind") == "direct":
                 tgt = _field_dict(c, "target")
-                lines.append(f"  {c.get('call_addr')}  direct -> {tgt.get('name', '<unknown>')} @ {tgt.get('address')}")
+                name = _shown_name(tgt, mangled=mangled) or "<unknown>"
+                if per_site:
+                    rows.append(f"  {c.get('call_addr')}  direct -> {name} @ {tgt.get('address')}")
+                    continue
+                # Rendered spellings, so a malformed field still groups (#619).
+                key = (f"{name}", f"{tgt.get('address')}")
+                if key not in groups:
+                    groups[key] = []
+                    rows.append(key)  # a group row, rendered once its sites are known
+                groups[key].append(c.get("call_addr"))
             else:
                 resolved = _field_list(c, "resolved")
                 if resolved:
-                    tgts = ", ".join(f"{_as_dict(r).get('name', '?')}@{_as_dict(r).get('address')}" for r in resolved)
+                    tgts = ", ".join(
+                        f"{_shown_name(_as_dict(r), mangled=mangled) or '?'}@{_as_dict(r).get('address')}"
+                        for r in resolved)
                     suffix = f"resolved: {tgts}"
                 else:
                     suffix = f"UNRESOLVED ({c.get('resolution_detail', 'indirect')})"
-                lines.append(f"  {c.get('call_addr')}  indirect [{c.get('dest_expr', '')}]  {suffix}")
+                rows.append(f"  {c.get('call_addr')}  indirect [{c.get('dest_expr', '')}]  {suffix}")
+        if per_site or not callees:
+            lines.append(f"callees ({len(callees)}):")
+        else:
+            distinct = sum(1 for row in rows if isinstance(row, tuple))
+            lines.append(f"callees ({len(callees)} sites, {distinct} distinct direct; "
+                         "--per-site lists each site):")
+        for row in rows:
+            if isinstance(row, tuple):
+                sites = groups[row]
+                lines.append(f"  direct -> {row[0]} @ {row[1]}  x{len(sites)}  at "
+                             f"{_callgraph_site_list(sites)}")
+            else:
+                lines.append(row)
     if _field_present(value, "callers"):
         callers = _field_list(value, "callers")
-        lines.append(f"callers ({len(callers)}):")
+        rows = []  # caller rows: strings, or a group key rendered below
+        caller_groups: dict[tuple[Any, Any], list[Any]] = {}
         for c in callers:
             if not isinstance(c, dict):
-                lines.append(f"  {c!r}")
+                rows.append(f"  {c!r}")
                 continue
             caller = _field_dict(c, "caller")
-            site = f"{c.get('call_addr')}  " if c.get("call_addr") else ""
-            lines.append(f"  {site}{caller.get('name', '<unknown>')} @ {caller.get('address', '?')}")
+            name = _shown_name(caller, mangled=mangled) or "<unknown>"
+            if per_site:
+                site = f"{c.get('call_addr')}  " if c.get("call_addr") else ""
+                rows.append(f"  {site}{name} @ {caller.get('address', '?')}")
+                continue
+            key = (f"{name}", f"{caller.get('address', '?')}")
+            if key not in caller_groups:
+                caller_groups[key] = []
+                rows.append(key)
+            if c.get("call_addr"):
+                caller_groups[key].append(c.get("call_addr"))
+        if per_site or not callers:
+            lines.append(f"callers ({len(callers)}):")
+        else:
+            distinct = sum(1 for row in rows if isinstance(row, tuple))
+            # BN's function-level fallback rows carry no call site.
+            unit = ("sites" if all(isinstance(c, dict) and c.get("call_addr") for c in callers)
+                    else "rows")
+            lines.append(f"callers ({len(callers)} {unit}, {distinct} distinct):")
+        for row in rows:
+            if isinstance(row, tuple):
+                sites = caller_groups[row]
+                lines.append(f"  {row[0]} @ {row[1]}"
+                             + (f"  x{len(sites)}  at {_callgraph_site_list(sites)}" if sites else ""))
+            else:
+                lines.append(row)
     return "\n".join(lines)
 
 
