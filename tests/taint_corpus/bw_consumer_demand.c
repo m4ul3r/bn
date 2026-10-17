@@ -3,9 +3,9 @@
  * one constant, or one outside the object, is never proven -- and "no call
  * certifies" holds on every consumer path: a pointer a call returned (into a
  * local, a heap object or a parameter's object), a heap object and a pointer
- * parameter are never complete. Only a debug-typed or user-typed local's
- * extent bounds a store proof; the _nog rebuilds (no debug info) are never
- * complete. Analyze only; never execute. */
+ * parameter are never complete. Since review round 3 no store proof makes a
+ * slice complete either: covered regions are reported as facts, with and
+ * without debug info (the _nog rebuilds). Analyze only; never execute. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>

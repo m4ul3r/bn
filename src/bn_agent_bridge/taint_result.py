@@ -533,8 +533,9 @@ def backward_diagnostics(
         if proof_leaf is not None:
             next_action += (
                 ". Stores cover the consumed bytes, but a store proof is reported, "
-                "not certified (#931): check by hand that the consumer reads only "
-                "those bytes of the whole object -- "
+                "not certified (#931), and covered bytes do not establish a NUL "
+                "terminator: check by hand that the consumer reads only those bytes "
+                "of the whole object -- "
                 f"`bn il {proof_leaf['function']} --view mlil` shows the stores and "
                 "the pointer arithmetic")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")

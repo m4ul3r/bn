@@ -414,6 +414,48 @@ int main(void) { return 0; }
 
 
 
+@pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+@pytest.mark.parametrize("bsymbolic", [False, True])
+def test_returned_pointer_over_a_got_loaded_global_fails_closed(tmp_path, shared_bn, arch,
+                                                                opt, bsymbolic):
+    """Re-dogfood of #931 round 3: in a PIC shared object the preemptible
+    `global_buf` is reached through the GOT (MLIL_IMPORT), and
+    `popen(fgets(global_buf, 0x40, f), "r")` was complete with `source:fgets`
+    on both architectures. Default deny: an object the walk cannot see as a
+    local buffer is a frontier. `-Wl,-Bsymbolic` (a direct constant address)
+    is the control, which already failed closed."""
+    cc = "gcc" if arch == "x86_64" else shutil.which("aarch64-linux-gnu-gcc")
+    if cc is None:
+        refuse_silent_skip(
+            "aarch64-linux-gnu-gcc is required for the AArch64 GOT fixture; "
+            "install the cross toolchain (Debian/Ubuntu: gcc-aarch64-linux-gnu)")
+    src = tmp_path / "got.c"
+    src.write_text("""
+#include <stdio.h>
+char global_buf[64];
+__attribute__((noinline)) void returned_global(FILE *f) {
+    popen(fgets(global_buf, 0x40, f), "r");
+}
+""")
+    binary = tmp_path / f"got_{arch}{opt}{'_sym' if bsymbolic else ''}.so"
+    built = subprocess.run(
+        [cc, opt, "-g", "-fPIC", "-shared", "-fno-inline", "-fno-stack-protector",
+         "-U_FORTIFY_SOURCE", *(["-Wl,-Bsymbolic"] if bsymbolic else []),
+         str(src), "-o", str(binary)],
+        capture_output=True, text=True, timeout=120.0)
+    if built.returncode:
+        raise FixtureBuildError(f"GOT fixture compile failed: {built.stderr}")
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "returned_global",
+                      "--sink", "arg:popen:0")
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    assert {sl["origin"]["kind"] for sl in result["slices"]} == {"source"}, result["slices"]
+    if not bsymbolic:
+        assert any(lf["kind"] == "pointer_object_unresolved" and lf.get("pointer") == "global_buf"
+                   for lf in result["leaves"]), result["leaves"]
+
+
 def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):
     """#1041 item 2 on the architecture it was found on: two 4-byte
     sign-extending loads of the upper half of an 8-byte field store feed the

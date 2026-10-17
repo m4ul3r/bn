@@ -1,15 +1,16 @@
-/* #931/#933: only plain stores prove the consumed region initialised, and the
- * region runs from the sink's pointer to the end of the object. gcc expands a
- * short literal strcpy and a constant memset into inline stores, which BN
- * outlines as `__builtin_*` calls; their extent counts only after the walk
- * checks their LLIL is that store run. Analyze only. */
+/* #931/#933: only plain stores count toward the consumed region, which runs
+ * from the sink's pointer to the end of the object -- and since review round 3
+ * a store-covered region is a reported fact, never a complete slice. gcc
+ * expands a short literal strcpy and a constant memset into inline stores,
+ * which BN outlines as `__builtin_*` calls; their extent counts only after the
+ * walk checks their LLIL is that store run. Analyze only. */
 #include <stdio.h>
 #include <string.h>
 
 struct tail_cmd { int id; char cmd[16]; };
 struct head_cmd { char cmd[16]; int flags; };
 
-/* cmd is the last member and its 16 bytes are stored: complete. */
+/* cmd is the last member and its 16 bytes are stored: covered, uncertified. */
 __attribute__((noinline)) void member_stored(void) {
     struct tail_cmd s;
     strcpy(s.cmd, "ls -la /tmp/xyz");

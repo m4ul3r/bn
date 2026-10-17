@@ -73,7 +73,8 @@ __attribute__((noinline)) void cont_strtok_r_restore(const char *host) {
     t[-1] = ',';
     popen(u.b, "r");
 }
-/* Control: no pointer into u is ever made outside the sink: complete. */
+/* Control: no pointer into u is ever made outside the sink: the store covers
+ * u, and the only frontier is the uncertified store proof. */
 __attribute__((noinline)) void si_control(const char *host) {
     union u8 u;
     u.q = 0x3231;

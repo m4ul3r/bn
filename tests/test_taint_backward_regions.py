@@ -514,3 +514,66 @@ def test_returned_pointer_over_a_writable_global_r3(addr):
     glob = [lf for lf in result["leaves"] if lf.get("global")]
     assert [lf["global"] for lf in glob] == [hex(addr)], result["leaves"]
     assert f"`bn xrefs {hex(addr)}`" in glob[0]["detail"], glob[0]["detail"]
+
+
+# --- re-dogfood of round 3: default deny on the returned-pointer path -------
+
+def _import_ref(name, slot):
+    e = FExpr("MLIL_IMPORT", name, constant=slot)
+    return e
+
+
+def test_returned_pointer_over_a_got_loaded_global_is_a_frontier():
+    # `popen(fgets(global_buf, 0x40, f), "r")` in a PIC shared object: the
+    # preemptible global's address is loaded from the GOT (`rdi#1 =
+    # global_buf`, MLIL_IMPORT). Nothing resolved it to a local or a named
+    # writable constant, so the slice was complete with `source:fgets`. The
+    # object is a `pointer_object_unresolved` frontier naming the GOT slot.
+    f = FVar("f", ident=51); f0 = FSSA(f, 0)
+    r1 = FSSA(FVar("rdi", typ="char*"), 1)
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[f])
+    _set_ptr(pg, r1, "rdi#1 = global_buf", _import_ref("global_buf", 0x403fb8))
+    pg.call(_B_FGETS, [_ssa_ref(r1), _const(0x40), FExpr("MLIL_VAR_SSA", "f#0", reads=[f0])],
+            reads=[r1, f0], writes=[p1])
+    _sink_ssa(pg, p1)
+    result, _, _ = _bw(pg.func())
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "fgets"}
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "pointer_object_unresolved"]
+    assert leaf["pointer"] == "global_buf" and "GOT slot 0x403fb8" in leaf["detail"], leaf
+
+
+def test_returned_pointer_over_an_unresolvable_object_is_denied_by_default():
+    # The object the call was handed reads no SSA value and names no local
+    # or writable global (`fgets([0x404000].q, ..)`: a pointer loaded from a
+    # constant slot). Whatever it is, it must end in a frontier.
+    f = FVar("f", ident=51); f0 = FSSA(f, 0)
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[f])
+    loaded = FExpr("MLIL_LOAD_SSA", "[0x404000].q", src=_cstr(0x404000), src_memory=0)
+    loaded.size = 8
+    pg.call(_B_FGETS, [loaded, _const(0x40), FExpr("MLIL_VAR_SSA", "f#0", reads=[f0])],
+            reads=[f0], writes=[p1])
+    _sink_ssa(pg, p1)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    assert any(lf["kind"] == "pointer_object_unresolved" and lf["pointer"] == "[0x404000].q"
+               for lf in result["leaves"]), result["leaves"]
+
+
+def test_direct_read_through_a_got_loaded_global_is_a_frontier():
+    # The direct path: `p = flag ? global_buf : arg; popen(p)` -- the
+    # parameter arm supplies an origin, so the GOT arm must not vanish as an
+    # unresolved definition the parameter outranks.
+    a = FVar("a", ident=61, typ="int64_t"); a0 = FSSA(a, 0)
+    r1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[a])
+    _set_ptr(pg, r1, "p#1 = global_buf", _import_ref("global_buf", 0x403fb8))
+    p2, phi = _vphi(FVar("p", typ="char*"), 2, [r1, a0], *pg._next())
+    pg.instrs.append(phi)
+    _sink_ssa(pg, p2)
+    result, _, _ = _bw(pg.func())
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    assert any(lf["kind"] == "pointer_object_unresolved" and lf["pointer"] == "global_buf"
+               for lf in result["leaves"]), result["leaves"]

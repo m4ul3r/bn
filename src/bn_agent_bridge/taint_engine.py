@@ -7845,7 +7845,8 @@ class TaintEngine:
                     f"stores the walk can see write every byte of {span} of local "
                     f"buffer {label} on every path, but a region proof from stores is "
                     f"not certified: it rests on BN's recovery of the object's extent "
-                    f"and of the consumer's offset, so the slice is NOT complete -- "
+                    f"and of the consumer's offset, and covered bytes do not establish "
+                    f"a NUL terminator, so the slice is NOT complete -- "
                     f"check by hand that the consumer reads only those bytes and that "
                     f"{label} is the whole object (`bn il {fn_ref} --view mlil` shows "
                     f"the stores and the pointer arithmetic)",
@@ -7995,13 +7996,15 @@ class TaintEngine:
                         idxs.append(cand)
             for i in idxs:
                 p = params[i]
+                blocking_before = sum(1 for lf in self._bw_leaves
+                                      if lf.get("kind") in BLOCKING_LEAF_KINDS)
                 locs = _arg_locals([p])
                 for loc in locs:
                     _walk_local_buffer(defn, loc, d, mv, (None, None, True))
                 # A constant address of writable storage (`fgets(g_buf, ..)`,
                 # `fgets(g_req.cmd, ..)`) has no SSA reads to follow: it is the
                 # same `global` frontier as consuming that global directly
-                # (round 3). Read-only storage stays a literal.
+                # (round 3).
                 for addr in self._address_terms(p)[1]:
                     if self._const_ptr_storage(addr) == "writable":
                         _global_leaf(defn, var_label(v), addr,
@@ -8010,6 +8013,39 @@ class TaintEngine:
                 if not locs:
                     for r in expr_reads(p):
                         walk(r, d + 1, mv, (p, None))
+                # Default deny (re-dogfood of round 3): the object the call was
+                # handed must end in a disclosed frontier -- a local's leaf, a
+                # `global` leaf, a pointer object's leaf. An object the walk
+                # resolved to none of those (a global reached through the GOT,
+                # `rdi = global_buf` as MLIL_IMPORT; a constant in read-only
+                # storage; any other expression) is a frontier of its own.
+                if sum(1 for lf in self._bw_leaves
+                       if lf.get("kind") in BLOCKING_LEAF_KINDS) == blocking_before:
+                    what, slot = str(p), None
+                    e = p
+                    for _ in range(8):
+                        rd = expr_reads(e)
+                        if op_name(e) == "MLIL_IMPORT" or len(rd) != 1 or op_name(e) not in _COPY_OPS:
+                            break
+                        try:
+                            dd = ssaf.get_ssa_var_definition(rd[0])
+                        except Exception:
+                            dd = None
+                        if dd is None or op_name(dd) != "MLIL_SET_VAR_SSA":
+                            break
+                        e = getattr(dd, "src", None)
+                    if op_name(e) == "MLIL_IMPORT":
+                        c = getattr(e, "constant", None)
+                        what, slot = str(e), (int(c) if isinstance(c, int) else None)
+                    via = (f" (its address is loaded from the GOT slot {slot:#x})"
+                           if slot is not None else "")
+                    _buffer_leaf(
+                        defn, what,
+                        f"the pointer {var_label(v)} returned by {self._prose_name(name)} "
+                        f"may point into `{what}`{via}, an object the walk cannot see as "
+                        f"a local buffer; its bytes are not accounted for, so the slice "
+                        f"is NOT complete -- inspect it with `bn il {fn_ref} --view mlil`",
+                        kind=_POINTER_LEAF)
             if fresh:
                 _walk_pointer_object(defn, v, d, mv, f"returned by {self._prose_name(name)}",
                                      before="it was written here")
@@ -8173,10 +8209,27 @@ class TaintEngine:
             # input of a local buffer's writer (`rsi = " -c 1"; strcat(cmd, rsi)`)
             # it must not outrank the parameter an older writer copied in.
             if not reads:
-                cval = self._int_const(getattr(defn, "src", None))
+                src0 = getattr(defn, "src", None)
+                cval = self._int_const(src0)
                 if cval is not None:
                     _set_origin({"kind": "constant", "value": cval, "var": var_label(v)},
                                 weak=True)
+                elif anchor is not None and op_name(src0) in ("MLIL_IMPORT", "MLIL_EXTERN_PTR"):
+                    # A consumer reads through an address BN resolved through
+                    # the GOT or an extern (a preemptible global in a shared
+                    # object): an object the walk cannot see as a local buffer,
+                    # so a frontier -- whatever origin another path supplies
+                    # (re-dogfood of round 3, default deny).
+                    c = getattr(src0, "constant", None)
+                    via = (f" (its address is loaded from the GOT slot {int(c):#x})"
+                           if isinstance(c, int) else "")
+                    _buffer_leaf(
+                        defn, str(src0),
+                        f"the slice reads through {var_label(v)} into `{src0}`{via}, an "
+                        f"object the walk cannot see as a local buffer; its bytes are not "
+                        f"accounted for, so the slice is NOT complete -- inspect it with "
+                        f"`bn il {fn_ref} --view mlil`",
+                        kind=_POINTER_LEAF)
             for r in reads:
                 walk(r, d + 1, mv, anchor)
 
