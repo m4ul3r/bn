@@ -417,14 +417,17 @@ int main(void) { return 0; }
 @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
 @pytest.mark.parametrize("opt", ["-O0", "-O2"])
 @pytest.mark.parametrize("bsymbolic", [False, True])
-def test_returned_pointer_over_a_got_loaded_global_fails_closed(tmp_path, shared_bn, arch,
-                                                                opt, bsymbolic):
-    """Re-dogfood of #931 round 3: in a PIC shared object the preemptible
-    `global_buf` is reached through the GOT (MLIL_IMPORT), and
-    `popen(fgets(global_buf, 0x40, f), "r")` was complete with `source:fgets`
-    on both architectures. Default deny: an object the walk cannot see as a
-    local buffer is a frontier. `-Wl,-Bsymbolic` (a direct constant address)
-    is the control, which already failed closed."""
+def test_pointer_sinks_over_got_loaded_globals_fail_closed(tmp_path, shared_bn, arch, opt,
+                                                           bsymbolic):
+    """#931, the re-dogfood of round 3 and the round-5 review: in a PIC
+    shared object a preemptible global is reached through the GOT
+    (MLIL_IMPORT), bare or nested in pointer arithmetic (`global_buf + i`, a
+    struct member), directly or through a returned pointer (fgets, strcpy,
+    strchr). Every one was complete. The policy: a sink reading through a
+    pointer is complete only for a constant read-only literal, and the
+    `pointer_demand_not_certified` leaf lists every object, each on its own
+    (the local AND the GOT member of a PHI). `-Wl,-Bsymbolic` (direct
+    constant addresses) is the control."""
     cc = "gcc" if arch == "x86_64" else shutil.which("aarch64-linux-gnu-gcc")
     if cc is None:
         refuse_silent_skip(
@@ -433,10 +436,15 @@ def test_returned_pointer_over_a_got_loaded_global_fails_closed(tmp_path, shared
     src = tmp_path / "got.c"
     src.write_text("""
 #include <stdio.h>
+#include <string.h>
 char global_buf[64];
-__attribute__((noinline)) void returned_global(FILE *f) {
-    popen(fgets(global_buf, 0x40, f), "r");
-}
+struct rec { int id; char cmd[32]; } global_record;
+__attribute__((noinline)) void returned_global(FILE *f) { popen(fgets(global_buf, 0x40, f), "r"); }
+__attribute__((noinline)) void got_index(FILE *f, int i) { fgets(global_buf, 64, f); popen(global_buf + i, "r"); }
+__attribute__((noinline)) void got_strcpy(const char *s, int i) { popen(strcpy(global_buf + i, s), "r"); }
+__attribute__((noinline)) void got_strchr(int i) { popen(strchr(global_buf + i, ' '), "r"); }
+__attribute__((noinline)) void got_member(int c) { char *p = strchr(global_record.cmd, ' '); popen(c ? p : "ls", "r"); }
+__attribute__((noinline)) void local_or_got(FILE *f, int c) { char buf[32]; char *p = c ? buf : global_record.cmd; popen(fgets(p, 32, f), "r"); }
 """)
     binary = tmp_path / f"got_{arch}{opt}{'_sym' if bsymbolic else ''}.so"
     built = subprocess.run(
@@ -447,13 +455,28 @@ __attribute__((noinline)) void returned_global(FILE *f) {
     if built.returncode:
         raise FixtureBuildError(f"GOT fixture compile failed: {built.stderr}")
     target = shared_bn.load(binary, copy=False)
-    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "returned_global",
-                      "--sink", "arg:popen:0")
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
-    assert {sl["origin"]["kind"] for sl in result["slices"]} == {"source"}, result["slices"]
-    if not bsymbolic:
-        assert any(lf["kind"] == "pointer_object_unresolved" and lf.get("pointer") == "global_buf"
-                   for lf in result["leaves"]), result["leaves"]
+
+    def objects(o):
+        yield o
+        for i in o.get("may_point_into", ()):
+            yield from objects(i)
+
+    for fn, want in [("returned_global", {"global_buf"}), ("got_index", {"global_buf"}),
+                     ("got_strcpy", {"global_buf"}), ("got_strchr", {"global_buf"}),
+                     ("got_member", {"global_record"}),
+                     ("local_or_got", {"global_record", "buf"})]:
+        result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
+                          "--sink", "arg:popen:0")
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is False, (fn, result)
+        [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "pointer_demand_not_certified"]
+        named = {o["object"] for top in leaf["objects"] for o in objects(top)
+                 if o["kind"] in ("got_or_extern", "local", "global")}
+        if bsymbolic:
+            assert "buf" in named or fn != "local_or_got", (fn, leaf["objects"])
+        else:
+            assert want <= named, (fn, leaf["objects"])
+            assert all(o.get("slot") for top in leaf["objects"] for o in objects(top)
+                       if o["kind"] == "got_or_extern"), (fn, leaf["objects"])
 
 
 def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):

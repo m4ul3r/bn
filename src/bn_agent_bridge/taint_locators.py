@@ -240,7 +240,7 @@ def derive_flow_facts(*, direction: str,
     traverses = o.get("kind") in {"unresolved", "indirect_call", "field_load_unresolved",
                                   "address_of_local_unresolved", "pointer_object_unresolved",
                                   "object_extent_unknown", "region_store_proof_not_certified",
-                                  "global"}
+                                  "pointer_demand_not_certified", "global"}
     metrics = {"steps": len(steps), "fns_spanned": max(1, len(set(crossed)) + 1),
                "traverses_unresolved": bool(traverses)}
     return metrics, _make_signature(source, chain, None, sink_callee,

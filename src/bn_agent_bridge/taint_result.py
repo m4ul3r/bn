@@ -96,6 +96,10 @@ BLOCKING_LEAF_KINDS = frozenset({
     # is reported (`stores_cover`) but never certifies the slice: the proof
     # rests on BN's recovery of the object's extent.
     "region_store_proof_not_certified",
+    # #931 round 5, the policy: a sink that reads through a pointer is
+    # complete only for a constant address of read-only data. Every other
+    # pointer demand carries this leaf, listing each object it may read.
+    "pointer_demand_not_certified",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -431,7 +435,8 @@ def backward_diagnostics(
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered",
                   "indirect_call_unresolved", "field_load_unresolved",
                   "address_of_local_unresolved", "pointer_object_unresolved",
-                  "object_extent_unknown", "region_store_proof_not_certified")
+                  "object_extent_unknown", "region_store_proof_not_certified",
+                  "pointer_demand_not_certified")
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
@@ -538,6 +543,15 @@ def backward_diagnostics(
                 "of the whole object -- "
                 f"`bn il {proof_leaf['function']} --view mlil` shows the stores and "
                 "the pointer arithmetic")
+        demand_leaf = next((lf for lf in unresolved_leaves
+                            if lf.get("kind") == "pointer_demand_not_certified"
+                            and isinstance(lf.get("function"), str)), None)
+        if demand_leaf is not None:
+            next_action += (
+                ". The sink reads through a pointer, and only a constant address of "
+                "read-only data is complete (#931): the leaf's `objects` lists every "
+                "object the pointer may read; check each by hand -- "
+                f"`bn il {demand_leaf['function']} --view mlil`")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
                for lf in unresolved_leaves):
             next_action += (

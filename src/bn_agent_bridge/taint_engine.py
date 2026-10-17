@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from types import SimpleNamespace
 from typing import Any
 
 # Structural split (#562): the engine re-exports the moved names so existing
@@ -7342,6 +7343,9 @@ class TaintEngine:
                         }
                         seen_origin[key] = entry
                         sink_slices.append(entry)
+                    if sink.get("kind") == "arg" and 0 <= sidx < len(sparams):
+                        self._bw_pointer_demand(func, ssaf, seed_var, sink_ins, sidx,
+                                                sparams[sidx])
                 slices.extend(sink_slices)
             except RecursionError:
                 slices.extend(sink_slices)  # keep the partial, already-deduped slices
@@ -8435,6 +8439,184 @@ class TaintEngine:
         if any((var_key(r), getattr(r, "version", None)) == want for r in reads):
             return seed_var if op_name(operand) in _COPY_OPS and len(reads) == 1 else operand
         return None
+
+    def _bw_pointer_demand(self, func: Any, ssaf: Any, seed_var: Any, sink_ins: Any,
+                           idx: int, operand: Any) -> None:
+        """THE POLICY (#931 round 5): neither a call nor a store certifies a
+        buffer's bytes, so a sink that reads through a pointer is complete
+        only when that pointer is a constant address of non-writable data
+        (base's literal rule, unchanged) -- on every path, with no
+        arithmetic. Every other pointer demand gets a blocking
+        ``pointer_demand_not_certified`` leaf listing EVERY object the
+        pointer may point into, each described on its own. The description
+        (``_demand_objects``) is descriptive only: it never decides
+        completeness. A sink that consumes a value (a malloc size, a memcpy
+        length) is untouched."""
+        if not self._sink_reads_through_pointer(seed_var, sink_ins, idx, operand):
+            return
+        objects = self._demand_objects(func, ssaf, operand)
+        if objects and all(o["kind"] == "literal" for o in objects):
+            return
+        uniq: list[dict[str, Any]] = []
+        for o in objects:
+            if o not in uniq:
+                uniq.append(o)
+
+        def say(o: dict[str, Any]) -> str:
+            if o["kind"] == "returned":
+                inner = ", ".join(say(i) for i in o["may_point_into"])
+                return (f"the pointer `{o['object']}` returned"
+                        + (f", into {inner}" if inner else "")
+                        + (f" ({o['note']})" if o.get("note") else ""))
+            extra = f" (GOT slot {o['slot']})" if o.get("slot") else ""
+            return f"{o['kind'].replace('_', ' ')} `{o['object']}`{extra}"
+
+        fn_ref = hex(int(getattr(func, "start", 0) or 0))
+        listed = "; ".join(say(o) for o in uniq) or "no object the walk could name"
+        leaf = {
+            "kind": "pointer_demand_not_certified",
+            "address": hex(int(getattr(sink_ins, "address", 0) or 0)),
+            "function": fn_ref,
+            "operand": str(operand),
+            "objects": uniq,
+            "il_text": str(sink_ins),
+            "detail": (f"the sink reads bytes through its argument {idx} (`{operand}`), and "
+                       f"no call or store certifies a buffer's bytes (#931): only a constant "
+                       f"address of read-only data is complete. It may read: {listed}. The "
+                       f"slice is NOT complete -- check each object by hand "
+                       f"(`bn il {fn_ref} --view mlil`)"),
+        }
+        if leaf not in self._bw_leaves:
+            self._bw_leaves.append(leaf)
+
+    def _sink_reads_through_pointer(self, seed_var: Any, sink_ins: Any, idx: int,
+                                    operand: Any) -> bool:
+        """Does the selected sink operand hand the sink a POINTER whose bytes
+        it reads (popen's command, write's buffer), rather than a value (a
+        malloc size, a memcpy length)? A folded `&buf`, a value BN types as a
+        pointer, or a callee parameter BN types as a pointer. A pointer BN
+        types as an integer at both ends is the disclosed residual."""
+        if isinstance(seed_var, _BufferSeed) or _is_pointer_typed(seed_var):
+            return True
+        if "CONST_PTR" in op_name(operand) or "ADDRESS_OF" in op_name(operand):
+            return True
+        try:
+            callee = resolve_call_target(self.bv, sink_ins, follow_thunks=True).function
+        except Exception:
+            callee = None
+        ptypes = []
+        ftype = getattr(callee, "type", None)
+        for p in list(getattr(ftype, "parameters", None) or []):
+            ptypes.append(getattr(p, "type", None))
+        if not ptypes:
+            ptypes = [getattr(v, "type", None)
+                      for v in list(getattr(callee, "parameter_vars", None) or [])]
+        if 0 <= idx < len(ptypes) and ptypes[idx] is not None:
+            return _is_pointer_typed(SimpleNamespace(type=ptypes[idx]))
+        return False
+
+    def _demand_objects(self, func: Any, ssaf: Any, expr: Any, *, arith: bool = False,
+                        seen: set | None = None, depth: int = 0) -> list[dict[str, Any]]:
+        """Every object a pointer *expr* may point into, each described --
+        DESCRIPTIVE ONLY (#931 round 5): the description fills a leaf's
+        detail and never decides completeness. Follows copies, phis and
+        pointer arithmetic to the roots: a local's address, a constant
+        address (``literal`` only for non-writable storage reached without
+        arithmetic), a GOT/extern import, a loaded pointer, a parameter, a
+        call's return (with the objects it may point into), or ``unknown``."""
+        seen = seen if seen is not None else set()
+        if expr is None or depth > 16:
+            return [{"kind": "unknown", "object": str(expr)}]
+        op = op_name(expr)
+
+        def rec(e, a=arith):
+            return self._demand_objects(func, ssaf, e, arith=a, seen=seen, depth=depth + 1)
+
+        if "ADDRESS_OF" in op:
+            v = getattr(expr, "src", None) or getattr(expr, "var", None)
+            off = getattr(expr, "offset", None) if op == "MLIL_ADDRESS_OF_FIELD" else 0
+            return [{"kind": "local", "object": var_label(v),
+                     **({"offset": int(off)} if isinstance(off, int) else {})}]
+        if op in ("MLIL_IMPORT", "MLIL_EXTERN_PTR"):
+            c = getattr(expr, "constant", None)
+            return [{"kind": "got_or_extern", "object": str(expr),
+                     **({"slot": hex(int(c))} if isinstance(c, int) else {})}]
+        if "CONST" in op:
+            c = self._int_const(expr)
+            if c is None:
+                return [{"kind": "unknown", "object": str(expr)}]
+            storage = self._const_ptr_storage(c)
+            kind = ("literal" if storage == "readonly" and not arith and "PTR" in op
+                    else "global" if storage == "writable" else "constant_address")
+            return [{"kind": kind, "object": str(expr), "address": hex(c)}]
+        if "LOAD" in op:
+            return [{"kind": "loaded_pointer", "object": str(expr)}]
+        if op in ("MLIL_VAR_ALIASED", "MLIL_VAR_ALIASED_FIELD"):
+            return [{"kind": "loaded_pointer", "object": str(expr)}]
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            sides = [s for s in (getattr(expr, "left", None), getattr(expr, "right", None))
+                     if s is not None and not (self._int_const(s) is not None
+                                               and "PTR" not in op_name(s))]
+            ptr = [s for s in sides
+                   if any(t in op_name(s) for t in ("ADDRESS_OF", "CONST_PTR", "IMPORT", "EXTERN"))
+                   or any(_is_pointer_typed(r) for r in expr_reads(s))]
+            out: list[dict[str, Any]] = []
+            for s in (ptr or sides):
+                out += rec(s, True)
+            return out or [{"kind": "unknown", "object": str(expr)}]
+        if is_ssa_var(expr):
+            key = (var_key(expr), getattr(expr, "version", None))
+            if key in seen:
+                return []
+            seen.add(key)
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            if d is None:
+                pidx = self._param_index_of(func, expr)
+                return [{"kind": "parameter", "object": var_label(expr),
+                         "pointer": _is_pointer_typed(expr),
+                         **({"index": pidx} if pidx is not None else {})}]
+            dop = op_name(d)
+            if dop == "MLIL_SET_VAR_SSA":
+                return rec(getattr(d, "src", None))
+            if dop == "MLIL_VAR_PHI":
+                out = []
+                for a in getattr(d, "src", None) or []:
+                    out += rec(a)
+                return out
+            if self._is_call(d):
+                name = self._callee_name(const_target(getattr(d, "dest", None)))
+                params = self._call_params(d)
+                # The arguments the model says the return points into (or
+                # writes through), else every pointer-looking argument.
+                model = lookup_model(self.models, name)[1] if name else None
+                want: list[int] = []
+                for rule in ((model or {}).get("sources") or []) + (
+                        (model or {}).get("propagates") or []):
+                    to, frm = str(rule.get("to") or ""), str(rule.get("from") or "")
+                    cand = (_try_arg_index(to) if to.startswith("*arg:")
+                            else _try_arg_index(frm) if to == "ret" else None)
+                    if cand is not None and cand not in want:
+                        want.append(cand)
+                picked = ([params[i] for i in want if i < len(params)] if want else params)
+                inner: list[dict[str, Any]] = []
+                for p in picked:
+                    if expr_reads(p) or any(t in op_name(p) for t in (
+                            "ADDRESS_OF", "CONST_PTR", "IMPORT", "EXTERN")):
+                        for o in rec(p, True):
+                            if (o["kind"] != "parameter" or o.get("pointer")) and o not in inner:
+                                inner.append(o)
+                note = ({"note": "BN recovered no argument the return may point into"}
+                        if not picked or any(i >= len(params) for i in want) else {})
+                return [{"kind": "returned", "object": f"{name or 'an indirect call'}()",
+                         "callee": name, "may_point_into": inner, **note}]
+            return [{"kind": "unknown", "object": var_label(expr)}]
+        reads = expr_reads(expr)
+        if len(reads) == 1 and op in _COPY_OPS:
+            return rec(reads[0])
+        return [{"kind": "unknown", "object": str(expr)}]
 
     def _continue_into_callers(self, func, terminal_params, depth, max_depth,
                                visited_funcs, base_steps,

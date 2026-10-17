@@ -577,3 +577,91 @@ def test_direct_read_through_a_got_loaded_global_is_a_frontier():
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
     assert any(lf["kind"] == "pointer_object_unresolved" and lf["pointer"] == "global_buf"
                for lf in result["leaves"]), result["leaves"]
+
+
+# --- round 5: the policy, not an object classification ----------------------
+# A sink that reads through a pointer is complete only when that pointer is a
+# constant address of read-only data. Every other pointer demand carries a
+# `pointer_demand_not_certified` leaf listing each object it may read; the
+# object descriptions are descriptive only.
+
+def _engine_result(pg, **storage):
+    from test_taint_engine import FBVStorage, te
+    bv = FBVStorage(_B_NAMES, **storage)
+    return te.TaintEngine(bv, te.load_models()).backward(pg.func(),
+                                                          [te.parse_locator("arg:popen:0")])
+
+
+def _demand_leaf(result):
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "pointer_demand_not_certified"]
+    return leaf
+
+
+def test_read_only_literal_sink_is_still_complete_r5():
+    # `p = "ls -l"; popen(p, "r")`: base's literal rule, unchanged.
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    _set_ptr(pg, p1, "p#1 = \"ls -l\"", _cstr(0x720))
+    _sink_ssa(pg, p1)
+    result = _engine_result(pg, ro=[(0x700, 0x800)])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+    assert result["leaves"] == [], result["leaves"]
+
+
+@pytest.mark.parametrize("index", ["parameter", "constant"])
+def test_got_global_plus_an_index_is_not_complete_r5(index):
+    # `popen(global_buf + i)` / `popen(g_req.cmd)` through the GOT: the
+    # import is nested under arithmetic. The objects name the GOT global.
+    i = FVar("i", ident=71, typ="int64_t"); i0 = FSSA(i, 0)
+    g1 = FSSA(FVar("rax", typ="char*"), 1)
+    p2 = FSSA(FVar("p", typ="char*"), 2)
+    pg = _BufProgram(params=[i])
+    _set_ptr(pg, g1, "rax#1 = global_buf", _import_ref("global_buf", 0x403fb8))
+    rhs = (FExpr("MLIL_VAR_SSA", "i#0", reads=[i0]) if index == "parameter" else _const(0x10))
+    _set_ptr(pg, p2, "p#2 = rax#1 + ...",
+             FExpr("MLIL_ADD", "rax#1 + x", left=_ssa_ref(g1), right=rhs,
+                   reads=[g1] + ([i0] if index == "parameter" else [])),
+             reads=[g1] + ([i0] if index == "parameter" else []))
+    _sink_ssa(pg, p2)
+    result = _engine_result(pg)
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    objs = _demand_leaf(result)["objects"]
+    assert objs == [{"kind": "got_or_extern", "object": "global_buf", "slot": "0x403fb8"}], objs
+
+
+def test_call_recovered_with_no_destination_is_not_complete_r5():
+    # BN recovers `fgets()` with no arguments (a reduced prototype): no
+    # argument names the object its return points into, so nothing was
+    # walked and the slice was complete with `source:fgets`.
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    pg.call(_B_FGETS, [], reads=[], writes=[p1])
+    _sink_ssa(pg, p1)
+    result = _engine_result(pg)
+    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "fgets"}
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [obj] = _demand_leaf(result)["objects"]
+    assert obj["kind"] == "returned" and obj["callee"] == "fgets", obj
+    assert obj["note"] == "BN recovered no argument the return may point into", obj
+
+
+def test_every_object_of_a_phi_is_disclosed_r5():
+    # `p = flag ? cmd : g_req.cmd (through the GOT); popen(p)`: the local's
+    # leaf must not stand in for the GOT member.
+    cmd = FVar("cmd", typ="char[0x40]")
+    a1 = FSSA(FVar("a", typ="char*"), 1)
+    g1 = FSSA(FVar("g", typ="char*"), 1)
+    b1 = FSSA(FVar("b", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    _set_ptr(pg, a1, "a#1 = &cmd", _addr_of(cmd))
+    _set_ptr(pg, g1, "g#1 = g_req", _import_ref("g_req", 0x403fc0))
+    _set_ptr(pg, b1, "b#1 = g#1 + 4",
+             FExpr("MLIL_ADD", "g#1 + 4", left=_ssa_ref(g1), right=_const(4), reads=[g1]),
+             reads=[g1])
+    p2, phi = _vphi(FVar("p", typ="char*"), 2, [a1, b1], *pg._next())
+    pg.instrs.append(phi)
+    _sink_ssa(pg, p2)
+    result = _engine_result(pg)
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    kinds = {(o["kind"], o["object"]) for o in _demand_leaf(result)["objects"]}
+    assert kinds == {("local", "cmd"), ("got_or_extern", "g_req")}, kinds

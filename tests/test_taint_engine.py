@@ -10268,9 +10268,15 @@ def _store_proof_only(result):
     strongest outcome a local buffer can reach. It is a fact, never a
     certified proof: the slice is incomplete and its only frontier is the
     `region_store_proof_not_certified` leaf."""
-    leaves = result["leaves"]
+    leaves = _object_leaves(result)
     return (result["diagnostics"]["safe_to_report_complete_slice"] is False and bool(leaves)
             and all(lf["kind"] == "region_store_proof_not_certified" for lf in leaves))
+
+
+def _object_leaves(result):
+    """The per-object leaves, without the round-5 policy leaf
+    (`pointer_demand_not_certified`) every pointer-consuming sink carries."""
+    return [lf for lf in result["leaves"] if lf["kind"] != "pointer_demand_not_certified"]
 
 
 def _only_call_fill_leaves(result, aol, *calls):
@@ -10278,7 +10284,7 @@ def _only_call_fill_leaves(result, aol, *calls):
     proves the consumed bytes initialised -- naming exactly *calls* -- and the
     slice is therefore not complete."""
     assert aol and all(l.get("calls") for l in aol), result["leaves"]
-    assert len(aol) == len(result["leaves"]), result["leaves"]
+    assert len(aol) == len(_object_leaves(result)), result["leaves"]
     assert {c for l in aol for c in l["calls"]} == set(calls), aol
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
 
