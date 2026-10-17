@@ -479,6 +479,178 @@ __attribute__((noinline)) void local_or_got(FILE *f, int c) { char buf[32]; char
                        if o["kind"] == "got_or_extern"), (fn, leaf["objects"])
 
 
+_ROLES_SRC = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+typedef int (*system_t)(const char *);
+static const char tmpl[64] = "echo placeholder";
+__attribute__((noinline)) void direct_system(const char *c) { system(c); }
+__attribute__((noinline)) void ind_sys_heap(system_t fn, int fd) { char *p = malloc(64); read(fd, p, 64); fn(p); }
+__attribute__((noinline)) void malloc_pointer(char *p) { malloc((size_t)p); }
+__attribute__((noinline)) void memcpy_length_pointer(char *d, char *s, char *p) { memcpy(d, s, (size_t)p); }
+__attribute__((noinline)) void literal_phi(int fd, int flag) { read(fd, (void *)tmpl, 63); const char *p = flag ? tmpl : "id"; popen(p, "r"); }
+__attribute__((noinline)) void offsets(int flag) { char b[16]; memset(b, 'a', sizeof b); b[15] = 0; char *p = b + 8; popen(flag ? p - 8 : p - 4, "r"); }
+__attribute__((noinline)) void popen_integer(long p) { popen((char *)p, "r"); }
+int main(void) { return 0; }
+"""
+
+
+def _cross_cc(arch: str) -> str:
+    cc = "gcc" if arch == "x86_64" else shutil.which("aarch64-linux-gnu-gcc")
+    if cc is None:
+        refuse_silent_skip(
+            "aarch64-linux-gnu-gcc is required for the AArch64 sink-role fixtures; "
+            "install the cross toolchain (Debian/Ubuntu: gcc-aarch64-linux-gnu)")
+    return cc
+
+
+def _build(cmd: list[str]) -> None:
+    built = subprocess.run(cmd, capture_output=True, text=True, timeout=120.0)
+    if built.returncode:
+        raise FixtureBuildError(f"fixture compile failed: {' '.join(cmd)}: {built.stderr}")
+
+
+def _make_rodata_segment_writable(src: Path, out: Path) -> None:
+    """Set PF_W on the PT_LOAD holding `.rodata`, leaving the section's own
+    (read-only) flags alone: the bytes are writable at run time while BN's
+    section semantics still say read-only data. ELF64 little-endian."""
+    import struct
+    data = bytearray(src.read_bytes())
+    phoff, shoff = struct.unpack_from("<QQ", data, 0x20)
+    phentsize, phnum, shentsize, shnum, shstrndx = struct.unpack_from("<HHHHH", data, 0x36)
+    strtab = struct.unpack_from("<Q", data, shoff + shstrndx * shentsize + 0x18)[0]
+    rodata = None
+    for i in range(shnum):
+        o = shoff + i * shentsize
+        name = bytes(data[strtab + struct.unpack_from("<I", data, o)[0]:]).split(b"\0", 1)[0]
+        if name == b".rodata":
+            rodata = struct.unpack_from("<Q", data, o + 0x10)[0]
+    assert rodata is not None, "no .rodata section"
+    for i in range(phnum):
+        o = phoff + i * phentsize
+        p_type, p_flags = struct.unpack_from("<II", data, o)
+        vaddr, memsz = struct.unpack_from("<Q", data, o + 0x10)[0], struct.unpack_from("<Q", data, o + 0x28)[0]
+        if p_type == 1 and vaddr <= rodata < vaddr + memsz:
+            struct.pack_into("<I", data, o + 4, p_flags | 2)
+    out.write_bytes(data)
+
+
+@pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_sink_model_role_decides_the_pointer_demand(tmp_path, shared_bn, arch, opt):
+    """#931 round 6: a sink that reads through a pointer is never complete,
+    and the sink MODEL's role for the argument -- not BN's typing -- says
+    whether it does. An indirect call pinned to `system` by --resolve-map
+    uses system's role (round 5 asked the unresolved call for a type and
+    completed it); a pointer-typed value cast into malloc's size or memcpy's
+    length is a value (no pointer leaf, complete as on base); a literal is a
+    fact in the leaf; an object's offset is the consumer's displacement
+    (`p = b + 8; popen(p - 8)` reads b at 0); a command BN recovered only
+    from its ABI register (popen's prototype reduced to no parameters) still
+    carries the leaf."""
+    cc = _cross_cc(arch)
+    src = tmp_path / "roles.c"
+    src.write_text(_ROLES_SRC)
+    binary = tmp_path / f"roles_{arch}{opt}"
+    _build([cc, opt, "-g", "-fno-inline", "-fno-builtin", "-U_FORTIFY_SOURCE",
+            "-fno-stack-protector", "-fno-optimize-sibling-calls", "-no-pie",
+            str(src), "-o", str(binary)])
+    target = shared_bn.load(binary, copy=False)
+
+    def query(fn, sink, *extra):
+        return _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
+                        "--sink", sink, *extra)
+
+    def demand(result):
+        return [lf for lf in result["leaves"] if lf["kind"] == "pointer_demand_not_certified"]
+
+    call_addr = _indirect_call_addr(shared_bn, "ind_sys_heap", binary.name)
+    rmap = tmp_path / "rmap.json"
+    rmap.write_text(json.dumps({call_addr: [_resolve_addr(shared_bn, "system")]}))
+    pinned = query("ind_sys_heap", "arg:system:0", "--resolve-map", str(rmap))
+    assert pinned["diagnostics"]["safe_to_report_complete_slice"] is False, pinned
+    [leaf] = demand(pinned)
+    assert [(o["kind"], o.get("callee")) for o in leaf["objects"]] == [("returned", "malloc")], leaf
+
+    for fn, sink in [("malloc_pointer", "arg:malloc:0"), ("memcpy_length_pointer", "arg:memcpy:2")]:
+        value = query(fn, sink)
+        assert value["leaves"] == [], (fn, value["leaves"])
+        assert value["diagnostics"]["safe_to_report_complete_slice"] is True, (fn, value)
+
+    lit = query("literal_phi", "arg:popen:0")
+    assert lit["diagnostics"]["safe_to_report_complete_slice"] is False, lit
+    [leaf] = demand(lit)
+    assert {(o["kind"], o["segment_writable"]) for o in leaf["objects"]} == {("literal", False)}, leaf
+
+    off = query("offsets", "arg:popen:0")
+    [leaf] = demand(off)
+    assert sorted((o["object"], o["offset"]) for o in leaf["objects"]) == [("b", 0), ("b", 4)], leaf
+
+    if opt == "-O0":
+        # O0 keeps the command in the ABI register at the call; at O2 the
+        # register's reaching definition is the entry value and the seed is
+        # refused outright (never complete either).
+        _bn_json(shared_bn, "-t", target, "proto", "set", "popen", "FILE* popen(void)")
+        reg = query("popen_integer", "arg:popen:0")
+        assert any("recovered from calling-convention register" in a for a in reg["assumptions"]), reg
+        assert reg["diagnostics"]["safe_to_report_complete_slice"] is False, reg
+        [leaf] = demand(reg)
+        assert leaf["recovered_from_register"] is True, leaf
+
+
+@pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+def test_literal_in_a_writable_mapping_is_never_complete(tmp_path, shared_bn, arch):
+    """#931 round 6: a `.rodata` literal in a PT_LOAD the loader maps
+    writable -- `read` overwrites it before `popen` picks it or "id". The
+    round-5 literal exception trusted the section semantics and completed
+    it. No literal is complete now; the leaf reports the segment's
+    writability as a fact."""
+    cc = _cross_cc(arch)
+    src = tmp_path / "roles.c"
+    src.write_text(_ROLES_SRC)
+    plain = tmp_path / f"roles_{arch}"
+    _build([cc, "-O2", "-g", "-fno-inline", "-fno-builtin", "-U_FORTIFY_SOURCE",
+            "-fno-stack-protector", "-fno-optimize-sibling-calls", "-no-pie",
+            str(src), "-o", str(plain)])
+    binary = tmp_path / f"roles_{arch}_w"
+    _make_rodata_segment_writable(plain, binary)
+    target = shared_bn.load(binary, copy=False)
+    lit = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "literal_phi",
+                   "--sink", "arg:popen:0")
+    assert lit["diagnostics"]["safe_to_report_complete_slice"] is False, lit
+    [leaf] = [lf for lf in lit["leaves"] if lf["kind"] == "pointer_demand_not_certified"]
+    assert {(o["kind"], o["segment_writable"]) for o in leaf["objects"]} == {("literal", True)}, leaf
+
+
+@pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+def test_untyped_import_sink_is_a_pointer_demand(tmp_path, shared_bn, arch):
+    """#931 round 6: popen/system imported from a library with no type
+    library prototype, declared integer at the call: the model's role makes
+    the command a pointer demand, so the slice is not complete."""
+    cc = _cross_cc(arch)
+    (tmp_path / "stub.c").write_text(
+        "long popen(long a, long b) { return a + b; }\nlong system(long a) { return a; }\n")
+    (tmp_path / "untyped.c").write_text("""
+extern long popen(long, long);
+extern long system(long);
+__attribute__((noinline)) void u_param(long cmd) { popen(cmd, (long)"r"); }
+__attribute__((noinline)) void u_system(long cmd) { system(cmd); }
+void _start(void) { u_param(0); u_system(0); }
+""")
+    _build([cc, "-shared", "-fPIC", str(tmp_path / "stub.c"), "-o", str(tmp_path / "libstub.so")])
+    binary = tmp_path / f"untyped_{arch}"
+    _build([cc, "-O0", "-g", "-nostdlib", "-no-pie", str(tmp_path / "untyped.c"),
+            f"-L{tmp_path}", "-lstub", "-o", str(binary)])
+    target = shared_bn.load(binary, copy=False)
+    for fn, sink in [("u_param", "arg:popen:0"), ("u_system", "arg:system:0")]:
+        result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn, "--sink", sink)
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is False, (fn, result)
+        assert [lf["kind"] for lf in result["leaves"]] == ["pointer_demand_not_certified"], (
+            fn, result["leaves"])
+
+
 def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):
     """#1041 item 2 on the architecture it was found on: two 4-byte
     sign-extending loads of the upper half of an 8-byte field store feed the

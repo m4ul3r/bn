@@ -18,6 +18,7 @@ from test_taint_engine import (
     _BufProgram,
     _bw,
     _cstr,
+    _object_leaves,
     _store_proof_only,
     _vphi,
 )
@@ -328,7 +329,7 @@ def test_store_proof_is_a_fact_never_certification_r3():
     pg.sink(buf)
     result, _, aol = _bw(pg.func())
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
-    [leaf] = result["leaves"]
+    [leaf] = _object_leaves(result)
     assert leaf["kind"] == "region_store_proof_not_certified" and aol == [], leaf
     assert leaf["stores_cover"] == [0, 0x40] and leaf["unproven"] == [], leaf
     assert result["slices"][0]["origin"]["kind"] == "constant", result["slices"][0]["origin"]
@@ -354,14 +355,17 @@ def test_pointer_returned_into_a_local_checks_the_local_r1():
     [leaf] = aol
     assert leaf["buffer"] == "c" and leaf["calls"] == ["fgets"], leaf
 
-    # An integer return (a count) is not read through: nothing changes.
+    # An integer return (a count) is not walked as a pointer object: no
+    # local leaf. popen still reads through its argument 0 (its model
+    # says so, whatever BN typed the value), so only the policy leaf blocks.
     n1 = FSSA(FVar("n", typ="int64_t"), 1)
     pg2 = _BufProgram(params=[f])
     pg2.call(_B_FGETS, [_addr_of(c), _const(0x40), FExpr("MLIL_VAR_SSA", "f#0", reads=[f0])],
              reads=[f0], writes=[n1])
     _sink_ssa(pg2, n1)
     result2, _, aol2 = _bw(pg2.func())
-    assert aol2 == [] and result2["diagnostics"]["safe_to_report_complete_slice"] is True
+    assert aol2 == [] and result2["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert [lf["kind"] for lf in result2["leaves"]] == ["pointer_demand_not_certified"], result2
 
 
 @pytest.mark.parametrize("root", ["malloc", "parameter"])
@@ -443,6 +447,10 @@ def test_demand_outside_the_object_fails_closed_r2(delta, where):
     [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "object_extent_unknown"]
     assert leaf["cause"] == "outside_object" and where in leaf["detail"], leaf
     assert leaf["region"]["offset"] == 4 + delta, leaf
+    # The policy leaf's object carries the CONSUMER's displacement, the same
+    # one the region leaf reports -- never the definition's `&s:4` (t-0148).
+    [demand] = [lf for lf in result["leaves"] if lf["kind"] == "pointer_demand_not_certified"]
+    assert demand["objects"] == [{"kind": "local", "object": "s", "offset": 4 + delta}], demand
 
 
 def test_unknown_offset_is_no_proof_r2():
@@ -462,7 +470,7 @@ def test_unknown_offset_is_no_proof_r2():
     _sink_ssa(pg, p2)
     result, _, _ = _bw(pg.func())
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
-    [leaf] = result["leaves"]
+    [leaf] = _object_leaves(result)
     assert leaf["kind"] == "object_extent_unknown" and leaf["cause"] == "offset_unknown", leaf
 
 
@@ -597,15 +605,33 @@ def _demand_leaf(result):
     return leaf
 
 
-def test_read_only_literal_sink_is_still_complete_r5():
-    # `p = "ls -l"; popen(p, "r")`: base's literal rule, unchanged.
+@pytest.mark.parametrize("segment_writable", [False, True])
+def test_literal_sink_is_never_complete_r6(segment_writable):
+    # `p = "ls -l"; popen(p, "r")`: round 6 drops the literal exception -- a
+    # sink that reads through a pointer is never complete. The literal is a
+    # FACT in the leaf, with its segment's writability. The twin is a
+    # `.rodata` section inside a writable PT_LOAD (section semantics say
+    # read-only, the mapping says writable): the round-5 exception trusted
+    # the section and completed it.
+    from test_taint_engine import FBVStorage, te
+
+    class View(FBVStorage):
+        def is_offset_writable(self, addr):
+            return segment_writable or super().is_offset_writable(addr)
+
     p1 = FSSA(FVar("p", typ="char*"), 1)
     pg = _BufProgram(params=[])
     _set_ptr(pg, p1, "p#1 = \"ls -l\"", _cstr(0x720))
     _sink_ssa(pg, p1)
-    result = _engine_result(pg, ro=[(0x700, 0x800)])
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is True, result
-    assert result["leaves"] == [], result["leaves"]
+    bv = View(_B_NAMES, ro=[(0x700, 0x800)])
+    result = te.TaintEngine(bv, te.load_models()).backward(pg.func(),
+                                                          [te.parse_locator("arg:popen:0")])
+    assert result["slices"][0]["origin"]["kind"] == "constant", result["slices"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = result["leaves"]
+    assert leaf["kind"] == "pointer_demand_not_certified", leaf
+    assert leaf["objects"] == [{"kind": "literal", "object": "0x720", "address": "0x720",
+                                "offset": 0, "segment_writable": segment_writable}], leaf
 
 
 @pytest.mark.parametrize("index", ["parameter", "constant"])
@@ -626,7 +652,8 @@ def test_got_global_plus_an_index_is_not_complete_r5(index):
     result = _engine_result(pg)
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
     objs = _demand_leaf(result)["objects"]
-    assert objs == [{"kind": "got_or_extern", "object": "global_buf", "slot": "0x403fb8"}], objs
+    assert objs == [{"kind": "got_or_extern", "object": "global_buf", "slot": "0x403fb8",
+                     "offset": None if index == "parameter" else 0x10}], objs
 
 
 def test_call_recovered_with_no_destination_is_not_complete_r5():
@@ -665,3 +692,172 @@ def test_every_object_of_a_phi_is_disclosed_r5():
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
     kinds = {(o["kind"], o["object"]) for o in _demand_leaf(result)["objects"]}
     assert kinds == {("local", "cmd"), ("got_or_extern", "g_req")}, kinds
+
+
+# --- round 6: the sink model's role decides pointer vs value ----------------
+
+_B_MEMCPY6, _B_SYSTEM6, _B_HELPER6 = 0x9a0, 0x9a1, 0x9a2
+_B_NAMES.update({_B_MEMCPY6: "memcpy", _B_SYSTEM6: "system", _B_HELPER6: "emit_line"})
+
+
+def _demand_leaves(result):
+    return [lf for lf in result["leaves"] if lf["kind"] == "pointer_demand_not_certified"]
+
+
+def test_object_offset_is_the_consumers_displacement_r6():
+    # t-0148: `p = b + 8; popen(p - 8)` reads b at 0 -- the region leaf said
+    # 0, the object said 8 (the definition's own offset).
+    b = FVar("b", typ="char[0x10]")
+    pg = _BufProgram()
+    p1, p2 = FSSA(FVar("p", typ="char*"), 1), FSSA(FVar("p", typ="char*"), 2)
+    _set_ptr(pg, p1, "p#1 = &b:8", _field_addr(b, 8))
+    _set_ptr(pg, p2, "p#2 = p#1 - 8",
+             FExpr("MLIL_SUB", "p#1 - 8", reads=[p1], left=_ssa_ref(p1), right=_const(8)),
+             reads=[p1])
+    _sink_ssa(pg, p2)
+    result, _, _ = _bw(pg.func())
+    [leaf] = _demand_leaves(result)
+    assert leaf["objects"] == [{"kind": "local", "object": "b", "offset": 0}], leaf
+    # A variable step: the displacement is unknown, said as such.
+    i = FVar("i", ident=81, typ="int64_t"); i0 = FSSA(i, 0)
+    pg2 = _BufProgram(params=[i])
+    q1, q2 = FSSA(FVar("q", typ="char*"), 1), FSSA(FVar("q", typ="char*"), 2)
+    _set_ptr(pg2, q1, "q#1 = &b:8", _field_addr(b, 8))
+    _set_ptr(pg2, q2, "q#2 = q#1 + i#0",
+             FExpr("MLIL_ADD", "q#1 + i#0", reads=[q1, i0], left=_ssa_ref(q1),
+                   right=FExpr("MLIL_VAR_SSA", "i#0", reads=[i0])), reads=[q1, i0])
+    _sink_ssa(pg2, q2)
+    result2, _, _ = _bw(pg2.func())
+    [leaf2] = _demand_leaves(result2)
+    assert leaf2["objects"] == [{"kind": "local", "object": "b", "offset": None}], leaf2
+
+
+def test_untyped_modeled_sink_argument_is_a_pointer_demand_r6():
+    # popen's model says its argument 0 is a command it reads through, so an
+    # untyped value (an import BN gave no prototype, a stripped register)
+    # carries the policy leaf: the role is the model's, not BN's typing.
+    n = FVar("n", ident=82); n0 = FSSA(n, 0)
+    pg = _BufProgram(params=[n])
+    p1 = FSSA(FVar("p"), 1)
+    _set_ptr(pg, p1, "p#1 = n#0", FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]), reads=[n0])
+    _sink_ssa(pg, p1)
+    result, _, _ = _bw(pg.func())
+    assert result["slices"][0]["origin"]["kind"] == "parameter", result["slices"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = _demand_leaves(result)
+    assert leaf["objects"][0]["kind"] == "parameter" and leaf["objects"][0]["object"] == "n#0"
+
+
+def test_register_recovered_pointer_argument_is_a_pointer_demand_r6(monkeypatch):
+    # BN recovered popen with no parameters; the backward seed reads arg 0
+    # from its calling-convention register. The policy ran only for an
+    # operand in the recovered parameter list, so this completed.
+    from test_taint_engine import FBV, te
+    n = FVar("n", ident=83); n0 = FSSA(n, 0)
+    rdi1 = FSSA(FVar("rdi", typ="char*"), 1)
+    pg = _BufProgram(params=[n])
+    _set_ptr(pg, rdi1, "rdi#1 = n#0", FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]), reads=[n0])
+    call = pg.call(_B_POPEN, [], reads=[])
+    func = pg.func()
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                        lambda f, sites, idx: ("rdi", [(rdi1, sites[0])]), raising=False)
+    result = engine.backward(func, [te.parse_locator("arg:popen:0")])
+    assert any("recovered from calling-convention register rdi" in a
+               for a in result["assumptions"]), result["assumptions"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = _demand_leaves(result)
+    assert leaf["recovered_from_register"] is True and leaf["operand"] == "rdi#1", leaf
+    assert leaf["objects"][0]["kind"] == "parameter", leaf
+    assert call is not None
+
+
+def test_resolve_map_pinned_sink_uses_the_pinned_models_role_r6():
+    # `call [slot](p)` pinned to system by --resolve-map: the locator's callee
+    # is the pinned target, so its model decides. The round-5 gate asked
+    # resolve_call_target, saw no callee and no type, and completed.
+    from test_taint_engine import FBV, FPVS, FFunc, FSSAFunc, te  # noqa: F401
+    n = FVar("n", ident=84); slot = FVar("slot")
+    n0, slot1 = FSSA(n, 0), FSSA(slot, 1)
+    instrs = [FInstr(0, 0x14, "MLIL_CALL_SSA", "[slot#1](n#0)", reads=[slot1, n0],
+                     dest=FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1]),
+                     params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])]
+    func = FFunc("dispatch", 0x10, FSSAFunc(instrs), params=[n])
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models(),
+                            resolve_map={"0x14": [hex(_B_SYSTEM6)]})
+    result = engine.backward(func, [te.parse_locator("arg:system:0")])
+    assert result["slices"][0]["origin"]["kind"] == "parameter", result["slices"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    assert len(_demand_leaves(result)) == 1, result["leaves"]
+
+
+@pytest.mark.parametrize("sink, idx", [("malloc", 0), ("memcpy", 2)])
+def test_pointer_typed_scalar_into_a_size_is_a_value_r6(sink, idx):
+    # `malloc((size_t)p)` / `memcpy(d, s, (size_t)p)` with `p` typed char*:
+    # the model says a size / a length -- a value. No pointer leaf, no
+    # pointer object: the slice completes at the parameter, as on base.
+    from test_taint_engine import FBV, te
+    p = FVar("p", ident=85, typ="char*"); p0 = FSSA(p, 0)
+    v1 = FSSA(FVar("v", typ="char*"), 1)
+    pg = _BufProgram(params=[p])
+    _set_ptr(pg, v1, "v#1 = p#0", FExpr("MLIL_VAR_SSA", "p#0", reads=[p0]), reads=[p0])
+    ref = FExpr("MLIL_VAR_SSA", "v#1", reads=[v1])
+    if sink == "malloc":
+        pg.call(_B_MALLOC, [ref], reads=[v1])
+    else:
+        pg.call(_B_MEMCPY6, [_cstr(0x404000), _cstr(0x405000), ref], reads=[v1])
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    result = engine.backward(pg.func(), [te.parse_locator(f"arg:{sink}:{idx}")])
+    assert result["leaves"] == [], result["leaves"]
+    assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "p#0"}
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True, result
+
+
+@pytest.mark.parametrize("ptype, complete", [(None, False), ("int64_t", True)])
+def test_ad_hoc_sink_falls_back_to_types_and_fails_closed_r6(ptype, complete):
+    # An unmodeled sink: no role. Unknown types fail closed (a pointer
+    # demand); an integer at BOTH ends -- the value and the callee's
+    # parameter -- is the disclosed integer residual, a value.
+    from test_taint_engine import FBV, te
+    n = FVar("n", ident=86, typ="int64_t"); n0 = FSSA(n, 0)
+    pg = _BufProgram(params=[n])
+    pg.call(_B_HELPER6, [FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])], reads=[n0])
+
+    class View(FBV):
+        def get_function_at(self, addr):
+            if addr == _B_HELPER6 and ptype is not None:
+                return SimpleNamespace(
+                    name="emit_line", start=addr, parameter_vars=[],
+                    type=SimpleNamespace(parameters=[SimpleNamespace(
+                        type=SimpleNamespace(type_class="IntegerTypeClass",
+                                             __str__=lambda s: ptype))]))
+            return super().get_function_at(addr)
+
+    engine = te.TaintEngine(View(_B_NAMES), te.load_models())
+    result = engine.backward(pg.func(), [te.parse_locator("arg:emit_line:0")])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete, result
+    assert bool(_demand_leaves(result)) is (not complete), result["leaves"]
+
+
+def test_mixed_sink_names_its_buffer_in_pointer_args_r6():
+    # `app_send(fd, buf, len)` as a net_write overlay: the buffer it names in
+    # `pointer_args` is a pointer demand, the length a value. A malformed
+    # `pointer_args` is refused at load.
+    from test_taint_engine import FBV, te
+    _B_NAMES[0x9a3] = "app_send"
+    overlay = {"app_send": {"sink": {"class": "net_write", "tainted_args": [1, 2],
+                                     "pointer_args": [1]}}}
+    b = FVar("b", ident=87); n = FVar("n", ident=88, typ="int64_t")
+    b0, n0 = FSSA(b, 0), FSSA(n, 0)
+    pg = _BufProgram(params=[b, n])
+    pg.call(0x9a3, [_const(1), FExpr("MLIL_VAR_SSA", "b#0", reads=[b0]),
+                    FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])], reads=[b0, n0])
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models(overlay))
+    buf = engine.backward(pg.func(), [te.parse_locator("arg:app_send:1")])
+    assert buf["diagnostics"]["safe_to_report_complete_slice"] is False, buf
+    assert len(_demand_leaves(buf)) == 1, buf["leaves"]
+    length = engine.backward(pg.func(), [te.parse_locator("arg:app_send:2")])
+    assert length["leaves"] == [] and length["diagnostics"]["safe_to_report_complete_slice"]
+    with pytest.raises(te.TaintError, match="pointer_args"):
+        te.load_models({"app_send": {"sink": {"class": "net_write", "tainted_args": [1],
+                                              "pointer_args": ["1"]}}})

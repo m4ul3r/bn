@@ -96,9 +96,9 @@ BLOCKING_LEAF_KINDS = frozenset({
     # is reported (`stores_cover`) but never certifies the slice: the proof
     # rests on BN's recovery of the object's extent.
     "region_store_proof_not_certified",
-    # #931 round 5, the policy: a sink that reads through a pointer is
-    # complete only for a constant address of read-only data. Every other
-    # pointer demand carries this leaf, listing each object it may read.
+    # #931 round 6, the policy: a sink that reads through a pointer is never
+    # complete. Every pointer demand carries this leaf, listing each object
+    # it may read.
     "pointer_demand_not_certified",
 })
 
@@ -548,9 +548,9 @@ def backward_diagnostics(
                             and isinstance(lf.get("function"), str)), None)
         if demand_leaf is not None:
             next_action += (
-                ". The sink reads through a pointer, and only a constant address of "
-                "read-only data is complete (#931): the leaf's `objects` lists every "
-                "object the pointer may read; check each by hand -- "
+                ". The sink reads through a pointer, so it is never complete (#931): "
+                "the leaf's `objects` lists every object the pointer may read; check "
+                "each by hand -- "
                 f"`bn il {demand_leaf['function']} --view mlil`")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
                for lf in unresolved_leaves):

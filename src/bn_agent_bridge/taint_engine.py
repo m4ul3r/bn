@@ -7308,19 +7308,31 @@ class TaintEngine:
                 for seed_var, sink_ins in seeds:
                     sink_addr = hex(int(getattr(sink_ins, "address", 0)))
                     seed_label = var_label(seed_var)
-                    # An `arg:` sink reads through the operand its locator
-                    # SELECTS (popen's command, write's buffer): the demand
-                    # starts there, at offset 0 of what that operand points
-                    # to (round 1). Never another argument that happens to
-                    # read the same SSA value at another offset (round 2). A
-                    # seed recovered from a register has no operand: no demand.
+                    # An `arg:` sink that reads through the argument its
+                    # locator SELECTS (popen's command, write's buffer) has a
+                    # demand: it starts there, at offset 0 of what that
+                    # operand points to (round 1), never at another argument
+                    # that reads the same SSA value (round 2). Whether the
+                    # sink reads through the argument at all is the sink
+                    # model's role for it (round 6), not BN's typing: a
+                    # malloc size or a memcpy length is a value, with no
+                    # demand, as on base. A seed recovered from a register
+                    # has no operand; its demand starts at the seed itself.
                     anchor = None
+                    reads_through = False
+                    operand = None
                     if sink.get("kind") == "arg":
                         sparams = self._call_params(sink_ins)
                         sidx = int(sink.get("index", -1))
-                        aexpr = (self._seed_anchor(seed_var, sparams[sidx])
-                                 if 0 <= sidx < len(sparams) else None)
-                        anchor = (aexpr, 0) if aexpr is not None else None
+                        operand = sparams[sidx] if 0 <= sidx < len(sparams) else None
+                        reads_through = self._sink_reads_through_pointer(
+                            sink, seed_var, sink_ins, sidx, operand)
+                        if reads_through:
+                            aexpr = (self._seed_anchor(seed_var, operand)
+                                     if operand is not None
+                                     else seed_var.expr if isinstance(seed_var, _BufferSeed)
+                                     else seed_var)
+                            anchor = (aexpr, 0) if aexpr is not None else None
                     for sl in self._backward_slice(func, seed_var, 0, max_depth, set(),
                                                    seed_ins=sink_ins, anchor=anchor):
                         o = sl["origin"]
@@ -7343,9 +7355,12 @@ class TaintEngine:
                         }
                         seen_origin[key] = entry
                         sink_slices.append(entry)
-                    if sink.get("kind") == "arg" and 0 <= sidx < len(sparams):
-                        self._bw_pointer_demand(func, ssaf, seed_var, sink_ins, sidx,
-                                                sparams[sidx])
+                    if reads_through:
+                        self._bw_pointer_demand(
+                            func, ssaf, sink_ins, sidx,
+                            operand if operand is not None else
+                            (seed_var.expr if isinstance(seed_var, _BufferSeed) else seed_var),
+                            recovered=operand is None)
                 slices.extend(sink_slices)
             except RecursionError:
                 slices.extend(sink_slices)  # keep the partial, already-deduped slices
@@ -8440,23 +8455,16 @@ class TaintEngine:
             return seed_var if op_name(operand) in _COPY_OPS and len(reads) == 1 else operand
         return None
 
-    def _bw_pointer_demand(self, func: Any, ssaf: Any, seed_var: Any, sink_ins: Any,
-                           idx: int, operand: Any) -> None:
-        """THE POLICY (#931 round 5): neither a call nor a store certifies a
-        buffer's bytes, so a sink that reads through a pointer is complete
-        only when that pointer is a constant address of non-writable data
-        (base's literal rule, unchanged) -- on every path, with no
-        arithmetic. Every other pointer demand gets a blocking
-        ``pointer_demand_not_certified`` leaf listing EVERY object the
-        pointer may point into, each described on its own. The description
-        (``_demand_objects``) is descriptive only: it never decides
-        completeness. A sink that consumes a value (a malloc size, a memcpy
-        length) is untouched."""
-        if not self._sink_reads_through_pointer(seed_var, sink_ins, idx, operand):
-            return
-        objects = self._demand_objects(func, ssaf, operand)
-        if objects and all(o["kind"] == "literal" for o in objects):
-            return
+    def _bw_pointer_demand(self, func: Any, ssaf: Any, sink_ins: Any, idx: int,
+                           pointer: Any, *, recovered: bool) -> None:
+        """THE POLICY (#931 round 6): neither a call nor a store certifies a
+        buffer's bytes, so a sink that reads through a pointer is NEVER
+        complete. Every pointer demand -- a constant literal included -- gets
+        a blocking ``pointer_demand_not_certified`` leaf listing every object
+        the pointer may read, each described on its own. The description
+        (``_demand_objects``) is descriptive only: nothing here decides
+        completeness but the role (``_sink_arg_role``)."""
+        objects = self._demand_objects(func, ssaf, pointer)
         uniq: list[dict[str, Any]] = []
         for o in objects:
             if o not in uniq:
@@ -8468,104 +8476,207 @@ class TaintEngine:
                 return (f"the pointer `{o['object']}` returned"
                         + (f", into {inner}" if inner else "")
                         + (f" ({o['note']})" if o.get("note") else ""))
-            extra = f" (GOT slot {o['slot']})" if o.get("slot") else ""
-            return f"{o['kind'].replace('_', ' ')} `{o['object']}`{extra}"
+            extra = []
+            if "offset" in o:
+                extra.append(f"offset {o['offset']:#x}" if isinstance(o["offset"], int)
+                             and o["offset"] >= 0 else
+                             f"offset -{-o['offset']:#x}" if isinstance(o["offset"], int)
+                             else "offset unknown")
+            if o.get("slot"):
+                extra.append(f"GOT slot {o['slot']}")
+            if o.get("segment_writable") is not None:
+                extra.append("in a writable segment" if o["segment_writable"]
+                             else "in a read-only segment")
+            return (f"{o['kind'].replace('_', ' ')} `{o['object']}`"
+                    + (f" ({', '.join(extra)})" if extra else ""))
 
         fn_ref = hex(int(getattr(func, "start", 0) or 0))
         listed = "; ".join(say(o) for o in uniq) or "no object the walk could name"
+        shown = var_label(pointer) if is_ssa_var(pointer) else str(pointer)
+        how = (f"its argument {idx}, recovered from a register (`{shown}`)" if recovered
+               else f"its argument {idx} (`{shown}`)")
         leaf = {
             "kind": "pointer_demand_not_certified",
             "address": hex(int(getattr(sink_ins, "address", 0) or 0)),
             "function": fn_ref,
-            "operand": str(operand),
+            "operand": shown,
             "objects": uniq,
             "il_text": str(sink_ins),
-            "detail": (f"the sink reads bytes through its argument {idx} (`{operand}`), and "
-                       f"no call or store certifies a buffer's bytes (#931): only a constant "
-                       f"address of read-only data is complete. It may read: {listed}. The "
-                       f"slice is NOT complete -- check each object by hand "
-                       f"(`bn il {fn_ref} --view mlil`)"),
+            "detail": (f"the sink reads bytes through {how}, and no call or store "
+                       f"certifies a buffer's bytes (#931): a sink that reads through a "
+                       f"pointer is never complete. It may read: {listed}. Check each "
+                       f"object by hand (`bn il {fn_ref} --view mlil`)"),
         }
+        if recovered:
+            leaf["recovered_from_register"] = True
         if leaf not in self._bw_leaves:
             self._bw_leaves.append(leaf)
 
-    def _sink_reads_through_pointer(self, seed_var: Any, sink_ins: Any, idx: int,
-                                    operand: Any) -> bool:
-        """Does the selected sink operand hand the sink a POINTER whose bytes
-        it reads (popen's command, write's buffer), rather than a value (a
-        malloc size, a memcpy length)? A folded `&buf`, a value BN types as a
-        pointer, or a callee parameter BN types as a pointer. A pointer BN
-        types as an integer at both ends is the disclosed residual."""
+    # The sink classes whose `tainted_args` are VALUES (a size, a length, a
+    # count) and those whose `tainted_args` are POINTERS the sink reads
+    # through (a command, a path, a format, a copied string). A mixed class
+    # (`file_write`, `net_write`: a buffer AND a length) names its pointer
+    # arguments in `sink.pointer_args`; its other tainted args are values.
+    _VALUE_SINK_CLASSES = frozenset({"alloc_size", "overflow_len", "fortified_overflow"})
+    _POINTER_SINK_CLASSES = frozenset({
+        "command_injection", "path_injection", "format_string", "format_or_overflow",
+        "fortified_format", "overflow_unbounded", "unbounded_input"})
+
+    def _sink_arg_role(self, callee: str, idx: int) -> str | None:
+        """The role of argument *idx* of the modeled sink *callee* --
+        ``"pointer"`` (the sink reads bytes through it), ``"value"`` (a
+        size, a length) or None when the model does not say. The locator's
+        callee is the target `_find_callsites` matched, whether directly,
+        through a thunk, or pinned by `--resolve-map` / a value set, so the
+        role is the pinned target's. In order: `sink.pointer_args`,
+        `buf_arg` / `len_arg`, a `*arg:N` pointee in the model's sources,
+        propagations or writes, then the sink class of a tainted arg."""
+        _, model = lookup_model(self.models, callee)
+        if model is None:
+            addr = self._callee_as_addr(callee)
+            name = self._callee_name(addr) if addr is not None else None
+            if name:
+                _, model = lookup_model(self.models, name)
+        if not isinstance(model, dict):
+            return None
+        sink = model.get("sink") if isinstance(model.get("sink"), dict) else {}
+        explicit = sink.get("pointer_args")
+        if isinstance(explicit, list) and idx in explicit:
+            return "pointer"
+        if sink.get("buf_arg") == idx:
+            return "pointer"
+        if sink.get("len_arg") == idx:
+            return "value"
+        toks = [str(r.get(k) or "") for key in ("sources", "propagates")
+                for r in (model.get(key) or []) if isinstance(r, dict) for k in ("from", "to")]
+        toks += [str(t) for t in (model.get("writes") or [])]
+        if any(t.startswith("*arg:") and _try_arg_index(t) == idx for t in toks):
+            return "pointer"
+        if idx in (sink.get("tainted_args") or []):
+            if isinstance(explicit, list):
+                return "value"
+            cls = sink.get("class")
+            if cls in self._VALUE_SINK_CLASSES:
+                return "value"
+            if cls in self._POINTER_SINK_CLASSES:
+                return "pointer"
+        return None
+
+    def _sink_reads_through_pointer(self, sink: dict[str, Any], seed_var: Any, sink_ins: Any,
+                                    idx: int, operand: Any) -> bool:
+        """Does the selected sink argument hand the sink a POINTER whose
+        bytes it reads, rather than a value? The sink model's role decides
+        (a pointer-typed scalar cast into malloc's size is a value). With no
+        model role: a folded `&buf`, an address operand, a pointer-typed
+        value or a pointer-typed callee parameter (the pinned target's, for
+        an indirect call) is a pointer; an integer at BOTH ends is the
+        disclosed residual; anything else fails closed as a pointer."""
+        role = self._sink_arg_role(str(sink.get("callee") or ""), idx)
+        if role is not None:
+            return role == "pointer"
         if isinstance(seed_var, _BufferSeed) or _is_pointer_typed(seed_var):
             return True
-        if "CONST_PTR" in op_name(operand) or "ADDRESS_OF" in op_name(operand):
+        if any(t in op_name(operand) for t in ("CONST_PTR", "ADDRESS_OF", "IMPORT", "EXTERN")):
             return True
-        try:
-            callee = resolve_call_target(self.bv, sink_ins, follow_thunks=True).function
-        except Exception:
-            callee = None
-        ptypes = []
-        ftype = getattr(callee, "type", None)
-        for p in list(getattr(ftype, "parameters", None) or []):
-            ptypes.append(getattr(p, "type", None))
-        if not ptypes:
-            ptypes = [getattr(v, "type", None)
-                      for v in list(getattr(callee, "parameter_vars", None) or [])]
-        if 0 <= idx < len(ptypes) and ptypes[idx] is not None:
-            return _is_pointer_typed(SimpleNamespace(type=ptypes[idx]))
-        return False
+        callees: list[Any] = []
+        cands, _ = self._indirect_call_resolution(sink_ins)
+        if cands:
+            callees = [function_at(self.bv, a) for a in cands]
+        else:
+            try:
+                callees = [resolve_call_target(self.bv, sink_ins, follow_thunks=True).function]
+            except Exception:
+                callees = []
+        ptypes: list[Any] = []
+        for fn in callees:
+            ts = [getattr(p, "type", None)
+                  for p in list(getattr(getattr(fn, "type", None), "parameters", None) or [])]
+            if not ts:
+                ts = [getattr(v, "type", None)
+                      for v in list(getattr(fn, "parameter_vars", None) or [])]
+            ptypes.append(ts[idx] if 0 <= idx < len(ts) else None)
+        if any(t is not None and _is_pointer_typed(SimpleNamespace(type=t)) for t in ptypes):
+            return True
+        seed_t = getattr(seed_var, "type", None) or getattr(getattr(seed_var, "var", None),
+                                                             "type", None)
+        both_integer = (seed_t is not None and ptypes and all(t is not None for t in ptypes))
+        return not both_integer
 
-    def _demand_objects(self, func: Any, ssaf: Any, expr: Any, *, arith: bool = False,
+    def _demand_objects(self, func: Any, ssaf: Any, expr: Any, *, disp: int | None = 0,
                         seen: set | None = None, depth: int = 0) -> list[dict[str, Any]]:
         """Every object a pointer *expr* may point into, each described --
-        DESCRIPTIVE ONLY (#931 round 5): the description fills a leaf's
+        DESCRIPTIVE ONLY (#931 rounds 5-6): the description fills a leaf's
         detail and never decides completeness. Follows copies, phis and
         pointer arithmetic to the roots: a local's address, a constant
-        address (``literal`` only for non-writable storage reached without
-        arithmetic), a GOT/extern import, a loaded pointer, a parameter, a
-        call's return (with the objects it may point into), or ``unknown``."""
+        address (``literal`` in read-only section storage, ``global`` in
+        writable storage, with the segment's writability as a separate
+        fact), a GOT/extern import, a loaded pointer, a parameter, a call's
+        return (with the objects it may point into), or ``unknown``.
+
+        *disp* is the displacement the consumer's pointer has from the
+        expression being resolved, accumulated from the operand down through
+        constant arithmetic (None once any non-constant term joins), so an
+        object's ``offset`` is where the CONSUMER points -- `p = b + 8;
+        popen(p - 8)` reads ``b`` at 0 -- never the definition's own offset."""
         seen = seen if seen is not None else set()
         if expr is None or depth > 16:
             return [{"kind": "unknown", "object": str(expr)}]
         op = op_name(expr)
 
-        def rec(e, a=arith):
-            return self._demand_objects(func, ssaf, e, arith=a, seen=seen, depth=depth + 1)
+        def rec(e, dd=disp):
+            return self._demand_objects(func, ssaf, e, disp=dd, seen=seen, depth=depth + 1)
+
+        def at(base: int | None) -> int | None:
+            return None if disp is None or base is None else base + disp
 
         if "ADDRESS_OF" in op:
             v = getattr(expr, "src", None) or getattr(expr, "var", None)
             off = getattr(expr, "offset", None) if op == "MLIL_ADDRESS_OF_FIELD" else 0
             return [{"kind": "local", "object": var_label(v),
-                     **({"offset": int(off)} if isinstance(off, int) else {})}]
+                     "offset": at(int(off) if isinstance(off, int) else None)}]
         if op in ("MLIL_IMPORT", "MLIL_EXTERN_PTR"):
             c = getattr(expr, "constant", None)
-            return [{"kind": "got_or_extern", "object": str(expr),
+            return [{"kind": "got_or_extern", "object": str(expr), "offset": at(0),
                      **({"slot": hex(int(c))} if isinstance(c, int) else {})}]
         if "CONST" in op:
             c = self._int_const(expr)
             if c is None:
                 return [{"kind": "unknown", "object": str(expr)}]
             storage = self._const_ptr_storage(c)
-            kind = ("literal" if storage == "readonly" and not arith and "PTR" in op
+            seg = None
+            wr = getattr(self.bv, "is_offset_writable", None)
+            if wr is not None:
+                try:
+                    seg = bool(wr(int(c)))
+                except Exception:
+                    seg = None
+            kind = ("literal" if storage == "readonly" and "PTR" in op
                     else "global" if storage == "writable" else "constant_address")
-            return [{"kind": kind, "object": str(expr), "address": hex(c)}]
-        if "LOAD" in op:
-            return [{"kind": "loaded_pointer", "object": str(expr)}]
-        if op in ("MLIL_VAR_ALIASED", "MLIL_VAR_ALIASED_FIELD"):
-            return [{"kind": "loaded_pointer", "object": str(expr)}]
+            return [{"kind": kind, "object": str(expr), "address": hex(c), "offset": at(0),
+                     "segment_writable": seg}]
+        if "LOAD" in op or op in ("MLIL_VAR_ALIASED", "MLIL_VAR_ALIASED_FIELD"):
+            return [{"kind": "loaded_pointer", "object": str(expr), "offset": None}]
         if op in ("MLIL_ADD", "MLIL_SUB"):
-            sides = [s for s in (getattr(expr, "left", None), getattr(expr, "right", None))
-                     if s is not None and not (self._int_const(s) is not None
-                                               and "PTR" not in op_name(s))]
-            ptr = [s for s in sides
+            left, right = getattr(expr, "left", None), getattr(expr, "right", None)
+            sides = [s for s in (left, right) if s is not None]
+            consts = {id(s): self._int_const(s) for s in sides
+                      if self._int_const(s) is not None and "PTR" not in op_name(s)}
+            terms = [s for s in sides if id(s) not in consts]
+            ptr = [s for s in terms
                    if any(t in op_name(s) for t in ("ADDRESS_OF", "CONST_PTR", "IMPORT", "EXTERN"))
                    or any(_is_pointer_typed(r) for r in expr_reads(s))]
+            base = ptr or terms
             out: list[dict[str, Any]] = []
-            for s in (ptr or sides):
-                out += rec(s, True)
+            for s in base:
+                if disp is None or len(terms) != 1 or (op == "MLIL_SUB" and s is not left):
+                    dd = None
+                else:
+                    k = sum(consts.values())
+                    dd = disp + (-k if op == "MLIL_SUB" else k)
+                out += rec(s, dd)
             return out or [{"kind": "unknown", "object": str(expr)}]
         if is_ssa_var(expr):
-            key = (var_key(expr), getattr(expr, "version", None))
+            key = (var_key(expr), getattr(expr, "version", None), disp)
             if key in seen:
                 return []
             seen.add(key)
@@ -8575,7 +8686,7 @@ class TaintEngine:
                 d = None
             if d is None:
                 pidx = self._param_index_of(func, expr)
-                return [{"kind": "parameter", "object": var_label(expr),
+                return [{"kind": "parameter", "object": var_label(expr), "offset": disp,
                          "pointer": _is_pointer_typed(expr),
                          **({"index": pidx} if pidx is not None else {})}]
             dop = op_name(d)
@@ -8590,7 +8701,8 @@ class TaintEngine:
                 name = self._callee_name(const_target(getattr(d, "dest", None)))
                 params = self._call_params(d)
                 # The arguments the model says the return points into (or
-                # writes through), else every pointer-looking argument.
+                # writes through), else every pointer-looking argument. Where
+                # in them the return points is unknown (strchr).
                 model = lookup_model(self.models, name)[1] if name else None
                 want: list[int] = []
                 for rule in ((model or {}).get("sources") or []) + (
@@ -8605,7 +8717,7 @@ class TaintEngine:
                 for p in picked:
                     if expr_reads(p) or any(t in op_name(p) for t in (
                             "ADDRESS_OF", "CONST_PTR", "IMPORT", "EXTERN")):
-                        for o in rec(p, True):
+                        for o in rec(p, None):
                             if (o["kind"] != "parameter" or o.get("pointer")) and o not in inner:
                                 inner.append(o)
                 note = ({"note": "BN recovered no argument the return may point into"}

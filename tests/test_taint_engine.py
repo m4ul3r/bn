@@ -9893,7 +9893,9 @@ def test_backward_unresolved_origin_withholds_completeness_915(models):
     assert sl["metrics"]["traverses_unresolved"] is True
     diag = result["diagnostics"]
     assert diag["safe_to_report_complete_slice"] is False, diag
-    assert diag["frontier"]["unresolved"] == 1, diag
+    # The buffer's own leaf, plus the #931 policy leaf: popen reads through
+    # its argument 0, so it is never complete.
+    assert diag["frontier"]["unresolved"] == 2, diag
     assert "address_of_local_unresolved" in diag["complete_slice_reason"], diag
     assert "reached its origins" not in diag["next_action"], diag
     leaf = next((l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"), None)
@@ -10347,7 +10349,7 @@ def test_backward_uncovered_memory_phi_arm_is_a_frontier_928():
     assert aol[0]["buffer"] == "dst"
     assert result["slices"][0]["origin"]["kind"] == "address_of_local_unresolved", result["slices"][0]["origin"]
     diag = result["diagnostics"]
-    assert diag["safe_to_report_complete_slice"] is False and diag["frontier"]["unresolved"] == 1, diag
+    assert diag["safe_to_report_complete_slice"] is False and diag["frontier"]["unresolved"] == 2, diag
 
 
 def test_backward_covered_memory_phi_arms_are_store_proven_928():
@@ -11186,7 +11188,8 @@ def test_backward_writable_global_element_is_a_leaf_928r4():
     # no global leaf (snprintf still proves no byte of cmd, #931).
     bv_ro = FBVStorage(_B_NAMES, ro=[(0x700, 0x800), (0x404000, 0x405000)])
     result2 = te.TaintEngine(bv_ro, te.load_models()).backward(pg.func(), [te.parse_locator("arg:popen:0")])
-    _only_call_fill_leaves(result2, result2["leaves"], "snprintf")
+    _only_call_fill_leaves(result2, [l for l in result2["leaves"]
+                                     if l["kind"] == "address_of_local_unresolved"], "snprintf")
 
 
 def _two_locals_phi_program():
