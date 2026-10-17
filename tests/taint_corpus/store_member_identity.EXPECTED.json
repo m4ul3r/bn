@@ -1,0 +1,74 @@
+{
+  "description": "From #941, verdicts re-derived: snprintf through a phi'd or reloaded pointer is never proof (#931).",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline",
+    "-fno-builtin"
+  ],
+  "backward": [
+    {
+      "function": "member_phi",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "member_phi_rev",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "member_phi_ctl",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "low_part_terminator",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "writes [0x0, 0x40)"
+      ]
+    }
+  ]
+}

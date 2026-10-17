@@ -1,0 +1,74 @@
+{
+  "description": "From #941: a member load consumes only its own bytes (#933).",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline",
+    "-fno-builtin"
+  ],
+  "backward": [
+    {
+      "function": "scalar_member_wrong",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "writes [0x8, 0x10)"
+      ]
+    },
+    {
+      "function": "scalar_member_ctl",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "constant"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "region_store_proof_not_certified"
+        }
+      ],
+      "leaf_details_contain": [
+        "a region proof from stores is not certified"
+      ]
+    },
+    {
+      "function": "scalar_member_mirror",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "writes [0x0, 0x8)"
+      ]
+    },
+    {
+      "function": "scalar_member_ptr_store",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "writes [0x8, 0x10)"
+      ]
+    }
+  ]
+}

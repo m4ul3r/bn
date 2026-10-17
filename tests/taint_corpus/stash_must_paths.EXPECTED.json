@@ -62,17 +62,21 @@
       "function": "ptr_copy_load",
       "sink": "arg:malloc:0",
       "origin_kinds": [
+        "address_of_local_unresolved",
         "call"
       ],
       "step_reasons_contain": [
         "written by memset"
       ],
-      "forbid_leaves": [
+      "complete_slice": false,
+      "leaves": [
         {
           "kind": "address_of_local_unresolved"
         }
       ],
-      "complete_slice": true
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
     }
   ]
 }

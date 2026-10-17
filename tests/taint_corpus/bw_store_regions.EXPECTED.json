@@ -1,0 +1,108 @@
+{
+  "description": "#931/#933: only plain stores the slice can see (and BN's __builtin_* store runs whose LLIL is checked) prove the consumed region, which runs from the sink's pointer to the end of the object. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline"
+  ],
+  "backward": [
+    {
+      "function": "member_stored",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "call"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "region_store_proof_not_certified"
+        }
+      ],
+      "leaf_details_contain": [
+        "a region proof from stores is not certified"
+      ]
+    },
+    {
+      "function": "whole_struct",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "writes [0x0, 0x4)"
+      ]
+    },
+    {
+      "function": "member_then_tail",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "writes [0x10, 0x14)"
+      ]
+    },
+    {
+      "function": "short_literal",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "writes [0xf, 0x10)"
+      ]
+    },
+    {
+      "function": "zeroed",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "call_fill",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "field_load_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        },
+        {
+          "kind": "field_load_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    }
+  ]
+}

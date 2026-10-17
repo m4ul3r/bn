@@ -102,6 +102,27 @@ BLOCKING_LEAF_KINDS = frozenset({
     # memory chain longer than the walk budget. The sink consumes the bytes,
     # not the pointer, so a slice that stops at the address-of is NOT complete.
     "address_of_local_unresolved",
+    # #931 round 1: a backward slice reached a pointer with no local behind it
+    # -- a call's return or a parameter -- that a consumer reads through. The
+    # object's extent and earlier contents are unknown to the walk, so nothing
+    # proves the bytes the consumer reads; its writers here stay in the slice.
+    "pointer_object_unresolved",
+    # #931/#933 round 2: stores cover a consumed region the walk cannot bound
+    # -- the consumer reads outside the object or at an offset that is not
+    # one constant. The stores are reported as facts, not a proof.
+    "object_extent_unknown",
+    # #931/#933 round 3: stores cover every consumed byte on every path. That
+    # is reported (`stores_cover`) but never certifies the slice: the proof
+    # rests on BN's recovery of the object's extent.
+    "region_store_proof_not_certified",
+    # #931 round 6, the policy: a sink that reads through a pointer is never
+    # complete. Every pointer demand carries this leaf, listing each object
+    # it may read.
+    "pointer_demand_not_certified",
+    # #931 round 7: an `arg:` sink argument no model gives a role (walked as
+    # a pointer demand), and a sink a multi-sink query could not seed at all.
+    "sink_role_unknown",
+    "sink_unseeded",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -556,7 +577,9 @@ def backward_diagnostics(
     # frontier a user can act on by re-running with a narrower sink.
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered",
                   "indirect_call_unresolved", "field_load_unresolved",
-                  "address_of_local_unresolved")
+                  "address_of_local_unresolved", "pointer_object_unresolved",
+                  "object_extent_unknown", "region_store_proof_not_certified",
+                  "pointer_demand_not_certified", "sink_role_unknown", "sink_unseeded")
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
@@ -638,6 +661,50 @@ def backward_diagnostics(
             next_action += (
                 f", or re-run `bn taint forward -f {buffer_leaf['function']} "
                 f"--source {source}` on the buffer")
+        call_leaf = next((lf for lf in unresolved_leaves
+                          if lf.get("kind") in ("address_of_local_unresolved",
+                                                "pointer_object_unresolved")
+                          and isinstance(lf.get("function"), str)
+                          and any(isinstance(c, str) and c and not c.startswith("__builtin_")
+                                  for c in lf.get("calls") or [])), None)
+        if call_leaf is not None:
+            callee = next(c for c in call_leaf["calls"]
+                          if isinstance(c, str) and c and not c.startswith("__builtin_"))
+            next_action += (
+                ". No call's write extent proves a buffer initialised (#931); check "
+                "by hand that the call's destination and length cover the bytes the "
+                f"sink reads: `bn callsites {shlex.quote(callee)} --within "
+                f"{call_leaf['function']}` prints it with its arguments")
+        proof_leaf = next((lf for lf in unresolved_leaves
+                           if lf.get("kind") == "region_store_proof_not_certified"
+                           and isinstance(lf.get("function"), str)), None)
+        if proof_leaf is not None:
+            next_action += (
+                ". Stores cover the consumed bytes, but a store proof is reported, "
+                "not certified (#931), and covered bytes do not establish a NUL "
+                "terminator: check by hand that the consumer reads only those bytes "
+                "of the whole object -- "
+                f"`bn il {proof_leaf['function']} --view mlil` shows the stores and "
+                "the pointer arithmetic")
+        demand_leaf = next((lf for lf in unresolved_leaves
+                            if lf.get("kind") == "pointer_demand_not_certified"
+                            and isinstance(lf.get("function"), str)), None)
+        if demand_leaf is not None:
+            next_action += (
+                ". The sink reads through a pointer, so it is never complete (#931): "
+                "the leaf's `objects` lists every object the pointer may read; check "
+                "each by hand -- "
+                f"`bn il {demand_leaf['function']} --view mlil`")
+        if any(lf.get("kind") == "sink_role_unknown" for lf in unresolved_leaves):
+            # #931 round 8: guidance only -- no generated overlay or re-run.
+            next_action += (
+                ". No sink model gives the selected argument a role, so it is treated as "
+                "a pointer the sink reads through (#931). If it is a value, declare it in "
+                "a model overlay: the leaf's `declare_value_role.entry` is a TEMPLATE "
+                "(replace the UPPER-CASE placeholders). An overlay entry replaces the "
+                "callee's whole model, so start from its current model -- `bn taint models "
+                "--format json` lists the catalog. Then add `--models FILE` to the same "
+                "command you ran")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
                for lf in unresolved_leaves):
             next_action += (

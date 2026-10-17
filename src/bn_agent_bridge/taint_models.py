@@ -228,6 +228,12 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
         ba = sink.get("buf_arg")
         if ba is not None and (not _is_int(ba) or ba < 0):
             _fail("`sink.buf_arg` must be a non-negative integer argument index")
+        # #931 round 6: the arguments of a mixed buffer+length sink class the
+        # sink reads bytes through (`write`'s buffer, not its length).
+        pa = sink.get("pointer_args")
+        if pa is not None and not (isinstance(pa, list) and all(_is_int(i) and i >= 0
+                                                                for i in pa)):
+            _fail("`sink.pointer_args` must be a list of non-negative integer argument indices")
         # #1041 item 4: a FORMAT-GATED sink (scanf's width-less %s) arms on the
         # constant format at `format_arg`; `first_dest` is the argument the first
         # assigning conversion writes.

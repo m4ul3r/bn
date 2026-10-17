@@ -1,0 +1,49 @@
+{
+  "description": "From #941: field loads through a parameter pointer keep the store-matched origin or a frontier.",
+  "lang": "c",
+  "cflags": [
+    "-fno-inline",
+    "-fno-builtin"
+  ],
+  "backward": [
+    {
+      "function": "external_wrong",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "field_load_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "field_load_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "external_control",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "constant"
+      ],
+      "complete_slice": true,
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "external_source",
+      "sink": "arg:malloc:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": true,
+      "forbid_leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    }
+  ]
+}

@@ -2,14 +2,39 @@
   "description": "backward slice from popen's command buffer continues through the modeled snprintf that filled the local buffer (to its parameter, then the caller); an unmodeled in-binary writer handed the buffer's address ends in an address_of_local_unresolved leaf and withholds the complete-slice claim",
   "lang": "c",
   "backward": [
-    {"function": "run_modeled", "sink": "arg:popen:0",
-     "origin_kinds": ["parameter", "constant", "field_load_unresolved"],
-     "expect_crossed": "run_modeled",
-     "step_reasons_contain": ["written by snprintf"],
-     "forbid_leaves": [{"kind": "address_of_local_unresolved"}]},
-    {"function": "run_opaque", "sink": "arg:popen:0",
-     "origin_kinds": ["address_of_local_unresolved"],
-     "leaves": [{"kind": "address_of_local_unresolved"}],
-     "complete_slice": false}
+    {
+      "function": "run_modeled",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter",
+        "constant",
+        "field_load_unresolved"
+      ],
+      "expect_crossed": "run_modeled",
+      "step_reasons_contain": [
+        "written by snprintf"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "run_opaque",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "complete_slice": false
+    }
   ]
 }

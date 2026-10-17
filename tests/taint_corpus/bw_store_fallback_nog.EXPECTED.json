@@ -1,0 +1,76 @@
+{
+  "description": "#931/#933 review round 3: a region proof from stores is a fact, never certification -- a stack array BN splits into fragments (renamed or not) and a stored array whose upper half `read` overwrites are incomplete -- and a pointer fgets returns over a writable global buffer or struct member is the same global frontier as the global. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-O0",
+    "-g0",
+    "-fno-inline",
+    "-U_FORTIFY_SOURCE"
+  ],
+  "backward": [
+    {
+      "function": "rename_fragment",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "call"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "region_store_proof_not_certified"
+        }
+      ],
+      "leaf_details_contain": [
+        "a region proof from stores is not certified"
+      ]
+    },
+    {
+      "function": "upper_half_read",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "call"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "region_store_proof_not_certified"
+        }
+      ],
+      "leaf_details_contain": [
+        "a region proof from stores is not certified"
+      ]
+    },
+    {
+      "function": "returned_global",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "of a global in writable storage"
+      ]
+    },
+    {
+      "function": "returned_global_member",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "of a global in writable storage"
+      ]
+    }
+  ]
+}

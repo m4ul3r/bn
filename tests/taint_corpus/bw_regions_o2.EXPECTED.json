@@ -1,0 +1,236 @@
+{
+  "description": "From #941, verdicts re-derived on the current solver (#931/#933): no call fill proves its region initialised; leaves name the call and the unproven bytes.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-fno-builtin",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=0"
+  ],
+  "backward": [
+    {
+      "function": "zero_read",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "short_read",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "full_request",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "suffix_read",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "indexed_row",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "append_only",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "member_string",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "member_copy",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "member_bytes",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "partial_member",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "unknown_member",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "string_not_full_bytes",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "byte_suffix",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "byte_suffix_gap",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    }
+  ]
+}

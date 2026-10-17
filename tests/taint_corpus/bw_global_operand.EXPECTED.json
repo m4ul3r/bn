@@ -2,15 +2,41 @@
   "description": "a CONST_PTR writer input is a literal only when it points into read-only storage: `sprintf(cmd, \"ping %s\", g_host)` with `g_host` in .bss is a frontier leaf naming the global (origin `global`) and withholds the complete-slice claim; the same call with a .rodata string literal is a complete literal slice",
   "lang": "c",
   "backward": [
-    {"function": "ping_global_array", "sink": "arg:popen:0",
-     "origin_kinds": ["global"],
-     "step_reasons_contain": ["local buffer cmd written by sprintf"],
-     "leaves": [{"kind": "address_of_local_unresolved"}],
-     "leaf_details_contain": ["writable storage"],
-     "complete_slice": false},
-    {"function": "ping_literal", "sink": "arg:popen:0",
-     "origin_kinds": ["call"],
-     "forbid_leaves": [{"kind": "address_of_local_unresolved"}],
-     "complete_slice": true}
+    {
+      "function": "ping_global_array",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "global"
+      ],
+      "step_reasons_contain": [
+        "local buffer cmd written by sprintf"
+      ],
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "writable storage"
+      ],
+      "complete_slice": false
+    },
+    {
+      "function": "ping_literal",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved",
+        "call"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    }
   ]
 }

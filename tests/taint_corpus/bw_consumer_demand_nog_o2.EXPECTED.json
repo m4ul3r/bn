@@ -1,0 +1,220 @@
+{
+  "description": "The same shapes built without debug info (-g0): BN recovers the stack objects itself, so no store proof completes a slice -- the stores are facts in object_extent_unknown leaves. Analyze only.",
+  "lang": "c",
+  "cflags": [
+    "-O2",
+    "-g0",
+    "-fno-inline",
+    "-U_FORTIFY_SOURCE"
+  ],
+  "backward": [
+    {
+      "function": "widened_array",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "loop_back",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "object_extent_unknown"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "object_extent_unknown"
+        }
+      ],
+      "leaf_details_contain": [
+        "is not one constant on every path"
+      ]
+    },
+    {
+      "function": "phi_minus",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "object_extent_unknown"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "object_extent_unknown"
+        }
+      ],
+      "leaf_details_contain": [
+        "is not one constant on every path"
+      ]
+    },
+    {
+      "function": "narrowed",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "call"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "region_store_proof_not_certified"
+        }
+      ],
+      "leaf_details_contain": [
+        "a region proof from stores is not certified"
+      ]
+    },
+    {
+      "function": "direct_member",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "call"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "region_store_proof_not_certified"
+        }
+      ],
+      "leaf_details_contain": [
+        "a region proof from stores is not certified"
+      ]
+    },
+    {
+      "function": "fgets_ret_write",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "fgets_ret_popen",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "no call's write extent is taken as proof"
+      ]
+    },
+    {
+      "function": "heap_fill",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "pointer_object_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "which is no local of this function"
+      ],
+      "step_reasons_contain": [
+        "written by strcpy"
+      ]
+    },
+    {
+      "function": "param_fill",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "pointer_object_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "which is no local of this function"
+      ],
+      "step_reasons_contain": [
+        "written by strcpy"
+      ]
+    },
+    {
+      "function": "nonul_memset",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "parameter"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "region_store_proof_not_certified"
+        }
+      ],
+      "leaf_details_contain": [
+        "a region proof from stores is not certified"
+      ]
+    },
+    {
+      "function": "negative_member",
+      "sink": "arg:popen:0",
+      "origin_kinds": [
+        "address_of_local_unresolved"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "address_of_local_unresolved"
+        }
+      ]
+    },
+    {
+      "function": "returned_heap",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "pointer_object_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "which is no local of this function"
+      ]
+    },
+    {
+      "function": "returned_param",
+      "sink": "arg:write:1",
+      "origin_kinds": [
+        "source"
+      ],
+      "complete_slice": false,
+      "leaves": [
+        {
+          "kind": "pointer_object_unresolved"
+        }
+      ],
+      "leaf_details_contain": [
+        "which is no local of this function"
+      ]
+    }
+  ]
+}
