@@ -2782,6 +2782,44 @@ def test_class_show_invokes_op(monkeypatch):
     assert captured["params"]["name"] == "net::Session"
 
 
+def _class_list_params(monkeypatch, *argv):
+    captured = {}
+
+    def fake_call(args, op, params, **kwargs):
+        captured.update(op=op, params=params)
+        return 0
+
+    import bn.commands.cpp_class as cpp_class
+    monkeypatch.setattr(cpp_class, "_call", fake_call)
+    from bn.cli import build_parser
+    args = build_parser().parse_args(["class", "list", *argv])
+    assert args.handler(args) == 0
+    assert captured["op"] == "class_list"
+    return captured["params"]
+
+
+def test_class_list_no_vendor_sends_the_named_namespaces_1040(monkeypatch):
+    params = _class_list_params(monkeypatch, "--no-vendor", "Poco, acme,")
+    assert params["no_vendor"] is True
+    assert params["vendor_prefixes"] == ["Poco", "acme"]
+    bare = _class_list_params(monkeypatch, "--no-vendor")
+    assert bare["no_vendor"] is True and "vendor_prefixes" not in bare
+    absent = _class_list_params(monkeypatch)
+    assert "no_vendor" not in absent and "vendor_prefixes" not in absent
+
+
+@pytest.mark.parametrize("spelling", ["--all", "--include-hidden"])
+def test_class_list_include_hidden_and_its_old_spelling_1040(monkeypatch, spelling):
+    assert _class_list_params(monkeypatch, spelling)["include_all"] is True
+
+
+def test_class_list_local_and_vtable_budget_are_forwarded_1040(monkeypatch):
+    params = _class_list_params(monkeypatch, "--local", "--vtable-budget", "2.5")
+    assert params["local_only"] is True and params["vtable_budget"] == 2.5
+    plain = _class_list_params(monkeypatch)
+    assert "local_only" not in plain and "vtable_budget" not in plain
+
+
 def test_admin_text_renderer_failure_becomes_clean_error(monkeypatch, capsys):
     # Admin commands build their result locally and render it WITHOUT going
     # through _call, so they must apply the SAME malformed-result guard _call has

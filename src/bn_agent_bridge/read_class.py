@@ -17,7 +17,7 @@ from . import il_format
 from ._shared import OperationFailure, _validate_count
 from .read_listing import _analysis_state_fields
 from .read_types import _follow_typedef
-from .seam import _view_memo
+from .seam import _view_data_memo, _view_memo
 
 
 def _strip_signature(name: str) -> str:
@@ -166,6 +166,38 @@ def _is_alias_symbol(sym) -> bool:
     return tname in _ALIAS_SYMBOL_TYPES
 
 
+def _is_import_or_copy(bv, sym) -> bool:
+    """#1040.3: *sym* names an object another module defines -- an import alias,
+    or a local symbol at an address that also carries one: a COPY relocation,
+    which places a library object's bytes in a non-PIE executable."""
+    if sym is None:
+        return False
+    if _is_alias_symbol(sym):
+        return True
+    get_symbols = getattr(bv, "get_symbols", None)
+    if not callable(get_symbols):
+        return False
+    try:
+        others = list(get_symbols(int(sym.address), 1) or [])
+    except Exception:
+        return False
+    return any(_is_alias_symbol(other) for other in others)
+
+
+def _record_is_imported(rec: dict[str, Any]) -> bool:
+    """#1040.3: whether a class record carries nothing defined in this binary --
+    every RTTI object it has is an import (or a copy of one), and every method
+    clustered under it is an import stub. A record with no RTTI object and no
+    method says nothing either way and is not called imported."""
+    rtti = [rec.get(key) for key in ("vtable", "typeinfo", "typeinfo_name")]
+    rtti = [entry for entry in rtti if isinstance(entry, dict)]
+    methods = rec.get("methods") or []
+    if not rtti and not methods:
+        return False
+    return (all(entry.get("imported") is True for entry in rtti)
+            and all(method.get("imported") is True for method in methods))
+
+
 def _rtti_symbol_maps(bv) -> dict[str, dict[str, Any]]:
     """{class_name: {"vtable": sym, "typeinfo": sym, "typeinfo_name": sym}}.
 
@@ -185,6 +217,167 @@ def _rtti_symbol_maps(bv) -> dict[str, dict[str, Any]]:
         elif _is_alias_symbol(existing) and not _is_alias_symbol(sym):
             slot[kind] = sym
     return maps
+
+
+# #1035.5: the Itanium ABI's three class-typeinfo vtables. Every class typeinfo
+# object's word[0] is one of their address points (object + 2 words), whatever
+# the binary's symbols say.
+_ABI_CLASS_TYPEINFO_VTABLES = (
+    ("_ZTVN10__cxxabiv117__class_type_infoE", "base"),
+    ("_ZTVN10__cxxabiv120__si_class_type_infoE", "si"),
+    ("_ZTVN10__cxxabiv121__vmi_class_type_infoE", "vmi"),
+)
+#: How many bytes of data sections the scan reads before it stops and says so.
+_ABI_SCAN_MAX_BYTES = 64 << 20
+#: The longest typeinfo name string the scan reads.
+_ABI_SCAN_MAX_NAME = 1024
+#: How many candidates a listing carries row by row (the count is whole).
+_ABI_SCAN_LISTED = 64
+_ABI_LAYOUT_VTABLE = {"base": "__cxxabiv1::__class_type_info",
+                      "si": "__cxxabiv1::__si_class_type_info",
+                      "vmi": "__cxxabiv1::__vmi_class_type_info"}
+
+
+class _TypeinfoScan(NamedTuple):
+    #: (address, layout, raw name string) of each candidate BN put no typeinfo
+    #: symbol on, in address order
+    candidates: tuple[tuple[int, str, str], ...]
+    #: the byte cap stopped the scan before every data section was read
+    truncated: bool
+
+
+_EMPTY_TYPEINFO_SCAN = _TypeinfoScan((), False)
+
+
+def _abi_data_sections(bv) -> list[tuple[int, int]]:
+    """The data sections' ranges, merged where they overlap or touch, so each
+    address is read (and charged to the byte budget) once (#1049 review
+    round 4: a user section over existing data listed every candidate twice)."""
+    spans = []
+    for sec in (getattr(bv, "sections", None) or {}).values():
+        semantics = getattr(getattr(sec, "semantics", None), "name", "") or str(getattr(sec, "semantics", ""))
+        if "DataSectionSemantics" not in semantics or "External" in semantics:
+            continue
+        start, end = int(getattr(sec, "start", 0)), int(getattr(sec, "end", 0))
+        if end > start:
+            spans.append((start, end))
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _abi_address_points(ctx, bv) -> dict[int, str]:
+    """{address point: layout} of the ABI's class-typeinfo vtables in *bv*."""
+    lookup = getattr(bv, "get_symbols_by_name", None)
+    if not callable(lookup):
+        return {}
+    ptr = ctx._pointer_size(bv)
+    out: dict[int, str] = {}
+    for raw, layout in _ABI_CLASS_TYPEINFO_VTABLES:
+        try:
+            syms = list(lookup(raw) or [])
+        except Exception:
+            syms = []
+        for sym in syms:
+            out[int(sym.address) + 2 * ptr] = layout
+    return out
+
+
+def _abi_raw_scan(ctx, bv, address_points: dict[int, str]) -> _TypeinfoScan:
+    """The byte half of :func:`_typeinfo_scan`: every aligned data word equal
+    to an ABI address point, with the raw string its next word points at. It
+    reads bytes only -- no symbol -- so it is memoised on the view's DATA
+    generation and survives renames."""
+    ptr = ctx._pointer_size(bv)
+    order = ctx._byteorder(bv)
+    if (ptr, order) not in ((4, "little"), (8, "little"), (4, "big"), (8, "big")):
+        return _EMPTY_TYPEINFO_SCAN
+    chunks: list[tuple[int, bytes]] = []
+    budget = _ABI_SCAN_MAX_BYTES
+    truncated = False
+    for start, end in _abi_data_sections(bv):
+        aligned = start + (-start % ptr)
+        # A word-aligned object cannot start in the sub-word tail, so only
+        # the byte budget -- never that tail -- leaves words unread.
+        whole = (end - aligned) - (end - aligned) % ptr if end > aligned else 0
+        if whole <= 0:
+            continue
+        if whole > budget:
+            truncated = True
+        length = min(whole, budget - budget % ptr)
+        if length <= 0:
+            continue
+        try:
+            data = bytes(bv.read(aligned, length))
+        except Exception:
+            continue
+        data = data[:len(data) - len(data) % ptr]
+        chunks.append((aligned, data))
+        budget -= len(data)
+    found: list[tuple[int, str, str]] = []
+    for base, data in chunks:
+        for ap, layout in address_points.items():
+            needle = ap.to_bytes(ptr, order)
+            at = data.find(needle)
+            while at != -1:
+                if at % ptr == 0:
+                    address = base + at
+                    name_at = ctx._read_pointer_value(bv, address + ptr, size=ptr)
+                    found.append((address, layout,
+                                  (_read_c_string(bv, name_at) or "") if name_at else ""))
+                at = data.find(needle, at + 1)
+    return _TypeinfoScan(tuple(sorted(found)), truncated)
+
+
+def _typeinfo_scan(ctx, bv) -> _TypeinfoScan:
+    """#1035.5: candidate class typeinfo objects in *bv*'s data that BN put no
+    typeinfo symbol on, found from the bytes -- a DISCLOSURE only.
+
+    In a non-PIE executable BN's RTTI analysis names no typeinfo: the ABI's
+    ``__cxxabiv1::__*class_type_info`` vtables are COPY-relocated into it, so
+    every typeinfo's word[0] points at a local copy. An aligned data word equal
+    to one of those vtables' address points is listed as a candidate with its
+    raw name string. Nothing here establishes that the word is a typeinfo
+    object or that the string names a class (#1049 review round 3), so a
+    candidate never becomes a class row, a card, or input to `apply-types`.
+
+    The byte half is bounded by :data:`_ABI_SCAN_MAX_BYTES` (disclosed as
+    ``truncated``) and memoised on the view's data generation; dropping the
+    addresses BN named is memoised per view generation."""
+    def build() -> _TypeinfoScan:
+        address_points = _abi_address_points(ctx, bv)
+        if not address_points:
+            return _EMPTY_TYPEINFO_SCAN
+        raw = _view_data_memo(bv, "abi_rtti_raw_scan", tuple(sorted(address_points.items())),
+                              lambda: _abi_raw_scan(ctx, bv, address_points))
+        get_symbol_at = getattr(bv, "get_symbol_at", None)
+        kept = []
+        for candidate in raw.candidates:
+            sym = get_symbol_at(candidate[0]) if callable(get_symbol_at) else None
+            if sym is not None and _rtti_kind_and_class(sym)[0] == "typeinfo":
+                continue   # BN named it; its symbol answers
+            kept.append(candidate)
+        return _TypeinfoScan(tuple(kept), raw.truncated)
+
+    return _view_memo(bv, "abi_rtti_scan", build)
+
+
+def _read_c_string(bv, address: int) -> str | None:
+    try:
+        data = bytes(bv.read(int(address), _ABI_SCAN_MAX_NAME))
+    except Exception:
+        return None
+    end = data.find(b"\0")
+    if end <= 0:
+        return None
+    try:
+        return data[:end].decode("ascii")
+    except UnicodeDecodeError:
+        return None
 
 
 def _last_component(class_name: str) -> str:
@@ -211,10 +404,11 @@ def _method_kind(class_name: str, method: str) -> str:
 def _sym_entry(sym) -> dict[str, Any] | None:
     if sym is None:
         return None
-    return {
+    entry = {
         "address": hex(int(getattr(sym, "address", 0))),
         "symbol": str(getattr(sym, "raw_name", "") or getattr(sym, "name", "")),
     }
+    return entry
 
 
 def _vtable_symbol_entry(ctx, bv, sym, class_name: str) -> dict[str, Any] | None:
@@ -350,12 +544,16 @@ def _scan_class_registry(ctx, bv) -> dict[str, dict[str, Any]]:
                 "confidence": "name-only",
                 "aliases": [],
             }
-        rec["methods"].append({
+        method = {
             "address": hex(int(getattr(fn, "start", 0))),
             "mangled": str(getattr(fn, "name", "")),
             "demangled": demangled,
             "kind": kind,
-        })
+        }
+        if _is_alias_symbol(getattr(fn, "symbol", None)):
+            # #1040.3: a PLT stub / import, not a body defined in this binary.
+            method["imported"] = True
+        rec["methods"].append(method)
 
     # Ensure RTTI-only classes (no demangled methods clustered) still appear.
     for cls in rtti:
@@ -376,19 +574,20 @@ def _scan_class_registry(ctx, bv) -> dict[str, dict[str, Any]]:
                                                   ctx._pointer_size(bv))
                                if rec["typeinfo"] and ctx is not None else None)
         rec["typeinfo_name"] = _sym_entry(syms.get("typeinfo_name"))
-        if syms.get("vtable") or syms.get("typeinfo") or syms.get("typeinfo_name"):
-            rec["confidence"] = "rtti"
-        elif any(m["kind"] in ("ctor", "dtor") for m in rec["methods"]):
-            rec["confidence"] = "ctor"
-        else:
-            rec["confidence"] = "name-only"
+        for key in ("vtable", "typeinfo", "typeinfo_name"):
+            if rec[key] is not None and _is_import_or_copy(bv, syms.get(key)):
+                rec[key]["imported"] = True
+        rec["confidence"] = _record_confidence(rec)
 
     _merge_spelling_variants(ctx, bv, registry, rtti)
+    for rec in registry.values():
+        rec["imported"] = _record_is_imported(rec)
     return registry
 
 
 def _record_confidence(rec: dict[str, Any]) -> str:
-    if rec["vtable"] or rec["typeinfo"] or rec["typeinfo_name"]:
+    rtti = [rec[key] for key in ("vtable", "typeinfo", "typeinfo_name") if rec[key]]
+    if rtti:
         return "rtti"
     if any(m["kind"] in ("ctor", "dtor") for m in rec["methods"]):
         return "ctor"
@@ -932,12 +1131,13 @@ def _is_thunk_artifact(name: str) -> bool:
     return bool(_THUNK_PREFIX_RE.match(name))
 
 
-def _is_vendor_class(name: str) -> bool:
-    """A class from a vendored/in-tree library `--no-vendor` folds out (boost),
-    the same idea as `--no-stl` for std/ABI (#309)."""
+def _is_vendor_class(name: str, extra: frozenset[str] = frozenset()) -> bool:
+    """A class from a vendored/in-tree library `--no-vendor` folds out (boost,
+    plus any top-level namespaces the caller names, #1040.3), the same idea as
+    `--no-stl` for std/ABI (#309)."""
     first = _first_toplevel_component(_strip_signature(name))
     base = first.split("<", 1)[0]
-    return base in _VENDOR_NAMESPACES
+    return base in _VENDOR_NAMESPACES or base in extra
 
 
 def _is_type_expression_name(name: str) -> bool:
@@ -1027,7 +1227,56 @@ def _list_row(rec: dict[str, Any]) -> dict[str, Any]:
         # agents can filter it. Keyed on the name SHAPE (not just missing-vtable), so a
         # real typeinfo-only class (anonymous-namespace / template) isn't mislabeled.
         "artifact": _is_non_class_rtti_artifact(rec),
+        # #1040.3: nothing of this class is defined in this binary (its RTTI is
+        # an import or a copy relocation, its methods are import stubs).
+        "imported": bool(rec.get("imported")),
     }
+
+
+# #1040.4: a library base (std::/ABI) that is the SOLE RTTI base of at least
+# this many classes carries a count on every row and card that shows it.
+_SHARED_BASE_NOTE_MIN = 2
+
+
+def _sole_base_census(ctx, bv, registry: dict[str, dict[str, Any]]) -> dict[int, int]:
+    """#1040.4: {base typeinfo address: number of classes whose
+    ``__si_class_type_info`` record names it as their one base}.
+
+    Neutral bookkeeping, no verdict: the count is what the bytes say, read from
+    word 2 of each single-inheritance typeinfo in the view. It exists because a
+    library template reported as the only base of many unrelated classes read
+    exactly like a real hierarchy, with nothing on the row to make a reader
+    check it. One pointer read per single-inheritance class, memoised with the
+    registry's generation."""
+    def build() -> dict[int, int]:
+        ptr = ctx._pointer_size(bv)
+        counts: dict[int, int] = {}
+        for rec in registry.values():
+            ti = rec.get("typeinfo")
+            if not isinstance(ti, dict) or ti.get("imported") or rec.get("typeinfo_abi") != "si":
+                continue
+            base = ctx._read_pointer_value(bv, int(ti["address"], 16) + 2 * ptr, size=ptr)
+            if base:
+                counts[base] = counts.get(base, 0) + 1
+        return counts
+
+    return _view_memo(bv, "class_sole_base_census", build)
+
+
+def _annotate_shared_base(rec: dict[str, Any], census: dict[int, int]) -> None:
+    """Stamp ``sole_base_of`` on a record's one library base when the census
+    counts at least :data:`_SHARED_BASE_NOTE_MIN` classes behind it (#1040.4)."""
+    bases = rec.get("bases") or []
+    if len(bases) != 1 or not isinstance(bases[0], dict):
+        return
+    base = bases[0]
+    name = str(base.get("name") or "")
+    try:
+        count = census.get(int(str(base.get("address")), 16), 0)
+    except ValueError:
+        return
+    if count >= _SHARED_BASE_NOTE_MIN and name and _is_library_class(name):
+        base["sole_base_of"] = count
 
 
 def _class_lens_inputs(ctx, bv) -> dict[str, int]:
@@ -1063,6 +1312,8 @@ def _class_lens_inputs(ctx, bv) -> dict[str, int]:
 # #1018.4: an additive budget, shared by the returned page, not per class.
 # A stopped backwalk is unknown, never a cached negative or a partial layout.
 _CLASS_LIST_VTABLE_BUDGET_SECONDS = 0.05
+# #1018 (budget comment): `--vtable-budget` raises the page's budget, up to this.
+_CLASS_LIST_VTABLE_BUDGET_MAX_SECONDS = 30.0
 
 
 class _VtableRecoveryBudgetExpired(Exception):
@@ -1097,6 +1348,25 @@ def _class_list_vtable(ctx, bv, rec: dict[str, Any], deadline: float) -> dict[st
             "vtable_slot_count": primary["total"]}
 
 
+def _scan_disclosure(ctx, bv) -> dict[str, Any]:
+    """#1035.5 / #1049 review round 3: the typeinfo byte scan's candidates, as
+    a listing of raw facts -- address, ABI layout, the raw string the next word
+    points at, and why it is listed -- and never a class identity: no row or
+    card comes from them. ``abi_scan_truncated`` when the scan hit its cap."""
+    scan = _typeinfo_scan(ctx, bv)
+    out: dict[str, Any] = {}
+    if scan.truncated:
+        out["abi_scan_truncated"] = True
+    if scan.candidates:
+        out["typeinfo_scan_candidates"] = len(scan.candidates)
+        out["typeinfo_scan_listing"] = [
+            {"address": hex(address), "layout": layout, "name_string": name,
+             "reason": f"word[0] is the address point of {_ABI_LAYOUT_VTABLE[layout]}; "
+                       "Binary Ninja put no typeinfo symbol here"}
+            for address, layout, name in scan.candidates[:_ABI_SCAN_LISTED]]
+    return out
+
+
 def _class_list(
     ctx,
     selector: str | None,
@@ -1105,12 +1375,28 @@ def _class_list(
     include_all: bool = False,
     no_stl: bool = False,
     no_vendor: bool = False,
+    vendor_prefixes: list[str] | tuple[str, ...] = (),
+    local_only: bool = False,
+    vtable_budget: float | None = None,
     offset: int = 0,
     limit: int | None = None,
     count_only: bool = False,
 ) -> dict[str, Any]:
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
+    extra_vendors = frozenset(str(p).strip() for p in vendor_prefixes or () if str(p).strip())
+    no_vendor = bool(no_vendor or extra_vendors)
+    budget = _CLASS_LIST_VTABLE_BUDGET_SECONDS
+    if vtable_budget is not None:
+        try:
+            budget = float(vtable_budget)
+        except (TypeError, ValueError):
+            budget = float("nan")
+        if not 0 < budget <= _CLASS_LIST_VTABLE_BUDGET_MAX_SECONDS:
+            raise OperationFailure(
+                "invalid_request",
+                f"vtable_budget must be a number of seconds in (0, "
+                f"{_CLASS_LIST_VTABLE_BUDGET_MAX_SECONDS:g}], got {vtable_budget!r}.")
     bv = ctx._resolve_view(selector)
     registry = _build_class_registry(ctx, bv, query=query)
     # #675.2: the DECLARED records join the candidates -- read live, never folded
@@ -1144,6 +1430,8 @@ def _class_list(
     candidates = []
     library_suppressed = 0
     vendor_suppressed = 0
+    imported_suppressed = 0
+    non_class_rtti_suppressed = 0
     construction_vtables_suppressed = 0
     thunks_suppressed = 0
     declared_suppressed = 0
@@ -1168,10 +1456,15 @@ def _class_list(
         if symbol_artifact and not include_all and _is_construction_vtable_artifact(name):
             construction_vtables_suppressed += 1
             continue
+        # #1040.3: typeinfo for a non-class TYPE (#481) is hidden the same way,
+        # counted, rather than listed as a row to be filtered by eye.
+        if symbol_artifact and not include_all and _is_non_class_rtti_artifact(rec):
+            non_class_rtti_suppressed += 1
+            continue
         if no_stl and _is_library_class(name):
             library_suppressed += 1
             continue
-        if no_vendor and _is_vendor_class(name):
+        if no_vendor and _is_vendor_class(name, extra_vendors):
             vendor_suppressed += 1
             continue
         if not (include_all or rec["confidence"] in ("rtti", "ctor")):
@@ -1186,6 +1479,11 @@ def _class_list(
             # even on the default listing.
             if rec["confidence"] == _DECLARED_CONFIDENCE:
                 declared_suppressed += 1
+            continue
+        # #1049 review round 4: after the confidence gate, so the count is only
+        # rows `--local` hides that the listing would otherwise show.
+        if local_only and rec.get("imported"):
+            imported_suppressed += 1
             continue
         candidates.append(rec)
     candidates.sort(key=lambda r: r["name"])
@@ -1214,9 +1512,11 @@ def _class_list(
             "include_all": include_all,
             "no_stl": no_stl,
             "no_vendor": no_vendor,
+            "local_only": local_only,
             "declared_suppressed": declared_suppressed,
             **_analysis_state_fields(bv),
         }
+        result.update(_scan_disclosure(ctx, bv))   # #1049 review: the count too
         if total == 0:
             result["inputs"] = _class_lens_inputs(ctx, bv)   # #653.6
         return result
@@ -1229,6 +1529,7 @@ def _class_list(
     rows = []
     recovery_deadline = None
     recovery_budget_exhausted = False
+    census: dict[int, int] | None = None
     for rec in page:
         if rec["confidence"] == _DECLARED_CONFIDENCE:
             # #675.2: the declared row's size, taken for this page only -- the
@@ -1241,11 +1542,17 @@ def _class_list(
         except Exception:
             rec["bases"] = []
         row = _list_row(rec)
+        if len(rec["bases"]) == 1:
+            if census is None:
+                census = _sole_base_census(ctx, bv, _build_class_registry(ctx, bv))
+            _annotate_shared_base(rec, census)
+            if rec["bases"][0].get("sole_base_of"):
+                row["base_sole_base_of"] = rec["bases"][0]["sole_base_of"]
         if (rec["confidence"] == "rtti"
                 and rec["vtable"] is None and rec.get("typeinfo")
                 and not row["artifact"]):
             if recovery_deadline is None:
-                recovery_deadline = time.monotonic() + _CLASS_LIST_VTABLE_BUDGET_SECONDS
+                recovery_deadline = time.monotonic() + budget
             try:
                 row.update(_class_list_vtable(ctx, bv, rec, recovery_deadline))
             except _VtableRecoveryBudgetExpired:
@@ -1270,15 +1577,20 @@ def _class_list(
         "include_all": include_all,
         "no_stl": no_stl,
         "no_vendor": no_vendor,
+        "vendor_prefixes": sorted(extra_vendors),
+        "local_only": local_only,
         "library_suppressed": library_suppressed,
         "vendor_suppressed": vendor_suppressed,
+        "imported_suppressed": imported_suppressed,
+        "non_class_rtti_suppressed": non_class_rtti_suppressed,
         "construction_vtables_suppressed": construction_vtables_suppressed,
         "thunks_suppressed": thunks_suppressed,
         "declared_suppressed": declared_suppressed,
-        "vtable_recovery_budget_seconds": _CLASS_LIST_VTABLE_BUDGET_SECONDS,
+        "vtable_recovery_budget_seconds": budget,
         "vtable_recovery_budget_exhausted": recovery_budget_exhausted,
         **_analysis_state_fields(bv),
     }
+    result.update(_scan_disclosure(ctx, bv))
     if total == 0:
         # #653.6: make "no classes" attributable -- C target vs failed clustering.
         result["inputs"] = _class_lens_inputs(ctx, bv)
@@ -2000,19 +2312,18 @@ def _infer_rtti_kind(ctx, bv, typeinfo_addr: int, ptr: int) -> str:
     return "base"
 
 
-#: #817: the ctor-new path cannot search at all -- the seam's
-#: ``_operator_new_size_at_ctor`` is still an unconditional ``return None`` stub
-#: (the #205 its TODO defers to is CLOSED). A size miss therefore means "one path
-#: was exhausted and the other was never tried", which is what this reason code
-#: says; a bare null said only "unknown".
-_SIZE_UNAVAILABLE_REASON = "operator_new_recovery_unimplemented"
+#: #817 / #1018.2: a class size comes only from a type BN has defined. An
+#: allocation is never read as a class size -- every class-level source failed
+#: review against legal C++ (trailing storage, ICF-folded constructors,
+#: class-specific or placement allocators) -- so the operator-new size reaches
+#: the card only as a per-site fact (``allocation_request`` on a construction
+#: site), and this reason code says the miss is "no type defined".
+_SIZE_UNAVAILABLE_REASON = "no_defined_type"
 
 
 def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
-    """Object size with provenance. A defined BN type's width wins (authoritative
-    when present); else the operator-new size at a construction site; else None
-    (never fabricated). ``ctx._find_type`` raises on a miss, so the lookup is
-    guarded.
+    """Object size with provenance: a defined BN type's width, else None (never
+    fabricated). ``ctx._find_type`` raises on a miss, so the lookup is guarded.
 
     A miss stays ``None`` rather than becoming a value-less envelope: the class
     card renders any ``size`` DICT as ``size ?`` because #619 requires that "an
@@ -2030,10 +2341,6 @@ def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
         width = int(getattr(type_obj, "width", 0) or 0)
         if width > 0:
             return {"value": hex(width), "source": "bn_type"}
-    new = ctx._operator_new_size_at_ctor(bv, record)
-    if new is not None:
-        size, at = new
-        return {"value": hex(int(size)), "source": "operator_new", "at": hex(int(at))}
     return None
 
 
@@ -2052,6 +2359,12 @@ def _instances(ctx, bv, record: dict[str, Any], *, cap: int = 128) -> dict[str, 
     sites.sort(key=lambda site: int(site["address"], 16))
     stored = ctx._global_vtable_stores(bv, record) if record.get("vtable") else []
     shown_sites = sites[:cap]
+    # #1018.2: the allocation feeding each SHOWN site, read from that site's own
+    # IL -- per site, so the listing cap also bounds the IL it costs.
+    for site in shown_sites:
+        request = ctx._allocation_request_at(bv, int(site["address"], 16))
+        if request:
+            site.update(request)
     shown_stored = stored[:cap]
     return {
         "construction_sites": shown_sites,
@@ -2156,14 +2469,189 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
     # rides BESIDE the size instead of inside it -- one place to read the
     # provenance whether or not a size was recovered, and the default text card
     # (which renders only `size`) is unchanged for a class that has none. The
-    # `size_reason` code then distinguishes "both paths searched, nothing found"
-    # from what actually happens today: the ctor-new path is a stub and was
-    # never tried. Null on a hit, mirroring `hlil_statement_reason`.
+    # `size_reason` code names the miss: no type is defined for the class, the
+    # one source a size is read from (per-site allocations stay on the
+    # construction sites, #1018.2). Null on a hit, mirroring `hlil_statement_reason`.
     rec["size_source"] = size["source"] if size else "unavailable"
     rec["size_reason"] = None if size else _SIZE_UNAVAILABLE_REASON
     rec["bases"] = ctx._bases_for(bv, rec)
+    if len(rec["bases"]) == 1 and isinstance(rec["bases"][0], dict):
+        _annotate_shared_base(rec, _sole_base_census(ctx, bv, _build_class_registry(ctx, bv)))
+        shared = rec["bases"][0].get("sole_base_of")
+        if shared and isinstance(rec.get("typeinfo"), dict):
+            # #1040.4: a count, not a verdict -- what the bytes say, so a reader
+            # who doubts the hierarchy has the scale and the record to check.
+            rec.setdefault("notes", []).append(
+                f"base {rec['bases'][0].get('name')} is named as the only base by {shared} "
+                f"__si_class_type_info records in this binary (word 2 of each record); "
+                f"inspect this class's record with "
+                f"`bn evidence table {rec['typeinfo']['address']} --entries 3`")
     rec["instances"] = ctx._instances_for(bv, rec)
+    _describe_unnamed_slots(ctx, bv, rec)
     return rec
+
+
+#: #1040.2: the longest body whose MLIL `class show` reads for the
+#: `into parameter 0` fact, and how many copies it follows back to parameter 0.
+_AP_STORE_MAX_INSTRUCTIONS = 4096
+_AP_STORE_COPY_HOPS = 8
+
+
+def _il_op_name(instr) -> str:
+    return str(getattr(getattr(instr, "operation", None), "name", "") or "")
+
+
+def _il_constant(expr) -> int | None:
+    """The constant an MLIL expression evaluates to in BN's own IL: a literal
+    constant or pointer, else BN's dataflow value when it is a constant."""
+    if _il_op_name(expr) in ("MLIL_CONST_PTR", "MLIL_CONST"):
+        return int(expr.constant)
+    value = getattr(expr, "value", None)
+    kind = str(getattr(getattr(value, "type", None), "name", "") or "")
+    if kind in ("ConstantPointerValue", "ConstantValue"):
+        return int(value.value)
+    return None
+
+
+def _is_parameter0(ssa, expr, param0) -> bool:
+    """Whether MLIL-SSA *expr* is BN's parameter-0 variable as it arrives, read
+    directly or through plain copies (a stack spill and reload at -O0)."""
+    if _il_op_name(expr) != "MLIL_VAR_SSA":
+        return False
+    ssa_var = expr.src
+    for _ in range(_AP_STORE_COPY_HOPS):
+        definition = ssa.get_ssa_var_definition(ssa_var)
+        if definition is None:
+            return ssa_var.var == param0
+        if _il_op_name(definition) != "MLIL_SET_VAR_SSA" or _il_op_name(definition.src) != "MLIL_VAR_SSA":
+            return False
+        ssa_var = definition.src.src
+    return False
+
+
+def _param0_address_point_stores(func) -> list[int] | None:
+    """#1040.2: the constants *func*'s own body stores at offset 0 of BN's
+    parameter-0 variable, read from its MLIL SSA, for `class show`'s neutral
+    `into parameter 0` fact; ``[]`` for none, None when the IL is unavailable or
+    the body is longer than :data:`_AP_STORE_MAX_INSTRUCTIONS`. A store at a
+    nonzero offset is not one. It does not tell a full vptr store from a
+    partial-width one or a folded reload, so nothing is typed from it."""
+    params = list(getattr(func, "parameter_vars", None) or [])
+    if not params:
+        return []
+    mlil = getattr(func, "mlil", None)
+    ssa = getattr(mlil, "ssa_form", None) if mlil is not None else None
+    if ssa is None:
+        return None
+    instructions = list(itertools.islice(ssa.instructions, _AP_STORE_MAX_INSTRUCTIONS + 1))
+    if len(instructions) > _AP_STORE_MAX_INSTRUCTIONS:
+        return None
+    values: list[int] = []
+    for ins in instructions:
+        op = _il_op_name(ins)
+        if op == "MLIL_STORE_SSA":
+            offset = 0
+        elif op == "MLIL_STORE_STRUCT_SSA":
+            offset = int(getattr(ins, "offset", -1))
+        else:
+            continue
+        if offset != 0 or not _is_parameter0(ssa, ins.dest, params[0]):
+            continue
+        value = _il_constant(ins.src)
+        if value is not None and value not in values:
+            values.append(value)
+    return values
+
+
+# #1040.2: what an UNNAMED vtable slot's body does, read from BN's MLIL. A body
+# longer than this is not read (`read: false`, with the reason).
+_SLOT_FACT_MAX_INSTRUCTIONS = 256
+_SLOT_FACT_MAX_CALLS = 4
+#: The global `operator delete` / `delete[]` (plain, sized, aligned forms).
+_GLOBAL_OPERATOR_DELETE_RE = re.compile(r"^_Zd[la]Pv")
+
+
+def _address_point_class(ctx, bv, value: int, ptr: int) -> str | None:
+    """The class whose primary vtable has its address point at *value*: the
+    word before it names that class's typeinfo and the word before that (the
+    offset-to-top) is 0 -- the Itanium header, read from the bytes."""
+    if ctx._read_pointer_value(bv, value - 2 * ptr, size=ptr) != 0:
+        return None
+    typeinfo = ctx._read_pointer_value(bv, value - ptr, size=ptr)
+    return ctx._typeinfo_name_at(bv, typeinfo) if typeinfo else None
+
+
+def _slot_body_facts(ctx, bv, address: int, ptr: int) -> dict[str, Any]:
+    """Neutral facts about one slot function's MLIL: the vtable address points
+    it writes to memory (and whose they are), the functions it calls, and
+    whether it calls the global ``operator delete``."""
+    func = bv.get_function_at(address)
+    mlil = getattr(func, "mlil", None) if func is not None else None
+    if mlil is None:
+        return {"read": False, "reason": "no_mlil"}
+    instructions = list(itertools.islice(mlil.instructions, _SLOT_FACT_MAX_INSTRUCTIONS + 1))
+    if len(instructions) > _SLOT_FACT_MAX_INSTRUCTIONS:
+        return {"read": False, "reason": "body_too_large"}
+    writes: list[dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
+    deletes = False
+    for ins in instructions:
+        op = str(getattr(getattr(ins, "operation", None), "name", ""))
+        if op in ("MLIL_STORE", "MLIL_STORE_STRUCT"):
+            src = getattr(ins, "src", None)
+            if str(getattr(getattr(src, "operation", None), "name", "")) in ("MLIL_CONST_PTR", "MLIL_CONST"):
+                value = int(src.constant)
+                owner = _address_point_class(ctx, bv, value, ptr)
+                if owner is not None and not any(w["address_point"] == hex(value) for w in writes):
+                    writes.append({"address_point": hex(value), "class": owner})
+        elif op in ("MLIL_CALL", "MLIL_TAILCALL"):
+            dest = getattr(ins, "dest", None)
+            if str(getattr(getattr(dest, "operation", None), "name", "")) not in ("MLIL_CONST_PTR", "MLIL_CONST", "MLIL_IMPORT"):
+                continue
+            target = int(dest.constant)
+            sym = bv.get_symbol_at(target)
+            raw = str(getattr(sym, "raw_name", "") or "") if sym is not None else ""
+            if _GLOBAL_OPERATOR_DELETE_RE.match(raw):
+                deletes = True
+            callee = bv.get_function_at(target)
+            name = (il_format._display_name(callee) if callee is not None else None) or raw or hex(target)
+            if len(calls) < _SLOT_FACT_MAX_CALLS and not any(c["address"] == hex(target) for c in calls):
+                calls.append({"address": hex(target), "name": name, "tail": op == "MLIL_TAILCALL"})
+    # #1040.2: which of those writes land at offset 0 of parameter 0 -- a
+    # neutral fact only; nothing is retyped or named from it (#1049).
+    try:
+        into_param0 = set(_param0_address_point_stores(func) or ())
+    except Exception:
+        into_param0 = set()
+    for write in writes:
+        write["into_parameter0"] = int(write["address_point"], 16) in into_param0
+    return {"read": True, "writes_address_points": writes, "calls": calls,
+            "calls_operator_delete": deletes}
+
+
+def _describe_unnamed_slots(ctx, bv, rec: dict[str, Any]) -> None:
+    """#1040.2: neutral facts for each unnamed primary-vtable slot: the vtable
+    address points its body writes (each named by the RTTI it points at), the
+    functions it calls, and whether it calls the global ``operator delete``.
+
+    No role is inferred from them. A destructor writes an address point and a
+    deleting destructor calls ``operator delete``, but so do a virtual
+    ``reset`` that placement-constructs into an argument, a ``clone`` that
+    stamps a new object's vptr, and ``release() { delete this; }`` (#1049
+    review): the facts are what the reader names the slot from."""
+    vtable = rec.get("vtable")
+    slots = vtable.get("slots") if isinstance(vtable, dict) else None
+    if not slots:
+        return
+    ptr = ctx._pointer_size(bv)
+    for slot in slots:
+        method = slot.get("method") if isinstance(slot, dict) else None
+        if not slot.get("unnamed") or not isinstance(method, dict) or not method.get("address"):
+            continue
+        try:
+            slot["body"] = _slot_body_facts(ctx, bv, int(str(method["address"]), 16), ptr)
+        except Exception:
+            slot["body"] = {"read": False, "reason": "il_unavailable"}
 
 
 def _class_name_suggestions(registry: dict[str, dict], name: str, *, limit: int = 5) -> str:
@@ -2508,7 +2996,7 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
         raise OperationFailure(
             "unknown_class",
             f"No class named {name!r}.{_class_name_suggestions(registry, name)} "
-            f"Run `bn class list` (add --all for name-only clusters) to discover "
+            f"Run `bn class list` (add --include-hidden for name-only clusters) to discover "
             f"available classes.{unreadable}",
         )
     records = []

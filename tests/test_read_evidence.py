@@ -6483,7 +6483,12 @@ def test_fortified_printf_family_shares_the_taint_models_format_index_994(monkey
     checked = 0
     for name, (fmt_index, _is_scanf) in bridge.il_format._VARIADIC_FORMAT_FAMILY.items():
         sink = (models.get(name) or {}).get("sink") or {}
-        if "tainted_args" in sink:
+        # A format-gated sink (#1041 item 4: sscanf's width-less %s) names its
+        # format directly; its tainted_args is the input string, not the format.
+        if "format_arg" in sink:
+            assert sink["format_arg"] == fmt_index, name
+            checked += 1
+        elif "tainted_args" in sink:
             assert sink["tainted_args"][0] == fmt_index, name
             checked += 1
     assert checked >= 4

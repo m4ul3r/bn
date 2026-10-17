@@ -88,16 +88,26 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
     _engine_kwargs: dict[str, Any] = {}
     if params.get("max_iters") is not None:
         _engine_kwargs["max_iters"] = int(params["max_iters"])
-    engine = _taint.TaintEngine(
-        bv,
-        models,
-        find_variable=_find_variable,
-        unknown_call_policy=str(params.get("unknown_call", "conservative")),
-        resolve_map=params.get("resolve_map") or {},
-        mangled=_validate_bool(params.get("mangled"), label="mangled", default=False),
-        **_engine_kwargs,
-    )
+    # #1041 item 3: the map is validated when the engine is built, so a bad
+    # entry is refused before the walk, naming the file the CLI read it from;
+    # a target spelled as a name resolves exactly as `-f` does.
+    _map_path = params.get("resolve_map_path")
+    # Present-but-null is a supplied document (refused by name), not an
+    # omission (#1050 review round 2): pass the map only when the request has one.
+    if "resolve_map" in params:
+        _engine_kwargs["resolve_map"] = params["resolve_map"]
     try:
+        engine = _taint.TaintEngine(
+            bv,
+            models,
+            find_variable=_find_variable,
+            unknown_call_policy=str(params.get("unknown_call", "conservative")),
+            resolve_map_origin=(f"--resolve-map {_map_path}" if _map_path
+                                else "--resolve-map"),
+            find_function=lambda name: int(ctx._find_function(bv, name).start),
+            mangled=_validate_bool(params.get("mangled"), label="mangled", default=False),
+            **_engine_kwargs,
+        )
         if direction == "forward":
             locators = [_taint.parse_locator(s) for s in (params.get("sources") or [])]
             if not locators:

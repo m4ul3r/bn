@@ -33,6 +33,7 @@ PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
 CANARY_BINARY = FIXTURES_DIR / "canary_x86_64"
 CLASSES_BINARY = FIXTURES_DIR / "classes_x86_64"
 CLASSES_STRIPPED_BINARY = FIXTURES_DIR / "classes_stripped_x86_64"
+CLASSES_NOPIE_STRIPPED_BINARY = FIXTURES_DIR / "classes_nopie_stripped_x86_64"
 VCALLS_BINARY = FIXTURES_DIR / "vcalls_x86_64"
 STATICS_BINARY = FIXTURES_DIR / "statics_x86_64"
 
@@ -1518,17 +1519,82 @@ class TestTypeStringsAndInheritance:
 
     def test_class_apply_types_stripped_rerun_is_a_noop(self, shared_bn):
         """#993 review: a re-run on a stripped build, where nothing is left to
-        write, is a clean noop rather than an exit-3 refusal, and the vtable's
-        slot functions are listed as skipped."""
+        write, changes nothing and exits 0 rather than refusing."""
         shared_bn.load(CLASSES_STRIPPED_BINARY)
-        first = shared_bn.json("class", "apply-types", "svc::Codec", "--summary")
+        first = shared_bn.json("class", "apply-types", "svc::AuditHandler", "--summary")
         assert first["committed"] is True and first["failed_count"] == 0, first
-        assert first["class_apply_types"]["skipped_methods"], first
-        again = shared_bn.run("class", "apply-types", "svc::Codec", "--format", "json", "--summary")
+        again = shared_bn.run("class", "apply-types", "svc::AuditHandler", "--format", "json", "--summary")
         assert again.returncode == 0, again.stdout + again.stderr
         summary = json.loads(again.stdout)
-        assert summary["noop_count"] == 1 and summary["dirty_after"] is False, summary
+        assert summary["changed_count"] == 0 and summary["dirty_after"] is False, summary
         assert summary["class_apply_types"]["instance_struct"] == "unchanged", summary
+
+    def test_class_apply_types_writes_no_parameter_0_on_a_stripped_build_1049(self, shared_bn):
+        """#1049 review round 3: parameter-0 retypes were withdrawn. On a
+        stripped build BN names no parameter `this`, so the batch writes no
+        local retype -- not even on the complete-object destructor, whose card
+        row still states that it writes the address point `into parameter 0`.
+        Every slot is listed with a `bn proto get` check that runs as printed."""
+        shared_bn.load(CLASSES_STRIPPED_BINARY)
+        card = shared_bn.run("class", "show", "svc::AuditHandler")
+        assert "vtable address point into parameter 0" in card.stdout, card.stdout
+
+        text = shared_bn.run("class", "apply-types", "svc::AuditHandler", "--preview")
+        assert text.returncode == 0, text.stdout + text.stderr
+        assert "\nthis retyped: 0 method(s)" in text.stdout, text.stdout
+        check = re.search(r"read its prototype: `(bn proto get 0x[0-9a-f]+)`", text.stdout).group(1)
+        ran = shared_bn.run(*shlex.split(check)[1:])
+        assert ran.returncode == 0, ran.stdout + ran.stderr
+
+        live = shared_bn.json("class", "apply-types", "svc::AuditHandler")
+        written = [r for r in live["results"] if r.get("op") == "local_retype"]
+        assert written == [], live["results"]
+        skipped = live["class_apply_types"]["skipped_methods"]
+        assert skipped and all(m["check"] == f"bn proto get {m['address']}" for m in skipped), skipped
+
+    def test_unnamed_slots_print_body_facts_and_no_role_1040(self, shared_bn):
+        """#1040.2: the card states what each unnamed slot's body does -- the
+        vtable address points it writes, its calls, `operator delete` -- and
+        claims no role from it (#1049 review: the destructor shape also fits
+        ordinary reset/clone/release methods)."""
+        shared_bn.load(CLASSES_STRIPPED_BINARY)
+        card = shared_bn.run("class", "show", "svc::AuditHandler")
+        assert card.returncode == 0, card.stderr
+        assert "writes svc::AuditHandler's vtable address point" in card.stdout, card.stdout
+        assert "operator delete" in card.stdout, card.stdout
+        assert "likely" not in card.stdout and "--emit-renames" not in card.stdout
+        assert shared_bn.run("class", "show", "svc::AuditHandler", "--emit-renames").returncode == 2
+
+    def test_non_pie_stripped_build_lists_raw_typeinfo_candidates_only_1049(self, shared_bn):
+        """#1035.5 / #1049 review round 3: in a stripped non-PIE build BN's RTTI
+        analysis names no typeinfo (the ABI's class-typeinfo vtables are
+        copy-relocated). The byte scan lists the candidate records -- address
+        and raw name string -- and no class row or card comes from them."""
+        shared_bn.load(CLASSES_NOPIE_STRIPPED_BINARY)
+        listing = shared_bn.json("class", "list", "--local")
+        assert not any(row["name"].startswith("svc::") for row in listing["items"]), listing["items"]
+        names = {row["name_string"] for row in listing["typeinfo_scan_listing"]}
+        assert {"N3svc7HandlerE", "N3svc12AuditHandlerE"} <= names, names
+        assert listing["typeinfo_scan_candidates"] >= len(names)
+        text = shared_bn.run("class", "list", "--local")
+        assert "no class row comes from them" in text.stdout, text.stdout
+        assert shared_bn.run("class", "show", "svc::AuditHandler").returncode != 0
+
+    def test_construction_sites_carry_their_own_allocation_request_1018(self, shared_bn):
+        """#1018.2: the allocation is per site. `make()` constructs a Dispatcher
+        into `operator new(0x40)`; AudioDisp's constructor constructs its base
+        into its own `this`, so that site carries none. It never becomes a class
+        size (#1049 review: trailing storage and a derived object agree too)."""
+        shared_bn.load(VCALLS_BINARY)
+        card = shared_bn.json("class", "show", "vc::Dispatcher")
+        sites = {s["function"]: s for s in card["instances"]["construction_sites"]}
+        assert sites["vc::make"]["allocation_request"] == 0x40, sites
+        assert sites["vc::make"]["allocator"] == "_Znwm", sites
+        assert "allocation_request" not in sites["vc::AudioDisp::AudioDisp"], sites
+        assert card["size"] is None and card["size_reason"] == "no_defined_type", card
+        plan = shared_bn.json("class", "apply-types", "vc::Dispatcher", "--preview",
+                              "--summary")["class_apply_types"]
+        assert plan["size"] is None, plan
 
     def test_qualified_prototype_preview_and_display_name_999(self, shared_bn, tmp_path):
         """#999 on BN's real parser: a `::`-qualified type in backticks and a
@@ -6742,8 +6808,8 @@ if original is not None:
 import binaryninja as bn
 from bn_agent_bridge import mutation_engine as engine
 original = engine._class_apply_types_plan
-def observed_plan(ctx, selector, name, _original=original):
-    operations, plan = _original(ctx, selector, name)
+def observed_plan(ctx, selector, name, _original=original, **options):
+    operations, plan = _original(ctx, selector, name, **options)
     assert not operations, 'fixture must exercise the direct noop return'
     if {retained!r}:
         ctx._resolve_view(selector).define_user_type('RetainedClass1031', bn.Type.int(4))

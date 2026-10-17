@@ -5948,13 +5948,13 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
     `--preview` or on a failure, revert as one mutation:
 
     * the instance struct is DECLARED when the view has none (sized from the
-      class card's ``size`` when one was recovered, padding after the vptr), or
-      its offset-0 member is retyped when it exists, keeping that member's name;
-      nothing when it already holds the typed vptr;
+      class card's ``size`` when one was recovered, padding after the vptr),
+      or its offset-0 member is retyped when it exists, keeping that member's
+      name; nothing when it already holds the typed vptr;
     * `this` is retyped on each of the class's own methods that has a parameter
       of that name. A thunk, or a method without one (a static member, or a
       stripped build where BN did not name it), is skipped and listed, never
-      guessed at.
+      guessed at. Each skipped row carries a `bn proto get` check (#1049).
 
     Refuses when the class has no primary vtable or BN defined no VTable type
     for it: then there is no table type for the vptr to point at."""
@@ -5984,27 +5984,34 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
     vtable_type = read_class._bn_vtable_type_name(bv, slot_start)
     instance = _lookup_named_type(bv, cls)
     if vtable_type is None:
+        type_names = sorted(_view_type_names(bv) or ())
         if instance is None:
             # The struct-show note names a derived class's table when BN made
             # only those (an abstract base), with the caveat that borrowing one
             # is a choice this command does not make for the caller.
-            note = ctx._class_vtable_note(cls, sorted(_view_type_names(bv) or ()))
+            note = ctx._class_vtable_note(cls, type_names)
         else:
             # #993 review: that note says the struct does not exist and offers
             # a declare that would replace it; this one is about the vptr only.
-            derived = sorted(n for n in _view_type_names(bv) or ()
+            derived = sorted(n for n in type_names
                              if n.startswith(f"{cls}::") and n.endswith("::VTable"))
             note = (f" BN made VTable types only for classes derived from {cls} "
                     f"({', '.join(derived[:3])}); their leading slots are {cls}'s virtuals, but "
                     f"their `this` types belong to the derived class. To borrow one, retype the "
                     f"vptr yourself: bn struct field set {cls} 0x0 <member> 'struct `{derived[0]}`*'."
                     if derived else "")
+        # #1035.5: a view where BN made no VTable type for ANY class (its RTTI
+        # analysis named nothing -- the non-PIE builds) says so, so the refusal
+        # is not read as something about this one class.
+        none_at_all = ("" if any(n.endswith("::VTable") for n in type_names) else
+                       " This view has no `<Class>::VTable` type for any class: Binary Ninja's "
+                       "RTTI analysis created none here.")
         raise OperationFailure(
             "invalid_request",
             f"Binary Ninja defined no `<Class>::VTable` type at {cls}'s slot array "
             f"({hex(slot_start)}), so there is no table type of its own for the vptr to point "
-            "at." + (note or " Declare one with `bn types declare`, then type the vptr with "
-                     "`bn struct field set`."),
+            "at." + none_at_all + (note or " Declare one with `bn types declare`, then type the "
+                                   "vptr with `bn struct field set`."),
             requested=requested,
         )
     vptr_type = f"struct `{vtable_type}`*"
@@ -6015,6 +6022,8 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
         width = int(str(size.get("value")), 16) if size.get("value") else 0
     except ValueError:
         width = 0
+    size_value = size.get("value") if width else None
+    size_source = card.get("size_source")
     vptr_before: dict[str, str] | None = None
     if instance is None:
         body = f"struct `{vtable_type}`* vtable;"
@@ -6079,6 +6088,13 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
     retyped: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = []
     seen: set[int] = set()
+
+    def skip(address: int, name: str, reason: str) -> None:
+        # #1049: every skipped row carries the read to make before typing it
+        # by hand; nothing here establishes what its parameters are.
+        skipped.append({"address": hex(address), "name": name, "reason": reason,
+                        "check": f"bn proto get {hex(address)}"})
+
     for method in card.get("methods") or []:
         try:
             address = int(str(method.get("address")), 16)
@@ -6089,12 +6105,12 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
         seen.add(address)
         row = {"address": hex(address), "name": str(method.get("demangled") or method.get("mangled") or "")}
         if (method.get("thunk") or {}).get("is_candidate"):
-            skipped.append({**row, "reason": "thunk"})
+            skip(address, row["name"], "thunk")
             continue
         fn = bv.get_function_at(address)
         params = list(getattr(fn, "parameter_vars", None) or []) if fn is not None else []
         if not any(str(getattr(var, "name", "")) == "this" for var in params):
-            skipped.append({**row, "reason": "no parameter named `this`"})
+            skip(address, row["name"], "no parameter named `this`")
             continue
         operations.append({"op": "local_retype", "function": hex(address), "variable": "this",
                            "new_type": f"struct `{cls}`*"})
@@ -6111,16 +6127,15 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
         if address in seen:
             continue
         seen.add(address)
-        skipped.append({"address": hex(address),
-                        "name": str(target.get("display_name") or target.get("name") or ""),
-                        "reason": "vtable slot that is not one of the class's own methods "
-                                  "(inherited, or unnamed in a stripped build)"})
+        skip(address, str(target.get("display_name") or target.get("name") or ""),
+             "vtable slot that is not one of the class's own methods "
+             "(inherited, or unnamed in a stripped build)")
     plan = {
         "class": cls,
         "vtable_type": vtable_type,
         "instance_struct": struct_action,
-        "size": size.get("value") if width else None,
-        "size_source": card.get("size_source"),
+        "size": size_value,
+        "size_source": size_source,
         "retyped_methods": retyped,
         "skipped_methods": skipped,
         **({"vptr_member_before": vptr_before} if vptr_before else {}),

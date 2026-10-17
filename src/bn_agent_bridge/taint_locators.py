@@ -104,6 +104,79 @@ def _locator_index(text: str, what: str) -> int:
     return n
 
 
+def normalize_resolve_map(raw: Any, *, origin: str = "--resolve-map",
+                          find_function: Callable[[str], int] | None = None,
+                          ) -> dict[int, list[int]]:
+    """Validate a ``--resolve-map`` once, when it is loaded (#1041 item 3).
+
+    The map was parsed lazily with ``int(x, 16)`` the first time an indirect
+    call needed it, so a function name died mid-walk as a raw Python error
+    naming neither the file nor the entry, and a call-address key spelled any
+    way but ``hex()``'s (upper case, say) silently never matched. Now:
+
+    * a key is a call-site address, a ``0x`` hex string (JSON keys are strings);
+    * a target is a ``0x`` hex string, a JSON number, or a function name, which
+      ``find_function`` resolves exactly as ``-f`` does; without a resolver a
+      name is refused.
+
+    A string of bare digits is refused rather than guessed: the old parser read
+    it as hex, ``-f`` reads it as decimal, and either guess silently maps the
+    call somewhere else. Every refusal names ``origin`` (the file) and the
+    offending entry. Returns ``{call_address: [target_address, ...]}``."""
+    if not isinstance(raw, dict):
+        raise TaintError(
+            f"{origin}: expected a JSON object mapping indirect call addresses to "
+            f"target lists, like {{\"0x4011f0\": [\"0x401176\"]}}; got {type(raw).__name__}")
+    spelling = "a 0x-prefixed hex string or a JSON number"
+
+    def address(value: Any, what: str) -> int | None:
+        """The address *value* spells; None for a string that is not numeric
+        (a name); a refusal for anything else."""
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if text.lower().startswith("0x"):
+                try:
+                    return int(text, 16)
+                except ValueError:
+                    pass
+            elif text and not text.isdigit():
+                return None
+        raise TaintError(f"{origin}: {what} {value!r} is not an address; write {spelling}")
+
+    out: dict[int, list[int]] = {}
+    for key, targets in raw.items():
+        call = None
+        if isinstance(key, str) and key.strip().lower().startswith("0x"):
+            call = address(key, "key")
+        if call is None:
+            raise TaintError(
+                f"{origin}: key {key!r} is not a call address; keys are the indirect "
+                f"call's address as a 0x-prefixed hex string")
+        if isinstance(targets, (str, int)) and not isinstance(targets, bool):
+            targets = [targets]
+        if not isinstance(targets, list) or not targets:
+            raise TaintError(
+                f"{origin}: {key} maps to {targets!r}; expected a non-empty list of "
+                f"target addresses or function names")
+        resolved: list[int] = []
+        for target in targets:
+            addr = address(target, f"{key} -> target")
+            if addr is None:
+                if find_function is None:
+                    raise TaintError(
+                        f"{origin}: {key} -> {target!r}: resolve-map targets must be "
+                        f"addresses here, {spelling}")
+                try:
+                    addr = int(find_function(target.strip()))
+                except Exception as exc:
+                    raise TaintError(f"{origin}: {key} -> {target!r}: {exc}") from None
+            resolved.append(addr)
+        out.setdefault(call, []).extend(resolved)
+    return out
+
+
 def format_locator(loc: dict[str, Any]) -> str:
     """Render a locator dict back to its ``kind:...`` string for diagnostics."""
     kind = loc.get("kind")

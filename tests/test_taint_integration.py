@@ -927,3 +927,288 @@ int main(int argc, char **argv) {
     ), result
     assert result["stats"]["functions_visited"] == 3, result
     assert not any("has no model" in a for a in result["assumptions"]), result
+
+
+_TEMPLATE = "template, fill in the UPPER-CASE words: `"
+
+
+def _forward_prose(result) -> str:
+    """Every prose field a forward result prints: its advice, caveats and notes."""
+    parts = [str((result.get("diagnostics") or {}).get("next_action") or "")]
+    parts += [str(a) for a in result.get("assumptions") or []]
+    for leaf in result.get("leaves") or []:
+        parts += [str(leaf.get(k) or "") for k in ("note", "detail")]
+    return "\n".join(parts)
+
+
+def _run_or_check_template(shared_bn, prose: str) -> tuple[int, int]:
+    """Run each backticked `bn` command exactly as printed; a command marked as
+    a template must instead parse as shell words with no `<...>` placeholder
+    and name its blanks in UPPER-CASE (#1033 item 6)."""
+    from conftest import _BN_CLI
+
+    ran = templates = 0
+    for match in re.finditer(r"`(bn [^`]+)`", prose):
+        argv = shlex.split(match.group(1))
+        if prose[:match.start()].endswith(_TEMPLATE[:-1]):
+            assert not any(c in match.group(1) for c in "<>"), match.group(1)
+            assert any(w.isupper() or w.split(":")[-1].isupper() for w in argv), match.group(1)
+            templates += 1
+            continue
+        res = subprocess.run([*_BN_CLI, *argv[1:]], capture_output=True, text=True,
+                             env=shared_bn.env(), timeout=300.0)
+        assert res.returncode == 0, f"{match.group(1)}: {res.stderr}"
+        ran += 1
+    return ran, templates
+
+
+def test_forward_advice_runs_as_printed_or_is_a_marked_template(tmp_path, shared_bn):
+    """#1033 item 6 / #1041 item 1: the commands forward taint prints."""
+    src = tmp_path / "advice.c"
+    src.write_text(r"""
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
+struct conn { int fd; char *buf; };
+__attribute__((noinline)) int pump(struct conn *c, long have) {
+    recv(c->fd, c->buf + have, 64, 0);           /* member buffer: not keyed */
+    return c->buf[4];
+}
+__attribute__((noinline)) int sink_len(long n) {
+    char d[8]; memcpy(d, "0123456789abcdef", n); return d[0];
+}
+__attribute__((noinline)) int deep(int fd) {
+    char b[16]; long n = read(fd, b, sizeof b); return sink_len(n);
+}
+__attribute__((noinline)) int hdr(int fd) {
+    char b[32]; struct iovec v = {b, sizeof b};
+    struct msghdr m = {0}; m.msg_iov = &v; m.msg_iovlen = 1;
+    recvmsg(fd, &m, 0); return b[0];
+}
+int main(int argc, char **argv) {
+    struct conn c = {argc, argv[0]};
+    return pump(&c, argc) + deep(argc) + hdr(argc);
+}
+""")
+    binary = tmp_path / "advice"
+    _compile(src, binary)
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn, *extra):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn, *extra)
+
+    unkeyed = forward("pump", "--source", "call:recv")
+    assert unkeyed["diagnostics"]["safe_to_report_all_clear"] is False
+    assert any(lf.get("seed") == "call" for lf in unkeyed["leaves"]), unkeyed["leaves"]
+    assert _run_or_check_template(shared_bn, _forward_prose(unkeyed))[1] >= 1
+
+    # Depth 0 stops at sink_len: the advice seeds inside it, filled in.
+    stopped = forward("deep", "--source", "call:read", "--max-depth", "0")
+    assert _run_or_check_template(shared_bn, _forward_prose(stopped))[0] >= 1
+
+    # arg:recvmsg seeds the header; the nudge names the call: reseed.
+    header = forward("hdr", "--source", "arg:recvmsg:1")
+    assert _run_or_check_template(shared_bn, _forward_prose(header))[0] >= 1
+
+
+@pytest.mark.parametrize("flags", [
+    # The PR's original build.
+    ["-O2", "-g", "-fno-stack-protector", "-fno-builtin", "-foptimize-sibling-calls", "-no-pie"],
+    # Compiler defaults (stack protector on): BN gives the wrapper call NO
+    # result, so only the call-site check sees `mov x2, x0` (#1050 re-dogfood).
+    ["-O2", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0"],
+    ["-O2", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0", "-no-pie"],
+], ids=["no-stack-protector", "compiler-default", "compiler-default-no-pie"])
+def test_aarch64_identity_tail_wrapper_is_a_frontier_not_an_all_clear(tmp_path, shared_bn, flags):
+    """#1034 item 5: BN recovers the AArch64 `ident` (a bare `ret`) with a
+    valueless return; the flow it carried is a frontier, never an all-clear."""
+    cc = shutil.which("aarch64-linux-gnu-gcc")
+    if cc is None:
+        refuse_silent_skip(
+            "aarch64-linux-gnu-gcc is required for the AArch64 tail-wrapper taint fixture; "
+            "install the cross toolchain (Debian/Ubuntu: gcc-aarch64-linux-gnu)")
+    src = tmp_path / "tail_ident.c"
+    src.write_text("""
+extern long read(int, void *, unsigned long);
+extern void *__memcpy_chk(void *, const void *, unsigned long, unsigned long);
+__attribute__((noinline, noipa)) long ident(long v) { return v; }
+__attribute__((noinline, noipa)) long conditional_tail(long v, int take) {
+    if (take)
+        return ident(v);
+    return 0;
+}
+int main(int argc, char **argv) {
+    char input[32], output[16];
+    long n = read(0, input, sizeof(input));
+    n = conditional_tail(n, argc & 1);
+    __memcpy_chk(output, input, (unsigned long)n, sizeof(output));
+    return output[0];
+}
+""")
+    binary = tmp_path / "tail_ident_a64"
+    built = subprocess.run(
+        [cc, *flags, str(src), "-o", str(binary)],
+        capture_output=True, text=True, timeout=120.0)
+    if built.returncode != 0:
+        raise FixtureBuildError(f"aarch64 build failed: {built.stderr.strip()}")
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                      "--source", "call:read")
+
+    # Judged on what BN recovered: the flow itself, or a frontier naming it.
+    lost = [lf for lf in result["leaves"] if lf.get("cause") == "return_value_unrecovered"]
+    assert result["reached_sinks"] or lost, result
+    if not result["reached_sinks"]:
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+        assert _run_or_check_template(shared_bn, _forward_prose(result))[0] >= 1
+
+
+def _build_arch(tmp_path, arch: str, name: str, source: str) -> Path:
+    """Build *source* at `-O2 -fno-stack-protector -fno-builtin -no-pie` for
+    `a64` (the AArch64 cross compiler) or `x64` (host gcc)."""
+    cc = shutil.which("aarch64-linux-gnu-gcc" if arch == "a64" else "gcc")
+    if cc is None:
+        if arch == "a64":
+            refuse_silent_skip(
+                "aarch64-linux-gnu-gcc is required for this AArch64 taint fixture; "
+                "install the cross toolchain (Debian/Ubuntu: gcc-aarch64-linux-gnu)")
+        raise FixtureBuildError("'gcc' not found; the real-BN taint lane is meant to run")
+    src = tmp_path / f"{name}.c"
+    src.write_text(source)
+    binary = tmp_path / f"{name}_{arch}"
+    built = subprocess.run(
+        [cc, "-O2", "-fno-stack-protector", "-fno-builtin", "-no-pie", str(src), "-o",
+         str(binary)], capture_output=True, text=True, timeout=120.0)
+    if built.returncode != 0:
+        raise FixtureBuildError(f"{arch} build of {name} failed: {built.stderr.strip()}")
+    return binary
+
+
+def test_a_return_register_read_in_a_jump_table_case_is_a_frontier(tmp_path, shared_bn):
+    """#1050 review round 8: the wrapper's MLIL call has no result, then a
+    dense switch (`br x1`) whose case 1 reads x0 into the copy's length. Since
+    round 9 every such call is a frontier, without reading the caller's LLIL."""
+    cases = "\n".join(f'    case {i}: puts("c{i}"); break;' for i in (0, 2, 3, 4, 5, 6, 7, 8, 9, 10))
+    binary = _build_arch(tmp_path, "a64", "switch_tail", f"""
+extern long read(int, void *, unsigned long);
+extern void *__memcpy_chk(void *, const void *, unsigned long, unsigned long);
+extern int puts(const char *);
+__attribute__((noinline, noipa)) long ident(long v) {{ return v; }}
+__attribute__((noinline, noipa)) long conditional_tail(long v, int take) {{
+    if (take)
+        return ident(v);
+    return 0;
+}}
+int main(int argc, char **argv) {{
+    char input[32], output[16];
+    long n = read(0, input, sizeof(input));
+    n = conditional_tail(n, argc & 1);
+    switch (argc) {{
+{cases}
+    case 1: __memcpy_chk(output, input, (unsigned long)n, sizeof(output)); break;
+    default: return 1;
+    }}
+    return output[0];
+}}
+""")
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                      "--source", "call:read")
+
+    lost = [lf for lf in result["leaves"] if lf.get("cause") == "return_value_unrecovered"]
+    assert result["reached_sinks"] or lost, result
+    if not result["reached_sinks"]:
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize("arch", ["a64", "x64"])
+def test_destinations_bn_did_not_recover_withhold_the_all_clear(tmp_path, shared_bn, arch):
+    """#1050 review round 8: three bounded conversions; `b` and `c` are
+    incoming pointers already in their argument registers, so the compiler
+    does not rewrite them and BN's MLIL lists only the format and `a`. The
+    shortfall is disclosed and the all-clear withheld -- or, should BN recover
+    `b`, its command sink is found."""
+    binary = _build_arch(tmp_path, arch, "fwd_scanf", """
+extern int scanf(const char *, ...);
+extern int system(const char *);
+__attribute__((noinline)) int fwd(char *unused0, char *unused1, char *b, char *c) {
+    char a[16];
+    int r = scanf("%15s %15s %15s", a, b, c);
+    system(b);
+    return r + a[0];
+}
+int main(void) { char b[16], c[16]; return fwd(0, 0, b, c); }
+""")
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "fwd",
+                      "--source", "call:scanf")
+
+    if not result["reached_sinks"]:
+        assert [lf["missing"] for lf in result["leaves"]
+                if lf["kind"] == "format_destination_unrecovered"], result
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+        assert _run_or_check_template(shared_bn, _forward_prose(result))[0] >= 1
+
+
+@pytest.mark.parametrize("arch", ["a64", "x64"])
+@pytest.mark.parametrize("pad", [600, 5000], ids=["nul-in-read", "nul-beyond-read"])
+def test_a_format_prefix_never_trims_a_real_destination(tmp_path, shared_bn, arch, pad):
+    """#1050 review round 8: two bounded conversions separated by a non-ASCII
+    literal and padding, so BN's ASCII string stops short of the second one.
+    Only a read that reached the format's NUL counts as the format; the second
+    buffer's command sink is found either way."""
+    fmt = '"%15s\\xe9" "' + "A" * pad + '%15s"'
+    binary = _build_arch(tmp_path, arch, f"longfmt{pad}", f"""
+extern int scanf(const char *, ...);
+extern int system(const char *);
+__attribute__((noinline)) int two(void) {{
+    char a[16], b[16];
+    int r = scanf({fmt}, a, b);
+    system(b);
+    return r + a[0];
+}}
+int main(void) {{ return two(); }}
+""")
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "two",
+                      "--source", "call:scanf")
+
+    assert "command_injection" in {s["sink"]["class"] for s in result["reached_sinks"]}, result
+
+
+def test_a_loop_reusing_the_previous_result_is_a_frontier(tmp_path, shared_bn):
+    """#1050 review round 9: each iteration copies with the count the wrapper
+    returned on the previous one, so the read of x0 sits in the call's own
+    block, reached by the back edge. Every descended no-result call with
+    tainted arguments is a frontier now, so the loop cannot hide it."""
+    binary = _build_arch(tmp_path, "a64", "loop_tail", """
+extern long read(int, void *, unsigned long);
+extern void *__memcpy_chk(void *, const void *, unsigned long, unsigned long);
+__attribute__((noinline, noipa)) long ident(long v) { return v; }
+__attribute__((noinline, noipa)) long conditional_tail(long v, int take) {
+    if (take)
+        return ident(v);
+    return 0;
+}
+int main(int argc, char **argv) {
+    char input[32], output[16];
+    long n = read(0, input, sizeof(input));
+    long prev = 0, cur = 0;
+    for (int i = 0; i < argc; i++) {
+        prev = cur;
+        cur = conditional_tail(n, i & 1);
+    }
+    __memcpy_chk(output, input, (unsigned long)prev, sizeof(output));
+    return output[0];
+}
+""")
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                      "--source", "call:read")
+
+    lost = [lf for lf in result["leaves"] if lf.get("cause") == "return_value_unrecovered"]
+    assert result["reached_sinks"] or lost, result
+    if not result["reached_sinks"]:
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+        assert _run_or_check_template(shared_bn, _forward_prose(result))[0] >= 1

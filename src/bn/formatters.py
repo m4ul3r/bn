@@ -5242,8 +5242,56 @@ def _render_flow_line(f: dict[str, Any], *, mangled: bool = False) -> str:
     unresolved = "y" if m.get("traverses_unresolved") else "n"
     facts = f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} unresolved={unresolved}}}"
     callee = _sink_callee_text(sink, mangled=mangled) or "?"
+    if not mangled:
+        # #1041 item 6: a flow through STL code printed ~800 bytes of template
+        # arguments per line. The compact line names each function with its
+        # template arguments elided; --verbose and JSON keep the full names.
+        sig = _elide_template_args(str(sig))
+        callee = _elide_template_args(str(callee))
     head = f"[{sink.get('class') or '?'}] {callee} @ {sink.get('address')}{arg}"
+    # #1041 item 6: a flow several sources each reach on their own names them
+    # as candidates; the signature keeps `multiple` (#1050 review finding 3).
+    cands = [str(c) for c in _field_list(f, "source_candidates")]
+    if len(cands) > 1:
+        facts += f"  (reached by each of: {', '.join(cands)})"
     return f"  {head}   {sig}   {facts}".rstrip()
+
+
+# `operator<`, `operator<<=`, `operator->`, ... : angle brackets that open no
+# template argument list.
+_OPERATOR_ANGLES = re.compile(r"operator\s*(?:<=>|<<=|>>=|<<|>>|<=|>=|->\*|->|<|>)")
+
+
+def _elide_template_args(text: str) -> str:
+    """``std::_Hashtable<std::string, ...>::clear`` -> ``std::_Hashtable<…>::clear``.
+    Every outermost ``<...>`` collapses to ``<…>``; the angle brackets of an
+    operator name are kept. Unbalanced text is returned unchanged rather than
+    cut somewhere wrong."""
+    out: list[str] = []
+    depth = 0
+    i = 0
+    while i < len(text):
+        op = _OPERATOR_ANGLES.match(text, i)
+        if op is not None:
+            if depth == 0:
+                out.append(op.group(0))
+            i = op.end()
+            continue
+        ch = text[i]
+        before = text[:i].rstrip()
+        if ch == "<" and (depth or (before and before[-1] not in "(,[{=→"
+                                    and not before.endswith(("→", "->")))):
+            if depth == 0:
+                out.append("<…")
+            depth += 1
+        elif ch == ">" and depth:
+            depth -= 1
+            if depth == 0:
+                out.append(">")
+        elif depth == 0:
+            out.append(ch)
+        i += 1
+    return text if depth else "".join(out)
 
 
 def _sink_callee_text(sink: dict[str, Any], *, mangled: bool = False) -> Any:
@@ -5316,6 +5364,10 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
                    + (" (may-analysis, not a proof)" if gate else ""))
         if diag.get("all_clear_reason"):
             out.append(f"    reason: {diag['all_clear_reason']}")
+        # #1041 item 1: what an all-clear from a receive-family seed does not
+        # cover (#1050 review round 5).
+        for caveat in _field_list(diag, "all_clear_caveats"):
+            out.append(f"    not covered: {caveat}")
     if diag.get("next_action"):
         out.append(f"  next: {diag['next_action']}")
     return out
@@ -5577,7 +5629,11 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
 
 
 @_discloses
-def _render_taint_models_text(value: Any, *, mangled: bool = False) -> str:
+def _render_taint_models_text(value: Any, *, mangled: bool = False,
+                              callsite_limit: int = 0) -> str:
+    """``callsite_limit`` caps the callsite rows printed under each model (0 =
+    all): `operator new` alone listed 225 rows ahead of every other class
+    (#1041 item 6). The count line names how many were left out."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     lines: list[str] = []
@@ -5599,7 +5655,8 @@ def _render_taint_models_text(value: Any, *, mangled: bool = False) -> str:
             # them and the text dropped them, so the flag read as ignored.
             lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}"
                          f"{_callsite_count_note(s)}")
-            lines.extend(_render_callsite_rows(s, indent="    ", mangled=mangled))
+            lines.extend(_render_callsite_rows(s, indent="    ", mangled=mangled,
+                                               limit=callsite_limit))
     sbc = _field_dict(value, "sinks_by_class")
     if sbc:
         lines.append("")
@@ -5622,7 +5679,8 @@ def _render_taint_models_text(value: Any, *, mangled: bool = False) -> str:
                 if not isinstance(e, dict):
                     lines.append(f"    {e!r}")
                     continue
-                lines.extend(_render_taint_sink_entry(e, mangled=mangled))
+                lines.extend(_render_taint_sink_entry(e, mangled=mangled,
+                                                      callsite_limit=callsite_limit))
     props = _field_list(value, "propagators")
     if props:
         lines.append("")
@@ -5664,6 +5722,9 @@ def _sink_arg_spec(e: dict[str, Any]) -> str:
     if la is not None:
         ba = e.get("buf_arg")
         parts.append(f"len arg {la}" + (f" into arg {ba}" if ba is not None else ""))
+    fa = e.get("format_arg")
+    if fa is not None:
+        parts.append(f"width-less %s/%[ in format arg {fa}")
     return ", ".join(parts) if parts else "unconditional"
 
 
@@ -5671,12 +5732,16 @@ _HIDDEN_KIND_LABELS = {"self_stub": "self stub",
                        "inline_builtin": "constant-argument inline builtin"}
 
 
-def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = False) -> list[str]:
+def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = False,
+                          limit: int = 0) -> list[str]:
     """The enriched callsite rows of a present model entry (address + containing
     function + non-audit kind + one line of disassembly), then a count of the
-    non-audit rows the bridge left out (#958: `--all-sites` shows them)."""
+    non-audit rows the bridge left out (#958: `--all-sites` shows them). With a
+    ``limit``, only the first ``limit`` rows print and a line counts the rest."""
     out = []
-    for c in _field_list(e, "callsites"):
+    rows = _field_list(e, "callsites")
+    cut = rows[limit:] if limit > 0 else []
+    for c in (rows[:limit] if limit > 0 else rows):
         if not isinstance(c, dict):
             out.append(f"{indent}{c!r}")
             continue
@@ -5692,6 +5757,9 @@ def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = Fal
         # bridge older than this CLI) renders exactly the previous row.
         dis = str(c.get("disasm") or "").strip()
         out.append(f"{indent}{c.get('address')}  {fn}{tag}" + (f"  {dis}" if dis else ""))
+    if cut:
+        out.append(f"{indent}+{len(cut)} more callsite(s) not shown; --callsite-limit 0 "
+                   f"lists them all")
     hidden = _field_dict(e, "hidden_callsites")
     shown = [(k, n) for k, n in hidden.items()
              if isinstance(n, int) and not isinstance(n, bool) and n > 0]
@@ -5702,7 +5770,8 @@ def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = Fal
     return out
 
 
-def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False) -> list[str]:
+def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False,
+                             callsite_limit: int = 0) -> list[str]:
     """One present/catalog sink entry: the model line plus, under --callsites, its
     enriched callsite rows (address + containing function + non-audit kind)."""
     p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
@@ -5710,7 +5779,8 @@ def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False) -> lis
     head = (f"    {e.get('symbol', '<unknown>')} ({_sink_arg_spec(e)}){p}"
             f"{_callsite_count_note(e)}{desc}")
     out = [head]
-    out.extend(_render_callsite_rows(e, indent="      ", mangled=mangled))
+    out.extend(_render_callsite_rows(e, indent="      ", mangled=mangled,
+                                     limit=callsite_limit))
     return out
 
 
@@ -7736,11 +7806,21 @@ def _render_mutation_summary_text(value: Any, *,
             line += f", already typed: {already}"
         if len(methods) - retyped - already:
             line += f", not applied: {len(methods) - retyped - already}"
+        # #1049: skips are counted by reason, not listed -- a stripped class
+        # can skip dozens -- and the JSON keeps every row with its `check`.
         skipped = _row_list(plan, "skipped_methods")
         if skipped:
-            line += "\nskipped: " + ", ".join(
-                f"{_text_value(m, 'name') or '<unnamed>'} @{_text_value(m, 'address') or '<unknown>'} "
-                f"({_text_value(m, 'reason') or 'unknown reason'})" for m in skipped)
+            reasons: dict[str, int] = {}
+            for m in skipped:
+                reason = _text_value(m, "reason") or "unknown reason"
+                reasons[reason] = reasons.get(reason, 0) + 1
+            line += (f"\nskipped: {len(skipped)} method(s) -- "
+                     + "; ".join(f"{n} {reason}" for reason, n in reasons.items())
+                     + " (`--format json` lists each)")
+            check = next((_text_value(m, "check") for m in skipped if _text_value(m, "check")), None)
+            if check:
+                line += (f"\nbefore typing a skipped method's parameters by hand, read its "
+                         f"prototype: `{check}` (each row carries its own `check`)")
     for entry in _row_list(value, "fallthrough_entries"):
         line += (f"\nwarning: {_text_value(entry, 'address') or '<unknown>'}: preceding word "
                  f"decodes as a fall-through instruction at {_text_value(entry, 'fallthrough_from') or '<unknown>'}; "
@@ -8359,6 +8439,18 @@ def _render_trace_frontiers(frontiers: Any, *, mangled: bool = False) -> list[st
     return out
 
 
+def _typeinfo_scan_candidates_note(value: Any) -> str:
+    """#1035.5 / #1049 review round 3: aligned data words equal to an ABI
+    class-typeinfo vtable's address point where BN put no typeinfo symbol --
+    raw candidates, never classes: no row here comes from them."""
+    if "typeinfo_scan_candidates" not in value:
+        return ""
+    n = _stated_count(value, "typeinfo_scan_candidates")
+    return (f"\n! typeinfo byte scan: {n} candidate typeinfo record(s) Binary Ninja named "
+            "nothing at; no class row comes from them. `--format json` lists the address and "
+            "raw name string of the first 64 under typeinfo_scan_listing")
+
+
 def _class_inputs_note(value: Any) -> str:
     """#653.6: on a ZERO-class result, print the empty inputs so the absence is
     ATTRIBUTABLE -- "this target is C" reads identically to "the lens failed to
@@ -8426,7 +8518,11 @@ def _render_class_list_text(value: Any) -> str:
             tail = " (? non-class RTTI/type artifacts)"
         else:
             tail = ""
-        return f"{quick_prefix}classes: {n}{tail}{_class_inputs_note(value)}"
+        scan = ("\n! typeinfo byte scan stopped at its data cap; its candidate listing is "
+                "incomplete."
+                if value.get("abi_scan_truncated") else "")
+        scan += _typeinfo_scan_candidates_note(value)
+        return f"{quick_prefix}classes: {n}{tail}{_class_inputs_note(value)}{scan}"
     # #770: the count line states the PAGE, and the shared paging footer carries
     # the total/resume half -- the same split every other paged list uses. This
     # header used to assert "classes: N shown of TOTAL" unconditionally, so a
@@ -8438,15 +8534,24 @@ def _render_class_list_text(value: Any) -> str:
     hidden_parts = []
     cv = _nonnegative_count(value, "construction_vtables_suppressed")
     if cv:
-        hidden_parts.append(f"{cv} construction-vtable artifact{'s' if cv != 1 else ''} (--all to show)")
+        hidden_parts.append(f"{cv} construction-vtable artifact{'s' if cv != 1 else ''} "
+                            "(--include-hidden to show)")
     elif _field_skewed("construction_vtables_suppressed"):
-        hidden_parts.append("? construction-vtable artifacts (--all to show)")
+        hidden_parts.append("? construction-vtable artifacts (--include-hidden to show)")
+    # #1040.3: typeinfo for non-class types is hidden by default, like the
+    # construction-vtable artifacts above.
+    nc = _nonnegative_count(value, "non_class_rtti_suppressed")
+    if nc:
+        hidden_parts.append(f"{nc} non-class RTTI artifact{'s' if nc != 1 else ''} "
+                            "(--include-hidden to show)")
+    elif _field_skewed("non_class_rtti_suppressed"):
+        hidden_parts.append("? non-class RTTI artifacts (--include-hidden to show)")
     th = _nonnegative_count(value, "thunks_suppressed")
     if th:
         hidden_parts.append(f"{th} thunk{'s' if th != 1 else ''}")
     elif _field_skewed("thunks_suppressed"):
         hidden_parts.append("? thunks")
-    # These two are read INSIDE their gate, not before it. A share the run
+    # These are read INSIDE their gate, not before it. A share the run
     # never asked to fold out is a number this line was never going to print,
     # so reading it early recorded a skew and drew a `! malformed` note about
     # a value with nothing in the `hidden:` tail to act on -- a disclosure
@@ -8463,6 +8568,12 @@ def _render_class_list_text(value: Any) -> str:
             hidden_parts.append(f"{ven} vendored")
         elif _field_skewed("vendor_suppressed"):
             hidden_parts.append("? vendored")
+    if value.get("local_only"):
+        imp = _nonnegative_count(value, "imported_suppressed")
+        if imp:
+            hidden_parts.append(f"{imp} defined in another module")
+        elif _field_skewed("imported_suppressed"):
+            hidden_parts.append("? defined in another module")
     # #675.2: user-declared class types are folded out by the confidence gate the
     # way name-only clusters are, so the default listing says they exist instead
     # of reading as a lens that never saw the class the user declared.
@@ -8494,11 +8605,19 @@ def _render_class_list_text(value: Any) -> str:
         # passed reads as a different, unsatisfied suggestion (#907 review r5).
         hidden_parts.append(
             f"{stated} user-declared class type{'s' if ds != 1 else ''}"
-            + ("" if value.get("include_all") else " (--all to show)"))
+            + ("" if value.get("include_all") else " (--include-hidden to show)"))
     if hidden_parts:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)
     lines = [header]
+    if value.get("abi_scan_truncated"):
+        # #1035.5: the byte scan for typeinfo BN did not name hit its cap.
+        lines.append(
+            "! typeinfo byte scan stopped at its data cap; its candidate listing is "
+            "incomplete.")
+    unnamed = _typeinfo_scan_candidates_note(value)
+    if unnamed:
+        lines.append(unnamed.lstrip("\n"))
     if value.get("vtable_recovery_budget_exhausted"):
         lines.append(
             "! vtable recovery budget exhausted; unchecked rows are unknown, "
@@ -8522,10 +8641,12 @@ def _render_class_list_text(value: Any) -> str:
         # joining a dict crashed the whole listing (#619).
         bases = ", ".join(str((b.get("name") or "?") if isinstance(b, dict) else b)
                           for b in _field_list(rec, "bases") if b)
-        base_s = f"  : {bases}" if bases else ""
         # #481: mark a non-class RTTI/type-signature artifact (rtti confidence but no
         # methods and no vtable) so it doesn't read as a domain class.
         art_s = "  [artifact: non-class RTTI]" if rec.get("artifact") else ""
+        # #1040.3: nothing of this class is defined here (`--local` hides it).
+        if rec.get("imported"):
+            art_s += "  [defined in another module]"
         # The row's method count is STATED, so `_stated_count` -- the one
         # number in this renderer the round-6 repair walked past, in the very
         # renderer that repair was filed against. Raw, it printed a flag as a
@@ -8540,6 +8661,11 @@ def _render_class_list_text(value: Any) -> str:
         token = _SKEWED_FIELDS.set([])
         try:
             methods = _stated_count(rec, "method_count")
+            # #1040.4: a library base that many classes name as their only
+            # base carries the count, so the row invites a check instead of
+            # reading as an ordinary hierarchy edge.
+            if bases and "base_sole_base_of" in rec:
+                bases += f" (only base of {_stated_count(rec, 'base_sole_base_of')} classes here)"
             slot_s = ""
             if "vtable_slot_count" in rec:
                 # A capped layout and a stopped/unsupported backwalk deliberately
@@ -8555,6 +8681,7 @@ def _render_class_list_text(value: Any) -> str:
             _SKEWED_FIELDS.reset(token)
         for key in row_unreadable:
             _record_skew(key)
+        base_s = f"  : {bases}" if bases else ""
         # #922 (d): the other demangled spellings this row absorbed, so a reader
         # who knows the class by the expanded template spelling finds the row.
         aliases = ", ".join(str(a) for a in _field_list(rec, "aliases") if a)
@@ -8586,6 +8713,30 @@ def _vtable_slot_label(s: dict[str, Any]) -> str:
     if s.get("null"):
         return "<null>"
     return "<unnamed>"
+
+
+def _vtable_slot_facts(s: dict[str, Any]) -> str:
+    """#1040.2: the neutral body facts bn read for an UNNAMED slot, as one
+    bracketed tail ("" when none were read). No role is inferred from them."""
+    if not _field_present(s, "body"):
+        return ""
+    body = _field_dict(s, "body")
+    if not body.get("read"):
+        return f"  [body not read: {_text_value(body, 'reason') or 'unknown'}]"
+    facts = []
+    for write in _field_list(body, "writes_address_points"):
+        if isinstance(write, dict):
+            facts.append(f"writes {_text_value(write, 'class') or '?'}'s vtable address point"
+                         + (" into parameter 0" if write.get("into_parameter0") is True else ""))
+    calls = [c for c in _field_list(body, "calls") if isinstance(c, dict)]
+    if calls:
+        facts.append("calls " + ", ".join(
+            (_text_value(c, "name") or _text_value(c, "address") or "?")
+            + (" (tail)" if c.get("tail") else "") for c in calls))
+    if body.get("calls_operator_delete") and not any(
+            str(_text_value(c, "name") or "").startswith("operator delete") for c in calls):
+        facts.append("calls operator delete")
+    return f"  [{'; '.join(facts)}]" if facts else ""
 
 
 @_discloses
@@ -8682,7 +8833,8 @@ def _render_one_class(rec: Any) -> str:
             if not isinstance(s, dict):
                 lines.append(f"  vtable {s!r}")
                 continue
-            lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
+            lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  "
+                         f"{_vtable_slot_label(s)}{_vtable_slot_facts(s)}")
     elif vt_addr:
         # A vtable symbol exists but no slots resolved. The causes differ (an
         # import/GOT slot for a vtable defined in another module, a PIE slot
@@ -8769,7 +8921,12 @@ def _render_one_class(rec: Any) -> str:
         if not isinstance(site, dict):
             parts.append(repr(site))
             continue
-        sz = f" (size {site['size']})" if site.get("size") else ""
+        # #1018.2: the allocation this ONE site constructs into, never a class
+        # size -- the wording keeps it attached to the site.
+        req = site.get("allocation_request")
+        sz = (f" (this = {site.get('allocator') or 'operator new'}"
+              f"({hex(req) if isinstance(req, int) else req}) @ {site.get('allocation_at', '?')})"
+              if req is not None else "")
         fn = f" (in {site['function']})" if site.get("function") else ""
         parts.append(f"{site.get('kind', '?')} @ {site.get('address', '?')}{sz}{fn}")
     for g in _field_list(inst, "stored_globals"):

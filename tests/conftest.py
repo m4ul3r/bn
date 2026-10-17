@@ -66,6 +66,7 @@ REQUIRED_INTEGRATION_FIXTURES = (
     "dispatch_table_x86_64",
     "classes_x86_64",   # C++ (src/classes.cpp): the class lens's RTTI shapes (#922)
     "classes_stripped_x86_64",  # same PIE with BN-synthesized vtable symbols (#935)
+    "classes_nopie_stripped_x86_64",  # same source, non-PIE + stripped: BN names no RTTI (#1035.5)
     "canary_x86_64",
     "vcalls_x86_64",    # C++ (src/vcalls.cpp): vtable-slot callers, address points (#998)
     "statics_x86_64",   # C++ (src/statics.cpp): a static member BN gives a `this` (#1013)

@@ -1,0 +1,11 @@
+{
+  "description": "#1050 review round 2: system(p) that runs before recv(fd, p, ..) into an unkeyed buffer must not become a flow; the run keeps its source_seed_misanchored frontier and is not an all-clear.",
+  "lang": "c",
+  "cflags": ["-O2", "-fno-builtin"],
+  "negative": [
+    {"function": "sys_before", "source": "call:recv",
+     "forbid_sink_classes": ["command_injection"], "all_clear": false},
+    {"function": "sys_before", "source": "arg:recv:1",
+     "forbid_sink_classes": ["command_injection"], "all_clear": false}
+  ]
+}

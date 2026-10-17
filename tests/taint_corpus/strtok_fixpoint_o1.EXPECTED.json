@@ -1,0 +1,25 @@
+{
+  "description": "#932 (shape salvaged from draft #941): an irreducible tokenizer loop -- two entries, two back-edges, unused-return strtok(line) initializers -- built at -O1. Every tainted strtok that reaches the strtok(NULL) arms it, whatever order the lift lists them in, so the token reaches system().",
+  "lang": "c",
+  "cflags": [
+    "-O1",
+    "-fno-builtin"
+  ],
+  "forward": [
+    {
+      "function": "token_cycle",
+      "source": "param:0",
+      "sinks": [
+        {
+          "callee": "system",
+          "class": "command_injection",
+          "arg": 0
+        }
+      ],
+      "assumptions_contain": [
+        "continues the tokenizer state",
+        "tokenizer_state_escapes"
+      ]
+    }
+  ]
+}
