@@ -26,9 +26,9 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 """
 from __future__ import annotations
 
+import json
 import re
 import shlex
-from types import SimpleNamespace
 from typing import Any
 
 # Structural split (#562): the engine re-exports the moved names so existing
@@ -7289,10 +7289,24 @@ class TaintEngine:
                 # conclusion, not a seed failure: record it as such and do NOT
                 # add it to `errors`, so an all-bounded slice returns a clean
                 # result (exit 0, --out written) instead of the all-failed hard
-                # error (#310).
+                # error (#310). Only for a VALUE role (round 7): a constant
+                # handed to an argument the sink reads through is an address.
+                if self._bw_unseeded_demand(func, ssaf, instrs, sink):
+                    sink_status.append({**desc, "seeded": False, "demand_leaf": True,
+                                        "note": str(exc)})
+                    continue
                 sink_status.append({**desc, "seeded": False, "bounded": True, "note": str(exc)})
                 continue
             except TaintError as exc:
+                # #931 round 7: the role is decided BEFORE the no-def-chain
+                # exit. An argument the sink reads through (or one with no
+                # value role) that has no backward seed -- `popen("ls")`, a
+                # fixed address -- is an incomplete result with its leaf, not
+                # a refusal another sink's complete slice could hide.
+                if self._bw_unseeded_demand(func, ssaf, instrs, sink):
+                    sink_status.append({**desc, "seeded": False, "demand_leaf": True,
+                                        "note": str(exc)})
+                    continue
                 errors.append((sink, str(exc)))
                 sink_status.append({**desc, "seeded": False, "note": str(exc)})
                 continue
@@ -7312,22 +7326,22 @@ class TaintEngine:
                     # locator SELECTS (popen's command, write's buffer) has a
                     # demand: it starts there, at offset 0 of what that
                     # operand points to (round 1), never at another argument
-                    # that reads the same SSA value (round 2). Whether the
-                    # sink reads through the argument at all is the sink
-                    # model's role for it (round 6), not BN's typing: a
-                    # malloc size or a memcpy length is a value, with no
-                    # demand, as on base. A seed recovered from a register
-                    # has no operand; its demand starts at the seed itself.
+                    # that reads the same SSA value (round 2). The sink
+                    # model's role for the argument decides (round 6); an
+                    # argument with no explicit value role is walked as a
+                    # pointer demand too (round 7). A malloc size or a
+                    # memcpy length is a value, with no demand, as on base. A
+                    # seed recovered from a register has no operand; its
+                    # demand starts at the seed itself.
                     anchor = None
-                    reads_through = False
+                    role = "value"
                     operand = None
                     if sink.get("kind") == "arg":
                         sparams = self._call_params(sink_ins)
                         sidx = int(sink.get("index", -1))
                         operand = sparams[sidx] if 0 <= sidx < len(sparams) else None
-                        reads_through = self._sink_reads_through_pointer(
-                            sink, seed_var, sink_ins, sidx, operand)
-                        if reads_through:
+                        role = self._sink_role(sink)
+                        if role != "value":
                             aexpr = (self._seed_anchor(seed_var, operand)
                                      if operand is not None
                                      else seed_var.expr if isinstance(seed_var, _BufferSeed)
@@ -7355,12 +7369,12 @@ class TaintEngine:
                         }
                         seen_origin[key] = entry
                         sink_slices.append(entry)
-                    if reads_through:
+                    if role != "value":
                         self._bw_pointer_demand(
                             func, ssaf, sink_ins, sidx,
                             operand if operand is not None else
                             (seed_var.expr if isinstance(seed_var, _BufferSeed) else seed_var),
-                            recovered=operand is None)
+                            recovered=operand is None, sink=sink, role=role)
                 slices.extend(sink_slices)
             except RecursionError:
                 slices.extend(sink_slices)  # keep the partial, already-deduped slices
@@ -7388,6 +7402,18 @@ class TaintEngine:
             raise TaintError(
                 "no backward seed resolved for any sink:\n  "
                 + "\n  ".join(f"{format_locator(s)}: {m}" for s, m in errors))
+        # #931 round 7: a multi-sink query is complete only when every selected
+        # operand is. A sink that could not be seeded at all (no call to it
+        # here, an index out of range) is not part of the answer, so the
+        # answer is not complete: a blocking leaf per refused sink.
+        for s, msg in errors:
+            leaf = {"kind": "sink_unseeded", "locator": format_locator(s),
+                    "function": hex(int(func.start)),
+                    "detail": (f"the sink {format_locator(s)} was not sliced ({msg}), so "
+                               f"this multi-sink result does not account for it and is "
+                               f"NOT complete")}
+            if leaf not in self._bw_leaves:
+                self._bw_leaves.append(leaf)
 
         for sl in slices:
             sm, ss = derive_flow_facts(
@@ -8456,15 +8482,19 @@ class TaintEngine:
         return None
 
     def _bw_pointer_demand(self, func: Any, ssaf: Any, sink_ins: Any, idx: int,
-                           pointer: Any, *, recovered: bool) -> None:
-        """THE POLICY (#931 round 6): neither a call nor a store certifies a
-        buffer's bytes, so a sink that reads through a pointer is NEVER
-        complete. Every pointer demand -- a constant literal included -- gets
-        a blocking ``pointer_demand_not_certified`` leaf listing every object
-        the pointer may read, each described on its own. The description
+                           pointer: Any, *, recovered: bool, sink: dict[str, Any],
+                           role: str) -> None:
+        """THE POLICY (#931 rounds 6-7): neither a call nor a store certifies
+        a buffer's bytes, so a sink that reads through a pointer is NEVER
+        complete, and an argument is a value only when its model says so.
+        A modeled pointer argument gets a blocking
+        ``pointer_demand_not_certified`` leaf; an argument with no model role
+        at all gets a blocking ``sink_role_unknown`` leaf whose detail prints
+        the overlay that declares a value role. Both list every object the
+        pointer may read, each described on its own. The description
         (``_demand_objects``) is descriptive only: nothing here decides
-        completeness but the role (``_sink_arg_role``)."""
-        objects = self._demand_objects(func, ssaf, pointer)
+        completeness but the role (``_sink_role``)."""
+        objects = self._demand_objects(func, ssaf, pointer) if pointer is not None else []
         uniq: list[dict[str, Any]] = []
         for o in objects:
             if o not in uniq:
@@ -8496,7 +8526,7 @@ class TaintEngine:
         how = (f"its argument {idx}, recovered from a register (`{shown}`)" if recovered
                else f"its argument {idx} (`{shown}`)")
         leaf = {
-            "kind": "pointer_demand_not_certified",
+            "kind": "pointer_demand_not_certified" if role == "pointer" else "sink_role_unknown",
             "address": hex(int(getattr(sink_ins, "address", 0) or 0)),
             "function": fn_ref,
             "operand": shown,
@@ -8507,6 +8537,24 @@ class TaintEngine:
                        f"pointer is never complete. It may read: {listed}. Check each "
                        f"object by hand (`bn il {fn_ref} --view mlil`)"),
         }
+        if role != "pointer":
+            callee = str(sink.get("callee") or "")
+            addr = self._callee_as_addr(callee)
+            name = (self._callee_name(addr) if addr is not None else None) or callee
+            overlay = json.dumps({name: {"sink": {"class": "alloc_size", "tainted_args": [idx],
+                                                  "optional": True}}}, separators=(",", ":"))
+            rerun = (f"bn taint backward -f {fn_ref} --sink "
+                     f"{shlex.quote(f'arg:{callee}:{idx}')} --models value_roles.json")
+            leaf["declare_value_role"] = {"models": json.loads(overlay),
+                                          "file": "value_roles.json", "command": rerun}
+            leaf["detail"] = (
+                f"no sink model gives argument {idx} of {self._prose_name(callee)} a role, so "
+                f"the slice treats it as a pointer the sink reads through (#931): it is "
+                f"NOT complete. It may read: {listed}. If the argument is a value (a "
+                f"size, a count, a flag), declare that with a model overlay -- "
+                f"`printf '%s\\n' {shlex.quote(overlay)} > value_roles.json` -- then "
+                f"re-run `{rerun}` (the `optional` sink fires in forward taint only "
+                f"under `--sink-class alloc_size`)")
         if recovered:
             leaf["recovered_from_register"] = True
         if leaf not in self._bw_leaves:
@@ -8562,45 +8610,39 @@ class TaintEngine:
                 return "pointer"
         return None
 
-    def _sink_reads_through_pointer(self, sink: dict[str, Any], seed_var: Any, sink_ins: Any,
-                                    idx: int, operand: Any) -> bool:
-        """Does the selected sink argument hand the sink a POINTER whose
-        bytes it reads, rather than a value? The sink model's role decides
-        (a pointer-typed scalar cast into malloc's size is a value). With no
-        model role: a folded `&buf`, an address operand, a pointer-typed
-        value or a pointer-typed callee parameter (the pinned target's, for
-        an indirect call) is a pointer; an integer at BOTH ends is the
-        disclosed residual; anything else fails closed as a pointer."""
-        role = self._sink_arg_role(str(sink.get("callee") or ""), idx)
-        if role is not None:
-            return role == "pointer"
-        if isinstance(seed_var, _BufferSeed) or _is_pointer_typed(seed_var):
-            return True
-        if any(t in op_name(operand) for t in ("CONST_PTR", "ADDRESS_OF", "IMPORT", "EXTERN")):
-            return True
-        callees: list[Any] = []
-        cands, _ = self._indirect_call_resolution(sink_ins)
-        if cands:
-            callees = [function_at(self.bv, a) for a in cands]
-        else:
-            try:
-                callees = [resolve_call_target(self.bv, sink_ins, follow_thunks=True).function]
-            except Exception:
-                callees = []
-        ptypes: list[Any] = []
-        for fn in callees:
-            ts = [getattr(p, "type", None)
-                  for p in list(getattr(getattr(fn, "type", None), "parameters", None) or [])]
-            if not ts:
-                ts = [getattr(v, "type", None)
-                      for v in list(getattr(fn, "parameter_vars", None) or [])]
-            ptypes.append(ts[idx] if 0 <= idx < len(ts) else None)
-        if any(t is not None and _is_pointer_typed(SimpleNamespace(type=t)) for t in ptypes):
-            return True
-        seed_t = getattr(seed_var, "type", None) or getattr(getattr(seed_var, "var", None),
-                                                             "type", None)
-        both_integer = (seed_t is not None and ptypes and all(t is not None for t in ptypes))
-        return not both_integer
+    def _sink_role(self, sink: dict[str, Any]) -> str:
+        """The role of the selected `arg:` sink argument: ``"pointer"`` or
+        ``"value"`` as its model says (``_sink_arg_role``), else
+        ``"unknown"`` (#931 round 7). An argument is a value ONLY when a
+        model -- builtin or a user overlay, an explicit claim either way --
+        says so; BN's typing never decides, so an unknown role is walked and
+        reported like a pointer demand."""
+        role = self._sink_arg_role(str(sink.get("callee") or ""), int(sink.get("index", -1)))
+        return role if role is not None else "unknown"
+
+    def _bw_unseeded_demand(self, func: Any, ssaf: Any, instrs: list[Any],
+                            sink: dict[str, Any]) -> bool:
+        """An `arg:` sink that could not be seeded (`popen("ls")`, a fixed
+        address, a constant): when its argument is not an explicit value,
+        the sink still reads through what each call hands it, so each call
+        site whose recovered parameters include the argument gets its
+        blocking leaf. True when any did -- the sink is then an incomplete
+        answer, not a refusal (#931 round 7)."""
+        if sink.get("kind") != "arg":
+            return False
+        role = self._sink_role(sink)
+        if role == "value":
+            return False
+        idx = int(sink.get("index", -1))
+        done = False
+        for site in self._find_callsites(instrs, str(sink.get("callee") or ""),
+                                         resolve_indirect=True):
+            params = self._call_params(site)
+            if 0 <= idx < len(params):
+                self._bw_pointer_demand(func, ssaf, site, idx, params[idx], recovered=False,
+                                        sink=sink, role=role)
+                done = True
+        return done
 
     def _demand_objects(self, func: Any, ssaf: Any, expr: Any, *, disp: int | None = 0,
                         seen: set | None = None, depth: int = 0) -> list[dict[str, Any]]:

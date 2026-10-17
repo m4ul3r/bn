@@ -813,30 +813,90 @@ def test_pointer_typed_scalar_into_a_size_is_a_value_r6(sink, idx):
     assert result["diagnostics"]["safe_to_report_complete_slice"] is True, result
 
 
-@pytest.mark.parametrize("ptype, complete", [(None, False), ("int64_t", True)])
-def test_ad_hoc_sink_falls_back_to_types_and_fails_closed_r6(ptype, complete):
-    # An unmodeled sink: no role. Unknown types fail closed (a pointer
-    # demand); an integer at BOTH ends -- the value and the callee's
-    # parameter -- is the disclosed integer residual, a value.
+@pytest.mark.parametrize("carrier", ["int64_t", "struct pair", "union word", "double"])
+def test_unmodeled_sink_argument_has_no_role_r7(carrier):
+    # An ad hoc `arg:emit_line:0`: no model gives the argument a role. Round 6
+    # fell back to BN's types and called every KNOWN type a value -- by-value
+    # structs, unions and floats included -- so the slice completed. An
+    # argument is a value only when a model says so: whatever the carrier,
+    # the slice is incomplete with a `sink_role_unknown` leaf that prints the
+    # overlay declaring a value role.
+    from test_taint_engine import FBV, te
+    n = FVar("n", ident=86, typ=carrier); n0 = FSSA(n, 0)
+    pg = _BufProgram(params=[n])
+    pg.call(_B_HELPER6, [FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])], reads=[n0])
+    result = te.TaintEngine(FBV(_B_NAMES), te.load_models()).backward(
+        pg.func(), [te.parse_locator("arg:emit_line:0")])
+    assert result["slices"][0]["origin"]["kind"] == "parameter", result["slices"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = result["leaves"]
+    assert leaf["kind"] == "sink_role_unknown", leaf
+    decl = leaf["declare_value_role"]
+    assert decl == {"models": {"emit_line": {"sink": {"class": "alloc_size", "tainted_args": [0],
+                                                      "optional": True}}},
+                    "file": "value_roles.json",
+                    "command": "bn taint backward -f 0x10 --sink arg:emit_line:0 "
+                               "--models value_roles.json"}, decl
+    assert decl["command"] in result["diagnostics"]["next_action"]
+
+
+def test_declared_value_role_completes_the_ad_hoc_sink_r7():
+    # The printed overlay is the explicit claim: with it the argument is a
+    # value, it carries no demand, and the slice completes at its parameter.
     from test_taint_engine import FBV, te
     n = FVar("n", ident=86, typ="int64_t"); n0 = FSSA(n, 0)
     pg = _BufProgram(params=[n])
     pg.call(_B_HELPER6, [FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])], reads=[n0])
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
+    decl = engine.backward(pg.func(), [te.parse_locator("arg:emit_line:0")])["leaves"][0][
+        "declare_value_role"]
+    declared = te.TaintEngine(FBV(_B_NAMES), te.load_models(decl["models"])).backward(
+        pg.func(), [te.parse_locator("arg:emit_line:0")])
+    assert declared["leaves"] == [], declared["leaves"]
+    assert declared["diagnostics"]["safe_to_report_complete_slice"] is True, declared
 
-    class View(FBV):
-        def get_function_at(self, addr):
-            if addr == _B_HELPER6 and ptype is not None:
-                return SimpleNamespace(
-                    name="emit_line", start=addr, parameter_vars=[],
-                    type=SimpleNamespace(parameters=[SimpleNamespace(
-                        type=SimpleNamespace(type_class="IntegerTypeClass",
-                                             __str__=lambda s: ptype))]))
-            return super().get_function_at(addr)
 
-    engine = te.TaintEngine(View(_B_NAMES), te.load_models())
-    result = engine.backward(pg.func(), [te.parse_locator("arg:emit_line:0")])
-    assert result["diagnostics"]["safe_to_report_complete_slice"] is complete, result
-    assert bool(_demand_leaves(result)) is (not complete), result["leaves"]
+def test_direct_literal_command_is_incomplete_not_refused_r7():
+    # `popen("ls", "r")`: the operand reads no variable. It was a refusal
+    # (exit 3, "reads no variable"); popen reads through it, so it is an
+    # incomplete answer whose leaf names the literal.
+    from test_taint_engine import FBVStorage, te
+    pg = _BufProgram(params=[])
+    pg.call(_B_POPEN, [_cstr(0x720), _cstr(0x710)])
+    bv = FBVStorage(_B_NAMES, ro=[(0x700, 0x800)])
+    result = te.TaintEngine(bv, te.load_models()).backward(pg.func(),
+                                                          [te.parse_locator("arg:popen:0")])
+    assert result["slices"] == [] and result["sink_status"][0]["demand_leaf"] is True
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = result["leaves"]
+    assert leaf["kind"] == "pointer_demand_not_certified", leaf
+    assert leaf["objects"] == [{"kind": "literal", "object": "0x720", "address": "0x720",
+                                "offset": 0, "segment_writable": False}], leaf
+
+
+@pytest.mark.parametrize("other", ["unseeded_pointer", "uncalled_sink"])
+def test_multi_sink_is_complete_only_when_every_operand_is_r7(other):
+    # The reviewer's case: a fixed address to popen (no seed) beside a
+    # parameter to malloc's size (a complete value slice). The popen operand
+    # was refused and skipped, and the malloc slice made the whole result
+    # complete with no leaf. An unseeded operand -- or a sink the query
+    # selected but the function never calls -- counts, with its leaf.
+    from test_taint_engine import FBV, te
+    n = FVar("n", ident=89, typ="int64_t"); n0 = FSSA(n, 0)
+    pg = _BufProgram(params=[n])
+    pg.call(_B_POPEN, [FExpr("MLIL_CONST", "0x4000", constant=0x4000), _cstr(0x710)])
+    pg.call(_B_MALLOC, [FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])], reads=[n0])
+    sinks = ["arg:malloc:0", "arg:popen:0" if other == "unseeded_pointer" else "arg:system:0"]
+    result = te.TaintEngine(FBV(_B_NAMES), te.load_models()).backward(
+        pg.func(), [te.parse_locator(s) for s in sinks])
+    assert result["slices"][0]["origin"]["kind"] == "parameter", result["slices"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    want = "pointer_demand_not_certified" if other == "unseeded_pointer" else "sink_unseeded"
+    assert [lf["kind"] for lf in result["leaves"]] == [want], result["leaves"]
+    # The malloc slice alone is still complete.
+    alone = te.TaintEngine(FBV(_B_NAMES), te.load_models()).backward(
+        pg.func(), [te.parse_locator("arg:malloc:0")])
+    assert alone["diagnostics"]["safe_to_report_complete_slice"] is True, alone
 
 
 def test_mixed_sink_names_its_buffer_in_pointer_args_r6():

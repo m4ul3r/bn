@@ -48,6 +48,7 @@ Reconciliation notes:
 """
 from __future__ import annotations
 
+import json
 import shlex
 from typing import Any
 
@@ -100,6 +101,10 @@ BLOCKING_LEAF_KINDS = frozenset({
     # complete. Every pointer demand carries this leaf, listing each object
     # it may read.
     "pointer_demand_not_certified",
+    # #931 round 7: an `arg:` sink argument no model gives a role (walked as
+    # a pointer demand), and a sink a multi-sink query could not seed at all.
+    "sink_role_unknown",
+    "sink_unseeded",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -436,7 +441,7 @@ def backward_diagnostics(
                   "indirect_call_unresolved", "field_load_unresolved",
                   "address_of_local_unresolved", "pointer_object_unresolved",
                   "object_extent_unknown", "region_store_proof_not_certified",
-                  "pointer_demand_not_certified")
+                  "pointer_demand_not_certified", "sink_role_unknown", "sink_unseeded")
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
@@ -552,6 +557,16 @@ def backward_diagnostics(
                 "the leaf's `objects` lists every object the pointer may read; check "
                 "each by hand -- "
                 f"`bn il {demand_leaf['function']} --view mlil`")
+        role_leaf = next((lf for lf in unresolved_leaves
+                          if lf.get("kind") == "sink_role_unknown"
+                          and isinstance(lf.get("declare_value_role"), dict)), None)
+        if role_leaf is not None:
+            decl = role_leaf["declare_value_role"]
+            next_action += (
+                ". No sink model gives the selected argument a role, so it is treated as "
+                "a pointer the sink reads through (#931); if it is a value, declare it: "
+                f"`printf '%s\\n' {shlex.quote(json.dumps(decl['models'], separators=(',', ':')))} "
+                f"> {decl['file']}` then re-run `{decl['command']}`")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
                for lf in unresolved_leaves):
             next_action += (

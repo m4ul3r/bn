@@ -4280,8 +4280,17 @@ def test_backward_constant_pointer_arg_is_seed_error_not_bounded(models):
     ]
     func = FFunc("copy_globals", 0x401189, FSSAFunc(instrs), params=[])
     engine = te.TaintEngine(bv, models)
+    # #931 round 7: memcpy reads/writes through arg 0 (its `*arg:0` rule), so
+    # an unseeded constant address there is an INCOMPLETE answer with the
+    # pointer-demand leaf -- never a bounded success, and no longer a refusal.
+    result = engine.backward(func, [te.parse_locator("arg:memcpy:0")])  # arg0 = const ptr
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    [leaf] = result["leaves"]
+    assert leaf["kind"] == "pointer_demand_not_certified" and leaf["objects"][0]["address"] == "0x500000"
+    assert result["sink_status"][0]["demand_leaf"] is True
+    # A VALUE argument with no def-chain stays a genuine seed error.
     with pytest.raises(te.TaintError, match=r"address or fixed expression"):
-        engine.backward(func, [te.parse_locator("arg:memcpy:0")])  # arg0 = const ptr
+        engine.backward(func, [te.parse_locator("arg:memcpy:2")])
 
 
 def test_backward_all_genuinely_unseeded_still_hard_errors(models):
@@ -4444,9 +4453,12 @@ def test_backward_arg_with_no_variable_reads_says_so(process_func, models):
     bv = FBV({0x401070: "read", 0x401080: "memcpy"})
     engine = te.TaintEngine(bv, models)
     # process_func passes &buf (an address expr, no SSA reads) as memcpy arg 1:
-    # there is nothing to slice, but the locator itself was fine.
-    with pytest.raises(te.TaintError, match=r"reads no variable in the recovered IL"):
-        engine.backward(process_func, [te.parse_locator("arg:memcpy:1")])
+    # there is nothing to slice, but memcpy reads through arg 1, so the
+    # answer is incomplete with its leaf (#931 round 7), not a refusal.
+    result = engine.backward(process_func, [te.parse_locator("arg:memcpy:1")])
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
+    assert "reads no variable in the recovered IL" in result["sink_status"][0]["note"]
+    assert [lf["kind"] for lf in result["leaves"]] == ["pointer_demand_not_certified"]
 
 
 def test_parse_locator_rejects_negative_arg_index():
@@ -10526,8 +10538,10 @@ def test_backward_folded_address_of_sink_operand_is_seeded_928():
     # An address expression that is NOT a local's address still cannot seed.
     pg2 = _BufProgram(params=[ctx])
     pg2.call(_B_POPEN, [FExpr("MLIL_VAR_SSA", "&dst", reads=[]), _cstr(0x710)])
-    with pytest.raises(te.TaintError, match="reads no variable"):
-        _bw(pg2.func())
+    unseeded, _, _ = _bw(pg2.func())
+    assert unseeded["slices"] == [] and unseeded["sink_status"][0]["seeded"] is False
+    assert [lf["kind"] for lf in unseeded["leaves"]] == ["pointer_demand_not_certified"]
+    assert unseeded["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 def test_backward_caller_ascent_follows_a_folded_address_of_argument_928():

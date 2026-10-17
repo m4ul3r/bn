@@ -19,7 +19,7 @@ import re
 import shlex
 
 import pytest
-from conftest import FixtureBuildError, refuse_silent_skip
+from conftest import _BN_CLI, FixtureBuildError, refuse_silent_skip
 
 CORPUS = Path(__file__).parent / "taint_corpus"
 
@@ -649,6 +649,90 @@ void _start(void) { u_param(0); u_system(0); }
         assert result["diagnostics"]["safe_to_report_complete_slice"] is False, (fn, result)
         assert [lf["kind"] for lf in result["leaves"]] == ["pointer_demand_not_certified"], (
             fn, result["leaves"])
+
+
+_ROLE_FALLBACK_SRC = r"""
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+struct pair_carrier { uintptr_t ignored; char *pointer; };
+union word_carrier { uintptr_t bits; char *pointer; };
+__attribute__((noinline)) int double_sink(double c) { return system((char *)(uintptr_t)c); }
+__attribute__((noinline)) int double_caller(double c) { return double_sink(c); }
+__attribute__((noinline)) int struct_sink(struct pair_carrier c) { return system(c.pointer); }
+__attribute__((noinline)) int struct_caller(struct pair_carrier c) { return struct_sink(c); }
+__attribute__((noinline)) int union_sink(union word_carrier c) { return system(c.pointer); }
+__attribute__((noinline)) int union_caller(union word_carrier c) { return union_sink(c); }
+__attribute__((noinline)) long int_sink(long v) { return v * 3; }
+__attribute__((noinline)) long int_caller(long v) { return int_sink(v) + 1; }
+__attribute__((noinline)) void constant_pointer(long n) {
+    FILE *stream = popen((char *)(uintptr_t)1, "r");
+    void *allocation = malloc((size_t)n);
+    __asm__ volatile("" : : "r"(stream), "r"(allocation) : "memory");
+}
+__attribute__((noinline)) void direct_literal(void) { popen("ls", "r"); }
+int main(void) { return 0; }
+"""
+
+
+@pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_sink_argument_without_a_value_role_is_incomplete(tmp_path, shared_bn, arch, opt):
+    """#931 round 7, the announced fallback: an argument is a value only when
+    a model says so. A double, a by-value struct or a union carried into an
+    unmodeled helper completed under round 6's type fallback; now each is
+    incomplete with `sink_role_unknown`, and so is a plain integer -- until
+    the overlay the leaf PRINTS is applied, run exactly as printed. The role
+    is decided before the no-def-chain exit: a fixed address to popen beside
+    a parameter to malloc's size was refused and skipped, letting the malloc
+    slice complete the query; a direct `popen("ls")` was a refusal. Both are
+    incomplete with their leaf now."""
+    cc = _cross_cc(arch)
+    src = tmp_path / "fallback.c"
+    src.write_text(_ROLE_FALLBACK_SRC)
+    binary = tmp_path / f"fallback_{arch}{opt}"
+    _build([cc, opt, "-g", "-fno-inline", "-fno-builtin", "-U_FORTIFY_SOURCE",
+            "-fno-stack-protector", "-fno-optimize-sibling-calls", "-no-pie",
+            str(src), "-o", str(binary)])
+    target = shared_bn.load(binary, copy=False)
+
+    def query(fn, *sinks):
+        args = ["-t", target, "taint", "backward", "-f", fn]
+        for s in sinks:
+            args += ["--sink", s]
+        return _bn_json(shared_bn, *args)
+
+    for fn, sink in [("double_caller", "arg:double_sink:0"), ("struct_caller", "arg:struct_sink:0"),
+                     ("union_caller", "arg:union_sink:0"), ("int_caller", "arg:int_sink:0")]:
+        result = query(fn, sink)
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is False, (fn, result)
+        assert "sink_role_unknown" in {lf["kind"] for lf in result["leaves"]}, (fn, result["leaves"])
+
+    # The printed declaration, run as printed: the `printf` line, then the
+    # routed `bn` re-run, from the directory the file is written to.
+    advice = query("int_caller", "arg:int_sink:0")["diagnostics"]["next_action"]
+    printf_cmd = re.search(r"`(printf [^`]+)`", advice).group(1)
+    rerun = re.search(r"`(bn [^`]*--models value_roles\.json)`", advice).group(1)
+    subprocess.run(printf_cmd, shell=True, cwd=tmp_path, check=True, timeout=30)
+    declared = subprocess.run(
+        [*_BN_CLI, *shlex.split(rerun)[1:], "--format", "json"], cwd=tmp_path,
+        capture_output=True, text=True, timeout=120.0, env=shared_bn.env())
+    assert declared.returncode == 0, declared.stderr
+    declared = json.loads(declared.stdout)
+    assert declared["leaves"] == [], declared["leaves"]
+    assert declared["diagnostics"]["safe_to_report_complete_slice"] is True, declared
+
+    both = query("constant_pointer", "arg:popen:0", "arg:malloc:0")
+    assert both["diagnostics"]["safe_to_report_complete_slice"] is False, both
+    assert [lf["kind"] for lf in both["leaves"]] == ["pointer_demand_not_certified"], both["leaves"]
+    assert {s["seeded"] for s in both["sink_status"]} == {True, False}, both["sink_status"]
+
+    lit = query("direct_literal", "arg:popen:0")
+    assert lit["diagnostics"]["safe_to_report_complete_slice"] is False, lit
+    [leaf] = lit["leaves"]
+    assert leaf["kind"] == "pointer_demand_not_certified", leaf
+    assert [o["kind"] for o in leaf["objects"]] == ["literal"], leaf
+
 
 
 def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):
