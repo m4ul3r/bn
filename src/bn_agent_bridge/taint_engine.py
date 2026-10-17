@@ -253,6 +253,16 @@ class _BufferSeed:
 # engine
 # --------------------------------------------------------------------------
 
+
+def _code(text: Any) -> str:
+    """*text* as inline code in leaf prose -- unless it carries a backtick
+    (a function named with one), which would unbalance the framing and let
+    the command router read a name as the start of a `bn ...` command; then
+    it is JSON-quoted plain text (#931 round 8)."""
+    t = str(text)
+    return json.dumps(t) if "`" in t else f"`{t}`"
+
+
 class TaintEngine:
     def __init__(
         self,
@@ -8503,7 +8513,7 @@ class TaintEngine:
         def say(o: dict[str, Any]) -> str:
             if o["kind"] == "returned":
                 inner = ", ".join(say(i) for i in o["may_point_into"])
-                return (f"the pointer `{o['object']}` returned"
+                return (f"the pointer {_code(o['object'])} returned"
                         + (f", into {inner}" if inner else "")
                         + (f" ({o['note']})" if o.get("note") else ""))
             extra = []
@@ -8517,14 +8527,14 @@ class TaintEngine:
             if o.get("segment_writable") is not None:
                 extra.append("in a writable segment" if o["segment_writable"]
                              else "in a read-only segment")
-            return (f"{o['kind'].replace('_', ' ')} `{o['object']}`"
+            return (f"{o['kind'].replace('_', ' ')} {_code(o['object'])}"
                     + (f" ({', '.join(extra)})" if extra else ""))
 
         fn_ref = hex(int(getattr(func, "start", 0) or 0))
         listed = "; ".join(say(o) for o in uniq) or "no object the walk could name"
         shown = var_label(pointer) if is_ssa_var(pointer) else str(pointer)
-        how = (f"its argument {idx}, recovered from a register (`{shown}`)" if recovered
-               else f"its argument {idx} (`{shown}`)")
+        how = (f"its argument {idx}, recovered from a register ({_code(shown)})" if recovered
+               else f"its argument {idx} ({_code(shown)})")
         leaf = {
             "kind": "pointer_demand_not_certified" if role == "pointer" else "sink_role_unknown",
             "address": hex(int(getattr(sink_ins, "address", 0) or 0)),
@@ -8538,23 +8548,35 @@ class TaintEngine:
                        f"object by hand (`bn il {fn_ref} --view mlil`)"),
         }
         if role != "pointer":
+            # #931 round 8: guidance, not a generated command. A printed
+            # overlay replaced the callee's whole model, a printed re-run
+            # dropped the query's other sinks and options, and a redirect
+            # overwrote a file: the leaf names the callee and argument, and
+            # `declare_value_role` is a TEMPLATE entry (UPPER-CASE
+            # placeholders, data only) the user merges into the callee's
+            # current model and passes with `--models FILE` to the same
+            # command they ran.
             callee = str(sink.get("callee") or "")
             addr = self._callee_as_addr(callee)
             name = (self._callee_name(addr) if addr is not None else None) or callee
-            overlay = json.dumps({name: {"sink": {"class": "alloc_size", "tainted_args": [idx],
-                                                  "optional": True}}}, separators=(",", ":"))
-            rerun = (f"bn taint backward -f {fn_ref} --sink "
-                     f"{shlex.quote(f'arg:{callee}:{idx}')} --models value_roles.json")
-            leaf["declare_value_role"] = {"models": json.loads(overlay),
-                                          "file": "value_roles.json", "command": rerun}
+            leaf["callee"] = name
+            leaf["arg_index"] = idx
+            leaf["declare_value_role"] = {
+                "template": True,
+                "entry": {name: {"sink": {"class": "VALUE_CLASS", "tainted_args": [idx]},
+                                 "OTHER_ROLES": "COPY_FROM_THE_CURRENT_MODEL"}},
+                "placeholders": {
+                    "VALUE_CLASS": sorted(self._VALUE_SINK_CLASSES),
+                    "OTHER_ROLES": "every other key of the callee's current model "
+                                   "(sources, propagates, ...), copied unchanged",
+                },
+            }
             leaf["detail"] = (
-                f"no sink model gives argument {idx} of {self._prose_name(callee)} a role, so "
-                f"the slice treats it as a pointer the sink reads through (#931): it is "
-                f"NOT complete. It may read: {listed}. If the argument is a value (a "
-                f"size, a count, a flag), declare that with a model overlay -- "
-                f"`printf '%s\\n' {shlex.quote(overlay)} > value_roles.json` -- then "
-                f"re-run `{rerun}` (the `optional` sink fires in forward taint only "
-                f"under `--sink-class alloc_size`)")
+                f"no sink model gives argument {idx} of {_code(self._prose_name(callee))} "
+                f"a role, so the slice treats it as a pointer the sink reads through "
+                f"(#931): it is NOT complete. It may read: {listed}. If the argument is "
+                f"a value (a size, a count, a flag), declare it in a model overlay: the "
+                f"leaf's `declare_value_role.entry` is a TEMPLATE")
         if recovered:
             leaf["recovered_from_register"] = True
         if leaf not in self._bw_leaves:

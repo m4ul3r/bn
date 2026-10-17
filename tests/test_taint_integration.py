@@ -664,7 +664,11 @@ __attribute__((noinline)) int struct_caller(struct pair_carrier c) { return stru
 __attribute__((noinline)) int union_sink(union word_carrier c) { return system(c.pointer); }
 __attribute__((noinline)) int union_caller(union word_carrier c) { return union_sink(c); }
 __attribute__((noinline)) long int_sink(long v) { return v * 3; }
-__attribute__((noinline)) long int_caller(long v) { return int_sink(v) + 1; }
+__attribute__((noinline)) long int_caller(long v) {
+    void *p = malloc((size_t)v);
+    __asm__ volatile("" : : "r"(p) : "memory");
+    return int_sink(v) + 1;
+}
 __attribute__((noinline)) void constant_pointer(long n) {
     FILE *stream = popen((char *)(uintptr_t)1, "r");
     void *allocation = malloc((size_t)n);
@@ -678,15 +682,17 @@ int main(void) { return 0; }
 @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
 @pytest.mark.parametrize("opt", ["-O0", "-O2"])
 def test_sink_argument_without_a_value_role_is_incomplete(tmp_path, shared_bn, arch, opt):
-    """#931 round 7, the announced fallback: an argument is a value only when
-    a model says so. A double, a by-value struct or a union carried into an
-    unmodeled helper completed under round 6's type fallback; now each is
-    incomplete with `sink_role_unknown`, and so is a plain integer -- until
-    the overlay the leaf PRINTS is applied, run exactly as printed. The role
-    is decided before the no-def-chain exit: a fixed address to popen beside
-    a parameter to malloc's size was refused and skipped, letting the malloc
-    slice complete the query; a direct `popen("ls")` was a refusal. Both are
-    incomplete with their leaf now."""
+    """#931 rounds 7-8, the announced fallback: an argument is a value only
+    when a model says so. A double, a by-value struct or a union carried into
+    an unmodeled helper completed under round 6's type fallback; now each is
+    incomplete with `sink_role_unknown`, and so is a plain integer -- until a
+    filled-in copy of the leaf's TEMPLATE entry is passed with `--models` to
+    the same command. The advice prints no overlay command and no re-run
+    (round 8); every `bn` command it does print runs as printed with two
+    targets open. The role is decided before the no-def-chain exit: a fixed
+    address to popen beside a parameter to malloc's size was refused and
+    skipped, letting the malloc slice complete the query; a direct
+    `popen("ls")` was a refusal. Both are incomplete with their leaf now."""
     cc = _cross_cc(arch)
     src = tmp_path / "fallback.c"
     src.write_text(_ROLE_FALLBACK_SRC)
@@ -708,19 +714,36 @@ def test_sink_argument_without_a_value_role_is_incomplete(tmp_path, shared_bn, a
         assert result["diagnostics"]["safe_to_report_complete_slice"] is False, (fn, result)
         assert "sink_role_unknown" in {lf["kind"] for lf in result["leaves"]}, (fn, result["leaves"])
 
-    # The printed declaration, run as printed: the `printf` line, then the
-    # routed `bn` re-run, from the directory the file is written to.
-    advice = query("int_caller", "arg:int_sink:0")["diagnostics"]["next_action"]
-    printf_cmd = re.search(r"`(printf [^`]+)`", advice).group(1)
-    rerun = re.search(r"`(bn [^`]*--models value_roles\.json)`", advice).group(1)
-    subprocess.run(printf_cmd, shell=True, cwd=tmp_path, check=True, timeout=30)
-    declared = subprocess.run(
-        [*_BN_CLI, *shlex.split(rerun)[1:], "--format", "json"], cwd=tmp_path,
-        capture_output=True, text=True, timeout=120.0, env=shared_bn.env())
-    assert declared.returncode == 0, declared.stderr
-    declared = json.loads(declared.stdout)
+    # Round 8: the advice is guidance. The template, filled in (int_sink has
+    # no current model, so no other roles to copy), is passed with --models
+    # to the SAME command -- the two-sink query keeps both sinks.
+    two = query("int_caller", "arg:int_sink:0", "arg:malloc:0")
+    advice = two["diagnostics"]["next_action"]
+    assert "bn taint backward" not in advice and ">" not in advice, advice
+    [leaf] = [lf for lf in two["leaves"] if lf["kind"] == "sink_role_unknown"]
+    entry = leaf["declare_value_role"]["entry"]
+    assert leaf["declare_value_role"]["template"] is True, leaf
+    entry["int_sink"]["sink"]["class"] = "alloc_size"
+    del entry["int_sink"]["OTHER_ROLES"]
+    models = tmp_path / "value_roles.json"
+    models.write_text(json.dumps(entry))
+    declared = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "int_caller",
+                        "--sink", "arg:int_sink:0", "--sink", "arg:malloc:0",
+                        "--models", str(models))
     assert declared["leaves"] == [], declared["leaves"]
     assert declared["diagnostics"]["safe_to_report_complete_slice"] is True, declared
+
+    # Every `bn` command the advice prints is routed and runs as printed
+    # with a second target open.
+    shared_bn.load(binary)
+    printed = set()
+    for text in (advice, leaf["detail"], query("direct_literal", "arg:popen:0")["leaves"][0]["detail"]):
+        printed |= set(re.findall(r"`(bn [^`]+)`", text))
+    assert any(" taint models " in c for c in printed) and any(" il " in c for c in printed), printed
+    for command in printed:
+        ran = subprocess.run([*_BN_CLI, *shlex.split(command)[1:]], capture_output=True,
+                             text=True, timeout=120.0, env=shared_bn.env())
+        assert ran.returncode == 0, (command, ran.stderr)
 
     both = query("constant_pointer", "arg:popen:0", "arg:malloc:0")
     assert both["diagnostics"]["safe_to_report_complete_slice"] is False, both

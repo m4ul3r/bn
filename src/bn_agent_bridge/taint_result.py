@@ -48,7 +48,6 @@ Reconciliation notes:
 """
 from __future__ import annotations
 
-import json
 import shlex
 from typing import Any
 
@@ -557,16 +556,16 @@ def backward_diagnostics(
                 "the leaf's `objects` lists every object the pointer may read; check "
                 "each by hand -- "
                 f"`bn il {demand_leaf['function']} --view mlil`")
-        role_leaf = next((lf for lf in unresolved_leaves
-                          if lf.get("kind") == "sink_role_unknown"
-                          and isinstance(lf.get("declare_value_role"), dict)), None)
-        if role_leaf is not None:
-            decl = role_leaf["declare_value_role"]
+        if any(lf.get("kind") == "sink_role_unknown" for lf in unresolved_leaves):
+            # #931 round 8: guidance only -- no generated overlay or re-run.
             next_action += (
                 ". No sink model gives the selected argument a role, so it is treated as "
-                "a pointer the sink reads through (#931); if it is a value, declare it: "
-                f"`printf '%s\\n' {shlex.quote(json.dumps(decl['models'], separators=(',', ':')))} "
-                f"> {decl['file']}` then re-run `{decl['command']}`")
+                "a pointer the sink reads through (#931). If it is a value, declare it in "
+                "a model overlay: the leaf's `declare_value_role.entry` is a TEMPLATE "
+                "(replace the UPPER-CASE placeholders). An overlay entry replaces the "
+                "callee's whole model, so start from its current model -- `bn taint models "
+                "--format json` lists the catalog. Then add `--models FILE` to the same "
+                "command you ran")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
                for lf in unresolved_leaves):
             next_action += (

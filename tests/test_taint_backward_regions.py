@@ -831,13 +831,20 @@ def test_unmodeled_sink_argument_has_no_role_r7(carrier):
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
     [leaf] = result["leaves"]
     assert leaf["kind"] == "sink_role_unknown", leaf
+    assert (leaf["callee"], leaf["arg_index"]) == ("emit_line", 0), leaf
+    # Round 8: guidance, not a generated command. A TEMPLATE entry as data,
+    # UPPER-CASE placeholders, no redirection, no rebuilt re-run.
     decl = leaf["declare_value_role"]
-    assert decl == {"models": {"emit_line": {"sink": {"class": "alloc_size", "tainted_args": [0],
-                                                      "optional": True}}},
-                    "file": "value_roles.json",
-                    "command": "bn taint backward -f 0x10 --sink arg:emit_line:0 "
-                               "--models value_roles.json"}, decl
-    assert decl["command"] in result["diagnostics"]["next_action"]
+    assert decl["template"] is True, decl
+    assert decl["entry"] == {"emit_line": {
+        "sink": {"class": "VALUE_CLASS", "tainted_args": [0]},
+        "OTHER_ROLES": "COPY_FROM_THE_CURRENT_MODEL"}}, decl
+    assert decl["placeholders"]["VALUE_CLASS"] == ["alloc_size", "fortified_overflow",
+                                                   "overflow_len"], decl
+    advice = result["diagnostics"]["next_action"]
+    assert ">" not in advice and "printf" not in advice, advice
+    assert "bn taint backward" not in advice and "add `--models FILE` to the same command" in advice
+    assert "`bn taint models --format json`" in advice, advice
 
 
 def test_declared_value_role_completes_the_ad_hoc_sink_r7():
@@ -848,9 +855,13 @@ def test_declared_value_role_completes_the_ad_hoc_sink_r7():
     pg = _BufProgram(params=[n])
     pg.call(_B_HELPER6, [FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])], reads=[n0])
     engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
-    decl = engine.backward(pg.func(), [te.parse_locator("arg:emit_line:0")])["leaves"][0][
-        "declare_value_role"]
-    declared = te.TaintEngine(FBV(_B_NAMES), te.load_models(decl["models"])).backward(
+    entry = engine.backward(pg.func(), [te.parse_locator("arg:emit_line:0")])["leaves"][0][
+        "declare_value_role"]["entry"]
+    # Fill the template: a value class; emit_line has no current model, so
+    # there are no other roles to copy.
+    entry["emit_line"]["sink"]["class"] = "alloc_size"
+    del entry["emit_line"]["OTHER_ROLES"]
+    declared = te.TaintEngine(FBV(_B_NAMES), te.load_models(entry)).backward(
         pg.func(), [te.parse_locator("arg:emit_line:0")])
     assert declared["leaves"] == [], declared["leaves"]
     assert declared["diagnostics"]["safe_to_report_complete_slice"] is True, declared
@@ -921,3 +932,23 @@ def test_mixed_sink_names_its_buffer_in_pointer_args_r6():
     with pytest.raises(te.TaintError, match="pointer_args"):
         te.load_models({"app_send": {"sink": {"class": "net_write", "tainted_args": [1],
                                               "pointer_args": ["1"]}}})
+
+
+def test_role_advice_survives_a_backtick_in_the_name_and_rebuilds_no_query_r8():
+    # A callee named with a backtick must not unbalance the leaf's inline
+    # code (nor feed the `bn ...` router a fake command), and a two-sink
+    # query gets no rebuilt one-sink re-run.
+    from test_taint_engine import FBV, te
+    _B_NAMES[0x9a4] = "emit`line"
+    n = FVar("n", ident=90, typ="int64_t"); n0 = FSSA(n, 0)
+    pg = _BufProgram(params=[n])
+    pg.call(0x9a4, [FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])], reads=[n0])
+    pg.call(_B_MALLOC, [FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])], reads=[n0])
+    result = te.TaintEngine(FBV(_B_NAMES), te.load_models()).backward(
+        pg.func(), [te.parse_locator("arg:emit`line:0"), te.parse_locator("arg:malloc:0")])
+    [leaf] = result["leaves"]
+    assert leaf["callee"] == "emit`line" and '"emit`line"' in leaf["detail"], leaf["detail"]
+    for text in (leaf["detail"], result["diagnostics"]["next_action"]):
+        stripped = text.replace('"emit`line"', "")
+        assert stripped.count("`") % 2 == 0, text
+        assert "bn taint backward" not in text and "--models value_roles" not in text, text
