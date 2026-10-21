@@ -8041,6 +8041,11 @@ class TaintEngine:
         # edge contributes no formal origin (the enclosing frame answers it),
         # so these producers are all it can contribute -- kept, not dropped.
         producers: list[dict[str, Any]] = []
+        # The calls whose RETURN the def chain combines into the value (an
+        # unmodeled `getpid()`, a modeled source's return): each is a root of
+        # its own whatever else represents the slice, so a formal beside it
+        # -- or how many callers answer that formal -- never trades it away.
+        returned: list[dict[str, Any]] = []
         # The (function, formal) demands each back edge closed on, for the
         # whole ascent from one sink seed: `_continue_into_callers` reads
         # which demand a cycle answered (its own, or one further up).
@@ -8059,6 +8064,8 @@ class TaintEngine:
                 param_origins.setdefault(int(o["index"]), o)
             elif o not in producers:
                 producers.append(o)
+            if rank == 1 and o.get("kind") == "call" and o not in returned:
+                returned.append(o)
             if origin["kind"] == "unresolved" or origin_rank > rank:
                 origin = o
                 origin_rank = rank
@@ -8072,6 +8079,8 @@ class TaintEngine:
             nonlocal origin, origin_rank
             if o not in producers:
                 producers.append(o)
+            if o not in returned:
+                returned.append(o)
             origin, origin_rank = o, 0
 
         # (buffer key, memory version) pairs already walked, so two buffers that
@@ -9076,11 +9085,14 @@ class TaintEngine:
         # operand order.
         if origin["kind"] != "parameter" and not (cuts and origin["kind"] == "unresolved"):
             out.insert(0, {"steps": base_steps, "origin": origin, "crossed": []})
-        if back_edge:
-            # Each independent producer on the back edge, the representative
-            # aside (already a slice), so none is traded for the cycle.
-            out += [{"steps": base_steps, "origin": o, "crossed": []}
-                    for o in producers if o is not origin and o["kind"] != "unresolved"]
+        # Each independent producer keeps its own slice, the representative
+        # aside (already one): on a back edge every producer the walk reached
+        # (the cycle answers nothing else), elsewhere every call RETURN the
+        # value combines -- so neither a formal beside it nor the callers
+        # that answer that formal (one entry or several) trade it away.
+        extra = producers if back_edge else returned
+        out += [{"steps": base_steps, "origin": o, "crossed": []}
+                for o in extra if o is not origin and o["kind"] != "unresolved"]
         if cuts:
             # Replaces a bare `unresolved` origin: the cut is why it is one.
             # `var` names the cut values IN this function: the public slice

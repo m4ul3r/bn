@@ -437,12 +437,14 @@ def test_recursive_back_edge_keeps_the_producer_it_introduces(callee, origin):
 
 
 
-def _remap_pair(mutual, external_caller=True):
+def _remap_pair(mutual, external_caller=True, *, extra_entry=False, max_depth=8):
     """The reviewer's remap_cycle shape: ``remap_a(first, second) {
     malloc(first); remap_b(first, second); }``, ``remap_b(x, y) {
     remap_a(y, x + getpid()); }`` and ``start_remap(external) { remap_a(7,
     external); }`` -- or, ``mutual=False``, the same remap as a direct
-    self-call ``direct_remap(second, first + getpid())``."""
+    self-call ``direct_remap(second, first + getpid())``. ``extra_entry``
+    adds remap_branch's second way into the cycle, ``start_other() {
+    remap_b(13, 17); }``."""
     first, second = FVar("first", ident=120), FVar("second", ident=121)
     f0, s0 = FSSA(first, 0), FSSA(second, 0)
     a = FFunc("remap_a" if mutual else "direct_remap", 0x800, FSSAFunc([]), params=[first, second])
@@ -467,6 +469,11 @@ def _remap_pair(mutual, external_caller=True):
             _call(1, 0x810, 0x900, [_var(f0), _var(s0)]),
         ])).mlil
         b.caller_sites = [FSite(a, 0x810)]
+        if extra_entry:
+            other = FFunc("start_other", 0xb00, FSSAFunc([
+                _call(0, 0xb10, 0x900, [_const(13), _const(17)]),
+            ]))
+            b.caller_sites.append(FSite(other, 0xb10))
         sites.append(FSite(b, 0x910))
     else:
         a.mlil = FFunc("_", 0, FSSAFunc(
@@ -479,7 +486,7 @@ def _remap_pair(mutual, external_caller=True):
         ]), params=[ext])
         sites.append(FSite(start, 0xa10))
     a.caller_sites = sites
-    return _backward(a, names, "arg:malloc:0")
+    return _backward(a, names, "arg:malloc:0", max_depth=max_depth)
 
 
 @pytest.mark.parametrize("mutual", [True, False], ids=["mutual", "direct"])
@@ -510,6 +517,59 @@ def test_pure_recursive_cycle_keeps_its_own_formal_as_the_origin(mutual):
     assert {"kind": "parameter", "index": 0, "var": "first#0"} in origins, origins
     assert {"kind": "call", "callee": "getpid"} in origins, origins
     assert not any(o.get("var") in ("x#0", "y#0", "second#0") for o in origins), origins
+
+
+@pytest.mark.parametrize("max_depth", [4, 8, 16])
+@pytest.mark.parametrize("extra_entry", [False, True], ids=["single-entry", "extra-entry"])
+def test_mutual_remap_keeps_getpid_however_many_entries_reach_the_cycle(extra_entry, max_depth):
+    # remap_branch: a second way into the cycle (`start_other -> remap_b(13,
+    # 17)`) answers remap_b's formals with literals, but the getpid() remap_b
+    # adds is still a root of the sink's value. It stays an origin with one
+    # entry or two, at every caller depth that reaches remap_b's body; the
+    # literals and `external` are roots too, and no internal formal is.
+    result = _remap_pair(True, extra_entry=extra_entry, max_depth=max_depth)
+
+    origins = _origins(result)
+    assert {"kind": "call", "callee": "getpid"} in origins, origins
+    assert {"kind": "constant", "value": 7} in origins, origins
+    if extra_entry:
+        assert {"kind": "constant", "value": 13} in origins, origins
+        assert {"kind": "constant", "value": 17} in origins, origins
+    assert [o for o in origins if o["kind"] == "parameter"] == [
+        {"kind": "parameter", "index": 0, "var": "external#0"}], origins
+    assert _gate(result) is True, result["diagnostics"]
+
+
+@pytest.mark.parametrize("extra_entry", [False, True], ids=["single-entry", "extra-entry"])
+def test_mutual_remap_cut_short_of_getpid_is_not_complete(extra_entry):
+    # Control: a caller depth that stops before remap_b's body is reached
+    # cannot see getpid -- and then says so, it does not certify the rest.
+    result = _remap_pair(True, extra_entry=extra_entry, max_depth=1)
+
+    assert {"kind": "call", "callee": "getpid"} not in _origins(result)
+    assert _gate(result) is False, result["diagnostics"]
+    assert any(lf.get("reasons", {}).get("max_depth") for lf in _caller_leaves(result))
+
+
+def test_formal_beside_a_call_return_keeps_both_roots():
+    # Control without any recursion: `malloc(n + getpid())` whose caller
+    # passes a literal -- the literal answers `n`, getpid is its own root.
+    n = FVar("n", ident=130)
+    n0, g1, t1 = FSSA(n, 0), FSSA(FVar("g", ident=131), 1), FSSA(FVar("t", ident=132), 1)
+    f = FFunc("add_pid", 0x800, FSSAFunc([
+        _call(0, 0x804, _GETPID, [], writes=[g1]),
+        FInstr(1, 0x808, "MLIL_SET_VAR_SSA", "t#1 = n#0 + g#1", reads=[n0, g1], writes=[t1],
+               src=FExpr("MLIL_ADD", "n#0 + g#1", reads=[n0, g1])),
+        _call(2, 0x80c, _MALLOC, [_var(t1)]),
+    ]), params=[n])
+    main = FFunc("main", 0xa00, FSSAFunc([_call(0, 0xa10, 0x800, [_const(9)])]))
+    f.caller_sites = [FSite(main, 0xa10)]
+    result = _backward(f, {**_NAMES, 0x800: "add_pid"}, "arg:malloc:0")
+
+    origins = _origins(result)
+    assert {"kind": "constant", "value": 9} in origins, origins
+    assert {"kind": "call", "callee": "getpid"} in origins, origins
+    assert _gate(result) is True, result["diagnostics"]
 
 
 # --------------------------------------------------------------------------
@@ -918,6 +978,29 @@ NO void pure_b(size_t first, size_t second, unsigned r) {
 }
 """
 
+# The reviewer's remap_branch fixture, verbatim: -DEXTRA_ENTRY adds a second
+# way into the cycle.
+_REMAP_BRANCH_C = r"""
+/* Public synthetic review fixture; analyze only. */
+#include <stddef.h>
+#include <stdlib.h>
+#include <unistd.h>
+volatile size_t observed;
+#define NO __attribute__((noinline))
+NO void remap_b(size_t, size_t, unsigned);
+NO void remap_a(size_t first, size_t second, unsigned r) {
+    observed = (size_t)malloc(first);
+    if (r) remap_b(first, second, r - 1);
+}
+NO void remap_b(size_t first, size_t second, unsigned r) {
+    if (r) remap_a(second, first + (size_t)getpid(), r - 1);
+}
+NO void start_remap(size_t external) { remap_a(7, external, 5); }
+#ifdef EXTRA_ENTRY
+NO void start_other(void) { remap_b(13, 17, 5); }
+#endif
+"""
+
 
 def _compile(tmp_path: Path, name: str, source: str, flags: list[str]) -> Path:
     cc = shutil.which("cc") or shutil.which("gcc")
@@ -1078,3 +1161,26 @@ def test_real_bn_mutual_recursion_keeps_the_back_edge_producer(tmp_path, shared_
                          "--sink", "arg:malloc:0", timeout=180.0)
     assert text.returncode == 0, text.stderr
     assert "getpid" in text.stdout, text.stdout
+
+
+@pytest.mark.real_bn
+def test_real_bn_extra_entry_into_the_cycle_keeps_getpid(tmp_path, shared_bn):
+    # The same source with one or two ways into the remap cycle, at several
+    # caller depths: getpid stays an origin either way, beside 7 / 13 / 17
+    # and `external`, and no internal formal stands in for it.
+    flags = ["-fno-optimize-sibling-calls", "-shared", "-fPIC", "-Wl,-Bsymbolic"]
+    for variant, extra in (("remap_single.so", []), ("remap_extra.so", ["-DEXTRA_ENTRY"])):
+        target = shared_bn.load(_compile(tmp_path, variant, _REMAP_BRANCH_C, flags + extra),
+                                copy=False)
+        for depth in ("4", "8", "16"):
+            result = _bn_backward(shared_bn, target, "remap_a", "arg:malloc:0",
+                                  "--max-depth", depth)
+            origins = [sl["origin"] for sl in result["slices"]]
+            assert {"kind": "call", "callee": "getpid"} in origins, (variant, depth, origins)
+            assert {"kind": "constant", "value": 7} in origins, (variant, depth, origins)
+            if extra:
+                assert {"kind": "constant", "value": 13} in origins, (variant, depth, origins)
+                assert {"kind": "constant", "value": 17} in origins, (variant, depth, origins)
+            params = [o for o in origins if o["kind"] == "parameter"]
+            assert len(params) == 1, (variant, depth, origins)  # start_remap's `external`
+            assert result["diagnostics"]["safe_to_report_complete_slice"] is True
