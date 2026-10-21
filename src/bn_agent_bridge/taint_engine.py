@@ -9445,13 +9445,10 @@ class TaintEngine:
         certified itself complete (IC01). Every such (site, formal) is now a
         row of ONE ``caller_sites_truncated`` frontier, with its reason. A
         caller's literal is not a skip: it is the origin, reached. Process-entry
-        references are not exempt: a crt1/runtime handoff, whether static,
-        imported, GOT-indirect or through a PLT stub, does not establish the
-        origins the unanalysed caller supplies. ``runtime_start_boundary``
-        is advice only for the main callback passed as operand 0 of a resolved
-        imported C-runtime startup call. Other roles, local calls, stores and
-        unknown uses retain ``indirect_reference`` and dispatch advice.
-        Neither classification exempts a reference or proves its origins.
+        and startup references are ordinary ``indirect_reference`` boundaries
+        too: names, imports, operand roles and optional entry metadata prove
+        neither caller-supplied origins nor completeness. No entry/runtime
+        classifier is consulted, and every known unresolved reference is kept.
         Returns ``(slices, cycled)``: at least one slice per formal -- a
         formal no caller resolved keeps its own parameter slice -- except the
         ``cycled`` formals, every resolved caller of which was a back edge to
@@ -9468,9 +9465,6 @@ class TaintEngine:
         except Exception:
             pass
         get_code_refs = getattr(self.bv, "get_code_refs", None)
-        entry = getattr(self.bv, "entry_function", None)
-        entry_start = None if entry is None else int(entry.start)
-        entry_runtime: bool | None = None
         direct = {int(getattr(s, "address", 0)) for s in caller_sites}
         try:
             for ref in (get_code_refs(start) if callable(get_code_refs) else []):
@@ -9612,15 +9606,8 @@ class TaintEngine:
                 _drop(int(getattr(site, "address", 0)), getattr(site, "function", None), pidx,
                       "max_depth" if not ascend else "caller_cap", listed=not ascend)
         for a, rf in sorted(indirect.items()):
-            reason = "indirect_reference"
-            if entry_start is not None and rf is not None \
-                    and int(getattr(rf, "start", -1)) == entry_start:
-                if entry_runtime is None:
-                    entry_runtime = self._entry_handoff_is_runtime_main(entry, start)
-                if entry_runtime:
-                    reason = "runtime_start_boundary"
             for pidx in demands:
-                _drop(a, rf, pidx, reason)
+                _drop(a, rf, pidx, "indirect_reference")
         if reasons:
             self._bw_note_unfollowed_callers(
                 func, direct=len(caller_sites), considered=len(considered),
@@ -9632,67 +9619,6 @@ class TaintEngine:
     def _caller_key(func: Any) -> tuple[int, str]:
         """A function's identity in the ascent's demand keys."""
         return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
-
-    def _entry_handoff_is_runtime_main(self, entry: Any, target: int) -> bool:
-        """Advice only: the target is the operand-0 main callback of resolved
-        imported C-runtime startup calls, with no other visible address uses.
-        The advertised runtime ABI selects guidance, never a completeness
-        exemption or proof of the implementation or values it supplies."""
-        try:
-            instrs = self._instrs(self._ssa_func(entry))
-        except TaintError:
-            return False
-
-        def is_target(expr: Any) -> bool:
-            value = const_target(expr)
-            return value == target or bool(
-                value is not None and value & 1 and value & ~1 == target
-                and getattr(function_at(self.bv, value), "start", None) == target)
-
-        def uses(expr: Any, depth: int = 0) -> int | None:
-            if depth > 32:
-                return None
-            if isinstance(expr, (list, tuple)):
-                children = expr
-                own = 0
-            elif hasattr(expr, "operation"):
-                own = int(is_target(expr))
-                children = getattr(expr, "operands", None) or [
-                    getattr(expr, k, None) for k in ("dest", "src", "params", "left", "right")]
-            else:
-                return 0
-            for child in children:
-                count = uses(child, depth + 1)
-                if count is None:
-                    return None
-                own += count
-            return own
-
-        handed = False
-        for ins in instrs:
-            count = uses(ins)
-            if count is None:
-                return False
-            if not count:
-                continue
-            params = self._call_params(ins) if self._is_call(ins) else []
-            if count != 1 or not params or not is_target(params[0]):
-                return False
-            dest = getattr(ins, "dest", None)
-            if op_name(dest) == "MLIL_IMPORT":
-                slot = getattr(dest, "constant", None)
-            else:
-                callee = function_at(self.bv, const_target(dest))
-                sym = getattr(callee, "symbol", None)
-                if getattr(getattr(sym, "type", None), "name", "") != "ImportedFunctionSymbol":
-                    return False
-                slot = int(callee.start)
-            name = str(self._callee_name(slot) or "").split("@", 1)[0]
-            if name not in ("__libc_start_main", "__uClibc_main"):
-                return False
-            handed = True
-        return handed
-
 
     def _bw_note_unfollowed_callers(self, func: Any, *, direct: int, considered: int,
                                     followed: int, indirect: int,

@@ -661,22 +661,13 @@ def backward_diagnostics(
                 advice.append(
                     prefix + "the caller ascent stopped at the configured depth; re-run "
                     "with a larger --max-depth to follow the remaining callers")
-            if "runtime_start_boundary" in why:
-                advice.append(
-                    prefix + "the imported C-runtime main-callback handoff remains unresolved -- "
-                    "treat its parameters as external input origins for downstream analysis, "
-                    "and establish the runtime's input contract separately; the imported "
-                    "routine's identity does not prove which values it supplies")
             if "indirect_reference" in why:
                 advice.append(
                     prefix + "the function's address is taken (stored in data or handed on as a "
                     "value), so it has indirect callers the ascent cannot follow; "
                     f"`bn xrefs {selector}` lists the references -- slice "
-                    "backward from the dispatching caller"
-                    + (" for this function's non-runtime references only"
-                       if "runtime_start_boundary" in why else ""))
-            sites = sorted(why - {"caller_cap", "max_depth", "indirect_reference",
-                                  "runtime_start_boundary"})
+                    "backward from the dispatching caller")
+            sites = sorted(why - {"caller_cap", "max_depth", "indirect_reference"})
             if sites:
                 advice.append(
                     prefix + f"some caller sites could not be followed ({', '.join(sites)}; the "
