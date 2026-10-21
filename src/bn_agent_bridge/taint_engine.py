@@ -8041,6 +8041,11 @@ class TaintEngine:
         # edge contributes no formal origin (the enclosing frame answers it),
         # so these producers are all it can contribute -- kept, not dropped.
         producers: list[dict[str, Any]] = []
+        # The (function, formal) demands each back edge closed on, for the
+        # whole ascent from one sink seed: `_continue_into_callers` reads
+        # which demand a cycle answered (its own, or one further up).
+        if depth == 0:
+            self._bw_cycle_hits: list[tuple] = []
 
         def _set_origin(o, *, weak: int | bool = 0):
             nonlocal origin, origin_rank
@@ -9040,6 +9045,8 @@ class TaintEngine:
         # solved further up this ascent -- the same (function, formal) -- is
         # answered there, by the frame enumerating that formal's callers: the
         # formal is a cycle's back edge, not an origin, and stops the ascent.
+        # So is a formal whose every resolved caller turned out to be such a
+        # back edge further up (mutual recursion: `a(x) -> b(x) -> a(y + ..)`).
         # What the back edge ADDS on its way round -- `f(n + getpid())` -- is
         # not answered upstream, so every producer it reached keeps a slice
         # (below). A recursive call that remaps the demand to ANOTHER formal
@@ -9048,12 +9055,14 @@ class TaintEngine:
         demands = {p: param_origins.get(p) or {"kind": "parameter", "index": p,
                                                 "var": var_label(v)}
                    for p, v in terminal_params.items() if (fkey, p) not in visited_funcs}
-        back_edge = len(demands) < len(terminal_params)
         out: list[dict[str, Any]] = []
+        cycled: set[int] = set()
         if demands:
-            out = self._continue_into_callers(
+            out, cycled = self._continue_into_callers(
                 func, demands, depth, max_depth,
                 visited_funcs | {(fkey, p) for p in demands}, base_steps, param_demands)
+        back_edge = bool(cycled) or len(demands) < len(terminal_params)
+        self._bw_cycle_hits.extend((fkey, p) for p in terminal_params if p not in demands)
         # A cut stands only if no path walked that value or load.
         cuts = list(dict.fromkeys(
             label for (kind, k), label in budget_cuts.items()
@@ -9404,7 +9413,7 @@ class TaintEngine:
     def _continue_into_callers(self, func, demands, depth, max_depth,
                                visited_funcs, base_steps,
                                param_demands: dict[int, int | None] | None = None
-                               ) -> list[dict[str, Any]]:
+                               ) -> tuple[list[dict[str, Any]], set[int]]:
         """Ascend each formal demand of *func* (``{index: origin row}``) into
         every known caller, and account for each caller it did not follow.
 
@@ -9428,8 +9437,11 @@ class TaintEngine:
         exempt (``_runtime_start_handoff``), never a name: a custom entry's
         `dispatch(handler)` -- `dispatch(main)` included -- is an indirect
         callee like any other.
-        Returns one slice per formal at least; a formal no caller resolved
-        keeps its own parameter slice."""
+        Returns ``(slices, cycled)``: at least one slice per formal -- a
+        formal no caller resolved keeps its own parameter slice -- except the
+        ``cycled`` formals, every resolved caller of which was a back edge to
+        a demand already being solved upstream: they have no origin of their
+        own, and the caller keeps the producers its walk reached instead."""
         caller_sites = list(getattr(func, "caller_sites", None) or [])
         start = int(getattr(func, "start", 0))
         # address -> referencing function (None: a data reference)
@@ -9477,8 +9489,20 @@ class TaintEngine:
                              "caller": None if caller is None else self._prose_function(caller),
                              "param": pidx, "reason": reason})
 
+        cycled: set[int] = set()
+        fkey = (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
         for pidx, porigin in demands.items():
             followed = False
+            # Each site either supplies the value from outside any cycle, or
+            # loops back to a demand this ascent is already solving: this
+            # demand itself (`f(n - 1)`, or `a -> b -> a` remapping back to
+            # it) or one further up (mutual recursion that re-enters an
+            # ancestor demand, whose own callers answer it). A demand whose
+            # cycle closes on itself and that no other site supplies is the
+            # cycle's root: its formal stays an origin beside whatever the
+            # cycle adds. One whose every site loops to an ancestor has no
+            # origin of its own -- never the internal formal.
+            via_cycle = self_closed = supplied = False
             for idx, site in enumerate(considered):
                 caller = getattr(site, "function", None)
                 addr = int(getattr(site, "address", 0))
@@ -9520,7 +9544,7 @@ class TaintEngine:
                         results.append({"steps": [boundary] + base_steps,
                                         "origin": {"kind": "constant", "value": value},
                                         "crossed": [str(func.name)]})
-                        followed = True
+                        followed = supplied = True
                         continue
                     self._bw_assume(
                         f"arg {pidx} at {hex(addr)} in {self._prose_function(caller)} is not a trackable "
@@ -9530,6 +9554,8 @@ class TaintEngine:
                           if "CONST" in op_name(arg) or op_name(arg) in ("MLIL_IMPORT", "MLIL_EXTERN_PTR")
                           else "argument_not_trackable")
                     continue
+                site_slices = 0
+                mark = len(self._bw_cycle_hits)
                 for sv in seeds:
                     # A parameter the callee read through is read in the
                     # caller's object at the same delta from the argument.
@@ -9544,8 +9570,20 @@ class TaintEngine:
                             "crossed": [str(func.name)] + sub["crossed"],
                         })
                         followed = True
-            if not followed:
+                        site_slices += 1
+                closes_here = (fkey, pidx) in self._bw_cycle_hits[mark:]
+                self_closed |= closes_here
+                if site_slices and not closes_here:
+                    supplied = True
+                elif not site_slices:
+                    via_cycle = True
+            if self_closed and not supplied:
                 results.append({"steps": base_steps, "origin": porigin, "crossed": []})
+            elif not followed:
+                if via_cycle:
+                    cycled.add(pidx)
+                else:
+                    results.append({"steps": base_steps, "origin": porigin, "crossed": []})
 
         for idx, site in enumerate(caller_sites[len(considered):], start=len(considered)):
             dropped_sites.add(idx)
@@ -9561,7 +9599,7 @@ class TaintEngine:
                 func, direct=len(caller_sites), considered=len(considered),
                 followed=len(caller_sites) - len(dropped_sites), indirect=len(indirect),
                 rows=rows, reasons=reasons)
-        return results
+        return results, cycled
 
     # C-runtime start routines whose FIRST operand is the program's main
     # callback, which they call with what the loader supplied.

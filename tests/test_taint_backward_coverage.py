@@ -437,6 +437,81 @@ def test_recursive_back_edge_keeps_the_producer_it_introduces(callee, origin):
 
 
 
+def _remap_pair(mutual, external_caller=True):
+    """The reviewer's remap_cycle shape: ``remap_a(first, second) {
+    malloc(first); remap_b(first, second); }``, ``remap_b(x, y) {
+    remap_a(y, x + getpid()); }`` and ``start_remap(external) { remap_a(7,
+    external); }`` -- or, ``mutual=False``, the same remap as a direct
+    self-call ``direct_remap(second, first + getpid())``."""
+    first, second = FVar("first", ident=120), FVar("second", ident=121)
+    f0, s0 = FSSA(first, 0), FSSA(second, 0)
+    a = FFunc("remap_a" if mutual else "direct_remap", 0x800, FSSAFunc([]), params=[first, second])
+    names = {**_NAMES, 0x800: a.name}
+    g1, t1 = FSSA(FVar("g", ident=122), 1), FSSA(FVar("t", ident=123), 1)
+
+    def _remap_body(index0, x0, y0, back_to):
+        return [_call(index0, 0x904 if mutual else 0x808, _GETPID, [], writes=[g1]),
+                FInstr(index0 + 1, 0x908 if mutual else 0x80c, "MLIL_SET_VAR_SSA",
+                       "t#1 = x + g#1", reads=[x0, g1], writes=[t1],
+                       src=FExpr("MLIL_ADD", "x + g#1", reads=[x0, g1])),
+                _call(index0 + 2, 0x910 if mutual else 0x810, back_to, [_var(y0), _var(t1)])]
+
+    sites = []
+    if mutual:
+        x, y = FVar("x", ident=124), FVar("y", ident=125)
+        b = FFunc("remap_b", 0x900, FSSAFunc(_remap_body(0, FSSA(x, 0), FSSA(y, 0), 0x800)),
+                  params=[x, y])
+        names[0x900] = "remap_b"
+        a.mlil = FFunc("_", 0, FSSAFunc([
+            _call(0, 0x804, _MALLOC, [_var(f0)]),
+            _call(1, 0x810, 0x900, [_var(f0), _var(s0)]),
+        ])).mlil
+        b.caller_sites = [FSite(a, 0x810)]
+        sites.append(FSite(b, 0x910))
+    else:
+        a.mlil = FFunc("_", 0, FSSAFunc(
+            [_call(0, 0x804, _MALLOC, [_var(f0)])] + _remap_body(1, f0, s0, 0x800))).mlil
+        sites.append(FSite(a, 0x810))
+    if external_caller:
+        ext = FVar("external", ident=126)
+        start = FFunc("start_remap", 0xa00, FSSAFunc([
+            _call(0, 0xa10, 0x800, [_const(7), _var(FSSA(ext, 0))]),
+        ]), params=[ext])
+        sites.append(FSite(start, 0xa10))
+    a.caller_sites = sites
+    return _backward(a, names, "arg:malloc:0")
+
+
+@pytest.mark.parametrize("mutual", [True, False], ids=["mutual", "direct"])
+def test_recursive_remap_keeps_the_back_edge_producer_not_an_internal_formal(mutual):
+    # first <- (b) second <- (a) second <- (b) x + getpid() <- (a) first: the
+    # walk closes the cycle on `first`, already being solved by the outer
+    # frame. The literal 7, `external` and the getpid() the cycle adds are
+    # the roots; no internal formal stands in for the getpid producer, in
+    # mutual recursion exactly as in the direct self-call.
+    result = _remap_pair(mutual)
+
+    origins = _origins(result)
+    assert {"kind": "constant", "value": 7} in origins, origins
+    assert {"kind": "call", "callee": "getpid"} in origins, origins
+    params = [o for o in origins if o["kind"] == "parameter"]
+    assert params == [{"kind": "parameter", "index": 0, "var": "external#0"}], origins
+    assert _gate(result) is True, result["diagnostics"]
+
+
+@pytest.mark.parametrize("mutual", [True, False], ids=["mutual", "direct"])
+def test_pure_recursive_cycle_keeps_its_own_formal_as_the_origin(mutual):
+    # Control: no caller outside the cycle. What closes on the sink's own
+    # demand is answered by nothing else, so its formal stays the origin
+    # (beside the producer the cycle adds) -- never an empty slice list.
+    result = _remap_pair(mutual, external_caller=False)
+
+    origins = _origins(result)
+    assert {"kind": "parameter", "index": 0, "var": "first#0"} in origins, origins
+    assert {"kind": "call", "callee": "getpid"} in origins, origins
+    assert not any(o.get("var") in ("x#0", "y#0", "second#0") for o in origins), origins
+
+
 # --------------------------------------------------------------------------
 # BN6-C005: the engine's def-chain step budget cuts one operand
 # --------------------------------------------------------------------------
@@ -811,6 +886,38 @@ __attribute__((noinline)) void remap_copy(size_t first, size_t second, unsigned 
 __attribute__((noinline)) void start_remap(size_t external) { remap_copy(7, external, 1); }
 """
 
+# The reviewer's remap_cycle fixture, verbatim, plus the same remaps with no
+# caller outside the cycle (`pure_*`).
+_REMAP_CYCLE_C = r"""
+#include <stddef.h>
+#include <stdlib.h>
+#include <unistd.h>
+volatile size_t observed;
+#define NO __attribute__((noinline))
+NO void remap_b(size_t, size_t, unsigned);
+NO void remap_a(size_t first, size_t second, unsigned r) {
+    observed = (size_t)malloc(first);
+    if (r) remap_b(first, second, r - 1);
+}
+NO void remap_b(size_t first, size_t second, unsigned r) {
+    if (r) remap_a(second, first + (size_t)getpid(), r - 1);
+}
+NO void start_remap(size_t external) { remap_a(7, external, 5); }
+NO void direct_remap(size_t first, size_t second, unsigned r) {
+    observed = (size_t)malloc(first);
+    if (r) direct_remap(second, first + (size_t)getpid(), r - 1);
+}
+NO void start_direct(size_t external) { direct_remap(7, external, 5); }
+NO void pure_b(size_t, size_t, unsigned);
+NO void pure_a(size_t first, size_t second, unsigned r) {
+    observed = (size_t)malloc(first);
+    if (r) pure_b(first, second, r - 1);
+}
+NO void pure_b(size_t first, size_t second, unsigned r) {
+    if (r) pure_a(second, first + (size_t)getpid(), r - 1);
+}
+"""
+
 
 def _compile(tmp_path: Path, name: str, source: str, flags: list[str]) -> Path:
     cc = shutil.which("cc") or shutil.which("gcc")
@@ -934,3 +1041,40 @@ def test_real_bn_recursive_back_edge_keeps_its_producers(tmp_path, shared_bn):
     assert any(k == "parameter" and crossed == ["remap_copy", "remap_copy"]
                for k, _, crossed in origins), origins
     assert sum(1 for k, _, _ in origins if k == "parameter") == 1, origins
+
+
+@pytest.mark.real_bn
+def test_real_bn_mutual_recursion_keeps_the_back_edge_producer(tmp_path, shared_bn):
+    # remap_a -> remap_b -> remap_a(second, first + getpid()): the literal 7,
+    # `external` and getpid() are the roots, in mutual recursion exactly as
+    # in the equivalent direct self-call -- no internal formal stands in for
+    # getpid. With no caller outside the cycle, the sink's own formal is the
+    # cycle's root beside getpid.
+    binary = _compile(tmp_path, "remap_cycle.so", _REMAP_CYCLE_C,
+                      ["-fno-optimize-sibling-calls", "-shared", "-fPIC", "-Wl,-Bsymbolic"])
+    target = shared_bn.load(binary, copy=False)
+    getpid = {"kind": "call", "callee": "getpid"}
+
+    for fn in ("remap_a", "direct_remap"):
+        result = _bn_backward(shared_bn, target, fn, "arg:malloc:0")
+        origins = [sl["origin"] for sl in result["slices"]]
+        assert {"kind": "constant", "value": 7} in origins, (fn, origins)
+        assert getpid in origins, (fn, origins)
+        params = [o for o in origins if o["kind"] == "parameter"]
+        assert len(params) == 1 and params[0]["index"] == 0, (fn, origins)
+        crossed = {tuple(sl["crossed_functions"]) for sl in result["slices"]
+                   if sl["origin"]["kind"] == "parameter"}
+        assert all(c and c[-1] == fn for c in crossed), (fn, crossed)  # start_*'s formal
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+
+    pure = _bn_backward(shared_bn, target, "pure_a", "arg:malloc:0")
+    origins = [(sl["origin"].get("kind"), sl["origin"].get("callee"), sl["crossed_functions"])
+               for sl in pure["slices"]]
+    assert any(k == "call" and callee == "getpid" for k, callee, _ in origins), origins
+    # the sink's own formal, not a pure_b one: the cycle's root
+    assert [c for k, _, c in origins if k == "parameter"] == [[]], origins
+
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "remap_a",
+                         "--sink", "arg:malloc:0", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "getpid" in text.stdout, text.stdout
