@@ -638,13 +638,22 @@ def backward_diagnostics(
         # Each reason the ascent left callers unfollowed has its own remedy
         # (IC01). A leaf with no `reasons` tally is a cap leaf (#810).
         why: dict[str, str] = {}
+        indirect_functions: dict[str, str] = {}
+        runtime_functions: set[str] = set()
         for lf in leaves or []:
             if lf.get("kind") != "caller_sites_truncated":
                 continue
             fn = lf.get("function") if isinstance(lf.get("function"), dict) else {}
-            for r in (lf.get("reasons") if isinstance(lf.get("reasons"), dict)
-                      and lf.get("reasons") else {"caller_cap": 1}):
-                why.setdefault(str(r), shlex.quote(str(fn.get("name") or fn.get("address") or "<function>")))
+            reasons = (lf.get("reasons") if isinstance(lf.get("reasons"), dict)
+                       and lf.get("reasons") else {"caller_cap": 1})
+            selector = shlex.quote(str(fn.get("name") or fn.get("address") or "<function>"))
+            function_key = str(fn.get("address") or fn.get("name") or "<function>")
+            if "runtime_start_boundary" in reasons:
+                runtime_functions.add(function_key)
+            if "indirect_reference" in reasons:
+                indirect_functions.setdefault(function_key, selector)
+            for r in reasons:
+                why.setdefault(str(r), selector)
         advice = []
         if "caller_cap" in why:
             advice.append(
@@ -656,17 +665,19 @@ def backward_diagnostics(
                           "with a larger --max-depth to follow the remaining callers")
         if "runtime_start_boundary" in why:
             advice.append(
-                "the process-entry/runtime handoff remains unresolved; treat the "
-                "affected parameters, including main's argc/argv, as external input "
-                "origins for downstream analysis; establish runtime/loader provenance "
-                "separately rather than treating the entry's code as their producer")
-        if "indirect_reference" in why:
+                "an external handoff from the process entry remains unresolved; "
+                "treat the affected callback parameters as external input origins "
+                "for downstream analysis; establish the external/runtime callee's "
+                "input contract separately -- import metadata does not prove which "
+                "values it supplies")
+        for function_key, selector in indirect_functions.items():
             advice.append(
                 "the function's address is taken (stored in data or handed on as a "
                 "value), so it has indirect callers the ascent cannot follow; "
-                f"`bn xrefs {why['indirect_reference']}` lists the references -- slice "
+                f"`bn xrefs {selector}` lists the references -- slice "
                 "backward from the dispatching caller"
-                + (" for non-entry references only" if "runtime_start_boundary" in why else ""))
+                + (" for this function's non-runtime references only"
+                   if function_key in runtime_functions else ""))
         sites = sorted(set(why) - {"caller_cap", "max_depth", "indirect_reference",
                                   "runtime_start_boundary"})
         if sites:
