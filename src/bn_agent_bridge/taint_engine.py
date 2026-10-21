@@ -9447,9 +9447,10 @@ class TaintEngine:
         caller's literal is not a skip: it is the origin, reached. Process-entry
         references are not exempt: a crt1/runtime handoff, whether static,
         imported, GOT-indirect or through a PLT stub, does not establish the
-        origins the unanalysed caller supplies. Those references retain the
-        same explicit indirect-caller boundary as any other address-taking
-        reference, regardless of function names or import metadata.
+        origins the unanalysed caller supplies. References from the view's
+        process-entry function carry ``runtime_start_boundary``; other
+        address-taking references remain ``indirect_reference``. Both block
+        completeness regardless of function names or import metadata.
         Returns ``(slices, cycled)``: at least one slice per formal -- a
         formal no caller resolved keeps its own parameter slice -- except the
         ``cycled`` formals, every resolved caller of which was a back edge to
@@ -9466,6 +9467,8 @@ class TaintEngine:
         except Exception:
             pass
         get_code_refs = getattr(self.bv, "get_code_refs", None)
+        entry = getattr(self.bv, "entry_function", None)
+        entry_start = None if entry is None else int(entry.start)
         direct = {int(getattr(s, "address", 0)) for s in caller_sites}
         try:
             for ref in (get_code_refs(start) if callable(get_code_refs) else []):
@@ -9607,8 +9610,12 @@ class TaintEngine:
                 _drop(int(getattr(site, "address", 0)), getattr(site, "function", None), pidx,
                       "max_depth" if not ascend else "caller_cap", listed=not ascend)
         for a, rf in sorted(indirect.items()):
+            reason = ("runtime_start_boundary"
+                      if entry_start is not None and rf is not None
+                      and int(getattr(rf, "start", -1)) == entry_start
+                      else "indirect_reference")
             for pidx in demands:
-                _drop(a, rf, pidx, "indirect_reference")
+                _drop(a, rf, pidx, reason)
         if reasons:
             self._bw_note_unfollowed_callers(
                 func, direct=len(caller_sites), considered=len(considered),

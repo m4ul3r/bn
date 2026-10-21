@@ -227,8 +227,8 @@ def test_callback_the_entry_function_hands_on_is_an_indirect_caller():
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
     assert [(r["address"], r["caller"], r["reason"]) for r in leaf["unfollowed"]] == [
-        ("0x40d", "entry_point", "indirect_reference"),
-        ("0x414", "entry_point", "indirect_reference")]
+        ("0x40d", "entry_point", "runtime_start_boundary"),
+        ("0x414", "entry_point", "runtime_start_boundary")]
 
 
 _LIBC_START_SLOT, _DISPATCH = 0x990, 0x980
@@ -271,6 +271,7 @@ def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
     (leaf,) = _caller_leaves(result)
     assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [
         ("0x41e", "_start"), ("0xb0c", "register_hooks")]
+    assert leaf["reasons"] == {"runtime_start_boundary": 1, "indirect_reference": 1}
 
 
 @pytest.mark.parametrize("calls", [
@@ -303,10 +304,10 @@ def test_in_binary_runtime_name_does_not_prove_a_startup_boundary(runtime, opera
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert leaf["reasons"] == {"runtime_start_boundary": 1}
     assert (leaf["callers_total"], leaf["callers_followed"]) == (1, 0)
     assert leaf["unfollowed"] == [{"address": "0x40d", "caller": "entry_point",
-                                  "param": 2, "reason": "indirect_reference"}]
+                                  "param": 2, "reason": "runtime_start_boundary"}]
 
 
 def test_static_runtime_handoff_is_an_unproven_indirect_boundary():
@@ -318,9 +319,9 @@ def test_static_runtime_handoff_is_an_unproven_indirect_boundary():
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert leaf["reasons"] == {"runtime_start_boundary": 1}
     assert leaf["unfollowed"] == [{"address": "0x41e", "caller": "_start",
-                                  "param": 0, "reason": "indirect_reference"}]
+                                  "param": 0, "reason": "runtime_start_boundary"}]
 
 
 @pytest.mark.parametrize("runtime", ["__libc_start_main", "__uClibc_main"])
@@ -344,9 +345,9 @@ def test_direct_runtime_handoff_metadata_does_not_prove_caller_origins(runtime, 
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert leaf["reasons"] == {"runtime_start_boundary": 1}
     assert leaf["unfollowed"] == [{"address": "0x41e", "caller": "_start",
-                                  "param": 0, "reason": "indirect_reference"}]
+                                  "param": 0, "reason": "runtime_start_boundary"}]
 
 
 def test_imported_process_entry_handoff_is_an_unresolved_caller_boundary():
@@ -357,8 +358,46 @@ def test_imported_process_entry_handoff_is_an_unresolved_caller_boundary():
                         code_refs={0x800: [(0x41e, start)]}, entry=start)
     assert _gate(handoff) is False, handoff["diagnostics"]
     (leaf,) = _caller_leaves(handoff)
-    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert leaf["reasons"] == {"runtime_start_boundary": 1}
     assert _origins(handoff) == [{"kind": "parameter", "index": 0, "var": "argc#0"}]
+
+
+@pytest.mark.parametrize("dest_op,callback", [
+    ("MLIL_IMPORT", 0x800),       # GOT/IAT handoff
+    ("MLIL_CONST_PTR", 0x800),    # i386/AArch64/MIPS-style direct PLT or static call
+    ("MLIL_EXTERN_PTR", 0x800),   # external pointer IL
+    ("MLIL_CONST_PTR", 0x801),    # ARM/Thumb-tagged callback address
+], ids=["got", "plt-or-static", "extern", "thumb-tagged"])
+def test_runtime_boundary_instruction_forms_need_no_cross_toolchain(dest_op, callback):
+    entry = _entry("opaque_entry", [(_LIBC_START_SLOT, False)])
+    call = entry.mlil.ssa_form.instructions[0]
+    call.dest = FExpr(dest_op, "runtime", constant=_LIBC_START_SLOT)
+    call.params[0] = FExpr("MLIL_CONST_PTR", "callback", constant=callback)
+    # BN may give another wrapper for the same entry; compare function
+    # identity by address, not its Python wrapper or a startup symbol name.
+    ref_fn = FFunc("entry_alias", entry.start, FSSAFunc([]))
+    result = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0x41e, ref_fn)]}, entry=entry)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"runtime_start_boundary": 1}
+    assert leaf["unfollowed"] == [{"address": "0x41e", "caller": "entry_alias",
+                                  "param": 0, "reason": "runtime_start_boundary"}]
+    advice = result["diagnostics"]["next_action"]
+    assert "external input" in advice and "runtime" in advice
+    assert "dispatching caller" not in advice and "bn callsites" not in advice
+
+
+def test_function_named_start_is_not_the_process_entry_by_name_alone():
+    entry = FFunc("actual_entry", 0x400, FSSAFunc([]))
+    ordinary = FFunc("_start", 0xa00, FSSAFunc([]))
+    result = _backward(_main_fn(41), {**_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0xa10, ordinary)]}, entry=entry)
+
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert "dispatching caller" in result["diagnostics"]["next_action"]
 
 
 def test_direct_call_code_references_are_still_followed():
@@ -374,6 +413,18 @@ def test_direct_call_code_references_are_still_followed():
     assert _gate(direct) is True, direct["diagnostics"]
     assert _caller_leaves(direct) == []
     assert {"kind": "parameter", "index": 0, "var": "argc#0"} in _origins(direct)
+
+
+def test_actual_direct_call_from_entry_is_still_ascended():
+    put = _length_sink("put", 0x800, 20)
+    entry = _caller("entry_point", 0x400, 0x410, put.start, _const(37))
+    put.caller_sites = [FSite(entry, 0x410)]
+    result = _backward(put, {**_NAMES, put.start: "put"},
+                       code_refs={put.start: [(0x410, entry)]}, entry=entry)
+
+    assert _gate(result) is True, result["diagnostics"]
+    assert _caller_leaves(result) == []
+    assert _origins(result) == [{"kind": "constant", "value": 37}]
 
 
 # --------------------------------------------------------------------------
@@ -965,6 +1016,27 @@ def test_next_action_names_each_unfollowed_reason_and_keeps_the_cap_advice():
     assert diag["safe_to_report_complete_slice"] is False
 
 
+@pytest.mark.parametrize("indirect", [False, True], ids=["runtime-only", "runtime-and-indirect"])
+def test_runtime_boundary_advice_separates_external_input_from_indirect_dispatch(indirect):
+    from bn_agent_bridge.taint_result import backward_diagnostics
+
+    reasons = {"runtime_start_boundary": 1}
+    if indirect:
+        reasons["indirect_reference"] = 1
+    leaf = {"kind": "caller_sites_truncated", "function": {"name": "main"}, "reasons": reasons}
+    diag = backward_diagnostics([leaf], [], sinks_seeded=1, slices=1)
+
+    assert diag["safe_to_report_complete_slice"] is False
+    assert "external input" in diag["next_action"]
+    assert "runtime" in diag["next_action"]
+    assert "bn callsites" not in diag["next_action"]
+    if indirect:
+        assert "bn xrefs main" in diag["next_action"]
+        assert "non-entry" in diag["next_action"]
+    else:
+        assert "dispatching caller" not in diag["next_action"]
+
+
 # --------------------------------------------------------------------------
 # real Binary Ninja: the same shapes on compiled public synthetic programs
 # --------------------------------------------------------------------------
@@ -1219,11 +1291,10 @@ int main(void) { start_b(); start_direct(); return 0; }
 """
 
 
-def _compile(tmp_path: Path, name: str, source: str, flags: list[str], *,
-             compiler: str = "cc") -> Path:
-    cc = shutil.which(compiler) or (shutil.which("gcc") if compiler == "cc" else None)
+def _compile(tmp_path: Path, name: str, source: str, flags: list[str]) -> Path:
+    cc = shutil.which("cc") or shutil.which("gcc")
     if cc is None:
-        raise FixtureBuildError(f"{compiler} unavailable; the real-BN coverage lane cannot build its programs")
+        raise FixtureBuildError("no C compiler; the real-BN coverage lane cannot build its programs")
     src = tmp_path / f"{name}.c"
     src.write_text(source)
     out = tmp_path / name
@@ -1250,7 +1321,7 @@ def test_real_bn_custom_entry_callback_is_an_indirect_caller(tmp_path, shared_bn
 
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert leaf["reasons"] == {"runtime_start_boundary": len(leaf["unfollowed"])}
     assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
 
 
@@ -1265,7 +1336,7 @@ def test_real_bn_custom_entry_dispatching_main_is_an_indirect_caller(tmp_path, s
 
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert leaf["reasons"] == {"runtime_start_boundary": len(leaf["unfollowed"])}
     assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
 
 
@@ -1281,7 +1352,7 @@ def test_real_bn_in_binary_runtime_impostor_is_an_indirect_caller(tmp_path, shar
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert leaf["reasons"] == {"runtime_start_boundary": len(leaf["unfollowed"])}
     assert leaf["callers_total"] == leaf["callers_dropped"] == len(leaf["unfollowed"])
     assert leaf["callers_followed"] == 0
     assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
@@ -1295,33 +1366,29 @@ def test_real_bn_static_startup_is_an_unproven_indirect_boundary(tmp_path, share
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert leaf["reasons"] == {"runtime_start_boundary": len(leaf["unfollowed"])}
     assert leaf["callers_followed"] == 0
     assert {r["caller"] for r in leaf["unfollowed"]} == {"_start"}
 
 
 @pytest.mark.real_bn
-@pytest.mark.parametrize("compiler,flags", [
-    ("cc", ["-no-pie"]), ("cc", ["-fPIE", "-pie"]),
-    ("cc", ["-m32", "-no-pie"]), ("cc", ["-m32", "-fPIE", "-pie"]),
-    ("aarch64-linux-gnu-gcc", ["-no-pie"]), ("aarch64-linux-gnu-gcc", ["-fPIE", "-pie"]),
-    ("arm-linux-gnueabihf-gcc", ["-no-pie"]), ("arm-linux-gnueabihf-gcc", ["-fPIE", "-pie"]),
-], ids=["x64", "x64-pie", "i386-plt", "i386-pie", "a64-plt", "a64-pie", "thumb", "thumb-pie"])
-def test_real_bn_runtime_entry_references_are_unresolved(tmp_path, shared_bn, compiler, flags):
-    binary = _compile(tmp_path, "startup", _STARTUP_C, flags, compiler=compiler)
+@pytest.mark.parametrize("flags", [["-no-pie"], ["-fPIE", "-pie"]], ids=["host", "host-pie"])
+def test_real_bn_runtime_entry_references_are_unresolved(tmp_path, shared_bn, flags):
+    binary = _compile(tmp_path, "startup", _STARTUP_C, flags)
     target = shared_bn.load(binary, copy=False)
     result = _bn_backward(shared_bn, target, "main", "param:0")
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert set(leaf["reasons"]) == {"indirect_reference"}
+    assert set(leaf["reasons"]) == {"runtime_start_boundary"}
     assert leaf["callers_followed"] == 0
     assert [(o["kind"], o.get("index")) for o in _origins(result)] == [("parameter", 0)]
     text = shared_bn.run("-t", target, "taint", "backward", "-f", "main", "--sink", "param:0",
                          "--verbose", timeout=180.0)
     assert text.returncode == 0, text.stderr
     assert "safe_to_report_complete_slice: false" in text.stdout
-    assert "caller_sites_truncated" in text.stdout and "indirect_reference" in text.stdout
+    assert "caller_sites_truncated" in text.stdout and "runtime_start_boundary" in text.stdout
+    assert "external input" in text.stdout and "dispatching caller" not in text.stdout
 
 
 @pytest.mark.real_bn
@@ -1336,14 +1403,15 @@ def test_real_bn_external_runtime_impostor_is_an_unresolved_caller(tmp_path, sha
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert set(leaf["reasons"]) == {"indirect_reference"}
+    assert set(leaf["reasons"]) == {"runtime_start_boundary"}
     assert leaf["callers_followed"] == 0
     assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
     text = shared_bn.run("-t", target, "taint", "backward", "-f", "copy_handler",
                          "--sink", "arg:memcpy:2", "--verbose", timeout=180.0)
     assert text.returncode == 0, text.stderr
     assert "safe_to_report_complete_slice: false" in text.stdout
-    assert "indirect_reference" in text.stdout
+    assert "runtime_start_boundary" in text.stdout
+    assert "external input" in text.stdout and "dispatching caller" not in text.stdout
 
 
 @pytest.mark.real_bn
@@ -1359,7 +1427,7 @@ def test_real_bn_direct_ascent_reaches_runtime_boundary_beside_a_callback(tmp_pa
     assert _gate(direct) is False, direct["diagnostics"]
     (leaf,) = _caller_leaves(direct)
     assert {r["caller"] for r in leaf["unfollowed"]} == {"_start"}
-    assert set(leaf["reasons"]) == {"indirect_reference"}
+    assert set(leaf["reasons"]) == {"runtime_start_boundary"}
     assert [(sl["origin"]["kind"], sl["origin"].get("index"), sl["crossed_functions"])
             for sl in direct["slices"]] == [("parameter", 0, ["put_len"])]
 

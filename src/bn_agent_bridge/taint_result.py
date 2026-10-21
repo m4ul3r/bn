@@ -654,13 +654,21 @@ def backward_diagnostics(
         if "max_depth" in why:
             advice.append("the caller ascent stopped at the configured depth; re-run "
                           "with a larger --max-depth to follow the remaining callers")
+        if "runtime_start_boundary" in why:
+            advice.append(
+                "the process-entry/runtime handoff remains unresolved; treat the "
+                "affected parameters, including main's argc/argv, as external input "
+                "origins for downstream analysis; establish runtime/loader provenance "
+                "separately rather than treating the entry's code as their producer")
         if "indirect_reference" in why:
             advice.append(
                 "the function's address is taken (stored in data or handed on as a "
                 "value), so it has indirect callers the ascent cannot follow; "
                 f"`bn xrefs {why['indirect_reference']}` lists the references -- slice "
-                "backward from the dispatching caller")
-        sites = sorted(set(why) - {"caller_cap", "max_depth", "indirect_reference"})
+                "backward from the dispatching caller"
+                + (" for non-entry references only" if "runtime_start_boundary" in why else ""))
+        sites = sorted(set(why) - {"caller_cap", "max_depth", "indirect_reference",
+                                  "runtime_start_boundary"})
         if sites:
             advice.append(
                 f"some caller sites could not be followed ({', '.join(sites)}; the "
