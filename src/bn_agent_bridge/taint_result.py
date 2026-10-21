@@ -656,9 +656,10 @@ def backward_diagnostics(
                           "with a larger --max-depth to follow the remaining callers")
         if "indirect_reference" in why:
             advice.append(
-                "the function's address is stored in data, so it has indirect callers "
-                f"the ascent cannot follow; `bn xrefs {why['indirect_reference']}` lists "
-                "the references -- slice backward from the dispatching caller")
+                "the function's address is taken (stored in data or handed on as a "
+                "value), so it has indirect callers the ascent cannot follow; "
+                f"`bn xrefs {why['indirect_reference']}` lists the references -- slice "
+                "backward from the dispatching caller")
         sites = sorted(set(why) - {"caller_cap", "max_depth", "indirect_reference"})
         if sites:
             advice.append(

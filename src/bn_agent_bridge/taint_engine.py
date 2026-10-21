@@ -8027,9 +8027,15 @@ class TaintEngine:
         # caller's object where the callee did (round 1).
         param_demands: dict[int, int | None] = {}
         # Def-chain values / loads the engine's step budget (`self.max_depth`)
-        # left unwalked. Each is an origin this slice did not reach, so it is a
-        # structured `unresolved` slice, not just the assumption prose (IC01).
-        budget_cuts: list[str] = []
+        # cut on some path, keyed as `visited_vars` / `visited_loads` key them.
+        # One some other path walked is no cut; each that stays one is an
+        # origin this slice did not reach -- a structured `unresolved` slice,
+        # not just the assumption prose (IC01).
+        budget_cuts: dict[tuple, str] = {}
+        # The shallowest depth each value was walked from, and the values
+        # walked again from a shallower path after a cut (see `walk`).
+        walked_at: dict[tuple, int] = {}
+        rewalked: set = set()
 
         def _set_origin(o, *, weak: int | bool = 0):
             nonlocal origin, origin_rank
@@ -8634,11 +8640,25 @@ class TaintEngine:
             index). It rides along unchanged, like *mv*, so the region is
             always the consumer's, never the definition's (round 1)."""
             nonlocal origin
+            ckey = (var_key(v), getattr(v, "version", None),
+                    None if anchor is None else (str(anchor[0]), anchor[1]))
             if d > self.max_depth:
-                self._bw_assume(
-                    f"def-chain walk truncated at {self.max_depth} steps (engine max_depth)")
-                budget_cuts.append(var_label(v))
+                # Over budget on THIS path only: a value another path walks
+                # is no cut -- its chain is followed there. Settled when the
+                # slice is built.
+                if ckey not in visited_vars:
+                    budget_cuts[("var", ckey)] = var_label(v)
                 return
+            # A value first walked deeper, with the budget cutting something,
+            # is walked again from this shallower path: what was cut beneath
+            # it may be within reach now. Only then, and only while shallower,
+            # so each value is walked at most `max_depth` times.
+            seen = walked_at.get(ckey)
+            if seen is None or (d < seen and budget_cuts):
+                if seen is not None:
+                    visited_vars.discard(ckey)
+                    rewalked.add(ckey)
+                walked_at[ckey] = d
             key = (var_key(v), getattr(v, "version", None),
                    None if anchor is None else (str(anchor[0]), anchor[1]))
             if key in visited_vars:
@@ -8843,9 +8863,10 @@ class TaintEngine:
                 return
             visited_loads.add(key)
             if d > self.max_depth:
-                self._bw_assume(
-                    f"def-chain walk truncated at {self.max_depth} steps (engine max_depth)")
-                budget_cuts.append(str(load))
+                # Not walked: unmark it so a shallower path still can, and
+                # settle the cut when the slice is built.
+                visited_loads.discard(key)
+                budget_cuts[("load", key)] = str(load)
                 return
             addr = getattr(load, "src", None)
             lmv = getattr(load, "src_memory", None)
@@ -8987,6 +9008,14 @@ class TaintEngine:
             walk(seed_var, 0, seed_mv, anchor)
         base_steps = list(reversed(steps))
 
+        if rewalked:
+            # A value walked again records its definitions again; keep the
+            # first record of each step.
+            seen_steps: list[dict[str, Any]] = []
+            for st in steps:
+                if st not in seen_steps:
+                    seen_steps.append(st)
+            base_steps = list(reversed(seen_steps))
         # Every formal the slice bottomed out at is a demand on the callers,
         # whatever origin represents the slice (IC01). A demand already being
         # solved further up this ascent -- the same (function, formal) -- is
@@ -9003,17 +9032,27 @@ class TaintEngine:
             out = self._continue_into_callers(
                 func, demands, depth, max_depth,
                 visited_funcs | {(fkey, p) for p in demands}, base_steps, param_demands)
+        # A cut stands only if no path walked that value or load.
+        cuts = list(dict.fromkeys(
+            label for (kind, k), label in budget_cuts.items()
+            if k not in (visited_vars if kind == "var" else visited_loads)))
+        if cuts:
+            self._bw_assume(
+                f"def-chain walk truncated at {self.max_depth} steps (engine max_depth)")
         # A non-formal representative keeps its own slice beside the formals'
         # ascent and leads, as it did before the formals ascended -- a source
         # next to a formal is never traded for the formal's callers, in either
         # operand order.
-        if origin["kind"] != "parameter" and not (budget_cuts and origin["kind"] == "unresolved"):
+        if origin["kind"] != "parameter" and not (cuts and origin["kind"] == "unresolved"):
             out.insert(0, {"steps": base_steps, "origin": origin, "crossed": []})
-        if budget_cuts:
+        if cuts:
             # Replaces a bare `unresolved` origin: the cut is why it is one.
+            # `var` names the cut values IN this function: the public slice
+            # dedup keys on it, so two callers' distinct cuts stay two rows.
             out.append({"steps": base_steps, "crossed": [], "origin": {
                 "kind": "unresolved", "cause": "def_chain_budget",
-                "budget": int(self.max_depth), "unwalked": list(dict.fromkeys(budget_cuts))}})
+                "budget": int(self.max_depth), "function": fn_ref, "unwalked": cuts,
+                "var": f"{', '.join(cuts)} in {fn_ref}"}})
         return out
 
     @staticmethod
@@ -9347,22 +9386,42 @@ class TaintEngine:
         ``MAX_CALLERS`` cap, beyond the configured ``max_depth``, with no call
         instruction at the recorded address, an unlifted caller, an arity BN
         recovered short, an argument with no def chain to walk -- and a
-        reference that stores the function's address (a dispatch table: its
-        callers are indirect, and none is a direct call site) each leave the
-        slice short of the origin that caller supplies. They were skipped with
-        at most a caveat, so a slice that dropped them certified itself
-        complete (IC01). Every such (site, formal) is now a row of ONE
-        ``caller_sites_truncated`` frontier, with its reason. A caller's
-        literal is not a skip: it is the origin, reached.
+        reference that takes the function's address without calling it (a
+        dispatch table entry; `dispatch(copy_handler, n)` handing it on as a
+        callback: its callers are indirect, and none is a direct call site)
+        each leave the slice short of the origin that caller supplies. They
+        were skipped with at most a caveat, so a slice that dropped them
+        certified itself complete (IC01). Every such (site, formal) is now a
+        row of ONE ``caller_sites_truncated`` frontier, with its reason. A
+        caller's literal is not a skip: it is the origin, reached. The one
+        address-taking reference that is no in-binary caller is the process
+        entry's: `_start` hands `main` to the C runtime, which calls it with
+        what the loader supplied, so `main`'s formals stay its origins.
         Returns one slice per formal at least; a formal no caller resolved
         keeps its own parameter slice."""
         caller_sites = list(getattr(func, "caller_sites", None) or [])
+        start = int(getattr(func, "start", 0))
+        # address -> referencing function (None: a data reference)
+        indirect: dict[int, Any] = {}
         get_data_refs = getattr(self.bv, "get_data_refs", None)
         try:
-            indirect = (sorted({int(a) for a in get_data_refs(int(getattr(func, "start", 0)))})
-                        if callable(get_data_refs) else [])
+            indirect.update((int(a), None) for a in (
+                get_data_refs(start) if callable(get_data_refs) else []))
         except Exception:
-            indirect = []
+            pass
+        get_code_refs = getattr(self.bv, "get_code_refs", None)
+        entry = getattr(self.bv, "entry_function", None)
+        entry_start = None if entry is None else int(getattr(entry, "start", -1))
+        direct = {int(getattr(s, "address", 0)) for s in caller_sites}
+        try:
+            for ref in (get_code_refs(start) if callable(get_code_refs) else []):
+                a, rf = int(getattr(ref, "address", 0)), getattr(ref, "function", None)
+                if a in direct or (rf is not None and entry_start is not None
+                                   and int(getattr(rf, "start", -2)) == entry_start):
+                    continue
+                indirect.setdefault(a, rf)
+        except Exception:
+            pass
         ascend = depth < max_depth
         # The cap offers only the first MAX_CALLERS sites, and an offered site
         # may still be unfollowable; the disclosure reports the measurement,
@@ -9456,9 +9515,9 @@ class TaintEngine:
                 # Past the cap the sites are counted, not listed (#810).
                 _drop(int(getattr(site, "address", 0)), getattr(site, "function", None), pidx,
                       "max_depth" if not ascend else "caller_cap", listed=not ascend)
-        for a in indirect:
+        for a, rf in sorted(indirect.items()):
             for pidx in demands:
-                _drop(a, None, pidx, "indirect_reference")
+                _drop(a, rf, pidx, "indirect_reference")
         if reasons:
             self._bw_note_unfollowed_callers(
                 func, direct=len(caller_sites), considered=len(considered),

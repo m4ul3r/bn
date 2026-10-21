@@ -17,15 +17,22 @@ _NAMES = {_MEMCPY: "memcpy", _MALLOC: "malloc", _RECV: "recv", _GETPID: "getpid"
 
 
 class _BV(FBV):
-    """FBV with BN's reverse data-reference query: *data_refs* maps a
-    function start to the data addresses that store it (a dispatch table)."""
+    """FBV with BN's reverse reference queries: *data_refs* maps a function
+    start to the data addresses that store it (a dispatch table), *code_refs*
+    to ``(address, referencing function)`` code references (a call site, or
+    `mov edi, handler` handing it on); *entry* is the view's entry function."""
 
-    def __init__(self, names, data_refs=None):
+    def __init__(self, names, data_refs=None, code_refs=None, entry=None):
         super().__init__(names)
         self._data_refs = data_refs or {}
+        self._code_refs = code_refs or {}
+        self.entry_function = entry
 
     def get_data_refs(self, addr):
         return list(self._data_refs.get(int(addr), []))
+
+    def get_code_refs(self, addr):
+        return [FSite(fn, a) for a, fn in self._code_refs.get(int(addr), [])]
 
 
 def _var(e):
@@ -62,8 +69,9 @@ def _caller(name, start, call_addr, callee_start, arg, params=()):
     ]), params=list(params))
 
 
-def _backward(func, names, sink="arg:memcpy:2", *, max_depth=8, engine_depth=None, data_refs=None):
-    bv = _BV(names, data_refs)
+def _backward(func, names, sink="arg:memcpy:2", *, max_depth=8, engine_depth=None, data_refs=None,
+              code_refs=None, entry=None):
+    bv = _BV(names, data_refs, code_refs, entry)
     kw = {} if engine_depth is None else {"max_depth": engine_depth}
     return te.TaintEngine(bv, te.load_models(), **kw).backward(
         func, [te.parse_locator(sink)], max_depth=max_depth)
@@ -179,6 +187,49 @@ def test_function_with_no_known_caller_stays_a_complete_parameter_slice():
     assert _gate(result) is True, result["diagnostics"]
     assert _caller_leaves(result) == []
     assert _origins(result) == [{"kind": "parameter", "index": 2, "var": "n#0"}]
+
+
+def _copy_handler():
+    """``copy_handler(.., n) { memcpy(.., n); }`` with no direct call site."""
+    return _length_sink("copy_handler", 0x800, 20)
+
+
+def test_callback_handed_on_in_code_is_an_indirect_caller_not_a_complete_slice():
+    # `dispatch(copy_handler, n)`: main takes the handler's address in code
+    # (`mov edi, copy_handler`) and dispatch calls it through the pointer. No
+    # data reference and no direct call site, so the formal was certified as
+    # the origin; the caller that supplies `n` was never followed.
+    main = FFunc("main", 0xa00, FSSAFunc([]))
+    start = FFunc("_start", 0x400, FSSAFunc([]))
+    result = _backward(_copy_handler(), {**_NAMES, 0x800: "copy_handler"},
+                       code_refs={0x800: [(0xa1e, main)]}, entry=start)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["unfollowed"] == [{"address": "0xa1e", "caller": "main",
+                                   "param": 2, "reason": "indirect_reference"}]
+    assert "handed on as a value" in result["diagnostics"]["next_action"]
+
+
+def test_process_entry_handoff_and_direct_call_refs_are_not_indirect_callers():
+    # Controls: `_start` handing `main` to the C runtime is no in-binary
+    # caller (its formals are what the loader supplied), and the code
+    # reference a direct call site makes is that site, already followed.
+    start = FFunc("_start", 0x400, FSSAFunc([]))
+    handoff = _backward(_copy_handler(), {**_NAMES, 0x800: "copy_handler"},
+                        code_refs={0x800: [(0x41e, start)]}, entry=start)
+    assert _gate(handoff) is True, handoff["diagnostics"]
+    assert _caller_leaves(handoff) == []
+
+    put = _length_sink("put", 0x800, 20)
+    x = FVar("argc", ident=40)
+    main = _caller("main", 0xa00, 0xa10, 0x800, _var(FSSA(x, 0)), params=[x])
+    put.caller_sites = [FSite(main, 0xa10)]
+    direct = _backward(put, {**_NAMES, 0x800: "put"},
+                       code_refs={0x800: [(0xa10, main)]}, entry=start)
+    assert _gate(direct) is True, direct["diagnostics"]
+    assert _caller_leaves(direct) == []
+    assert {"kind": "parameter", "index": 0, "var": "argc#0"} in _origins(direct)
 
 
 # --------------------------------------------------------------------------
@@ -375,6 +426,98 @@ def test_larger_load_traversal_budget_walks_to_the_stored_literal_and_drops_the_
     texts = [st.get("il_text", "") for sl in result["slices"] for st in sl["slice"]]
     assert any("0x18] = 0x5" in t for t in texts), texts
     assert _gate(result) is True, result["diagnostics"]
+
+
+# --------------------------------------------------------------------------
+# review round 1: a cut must be a value NO path walked, and each caller's
+# cut stays its own row
+# --------------------------------------------------------------------------
+
+def _shared_dag(formal_first, links=8):
+    """``resolved_dag(root) { c = root; a0 = c + 0; ...; malloc(c + a_last); }``
+    -- the chain reaches the shared copy ``c`` one step past an engine budget
+    of ``links + 1``, the other operand reaches it at the second step."""
+    root = FVar("root", ident=80)
+    r0, c1 = FSSA(root, 0), FSSA(FVar("c", ident=81), 1)
+    instrs = [FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "c#1 = root#0", reads=[r0], writes=[c1],
+                     src=_var(r0))]
+    prev = c1
+    for i in range(links):
+        v = FSSA(FVar(f"a{i}", ident=90 + i), 1)
+        instrs.append(FInstr(i + 1, 0x14 + 4 * i, "MLIL_SET_VAR_SSA", f"a{i}#1 = ...",
+                             reads=[prev], writes=[v],
+                             src=FExpr("MLIL_ADD", f"{prev.var.name} + {i}", reads=[prev])))
+        prev = v
+    size = FSSA(FVar("size", ident=99), 1)
+    reads = [c1, prev] if formal_first else [prev, c1]
+    k = len(instrs)
+    instrs.append(FInstr(k, 0x80, "MLIL_SET_VAR_SSA", "size#1 = c#1 + a", reads=reads,
+                         writes=[size], src=FExpr("MLIL_ADD", "c#1 + a", reads=reads)))
+    instrs.append(_call(k + 1, 0x84, _MALLOC, [_var(size)]))
+    return FFunc("resolved_dag", 0x400, FSSAFunc(instrs), params=[root])
+
+
+@pytest.mark.parametrize("formal_first", [True, False])
+@pytest.mark.parametrize("links", [8, 9])
+def test_value_cut_on_one_path_but_walked_on_another_is_no_budget_cut(formal_first, links):
+    # The chain reaches past the budget either at the shared copy `c` itself
+    # (9 links) or at `root` behind it (8 links); the other operand walks `c`
+    # and `root` within it, whichever operand the walk takes first -- also
+    # when the chain walked `c` first, deeper, and cut `root` beneath it.
+    # Every dependency was followed: complete, with no cut origin or prose.
+    result = _backward(_shared_dag(formal_first, links), _NAMES, "arg:malloc:0",
+                       engine_depth=9)
+
+    assert _origins(result) == [{"kind": "parameter", "index": 0, "var": "root#0"}]
+    assert not any("def-chain walk truncated" in a for a in result["assumptions"]), result
+    assert _gate(result) is True, result["diagnostics"]
+
+
+@pytest.mark.parametrize("formal_first", [True, False])
+def test_value_cut_on_every_path_stays_a_budget_cut(formal_first):
+    # Control: with a smaller budget the chain is cut at a link only the
+    # chain reaches -- that cut stands, beside the resolved formal.
+    result = _backward(_shared_dag(formal_first), _NAMES, "arg:malloc:0", engine_depth=5)
+
+    cuts = [o for o in _origins(result) if o.get("cause") == "def_chain_budget"]
+    assert [c["unwalked"] for c in cuts] == [["a2#1"]], _origins(result)
+    assert {"kind": "parameter", "index": 0, "var": "root#0"} in _origins(result)
+    assert _gate(result) is False, result["diagnostics"]
+
+
+def _chain_caller(name, start, call_addr, ident, links):
+    """``name(x) { v0 = x + 0; ...; accept_size(v_last); }`` -- the chain's
+    variables are named alike in every caller."""
+    x = FVar("x", ident=ident)
+    prev, instrs = FSSA(x, 0), []
+    for i in range(links):
+        v = FSSA(FVar(f"v{i}", ident=ident + 1 + i), 1)
+        instrs.append(FInstr(i, start + 4 + 4 * i, "MLIL_SET_VAR_SSA", f"v{i}#1 = ...",
+                             reads=[prev], writes=[v],
+                             src=FExpr("MLIL_ADD", f"{prev.var.name} + {i}", reads=[prev])))
+        prev = v
+    instrs.append(_call(links, call_addr, 0x800, [_var(prev)]))
+    return FFunc(name, start, FSSAFunc(instrs), params=[x])
+
+
+def test_each_callers_budget_cut_is_its_own_slice():
+    # accept_size(n) { malloc(n); } with two callers whose chains are cut by
+    # the same engine budget at the same variable NAME: two frontiers in two
+    # functions, never one row "reached via 2 call sites".
+    accept = FFunc("accept_size", 0x800, FSSAFunc([
+        _call(0, 0x804, _MALLOC, [_var(FSSA(FVar("n", ident=70), 0))]),
+    ]), params=[FVar("n", ident=70)])
+    first = _chain_caller("first_chain", 0x3000, 0x3080, 200, 8)
+    second = _chain_caller("second_chain", 0x3100, 0x3180, 300, 8)
+    accept.caller_sites = [FSite(first, 0x3080), FSite(second, 0x3180)]
+    result = _backward(accept, {**_NAMES, 0x800: "accept_size"}, "arg:malloc:0",
+                       engine_depth=4)
+
+    cuts = [sl for sl in result["slices"] if sl["origin"].get("cause") == "def_chain_budget"]
+    assert sorted(sl["origin"]["function"] for sl in cuts) == ["0x3000", "0x3100"], cuts
+    assert all(sl["origin"]["unwalked"] == ["v2#1"] for sl in cuts), cuts
+    assert all("reached_via_call_sites" not in sl for sl in cuts), cuts
+    assert _gate(result) is False, result["diagnostics"]
 
 
 # --------------------------------------------------------------------------
