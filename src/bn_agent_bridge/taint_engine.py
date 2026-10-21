@@ -8032,9 +8032,10 @@ class TaintEngine:
         # origin this slice did not reach -- a structured `unresolved` slice,
         # not just the assumption prose (IC01).
         budget_cuts: dict[tuple, str] = {}
-        # The shallowest depth each value was walked from, and the values
-        # walked again from a shallower path after a cut (see `walk`).
+        # The shallowest depth each value / load was walked from, and the
+        # values walked again from a shallower path after a cut (see `walk`).
         walked_at: dict[tuple, int] = {}
+        load_at: dict[tuple, int] = {}
         rewalked: set = set()
 
         def _set_origin(o, *, weak: int | bool = 0):
@@ -8651,13 +8652,18 @@ class TaintEngine:
                 return
             # A value first walked deeper, with the budget cutting something,
             # is walked again from this shallower path: what was cut beneath
-            # it may be within reach now. Only then, and only while shallower,
-            # so each value is walked at most `max_depth` times.
+            # it may be within reach now -- and so may what was cut beneath a
+            # load first entered deeper, so those loads are re-enterable too
+            # (`_follow_load` re-walks one only from a shallower depth). Only
+            # then, and only while shallower, so each value and load is walked
+            # at most `max_depth` times.
             seen = walked_at.get(ckey)
             if seen is None or (d < seen and budget_cuts):
                 if seen is not None:
                     visited_vars.discard(ckey)
                     rewalked.add(ckey)
+                    for lk in [lk for lk, ld in load_at.items() if ld > d]:
+                        visited_loads.discard(lk)
                 walked_at[ckey] = d
             key = (var_key(v), getattr(v, "version", None),
                    None if anchor is None else (str(anchor[0]), anchor[1]))
@@ -8868,6 +8874,11 @@ class TaintEngine:
                 visited_loads.discard(key)
                 budget_cuts[("load", key)] = str(load)
                 return
+            # Re-entered after a shallower re-walk unmarked it (see `walk`):
+            # walk it again only from a shallower depth than before.
+            if load_at.get(key, d + 1) <= d:
+                return
+            load_at[key] = d
             addr = getattr(load, "src", None)
             lmv = getattr(load, "src_memory", None)
             # The address's reads (pointer and index); a load whose address
@@ -9035,7 +9046,7 @@ class TaintEngine:
         # A cut stands only if no path walked that value or load.
         cuts = list(dict.fromkeys(
             label for (kind, k), label in budget_cuts.items()
-            if k not in (visited_vars if kind == "var" else visited_loads)))
+            if k not in (walked_at if kind == "var" else load_at)))
         if cuts:
             self._bw_assume(
                 f"def-chain walk truncated at {self.max_depth} steps (engine max_depth)")
@@ -9395,8 +9406,11 @@ class TaintEngine:
         row of ONE ``caller_sites_truncated`` frontier, with its reason. A
         caller's literal is not a skip: it is the origin, reached. The one
         address-taking reference that is no in-binary caller is the process
-        entry's: `_start` hands `main` to the C runtime, which calls it with
-        what the loader supplied, so `main`'s formals stay its origins.
+        entry's handoff of `main`: `_start` hands `main` to the C runtime,
+        which calls it with what the loader supplied, so `main`'s formals stay
+        its origins. Only that pair is exempt -- any other function the entry
+        function takes the address of (a custom entry's `dispatch(handler)`)
+        is an indirect callee like any other.
         Returns one slice per formal at least; a formal no caller resolved
         keeps its own parameter slice."""
         caller_sites = list(getattr(func, "caller_sites", None) or [])
@@ -9410,8 +9424,10 @@ class TaintEngine:
         except Exception:
             pass
         get_code_refs = getattr(self.bv, "get_code_refs", None)
+        # Exempt only `main`'s address taken by the view's entry function.
         entry = getattr(self.bv, "entry_function", None)
-        entry_start = None if entry is None else int(getattr(entry, "start", -1))
+        entry_start = (None if entry is None or str(getattr(func, "name", "")) != "main"
+                       else int(getattr(entry, "start", -1)))
         direct = {int(getattr(s, "address", 0)) for s in caller_sites}
         try:
             for ref in (get_code_refs(start) if callable(get_code_refs) else []):

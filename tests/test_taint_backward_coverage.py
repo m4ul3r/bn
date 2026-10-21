@@ -8,7 +8,12 @@ representative. A chain that WAS walked to its origins (a caller's literal, a
 formal with no known caller) stays a complete slice."""
 from __future__ import annotations
 
+import shutil
+import subprocess
+from pathlib import Path
+
 import pytest
+from conftest import FixtureBuildError
 from test_taint_backward_loads import _FieldProgram
 from test_taint_engine import FBV, FSSA, FExpr, FFunc, FInstr, FSite, FSSAFunc, FVar, te
 
@@ -211,15 +216,54 @@ def test_callback_handed_on_in_code_is_an_indirect_caller_not_a_complete_slice()
     assert "handed on as a value" in result["diagnostics"]["next_action"]
 
 
-def test_process_entry_handoff_and_direct_call_refs_are_not_indirect_callers():
+def test_callback_the_entry_function_hands_on_is_an_indirect_caller():
+    # A custom entry (`-nostartfiles -e entry_point`) calling
+    # `dispatch(copy_handler, 17)`: the entry function's reference is not the
+    # runtime's handoff of `main`, so the handler's caller is unfollowed.
+    entry = FFunc("entry_point", 0x400, FSSAFunc([]))
+    result = _backward(_copy_handler(), {**_NAMES, 0x800: "copy_handler"},
+                       code_refs={0x800: [(0x40d, entry), (0x414, entry)]}, entry=entry)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert [(r["address"], r["caller"], r["reason"]) for r in leaf["unfollowed"]] == [
+        ("0x40d", "entry_point", "indirect_reference"),
+        ("0x414", "entry_point", "indirect_reference")]
+
+
+def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
+    # Only the ENTRY function's reference to `main` is the runtime handoff;
+    # another function taking `main`'s address is a callback like any other.
+    start = FFunc("_start", 0x400, FSSAFunc([]))
+    hooks = FFunc("register_hooks", 0xb00, FSSAFunc([]))
+    argc = FVar("argc", ident=42)
+    main_fn = FFunc("main", 0x800, FSSAFunc([
+        _call(0, 0x804, _MEMCPY, [FExpr("MLIL_VAR_SSA", "d"), FExpr("MLIL_VAR_SSA", "s"),
+                                  _var(FSSA(argc, 0))]),
+    ]), params=[argc])
+    result = _backward(main_fn, {**_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0x41e, start), (0xb0c, hooks)]}, entry=start)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [("0xb0c", "register_hooks")]
+
+
+def test_process_entry_handoff_of_main_and_direct_call_refs_are_not_indirect_callers():
     # Controls: `_start` handing `main` to the C runtime is no in-binary
     # caller (its formals are what the loader supplied), and the code
     # reference a direct call site makes is that site, already followed.
     start = FFunc("_start", 0x400, FSSAFunc([]))
-    handoff = _backward(_copy_handler(), {**_NAMES, 0x800: "copy_handler"},
+    argc = FVar("argc", ident=41)
+    main_fn = FFunc("main", 0x800, FSSAFunc([
+        _call(0, 0x804, _MEMCPY, [FExpr("MLIL_VAR_SSA", "d"), FExpr("MLIL_VAR_SSA", "s"),
+                                  _var(FSSA(argc, 0))]),
+    ]), params=[argc])
+    handoff = _backward(main_fn, {**_NAMES, 0x800: "main"},
                         code_refs={0x800: [(0x41e, start)]}, entry=start)
     assert _gate(handoff) is True, handoff["diagnostics"]
     assert _caller_leaves(handoff) == []
+    assert _origins(handoff) == [{"kind": "parameter", "index": 0, "var": "argc#0"}]
 
     put = _length_sink("put", 0x800, 20)
     x = FVar("argc", ident=40)
@@ -520,6 +564,60 @@ def test_each_callers_budget_cut_is_its_own_slice():
     assert _gate(result) is False, result["diagnostics"]
 
 
+def _shared_load(formal_first, budget, links=6):
+    """``f(m, n, src) { m->len = src + 1; c = m->len; a0 = c + 0; ...;
+    memcpy(.., a_last + c); }`` -- the chain enters the load of ``m->len``
+    one step within an engine budget of ``links + 1`` and reaches ``src``
+    beneath it past the budget; the other operand enters the same load at
+    the first step."""
+    p = _FieldProgram()
+    p.store(p.addr(p.m0, 8), 8,
+            value=FExpr("MLIL_ADD", "src#0 + 1", reads=[p.src0],
+                        left=FExpr("MLIL_VAR_SSA", "src#0", reads=[p.src0]), right=_const(1)))
+    c1 = FSSA(FVar("c", ident=40), 1)
+    loaded = p.load(p.addr(p.m0, 8), 8)
+    i, a = p._at()
+    p.instrs.append(FInstr(i, a, "MLIL_SET_VAR_SSA", "c#1 = [m + 8].q", reads=[p.m0],
+                           writes=[c1], src=loaded))
+    prev = c1
+    for k in range(links):
+        v = FSSA(FVar(f"a{k}", ident=41 + k), 1)
+        i, a = p._at()
+        p.instrs.append(FInstr(i, a, "MLIL_SET_VAR_SSA", f"a{k}#1 = ...", reads=[prev],
+                               writes=[v], src=FExpr("MLIL_ADD", f"{prev.var.name} + {k}",
+                                                     reads=[prev])))
+        prev = v
+    reads = [c1, prev] if formal_first else [prev, c1]
+    p.sink(FExpr("MLIL_ADD", "c#1 + a", reads=reads))
+    func = FFunc("f", 0x10, FSSAFunc(p.instrs, mem_defs=p.mem_defs), params=[p.m, p.n, p.src])
+    return te.TaintEngine(FBV({0xa20: "memcpy", 0xa10: "read_u32"}), te.load_models(),
+                          max_depth=budget).backward(func, [te.parse_locator("arg:memcpy:2")])
+
+
+@pytest.mark.parametrize("formal_first", [True, False])
+@pytest.mark.parametrize("budget", [7, 8, 64])
+def test_shared_load_entered_deep_then_shallow_keeps_its_root(formal_first, budget):
+    # The chain enters the load first (when it is the first operand) and the
+    # budget cuts `src` beneath it; the shallow operand reaches the same load
+    # within budget. The root must survive -- not a lone cut -- in either
+    # operand order and at every budget that reaches the load at all.
+    result = _shared_load(formal_first, budget)
+
+    assert {"kind": "parameter", "index": 2, "var": "src#0"} in _origins(result), _origins(result)
+    assert not any(o.get("cause") == "def_chain_budget" for o in _origins(result)), _origins(result)
+    assert _gate(result) is True, result["diagnostics"]
+
+
+@pytest.mark.parametrize("formal_first", [True, False])
+def test_shared_load_cut_on_every_path_stays_a_budget_cut(formal_first):
+    # Control: a budget the shallow path cannot reach `src` within either
+    # leaves the cut standing, and no root is invented.
+    result = _shared_load(formal_first, 1)
+
+    assert any(o.get("cause") == "def_chain_budget" for o in _origins(result)), _origins(result)
+    assert _gate(result) is False, result["diagnostics"]
+
+
 # --------------------------------------------------------------------------
 # the diagnostics vocabulary: per-reason remediation, one leaf kind
 # --------------------------------------------------------------------------
@@ -536,3 +634,134 @@ def test_next_action_names_each_unfollowed_reason_and_keeps_the_cap_advice():
     assert "bn callsites" in nxt
     assert diag["frontier"]["dropped_callers"] == 1
     assert diag["safe_to_report_complete_slice"] is False
+
+
+# --------------------------------------------------------------------------
+# real Binary Ninja: the same shapes on compiled public synthetic programs
+# --------------------------------------------------------------------------
+
+_ENTRY_CALLBACK_C = r"""
+#include <stddef.h>
+#include <string.h>
+static char out[128];
+typedef void (*handler)(size_t);
+__attribute__((noinline)) void copy_handler(size_t n) { memcpy(out, "public", n); }
+__attribute__((noinline)) void dispatch(handler h, size_t n) { h(n); }
+__attribute__((noinline,noreturn)) void entry_point(void) {
+    dispatch(copy_handler, 17);
+    for (;;) __asm__ volatile ("pause");
+}
+"""
+
+_STARTUP_C = r"""
+#include <stddef.h>
+#include <string.h>
+typedef void (*handler)(size_t);
+static char out[128];
+__attribute__((noinline)) void put_len(size_t n) { memcpy(out, "public", n); }
+__attribute__((noinline)) void copy_handler(size_t n) { memcpy(out, "public", n); }
+__attribute__((noinline)) void dispatch(handler h, size_t n) { h(n); }
+int main(int argc, char **argv) {
+    (void)argv;
+    put_len((size_t)argc);
+    dispatch(copy_handler, (size_t)argc);
+    return out[0];
+}
+"""
+
+_BUDGET_C = r"""
+#include <stddef.h>
+#include <stdlib.h>
+size_t observed;
+#define CHAIN8(x) x=x+1; x=x+2; x=x+3; x=x+4; x=x+5; x=x+6; x=x+7; x=x+8;
+#define CHAIN64(x) CHAIN8(x) CHAIN8(x) CHAIN8(x) CHAIN8(x) CHAIN8(x) CHAIN8(x) CHAIN8(x) CHAIN8(x)
+#define LINKS(c) size_t a0=c+1; size_t a1=a0+2; size_t a2=a1+3; size_t a3=a2+4; \
+    size_t a4=a3+5; size_t a5=a4+6; size_t a6=a5+7; size_t a7=a6+8; size_t a8=a7+9; \
+    size_t a9=a8+10; size_t a10=a9+11; size_t a11=a10+12; size_t a12=a11+13; \
+    size_t a13=a12+14; size_t a14=a13+15; size_t a15=a14+16; size_t a16=a15+17; \
+    size_t a17=a16+18; size_t a18=a17+19; size_t a19=a18+20;
+__attribute__((noinline)) void accept_size(size_t n) { observed = (size_t)malloc(n); }
+__attribute__((noinline)) void first_chain(size_t alpha) { CHAIN64(alpha) CHAIN64(alpha) accept_size(alpha); }
+__attribute__((noinline)) void second_chain(size_t beta) { CHAIN64(beta) CHAIN64(beta) CHAIN8(beta) accept_size(beta); }
+__attribute__((noinline)) void *dag(size_t root) { size_t c = root; LINKS(c) return malloc(a19 + c); }
+__attribute__((noinline)) void *dag_reverse(size_t root) { size_t c = root; LINKS(c) return malloc(c + a19); }
+__attribute__((noinline)) void *shared_load(size_t *m, size_t root) { m[0] = root + 1; size_t c = m[0]; LINKS(c) return malloc(a19 + c); }
+__attribute__((noinline)) void *shared_load_reverse(size_t *m, size_t root) { m[0] = root + 1; size_t c = m[0]; LINKS(c) return malloc(c + a19); }
+"""
+
+
+def _compile(tmp_path: Path, name: str, source: str, flags: list[str]) -> Path:
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        raise FixtureBuildError("no C compiler; the real-BN coverage lane cannot build its programs")
+    src = tmp_path / f"{name}.c"
+    src.write_text(source)
+    out = tmp_path / name
+    built = subprocess.run([cc, "-O0", "-g", "-fno-builtin", *flags, str(src), "-o", str(out)],
+                           capture_output=True, text=True, timeout=120.0)
+    if built.returncode:
+        raise FixtureBuildError(f"{name} failed to build: {built.stderr}")
+    return out
+
+
+def _bn_backward(bridge, target: str, fn: str, sink: str, *extra: str):
+    return bridge.json("-t", target, "taint", "backward", "-f", fn, "--sink", sink, *extra,
+                       "--verbose", timeout=180.0)
+
+
+@pytest.mark.real_bn
+def test_real_bn_custom_entry_callback_is_an_indirect_caller(tmp_path, shared_bn):
+    # `-nostartfiles -e entry_point`: the entry function hands copy_handler to
+    # dispatch. That is a callback, not the runtime's handoff of `main`.
+    binary = _compile(tmp_path, "entry_callback", _ENTRY_CALLBACK_C,
+                      ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "copy_handler", "arg:memcpy:2")
+
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
+
+
+@pytest.mark.real_bn
+def test_real_bn_main_startup_stays_an_origin_beside_a_real_callback(tmp_path, shared_bn):
+    # Normal `_start -> __libc_start_main(main)` startup: main's argc is the
+    # origin of a complete slice. In the same program a handler main hands to
+    # dispatch is an indirect callee.
+    binary = _compile(tmp_path, "startup", _STARTUP_C, ["-no-pie"])
+    target = shared_bn.load(binary, copy=False)
+
+    direct = _bn_backward(shared_bn, target, "put_len", "arg:memcpy:2")
+    assert direct["diagnostics"]["safe_to_report_complete_slice"] is True, direct["diagnostics"]
+    assert _caller_leaves(direct) == []
+    assert [(sl["origin"]["kind"], sl["origin"].get("index"), sl["crossed_functions"])
+            for sl in direct["slices"]] == [("parameter", 0, ["put_len"])]
+
+    callback = _bn_backward(shared_bn, target, "copy_handler", "arg:memcpy:2")
+    assert callback["diagnostics"]["safe_to_report_complete_slice"] is False
+    (leaf,) = _caller_leaves(callback)
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"main"}
+
+
+@pytest.mark.real_bn
+def test_real_bn_budget_cuts_are_per_path_and_per_caller(tmp_path, shared_bn):
+    binary = _compile(tmp_path, "budget.so", _BUDGET_C, ["-shared", "-fPIC", "-Wl,-Bsymbolic"])
+    target = shared_bn.load(binary, copy=False)
+
+    # A shared value / shared load the long operand reaches past the budget
+    # but the short one walks: complete, the formal root, no cut -- in either
+    # operand order.
+    for fn, root_index in [("dag", 0), ("dag_reverse", 0),
+                           ("shared_load", 1), ("shared_load_reverse", 1)]:
+        result = _bn_backward(shared_bn, target, fn, "arg:malloc:0")
+        origins = [sl["origin"] for sl in result["slices"]]
+        assert [(o["kind"], o.get("index")) for o in origins] == [("parameter", root_index)], (fn, origins)
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is True, (fn, result["diagnostics"])
+
+    # Two callers whose chains the budget really cuts: two frontiers, one per caller.
+    result = _bn_backward(shared_bn, target, "accept_size", "arg:malloc:0")
+    cuts = [sl["origin"] for sl in result["slices"]
+            if sl["origin"].get("cause") == "def_chain_budget"]
+    assert len({c["function"] for c in cuts}) == 2, cuts
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
