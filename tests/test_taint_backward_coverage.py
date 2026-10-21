@@ -394,6 +394,49 @@ def test_recursive_remap_to_another_formal_is_followed_to_the_external_caller():
                    for o in origins), origins
 
 
+def _recursive_producer(update_callee):
+    """``recursive_producer(n, rem) { malloc(n); recursive_producer(n + u(), rem); }``
+    and ``start_producer() { recursive_producer(16, 1); }`` -- the back edge
+    adds the return of ``u`` (``getpid``: unmodeled; ``recv``: a source)."""
+    n, rem = FVar("n", ident=110), FVar("remaining", ident=111)
+    n0, u1, t1 = FSSA(n, 0), FSSA(FVar("u", ident=112), 1), FSSA(FVar("t", ident=113), 1)
+    rp = FFunc("recursive_producer", 0x800, FSSAFunc([
+        _call(0, 0x804, _MALLOC, [_var(n0)]),
+        _call(1, 0x808, update_callee, [], writes=[u1]),
+        FInstr(2, 0x80c, "MLIL_SET_VAR_SSA", "t#1 = n#0 + u#1", reads=[n0, u1], writes=[t1],
+               src=FExpr("MLIL_ADD", "n#0 + u#1", reads=[n0, u1])),
+        _call(3, 0x810, 0x800, [_var(t1), FExpr("MLIL_VAR_SSA", "remaining#0")]),
+    ]), params=[n, rem])
+    start = FFunc("start_producer", 0x900, FSSAFunc([
+        _call(0, 0x910, 0x800, [_const(16), _const(1)]),
+    ]))
+    rp.caller_sites = [FSite(rp, 0x810), FSite(start, 0x910)]
+    return _backward(rp, {**_NAMES, 0x800: "recursive_producer", 0x900: "start_producer"},
+                     "arg:malloc:0")
+
+
+@pytest.mark.parametrize("callee,origin", [
+    (_GETPID, {"kind": "call", "callee": "getpid"}),
+    (_RECV, {"kind": "source", "callee": "recv"}),
+], ids=["getpid", "recv-source"])
+def test_recursive_back_edge_keeps_the_producer_it_introduces(callee, origin):
+    # The self-call's back edge stops the ascent (its `n` is answered by the
+    # enclosing frame) but the `u()` it adds on the way round is a root no
+    # other path reaches: it keeps its own slice, with the definitions that
+    # lead to it, beside the start_producer literal -- never a constant-only
+    # slice certified complete.
+    result = _recursive_producer(callee)
+
+    origins = _origins(result)
+    assert {"kind": "constant", "value": 16} in origins, origins
+    assert origin in origins, origins
+    produced = next(sl for sl in result["slices"] if sl["origin"] == origin)
+    assert produced["crossed_functions"] == ["recursive_producer"]
+    assert {"0x808", "0x80c", "0x810"} <= {st["address"] for st in produced["slice"]}
+    assert not any(o.get("kind") == "parameter" for o in origins), origins
+
+
+
 # --------------------------------------------------------------------------
 # BN6-C005: the engine's def-chain step budget cuts one operand
 # --------------------------------------------------------------------------
@@ -744,6 +787,30 @@ __attribute__((noinline)) void *shared_load(size_t *m, size_t root) { m[0] = roo
 __attribute__((noinline)) void *shared_load_reverse(size_t *m, size_t root) { m[0] = root + 1; size_t c = m[0]; LINKS(c) return malloc(c + a19); }
 """
 
+_RECURSIVE_C = r"""
+#include <stddef.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
+size_t observed;
+__attribute__((noinline)) void pid_producer(size_t n, unsigned remaining) {
+    observed = (size_t)malloc(n);
+    if (remaining) pid_producer(n + (size_t)getpid(), remaining - 1);
+}
+__attribute__((noinline)) void start_pid(void) { pid_producer(16, 1); }
+__attribute__((noinline)) void recv_producer(size_t n, unsigned remaining) {
+    char bytes[8];
+    observed = (size_t)malloc(n);
+    if (remaining) recv_producer(n + (size_t)recv(0, bytes, sizeof(bytes), 0), remaining - 1);
+}
+__attribute__((noinline)) void start_recv(void) { recv_producer(16, 1); }
+__attribute__((noinline)) void remap_copy(size_t first, size_t second, unsigned remaining) {
+    observed = (size_t)malloc(first);
+    if (remaining) remap_copy(second, first, remaining - 1);
+}
+__attribute__((noinline)) void start_remap(size_t external) { remap_copy(7, external, 1); }
+"""
+
 
 def _compile(tmp_path: Path, name: str, source: str, flags: list[str]) -> Path:
     cc = shutil.which("cc") or shutil.which("gcc")
@@ -835,3 +902,35 @@ def test_real_bn_budget_cuts_are_per_path_and_per_caller(tmp_path, shared_bn):
             if sl["origin"].get("cause") == "def_chain_budget"]
     assert len({c["function"] for c in cuts}) == 2, cuts
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+@pytest.mark.real_bn
+def test_real_bn_recursive_back_edge_keeps_its_producers(tmp_path, shared_bn):
+    # `f(n + getpid())` around a self-call: the literal from the outside
+    # caller AND the getpid() the back edge adds -- in JSON and in text. A
+    # modeled source on the back edge (`recv`) is the control, and a pure
+    # remap back edge still adds no pseudo-origin.
+    binary = _compile(tmp_path, "recursive.so", _RECURSIVE_C,
+                      ["-fno-optimize-sibling-calls", "-shared", "-fPIC", "-Wl,-Bsymbolic"])
+    target = shared_bn.load(binary, copy=False)
+
+    for fn, root in [("pid_producer", {"kind": "call", "callee": "getpid"}),
+                     ("recv_producer", {"kind": "source", "callee": "recv"})]:
+        result = _bn_backward(shared_bn, target, fn, "arg:malloc:0")
+        origins = [sl["origin"] for sl in result["slices"]]
+        assert {"kind": "constant", "value": 16} in origins, (fn, origins)
+        assert root in origins, (fn, origins)
+        assert not any(o.get("kind") == "parameter" for o in origins), (fn, origins)
+
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "pid_producer",
+                         "--sink", "arg:malloc:0", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "getpid" in text.stdout and "constant" in text.stdout, text.stdout
+
+    remap = _bn_backward(shared_bn, target, "remap_copy", "arg:malloc:0")
+    origins = [(sl["origin"].get("kind"), sl["origin"].get("value"), sl["crossed_functions"])
+               for sl in remap["slices"]]
+    assert ("constant", 7, ["remap_copy"]) in origins, origins
+    assert any(k == "parameter" and crossed == ["remap_copy", "remap_copy"]
+               for k, _, crossed in origins), origins
+    assert sum(1 for k, _, _ in origins if k == "parameter") == 1, origins

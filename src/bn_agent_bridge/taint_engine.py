@@ -8037,6 +8037,10 @@ class TaintEngine:
         walked_at: dict[tuple, int] = {}
         load_at: dict[tuple, int] = {}
         rewalked: set = set()
+        # Every non-formal origin the walk reached, in order. A recursive back
+        # edge contributes no formal origin (the enclosing frame answers it),
+        # so these producers are all it can contribute -- kept, not dropped.
+        producers: list[dict[str, Any]] = []
 
         def _set_origin(o, *, weak: int | bool = 0):
             nonlocal origin, origin_rank
@@ -8048,6 +8052,8 @@ class TaintEngine:
                 rank = 0 if o.get("kind") == "parameter" else 1
             if rank == 0:
                 param_origins.setdefault(int(o["index"]), o)
+            elif o not in producers:
+                producers.append(o)
             if origin["kind"] == "unresolved" or origin_rank > rank:
                 origin = o
                 origin_rank = rank
@@ -8059,6 +8065,8 @@ class TaintEngine:
             (the outright assignment left a stale rank that could). A formal
             beside it still ascends on its own (IC01)."""
             nonlocal origin, origin_rank
+            if o not in producers:
+                producers.append(o)
             origin, origin_rank = o, 0
 
         # (buffer key, memory version) pairs already walked, so two buffers that
@@ -9030,14 +9038,17 @@ class TaintEngine:
         # Every formal the slice bottomed out at is a demand on the callers,
         # whatever origin represents the slice (IC01). A demand already being
         # solved further up this ascent -- the same (function, formal) -- is
-        # answered there, by the frame enumerating that formal's callers: it
-        # is a cycle's back edge, not an origin, so it adds no slice. A
-        # recursive call that remaps the demand to ANOTHER formal is a new
-        # demand and ascends.
+        # answered there, by the frame enumerating that formal's callers: the
+        # formal is a cycle's back edge, not an origin, and stops the ascent.
+        # What the back edge ADDS on its way round -- `f(n + getpid())` -- is
+        # not answered upstream, so every producer it reached keeps a slice
+        # (below). A recursive call that remaps the demand to ANOTHER formal
+        # is a new demand and ascends.
         fkey = (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
         demands = {p: param_origins.get(p) or {"kind": "parameter", "index": p,
                                                 "var": var_label(v)}
                    for p, v in terminal_params.items() if (fkey, p) not in visited_funcs}
+        back_edge = len(demands) < len(terminal_params)
         out: list[dict[str, Any]] = []
         if demands:
             out = self._continue_into_callers(
@@ -9056,6 +9067,11 @@ class TaintEngine:
         # operand order.
         if origin["kind"] != "parameter" and not (cuts and origin["kind"] == "unresolved"):
             out.insert(0, {"steps": base_steps, "origin": origin, "crossed": []})
+        if back_edge:
+            # Each independent producer on the back edge, the representative
+            # aside (already a slice), so none is traded for the cycle.
+            out += [{"steps": base_steps, "origin": o, "crossed": []}
+                    for o in producers if o is not origin and o["kind"] != "unresolved"]
         if cuts:
             # Replaces a bare `unresolved` origin: the cut is why it is one.
             # `var` names the cut values IN this function: the public slice
