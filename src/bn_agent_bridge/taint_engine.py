@@ -9406,11 +9406,12 @@ class TaintEngine:
         row of ONE ``caller_sites_truncated`` frontier, with its reason. A
         caller's literal is not a skip: it is the origin, reached. The one
         address-taking reference that is no in-binary caller is the process
-        entry's handoff of `main`: `_start` hands `main` to the C runtime,
-        which calls it with what the loader supplied, so `main`'s formals stay
-        its origins. Only that pair is exempt -- any other function the entry
-        function takes the address of (a custom entry's `dispatch(handler)`)
-        is an indirect callee like any other.
+        entry's handoff to the C runtime: `_start` passes `main` to
+        `__libc_start_main`, which calls it with what the loader supplied, so
+        `main`'s formals stay its origins. Only that evidenced handoff is
+        exempt (``_runtime_start_handoff``), never a name: a custom entry's
+        `dispatch(handler)` -- `dispatch(main)` included -- is an indirect
+        callee like any other.
         Returns one slice per formal at least; a formal no caller resolved
         keeps its own parameter slice."""
         caller_sites = list(getattr(func, "caller_sites", None) or [])
@@ -9424,17 +9425,22 @@ class TaintEngine:
         except Exception:
             pass
         get_code_refs = getattr(self.bv, "get_code_refs", None)
-        # Exempt only `main`'s address taken by the view's entry function.
+        # Exempt only the entry function's evidenced C-runtime handoff of it.
         entry = getattr(self.bv, "entry_function", None)
-        entry_start = (None if entry is None or str(getattr(func, "name", "")) != "main"
-                       else int(getattr(entry, "start", -1)))
+        entry_start = None if entry is None else int(getattr(entry, "start", -1))
         direct = {int(getattr(s, "address", 0)) for s in caller_sites}
+        entry_handoff: bool | None = None
         try:
             for ref in (get_code_refs(start) if callable(get_code_refs) else []):
                 a, rf = int(getattr(ref, "address", 0)), getattr(ref, "function", None)
-                if a in direct or (rf is not None and entry_start is not None
-                                   and int(getattr(rf, "start", -2)) == entry_start):
+                if a in direct:
                     continue
+                if rf is not None and entry_start is not None \
+                        and int(getattr(rf, "start", -2)) == entry_start:
+                    if entry_handoff is None:
+                        entry_handoff = self._runtime_start_handoff(rf, start)
+                    if entry_handoff:
+                        continue
                 indirect.setdefault(a, rf)
         except Exception:
             pass
@@ -9540,6 +9546,58 @@ class TaintEngine:
                 followed=len(caller_sites) - len(dropped_sites), indirect=len(indirect),
                 rows=rows, reasons=reasons)
         return results
+
+    # C-runtime start routines whose FIRST operand is the program's main
+    # callback, which they call with what the loader supplied.
+    _RUNTIME_START_ROUTINES = frozenset({"__libc_start_main", "__uClibc_main"})
+
+    def _runtime_start_handoff(self, entry: Any, target: int) -> bool:
+        """Whether the entry function's references to *target* are proven to
+        be only the process-start handoff: *target*'s exact address is the
+        main-callback operand (argument 0) of a call resolved to a C-runtime
+        start routine (``_start -> __libc_start_main(main, ..)``, through the
+        GOT or directly in a static binary), and the entry function uses the
+        address nowhere else. Anything else -- a custom entry's
+        `dispatch(main, 17)`, the address in another operand or a store, an
+        unresolved or unknown start routine -- is not proven, and fails
+        closed: the reference stays an indirect caller, whatever the
+        function is named."""
+        try:
+            instrs = self._instrs(self._ssa_func(entry))
+        except TaintError:
+            return False
+
+        def uses(expr: Any, depth: int = 0) -> int:
+            if expr is None or depth > 32:
+                return 0
+            if isinstance(expr, (list, tuple)):
+                return sum(uses(e, depth + 1) for e in expr)
+            if not hasattr(expr, "operation"):
+                return 0
+            own = int("CONST" in op_name(expr) and getattr(expr, "constant", None) == target)
+            kids = getattr(expr, "operands", None) or [
+                getattr(expr, k, None) for k in ("dest", "src", "params", "left", "right")]
+            return own + sum(uses(e, depth + 1) for e in kids)
+
+        handed = other = 0
+        for ins in instrs:
+            n = uses(ins)
+            if not n:
+                continue
+            if self._is_call(ins) and n == 1:
+                dest = getattr(ins, "dest", None)
+                slot = (getattr(dest, "constant", None) if op_name(dest) == "MLIL_IMPORT"
+                        else const_target(dest))
+                name = str(self._callee_name(slot) or "").split("@")[0]
+                params = self._call_params(ins)
+                main_op = params[0] if params else None
+                if (name in self._RUNTIME_START_ROUTINES and main_op is not None
+                        and "CONST" in op_name(main_op)
+                        and getattr(main_op, "constant", None) == target):
+                    handed += 1
+                    continue
+            other += n
+        return handed > 0 and other == 0
 
     def _bw_note_unfollowed_callers(self, func: Any, *, direct: int, considered: int,
                                     followed: int, indirect: int,

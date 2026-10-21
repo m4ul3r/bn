@@ -231,17 +231,40 @@ def test_callback_the_entry_function_hands_on_is_an_indirect_caller():
         ("0x414", "entry_point", "indirect_reference")]
 
 
-def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
-    # Only the ENTRY function's reference to `main` is the runtime handoff;
-    # another function taking `main`'s address is a callback like any other.
-    start = FFunc("_start", 0x400, FSSAFunc([]))
-    hooks = FFunc("register_hooks", 0xb00, FSSAFunc([]))
-    argc = FVar("argc", ident=42)
-    main_fn = FFunc("main", 0x800, FSSAFunc([
+_LIBC_START_SLOT, _DISPATCH = 0x990, 0x980
+_ENTRY_NAMES = {_LIBC_START_SLOT: "__libc_start_main", _DISPATCH: "dispatch"}
+
+
+def _main_fn(ident):
+    """``main(argc) { memcpy(.., argc); }`` at 0x800."""
+    argc = FVar("argc", ident=ident)
+    return FFunc("main", 0x800, FSSAFunc([
         _call(0, 0x804, _MEMCPY, [FExpr("MLIL_VAR_SSA", "d"), FExpr("MLIL_VAR_SSA", "s"),
                                   _var(FSSA(argc, 0))]),
     ]), params=[argc])
-    result = _backward(main_fn, {**_NAMES, 0x800: "main"},
+
+
+def _entry(name, calls):
+    """An entry function whose calls hand on the address 0x800: *calls* is
+    ``[(callee, is_import)]`` (0x800 as operand 0) or ``[(callee, is_import,
+    operand)]``."""
+    instrs = []
+    for i, (callee, imported, *where) in enumerate(calls):
+        dest = (FExpr("MLIL_IMPORT", "slot", constant=callee) if imported
+                else FExpr("MLIL_CONST_PTR", hex(callee), constant=callee))
+        params = [_const(17), _const(0), _const(0), _const(0)]
+        params[where[0] if where else 0] = FExpr("MLIL_CONST_PTR", "0x800", constant=0x800)
+        instrs.append(FInstr(i, 0x410 + 8 * i, "MLIL_CALL_SSA", "call", dest=dest,
+                             params=params))
+    return FFunc(name, 0x400, FSSAFunc(instrs))
+
+
+def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
+    # Only the entry function's runtime handoff of `main` is exempt; another
+    # function taking `main`'s address is a callback like any other.
+    start = _entry("_start", [(_LIBC_START_SLOT, True)])
+    hooks = FFunc("register_hooks", 0xb00, FSSAFunc([]))
+    result = _backward(_main_fn(42), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
                        code_refs={0x800: [(0x41e, start), (0xb0c, hooks)]}, entry=start)
 
     assert _gate(result) is False, result["diagnostics"]
@@ -249,17 +272,32 @@ def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
     assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [("0xb0c", "register_hooks")]
 
 
-def test_process_entry_handoff_of_main_and_direct_call_refs_are_not_indirect_callers():
-    # Controls: `_start` handing `main` to the C runtime is no in-binary
-    # caller (its formals are what the loader supplied), and the code
-    # reference a direct call site makes is that site, already followed.
-    start = FFunc("_start", 0x400, FSSAFunc([]))
-    argc = FVar("argc", ident=41)
-    main_fn = FFunc("main", 0x800, FSSAFunc([
-        _call(0, 0x804, _MEMCPY, [FExpr("MLIL_VAR_SSA", "d"), FExpr("MLIL_VAR_SSA", "s"),
-                                  _var(FSSA(argc, 0))]),
-    ]), params=[argc])
-    handoff = _backward(main_fn, {**_NAMES, 0x800: "main"},
+@pytest.mark.parametrize("calls", [
+    [(_DISPATCH, False)],                              # entry_point: dispatch(main, 17)
+    [(_LIBC_START_SLOT, True), (_DISPATCH, False)],    # the handoff AND an in-binary dispatch
+    [],                                                 # an entry reference with no handoff evidence
+    [(_LIBC_START_SLOT, True, 3)],                      # handed to the runtime, but not as main
+], ids=["dispatch-only", "handoff-and-dispatch", "no-evidence", "not-the-main-operand"])
+def test_callback_named_main_the_entry_dispatches_is_an_indirect_caller(calls):
+    # The exemption is evidence, not a name: a custom entry handing `main` to
+    # its own dispatcher is an in-binary indirect caller of `main`.
+    entry = _entry("entry_point", calls)
+    result = _backward(_main_fn(43), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0x40d, entry)]}, entry=entry)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [("0x40d", "entry_point")]
+
+
+@pytest.mark.parametrize("imported", [True, False], ids=["plt-import", "static-direct"])
+def test_process_entry_handoff_of_main_and_direct_call_refs_are_not_indirect_callers(imported):
+    # Controls: `_start` handing `main` to `__libc_start_main` (through the
+    # GOT, or a direct call in a static binary) is no in-binary caller -- its
+    # formals are what the loader supplied -- and the code reference a
+    # direct call site makes is that site, already followed.
+    start = _entry("_start", [(_LIBC_START_SLOT, imported)])
+    handoff = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
                         code_refs={0x800: [(0x41e, start)]}, entry=start)
     assert _gate(handoff) is True, handoff["diagnostics"]
     assert _caller_leaves(handoff) == []
@@ -653,6 +691,23 @@ __attribute__((noinline,noreturn)) void entry_point(void) {
 }
 """
 
+_MAIN_CALLBACK_C = r"""
+#include <stddef.h>
+#include <string.h>
+static char out[128];
+typedef int (*handler)(int, char **);
+__attribute__((noinline)) int main(int n, char **args) {
+    (void)args;
+    memcpy(out, "public", (size_t)n);
+    return out[0];
+}
+__attribute__((noinline)) int dispatch(handler h, int n) { return h(n, 0); }
+__attribute__((noinline,noreturn)) void entry_point(void) {
+    (void)dispatch(main, 17);
+    for (;;) __asm__ volatile ("pause");
+}
+"""
+
 _STARTUP_C = r"""
 #include <stddef.h>
 #include <string.h>
@@ -717,6 +772,21 @@ def test_real_bn_custom_entry_callback_is_an_indirect_caller(tmp_path, shared_bn
                       ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point"])
     target = shared_bn.load(binary, copy=False)
     result = _bn_backward(shared_bn, target, "copy_handler", "arg:memcpy:2")
+
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
+
+
+@pytest.mark.real_bn
+def test_real_bn_custom_entry_dispatching_main_is_an_indirect_caller(tmp_path, shared_bn):
+    # A callback NAMED main that the custom entry hands to its own
+    # dispatcher: no C-runtime handoff, so the name earns no exemption.
+    binary = _compile(tmp_path, "main_callback", _MAIN_CALLBACK_C,
+                      ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "main", "arg:memcpy:2")
 
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
