@@ -573,8 +573,9 @@ def backward_diagnostics(
     # Same vocabulary the forward frontier groups by, so one leaf kind never
     # means two things across directions. `caller_sites_truncated` is counted
     # under its own heading: it is not an unresolved callee or a coarse store
-    # but a deliberately abandoned ascent, and conflating it would hide the one
-    # frontier a user can act on by re-running with a narrower sink.
+    # but known callers the ascent did not follow (past the cap, past
+    # --max-depth, unfollowable sites, a stored address), each with its own
+    # remedy, and conflating it would hide the frontier a user can act on.
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered",
                   "indirect_call_unresolved", "field_load_unresolved",
                   "address_of_local_unresolved", "pointer_object_unresolved",
@@ -634,15 +635,51 @@ def backward_diagnostics(
             "not a proof that no other value reaches the sink")
 
     if dropped_callers_n:
-        next_action = (
-            "the caller ascent was capped, so some calling sites were never "
-            "followed; re-run against a specific caller or narrow the sink to "
-            "see the origins behind the dropped sites")
+        # Each reason the ascent left callers unfollowed has its own remedy
+        # (IC01). A leaf with no `reasons` tally is a cap leaf (#810).
+        why: dict[str, str] = {}
+        for lf in leaves or []:
+            if lf.get("kind") != "caller_sites_truncated":
+                continue
+            fn = lf.get("function") if isinstance(lf.get("function"), dict) else {}
+            for r in (lf.get("reasons") if isinstance(lf.get("reasons"), dict)
+                      and lf.get("reasons") else {"caller_cap": 1}):
+                why.setdefault(str(r), shlex.quote(str(fn.get("name") or fn.get("address") or "<function>")))
+        advice = []
+        if "caller_cap" in why:
+            advice.append(
+                "the caller ascent was capped, so some calling sites were never "
+                "followed; re-run against a specific caller or narrow the sink to "
+                "see the origins behind the dropped sites")
+        if "max_depth" in why:
+            advice.append("the caller ascent stopped at the configured depth; re-run "
+                          "with a larger --max-depth to follow the remaining callers")
+        if "indirect_reference" in why:
+            advice.append(
+                "the function's address is taken (stored in data or handed on as a "
+                "value), so it has indirect callers the ascent cannot follow; "
+                f"`bn xrefs {why['indirect_reference']}` lists the references -- slice "
+                "backward from the dispatching caller")
+        sites = sorted(set(why) - {"caller_cap", "max_depth", "indirect_reference"})
+        if sites:
+            advice.append(
+                f"some caller sites could not be followed ({', '.join(sites)}; the "
+                "leaf's `unfollowed` rows name each); inspect them with "
+                f"`bn callsites {why[sites[0]]}`")
+        next_action = "; ".join(advice)
     elif truncated and truncation_cause:
         # A named cut (the memory-chain budget, a depth bound) has its own
         # remediation; the generic unresolved text below would send the reader
         # to `bn proto set` for a walk that simply ran out of budget (round 3).
         next_action = _truncation_hint(truncation_cause)
+    elif (any("def-chain walk truncated" in str(a) for a in assumptions or [])
+          and not any(lf.get("kind") in UNRESOLVED for lf in leaves or [])):
+        # The engine's def-chain step budget cut a value; its `unresolved`
+        # slice (cause `def_chain_budget`) names what was left unwalked.
+        next_action = (
+            "the def-chain step budget cut the walk before some values reached an "
+            "origin (the `unresolved` slice with cause `def_chain_budget` lists them "
+            "under `unwalked`); slice backward from closer to those values")
     elif unresolved_n:
         unresolved_leaves = [lf for lf in leaves or [] if lf.get("kind") in UNRESOLVED]
         # The forward run is printed only for a buffer a leaf names together
