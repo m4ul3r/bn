@@ -637,35 +637,63 @@ def backward_diagnostics(
     if dropped_callers_n:
         # Each reason the ascent left callers unfollowed has its own remedy
         # (IC01). A leaf with no `reasons` tally is a cap leaf (#810).
-        why: dict[str, str] = {}
+        functions: dict[str, tuple[str, set[str]]] = {}
         for lf in leaves or []:
             if lf.get("kind") != "caller_sites_truncated":
                 continue
             fn = lf.get("function") if isinstance(lf.get("function"), dict) else {}
-            for r in (lf.get("reasons") if isinstance(lf.get("reasons"), dict)
-                      and lf.get("reasons") else {"caller_cap": 1}):
-                why.setdefault(str(r), shlex.quote(str(fn.get("name") or fn.get("address") or "<function>")))
+            reasons = (lf.get("reasons") if isinstance(lf.get("reasons"), dict)
+                       and lf.get("reasons") else {"caller_cap": 1})
+            selector = shlex.quote(str(fn.get("name") or fn.get("address") or "<function>"))
+            function_key = str(fn.get("address") or fn.get("name") or "<function>")
+            if function_key not in functions:
+                functions[function_key] = (selector, set())
+            functions[function_key][1].update(str(r) for r in reasons)
+        selector_counts: dict[str, int] = {}
+        for selector, _ in functions.values():
+            selector_counts[selector] = selector_counts.get(selector, 0) + 1
+        # Bound examples, not evidence: all frontier rows stay in the result.
+        # As with the xrefs preview, show at most three complete targets.
+        def examples(reason: str, operation: str | None = None) -> str:
+            shown: list[str] = []
+            total = 0
+            for function_key, (selector, why) in functions.items():
+                if reason not in why:
+                    continue
+                total += 1
+                if len(shown) < 3:
+                    if selector_counts[selector] > 1:
+                        selector = shlex.quote(function_key)
+                    shown.append(f"`bn {operation} {selector}`" if operation else selector)
+            text = ", ".join(shown)
+            omitted = total - len(shown)
+            if omitted:
+                text += (f" (+{omitted} more affected functions; see full "
+                         "caller_sites_truncated leaves in JSON)")
+            return text
+
+        reasons = {reason for _, why in functions.values() for reason in why}
         advice = []
-        if "caller_cap" in why:
+        if "caller_cap" in reasons:
             advice.append(
-                "the caller ascent was capped, so some calling sites were never "
-                "followed; re-run against a specific caller or narrow the sink to "
-                "see the origins behind the dropped sites")
-        if "max_depth" in why:
-            advice.append("the caller ascent stopped at the configured depth; re-run "
-                          "with a larger --max-depth to follow the remaining callers")
-        if "indirect_reference" in why:
+                f"for {examples('caller_cap')}: the caller ascent was capped, so some "
+                "calling sites were never followed; re-run against a specific caller "
+                "or narrow the sink to see the origins behind the dropped sites")
+        if "max_depth" in reasons:
             advice.append(
-                "the function's address is taken (stored in data or handed on as a "
-                "value), so it has indirect callers the ascent cannot follow; "
-                f"`bn xrefs {why['indirect_reference']}` lists the references -- slice "
+                f"for {examples('max_depth')}: the caller ascent stopped at the configured "
+                "depth; re-run with a larger --max-depth to follow the remaining callers")
+        if "indirect_reference" in reasons:
+            advice.append(
+                "function addresses are taken (stored in data or handed on as a value), "
+                "so indirect callers remain unfollowed; inspect "
+                f"{examples('indirect_reference', 'xrefs')} for the references -- slice "
                 "backward from the dispatching caller")
-        sites = sorted(set(why) - {"caller_cap", "max_depth", "indirect_reference"})
-        if sites:
+        for reason in sorted(reasons - {"caller_cap", "max_depth", "indirect_reference"}):
             advice.append(
-                f"some caller sites could not be followed ({', '.join(sites)}; the "
-                "leaf's `unfollowed` rows name each); inspect them with "
-                f"`bn callsites {why[sites[0]]}`")
+                f"some caller sites could not be followed ({reason}); the full leaf's "
+                "`unfollowed` rows name each -- inspect "
+                f"{examples(reason, 'callsites')}")
         next_action = "; ".join(advice)
     elif truncated and truncation_cause:
         # A named cut (the memory-chain budget, a depth bound) has its own

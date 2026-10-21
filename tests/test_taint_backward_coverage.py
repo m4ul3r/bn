@@ -8,6 +8,9 @@ representative. A chain that WAS walked to its origins (a caller's literal, a
 formal with no known caller) stays a complete slice."""
 from __future__ import annotations
 
+import copy
+import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -92,6 +95,11 @@ def _caller_leaves(result):
 
 def _origins(result):
     return [sl["origin"] for sl in result["slices"]]
+
+
+def _advice_commands(advice: str, operation: str) -> list[list[str]]:
+    commands = [shlex.split(command) for command in re.findall(r"`(bn [^`]+)`", advice)]
+    return [command for command in commands if operation in command]
 
 
 # --------------------------------------------------------------------------
@@ -218,8 +226,8 @@ def test_callback_handed_on_in_code_is_an_indirect_caller_not_a_complete_slice()
 
 def test_callback_the_entry_function_hands_on_is_an_indirect_caller():
     # A custom entry (`-nostartfiles -e entry_point`) calling
-    # `dispatch(copy_handler, 17)`: the entry function's reference is not the
-    # runtime's handoff of `main`, so the handler's caller is unfollowed.
+    # `dispatch(copy_handler, 17)`: the entry function's address-taking
+    # references leave the indirect caller unfollowed.
     entry = FFunc("entry_point", 0x400, FSSAFunc([]))
     result = _backward(_copy_handler(), {**_NAMES, 0x800: "copy_handler"},
                        code_refs={0x800: [(0x40d, entry), (0x414, entry)]}, entry=entry)
@@ -229,6 +237,9 @@ def test_callback_the_entry_function_hands_on_is_an_indirect_caller():
     assert [(r["address"], r["caller"], r["reason"]) for r in leaf["unfollowed"]] == [
         ("0x40d", "entry_point", "indirect_reference"),
         ("0x414", "entry_point", "indirect_reference")]
+    assert "bn xrefs" in result["diagnostics"]["next_action"]
+    assert "dispatching caller" in result["diagnostics"]["next_action"]
+    assert "external input" not in result["diagnostics"]["next_action"]
 
 
 _LIBC_START_SLOT, _DISPATCH = 0x990, 0x980
@@ -260,8 +271,8 @@ def _entry(name, calls):
 
 
 def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
-    # Only the entry function's runtime handoff of `main` is exempt; another
-    # function taking `main`'s address is a callback like any other.
+    # Both the entry's runtime handoff and an ordinary function taking main's
+    # address are unresolved callers; neither erases the other's boundary.
     start = _entry("_start", [(_LIBC_START_SLOT, True)])
     hooks = FFunc("register_hooks", 0xb00, FSSAFunc([]))
     result = _backward(_main_fn(42), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
@@ -269,7 +280,9 @@ def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [("0xb0c", "register_hooks")]
+    assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [
+        ("0x41e", "_start"), ("0xb0c", "register_hooks")]
+    assert leaf["reasons"] == {"indirect_reference": 2}
 
 
 @pytest.mark.parametrize("calls", [
@@ -279,8 +292,8 @@ def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
     [(_LIBC_START_SLOT, True, 3)],                      # handed to the runtime, but not as main
 ], ids=["dispatch-only", "handoff-and-dispatch", "no-evidence", "not-the-main-operand"])
 def test_callback_named_main_the_entry_dispatches_is_an_indirect_caller(calls):
-    # The exemption is evidence, not a name: a custom entry handing `main` to
-    # its own dispatcher is an in-binary indirect caller of `main`.
+    # A custom entry handing `main` to its own dispatcher is an indirect
+    # caller, just like a runtime entry handing the function to external code.
     entry = _entry("entry_point", calls)
     result = _backward(_main_fn(43), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
                        code_refs={0x800: [(0x40d, entry)]}, entry=entry)
@@ -288,21 +301,227 @@ def test_callback_named_main_the_entry_dispatches_is_an_indirect_caller(calls):
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
     assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [("0x40d", "entry_point")]
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert "dispatching caller" in result["diagnostics"]["next_action"]
+    assert "external input" not in result["diagnostics"]["next_action"]
 
 
-@pytest.mark.parametrize("imported", [True, False], ids=["plt-import", "static-direct"])
-def test_process_entry_handoff_of_main_and_direct_call_refs_are_not_indirect_callers(imported):
-    # Controls: `_start` handing `main` to `__libc_start_main` (through the
-    # GOT, or a direct call in a static binary) is no in-binary caller -- its
-    # formals are what the loader supplied -- and the code reference a
-    # direct call site makes is that site, already followed.
-    start = _entry("_start", [(_LIBC_START_SLOT, imported)])
+@pytest.mark.parametrize("runtime", ["__libc_start_main", "__uClibc_main"])
+@pytest.mark.parametrize("operand", [0, 1, 3])
+def test_in_binary_runtime_name_does_not_prove_a_startup_boundary(runtime, operand):
+    # A custom entry's own dispatcher can use either runtime symbol name.
+    # Even operand 0 is not proof that the callee is outside this binary.
+    entry = _entry("entry_point", [(_LIBC_START_SLOT, False, operand)])
+    result = _backward(_copy_handler(),
+                       {**_NAMES, _LIBC_START_SLOT: runtime, 0x800: "copy_handler"},
+                       code_refs={0x800: [(0x40d, entry)]}, entry=entry)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert (leaf["callers_total"], leaf["callers_followed"]) == (1, 0)
+    assert leaf["unfollowed"] == [{"address": "0x40d", "caller": "entry_point",
+                                  "param": 2, "reason": "indirect_reference"}]
+
+
+def test_static_runtime_handoff_is_an_unproven_indirect_boundary():
+    # A static libc body and a same-named impostor leave the callback's
+    # caller-supplied origins unresolved, even when the entry is `_start`.
+    start = _entry("_start", [(_LIBC_START_SLOT, False)])
+    result = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0x41e, start)]}, entry=start)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert leaf["unfollowed"] == [{"address": "0x41e", "caller": "_start",
+                                  "param": 0, "reason": "indirect_reference"}]
+
+
+@pytest.mark.parametrize("runtime", ["__libc_start_main", "__uClibc_main"])
+@pytest.mark.parametrize("symbol_type,is_thunk", [
+    ("ImportedFunctionSymbol", True),
+    ("FunctionSymbol", True),
+    ("LibraryFunctionSymbol", False),
+])
+@pytest.mark.parametrize("operand", [0, 1])
+def test_direct_runtime_handoff_metadata_does_not_prove_caller_origins(runtime, symbol_type,
+                                                                    is_thunk, operand):
+    # Import metadata, a thunk flag, or a library signature identifies no
+    # caller-supplied value. The handoff remains an unresolved caller boundary.
+    entry = _entry("_start", [(_LIBC_START_SLOT, False, operand)])
+    bv = _BV({**_NAMES, _LIBC_START_SLOT: runtime, 0x800: "main"},
+             code_refs={0x800: [(0x41e, entry)]}, entry=entry)
+    bv._funcs[_LIBC_START_SLOT] = FFunc(runtime, _LIBC_START_SLOT, FSSAFunc([]),
+                                      symbol_type=symbol_type, is_thunk=is_thunk)
+    result = te.TaintEngine(bv, te.load_models()).backward(
+        _main_fn(41), [te.parse_locator("arg:memcpy:2")], max_depth=8)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert leaf["unfollowed"] == [{"address": "0x41e", "caller": "_start",
+                                  "param": 0, "reason": "indirect_reference"}]
+
+
+def test_imported_process_entry_handoff_is_an_unresolved_caller_boundary():
+    # GOT/import provenance does not prove which origins the external runtime
+    # supplies to main.
+    start = _entry("_start", [(_LIBC_START_SLOT, True)])
     handoff = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
                         code_refs={0x800: [(0x41e, start)]}, entry=start)
-    assert _gate(handoff) is True, handoff["diagnostics"]
-    assert _caller_leaves(handoff) == []
+    assert _gate(handoff) is False, handoff["diagnostics"]
+    (leaf,) = _caller_leaves(handoff)
+    assert leaf["reasons"] == {"indirect_reference": 1}
     assert _origins(handoff) == [{"kind": "parameter", "index": 0, "var": "argc#0"}]
 
+
+@pytest.mark.parametrize("dest_op,callback", [
+    ("MLIL_IMPORT", 0x800),       # GOT/IAT handoff
+    ("MLIL_CONST_PTR", 0x800),    # imported i386/AArch64/MIPS-style PLT
+    ("MLIL_EXTERN_PTR", 0x800),   # external pointer IL
+    ("MLIL_CONST_PTR", 0x801),    # ARM/Thumb-tagged callback address
+], ids=["got", "plt", "extern", "thumb-tagged"])
+def test_entry_instruction_forms_have_the_same_indirect_boundary(dest_op, callback):
+    entry = _entry("opaque_entry", [(_LIBC_START_SLOT, False)])
+    call = entry.mlil.ssa_form.instructions[0]
+    call.dest = FExpr(dest_op, "runtime", constant=_LIBC_START_SLOT)
+    call.params[0] = FExpr("MLIL_CONST_PTR", "callback", constant=callback)
+    # BN may give another wrapper for the same entry; compare function
+    # identity by address, not its Python wrapper or a startup symbol name.
+    ref_fn = FFunc("entry_alias", entry.start, FSSAFunc([]))
+    main = _main_fn(41)
+    bv = _BV({**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
+             code_refs={0x800: [(0x41e, ref_fn)]}, entry=entry)
+    bv._funcs[0x800] = main
+    bv._funcs[_LIBC_START_SLOT] = FFunc("__libc_start_main", _LIBC_START_SLOT, FSSAFunc([]),
+                                      symbol_type="ImportedFunctionSymbol", is_thunk=True)
+    result = te.TaintEngine(bv, te.load_models()).backward(
+        main, [te.parse_locator("arg:memcpy:2")], max_depth=8)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert leaf["unfollowed"] == [{"address": "0x41e", "caller": "entry_alias",
+                                  "param": 0, "reason": "indirect_reference"}]
+    advice = result["diagnostics"]["next_action"]
+    assert "bn xrefs main" in advice and "dispatching caller" in advice
+    assert "external input" not in advice
+
+
+@pytest.mark.parametrize("callee,operand", [
+    ("__libc_start_main", 0),
+    ("__uClibc_main", 0),
+    ("__libc_start_main@GLIBC_2.34", 0),
+    ("queue_job", 0),
+    ("register_hook", 0),
+    ("__libc_start_main", 1),
+    ("__libc_start_main", 3),
+], ids=["libc-main", "uclibc-main", "versioned-main", "foreign-queue", "foreign-hook",
+        "runtime-operand-1", "runtime-operand-3"])
+def test_imported_names_and_operand_roles_do_not_change_the_indirect_boundary(callee, operand):
+    entry = _entry("entry_point", [(_LIBC_START_SLOT, True, operand)])
+    bv = _BV({**_NAMES, _LIBC_START_SLOT: callee, 0x800: "copy_handler"},
+             code_refs={0x800: [(0x41e, entry)]}, entry=entry)
+    result = te.TaintEngine(bv, te.load_models()).backward(
+        _copy_handler(), [te.parse_locator("arg:memcpy:2")], max_depth=8)
+
+    assert _gate(result) is False
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert leaf["unfollowed"][0]["reason"] == "indirect_reference"
+    advice = result["diagnostics"]["next_action"]
+    assert "xrefs copy_handler" in advice and "dispatching caller" in advice
+    assert "external input" not in advice
+
+
+def test_an_offset_from_the_main_callback_is_not_the_program_main_operand():
+    entry = _entry("entry_point", [(_LIBC_START_SLOT, True)])
+    entry.mlil.ssa_form.instructions[0].params[0] = FExpr(
+        "MLIL_ADD", "callback + 4",
+        left=FExpr("MLIL_CONST_PTR", "callback", constant=0x800), right=_const(4))
+    result = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0x41e, entry)]}, entry=entry)
+
+    assert _gate(result) is False
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert "dispatching caller" in result["diagnostics"]["next_action"]
+
+
+@pytest.mark.parametrize("local_first", [False, True])
+def test_entry_handing_the_same_callback_to_local_and_external_callees_keeps_dispatch_advice(local_first):
+    calls = [(_LIBC_START_SLOT, True), (_DISPATCH, False)]
+    if local_first:
+        calls.reverse()
+    entry = _entry("entry_point", calls)
+    result = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0x41e, entry), (0x426, entry)]}, entry=entry)
+
+    assert _gate(result) is False
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 2}
+    assert "bn xrefs main" in result["diagnostics"]["next_action"]
+    assert "dispatching caller" in result["diagnostics"]["next_action"]
+    assert "external input" not in result["diagnostics"]["next_action"]
+
+
+def test_external_handoff_beside_a_store_keeps_local_dispatch_advice():
+    entry = _entry("entry_point", [(_LIBC_START_SLOT, True)])
+    entry.mlil.ssa_form.instructions.append(FInstr(
+        1, 0x420, "MLIL_STORE_SSA", "save callback",
+        dest=FExpr("MLIL_CONST_PTR", "slot", constant=0x4000),
+        src=FExpr("MLIL_CONST_PTR", "main", constant=0x800)))
+    result = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0x41e, entry), (0x420, entry)]}, entry=entry)
+
+    assert _gate(result) is False
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 2}
+    assert "dispatching caller" in result["diagnostics"]["next_action"]
+    assert "external input" not in result["diagnostics"]["next_action"]
+
+
+def test_function_named_start_is_not_the_process_entry_by_name_alone():
+    entry = FFunc("actual_entry", 0x400, FSSAFunc([]))
+    ordinary = FFunc("_start", 0xa00, FSSAFunc([]))
+    result = _backward(_main_fn(41), {**_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0xa10, ordinary)]}, entry=entry)
+
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert "dispatching caller" in result["diagnostics"]["next_action"]
+
+
+@pytest.mark.parametrize("fault", ["missing-start", "invalid-start", "raising-il"])
+def test_broken_entry_metadata_cannot_escape_or_drop_a_known_reference(fault):
+    class BrokenEntry:
+        @property
+        def start(self):
+            if fault == "missing-start":
+                raise AttributeError("entry start unavailable")
+            return "not-an-address" if fault == "invalid-start" else 0x400
+
+        @property
+        def mlil(self):
+            raise RuntimeError("entry IL unavailable")
+
+    referenced_by = FFunc("_start", 0x400, FSSAFunc([]))
+    result = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0x40d, referenced_by), (0x414, referenced_by)]},
+                       entry=BrokenEntry())
+
+    assert _gate(result) is False
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 2}
+    assert (leaf["callers_total"], leaf["callers_followed"], leaf["callers_dropped"]) == (2, 0, 2)
+    assert {r["address"] for r in leaf["unfollowed"]} == {"0x40d", "0x414"}
+
+
+def test_direct_call_code_references_are_still_followed():
+    # An actual direct call site is followed, not confused with address-taking
+    # evidence. Its caller's formal remains a complete scalar origin.
+    start = _entry("_start", [(_LIBC_START_SLOT, True)])
     put = _length_sink("put", 0x800, 20)
     x = FVar("argc", ident=40)
     main = _caller("main", 0xa00, 0xa10, 0x800, _var(FSSA(x, 0)), params=[x])
@@ -312,6 +531,18 @@ def test_process_entry_handoff_of_main_and_direct_call_refs_are_not_indirect_cal
     assert _gate(direct) is True, direct["diagnostics"]
     assert _caller_leaves(direct) == []
     assert {"kind": "parameter", "index": 0, "var": "argc#0"} in _origins(direct)
+
+
+def test_actual_direct_call_from_entry_is_still_ascended():
+    put = _length_sink("put", 0x800, 20)
+    entry = _caller("entry_point", 0x400, 0x410, put.start, _const(37))
+    put.caller_sites = [FSite(entry, 0x410)]
+    result = _backward(put, {**_NAMES, put.start: "put"},
+                       code_refs={put.start: [(0x410, entry)]}, entry=entry)
+
+    assert _gate(result) is True, result["diagnostics"]
+    assert _caller_leaves(result) == []
+    assert _origins(result) == [{"kind": "constant", "value": 37}]
 
 
 # --------------------------------------------------------------------------
@@ -903,6 +1134,127 @@ def test_next_action_names_each_unfollowed_reason_and_keeps_the_cap_advice():
     assert diag["safe_to_report_complete_slice"] is False
 
 
+@pytest.mark.parametrize("count", [3, 4, 20, 200])
+def test_indirect_advice_groups_boilerplate_and_bounds_function_examples(count):
+    from bn_agent_bridge.taint_result import backward_diagnostics
+
+    leaves = [
+        {"kind": "caller_sites_truncated",
+         "function": {"name": f"handler_{i}", "address": hex(0x800 + i * 0x20)},
+         "reasons": {"indirect_reference": 1},
+         "unfollowed": [{"address": hex(0x4000 + i * 8), "param": 0,
+                         "reason": "indirect_reference"}]}
+        for i in range(count)
+    ]
+    original = copy.deepcopy(leaves)
+    diag = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)
+    advice = diag["next_action"]
+    commands = _advice_commands(advice, "xrefs")
+    shown = {command[command.index("xrefs") + 1] for command in commands}
+
+    assert diag["safe_to_report_complete_slice"] is False
+    assert diag["frontier"]["dropped_callers"] == count
+    assert len(commands) == len(shown) == min(count, 3)
+    assert shown <= {leaf["function"]["name"] for leaf in leaves}
+    assert advice.count("dispatching caller") == 1
+    assert len(advice) < 1000
+    if count > len(shown):
+        assert f"{count - len(shown)} more affected functions" in advice
+        assert "caller_sites_truncated" in advice
+    else:
+        assert "more affected functions" not in advice
+    assert leaves == original
+
+
+def test_advice_omission_counts_unique_functions_per_reason_without_hiding_other_reasons():
+    from bn_agent_bridge.taint_result import backward_diagnostics
+
+    leaves = [{"kind": "caller_sites_truncated",
+               "function": {"name": f"handler_{i}", "address": hex(0x800 + i * 0x20)},
+               "reasons": {"indirect_reference": 1},
+               "unfollowed": [{"address": "0x4000", "param": 0, "reason": "indirect_reference"}]}
+              for i in range(20)]
+    second_formal = copy.deepcopy(leaves[0])
+    second_formal["unfollowed"][0]["param"] = 1
+    leaves.extend([
+        second_formal,
+        {"kind": "caller_sites_truncated", "function": {"name": "relay", "address": "0x2000"},
+         "reasons": {"max_depth": 1}},
+        {"kind": "caller_sites_truncated", "function": {"name": "short_call", "address": "0x3000"},
+         "reasons": {"arity_short": 1}},
+    ])
+    original = copy.deepcopy(leaves)
+    diag = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)
+    advice = diag["next_action"]
+    xrefs = _advice_commands(advice, "xrefs")
+    callsites = _advice_commands(advice, "callsites")
+
+    assert diag["safe_to_report_complete_slice"] is False
+    assert len(xrefs) == 3
+    assert "17 more affected functions" in advice
+    assert {command[command.index("callsites") + 1] for command in callsites} == {"short_call"}
+    assert "--max-depth" in advice and "relay" in advice
+    assert all(command[command.index("xrefs") + 1].startswith("handler_") for command in xrefs)
+    assert leaves == original
+
+
+def test_bounded_examples_disambiguate_equal_names_by_function_address():
+    from bn_agent_bridge.taint_result import backward_diagnostics
+
+    leaves = [{"kind": "caller_sites_truncated",
+               "function": {"name": "handle_packet", "address": address},
+               "reasons": {"indirect_reference": 1}}
+              for address in ("0x800", "0x900")]
+    diag = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)
+    commands = _advice_commands(diag["next_action"], "xrefs")
+
+    assert diag["safe_to_report_complete_slice"] is False
+    assert {command[command.index("xrefs") + 1] for command in commands} == {"0x800", "0x900"}
+    assert "more affected functions" not in diag["next_action"]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("same_name", [False, True])
+def test_another_functions_depth_boundary_does_not_restrict_dispatch_advice(reverse, same_name):
+    from bn_agent_bridge.taint_result import backward_diagnostics
+
+    indirect = {"kind": "caller_sites_truncated",
+                "function": {"name": "handler_a", "address": "0x800"},
+                "reasons": {"indirect_reference": 1}}
+    depth_limited = {"kind": "caller_sites_truncated",
+                     "function": {"name": "handler_a" if same_name else "main", "address": "0x400"},
+                     "reasons": {"max_depth": 1}}
+    leaves = [depth_limited, indirect] if reverse else [indirect, depth_limited]
+    diag = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)
+
+    assert diag["safe_to_report_complete_slice"] is False
+    indirect_selector = "0x800" if same_name else "handler_a"
+    assert f"bn xrefs {indirect_selector}" in diag["next_action"]
+    assert "dispatching caller" in diag["next_action"]
+    assert "references only" not in diag["next_action"]
+    limited_selector = "0x400" if same_name else "main"
+    assert f"for {limited_selector}:" in diag["next_action"]
+
+
+def test_each_function_keeps_its_indirect_advice_beside_depth_boundaries():
+    from bn_agent_bridge.taint_result import backward_diagnostics
+
+    leaves = [
+        {"kind": "caller_sites_truncated", "function": {"name": "handler_a", "address": "0x800"},
+         "reasons": {"indirect_reference": 1}},
+        {"kind": "caller_sites_truncated", "function": {"name": "main", "address": "0x400"},
+         "reasons": {"max_depth": 1, "indirect_reference": 1}},
+    ]
+    advice = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)["next_action"]
+
+    actions = advice.split("; ")
+    handler_action = next(action for action in actions if "`bn xrefs handler_a`" in action)
+    main_action = next(action for action in actions if "`bn xrefs main`" in action)
+    assert "references only" not in handler_action
+    assert "references only" not in main_action
+    assert "--max-depth" in advice and "for main:" in advice
+
+
 # --------------------------------------------------------------------------
 # real Binary Ninja: the same shapes on compiled public synthetic programs
 # --------------------------------------------------------------------------
@@ -937,6 +1289,68 @@ __attribute__((noinline,noreturn)) void entry_point(void) {
 }
 """
 
+_QUEUED_ENTRY_C = r"""
+#include <stddef.h>
+#include <string.h>
+typedef void (*handler)(size_t);
+static handler saved;
+static char out[64];
+__attribute__((noinline)) void copy_handler(size_t n) { memcpy(out, "public", n); }
+__attribute__((noinline)) void dispatch_saved(void) { saved(4096); }
+__attribute__((noinline)) void queue_job(handler h, size_t ignored) {
+    (void)ignored; saved = h; dispatch_saved();
+}
+__attribute__((noreturn)) void entry_point(void) {
+    queue_job(copy_handler, 1);
+    for (;;) __asm__ volatile ("pause");
+}
+"""
+
+
+_MIXED_BOUNDARY_C = r"""
+#include <stddef.h>
+#include <stdlib.h>
+typedef void (*handler)(size_t);
+static handler saved;
+static void *observed;
+__attribute__((noinline)) void sink_size(size_t n) { observed = malloc(n); }
+__attribute__((noinline)) void handler_a(size_t n) { sink_size(n); }
+__attribute__((noinline)) void queue_job(handler h) { saved = h; saved(4096); }
+#ifdef USE_RELAY
+__attribute__((noinline)) void relay_size(size_t n) { sink_size(n); }
+#endif
+int main(int argc, char **argv) {
+    (void)argv;
+#ifdef USE_RELAY
+    relay_size((size_t)argc);
+#else
+    sink_size((size_t)argc);
+#endif
+    queue_job(handler_a);
+    return observed != 0;
+}
+"""
+
+
+_DISPATCH_TWENTY_C = r"""
+#include <stddef.h>
+#include <string.h>
+typedef void (*handler)(size_t);
+static char out[64];
+__attribute__((noinline)) void sink_copy(size_t n) { memcpy(out, "public", n); }
+#define EACH(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) \
+                X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19)
+#define DECL(N) __attribute__((noinline)) void handler_##N(size_t n) { sink_copy(n); }
+EACH(DECL)
+#define REF(N) handler_##N,
+static handler table[] = { EACH(REF) };
+__attribute__((noinline)) void dispatch(unsigned index, size_t n) { table[index % 20](n); }
+int main(int argc, char **argv) {
+    (void)argv; dispatch((unsigned)argc, (size_t)argc); return out[0];
+}
+"""
+
+
 _STARTUP_C = r"""
 #include <stddef.h>
 #include <string.h>
@@ -950,6 +1364,79 @@ int main(int argc, char **argv) {
     put_len((size_t)argc);
     dispatch(copy_handler, (size_t)argc);
     return out[0];
+}
+"""
+
+
+_RUNTIME_IMPOSTOR_C = r"""
+#include <stddef.h>
+#include <string.h>
+static char out[64];
+typedef void (*handler)(size_t);
+static handler saved;
+__attribute__((noinline, used)) void copy_handler(size_t n) { memcpy(out, out, n); }
+#ifdef OPERAND_ONE
+__attribute__((noinline, used)) void __libc_start_main(size_t n, handler h) {
+#else
+__attribute__((noinline, used)) void __libc_start_main(handler h, size_t n) {
+#endif
+    (void)n;
+    saved = h;
+    saved(4096);
+}
+__attribute__((noinline, used, noreturn)) void entry_point(void) {
+#ifdef OPERAND_ONE
+    __libc_start_main(1, copy_handler);
+#else
+    __libc_start_main(copy_handler, 1);
+#endif
+    for (;;) __asm__ volatile ("pause");
+}
+"""
+
+
+_EXTERNAL_RUNTIME_C = r"""
+#include <stddef.h>
+typedef void (*handler)(size_t);
+static handler saved;
+#ifndef RUNTIME_NAME
+#define RUNTIME_NAME __libc_start_main
+#endif
+#ifdef CALLBACK_SECOND
+__attribute__((noinline)) void RUNTIME_NAME(size_t ignored, handler h) {
+#else
+__attribute__((noinline)) void RUNTIME_NAME(handler h, size_t ignored) {
+#endif
+    (void)ignored;
+    saved = h;
+    saved(4096);
+}
+"""
+
+_EXTERNAL_RUNTIME_ENTRY_C = r"""
+#include <stddef.h>
+#include <string.h>
+typedef void (*handler)(size_t);
+#ifndef RUNTIME_NAME
+#define RUNTIME_NAME __libc_start_main
+#endif
+#ifdef USE_GOT
+__attribute__((noplt))
+#endif
+#ifdef CALLBACK_SECOND
+extern void RUNTIME_NAME(size_t, handler);
+#else
+extern void RUNTIME_NAME(handler, size_t);
+#endif
+static char out[64];
+__attribute__((noinline)) void copy_handler(size_t n) { memcpy(out, out, n); }
+__attribute__((noreturn)) void entry_point(void) {
+#ifdef CALLBACK_SECOND
+    RUNTIME_NAME(1, copy_handler);
+#else
+    RUNTIME_NAME(copy_handler, 1);
+#endif
+    for (;;) __asm__ volatile ("pause");
 }
 """
 
@@ -1124,7 +1611,7 @@ def _bn_backward(bridge, target: str, fn: str, sink: str, *extra: str):
 @pytest.mark.real_bn
 def test_real_bn_custom_entry_callback_is_an_indirect_caller(tmp_path, shared_bn):
     # `-nostartfiles -e entry_point`: the entry function hands copy_handler to
-    # dispatch. That is a callback, not the runtime's handoff of `main`.
+    # dispatch. Its indirect caller remains unresolved.
     binary = _compile(tmp_path, "entry_callback", _ENTRY_CALLBACK_C,
                       ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point"])
     target = shared_bn.load(binary, copy=False)
@@ -1134,12 +1621,15 @@ def test_real_bn_custom_entry_callback_is_an_indirect_caller(tmp_path, shared_bn
     (leaf,) = _caller_leaves(result)
     assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
     assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
+    assert "xrefs copy_handler" in result["diagnostics"]["next_action"]
+    assert "dispatching caller" in result["diagnostics"]["next_action"]
+    assert "external input" not in result["diagnostics"]["next_action"]
 
 
 @pytest.mark.real_bn
 def test_real_bn_custom_entry_dispatching_main_is_an_indirect_caller(tmp_path, shared_bn):
     # A callback NAMED main that the custom entry hands to its own
-    # dispatcher: no C-runtime handoff, so the name earns no exemption.
+    # dispatcher: neither the callback name nor the entry confers completeness.
     binary = _compile(tmp_path, "main_callback", _MAIN_CALLBACK_C,
                       ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point"])
     target = shared_bn.load(binary, copy=False)
@@ -1152,16 +1642,210 @@ def test_real_bn_custom_entry_dispatching_main_is_an_indirect_caller(tmp_path, s
 
 
 @pytest.mark.real_bn
-def test_real_bn_main_startup_stays_an_origin_beside_a_real_callback(tmp_path, shared_bn):
-    # Normal `_start -> __libc_start_main(main)` startup: main's argc is the
-    # origin of a complete slice. In the same program a handler main hands to
-    # dispatch is an indirect callee.
-    binary = _compile(tmp_path, "startup", _STARTUP_C, ["-no-pie"])
+@pytest.mark.parametrize("operand", [0, 1])
+def test_real_bn_in_binary_runtime_impostor_is_an_indirect_caller(tmp_path, shared_bn, operand):
+    flags = ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point"]
+    if operand == 1:
+        flags.append("-DOPERAND_ONE")
+    binary = _compile(tmp_path, "runtime_impostor", _RUNTIME_IMPOSTOR_C, flags)
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "copy_handler", "arg:memcpy:2")
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert leaf["callers_total"] == leaf["callers_dropped"] == len(leaf["unfollowed"])
+    assert leaf["callers_followed"] == 0
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
+
+
+@pytest.mark.real_bn
+def test_real_bn_static_startup_is_an_unproven_indirect_boundary(tmp_path, shared_bn):
+    binary = _compile(tmp_path, "static_startup", _STARTUP_C, ["-static", "-no-pie"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "main", "param:0")
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert leaf["callers_followed"] == 0
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"_start"}
+
+
+@pytest.mark.real_bn
+def test_real_bn_queued_custom_entry_keeps_the_local_dispatch_path_actionable(tmp_path, shared_bn):
+    binary = _compile(tmp_path, "queued_entry", _QUEUED_ENTRY_C,
+                      ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "copy_handler", "arg:memcpy:2")
+
+    assert _gate(result) is False
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
+    advice = result["diagnostics"]["next_action"]
+    assert "xrefs copy_handler" in advice and "dispatching caller" in advice
+    assert "external input" not in advice and "references only" not in advice
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "copy_handler",
+                         "--sink", "arg:memcpy:2", "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "indirect_reference" in text.stdout and "runtime_start_boundary" not in text.stdout
+    assert "dispatching caller" in text.stdout and "external input" not in text.stdout
+
+
+@pytest.mark.real_bn
+def test_real_bn_mixed_runtime_and_dispatch_boundaries_keep_each_functions_advice(tmp_path, shared_bn):
+    binary = _compile(tmp_path, "mixed_boundaries", _MIXED_BOUNDARY_C, ["-no-pie"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "sink_size", "arg:malloc:0")
+
+    assert _gate(result) is False
+    leaves = {leaf["function"]["name"]: leaf for leaf in _caller_leaves(result)}
+    assert set(leaves) == {"main", "handler_a"}
+    assert set(leaves["main"]["reasons"]) == {"indirect_reference"}
+    assert set(leaves["handler_a"]["reasons"]) == {"indirect_reference"}
+    advice = result["diagnostics"]["next_action"]
+    assert "xrefs main" in advice and "xrefs handler_a" in advice
+    assert "external input" not in advice
+    handler_action = next(action for action in advice.split("; ") if "xrefs handler_a" in action)
+    assert "dispatching caller" in handler_action and "references only" not in handler_action
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "sink_size",
+                         "--sink", "arg:malloc:0", "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "xrefs main" in text.stdout and "xrefs handler_a" in text.stdout
+    assert "safe_to_report_complete_slice: false" in text.stdout
+
+
+@pytest.mark.real_bn
+def test_real_bn_dispatch_table_advice_is_bounded_without_losing_frontiers(tmp_path, shared_bn):
+    binary = _compile(tmp_path, "dispatch_twenty", _DISPATCH_TWENTY_C, ["-no-pie"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "sink_copy", "arg:memcpy:2")
+    leaves = _caller_leaves(result)
+    cap, = [leaf for leaf in leaves if "caller_cap" in leaf["reasons"]]
+    indirect = [leaf for leaf in leaves if "indirect_reference" in leaf["reasons"]]
+
+    assert _gate(result) is False
+    assert len(leaves) == 17
+    assert len(indirect) == 16
+    assert (cap["callers_total"], cap["callers_followed"], cap["callers_dropped"]) == (20, 16, 4)
+    assert cap["reasons"] == {"caller_cap": 4}
+    advice = result["diagnostics"]["next_action"]
+    commands = _advice_commands(advice, "xrefs")
+    assert len(commands) == 3
+    assert "13 more affected functions" in advice and "caller_sites_truncated" in advice
+    assert advice.count("dispatching caller") == 1
+    by_name = {leaf["function"]["name"]: leaf for leaf in indirect}
+    for command in commands:
+        options = {token: command[i + 1] for i, token in enumerate(command[:-1])
+                   if token in ("-i", "--instance", "-t", "--target")}
+        assert options.get("-i", options.get("--instance")) == shared_bn.instance_id
+        assert options.get("-t", options.get("--target")) == target
+        selected = command[command.index("xrefs") + 1]
+        assert selected in by_name
+        xrefs = shared_bn.json(*command[1:], timeout=180.0)
+        assert xrefs["address"] == by_name[selected]["function"]["address"]
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "sink_copy",
+                         "--sink", "arg:memcpy:2", "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "13 more affected functions" in text.stdout
+    assert "safe_to_report_complete_slice: false" in text.stdout
+    assert text.stdout.count("dispatching caller") == 1
+    assert len(_advice_commands(text.stdout, "xrefs")) == 3
+
+
+@pytest.mark.real_bn
+def test_real_bn_mixed_reasons_keep_each_remedy_and_its_function_targets(tmp_path, shared_bn):
+    binary = _compile(tmp_path, "mixed_reasons", _MIXED_BOUNDARY_C, ["-no-pie", "-DUSE_RELAY"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "sink_size", "arg:malloc:0", "--max-depth", "1")
+    leaves = {leaf["function"]["name"]: leaf for leaf in _caller_leaves(result)}
+
+    assert _gate(result) is False
+    assert set(leaves) == {"handler_a", "relay_size"}
+    assert leaves["relay_size"]["reasons"] == {"max_depth": 1}
+    assert set(leaves["handler_a"]["reasons"]) == {"indirect_reference"}
+    advice = result["diagnostics"]["next_action"]
+    assert "--max-depth" in advice and "relay_size" in advice
+    commands = _advice_commands(advice, "xrefs")
+    assert {command[command.index("xrefs") + 1] for command in commands} == {"handler_a"}
+    assert "references only" not in advice
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "sink_size",
+                         "--sink", "arg:malloc:0", "--max-depth", "1", "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "--max-depth" in text.stdout and "relay_size" in text.stdout
+    assert {cmd[cmd.index("xrefs") + 1] for cmd in _advice_commands(text.stdout, "xrefs")} == {"handler_a"}
+    assert "safe_to_report_complete_slice: false" in text.stdout
+
+
+@pytest.mark.real_bn
+@pytest.mark.parametrize("flags", [["-no-pie"], ["-fPIE", "-pie"]], ids=["host", "host-pie"])
+def test_real_bn_runtime_entry_references_are_unresolved(tmp_path, shared_bn, flags):
+    binary = _compile(tmp_path, "startup", _STARTUP_C, flags)
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "main", "param:0")
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert set(leaf["reasons"]) == {"indirect_reference"}
+    assert leaf["callers_followed"] == 0
+    assert [(o["kind"], o.get("index")) for o in _origins(result)] == [("parameter", 0)]
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "main", "--sink", "param:0",
+                         "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "safe_to_report_complete_slice: false" in text.stdout
+    assert "caller_sites_truncated" in text.stdout and "indirect_reference" in text.stdout
+    assert "xrefs main" in text.stdout and "dispatching caller" in text.stdout
+    assert "external input" not in text.stdout and "runtime_start_boundary" not in text.stdout
+
+
+@pytest.mark.real_bn
+@pytest.mark.parametrize("flags", [
+    ["-DUSE_GOT"],
+    [],
+    ["-DUSE_GOT", "-DRUNTIME_NAME=queue_job"],
+    ["-DRUNTIME_NAME=queue_job"],
+    ["-DUSE_GOT", "-DCALLBACK_SECOND"],
+    ["-DCALLBACK_SECOND"],
+], ids=["got-main", "plt-main", "got-queue", "plt-queue", "got-operand-1", "plt-operand-1"])
+def test_real_bn_external_runtime_impostor_is_an_unresolved_caller(tmp_path, shared_bn, flags):
+    _compile(tmp_path, "libruntime.so", _EXTERNAL_RUNTIME_C, ["-shared", "-fPIC", *flags])
+    binary = _compile(tmp_path, "external_runtime", _EXTERNAL_RUNTIME_ENTRY_C,
+                      ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point", *flags,
+                       "-Wl,--no-as-needed", f"-L{tmp_path}", "-lruntime", "-Wl,-rpath,$ORIGIN"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "copy_handler", "arg:memcpy:2")
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert set(leaf["reasons"]) == {"indirect_reference"}
+    assert leaf["callers_followed"] == 0
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "copy_handler",
+                         "--sink", "arg:memcpy:2", "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "safe_to_report_complete_slice: false" in text.stdout
+    assert "indirect_reference" in text.stdout
+    assert "xrefs copy_handler" in text.stdout and "dispatching caller" in text.stdout
+    assert "external input" not in text.stdout and "runtime_start_boundary" not in text.stdout
+    xrefs = shared_bn.json("-t", target, "xrefs", "copy_handler", timeout=180.0)
+    assert {r["caller_function"]["name"] for r in xrefs["items"] if r["kind"] == "code"} == {"entry_point"}
+
+
+@pytest.mark.real_bn
+@pytest.mark.parametrize("flags", [["-no-pie"], ["-fPIE", "-pie"]], ids=["non-pie", "pie"])
+def test_real_bn_direct_ascent_reaches_runtime_boundary_beside_a_callback(tmp_path, shared_bn, flags):
+    # The direct put_len caller is followed to main's argc, but the runtime's
+    # caller-supplied origin remains unresolved. Main's own dispatch is a
+    # separate indirect caller of copy_handler.
+    binary = _compile(tmp_path, "startup", _STARTUP_C, flags)
     target = shared_bn.load(binary, copy=False)
 
     direct = _bn_backward(shared_bn, target, "put_len", "arg:memcpy:2")
-    assert direct["diagnostics"]["safe_to_report_complete_slice"] is True, direct["diagnostics"]
-    assert _caller_leaves(direct) == []
+    assert _gate(direct) is False, direct["diagnostics"]
+    (leaf,) = _caller_leaves(direct)
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"_start"}
+    assert set(leaf["reasons"]) == {"indirect_reference"}
     assert [(sl["origin"]["kind"], sl["origin"].get("index"), sl["crossed_functions"])
             for sl in direct["slices"]] == [("parameter", 0, ["put_len"])]
 
