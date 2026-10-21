@@ -218,8 +218,8 @@ def test_callback_handed_on_in_code_is_an_indirect_caller_not_a_complete_slice()
 
 def test_callback_the_entry_function_hands_on_is_an_indirect_caller():
     # A custom entry (`-nostartfiles -e entry_point`) calling
-    # `dispatch(copy_handler, 17)`: the entry function's reference is not the
-    # runtime's handoff of `main`, so the handler's caller is unfollowed.
+    # `dispatch(copy_handler, 17)`: the entry function's address-taking
+    # references leave the indirect caller unfollowed.
     entry = FFunc("entry_point", 0x400, FSSAFunc([]))
     result = _backward(_copy_handler(), {**_NAMES, 0x800: "copy_handler"},
                        code_refs={0x800: [(0x40d, entry), (0x414, entry)]}, entry=entry)
@@ -260,8 +260,8 @@ def _entry(name, calls):
 
 
 def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
-    # Only the entry function's runtime handoff of `main` is exempt; another
-    # function taking `main`'s address is a callback like any other.
+    # Both the entry's runtime handoff and an ordinary function taking main's
+    # address are unresolved callers; neither erases the other's boundary.
     start = _entry("_start", [(_LIBC_START_SLOT, True)])
     hooks = FFunc("register_hooks", 0xb00, FSSAFunc([]))
     result = _backward(_main_fn(42), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
@@ -269,7 +269,8 @@ def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [("0xb0c", "register_hooks")]
+    assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [
+        ("0x41e", "_start"), ("0xb0c", "register_hooks")]
 
 
 @pytest.mark.parametrize("calls", [
@@ -279,8 +280,8 @@ def test_main_handed_on_by_an_ordinary_function_is_an_indirect_caller():
     [(_LIBC_START_SLOT, True, 3)],                      # handed to the runtime, but not as main
 ], ids=["dispatch-only", "handoff-and-dispatch", "no-evidence", "not-the-main-operand"])
 def test_callback_named_main_the_entry_dispatches_is_an_indirect_caller(calls):
-    # The exemption is evidence, not a name: a custom entry handing `main` to
-    # its own dispatcher is an in-binary indirect caller of `main`.
+    # A custom entry handing `main` to its own dispatcher is an indirect
+    # caller, just like a runtime entry handing the function to external code.
     entry = _entry("entry_point", calls)
     result = _backward(_main_fn(43), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
                        code_refs={0x800: [(0x40d, entry)]}, entry=entry)
@@ -309,8 +310,8 @@ def test_in_binary_runtime_name_does_not_prove_a_startup_boundary(runtime, opera
 
 
 def test_static_runtime_handoff_is_an_unproven_indirect_boundary():
-    # A static libc body and a same-named impostor have no independently
-    # external boundary. Both fail closed, even when the entry is `_start`.
+    # A static libc body and a same-named impostor leave the callback's
+    # caller-supplied origins unresolved, even when the entry is `_start`.
     start = _entry("_start", [(_LIBC_START_SLOT, False)])
     result = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
                        code_refs={0x800: [(0x41e, start)]}, entry=start)
@@ -322,16 +323,48 @@ def test_static_runtime_handoff_is_an_unproven_indirect_boundary():
                                   "param": 0, "reason": "indirect_reference"}]
 
 
-def test_process_entry_handoff_of_main_and_direct_call_refs_are_not_indirect_callers():
-    # Controls: the GOT import establishes the external startup boundary;
-    # the code reference a direct call site makes is already followed.
+@pytest.mark.parametrize("runtime", ["__libc_start_main", "__uClibc_main"])
+@pytest.mark.parametrize("symbol_type,is_thunk", [
+    ("ImportedFunctionSymbol", True),
+    ("FunctionSymbol", True),
+    ("LibraryFunctionSymbol", False),
+])
+@pytest.mark.parametrize("operand", [0, 1])
+def test_direct_runtime_handoff_metadata_does_not_prove_caller_origins(runtime, symbol_type,
+                                                                    is_thunk, operand):
+    # Import metadata, a thunk flag, or a library signature identifies no
+    # caller-supplied value. The handoff remains an unresolved caller boundary.
+    entry = _entry("_start", [(_LIBC_START_SLOT, False, operand)])
+    bv = _BV({**_NAMES, _LIBC_START_SLOT: runtime, 0x800: "main"},
+             code_refs={0x800: [(0x41e, entry)]}, entry=entry)
+    bv._funcs[_LIBC_START_SLOT] = FFunc(runtime, _LIBC_START_SLOT, FSSAFunc([]),
+                                      symbol_type=symbol_type, is_thunk=is_thunk)
+    result = te.TaintEngine(bv, te.load_models()).backward(
+        _main_fn(41), [te.parse_locator("arg:memcpy:2")], max_depth=8)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert leaf["unfollowed"] == [{"address": "0x41e", "caller": "_start",
+                                  "param": 0, "reason": "indirect_reference"}]
+
+
+def test_imported_process_entry_handoff_is_an_unresolved_caller_boundary():
+    # GOT/import provenance does not prove which origins the external runtime
+    # supplies to main.
     start = _entry("_start", [(_LIBC_START_SLOT, True)])
     handoff = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
                         code_refs={0x800: [(0x41e, start)]}, entry=start)
-    assert _gate(handoff) is True, handoff["diagnostics"]
-    assert _caller_leaves(handoff) == []
+    assert _gate(handoff) is False, handoff["diagnostics"]
+    (leaf,) = _caller_leaves(handoff)
+    assert leaf["reasons"] == {"indirect_reference": 1}
     assert _origins(handoff) == [{"kind": "parameter", "index": 0, "var": "argc#0"}]
 
+
+def test_direct_call_code_references_are_still_followed():
+    # An actual direct call site is followed, not confused with address-taking
+    # evidence. Its caller's formal remains a complete scalar origin.
+    start = _entry("_start", [(_LIBC_START_SLOT, True)])
     put = _length_sink("put", 0x800, 20)
     x = FVar("argc", ident=40)
     main = _caller("main", 0xa00, 0xa10, 0x800, _var(FSSA(x, 0)), params=[x])
@@ -1009,6 +1042,34 @@ __attribute__((noinline, used, noreturn)) void entry_point(void) {
 }
 """
 
+
+_EXTERNAL_RUNTIME_C = r"""
+#include <stddef.h>
+typedef void (*handler)(size_t);
+static handler saved;
+__attribute__((noinline)) void __libc_start_main(handler h, size_t ignored) {
+    (void)ignored;
+    saved = h;
+    saved(4096);
+}
+"""
+
+_EXTERNAL_RUNTIME_ENTRY_C = r"""
+#include <stddef.h>
+#include <string.h>
+typedef void (*handler)(size_t);
+#ifdef USE_GOT
+__attribute__((noplt))
+#endif
+extern void __libc_start_main(handler, size_t);
+static char out[64];
+__attribute__((noinline)) void copy_handler(size_t n) { memcpy(out, out, n); }
+__attribute__((noreturn)) void entry_point(void) {
+    __libc_start_main(copy_handler, 1);
+    for (;;) __asm__ volatile ("pause");
+}
+"""
+
 _BUDGET_C = r"""
 #include <stddef.h>
 #include <stdlib.h>
@@ -1158,10 +1219,11 @@ int main(void) { start_b(); start_direct(); return 0; }
 """
 
 
-def _compile(tmp_path: Path, name: str, source: str, flags: list[str]) -> Path:
-    cc = shutil.which("cc") or shutil.which("gcc")
+def _compile(tmp_path: Path, name: str, source: str, flags: list[str], *,
+             compiler: str = "cc") -> Path:
+    cc = shutil.which(compiler) or (shutil.which("gcc") if compiler == "cc" else None)
     if cc is None:
-        raise FixtureBuildError("no C compiler; the real-BN coverage lane cannot build its programs")
+        raise FixtureBuildError(f"{compiler} unavailable; the real-BN coverage lane cannot build its programs")
     src = tmp_path / f"{name}.c"
     src.write_text(source)
     out = tmp_path / name
@@ -1180,7 +1242,7 @@ def _bn_backward(bridge, target: str, fn: str, sink: str, *extra: str):
 @pytest.mark.real_bn
 def test_real_bn_custom_entry_callback_is_an_indirect_caller(tmp_path, shared_bn):
     # `-nostartfiles -e entry_point`: the entry function hands copy_handler to
-    # dispatch. That is a callback, not the runtime's handoff of `main`.
+    # dispatch. Its indirect caller remains unresolved.
     binary = _compile(tmp_path, "entry_callback", _ENTRY_CALLBACK_C,
                       ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point"])
     target = shared_bn.load(binary, copy=False)
@@ -1195,7 +1257,7 @@ def test_real_bn_custom_entry_callback_is_an_indirect_caller(tmp_path, shared_bn
 @pytest.mark.real_bn
 def test_real_bn_custom_entry_dispatching_main_is_an_indirect_caller(tmp_path, shared_bn):
     # A callback NAMED main that the custom entry hands to its own
-    # dispatcher: no C-runtime handoff, so the name earns no exemption.
+    # dispatcher: neither the callback name nor the entry confers completeness.
     binary = _compile(tmp_path, "main_callback", _MAIN_CALLBACK_C,
                       ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point"])
     target = shared_bn.load(binary, copy=False)
@@ -1239,17 +1301,65 @@ def test_real_bn_static_startup_is_an_unproven_indirect_boundary(tmp_path, share
 
 
 @pytest.mark.real_bn
+@pytest.mark.parametrize("compiler,flags", [
+    ("cc", ["-no-pie"]), ("cc", ["-fPIE", "-pie"]),
+    ("cc", ["-m32", "-no-pie"]), ("cc", ["-m32", "-fPIE", "-pie"]),
+    ("aarch64-linux-gnu-gcc", ["-no-pie"]), ("aarch64-linux-gnu-gcc", ["-fPIE", "-pie"]),
+    ("arm-linux-gnueabihf-gcc", ["-no-pie"]), ("arm-linux-gnueabihf-gcc", ["-fPIE", "-pie"]),
+], ids=["x64", "x64-pie", "i386-plt", "i386-pie", "a64-plt", "a64-pie", "thumb", "thumb-pie"])
+def test_real_bn_runtime_entry_references_are_unresolved(tmp_path, shared_bn, compiler, flags):
+    binary = _compile(tmp_path, "startup", _STARTUP_C, flags, compiler=compiler)
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "main", "param:0")
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert set(leaf["reasons"]) == {"indirect_reference"}
+    assert leaf["callers_followed"] == 0
+    assert [(o["kind"], o.get("index")) for o in _origins(result)] == [("parameter", 0)]
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "main", "--sink", "param:0",
+                         "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "safe_to_report_complete_slice: false" in text.stdout
+    assert "caller_sites_truncated" in text.stdout and "indirect_reference" in text.stdout
+
+
+@pytest.mark.real_bn
+@pytest.mark.parametrize("flags", [["-DUSE_GOT"], []], ids=["got", "plt"])
+def test_real_bn_external_runtime_impostor_is_an_unresolved_caller(tmp_path, shared_bn, flags):
+    _compile(tmp_path, "libruntime.so", _EXTERNAL_RUNTIME_C, ["-shared", "-fPIC"])
+    binary = _compile(tmp_path, "external_runtime", _EXTERNAL_RUNTIME_ENTRY_C,
+                      ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point", *flags,
+                       "-Wl,--no-as-needed", f"-L{tmp_path}", "-lruntime", "-Wl,-rpath,$ORIGIN"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "copy_handler", "arg:memcpy:2")
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert set(leaf["reasons"]) == {"indirect_reference"}
+    assert leaf["callers_followed"] == 0
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "copy_handler",
+                         "--sink", "arg:memcpy:2", "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "safe_to_report_complete_slice: false" in text.stdout
+    assert "indirect_reference" in text.stdout
+
+
+@pytest.mark.real_bn
 @pytest.mark.parametrize("flags", [["-no-pie"], ["-fPIE", "-pie"]], ids=["non-pie", "pie"])
-def test_real_bn_main_startup_stays_an_origin_beside_a_real_callback(tmp_path, shared_bn, flags):
-    # Normal `_start -> __libc_start_main(main)` startup: main's argc is the
-    # origin of a complete slice. In the same program a handler main hands to
-    # dispatch is an indirect callee.
+def test_real_bn_direct_ascent_reaches_runtime_boundary_beside_a_callback(tmp_path, shared_bn, flags):
+    # The direct put_len caller is followed to main's argc, but the runtime's
+    # caller-supplied origin remains unresolved. Main's own dispatch is a
+    # separate indirect caller of copy_handler.
     binary = _compile(tmp_path, "startup", _STARTUP_C, flags)
     target = shared_bn.load(binary, copy=False)
 
     direct = _bn_backward(shared_bn, target, "put_len", "arg:memcpy:2")
-    assert direct["diagnostics"]["safe_to_report_complete_slice"] is True, direct["diagnostics"]
-    assert _caller_leaves(direct) == []
+    assert _gate(direct) is False, direct["diagnostics"]
+    (leaf,) = _caller_leaves(direct)
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"_start"}
+    assert set(leaf["reasons"]) == {"indirect_reference"}
     assert [(sl["origin"]["kind"], sl["origin"].get("index"), sl["crossed_functions"])
             for sl in direct["slices"]] == [("parameter", 0, ["put_len"])]
 
