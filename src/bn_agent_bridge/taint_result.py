@@ -637,9 +637,7 @@ def backward_diagnostics(
     if dropped_callers_n:
         # Each reason the ascent left callers unfollowed has its own remedy
         # (IC01). A leaf with no `reasons` tally is a cap leaf (#810).
-        why: dict[str, str] = {}
-        indirect_functions: dict[str, str] = {}
-        runtime_functions: set[str] = set()
+        functions: dict[str, tuple[str, set[str]]] = {}
         for lf in leaves or []:
             if lf.get("kind") != "caller_sites_truncated":
                 continue
@@ -648,43 +646,42 @@ def backward_diagnostics(
                        and lf.get("reasons") else {"caller_cap": 1})
             selector = shlex.quote(str(fn.get("name") or fn.get("address") or "<function>"))
             function_key = str(fn.get("address") or fn.get("name") or "<function>")
-            if "runtime_start_boundary" in reasons:
-                runtime_functions.add(function_key)
-            if "indirect_reference" in reasons:
-                indirect_functions.setdefault(function_key, selector)
-            for r in reasons:
-                why.setdefault(str(r), selector)
+            if function_key not in functions:
+                functions[function_key] = (selector, set())
+            functions[function_key][1].update(str(r) for r in reasons)
         advice = []
-        if "caller_cap" in why:
-            advice.append(
-                "the caller ascent was capped, so some calling sites were never "
-                "followed; re-run against a specific caller or narrow the sink to "
-                "see the origins behind the dropped sites")
-        if "max_depth" in why:
-            advice.append("the caller ascent stopped at the configured depth; re-run "
-                          "with a larger --max-depth to follow the remaining callers")
-        if "runtime_start_boundary" in why:
-            advice.append(
-                "an external handoff from the process entry remains unresolved; "
-                "treat the affected callback parameters as external input origins "
-                "for downstream analysis; establish the external/runtime callee's "
-                "input contract separately -- import metadata does not prove which "
-                "values it supplies")
-        for function_key, selector in indirect_functions.items():
-            advice.append(
-                "the function's address is taken (stored in data or handed on as a "
-                "value), so it has indirect callers the ascent cannot follow; "
-                f"`bn xrefs {selector}` lists the references -- slice "
-                "backward from the dispatching caller"
-                + (" for this function's non-runtime references only"
-                   if function_key in runtime_functions else ""))
-        sites = sorted(set(why) - {"caller_cap", "max_depth", "indirect_reference",
+        for selector, why in functions.values():
+            prefix = f"for {selector}: "
+            if "caller_cap" in why:
+                advice.append(
+                    prefix + "the caller ascent was capped, so some calling sites were never "
+                    "followed; re-run against a specific caller or narrow the sink to "
+                    "see the origins behind the dropped sites")
+            if "max_depth" in why:
+                advice.append(
+                    prefix + "the caller ascent stopped at the configured depth; re-run "
+                    "with a larger --max-depth to follow the remaining callers")
+            if "runtime_start_boundary" in why:
+                advice.append(
+                    prefix + "the imported C-runtime main-callback handoff remains unresolved -- "
+                    "treat its parameters as external input origins for downstream analysis, "
+                    "and establish the runtime's input contract separately; the imported "
+                    "routine's identity does not prove which values it supplies")
+            if "indirect_reference" in why:
+                advice.append(
+                    prefix + "the function's address is taken (stored in data or handed on as a "
+                    "value), so it has indirect callers the ascent cannot follow; "
+                    f"`bn xrefs {selector}` lists the references -- slice "
+                    "backward from the dispatching caller"
+                    + (" for this function's non-runtime references only"
+                       if "runtime_start_boundary" in why else ""))
+            sites = sorted(why - {"caller_cap", "max_depth", "indirect_reference",
                                   "runtime_start_boundary"})
-        if sites:
-            advice.append(
-                f"some caller sites could not be followed ({', '.join(sites)}; the "
-                "leaf's `unfollowed` rows name each); inspect them with "
-                f"`bn callsites {why[sites[0]]}`")
+            if sites:
+                advice.append(
+                    prefix + f"some caller sites could not be followed ({', '.join(sites)}; the "
+                    "leaf's `unfollowed` rows name each); inspect them with "
+                    f"`bn callsites {selector}`")
         next_action = "; ".join(advice)
     elif truncated and truncation_cause:
         # A named cut (the memory-chain budget, a depth bound) has its own

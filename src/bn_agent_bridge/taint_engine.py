@@ -9448,10 +9448,10 @@ class TaintEngine:
         references are not exempt: a crt1/runtime handoff, whether static,
         imported, GOT-indirect or through a PLT stub, does not establish the
         origins the unanalysed caller supplies. ``runtime_start_boundary``
-        is advice for an evidenced entry-to-external handoff only; local,
-        stored or unknown uses retain ``indirect_reference`` and dispatch
-        advice. Neither classification certifies completeness or startup
-        semantics from a function name, prototype or import.
+        is advice only for the main callback passed as operand 0 of a resolved
+        imported C-runtime startup call. Other roles, local calls, stores and
+        unknown uses retain ``indirect_reference`` and dispatch advice.
+        Neither classification exempts a reference or proves its origins.
         Returns ``(slices, cycled)``: at least one slice per formal -- a
         formal no caller resolved keeps its own parameter slice -- except the
         ``cycled`` formals, every resolved caller of which was a back edge to
@@ -9470,7 +9470,7 @@ class TaintEngine:
         get_code_refs = getattr(self.bv, "get_code_refs", None)
         entry = getattr(self.bv, "entry_function", None)
         entry_start = None if entry is None else int(entry.start)
-        entry_external: bool | None = None
+        entry_runtime: bool | None = None
         direct = {int(getattr(s, "address", 0)) for s in caller_sites}
         try:
             for ref in (get_code_refs(start) if callable(get_code_refs) else []):
@@ -9615,9 +9615,9 @@ class TaintEngine:
             reason = "indirect_reference"
             if entry_start is not None and rf is not None \
                     and int(getattr(rf, "start", -1)) == entry_start:
-                if entry_external is None:
-                    entry_external = self._entry_handoff_is_external(entry, start)
-                if entry_external:
+                if entry_runtime is None:
+                    entry_runtime = self._entry_handoff_is_runtime_main(entry, start)
+                if entry_runtime:
                     reason = "runtime_start_boundary"
             for pidx in demands:
                 _drop(a, rf, pidx, reason)
@@ -9633,15 +9633,21 @@ class TaintEngine:
         """A function's identity in the ascent's demand keys."""
         return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
 
-    def _entry_handoff_is_external(self, entry: Any, target: int) -> bool:
-        """Advice only: every visible use of the callback address is an
-        argument handed to an explicitly external callee. Local calls, stores,
-        unknown uses or unavailable IL keep xrefs/dispatch advice. This never
-        exempts a reference or establishes the values a runtime supplies."""
+    def _entry_handoff_is_runtime_main(self, entry: Any, target: int) -> bool:
+        """Advice only: the target is the operand-0 main callback of resolved
+        imported C-runtime startup calls, with no other visible address uses.
+        The advertised runtime ABI selects guidance, never a completeness
+        exemption or proof of the implementation or values it supplies."""
         try:
             instrs = self._instrs(self._ssa_func(entry))
         except TaintError:
             return False
+
+        def is_target(expr: Any) -> bool:
+            value = const_target(expr)
+            return value == target or bool(
+                value is not None and value & 1 and value & ~1 == target
+                and getattr(function_at(self.bv, value), "start", None) == target)
 
         def uses(expr: Any, depth: int = 0) -> int | None:
             if depth > 32:
@@ -9650,10 +9656,7 @@ class TaintEngine:
                 children = expr
                 own = 0
             elif hasattr(expr, "operation"):
-                value = const_target(expr)
-                tagged = (value is not None and value & 1 and value & ~1 == target
-                          and getattr(function_at(self.bv, value), "start", None) == target)
-                own = int(value == target or bool(tagged))
+                own = int(is_target(expr))
                 children = getattr(expr, "operands", None) or [
                     getattr(expr, k, None) for k in ("dest", "src", "params", "left", "right")]
             else:
@@ -9672,16 +9675,20 @@ class TaintEngine:
                 return False
             if not count:
                 continue
-            if not self._is_call(ins) or uses(self._call_params(ins)) != count:
+            params = self._call_params(ins) if self._is_call(ins) else []
+            if count != 1 or not params or not is_target(params[0]):
                 return False
             dest = getattr(ins, "dest", None)
-            external = op_name(dest) in ("MLIL_IMPORT", "MLIL_EXTERN_PTR")
-            if not external:
+            if op_name(dest) == "MLIL_IMPORT":
+                slot = getattr(dest, "constant", None)
+            else:
                 callee = function_at(self.bv, const_target(dest))
                 sym = getattr(callee, "symbol", None)
-                external = getattr(getattr(sym, "type", None), "name", "") in (
-                    "ImportedFunctionSymbol", "ExternalSymbol")
-            if not external:
+                if getattr(getattr(sym, "type", None), "name", "") != "ImportedFunctionSymbol":
+                    return False
+                slot = int(callee.start)
+            name = str(self._callee_name(slot) or "").split("@", 1)[0]
+            if name not in ("__libc_start_main", "__uClibc_main"):
                 return False
             handed = True
         return handed

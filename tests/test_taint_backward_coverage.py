@@ -293,12 +293,9 @@ def test_callback_named_main_the_entry_dispatches_is_an_indirect_caller(calls):
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
     assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [("0x40d", "entry_point")]
-    expected = ("runtime_start_boundary" if calls == [(_LIBC_START_SLOT, True, 3)]
-                else "indirect_reference")
-    assert leaf["reasons"] == {expected: 1}
-    if expected == "indirect_reference":
-        assert "dispatching caller" in result["diagnostics"]["next_action"]
-        assert "external input" not in result["diagnostics"]["next_action"]
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert "dispatching caller" in result["diagnostics"]["next_action"]
+    assert "external input" not in result["diagnostics"]["next_action"]
 
 
 @pytest.mark.parametrize("runtime", ["__libc_start_main", "__uClibc_main"])
@@ -354,7 +351,8 @@ def test_direct_runtime_handoff_metadata_does_not_prove_caller_origins(runtime, 
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    expected = "runtime_start_boundary" if symbol_type == "ImportedFunctionSymbol" else "indirect_reference"
+    expected = ("runtime_start_boundary"
+                if symbol_type == "ImportedFunctionSymbol" and operand == 0 else "indirect_reference")
     assert leaf["reasons"] == {expected: 1}
     assert leaf["unfollowed"] == [{"address": "0x41e", "caller": "_start",
                                   "param": 0, "reason": expected}]
@@ -390,7 +388,7 @@ def test_runtime_boundary_instruction_forms_need_no_cross_toolchain(dest_op, cal
     bv = _BV({**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
              code_refs={0x800: [(0x41e, ref_fn)]}, entry=entry)
     bv._funcs[0x800] = main
-    bv._funcs[_LIBC_START_SLOT] = FFunc("opaque_import", _LIBC_START_SLOT, FSSAFunc([]),
+    bv._funcs[_LIBC_START_SLOT] = FFunc("__libc_start_main", _LIBC_START_SLOT, FSSAFunc([]),
                                       symbol_type="ImportedFunctionSymbol", is_thunk=True)
     result = te.TaintEngine(bv, te.load_models()).backward(
         main, [te.parse_locator("arg:memcpy:2")], max_depth=8)
@@ -403,6 +401,50 @@ def test_runtime_boundary_instruction_forms_need_no_cross_toolchain(dest_op, cal
     advice = result["diagnostics"]["next_action"]
     assert "external input" in advice and "runtime" in advice
     assert "dispatching caller" not in advice and "bn callsites" not in advice
+
+
+@pytest.mark.parametrize("callee,operand,reason", [
+    ("__libc_start_main", 0, "runtime_start_boundary"),
+    ("__uClibc_main", 0, "runtime_start_boundary"),
+    ("__libc_start_main@GLIBC_2.34", 0, "runtime_start_boundary"),
+    ("queue_job", 0, "indirect_reference"),
+    ("register_hook", 0, "indirect_reference"),
+    ("__libc_start_main", 1, "indirect_reference"),
+    ("__libc_start_main", 3, "indirect_reference"),
+], ids=["libc-main", "uclibc-main", "versioned-main", "foreign-queue", "foreign-hook",
+        "runtime-operand-1", "runtime-operand-3"])
+def test_only_the_imported_runtime_main_operand_gets_runtime_guidance(callee, operand, reason):
+    entry = _entry("entry_point", [(_LIBC_START_SLOT, True, operand)])
+    bv = _BV({**_NAMES, _LIBC_START_SLOT: callee, 0x800: "copy_handler"},
+             code_refs={0x800: [(0x41e, entry)]}, entry=entry)
+    result = te.TaintEngine(bv, te.load_models()).backward(
+        _copy_handler(), [te.parse_locator("arg:memcpy:2")], max_depth=8)
+
+    assert _gate(result) is False
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {reason: 1}
+    assert leaf["unfollowed"][0]["reason"] == reason
+    advice = result["diagnostics"]["next_action"]
+    if reason == "indirect_reference":
+        assert "xrefs copy_handler" in advice and "dispatching caller" in advice
+        assert "external input" not in advice
+    else:
+        assert "for copy_handler:" in advice and "external input" in advice
+        assert "dispatching caller" not in advice
+
+
+def test_an_offset_from_the_main_callback_is_not_the_program_main_operand():
+    entry = _entry("entry_point", [(_LIBC_START_SLOT, True)])
+    entry.mlil.ssa_form.instructions[0].params[0] = FExpr(
+        "MLIL_ADD", "callback + 4",
+        left=FExpr("MLIL_CONST_PTR", "callback", constant=0x800), right=_const(4))
+    result = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0x41e, entry)]}, entry=entry)
+
+    assert _gate(result) is False
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert "dispatching caller" in result["diagnostics"]["next_action"]
 
 
 @pytest.mark.parametrize("local_first", [False, True])
@@ -1084,6 +1126,7 @@ def test_runtime_boundary_advice_separates_external_input_from_indirect_dispatch
         assert "non-runtime" in diag["next_action"]
     else:
         assert "dispatching caller" not in diag["next_action"]
+    assert "for main:" in diag["next_action"]
 
 
 @pytest.mark.parametrize("reverse", [False, True])
@@ -1104,6 +1147,9 @@ def test_runtime_advice_for_one_function_does_not_restrict_another_functions_dis
     assert "bn xrefs handler_a" in diag["next_action"]
     assert "dispatching caller" in diag["next_action"]
     assert "references only" not in diag["next_action"]
+    runtime_name = "handler_a" if same_name else "main"
+    assert f"for {runtime_name}:" in diag["next_action"]
+    assert "for handler_a:" in diag["next_action"]
 
 
 def test_runtime_dispatch_qualification_is_scoped_to_the_matching_function():
@@ -1176,6 +1222,24 @@ __attribute__((noreturn)) void entry_point(void) {
 """
 
 
+_MIXED_BOUNDARY_C = r"""
+#include <stddef.h>
+#include <stdlib.h>
+typedef void (*handler)(size_t);
+static handler saved;
+static void *observed;
+__attribute__((noinline)) void sink_size(size_t n) { observed = malloc(n); }
+__attribute__((noinline)) void handler_a(size_t n) { sink_size(n); }
+__attribute__((noinline)) void queue_job(handler h) { saved = h; saved(4096); }
+int main(int argc, char **argv) {
+    (void)argv;
+    sink_size((size_t)argc);
+    queue_job(handler_a);
+    return observed != 0;
+}
+"""
+
+
 _STARTUP_C = r"""
 #include <stddef.h>
 #include <string.h>
@@ -1224,7 +1288,14 @@ _EXTERNAL_RUNTIME_C = r"""
 #include <stddef.h>
 typedef void (*handler)(size_t);
 static handler saved;
-__attribute__((noinline)) void __libc_start_main(handler h, size_t ignored) {
+#ifndef RUNTIME_NAME
+#define RUNTIME_NAME __libc_start_main
+#endif
+#ifdef CALLBACK_SECOND
+__attribute__((noinline)) void RUNTIME_NAME(size_t ignored, handler h) {
+#else
+__attribute__((noinline)) void RUNTIME_NAME(handler h, size_t ignored) {
+#endif
     (void)ignored;
     saved = h;
     saved(4096);
@@ -1235,14 +1306,25 @@ _EXTERNAL_RUNTIME_ENTRY_C = r"""
 #include <stddef.h>
 #include <string.h>
 typedef void (*handler)(size_t);
+#ifndef RUNTIME_NAME
+#define RUNTIME_NAME __libc_start_main
+#endif
 #ifdef USE_GOT
 __attribute__((noplt))
 #endif
-extern void __libc_start_main(handler, size_t);
+#ifdef CALLBACK_SECOND
+extern void RUNTIME_NAME(size_t, handler);
+#else
+extern void RUNTIME_NAME(handler, size_t);
+#endif
 static char out[64];
 __attribute__((noinline)) void copy_handler(size_t n) { memcpy(out, out, n); }
 __attribute__((noreturn)) void entry_point(void) {
-    __libc_start_main(copy_handler, 1);
+#ifdef CALLBACK_SECOND
+    RUNTIME_NAME(1, copy_handler);
+#else
+    RUNTIME_NAME(copy_handler, 1);
+#endif
     for (;;) __asm__ volatile ("pause");
 }
 """
@@ -1501,6 +1583,29 @@ def test_real_bn_queued_custom_entry_keeps_the_local_dispatch_path_actionable(tm
 
 
 @pytest.mark.real_bn
+def test_real_bn_mixed_runtime_and_dispatch_boundaries_keep_each_functions_advice(tmp_path, shared_bn):
+    binary = _compile(tmp_path, "mixed_boundaries", _MIXED_BOUNDARY_C, ["-no-pie"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "sink_size", "arg:malloc:0")
+
+    assert _gate(result) is False
+    leaves = {leaf["function"]["name"]: leaf for leaf in _caller_leaves(result)}
+    assert set(leaves) == {"main", "handler_a"}
+    assert set(leaves["main"]["reasons"]) == {"runtime_start_boundary"}
+    assert set(leaves["handler_a"]["reasons"]) == {"indirect_reference"}
+    advice = result["diagnostics"]["next_action"]
+    assert "for main:" in advice and "external input" in advice
+    assert "for handler_a:" in advice and "xrefs handler_a" in advice
+    handler_action = next(action for action in advice.split("; ") if "xrefs handler_a" in action)
+    assert "dispatching caller" in handler_action and "references only" not in handler_action
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "sink_size",
+                         "--sink", "arg:malloc:0", "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "for main:" in text.stdout and "for handler_a:" in text.stdout
+    assert "safe_to_report_complete_slice: false" in text.stdout
+
+
+@pytest.mark.real_bn
 @pytest.mark.parametrize("flags", [["-no-pie"], ["-fPIE", "-pie"]], ids=["host", "host-pie"])
 def test_real_bn_runtime_entry_references_are_unresolved(tmp_path, shared_bn, flags):
     binary = _compile(tmp_path, "startup", _STARTUP_C, flags)
@@ -1521,9 +1626,16 @@ def test_real_bn_runtime_entry_references_are_unresolved(tmp_path, shared_bn, fl
 
 
 @pytest.mark.real_bn
-@pytest.mark.parametrize("flags", [["-DUSE_GOT"], []], ids=["got", "plt"])
-def test_real_bn_external_runtime_impostor_is_an_unresolved_caller(tmp_path, shared_bn, flags):
-    _compile(tmp_path, "libruntime.so", _EXTERNAL_RUNTIME_C, ["-shared", "-fPIC"])
+@pytest.mark.parametrize("flags,reason", [
+    (["-DUSE_GOT"], "runtime_start_boundary"),
+    ([], "runtime_start_boundary"),
+    (["-DUSE_GOT", "-DRUNTIME_NAME=queue_job"], "indirect_reference"),
+    (["-DRUNTIME_NAME=queue_job"], "indirect_reference"),
+    (["-DUSE_GOT", "-DCALLBACK_SECOND"], "indirect_reference"),
+    (["-DCALLBACK_SECOND"], "indirect_reference"),
+], ids=["got-main", "plt-main", "got-queue", "plt-queue", "got-operand-1", "plt-operand-1"])
+def test_real_bn_external_runtime_impostor_is_an_unresolved_caller(tmp_path, shared_bn, flags, reason):
+    _compile(tmp_path, "libruntime.so", _EXTERNAL_RUNTIME_C, ["-shared", "-fPIC", *flags])
     binary = _compile(tmp_path, "external_runtime", _EXTERNAL_RUNTIME_ENTRY_C,
                       ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point", *flags,
                        "-Wl,--no-as-needed", f"-L{tmp_path}", "-lruntime", "-Wl,-rpath,$ORIGIN"])
@@ -1532,15 +1644,19 @@ def test_real_bn_external_runtime_impostor_is_an_unresolved_caller(tmp_path, sha
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert set(leaf["reasons"]) == {"runtime_start_boundary"}
+    assert set(leaf["reasons"]) == {reason}
     assert leaf["callers_followed"] == 0
     assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
     text = shared_bn.run("-t", target, "taint", "backward", "-f", "copy_handler",
                          "--sink", "arg:memcpy:2", "--verbose", timeout=180.0)
     assert text.returncode == 0, text.stderr
     assert "safe_to_report_complete_slice: false" in text.stdout
-    assert "runtime_start_boundary" in text.stdout
-    assert "external input" in text.stdout and "dispatching caller" not in text.stdout
+    assert reason in text.stdout
+    if reason == "runtime_start_boundary":
+        assert "external input" in text.stdout and "dispatching caller" not in text.stdout
+    else:
+        assert "xrefs copy_handler" in text.stdout and "dispatching caller" in text.stdout
+        assert "external input" not in text.stdout
 
 
 @pytest.mark.real_bn
