@@ -551,6 +551,57 @@ def test_mutual_remap_cut_short_of_getpid_is_not_complete(extra_entry):
     assert any(lf.get("reasons", {}).get("max_depth") for lf in _caller_leaves(result))
 
 
+@pytest.mark.parametrize("max_depth", [4, 8, 16])
+def test_cycle_entered_only_through_another_member_has_no_internal_origin(max_depth):
+    # entry_remap: the only way in is `start_b -> remap_b(43, 47)`; remap_a
+    # has no caller outside the cycle. Its `first` is fully supplied through
+    # the cycle (43, 47, getpid) -- the internal formal is not a root.
+    result = _remap_pair(True, external_caller=False, extra_entry=True, max_depth=max_depth)
+
+    origins = _origins(result)
+    for root in ({"kind": "constant", "value": 13}, {"kind": "constant", "value": 17},
+                 {"kind": "call", "callee": "getpid"}):
+        assert root in origins, origins
+    assert not any(o["kind"] == "parameter" for o in origins), origins
+    assert _gate(result) is True, result["diagnostics"]
+
+
+def _rotation(entry_member):
+    """entry_rotation_static: ``cycle_a(n) { malloc(n); cycle_b(n); }``,
+    ``cycle_b(n) { cycle_a(n); }`` and one entry, ``start(43)`` calling
+    *entry_member* (``"a"``, ``"b"``, or None for no entry at all)."""
+    na, nb = FVar("n", ident=140), FVar("m", ident=141)
+    a = FFunc("cycle_a", 0x800, FSSAFunc([
+        _call(0, 0x804, _MALLOC, [_var(FSSA(na, 0))]),
+        _call(1, 0x810, 0x900, [_var(FSSA(na, 0))]),
+    ]), params=[na])
+    b = FFunc("cycle_b", 0x900, FSSAFunc([
+        _call(0, 0x910, 0x800, [_var(FSSA(nb, 0))]),
+    ]), params=[nb])
+    a.caller_sites, b.caller_sites = [FSite(b, 0x910)], [FSite(a, 0x810)]
+    if entry_member:
+        target = 0x800 if entry_member == "a" else 0x900
+        start = FFunc("start", 0xa00, FSSAFunc([_call(0, 0xa10, target, [_const(43)])]))
+        (a if entry_member == "a" else b).caller_sites.append(FSite(start, 0xa10))
+    return _backward(a, {**_NAMES, 0x800: "cycle_a", 0x900: "cycle_b"}, "arg:malloc:0")
+
+
+@pytest.mark.parametrize("entry_member", ["a", "b"])
+def test_rotation_cycle_entered_through_either_member_is_its_literal(entry_member):
+    # Whichever member the entry calls, the only root is the literal 43.
+    result = _rotation(entry_member)
+
+    assert _origins(result) == [{"kind": "constant", "value": 43}], _origins(result)
+    assert _gate(result) is True, result["diagnostics"]
+
+
+def test_rotation_cycle_with_no_entry_keeps_its_root_formal():
+    # Control: no caller outside the cycle -- the sink's own formal is the root.
+    result = _rotation(None)
+
+    assert _origins(result) == [{"kind": "parameter", "index": 0, "var": "n#0"}], _origins(result)
+
+
 def test_formal_beside_a_call_return_keeps_both_roots():
     # Control without any recursion: `malloc(n + getpid())` whose caller
     # passes a literal -- the literal answers `n`, getpid is its own root.
@@ -1001,6 +1052,55 @@ NO void start_other(void) { remap_b(13, 17, 5); }
 #endif
 """
 
+# The reviewer's static-cycle fixtures, verbatim: the cycle is entered only
+# through `start_b -> cycle_b / remap_b`, never through the sink's function.
+_ENTRY_ROTATION_C = r"""
+/* Public synthetic review fixture: analyze only. */
+#include <stdlib.h>
+#include <stddef.h>
+#define NO __attribute__((noinline))
+volatile size_t observed;
+NO static void cycle_b(size_t n, unsigned r);
+NO static void cycle_a(size_t n, unsigned r) {
+ observed=(size_t)malloc(n);
+ if(r) cycle_b(n,r-1);
+}
+NO static void cycle_b(size_t n,unsigned r) {
+ if(r) cycle_a(n,r-1);
+}
+NO void start_b(void) { cycle_b(43,5); }
+NO static void direct(size_t n,unsigned r) {
+ observed=(size_t)malloc(n);
+ if(r) direct(n,r-1);
+}
+NO void start_direct(void) { direct(43,5); }
+int main(void) { start_b(); start_direct(); return 0; }
+"""
+
+_ENTRY_REMAP_C = r"""
+/* Public synthetic review fixture: analyze only. */
+#include <stdlib.h>
+#include <stddef.h>
+#include <unistd.h>
+#define NO __attribute__((noinline))
+volatile size_t observed;
+NO static void remap_b(size_t first, size_t second, unsigned r);
+NO static void remap_a(size_t first, size_t second, unsigned r) {
+ observed=(size_t)malloc(first);
+ if(r) remap_b(first,second,r-1);
+}
+NO static void remap_b(size_t first,size_t second,unsigned r) {
+ if(r) remap_a(second,first+(size_t)getpid(),r-1);
+}
+NO void start_b(void) { remap_b(43,47,5); }
+NO static void direct(size_t first,size_t second,unsigned r) {
+ observed=(size_t)malloc(first);
+ if(r) direct(second,first+(size_t)getpid(),r-1);
+}
+NO void start_direct(void) { direct(47,43+(size_t)getpid(),5); }
+int main(void) { start_b(); start_direct(); return 0; }
+"""
+
 
 def _compile(tmp_path: Path, name: str, source: str, flags: list[str]) -> Path:
     cc = shutil.which("cc") or shutil.which("gcc")
@@ -1184,3 +1284,35 @@ def test_real_bn_extra_entry_into_the_cycle_keeps_getpid(tmp_path, shared_bn):
             params = [o for o in origins if o["kind"] == "parameter"]
             assert len(params) == 1, (variant, depth, origins)  # start_remap's `external`
             assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
+@pytest.mark.real_bn
+def test_real_bn_cycle_entered_through_another_member_has_no_internal_origin(tmp_path, shared_bn):
+    # The cycle's only entry calls the OTHER member: the sink function's
+    # formal is fully supplied through the cycle, so it is no origin --
+    # exactly as for the equivalent direct self-call. Too shallow a caller
+    # depth says so instead of certifying.
+    flags = ["-fno-optimize-sibling-calls", "-no-pie"]
+    rotation = shared_bn.load(_compile(tmp_path, "entry_rotation", _ENTRY_ROTATION_C, flags),
+                              copy=False)
+    remap = shared_bn.load(_compile(tmp_path, "entry_remap", _ENTRY_REMAP_C, flags), copy=False)
+    getpid = {"kind": "call", "callee": "getpid"}
+    for depth in ("4", "8", "16"):
+        for fn in ("cycle_a", "direct"):
+            result = _bn_backward(shared_bn, rotation, fn, "arg:malloc:0", "--max-depth", depth)
+            origins = [sl["origin"] for sl in result["slices"]]
+            assert origins == [{"kind": "constant", "value": 43}], (fn, depth, origins)
+            assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+        result = _bn_backward(shared_bn, remap, "remap_a", "arg:malloc:0", "--max-depth", depth)
+        origins = [sl["origin"] for sl in result["slices"]]
+        for root in ({"kind": "constant", "value": 43}, {"kind": "constant", "value": 47}, getpid):
+            assert root in origins, (depth, origins)
+        assert not any(o["kind"] == "parameter" for o in origins), (depth, origins)
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+        direct = _bn_backward(shared_bn, remap, "direct", "arg:malloc:0", "--max-depth", depth)
+        origins = [sl["origin"] for sl in direct["slices"]]
+        assert getpid in origins and {"kind": "constant", "value": 47} in origins, (depth, origins)
+        assert not any(o["kind"] == "parameter" for o in origins), (depth, origins)
+
+    shallow = _bn_backward(shared_bn, rotation, "cycle_a", "arg:malloc:0", "--max-depth", "1")
+    assert shallow["diagnostics"]["safe_to_report_complete_slice"] is False

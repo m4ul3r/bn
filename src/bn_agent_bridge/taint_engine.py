@@ -8048,9 +8048,12 @@ class TaintEngine:
         returned: list[dict[str, Any]] = []
         # The (function, formal) demands each back edge closed on, for the
         # whole ascent from one sink seed: `_continue_into_callers` reads
-        # which demand a cycle answered (its own, or one further up).
+        # which demand a cycle answered (its own, or one further up). And
+        # every caller site outside the functions being solved that supplied
+        # a value -- an entry into whatever cycle the ascent is in.
         if depth == 0:
             self._bw_cycle_hits: list[tuple] = []
+            self._bw_entries: list[tuple] = []
 
         def _set_origin(o, *, weak: int | bool = 0):
             nonlocal origin, origin_rank
@@ -9060,7 +9063,7 @@ class TaintEngine:
         # not answered upstream, so every producer it reached keeps a slice
         # (below). A recursive call that remaps the demand to ANOTHER formal
         # is a new demand and ascends.
-        fkey = (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
+        fkey = self._caller_key(func)
         demands = {p: param_origins.get(p) or {"kind": "parameter", "index": p,
                                                 "var": var_label(v)}
                    for p, v in terminal_params.items() if (fkey, p) not in visited_funcs}
@@ -9502,15 +9505,19 @@ class TaintEngine:
                              "param": pidx, "reason": reason})
 
         cycled: set[int] = set()
-        fkey = (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
+        fkey = self._caller_key(func)
+        on_stack = {fk for fk, _ in visited_funcs}
         for pidx, porigin in demands.items():
             followed = False
             # Each site either supplies the value from outside any cycle, or
             # loops back to a demand this ascent is already solving: this
             # demand itself (`f(n - 1)`, or `a -> b -> a` remapping back to
             # it) or one further up (mutual recursion that re-enters an
-            # ancestor demand, whose own callers answer it). A demand whose
-            # cycle closes on itself and that no other site supplies is the
+            # ancestor demand, whose own callers answer it). A site that loops
+            # back to this demand still supplies it when the loop is entered
+            # from outside somewhere along the way (`start_b -> b -> a -> b`):
+            # a caller outside the functions being solved supplied a value.
+            # A demand whose cycle closes on itself with no such entry is the
             # cycle's root: its formal stays an origin beside whatever the
             # cycle adds. One whose every site loops to an ancestor has no
             # origin of its own -- never the internal formal.
@@ -9557,6 +9564,8 @@ class TaintEngine:
                                         "origin": {"kind": "constant", "value": value},
                                         "crossed": [str(func.name)]})
                         followed = supplied = True
+                        if self._caller_key(caller) not in on_stack:
+                            self._bw_entries.append((self._caller_key(caller), addr))
                         continue
                     self._bw_assume(
                         f"arg {pidx} at {hex(addr)} in {self._prose_function(caller)} is not a trackable "
@@ -9567,7 +9576,7 @@ class TaintEngine:
                           else "argument_not_trackable")
                     continue
                 site_slices = 0
-                mark = len(self._bw_cycle_hits)
+                mark, emark = len(self._bw_cycle_hits), len(self._bw_entries)
                 for sv in seeds:
                     # A parameter the callee read through is read in the
                     # caller's object at the same delta from the argument.
@@ -9583,9 +9592,15 @@ class TaintEngine:
                         })
                         followed = True
                         site_slices += 1
+                # An entry into the cycle: a caller outside the functions
+                # being solved that supplied the value without looping back.
+                if (site_slices and self._caller_key(caller) not in on_stack
+                        and not self._bw_cycle_hits[mark:]):
+                    self._bw_entries.append((self._caller_key(caller), addr))
                 closes_here = (fkey, pidx) in self._bw_cycle_hits[mark:]
+                entered = len(self._bw_entries) > emark
                 self_closed |= closes_here
-                if site_slices and not closes_here:
+                if site_slices and (entered or not closes_here):
                     supplied = True
                 elif not site_slices:
                     via_cycle = True
@@ -9612,6 +9627,11 @@ class TaintEngine:
                 followed=len(caller_sites) - len(dropped_sites), indirect=len(indirect),
                 rows=rows, reasons=reasons)
         return results, cycled
+
+    @staticmethod
+    def _caller_key(func: Any) -> tuple[int, str]:
+        """A function's identity in the ascent's demand keys."""
+        return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
 
     # C-runtime start routines whose FIRST operand is the program's main
     # callback, which they call with what the loader supplied.
