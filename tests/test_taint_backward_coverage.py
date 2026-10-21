@@ -8,6 +8,9 @@ representative. A chain that WAS walked to its origins (a caller's literal, a
 formal with no known caller) stays a complete slice."""
 from __future__ import annotations
 
+import copy
+import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -92,6 +95,11 @@ def _caller_leaves(result):
 
 def _origins(result):
     return [sl["origin"] for sl in result["slices"]]
+
+
+def _advice_commands(advice: str, operation: str) -> list[list[str]]:
+    commands = [shlex.split(command) for command in re.findall(r"`(bn [^`]+)`", advice)]
+    return [command for command in commands if operation in command]
 
 
 # --------------------------------------------------------------------------
@@ -1126,6 +1134,85 @@ def test_next_action_names_each_unfollowed_reason_and_keeps_the_cap_advice():
     assert diag["safe_to_report_complete_slice"] is False
 
 
+@pytest.mark.parametrize("count", [3, 4, 20, 200])
+def test_indirect_advice_groups_boilerplate_and_bounds_function_examples(count):
+    from bn_agent_bridge.taint_result import backward_diagnostics
+
+    leaves = [
+        {"kind": "caller_sites_truncated",
+         "function": {"name": f"handler_{i}", "address": hex(0x800 + i * 0x20)},
+         "reasons": {"indirect_reference": 1},
+         "unfollowed": [{"address": hex(0x4000 + i * 8), "param": 0,
+                         "reason": "indirect_reference"}]}
+        for i in range(count)
+    ]
+    original = copy.deepcopy(leaves)
+    diag = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)
+    advice = diag["next_action"]
+    commands = _advice_commands(advice, "xrefs")
+    shown = {command[command.index("xrefs") + 1] for command in commands}
+
+    assert diag["safe_to_report_complete_slice"] is False
+    assert diag["frontier"]["dropped_callers"] == count
+    assert len(commands) == len(shown) == min(count, 3)
+    assert shown <= {leaf["function"]["name"] for leaf in leaves}
+    assert advice.count("dispatching caller") == 1
+    assert len(advice) < 1000
+    if count > len(shown):
+        assert f"{count - len(shown)} more affected functions" in advice
+        assert "caller_sites_truncated" in advice
+    else:
+        assert "more affected functions" not in advice
+    assert leaves == original
+
+
+def test_advice_omission_counts_unique_functions_per_reason_without_hiding_other_reasons():
+    from bn_agent_bridge.taint_result import backward_diagnostics
+
+    leaves = [{"kind": "caller_sites_truncated",
+               "function": {"name": f"handler_{i}", "address": hex(0x800 + i * 0x20)},
+               "reasons": {"indirect_reference": 1},
+               "unfollowed": [{"address": "0x4000", "param": 0, "reason": "indirect_reference"}]}
+              for i in range(20)]
+    second_formal = copy.deepcopy(leaves[0])
+    second_formal["unfollowed"][0]["param"] = 1
+    leaves.extend([
+        second_formal,
+        {"kind": "caller_sites_truncated", "function": {"name": "relay", "address": "0x2000"},
+         "reasons": {"max_depth": 1}},
+        {"kind": "caller_sites_truncated", "function": {"name": "short_call", "address": "0x3000"},
+         "reasons": {"arity_short": 1}},
+    ])
+    original = copy.deepcopy(leaves)
+    diag = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)
+    advice = diag["next_action"]
+    xrefs = _advice_commands(advice, "xrefs")
+    callsites = _advice_commands(advice, "callsites")
+
+    assert diag["safe_to_report_complete_slice"] is False
+    assert len(xrefs) == 3
+    assert "17 more affected functions" in advice
+    assert {command[command.index("callsites") + 1] for command in callsites} == {"short_call"}
+    assert "--max-depth" in advice and "relay" in advice
+    assert all(command[command.index("xrefs") + 1].startswith("handler_") for command in xrefs)
+    assert leaves == original
+
+
+def test_bounded_examples_disambiguate_equal_names_by_function_address():
+    from bn_agent_bridge.taint_result import backward_diagnostics
+
+    leaves = [{"kind": "caller_sites_truncated",
+               "function": {"name": "handle_packet", "address": address},
+               "reasons": {"indirect_reference": 1}}
+              for address in ("0x800", "0x900")]
+    diag = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)
+    commands = _advice_commands(diag["next_action"], "xrefs")
+
+    assert diag["safe_to_report_complete_slice"] is False
+    assert {command[command.index("xrefs") + 1] for command in commands} == {"0x800", "0x900"}
+    assert "more affected functions" not in diag["next_action"]
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 @pytest.mark.parametrize("same_name", [False, True])
 def test_another_functions_depth_boundary_does_not_restrict_dispatch_advice(reverse, same_name):
@@ -1141,12 +1228,12 @@ def test_another_functions_depth_boundary_does_not_restrict_dispatch_advice(reve
     diag = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)
 
     assert diag["safe_to_report_complete_slice"] is False
-    assert "bn xrefs handler_a" in diag["next_action"]
+    indirect_selector = "0x800" if same_name else "handler_a"
+    assert f"bn xrefs {indirect_selector}" in diag["next_action"]
     assert "dispatching caller" in diag["next_action"]
     assert "references only" not in diag["next_action"]
-    limited_name = "handler_a" if same_name else "main"
-    assert f"for {limited_name}:" in diag["next_action"]
-    assert "for handler_a:" in diag["next_action"]
+    limited_selector = "0x400" if same_name else "main"
+    assert f"for {limited_selector}:" in diag["next_action"]
 
 
 def test_each_function_keeps_its_indirect_advice_beside_depth_boundaries():
@@ -1229,11 +1316,37 @@ static void *observed;
 __attribute__((noinline)) void sink_size(size_t n) { observed = malloc(n); }
 __attribute__((noinline)) void handler_a(size_t n) { sink_size(n); }
 __attribute__((noinline)) void queue_job(handler h) { saved = h; saved(4096); }
+#ifdef USE_RELAY
+__attribute__((noinline)) void relay_size(size_t n) { sink_size(n); }
+#endif
 int main(int argc, char **argv) {
     (void)argv;
+#ifdef USE_RELAY
+    relay_size((size_t)argc);
+#else
     sink_size((size_t)argc);
+#endif
     queue_job(handler_a);
     return observed != 0;
+}
+"""
+
+
+_DISPATCH_TWENTY_C = r"""
+#include <stddef.h>
+#include <string.h>
+typedef void (*handler)(size_t);
+static char out[64];
+__attribute__((noinline)) void sink_copy(size_t n) { memcpy(out, "public", n); }
+#define EACH(X) X(0) X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) \
+                X(10) X(11) X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19)
+#define DECL(N) __attribute__((noinline)) void handler_##N(size_t n) { sink_copy(n); }
+EACH(DECL)
+#define REF(N) handler_##N,
+static handler table[] = { EACH(REF) };
+__attribute__((noinline)) void dispatch(unsigned index, size_t n) { table[index % 20](n); }
+int main(int argc, char **argv) {
+    (void)argv; dispatch((unsigned)argc, (size_t)argc); return out[0];
 }
 """
 
@@ -1592,15 +1705,76 @@ def test_real_bn_mixed_runtime_and_dispatch_boundaries_keep_each_functions_advic
     assert set(leaves["main"]["reasons"]) == {"indirect_reference"}
     assert set(leaves["handler_a"]["reasons"]) == {"indirect_reference"}
     advice = result["diagnostics"]["next_action"]
-    assert "for main:" in advice and "xrefs main" in advice
-    assert "for handler_a:" in advice and "xrefs handler_a" in advice
+    assert "xrefs main" in advice and "xrefs handler_a" in advice
     assert "external input" not in advice
     handler_action = next(action for action in advice.split("; ") if "xrefs handler_a" in action)
     assert "dispatching caller" in handler_action and "references only" not in handler_action
     text = shared_bn.run("-t", target, "taint", "backward", "-f", "sink_size",
                          "--sink", "arg:malloc:0", "--verbose", timeout=180.0)
     assert text.returncode == 0, text.stderr
-    assert "for main:" in text.stdout and "for handler_a:" in text.stdout
+    assert "xrefs main" in text.stdout and "xrefs handler_a" in text.stdout
+    assert "safe_to_report_complete_slice: false" in text.stdout
+
+
+@pytest.mark.real_bn
+def test_real_bn_dispatch_table_advice_is_bounded_without_losing_frontiers(tmp_path, shared_bn):
+    binary = _compile(tmp_path, "dispatch_twenty", _DISPATCH_TWENTY_C, ["-no-pie"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "sink_copy", "arg:memcpy:2")
+    leaves = _caller_leaves(result)
+    cap, = [leaf for leaf in leaves if "caller_cap" in leaf["reasons"]]
+    indirect = [leaf for leaf in leaves if "indirect_reference" in leaf["reasons"]]
+
+    assert _gate(result) is False
+    assert len(leaves) == 17
+    assert len(indirect) == 16
+    assert (cap["callers_total"], cap["callers_followed"], cap["callers_dropped"]) == (20, 16, 4)
+    assert cap["reasons"] == {"caller_cap": 4}
+    advice = result["diagnostics"]["next_action"]
+    commands = _advice_commands(advice, "xrefs")
+    assert len(commands) == 3
+    assert "13 more affected functions" in advice and "caller_sites_truncated" in advice
+    assert advice.count("dispatching caller") == 1
+    by_name = {leaf["function"]["name"]: leaf for leaf in indirect}
+    for command in commands:
+        options = {token: command[i + 1] for i, token in enumerate(command[:-1])
+                   if token in ("-i", "--instance", "-t", "--target")}
+        assert options.get("-i", options.get("--instance")) == shared_bn.instance_id
+        assert options.get("-t", options.get("--target")) == target
+        selected = command[command.index("xrefs") + 1]
+        assert selected in by_name
+        xrefs = shared_bn.json(*command[1:], timeout=180.0)
+        assert xrefs["address"] == by_name[selected]["function"]["address"]
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "sink_copy",
+                         "--sink", "arg:memcpy:2", "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "13 more affected functions" in text.stdout
+    assert "safe_to_report_complete_slice: false" in text.stdout
+    assert text.stdout.count("dispatching caller") == 1
+    assert len(_advice_commands(text.stdout, "xrefs")) == 3
+
+
+@pytest.mark.real_bn
+def test_real_bn_mixed_reasons_keep_each_remedy_and_its_function_targets(tmp_path, shared_bn):
+    binary = _compile(tmp_path, "mixed_reasons", _MIXED_BOUNDARY_C, ["-no-pie", "-DUSE_RELAY"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "sink_size", "arg:malloc:0", "--max-depth", "1")
+    leaves = {leaf["function"]["name"]: leaf for leaf in _caller_leaves(result)}
+
+    assert _gate(result) is False
+    assert set(leaves) == {"handler_a", "relay_size"}
+    assert leaves["relay_size"]["reasons"] == {"max_depth": 1}
+    assert set(leaves["handler_a"]["reasons"]) == {"indirect_reference"}
+    advice = result["diagnostics"]["next_action"]
+    assert "--max-depth" in advice and "relay_size" in advice
+    commands = _advice_commands(advice, "xrefs")
+    assert {command[command.index("xrefs") + 1] for command in commands} == {"handler_a"}
+    assert "references only" not in advice
+    text = shared_bn.run("-t", target, "taint", "backward", "-f", "sink_size",
+                         "--sink", "arg:malloc:0", "--max-depth", "1", "--verbose", timeout=180.0)
+    assert text.returncode == 0, text.stderr
+    assert "--max-depth" in text.stdout and "relay_size" in text.stdout
+    assert {cmd[cmd.index("xrefs") + 1] for cmd in _advice_commands(text.stdout, "xrefs")} == {"handler_a"}
     assert "safe_to_report_complete_slice: false" in text.stdout
 
 

@@ -649,30 +649,51 @@ def backward_diagnostics(
             if function_key not in functions:
                 functions[function_key] = (selector, set())
             functions[function_key][1].update(str(r) for r in reasons)
+        selector_counts: dict[str, int] = {}
+        for selector, _ in functions.values():
+            selector_counts[selector] = selector_counts.get(selector, 0) + 1
+        # Bound examples, not evidence: all frontier rows stay in the result.
+        # As with the xrefs preview, show at most three complete targets.
+        def examples(reason: str, operation: str | None = None) -> str:
+            shown: list[str] = []
+            total = 0
+            for function_key, (selector, why) in functions.items():
+                if reason not in why:
+                    continue
+                total += 1
+                if len(shown) < 3:
+                    if selector_counts[selector] > 1:
+                        selector = shlex.quote(function_key)
+                    shown.append(f"`bn {operation} {selector}`" if operation else selector)
+            text = ", ".join(shown)
+            omitted = total - len(shown)
+            if omitted:
+                text += (f" (+{omitted} more affected functions; see full "
+                         "caller_sites_truncated leaves in JSON)")
+            return text
+
+        reasons = {reason for _, why in functions.values() for reason in why}
         advice = []
-        for selector, why in functions.values():
-            prefix = f"for {selector}: "
-            if "caller_cap" in why:
-                advice.append(
-                    prefix + "the caller ascent was capped, so some calling sites were never "
-                    "followed; re-run against a specific caller or narrow the sink to "
-                    "see the origins behind the dropped sites")
-            if "max_depth" in why:
-                advice.append(
-                    prefix + "the caller ascent stopped at the configured depth; re-run "
-                    "with a larger --max-depth to follow the remaining callers")
-            if "indirect_reference" in why:
-                advice.append(
-                    prefix + "the function's address is taken (stored in data or handed on as a "
-                    "value), so it has indirect callers the ascent cannot follow; "
-                    f"`bn xrefs {selector}` lists the references -- slice "
-                    "backward from the dispatching caller")
-            sites = sorted(why - {"caller_cap", "max_depth", "indirect_reference"})
-            if sites:
-                advice.append(
-                    prefix + f"some caller sites could not be followed ({', '.join(sites)}; the "
-                    "leaf's `unfollowed` rows name each); inspect them with "
-                    f"`bn callsites {selector}`")
+        if "caller_cap" in reasons:
+            advice.append(
+                f"for {examples('caller_cap')}: the caller ascent was capped, so some "
+                "calling sites were never followed; re-run against a specific caller "
+                "or narrow the sink to see the origins behind the dropped sites")
+        if "max_depth" in reasons:
+            advice.append(
+                f"for {examples('max_depth')}: the caller ascent stopped at the configured "
+                "depth; re-run with a larger --max-depth to follow the remaining callers")
+        if "indirect_reference" in reasons:
+            advice.append(
+                "function addresses are taken (stored in data or handed on as a value), "
+                "so indirect callers remain unfollowed; inspect "
+                f"{examples('indirect_reference', 'xrefs')} for the references -- slice "
+                "backward from the dispatching caller")
+        for reason in sorted(reasons - {"caller_cap", "max_depth", "indirect_reference"}):
+            advice.append(
+                f"some caller sites could not be followed ({reason}); the full leaf's "
+                "`unfollowed` rows name each -- inspect "
+                f"{examples(reason, 'callsites')}")
         next_action = "; ".join(advice)
     elif truncated and truncation_cause:
         # A named cut (the memory-chain budget, a depth bound) has its own
