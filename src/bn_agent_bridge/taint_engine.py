@@ -9640,14 +9640,13 @@ class TaintEngine:
     def _runtime_start_handoff(self, entry: Any, target: int) -> bool:
         """Whether the entry function's references to *target* are proven to
         be only the process-start handoff: *target*'s exact address is the
-        main-callback operand (argument 0) of a call resolved to a C-runtime
-        start routine (``_start -> __libc_start_main(main, ..)``, through the
-        GOT or directly in a static binary), and the entry function uses the
-        address nowhere else. Anything else -- a custom entry's
-        `dispatch(main, 17)`, the address in another operand or a store, an
-        unresolved or unknown start routine -- is not proven, and fails
-        closed: the reference stays an indirect caller, whatever the
-        function is named."""
+        main-callback operand (argument 0) of an imported C-runtime start
+        routine (``_start -> __libc_start_main(main, ..)`` through the GOT),
+        and the entry function uses the address nowhere else. A direct
+        in-binary callee's name proves no runtime provenance, including in
+        static binaries. Anything else -- a custom entry's dispatcher, the
+        address in another operand or a store, an unresolved or unknown
+        start routine -- fails closed as an indirect caller."""
         try:
             instrs = self._instrs(self._ssa_func(entry))
         except TaintError:
@@ -9672,8 +9671,9 @@ class TaintEngine:
                 continue
             if self._is_call(ins) and n == 1:
                 dest = getattr(ins, "dest", None)
-                slot = (getattr(dest, "constant", None) if op_name(dest) == "MLIL_IMPORT"
-                        else const_target(dest))
+                # The import IL establishes the external boundary; a symbol
+                # name alone cannot distinguish static libc from an impostor.
+                slot = getattr(dest, "constant", None) if op_name(dest) == "MLIL_IMPORT" else None
                 name = str(self._callee_name(slot) or "").split("@")[0]
                 params = self._call_params(ins)
                 main_op = params[0] if params else None

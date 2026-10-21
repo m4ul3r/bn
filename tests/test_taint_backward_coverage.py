@@ -290,13 +290,42 @@ def test_callback_named_main_the_entry_dispatches_is_an_indirect_caller(calls):
     assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [("0x40d", "entry_point")]
 
 
-@pytest.mark.parametrize("imported", [True, False], ids=["plt-import", "static-direct"])
-def test_process_entry_handoff_of_main_and_direct_call_refs_are_not_indirect_callers(imported):
-    # Controls: `_start` handing `main` to `__libc_start_main` (through the
-    # GOT, or a direct call in a static binary) is no in-binary caller -- its
-    # formals are what the loader supplied -- and the code reference a
-    # direct call site makes is that site, already followed.
-    start = _entry("_start", [(_LIBC_START_SLOT, imported)])
+@pytest.mark.parametrize("runtime", ["__libc_start_main", "__uClibc_main"])
+@pytest.mark.parametrize("operand", [0, 1, 3])
+def test_in_binary_runtime_name_does_not_prove_a_startup_boundary(runtime, operand):
+    # A custom entry's own dispatcher can use either runtime symbol name.
+    # Even operand 0 is not proof that the callee is outside this binary.
+    entry = _entry("entry_point", [(_LIBC_START_SLOT, False, operand)])
+    result = _backward(_copy_handler(),
+                       {**_NAMES, _LIBC_START_SLOT: runtime, 0x800: "copy_handler"},
+                       code_refs={0x800: [(0x40d, entry)]}, entry=entry)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert (leaf["callers_total"], leaf["callers_followed"]) == (1, 0)
+    assert leaf["unfollowed"] == [{"address": "0x40d", "caller": "entry_point",
+                                  "param": 2, "reason": "indirect_reference"}]
+
+
+def test_static_runtime_handoff_is_an_unproven_indirect_boundary():
+    # A static libc body and a same-named impostor have no independently
+    # external boundary. Both fail closed, even when the entry is `_start`.
+    start = _entry("_start", [(_LIBC_START_SLOT, False)])
+    result = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
+                       code_refs={0x800: [(0x41e, start)]}, entry=start)
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert leaf["unfollowed"] == [{"address": "0x41e", "caller": "_start",
+                                  "param": 0, "reason": "indirect_reference"}]
+
+
+def test_process_entry_handoff_of_main_and_direct_call_refs_are_not_indirect_callers():
+    # Controls: the GOT import establishes the external startup boundary;
+    # the code reference a direct call site makes is already followed.
+    start = _entry("_start", [(_LIBC_START_SLOT, True)])
     handoff = _backward(_main_fn(41), {**_NAMES, **_ENTRY_NAMES, 0x800: "main"},
                         code_refs={0x800: [(0x41e, start)]}, entry=start)
     assert _gate(handoff) is True, handoff["diagnostics"]
@@ -953,6 +982,33 @@ int main(int argc, char **argv) {
 }
 """
 
+
+_RUNTIME_IMPOSTOR_C = r"""
+#include <stddef.h>
+#include <string.h>
+static char out[64];
+typedef void (*handler)(size_t);
+static handler saved;
+__attribute__((noinline, used)) void copy_handler(size_t n) { memcpy(out, out, n); }
+#ifdef OPERAND_ONE
+__attribute__((noinline, used)) void __libc_start_main(size_t n, handler h) {
+#else
+__attribute__((noinline, used)) void __libc_start_main(handler h, size_t n) {
+#endif
+    (void)n;
+    saved = h;
+    saved(4096);
+}
+__attribute__((noinline, used, noreturn)) void entry_point(void) {
+#ifdef OPERAND_ONE
+    __libc_start_main(1, copy_handler);
+#else
+    __libc_start_main(copy_handler, 1);
+#endif
+    for (;;) __asm__ volatile ("pause");
+}
+"""
+
 _BUDGET_C = r"""
 #include <stddef.h>
 #include <stdlib.h>
@@ -1152,11 +1208,43 @@ def test_real_bn_custom_entry_dispatching_main_is_an_indirect_caller(tmp_path, s
 
 
 @pytest.mark.real_bn
-def test_real_bn_main_startup_stays_an_origin_beside_a_real_callback(tmp_path, shared_bn):
+@pytest.mark.parametrize("operand", [0, 1])
+def test_real_bn_in_binary_runtime_impostor_is_an_indirect_caller(tmp_path, shared_bn, operand):
+    flags = ["-no-pie", "-nostartfiles", "-Wl,-e,entry_point"]
+    if operand == 1:
+        flags.append("-DOPERAND_ONE")
+    binary = _compile(tmp_path, "runtime_impostor", _RUNTIME_IMPOSTOR_C, flags)
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "copy_handler", "arg:memcpy:2")
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert leaf["callers_total"] == leaf["callers_dropped"] == len(leaf["unfollowed"])
+    assert leaf["callers_followed"] == 0
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
+
+
+@pytest.mark.real_bn
+def test_real_bn_static_startup_is_an_unproven_indirect_boundary(tmp_path, shared_bn):
+    binary = _compile(tmp_path, "static_startup", _STARTUP_C, ["-static", "-no-pie"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_backward(shared_bn, target, "main", "param:0")
+
+    assert _gate(result) is False, result["diagnostics"]
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
+    assert leaf["callers_followed"] == 0
+    assert {r["caller"] for r in leaf["unfollowed"]} == {"_start"}
+
+
+@pytest.mark.real_bn
+@pytest.mark.parametrize("flags", [["-no-pie"], ["-fPIE", "-pie"]], ids=["non-pie", "pie"])
+def test_real_bn_main_startup_stays_an_origin_beside_a_real_callback(tmp_path, shared_bn, flags):
     # Normal `_start -> __libc_start_main(main)` startup: main's argc is the
     # origin of a complete slice. In the same program a handler main hands to
     # dispatch is an indirect callee.
-    binary = _compile(tmp_path, "startup", _STARTUP_C, ["-no-pie"])
+    binary = _compile(tmp_path, "startup", _STARTUP_C, flags)
     target = shared_bn.load(binary, copy=False)
 
     direct = _bn_backward(shared_bn, target, "put_len", "arg:memcpy:2")
