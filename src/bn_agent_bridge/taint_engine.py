@@ -7780,6 +7780,13 @@ class TaintEngine:
         ssaf = self._ssa_func(func)
         instrs = self._instrs(ssaf)
 
+        # An identical locator given twice is one query: expanding it twice
+        # repeated every site row, seed and slice. Distinct locators -- another
+        # callee at the same mapped address included -- stay distinct.
+        unique: dict[str, dict[str, Any]] = {}
+        for sink in sinks:
+            unique.setdefault(json.dumps(sink, sort_keys=True, default=repr), sink)
+        sinks = list(unique.values())
         # Resolve argument locators into individual call sites BEFORE seeding:
         # one site's SSA reads must never hide another site's constant or missing
         # operand. Non-argument locators and absent calls retain their refusal path.
@@ -7911,12 +7918,31 @@ class TaintEngine:
             # Every sink failed to seed -> hard error (no partial results to keep).
             if len(errors) == 1 and "address" not in errors[0][0]:
                 raise TaintError(errors[0][1])
-            raise TaintError(
-                "no backward seed resolved for any sink:\n  "
-                + "\n  ".join(
-                    f"{format_locator(s)}"
-                    + (f" @ {s['address']}" if "address" in s else "")
-                    + f" [unseeded]: {m}" for s, m in errors))
+            # One line per (locator, explanation), naming its sites: a hundred
+            # sites refused for one reason are one explanation, not a hundred.
+            # The text names at most MAX_CALLERS sites per line and counts the
+            # rest; every site row rides on the refusal's `observed`.
+            groups: dict[tuple[str, str], list[str | None]] = {}
+            for s, m in errors:
+                groups.setdefault((format_locator(s), m), []).append(s.get("address"))
+            lines = []
+            for (loc, m), addresses in list(groups.items())[:MAX_CALLERS]:
+                named = [a for a in addresses if a is not None]
+                where = ""
+                if named:
+                    where = " @ " + ", ".join(named[:MAX_CALLERS])
+                    if len(named) > MAX_CALLERS:
+                        where += f" (+{len(named) - MAX_CALLERS} more site(s))"
+                lines.append(f"{loc}{where} [unseeded]: {m}")
+            if len(groups) > MAX_CALLERS:
+                rest = list(groups.values())[MAX_CALLERS:]
+                lines.append(f"(+{len(rest)} more refusal(s) covering "
+                             f"{sum(len(a) for a in rest)} site(s))")
+            refusal = TaintError(
+                f"no backward seed resolved for any sink ({len(errors)} site(s)):\n  "
+                + "\n  ".join(lines))
+            refusal.observed = {"sink_status": sink_status}
+            raise refusal
         # #931 round 7: a multi-sink query is complete only when every selected
         # operand is. A sink that could not be seeded at all (no call to it
         # here, an index out of range) is not part of the answer, so the
@@ -9637,7 +9663,8 @@ class TaintEngine:
             for pidx in demands:
                 _drop(a, rf, pidx, "indirect_reference")
         self._bw_note_unfollowed_callers(
-            func, direct=direct, indirect=set(indirect), rows=rows, misses=misses)
+            func, direct=direct, indirect=set(indirect), formals=set(demands),
+            rows=rows, misses=misses)
         return results, cycled
 
     @staticmethod
@@ -9646,21 +9673,28 @@ class TaintEngine:
         return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
 
     def _bw_note_unfollowed_callers(
-        self, func: Any, *, direct: set[int], indirect: set[int],
+        self, func: Any, *, direct: set[int], indirect: set[int], formals: set[int],
         rows: list[dict[str, Any]], misses: set[tuple[int, int, str]],
     ) -> None:
         """One caller frontier per function, across every demanded formal.
 
-        Coverage counts distinct reference addresses. Reasons and examples are
-        separate evidence about (reference, formal, reason) boundaries, so their
-        tallies may exceed the number of dropped references. Keep full identity
-        internally even when the public examples are capped at MAX_CALLERS.
+        Coverage counts distinct reference addresses, each classed by the
+        formals demanded of it: FULLY followed (every demanded formal
+        followed), PARTIALLY followed (some), or UNFOLLOWED (none).
+        ``callers_dropped`` is the partial and unfollowed references together
+        -- every reference that left at least one demand unfollowed -- and the
+        (reference, formal) demand counts say how many demands that was.
+        Reasons and examples are separate evidence about (reference, formal,
+        reason) boundaries, so their tallies may exceed the number of dropped
+        references. Keep full identity internally even when the public
+        examples are capped at MAX_CALLERS.
         """
         start = int(func.start)
         state = self._bw_caller_frontiers.get(start)
         if state is None:
             state = {
                 "direct": set(), "known": set(), "dropped": set(), "misses": set(),
+                "demanded": {}, "missed": {},
                 "reasons": {}, "examples": {}, "leaf": None, "cap_assumption": None,
             }
             self._bw_caller_frontiers[start] = state
@@ -9669,8 +9703,11 @@ class TaintEngine:
         state["direct"].update(direct)
         state["known"].update(direct)
         state["known"].update(indirect)
+        for address in direct | indirect:
+            state["demanded"].setdefault(address, set()).update(formals)
         for address, param, reason in misses:
             state["dropped"].add(address)
+            state["missed"].setdefault(address, set()).add(param)
             key = (address, param, reason)
             if key not in state["misses"]:
                 state["misses"].add(key)
@@ -9684,7 +9721,16 @@ class TaintEngine:
 
         total = len(state["known"])
         dropped = len(state["dropped"])
-        followed = total - dropped
+        fully = total - dropped
+        partial: list[tuple[int, set[int], set[int]]] = []
+        for address in sorted(state["dropped"]):
+            demanded = state["demanded"].get(address, set())
+            missed = state["missed"][address]
+            if demanded - missed:
+                partial.append((address, demanded - missed, missed))
+        unfollowed = dropped - len(partial)
+        demands_total = sum(len(state["demanded"].get(a, set())) for a in state["known"])
+        demands_unfollowed = sum(len(m) for m in state["missed"].values())
         reasons = dict(sorted(state["reasons"].items()))
         name = self._prose_function(func)
         capped = "caller_cap" in reasons
@@ -9692,7 +9738,7 @@ class TaintEngine:
             self._bw_truncated = True
             self._bw_truncation_causes.add("caller_cap")
             assumption = (
-                f"{name} has {len(state['direct'])} callers; caller ascent followed "
+                f"{name} has {len(state['direct'])} callers; caller ascent fully followed "
                 f"{len(state['direct'] - state['dropped'])}, capped at {MAX_CALLERS} "
                 f"(function {start:#x})")
             old = state["cap_assumption"]
@@ -9703,8 +9749,10 @@ class TaintEngine:
                 state["cap_assumption"] = assumption
         note = (
             ("caller-site cap: " if capped else "")
-            + f"the ascent followed {followed} of {total} distinct caller reference(s); "
-            f"{dropped} not followed; unfollowed demand boundaries (reference, formal): "
+            + f"of {total} distinct caller reference(s), the ascent fully followed {fully} "
+            f"(every demanded formal), partially followed {len(partial)} and followed "
+            f"none of {unfollowed}; {demands_unfollowed} of {demands_total} "
+            "(reference, formal) demand(s) unfollowed: "
             + ", ".join(f"{n} {r}" for r, n in reasons.items()))
         leaf = state["leaf"]
         if leaf is None:
@@ -9717,9 +9765,20 @@ class TaintEngine:
             state["leaf"] = leaf
             self._bw_leaves.append(leaf)
         leaf.update({
-            "callers_total": total, "callers_followed": followed,
-            "callers_dropped": dropped, "reasons": reasons,
+            "callers_total": total,
+            "callers_fully_followed": fully,
+            "callers_partially_followed": len(partial),
+            "callers_unfollowed": unfollowed,
+            "callers_dropped": dropped,
+            "demands_total": demands_total,
+            "demands_unfollowed": demands_unfollowed,
+            "reasons": reasons,
             "unfollowed": list(state["examples"].values()),
+            # Which formals each partially followed reference did and did not
+            # supply; bounded like `unfollowed`, counted exactly above.
+            "partially_followed": [
+                {"address": hex(a), "followed_params": sorted(f), "unfollowed_params": sorted(m)}
+                for a, f, m in partial[:MAX_CALLERS]],
             "note": (note + " -- an origin reachable only from an unfollowed caller "
                      "is missing from this slice"),
         })

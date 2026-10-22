@@ -4113,7 +4113,8 @@ def test_backward_caller_cap_is_leaf_and_truncation(models):
     assert len(caps) == 1, result["leaves"]
     cap = caps[0]
     assert cap["callers_total"] == 20
-    assert cap["callers_followed"] == 16
+    assert cap["callers_fully_followed"] == 16
+    assert (cap["callers_partially_followed"], cap["callers_unfollowed"]) == (0, 4)
     assert cap["callers_dropped"] == 4
     assert cap["function"]["name"] == "use_len"
     # The signal is machine-readable on the envelope, not prose-only ...
@@ -4128,7 +4129,7 @@ def test_backward_caller_cap_is_leaf_and_truncation(models):
     assert len(result["slices"]) == 16
     # The caveat names the MEASURED ascent (this fixture resolves every site, so
     # it equals the cap) -- never the cap constant as if it were coverage.
-    assert any("caller ascent followed 16, capped at 16" in a
+    assert any("caller ascent fully followed 16, capped at 16" in a
                for a in result["assumptions"]), result["assumptions"]
 
 
@@ -4147,18 +4148,18 @@ def test_backward_caller_cap_counts_the_sites_the_ascent_actually_followed(model
     caps = [lf for lf in result["leaves"] if lf.get("kind") == "caller_sites_truncated"]
     assert len(caps) == 1, result["leaves"]
     assert caps[0]["callers_total"] == 20
-    assert caps[0]["callers_followed"] == 6
+    assert caps[0]["callers_fully_followed"] == 6
     assert caps[0]["callers_dropped"] == 14
     # The 6 resolvable sites are exactly the ones that produced slices.
     assert len(result["slices"]) == 6
     # The human-readable half must agree with the machine-readable one.
-    assert any("caller ascent followed 6, capped at 16" in a
+    assert any("caller ascent fully followed 6, capped at 16" in a
                for a in result["assumptions"]), result["assumptions"]
     # ... and the real text frontier (what a human reads) prints the measurement
     # the JSON carries, on an envelope that says INCOMPLETE.
     from bn.formatters import _render_taint_text
     text = _render_taint_text(result)
-    assert "6 of 20 caller(s) followed; 14 dropped" in text
+    assert "20 caller reference(s): 6 fully followed, 0 partially, 14 not followed; 14 dropped" in text
     assert "verdict: INCOMPLETE" in text
 
 
@@ -4175,7 +4176,7 @@ def test_backward_caller_cap_reports_a_zero_ascent_as_zero(models):
     caps = [lf for lf in result["leaves"] if lf.get("kind") == "caller_sites_truncated"]
     assert len(caps) == 1, result["leaves"]
     assert caps[0]["callers_total"] == 20
-    assert caps[0]["callers_followed"] == 0
+    assert caps[0]["callers_fully_followed"] == 0
     assert caps[0]["callers_dropped"] == 20
     assert result["stats"]["truncated"] is True
     assert result["stats"]["truncation_cause"] == ["caller_cap"]
@@ -9583,7 +9584,7 @@ def test_backward_weak_sink_seed_withholds_completeness_812():
     # note the backward walk really does record must not be read as a weak seed,
     # or every capped ascent would be blamed on its seed.
     ordinary = tr.backward_diagnostics(
-        [], ["parse_record has 9 callers; caller ascent followed 4, capped at 4"],
+        [], ["parse_record has 9 callers; caller ascent fully followed 4, capped at 4"],
         sinks_seeded=1, slices=1)
     assert ordinary["safe_to_report_complete_slice"] is True, ordinary
 
