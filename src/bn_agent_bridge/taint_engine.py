@@ -5402,19 +5402,95 @@ class TaintEngine:
         subs.extend(getattr(expr, "operands", None) or ())
         return any(self._expr_loads_global(ssaf, s, ga, depth + 1) for s in subs)
 
+    def _may_be_global(self, ssaf: Any, expr: Any, ga: int, depth: int = 0) -> bool:
+        """Whether *expr* may hold the address of the global at *ga*.
+
+        ``_global_addr`` follows a single-reader copy chain; this also looks
+        THROUGH an SSA PHI, because a pointer a branch selected is still that
+        pointer (round-3 review R1: `p = cond ? g : other; system(p)` resolved
+        to nothing and the consumer read as write-only)."""
+        if expr is None or depth > 8:
+            return False
+        if self._global_addr(ssaf, expr) == ga:
+            return True
+        var = expr if is_ssa_var(expr) else None
+        if var is None:
+            reads = expr_reads(expr)
+            var = reads[0] if len(reads) == 1 else None
+        if var is None:
+            return False
+        try:
+            defn = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            defn = None
+        if defn is None or "PHI" not in op_name(defn):
+            return False
+        srcs = getattr(defn, "src", None)
+        if not isinstance(srcs, (list, tuple)):
+            srcs = [] if srcs is None else [srcs]
+        return any(self._may_be_global(ssaf, s, ga, depth + 1) for s in srcs)
+
+    def _expr_mentions_global(self, ssaf: Any, expr: Any, ga: int, depth: int = 0) -> bool:
+        """Whether any sub-expression of *expr* may be the global at *ga*."""
+        if expr is None or depth > 10 or not hasattr(expr, "operation"):
+            return False
+        if self._may_be_global(ssaf, expr, ga):
+            return True
+        subs: list[Any] = []
+        for attr in ("src", "dest", "left", "right", "params"):
+            sub = getattr(expr, attr, None)
+            if isinstance(sub, (list, tuple)):
+                subs.extend(sub)
+            elif sub is not None:
+                subs.append(sub)
+        subs.extend(getattr(expr, "operands", None) or ())
+        return any(self._expr_mentions_global(ssaf, s, ga, depth + 1) for s in subs)
+
+    @staticmethod
+    def _model_write_only_arg(model: dict[str, Any] | None, idx: int) -> bool:
+        """Whether *model* says argument *idx* is a destination the callee
+        only WRITES through -- ``*arg:idx`` is a propagate/write target and
+        never a propagate source, and the model reports no sink on it.
+
+        This is what tells `memset(g, 0, 64)` and `memcpy(g, "safe", 5)`
+        apart from `system(g)` and `snprintf(buf, n, "%s", g)` (round-3
+        review R2: a modeled write destination is not a reader). An unmodeled
+        callee has no such promise, so it is never write-only here."""
+        if not model:
+            return False
+        tok = f"*arg:{idx}"
+        rules = list(model.get("propagates") or ())
+        written = tok in (model.get("writes") or ())
+        for rule in rules:
+            if str(rule.get("to") or "") == tok:
+                written = True
+            if str(rule.get("from") or "") == tok:
+                return False
+        varargs = model.get("varargs") or {}
+        if str(varargs.get("to") or "") == tok:
+            written = True
+        if idx >= int(varargs.get("first_index", 1 << 30)):
+            return False        # a vararg the model folds INTO the destination
+        sink = model.get("sink") or {}
+        if idx in (sink.get("tainted_args") or ()):
+            return False
+        return written
+
     def _global_access(self, fn: Any, ga: int) -> tuple[int | None, str]:
         """``(address, kind)`` of the first use of the global at *ga* inside
-        *fn* that can READ its bytes, or ``(None, "write_only")`` when every
-        use is proven to be a store INTO it (round-3 review F3: a function
-        whose only reference is ``g[0] = 0`` consumes nothing, and naming it
-        a consumer manufactures a frontier the base engine never had).
+        *fn* that can READ its bytes, or ``(None, "write_only")`` ONLY when
+        every use in the body is proven to write into it.
 
-        Kinds, all conservative in the "could the bytes escape here" sense:
-        ``load`` (the bytes are loaded), ``call_arg`` (the address is handed
-        to a call, which may read it), ``address_escape`` (the address is
-        stored into memory), ``return`` (the address is returned) and
-        ``unreadable`` -- a body whose MLIL this run cannot read at all, which
-        stays a disclosed consumer rather than a silent drop."""
+        The default is "consumer": a mention this classifier cannot account
+        for as a write is read-capable, because the cost of a wrong "it only
+        writes" is the false all-clear this frontier exists to withhold
+        (round-3 review R1). Kinds: ``load`` (the bytes are loaded),
+        ``call_arg`` (the address is handed to a call that is not a modeled
+        write destination), ``address_escape`` (the address is stored into
+        memory), ``return``, ``address_taken`` (the address is materialised
+        and the use is not otherwise classifiable), ``unclassified`` (BN
+        records a reference this scan could not find) and ``unreadable`` (the
+        body's MLIL could not be read at all)."""
         key = (int(getattr(fn, "start", 0)), int(ga))
         cached = self._global_access_cache.get(key)
         if cached is not None:
@@ -5427,30 +5503,57 @@ class TaintEngine:
             out: tuple[int | None, str] = (fallback, "unreadable")
             self._global_access_cache[key] = out
             return out
-        out = (None, "write_only")
+        wrote = False
+        out = None
         for ins in instrs:
             opn = op_name(ins)
-            kind: str | None = None
+            at = int(getattr(ins, "address", 0))
             if self._is_call(ins):
-                if any(self._global_addr(ssaf, p) == ga
-                       for p in self._call_params(ins)):
-                    kind = "call_arg"
-            elif "RET" in opn:
+                params = self._call_params(ins)
+                hit = [i for i, p in enumerate(params)
+                       if self._may_be_global(ssaf, p, ga)]
+                if hit:
+                    _key, model = lookup_model(
+                        self.models, self._callee_name(self._resolve_direct_target(ins)))
+                    if all(self._model_write_only_arg(model, i) for i in hit):
+                        wrote = True
+                        continue
+                    out = (at, "call_arg")
+                    break
+                if self._expr_mentions_global(ssaf, ins, ga):
+                    out = (at, "call_arg")
+                    break
+                continue
+            if "RET" in opn:
                 srcs = getattr(ins, "src", None)
                 if not isinstance(srcs, (list, tuple)):
                     srcs = [] if srcs is None else [srcs]
-                if any(self._global_addr(ssaf, s) == ga for s in srcs):
-                    kind = "return"
-            elif "STORE" in opn \
-                    and self._global_addr(ssaf, getattr(ins, "src", None)) == ga:
-                # `*p = &g`: the address leaves through memory, so the bytes
-                # are reachable from somewhere this walk cannot see.
-                kind = "address_escape"
-            if kind is None and self._expr_loads_global(ssaf, ins, ga):
-                kind = "load"
-            if kind is not None:
-                out = (int(getattr(ins, "address", 0)), kind)
+                if any(self._may_be_global(ssaf, s, ga) for s in srcs):
+                    out = (at, "return")
+                    break
+            if "STORE" in opn:
+                dest_hit = self._may_be_global(ssaf, getattr(ins, "dest", None), ga)
+                src_hit = self._expr_mentions_global(ssaf, getattr(ins, "src", None), ga)
+                if dest_hit and not src_hit:
+                    wrote = True       # `g[i] = <value that is not g>`
+                    continue
+                if dest_hit or src_hit:
+                    # `g[i] = g[j] + 1` reads, and `*p = &g` escapes the
+                    # address to memory this walk cannot follow.
+                    out = (at, "load" if self._expr_loads_global(ssaf, ins, ga)
+                           else "address_escape")
+                    break
+                continue
+            if self._expr_mentions_global(ssaf, ins, ga):
+                out = (at, "load" if self._expr_loads_global(ssaf, ins, ga)
+                       else "address_taken")
                 break
+        if out is None:
+            # Nothing read-capable. A body with a proven write and nothing
+            # else is a write-only reference; a body where this scan found no
+            # mention at all contradicts BN's own code reference, so it is
+            # disclosed rather than cleared.
+            out = (None, "write_only") if wrote else (fallback, "unclassified")
         self._global_access_cache[key] = out
         return out
 
@@ -5577,11 +5680,14 @@ class TaintEngine:
                 f"Read every reference with `bn xrefs {hex(ga)}`, then re-seed inside the "
                 f"consumer on the value it loads ({reseed})")
         else:
-            bound = ("the configured interprocedural depth"
-                     if reach.get("cause") == "depth_budget" else
-                     "an unresolved in-binary thunk"
-                     if reach.get("cause") == "unresolved_thunk" else
-                     f"the {reach.get('function_budget')}-function reachability bound")
+            bound = {
+                "depth_budget": "the configured interprocedural depth",
+                "unresolved_thunk": "an in-binary thunk whose tail call did not resolve",
+                "unread_callee_body": (
+                    "an in-binary callee body Binary Ninja never analysed "
+                    "(re-run after `bn decompile <callee> --force-analysis`)"),
+            }.get(str(reach.get("cause")),
+                  f"the {reach.get('function_budget')}-function reachability bound")
             detail = (
                 f"tainted bytes were copied into the writable global {hex(ga)}, and the "
                 f"search for code reading it past this call stopped at {bound} after "
@@ -5853,27 +5959,46 @@ class TaintEngine:
                 cfn = function_at(self.bv, taddr)
                 if cfn is None:
                     continue
-                unresolved_thunk = False
-                if not self._is_internal(cfn):
+                unread: str | None = None
+                reason = self._not_internal_reason(cfn)
+                if reason is not None:
                     # A .plt/veneer thunk is not a body, but it is not a dead
                     # end either: resolve it with the same helper the descent
                     # uses (#807), so a global consumed behind a thunk is not
-                    # dropped (F1). An IN-BINARY thunk whose tail call does not
-                    # resolve fails CLOSED: its references cannot be read, so
-                    # "nothing reads the global" is not an answer. A resolved
-                    # import is external -- the model/unmodeled-callee
-                    # machinery owns that call, as before.
+                    # dropped (F1). Two in-binary shapes then fail CLOSED,
+                    # because their references cannot be read and "nothing
+                    # reads the global" is not an answer: a thunk whose tail
+                    # call does not resolve, and a body BN never analysed (an
+                    # oversized function past analysis.limits.maxFunctionSize,
+                    # a failed lift) -- round-3 review R3. A resolved import is
+                    # external; the model/unmodeled-callee machinery owns that
+                    # call, as before.
                     resolved = self._follow_thunk_cached(cfn)
-                    if resolved is not None and self._is_internal(resolved):
+                    if resolved is not None:
+                        if not self._is_internal(resolved):
+                            continue      # a PLT stub onto an import: external
                         cfn = resolved
-                    elif resolved is None and self._not_internal_reason(cfn) == "thunk":
-                        unresolved_thunk = True
+                    elif reason == "thunk":
+                        unread = "unresolved_thunk"
+                    elif str(reason).startswith("analysis_skipped:"):
+                        # BN says, explicitly, that it did not analyse this
+                        # IN-BINARY body (oversized past
+                        # analysis.limits.maxFunctionSize, a failed lift). Its
+                        # references cannot be read, so what the global
+                        # reaches past this call is unknown, not clear.
+                        # `no_mlil` is deliberately NOT here: that is the
+                        # degenerate shape (a stub, a view that hands back a
+                        # function with no IL at all), which the external and
+                        # unmodeled-callee machinery already owns.
+                        unread = "unread_callee_body"
+                        self._analysis_incomplete.add(
+                            str(getattr(cfn, "name", None) or hex(int(taddr))))
                     else:
                         continue
                 for ga in list(pending):
-                    if unresolved_thunk:
+                    if unread is not None:
                         refs, reach = (), self._reach_status(
-                            "unresolved_thunk", 0, sorted(self._global_ref_functions(ga)))
+                            unread, 0, sorted(self._global_ref_functions(ga)))
                     else:
                         refs, reach = self._global_refs_reachable(cfn, ga, budget)
                     if not refs and reach["status"] != "truncated":
@@ -5884,10 +6009,12 @@ class TaintEngine:
                         ins, ga, cfn, refs, descended, reach)
                     if leaf not in leaves:
                         leaves.append(leaf)
-                    if reach["status"] == "truncated":
-                        # The run's coverage really is incomplete: say so with
+                    if reach["cause"] in ("depth_budget", "function_budget"):
+                        # A BUDGET really did cut coverage short: say so with
                         # the cause, so `truncated`/`truncation_cause` and the
-                        # remediation agree with the leaf (F2).
+                        # remediation agree with the leaf (F2). An unreadable
+                        # callee is not a budget -- it is disclosed by the leaf
+                        # and, for an unread body, by analysis_incomplete.
                         self._truncated = True
                         self._truncation_causes.add(
                             "max_depth" if reach["cause"] == "depth_budget"

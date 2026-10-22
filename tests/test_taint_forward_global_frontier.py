@@ -40,6 +40,7 @@ KIND = "global_memory_continuation"
 G_DIR = 0x404060        # the global the copy fills
 G_OTHER = 0x404160      # a second, unrelated global
 STRNCPY, STRCPY, SPRINTF, MEMCPY, SYSTEM = 0x401030, 0x401040, 0x401050, 0x401060, 0x401070
+MEMSET = 0x401080
 
 
 @pytest.fixture
@@ -631,7 +632,9 @@ def test_an_unresolved_in_binary_thunk_fails_closed(models):
     assert leaf["reachability"]["cause"] == "unresolved_thunk"
     assert leaf["reachability"]["unexamined_references"] == [hex(0x401500)]
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
-    assert "global_reference_budget" in result["stats"]["truncation_cause"]
+    # An unreadable callee is not a BUDGET: the leaf carries the whole story,
+    # and the run is not mislabelled as depth- or budget-truncated.
+    assert result["stats"]["truncation_cause"] == [], result["stats"]
 
 
 def test_a_thunk_onto_an_import_stays_external(models):
@@ -805,21 +808,173 @@ def test_a_mixed_write_then_read_reference_is_a_consumer(models):
         "address": hex(0x401200), "at": hex(0x401218), "access": "call_arg"}
 
 
-def test_a_body_whose_il_cannot_be_read_stays_a_consumer(models):
-    # Conservative in the other direction: a referencing function with no
-    # MLIL cannot be proven write-only, so it is disclosed rather than
-    # silently cleared.
-    opaque = GFunc("opaque", 0x401200, FSSAFunc([]), params=[])
-    opaque.mlil = None
+
+# --------------------------------------------------------------------------
+# round-2 review: the classifier defaults to CONSUMER, and only a proven
+# write -- a store, or a modeled write-only destination argument -- clears it
+# --------------------------------------------------------------------------
+
+def _phi_reader(name, start, global_addr, at):
+    """`p = cond ? g : other; system(p)`: the pointer reaches the call through
+    an SSA PHI, which no single-reader copy chain resolves."""
+    p = FVar("p")
+    p1, p2, p3 = FSSA(p, 1), FSSA(p, 2), FSSA(p, 3)
+    instrs = [
+        FInstr(0, start, "MLIL_SET_VAR_SSA", f"p#1 = {hex(global_addr)}",
+               writes=[p1], src=_gptr(global_addr)),
+        FInstr(1, start + 4, "MLIL_SET_VAR_SSA", f"p#2 = {hex(G_OTHER)}",
+               writes=[p2], src=_gptr(G_OTHER)),
+        FInstr(2, start + 8, "MLIL_VAR_PHI", "p#3 = phi(p#1, p#2)",
+               writes=[p3], src=[p1, p2]),
+        FInstr(3, at, "MLIL_CALL_SSA", "system(p#3)", reads=[p3],
+               dest=_gptr(SYSTEM), params=[_var(p3)]),
+    ]
+    return GFunc(name, start, FSSAFunc(instrs), params=[])
+
+
+def test_a_phi_selected_global_pointer_is_a_consumer(models):
+    # Round-2 review R1: a branch-selected pointer is still that pointer. The
+    # classifier used to find no `load` and no directly-resolvable call
+    # argument and call the whole body write-only -- a false all-clear on an
+    # ordinary `cond ? g : other` consumer.
+    func, bv = _after_copy(_phi_reader("conditional_reader", 0x401200, G_DIR, 0x401210))
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["access"] != "write_only", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # ...and the mechanism is the resolver itself: the call argument reaches
+    # the global only through the PHI, and `_may_be_global` follows it. A
+    # single-reader copy chain (what `_global_addr` walks) stops at the merge.
+    eng = te.TaintEngine(bv, models)
+    phi_fn = bv.get_function_at(0x401200)
+    ssaf = phi_fn.mlil.ssa_form
+    call = ssaf.instructions[3]
+    assert eng._global_addr(ssaf, call.params[0]) is None
+    assert eng._may_be_global(ssaf, call.params[0], G_DIR) is True
+
+
+def test_an_address_taken_global_with_no_classifiable_use_is_a_consumer(models):
+    # The address is materialised and then used in a way this scan cannot
+    # account for as a write. Defaulting to "it only writes" is what produced
+    # the false all-clear; the conservative answer is a disclosed boundary.
+    v = FSSA(FVar("p"), 1)
+    body = GFunc("opaque_use", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_SET_VAR_SSA", f"p#1 = {hex(G_DIR)}",
+               writes=[v], src=_gptr(G_DIR)),
+    ]), params=[])
+    func, bv = _after_copy(body)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["access"] == "address_taken", leaf
+
+
+def _modeled_call(name, start, callee_addr, params, at=0x401210):
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", f"{hex(callee_addr)}(...)",
+               dest=_gptr(callee_addr), params=list(params)),
+    ]), params=[])
+
+
+@pytest.mark.parametrize("callee,params", [
+    (MEMSET, [_gptr(G_DIR), _const(0), _const(64)]),          # memset(g, 0, 64)
+    (MEMCPY, [_gptr(G_DIR), _gptr(0x402000), _const(5)]),     # memcpy(g, "safe", 5)
+])
+def test_a_modeled_write_only_destination_is_not_a_reader(models, callee, params):
+    # Round-2 review R2: the model says these callees only WRITE through arg0.
+    # Treating the argument as a read invented a blocking frontier on a helper
+    # that overwrites the global with constants.
+    helper = _modeled_call("reset_helper", 0x401200, callee, params)
+    func, bv = _after_copy(helper)
+    bv._names[callee] = {MEMSET: "memset", MEMCPY: "memcpy"}[callee]
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_modeled_source_argument_is_still_a_reader(models):
+    # The mirror: the same model reads through arg1, so a helper that copies
+    # the tainted global OUT of it is a consumer.
+    helper = _modeled_call("leak_helper", 0x401200, MEMCPY,
+                           [_gptr(G_OTHER), _gptr(G_DIR), _const(16)])
+    func, bv = _after_copy(helper)
+    bv._names[MEMCPY] = "memcpy"
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+
+
+def test_an_unmodeled_call_handed_the_global_is_a_reader(models):
+    # No model, no promise: an unmodeled callee handed the address could read
+    # it, so it is disclosed rather than assumed to be a write destination.
+    helper = _modeled_call("unknown_helper", 0x401200, 0x401900, [_gptr(G_DIR)])
+    func, bv = _after_copy(helper)
+    bv._names[0x401900] = "app_blob"
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+
+
+def test_a_modeled_write_destination_beside_a_read_is_still_a_reader(models):
+    # memcpy(g, g, 8): arg0 is the model's write destination, arg1 its source.
+    # One write-only position does not clear the call.
+    helper = _modeled_call("churn", 0x401200, MEMCPY,
+                           [_gptr(G_DIR), _gptr(G_DIR), _const(8)])
+    func, bv = _after_copy(helper)
+    bv._names[MEMCPY] = "memcpy"
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+
+
+def test_a_scalar_store_to_another_global_is_silent(models):
+    # The control for the write-only rule: a helper that writes an UNRELATED
+    # global is not a reference to the tainted one at all.
+    helper = _store_only("scalar_helper", 0x401200, G_OTHER, 0x401210)
     func, _argv = _copy_then_call(
-        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401200), [])],
-        params_extra=[_const(0xff)])
-    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "opaque"},
-                   funcs={0x401200: opaque}, refs={G_DIR: [FRef(opaque, 0x401210)]})
-    # A body with no MLIL is also not an internal descent target, so this call
-    # never reaches the global question at all -- the existing external/unread
-    # machinery owns it. What must NOT happen is the CLASSIFIER quietly
-    # calling it write-only, which would clear a reference it never read.
-    _forward(bv, func, models)
-    at, kind = te.TaintEngine(bv, models)._global_access(opaque, G_DIR)
-    assert (at, kind) == (0x401210, "unreadable"), (at, kind)
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "scalar_helper"},
+                   funcs={0x401200: helper},
+                   refs={G_OTHER: [FRef(helper, 0x401210)]})
+    result = _forward(bv, func, models)
+    assert result["leaves"] == [], result["leaves"]
+
+
+# --------------------------------------------------------------------------
+# round-2 review R3: an in-binary consumer BN never analysed
+# --------------------------------------------------------------------------
+
+def test_an_unanalysed_in_binary_consumer_is_disclosed(models):
+    # BN measured the body and skipped it (oversized past
+    # analysis.limits.maxFunctionSize). Its references cannot be read, so
+    # "nothing reads the global" is not an answer -- and the run says its
+    # analysis was incomplete, which it was.
+    skipped = GFunc("huge_reader", 0x401200, FSSAFunc([]), params=[])
+    skipped.analysis_skipped = True
+    skipped.analysis_skip_reason = type("R", (), {"name": "ExceedFunctionSizeSkipReason"})()
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "huge_reader"},
+                   funcs={0x401200: skipped},
+                   refs={G_DIR: [FRef(skipped, 0x401210)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"] == [], leaf
+    assert leaf["reachability"]["cause"] == "unread_callee_body"
+    assert leaf["reachability"]["unexamined_references"] == [hex(0x401200)]
+    assert "force-analysis" in leaf["detail"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert result["stats"]["analysis_incomplete"] is True
+    assert "huge_reader" in result["stats"]["analysis_incomplete_functions"]
+
+
+def test_a_function_with_no_il_at_all_is_left_to_the_external_machinery(models):
+    # `no_mlil` is the degenerate shape (a stub, a view that hands back a
+    # function with no IL), not a body BN measured and skipped: the existing
+    # external/unmodeled-callee machinery owns it, and no global boundary is
+    # invented for it.
+    stub = GFunc("stub", 0x401200, FSSAFunc([]), params=[])
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "stub"},
+                   funcs={0x401200: stub}, refs={G_DIR: [FRef(stub, 0x401210)]})
+    assert _leaves(_forward(bv, func, models)) == []

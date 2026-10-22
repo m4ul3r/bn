@@ -1446,3 +1446,132 @@ def test_global_continuation_discloses_an_exhausted_reachability_budget(tmp_path
     assert "reachability truncated" in rendered.stdout, rendered.stdout
     assert "function_budget" in rendered.stdout, rendered.stdout
     assert sum(_run_or_check_template(shared_bn, _forward_prose(result))) >= 1
+
+
+def test_global_continuation_phi_selected_pointer_is_a_consumer(tmp_path, shared_bn):
+    """Round-2 review R1: `p = cond ? g : other; system(p)` is a reader.
+
+    The consumer reaches the tainted global through a branch merge, which no
+    single-reader copy chain resolves. Concluding "it only writes" from that
+    restores the false all-clear this frontier exists to withhold."""
+    src = tmp_path / "condcont.c"
+    src.write_text(r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[64];
+char fallback_bytes[64] = "/bin/true";
+__attribute__((noinline)) int conditional_reader(int flag) {
+    const char *p = flag ? global_bytes : fallback_bytes;
+    return system(p);
+}
+__attribute__((noinline)) int transfer(const char *src) {
+    memcpy(global_bytes, src, 16);
+    return conditional_reader(1);
+}
+int main(int argc, char **argv) { return argc > 1 ? transfer(argv[1]) : 0; }
+""")
+    binary = tmp_path / "condcont"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                      "-f", "transfer", "--source", "param:0")
+
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "global_memory_continuation"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+    assert [r["display_name"] for r in leaf["references"]] == ["conditional_reader"], leaf
+    assert leaf["references"][0]["access"] != "write_only", leaf
+
+    # both sides of the merge reference the identical global base
+    listing = _bn_json(shared_bn, "-t", target, "disasm", "conditional_reader")["text"]
+    assert f"{int(leaf['global']['address'], 16):x}" in listing.lower(), listing
+
+
+def test_global_continuation_modeled_write_destinations_are_not_readers(tmp_path, shared_bn):
+    """Round-2 review R2: a modeled write destination reads nothing.
+
+    `memset(g, 0, 64)` and `memcpy(g, "safe", 5)` hand the global to a call,
+    but their models say that argument is written and never read, so neither
+    helper is a consumer. The unrelated-global and scalar-store controls stay
+    silent too, and a helper that copies the global OUT is still a reader."""
+    src = tmp_path / "wocalls.c"
+    src.write_text(r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[64];
+char other_global[64];
+int counter;
+__attribute__((noinline)) void reset_helper(void) { memset(global_bytes, 0, 64); }
+__attribute__((noinline)) void copy_reset_helper(void) { memcpy(global_bytes, "safe", 5); }
+__attribute__((noinline)) void scalar_helper(void) { counter = 0; }
+__attribute__((noinline)) void other_helper(void) { system(other_global); }
+__attribute__((noinline)) void leak_helper(void) { memcpy(other_global, global_bytes, 16); }
+__attribute__((noinline)) int reset_case(const char *s) { memcpy(global_bytes, s, 16); reset_helper(); return 0; }
+__attribute__((noinline)) int copy_reset_case(const char *s) { memcpy(global_bytes, s, 16); copy_reset_helper(); return 0; }
+__attribute__((noinline)) int scalar_case(const char *s) { memcpy(global_bytes, s, 16); scalar_helper(); return 0; }
+__attribute__((noinline)) int other_case(const char *s) { memcpy(global_bytes, s, 16); other_helper(); return 0; }
+__attribute__((noinline)) int leak_case(const char *s) { memcpy(global_bytes, s, 16); leak_helper(); return 0; }
+int main(int argc, char **argv) {
+    return argc > 1 ? reset_case(argv[1]) + copy_reset_case(argv[1])
+                      + scalar_case(argv[1]) + other_case(argv[1])
+                      + leak_case(argv[1]) : 0;
+}
+""")
+    binary = tmp_path / "wocalls"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0")
+
+    for fn in ("reset_case", "copy_reset_case", "scalar_case", "other_case"):
+        quiet = forward(fn)
+        assert [lf for lf in quiet["leaves"]
+                if lf["kind"] == "global_memory_continuation"] == [], (fn, quiet["leaves"])
+        assert quiet["diagnostics"]["safe_to_report_all_clear"] is True, (fn, quiet)
+
+    # the mirror: the same model READS through arg1
+    loud = forward("leak_case")
+    [leaf] = [lf for lf in loud["leaves"] if lf["kind"] == "global_memory_continuation"]
+    assert leaf["references"][0]["display_name"] == "leak_helper", leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert loud["diagnostics"]["safe_to_report_all_clear"] is False, loud["diagnostics"]
+
+
+def test_global_continuation_unanalysed_consumer_body_is_disclosed(tmp_path, shared_bn):
+    """Round-2 review R3: an in-binary body BN skipped is not a dead end.
+
+    The consumer is past `analysis.limits.maxFunctionSize`, so BN never
+    analysed it and its references cannot be read. Skipping the call reported
+    zero sinks, zero leaves, a true all-clear and `analysis_incomplete: false`
+    on a program whose consumer hands the global to `system`."""
+    src = tmp_path / "unreadcont.c"
+    src.write_text(r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[64];
+__attribute__((noinline)) int huge_reader(void) {
+    __asm__ volatile(".rept 70000\n nop\n .endr\n");
+    return system(global_bytes);
+}
+__attribute__((noinline)) int transfer(const char *src) {
+    memcpy(global_bytes, src, 16);
+    return huge_reader();
+}
+int main(int argc, char **argv) { return argc > 1 ? transfer(argv[1]) : 0; }
+""")
+    binary = tmp_path / "unreadcont"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                      "-f", "transfer", "--source", "param:0")
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "global_memory_continuation"]
+    assert leaf["references"] == [], leaf
+    assert leaf["reachability"]["cause"] == "unread_callee_body", leaf
+    assert "force-analysis" in leaf["detail"], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+    assert result["stats"]["analysis_incomplete"] is True, result["stats"]
+    assert "huge_reader" in result["stats"]["analysis_incomplete_functions"], result["stats"]
