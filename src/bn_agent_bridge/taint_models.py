@@ -88,14 +88,6 @@ class TaintError(RuntimeError):
     """User-facing taint configuration/resolution error."""
 
 
-class BoundedSink(Exception):
-    """A backward sink whose argument is a compile-time constant (e.g. a fixed
-    copy length): provably bounded, with no def-chain to slice. This is a
-    SUCCESSFUL conclusion, not a seed failure -- it must NOT count toward the
-    all-sinks-failed hard error, so a bounded sink returns a clean result
-    (exit 0, --out written) instead of looking like a crash (#310)."""
-
-
 # --------------------------------------------------------------------------
 # model database
 # --------------------------------------------------------------------------

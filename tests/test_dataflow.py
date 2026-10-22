@@ -363,24 +363,6 @@ def test_render_taint_backward_complete_run_keeps_old_text():
     assert "caller_sites_truncated" not in text
 
 
-def test_render_taint_backward_bounded_sink_is_success_not_unseeded():
-    # #310: a provably-bounded (constant-length) sink renders under "provably
-    # bounded", NOT "UNSEEDED SINKS" -- it's a successful conclusion.
-    value = {
-        "direction": "backward",
-        "function": {"name": "f", "address": "0x401189"},
-        "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
-        "slices": [],
-        "sink_status": [{"kind": "arg", "callee": "memcpy", "index": 2,
-                         "seeded": False, "bounded": True,
-                         "note": "arg 2 of memcpy is a compile-time constant -- provably bounded"}],
-        "leaves": [], "assumptions": [], "soundness": "x",
-    }
-    text = _render_taint_text(value)
-    assert "provably bounded (1)" in text
-    assert "UNSEEDED SINKS" not in text
-
-
 def test_render_taint_groups_repeated_leaves():
     # many near-identical frontier leaves must collapse to one grouped line with
     # a count, not a wall of per-leaf lines (#160).

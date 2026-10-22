@@ -531,6 +531,7 @@ def backward_diagnostics(
     *,
     sinks_seeded: int,
     slices: int,
+    sinks_constant: int = 0,
     unresolved_origins: int = 0,
     truncated: bool = False,
     truncation_cause: list[str] | None = None,
@@ -584,7 +585,11 @@ def backward_diagnostics(
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
-    dropped_callers_n = by_kind.get("caller_sites_truncated", 0)
+    # The producer merges each function's reference identities across all
+    # formal demands into one frontier. Reason/example counts are demand
+    # evidence, not additional dropped caller references.
+    dropped_callers_n = sum(lf["callers_dropped"] for lf in leaves or []
+                            if lf.get("kind") == "caller_sites_truncated")
 
     blocking = [str(lf.get("kind")) for lf in (leaves or [])
                 if lf.get("kind") in BLOCKING_LEAF_KINDS]
@@ -598,8 +603,8 @@ def backward_diagnostics(
                 seen.append(k)
         complete, reason = False, (
             f"{len(blocking)} frontier leaf(s) ({', '.join(seen)}) remain -- the "
-            "def-chain was not followed to every origin, so this slice is NOT a "
-            "complete account of what reaches the sink")
+            "value origins or consumed pointer bytes remain unaccounted for, so "
+            "this slice is NOT a complete account of what reaches the sink")
     elif unresolved_origins:
         complete, reason = False, (
             f"{int(unresolved_origins)} slice(s) bottomed out at an unresolved "
@@ -624,15 +629,15 @@ def backward_diagnostics(
         complete, reason = False, (
             "the sink seed was incomplete or mis-anchored (see caveats), so the "
             "walk may have started from the wrong value -- NOT a complete slice")
-    elif not sinks_seeded:
+    elif not sinks_seeded and not sinks_constant:
         complete, reason = False, (
             "no sink seeded, so nothing was walked -- an empty slice list here "
             "is a seeding outcome, not a complete answer")
     else:
         complete, reason = True, (
-            "every seeded sink was walked to its origins with no frontier leaf "
-            "and no truncation; still a may-analysis over the recovered IL -- "
-            "not a proof that no other value reaches the sink")
+            "every selected sink site has a scalar origin or finite constant "
+            "with no frontier leaf and no truncation; still a may-analysis over "
+            "the recovered IL, not a destination-capacity or safety proof")
 
     if dropped_callers_n:
         # Each reason the ascent left callers unfollowed has its own remedy
@@ -719,8 +724,8 @@ def backward_diagnostics(
                             and isinstance(lf.get("function"), str) and not lf.get("global")),
                            None)
         next_action = (
-            "the walk bottomed out at an unresolved definition; inspect the frontier "
-            "leaves and argument consumption, or seed inside the producing function")
+            "value origins or consumed pointer bytes remain unresolved; inspect "
+            "the frontier leaves and argument consumption, or seed inside the producing function")
         if buffer_leaf is not None:
             source = shlex.quote(f"var:{buffer_leaf['buffer']}")
             next_action += (
@@ -792,6 +797,11 @@ def backward_diagnostics(
             "the walk crossed a coarse-memory frontier (a pointer/store not "
             "precisely tracked); inspect the frontier leaves or re-seed on the "
             "destination buffer directly")
+    elif not sinks_seeded and sinks_constant:
+        next_action = (
+            "the selected scalar operands are finite constants with no def-chain "
+            "to walk; check destination capacity separately -- a finite count "
+            "does not prove that a copy fits")
     elif not sinks_seeded:
         # Must precede the no-slices branch: with nothing seeded there are also
         # no slices, so the generic "the sink seeded but no slice was produced"
@@ -815,6 +825,7 @@ def backward_diagnostics(
 
     return {
         "sinks_seeded": int(sinks_seeded),
+        "sinks_constant": int(sinks_constant),
         "slices": int(slices),
         "truncated": bool(truncated),
         "truncation_cause": truncation_cause,

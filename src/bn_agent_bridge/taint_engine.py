@@ -37,7 +37,7 @@ from typing import Any
 from .taint_models import (  # noqa: F401
     SOUNDNESS, _OVERFLOW_INDEX_CLASSES, _RECVMSG_FAMILY,
     _BROAD_SOURCE_BYTES, _BROAD_SOURCE_MEMBERS, _BUILTIN_MODELS,
-    _model_buffer_source_args, TaintError, BoundedSink,
+    _model_buffer_source_args, TaintError,
     _coerce_model_map, _validate_model_interior, load_models,
     model_overlay_sources, _canonical_cxx_alloc, lookup_model,
     _try_arg_index, model_arg_indices, model_is_benign_marker,
@@ -7763,6 +7763,9 @@ class TaintEngine:
     def backward(self, func: Any, sinks: list[dict[str, Any]], *, max_depth: int = 8) -> dict[str, Any]:
         self._bw_leaves: list[dict[str, Any]] = []
         self._bw_assumptions: list[str] = []
+        # Shared by every seed and recursive ascent in this run. Reference
+        # coverage is per function/site, not per demanded formal.
+        self._bw_caller_frontiers: dict[int, dict[str, Any]] = {}
         # #810: backward-run truncation state, mirroring the forward contract
         # (``_truncated`` + ``_truncation_causes``, #579/#576). The caller-site cap
         # used to be disclosed as an assumption string ONLY -- prose no consumer can
@@ -7777,41 +7780,45 @@ class TaintEngine:
         ssaf = self._ssa_func(func)
         instrs = self._instrs(ssaf)
 
-        # Per-sink isolation: a sink that can't be seeded (callee not called
-        # here, arg is a constant, ...) records a status note and the analysis
-        # continues with the remaining sinks. Only an all-sinks-fail run is a
-        # hard error, preserving the original single-sink behavior.
+        # Resolve argument locators into individual call sites BEFORE seeding:
+        # one site's SSA reads must never hide another site's constant or missing
+        # operand. Non-argument locators and absent calls retain their refusal path.
+        selections: list[tuple[dict[str, Any], Any]] = []
+        for sink in sinks:
+            sites = (self._find_callsites(instrs, sink["callee"], resolve_indirect=True)
+                     if sink.get("kind") == "arg" else [])
+            selections.extend((sink, site) for site in sites or [None])
         sink_status: list[dict[str, Any]] = []
         errors: list[tuple[dict[str, Any], str]] = []
-        for sink in sinks:
+        for sink, site in selections:
             desc = self._describe_locator(sink)
+            site_instrs = instrs if site is None else [site]
+            if site is not None:
+                desc["address"] = hex(int(site.address))
+                params = self._call_params(site)
+                idx = int(sink["index"])
+                if 0 <= idx < len(params) and self._sink_role(sink) == "value":
+                    operand = params[idx]
+                    if op_name(operand) == "MLIL_CONST":
+                        self._note_indirect_anchors(site_instrs, sink["callee"], self._bw_assume)
+                        sink_status.append({
+                            **desc, "status": "constant", "seeded": False,
+                            "scalar": {"kind": "constant", "value": int(operand.constant)},
+                            "destination_fit": "unproved"})
+                        continue
             try:
-                seeds = self._seed_backward(func, ssaf, instrs, sink)
-            except BoundedSink as exc:
-                # A constant-length sink is a SUCCESSFUL "provably bounded"
-                # conclusion, not a seed failure: record it as such and do NOT
-                # add it to `errors`, so an all-bounded slice returns a clean
-                # result (exit 0, --out written) instead of the all-failed hard
-                # error (#310). Only for a VALUE role (round 7): a constant
-                # handed to an argument the sink reads through is an address.
-                if self._bw_unseeded_demand(func, ssaf, instrs, sink):
-                    sink_status.append({**desc, "seeded": False, "demand_leaf": True,
-                                        "note": str(exc)})
-                    continue
-                sink_status.append({**desc, "seeded": False, "bounded": True, "note": str(exc)})
-                continue
+                seeds = self._seed_backward(func, ssaf, site_instrs, sink)
             except TaintError as exc:
-                # #931 round 7: the role is decided BEFORE the no-def-chain
-                # exit. An argument the sink reads through (or one with no
-                # value role) that has no backward seed -- `popen("ls")`, a
-                # fixed address -- is an incomplete result with its leaf, not
-                # a refusal another sink's complete slice could hide.
-                if self._bw_unseeded_demand(func, ssaf, instrs, sink):
-                    sink_status.append({**desc, "seeded": False, "demand_leaf": True,
-                                        "note": str(exc)})
+                if self._bw_unseeded_demand(func, ssaf, site_instrs, sink):
+                    sink_status.append({
+                        **desc, "status": "demand", "seeded": False,
+                        "note": "the selected operand has a semantic demand; "
+                                "its pointer bytes or argument role remain unresolved "
+                                "(see frontier leaves)"})
                     continue
-                errors.append((sink, str(exc)))
-                sink_status.append({**desc, "seeded": False, "note": str(exc)})
+                errors.append((desc, str(exc)))
+                sink_status.append({**desc, "status": "unseeded", "seeded": False,
+                                    "note": str(exc)})
                 continue
             n_before = len(slices)
             sink_slices: list[dict[str, Any]] = []
@@ -7853,8 +7860,9 @@ class TaintEngine:
                     for sl in self._backward_slice(func, seed_var, 0, max_depth, set(),
                                                    seed_ins=sink_ins, anchor=anchor):
                         o = sl["origin"]
-                        key = (seed_label, sink_addr, o.get("kind"), o.get("var"),
-                               o.get("value"), o.get("callee"), o.get("index"))
+                        # Every kind's complete provenance participates, including
+                        # nested region/cut facts; display names live outside origin.
+                        key = (seed_label, sink_addr, json.dumps(o, sort_keys=True))
                         rep = seen_origin.get(key)
                         if rep is not None:
                             rep["reached_via_call_sites"] = rep.get("reached_via_call_sites", 1) + 1
@@ -7892,19 +7900,23 @@ class TaintEngine:
                 # "complete" claim for a run that lost slices.
                 self._bw_truncated = True
                 self._bw_truncation_causes.add("recursion")
-                sink_status.append({**desc, "seeded": True, "truncated": True,
+                sink_status.append({**desc, "status": "truncated", "seeded": True, "truncated": True,
                                     "slices": len(slices) - n_before,
                                     "note": "recursion limit reached while slicing; results incomplete"})
                 continue
-            sink_status.append({**desc, "seeded": True, "slices": len(slices) - n_before})
+            sink_status.append({**desc, "status": "seeded", "seeded": True,
+                                "slices": len(slices) - n_before})
 
-        if sinks and len(errors) == len(sinks):
+        if selections and len(errors) == len(selections):
             # Every sink failed to seed -> hard error (no partial results to keep).
-            if len(errors) == 1:
+            if len(errors) == 1 and "address" not in errors[0][0]:
                 raise TaintError(errors[0][1])
             raise TaintError(
                 "no backward seed resolved for any sink:\n  "
-                + "\n  ".join(f"{format_locator(s)}: {m}" for s, m in errors))
+                + "\n  ".join(
+                    f"{format_locator(s)}"
+                    + (f" @ {s['address']}" if "address" in s else "")
+                    + f" [unseeded]: {m}" for s, m in errors))
         # #931 round 7: a multi-sink query is complete only when every selected
         # operand is. A sink that could not be seeded at all (no call to it
         # here, an index out of range) is not part of the answer, so the
@@ -7912,6 +7924,7 @@ class TaintEngine:
         for s, msg in errors:
             leaf = {"kind": "sink_unseeded", "locator": format_locator(s),
                     "function": hex(int(func.start)),
+                    **({"address": s["address"]} if "address" in s else {}),
                     "detail": (f"the sink {format_locator(s)} was not sliced ({msg}), so "
                                f"this multi-sink result does not account for it and is "
                                f"NOT complete")}
@@ -7962,6 +7975,7 @@ class TaintEngine:
             "diagnostics": backward_diagnostics(
                 self._bw_leaves, self._bw_assumptions,
                 sinks_seeded=sum(1 for s in sink_status if s.get("seeded")),
+                sinks_constant=sum(1 for s in sink_status if s["status"] == "constant"),
                 slices=len(slices),
                 # A slice whose own origin is `unresolved` is the walk admitting
                 # it stopped short; the gate must see it even with no leaf.
@@ -7996,7 +8010,8 @@ class TaintEngine:
         ssaf = self._ssa_func(func)
         steps: list[dict[str, Any]] = []
         visited_vars: set = set()
-        origin = {"kind": "unresolved"}
+        fn_ref = hex(int(getattr(func, "start", 0) or 0))
+        origin = {"kind": "unresolved", "function": fn_ref, "var": var_label(seed_var)}
         # A LITERAL origin reached through a local buffer's writers (a `strcat`
         # appending a constant, a `buf[n] = 0` terminator) is "weak": the buffer's
         # writers are walked newest-first, and the sink's bytes also come from
@@ -8057,6 +8072,7 @@ class TaintEngine:
 
         def _set_origin(o, *, weak: int | bool = 0):
             nonlocal origin, origin_rank
+            o["function"] = fn_ref
             if weak is True:
                 rank = 3
             elif weak:
@@ -8080,6 +8096,7 @@ class TaintEngine:
             (the outright assignment left a stale rank that could). A formal
             beside it still ascends on its own (IC01)."""
             nonlocal origin, origin_rank
+            o["function"] = fn_ref
             if o not in producers:
                 producers.append(o)
             if o not in returned:
@@ -8092,8 +8109,6 @@ class TaintEngine:
         # (instruction, load) pairs already followed: a store's value may
         # reload the slot it writes (`[p] = [p] + 1` around a loop).
         visited_loads: set = set()
-
-        fn_ref = hex(int(getattr(func, "start", 0) or 0))
 
         def _forward_cmd(label: str) -> str:
             """The forward run on a local buffer of THIS function, complete
@@ -8235,7 +8250,7 @@ class TaintEngine:
             it read back), a fill's inputs and length operands. Returns the
             opaque (may-write) callees and stores, already disclosed as
             *kind* leaves."""
-            opaque: list[str] = []
+            opaque: list[dict[str, str]] = []
             key = "pointer" if kind == _POINTER_LEAF else "buffer"
             for w in res["writers"]:
                 wkind, wdefn = w[0], w[1]
@@ -8269,7 +8284,8 @@ class TaintEngine:
                         "reads is unknown, so the slice is NOT complete -- inspect "
                         "the pointer's definition or seed inside the producing loop",
                         kind=kind)
-                    opaque.append(str(wdefn))
+                    opaque.append({"address": hex(int(wdefn.address)),
+                                   "kind": wkind, "callee": str(wdefn)})
                 elif wkind == "escape":
                     steps.append(_instr_dict(
                         wdefn, reason=f"address of {noun} {label} stored to memory"))
@@ -8292,7 +8308,8 @@ class TaintEngine:
                     steps.append(_instr_dict(
                         wdefn, reason=f"{noun} {label} written by {self._prose_name(mkey)}"))
                     if is_source:
-                        _set_origin({"kind": "source", "callee": mkey})
+                        _set_origin({"kind": "source", "callee": mkey,
+                                     "address": hex(int(wdefn.address))})
                     states = [_follow_input(wdefn, params[i], d, wmv, label,
                                             f"input {i} of {self._prose_name(mkey)} writing",
                                             noun=noun)
@@ -8308,7 +8325,8 @@ class TaintEngine:
                         # Every input the model names is an established
                         # constant (a literal format/string): the bytes come
                         # from the call itself.
-                        _set_origin({"kind": "call", "callee": mkey}, weak=1)
+                        _set_origin({"kind": "call", "callee": mkey,
+                                     "address": hex(int(wdefn.address))}, weak=1)
                 else:  # opaque: a call may have written the bytes
                     _, _, callee, why = w
                     steps.append(_instr_dict(
@@ -8319,12 +8337,15 @@ class TaintEngine:
                         "reads is unknown, so the slice is NOT complete -- model the "
                         "call or seed inside it",
                         kind=kind, callee=callee)
-                    opaque.append(callee)
+                    opaque.append({"address": hex(int(wdefn.address)),
+                                   "kind": wkind, "callee": callee})
             if opaque:
                 # Deferred past the loop so a real origin reached through another
                 # writer (a modeled fill from a parameter) wins the slice's
                 # origin and the opaque call stays what it is: a frontier leaf.
-                _set_origin({"kind": kind, key: label, "callee": opaque[0]})
+                opaque.sort(key=lambda w: (w["address"], w["kind"], w["callee"]))
+                _set_origin({"kind": kind, key: label, "callee": opaque[0]["callee"],
+                             "writers": opaque})
             if res["truncated"]:
                 # Discovery or fixed-point proof work was cut. Known writer
                 # rows remain visible, but missing writers or an unfinished
@@ -8424,7 +8445,8 @@ class TaintEngine:
                     f"store proves them, so the slice is NOT complete -- inspect the "
                     f"pointer arithmetic with `bn il {fn_ref} --view mlil`",
                     kind=_EXTENT_LEAF, cause="outside_object", **facts)
-                _set_origin({"kind": _EXTENT_LEAF, "buffer": label})
+                _set_origin({"kind": _EXTENT_LEAF, "buffer": label,
+                             "cause": "outside_object", **facts})
             elif res["covered"] and d_lo is None:
                 _buffer_leaf(
                     defn, label,
@@ -8435,7 +8457,8 @@ class TaintEngine:
                     f"stores are facts, not a proof, so the slice is NOT complete -- "
                     f"inspect the pointer arithmetic with `bn il {fn_ref} --view mlil`",
                     kind=_EXTENT_LEAF, cause="offset_unknown", **facts)
-                _set_origin({"kind": _EXTENT_LEAF, "buffer": label})
+                _set_origin({"kind": _EXTENT_LEAF, "buffer": label,
+                             "cause": "offset_unknown", **facts})
             elif res["covered"]:
                 # Stores the walk can see write every consumed byte on every
                 # path. That is reported as a fact and never certifies the
@@ -8738,14 +8761,16 @@ class TaintEngine:
                     # The representative, ranked (IC01): the outright
                     # assignment left a stale rank a later weak origin could
                     # undercut; a formal beside it still ascends on its own.
-                    _set_source_origin({"kind": "source", "callee": mkey or name})
+                    _set_source_origin({"kind": "source", "callee": mkey or name,
+                                        "address": hex(int(defn.address))})
                     # A modeled source's returned bytes are the source -- but
                     # a return into an object it was handed -- a local
                     # (`fgets(c, ..)`), a heap allocation, a pointer parameter
                     # -- reads that object, whose bytes no call proves.
                     _returned_object(defn, v, d, mv, anchor, name, model, fresh=False)
                 elif target is None:
-                    origin = {"kind": "indirect_call", "var": var_label(v)}
+                    origin = {"kind": "indirect_call", "var": var_label(v),
+                              "function": fn_ref, "address": hex(int(defn.address))}
                     leaf = {"kind": "indirect_call_unresolved",
                             "address": hex(int(getattr(defn, "address", 0))), "il_text": str(defn)}
                     if leaf not in self._bw_leaves:
@@ -8778,10 +8803,12 @@ class TaintEngine:
                             defn, cparams[fi], d, mv, var_label(v),
                             f"argument {fi} of {mkey or name} returned by", arg_dem))
                     if not states:
-                        _set_origin({"kind": "call", "callee": name})
+                        _set_origin({"kind": "call", "callee": name,
+                                     "address": hex(int(defn.address))})
                         _returned_object(defn, v, d, mv, anchor, name, model, fresh=True)
                     elif all(s == "literal" for s in states):
-                        _set_origin({"kind": "call", "callee": mkey or name}, weak=1)
+                        _set_origin({"kind": "call", "callee": mkey or name,
+                                     "address": hex(int(defn.address))}, weak=1)
                 return
             steps.append(_instr_dict(defn, reason="definition"))
             src_expr = getattr(defn, "src", None)
@@ -8991,7 +9018,8 @@ class TaintEngine:
                                         "cannot prove disjoint from them")
                     elif kind == "may_source":
                         steps.append(_instr_dict(w[1], reason=f"field may be filled by source {w[2]}"))
-                        _set_origin({"kind": "source", "callee": w[2]})
+                        _set_origin({"kind": "source", "callee": w[2],
+                                     "address": hex(int(w[1].address))})
                         gaps.append(f"`{w[1]}` may have written them (no call's write "
                                     "extent is trusted)")
                     elif kind == "opaque":
@@ -9065,7 +9093,7 @@ class TaintEngine:
         # is a new demand and ascends.
         fkey = self._caller_key(func)
         demands = {p: param_origins.get(p) or {"kind": "parameter", "index": p,
-                                                "var": var_label(v)}
+                                                "var": var_label(v), "function": fn_ref}
                    for p, v in terminal_params.items() if (fkey, p) not in visited_funcs}
         out: list[dict[str, Any]] = []
         cycled: set[int] = set()
@@ -9076,9 +9104,9 @@ class TaintEngine:
         back_edge = bool(cycled) or len(demands) < len(terminal_params)
         self._bw_cycle_hits.extend((fkey, p) for p in terminal_params if p not in demands)
         # A cut stands only if no path walked that value or load.
-        cuts = list(dict.fromkeys(
+        cuts = sorted({
             label for (kind, k), label in budget_cuts.items()
-            if k not in (walked_at if kind == "var" else load_at)))
+            if k not in (walked_at if kind == "var" else load_at)})
         if cuts:
             self._bw_assume(
                 f"def-chain walk truncated at {self.max_depth} steps (engine max_depth)")
@@ -9481,11 +9509,13 @@ class TaintEngine:
         considered = caller_sites[:MAX_CALLERS] if ascend else []
         results: list[dict[str, Any]] = []
         rows: list[dict[str, Any]] = []
-        reasons: dict[str, int] = {}
-        dropped_sites: set[int] = set()
+        misses: set[tuple[int, int, str]] = set()
 
         def _drop(address: int, caller: Any, pidx: int, reason: str, *, listed: bool = True) -> None:
-            reasons[reason] = reasons.get(reason, 0) + 1
+            key = (int(address), pidx, reason)
+            if key in misses:
+                return
+            misses.add(key)
             if listed and len(rows) < MAX_CALLERS:
                 rows.append({"address": hex(int(address)),
                              "caller": None if caller is None else self._prose_function(caller),
@@ -9509,7 +9539,7 @@ class TaintEngine:
             # cycle adds. One whose every site loops to an ancestor has no
             # origin of its own -- never the internal formal.
             via_cycle = self_closed = supplied = False
-            for idx, site in enumerate(considered):
+            for site in considered:
                 caller = getattr(site, "function", None)
                 addr = int(getattr(site, "address", 0))
                 reason = None
@@ -9530,7 +9560,6 @@ class TaintEngine:
                 if reason is None and pidx >= len(cparams):
                     reason = "arity_short"
                 if reason is not None:
-                    dropped_sites.add(idx)
                     _drop(addr, caller, pidx, reason)
                     continue
                 arg = cparams[pidx]
@@ -9548,7 +9577,8 @@ class TaintEngine:
                         # and that sink's pointer demand already withholds
                         # completeness; a constant ADDRESS stays unfollowed.
                         results.append({"steps": [boundary] + base_steps,
-                                        "origin": {"kind": "constant", "value": value},
+                                        "origin": {"kind": "constant", "value": value,
+                                                   "function": hex(int(caller.start))},
                                         "crossed": [str(func.name)]})
                         followed = supplied = True
                         if self._caller_key(caller) not in on_stack:
@@ -9557,7 +9587,6 @@ class TaintEngine:
                     self._bw_assume(
                         f"arg {pidx} at {hex(addr)} in {self._prose_function(caller)} is not a trackable "
                         "scalar; caller slice not followed")
-                    dropped_sites.add(idx)
                     _drop(addr, caller, pidx, "constant_address"
                           if "CONST" in op_name(arg) or op_name(arg) in ("MLIL_IMPORT", "MLIL_EXTERN_PTR")
                           else "argument_not_trackable")
@@ -9599,8 +9628,7 @@ class TaintEngine:
                 else:
                     results.append({"steps": base_steps, "origin": porigin, "crossed": []})
 
-        for idx, site in enumerate(caller_sites[len(considered):], start=len(considered)):
-            dropped_sites.add(idx)
+        for site in caller_sites[len(considered):]:
             for pidx in demands:
                 # Past the cap the sites are counted, not listed (#810).
                 _drop(int(getattr(site, "address", 0)), getattr(site, "function", None), pidx,
@@ -9608,11 +9636,8 @@ class TaintEngine:
         for a, rf in sorted(indirect.items()):
             for pidx in demands:
                 _drop(a, rf, pidx, "indirect_reference")
-        if reasons:
-            self._bw_note_unfollowed_callers(
-                func, direct=len(caller_sites), considered=len(considered),
-                followed=len(caller_sites) - len(dropped_sites), indirect=len(indirect),
-                rows=rows, reasons=reasons)
+        self._bw_note_unfollowed_callers(
+            func, direct=direct, indirect=set(indirect), rows=rows, misses=misses)
         return results, cycled
 
     @staticmethod
@@ -9620,56 +9645,84 @@ class TaintEngine:
         """A function's identity in the ascent's demand keys."""
         return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
 
-    def _bw_note_unfollowed_callers(self, func: Any, *, direct: int, considered: int,
-                                    followed: int, indirect: int,
-                                    rows: list[dict[str, Any]], reasons: dict[str, int]) -> None:
-        """Disclose the callers the ascent did not follow (#810, IC01).
+    def _bw_note_unfollowed_callers(
+        self, func: Any, *, direct: set[int], indirect: set[int],
+        rows: list[dict[str, Any]], misses: set[tuple[int, int, str]],
+    ) -> None:
+        """One caller frontier per function, across every demanded formal.
 
-        Prose alone -- an assumption string, or nothing at all -- let a slice
-        that dropped callers return exactly the envelope of a complete one. One
-        blocking ``caller_sites_truncated`` frontier per function carries the
-        measured counts (direct call sites plus stored-address references in
-        ``callers_total``, the sites the ascent followed for every demanded
-        formal in ``callers_followed``), the per-reason tally of unfollowed
-        (site, formal) pairs in ``reasons``, and the first ``MAX_CALLERS`` of
-        them in ``unfollowed`` -- so the loss is machine-readable in ``--format
-        json`` and named in the text frontiers and verdict. Only the cap is a
-        budget the run truncated at: it alone sets ``stats.truncated`` with
-        cause ``caller_cap``, the forward pair (#579/#576), and keeps its
-        measured assumption."""
-        total = int(direct) + int(indirect)
-        dropped = total - int(followed)
+        Coverage counts distinct reference addresses. Reasons and examples are
+        separate evidence about (reference, formal, reason) boundaries, so their
+        tallies may exceed the number of dropped references. Keep full identity
+        internally even when the public examples are capped at MAX_CALLERS.
+        """
+        start = int(func.start)
+        state = self._bw_caller_frontiers.get(start)
+        if state is None:
+            state = {
+                "direct": set(), "known": set(), "dropped": set(), "misses": set(),
+                "reasons": {}, "examples": {}, "leaf": None, "cap_assumption": None,
+            }
+            self._bw_caller_frontiers[start] = state
+        # Merge after descent into the current accumulator: a recursive ascent
+        # may already have recorded this function's other formal demands.
+        state["direct"].update(direct)
+        state["known"].update(direct)
+        state["known"].update(indirect)
+        for address, param, reason in misses:
+            state["dropped"].add(address)
+            key = (address, param, reason)
+            if key not in state["misses"]:
+                state["misses"].add(key)
+                state["reasons"][reason] = state["reasons"].get(reason, 0) + 1
+        for row in rows:
+            key = (row["address"], row["param"], row["reason"])
+            if key not in state["examples"] and len(state["examples"]) < MAX_CALLERS:
+                state["examples"][key] = row
+        if not state["dropped"]:
+            return
+
+        total = len(state["known"])
+        dropped = len(state["dropped"])
+        followed = total - dropped
+        reasons = dict(sorted(state["reasons"].items()))
         name = self._prose_function(func)
-        if "caller_cap" in reasons:
-            unresolved = int(considered) - int(followed)
-            self._bw_assume(f"{name} has {direct} callers; "
-                            f"caller ascent followed {followed}, capped at {MAX_CALLERS}")
+        capped = "caller_cap" in reasons
+        if capped:
             self._bw_truncated = True
             self._bw_truncation_causes.add("caller_cap")
-            note = (f"caller-site cap: the ascent followed {followed} of {direct} "
-                    f"callers ({unresolved} of the {considered} sites the cap let "
-                    f"through could not be followed, {direct - considered} left "
-                    "past the cap)")
-        else:
-            note = (f"the ascent followed {followed} of {total} caller(s); "
-                    f"{dropped} not followed ("
-                    + ", ".join(f"{n} {r}" for r, n in sorted(reasons.items())) + ")")
-        leaf = {
-            "kind": "caller_sites_truncated",
-            "address": hex(int(getattr(func, "start", 0))),
-            "function": {"name": str(getattr(func, "name", "?")),
-                         "display_name": _display_name(func) or "?",
-                         "address": hex(int(getattr(func, "start", 0)))},
-            "callers_total": total,
-            "callers_followed": int(followed),
-            "callers_dropped": dropped,
-            "reasons": dict(sorted(reasons.items())),
-            "unfollowed": rows,
-            "note": (note + " -- an origin reachable only from an unfollowed caller is "
-                     "missing from this slice"),
-        }
-        if leaf not in self._bw_leaves:
+            assumption = (
+                f"{name} has {len(state['direct'])} callers; caller ascent followed "
+                f"{len(state['direct'] - state['dropped'])}, capped at {MAX_CALLERS} "
+                f"(function {start:#x})")
+            old = state["cap_assumption"]
+            if old != assumption:
+                if old is not None:
+                    self._bw_assumptions.remove(old)
+                self._bw_assume(assumption)
+                state["cap_assumption"] = assumption
+        note = (
+            ("caller-site cap: " if capped else "")
+            + f"the ascent followed {followed} of {total} distinct caller reference(s); "
+            f"{dropped} not followed; unfollowed demand boundaries (reference, formal): "
+            + ", ".join(f"{n} {r}" for r, n in reasons.items()))
+        leaf = state["leaf"]
+        if leaf is None:
+            leaf = {
+                "kind": "caller_sites_truncated", "address": hex(start),
+                "function": {"name": str(getattr(func, "name", "?")),
+                             "display_name": _display_name(func) or "?",
+                             "address": hex(start)},
+            }
+            state["leaf"] = leaf
             self._bw_leaves.append(leaf)
+        leaf.update({
+            "callers_total": total, "callers_followed": followed,
+            "callers_dropped": dropped, "reasons": reasons,
+            "unfollowed": list(state["examples"].values()),
+            "note": (note + " -- an origin reachable only from an unfollowed caller "
+                     "is missing from this slice"),
+        })
 
     def _seed_backward(self, func, ssaf, instrs, sink) -> list[tuple]:
         kind = sink.get("kind")
@@ -9770,22 +9823,6 @@ class TaintEngine:
                     raise TaintError(
                         f"--sink arg index {idx} is out of range for {self._prose_name(callee)}: {detail}")
                 if not out:
-                    # Nothing to slice. A scalar CONSTANT literal (e.g. a fixed copy
-                    # length) is a provably-bounded SUCCESS (#310). Gate on the
-                    # operation being MLIL_CONST specifically -- NOT MLIL_CONST_PTR,
-                    # which is a constant ADDRESS (a global dest/src pointer): that's
-                    # an address expression with no def-chain, which must stay a seed
-                    # error, not a misleading "bounded length" verdict.
-                    arg_is_const = any(
-                        op_name(params[idx]) == "MLIL_CONST"
-                        for c in sites
-                        for params in (self._call_params(c),)
-                        if idx < len(params)
-                    )
-                    if arg_is_const:
-                        raise BoundedSink(
-                            f"--sink arg {idx} of {callee} is a compile-time constant in the "
-                            f"recovered IL -- provably bounded, with no def-chain to slice backward")
                     raise TaintError(
                         f"--sink arg {idx} of {callee} reads no variable in the recovered IL "
                         f"(it is an address or fixed expression) -- there is no def-chain "

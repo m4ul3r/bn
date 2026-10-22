@@ -97,7 +97,7 @@ def test_short_source_preserves_source_without_coverage(length):
                      FExpr("MLIL_CONST", str(length), constant=length)])
     pg.sink(buf)
     result, reasons, leaves = _bw(pg.func())
-    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["callee"]) == ("source", "read")
     assert leaves and not result["diagnostics"]["safe_to_report_complete_slice"]
 
 
