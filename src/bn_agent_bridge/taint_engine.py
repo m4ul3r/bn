@@ -5391,55 +5391,62 @@ class TaintEngine:
         cached = self._global_extent_cache.get(ga)
         if cached is not None:
             return cached
-        extent = 0
+        typed = 0
         getdv = getattr(self.bv, "get_data_var_at", None)
         if callable(getdv):
             try:
                 width = getattr(getattr(getdv(ga), "type", None), "width", None)
-                extent = int(width) if width else 0
+                typed = int(width) if width else 0
             except Exception:
-                extent = 0
-        if extent <= 0:
-            bounds: list[int] = []
-            nxt = getattr(self.bv, "get_next_data_var_after", None)
-            getsym = getattr(self.bv, "get_symbol_at", None)
-            if callable(nxt):
-                # The next data variable that carries a SYMBOL. An untyped
-                # global makes BN invent a bare data variable at each offset
-                # something references, so stopping at the first data
-                # variable would cut the object at its own first interior
-                # reference -- the very reference being looked for.
-                addr = ga
-                for _ in range(64):
-                    try:
-                        nxt_addr = getattr(nxt(addr), "address", None)
-                    except Exception:
-                        break
-                    if nxt_addr is None or int(nxt_addr) <= addr:
-                        break
-                    addr = int(nxt_addr)
-                    named = None
-                    if callable(getsym):
-                        try:
-                            named = getsym(addr)
-                        except Exception:
-                            named = None
-                    if named is not None or not callable(getsym):
-                        bounds.append(addr)
-                        break
-            getsecs = getattr(self.bv, "get_sections_at", None)
-            if callable(getsecs):
+                typed = 0
+        # The recovered type is a LOWER bound, never the last word. Without
+        # debug info BN sizes an initialised buffer from the bytes it can
+        # see -- `char global_bytes[64] = "seed"` comes back `char[0x5]` --
+        # so trusting it stopped the object five bytes in and a consumer
+        # reading `g + 8` was never discovered (round-3 review F11). The
+        # layout bound below is computed either way and the wider of the two
+        # wins; it still stops where a symbolled neighbour begins.
+        bounds: list[int] = []
+        nxt = getattr(self.bv, "get_next_data_var_after", None)
+        getsym = getattr(self.bv, "get_symbol_at", None)
+        if callable(nxt):
+            # The next data variable that carries a SYMBOL. An untyped
+            # global makes BN invent a bare data variable at each offset
+            # something references, so stopping at the first data
+            # variable would cut the object at its own first interior
+            # reference -- the very reference being looked for.
+            addr = ga
+            for _ in range(64):
                 try:
-                    for sec in (getsecs(ga) or []):
-                        end = getattr(sec, "end", None)
-                        if end is not None and int(end) > ga:
-                            bounds.append(int(end))
+                    nxt_addr = getattr(nxt(addr), "address", None)
                 except Exception:
-                    pass
-            # No type AND no layout to infer from: claim nothing. Widening
-            # on a view that cannot answer would sweep a neighbouring
-            # object's references into this one.
-            extent = (min(bounds) - ga) if bounds else 1
+                    break
+                if nxt_addr is None or int(nxt_addr) <= addr:
+                    break
+                addr = int(nxt_addr)
+                named = None
+                if callable(getsym):
+                    try:
+                        named = getsym(addr)
+                    except Exception:
+                        named = None
+                if named is not None or not callable(getsym):
+                    bounds.append(addr)
+                    break
+        getsecs = getattr(self.bv, "get_sections_at", None)
+        if callable(getsecs):
+            try:
+                for sec in (getsecs(ga) or []):
+                    end = getattr(sec, "end", None)
+                    if end is not None and int(end) > ga:
+                        bounds.append(int(end))
+            except Exception:
+                pass
+        # No type AND no layout to infer from: claim nothing. Widening
+        # on a view that cannot answer would sweep a neighbouring
+        # object's references into this one.
+        laid_out = (min(bounds) - ga) if bounds else 0
+        extent = max(typed, laid_out, 1)
         extent = max(1, min(int(extent), self._GLOBAL_EXTENT_FALLBACK))
         self._global_extent_cache[ga] = extent
         return extent

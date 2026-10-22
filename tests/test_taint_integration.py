@@ -2031,3 +2031,89 @@ def test_global_continuation_returned_alias_and_append_destinations(tmp_path, sh
     assert [lf for lf in reset["leaves"]
             if lf["kind"] == "global_memory_continuation"] == [], reset["leaves"]
     assert reset["diagnostics"]["safe_to_report_all_clear"] is True, reset
+
+
+_INITIALIZED_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[64] = "seed";
+char neighbour_bytes[64] = "/bin/true";
+extern char *__strcat_chk(char *, const char *, unsigned long);
+extern char *__strncat_chk(char *, const char *, unsigned long, unsigned long);
+__attribute__((noinline)) int interior_reader(void) { return system(global_bytes + 8); }
+__attribute__((noinline)) int neighbour_reader(void) { return system(neighbour_bytes + 8); }
+__attribute__((noinline)) int fort_append_consumer(void) { __strcat_chk(global_bytes, "suffix", 64); return 0; }
+__attribute__((noinline)) int fort_nappend_consumer(void) { __strncat_chk(global_bytes, "suffix", 6, 64); return 0; }
+__attribute__((noinline)) int append_consumer(void) { strcat(global_bytes, "suffix"); return 0; }
+__attribute__((noinline)) int reset_consumer(void) { memset(global_bytes, 0, 64); return 0; }
+__attribute__((noinline)) int entry(const char *s) { memcpy(global_bytes, s, 16); return interior_reader(); }
+__attribute__((noinline)) int neighbour_case(const char *s) { memcpy(global_bytes, s, 16); return neighbour_reader(); }
+__attribute__((noinline)) int fort_append_case(const char *s) { memcpy(global_bytes, s, 16); return fort_append_consumer(); }
+__attribute__((noinline)) int fort_nappend_case(const char *s) { memcpy(global_bytes, s, 16); return fort_nappend_consumer(); }
+__attribute__((noinline)) int append_case(const char *s) { memcpy(global_bytes, s, 16); return append_consumer(); }
+__attribute__((noinline)) int reset_case(const char *s) { memcpy(global_bytes, s, 16); return reset_consumer(); }
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    return entry(argv[1]) + neighbour_case(argv[1]) + fort_append_case(argv[1])
+         + fort_nappend_case(argv[1]) + append_case(argv[1]) + reset_case(argv[1]);
+}
+"""
+
+
+@pytest.mark.parametrize("debug", [True, False], ids=["typed", "stripped"])
+def test_global_continuation_initialised_global_and_fortified_appends(tmp_path,
+                                                                     shared_bn, debug):
+    """Round-3 review F11 and F14.
+
+    F11: `char g[64] = "seed"` with no debug info comes back `char[0x5]` --
+    BN sized it from the bytes it could see. Taking that as the object's
+    extent stopped five bytes in, so `system(g + 8)` was never discovered.
+    The recovered type is a LOWER bound now; the layout (to the next data
+    variable that carries a symbol) is the wider answer, and the symbolled
+    neighbour still bounds it.
+
+    F14: a fortified append stops somewhere else than a bare one, but it
+    still walks the destination's existing bytes to find the terminator, so
+    `__strcat_chk`/`__strncat_chk` destinations are not write-only. The
+    genuine `memset` reset stays silent."""
+    name = "initialized" if debug else "initialized_nodbg"
+    src = tmp_path / f"{name}.c"
+    src.write_text(_INITIALIZED_SRC)
+    binary = tmp_path / name
+    _compile(src, binary, ["-fno-builtin"] + ([] if debug else ["-g0"]))
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0")
+
+    # F11: the consumer reads past the width BN inferred from the literal
+    interior = forward("entry")
+    [leaf] = [lf for lf in interior["leaves"]
+              if lf["kind"] == "global_memory_continuation"]
+    assert leaf["references"][0]["display_name"] == "interior_reader", leaf
+    assert leaf["references"][0]["offset"] == 8, leaf
+    assert interior["diagnostics"]["safe_to_report_all_clear"] is False, interior
+
+    # ...and the symbolled neighbour is still a different object
+    neighbour = forward("neighbour_case")
+    assert [lf for lf in neighbour["leaves"]
+            if lf["kind"] == "global_memory_continuation"] == [], neighbour["leaves"]
+    assert neighbour["diagnostics"]["safe_to_report_all_clear"] is True, neighbour
+
+    # F14: fortified, bounds-shifted and bare appends all read the dest
+    for fn, consumer in (("fort_append_case", "fort_append_consumer"),
+                         ("fort_nappend_case", "fort_nappend_consumer"),
+                         ("append_case", "append_consumer")):
+        result = forward(fn)
+        [leaf] = [lf for lf in result["leaves"]
+                  if lf["kind"] == "global_memory_continuation"]
+        assert [r["display_name"] for r in leaf["references"]] == [consumer], (fn, leaf)
+        assert leaf["references"][0]["access"] == "call_arg", (fn, leaf)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, result)
+
+    # ...and a genuine reset is still not a reader
+    reset = forward("reset_case")
+    assert [lf for lf in reset["leaves"]
+            if lf["kind"] == "global_memory_continuation"] == [], reset["leaves"]
+    assert reset["diagnostics"]["safe_to_report_all_clear"] is True, reset

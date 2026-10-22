@@ -42,6 +42,7 @@ G_OTHER = 0x404160      # a second, unrelated global
 STRNCPY, STRCPY, SPRINTF, MEMCPY, SYSTEM = 0x401030, 0x401040, 0x401050, 0x401060, 0x401070
 MEMSET = 0x401080
 STRCAT = 0x401090
+STRCAT_CHK = 0x4010a0
 
 
 @pytest.fixture
@@ -1677,3 +1678,82 @@ def test_a_true_reset_destination_stays_write_only(models):
     result = _forward(bv, func, models)
     assert _leaves(result) == [], result["leaves"]
     assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+# --------------------------------------------------------------------------
+# round-3 review F11: a recovered type is a LOWER bound on the object
+# --------------------------------------------------------------------------
+
+def test_an_inferred_string_width_does_not_shrink_the_object(models):
+    # `char g[64] = "seed"` with no debug info comes back `char[0x5]`: BN
+    # sized it from the bytes it could see. Taking that as the object's
+    # extent stopped five bytes in, so a consumer reading `g + 8` was never
+    # discovered and the run cleared (round-3 review F11). The layout bound
+    # -- to the next data variable that carries a symbol -- is the wider and
+    # therefore the answer.
+    consumer = _interior_reader("interior_reader", 0x401200, G_DIR + 8, 0x401210)
+    func, bv = _interior_program(
+        consumer, {G_DIR + 8: [FRef(consumer, 0x401210)]},
+        {G_DIR: 5, G_DIR + 64: 5},               # BN's guess from the literal
+        interior=[G_DIR + 8], section=(G_DIR - 0x20, G_DIR + 0x80))
+    assert te.TaintEngine(bv, models)._global_extent(G_DIR) == 64
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["offset"] == 8, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_the_neighbour_still_bounds_an_under_typed_object(models):
+    # The same under-typed pair: widening stops where the symbolled
+    # neighbour begins, so its reader is still a different object.
+    neighbour = G_DIR + 64
+    consumer = _interior_reader("neighbour_reader", 0x401200, neighbour + 8, 0x401210)
+    func, bv = _interior_program(
+        consumer, {neighbour + 8: [FRef(consumer, 0x401210)]},
+        {G_DIR: 5, neighbour: 5},
+        interior=[neighbour + 8], section=(G_DIR - 0x20, G_DIR + 0x80))
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_type_wider_than_the_layout_keeps_its_own_width(models):
+    # The other direction: the recovered type is a lower bound, so a typed
+    # object wider than the next symbol is not cut down to it.
+    bv = FExtentBV({}, objects={G_DIR: 256, G_DIR + 64: 8},
+                   section=(G_DIR, G_DIR + 0x80))
+    assert te.TaintEngine(bv, te.load_models())._global_extent(G_DIR) == 256
+
+
+# --------------------------------------------------------------------------
+# round-3 review F14: fortified and bounds-checked appends read too
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", [
+    "strcat", "strncat", "strlcat",
+    "strcat_chk", "strncat_chk", "strlcat_chk",
+    "strcat_s", "strncat_s", "g_strlcat",
+])
+def test_every_append_spelling_reads_its_destination(models, name):
+    # A fortified (`__*_chk`) or bounds-checked (`*_s`) wrapper changes WHERE
+    # an append stops, never that it walks the destination's existing bytes
+    # first -- so none of these destinations is write-only.
+    assert te.TaintEngine._model_arg_role(models[name], 0) == "read", name
+
+
+@pytest.mark.parametrize("name", ["memset", "memset_chk", "strcpy_chk", "strlcpy_chk"])
+def test_a_plain_write_destination_stays_write_only(models, name):
+    assert te.TaintEngine._model_arg_role(models[name], 0) == "write", name
+
+
+def test_a_fortified_append_consumer_blocks(models):
+    # End to end: the helper's only use of the tainted global is
+    # `__strcat_chk(g, "suffix", 64)`, and that reads g before it appends.
+    consumer = _modeled_call("fort_append_consumer", 0x401200, STRCAT_CHK,
+                             [_gptr(G_DIR), _gptr(0x402000), _const(64)])
+    func, bv = _after_copy(consumer)
+    bv._names[STRCAT_CHK] = "__strcat_chk"
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
