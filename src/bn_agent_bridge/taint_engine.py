@@ -323,6 +323,14 @@ class TaintEngine:
         # Definite stash-slot proofs (`_definite_slot_store`), per function
         # and load: structural, so one answer serves every fixed-point sweep.
         self._slot_proofs: dict[Any, tuple[Any, dict[Any, Any]]] = {}
+        # Global-memory continuation (IC03): BN's own code references to a
+        # writable global, keyed by address, and the bounded call-graph
+        # reachability answers derived from them. Both are facts about the
+        # VIEW, so they outlive the per-source re-runs of `_forward_run`, and
+        # both are only ever consulted for a global the walk already tainted --
+        # a targeted xref query, not a whole-program solve.
+        self._global_refs: dict[int, dict[int, int]] = {}
+        self._global_reach: dict[tuple[int, int, int], tuple] = {}
 
     # -- shared resolution ------------------------------------------------
 
@@ -5322,6 +5330,127 @@ class TaintEngine:
         the module-level :func:`targets_from_pvs`)."""
         return targets_from_pvs(pvs)
 
+    # Bound on the call graph walked to answer ONE global-continuation
+    # question. The depth budget is the descent the walk itself would have
+    # made; this cap keeps a densely connected binary from turning that
+    # question into a program-wide sweep.
+    _GLOBAL_REACH_FUNCS = 512
+
+    def _global_ref_functions(self, ga: int) -> dict[int, int]:
+        """``{function start: lowest referencing address}`` for every code
+        reference to the global at *ga*, read from BN's own code-reference DB
+        (the source `bn xrefs` reads).
+
+        ``{}`` whenever that DB cannot answer -- a view with no
+        ``get_code_refs`` (the unit fakes, a partially loaded view), a raising
+        call, refs with no owning function. An absent answer is NOT evidence:
+        the caller stays silent rather than inventing a boundary, because the
+        alternative is a frontier on every call after any global write."""
+        cached = self._global_refs.get(ga)
+        if cached is not None:
+            return cached
+        out: dict[int, int] = {}
+        get_refs = getattr(self.bv, "get_code_refs", None)
+        if callable(get_refs):
+            try:
+                refs = list(get_refs(int(ga)) or [])
+            except Exception:
+                refs = []
+            for ref in refs:
+                start = getattr(getattr(ref, "function", None), "start", None)
+                if start is None:
+                    continue
+                start = int(start)
+                try:
+                    at = int(getattr(ref, "address", start))
+                except (TypeError, ValueError):
+                    at = start
+                if start not in out or at < out[start]:
+                    out[start] = at
+        self._global_refs[ga] = out
+        return out
+
+    def _global_refs_reachable(self, fn: Any, ga: int, budget: int) -> tuple:
+        """``((function start, referencing address), ...)`` for the functions
+        that reference the global at *ga* and sit within *budget* further call
+        levels of *fn* (level 0 is *fn* itself), ordered by function address so
+        one leaf is byte-identical across the fixpoint's repeated visits.
+
+        The walk follows BN's ``Function.callees`` edges only -- a resolved
+        call graph, the same evidence `bn dataflow callgraph` renders. An
+        unresolved indirect edge simply contributes no successor: this answers
+        "a reference IS reachable", never "no reference exists"."""
+        known = self._global_ref_functions(ga)
+        if not known:
+            return ()
+        start = int(getattr(fn, "start", 0))
+        key = (start, ga, int(budget))
+        cached = self._global_reach.get(key)
+        if cached is not None:
+            return cached
+        found: dict[int, int] = {}
+        seen = {start}
+        level, wave = 0, [fn]
+        while wave and level <= budget and len(seen) <= self._GLOBAL_REACH_FUNCS:
+            nxt = []
+            for cur in wave:
+                at = known.get(int(getattr(cur, "start", 0)))
+                if at is not None:
+                    found.setdefault(int(getattr(cur, "start", 0)), at)
+                try:
+                    callees = list(getattr(cur, "callees", None) or ())
+                except Exception:
+                    callees = []
+                for callee in callees:
+                    cs = getattr(callee, "start", None)
+                    if cs is None:
+                        continue
+                    cs = int(cs)
+                    if cs in seen:
+                        continue
+                    seen.add(cs)
+                    nxt.append(callee)
+            wave, level = nxt, level + 1
+        out = tuple(sorted(found.items()))
+        self._global_reach[key] = out
+        return out
+
+    def _global_continuation_leaf(self, ins: Any, ga: int, callee_fn: Any,
+                                  references: tuple, descended: bool) -> dict[str, Any]:
+        """The blocking frontier for tainted global bytes crossing a call the
+        walk does not carry them across (IC03 / TT-PILOT-FW03-01)."""
+        rows = []
+        for start, at in references[:8]:
+            rfn = function_at(self.bv, start)
+            nm = str(getattr(rfn, "name", None) or self._callee_name(start) or hex(start))
+            rows.append({"name": nm,
+                         "display_name": (_display_name(rfn) or nm) if rfn is not None else nm,
+                         "address": hex(start), "at": hex(at)})
+        where = ", ".join(f"{r['display_name']} @ {r['at']}" for r in rows)
+        crossed = ("this call is descended with its tainted argument(s) only"
+                   if descended else
+                   "no argument of this call carries taint, so it is not descended")
+        reseed = command_template(
+            f"bn taint forward -f {rows[0]['address']} --source var:VAR")
+        return {
+            "kind": "global_memory_continuation",
+            "address": hex(int(getattr(ins, "address", 0))),
+            "global": {"address": hex(ga), "label": f"glob_{hex(ga)}"},
+            "callee": {"name": str(getattr(callee_fn, "name", "?")),
+                       "display_name": _display_name(callee_fn) or str(getattr(callee_fn, "name", "?")),
+                       "address": hex(int(getattr(callee_fn, "start", 0)))},
+            "references": rows,
+            "call_descended": bool(descended),
+            "il_text": str(ins),
+            "detail": (
+                f"tainted bytes were copied into the writable global {hex(ga)}, and code "
+                f"reachable from this call references it ({where}). Taint is tracked per "
+                f"function, and {crossed}: what those bytes reach past this point is NOT "
+                f"followed -- a 'no sinks reached' result here is not proof of safety. "
+                f"Read every reference with `bn xrefs {hex(ga)}`, then re-seed inside the "
+                f"consumer on the value it loads ({reseed})"),
+        }
+
     def _run_forward(self, func: Any, locators: list[dict[str, Any]], depth: int,
                      max_depth: int, *, top: bool) -> dict[str, Any]:
         ssaf = self._ssa_func(func)
@@ -5346,6 +5475,19 @@ class TaintEngine:
         processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
         out_params: set[int] = set()         # this func's params whose pointee got tainted
         out_param_elems: set = set()         # (param_idx, field) descriptor-array elems filled (#319b)
+        # IC03: the writable globals THIS run has tainted, {address: node}, kept
+        # by `taint_node` as the taint set grows. A global is program state, not
+        # frame state: the call branch below asks, per global, whether code
+        # reachable from a call references it, and discloses the boundary when
+        # it does. Tracking it here (rather than rescanning `tainted` at every
+        # call on every fixpoint pass) keeps that question O(1) to ask.
+        live_globals: dict[int, tuple] = {}
+        # (call address, global address) already disclosed, so the fixpoint's
+        # repeated visits report one boundary, not one per pass.
+        global_frontiers_seen: set[tuple[int, int]] = set()
+        # Call targets resolved for the global question, per call address, so
+        # the fixpoint's repeated visits pay BN's value-set query once.
+        global_call_targets: dict[int, tuple[int, ...]] = {}
         # Static-state tokenizers (`continuation` models, e.g. strtok): every
         # call SITE in THIS function whose `null_arg` was tainted, keyed by
         # (model key, IL index) -> (tainted node, call address, call
@@ -5396,6 +5538,9 @@ class TaintEngine:
             if node in tainted:
                 return False
             tainted.add(node)
+            key = node[0]
+            if type(key) is tuple and len(key) == 2 and key[0] == "global":
+                live_globals.setdefault(int(key[1]), node)
             why[node] = {"label": label, "instr": ins, "reason": reason, "parents": list(parents)}
             return True
 
@@ -5514,6 +5659,52 @@ class TaintEngine:
                 if node is not None:
                     hit.append(node)
             return hit
+
+        def note_global_continuation(ins: Any, target: int | None, descended: bool) -> None:
+            """Disclose tainted global bytes crossing a call boundary (IC03).
+
+            One leaf per (call address, global address), emitted only when a
+            RESOLVED in-binary target can reach a reference to that global
+            within the descent budget this walk has left. An unresolved
+            indirect call has no body whose references could be read, so none
+            is invented for it -- the existing ``indirect_call_unresolved``
+            frontier owns that call."""
+            addr = int(getattr(ins, "address", 0))
+            # Cheapest filter first: a global already disclosed at this call,
+            # or one BN records no reference to anywhere, asks nothing of the
+            # call graph. The fixpoint revisits this instruction on every pass,
+            # so an unreachable-but-referenced global must not re-resolve the
+            # call's targets each time -- memoize them per call site.
+            pending = [ga for ga in sorted(live_globals)
+                       if (addr, ga) not in global_frontiers_seen
+                       and self._global_ref_functions(ga)]
+            if not pending:
+                return
+            cands = global_call_targets.get(addr)
+            if cands is None:
+                if target is not None:
+                    cands = (target,)
+                else:
+                    cands = tuple(self.resolve_map.get(addr) or ()) or tuple(
+                        self._call_targets_from_pvs(
+                            getattr(getattr(ins, "dest", None), "possible_values", None)))
+                global_call_targets[addr] = cands
+            if not cands:
+                return
+            budget = max(0, max_depth - depth)
+            for taddr in cands:
+                cfn = function_at(self.bv, taddr)
+                if cfn is None or not self._is_internal(cfn):
+                    continue
+                for ga in list(pending):
+                    refs = self._global_refs_reachable(cfn, ga, budget)
+                    if not refs:
+                        continue
+                    global_frontiers_seen.add((addr, ga))
+                    pending.remove(ga)
+                    leaf = self._global_continuation_leaf(ins, ga, cfn, refs, descended)
+                    if leaf not in leaves:
+                        leaves.append(leaf)
 
         def cons_return(ins: Any, reason: str) -> bool:
             nonlocal reached_return
@@ -6411,6 +6602,20 @@ class TaintEngine:
 
                     # 3) resolve the target(s) and descend.
                     tainted_args = {i: arg_taint(p) for i, p in enumerate(params) if arg_taint(p)}
+                    # IC03 / TT-PILOT-FW03-01: tainted bytes that landed in a
+                    # keyable writable global are PROGRAM state. This walk keeps
+                    # taint per function and hands nothing but arguments across a
+                    # call, so a callee reading that global consumes bytes the
+                    # walk never follows -- and when no argument is tainted the
+                    # call below is not even descended. Disclose that boundary
+                    # wherever BN's own code references show a reader reachable
+                    # from the call, for a descended call too (descent carries
+                    # the ARGUMENT's taint, never the global's). Evidence-gated
+                    # on both sides: no tainted global, no reachable reference,
+                    # or no code-ref DB means nothing is emitted, so this is
+                    # never a blanket marker on every call after a global write.
+                    if live_globals:
+                        note_global_continuation(ins, target, bool(tainted_args))
                     if not tainted_args:
                         # The MLIL call recovered no tainted arg -- but BN may have
                         # under-recovered the callee's arity (Thumb 0-arity miss /

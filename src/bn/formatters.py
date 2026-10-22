@@ -4999,6 +4999,19 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"dropped arg(s) {_field_list(leaf, 'dropped_args')})"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
+    if kind == "global_memory_continuation":
+        cal = _field_dict(leaf, "callee")
+        glob = _field_dict(leaf, "global")
+        refs = [r for r in _field_list(leaf, "references") if isinstance(r, dict)]
+        where = ", ".join(
+            f"{_shown_name(r, mangled=mangled) or '?'} @ {r.get('at', '?')}" for r in refs)
+        return (
+            f"  global_memory_continuation @ {leaf.get('address')}"
+            f"  global={glob.get('address', '?')}"
+            f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
+            + (f"  (referenced by {where})" if where else "")
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+        )
     if kind == "caller_sites_truncated":
         fn = _field_dict(leaf, "function")
         return (
@@ -5034,6 +5047,12 @@ def _leaf_group_key(leaf: Any) -> tuple:
         return (kind, str(leaf.get("base")), str(leaf.get("offset")))
     if kind == "arg_under_recovered":
         return (kind, str(_field_dict(leaf, "callee").get("name", "?")))
+    if kind == "global_memory_continuation":
+        # The global IS the identity here: two calls that hand two different
+        # globals past the walk are two boundaries an agent must chase
+        # separately, not one "[2 leaves]" row under the first address.
+        return (kind, str(_field_dict(leaf, "global").get("address")),
+                str(_field_dict(leaf, "callee").get("address")))
     if kind == "caller_sites_truncated":
         fn = _field_dict(leaf, "function")
         # The reason tally's identity is its (reason, count) pairs, never the

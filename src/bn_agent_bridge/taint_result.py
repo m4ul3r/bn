@@ -123,6 +123,12 @@ BLOCKING_LEAF_KINDS = frozenset({
     # a pointer demand), and a sink a multi-sink query could not seed at all.
     "sink_role_unknown",
     "sink_unseeded",
+    # IC03 / TT-PILOT-FW03-01: tainted bytes reached a keyable writable global
+    # and code reachable from a call references that global. Taint is tracked
+    # per function and nothing but arguments crosses a call, so what those
+    # bytes reach past that boundary was never walked -- an empty
+    # reached_sinks there is not an all-clear.
+    "global_memory_continuation",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -418,6 +424,25 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                 f"and callee argument consumption, or {seed}. Repair a prototype only "
                 "where confirmed extra arguments disagree with a determined "
                 "nonvariadic declaration")
+    crossed = [lf for lf in leaves if lf.get("kind") == "global_memory_continuation"]
+    if crossed:
+        # IC03: the most actionable zero-sink frontier there is -- the bytes
+        # have a known address and the references that read them are named, so
+        # the advice points at them rather than at this function.
+        globals_at = sorted({str((lf.get("global") or {}).get("address"))
+                             for lf in crossed if isinstance(lf.get("global"), dict)})
+        reads = sorted({str(r.get("at")) for lf in crossed
+                        for r in (lf.get("references") or []) if isinstance(r, dict)})
+        inside = next((str(r.get("address")) for lf in crossed
+                       for r in (lf.get("references") or [])
+                       if isinstance(r, dict) and r.get("address")), None)
+        seed = (f" ({command_template(forward(inside, 'var:VAR'))})" if inside else "")
+        return ("taint reached no modeled sink HERE, but it was copied into the writable "
+                f"global(s) {', '.join(globals_at)}, which code reachable from a call this "
+                f"walk made references ({', '.join(reads)}); those bytes are not followed "
+                f"across the call. Read the references with "
+                f"`bn xrefs {globals_at[0]}` and re-seed inside the consumer on the value "
+                f"it loads{seed}")
     if by_kind.get("coarse_memory_store", 0) or by_kind.get("pointer_escape", 0):
         # The coarse leaf exists precisely because the destination could not be
         # keyed, so no var: names it; the template seeds a value read back.
@@ -477,7 +502,11 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
         k = str(lf.get("kind", "?"))
         by_kind[k] = by_kind.get(k, 0) + 1
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered", "indirect_call_unresolved")
-    COARSE = ("coarse_memory_store", "pointer_escape")
+    # A global-memory continuation is a MEMORY boundary (the bytes are at a
+    # known address and the walk stops following them), not an unresolved
+    # call: the target resolved, it is the memory hand-off that is not
+    # carried. It belongs in the coarse-memory tally with the other two.
+    COARSE = ("coarse_memory_store", "pointer_escape", "global_memory_continuation")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
     seed_misanchored_n = sum(by_kind.get(k, 0) for k in _SEED_MISANCHORED_KINDS)

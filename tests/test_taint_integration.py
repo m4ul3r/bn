@@ -1212,3 +1212,81 @@ int main(int argc, char **argv) {
     if not result["reached_sinks"]:
         assert result["diagnostics"]["safe_to_report_all_clear"] is False
         assert _run_or_check_template(shared_bn, _forward_prose(result))[0] >= 1
+
+
+def test_global_memory_continuation_names_the_global_and_its_consumer(tmp_path, shared_bn):
+    """IC03 / TT-PILOT-FW03-01: a bounded copy fills a writable global and a
+    later call with no tainted argument reads it into a modeled sink.
+
+    The walk tracks taint per function and hands nothing but arguments across a
+    call, so this used to report zero sinks, zero leaves and a TRUE all-clear.
+    The boundary is now disclosed -- for the consumer only. A callee that
+    references no global, and a global this run never tainted, stay silent, so
+    the frontier is evidence-gated rather than a marker on every call after a
+    global write."""
+    src = tmp_path / "globalcont.c"
+    src.write_text(r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+char g_dir[256];                 /* filled with attacker bytes */
+char g_clean[64];                /* never tainted: the control global */
+__attribute__((noinline)) void run_hook(void) {
+    char cmd[300];
+    snprintf(cmd, sizeof cmd, "%s/hook.sh", g_dir);
+    system(cmd);
+}
+__attribute__((noinline)) void clean_hook(void) { puts(g_clean); }
+__attribute__((noinline)) void no_global(void) { putchar('.'); }
+int main(int argc, char **argv) {
+    if (argc < 2) return 1;
+    strncpy(g_dir, argv[1], sizeof g_dir - 1);
+    no_global();
+    clean_hook();
+    run_hook();
+    return 0;
+}
+""")
+    binary = tmp_path / "globalcont"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                      "--source", "param:1")
+
+    frontiers = [lf for lf in result["leaves"]
+                 if lf["kind"] == "global_memory_continuation"]
+    assert len(frontiers) == 1, result["leaves"]
+    [leaf] = frontiers
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+
+    # It names the consumer, not the quiet callee and not the clean global's.
+    assert leaf["callee"]["display_name"] == "run_hook", leaf
+    assert [r["display_name"] for r in leaf["references"]] == ["run_hook"], leaf
+
+    # The address the frontier names is the global `main` WROTE and `run_hook`
+    # READS -- proven against the disassembly of both, not against the leaf.
+    written = _bn_json(shared_bn, "-t", target, "disasm", "main")
+    read_back = _bn_json(shared_bn, "-t", target, "disasm", "run_hook")
+    g_dir = int(leaf["global"]["address"], 16)
+
+    def lines(listing):
+        return [ln for ln in str(listing["text"]).splitlines() if ln.strip()]
+
+    def mentions(listing, addr):
+        return any(f"{addr:x}" in ln.lower() for ln in lines(listing))
+
+    assert mentions(written, g_dir) and mentions(read_back, g_dir), leaf["global"]
+    # ...and the cited reference address is an instruction of the consumer that
+    # names that very global.
+    cited = [ln for ln in lines(read_back)
+             if ln.lower().startswith(leaf["references"][0]["at"].lower() + " ")]
+    assert cited and f"{g_dir:x}" in cited[0].lower(), (cited, leaf)
+
+    # The reference the frontier cites really loads that global: the consumer
+    # seeded on it reaches the modeled sink the forward run stopped short of.
+    inside = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                      "-f", leaf["callee"]["address"], "--source", "arg:snprintf:3")
+    assert any(s["sink"]["callee"] == "system" for s in inside["reached_sinks"]), inside
+
+    # Advice is runnable or marked as a template, like every other frontier.
+    assert sum(_run_or_check_template(shared_bn, _forward_prose(result))) >= 1
