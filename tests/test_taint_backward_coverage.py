@@ -1926,7 +1926,7 @@ def test_real_bn_mutual_recursion_keeps_the_back_edge_producer(tmp_path, shared_
         result = _bn_backward(shared_bn, target, fn, "arg:malloc:0")
         origins = [sl["origin"] for sl in result["slices"]]
         assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in origins), (fn, origins)
-        assert getpid in origins, (fn, origins)
+        assert any(getpid.items() <= o.items() for o in origins), (fn, origins)
         params = [o for o in origins if o["kind"] == "parameter"]
         assert len(params) == 1 and params[0]["index"] == 0, (fn, origins)
         crossed = {tuple(sl["crossed_functions"]) for sl in result["slices"]
@@ -1990,12 +1990,12 @@ def test_real_bn_cycle_entered_through_another_member_has_no_internal_origin(tmp
         result = _bn_backward(shared_bn, remap, "remap_a", "arg:malloc:0", "--max-depth", depth)
         origins = [sl["origin"] for sl in result["slices"]]
         for root in ({"kind": "constant", "value": 43}, {"kind": "constant", "value": 47}, getpid):
-            assert root in origins, (depth, origins)
+            assert any(root.items() <= o.items() for o in origins), (depth, origins)
         assert not any(o["kind"] == "parameter" for o in origins), (depth, origins)
         assert result["diagnostics"]["safe_to_report_complete_slice"] is True
         direct = _bn_backward(shared_bn, remap, "direct", "arg:malloc:0", "--max-depth", depth)
         origins = [sl["origin"] for sl in direct["slices"]]
-        assert getpid in origins and any(o.get("kind") == "constant" and o.get("value") == 47 for o in origins), (depth, origins)
+        assert any(getpid.items() <= o.items() for o in origins) and any(o.get("kind") == "constant" and o.get("value") == 47 for o in origins), (depth, origins)
         assert not any(o["kind"] == "parameter" for o in origins), (depth, origins)
 
     shallow = _bn_backward(shared_bn, rotation, "cycle_a", "arg:malloc:0", "--max-depth", "1")
