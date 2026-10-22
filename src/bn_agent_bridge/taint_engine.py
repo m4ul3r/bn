@@ -285,6 +285,66 @@ def _code(text: Any) -> str:
     return json.dumps(t) if "`" in t else f"`{t}`"
 
 
+# What a reached pointer-scan bound is REPORTED as. Both are blocking: the
+# scan did not finish, so neither "it only writes" nor "nothing is here" was
+# established (BN21-BOUND-02/03).
+_SCAN_CAUSE_KINDS = {
+    "pointer_scan_budget": "scan_budget_exhausted",
+    "pointer_return_depth": "pointer_depth_exhausted",
+}
+_SCAN_KIND_CAUSES = {v: k for k, v in _SCAN_CAUSE_KINDS.items()}
+
+
+class _ScanBudget:
+    """The node allowance ONE pointer scan may spend, and why it stopped.
+
+    A bound that is reached is a fact about the answer, not a detail of the
+    walk: node exhaustion and the internal return-pointer depth both used to
+    read out as "nothing here" (BN21-BOUND-02/03), so the budget carries the
+    cause back and the classifier turns it into a frontier."""
+
+    __slots__ = ("nodes", "cause")
+
+    # A pointer-return chain costs `_PTR_RETURN_STEP` levels per hop, so the
+    # depth limit is a WRAPPER-CHAIN limit, not a CLI `--max-depth`. Reaching
+    # it is reported under its own cause; raising `--max-depth` cannot move it.
+    def __init__(self, nodes: int) -> None:
+        self.nodes = int(nodes)
+        self.cause: str | None = None
+
+    def spend(self) -> bool:
+        """Charge one node; False once the allowance is gone."""
+        if self.nodes <= 0:
+            self.cause = self.cause or "pointer_scan_budget"
+            return False
+        self.nodes -= 1
+        return True
+
+    def depth_exhausted(self) -> None:
+        self.cause = self.cause or "pointer_return_depth"
+
+
+class _SalvageList(list):
+    """A findings/leaves list that mirrors every append into a run-level
+    buffer, so a `RecursionError` unwinding the walk cannot DISCARD results
+    the walk had already observed (round-3 review R3)."""
+
+    __slots__ = ("_keep",)
+
+    def __init__(self, keep: list) -> None:
+        super().__init__()
+        self._keep = keep
+
+    def append(self, item: Any) -> None:
+        super().append(item)
+        self._keep.append(item)
+
+    def extend(self, items: Any) -> None:
+        items = list(items)
+        super().extend(items)
+        self._keep.extend(items)
+
+
 class TaintEngine:
     def __init__(
         self,
@@ -342,8 +402,12 @@ class TaintEngine:
         # both are only ever consulted for a global the walk already tainted --
         # a targeted xref query, not a whole-program solve.
         self._canon_global_cache: dict[int, int | None] = {}
+        self._global_keyed_offsets: dict[int, set[int]] = {}
+        self._global_write_span: dict[int, int] = {}
+        self._global_extent_unproven: set[int] = set()
         self._ssa_def_cache: dict[tuple, Any] = {}
         self._returned_params_cache: dict[int, tuple] = {}
+        self._returned_params_active: set[int] = set()
         self._global_refs: dict[int, dict[int, int]] = {}
         # globals whose reference sweep hit its chunk budget, so "no further
         # references" was never established for them.
@@ -1227,6 +1291,12 @@ class TaintEngine:
             return (var_key(pv), var_label(pv))
         ga = self._global_addr(ssaf, expr)
         if ga is not None:
+            raw = self._global_addr(ssaf, expr, canon=False)
+            if raw is not None and int(raw) != ga:
+                # The key is the OBJECT; the offset it was reached at is kept
+                # so the leaf can say which bytes were written, and so a
+                # partial write is never read as covering the whole object.
+                self._global_keyed_offsets.setdefault(ga, set()).add(int(raw) - ga)
             return (("global", ga), f"glob_{hex(ga)}")
         hk = self._heap_buffer_key(ssaf, expr)
         if hk is not None:
@@ -1299,8 +1369,50 @@ class TaintEngine:
                 return None  # not a known data variable -> not a global buffer
             base = getattr(dv, "address", None)
             base = int(base) if base is not None else addr
+            base = self._containing_object(base)
             return base if self._is_writable(base) else None
         return addr if self._is_writable(addr) else None
+
+    def _containing_object(self, base: int) -> int:
+        """Fold a nameless interior data variable onto the object it lies in.
+
+        `memcpy(g + 8, src, 64)` makes BN invent a bare data variable at
+        `g + 8`, so the write keyed a DIFFERENT location from the one
+        `system(g)` reads and a real flow answered all-clear (round-3 review
+        R1). An OBJECT is what carries a symbol; a nameless variable inside a
+        symbolled object's extent belongs to it, and one that lies outside
+        every extent stays itself, so disjoint neighbours never merge."""
+        getsym = getattr(self.bv, "get_symbol_at", None)
+        prev = getattr(self.bv, "get_previous_data_var_before", None)
+        if not callable(getsym) or not callable(prev):
+            return base            # a view that cannot say: claim nothing
+        try:
+            if getsym(base) is not None:
+                return base        # already a named object
+        except Exception:
+            return base
+        at = base
+        for _ in range(64):
+            try:
+                got = prev(at)
+            except Exception:
+                return base
+            addr = got if isinstance(got, int) else getattr(got, "address", None)
+            if addr is None or int(addr) >= at:
+                return base
+            at = int(addr)
+            try:
+                named = getsym(at)
+            except Exception:
+                return base
+            if named is None:
+                continue           # another invented interior variable
+            # The nearest NAMED predecessor: it owns `base` only if its own
+            # extent reaches that far. `_global_extent` stops where the next
+            # symbolled neighbour begins, so a separate object never swallows
+            # this one.
+            return at if at + self._global_extent(at) > base else base
+        return base
 
     def _is_writable(self, addr: int) -> bool:
         fn = getattr(self.bv, "is_offset_writable", None)
@@ -3440,6 +3552,7 @@ class TaintEngine:
         # #1041 item 1: a call:/arg: source seeded a buffer its model fills, so
         # an all-clear carries the receive-family caveat (#1050 review round 5).
         self._buffer_seeded = False
+        self._salvage = {"findings": [], "leaves": []}
 
         try:
             sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
@@ -3447,9 +3560,27 @@ class TaintEngine:
             # Defense in depth: should not happen now that thunk-following and the
             # SSA/call walks are cycle-guarded, but a pathological binary must
             # degrade to a bounded, honest result rather than crash the whole op.
+            # What was ALREADY OBSERVED survives: discarding it reported
+            # `reached_sinks: []` for a `system(s)` the walk had seen several
+            # instructions before the cycle, which is strictly worse than the
+            # crash (round-3 review R3). The unwind loses the walk, not the
+            # findings -- those are mirrored into `_salvage` as they are made.
             self._truncated = True
             self._truncation_causes.add("recursion")
-            sub = {"findings": [], "leaves": [], "assumptions": [
+            sub = {"findings": list(self._salvage["findings"]),
+                   "leaves": list(self._salvage["leaves"]) + [{
+                       "kind": "analysis_truncated",
+                       "address": hex(int(getattr(func, "start", 0))),
+                       "cause": "recursion",
+                       "detail": (
+                           "the walk hit Python's recursion limit (an unresolved "
+                           "cycle) and unwound: what it had already found is "
+                           "reported, what it had not reached was never walked. "
+                           "An empty or short result here is NOT an all-clear -- "
+                           "re-run with a lower --max-depth to get a bounded, "
+                           "complete answer over the region it can finish."),
+                   }],
+                   "assumptions": [
                 f"analysis of {func.name} truncated: Python recursion limit reached "
                 "while propagating taint (possible unresolved cycle); results incomplete"]}
         # collapse any duplicate sink reports (same callee/site/arg) that distinct
@@ -5471,10 +5602,80 @@ class TaintEngine:
         # on a view that cannot answer would sweep a neighbouring
         # object's references into this one.
         laid_out = (min(bounds) - ga) if bounds else 0
-        extent = max(typed, laid_out, 1)
+        # The program's own copy is better evidence than the layout: a symbol
+        # INSIDE an untyped object (`.set mid, g + 64`) is a data variable
+        # like any other, so the layout bound cut the object in half and a
+        # reader at +80 fell outside it (BN21-OBJ-01). A copy of 96 bytes at
+        # `g` proves `g` is at least 96 wide -- and only a copy that really
+        # spans the boundary can merge two neighbours.
+        written = int(self._global_write_span.get(ga) or 0)
+        if typed == 0 and 0 < laid_out < written:
+            # BN21-OBJ-01: the object has no recovered type, so its end was
+            # guessed from LAYOUT -- and an ALIAS symbol inside it
+            # (`.set mid, g + 64`) is a data variable like any other, which
+            # halved the object and hid a reader at +80. The program copies
+            # PAST that bound, so either the object is wider than the layout
+            # says or this copy overflows into the neighbour. Neither is a
+            # clear: the identity/extent is recorded as unproven, and the
+            # sweep covers what was actually written so a reader inside it is
+            # still named.
+            self._global_extent_unproven.add(ga)
+        # A recovered type IS an answer about the object's extent: a copy
+        # longer than it is an OVERFLOW, which the sink machinery owns, not
+        # evidence that the neighbour belongs to this object. Only an
+        # untyped object takes its width from what was written.
+        extent = max(typed, laid_out, written if typed == 0 else 0, 1)
         extent = max(1, int(extent))
         self._global_extent_cache[ga] = extent
         return extent
+
+    @staticmethod
+    def _model_len_index(model: dict[str, Any] | None) -> int | None:
+        """The argument index a model's copy length comes from, if it states
+        one -- `memcpy(dst, src, n)` is 2."""
+        sink = (model or {}).get("sink") or {}
+        if sink.get("len_arg") is not None:
+            try:
+                return int(sink["len_arg"])
+            except (TypeError, ValueError):
+                return None
+        if str(sink.get("class")) in ("overflow_len", "fortified_overflow"):
+            args = list(sink.get("tainted_args") or ())
+            if len(args) == 1:
+                try:
+                    return int(args[0])
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _note_write_span(self, ssaf: Any, params: list, idx: int,
+                         model: dict[str, Any] | None) -> None:
+        """Record how far a modeled copy writes into a global object.
+
+        An untyped global's extent is otherwise inferred from LAYOUT, which
+        an alias/subobject symbol inside the object silently halves
+        (BN21-OBJ-01). What the program copies is direct evidence of how wide
+        the object is, so it is kept as a lower bound on the extent."""
+        if idx >= len(params):
+            return
+        ga = self._global_addr(ssaf, params[idx])
+        if ga is None:
+            return
+        raw = self._global_addr(ssaf, params[idx], canon=False)
+        offset = (int(raw) - ga) if raw is not None and int(raw) >= ga else 0
+        length = self._model_len_index(model)
+        n = None if length is None else self._int_const(params[length]) \
+            if length < len(params) else None
+        if n is None or int(n) <= 0:
+            return
+        span = offset + int(n)
+        if span > int(self._global_write_span.get(ga) or 0):
+            self._global_write_span[ga] = span
+            # The extent is memoised, and this is new evidence about it.
+            self._global_extent_cache.pop(ga, None)
+            self._global_refs.pop(ga, None)
+            self._global_reach.clear()
+            self._global_access_cache.clear()
 
     def _global_use_offset(self, expr: Any, ga: int) -> int:
         """Byte offset INSIDE the global at *ga* that *expr* names, else 0.
@@ -5707,7 +5908,7 @@ class TaintEngine:
 
     def _ptr_resolves(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
                       seen: set | None = None, *, alias: bool = True,
-                      budget: list | None = None) -> bool:
+                      budget: _ScanBudget | None = None) -> bool:
         """Whether *expr* may hold a pointer *base* accepts.
 
         Follows SSA definitions generally -- so EVERY arm of a PHI merge is
@@ -5718,10 +5919,16 @@ class TaintEngine:
         understand: an unrecognised expression simply contributes nothing,
         and every caller's default is "consumer"."""
         if budget is None:
-            budget = [self._PTR_RESOLVE_NODES]
-        if expr is None or depth > self._PTR_RESOLVE_DEPTH or budget[0] <= 0:
+            budget = _ScanBudget(self._PTR_RESOLVE_NODES)
+        if expr is None:
             return False
-        budget[0] -= 1
+        if depth > self._PTR_RESOLVE_DEPTH:
+            # BN21-BOUND-03: this is the INTERNAL wrapper-chain bound, not the
+            # CLI's call depth. Saying "no alias" here lost a real one.
+            budget.depth_exhausted()
+            return False
+        if not budget.spend():
+            return False
         seen = set() if seen is None else seen
         idx = getattr(expr, "expr_index", None)
         if idx is not None:
@@ -5767,19 +5974,29 @@ class TaintEngine:
                 # memset(g, 0, n); }`). Ask it, so the CALLER's use of the
                 # result is the read that blocks (round-3 review F17).
                 body, _unread = self._callee_body(defn)
-                if body is None:
-                    return False
-                if self._fn_returns_pointer(
-                        body, base, depth + self._PTR_RETURN_STEP, budget=budget):
-                    return True
-                # ...or it hands back one of its own parameters, in which
-                # case the result is whatever THIS call passed there (F19).
-                for pidx in self._fn_returned_params(body):
-                    if pidx < len(params) and self._ptr_resolves(
-                            ssaf, params[pidx], base,
-                            depth + self._PTR_RETURN_STEP, seen,
-                            alias=alias, budget=budget):
+                bodies = [body] if body is not None else [
+                    # An indirect site the agent PINNED with --resolve-map is
+                    # resolved for the reachability walk already; the alias
+                    # walk has to honour the same pin, or supplying the map
+                    # turns a disclosed frontier into a false all-clear
+                    # (round-3 review R2).
+                    cfn for cfn in (
+                        function_at(self.bv, int(t))
+                        for t in (self.resolve_map.get(
+                            int(getattr(defn, "address", 0))) or ()))
+                    if cfn is not None]
+                for cand in bodies:
+                    if self._fn_returns_pointer(
+                            cand, base, depth + self._PTR_RETURN_STEP, budget=budget):
                         return True
+                    # ...or it hands back one of its own parameters, in which
+                    # case the result is whatever THIS call passed there (F19).
+                    for pidx in self._fn_returned_params(cand):
+                        if pidx < len(params) and self._ptr_resolves(
+                                ssaf, params[pidx], base,
+                                depth + self._PTR_RETURN_STEP, seen,
+                                alias=alias, budget=budget):
+                            return True
                 return False
             srcs = getattr(defn, "src", None)
             if not isinstance(srcs, (list, tuple)):
@@ -5835,6 +6052,16 @@ class TaintEngine:
         cached = self._returned_params_cache.get(key)
         if cached is not None:
             return cached
+        formal_count = len(list(getattr(fn, "parameter_vars", []) or []))
+        if key in self._returned_params_active:
+            # A cycle: `char *f(char *p, int n) { return n ? f(p, n-1) : p; }`.
+            # Unrolling it is what reached the Python recursion limit
+            # (round-3 review R3). Answering "returns nothing" would be a
+            # guess in the CLEARING direction, so a cycle answers with every
+            # formal -- the conservative side, and never cached as the
+            # function's own answer.
+            return tuple(range(formal_count))
+        self._returned_params_active.add(key)
         out: list[int] = []
         ssaf = None
         instrs: list[Any] = []
@@ -5851,18 +6078,21 @@ class TaintEngine:
             if any(self._ptr_resolves(ssaf, src, root)
                    for ins in rets for src in self._ret_sources(ins)):
                 out.append(idx)
+        self._returned_params_active.discard(key)
         result = tuple(out)
         self._returned_params_cache[key] = result
         return result
 
     def _fn_returns_pointer(self, fn: Any, base: Any, depth: int = 0,
-                            budget: list | None = None) -> bool:
+                            budget: _ScanBudget | None = None) -> bool:
         """Whether *fn* returns a pointer *base* accepts.
 
         A callee that hands the object's address back does not read its
         bytes -- the caller that consumes the result does, and this is what
         lets the caller's own scan see it (round-3 review F17)."""
         if depth > self._PTR_RESOLVE_DEPTH:
+            if budget is not None:
+                budget.depth_exhausted()
             return False
         try:
             ssaf = self._ssa_func(fn)
@@ -5878,15 +6108,15 @@ class TaintEngine:
         return False
 
     def _expr_mentions(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
-                       budget: list | None = None) -> bool:
+                       budget: _ScanBudget | None = None) -> bool:
         """Whether any sub-expression of *expr* may be the tracked pointer.
 
         One node budget is shared across the whole walk: giving each
         sub-expression its own turned a function with a long accumulator
         chain into a quadratic sweep over BN's API."""
         if budget is None:
-            budget = [self._PTR_RESOLVE_NODES]
-        if expr is None or depth > 10 or budget[0] <= 0:
+            budget = _ScanBudget(self._PTR_RESOLVE_NODES)
+        if expr is None or depth > 10 or not budget.spend():
             return False
         if is_ssa_var(expr):
             return self._ptr_resolves(ssaf, expr, base, budget=budget)
@@ -5905,15 +6135,15 @@ class TaintEngine:
         return any(self._expr_mentions(ssaf, s, base, depth + 1, budget) for s in subs)
 
     def _expr_loads(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
-                    budget: list | None = None) -> bool:
+                    budget: _ScanBudget | None = None) -> bool:
         """Whether any sub-expression of *expr* LOADS through the pointer.
 
         A store's destination is reached only through ``operands``, where it
         is an address expression and not a load, so ``[p] = 0`` answers False
         while ``[p] = [p] + 1`` and ``x = [q]`` (``q = p``) answer True."""
         if budget is None:
-            budget = [self._PTR_RESOLVE_NODES]
-        if expr is None or depth > 10 or budget[0] <= 0 \
+            budget = _ScanBudget(self._PTR_RESOLVE_NODES)
+        if expr is None or depth > 10 or not budget.spend() \
                 or not hasattr(expr, "operation"):
             return False
         if "LOAD" in op_name(expr) and self._ptr_resolves(
@@ -6060,7 +6290,7 @@ class TaintEngine:
         return cached[1] == "write_only"
 
     def _is_pointer_carry(self, ssaf: Any, ins: Any, base: Any,
-                          budget: list | None = None) -> bool:
+                          budget: _ScanBudget | None = None) -> bool:
         """`p = g`, `p = q + 4`, `p = phi(..)`: the pointer is MOVED, not used.
 
         Materialising an address is not an access -- the access happens at
@@ -6099,17 +6329,28 @@ class TaintEngine:
             ssaf = self._ssa_func(fn)
             instrs = self._instrs(ssaf)
         except TaintError:
-            return (fallback, "unreadable", 0)
+            return (fallback, "unreadable", 0, None)
 
-        def verdict(ins: Any, kind: str) -> tuple:
-            """`(address, kind, offset)` -- the offset names WHICH bytes of
-            the object the use reached (F8); 0 when it is the base or when
-            the tracked pointer is not an object with a base."""
+        def verdict(ins: Any, kind: str, seed: str | None = None) -> tuple:
+            """`(address, kind, offset, seed)` -- the offset names WHICH bytes
+            of the object the use reached (F8); 0 when it is the base or when
+            the tracked pointer is not an object with a base. `seed` is a
+            SOURCE LOCATOR that re-seeds this use, when the use names one
+            (round-3 review R4: a constant-address reader has no variable, so
+            `var:VAR` was advice nothing could run)."""
             return (int(getattr(ins, "address", 0)), kind,
-                    int(offset_of(ins)) if offset_of is not None else 0)
+                    int(offset_of(ins)) if offset_of is not None else 0, seed)
+
+        def arg_seed(ins: Any, hit: list[int]) -> str | None:
+            """`arg:<callee>:<index>` for a pointer that reaches a named
+            call's argument -- the locator that seeds those bytes inside the
+            consumer."""
+            name = self._callee_name(self._resolve_direct_target(ins))
+            return f"arg:{name}:{hit[0]}" if name and hit else None
 
         wrote = False
-        scan = [self._PTR_SCAN_NODES]
+        first_at = int(getattr(instrs[0], "address", 0)) if instrs else None
+        scan = _ScanBudget(self._PTR_SCAN_NODES)
 
         def resolves(expr: Any, *, alias: bool = True) -> bool:
             return self._ptr_resolves(ssaf, expr, base, alias=alias, budget=scan)
@@ -6117,10 +6358,13 @@ class TaintEngine:
         for ins in instrs:
             opn = op_name(ins)
             at = int(getattr(ins, "address", 0))
-            if scan[0] <= 0:
+            if scan.nodes <= 0:
                 # The scan ran out before it could account for the rest of
-                # this body: say so rather than answer "nothing here".
-                return verdict(ins, "unclassified")
+                # this body. BN21-BOUND-02: say WHICH bound stopped it, so
+                # the leaf reads as an unfinished classification and not as a
+                # reader this walk identified.
+                scan.cause = scan.cause or "pointer_scan_budget"
+                return verdict(ins, "scan_budget_exhausted")
             if self._is_call(ins):
                 params = self._call_params(ins)
                 hit = [i for i, p in enumerate(params) if resolves(p)]
@@ -6138,20 +6382,21 @@ class TaintEngine:
                     if all(self._param_destination_only(body, i, depth) for i in hit):
                         wrote = True
                         continue
-                    return verdict(ins, "unknown_call_arg")
+                    return verdict(ins, "unknown_call_arg", arg_seed(ins, hit))
                 if unread_body:
                     # There IS an in-binary body and nothing read it, so no
                     # model on this name can promise it only writes (F7).
-                    return verdict(ins, "unknown_call_arg")
+                    return verdict(ins, "unknown_call_arg", arg_seed(ins, hit))
                 _key, model = lookup_model(
                     self.models, self._callee_name(self._resolve_direct_target(ins)))
                 roles = [self._model_arg_role(model, i) for i in hit]
                 if "read" in roles:
-                    return verdict(ins, "call_arg")   # a modeled source operand
+                    # a modeled source operand
+                    return verdict(ins, "call_arg", arg_seed(ins, hit))
                 if all(r == "write" for r in roles):
                     wrote = True                  # a modeled destination, and
                     continue                      # no body to contradict it
-                return verdict(ins, "unknown_call_arg")
+                return verdict(ins, "unknown_call_arg", arg_seed(ins, hit))
             if "RET" in opn:
                 srcs = self._ret_sources(ins)
                 # Returning the POINTER is not reading the bytes, and the
@@ -6186,7 +6431,14 @@ class TaintEngine:
         # Nothing read-capable. A body with a proven write and nothing else
         # is a write-only use; a body where this scan accounted for no use at
         # all is disclosed rather than cleared.
-        return (None, "write_only", 0) if wrote else (fallback, "unclassified", 0)
+        if scan.cause is not None:
+            # A bound was reached somewhere in this body, so "every use is a
+            # proven write" and "no use at all" are both claims this scan did
+            # not establish (BN21-BOUND-02/03).
+            return (fallback if fallback is not None else first_at,
+                    _SCAN_CAUSE_KINDS[scan.cause], 0, None)
+        return (None, "write_only", 0, None) if wrote else (
+            fallback, "unclassified", 0, None)
 
     def _global_access(self, fn: Any, ga: int) -> tuple:
         """:meth:`_pointer_access` rooted at the global at *ga*, cached.
@@ -6200,7 +6452,8 @@ class TaintEngine:
         try:
             ssaf = self._ssa_func(fn)
         except TaintError:
-            out: tuple = (self._global_ref_functions(ga).get(key[0]), "unreadable", 0)
+            out: tuple = (self._global_ref_functions(ga).get(key[0]),
+                          "unreadable", 0, None)
             self._global_access_cache[key] = out
             return out
         out = self._pointer_access(
@@ -6304,14 +6557,20 @@ class TaintEngine:
                 cs = int(getattr(cur, "start", 0))
                 done.add(cs)
                 reason = str(self._not_internal_reason(cur) or "")
-                if reason.startswith("analysis_skipped:") and lookup_model(
-                        self.models, self._callee_name(cs))[1] is None:
+                if reason.startswith("analysis_skipped:"):
+                    # BN21-REACH-01: a model is ADDITIVE evidence over a body,
+                    # never a substitute for one. Exempting a modeled name
+                    # here let a truthful partial overlay (`arg:0 -> ret`)
+                    # DELETE the disclosure that this in-binary body was never
+                    # read -- accurate positive evidence made the answer less
+                    # conservative, which is exactly backwards. An import has
+                    # no body and never reaches this branch.
                     # F9: an in-binary descendant BN measured and skipped.
                     # Nothing read its references, so the walk past it proves
                     # nothing -- whatever depth it sits at.
                     unread[cs] = str(getattr(cur, "name", None) or hex(cs))
                     for site in self._native_global_refs(cur, ga)[:1]:
-                        found.setdefault(cs, (site, "unreadable", 0))
+                        found.setdefault(cs, (site, "unreadable", 0, None))
                     continue
                 if cs not in found:
                     # EVERY examined function is classified, not just the
@@ -6320,9 +6579,9 @@ class TaintEngine:
                     # that never names the address itself (round-3 review
                     # F18). A function with no use of the object answers with
                     # no address and costs one bounded scan.
-                    at, kind, off = self._global_access(cur, ga)
+                    at, kind, off, seed = self._global_access(cur, ga)
                     if at is not None:
-                        found[cs] = (at, kind, off)
+                        found[cs] = (at, kind, off, seed)
                 try:
                     callees = list(getattr(cur, "callees", None) or ())
                 except Exception:
@@ -6365,6 +6624,13 @@ class TaintEngine:
             # I2: control left the examined region through a call bn could
             # not name, so "no reader is reachable" was never established.
             cut = "unresolved_call_target"
+        scan_cut = next((_SCAN_KIND_CAUSES[k] for _a, (_at, k, _o, _s) in
+                         sorted(found.items()) if k in _SCAN_KIND_CAUSES), None)
+        if scan_cut and cut is None:
+            # BN21-BOUND-02/03: a classification that ran out of nodes, or out
+            # of internal return-pointer depth, did not finish -- so "these
+            # are the readers" is not an answer either.
+            cut = scan_cut
         if unread:
             # An unread descendant outranks a budget: the walk did not stop
             # early, it walked INTO something it could not read (F9).
@@ -6373,7 +6639,8 @@ class TaintEngine:
         status["unread_bodies"] = [
             {"name": unread[k], "address": hex(k)} for k in sorted(unread)]
         status["unresolved_calls"] = [hex(a) for a in sorted(set(opaque))[:8]]
-        out = (tuple(sorted((st, a, k, o) for st, (a, k, o) in found.items())),
+        out = (tuple(sorted((st, a, k, o, s or "")
+                            for st, (a, k, o, s) in found.items())),
                status)
         self._global_reach[key] = out
         return out
@@ -6418,13 +6685,13 @@ class TaintEngine:
         not be read. ``access`` says which, and the prose never claims a read
         it did not see."""
         rows = []
-        for start, at, kind, offset in references[:8]:
+        for start, at, kind, offset, seed in references[:8]:
             rfn = function_at(self.bv, start)
             nm = str(getattr(rfn, "name", None) or self._callee_name(start) or hex(start))
             rows.append({"name": nm,
                          "display_name": (_display_name(rfn) or nm) if rfn is not None else nm,
                          "address": hex(start), "at": hex(at), "access": kind,
-                         "offset": int(offset)})
+                         "offset": int(offset), "seed": str(seed or "") or None})
         crossed = ("this call is descended with its tainted argument(s) only"
                    if descended else
                    "no argument of this call carries taint, so it is not descended")
@@ -6435,15 +6702,24 @@ class TaintEngine:
         else:
             sites = reach.get("unexamined_reference_sites") or []
             seed_at = str(sites[0].get("address")) if sites else hex(ga)
-        reseed = command_template(f"bn taint forward -f {seed_at} --source var:VAR")
+        # R4: a locator the agent can RUN, or none at all. A reader that
+        # names the object by constant address has no variable to seed, and
+        # `--source var:VAR` there was a template with nothing to fill in --
+        # every spelling of it is rejected by the var: grammar.
+        seed_loc = next((r["seed"] for r in rows if r.get("seed")), None)
+        # A concrete locator is a COMMAND, not a template: nothing in it is
+        # left to fill in, so it must not carry the fill-in-the-blanks marker
+        # that tells a reader (and the paste test) it cannot be run.
+        reseed = (f"`bn taint forward -f {seed_at} --source {seed_loc}`"
+                  if seed_loc else None)
         parts = []
         if rows:
             where = ", ".join(
                 f"{r['display_name']} @ {r['at']}"
                 + (f" (+{hex(r['offset'])})" if r["offset"] else "")
                 + f" ({r['access']})" for r in rows)
-            verb = ("reads" if any(r["access"] in _PROVEN_GLOBAL_READS for r in rows)
-                    else "may read")
+            proven = any(r["access"] in _PROVEN_GLOBAL_READS for r in rows)
+            verb = "reads" if proven else "may read"
             parts.append(
                 f"tainted bytes were copied into the writable global {hex(ga)}, and code "
                 f"reachable from this call {verb} it ({where}).")
@@ -6468,6 +6744,21 @@ class TaintEngine:
                 "unread_callee_body": (
                     "an in-binary callee body Binary Ninja did not analyse "
                     "(re-run after `bn decompile <callee> --force-analysis`)"),
+                "object_extent_unproven": (
+                    "an object with no recovered type that is written PAST "
+                    "the next symbol in the layout -- so where it ends, and "
+                    "which references belong to it, are not established "
+                    "(give the global a type with `bn retype` and re-run)"),
+                "pointer_scan_budget": (
+                    "the bound on how many expression nodes ONE function's "
+                    "pointer scan may visit, so what the rest of that body "
+                    "does with the object was never classified -- this bound "
+                    "is internal, `--max-depth` does not move it"),
+                "pointer_return_depth": (
+                    "the bound on how far a pointer may be followed back "
+                    "through RETURNING wrappers, so whether the object comes "
+                    "back out of that chain is unknown -- this bound is "
+                    "internal, `--max-depth` does not move it"),
             }.get(str(reach.get("cause")),
                   f"the {reach.get('function_budget')}-function reachability bound")
             unread_named = ", ".join(
@@ -6487,25 +6778,41 @@ class TaintEngine:
                 f"{reach.get('unexamined_references_total')} referencing function(s) never "
                 f"examined ({unreached}), so whether those bytes reach a sink past this "
                 f"call is UNKNOWN, not clear.")
+        advice = (f" then re-seed inside the consumer on the value it loads ({reseed})."
+                  if reseed else
+                  " the consumer reaches those bytes by constant address, so there is no"
+                  " variable inside it to seed: audit the references by hand.")
         parts.append(
             f"Taint is tracked per function, and {crossed}: what those bytes reach past "
             f"this point is NOT followed -- a 'no sinks reached' result here is not proof "
-            f"of safety. List every reference with `bn xrefs {hex(ga)}` and audit them, "
-            f"then re-seed inside the consumer on the value it loads ({reseed}).")
+            f"of safety. List every reference with `bn xrefs {hex(ga)}` and audit them,"
+            f"{advice}")
         detail = " ".join(parts)
         return {
             "kind": "global_memory_continuation",
             "address": hex(int(getattr(ins, "address", 0))),
-            "global": {"address": hex(ga), "label": f"glob_{hex(ga)}"},
+            "global": {"address": hex(ga), "label": f"glob_{hex(ga)}",
+                       # WHICH bytes of the object the walk keyed here: an
+                       # interior write (`memcpy(g + 8, ..)`) is the same
+                       # object, and naming the offset keeps a partial write
+                       # from reading as the whole object (R1).
+                       "written_offsets": [
+                           hex(o) for o in
+                           sorted(self._global_keyed_offsets.get(ga) or ())[:8]]},
             "callee": None if callee_fn is None else {
                 "name": str(getattr(callee_fn, "name", "?")),
                 "display_name": (_display_name(callee_fn)
                                  or str(getattr(callee_fn, "name", "?"))),
                 "address": hex(int(getattr(callee_fn, "start", 0)))},
             "references": rows,
+            # BN21-BOUND-02: whether a reference was PROVEN to read the bytes,
+            # or merely could not be ruled out. Every surface renders the one
+            # the evidence supports instead of claiming a read it did not see.
+            "reads_proven": any(r["access"] in _PROVEN_GLOBAL_READS for r in rows),
             "reachability": reach,
             "call_descended": bool(descended),
             "il_text": str(ins),
+            "reseed": reseed,
             "detail": detail,
         }
 
@@ -6527,8 +6834,8 @@ class TaintEngine:
         tainted: set[tuple] = set()
         why: dict[tuple, dict[str, Any]] = {}
         assumptions: list[str] = []
-        leaves: list[dict[str, Any]] = []
-        findings: list[dict[str, Any]] = []
+        leaves: list[dict[str, Any]] = _SalvageList(self._salvage["leaves"])
+        findings: list[dict[str, Any]] = _SalvageList(self._salvage["findings"])
         recorded_sinks: set[tuple] = set()
         processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
         out_params: set[int] = set()         # this func's params whose pointee got tainted
@@ -6800,8 +7107,7 @@ class TaintEngine:
                         if self._is_internal(resolved):
                             cfn = resolved
                         elif str(self._not_internal_reason(resolved) or "").startswith(
-                                "analysis_skipped:") and lookup_model(
-                                    self.models, self._callee_name(rstart))[1] is None:
+                                "analysis_skipped:"):
                             # A veneer onto an IN-BINARY body BN measured and
                             # skipped. Following the thunk and then calling
                             # the result "external" lost both the boundary
@@ -6817,19 +7123,25 @@ class TaintEngine:
                             continue      # a PLT stub onto an import: external
                     elif reason == "thunk":
                         unread = "unresolved_thunk"
-                    elif self._unanalysed_body_phrase(reason) is not None \
-                            and lookup_model(self.models,
-                                             self._callee_name(int(taddr)))[1] is None:
+                    elif self._unanalysed_body_phrase(reason) is not None and (
+                            # A body BN MEASURED and skipped is a hole whatever
+                            # its name is modeled as (BN21-REACH-01); a name
+                            # with no IL at all may still be an import stub,
+                            # whose model owns the story as before.
+                            reason.startswith("analysis_skipped:")
+                            or lookup_model(self.models,
+                                            self._callee_name(int(taddr)))[1] is None):
                         # An IN-BINARY body whose MLIL this run cannot read --
                         # BN skipped it (oversized past
                         # analysis.limits.maxFunctionSize, a failed lift) or
                         # produced none at all. Its references cannot be
                         # classified, so "nothing reads the global" is not an
                         # answer and the walk must not continue to an
-                        # all-clear (round-3 review F6). A MODELED name is
-                        # excluded: a libc/kernel callee behind an import stub
-                        # has no body by construction and its model owns the
-                        # story, exactly as the descent treats it.
+                        # all-clear (round-3 review F6). A model on the name
+                        # does NOT excuse it (BN21-REACH-01): an import has no
+                        # body and never gets here, while a measured, skipped
+                        # in-binary body is a hole whatever its name is
+                        # modeled as.
                         unread = "unread_callee_body"
                         self._analysis_incomplete.add(
                             str(getattr(cfn, "name", None) or hex(int(taddr))))
@@ -6853,12 +7165,19 @@ class TaintEngine:
                             sites = self._native_global_refs(cfn, ga)
                         else:
                             sites = ()
-                        refs = tuple((own, a, "unreadable", 0) for a in sites[:8])
+                        refs = tuple((own, a, "unreadable", 0, "") for a in sites[:8])
                         reach = self._reach_status(
                             unread, 0,
                             sorted(k for k in known if not (refs and k == own)), known)
                     else:
                         refs, reach = self._global_refs_reachable(cfn, ga, budget)
+                        if ga in self._global_extent_unproven \
+                                and reach["cause"] is None:
+                            # BN21-OBJ-01: the object's own extent is not
+                            # established, so "these are its references" is
+                            # not established either.
+                            reach = dict(reach, status="truncated",
+                                         cause="object_extent_unproven")
                         if ga in self._global_refs_truncated \
                                 and reach["cause"] is None:
                             # F15: the object is larger than the reference
@@ -6878,16 +7197,27 @@ class TaintEngine:
                         ins, ga, cfn, refs, descended, reach)
                     if leaf not in leaves:
                         leaves.append(leaf)
-                    if reach["cause"] in ("depth_budget", "function_budget"):
-                        # A BUDGET really did cut coverage short: say so with
-                        # the cause, so `truncated`/`truncation_cause` and the
-                        # remediation agree with the leaf (F2). An unreadable
-                        # callee is not a budget -- it is disclosed by the leaf
-                        # and, for an unread body, by analysis_incomplete.
+                    # A BUDGET really did cut coverage short: say so with the
+                    # cause, so `truncated`/`truncation_cause` and the
+                    # remediation agree with the leaf (F2). An unreadable
+                    # callee is not a budget -- it is disclosed by the leaf
+                    # and, for an unread body, by analysis_incomplete.
+                    # BN21-BOUND-01/02/03: the sweep, the pointer-scan node
+                    # pool and the internal return-pointer depth are bounds
+                    # too. Each was disclosed by the leaf and absent from the
+                    # aggregate, so a consumer reading `stats` alone saw a
+                    # COMPLETE run.
+                    aggregate = {
+                        "depth_budget": "max_depth",
+                        "function_budget": "global_reference_budget",
+                        "reference_sweep_budget": "global_reference_budget",
+                        "object_extent_unproven": "global_object_extent",
+                        "pointer_scan_budget": "pointer_scan_budget",
+                        "pointer_return_depth": "pointer_return_depth",
+                    }.get(str(reach["cause"]))
+                    if aggregate:
                         self._truncated = True
-                        self._truncation_causes.add(
-                            "max_depth" if reach["cause"] == "depth_budget"
-                            else "global_reference_budget")
+                        self._truncation_causes.add(aggregate)
 
         def cons_return(ins: Any, reason: str) -> bool:
             nonlocal reached_return
@@ -7542,6 +7872,7 @@ class TaintEngine:
                         k = int(to.split("arg:", 1)[1])
                         if k < len(params):
                             propagated.add(k)
+                            self._note_write_span(ssaf, params, k, model)
                     # Visibility for a tainted copy *source* (#44): the buffer a
                     # source operand (arg N>=1) points at is copied into the
                     # destination buffer (arg 0). The flow is propagated -- so a

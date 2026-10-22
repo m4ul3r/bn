@@ -2296,3 +2296,272 @@ def test_global_continuation_returned_aliases_and_source_destinations(tmp_path,
     assert [r["display_name"] for r in leaf["references"]] == ["refill_then_read"], leaf
     assert leaf["references"][0]["access"] == "call_arg", leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False, result
+
+
+_R3OBJECTS_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[128] = "safe";
+char clean_bytes[128] = "clean";
+__attribute__((noinline)) void reader(void) { system(global_bytes); }
+__attribute__((noinline)) void quiet(void) { system(clean_bytes); }
+__attribute__((noinline)) char *reset_ret(void) { return memset(global_bytes, 0, 1); }
+__attribute__((noinline)) void indirect_reader(char *(*cb)(void)) { char *p = cb(); system(p + 8); }
+__attribute__((noinline)) char *recursive_alias(char *p, int n) {
+    if (n > 0) return recursive_alias(p, n - 1);
+    return p;
+}
+__attribute__((noinline)) void recursive_reader(int n) { system(recursive_alias(global_bytes, n) + 8); }
+__attribute__((noinline)) int interior_case(const char *s) { memset(global_bytes, 'x', 8); memcpy(global_bytes + 8, s, 64); reader(); return 0; }
+__attribute__((noinline)) int disjoint_case(const char *s) { memcpy(global_bytes, s, 64); quiet(); return 0; }
+__attribute__((noinline)) int indirect_case(const char *s, char *(*cb)(void)) { memcpy(global_bytes, s, 64); indirect_reader(cb); return 0; }
+__attribute__((noinline)) int recursive_case(const char *s, int n) { system(s); memcpy(global_bytes, s, 64); recursive_reader(n); return 0; }
+__attribute__((noinline)) int baseline_case(const char *s) { memcpy(global_bytes, s, 64); reader(); return 0; }
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    switch (argc) {
+    case 2: return interior_case(argv[1]);
+    case 3: return disjoint_case(argv[1]);
+    case 4: return indirect_case(argv[1], reset_ret);
+    case 5: return baseline_case(argv[1]);
+    default: return recursive_case(argv[1], argc);
+    }
+}
+"""
+
+
+@pytest.mark.parametrize("debug", [True, False], ids=["typed", "stripped"])
+def test_global_continuation_interior_writes_pins_and_cycles(tmp_path, shared_bn, debug):
+    """Round-3 review R1, R2, R3 and R4.
+
+    R1: `memcpy(g + 8, s, 64)` writes the SAME object `system(g)` reads --
+    BN invents a nameless data variable at the interior address, and keying
+    the write there cleared a real flow. A disjoint neighbour is still a
+    different object.
+    R2: pinning the indirect site with `--resolve-map` must not LOSE the
+    boundary it discloses while unpinned.
+    R3: a self-recursive alias must not unwind the walk, and a sink already
+    observed must survive if it ever does.
+    R4: the re-seed advice has to be runnable."""
+    # A selector is a BASENAME: this lane's bridge is shared, so a fixture
+    # name another test already uses would resolve to the wrong target.
+    name = "r3objects" if debug else "r3objects_nodbg"
+    src = tmp_path / f"{name}.c"
+    src.write_text(_R3OBJECTS_SRC)
+    binary = tmp_path / name
+    _compile(src, binary, ["-fno-builtin", "-fno-inline"] + ([] if debug else ["-g0"]))
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn, *extra):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0", *extra)
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # R1: the interior write is the object the reader reads, and WHICH bytes
+    # were written is kept.
+    result, leaves = gmc("interior_case")
+    [leaf] = leaves
+    assert [r["display_name"] for r in leaf["references"]] == ["reader"], leaf
+    assert leaf["global"]["written_offsets"] == ["0x8"], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result
+
+    # ...and a disjoint object is not folded into it
+    result, leaves = gmc("disjoint_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result
+
+    # R2: unpinned the indirect site is disclosed; pinned it names the reader
+    result, leaves = gmc("indirect_case")
+    [leaf] = leaves
+    assert leaf["reachability"]["cause"] == "unresolved_call_target", leaf
+    site = leaf["reachability"]["unresolved_calls"][0]
+    pin = tmp_path / "resolve_map.json"
+    pin.write_text(json.dumps({site: ["reset_ret"]}))
+    result, leaves = gmc("indirect_case", "--resolve-map", str(pin))
+    [leaf] = leaves
+    assert [r["display_name"] for r in leaf["references"]] == ["indirect_reader"], leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result
+
+    # R3: the cycle is classified, and the sink seen before it survives
+    result, leaves = gmc("recursive_case")
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"]
+    assert "recursion" not in (result["stats"]["truncation_cause"] or [])
+    assert any(r["display_name"] == "recursive_reader"
+               for lf in leaves for r in lf["references"]), leaves
+
+    # R4: the advice names a locator that RUNS and reaches the sink
+    result, leaves = gmc("baseline_case")
+    [leaf] = leaves
+    assert "var:VAR" not in leaf["detail"], leaf
+    assert leaf["reseed"] and "--source arg:system:0" in leaf["reseed"], leaf
+    inner = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                     "-f", leaf["references"][0]["address"],
+                     "--source", leaf["references"][0]["seed"])
+    assert [s["sink"]["class"] for s in inner["reached_sinks"]] == ["command_injection"]
+
+
+_ASTRA_SRC = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline))
+char alias_global[128];
+extern char alias_middle[64];
+__asm__(".globl alias_middle\n.set alias_middle, alias_global+64\n"
+        ".type alias_middle,@object\n.size alias_middle,64\n");
+char neighbour_global[64];
+char span_global[96] = "seed";
+char tracked[128] = "seed";
+volatile unsigned char span_observed;
+N unsigned char unused_probe(void) { return span_global[40]; }
+N void span_reader(void) { char local[80]; memcpy(local, span_global, 80); span_observed = local[40]; }
+N void read_alias_middle(void) { system(alias_middle + 16); }
+N void read_neighbour(void) { system(neighbour_global + 8); }
+N char *refill_alias(char *a) { return fgets(a, 2, stdin); }
+N void use_fgets_alias(void) { char *p = refill_alias(tracked); if (p) system(p + 8); }
+N void ignore_fgets(void) { refill_alias(tracked); }
+N char *relay0(void) { return memset(tracked, 0, 1); }
+N char *relay1(void) { return relay0(); }
+N char *relay2(void) { return relay1(); }
+N char *relay3(void) { return relay2(); }
+N char *relay4(void) { return relay3(); }
+N void use_relay4(void) { system(relay4() + 24); }
+N void alias_cross_case(char *p) { memcpy(alias_global, p, 96); read_alias_middle(); }
+N void alias_inside_case(char *p) { memcpy(alias_global, p, 32); read_alias_middle(); }
+N void neighbour_case(char *p) { memcpy(alias_global, p, 32); read_neighbour(); }
+N void span_case(char *p) { memcpy(span_global + 40, p, 16); span_reader(); }
+N void fgets_case(char *p) { memcpy(tracked, p, 64); use_fgets_alias(); }
+N void fgets_ignored_case(char *p) { memcpy(tracked, p, 64); ignore_fgets(); }
+N void chain_case(char *p) { memcpy(tracked, p, 64); use_relay4(); }
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    switch (argc) {
+    case 2: alias_cross_case(argv[1]); break;
+    case 3: alias_inside_case(argv[1]); break;
+    case 4: neighbour_case(argv[1]); break;
+    case 5: span_case(argv[1]); break;
+    case 6: fgets_case(argv[1]); break;
+    case 7: fgets_ignored_case(argv[1]); break;
+    default: chain_case(argv[1]); break;
+    }
+    return 0;
+}
+"""
+
+
+def test_global_continuation_object_extent_aliases_and_internal_bounds(tmp_path,
+                                                                      shared_bn):
+    """BN21-OBJ-01, OBJ-02, ALIAS-01 and BOUND-03 on a real stripped build.
+
+    OBJ-01: `.set alias_middle, alias_global + 64` puts a symbol INSIDE an
+    untyped object, so its end was taken from the layout and a reader at +80
+    fell outside it. A copy of 96 bytes proves otherwise -- and the
+    uncertainty that remains is disclosed, never resolved by guesswork.
+    OBJ-02: an analysis-created interior data variable is not a second
+    object; a reader spanning the base still sees the interior write.
+    ALIAS-01: `fgets` hands its destination back, so a partial refill
+    followed by `system(p + 8)` reads bytes it never touched.
+    BOUND-03: a returning-wrapper chain past the INTERNAL pointer-return
+    depth is unknown, not "no alias"."""
+    src = tmp_path / "r3astra.c"
+    src.write_text(_ASTRA_SRC)
+    binary = tmp_path / "r3astra"
+    _compile(src, binary, ["-fno-builtin", "-fno-inline", "-fno-stack-protector", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # OBJ-01: the copy spans the alias symbol, so the object's end is not
+    # established -- the reader past it is named AND the doubt is disclosed.
+    result, leaves = gmc("alias_cross_case")
+    [leaf] = leaves
+    assert [r["display_name"] for r in leaf["references"]] == ["read_alias_middle"], leaf
+    assert leaf["references"][0]["offset"] == 80, leaf
+    assert leaf["reachability"]["cause"] == "object_extent_unproven", leaf
+    assert "global_object_extent" in result["stats"]["truncation_cause"], result
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # ...and a copy that stays inside the layout keeps the neighbour disjoint
+    for fn in ("alias_inside_case", "neighbour_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+    # OBJ-02: the interior variable BN invented is the same object
+    result, leaves = gmc("span_case")
+    [leaf] = leaves
+    assert [r["display_name"] for r in leaf["references"]] == ["span_reader"], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # ALIAS-01: a used returned destination blocks, an ignored one does not
+    result, leaves = gmc("fgets_case")
+    [leaf] = leaves
+    assert [r["display_name"] for r in leaf["references"]] == ["use_fgets_alias"], leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    result, leaves = gmc("fgets_ignored_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+    # BOUND-03: the internal return-pointer depth is a disclosed bound
+    result, leaves = gmc("chain_case")
+    [leaf] = leaves
+    assert leaf["reachability"]["cause"] in ("pointer_return_depth", "depth_budget"), leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert result["stats"]["truncated"] is True, result
+
+
+_UNREAD_OVERLAY_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline))
+char request_bytes[128];
+N int opaque_stage(int token) {
+    /* Past analysis.limits.maxFunctionSize, so BN MEASURES this body and
+       refuses to analyse it -- the shape a model must never speak for. */
+    __asm__ volatile(".rept 70000\n nop\n .endr\n");
+    system(request_bytes + 24);
+    return token;
+}
+N int wrapped_stage(int token) { return opaque_stage(token); }
+N void direct_case(char *p) { memcpy(request_bytes, p, 64); opaque_stage(1); }
+N void wrapped_case(char *p) { memcpy(request_bytes, p, 64); wrapped_stage(1); }
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    if (argc == 2) direct_case(argv[1]); else wrapped_case(argv[1]);
+    return 0;
+}
+"""
+
+
+def test_a_partial_model_never_buys_off_an_unread_body(tmp_path, shared_bn):
+    """BN21-REACH-01 on a real build with a body BN refuses to analyse.
+
+    A truthful additive overlay (`arg:0 -> ret`) used to DELETE the
+    unread-body frontier and the analysis-incomplete signal: accurate
+    positive evidence made the answer less conservative, which is backwards.
+    """
+    src = tmp_path / "r3unread.c"
+    src.write_text(_UNREAD_OVERLAY_SRC)
+    binary = tmp_path / "r3unread"
+    _compile(src, binary, ["-fno-builtin", "-fno-inline", "-g0"])
+    overlay = tmp_path / "overlay.json"
+    overlay.write_text(json.dumps(
+        {"opaque_stage": {"propagates": [{"from": "arg:0", "to": "ret"}]}}))
+    target = shared_bn.load(binary, copy=False)
+
+    for fn in ("direct_case", "wrapped_case"):
+        for extra in ((), ("--models", str(overlay))):
+            result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                              "-f", fn, "--source", "param:0", *extra)
+            leaves = [lf for lf in result["leaves"]
+                      if lf["kind"] == "global_memory_continuation"]
+            assert [lf["reachability"]["cause"] for lf in leaves] == [
+                "unread_callee_body"], (fn, extra, result["leaves"])
+            assert result["diagnostics"]["analysis_incomplete"] is True, (fn, extra)
+            assert result["diagnostics"]["safe_to_report_all_clear"] is False

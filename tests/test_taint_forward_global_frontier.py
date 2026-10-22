@@ -172,11 +172,13 @@ def test_keyable_global_copy_into_zero_arg_consumer_emits_continuation(models):
 
     [leaf] = _leaves(result)
     assert leaf["address"] == hex(0x401108)                       # the call boundary
-    assert leaf["global"] == {"address": hex(G_DIR), "label": f"glob_{hex(G_DIR)}"}
+    assert leaf["global"] == {"address": hex(G_DIR), "label": f"glob_{hex(G_DIR)}",
+                              "written_offsets": []}
     assert leaf["callee"]["address"] == hex(hook.start)
     assert leaf["references"] == [{"name": "run_hook", "display_name": "run_hook",
                                    "address": hex(hook.start), "at": hex(0x401210),
-                                   "access": "call_arg", "offset": 0}]
+                                   "access": "call_arg", "offset": 0,
+                                   "seed": "arg:system:0"}]
     assert leaf["reachability"]["status"] == "complete"
     assert leaf["call_descended"] is False
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
@@ -848,7 +850,7 @@ def test_a_mixed_write_then_read_reference_is_a_consumer(models):
     assert leaf["references"][0] == {
         "name": "overwrite_then_run", "display_name": "overwrite_then_run",
         "address": hex(0x401200), "at": hex(0x401218), "access": "call_arg",
-        "offset": 0}
+        "offset": 0, "seed": "arg:system:0"}
 
 
 
@@ -1027,7 +1029,7 @@ def test_an_unanalysed_in_binary_consumer_is_disclosed(models):
     # -- marked `unreadable`, so the prose says "may read", never "reads".
     assert leaf["references"] == [{"name": "huge_reader", "display_name": "huge_reader",
                                    "address": hex(0x401200), "at": hex(0x401210),
-                                   "access": "unreadable", "offset": 0}], leaf
+                                   "access": "unreadable", "offset": 0, "seed": None}], leaf
     assert "may read" in leaf["detail"]
     assert leaf["reachability"]["cause"] == "unread_callee_body"
     assert leaf["reachability"]["status"] == "truncated"
@@ -1388,6 +1390,13 @@ class FExtentBV(FGlobalBV):
                 return FDataVar(a, self._objects.get(a, 0))
         return None
 
+    def get_previous_data_var_before(self, addr):
+        starts = sorted(set(self._objects) | set(self._interior))
+        for a in reversed(starts):
+            if a < int(addr):
+                return FDataVar(a, self._objects.get(a, 0))
+        return None
+
     def get_symbol_at(self, addr):
         if int(addr) in self._interior or int(addr) not in self._objects:
             return None
@@ -1416,11 +1425,11 @@ def _interior_reader(name, start, addr, at):
     ]), params=[])
 
 
-def _interior_program(consumer, refs, objects, **kw):
+def _interior_program(consumer, refs, objects, copy_len=0x20, **kw):
     func, _argv = _copy_then_call(
         0x401104, STRNCPY, G_DIR,
         call_sites=[(0x401108, _gptr(int(consumer.start)), [])],
-        params_extra=[_const(0xff)])
+        params_extra=[_const(copy_len)])
     bv = FExtentBV({STRNCPY: "strncpy", SYSTEM: "system",
                     int(consumer.start): consumer.name},
                    funcs={int(consumer.start): consumer},
@@ -2085,7 +2094,13 @@ def test_the_scan_budget_is_disclosed_not_silently_cleared(models, monkeypatch):
     func, hook, bv = _globalflow(extra_copy_params=[_const(0xff)])
     result = _forward(bv, func, models)
     [leaf] = _leaves(result)
-    assert leaf["references"][0]["access"] == "unclassified", leaf
+    assert leaf["references"][0]["access"] == "scan_budget_exhausted", leaf
+    # BN21-BOUND-02: the bound is named, the search is NOT called complete,
+    # and the run's aggregate statistics carry it.
+    assert leaf["reachability"]["status"] == "truncated", leaf
+    assert leaf["reachability"]["cause"] == "pointer_scan_budget", leaf
+    assert result["stats"]["truncated"] is True
+    assert "pointer_scan_budget" in result["stats"]["truncation_cause"]
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
@@ -2146,3 +2161,457 @@ def test_an_in_binary_body_still_outranks_a_source_model(models):
     bv._funcs[0x401400] = body
     [leaf] = _leaves(_forward(bv, func, models))
     assert leaf["references"][0]["access"] == "unknown_call_arg", leaf
+
+
+# --------------------------------------------------------------------------
+# round-3 review R1: an INTERIOR destination is the same object
+# --------------------------------------------------------------------------
+
+def _copy_into(dest_addr, consumer_start, *, copy_at=0x401104, call_at=0x401108):
+    """`main(argv)`: `memcpy(dest_addr, argv, 64)` then `consumer()`."""
+    return _copy_then_call(copy_at, MEMCPY, _gptr(dest_addr),
+                           call_sites=[(call_at, _gptr(consumer_start), [])],
+                           params_extra=[_const(0x40)])
+
+
+def _interior_dest_program(dest_addr, *, objects, interior, refs_at=G_DIR):
+    reader = _reader("reader", 0x401200, refs_at, 0x401210)
+    func, _argv = _copy_into(dest_addr, 0x401200)
+    bv = FExtentBV({STRNCPY: "strncpy", MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401200: "reader"},
+                   funcs={0x401200: reader},
+                   refs={refs_at: [FRef(reader, 0x401210)]},
+                   objects=objects, interior=interior,
+                   section=(0x404000, 0x405000))
+    return func, bv
+
+
+def test_an_interior_write_is_keyed_to_the_containing_object(models):
+    # Round-3 review R1: `memcpy(g + 8, s, 64)` makes BN invent a nameless
+    # data variable at `g + 8`. Keying the write THERE and the reader's
+    # `system(g)` at the base left two unrelated locations, and a real flow
+    # answered all-clear.
+    func, bv = _interior_dest_program(G_DIR + 8,
+                                 objects={G_DIR: 0, G_OTHER: 0},
+                                 interior=[G_DIR + 8])
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["global"]["address"] == hex(G_DIR)
+    # ...and WHICH bytes were written is kept: a write to part of an object
+    # never reads as coverage of the whole of it.
+    assert leaf["global"]["written_offsets"] == ["0x8"]
+    assert leaf["references"][0]["display_name"] == "reader"
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_write_into_a_disjoint_object_is_not_folded(models):
+    # The control: `G_OTHER` is its own symbolled object, so a write there is
+    # NOT the object `reader` reads, whatever lies between them.
+    func, bv = _interior_dest_program(G_OTHER,
+                                 objects={G_DIR: 0, G_OTHER: 0},
+                                 interior=[])
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_an_interior_write_past_the_object_extent_is_not_folded(models):
+    # An address inside a NEIGHBOUR's extent belongs to the neighbour: the
+    # fold stops where the next symbolled object begins.
+    func, bv = _interior_dest_program(G_OTHER + 8,
+                                 objects={G_DIR: 0, G_OTHER: 0},
+                                 interior=[G_OTHER + 8])
+    assert _leaves(_forward(bv, func, models)) == []
+
+
+def test_a_typed_object_folds_an_interior_address_within_its_width(models):
+    func, bv = _interior_dest_program(G_DIR + 8,
+                                 objects={G_DIR: 0x80, G_OTHER: 0x80},
+                                 interior=[G_DIR + 8])
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["global"]["address"] == hex(G_DIR)
+    assert leaf["global"]["written_offsets"] == ["0x8"]
+
+
+def test_the_text_row_names_the_written_offset(models):
+    func, bv = _interior_dest_program(G_DIR + 8,
+                                 objects={G_DIR: 0, G_OTHER: 0},
+                                 interior=[G_DIR + 8])
+    [leaf] = _leaves(_forward(bv, func, models))
+    row = formatters._render_leaf_line(leaf)
+    assert f"global={hex(G_DIR)}(+0x8)" in row, row
+
+
+# --------------------------------------------------------------------------
+# round-3 review R2: a --resolve-map pin binds the returned pointer too
+# --------------------------------------------------------------------------
+
+def _indirect_consumer(name, start, call_at=0x401310, use_at=0x401318):
+    """`void f(cb) { char *p = cb(); system(p + 8); }` -- the call is indirect."""
+    cb = FVar("cb")
+    cb0, q = FSSA(cb, 0), FSSA(FVar("q"), 1)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, call_at, "MLIL_CALL_SSA", "q#1 = cb#0()", reads=[cb0], writes=[q],
+               dest=_var(cb0), params=[]),
+        FInstr(1, use_at, "MLIL_CALL_SSA", "system(q#1 + 8)", reads=[q],
+               dest=_gptr(SYSTEM),
+               params=[FExpr("MLIL_ADD", "q#1 + 8", left=_var(q), right=_const(8))]),
+    ]), params=[cb])
+
+
+def _resolve_map_program():
+    inner = _ret_helper("reset_ret", 0x401200)        # returns memset(g, 0, 1)
+    consumer = _indirect_consumer("indirect_reader", 0x401300)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [_gptr(0x401200)])],
+        params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", MEMSET: "memset",
+                    0x401200: "reset_ret", 0x401300: "indirect_reader"},
+                   funcs={0x401200: inner, 0x401300: consumer},
+                   refs={G_DIR: [FRef(inner, 0x401210)]})
+    return func, bv
+
+
+def test_an_unpinned_indirect_site_is_disclosed(models):
+    func, bv = _resolve_map_program()
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["reachability"]["cause"] == "unresolved_call_target", leaf
+
+
+def test_a_pinned_indirect_site_keeps_the_returned_global_provenance(models):
+    # Round-3 review R2: supplying --resolve-map RESOLVED the site, which
+    # removed the `unresolved_call_target` disclosure -- and the alias walk
+    # did not honour the same pin, so the consumer that reads `p + 8` was
+    # never classified and the run went all-clear. Resolving a site must
+    # never lose a boundary.
+    func, bv = _resolve_map_program()
+    result = te.TaintEngine(
+        bv, models, resolve_map={"0x401310": ["0x401200"]}).forward(
+            func, [te.parse_locator("param:0")])
+    [leaf] = _leaves(result)
+    assert leaf["reachability"]["cause"] is None, leaf
+    assert leaf["references"][0]["display_name"] == "indirect_reader", leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+# --------------------------------------------------------------------------
+# round-3 review R3: alias inference is cycle-safe, and a recursion unwind
+# never discards what the walk already observed
+# --------------------------------------------------------------------------
+
+def _self_recursive_alias(name, start):
+    """`char *f(char *p, int n) { return n ? f(p, n - 1) : p; }`."""
+    p, n = FVar("p"), FVar("n")
+    p0, n0, r = FSSA(p, 0), FSSA(n, 0), FSSA(FVar("r"), 1)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, start, "MLIL_CALL_SSA", f"r#1 = {hex(start)}(p#0, n#0)",
+               reads=[p0, n0], writes=[r], dest=_gptr(start),
+               params=[_var(p0), _var(n0)]),
+        FInstr(1, start + 8, "MLIL_RET", "return r#1", reads=[r], src=[_var(r)]),
+        FInstr(2, start + 16, "MLIL_RET", "return p#0", reads=[p0], src=[_var(p0)]),
+    ]), params=[p, n])
+
+
+def test_returned_parameter_inference_terminates_on_a_cycle(models):
+    # Round-3 review R3: unrolling `f(p, n - 1)` is what reached Python's
+    # recursion limit. The cycle answers conservatively -- every formal may
+    # come back -- and never by guessing "nothing does".
+    helper = _self_recursive_alias("recursive_alias", 0x401200)
+    bv = FGlobalBV({0x401200: "recursive_alias"}, funcs={0x401200: helper})
+    eng = te.TaintEngine(bv, models)
+    assert eng._fn_returned_params(helper) == (0, 1)
+
+
+def test_a_recursive_alias_chain_is_classified_without_unwinding(models):
+    helper = _self_recursive_alias("recursive_alias", 0x401200)
+    consumer = _reads_offset("recursive_reader", 0x401300, 0x401200,
+                             args=[_gptr(G_DIR), _const(3)])
+    consumer.callees = [helper]
+    func, bv = _chain_program([helper], consumer, helper)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert [r["display_name"] for r in leaf["references"]] == [
+        "recursive_alias", "recursive_reader"], leaf
+
+
+def test_a_recursion_unwind_keeps_what_was_already_found(models, monkeypatch):
+    # Round-3 review R3: a sink observed BEFORE the cycle was discarded by
+    # the unwind, so the run reported `reached_sinks: []` for a flow it had
+    # already proven. The walk is lost; the findings are not.
+    func, hook, bv = _globalflow(extra_copy_params=[_const(0xff)])
+    eng = te.TaintEngine(bv, models)
+    real = eng._run_forward
+
+    def explode(fn, *a, **kw):
+        real(fn, *a, **kw)
+        raise RecursionError("synthetic cycle")
+
+    monkeypatch.setattr(eng, "_run_forward", explode)
+    result = eng.forward(func, [te.parse_locator("param:0")])
+    assert result["stats"]["truncation_cause"] == ["recursion"]
+    kinds = [lf["kind"] for lf in result["leaves"]]
+    assert "analysis_truncated" in kinds, result["leaves"]
+    assert KIND in kinds, result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert "recursion limit" in result["diagnostics"]["next_action"]
+
+
+def test_the_truncation_leaf_blocks_the_all_clear():
+    assert "analysis_truncated" in BLOCKING_LEAF_KINDS
+
+
+# --------------------------------------------------------------------------
+# round-3 review R4: the re-seed advice is runnable, or absent
+# --------------------------------------------------------------------------
+
+def test_the_reseed_advice_names_a_runnable_locator(models):
+    # `var:VAR` was a template nothing could fill in: the consumer reads the
+    # object by CONSTANT ADDRESS, so it has no variable to seed. The
+    # argument it hands those bytes to does name one.
+    func, hook, bv = _globalflow(extra_copy_params=[_const(0xff)])
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["seed"] == "arg:system:0"
+    assert leaf["reseed"] == (
+        f"`bn taint forward -f {hex(hook.start)} --source arg:system:0`")
+    assert "var:VAR" not in leaf["detail"]
+    assert "--source arg:system:0" in leaf["detail"]
+    assert "var:VAR" not in result["diagnostics"]["next_action"]
+    assert "--source arg:system:0" in result["diagnostics"]["next_action"]
+
+
+def test_an_unnameable_consumer_omits_the_reseed_instead_of_faking_one(models):
+    # An unread body names no locator at all: the advice keeps the xref
+    # audit and says to do it by hand, rather than printing a command that
+    # cannot be run.
+    skipped = GFunc("huge_reader", 0x401200, FSSAFunc([]), params=[])
+    skipped.analysis_skipped = True
+    skipped.analysis_skip_reason = type(
+        "R", (), {"name": "ExceedFunctionSizeSkipReason"})()
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "huge_reader"},
+                   funcs={0x401200: skipped},
+                   refs={G_DIR: [FRef(skipped, 0x401210)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["reseed"] is None, leaf
+    assert "var:VAR" not in leaf["detail"]
+    assert "audit the references by hand" in leaf["detail"]
+    assert "var:VAR" not in result["diagnostics"]["next_action"]
+
+
+# --------------------------------------------------------------------------
+# BN21-OBJ-01: an alias symbol inside an untyped object is not its end
+# --------------------------------------------------------------------------
+
+G_MID = G_DIR + 64      # `.set alias_middle, alias_global + 64`
+
+
+def _alias_program(copy_len, read_at, objects=None):
+    """`memcpy(g, p, copy_len)` then a reader of `g + read_at`, where a SECOND
+    symbol sits at `g + 64` -- the shape an alias/subobject symbol makes."""
+    consumer = _interior_reader("alias_reader", 0x401200, G_DIR + read_at, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(copy_len)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "alias_reader"},
+                   funcs={0x401200: consumer},
+                   refs={G_DIR + read_at: [FRef(consumer, 0x401210)]},
+                   objects=objects if objects is not None else {G_DIR: 0, G_MID: 0},
+                   section=(0x404000, 0x405000))
+    return func, bv
+
+
+def test_a_copy_past_an_untyped_objects_layout_bound_is_disclosed(models):
+    # BN21-OBJ-01: `alias_global` has no recovered type, so its end was taken
+    # from the LAYOUT -- and `.set alias_middle, alias_global + 64` puts a
+    # symbol inside it. The object was cut in half and the reader at +80 fell
+    # outside, clearing a real flow. Writing 96 bytes proves otherwise.
+    func, bv = _alias_program(96, 80)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "alias_reader", leaf
+    assert leaf["references"][0]["offset"] == 80, leaf
+    # ...and the uncertainty itself is disclosed, not quietly resolved.
+    assert leaf["reachability"]["cause"] == "object_extent_unproven", leaf
+    assert "global_object_extent" in result["stats"]["truncation_cause"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_copy_within_the_layout_bound_keeps_the_neighbour_disjoint(models):
+    # The control: the copy stays inside the object the layout describes, so
+    # the next symbol is still a different object and its reader is not this
+    # object's business.
+    func, bv = _alias_program(32, 80)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_typed_object_is_not_second_guessed_by_an_overflowing_copy(models):
+    # A recovered type IS an answer about the object's extent. A copy longer
+    # than it is an overflow -- the sink machinery's business, not evidence
+    # that the neighbour is part of this object.
+    func, bv = _alias_program(96, 80, objects={G_DIR: 64, G_MID: 64})
+    assert _leaves(_forward(bv, func, models)) == []
+
+
+# --------------------------------------------------------------------------
+# BN21-ALIAS-01: a receive call that hands its destination back
+# --------------------------------------------------------------------------
+
+FGETS = 0x4010c0
+
+
+@pytest.mark.parametrize("name,idx", [("fgets", 0), ("gets", 0)])
+def test_the_receive_family_declares_its_destination_return(models, name, idx):
+    # The relation is POINTER identity, spelled the way memcpy/strcpy spell
+    # it: `arg:N -> ret` carries the pointer, never the bytes.
+    _key, model = te.lookup_model(models, name)
+    assert {"from": f"arg:{idx}", "to": "ret"} in model["propagates"]
+    assert te.TaintEngine._model_arg_role(model, idx) == "write"
+
+
+def _fgets_program(consume):
+    """`char *p = fgets(g, 2, stdin);` and, optionally, `system(p + 8)`."""
+    q = FSSA(FVar("q"), 1)
+    body = [FInstr(0, 0x401310, "MLIL_CALL_SSA", "q#1 = fgets(g, 2, stdin)",
+                   writes=[q], dest=_gptr(FGETS),
+                   params=[_gptr(G_DIR), _const(2), _const(0)])]
+    if consume:
+        body.append(FInstr(1, 0x401318, "MLIL_CALL_SSA", "system(q#1 + 8)",
+                           reads=[q], dest=_gptr(SYSTEM),
+                           params=[FExpr("MLIL_ADD", "q#1 + 8",
+                                         left=_var(q), right=_const(8))]))
+    consumer = GFunc("use_fgets", 0x401300, FSSAFunc(body), params=[])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", FGETS: "fgets",
+                    0x401300: "use_fgets"},
+                   funcs={0x401300: consumer},
+                   refs={G_DIR: [FRef(consumer, 0x401310)]})
+    return func, bv
+
+
+def test_a_partial_refill_through_a_returned_destination_blocks(models):
+    # BN21-ALIAS-01: `fgets(g, 2, ..)` overwrites at most two bytes and hands
+    # `g` back; `system(p + 8)` reads bytes it never touched. Forgetting the
+    # returned destination cleared that flow.
+    func, bv = _fgets_program(consume=True)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert leaf["references"][0]["at"] == hex(0x401318), leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_refill_whose_return_is_ignored_stays_silent(models):
+    func, bv = _fgets_program(consume=False)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+# --------------------------------------------------------------------------
+# BN21-REACH-01: a partial model never buys off an unread body
+# --------------------------------------------------------------------------
+
+def _unread_program(hops=0):
+    """A call onto a body BN measured and skipped, optionally behind hops."""
+    skipped = _skipped("opaque_stage", 0x401200)
+    funcs = {0x401200: skipped}
+    names = {STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "opaque_stage"}
+    entry = 0x401200
+    for i in range(hops):
+        start = 0x401400 + i * 0x20
+        wrapper = GFunc(f"wrap{i}", start, FSSAFunc([
+            FInstr(0, start, "MLIL_CALL_SSA", f"{hex(entry)}()",
+                   dest=_gptr(entry), params=[]),
+        ]), params=[], callees=[funcs[entry]])
+        funcs[start] = wrapper
+        names[start] = wrapper.name
+        entry = start
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(entry), [])], params_extra=[_const(0x20)])
+    bv = FGlobalBV(names, funcs=funcs, refs={G_DIR: [FRef(skipped, 0x401210)]})
+    return func, bv
+
+
+@pytest.mark.parametrize("hops", [0, 1, 2])
+def test_a_partial_model_does_not_erase_an_unread_body(models, hops):
+    # BN21-REACH-01: adding a TRUTHFUL partial overlay (`arg:0 -> ret`) made
+    # the result LESS conservative -- the unread-body frontier and the
+    # analysis-incomplete signal both disappeared. A model is additive
+    # evidence over a body; it is never a substitute for reading one.
+    func, bv = _unread_program(hops)
+    overlaid = dict(models)
+    overlaid["opaque_stage"] = {"propagates": [{"from": "arg:0", "to": "ret"}]}
+    for catalog in (models, overlaid):
+        result = _forward(bv, func, catalog)
+        [leaf] = _leaves(result)
+        assert leaf["reachability"]["cause"] == "unread_callee_body", leaf
+        assert result["diagnostics"]["analysis_incomplete"] is True
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+# --------------------------------------------------------------------------
+# BN21-BOUND-01/02/03: every reached bound is in the aggregate statistics
+# --------------------------------------------------------------------------
+
+def test_a_truncated_reference_sweep_reaches_the_run_statistics(models,
+                                                                monkeypatch):
+    # BN21-BOUND-01: the leaf said `reference_sweep_budget` while
+    # `stats.truncated` stayed false, so a consumer reading the aggregate saw
+    # a complete run.
+    monkeypatch.setattr(te.TaintEngine, "_GLOBAL_REF_CHUNKS", 0)
+    func, bv = _alias_program(32, 8)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["reachability"]["cause"] == "reference_sweep_budget", leaf
+    assert result["stats"]["truncated"] is True
+    assert "global_reference_budget" in result["stats"]["truncation_cause"]
+
+
+def test_pointer_return_depth_exhaustion_is_its_own_blocking_bound(models,
+                                                                   monkeypatch):
+    # BN21-BOUND-03: a returning-wrapper chain longer than the INTERNAL
+    # pointer-return depth answered "not an alias" and cleared the run, with
+    # CLI `--max-depth 64` powerless over it.
+    monkeypatch.setattr(te.TaintEngine, "_PTR_RESOLVE_DEPTH", 1)
+    inner = _ret_helper("reset_ret", 0x401200)
+    relay = _relay("relay", 0x401400, 0x401200)
+    relay.callees = [inner]
+    consumer = _reads_offset("use_ret", 0x401300, 0x401400)
+    consumer.callees = [relay]
+    func, bv = _chain_program([inner, relay], consumer, inner)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert any(r["access"] == "pointer_depth_exhausted"
+               for r in leaf["references"]), leaf
+    assert leaf["reachability"]["cause"] == "pointer_return_depth", leaf
+    assert "pointer_return_depth" in result["stats"]["truncation_cause"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    # ...and the advice does not promise a knob that cannot move this bound.
+    assert "--max-depth" not in result["diagnostics"]["next_action"] or \
+        "does not move it" in result["diagnostics"]["next_action"]
+
+
+def test_an_unfinished_scan_is_not_rendered_as_a_reader(models, monkeypatch):
+    # BN21-BOUND-02: "read by noisy" for a body whose classification never
+    # finished states a fact the walk did not establish.
+    monkeypatch.setattr(te.TaintEngine, "_PTR_SCAN_NODES", 0)
+    func, hook, bv = _globalflow(extra_copy_params=[_const(0x20)])
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["reads_proven"] is False, leaf
+    row = formatters._render_leaf_line(leaf)
+    assert "may be read by" in row, row
+    assert "(read by" not in row, row
+    assert " reads (" not in result["diagnostics"]["next_action"]

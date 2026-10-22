@@ -129,6 +129,11 @@ BLOCKING_LEAF_KINDS = frozenset({
     # bytes reach past that boundary was never walked -- an empty
     # reached_sinks there is not an all-clear.
     "global_memory_continuation",
+    # Round-3 review R3: the forward walk unwound on Python's recursion limit
+    # (an unresolved cycle). Whatever it had already found is reported, but
+    # the rest was never walked -- so the run is explicitly a frontier, not a
+    # short clean answer.
+    "analysis_truncated",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -435,6 +440,11 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                 "where confirmed extra arguments disagree with a determined "
                 "nonvariadic declaration")
     crossed = [lf for lf in leaves if lf.get("kind") == "global_memory_continuation"]
+    if by_kind.get("analysis_truncated", 0):
+        return ("the walk unwound on Python's recursion limit (an unresolved cycle): "
+                "what it had already found is reported and the rest was never walked "
+                "-- re-run with a lower `--max-depth` for a bounded, complete answer "
+                "over the region it can finish")
     if crossed:
         # IC03: the most actionable zero-sink frontier there is -- the bytes
         # have a known address, so the advice points at them rather than at
@@ -444,10 +454,11 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                              for lf in crossed if isinstance(lf.get("global"), dict)})
         reads = sorted({str(r.get("at")) for lf in crossed
                         for r in (lf.get("references") or []) if isinstance(r, dict)})
-        inside = next((str(r.get("address")) for lf in crossed
-                       for r in (lf.get("references") or [])
-                       if isinstance(r, dict) and r.get("address")), None)
-        seed = (f" ({command_template(forward(inside, 'var:VAR'))})" if inside else "")
+        # R4: the leaf carries a RUNNABLE re-seed when the consumer names a
+        # locator; a constant-address reader names none, and advising
+        # `var:VAR` there was a template nothing could fill in.
+        reseed = next((str(lf.get("reseed")) for lf in crossed if lf.get("reseed")), None)
+        seed = f" ({reseed})" if reseed else ""   # already backticked: a command
         head = ("taint reached no modeled sink HERE, but it was copied into the writable "
                 f"global(s) {', '.join(globals_at)}")
         truncated_at = sorted({str((lf.get("reachability") or {}).get("cause"))
@@ -458,15 +469,26 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
             # both, so the advice never reads as "and that is all of them".
             cut = (f" The search was also TRUNCATED ({', '.join(truncated_at)}), so "
                    f"further references may exist." if truncated_at else "")
-            return (f"{head}, which code reachable from a call this walk made reads "
+            # BN21-BOUND-02: only a proven read is reported as a read.
+            verb = ("reads" if any(lf.get("reads_proven") for lf in crossed)
+                    else "may use")
+            return (f"{head}, which code reachable from a call this walk made {verb} "
                     f"({', '.join(reads)}); those bytes are not followed across the call."
-                    f"{cut} Read every reference with `bn xrefs {globals_at[0]}` and "
-                    f"re-seed inside the consumer on the value it loads{seed}")
+                    f"{cut} Read every reference with `bn xrefs {globals_at[0]}`"
+                    + (f" and re-seed inside the consumer on the value it loads{seed}"
+                       if seed else
+                       " and audit them by hand: the consumer reads those bytes by"
+                       " constant address, so there is no variable inside it to seed"))
+        # BN21-BOUND-03: `--max-depth` moves the CALL-GRAPH bound and nothing
+        # else. Advising it for a bound it cannot move is advice that fails.
+        widen = (" or raise --max-depth and re-run"
+                 if any(c in ("depth_budget", "function_budget") for c in truncated_at)
+                 else " -- this bound is internal, `--max-depth` does not move it")
         return (f"{head}, and the search for code reading it past a call this walk made "
                 f"was TRUNCATED ({', '.join(truncated_at) or 'bound reached'}) with "
                 f"references unexamined -- whether those bytes reach a sink is unknown, "
-                f"not clear. Audit every reference with `bn xrefs {globals_at[0]}`, or "
-                f"raise --max-depth and re-run")
+                f"not clear. Audit every reference with `bn xrefs {globals_at[0]}`"
+                f"{widen}")
     if by_kind.get("coarse_memory_store", 0) or by_kind.get("pointer_escape", 0):
         # The coarse leaf exists precisely because the destination could not be
         # keyed, so no var: names it; the template seeds a value read back.

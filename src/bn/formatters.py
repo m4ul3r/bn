@@ -5009,12 +5009,15 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             + (f" ({r['access']})" if r.get("access") else "")
             for r in refs)
         truncated = str(reach.get("status")) == "truncated"
+        # BN21-BOUND-02: a reference the scan could not account for is not a
+        # reader this walk identified; only a PROVEN read says "read by".
+        verb = "read by" if leaf.get("reads_proven") else "may be read by"
         if where and not truncated:
-            middle = f"  (read by {where})"
+            middle = f"  ({verb} {where})"
         elif where:
             # A named reader and an unfinished search are not alternatives:
             # the row says both, so it never reads as "and that is all".
-            middle = (f"  (read by {where}; reachability truncated:"
+            middle = (f"  ({verb} {where}; reachability truncated:"
                       f" {reach.get('cause', '?')})")
         else:
             # No reader is NAMED because the search never finished: say which
@@ -5029,7 +5032,12 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
         return (
             f"  global_memory_continuation @ {leaf.get('address')}"
             f"  global={glob.get('address', '?')}"
-            f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
+            # WHICH bytes were written: an interior copy is the same object,
+            # and naming the offset keeps a partial write from reading as
+            # coverage of the whole object (round-3 review R1).
+            + (f"(+{', +'.join(str(o) for o in _field_list(glob, 'written_offsets'))})"
+               if _field_list(glob, "written_offsets") else "")
+            + f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
             + middle
             + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
         )
