@@ -2565,3 +2565,96 @@ def test_a_partial_model_never_buys_off_an_unread_body(tmp_path, shared_bn):
                 "unread_callee_body"], (fn, extra, result["leaves"])
             assert result["diagnostics"]["analysis_incomplete"] is True, (fn, extra)
             assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+_OVERLAP_SRC = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline))
+char packet[128];
+extern char packet_tail[64];
+__asm__(".globl packet_tail\n.set packet_tail, packet+64\n"
+        ".type packet_tail,@object\n.size packet_tail,64\n");
+char other[128];
+char tracked[128] = "seed";
+N void consumer(void) { char local[112]; memcpy(local, packet, sizeof(local)); system(local + 80); }
+N void shallow(void) { char local[16]; memcpy(local, packet, sizeof(local)); system(local); }
+N void other_reader(void) { char local[16]; memcpy(local, other, sizeof(local)); system(local); }
+N void reader(void) { system(tracked); }
+N char *refill(char *a) { return fgets(a, 2, stdin); }
+N void use_refill(void) { char *p = refill(tracked); if (p) system(p + 8); }
+N void overlap_case(char *s) { memcpy(packet_tail, s, 32); consumer(); }
+N void shallow_case(char *s) { memcpy(packet_tail, s, 32); shallow(); }
+N void neighbour_case(char *s) { memcpy(packet_tail, s, 32); other_reader(); }
+N void before_case(char *s) { reader(); memcpy(tracked, s, 64); }
+N void after_case(char *s) { memcpy(tracked, s, 64); reader(); }
+N void loop_case(char *s, int n) { for (int i = 0; i < n; i++) { reader(); memcpy(tracked, s, 64); } }
+N void offset_case(char *s) { memcpy(tracked, s, 64); use_refill(); }
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    switch (argc) {
+    case 2: overlap_case(argv[1]); break;
+    case 3: shallow_case(argv[1]); break;
+    case 4: neighbour_case(argv[1]); break;
+    case 5: before_case(argv[1]); break;
+    case 6: after_case(argv[1]); break;
+    case 7: offset_case(argv[1]); break;
+    default: loop_case(argv[1], argc); break;
+    }
+    return 0;
+}
+"""
+
+
+def test_global_continuation_symbol_overlap_offsets_and_order(tmp_path, shared_bn):
+    """Round-10 review C1, M1 and M2 on a real stripped build.
+
+    C1: `.set packet_tail, packet + 64` gives one buffer two symbols, so a
+    copy of `packet[0..112)` reads bytes a write to `packet_tail` put there
+    while naming the other symbol. The access SPAN is what decides: a read
+    that stops short of them, or one of a different object, stays silent.
+    M1: a pointer handed back by `fgets` carries its displacement in the SSA
+    chain, not in the instruction -- `system(p + 8)` is a read at +8.
+    M2: a call that runs BEFORE the only write carries nothing; a loop's
+    back edge still does.
+    """
+    src = tmp_path / "r3overlap.c"
+    src.write_text(_OVERLAP_SRC)
+    binary = tmp_path / "r3overlap"
+    _compile(src, binary, ["-fno-builtin", "-fno-inline", "-fno-stack-protector", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # C1: the overlapping read of the enclosing symbol is a consumer
+    result, leaves = gmc("overlap_case")
+    [leaf] = leaves
+    assert [r["display_name"] for r in leaf["references"]] == ["consumer"], leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # ...and a read that stops short, or reads a different object, is not
+    for fn in ("shallow_case", "neighbour_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+    # M1: the displacement through the returned destination
+    result, leaves = gmc("offset_case")
+    [leaf] = leaves
+    assert leaf["references"][0]["offset"] == 8, leaf
+    assert leaf["references"][0]["offset_known"] is True, leaf
+
+    # M2: before the write is silent; after it, and round a loop, is not
+    result, leaves = gmc("before_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    for fn in ("after_case", "loop_case"):
+        result, leaves = gmc(fn)
+        assert [r["display_name"] for r in leaves[0]["references"]] == ["reader"], fn
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn

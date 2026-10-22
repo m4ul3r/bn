@@ -178,6 +178,7 @@ def test_keyable_global_copy_into_zero_arg_consumer_emits_continuation(models):
     assert leaf["references"] == [{"name": "run_hook", "display_name": "run_hook",
                                    "address": hex(hook.start), "at": hex(0x401210),
                                    "access": "call_arg", "offset": 0,
+                                   "offset_known": True,
                                    "seed": "arg:system:0"}]
     assert leaf["reachability"]["status"] == "complete"
     assert leaf["call_descended"] is False
@@ -850,7 +851,7 @@ def test_a_mixed_write_then_read_reference_is_a_consumer(models):
     assert leaf["references"][0] == {
         "name": "overwrite_then_run", "display_name": "overwrite_then_run",
         "address": hex(0x401200), "at": hex(0x401218), "access": "call_arg",
-        "offset": 0, "seed": "arg:system:0"}
+        "offset": 0, "offset_known": True, "seed": "arg:system:0"}
 
 
 
@@ -1029,7 +1030,8 @@ def test_an_unanalysed_in_binary_consumer_is_disclosed(models):
     # -- marked `unreadable`, so the prose says "may read", never "reads".
     assert leaf["references"] == [{"name": "huge_reader", "display_name": "huge_reader",
                                    "address": hex(0x401200), "at": hex(0x401210),
-                                   "access": "unreadable", "offset": 0, "seed": None}], leaf
+                                   "access": "unreadable", "offset": 0,
+                                   "offset_known": True, "seed": None}], leaf
     assert "may read" in leaf["detail"]
     assert leaf["reachability"]["cause"] == "unread_callee_body"
     assert leaf["reachability"]["status"] == "truncated"
@@ -2615,3 +2617,173 @@ def test_an_unfinished_scan_is_not_rendered_as_a_reader(models, monkeypatch):
     assert "may be read by" in row, row
     assert "(read by" not in row, row
     assert " reads (" not in result["diagnostics"]["next_action"]
+
+
+# --------------------------------------------------------------------------
+# round-10 review C1: a named symbol can be the INTERIOR of one object
+# --------------------------------------------------------------------------
+
+G_TAIL = G_DIR + 64     # `.set packet_tail, packet + 64`
+
+
+def _spanning_reader(name, start, from_addr, length, at=0x401210):
+    """`memcpy(local, from_addr, length)` -- a read whose SPAN is known."""
+    local = FSSA(FVar("local"), 1)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", f"memcpy(&local, {hex(from_addr)}, {length})",
+               writes=[local], dest=_gptr(MEMCPY),
+               params=[_var(local), _gptr(from_addr), _const(length)]),
+    ]), params=[])
+
+
+def _overlap_program(read_len, read_from=G_DIR, objects=None):
+    """Write 32 bytes into the tail symbol, then call a reader of the base."""
+    consumer = _spanning_reader("consumer", 0x401200, read_from, read_len)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_TAIL),
+        call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(32)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "consumer"},
+                   funcs={0x401200: consumer},
+                   # BN records the writer's own reference to the tail
+                   # symbol, exactly as it does for the real fixture.
+                   refs={read_from: [FRef(consumer, 0x401210)],
+                         # BN records the writer's own reference to the tail
+                         # symbol, exactly as it does for the real fixture.
+                         G_TAIL: [FRef(func, 0x401104)]},
+                   objects=objects if objects is not None else {
+                       G_DIR: 0, G_TAIL: 0, G_OTHER: 0},
+                   section=(0x404000, 0x405000))
+    return func, bv
+
+
+def test_an_overlapping_read_of_the_enclosing_symbol_blocks(models):
+    # Round-10 review C1: `.set packet_tail, packet + 64` gives one buffer
+    # two symbols. A copy of `packet[0..112)` reads the bytes a write to
+    # `packet_tail` put there, but it names the OTHER symbol -- so neither
+    # the reference sweep nor the classifier saw it and the run cleared.
+    func, bv = _overlap_program(112)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "consumer", leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert leaf["references"][0]["offset"] == 0, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_read_of_the_neighbour_that_stops_short_is_silent(models):
+    # The discriminator is the access SPAN, not the adjacency: a read of the
+    # first 16 bytes of the preceding symbol never reaches these bytes.
+    func, bv = _overlap_program(16)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_reader_of_an_unrelated_object_is_not_an_overlap(models):
+    func, bv = _overlap_program(112, read_from=G_OTHER)
+    assert _leaves(_forward(bv, func, models)) == []
+
+
+# --------------------------------------------------------------------------
+# round-10 review M1: the displacement through a returned pointer
+# --------------------------------------------------------------------------
+
+def test_a_returned_destination_reports_the_offset_it_is_read_at(models):
+    # `p = fgets(g, 2, ..); system(p + 8)` is a read at +8. The literal scan
+    # looks at the INSTRUCTION, where that displacement is not written down,
+    # and reported 0 -- which reads as "the base".
+    func, bv = _fgets_program(consume=True)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["offset"] == 8, leaf
+    assert leaf["references"][0]["offset_known"] is True, leaf
+
+
+def test_an_offset_through_a_wrapper_chain_is_resolved(models):
+    # ...and through a chain of returning wrappers, where the pointer and
+    # its displacement are two hops apart.
+    inner = _ret_helper("reset_ret", 0x401200)
+    relay = _relay("relay", 0x401400, 0x401200)
+    relay.callees = [inner]
+    consumer = _reads_offset("use_ret", 0x401300, 0x401400)
+    consumer.callees = [relay]
+    func, bv = _chain_program([inner, relay], consumer, inner)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["offset"] == 8, leaf
+    assert leaf["references"][0]["offset_known"] is True, leaf
+
+
+def test_an_unresolved_displacement_is_not_reported_as_the_base(models,
+                                                                monkeypatch):
+    # A displacement this scan cannot establish is UNKNOWN. Rendering it as
+    # 0 conflates it with a read of the object's first byte.
+    monkeypatch.setattr(te.TaintEngine, "_global_ptr_offset",
+                        lambda *a, **k: None)
+    func, bv = _fgets_program(consume=True)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["offset_known"] is False, leaf
+    assert "(+?)" in formatters._render_leaf_line(leaf)
+
+
+# --------------------------------------------------------------------------
+# round-10 review M2: a call BEFORE the write carries nothing
+# --------------------------------------------------------------------------
+
+class FBlock:
+    def __init__(self, start, end, edges=()):
+        self.start, self.end = start, end
+        self.outgoing_edges = [type("E", (), {"target": t})() for t in edges]
+
+
+def _before_after_program(order, blocks=None):
+    """`reader()` and the tainting copy, in the requested order."""
+    hook = _reader("reader", 0x401200, G_DIR, 0x401210)
+    argv = FVar("argv")
+    argv0 = FSSA(argv, 0)
+    copy = FInstr(0, 0x401104, "MLIL_CALL_SSA", "memcpy(g, argv#0, 0x40)",
+                  reads=[argv0], dest=_gptr(MEMCPY),
+                  params=[_gptr(G_DIR), _var(argv0), _const(0x40)])
+    call = FInstr(1, 0x401108, "MLIL_CALL_SSA", "reader()",
+                  dest=_gptr(0x401200), params=[])
+    instrs = [copy, call] if order == "after" else [call, copy]
+    for i, ins in enumerate(instrs):
+        ins.instr_index = i
+    ssaf = FSSAFunc(instrs)
+    if blocks is not None:
+        ssaf.basic_blocks = blocks
+    func = GFunc("main", 0x401100, ssaf, params=[argv])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader"},
+                   funcs={0x401200: hook}, refs={G_DIR: [FRef(hook, 0x401210)]})
+    return func, bv
+
+
+def test_a_call_before_the_only_write_carries_nothing(models):
+    # Round-10 review M2: `reader(); memcpy(g, s, 64);` has no path from the
+    # write back to the reader, yet the fixpoint kept the global live across
+    # passes and attached a proven-read continuation to the EARLIER call.
+    func, bv = _before_after_program("before", blocks=[FBlock(0, 2)])
+    result = _forward(bv, func, models, source="param:0")
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_call_after_the_write_still_blocks(models):
+    func, bv = _before_after_program("after", blocks=[FBlock(0, 2)])
+    [leaf] = _leaves(_forward(bv, func, models, source="param:0"))
+    assert leaf["references"][0]["display_name"] == "reader", leaf
+
+
+def test_a_loop_back_edge_reaches_the_earlier_call(models):
+    # The write is textually later, but the loop's back edge carries those
+    # bytes round to the reader on the next iteration.
+    block = FBlock(0, 2)
+    block.outgoing_edges = [type("E", (), {"target": block})()]
+    func, bv = _before_after_program("before", blocks=[block])
+    [leaf] = _leaves(_forward(bv, func, models, source="param:0"))
+    assert leaf["references"][0]["display_name"] == "reader", leaf
+
+
+def test_without_a_cfg_the_walk_claims_nothing(models):
+    # A view that cannot answer "is there a path" must not be read as "no".
+    func, bv = _before_after_program("before")
+    assert _leaves(_forward(bv, func, models, source="param:0")) != []
