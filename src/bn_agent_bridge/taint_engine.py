@@ -5671,11 +5671,18 @@ class TaintEngine:
         span = offset + int(n)
         if span > int(self._global_write_span.get(ga) or 0):
             self._global_write_span[ga] = span
-            # The extent is memoised, and this is new evidence about it.
+            # The extent is memoised, and this is new evidence about it --
+            # for THIS object only. Clearing every cached sweep and
+            # classification instead made each new global write re-derive the
+            # whole program's reachability, which is quadratic on a binary
+            # that fills several globals in a row.
             self._global_extent_cache.pop(ga, None)
             self._global_refs.pop(ga, None)
-            self._global_reach.clear()
-            self._global_access_cache.clear()
+            self._global_extent_unproven.discard(ga)
+            for key in [k for k in self._global_reach if k[1] == ga]:
+                del self._global_reach[key]
+            for key in [k for k in self._global_access_cache if k[1] == ga]:
+                del self._global_access_cache[key]
 
     def _global_use_offset(self, expr: Any, ga: int) -> int:
         """Byte offset INSIDE the global at *ga* that *expr* names, else 0.
