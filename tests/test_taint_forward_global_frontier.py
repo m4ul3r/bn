@@ -2867,20 +2867,19 @@ def test_a_read_of_unstated_length_cannot_be_ruled_out(models, make, name):
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
-def test_a_neighbour_with_a_gap_is_not_this_objects_storage(models):
-    # The preceding object ends well before this one begins, so no write
-    # here can have landed in it.
-    consumer = _unbounded_reader("far", 0x401200, G_DIR)
-    func, _argv = _copy_then_call(
-        0x401104, MEMCPY, _gptr(G_OTHER),
-        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(32)])
-    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "far"},
-                   funcs={0x401200: consumer},
-                   refs={G_DIR: [FRef(consumer, 0x401210)],
-                         G_OTHER: [FRef(func, 0x401104)]},
-                   objects={G_DIR: 16, G_OTHER: 16},
-                   section=(0x404000, 0x405000))
-    assert _leaves(_forward(bv, func, models)) == []
+def test_a_recovered_type_never_proves_where_an_object_ends(models):
+    # Round-12 review F26: BN sizes an initialised buffer from the bytes it
+    # can see -- `char init_packet[128] = "seed"` comes back `char[0x5]` --
+    # so a recovered width is a LOWER bound on the object, exactly as
+    # `_global_extent` already treats it. Reading it as the object's END let
+    # an initialised enclosing object disown its own interior alias.
+    func, bv = _interval_program(
+        _spanning_reader("init_reader", 0x401200, G_DIR, 112))
+    bv._objects[G_DIR] = 5          # the initialised prefix, not the object
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "init_reader", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 # --------------------------------------------------------------------------
@@ -3052,3 +3051,168 @@ def test_an_object_in_another_section_is_never_this_objects_storage(models):
                          G_TAIL: [FRef(func, 0x401104)]},
                    objects={G_DIR: 0, G_TAIL: 0}, section=(G_TAIL, 0x405000))
     assert _leaves(_forward(bv, func, models)) == []
+
+
+# --------------------------------------------------------------------------
+# round-12 review F24: every tainting site, not just the first
+# --------------------------------------------------------------------------
+
+def _two_write_program(order=("write", "write_read")):
+    """Two mutually exclusive branches, each writing the global; one of them
+    also calls the reader."""
+    hook = _reader("reader", 0x401200, G_DIR, 0x401210)
+    argv = FVar("argv")
+    argv0 = FSSA(argv, 0)
+
+    def write(idx, addr, length):
+        return FInstr(idx, addr, "MLIL_CALL_SSA",
+                      f"memcpy(g, argv#0, {length})", reads=[argv0],
+                      dest=_gptr(MEMCPY),
+                      params=[_gptr(G_DIR), _var(argv0), _const(length)])
+    instrs = [FInstr(0, 0x401100, "MLIL_IF", "if (flag) then 1 else 3")]
+    blocks = [FBlock(0, 1)]
+    idx = 1
+    starts = []
+    for arm in order:
+        starts.append(idx)
+        instrs.append(write(idx, 0x401100 + idx * 8,
+                            16 if arm == "write_read" else 64))
+        idx += 1
+        if arm == "write_read":
+            instrs.append(FInstr(idx, 0x401100 + idx * 8, "MLIL_CALL_SSA",
+                                 "reader()", dest=_gptr(0x401200), params=[]))
+            idx += 1
+        blocks.append(FBlock(starts[-1], idx))
+    instrs.append(FInstr(idx, 0x401100 + idx * 8, "MLIL_RET", "return"))
+    tail = FBlock(idx, idx + 1)
+    for i, ins in enumerate(instrs):
+        ins.instr_index = i
+    blocks[0].outgoing_edges = [type("E", (), {"target": b})()
+                                for b in blocks[1:]]
+    for b in blocks[1:]:
+        b.outgoing_edges = [type("E", (), {"target": tail})()]
+    ssaf = FSSAFunc(instrs)
+    ssaf.basic_blocks = blocks + [tail]
+    func = GFunc("main", 0x401100, ssaf, params=[argv])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader"},
+                   funcs={0x401200: hook}, refs={G_DIR: [FRef(hook, 0x401210)]})
+    return func, bv
+
+
+@pytest.mark.parametrize("order", [("write_read", "write"), ("write", "write_read")])
+def test_a_later_write_on_the_readers_own_branch_still_blocks(models, order):
+    # Round-12 review F24: recording only the FIRST write let a mutually
+    # exclusive branch's write -- which cannot reach the reader -- hide the
+    # write on the reader's own branch, which obviously does.
+    func, bv = _two_write_program(order)
+    [leaf] = _leaves(_forward(bv, func, models, source="param:0"))
+    assert leaf["references"][0]["display_name"] == "reader", leaf
+
+
+def test_a_write_on_the_other_branch_alone_stays_silent(models):
+    # The control from round 11 still holds: with no write on the reader's
+    # path, nothing reaches it.
+    func, bv = _branch_program()
+    assert _leaves(_forward(bv, func, models, source="param:0")) == []
+
+
+# --------------------------------------------------------------------------
+# round-12 review F25: enumerate the whole alias chain
+# --------------------------------------------------------------------------
+
+def test_many_alias_symbols_do_not_hide_the_base_reader(models):
+    # Round-12 review F25: `mid1`, `mid2`, `mid3` and `tail` all name the
+    # inside of one object. A fixed two-predecessor search stopped at the
+    # third alias and never reached the object whose base is read.
+    aliases = {G_DIR: 0, G_DIR + 16: 0, G_DIR + 32: 0, G_DIR + 48: 0,
+               G_TAIL: 0, G_OTHER: 0}
+    consumer = _spanning_reader("base_reader", 0x401200, G_DIR, 112)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_TAIL),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(32)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "base_reader"},
+                   funcs={0x401200: consumer},
+                   refs={G_DIR: [FRef(consumer, 0x401210)],
+                         G_TAIL: [FRef(func, 0x401104)]},
+                   objects=aliases, section=(0x404000, 0x405000))
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["display_name"] == "base_reader", leaf
+
+
+def test_an_exhausted_alias_search_is_disclosed(models, monkeypatch):
+    # The search is bounded, and reaching the bound means a plausible
+    # enclosing object was never examined -- which is disclosed, not
+    # answered as "nothing encloses it".
+    monkeypatch.setattr(te.TaintEngine, "_ALIAS_HOPS", 1)
+    aliases = {G_DIR: 0, G_DIR + 16: 0, G_DIR + 32: 0, G_TAIL: 0, G_OTHER: 0}
+    consumer = _spanning_reader("base_reader", 0x401200, G_DIR, 112)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_TAIL),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(32)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "base_reader"},
+                   funcs={0x401200: consumer},
+                   refs={G_DIR: [FRef(consumer, 0x401210)],
+                         G_TAIL: [FRef(func, 0x401104)]},
+                   objects=aliases, section=(0x404000, 0x405000))
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["reachability"]["cause"] == "object_extent_unproven", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+# --------------------------------------------------------------------------
+# round-12 review F27: the offset lattice
+# --------------------------------------------------------------------------
+
+def _phi_offsets(models, left, right):
+    """`p = flag ? g + left : g + right; system(p)` -- the offset of p."""
+    eng = te.TaintEngine(FGlobalBV({}), models)
+    a, b, merged = FSSA(FVar("a"), 1), FSSA(FVar("b"), 1), FSSA(FVar("m"), 1)
+
+    def arm(ssa, addr, delta):
+        if delta is None:        # a volatile load: no constant at all
+            return FInstr(0, addr, "MLIL_SET_VAR_SSA", "x = g + sel",
+                          writes=[ssa],
+                          src=FExpr("MLIL_ADD", "g + sel", left=_gptr(G_DIR),
+                                    right=FExpr("MLIL_LOAD_SSA", "[sel]",
+                                                src=_gptr(G_OTHER))))
+        return FInstr(0, addr, "MLIL_SET_VAR_SSA", f"x = g + {delta}",
+                      writes=[ssa],
+                      src=FExpr("MLIL_ADD", f"g + {delta}", left=_gptr(G_DIR),
+                                right=_const(delta)))
+    ssaf = FSSAFunc([
+        arm(a, 0x401200, left), arm(b, 0x401208, right),
+        FInstr(2, 0x401210, "MLIL_VAR_PHI", "m#1 = phi(a#1, b#1)",
+               reads=[a, b], writes=[merged], src=[_var(a), _var(b)]),
+    ])
+    return eng._global_ptr_offset(ssaf, _var(merged), G_DIR)
+
+
+def test_phi_arms_that_agree_have_that_offset(models):
+    assert _phi_offsets(models, 8, 8) == 8
+
+
+@pytest.mark.parametrize("left,right", [(8, 24), (8, None)])
+def test_phi_arms_that_disagree_or_are_unknown_are_not_known(models, left, right):
+    # Round-12 review F27: `{+8, +24}` and `{+8, unknown}` are both UNKNOWN.
+    # Sharing one cycle state across the arms made a revisited arm answer
+    # "nothing here", which was then dropped and read as agreement.
+    assert _phi_offsets(models, left, right) is None
+
+
+def test_a_wrapper_returning_two_displacements_has_neither(models):
+    # `char *choose(char *p, int f) { if (f) return p + 8; return p + 24; }`
+    p, flag = FVar("p"), FVar("f")
+    p0 = FSSA(p, 0)
+
+    def ret(idx, addr, delta):
+        return FInstr(idx, addr, "MLIL_RET", f"return p#0 + {delta}",
+                      reads=[p0],
+                      src=[FExpr("MLIL_ADD", f"p#0 + {delta}", left=_var(p0),
+                                 right=_const(delta))])
+    helper = GFunc("choose", 0x401200, FSSAFunc([
+        FInstr(0, 0x401200, "MLIL_IF", "if (f)"), ret(1, 0x401208, 8),
+        ret(2, 0x401210, 24)]), params=[p, flag])
+    eng = te.TaintEngine(FGlobalBV({0x401200: "choose"},
+                                   funcs={0x401200: helper}), models)
+    assert eng._fn_returned_param_offset(helper, 0) is None

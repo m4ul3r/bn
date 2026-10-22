@@ -421,7 +421,8 @@ class TaintEngine:
         self._canon_global_cache: dict[int, int | None] = {}
         self._global_keyed_offsets: dict[int, set[int]] = {}
         self._global_write_span: dict[int, int] = {}
-        self._global_tainted_ranges: dict[int, list[tuple[int, int]]] = {}
+        self._global_tainted_ranges: dict[int, list[tuple]] = {}
+        self._alias_chain_cache: dict[int, tuple] = {}
         self._global_extent_unproven: set[int] = set()
         self._ssa_def_cache: dict[tuple, Any] = {}
         self._returned_params_cache: dict[int, tuple] = {}
@@ -5685,15 +5686,19 @@ class TaintEngine:
         length = self._model_len_index(model)
         n = None if length is None else self._int_const(params[length]) \
             if length < len(params) else None
+        # The bytes this copy made tainted, as an interval of the object: an
+        # overlap test on intervals is what tells a read that reaches them
+        # from one that stops short (round-11 review F21). A length nothing
+        # states makes the interval UNBOUNDED -- `memcpy(g, s, n)` may have
+        # filled everything after its destination, and claiming it stopped
+        # at the one length that WAS constant is the clearing direction.
+        ranges = self._global_tainted_ranges.setdefault(ga, [])
+        interval = (offset, None if n is None or int(n) <= 0 else offset + int(n))
+        if interval not in ranges:
+            ranges.append(interval)
         if n is None or int(n) <= 0:
             return
         span = offset + int(n)
-        # The bytes this copy made tainted, as an interval of the object:
-        # an overlap test on intervals is what tells a read that reaches
-        # them from one that stops short (round-11 review F21).
-        ranges = self._global_tainted_ranges.setdefault(ga, [])
-        if (offset, span) not in ranges:
-            ranges.append((offset, span))
         if span > int(self._global_write_span.get(ga) or 0):
             self._global_write_span[ga] = span
             # The extent is memoised, and this is new evidence about it --
@@ -6607,11 +6612,7 @@ class TaintEngine:
             srcs = getattr(defn, "src", None)
             if not isinstance(srcs, (list, tuple)):
                 srcs = [] if srcs is None else [srcs]
-            # A PHI merges several arms: one displacement only if they agree.
-            answers = {self._ptr_offset(ssaf, src, root, depth + 1, seen)
-                       for src in srcs}
-            answers.discard(None)
-            return answers.pop() if len(answers) == 1 else None
+            return self._merge_offsets(ssaf, srcs, root, depth, seen)
         if any(tok in opn for tok in ("ADD", "SUB")):
             left, right = getattr(expr, "left", None), getattr(expr, "right", None)
             sign = -1 if "SUB" in opn else 1
@@ -6634,6 +6635,33 @@ class TaintEngine:
             got = self._ptr_offset(ssaf, one, root, depth + 1, seen)
             if got is not None:
                 return got
+        return None
+
+    def _merge_offsets(self, ssaf: Any, arms: list, root: Any, depth: int,
+                       seen: set) -> int | None:
+        """The displacement a MERGE of *arms* carries, as a lattice join.
+
+        Exact only when every FEASIBLE arm -- one that can hold this pointer
+        at all -- resolves, and they all resolve to the SAME displacement.
+        An arm this walk cannot resolve, or one that disagrees, makes the
+        answer unknown (round-12 review F27). Each arm gets its own cycle
+        state: sharing one made a revisited arm answer "nothing here", which
+        was then dropped and read as agreement."""
+        def feasible(arm: Any) -> bool:
+            return self._ptr_resolves(ssaf, arm, lambda e: root(e) is not None)
+
+        answers: set[int] = set()
+        for arm in arms:
+            if len(arms) > 1 and not feasible(arm):
+                continue        # this arm cannot be the pointer at all
+            got = self._ptr_offset(ssaf, arm, root, depth + 1, set(seen))
+            if got is None:
+                if len(arms) == 1 or feasible(arm):
+                    return None
+                continue
+            answers.add(got)
+        if len(answers) == 1:
+            return answers.pop()
         return None
 
     def _call_offset(self, ssaf: Any, defn: Any, root: Any, depth: int,
@@ -6722,14 +6750,16 @@ class TaintEngine:
             self._return_offset_active.discard(key)
             return None
         try:
-            for ins in instrs:
-                if "RET" not in op_name(ins):
-                    continue
-                for src in self._ret_sources(ins):
-                    got = self._ptr_offset(ssaf, src, root, depth + 1)
-                    if got is not None:
-                        return got
-            return None
+            # EVERY return that can carry this pointer, joined: a wrapper
+            # returning `p + 8` on one path and `p + 24` on another has no
+            # single displacement, and taking the first one reported a
+            # certainty it did not have (round-12 review F27).
+            arms = [src for ins in instrs if "RET" in op_name(ins)
+                    for src in self._ret_sources(ins)
+                    if self._ptr_resolves(ssaf, src, lambda e: root(e) is not None)]
+            if not arms:
+                return None
+            return self._merge_offsets(ssaf, arms, root, depth, set())
         finally:
             self._return_offset_active.discard(key)
 
@@ -6816,20 +6846,39 @@ class TaintEngine:
             wave = nxt
         return False
 
-    def _preceding_objects(self, ga: int, hops: int = 2) -> list[int]:
-        """The nearest symbolled objects that START BEFORE *ga*.
+    # How far back an enclosing object may begin, and how many symbolled
+    # predecessors the search will walk to find it. An alias/subobject names
+    # the inside of ONE object, so the window is the object's own plausible
+    # size; exhausting the hop budget is DISCLOSED, never answered as "no
+    # enclosing object" (round-12 review F25).
+    _ALIAS_WINDOW = 1 << 20
+    _ALIAS_HOPS = 64
+
+    def _preceding_objects(self, ga: int) -> tuple[list[int], bool]:
+        """``(candidate enclosing objects, budget exhausted)`` for *ga*.
 
         A symbol is not proof of a separate object: `.set tail, packet + 64`
-        names the INTERIOR of one (round-10 review C1). Those neighbours are
-        where an overlapping access to this object's bytes comes from."""
+        names the INTERIOR of one. Several aliases may name the same object
+        -- `mid1`, `mid2`, `mid3`, `tail` all inside `packet` -- so the
+        search walks the whole CONTIGUOUS run of symbolled predecessors in
+        the same section rather than a fixed couple of hops, which hid the
+        base reader behind the fourth alias (round-12 review F25)."""
+        cached = self._alias_chain_cache.get(ga)
+        if cached is not None:
+            return cached
         prev = getattr(self.bv, "get_previous_data_var_before", None)
         getsym = getattr(self.bv, "get_symbol_at", None)
         if not callable(prev) or not callable(getsym):
-            return []
-        out: list[int] = []
+            out: tuple = ([], False)
+            self._alias_chain_cache[ga] = out
+            return out
+        section = self._section_names(ga)
+        found: list[int] = []
+        exhausted = False
         at = int(ga)
-        for _ in range(64):
-            if len(out) >= hops:
+        for _ in range(self._ALIAS_HOPS * 4):
+            if len(found) >= self._ALIAS_HOPS:
+                exhausted = True
                 break
             try:
                 got = prev(at)
@@ -6839,11 +6888,19 @@ class TaintEngine:
             if addr is None or int(addr) >= at:
                 break
             at = int(addr)
+            if ga - at > self._ALIAS_WINDOW:
+                break           # too far back to be this object's own start
             try:
-                if getsym(at) is not None:
-                    out.append(at)
+                named = getsym(at)
             except Exception:
                 break
+            if named is None:
+                continue        # a bare interior variable BN invented
+            if self._section_names(at) != section:
+                break           # another section is another object
+            found.append(at)
+        out = (found, exhausted)
+        self._alias_chain_cache[ga] = out
         return out
 
     def _section_names(self, addr: int) -> tuple:
@@ -6872,9 +6929,9 @@ class TaintEngine:
         """The byte intervals of the object at *ga* this run has tainted,
         absolute. Falls back to the whole object when no copy named a
         length -- claiming less than was written is the wrong direction."""
-        ranges = [(ga + lo, ga + hi)
+        ranges = [(ga + lo, None if hi is None else ga + hi)
                   for lo, hi in (self._global_tainted_ranges.get(ga) or ())
-                  if hi > lo]
+                  if hi is None or hi > lo]
         return ranges or [(ga, ga + self._global_extent(ga))]
 
     def _overlap_access(self, fn: Any, ssaf: Any, ga: int) -> Any:
@@ -6894,24 +6951,21 @@ class TaintEngine:
         gap after it is not storage this write can have reached."""
         tainted = self._tainted_ranges(ga)
         start = int(getattr(fn, "start", 0))
-        for pb in self._preceding_objects(ga):
+        candidates, exhausted = self._preceding_objects(ga)
+        if exhausted:
+            # The enumeration stopped with plausible enclosing objects
+            # unexamined, so "nothing encloses it" was never established.
+            self._global_extent_unproven.add(ga)
+        for pb in candidates:
             if start not in self._global_ref_functions(pb):
                 continue        # this body does not touch that object at all
-            if pb + self._global_extent(pb) < ga:
-                continue        # not even adjacent: separate storage
-            if self._section_names(pb) != self._section_names(ga):
-                # Two different sections are two different objects: an
-                # alias/subobject shares its enclosing object's storage by
-                # construction.
-                continue
-            typed = self._typed_width(pb)
-            if typed and pb + typed <= ga:
-                # A RECOVERED TYPE is an answer about where that object
-                # ends: this one begins past it, so they are separate
-                # storage and no write here can have landed in it. An
-                # untyped neighbour says nothing, and an alias symbol inside
-                # one is exactly the case that must still be considered.
-                continue
+            # NOTE: the recovered type is NOT consulted here. BN sizes an
+            # initialised buffer from the bytes it can see -- `char
+            # init_packet[128] = "seed"` comes back `char[0x5]` -- so a type
+            # is a LOWER bound on the object and can never prove where it
+            # ends (round-12 review F26, the same rule `_global_extent`
+            # applies). Separation is established by SECTION and by the
+            # interval test below, never by a width BN inferred.
             uses: list = []
             self._pointer_access(
                 fn, self._global_base(ssaf, pb), fallback=None,
@@ -6930,7 +6984,7 @@ class TaintEngine:
                 else:
                     lo, hi, bounded = pb, None, False
                 for tlo, thi in tainted:
-                    if lo >= thi:
+                    if thi is not None and lo >= thi:
                         continue
                     if hi is not None and hi <= tlo:
                         continue
@@ -7420,17 +7474,20 @@ class TaintEngine:
                 assumptions.append(msg)
 
         def taint_node(node: tuple, label: str, ins: Any, reason: str, parents: list[tuple]) -> bool:
+            key = node[0]
+            if type(key) is tuple and len(key) == 2 and key[0] == "global" \
+                    and ins is not None:
+                # EVERY site, deduped -- INCLUDING a write to a global this
+                # run has already tainted. Recording only the first one let a
+                # mutually exclusive earlier write hide the later write that
+                # actually reaches the reader (round-12 review F24), so this
+                # runs before the already-tainted early return.
+                live_global_sites.setdefault(int(key[1]), set()).add(ins_key(ins))
             if node in tainted:
                 return False
             tainted.add(node)
-            key = node[0]
             if type(key) is tuple and len(key) == 2 and key[0] == "global":
                 live_globals.setdefault(int(key[1]), node)
-                if ins is not None:
-                    # EVERY site: a call reachable from a later write but not
-                    # from the first one is still carrying those bytes.
-                    live_global_sites.setdefault(int(key[1]), set()).add(
-                        ins_key(ins))
             why[node] = {"label": label, "instr": ins, "reason": reason, "parents": list(parents)}
             return True
 

@@ -2713,3 +2713,115 @@ def test_global_continuation_symbol_overlap_offsets_and_order(tmp_path, shared_b
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
         assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+
+_VARIANTS_SRC = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline))
+char packet[256];
+extern char mid1[240], mid2[224], mid3[208], tail[192];
+__asm__(".globl mid1\n.set mid1,packet+16\n.type mid1,@object\n.size mid1,240\n"
+        ".globl mid2\n.set mid2,packet+32\n.type mid2,@object\n.size mid2,224\n"
+        ".globl mid3\n.set mid3,packet+48\n.type mid3,@object\n.size mid3,208\n"
+        ".globl tail\n.set tail,packet+64\n.type tail,@object\n.size tail,192\n");
+char init_packet[128] = "seed";
+extern char init_tail[64];
+__asm__(".globl init_tail\n.set init_tail,init_packet+64\n.type init_tail,@object\n.size init_tail,64\n");
+char tracked[128] = "seed";
+char clean[128];
+volatile int selector;
+N void base_reader(void) { char local[112]; memcpy(local, packet, 112); system(local + 80); }
+N void init_reader(void) { char local[112]; memcpy(local, init_packet, 112); system(local + 80); }
+N void reader(void) { system(tracked); }
+N void different_reader(void) { system(clean); }
+N char *refill(void) { return fgets(tracked, 2, stdin); }
+N char *choose_return(char *p, int flag) { if (flag) return p + 8; return p + 24; }
+N char *producer_choices(void) { return choose_return(refill(), selector); }
+N void use_producer_choices(void) { char *p = producer_choices(); system(p); }
+N void literal_phi(void) { char *p; if (selector) p = tracked + 8; else p = tracked + selector; system(p); }
+N void separate_phi(void) { char *p; if (selector) p = tracked + 8; else p = tracked + 24; system(p); }
+N void many_aliases(char *s) { memcpy(tail, s, 32); base_reader(); }
+N void initialized_alias(char *s) { memcpy(init_tail, s, 32); init_reader(); }
+N void earlier_branch_write(char *s, int flag) { if (flag) { memcpy(tracked, s, 16); reader(); } else { memcpy(tracked, s, 64); } }
+N void later_branch_write(char *s, int flag) { if (flag) { memcpy(tracked, s, 16); } else { memcpy(tracked, s, 64); reader(); } }
+N void disjoint(char *s, int flag) { if (flag) reader(); else memcpy(tracked, s, 64); }
+N void loop_continue(char *s, int n) { for (int i = 0; i < n; i++) { if (i & 1) { reader(); continue; } memcpy(tracked, s, 64); } }
+N void different_case(char *s) { memcpy(tracked, s, 64); different_reader(); }
+N void producer_choices_case(char *s) { memcpy(tracked, s, 64); use_producer_choices(); }
+N void literal_phi_case(char *s) { memcpy(tracked, s, 64); literal_phi(); }
+N void separate_phi_case(char *s) { memcpy(tracked, s, 64); separate_phi(); }
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    selector = argc;
+    memset(packet, 'A', 64);
+    switch (argc) {
+    case 2: many_aliases(argv[1]); break;
+    case 3: initialized_alias(argv[1]); break;
+    case 4: earlier_branch_write(argv[1], argc); break;
+    case 5: later_branch_write(argv[1], argc); break;
+    case 6: disjoint(argv[1], argc); break;
+    case 7: loop_continue(argv[1], argc); break;
+    case 8: different_case(argv[1]); break;
+    case 9: producer_choices_case(argv[1]); break;
+    case 10: literal_phi_case(argv[1]); break;
+    default: separate_phi_case(argv[1]); break;
+    }
+    return 0;
+}
+"""
+
+
+def test_global_continuation_alias_chains_write_sites_and_ambiguity(tmp_path,
+                                                                    shared_bn):
+    """Round-12 review F24, F25, F26 and F27 on a real stripped build.
+
+    F24: every tainting site is kept, so a mutually exclusive EARLIER write
+    cannot hide the write on the reader's own branch.
+    F25: four `.set` aliases name the inside of one object; the search walks
+    the whole chain rather than a fixed couple of predecessors.
+    F26: BN sizes `char init_packet[128] = "seed"` as `char[0x5]` -- a LOWER
+    bound on the object, never proof of where it ends.
+    F27: a displacement is exact only when every feasible path agrees."""
+    src = tmp_path / "r3variants.c"
+    src.write_text(_VARIANTS_SRC)
+    binary = tmp_path / "r3variants"
+    _compile(src, binary, ["-fno-builtin", "-fno-inline", "-fno-stack-protector", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # F25 / F26: the enclosing object's reader is found through four aliases,
+    # and an initialised prefix type does not disown the object's interior.
+    for fn, who in (("many_aliases", "base_reader"),
+                    ("initialized_alias", "init_reader")):
+        result, leaves = gmc(fn)
+        assert any(r["display_name"] == who
+                   for lf in leaves for r in lf["references"]), (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # F24: a write on the reader's own branch blocks whichever branch it is
+    for fn in ("earlier_branch_write", "later_branch_write", "loop_continue"):
+        result, leaves = gmc(fn)
+        assert any(r["display_name"] == "reader"
+                   for lf in leaves for r in lf["references"]), (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # ...and mutually exclusive branches, or another object, still clear
+    for fn in ("disjoint", "different_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+    # F27: ambiguous displacements are reported as unknown, never as 0
+    for fn in ("literal_phi_case", "separate_phi_case", "producer_choices_case"):
+        result, leaves = gmc(fn)
+        rows = [r for lf in leaves for r in lf["references"]
+                if r["access"] in ("call_arg", "load")]
+        assert rows, (fn, leaves)
+        assert all(r["offset_known"] is False for r in rows), (fn, rows)
