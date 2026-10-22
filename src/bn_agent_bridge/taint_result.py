@@ -585,6 +585,9 @@ def backward_diagnostics(
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
+    # The producer merges each function's reference identities across all
+    # formal demands into one frontier. Reason/example counts are demand
+    # evidence, not additional dropped caller references.
     dropped_callers_n = sum(lf["callers_dropped"] for lf in leaves or []
                             if lf.get("kind") == "caller_sites_truncated")
 

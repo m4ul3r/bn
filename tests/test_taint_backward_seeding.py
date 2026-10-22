@@ -345,3 +345,135 @@ def test_different_opaque_writers_of_one_local_are_distinct_origins():
     assert len(origins) == 2
     assert all(o["function"] == "0xa00" and o["buffer"] == "buffer" for o in origins)
     assert {o["writers"][0]["address"] for o in origins} == {"0xa00", "0xa10"}
+
+
+def _two_formal_caller_query(caller_arguments, *, shared_sink=False, repeat_formal=False,
+                             indirect=(), reverse=False):
+    from test_taint_backward_coverage import _BV
+
+    dst, n, m = (FVar(name, ident=110 + i) for i, name in enumerate(("dst", "n", "m")))
+    n0, m0 = FSSA(n, 0), FSSA(m, 0)
+    operands = ([_var(n0), _var(n0 if repeat_formal else m0)] if not shared_sink else
+                [FExpr("MLIL_ADD", "n + m", reads=[n0, m0])])
+    calls = [_call(i, 0x804 + i * 4, _MEMCPY, [_const(0), _const(0), arg])
+             for i, arg in enumerate(operands)]
+    if reverse:
+        calls.reverse()
+    target = FFunc("top3", 0x800, FSSAFunc(calls), params=[dst, n, m])
+    for i, args in enumerate(caller_arguments):
+        start = 0xa00 + i * 0x100
+        call = _call(0, start + 4, target.start, [_const(0), *args])
+        caller = FFunc(f"caller_{i}", start, FSSAFunc([call]))
+        target.caller_sites.append(FSite(caller, call.address))
+    bv = _BV({**_NAMES, target.start: target.name}, data_refs={target.start: list(indirect)})
+    return target, bv, te.TaintEngine(bv, te.load_models())
+
+
+@pytest.mark.parametrize("shared_sink", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_dropped_references_not_multiplied_by_demanded_formals(shared_sink, reverse):
+    target, bv, engine = _two_formal_caller_query(
+        [(_const(64), _const(32))], shared_sink=shared_sink,
+        indirect=[0x403000], reverse=reverse)
+    # The first formal also ascends through a caller with its own stored-address
+    # boundary, reproducing two distinct dropped references across two functions.
+    external = FVar("external", ident=120)
+    caller = target.caller_sites[0].function
+    caller.parameter_vars = [external]
+    call = caller.mlil.ssa_form.instructions[0]
+    call.params[1] = _var(FSSA(external, 0))
+    call.vars_read = [FSSA(external, 0)]
+    bv._data_refs[caller.start] = [0x403008]
+    result = engine.backward(target, [te.parse_locator("arg:memcpy:2")])
+    leaves = [lf for lf in result["leaves"] if lf["kind"] == "caller_sites_truncated"]
+    assert len(leaves) == 2
+    by_function = {lf["function"]["address"]: lf for lf in leaves}
+    top = by_function["0x800"]
+    assert (top["callers_total"], top["callers_followed"], top["callers_dropped"]) == (2, 1, 1)
+    assert top["reasons"] == {"indirect_reference": 2}
+    assert {(row["address"], row["param"]) for row in top["unfollowed"]} == {
+        ("0x403000", 1), ("0x403000", 2)}
+    assert by_function["0xa00"]["callers_dropped"] == 1
+    assert result["diagnostics"]["frontier"]["dropped_callers"] == 2
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    text = _render_taint_text(result)
+    assert "2 dropped-caller-site(s)" in text
+    rows = [ln for ln in text.splitlines() if "caller_sites_truncated @" in ln]
+    assert len(rows) == 2 and all("[2 leaves]" not in ln for ln in rows)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_caller_coverage_unions_disjoint_and_overlapping_reference_losses(overlap):
+    fixed = FExpr("MLIL_CONST_PTR", "fixed address", constant=0x4000)
+    args = [(fixed, _const(32)), (_const(64), fixed)]
+    if overlap:
+        args.insert(0, (fixed, fixed))
+    args.append((_const(64), _const(32)))
+    target, _, engine = _two_formal_caller_query(args)
+    result = engine.backward(target, [te.parse_locator("arg:memcpy:2")])
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "caller_sites_truncated"]
+    expected = 3 if overlap else 2
+    assert (leaf["callers_total"], leaf["callers_followed"], leaf["callers_dropped"]) == (
+        len(args), 1, expected)
+    assert leaf["reasons"] == {"constant_address": 4 if overlap else 2}
+    assert len({row["address"] for row in leaf["unfollowed"]}) == expected
+    assert {row["param"] for row in leaf["unfollowed"]} == {1, 2}
+    assert result["diagnostics"]["frontier"]["dropped_callers"] == expected
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+@pytest.mark.parametrize("indirect_count", [1, 20])
+def test_capped_reference_union_uses_all_sites_not_bounded_examples(indirect_count):
+    target, _, engine = _two_formal_caller_query(
+        [(_const(i), _const(i + 1)) for i in range(20)],
+        indirect=[0x404000 + 8 * i for i in range(indirect_count)])
+    result = engine.backward(target, [te.parse_locator("arg:memcpy:2")])
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "caller_sites_truncated"]
+    assert (leaf["callers_total"], leaf["callers_followed"], leaf["callers_dropped"]) == (
+        20 + indirect_count, 16, 4 + indirect_count)
+    assert leaf["reasons"] == {"caller_cap": 8, "indirect_reference": indirect_count * 2}
+    assert len(leaf["unfollowed"]) == min(16, indirect_count * 2)
+    assert result["diagnostics"]["frontier"]["dropped_callers"] == 4 + indirect_count
+    assert result["stats"]["truncation_cause"] == ["caller_cap"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_repeated_formal_does_not_duplicate_demand_evidence_and_run_state_resets():
+    target, bv, engine = _two_formal_caller_query(
+        [(_const(64), _const(32))], repeat_formal=True, indirect=[0x403000])
+    result = engine.backward(target, [te.parse_locator("arg:memcpy:2")])
+    [leaf] = result["leaves"]
+    assert leaf["callers_dropped"] == 1
+    assert leaf["reasons"] == {"indirect_reference": 1}
+    assert len(leaf["unfollowed"]) == 1
+    # Reusing the public engine for a clean query must not retain prior frontiers.
+    target.caller_sites.clear()
+    bv._data_refs.clear()
+    clean = engine.backward(target, [te.parse_locator("arg:memcpy:2")])
+    assert clean["leaves"] == []
+    assert clean["diagnostics"]["frontier"]["dropped_callers"] == 0
+    assert clean["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
+def test_nested_formal_frontier_survives_outer_ascent_without_local_misses():
+    dst, n, m = (FVar(name, ident=130 + i) for i, name in enumerate(("dst", "n", "m")))
+    n0, m0 = FSSA(n, 0), FSSA(m, 0)
+    target = FFunc("rotate", 0x800, FSSAFunc([
+        _call(0, 0x804, _MEMCPY, [_const(0), _const(0), _var(n0)]),
+        _call(1, 0x810, 0x800, [_const(0), _var(m0), _const(64)]),
+    ]), params=[dst, n, m])
+    target.caller_sites = [FSite(target, 0x810)]
+    engine = te.TaintEngine(FBV({**_NAMES, target.start: target.name}), te.load_models())
+    result = engine.backward(target, [te.parse_locator("arg:memcpy:2")], max_depth=1)
+    [leaf] = result["leaves"]
+    assert leaf["function"]["address"] == "0x800"
+    assert (leaf["callers_total"], leaf["callers_followed"], leaf["callers_dropped"]) == (1, 0, 1)
+    assert leaf["unfollowed"] == [{"address": "0x810", "caller": "rotate",
+                                  "param": 2, "reason": "max_depth"}]
+    assert result["diagnostics"]["frontier"]["dropped_callers"] == 1
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    assert result["stats"]["truncated"] is False
+    # With room to follow the remapped formal, the literal is the root.
+    complete = engine.backward(target, [te.parse_locator("arg:memcpy:2")], max_depth=2)
+    assert complete["leaves"] == []
+    assert complete["diagnostics"]["safe_to_report_complete_slice"] is True

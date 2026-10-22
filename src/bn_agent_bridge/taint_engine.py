@@ -7763,6 +7763,9 @@ class TaintEngine:
     def backward(self, func: Any, sinks: list[dict[str, Any]], *, max_depth: int = 8) -> dict[str, Any]:
         self._bw_leaves: list[dict[str, Any]] = []
         self._bw_assumptions: list[str] = []
+        # Shared by every seed and recursive ascent in this run. Reference
+        # coverage is per function/site, not per demanded formal.
+        self._bw_caller_frontiers: dict[int, dict[str, Any]] = {}
         # #810: backward-run truncation state, mirroring the forward contract
         # (``_truncated`` + ``_truncation_causes``, #579/#576). The caller-site cap
         # used to be disclosed as an assumption string ONLY -- prose no consumer can
@@ -9506,11 +9509,13 @@ class TaintEngine:
         considered = caller_sites[:MAX_CALLERS] if ascend else []
         results: list[dict[str, Any]] = []
         rows: list[dict[str, Any]] = []
-        reasons: dict[str, int] = {}
-        dropped_sites: set[int] = set()
+        misses: set[tuple[int, int, str]] = set()
 
         def _drop(address: int, caller: Any, pidx: int, reason: str, *, listed: bool = True) -> None:
-            reasons[reason] = reasons.get(reason, 0) + 1
+            key = (int(address), pidx, reason)
+            if key in misses:
+                return
+            misses.add(key)
             if listed and len(rows) < MAX_CALLERS:
                 rows.append({"address": hex(int(address)),
                              "caller": None if caller is None else self._prose_function(caller),
@@ -9534,7 +9539,7 @@ class TaintEngine:
             # cycle adds. One whose every site loops to an ancestor has no
             # origin of its own -- never the internal formal.
             via_cycle = self_closed = supplied = False
-            for idx, site in enumerate(considered):
+            for site in considered:
                 caller = getattr(site, "function", None)
                 addr = int(getattr(site, "address", 0))
                 reason = None
@@ -9555,7 +9560,6 @@ class TaintEngine:
                 if reason is None and pidx >= len(cparams):
                     reason = "arity_short"
                 if reason is not None:
-                    dropped_sites.add(idx)
                     _drop(addr, caller, pidx, reason)
                     continue
                 arg = cparams[pidx]
@@ -9583,7 +9587,6 @@ class TaintEngine:
                     self._bw_assume(
                         f"arg {pidx} at {hex(addr)} in {self._prose_function(caller)} is not a trackable "
                         "scalar; caller slice not followed")
-                    dropped_sites.add(idx)
                     _drop(addr, caller, pidx, "constant_address"
                           if "CONST" in op_name(arg) or op_name(arg) in ("MLIL_IMPORT", "MLIL_EXTERN_PTR")
                           else "argument_not_trackable")
@@ -9625,8 +9628,7 @@ class TaintEngine:
                 else:
                     results.append({"steps": base_steps, "origin": porigin, "crossed": []})
 
-        for idx, site in enumerate(caller_sites[len(considered):], start=len(considered)):
-            dropped_sites.add(idx)
+        for site in caller_sites[len(considered):]:
             for pidx in demands:
                 # Past the cap the sites are counted, not listed (#810).
                 _drop(int(getattr(site, "address", 0)), getattr(site, "function", None), pidx,
@@ -9634,11 +9636,8 @@ class TaintEngine:
         for a, rf in sorted(indirect.items()):
             for pidx in demands:
                 _drop(a, rf, pidx, "indirect_reference")
-        if reasons:
-            self._bw_note_unfollowed_callers(
-                func, direct=len(caller_sites), considered=len(considered),
-                followed=len(caller_sites) - len(dropped_sites), indirect=len(indirect),
-                rows=rows, reasons=reasons)
+        self._bw_note_unfollowed_callers(
+            func, direct=direct, indirect=set(indirect), rows=rows, misses=misses)
         return results, cycled
 
     @staticmethod
@@ -9646,56 +9645,84 @@ class TaintEngine:
         """A function's identity in the ascent's demand keys."""
         return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
 
-    def _bw_note_unfollowed_callers(self, func: Any, *, direct: int, considered: int,
-                                    followed: int, indirect: int,
-                                    rows: list[dict[str, Any]], reasons: dict[str, int]) -> None:
-        """Disclose the callers the ascent did not follow (#810, IC01).
+    def _bw_note_unfollowed_callers(
+        self, func: Any, *, direct: set[int], indirect: set[int],
+        rows: list[dict[str, Any]], misses: set[tuple[int, int, str]],
+    ) -> None:
+        """One caller frontier per function, across every demanded formal.
 
-        Prose alone -- an assumption string, or nothing at all -- let a slice
-        that dropped callers return exactly the envelope of a complete one. One
-        blocking ``caller_sites_truncated`` frontier per function carries the
-        measured counts (direct call sites plus stored-address references in
-        ``callers_total``, the sites the ascent followed for every demanded
-        formal in ``callers_followed``), the per-reason tally of unfollowed
-        (site, formal) pairs in ``reasons``, and the first ``MAX_CALLERS`` of
-        them in ``unfollowed`` -- so the loss is machine-readable in ``--format
-        json`` and named in the text frontiers and verdict. Only the cap is a
-        budget the run truncated at: it alone sets ``stats.truncated`` with
-        cause ``caller_cap``, the forward pair (#579/#576), and keeps its
-        measured assumption."""
-        total = int(direct) + int(indirect)
-        dropped = total - int(followed)
+        Coverage counts distinct reference addresses. Reasons and examples are
+        separate evidence about (reference, formal, reason) boundaries, so their
+        tallies may exceed the number of dropped references. Keep full identity
+        internally even when the public examples are capped at MAX_CALLERS.
+        """
+        start = int(func.start)
+        state = self._bw_caller_frontiers.get(start)
+        if state is None:
+            state = {
+                "direct": set(), "known": set(), "dropped": set(), "misses": set(),
+                "reasons": {}, "examples": {}, "leaf": None, "cap_assumption": None,
+            }
+            self._bw_caller_frontiers[start] = state
+        # Merge after descent into the current accumulator: a recursive ascent
+        # may already have recorded this function's other formal demands.
+        state["direct"].update(direct)
+        state["known"].update(direct)
+        state["known"].update(indirect)
+        for address, param, reason in misses:
+            state["dropped"].add(address)
+            key = (address, param, reason)
+            if key not in state["misses"]:
+                state["misses"].add(key)
+                state["reasons"][reason] = state["reasons"].get(reason, 0) + 1
+        for row in rows:
+            key = (row["address"], row["param"], row["reason"])
+            if key not in state["examples"] and len(state["examples"]) < MAX_CALLERS:
+                state["examples"][key] = row
+        if not state["dropped"]:
+            return
+
+        total = len(state["known"])
+        dropped = len(state["dropped"])
+        followed = total - dropped
+        reasons = dict(sorted(state["reasons"].items()))
         name = self._prose_function(func)
-        if "caller_cap" in reasons:
-            unresolved = int(considered) - int(followed)
-            self._bw_assume(f"{name} has {direct} callers; "
-                            f"caller ascent followed {followed}, capped at {MAX_CALLERS}")
+        capped = "caller_cap" in reasons
+        if capped:
             self._bw_truncated = True
             self._bw_truncation_causes.add("caller_cap")
-            note = (f"caller-site cap: the ascent followed {followed} of {direct} "
-                    f"callers ({unresolved} of the {considered} sites the cap let "
-                    f"through could not be followed, {direct - considered} left "
-                    "past the cap)")
-        else:
-            note = (f"the ascent followed {followed} of {total} caller(s); "
-                    f"{dropped} not followed ("
-                    + ", ".join(f"{n} {r}" for r, n in sorted(reasons.items())) + ")")
-        leaf = {
-            "kind": "caller_sites_truncated",
-            "address": hex(int(getattr(func, "start", 0))),
-            "function": {"name": str(getattr(func, "name", "?")),
-                         "display_name": _display_name(func) or "?",
-                         "address": hex(int(getattr(func, "start", 0)))},
-            "callers_total": total,
-            "callers_followed": int(followed),
-            "callers_dropped": dropped,
-            "reasons": dict(sorted(reasons.items())),
-            "unfollowed": rows,
-            "note": (note + " -- an origin reachable only from an unfollowed caller is "
-                     "missing from this slice"),
-        }
-        if leaf not in self._bw_leaves:
+            assumption = (
+                f"{name} has {len(state['direct'])} callers; caller ascent followed "
+                f"{len(state['direct'] - state['dropped'])}, capped at {MAX_CALLERS} "
+                f"(function {start:#x})")
+            old = state["cap_assumption"]
+            if old != assumption:
+                if old is not None:
+                    self._bw_assumptions.remove(old)
+                self._bw_assume(assumption)
+                state["cap_assumption"] = assumption
+        note = (
+            ("caller-site cap: " if capped else "")
+            + f"the ascent followed {followed} of {total} distinct caller reference(s); "
+            f"{dropped} not followed; unfollowed demand boundaries (reference, formal): "
+            + ", ".join(f"{n} {r}" for r, n in reasons.items()))
+        leaf = state["leaf"]
+        if leaf is None:
+            leaf = {
+                "kind": "caller_sites_truncated", "address": hex(start),
+                "function": {"name": str(getattr(func, "name", "?")),
+                             "display_name": _display_name(func) or "?",
+                             "address": hex(start)},
+            }
+            state["leaf"] = leaf
             self._bw_leaves.append(leaf)
+        leaf.update({
+            "callers_total": total, "callers_followed": followed,
+            "callers_dropped": dropped, "reasons": reasons,
+            "unfollowed": list(state["examples"].values()),
+            "note": (note + " -- an origin reachable only from an unfollowed caller "
+                     "is missing from this slice"),
+        })
 
     def _seed_backward(self, func, ssaf, instrs, sink) -> list[tuple]:
         kind = sink.get("kind")
