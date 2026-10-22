@@ -306,17 +306,21 @@ _BACKWARD_CAPPED = {
                 "slice": []}],
     "leaves": [{"kind": "caller_sites_truncated", "address": "0x800",
                 "function": {"name": "use_len", "address": "0x800"},
-                "callers_total": 20, "callers_followed": 16, "callers_dropped": 4,
-                "note": ("caller-site cap: the ascent followed 16 of 20 callers "
-                         "(0 of the 16 sites the cap let through could not be "
-                         "followed, 4 left past the cap) -- an origin reachable "
-                         "only from an unfollowed caller is missing from this "
-                         "slice")}],
+                "callers_total": 20, "callers_fully_followed": 16,
+                "callers_partially_followed": 0, "callers_unfollowed": 4,
+                "callers_dropped": 4, "demands_total": 20, "demands_unfollowed": 4,
+                "reasons": {"caller_cap": 4}, "partially_followed": [],
+                "note": ("caller-site cap: of 20 distinct caller reference(s), the "
+                         "ascent fully followed 16 (every demanded formal), partially "
+                         "followed 0 and followed none of 4; 4 of 20 (reference, "
+                         "formal) demand(s) unfollowed: 4 caller_cap -- an origin "
+                         "reachable only from an unfollowed caller is missing from "
+                         "this slice")}],
     # The wording is the engine's own (`_bw_note_caller_cap`), copied rather than
     # paraphrased: a fixture that drifts from the envelope it stands for renders
     # prose no run can produce, and the renderer assertions stop describing the
     # real thing (#810 review).
-    "assumptions": ["use_len has 20 callers; caller ascent followed 16, capped at 16"],
+    "assumptions": ["use_len has 20 callers; caller ascent fully followed 16, capped at 16"],
     "stats": {"leaves": 1, "slices": 1, "truncated": True,
               "truncation_cause": ["caller_cap"]},
     "soundness": "x",
@@ -331,7 +335,7 @@ def test_render_taint_backward_truncated_is_not_a_complete_result():
     assert "verdict: INCOMPLETE" in text
     assert "caller-site cap reached" in text
     assert "caller_sites_truncated @ 0x800" in text
-    assert "16 of 20 caller(s) followed; 4 dropped" in text
+    assert "20 caller reference(s): 16 fully followed, 0 partially, 4 not followed; 4 dropped" in text
 
 
 def test_render_taint_backward_memory_chain_cut_names_its_cause_928r3():

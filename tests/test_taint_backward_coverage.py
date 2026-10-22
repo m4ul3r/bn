@@ -130,7 +130,7 @@ def test_constant_address_caller_argument_is_an_unfollowed_site_not_a_complete_s
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
     assert leaf["callers_total"] == 3
-    assert leaf["callers_followed"] == 2
+    assert leaf["callers_fully_followed"] == 2
     assert leaf["callers_dropped"] == 1
     assert leaf["unfollowed"] == [{"address": "0xc10", "caller": "from_config",
                                    "param": 2, "reason": "constant_address"}]
@@ -150,7 +150,7 @@ def test_caller_site_with_no_call_instruction_below_the_cap_blocks_the_gate():
 
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
-    assert (leaf["callers_total"], leaf["callers_followed"], leaf["callers_dropped"]) == (3, 2, 1)
+    assert (leaf["callers_total"], leaf["callers_fully_followed"], leaf["callers_dropped"]) == (3, 2, 1)
     assert leaf["unfollowed"] == [{"address": "0xc18", "caller": "from_config",
                                    "param": 2, "reason": "no_call_instruction"}]
     assert result["stats"]["truncated"] is False  # not the cap: nothing was budgeted away
@@ -187,7 +187,7 @@ def test_function_reached_only_through_a_stored_address_is_not_a_complete_slice(
     assert leaf["reasons"] == {"indirect_reference": 1}
     assert leaf["unfollowed"] == [{"address": "0x403df0", "caller": None,
                                    "param": 2, "reason": "indirect_reference"}]
-    assert (leaf["callers_followed"], leaf["callers_dropped"]) == (0, 1)
+    assert (leaf["callers_fully_followed"], leaf["callers_dropped"]) == (0, 1)
     assert "indirect" in result["diagnostics"]["next_action"]
 
 
@@ -319,7 +319,7 @@ def test_in_binary_runtime_name_does_not_prove_a_startup_boundary(runtime, opera
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
     assert leaf["reasons"] == {"indirect_reference": 1}
-    assert (leaf["callers_total"], leaf["callers_followed"]) == (1, 0)
+    assert (leaf["callers_total"], leaf["callers_fully_followed"]) == (1, 0)
     assert leaf["unfollowed"] == [{"address": "0x40d", "caller": "entry_point",
                                   "param": 2, "reason": "indirect_reference"}]
 
@@ -514,7 +514,7 @@ def test_broken_entry_metadata_cannot_escape_or_drop_a_known_reference(fault):
     assert _gate(result) is False
     (leaf,) = _caller_leaves(result)
     assert leaf["reasons"] == {"indirect_reference": 2}
-    assert (leaf["callers_total"], leaf["callers_followed"], leaf["callers_dropped"]) == (2, 0, 2)
+    assert (leaf["callers_total"], leaf["callers_fully_followed"], leaf["callers_dropped"]) == (2, 0, 2)
     assert {r["address"] for r in leaf["unfollowed"]} == {"0x40d", "0x414"}
 
 
@@ -573,7 +573,7 @@ def test_caller_depth_cut_is_structured_incompleteness_beside_a_resolved_sibling
     (leaf,) = _caller_leaves(result)
     assert leaf["function"]["name"] == cut_in
     assert leaf["reasons"] == {"max_depth": len(leaf["unfollowed"])}
-    assert leaf["callers_followed"] == 0
+    assert leaf["callers_fully_followed"] == 0
     assert "--max-depth" in result["diagnostics"]["next_action"]
     if depth == 1:
         # the literal sibling was resolved; the cut is still disclosed
@@ -1655,7 +1655,7 @@ def test_real_bn_in_binary_runtime_impostor_is_an_indirect_caller(tmp_path, shar
     (leaf,) = _caller_leaves(result)
     assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
     assert leaf["callers_total"] == leaf["callers_dropped"] == len(leaf["unfollowed"])
-    assert leaf["callers_followed"] == 0
+    assert leaf["callers_fully_followed"] == 0
     assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
 
 
@@ -1668,7 +1668,7 @@ def test_real_bn_static_startup_is_an_unproven_indirect_boundary(tmp_path, share
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
     assert leaf["reasons"] == {"indirect_reference": len(leaf["unfollowed"])}
-    assert leaf["callers_followed"] == 0
+    assert leaf["callers_fully_followed"] == 0
     assert {r["caller"] for r in leaf["unfollowed"]} == {"_start"}
 
 
@@ -1728,7 +1728,7 @@ def test_real_bn_dispatch_table_advice_is_bounded_without_losing_frontiers(tmp_p
     assert _gate(result) is False
     assert len(leaves) == 17
     assert len(indirect) == 16
-    assert (cap["callers_total"], cap["callers_followed"], cap["callers_dropped"]) == (20, 16, 4)
+    assert (cap["callers_total"], cap["callers_fully_followed"], cap["callers_dropped"]) == (20, 16, 4)
     assert cap["reasons"] == {"caller_cap": 4}
     advice = result["diagnostics"]["next_action"]
     commands = _advice_commands(advice, "xrefs")
@@ -1788,7 +1788,7 @@ def test_real_bn_runtime_entry_references_are_unresolved(tmp_path, shared_bn, fl
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
     assert set(leaf["reasons"]) == {"indirect_reference"}
-    assert leaf["callers_followed"] == 0
+    assert leaf["callers_fully_followed"] == 0
     assert [(o["kind"], o.get("index")) for o in _origins(result)] == [("parameter", 0)]
     text = shared_bn.run("-t", target, "taint", "backward", "-f", "main", "--sink", "param:0",
                          "--verbose", timeout=180.0)
@@ -1819,7 +1819,7 @@ def test_real_bn_external_runtime_impostor_is_an_unresolved_caller(tmp_path, sha
     assert _gate(result) is False, result["diagnostics"]
     (leaf,) = _caller_leaves(result)
     assert set(leaf["reasons"]) == {"indirect_reference"}
-    assert leaf["callers_followed"] == 0
+    assert leaf["callers_fully_followed"] == 0
     assert {r["caller"] for r in leaf["unfollowed"]} == {"entry_point"}
     text = shared_bn.run("-t", target, "taint", "backward", "-f", "copy_handler",
                          "--sink", "arg:memcpy:2", "--verbose", timeout=180.0)

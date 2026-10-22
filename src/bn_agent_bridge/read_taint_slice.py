@@ -125,7 +125,9 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
         else:
             raise OperationFailure("unsupported", f"unknown taint direction: {direction}")
     except _taint.TaintError as exc:
-        raise OperationFailure("unsupported", str(exc)) from exc
+        # An all-sites refusal carries every site row; its text is bounded.
+        raise OperationFailure("unsupported", str(exc),
+                               observed=getattr(exc, "observed", None)) from exc
     # #415: disclose which taint-model overlays were in effect for this run, so an
     # agent can confirm a project-local --models / BN_TAINT_MODELS file landed
     # (load_models reads them per request -- no bridge restart needed). Uses the

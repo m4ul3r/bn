@@ -120,7 +120,7 @@ def test_origin_identity_survives_public_slice_dedup(origin_kind, same_function)
 @pytest.mark.parametrize("counts", [(1,), (4,), (12,), (1, 4, 12)])
 def test_dropped_callers_sums_sites_not_frontier_rows(counts):
     leaves = [{"kind": "caller_sites_truncated", "callers_dropped": count,
-               "callers_total": count + 16, "callers_followed": 16,
+               "callers_total": count + 16, "callers_fully_followed": 16,
                "function": {"name": f"handler_{i}", "address": hex(0x800 + i * 0x100)},
                "reasons": {"caller_cap": count}} for i, count in enumerate(counts)]
     diag = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)
@@ -222,7 +222,8 @@ def test_caller_frontier_text_preserves_each_functions_coverage():
     counts = [1, 4, 12]
     leaves = [{"kind": "caller_sites_truncated", "address": hex(0x800 + i * 0x100),
                "function": {"name": "same_name", "address": hex(0x800 + i * 0x100)},
-               "callers_followed": 16, "callers_total": 16 + count, "callers_dropped": count}
+               "callers_fully_followed": 16, "callers_partially_followed": 0,
+               "callers_unfollowed": count, "callers_total": 16 + count, "callers_dropped": count}
               for i, count in enumerate(counts)]
     diag = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)
     text = _render_taint_text({"direction": "backward", "leaves": leaves, "diagnostics": diag})
@@ -230,8 +231,9 @@ def test_caller_frontier_text_preserves_each_functions_coverage():
     assert len(rows) == 3
     for leaf in leaves:
         [row] = [line for line in rows if leaf["function"]["address"] in line]
-        assert f"{leaf['callers_followed']} of {leaf['callers_total']}" in row
-        assert f"{leaf['callers_dropped']} dropped" in row
+        assert (f"{leaf['callers_total']} caller reference(s): "
+                f"{leaf['callers_fully_followed']} fully followed") in row
+        assert f"{leaf['callers_unfollowed']} not followed; {leaf['callers_dropped']} dropped" in row
     assert "17 dropped-caller-site(s)" in text
 
 
@@ -240,7 +242,7 @@ def test_caller_frontier_distinguishes_same_function_coverage_and_bounds_output(
 
     leaves = [{"kind": "caller_sites_truncated", "address": hex(0x800 + i * 0x100),
                "function": {"name": f"caller_{i}", "address": hex(0x800 + i * 0x100)},
-               "callers_followed": 16, "callers_total": 17, "callers_dropped": 1}
+               "callers_fully_followed": 16, "callers_total": 17, "callers_dropped": 1}
               for i in range(20)]
     alternate = {**leaves[0], "callers_total": 20, "callers_dropped": 4}
     text = "\n".join(_render_grouped_leaves([leaves[0], alternate]))
@@ -347,6 +349,13 @@ def test_different_opaque_writers_of_one_local_are_distinct_origins():
     assert {o["writers"][0]["address"] for o in origins} == {"0xa00", "0xa10"}
 
 
+def _coverage(leaf):
+    """(total, fully, partially, unfollowed, dropped) distinct caller references."""
+    return tuple(leaf[k] for k in ("callers_total", "callers_fully_followed",
+                                   "callers_partially_followed", "callers_unfollowed",
+                                   "callers_dropped"))
+
+
 def _two_formal_caller_query(caller_arguments, *, shared_sink=False, repeat_formal=False,
                              indirect=(), reverse=False):
     from test_taint_backward_coverage import _BV
@@ -389,7 +398,7 @@ def test_dropped_references_not_multiplied_by_demanded_formals(shared_sink, reve
     assert len(leaves) == 2
     by_function = {lf["function"]["address"]: lf for lf in leaves}
     top = by_function["0x800"]
-    assert (top["callers_total"], top["callers_followed"], top["callers_dropped"]) == (2, 1, 1)
+    assert _coverage(top) == (2, 1, 0, 1, 1)
     assert top["reasons"] == {"indirect_reference": 2}
     assert {(row["address"], row["param"]) for row in top["unfollowed"]} == {
         ("0x403000", 1), ("0x403000", 2)}
@@ -413,8 +422,12 @@ def test_caller_coverage_unions_disjoint_and_overlapping_reference_losses(overla
     result = engine.backward(target, [te.parse_locator("arg:memcpy:2")])
     [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "caller_sites_truncated"]
     expected = 3 if overlap else 2
-    assert (leaf["callers_total"], leaf["callers_followed"], leaf["callers_dropped"]) == (
-        len(args), 1, expected)
+    # Each reference that supplied one formal and lost the other is PARTIALLY
+    # followed, not unfollowed: the slices reached through it are real.
+    assert _coverage(leaf) == (len(args), 1, 2, expected - 2, expected)
+    assert (leaf["demands_total"], leaf["demands_unfollowed"]) == (2 * len(args), 4 if overlap else 2)
+    assert sorted((row["followed_params"], row["unfollowed_params"])
+                  for row in leaf["partially_followed"]) == [([1], [2]), ([2], [1])]
     assert leaf["reasons"] == {"constant_address": 4 if overlap else 2}
     assert len({row["address"] for row in leaf["unfollowed"]}) == expected
     assert {row["param"] for row in leaf["unfollowed"]} == {1, 2}
@@ -429,8 +442,7 @@ def test_capped_reference_union_uses_all_sites_not_bounded_examples(indirect_cou
         indirect=[0x404000 + 8 * i for i in range(indirect_count)])
     result = engine.backward(target, [te.parse_locator("arg:memcpy:2")])
     [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "caller_sites_truncated"]
-    assert (leaf["callers_total"], leaf["callers_followed"], leaf["callers_dropped"]) == (
-        20 + indirect_count, 16, 4 + indirect_count)
+    assert _coverage(leaf) == (20 + indirect_count, 16, 0, 4 + indirect_count, 4 + indirect_count)
     assert leaf["reasons"] == {"caller_cap": 8, "indirect_reference": indirect_count * 2}
     assert len(leaf["unfollowed"]) == min(16, indirect_count * 2)
     assert result["diagnostics"]["frontier"]["dropped_callers"] == 4 + indirect_count
@@ -467,7 +479,9 @@ def test_nested_formal_frontier_survives_outer_ascent_without_local_misses():
     result = engine.backward(target, [te.parse_locator("arg:memcpy:2")], max_depth=1)
     [leaf] = result["leaves"]
     assert leaf["function"]["address"] == "0x800"
-    assert (leaf["callers_total"], leaf["callers_followed"], leaf["callers_dropped"]) == (1, 0, 1)
+    # The self-call supplied formal 1 (as `m`) and only formal 2's demand
+    # stopped at the depth bound: a partially followed reference.
+    assert _coverage(leaf) == (1, 0, 1, 0, 1)
     assert leaf["unfollowed"] == [{"address": "0x810", "caller": "rotate",
                                   "param": 2, "reason": "max_depth"}]
     assert result["diagnostics"]["frontier"]["dropped_callers"] == 1
@@ -477,3 +491,232 @@ def test_nested_formal_frontier_survives_outer_ascent_without_local_misses():
     complete = engine.backward(target, [te.parse_locator("arg:memcpy:2")], max_depth=2)
     assert complete["leaves"] == []
     assert complete["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
+# The completeness explanation must not depend on WHICH reason left a caller
+# unfollowed: the dropped-caller advice once reused the explanation's name as
+# its loop variable, so every reason it iterated replaced the sentence with
+# the bare reason token, in JSON and text alike.
+@pytest.mark.parametrize("reason", [
+    "caller_cap", "max_depth", "indirect_reference", "constant_address",
+    "argument_not_trackable", "arity_short", "no_call_instruction", "caller_unknown"])
+def test_completeness_explanation_survives_every_dropped_caller_reason(reason):
+    def frontier(why):
+        # The frozen HOST-01 shape: one capped function that also lost
+        # references for another reason, three functions that lost one
+        # reference each, and unrelated unresolved frontiers.
+        top = {"kind": "caller_sites_truncated", "address": "0x4100",
+               "function": {"name": "copy_name", "address": "0x4100"},
+               "callers_total": 19, "callers_fully_followed": 7,
+               "callers_partially_followed": 0, "callers_unfollowed": 12,
+               "callers_dropped": 12, "reasons": {"caller_cap": 3, why: 9}}
+        others = [{"kind": "caller_sites_truncated", "address": hex(0x4200 + 0x100 * i),
+                   "function": {"name": f"emit_{i}", "address": hex(0x4200 + 0x100 * i)},
+                   "callers_total": 2, "callers_fully_followed": 1,
+                   "callers_partially_followed": 0, "callers_unfollowed": 1,
+                   "callers_dropped": 1, "reasons": {why: 1}} for i in range(3)]
+        unresolved = [{"kind": "field_load_unresolved", "address": "0x4120"},
+                      {"kind": "pointer_object_unresolved", "address": "0x4128"}]
+        return [*others, top, *unresolved]
+
+    def diagnose(why):
+        return backward_diagnostics(frontier(why), [], sinks_seeded=1, slices=2,
+                                    truncated=True, truncation_cause=["caller_cap"])
+
+    diag = diagnose(reason)
+    # The control reason was never clobbered; every reason must explain alike.
+    assert diag["complete_slice_reason"] == diagnose("indirect_reference")["complete_slice_reason"]
+    assert "caller_sites_truncated" in diag["complete_slice_reason"]
+    assert diag["complete_slice_reason"] not in {
+        reason, "caller_cap", "max_depth", "indirect_reference"}
+    text = _render_taint_text({"direction": "backward", "leaves": frontier(reason),
+                               "diagnostics": diag})
+    assert f"    reason: {diag['complete_slice_reason']}" in text.splitlines()
+
+
+# A caller frontier from another producer -- an older bridge, replay tooling --
+# may carry no readable `callers_dropped`. It still proves a dropped reference.
+@pytest.mark.parametrize("dropped", [
+    "absent", None, "3", 3.5, True, -1, [2]], ids=repr)
+def test_unreadable_dropped_caller_count_degrades_explicitly(dropped):
+    measured = {"kind": "caller_sites_truncated", "address": "0x900",
+                "function": {"name": "measured", "address": "0x900"},
+                "callers_total": 9, "callers_dropped": 5, "reasons": {"caller_cap": 5}}
+    foreign = {"kind": "caller_sites_truncated", "address": "0x800",
+               "function": {"name": "foreign", "address": "0x800"},
+               "callers_total": 30, "callers_followed": 16}
+    if dropped != "absent":
+        foreign["callers_dropped"] = dropped
+    diag = backward_diagnostics([measured, foreign], [], sinks_seeded=1, slices=1)
+    frontier = diag["frontier"]
+    assert type(frontier["dropped_callers"]) is int
+    # The measured five plus at least one for the leaf that could not be read.
+    assert frontier["dropped_callers"] == 6
+    assert frontier["dropped_callers_unmeasured"] == 1
+    assert diag["safe_to_report_complete_slice"] is False
+    assert "foreign" in diag["next_action"] and "measured" in diag["next_action"]
+    text = _render_taint_text({"direction": "backward", "leaves": [measured, foreign],
+                               "diagnostics": diag})
+    assert "at least 6 dropped-caller-site(s)" in text
+    clean = backward_diagnostics([measured], [], sinks_seeded=1, slices=1)["frontier"]
+    assert clean["dropped_callers"] == 5 and "dropped_callers_unmeasured" not in clean
+
+
+def test_partially_followed_reference_is_not_reported_unfollowed():
+    fixed = FExpr("MLIL_CONST_PTR", "fixed address", constant=0x4000)
+    # caller_0 supplies formal 2 and loses formal 1; caller_1 the reverse;
+    # caller_2 loses both.
+    target, _, engine = _two_formal_caller_query(
+        [(fixed, _const(32)), (_const(64), fixed), (fixed, fixed)])
+    result = engine.backward(target, [te.parse_locator("arg:memcpy:2")])
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "caller_sites_truncated"]
+    assert _coverage(leaf) == (3, 0, 2, 1, 3)
+    assert (leaf["demands_total"], leaf["demands_unfollowed"]) == (6, 4)
+    # Each partially followed reference is a caller this result has slices from.
+    origin_functions = {sl["origin"].get("function") for sl in result["slices"]}
+    partial = {row["address"] for row in leaf["partially_followed"]}
+    assert partial == {"0xa04", "0xb04"}
+    assert {hex(int(a, 16) - 4) for a in partial} <= origin_functions
+    text = _render_taint_text(result)
+    [row] = [ln for ln in text.splitlines() if "caller_sites_truncated @" in ln]
+    assert "3 caller reference(s): 0 fully followed, 2 partially, 1 not followed; 3 dropped" in row
+
+
+def _locator_sites(count, operand):
+    return _sites([operand] * count)
+
+
+def test_all_sites_refusal_groups_one_explanation_and_bounds_site_names():
+    with pytest.raises(te.TaintError) as caught:
+        _backward(_locator_sites(120, "missing"), _NAMES)
+    message = str(caught.value)
+    addresses = [hex(0x810 + 0x10 * i) for i in range(120)]
+    # One explanation for 120 sites refused for one reason, naming complete
+    # site examples and the exact number it does not name.
+    assert message.count("out of range") == 1
+    assert all(a in message for a in addresses[:16])
+    assert not any(f"{a}," in message or f"{a} " in message for a in addresses[16:])
+    assert "+104 more site(s)" in message and "any sink (120 site(s))" in message
+    assert len(message) < 2_000
+    # Every site keeps its own row, address and status for a JSON reader.
+    rows = caught.value.observed["sink_status"]
+    assert [(r["address"], r["status"]) for r in rows] == [(a, "unseeded") for a in addresses]
+
+
+def test_all_sites_refusal_keeps_distinct_explanations_apart():
+    fixed = FExpr("MLIL_CONST_PTR", "fixed address", constant=0x7000)
+    with pytest.raises(te.TaintError) as caught:
+        _backward(_sites(["missing", fixed, "missing"]), _NAMES)
+    lines = str(caught.value).splitlines()[1:]
+    assert len(lines) == 2
+    [range_line] = [ln for ln in lines if "out of range" in ln]
+    [fixed_line] = [ln for ln in lines if "reads no variable" in ln]
+    assert "0x810, 0x830" in range_line and "0x820" in fixed_line
+    assert all("arg:memcpy:2" in ln and "[unseeded]" in ln for ln in lines)
+
+
+@pytest.mark.parametrize("repeat", [2, 3])
+def test_repeated_identical_sink_locator_is_one_query(repeat):
+    fn = _sites(["variable", 4096])
+    once = _backward(fn, _NAMES)
+    engine = te.TaintEngine(FBV(_NAMES), te.load_models())
+    repeated = engine.backward(fn, [te.parse_locator("arg:memcpy:2")] * repeat)
+    assert repeated["sink_status"] == once["sink_status"]
+    assert repeated["sinks"] == once["sinks"]
+    assert len(repeated["slices"]) == len(once["slices"])
+    for key in ("sinks_seeded", "sinks_constant", "slices"):
+        assert repeated["diagnostics"][key] == once["diagnostics"][key]
+
+
+def test_distinct_locators_at_one_mapped_site_are_not_merged():
+    fn = _sites([64])
+    call = fn.mlil.ssa_form.instructions[0]
+    call.dest = FExpr("MLIL_VAR_SSA", "callback")
+    names = {**_NAMES, 0x991: "memmove"}
+    engine = te.TaintEngine(FBV(names), te.load_models(),
+                            resolve_map={"0x810": [hex(_MEMCPY), "0x991"]})
+    result = engine.backward(fn, [te.parse_locator(s) for s in (
+        "arg:memcpy:2", "arg:memmove:2", "arg:memcpy:2", "arg:memmove:2")])
+    assert [(r["address"], r["callee"], r["status"]) for r in result["sink_status"]] == [
+        ("0x810", "memcpy", "constant"), ("0x810", "memmove", "constant")]
+    assert result["diagnostics"]["sinks_constant"] == 2
+
+
+def _site_row(i, status="seeded", **extra):
+    return {"kind": "arg", "callee": "memcpy", "index": 2,
+            "address": hex(0x401000 + 0x10 * i), "status": status,
+            "seeded": status == "seeded", **extra}
+
+
+def _render_sites(rows):
+    return _render_taint_text({"direction": "backward", "function": {"name": "copy_sites"},
+                               "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
+                               "sink_status": rows})
+
+
+@pytest.mark.parametrize("count", [120, 500])
+def test_sink_site_listing_is_bounded_with_exact_omitted_counts(count):
+    rows = [_site_row(i) for i in range(count - 2)]
+    rows.append(_site_row(count - 2, "constant", scalar={"kind": "constant", "value": 64},
+                          destination_fit="unproved"))
+    rows.append(_site_row(count - 1, "unseeded", note="no operand"))
+    text = _render_sites(rows)
+    listed = [ln for ln in text.splitlines() if ln.startswith("  arg:memcpy:2 @ ")]
+    assert len(listed) == 16
+    # Every status in the run is visible, even when its only row is the last.
+    for row in rows[-2:]:
+        assert any(row["address"] in ln and f"[{row['status']}]" in ln for ln in listed)
+    assert f"sink sites ({count}):" in text
+    assert f"{count - 16} more sink site(s) not listed: {count - 16} seeded" in text
+    assert len(text) < 4_000
+
+
+def test_unreadable_sink_status_rows_are_counted_and_disclosed():
+    rows = ["junk", None, _site_row(0), [1, 2]]
+    text = _render_sites(rows)
+    assert "sink sites (4):" in text
+    assert "3 sink_status row(s) unreadable" in text
+    assert "! malformed sink_status field" in text
+    assert "0x401000 [seeded]" in text
+
+
+@pytest.mark.parametrize("scalar", [
+    "absent", "constant 64", {"kind": "constant", "value": True},
+    {"kind": "constant", "value": "16"}, {"kind": "constant"}, {"value": 64}], ids=repr)
+def test_constant_site_keeps_capacity_verdict_when_its_scalar_is_damaged(scalar):
+    row = _site_row(0, "constant", destination_fit="unproved")
+    if scalar != "absent":
+        row["scalar"] = scalar
+    [line] = [ln for ln in _render_sites([row]).splitlines() if "[constant]" in ln]
+    assert "destination capacity=unproved" in line
+    # Neither a flag nor a string is a count.
+    assert "scalar=?" in line and "0x1" not in line and "=16" not in line
+
+
+def test_sink_site_at_address_zero_keeps_its_address():
+    row = {**_site_row(0), "address": 0}
+    assert "arg:memcpy:2 @ 0x0 [seeded]" in _render_sites([row])
+
+
+def test_pre_per_site_row_degrades_rather_than_reading_as_a_status():
+    legacy = {"kind": "arg", "callee": "memcpy", "index": 2, "address": "0x401900",
+              "bounded": True, "seeded": False, "note": "constant length, nothing to slice"}
+    text = _render_sites([legacy, {**_site_row(1), "status": "sparkling"}])
+    assert "0x401900 [? no status]" in text
+    assert "0x401010 [? unrecognised status 'sparkling']" in text
+    assert "! malformed status field" in text
+
+
+def test_caller_frontier_group_identity_ignores_reason_order():
+    from bn.formatters import _render_grouped_leaves
+
+    leaf = {"kind": "caller_sites_truncated", "address": "0x800",
+            "function": {"name": "dispatch", "address": "0x800"},
+            "callers_total": 30, "callers_fully_followed": 16,
+            "callers_partially_followed": 0, "callers_unfollowed": 14, "callers_dropped": 14}
+    first = {**leaf, "reasons": {"caller_cap": 2, "max_depth": 1}}
+    second = {**leaf, "reasons": {"max_depth": 1, "caller_cap": 2}}
+    text = "\n".join(_render_grouped_leaves([first, second]))
+    assert text.count("caller_sites_truncated @") == 1 and "[2 leaves]" in text
+    third = {**leaf, "reasons": {"max_depth": 2, "caller_cap": 1}}
+    assert "\n".join(_render_grouped_leaves([first, third])).count("caller_sites_truncated @") == 2

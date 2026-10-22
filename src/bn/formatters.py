@@ -5004,8 +5004,11 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
         return (
             f"  caller_sites_truncated @ {leaf.get('address')}"
             f"  -> {_shown_name(fn, mangled=mangled) or '?'} @ {fn.get('address', '?')}"
-            f"  ({leaf.get('callers_followed', '?')} of {leaf.get('callers_total', '?')} "
-            f"caller(s) followed; {leaf.get('callers_dropped', '?')} dropped)"
+            f"  ({leaf.get('callers_total', '?')} caller reference(s): "
+            f"{leaf.get('callers_fully_followed', '?')} fully followed, "
+            f"{leaf.get('callers_partially_followed', '?')} partially, "
+            f"{leaf.get('callers_unfollowed', '?')} not followed; "
+            f"{leaf.get('callers_dropped', '?')} dropped)"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
     return (
@@ -5033,9 +5036,14 @@ def _leaf_group_key(leaf: Any) -> tuple:
         return (kind, str(_field_dict(leaf, "callee").get("name", "?")))
     if kind == "caller_sites_truncated":
         fn = _field_dict(leaf, "function")
+        # The reason tally's identity is its (reason, count) pairs, never the
+        # order its keys arrived in.
+        reasons = tuple(sorted((str(k), repr(v)) for k, v in _field_dict(leaf, "reasons").items()))
         return (kind, str(fn.get("address") or leaf.get("address")), str(fn.get("name")),
-                str(leaf.get("callers_total")), str(leaf.get("callers_followed")),
-                str(leaf.get("callers_dropped")), str(leaf.get("reasons")))
+                *(str(leaf.get(k)) for k in (
+                    "callers_total", "callers_fully_followed", "callers_partially_followed",
+                    "callers_unfollowed", "callers_dropped", "demands_unfollowed")),
+                reasons)
     return (kind,)
 
 
@@ -5403,7 +5411,11 @@ def _render_backward_diagnostics(diag: dict[str, Any]) -> list[str]:
     _fr = (f"  frontier: {_stated_count(fr, 'unresolved')} unresolved, "
            f"{_stated_count(fr, 'coarse_memory')} coarse-memory")
     _dropped = _count_field(fr, "dropped_callers")
-    if _dropped:
+    _unmeasured = _count_field(fr, "dropped_callers_unmeasured")
+    if _unmeasured:
+        _fr += (f", at least {_dropped} dropped-caller-site(s) ({_unmeasured} caller "
+                "frontier(s) carried no readable count)")
+    elif _dropped:
         _fr += f", {_dropped} dropped-caller-site(s)"
     out.append(_fr)
     if "safe_to_report_complete_slice" in diag:
@@ -5414,6 +5426,89 @@ def _render_backward_diagnostics(diag: dict[str, Any]) -> list[str]:
             out.append(f"    reason: {diag['complete_slice_reason']}")
     if diag.get("next_action"):
         out.append(f"  next: {diag['next_action']}")
+    return out
+
+
+# The per-site statuses a backward run writes, and how many site rows the text
+# view lists before it counts the rest (the caller-example bound, MAX_CALLERS).
+_SINK_SITE_STATUSES = ("seeded", "constant", "demand", "unseeded", "truncated")
+_SINK_SITE_EXAMPLES = 16
+
+
+def _sink_site_line(row: dict[str, Any]) -> str:
+    """One complete text line for a backward ``sink_status`` row."""
+    address = row.get("address")
+    if isinstance(address, int) and not isinstance(address, bool):
+        address = hex(address)
+    # Presence, not truth: a site at address 0 is still a site.
+    site = f" @ {address}" if address is not None else ""
+    status = row.get("status")
+    if status in _SINK_SITE_STATUSES:
+        tag = f"[{status}]"
+    else:
+        # An older bridge's row (`bounded`, no status) or a foreign status: say
+        # so rather than rendering it as one of the statuses this view knows.
+        _record_skew("status")
+        tag = "[? no status]" if status is None else f"[? unrecognised status {status!r}]"
+    evidence = ""
+    note = row.get("note") or ""
+    if status == "constant":
+        scalar = _field_dict(row, "scalar")
+        value = scalar.get("value")
+        if (scalar.get("kind") == "constant" and isinstance(value, int)
+                and not isinstance(value, bool)):
+            shown = f"{value:#x}"
+        else:
+            # Only an integer is a scalar count: a flag or a string is not one.
+            _record_skew("scalar")
+            shown = "? (unreadable)"
+        if row.get("destination_fit", "unproved") != "unproved":
+            _record_skew("destination_fit")
+        # A finite count never proves a destination fits, so the capacity
+        # verdict does not depend on the scalar evidence being readable.
+        evidence = f" scalar={shown}; destination capacity=unproved"
+        note = ""
+    return f"  {_describe_loc(row)}{site} {tag}{evidence} {note}".rstrip()
+
+
+def _render_sink_sites(value: Any) -> list[str]:
+    """The backward ``sink sites`` block: bounded complete example rows plus the
+    exact count of every row it does not list. JSON keeps every site.
+
+    The examples include the first row of each status, so a status present
+    anywhere in the run is visible in text; the rest are listed in order."""
+    raw = _field_list(value, "sink_status")
+    if not raw:
+        return []
+    rows = _row_list(value, "sink_status")
+    kept: set[int] = set()
+    firsts: set[str] = set()
+    for i, row in enumerate(rows):
+        status = row.get("status")
+        key = repr(status)
+        if key not in firsts and len(kept) < _SINK_SITE_EXAMPLES:
+            firsts.add(key)
+            kept.add(i)
+    for i in range(len(rows)):
+        if len(kept) >= _SINK_SITE_EXAMPLES:
+            break
+        kept.add(i)
+    out = ["", f"sink sites ({len(raw)}):"]
+    out.extend(_sink_site_line(rows[i]) for i in sorted(kept))
+    omitted: dict[str, int] = {}
+    for i, row in enumerate(rows):
+        if i not in kept:
+            status = row.get("status")
+            label = status if status in _SINK_SITE_STATUSES else "unrecognised"
+            omitted[label] = omitted.get(label, 0) + 1
+    if omitted:
+        out.append(
+            f"  ... {sum(omitted.values())} more sink site(s) not listed: "
+            + ", ".join(f"{n} {s}" for s, n in sorted(omitted.items()))
+            + " (--format json lists every site)")
+    if len(raw) > len(rows):
+        out.append(f"  ! {len(raw) - len(rows)} sink_status row(s) unreadable, not listed "
+                   "(--format json)")
     return out
 
 
@@ -5551,25 +5646,7 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                 for step in _field_list(sl, "slice"):
                     if isinstance(step, dict):
                         lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
-        status = _field_list(value, "sink_status")
-        if status:
-            lines.append("")
-            lines.append("sink sites:")
-            for s in status:
-                if not isinstance(s, dict):
-                    continue
-                site = f" @ {s['address']}" if s.get("address") else ""
-                scalar = _field_dict(s, "scalar")
-                evidence = ""
-                note = s.get("note", "")
-                if scalar.get("kind") == "constant":
-                    val = scalar.get("value")
-                    shown = f"{val:#x}" if isinstance(val, int) else str(val)
-                    evidence = f" scalar={shown}; destination capacity={s.get('destination_fit', '?')}"
-                    note = ""
-                lines.append(
-                    f"  {_describe_loc(s)}{site} [{s.get('status', '?')}]"
-                    f"{evidence} {note}".rstrip())
+        lines.extend(_render_sink_sites(value))
         # #812: backward's completeness gate, rendered for every backward run
         # that carries one. Leaving it JSON-only would repeat the asymmetry #810
         # fixed for the truncation verdict -- a text reader could not tell a

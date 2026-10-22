@@ -4473,9 +4473,10 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # paging, so `_render_function_evidence_text(offset)` is now checked below
     # instead of skipped as unstated.
     # Merged with #1037: 63 + #1040/#1049's four + #1037's four.
-    assert len(sites) == 71, (
+    # R2-16-05 adds the backward frontier's `dropped_callers_unmeasured`.
+    assert len(sites) == 72, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 71. A "
+        "count helper, not 72. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4592,6 +4593,8 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "context]",
         "_render_backward_diagnostics(dropped_callers) [count not stated in "
         "this context]",
+        "_render_backward_diagnostics(dropped_callers_unmeasured) [count not "
+        "stated in this context]",
         "_render_backward_diagnostics(unresolved) [count not stated in this "
         "context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",

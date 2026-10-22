@@ -525,6 +525,17 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     }
 
 
+def _dropped_reference_count(leaf: dict[str, Any]) -> int | None:
+    """A caller frontier's ``callers_dropped`` when it states a count, else None.
+
+    Only a non-negative integer is a count: a bool, a fraction, a numeric
+    string or a missing key is a leaf this helper cannot measure."""
+    n = leaf.get("callers_dropped")
+    if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+        return n
+    return None
+
+
 def backward_diagnostics(
     leaves: list[dict[str, Any]],
     assumptions: list[str],
@@ -587,9 +598,15 @@ def backward_diagnostics(
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
     # The producer merges each function's reference identities across all
     # formal demands into one frontier. Reason/example counts are demand
-    # evidence, not additional dropped caller references.
-    dropped_callers_n = sum(lf["callers_dropped"] for lf in leaves or []
-                            if lf.get("kind") == "caller_sites_truncated")
+    # evidence, not additional dropped caller references. A leaf from another
+    # producer (an older bridge, replay tooling) may carry no readable count:
+    # it still proves at least one dropped reference, so it is counted as one
+    # and disclosed as unmeasured -- never raised on, and never a bool or a
+    # fraction read as a count.
+    caller_leaves = [lf for lf in leaves or [] if lf.get("kind") == "caller_sites_truncated"]
+    dropped_counts = [_dropped_reference_count(lf) for lf in caller_leaves]
+    unmeasured_callers_n = sum(1 for n in dropped_counts if n is None)
+    dropped_callers_n = sum(n for n in dropped_counts if n is not None) + unmeasured_callers_n
 
     blocking = [str(lf.get("kind")) for lf in (leaves or [])
                 if lf.get("kind") in BLOCKING_LEAF_KINDS]
@@ -639,13 +656,11 @@ def backward_diagnostics(
             "with no frontier leaf and no truncation; still a may-analysis over "
             "the recovered IL, not a destination-capacity or safety proof")
 
-    if dropped_callers_n:
+    if caller_leaves:
         # Each reason the ascent left callers unfollowed has its own remedy
         # (IC01). A leaf with no `reasons` tally is a cap leaf (#810).
         functions: dict[str, tuple[str, set[str]]] = {}
-        for lf in leaves or []:
-            if lf.get("kind") != "caller_sites_truncated":
-                continue
+        for lf in caller_leaves:
             fn = lf.get("function") if isinstance(lf.get("function"), dict) else {}
             reasons = (lf.get("reasons") if isinstance(lf.get("reasons"), dict)
                        and lf.get("reasons") else {"caller_cap": 1})
@@ -677,28 +692,30 @@ def backward_diagnostics(
                          "caller_sites_truncated leaves in JSON)")
             return text
 
-        reasons = {reason for _, why in functions.values() for reason in why}
+        caller_reasons = {why_one for _, why in functions.values() for why_one in why}
         advice = []
-        if "caller_cap" in reasons:
+        if "caller_cap" in caller_reasons:
             advice.append(
                 f"for {examples('caller_cap')}: the caller ascent was capped, so some "
                 "calling sites were never followed; re-run against a specific caller "
                 "or narrow the sink to see the origins behind the dropped sites")
-        if "max_depth" in reasons:
+        if "max_depth" in caller_reasons:
             advice.append(
                 f"for {examples('max_depth')}: the caller ascent stopped at the configured "
                 "depth; re-run with a larger --max-depth to follow the remaining callers")
-        if "indirect_reference" in reasons:
+        if "indirect_reference" in caller_reasons:
             advice.append(
                 "function addresses are taken (stored in data or handed on as a value), "
                 "so indirect callers remain unfollowed; inspect "
                 f"{examples('indirect_reference', 'xrefs')} for the references -- slice "
                 "backward from the dispatching caller")
-        for reason in sorted(reasons - {"caller_cap", "max_depth", "indirect_reference"}):
+        # `caller_reasons`, never `reason`: that name holds the completeness
+        # explanation returned below as `complete_slice_reason`.
+        for other in sorted(caller_reasons - {"caller_cap", "max_depth", "indirect_reference"}):
             advice.append(
-                f"some caller sites could not be followed ({reason}); the full leaf's "
+                f"some caller sites could not be followed ({other}); the full leaf's "
                 "`unfollowed` rows name each -- inspect "
-                f"{examples(reason, 'callsites')}")
+                f"{examples(other, 'callsites')}")
         next_action = "; ".join(advice)
     elif truncated and truncation_cause:
         # A named cut (the memory-chain budget, a depth bound) has its own
@@ -833,6 +850,10 @@ def backward_diagnostics(
             "unresolved": unresolved_n,
             "coarse_memory": coarse_n,
             "dropped_callers": dropped_callers_n,
+            # Present only when a caller frontier's count could not be read:
+            # `dropped_callers` is then a lower bound.
+            **({"dropped_callers_unmeasured": unmeasured_callers_n}
+               if unmeasured_callers_n else {}),
             "by_kind": by_kind,
         },
         "next_action": next_action,
