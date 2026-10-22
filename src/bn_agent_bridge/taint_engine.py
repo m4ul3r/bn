@@ -421,6 +421,7 @@ class TaintEngine:
         self._canon_global_cache: dict[int, int | None] = {}
         self._global_keyed_offsets: dict[int, set[int]] = {}
         self._global_write_span: dict[int, int] = {}
+        self._global_tainted_ranges: dict[int, list[tuple[int, int]]] = {}
         self._global_extent_unproven: set[int] = set()
         self._ssa_def_cache: dict[tuple, Any] = {}
         self._returned_params_cache: dict[int, tuple] = {}
@@ -5687,6 +5688,12 @@ class TaintEngine:
         if n is None or int(n) <= 0:
             return
         span = offset + int(n)
+        # The bytes this copy made tainted, as an interval of the object:
+        # an overlap test on intervals is what tells a read that reaches
+        # them from one that stops short (round-11 review F21).
+        ranges = self._global_tainted_ranges.setdefault(ga, [])
+        if (offset, span) not in ranges:
+            ranges.append((offset, span))
         if span > int(self._global_write_span.get(ga) or 0):
             self._global_write_span[ga] = span
             # The extent is memoised, and this is new evidence about it --
@@ -6184,6 +6191,37 @@ class TaintEngine:
         subs.extend(getattr(expr, "operands", None) or ())
         return any(self._expr_loads(ssaf, s, base, depth + 1, budget) for s in subs)
 
+    def _load_ptr(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
+                  budget: _ScanBudget | None = None) -> Any:
+        """The ADDRESS expression of the first LOAD through *base*, or None.
+
+        `observed = p[8]` reads at +8, and the displacement lives in that
+        address expression -- a load verdict that reported no expression at
+        all fell back to the literal scan and claimed the base (round-11
+        review F22)."""
+        if budget is None:
+            budget = _ScanBudget(self._PTR_RESOLVE_NODES)
+        if expr is None or depth > 10 or not budget.spend() \
+                or not hasattr(expr, "operation"):
+            return None
+        if "LOAD" in op_name(expr):
+            src = getattr(expr, "src", None)
+            if self._ptr_resolves(ssaf, src, base, budget=budget):
+                return src
+        subs: list[Any] = []
+        for attr in ("src", "left", "right", "params"):
+            sub = getattr(expr, attr, None)
+            if isinstance(sub, (list, tuple)):
+                subs.extend(sub)
+            elif sub is not None:
+                subs.append(sub)
+        subs.extend(getattr(expr, "operands", None) or ())
+        for one in subs:
+            got = self._load_ptr(ssaf, one, base, depth + 1, budget)
+            if got is not None:
+                return got
+        return None
+
     def _global_base(self, ssaf: Any, ga: int):
         """The root test for the global OBJECT based at *ga*.
 
@@ -6431,7 +6469,6 @@ class TaintEngine:
                         if hit_use is not None:
                             return hit_use
                     continue
-                expr = params[hit[0]]
                 span = None if span_of is None else span_of(ins, hit)
                 body, unread_body = self._callee_body(ins)
                 kind = None
@@ -6458,7 +6495,17 @@ class TaintEngine:
                         continue                  # no body to contradict it
                     else:
                         kind = "unknown_call_arg"
-                hit_use = emit(verdict(ins, kind, arg_seed(ins, hit), expr, span))
+                # The argument the callee READS is the one whose
+                # displacement describes this access: `memcpy(g, g + 48, 32)`
+                # reads at +48 and writes at 0 (round-11 review F21/F22).
+                read_hit = next(
+                    (i for i in hit
+                     if self._model_arg_role(
+                         lookup_model(self.models, self._callee_name(
+                             self._resolve_direct_target(ins)))[1], i) == "read"),
+                    hit[0])
+                hit_use = emit(verdict(ins, kind, arg_seed(ins, hit),
+                                       params[read_hit], span))
                 if hit_use is not None:
                     return hit_use
                 continue
@@ -6485,17 +6532,20 @@ class TaintEngine:
                 if dest_hit or src_hit:
                     # `p[i] = p[j] + 1` reads, and `*q = p` escapes the
                     # address to memory this walk cannot follow.
+                    loaded = self._load_ptr(ssaf, ins, base, budget=scan)
                     hit_use = emit(verdict(
                         ins, "load" if self._expr_loads(ssaf, ins, base, budget=scan)
                         else "address_escape",
-                        expr=getattr(ins, "dest", None) if dest_hit else None,
+                        expr=loaded if loaded is not None
+                        else (getattr(ins, "dest", None) if dest_hit else None),
                         span=int(getattr(ins, "size", 0) or 0) or None))
                     if hit_use is not None:
                         return hit_use
                 continue
             if self._expr_loads(ssaf, ins, base, budget=scan):
                 hit_use = emit(verdict(
-                    ins, "load", span=int(getattr(ins, "size", 0) or 0) or None))
+                    ins, "load", expr=self._load_ptr(ssaf, ins, base, budget=scan),
+                    span=int(getattr(ins, "size", 0) or 0) or None))
                 if hit_use is not None:
                     return hit_use
                 continue
@@ -6520,15 +6570,18 @@ class TaintEngine:
             return _Use(None, "write_only", 0, None, None, True)
         return _Use(fallback, "unclassified", 0, None, None, True)
 
-    def _global_ptr_offset(self, ssaf: Any, expr: Any, ga: int, depth: int = 0,
-                           seen: set | None = None) -> int | None:
-        """The byte displacement into the object at *ga* that *expr* points
-        at, or None when this scan cannot establish one.
+    def _ptr_offset(self, ssaf: Any, expr: Any, root: Any, depth: int = 0,
+                    seen: set | None = None) -> int | None:
+        """The byte displacement from *root* that *expr* points at, or None
+        when this scan cannot establish ONE value.
 
-        The literal scan reads displacements the INSTRUCTION carries. A
-        pointer handed back through a wrapper carries its displacement in the
-        SSA chain instead -- `p = fgets(g, 2, f); system(p + 8)` is a read at
-        +8 that the literal scan reported as the base (round-10 review M1)."""
+        Affine provenance, not a yes/no alias test: a displacement composes
+        along the chain (`advance(p)` returning `p + 16`, consumed as
+        `advance(..) + 8`, is +24), and a PHI whose arms disagree, or a hop
+        this walk cannot follow, is UNKNOWN -- never 0, which would read as
+        the object's base (round-11 review F22). *root* answers the leaf
+        question: the displacement of an expression that IS the tracked
+        object, or None."""
         if expr is None or depth > self._PTR_RESOLVE_DEPTH:
             return None
         seen = set() if seen is None else seen
@@ -6537,13 +6590,10 @@ class TaintEngine:
             if ("off", int(idx)) in seen:
                 return None
             seen.add(("off", int(idx)))
+        rooted = root(expr)
+        if rooted is not None:
+            return int(rooted)
         opn = op_name(expr)
-        if "CONST_PTR" in opn or "CONST" == opn.split("_")[-1]:
-            value = self._int_const(expr)
-            if value is None:
-                return None
-            value = int(value)
-            return value - ga if ga <= value < ga + self._global_extent(ga) else None
         if is_ssa_var(expr):
             key = (var_key(expr), getattr(expr, "version", None))
             if key in seen:
@@ -6553,41 +6603,20 @@ class TaintEngine:
             if defn is None:
                 return None
             if self._is_call(defn):
-                params = self._call_params(defn)
-                _k, model = lookup_model(
-                    self.models, self._callee_name(self._resolve_direct_target(defn)))
-                for rule in ((model or {}).get("propagates") or ()):
-                    if str(rule.get("to") or "") not in ("ret", "*ret"):
-                        continue
-                    arg = _try_arg_index(str(rule.get("from") or ""))
-                    if arg is not None and arg < len(params):
-                        got = self._global_ptr_offset(
-                            ssaf, params[arg], ga, depth + 1, seen)
-                        if got is not None:
-                            return got
-                body, _unread = self._callee_body(defn)
-                if body is None:
-                    return None
-                for pidx in self._fn_returned_params(body):
-                    if pidx < len(params):
-                        got = self._global_ptr_offset(
-                            ssaf, params[pidx], ga, depth + 1, seen)
-                        if got is not None:
-                            return got
-                return self._fn_return_offset(body, ga, depth + 1)
+                return self._call_offset(ssaf, defn, root, depth, seen)
             srcs = getattr(defn, "src", None)
             if not isinstance(srcs, (list, tuple)):
                 srcs = [] if srcs is None else [srcs]
-            for src in srcs:
-                got = self._global_ptr_offset(ssaf, src, ga, depth + 1, seen)
-                if got is not None:
-                    return got
-            return None
+            # A PHI merges several arms: one displacement only if they agree.
+            answers = {self._ptr_offset(ssaf, src, root, depth + 1, seen)
+                       for src in srcs}
+            answers.discard(None)
+            return answers.pop() if len(answers) == 1 else None
         if any(tok in opn for tok in ("ADD", "SUB")):
             left, right = getattr(expr, "left", None), getattr(expr, "right", None)
             sign = -1 if "SUB" in opn else 1
             for ptr, other in ((left, right), (right, left)):
-                base_off = self._global_ptr_offset(ssaf, ptr, ga, depth + 1, seen)
+                base_off = self._ptr_offset(ssaf, ptr, root, depth + 1, seen)
                 if base_off is None:
                     continue
                 delta = self._int_const(other)
@@ -6602,16 +6631,87 @@ class TaintEngine:
         # operand attribute -- the same place `_ptr_resolves` finds it.
         subs.extend(expr_reads(expr))
         for one in subs:
-            got = self._global_ptr_offset(ssaf, one, ga, depth + 1, seen)
+            got = self._ptr_offset(ssaf, one, root, depth + 1, seen)
             if got is not None:
                 return got
         return None
 
-    def _fn_return_offset(self, fn: Any, ga: int, depth: int = 0) -> int | None:
-        """The displacement into *ga* that *fn* RETURNS, if it returns one."""
+    def _call_offset(self, ssaf: Any, defn: Any, root: Any, depth: int,
+                     seen: set) -> int | None:
+        """The displacement a CALL's returned pointer carries.
+
+        Three routes, each composing the callee's own adjustment with the
+        actual argument's: a modeled `arg:N -> ret`, a body that hands back
+        one of its FORMALS (possibly displaced -- `return p + 16`), and a
+        body whose returns name the object itself."""
+        params = self._call_params(defn)
+        _k, model = lookup_model(
+            self.models, self._callee_name(self._resolve_direct_target(defn)))
+        for rule in ((model or {}).get("propagates") or ()):
+            if str(rule.get("to") or "") not in ("ret", "*ret"):
+                continue
+            arg = _try_arg_index(str(rule.get("from") or ""))
+            if arg is not None and arg < len(params):
+                got = self._ptr_offset(ssaf, params[arg], root, depth + 1, seen)
+                if got is not None:
+                    return got
+        body, _unread = self._callee_body(defn)
+        if body is None:
+            return None
+        for pidx in self._fn_returned_params(body):
+            if pidx >= len(params):
+                continue
+            actual = self._ptr_offset(ssaf, params[pidx], root, depth + 1, seen)
+            if actual is None:
+                continue
+            inner = self._fn_returned_param_offset(body, pidx, depth + 1)
+            # The callee's own adjustment is part of the answer: treating a
+            # returned formal as the argument itself dropped `+ 16` (F22).
+            return None if inner is None else actual + inner
+        return self._fn_return_offset_rooted(body, root, depth + 1)
+
+    def _global_root(self, ga: int):
+        """Leaf test for the object at *ga*: the displacement a constant
+        pointer into it names."""
+        extent = self._global_extent(ga)
+
+        def root(expr: Any) -> int | None:
+            value = self._int_const(expr)
+            if value is None:
+                return None
+            value = int(value)
+            return value - ga if ga <= value < ga + extent else None
+        return root
+
+    def _global_ptr_offset(self, ssaf: Any, expr: Any, ga: int) -> int | None:
+        """The displacement into the object at *ga* that *expr* points at."""
+        return self._ptr_offset(ssaf, expr, self._global_root(ga))
+
+    def _fn_returned_param_offset(self, fn: Any, pidx: int,
+                                  depth: int = 0) -> int | None:
+        """The displacement *fn* adds to formal *pidx* before returning it."""
+        key = (int(getattr(fn, "start", 0)), int(pidx), "formal")
+        if key in self._return_offset_active or depth > self._PTR_RESOLVE_DEPTH:
+            return None
+        self._return_offset_active.add(key)
+        try:
+            formals = list(getattr(fn, "parameter_vars", []) or [])
+            if pidx >= len(formals):
+                return None
+            pkey = var_key(formals[pidx])
+
+            def root(expr: Any) -> int | None:
+                return 0 if is_ssa_var(expr) and var_key(expr) == pkey else None
+            return self._fn_return_offset_rooted(fn, root, depth + 1)
+        finally:
+            self._return_offset_active.discard(key)
+
+    def _fn_return_offset_rooted(self, fn: Any, root: Any,
+                                 depth: int = 0) -> int | None:
+        """The displacement from *root* that *fn* RETURNS, if it returns one."""
         if depth > self._PTR_RESOLVE_DEPTH:
             return None
-        key = (int(getattr(fn, "start", 0)), int(ga))
+        key = (int(getattr(fn, "start", 0)), id(root))
         if key in self._return_offset_active:
             return None
         self._return_offset_active.add(key)
@@ -6626,12 +6726,15 @@ class TaintEngine:
                 if "RET" not in op_name(ins):
                     continue
                 for src in self._ret_sources(ins):
-                    got = self._global_ptr_offset(ssaf, src, ga, depth + 1)
+                    got = self._ptr_offset(ssaf, src, root, depth + 1)
                     if got is not None:
                         return got
             return None
         finally:
             self._return_offset_active.discard(key)
+
+    def _fn_return_offset(self, fn: Any, ga: int, depth: int = 0) -> int | None:
+        return self._fn_return_offset_rooted(fn, self._global_root(ga), depth)
 
     def _model_span(self, ins: Any, hit: list[int]) -> int | None:
         """How many bytes a modeled call touches through the argument that
@@ -6647,32 +6750,32 @@ class TaintEngine:
         n = self._int_const(params[length])
         return int(n) if n is not None and int(n) > 0 else None
 
-    def _call_sees_global(self, ssaf: Any, call: Any, site: int | None) -> bool:
-        """Whether tainted bytes written at IL index *site* can be live at
-        *call*.
+    def _call_sees_global(self, ssaf: Any, call: Any, sites: Any) -> bool:
+        """Whether tainted bytes written at any index in *sites* can be live
+        at *call*.
 
-        A call that runs BEFORE the only write to the global, with no path
-        back to it, cannot carry those bytes anywhere: `reader(); memcpy(g,
-        s, 64);` reported the reader as a continuation because the fixpoint
-        kept the global live across passes (round-10 review M2). Textual
-        order answers the forward case; a call that comes earlier is checked
-        against the CONTROL FLOW, so a loop that re-enters it still counts.
-        A view that cannot say answers yes."""
-        if site is None:
+        The question is CONTROL FLOW, not IL numbering: `if (flag) reader();
+        else memcpy(g, s, 64);` has the write at a lower index than the
+        reader and no path between them, so numeric order answered yes for a
+        branch that can never carry those bytes (round-11 review F23). Index
+        order decides only WITHIN one basic block, where it is the same
+        thing. A function with no readable CFG fails closed -- temporal
+        uncertainty is not proof of flow, but it is not proof against it
+        either."""
+        if not sites:
             return True
         try:
             at = int(getattr(call, "instr_index", getattr(call, "address", 0)))
         except Exception:
             return True
-        if at > int(site):
-            return True
-        return self._il_reaches(ssaf, int(site), at)
+        return any(self._il_reaches(ssaf, int(site), at) for site in sites)
 
     def _il_reaches(self, ssaf: Any, src: int, dst: int) -> bool:
         """Whether IL index *dst* is reachable from *src* through the CFG."""
         blocks = list(getattr(ssaf, "basic_blocks", None) or ())
         if not blocks:
             return True            # no CFG to read: claim nothing
+
         def holding(idx: int) -> Any:
             for block in blocks:
                 try:
@@ -6743,6 +6846,26 @@ class TaintEngine:
                 break
         return out
 
+    def _typed_width(self, ga: int) -> int:
+        """The width of the object's RECOVERED type, or 0 when it has none."""
+        getdv = getattr(self.bv, "get_data_var_at", None)
+        if not callable(getdv):
+            return 0
+        try:
+            width = getattr(getattr(getdv(ga), "type", None), "width", None)
+            return int(width) if width else 0
+        except Exception:
+            return 0
+
+    def _tainted_ranges(self, ga: int) -> list[tuple[int, int]]:
+        """The byte intervals of the object at *ga* this run has tainted,
+        absolute. Falls back to the whole object when no copy named a
+        length -- claiming less than was written is the wrong direction."""
+        ranges = [(ga + lo, ga + hi)
+                  for lo, hi in (self._global_tainted_ranges.get(ga) or ())
+                  if hi > lo]
+        return ranges or [(ga, ga + self._global_extent(ga))]
+
     def _overlap_access(self, fn: Any, ssaf: Any, ga: int) -> Any:
         """A use of a NEIGHBOURING object whose bytes reach into *ga*.
 
@@ -6750,14 +6873,27 @@ class TaintEngine:
         A copy of `packet[0..112)` reads the bytes a write to `packet_tail`
         put there, but it names the other symbol, so neither the reference
         sweep nor the classifier saw it and the run cleared (round-10 review
-        C1). An access is counted only when its SPAN reaches into this
-        object -- which is what keeps a genuinely adjacent neighbour, whose
-        accesses stay inside itself, out of it."""
-        extent = self._global_extent(ga)
+        C1). The test is on INTERVALS: the read's addressed bytes against the
+        bytes this run tainted. A read whose length is not a constant -- a
+        NUL-terminated `system(packet)`, a runtime `memcpy(.., packet, n)` --
+        cannot be shown to stop short, so it overlaps and the leaf says the
+        object's extent is what is unproven (round-11 review F21).
+
+        Only an ABUTTING neighbour is considered: a separate object with a
+        gap after it is not storage this write can have reached."""
+        tainted = self._tainted_ranges(ga)
         start = int(getattr(fn, "start", 0))
         for pb in self._preceding_objects(ga):
             if start not in self._global_ref_functions(pb):
                 continue        # this body does not touch that object at all
+            typed = self._typed_width(pb)
+            if typed and pb + typed <= ga:
+                # A RECOVERED TYPE is an answer about where that object
+                # ends: this one begins past it, so they are separate
+                # storage and no write here can have landed in it. An
+                # untyped neighbour says nothing, and an alias symbol inside
+                # one is exactly the case that must still be considered.
+                continue
             uses: list = []
             self._pointer_access(
                 fn, self._global_base(ssaf, pb), fallback=None,
@@ -6767,16 +6903,25 @@ class TaintEngine:
                 names_object=lambda ins: self._names_global(ins, pb),
                 collect=uses)
             for use in uses:
-                span = int(use.span or 1)
-                if use.offset_known:
-                    lo, hi = pb + use.offset, pb + use.offset + span
+                if use.offset_known and use.span:
+                    lo, hi, bounded = pb + use.offset, pb + use.offset + int(use.span), True
+                elif use.offset_known:
+                    # A length nothing states reads until it stops -- which
+                    # this walk cannot bound.
+                    lo, hi, bounded = pb + use.offset, None, False
                 else:
-                    # An unknown displacement cannot be used to rule the
-                    # overlap OUT: the access may be anywhere in the object.
-                    lo, hi = pb, pb + max(self._global_extent(pb), span)
-                if hi > ga and lo < ga + extent:
-                    return _Use(use.at, use.kind, max(lo, ga) - ga, use.seed,
-                                use.span, use.offset_known)
+                    lo, hi, bounded = pb, None, False
+                for tlo, thi in tainted:
+                    if lo >= thi:
+                        continue
+                    if hi is not None and hi <= tlo:
+                        continue
+                    if not bounded:
+                        # Disclose WHY it could not be ruled out, rather than
+                        # presenting an unbounded read as a measured one.
+                        self._global_extent_unproven.add(ga)
+                    return _Use(use.at, use.kind, max(lo, tlo) - ga, use.seed,
+                                use.span, use.offset_known and bounded)
         return None
 
     def _global_access(self, fn: Any, ga: int) -> Any:
@@ -7203,7 +7348,7 @@ class TaintEngine:
         # across passes, so a later pass saw a global live at every call --
         # including calls that run BEFORE the only write, which were then
         # reported as carrying tainted bytes across (round-10 review M2).
-        live_global_sites: dict[int, int] = {}
+        live_global_sites: dict[int, set] = {}
         # (call address, global address) already disclosed, so the fixpoint's
         # repeated visits report one boundary, not one per pass.
         global_frontiers_seen: set[tuple[int, int]] = set()
@@ -7264,10 +7409,10 @@ class TaintEngine:
             if type(key) is tuple and len(key) == 2 and key[0] == "global":
                 live_globals.setdefault(int(key[1]), node)
                 if ins is not None:
-                    site = ins_key(ins)
-                    prev = live_global_sites.get(int(key[1]))
-                    if prev is None or site < prev:
-                        live_global_sites[int(key[1])] = site
+                    # EVERY site: a call reachable from a later write but not
+                    # from the first one is still carrying those bytes.
+                    live_global_sites.setdefault(int(key[1]), set()).add(
+                        ins_key(ins))
             why[node] = {"label": label, "instr": ins, "reason": reason, "parents": list(parents)}
             return True
 

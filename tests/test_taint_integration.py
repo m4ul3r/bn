@@ -2587,6 +2587,23 @@ N void use_refill(void) { char *p = refill(tracked); if (p) system(p + 8); }
 N void overlap_case(char *s) { memcpy(packet_tail, s, 32); consumer(); }
 N void shallow_case(char *s) { memcpy(packet_tail, s, 32); shallow(); }
 N void neighbour_case(char *s) { memcpy(packet_tail, s, 32); other_reader(); }
+N void string_reader(void) { system(packet); }
+N void variable_span_reader(size_t n) { char local[128]; memcpy(local, packet, n); system(local + 80); }
+N void shifted_copy_reader(void) { char local[32]; memcpy(local, packet + 48, 32); system(local); }
+N void string_case(char *s) { memcpy(packet_tail, s, 32); string_reader(); }
+N void variable_case(char *s, size_t n) { memcpy(packet_tail, s, 32); variable_span_reader(n); }
+N void shifted_case(char *s) { memcpy(packet_tail, s, 32); shifted_copy_reader(); }
+N void branch_case(char *s, int flag) { if (flag) reader(); else memcpy(tracked, s, 64); }
+N void conditional_before_case(char *s, int flag) { if (flag) reader(); memcpy(tracked, s, 64); }
+N unsigned char observed;
+N void load_reader(void) { char *p = refill(tracked); if (p) observed = (unsigned char)p[8]; }
+N char *advance(char *p) { return p + 16; }
+N char *producer(void) { return advance(memset(tracked, 0, 1)); }
+N void advanced_reader(void) { char *p = producer(); system(p); }
+N void advanced_plus_reader(void) { char *p = producer(); system(p + 8); }
+N void load_case(char *s) { memcpy(tracked, s, 64); load_reader(); }
+N void advanced_case(char *s) { memcpy(tracked, s, 64); advanced_reader(); }
+N void advanced_plus_case(char *s) { memcpy(tracked, s, 64); advanced_plus_reader(); }
 N void before_case(char *s) { reader(); memcpy(tracked, s, 64); }
 N void after_case(char *s) { memcpy(tracked, s, 64); reader(); }
 N void loop_case(char *s, int n) { for (int i = 0; i < n; i++) { reader(); memcpy(tracked, s, 64); } }
@@ -2600,6 +2617,14 @@ int main(int argc, char **argv) {
     case 5: before_case(argv[1]); break;
     case 6: after_case(argv[1]); break;
     case 7: offset_case(argv[1]); break;
+    case 8: string_case(argv[1]); break;
+    case 9: variable_case(argv[1], 112); break;
+    case 10: shifted_case(argv[1]); break;
+    case 11: branch_case(argv[1], argc & 1); break;
+    case 12: conditional_before_case(argv[1], argc & 1); break;
+    case 13: load_case(argv[1]); break;
+    case 14: advanced_case(argv[1]); break;
+    case 15: advanced_plus_case(argv[1]); break;
     default: loop_case(argv[1], argc); break;
     }
     return 0;
@@ -2658,3 +2683,33 @@ def test_global_continuation_symbol_overlap_offsets_and_order(tmp_path, shared_b
         result, leaves = gmc(fn)
         assert [r["display_name"] for r in leaves[0]["references"]] == ["reader"], fn
         assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # Round-11 review F21: a read whose length is not stated cannot be shown
+    # to stop short of the tainted bytes, so it blocks -- and says the
+    # extent is what is unproven. One that starts INSIDE the enclosing
+    # object and reaches them blocks on the interval, not on adjacency.
+    for fn in ("string_case", "variable_case"):
+        result, leaves = gmc(fn)
+        [leaf] = leaves
+        assert leaf["references"][0]["offset_known"] is False, (fn, leaf)
+        assert leaf["reachability"]["cause"] == "object_extent_unproven", (fn, leaf)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+    result, leaves = gmc("shifted_case")
+    [leaf] = leaves
+    assert [r["display_name"] for r in leaf["references"]] == ["shifted_copy_reader"]
+
+    # F22: a pointer-adjusting wrapper composes its displacement, and a
+    # scalar load through a returned pointer reports the byte it reads.
+    for fn, want in (("load_case", 8), ("advanced_case", 16),
+                     ("advanced_plus_case", 24)):
+        result, leaves = gmc(fn)
+        row = max((r for lf in leaves for r in lf["references"]),
+                  key=lambda r: r["offset"])
+        assert row["offset"] == want, (fn, leaves)
+        assert row["offset_known"] is True, (fn, leaves)
+
+    # F23: mutually exclusive branches never carry those bytes to each other
+    for fn in ("branch_case", "conditional_before_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn

@@ -2787,3 +2787,252 @@ def test_without_a_cfg_the_walk_claims_nothing(models):
     # A view that cannot answer "is there a path" must not be read as "no".
     func, bv = _before_after_program("before")
     assert _leaves(_forward(bv, func, models, source="param:0")) != []
+
+
+# --------------------------------------------------------------------------
+# round-11 review F21: the overlap test is on tainted BYTE INTERVALS
+# --------------------------------------------------------------------------
+
+def _unbounded_reader(name, start, addr, at=0x401210):
+    """`system(packet)` -- a NUL-terminated read of unstated length."""
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", f"system({hex(addr)})",
+               dest=_gptr(SYSTEM), params=[_gptr(addr)]),
+    ]), params=[])
+
+
+def _variable_reader(name, start, addr, at=0x401210):
+    """`memcpy(local, packet, n)` -- a runtime length."""
+    local, n = FSSA(FVar("local"), 1), FSSA(FVar("n"), 0)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", f"memcpy(&local, {hex(addr)}, n#0)",
+               reads=[n], writes=[local], dest=_gptr(MEMCPY),
+               params=[_var(local), _gptr(addr), _var(n)]),
+    ]), params=[FVar("n")])
+
+
+def _interval_program(consumer, write_len=32, write_at=None):
+    """Write *write_len* bytes into the tail symbol, then call *consumer*."""
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_TAIL if write_at is None else write_at),
+        call_sites=[(0x401108, _gptr(int(consumer.start)), [])],
+        params_extra=[_const(write_len)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    int(consumer.start): consumer.name},
+                   funcs={int(consumer.start): consumer},
+                   refs={G_DIR: [FRef(consumer, 0x401210)],
+                         G_TAIL: [FRef(func, 0x401104)]},
+                   objects={G_DIR: 0, G_TAIL: 0, G_OTHER: 0},
+                   section=(0x404000, 0x405000))
+    return func, bv
+
+
+def test_a_read_that_stops_before_the_tainted_bytes_is_silent(models):
+    # The write fills [tail, tail + 32); a read of `packet[0..64)` ends
+    # exactly where they begin.
+    func, bv = _interval_program(_spanning_reader("short", 0x401200, G_DIR, 64))
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_read_that_reaches_the_tainted_bytes_blocks(models):
+    func, bv = _interval_program(_spanning_reader("spans", 0x401200, G_DIR, 80))
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["display_name"] == "spans", leaf
+
+
+def test_a_read_starting_inside_the_enclosing_object_blocks(models):
+    # `memcpy(dst, packet + 48, 32)` reads [48, 80) and the tainted bytes
+    # start at 64: the interval test is what tells them apart.
+    func, bv = _interval_program(
+        _spanning_reader("shifted", 0x401200, G_DIR + 48, 32))
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["display_name"] == "shifted", leaf
+
+
+@pytest.mark.parametrize("make,name", [
+    (_unbounded_reader, "string"), (_variable_reader, "variable")])
+def test_a_read_of_unstated_length_cannot_be_ruled_out(models, make, name):
+    # Round-11 review F21: a NUL-terminated `system(packet)` and a runtime
+    # `memcpy(.., packet, n)` both read an unbounded number of bytes from
+    # BEFORE the tainted ones. Nothing shows they stop short, so they block
+    # -- and the leaf says it is the extent that is unproven.
+    func, bv = _interval_program(make(name, 0x401200, G_DIR))
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == name, leaf
+    assert leaf["references"][0]["offset_known"] is False, leaf
+    assert leaf["reachability"]["cause"] == "object_extent_unproven", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_neighbour_with_a_gap_is_not_this_objects_storage(models):
+    # The preceding object ends well before this one begins, so no write
+    # here can have landed in it.
+    consumer = _unbounded_reader("far", 0x401200, G_DIR)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_OTHER),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(32)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "far"},
+                   funcs={0x401200: consumer},
+                   refs={G_DIR: [FRef(consumer, 0x401210)],
+                         G_OTHER: [FRef(func, 0x401104)]},
+                   objects={G_DIR: 16, G_OTHER: 16},
+                   section=(0x404000, 0x405000))
+    assert _leaves(_forward(bv, func, models)) == []
+
+
+# --------------------------------------------------------------------------
+# round-11 review F22: affine pointer provenance
+# --------------------------------------------------------------------------
+
+def _advancing_helper(name, start, delta, at=0x401210):
+    """`char *advance(char *p) { return p + delta; }`."""
+    p = FVar("p")
+    p0 = FSSA(p, 0)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_RET", f"return p#0 + {delta}", reads=[p0],
+               src=[FExpr("MLIL_ADD", f"p#0 + {delta}", left=_var(p0),
+                          right=_const(delta))]),
+    ]), params=[p])
+
+
+def _producer(name, start, helper_start, at=0x401220):
+    """`char *producer(void) { return advance(memset(g, 0, 1)); }`."""
+    inner, out = FSSA(FVar("i"), 1), FSSA(FVar("o"), 1)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", "i#1 = memset(g, 0, 1)", writes=[inner],
+               dest=_gptr(MEMSET), params=[_gptr(G_DIR), _const(0), _const(1)]),
+        FInstr(1, at + 8, "MLIL_CALL_SSA", f"o#1 = {hex(helper_start)}(i#1)",
+               reads=[inner], writes=[out], dest=_gptr(helper_start),
+               params=[_var(inner)]),
+        FInstr(2, at + 16, "MLIL_RET", "return o#1", reads=[out], src=[_var(out)]),
+    ]), params=[])
+
+
+def _advanced_program(use_delta):
+    helper = _advancing_helper("advance", 0x401200, 16)
+    producer = _producer("producer", 0x401250, 0x401200)
+    producer.callees = [helper]
+    consumer = _reads_offset("consumer", 0x401300, 0x401250, use_at=0x401318) \
+        if use_delta else None
+    q = FSSA(FVar("q"), 1)
+    body = [FInstr(0, 0x401310, "MLIL_CALL_SSA", "q#1 = producer()", writes=[q],
+                   dest=_gptr(0x401250), params=[])]
+    arg = (FExpr("MLIL_ADD", "q#1 + 8", left=_var(q), right=_const(use_delta))
+           if use_delta else _var(q))
+    body.append(FInstr(1, 0x401318, "MLIL_CALL_SSA", "system(..)", reads=[q],
+                       dest=_gptr(SYSTEM), params=[arg]))
+    consumer = GFunc("consumer", 0x401300, FSSAFunc(body), params=[],
+                     callees=[producer])
+    func, bv = _chain_program([helper, producer], consumer, producer)
+    return func, bv
+
+
+@pytest.mark.parametrize("use_delta,expected", [(0, 16), (8, 24)])
+def test_a_pointer_adjusting_wrapper_composes_its_offset(models, use_delta,
+                                                         expected):
+    # Round-11 review F22: `advance(p)` returns `p + 16`, and the caller adds
+    # 8 -- the read is at +24. Treating the returned formal as the ARGUMENT
+    # dropped the callee's own adjustment and reported 8.
+    func, bv = _advanced_program(use_delta)
+    [leaf] = _leaves(_forward(bv, func, models))
+    row = next(r for r in leaf["references"] if r["display_name"] == "consumer")
+    assert row["offset"] == expected, leaf
+    assert row["offset_known"] is True, leaf
+
+
+def test_a_scalar_load_through_a_returned_pointer_reports_its_offset(models):
+    # `p = fgets(g, ..); observed = p[8]` is a read at +8; a load verdict
+    # that carried no pointer expression fell back to the literal scan.
+    q = FSSA(FVar("q"), 1)
+    consumer = GFunc("loader", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "q#1 = fgets(g, 2, stdin)",
+               writes=[q], dest=_gptr(FGETS),
+               params=[_gptr(G_DIR), _const(2), _const(0)]),
+        FInstr(1, 0x401318, "MLIL_SET_VAR_SSA", "x#1 = [q#1 + 8].b",
+               reads=[q], writes=[FSSA(FVar("x"), 1)],
+               src=FExpr("MLIL_LOAD_SSA", "[q#1 + 8].b",
+                         src=FExpr("MLIL_ADD", "q#1 + 8", left=_var(q),
+                                   right=_const(8)))),
+    ]), params=[])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", FGETS: "fgets",
+                    0x401300: "loader"},
+                   funcs={0x401300: consumer},
+                   refs={G_DIR: [FRef(consumer, 0x401310)]})
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["access"] == "load", leaf
+    assert leaf["references"][0]["offset"] == 8, leaf
+    assert leaf["references"][0]["offset_known"] is True, leaf
+
+
+def test_a_phi_whose_arms_disagree_has_no_single_offset(models):
+    eng = te.TaintEngine(FGlobalBV({}), models)
+    a, b = FSSA(FVar("a"), 1), FSSA(FVar("b"), 1)
+    merged = FSSA(FVar("m"), 1)
+    ssaf = FSSAFunc([
+        FInstr(0, 0x401200, "MLIL_SET_VAR_SSA", "a#1 = g + 8", writes=[a],
+               src=FExpr("MLIL_ADD", "g + 8", left=_gptr(G_DIR), right=_const(8))),
+        FInstr(1, 0x401208, "MLIL_SET_VAR_SSA", "b#1 = g + 16", writes=[b],
+               src=FExpr("MLIL_ADD", "g + 16", left=_gptr(G_DIR), right=_const(16))),
+        FInstr(2, 0x401210, "MLIL_VAR_PHI", "m#1 = phi(a#1, b#1)",
+               reads=[a, b], writes=[merged], src=[_var(a), _var(b)]),
+    ])
+    assert eng._global_ptr_offset(ssaf, _var(merged), G_DIR) is None
+
+
+# --------------------------------------------------------------------------
+# round-11 review F23: a write reaches a call only through the CFG
+# --------------------------------------------------------------------------
+
+def _branch_program():
+    """`if (flag) reader(); else memcpy(g, s, 64);` -- sibling blocks."""
+    hook = _reader("reader", 0x401200, G_DIR, 0x401210)
+    argv = FVar("argv")
+    argv0 = FSSA(argv, 0)
+    instrs = [
+        FInstr(0, 0x401100, "MLIL_IF", "if (flag) then 1 else 2"),
+        FInstr(1, 0x401108, "MLIL_CALL_SSA", "reader()",
+               dest=_gptr(0x401200), params=[]),
+        FInstr(2, 0x401110, "MLIL_CALL_SSA", "memcpy(g, argv#0, 0x40)",
+               reads=[argv0], dest=_gptr(MEMCPY),
+               params=[_gptr(G_DIR), _var(argv0), _const(0x40)]),
+        FInstr(3, 0x401118, "MLIL_RET", "return"),
+    ]
+    for i, ins in enumerate(instrs):
+        ins.instr_index = i
+    ssaf = FSSAFunc(instrs)
+    head, left, right, tail = (FBlock(0, 1), FBlock(1, 2),
+                               FBlock(2, 3), FBlock(3, 4))
+    head.outgoing_edges = [type("E", (), {"target": left})(),
+                           type("E", (), {"target": right})()]
+    left.outgoing_edges = [type("E", (), {"target": tail})()]
+    right.outgoing_edges = [type("E", (), {"target": tail})()]
+    ssaf.basic_blocks = [head, left, right, tail]
+    func = GFunc("main", 0x401100, ssaf, params=[argv])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader"},
+                   funcs={0x401200: hook}, refs={G_DIR: [FRef(hook, 0x401210)]})
+    return func, bv
+
+
+def test_a_reader_on_the_other_branch_sees_nothing(models):
+    # Round-11 review F23: the write sits at a LOWER il index than the
+    # reader but on a sibling branch, so numeric order answered "after" for
+    # a path that can never carry those bytes.
+    func, bv = _branch_program()
+    result = _forward(bv, func, models, source="param:0")
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_il_order_decides_only_inside_one_block(models):
+    eng = te.TaintEngine(FGlobalBV({}), models)
+    func, _bv = _branch_program()
+    ssaf = func.mlil.ssa_form
+    assert eng._il_reaches(ssaf, 2, 1) is False     # sibling branches
+    assert eng._il_reaches(ssaf, 1, 2) is False     # ...in either direction
+    assert eng._il_reaches(ssaf, 0, 2) is True      # head to a successor
