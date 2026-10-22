@@ -162,7 +162,7 @@ def test_constant_table_at_a_scaled_index_is_a_frontier_with_the_index(writable)
         ranges=[SimpleNamespace(start=0x402020, end=0x402038, step=8)])
     p.sink(p.load(addr, 8))
     result, origins, _, fields = p.run(writable=writable, segment_writable=writable)
-    assert {"kind": "parameter", "index": 1, "var": "n#0"} in origins, origins
+    assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 1, "n#0") for o in origins), origins
     if writable:
         assert not fields, fields
         assert any(lf.get("global") == "0x402020" for lf in result["leaves"]), result["leaves"]
@@ -186,7 +186,8 @@ def test_sign_extended_upper_half_load_follows_the_bytes_not_the_pointer(stored)
         p.store(p.addr(p.m0, 8), 8)
     p.sink(_sx(p.load(p.addr(p.m0, 0xc), 4)))
     result, origins, reasons, fields = p.run()
-    assert {"kind": "parameter", "index": 0, "var": "m#0"} not in origins
+    assert not any(o["kind"] == "parameter" and o.get("index") == 0 and o.get("var") == "m#0"
+                   for o in origins)
     if stored:
         assert {"kind": "call", "callee": "read_u32"} in origins, origins
         assert any("reaching store to field" in r for r in reasons), reasons

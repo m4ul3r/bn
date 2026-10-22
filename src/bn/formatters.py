@@ -5523,6 +5523,8 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                 f"(seed {sink.get('seed', '?')})   {sig}   "
                 f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} "
                 f"unresolved={unresolved}}}{xn}".rstrip())
+            if origin.get("function"):
+                lines.append(f"  origin function: {origin['function']}")
             if full:
                 lines.append(
                     f"  slice for {_sink_callee_text(sink, mangled=mangled) or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
@@ -5545,22 +5547,22 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                     if isinstance(step, dict):
                         lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
         status = _field_list(value, "sink_status")
-        # A constant-length sink is "provably bounded" -- a SUCCESS, not a failed
-        # seed -- so report it apart from genuinely-unseeded sinks (#310). A
-        # malformed (non-dict) status row is neither.
-        bounded = [s for s in status if isinstance(s, dict) and s.get("bounded")]
-        unseeded = [s for s in status
-                    if isinstance(s, dict) and not s.get("seeded", True) and not s.get("bounded")]
-        if bounded:
+        if status:
             lines.append("")
-            lines.append(f"provably bounded ({len(bounded)}):")
-            for s in bounded:
-                lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'constant length, nothing to slice')}")
-        if unseeded:
-            lines.append("")
-            lines.append(f"UNSEEDED SINKS ({len(unseeded)}):")
-            for s in unseeded:
-                lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'could not seed')}")
+            lines.append("sink sites:")
+            for s in status:
+                if not isinstance(s, dict):
+                    continue
+                site = f" @ {s['address']}" if s.get("address") else ""
+                scalar = _field_dict(s, "scalar")
+                evidence = ""
+                if scalar.get("kind") == "constant":
+                    val = scalar.get("value")
+                    shown = f"{val:#x}" if isinstance(val, int) else str(val)
+                    evidence = f" scalar={shown}; destination capacity unproved;"
+                lines.append(
+                    f"  {_describe_loc(s)}{site} [{s.get('status', '?')}]"
+                    f"{evidence} {s.get('note', '')}".rstrip())
         # #812: backward's completeness gate, rendered for every backward run
         # that carries one. Leaving it JSON-only would repeat the asymmetry #810
         # fixed for the truncation verdict -- a text reader could not tell a

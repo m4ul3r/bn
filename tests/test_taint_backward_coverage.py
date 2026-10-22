@@ -136,7 +136,7 @@ def test_constant_address_caller_argument_is_an_unfollowed_site_not_a_complete_s
                                    "param": 2, "reason": "constant_address"}]
     assert leaf["reasons"] == {"constant_address": 1}
     # the followed formal and the caller's literal are both origins
-    assert {"kind": "parameter", "index": 0, "var": "argc#0"} in _origins(result)
+    assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 0, "argc#0") for o in _origins(result))
     assert {"kind": "constant", "value": 64} in _origins(result)
 
 
@@ -199,7 +199,7 @@ def test_function_with_no_known_caller_stays_a_complete_parameter_slice():
 
     assert _gate(result) is True, result["diagnostics"]
     assert _caller_leaves(result) == []
-    assert _origins(result) == [{"kind": "parameter", "index": 2, "var": "n#0"}]
+    assert _origins(result) == [{"kind": "parameter", "index": 2, "var": "n#0", "function": "0x800"}]
 
 
 def _copy_handler():
@@ -373,7 +373,7 @@ def test_imported_process_entry_handoff_is_an_unresolved_caller_boundary():
     assert _gate(handoff) is False, handoff["diagnostics"]
     (leaf,) = _caller_leaves(handoff)
     assert leaf["reasons"] == {"indirect_reference": 1}
-    assert _origins(handoff) == [{"kind": "parameter", "index": 0, "var": "argc#0"}]
+    assert _origins(handoff) == [{"kind": "parameter", "index": 0, "var": "argc#0", "function": "0x800"}]
 
 
 @pytest.mark.parametrize("dest_op,callback", [
@@ -530,7 +530,7 @@ def test_direct_call_code_references_are_still_followed():
                        code_refs={0x800: [(0xa10, main)]}, entry=start)
     assert _gate(direct) is True, direct["diagnostics"]
     assert _caller_leaves(direct) == []
-    assert {"kind": "parameter", "index": 0, "var": "argc#0"} in _origins(direct)
+    assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 0, "argc#0") for o in _origins(direct))
 
 
 def test_actual_direct_call_from_entry_is_still_ascended():
@@ -615,7 +615,7 @@ def test_recursive_remap_to_another_formal_is_followed_to_the_external_caller():
     result = _backward(rc, {**_NAMES, 0x800: "recursive_copy", 0x900: "start_recursive"})
 
     origins = _origins(result)
-    assert {"kind": "parameter", "index": 0, "var": "external#0"} in origins, origins
+    assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 0, "external#0") for o in origins), origins
     reached = [sl for sl in result["slices"] if sl["origin"].get("var") == "external#0"]
     assert reached[0]["crossed_functions"] == ["recursive_copy", "recursive_copy"]
     assert any(o.get("kind") == "call" and o.get("callee") == "getpid" for o in origins)
@@ -660,8 +660,8 @@ def test_recursive_back_edge_keeps_the_producer_it_introduces(callee, origin):
 
     origins = _origins(result)
     assert {"kind": "constant", "value": 16} in origins, origins
-    assert origin in origins, origins
-    produced = next(sl for sl in result["slices"] if sl["origin"] == origin)
+    assert any(origin.items() <= o.items() for o in origins), origins
+    produced = next(sl for sl in result["slices"] if origin.items() <= sl["origin"].items())
     assert produced["crossed_functions"] == ["recursive_producer"]
     assert {"0x808", "0x80c", "0x810"} <= {st["address"] for st in produced["slice"]}
     assert not any(o.get("kind") == "parameter" for o in origins), origins
@@ -733,7 +733,7 @@ def test_recursive_remap_keeps_the_back_edge_producer_not_an_internal_formal(mut
     assert {"kind": "constant", "value": 7} in origins, origins
     assert {"kind": "call", "callee": "getpid"} in origins, origins
     params = [o for o in origins if o["kind"] == "parameter"]
-    assert params == [{"kind": "parameter", "index": 0, "var": "external#0"}], origins
+    assert params == [{"kind": "parameter", "index": 0, "var": "external#0", "function": "0xa00"}], origins
     assert _gate(result) is True, result["diagnostics"]
 
 
@@ -745,7 +745,7 @@ def test_pure_recursive_cycle_keeps_its_own_formal_as_the_origin(mutual):
     result = _remap_pair(mutual, external_caller=False)
 
     origins = _origins(result)
-    assert {"kind": "parameter", "index": 0, "var": "first#0"} in origins, origins
+    assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 0, "first#0") for o in origins), origins
     assert {"kind": "call", "callee": "getpid"} in origins, origins
     assert not any(o.get("var") in ("x#0", "y#0", "second#0") for o in origins), origins
 
@@ -767,7 +767,7 @@ def test_mutual_remap_keeps_getpid_however_many_entries_reach_the_cycle(extra_en
         assert {"kind": "constant", "value": 13} in origins, origins
         assert {"kind": "constant", "value": 17} in origins, origins
     assert [o for o in origins if o["kind"] == "parameter"] == [
-        {"kind": "parameter", "index": 0, "var": "external#0"}], origins
+        {"kind": "parameter", "index": 0, "var": "external#0", "function": "0xa00"}], origins
     assert _gate(result) is True, result["diagnostics"]
 
 
@@ -830,7 +830,7 @@ def test_rotation_cycle_with_no_entry_keeps_its_root_formal():
     # Control: no caller outside the cycle -- the sink's own formal is the root.
     result = _rotation(None)
 
-    assert _origins(result) == [{"kind": "parameter", "index": 0, "var": "n#0"}], _origins(result)
+    assert _origins(result) == [{"kind": "parameter", "index": 0, "var": "n#0", "function": "0x800"}], _origins(result)
 
 
 def test_formal_beside_a_call_return_keeps_both_roots():
@@ -884,7 +884,7 @@ def test_def_chain_budget_cut_beside_a_resolved_formal_is_not_complete():
     assert _gate(result) is False, result["diagnostics"]
     cuts = [o for o in _origins(result) if o.get("cause") == "def_chain_budget"]
     assert cuts and cuts[0]["kind"] == "unresolved" and cuts[0]["budget"] == 6, _origins(result)
-    assert {"kind": "parameter", "index": 0, "var": "root#0"} in _origins(result)
+    assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 0, "root#0") for o in _origins(result))
 
 
 def test_larger_def_chain_budget_finds_the_cut_root_and_drops_the_boundary():
@@ -923,7 +923,7 @@ def test_source_plus_formal_keeps_both_roots_in_either_operand_order(formal_firs
     result = _backward(mixed, {**_NAMES, 0x800: "mixed_origin"}, "arg:malloc:0")
 
     origins = _origins(result)
-    assert {"kind": "source", "callee": "recv"} in origins, origins
+    assert any((o["kind"], o.get("callee")) == ("source", "recv") for o in origins), origins
     up_root = [sl for sl in result["slices"] if sl["origin"].get("var") == "external#0"]
     assert up_root and up_root[0]["crossed_functions"] == ["mixed_origin"], origins
     assert _gate(result) is True, result["diagnostics"]
@@ -957,7 +957,7 @@ def test_load_traversal_budget_cut_beside_a_resolved_formal_is_not_complete():
     assert any("def-chain walk truncated" in a for a in result["assumptions"]), result
     assert _gate(result) is False, result["diagnostics"]
     assert any(o.get("cause") == "def_chain_budget" for o in _origins(result)), _origins(result)
-    assert {"kind": "parameter", "index": 2, "var": "src#0"} in _origins(result)
+    assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 2, "src#0") for o in _origins(result))
 
 
 def test_larger_load_traversal_budget_walks_to_the_stored_literal_and_drops_the_boundary():
@@ -1010,7 +1010,7 @@ def test_value_cut_on_one_path_but_walked_on_another_is_no_budget_cut(formal_fir
     result = _backward(_shared_dag(formal_first, links), _NAMES, "arg:malloc:0",
                        engine_depth=9)
 
-    assert _origins(result) == [{"kind": "parameter", "index": 0, "var": "root#0"}]
+    assert _origins(result) == [{"kind": "parameter", "index": 0, "var": "root#0", "function": "0x400"}]
     assert not any("def-chain walk truncated" in a for a in result["assumptions"]), result
     assert _gate(result) is True, result["diagnostics"]
 
@@ -1023,7 +1023,7 @@ def test_value_cut_on_every_path_stays_a_budget_cut(formal_first):
 
     cuts = [o for o in _origins(result) if o.get("cause") == "def_chain_budget"]
     assert [c["unwalked"] for c in cuts] == [["a2#1"]], _origins(result)
-    assert {"kind": "parameter", "index": 0, "var": "root#0"} in _origins(result)
+    assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 0, "root#0") for o in _origins(result))
     assert _gate(result) is False, result["diagnostics"]
 
 
@@ -1101,7 +1101,7 @@ def test_shared_load_entered_deep_then_shallow_keeps_its_root(formal_first, budg
     # operand order and at every budget that reaches the load at all.
     result = _shared_load(formal_first, budget)
 
-    assert {"kind": "parameter", "index": 2, "var": "src#0"} in _origins(result), _origins(result)
+    assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 2, "src#0") for o in _origins(result)), _origins(result)
     assert not any(o.get("cause") == "def_chain_budget" for o in _origins(result)), _origins(result)
     assert _gate(result) is True, result["diagnostics"]
 
@@ -1123,14 +1123,14 @@ def test_shared_load_cut_on_every_path_stays_a_budget_cut(formal_first):
 def test_next_action_names_each_unfollowed_reason_and_keeps_the_cap_advice():
     from bn_agent_bridge.taint_result import backward_diagnostics
 
-    leaf = {"kind": "caller_sites_truncated",
+    leaf = {"kind": "caller_sites_truncated", "callers_dropped": 6,
             "reasons": {"caller_cap": 4, "max_depth": 1, "no_call_instruction": 1}}
     diag = backward_diagnostics([leaf], [], sinks_seeded=1, slices=1)
     nxt = diag["next_action"]
     assert "caller ascent was capped" in nxt
     assert "--max-depth" in nxt
     assert "bn callsites" in nxt
-    assert diag["frontier"]["dropped_callers"] == 1
+    assert diag["frontier"]["dropped_callers"] == 6
     assert diag["safe_to_report_complete_slice"] is False
 
 
@@ -1139,7 +1139,7 @@ def test_indirect_advice_groups_boilerplate_and_bounds_function_examples(count):
     from bn_agent_bridge.taint_result import backward_diagnostics
 
     leaves = [
-        {"kind": "caller_sites_truncated",
+        {"kind": "caller_sites_truncated", "callers_dropped": 1,
          "function": {"name": f"handler_{i}", "address": hex(0x800 + i * 0x20)},
          "reasons": {"indirect_reference": 1},
          "unfollowed": [{"address": hex(0x4000 + i * 8), "param": 0,
@@ -1169,7 +1169,7 @@ def test_indirect_advice_groups_boilerplate_and_bounds_function_examples(count):
 def test_advice_omission_counts_unique_functions_per_reason_without_hiding_other_reasons():
     from bn_agent_bridge.taint_result import backward_diagnostics
 
-    leaves = [{"kind": "caller_sites_truncated",
+    leaves = [{"kind": "caller_sites_truncated", "callers_dropped": 1,
                "function": {"name": f"handler_{i}", "address": hex(0x800 + i * 0x20)},
                "reasons": {"indirect_reference": 1},
                "unfollowed": [{"address": "0x4000", "param": 0, "reason": "indirect_reference"}]}
@@ -1178,9 +1178,9 @@ def test_advice_omission_counts_unique_functions_per_reason_without_hiding_other
     second_formal["unfollowed"][0]["param"] = 1
     leaves.extend([
         second_formal,
-        {"kind": "caller_sites_truncated", "function": {"name": "relay", "address": "0x2000"},
+        {"kind": "caller_sites_truncated", "callers_dropped": 1, "function": {"name": "relay", "address": "0x2000"},
          "reasons": {"max_depth": 1}},
-        {"kind": "caller_sites_truncated", "function": {"name": "short_call", "address": "0x3000"},
+        {"kind": "caller_sites_truncated", "callers_dropped": 1, "function": {"name": "short_call", "address": "0x3000"},
          "reasons": {"arity_short": 1}},
     ])
     original = copy.deepcopy(leaves)
@@ -1201,7 +1201,7 @@ def test_advice_omission_counts_unique_functions_per_reason_without_hiding_other
 def test_bounded_examples_disambiguate_equal_names_by_function_address():
     from bn_agent_bridge.taint_result import backward_diagnostics
 
-    leaves = [{"kind": "caller_sites_truncated",
+    leaves = [{"kind": "caller_sites_truncated", "callers_dropped": 1,
                "function": {"name": "handle_packet", "address": address},
                "reasons": {"indirect_reference": 1}}
               for address in ("0x800", "0x900")]
@@ -1218,10 +1218,10 @@ def test_bounded_examples_disambiguate_equal_names_by_function_address():
 def test_another_functions_depth_boundary_does_not_restrict_dispatch_advice(reverse, same_name):
     from bn_agent_bridge.taint_result import backward_diagnostics
 
-    indirect = {"kind": "caller_sites_truncated",
+    indirect = {"kind": "caller_sites_truncated", "callers_dropped": 1,
                 "function": {"name": "handler_a", "address": "0x800"},
                 "reasons": {"indirect_reference": 1}}
-    depth_limited = {"kind": "caller_sites_truncated",
+    depth_limited = {"kind": "caller_sites_truncated", "callers_dropped": 1,
                      "function": {"name": "handler_a" if same_name else "main", "address": "0x400"},
                      "reasons": {"max_depth": 1}}
     leaves = [depth_limited, indirect] if reverse else [indirect, depth_limited]
@@ -1240,9 +1240,9 @@ def test_each_function_keeps_its_indirect_advice_beside_depth_boundaries():
     from bn_agent_bridge.taint_result import backward_diagnostics
 
     leaves = [
-        {"kind": "caller_sites_truncated", "function": {"name": "handler_a", "address": "0x800"},
+        {"kind": "caller_sites_truncated", "callers_dropped": 1, "function": {"name": "handler_a", "address": "0x800"},
          "reasons": {"indirect_reference": 1}},
-        {"kind": "caller_sites_truncated", "function": {"name": "main", "address": "0x400"},
+        {"kind": "caller_sites_truncated", "callers_dropped": 2, "function": {"name": "main", "address": "0x400"},
          "reasons": {"max_depth": 1, "indirect_reference": 1}},
     ]
     advice = backward_diagnostics(leaves, [], sinks_seeded=1, slices=1)["next_action"]
@@ -1893,7 +1893,7 @@ def test_real_bn_recursive_back_edge_keeps_its_producers(tmp_path, shared_bn):
         result = _bn_backward(shared_bn, target, fn, "arg:malloc:0")
         origins = [sl["origin"] for sl in result["slices"]]
         assert {"kind": "constant", "value": 16} in origins, (fn, origins)
-        assert root in origins, (fn, origins)
+        assert any(root.items() <= o.items() for o in origins), (fn, origins)
         assert not any(o.get("kind") == "parameter" for o in origins), (fn, origins)
 
     text = shared_bn.run("-t", target, "taint", "backward", "-f", "pid_producer",

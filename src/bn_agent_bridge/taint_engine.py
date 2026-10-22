@@ -37,7 +37,7 @@ from typing import Any
 from .taint_models import (  # noqa: F401
     SOUNDNESS, _OVERFLOW_INDEX_CLASSES, _RECVMSG_FAMILY,
     _BROAD_SOURCE_BYTES, _BROAD_SOURCE_MEMBERS, _BUILTIN_MODELS,
-    _model_buffer_source_args, TaintError, BoundedSink,
+    _model_buffer_source_args, TaintError,
     _coerce_model_map, _validate_model_interior, load_models,
     model_overlay_sources, _canonical_cxx_alloc, lookup_model,
     _try_arg_index, model_arg_indices, model_is_benign_marker,
@@ -7777,41 +7777,46 @@ class TaintEngine:
         ssaf = self._ssa_func(func)
         instrs = self._instrs(ssaf)
 
-        # Per-sink isolation: a sink that can't be seeded (callee not called
-        # here, arg is a constant, ...) records a status note and the analysis
-        # continues with the remaining sinks. Only an all-sinks-fail run is a
-        # hard error, preserving the original single-sink behavior.
+        # Resolve argument locators into individual call sites BEFORE seeding:
+        # one site's SSA reads must never hide another site's constant or missing
+        # operand. Non-argument locators and absent calls retain their refusal path.
+        selections: list[tuple[dict[str, Any], Any]] = []
+        for sink in sinks:
+            sites = (self._find_callsites(instrs, sink["callee"], resolve_indirect=True)
+                     if sink.get("kind") == "arg" else [])
+            selections.extend((sink, site) for site in sites or [None])
         sink_status: list[dict[str, Any]] = []
         errors: list[tuple[dict[str, Any], str]] = []
-        for sink in sinks:
+        for sink, site in selections:
             desc = self._describe_locator(sink)
+            site_instrs = instrs if site is None else [site]
+            if site is not None:
+                desc["address"] = hex(int(site.address))
+                params = self._call_params(site)
+                idx = int(sink["index"])
+                if 0 <= idx < len(params) and self._sink_role(sink) == "value":
+                    operand = params[idx]
+                    if op_name(operand) == "MLIL_CONST":
+                        self._note_indirect_anchors(site_instrs, sink["callee"], self._bw_assume)
+                        sink_status.append({
+                            **desc, "status": "constant", "seeded": False,
+                            "scalar": {"kind": "constant", "value": int(operand.constant)},
+                            "destination_fit": "unproved",
+                            "note": "finite scalar; destination capacity has not been proved"})
+                        continue
             try:
-                seeds = self._seed_backward(func, ssaf, instrs, sink)
-            except BoundedSink as exc:
-                # A constant-length sink is a SUCCESSFUL "provably bounded"
-                # conclusion, not a seed failure: record it as such and do NOT
-                # add it to `errors`, so an all-bounded slice returns a clean
-                # result (exit 0, --out written) instead of the all-failed hard
-                # error (#310). Only for a VALUE role (round 7): a constant
-                # handed to an argument the sink reads through is an address.
-                if self._bw_unseeded_demand(func, ssaf, instrs, sink):
-                    sink_status.append({**desc, "seeded": False, "demand_leaf": True,
-                                        "note": str(exc)})
-                    continue
-                sink_status.append({**desc, "seeded": False, "bounded": True, "note": str(exc)})
-                continue
+                seeds = self._seed_backward(func, ssaf, site_instrs, sink)
             except TaintError as exc:
-                # #931 round 7: the role is decided BEFORE the no-def-chain
-                # exit. An argument the sink reads through (or one with no
-                # value role) that has no backward seed -- `popen("ls")`, a
-                # fixed address -- is an incomplete result with its leaf, not
-                # a refusal another sink's complete slice could hide.
-                if self._bw_unseeded_demand(func, ssaf, instrs, sink):
-                    sink_status.append({**desc, "seeded": False, "demand_leaf": True,
-                                        "note": str(exc)})
+                if self._bw_unseeded_demand(func, ssaf, site_instrs, sink):
+                    sink_status.append({
+                        **desc, "status": "demand", "seeded": False,
+                        "note": "the selected operand has a semantic demand; "
+                                "its pointer bytes or argument role remain unresolved "
+                                "(see frontier leaves)"})
                     continue
-                errors.append((sink, str(exc)))
-                sink_status.append({**desc, "seeded": False, "note": str(exc)})
+                errors.append((desc, str(exc)))
+                sink_status.append({**desc, "status": "unseeded", "seeded": False,
+                                    "note": str(exc)})
                 continue
             n_before = len(slices)
             sink_slices: list[dict[str, Any]] = []
@@ -7853,8 +7858,8 @@ class TaintEngine:
                     for sl in self._backward_slice(func, seed_var, 0, max_depth, set(),
                                                    seed_ins=sink_ins, anchor=anchor):
                         o = sl["origin"]
-                        key = (seed_label, sink_addr, o.get("kind"), o.get("var"),
-                               o.get("value"), o.get("callee"), o.get("index"))
+                        key = (seed_label, sink_addr, o.get("kind"), o.get("function"),
+                               o.get("var"), o.get("value"), o.get("callee"), o.get("index"))
                         rep = seen_origin.get(key)
                         if rep is not None:
                             rep["reached_via_call_sites"] = rep.get("reached_via_call_sites", 1) + 1
@@ -7892,13 +7897,14 @@ class TaintEngine:
                 # "complete" claim for a run that lost slices.
                 self._bw_truncated = True
                 self._bw_truncation_causes.add("recursion")
-                sink_status.append({**desc, "seeded": True, "truncated": True,
+                sink_status.append({**desc, "status": "truncated", "seeded": True, "truncated": True,
                                     "slices": len(slices) - n_before,
                                     "note": "recursion limit reached while slicing; results incomplete"})
                 continue
-            sink_status.append({**desc, "seeded": True, "slices": len(slices) - n_before})
+            sink_status.append({**desc, "status": "seeded", "seeded": True,
+                                "slices": len(slices) - n_before})
 
-        if sinks and len(errors) == len(sinks):
+        if selections and len(errors) == len(selections):
             # Every sink failed to seed -> hard error (no partial results to keep).
             if len(errors) == 1:
                 raise TaintError(errors[0][1])
@@ -7912,6 +7918,7 @@ class TaintEngine:
         for s, msg in errors:
             leaf = {"kind": "sink_unseeded", "locator": format_locator(s),
                     "function": hex(int(func.start)),
+                    **({"address": s["address"]} if "address" in s else {}),
                     "detail": (f"the sink {format_locator(s)} was not sliced ({msg}), so "
                                f"this multi-sink result does not account for it and is "
                                f"NOT complete")}
@@ -7962,6 +7969,7 @@ class TaintEngine:
             "diagnostics": backward_diagnostics(
                 self._bw_leaves, self._bw_assumptions,
                 sinks_seeded=sum(1 for s in sink_status if s.get("seeded")),
+                sinks_constant=sum(1 for s in sink_status if s["status"] == "constant"),
                 slices=len(slices),
                 # A slice whose own origin is `unresolved` is the walk admitting
                 # it stopped short; the gate must see it even with no leaf.
@@ -8057,6 +8065,8 @@ class TaintEngine:
 
         def _set_origin(o, *, weak: int | bool = 0):
             nonlocal origin, origin_rank
+            if o.get("kind") in ("parameter", "source", "entry"):
+                o["function"] = fn_ref
             if weak is True:
                 rank = 3
             elif weak:
@@ -8080,6 +8090,7 @@ class TaintEngine:
             (the outright assignment left a stale rank that could). A formal
             beside it still ascends on its own (IC01)."""
             nonlocal origin, origin_rank
+            o["function"] = fn_ref
             if o not in producers:
                 producers.append(o)
             if o not in returned:
@@ -9065,7 +9076,7 @@ class TaintEngine:
         # is a new demand and ascends.
         fkey = self._caller_key(func)
         demands = {p: param_origins.get(p) or {"kind": "parameter", "index": p,
-                                                "var": var_label(v)}
+                                                "var": var_label(v), "function": fn_ref}
                    for p, v in terminal_params.items() if (fkey, p) not in visited_funcs}
         out: list[dict[str, Any]] = []
         cycled: set[int] = set()
@@ -9770,22 +9781,6 @@ class TaintEngine:
                     raise TaintError(
                         f"--sink arg index {idx} is out of range for {self._prose_name(callee)}: {detail}")
                 if not out:
-                    # Nothing to slice. A scalar CONSTANT literal (e.g. a fixed copy
-                    # length) is a provably-bounded SUCCESS (#310). Gate on the
-                    # operation being MLIL_CONST specifically -- NOT MLIL_CONST_PTR,
-                    # which is a constant ADDRESS (a global dest/src pointer): that's
-                    # an address expression with no def-chain, which must stay a seed
-                    # error, not a misleading "bounded length" verdict.
-                    arg_is_const = any(
-                        op_name(params[idx]) == "MLIL_CONST"
-                        for c in sites
-                        for params in (self._call_params(c),)
-                        if idx < len(params)
-                    )
-                    if arg_is_const:
-                        raise BoundedSink(
-                            f"--sink arg {idx} of {callee} is a compile-time constant in the "
-                            f"recovered IL -- provably bounded, with no def-chain to slice backward")
                     raise TaintError(
                         f"--sink arg {idx} of {callee} reads no variable in the recovered IL "
                         f"(it is an address or fixed expression) -- there is no def-chain "
