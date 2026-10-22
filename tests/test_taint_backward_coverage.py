@@ -137,7 +137,7 @@ def test_constant_address_caller_argument_is_an_unfollowed_site_not_a_complete_s
     assert leaf["reasons"] == {"constant_address": 1}
     # the followed formal and the caller's literal are both origins
     assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 0, "argc#0") for o in _origins(result))
-    assert {"kind": "constant", "value": 64} in _origins(result)
+    assert any(o.get("kind") == "constant" and o.get("value") == 64 for o in _origins(result))
 
 
 def test_caller_site_with_no_call_instruction_below_the_cap_blocks_the_gate():
@@ -542,7 +542,7 @@ def test_actual_direct_call_from_entry_is_still_ascended():
 
     assert _gate(result) is True, result["diagnostics"]
     assert _caller_leaves(result) == []
-    assert _origins(result) == [{"kind": "constant", "value": 37}]
+    assert [(o["kind"], o.get("value")) for o in _origins(result)] == [("constant", 37)]
 
 
 # --------------------------------------------------------------------------
@@ -577,7 +577,7 @@ def test_caller_depth_cut_is_structured_incompleteness_beside_a_resolved_sibling
     assert "--max-depth" in result["diagnostics"]["next_action"]
     if depth == 1:
         # the literal sibling was resolved; the cut is still disclosed
-        assert {"kind": "constant", "value": 7} in _origins(result)
+        assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in _origins(result))
 
 
 def test_larger_caller_depth_reaches_the_root_and_removes_the_boundary():
@@ -659,7 +659,7 @@ def test_recursive_back_edge_keeps_the_producer_it_introduces(callee, origin):
     result = _recursive_producer(callee)
 
     origins = _origins(result)
-    assert {"kind": "constant", "value": 16} in origins, origins
+    assert any(o.get("kind") == "constant" and o.get("value") == 16 for o in origins), origins
     assert any(origin.items() <= o.items() for o in origins), origins
     produced = next(sl for sl in result["slices"] if origin.items() <= sl["origin"].items())
     assert produced["crossed_functions"] == ["recursive_producer"]
@@ -730,8 +730,8 @@ def test_recursive_remap_keeps_the_back_edge_producer_not_an_internal_formal(mut
     result = _remap_pair(mutual)
 
     origins = _origins(result)
-    assert {"kind": "constant", "value": 7} in origins, origins
-    assert {"kind": "call", "callee": "getpid"} in origins, origins
+    assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in origins), origins
+    assert any(o.get("kind") == "call" and o.get("callee") == "getpid" for o in origins), origins
     params = [o for o in origins if o["kind"] == "parameter"]
     assert params == [{"kind": "parameter", "index": 0, "var": "external#0", "function": "0xa00"}], origins
     assert _gate(result) is True, result["diagnostics"]
@@ -746,7 +746,7 @@ def test_pure_recursive_cycle_keeps_its_own_formal_as_the_origin(mutual):
 
     origins = _origins(result)
     assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 0, "first#0") for o in origins), origins
-    assert {"kind": "call", "callee": "getpid"} in origins, origins
+    assert any(o.get("kind") == "call" and o.get("callee") == "getpid" for o in origins), origins
     assert not any(o.get("var") in ("x#0", "y#0", "second#0") for o in origins), origins
 
 
@@ -761,11 +761,11 @@ def test_mutual_remap_keeps_getpid_however_many_entries_reach_the_cycle(extra_en
     result = _remap_pair(True, extra_entry=extra_entry, max_depth=max_depth)
 
     origins = _origins(result)
-    assert {"kind": "call", "callee": "getpid"} in origins, origins
-    assert {"kind": "constant", "value": 7} in origins, origins
+    assert any(o.get("kind") == "call" and o.get("callee") == "getpid" for o in origins), origins
+    assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in origins), origins
     if extra_entry:
-        assert {"kind": "constant", "value": 13} in origins, origins
-        assert {"kind": "constant", "value": 17} in origins, origins
+        assert any(o.get("kind") == "constant" and o.get("value") == 13 for o in origins), origins
+        assert any(o.get("kind") == "constant" and o.get("value") == 17 for o in origins), origins
     assert [o for o in origins if o["kind"] == "parameter"] == [
         {"kind": "parameter", "index": 0, "var": "external#0", "function": "0xa00"}], origins
     assert _gate(result) is True, result["diagnostics"]
@@ -792,7 +792,7 @@ def test_cycle_entered_only_through_another_member_has_no_internal_origin(max_de
     origins = _origins(result)
     for root in ({"kind": "constant", "value": 13}, {"kind": "constant", "value": 17},
                  {"kind": "call", "callee": "getpid"}):
-        assert root in origins, origins
+        assert any(root.items() <= o.items() for o in origins), origins
     assert not any(o["kind"] == "parameter" for o in origins), origins
     assert _gate(result) is True, result["diagnostics"]
 
@@ -822,7 +822,7 @@ def test_rotation_cycle_entered_through_either_member_is_its_literal(entry_membe
     # Whichever member the entry calls, the only root is the literal 43.
     result = _rotation(entry_member)
 
-    assert _origins(result) == [{"kind": "constant", "value": 43}], _origins(result)
+    assert [(o["kind"], o.get("value")) for o in _origins(result)] == [("constant", 43)], _origins(result)
     assert _gate(result) is True, result["diagnostics"]
 
 
@@ -849,8 +849,8 @@ def test_formal_beside_a_call_return_keeps_both_roots():
     result = _backward(f, {**_NAMES, 0x800: "add_pid"}, "arg:malloc:0")
 
     origins = _origins(result)
-    assert {"kind": "constant", "value": 9} in origins, origins
-    assert {"kind": "call", "callee": "getpid"} in origins, origins
+    assert any(o.get("kind") == "constant" and o.get("value") == 9 for o in origins), origins
+    assert any(o.get("kind") == "call" and o.get("callee") == "getpid" for o in origins), origins
     assert _gate(result) is True, result["diagnostics"]
 
 
@@ -1892,7 +1892,7 @@ def test_real_bn_recursive_back_edge_keeps_its_producers(tmp_path, shared_bn):
                      ("recv_producer", {"kind": "source", "callee": "recv"})]:
         result = _bn_backward(shared_bn, target, fn, "arg:malloc:0")
         origins = [sl["origin"] for sl in result["slices"]]
-        assert {"kind": "constant", "value": 16} in origins, (fn, origins)
+        assert any(o.get("kind") == "constant" and o.get("value") == 16 for o in origins), (fn, origins)
         assert any(root.items() <= o.items() for o in origins), (fn, origins)
         assert not any(o.get("kind") == "parameter" for o in origins), (fn, origins)
 
@@ -1925,7 +1925,7 @@ def test_real_bn_mutual_recursion_keeps_the_back_edge_producer(tmp_path, shared_
     for fn in ("remap_a", "direct_remap"):
         result = _bn_backward(shared_bn, target, fn, "arg:malloc:0")
         origins = [sl["origin"] for sl in result["slices"]]
-        assert {"kind": "constant", "value": 7} in origins, (fn, origins)
+        assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in origins), (fn, origins)
         assert getpid in origins, (fn, origins)
         params = [o for o in origins if o["kind"] == "parameter"]
         assert len(params) == 1 and params[0]["index"] == 0, (fn, origins)
@@ -1960,11 +1960,11 @@ def test_real_bn_extra_entry_into_the_cycle_keeps_getpid(tmp_path, shared_bn):
             result = _bn_backward(shared_bn, target, "remap_a", "arg:malloc:0",
                                   "--max-depth", depth)
             origins = [sl["origin"] for sl in result["slices"]]
-            assert {"kind": "call", "callee": "getpid"} in origins, (variant, depth, origins)
-            assert {"kind": "constant", "value": 7} in origins, (variant, depth, origins)
+            assert any(o.get("kind") == "call" and o.get("callee") == "getpid" for o in origins), (variant, depth, origins)
+            assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in origins), (variant, depth, origins)
             if extra:
-                assert {"kind": "constant", "value": 13} in origins, (variant, depth, origins)
-                assert {"kind": "constant", "value": 17} in origins, (variant, depth, origins)
+                assert any(o.get("kind") == "constant" and o.get("value") == 13 for o in origins), (variant, depth, origins)
+                assert any(o.get("kind") == "constant" and o.get("value") == 17 for o in origins), (variant, depth, origins)
             params = [o for o in origins if o["kind"] == "parameter"]
             assert len(params) == 1, (variant, depth, origins)  # start_remap's `external`
             assert result["diagnostics"]["safe_to_report_complete_slice"] is True
@@ -1985,7 +1985,7 @@ def test_real_bn_cycle_entered_through_another_member_has_no_internal_origin(tmp
         for fn in ("cycle_a", "direct"):
             result = _bn_backward(shared_bn, rotation, fn, "arg:malloc:0", "--max-depth", depth)
             origins = [sl["origin"] for sl in result["slices"]]
-            assert origins == [{"kind": "constant", "value": 43}], (fn, depth, origins)
+            assert [(o["kind"], o.get("value")) for o in origins] == [("constant", 43)], (fn, depth, origins)
             assert result["diagnostics"]["safe_to_report_complete_slice"] is True
         result = _bn_backward(shared_bn, remap, "remap_a", "arg:malloc:0", "--max-depth", depth)
         origins = [sl["origin"] for sl in result["slices"]]
@@ -1995,7 +1995,7 @@ def test_real_bn_cycle_entered_through_another_member_has_no_internal_origin(tmp
         assert result["diagnostics"]["safe_to_report_complete_slice"] is True
         direct = _bn_backward(shared_bn, remap, "direct", "arg:malloc:0", "--max-depth", depth)
         origins = [sl["origin"] for sl in direct["slices"]]
-        assert getpid in origins and {"kind": "constant", "value": 47} in origins, (depth, origins)
+        assert getpid in origins and any(o.get("kind") == "constant" and o.get("value") == 47 for o in origins), (depth, origins)
         assert not any(o["kind"] == "parameter" for o in origins), (depth, origins)
 
     shallow = _bn_backward(shared_bn, rotation, "cycle_a", "arg:malloc:0", "--max-depth", "1")

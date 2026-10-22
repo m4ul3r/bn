@@ -5015,8 +5015,8 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
 
 
 def _leaf_group_key(leaf: Any) -> tuple:
-    """Collapse near-identical frontier leaves: one group per callee for
-    unmodeled calls, per (base, offset) for field loads, per kind otherwise."""
+    """Group calls by callee, field loads by slot, caller frontiers by function
+    and measured coverage, and other near-identical frontiers by kind."""
     if not isinstance(leaf, dict):
         # Group malformed leaves by (type, repr): a type key can't collide with a
         # real `kind` string, and keying on the repr too means two DISTINCT
@@ -5031,6 +5031,11 @@ def _leaf_group_key(leaf: Any) -> tuple:
         return (kind, str(leaf.get("base")), str(leaf.get("offset")))
     if kind == "arg_under_recovered":
         return (kind, str(_field_dict(leaf, "callee").get("name", "?")))
+    if kind == "caller_sites_truncated":
+        fn = _field_dict(leaf, "function")
+        return (kind, str(fn.get("address") or leaf.get("address")), str(fn.get("name")),
+                str(leaf.get("callers_total")), str(leaf.get("callers_followed")),
+                str(leaf.get("callers_dropped")), str(leaf.get("reasons")))
     return (kind,)
 
 
@@ -5556,13 +5561,15 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                 site = f" @ {s['address']}" if s.get("address") else ""
                 scalar = _field_dict(s, "scalar")
                 evidence = ""
+                note = s.get("note", "")
                 if scalar.get("kind") == "constant":
                     val = scalar.get("value")
                     shown = f"{val:#x}" if isinstance(val, int) else str(val)
-                    evidence = f" scalar={shown}; destination capacity unproved;"
+                    evidence = f" scalar={shown}; destination capacity={s.get('destination_fit', '?')}"
+                    note = ""
                 lines.append(
                     f"  {_describe_loc(s)}{site} [{s.get('status', '?')}]"
-                    f"{evidence} {s.get('note', '')}".rstrip())
+                    f"{evidence} {note}".rstrip())
         # #812: backward's completeness gate, rendered for every backward run
         # that carries one. Leaving it JSON-only would repeat the asymmetry #810
         # fixed for the truncation verdict -- a text reader could not tell a

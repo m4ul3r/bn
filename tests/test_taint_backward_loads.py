@@ -189,7 +189,7 @@ def test_sign_extended_upper_half_load_follows_the_bytes_not_the_pointer(stored)
     assert not any(o["kind"] == "parameter" and o.get("index") == 0 and o.get("var") == "m#0"
                    for o in origins)
     if stored:
-        assert {"kind": "call", "callee": "read_u32"} in origins, origins
+        assert any(o.get("kind") == "call" and o.get("callee") == "read_u32" for o in origins), origins
         assert any("reaching store to field" in r for r in reasons), reasons
         assert not fields
     else:
@@ -205,7 +205,7 @@ def test_field_stored_on_one_path_only_is_a_frontier():
     p.phi(0, 1)
     p.sink(p.load(p.addr(p.m0, 8), 4))
     result, origins, reasons, fields = p.run()
-    assert {"kind": "call", "callee": "read_u32"} in origins or any(
+    assert any(o.get("kind") == "call" and o.get("callee") == "read_u32" for o in origins) or any(
         "reaching store" in r for r in reasons)
     assert fields and "stored before this function ran" in fields[0]["detail"], fields
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
@@ -221,7 +221,7 @@ def test_store_through_another_pointer_may_write_the_loaded_field(second):
     p.store(p.addr(base, off), 4, FExpr("MLIL_CONST", "0", constant=0))
     p.sink(p.load(p.addr(p.m0, 8), 4))
     result, origins, _, fields = p.run()
-    assert {"kind": "call", "callee": "read_u32"} in origins or fields
+    assert any(o.get("kind") == "call" and o.get("callee") == "read_u32" for o in origins) or fields
     if second == "other_pointer":
         assert fields and "cannot prove disjoint" in fields[0]["detail"], fields
         assert result["diagnostics"]["safe_to_report_complete_slice"] is False
@@ -241,7 +241,7 @@ def test_struct_field_offsets_key_the_loaded_slot(store_offset, covers):
     p.sink(p.load(FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0]), 4,
                   op="MLIL_LOAD_STRUCT_SSA", offset=8))
     result, origins, _, fields = p.run()
-    assert ({"kind": "call", "callee": "read_u32"} in origins) is covers, origins
+    assert (any(o.get("kind") == "call" and o.get("callee") == "read_u32" for o in origins)) is covers, origins
     assert bool(fields) is not covers
     assert result["diagnostics"]["safe_to_report_complete_slice"] is covers
 

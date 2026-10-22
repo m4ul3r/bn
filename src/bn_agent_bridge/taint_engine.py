@@ -7801,8 +7801,7 @@ class TaintEngine:
                         sink_status.append({
                             **desc, "status": "constant", "seeded": False,
                             "scalar": {"kind": "constant", "value": int(operand.constant)},
-                            "destination_fit": "unproved",
-                            "note": "finite scalar; destination capacity has not been proved"})
+                            "destination_fit": "unproved"})
                         continue
             try:
                 seeds = self._seed_backward(func, ssaf, site_instrs, sink)
@@ -7858,8 +7857,9 @@ class TaintEngine:
                     for sl in self._backward_slice(func, seed_var, 0, max_depth, set(),
                                                    seed_ins=sink_ins, anchor=anchor):
                         o = sl["origin"]
-                        key = (seed_label, sink_addr, o.get("kind"), o.get("function"),
-                               o.get("var"), o.get("value"), o.get("callee"), o.get("index"))
+                        # Every kind's complete provenance participates, including
+                        # nested region/cut facts; display names live outside origin.
+                        key = (seed_label, sink_addr, json.dumps(o, sort_keys=True))
                         rep = seen_origin.get(key)
                         if rep is not None:
                             rep["reached_via_call_sites"] = rep.get("reached_via_call_sites", 1) + 1
@@ -7906,11 +7906,14 @@ class TaintEngine:
 
         if selections and len(errors) == len(selections):
             # Every sink failed to seed -> hard error (no partial results to keep).
-            if len(errors) == 1:
+            if len(errors) == 1 and "address" not in errors[0][0]:
                 raise TaintError(errors[0][1])
             raise TaintError(
                 "no backward seed resolved for any sink:\n  "
-                + "\n  ".join(f"{format_locator(s)}: {m}" for s, m in errors))
+                + "\n  ".join(
+                    f"{format_locator(s)}"
+                    + (f" @ {s['address']}" if "address" in s else "")
+                    + f" [unseeded]: {m}" for s, m in errors))
         # #931 round 7: a multi-sink query is complete only when every selected
         # operand is. A sink that could not be seeded at all (no call to it
         # here, an index out of range) is not part of the answer, so the
@@ -8004,7 +8007,8 @@ class TaintEngine:
         ssaf = self._ssa_func(func)
         steps: list[dict[str, Any]] = []
         visited_vars: set = set()
-        origin = {"kind": "unresolved"}
+        fn_ref = hex(int(getattr(func, "start", 0) or 0))
+        origin = {"kind": "unresolved", "function": fn_ref, "var": var_label(seed_var)}
         # A LITERAL origin reached through a local buffer's writers (a `strcat`
         # appending a constant, a `buf[n] = 0` terminator) is "weak": the buffer's
         # writers are walked newest-first, and the sink's bytes also come from
@@ -8065,8 +8069,7 @@ class TaintEngine:
 
         def _set_origin(o, *, weak: int | bool = 0):
             nonlocal origin, origin_rank
-            if o.get("kind") in ("parameter", "source", "entry"):
-                o["function"] = fn_ref
+            o["function"] = fn_ref
             if weak is True:
                 rank = 3
             elif weak:
@@ -8103,8 +8106,6 @@ class TaintEngine:
         # (instruction, load) pairs already followed: a store's value may
         # reload the slot it writes (`[p] = [p] + 1` around a loop).
         visited_loads: set = set()
-
-        fn_ref = hex(int(getattr(func, "start", 0) or 0))
 
         def _forward_cmd(label: str) -> str:
             """The forward run on a local buffer of THIS function, complete
@@ -8246,7 +8247,7 @@ class TaintEngine:
             it read back), a fill's inputs and length operands. Returns the
             opaque (may-write) callees and stores, already disclosed as
             *kind* leaves."""
-            opaque: list[str] = []
+            opaque: list[dict[str, str]] = []
             key = "pointer" if kind == _POINTER_LEAF else "buffer"
             for w in res["writers"]:
                 wkind, wdefn = w[0], w[1]
@@ -8280,7 +8281,8 @@ class TaintEngine:
                         "reads is unknown, so the slice is NOT complete -- inspect "
                         "the pointer's definition or seed inside the producing loop",
                         kind=kind)
-                    opaque.append(str(wdefn))
+                    opaque.append({"address": hex(int(wdefn.address)),
+                                   "kind": wkind, "callee": str(wdefn)})
                 elif wkind == "escape":
                     steps.append(_instr_dict(
                         wdefn, reason=f"address of {noun} {label} stored to memory"))
@@ -8303,7 +8305,8 @@ class TaintEngine:
                     steps.append(_instr_dict(
                         wdefn, reason=f"{noun} {label} written by {self._prose_name(mkey)}"))
                     if is_source:
-                        _set_origin({"kind": "source", "callee": mkey})
+                        _set_origin({"kind": "source", "callee": mkey,
+                                     "address": hex(int(wdefn.address))})
                     states = [_follow_input(wdefn, params[i], d, wmv, label,
                                             f"input {i} of {self._prose_name(mkey)} writing",
                                             noun=noun)
@@ -8319,7 +8322,8 @@ class TaintEngine:
                         # Every input the model names is an established
                         # constant (a literal format/string): the bytes come
                         # from the call itself.
-                        _set_origin({"kind": "call", "callee": mkey}, weak=1)
+                        _set_origin({"kind": "call", "callee": mkey,
+                                     "address": hex(int(wdefn.address))}, weak=1)
                 else:  # opaque: a call may have written the bytes
                     _, _, callee, why = w
                     steps.append(_instr_dict(
@@ -8330,12 +8334,15 @@ class TaintEngine:
                         "reads is unknown, so the slice is NOT complete -- model the "
                         "call or seed inside it",
                         kind=kind, callee=callee)
-                    opaque.append(callee)
+                    opaque.append({"address": hex(int(wdefn.address)),
+                                   "kind": wkind, "callee": callee})
             if opaque:
                 # Deferred past the loop so a real origin reached through another
                 # writer (a modeled fill from a parameter) wins the slice's
                 # origin and the opaque call stays what it is: a frontier leaf.
-                _set_origin({"kind": kind, key: label, "callee": opaque[0]})
+                opaque.sort(key=lambda w: (w["address"], w["kind"], w["callee"]))
+                _set_origin({"kind": kind, key: label, "callee": opaque[0]["callee"],
+                             "writers": opaque})
             if res["truncated"]:
                 # Discovery or fixed-point proof work was cut. Known writer
                 # rows remain visible, but missing writers or an unfinished
@@ -8435,7 +8442,8 @@ class TaintEngine:
                     f"store proves them, so the slice is NOT complete -- inspect the "
                     f"pointer arithmetic with `bn il {fn_ref} --view mlil`",
                     kind=_EXTENT_LEAF, cause="outside_object", **facts)
-                _set_origin({"kind": _EXTENT_LEAF, "buffer": label})
+                _set_origin({"kind": _EXTENT_LEAF, "buffer": label,
+                             "cause": "outside_object", **facts})
             elif res["covered"] and d_lo is None:
                 _buffer_leaf(
                     defn, label,
@@ -8446,7 +8454,8 @@ class TaintEngine:
                     f"stores are facts, not a proof, so the slice is NOT complete -- "
                     f"inspect the pointer arithmetic with `bn il {fn_ref} --view mlil`",
                     kind=_EXTENT_LEAF, cause="offset_unknown", **facts)
-                _set_origin({"kind": _EXTENT_LEAF, "buffer": label})
+                _set_origin({"kind": _EXTENT_LEAF, "buffer": label,
+                             "cause": "offset_unknown", **facts})
             elif res["covered"]:
                 # Stores the walk can see write every consumed byte on every
                 # path. That is reported as a fact and never certifies the
@@ -8749,14 +8758,16 @@ class TaintEngine:
                     # The representative, ranked (IC01): the outright
                     # assignment left a stale rank a later weak origin could
                     # undercut; a formal beside it still ascends on its own.
-                    _set_source_origin({"kind": "source", "callee": mkey or name})
+                    _set_source_origin({"kind": "source", "callee": mkey or name,
+                                        "address": hex(int(defn.address))})
                     # A modeled source's returned bytes are the source -- but
                     # a return into an object it was handed -- a local
                     # (`fgets(c, ..)`), a heap allocation, a pointer parameter
                     # -- reads that object, whose bytes no call proves.
                     _returned_object(defn, v, d, mv, anchor, name, model, fresh=False)
                 elif target is None:
-                    origin = {"kind": "indirect_call", "var": var_label(v)}
+                    origin = {"kind": "indirect_call", "var": var_label(v),
+                              "function": fn_ref, "address": hex(int(defn.address))}
                     leaf = {"kind": "indirect_call_unresolved",
                             "address": hex(int(getattr(defn, "address", 0))), "il_text": str(defn)}
                     if leaf not in self._bw_leaves:
@@ -8789,10 +8800,12 @@ class TaintEngine:
                             defn, cparams[fi], d, mv, var_label(v),
                             f"argument {fi} of {mkey or name} returned by", arg_dem))
                     if not states:
-                        _set_origin({"kind": "call", "callee": name})
+                        _set_origin({"kind": "call", "callee": name,
+                                     "address": hex(int(defn.address))})
                         _returned_object(defn, v, d, mv, anchor, name, model, fresh=True)
                     elif all(s == "literal" for s in states):
-                        _set_origin({"kind": "call", "callee": mkey or name}, weak=1)
+                        _set_origin({"kind": "call", "callee": mkey or name,
+                                     "address": hex(int(defn.address))}, weak=1)
                 return
             steps.append(_instr_dict(defn, reason="definition"))
             src_expr = getattr(defn, "src", None)
@@ -9002,7 +9015,8 @@ class TaintEngine:
                                         "cannot prove disjoint from them")
                     elif kind == "may_source":
                         steps.append(_instr_dict(w[1], reason=f"field may be filled by source {w[2]}"))
-                        _set_origin({"kind": "source", "callee": w[2]})
+                        _set_origin({"kind": "source", "callee": w[2],
+                                     "address": hex(int(w[1].address))})
                         gaps.append(f"`{w[1]}` may have written them (no call's write "
                                     "extent is trusted)")
                     elif kind == "opaque":
@@ -9087,9 +9101,9 @@ class TaintEngine:
         back_edge = bool(cycled) or len(demands) < len(terminal_params)
         self._bw_cycle_hits.extend((fkey, p) for p in terminal_params if p not in demands)
         # A cut stands only if no path walked that value or load.
-        cuts = list(dict.fromkeys(
+        cuts = sorted({
             label for (kind, k), label in budget_cuts.items()
-            if k not in (walked_at if kind == "var" else load_at)))
+            if k not in (walked_at if kind == "var" else load_at)})
         if cuts:
             self._bw_assume(
                 f"def-chain walk truncated at {self.max_depth} steps (engine max_depth)")
@@ -9559,7 +9573,8 @@ class TaintEngine:
                         # and that sink's pointer demand already withholds
                         # completeness; a constant ADDRESS stays unfollowed.
                         results.append({"steps": [boundary] + base_steps,
-                                        "origin": {"kind": "constant", "value": value},
+                                        "origin": {"kind": "constant", "value": value,
+                                                   "function": hex(int(caller.start))},
                                         "crossed": [str(func.name)]})
                         followed = supplied = True
                         if self._caller_key(caller) not in on_stack:
