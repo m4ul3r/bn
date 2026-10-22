@@ -3036,3 +3036,19 @@ def test_il_order_decides_only_inside_one_block(models):
     assert eng._il_reaches(ssaf, 2, 1) is False     # sibling branches
     assert eng._il_reaches(ssaf, 1, 2) is False     # ...in either direction
     assert eng._il_reaches(ssaf, 0, 2) is True      # head to a successor
+
+
+def test_an_object_in_another_section_is_never_this_objects_storage(models):
+    # An alias/subobject shares its enclosing object's storage by
+    # construction; two SECTIONS are two objects, so an unbounded read of a
+    # preceding `.data` string is not a read of a `.bss` buffer.
+    consumer = _unbounded_reader("other_section", 0x401200, G_DIR)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_TAIL),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(32)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "other_section"},
+                   funcs={0x401200: consumer},
+                   refs={G_DIR: [FRef(consumer, 0x401210)],
+                         G_TAIL: [FRef(func, 0x401104)]},
+                   objects={G_DIR: 0, G_TAIL: 0}, section=(G_TAIL, 0x405000))
+    assert _leaves(_forward(bv, func, models)) == []

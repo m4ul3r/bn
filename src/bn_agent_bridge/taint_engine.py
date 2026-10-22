@@ -6846,6 +6846,17 @@ class TaintEngine:
                 break
         return out
 
+    def _section_names(self, addr: int) -> tuple:
+        """The sections an address lies in, as a comparable key."""
+        getsecs = getattr(self.bv, "get_sections_at", None)
+        if not callable(getsecs):
+            return ()
+        try:
+            return tuple(sorted(str(getattr(sec, "name", getattr(sec, "start", "")))
+                                for sec in (getsecs(int(addr)) or [])))
+        except Exception:
+            return ()
+
     def _typed_width(self, ga: int) -> int:
         """The width of the object's RECOVERED type, or 0 when it has none."""
         getdv = getattr(self.bv, "get_data_var_at", None)
@@ -6886,6 +6897,13 @@ class TaintEngine:
         for pb in self._preceding_objects(ga):
             if start not in self._global_ref_functions(pb):
                 continue        # this body does not touch that object at all
+            if pb + self._global_extent(pb) < ga:
+                continue        # not even adjacent: separate storage
+            if self._section_names(pb) != self._section_names(ga):
+                # Two different sections are two different objects: an
+                # alias/subobject shares its enclosing object's storage by
+                # construction.
+                continue
             typed = self._typed_width(pb)
             if typed and pb + typed <= ga:
                 # A RECOVERED TYPE is an answer about where that object
