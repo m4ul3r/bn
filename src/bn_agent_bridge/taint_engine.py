@@ -422,6 +422,8 @@ class TaintEngine:
         self._global_keyed_offsets: dict[int, set[int]] = {}
         self._global_write_span: dict[int, int] = {}
         self._global_tainted_ranges: dict[int, list[tuple]] = {}
+        self._global_write_unbounded: set[int] = set()
+        self._global_search_truncated: set[int] = set()
         self._alias_chain_cache: dict[int, tuple] = {}
         self._global_extent_unproven: set[int] = set()
         self._ssa_def_cache: dict[tuple, Any] = {}
@@ -5628,8 +5630,21 @@ class TaintEngine:
         # reader at +80 fell outside it (BN21-OBJ-01). A copy of 96 bytes at
         # `g` proves `g` is at least 96 wide -- and only a copy that really
         # spans the boundary can merge two neighbours.
+        authoritative = self._authoritative_width(ga)
+        if authoritative:
+            # A type a HUMAN applied answers where this object ends; nothing
+            # inferred widens past it (round-13 review F31).
+            extent = max(int(authoritative), 1)
+            self._global_extent_cache[ga] = extent
+            return extent
         written = int(self._global_write_span.get(ga) or 0)
-        if typed == 0 and 0 < laid_out < written:
+        if ga in self._global_write_unbounded:
+            # A copy whose LENGTH nothing states may have filled everything
+            # after its destination; the object runs at least through the
+            # storage the next symbols name (round-13 review F28).
+            written = max(written, self._forward_window(ga))
+            self._global_extent_unproven.add(ga)
+        if 0 < laid_out < written:
             # BN21-OBJ-01: the object has no recovered type, so its end was
             # guessed from LAYOUT -- and an ALIAS symbol inside it
             # (`.set mid, g + 64`) is a data variable like any other, which
@@ -5640,11 +5655,12 @@ class TaintEngine:
             # sweep covers what was actually written so a reader inside it is
             # still named.
             self._global_extent_unproven.add(ga)
-        # A recovered type IS an answer about the object's extent: a copy
-        # longer than it is an OVERFLOW, which the sink machinery owns, not
-        # evidence that the neighbour belongs to this object. Only an
-        # untyped object takes its width from what was written.
-        extent = max(typed, laid_out, written if typed == 0 else 0, 1)
+        # An INFERRED type is a lower bound, never an upper one: BN sizes
+        # `char initialized[128] = "seed"` as `char[0x5]`, so a copy of 112
+        # bytes into it is evidence about the object, not an overflow of it
+        # (round-13 review F28). Only an authoritative type, handled above,
+        # says where the object ends.
+        extent = max(typed, laid_out, written, 1)
         extent = max(1, int(extent))
         self._global_extent_cache[ga] = extent
         return extent
@@ -5697,22 +5713,17 @@ class TaintEngine:
         if interval not in ranges:
             ranges.append(interval)
         if n is None or int(n) <= 0:
+            # An unbounded write is evidence about the object too: it is
+            # recorded so the extent stops being clipped by an inferred
+            # initialiser width (F28).
+            if ga not in self._global_write_unbounded:
+                self._global_write_unbounded.add(ga)
+                self._invalidate_object(ga)
             return
         span = offset + int(n)
         if span > int(self._global_write_span.get(ga) or 0):
             self._global_write_span[ga] = span
-            # The extent is memoised, and this is new evidence about it --
-            # for THIS object only. Clearing every cached sweep and
-            # classification instead made each new global write re-derive the
-            # whole program's reachability, which is quadratic on a binary
-            # that fills several globals in a row.
-            self._global_extent_cache.pop(ga, None)
-            self._global_refs.pop(ga, None)
-            self._global_extent_unproven.discard(ga)
-            for key in [k for k in self._global_reach if k[1] == ga]:
-                del self._global_reach[key]
-            for key in [k for k in self._global_access_cache if k[1] == ga]:
-                del self._global_access_cache[key]
+            self._invalidate_object(ga)
 
     def _global_use_offset(self, expr: Any, ga: int) -> int:
         """Byte offset INSIDE the global at *ga* that *expr* names, else 0.
@@ -6686,16 +6697,31 @@ class TaintEngine:
         body, _unread = self._callee_body(defn)
         if body is None:
             return None
-        for pidx in self._fn_returned_params(body):
-            if pidx >= len(params):
-                continue
-            actual = self._ptr_offset(ssaf, params[pidx], root, depth + 1, seen)
+        formals = [pidx for pidx in self._fn_returned_params(body)
+                   if pidx < len(params)]
+        answers: set[int] = set()
+        for pidx in formals:
+            actual = self._ptr_offset(ssaf, params[pidx], root, depth + 1,
+                                      set(seen))
             if actual is None:
+                # This argument cannot be the object at all, so it is not a
+                # path the pointer takes; one that COULD be and does not
+                # resolve is handled by `_ptr_offset` returning None below.
+                if self._ptr_resolves(ssaf, params[pidx],
+                                      lambda e: root(e) is not None):
+                    return None
                 continue
             inner = self._fn_returned_param_offset(body, pidx, depth + 1)
             # The callee's own adjustment is part of the answer: treating a
             # returned formal as the argument itself dropped `+ 16` (F22).
-            return None if inner is None else actual + inner
+            if inner is None:
+                return None
+            answers.add(actual + inner)
+        if answers:
+            # `choose(p, q, n)` may hand back EITHER formal: two feasible
+            # actuals are two displacements, so there is no single one
+            # (round-13 review F30).
+            return answers.pop() if len(answers) == 1 else None
         return self._fn_return_offset_rooted(body, root, depth + 1)
 
     def _global_root(self, ga: int):
@@ -6889,7 +6915,11 @@ class TaintEngine:
                 break
             at = int(addr)
             if ga - at > self._ALIAS_WINDOW:
-                break           # too far back to be this object's own start
+                # A bound reached is not evidence: an object whose base lies
+                # further back than the window is still an object this write
+                # may be inside (round-13 review F29).
+                exhausted = True
+                break
             try:
                 named = getsym(at)
             except Exception:
@@ -6913,6 +6943,74 @@ class TaintEngine:
                                 for sec in (getsecs(int(addr)) or [])))
         except Exception:
             return ()
+
+    def _invalidate_object(self, ga: int) -> None:
+        """New evidence about ONE object's extent: drop what was derived
+        from the old one, for that object only. Clearing every cached sweep
+        instead made each new global write re-derive the whole program's
+        reachability, which is quadratic on a binary that fills several
+        globals in a row."""
+        self._global_extent_cache.pop(ga, None)
+        self._global_refs.pop(ga, None)
+        self._global_extent_unproven.discard(ga)
+        self._alias_chain_cache.pop(ga, None)
+        for key in [k for k in self._global_reach if k[1] == ga]:
+            del self._global_reach[key]
+        for key in [k for k in self._global_access_cache if k[1] == ga]:
+            del self._global_access_cache[key]
+
+    def _forward_window(self, ga: int) -> int:
+        """How far the storage the NEXT symbols name reaches past *ga*.
+
+        What an unbounded write into this object may have filled: the object
+        runs at least through the symbols that follow it contiguously, which
+        is where an interior alias of it lives."""
+        nxt = getattr(self.bv, "get_next_data_var_after", None)
+        getsym = getattr(self.bv, "get_symbol_at", None)
+        if not callable(nxt) or not callable(getsym):
+            return 0
+        at, seen_named, end = int(ga), 0, 0
+        section = self._section_names(ga)
+        for _ in range(self._ALIAS_HOPS):
+            try:
+                got = nxt(at)
+            except Exception:
+                break
+            addr = got if isinstance(got, int) else getattr(got, "address", None)
+            if addr is None or int(addr) <= at:
+                break
+            at = int(addr)
+            if at - ga > self._ALIAS_WINDOW or self._section_names(at) != section:
+                break
+            try:
+                if getsym(at) is None:
+                    continue
+            except Exception:
+                break
+            seen_named += 1
+            end = at - ga
+            if seen_named >= 2:
+                break
+        return end
+
+    def _authoritative_width(self, ga: int) -> int:
+        """The width of a type a HUMAN applied to this object, else 0.
+
+        BN marks the data variables it discovered itself (`auto_discovered`);
+        a type the user applied is evidence about the object, while one
+        inferred from an initialiser is only a lower bound (round-13 review
+        F31 against F26)."""
+        getdv = getattr(self.bv, "get_data_var_at", None)
+        if not callable(getdv):
+            return 0
+        try:
+            dv = getdv(ga)
+            if dv is None or getattr(dv, "auto_discovered", True):
+                return 0
+            width = getattr(getattr(dv, "type", None), "width", None)
+            return int(width) if width else 0
+        except Exception:
+            return 0
 
     def _typed_width(self, ga: int) -> int:
         """The width of the object's RECOVERED type, or 0 when it has none."""
@@ -6955,11 +7053,18 @@ class TaintEngine:
         if exhausted:
             # The enumeration stopped with plausible enclosing objects
             # unexamined, so "nothing encloses it" was never established.
-            self._global_extent_unproven.add(ga)
+            self._global_search_truncated.add(ga)
         for pb in candidates:
             if start not in self._global_ref_functions(pb):
                 continue        # this body does not touch that object at all
-            # NOTE: the recovered type is NOT consulted here. BN sizes an
+            authoritative = self._authoritative_width(pb)
+            if authoritative and pb + authoritative <= ga:
+                # A type a HUMAN applied is an answer about where that
+                # object ends -- unlike one BN inferred from an initialiser
+                # (round-13 review F31). This object begins past it, so they
+                # are separate storage.
+                continue
+            # NOTE: an INFERRED type is not consulted here. BN sizes an
             # initialised buffer from the bytes it can see -- `char
             # init_packet[128] = "seed"` comes back `char[0x5]` -- so a type
             # is a LOWER bound on the object and can never prove where it
@@ -7273,12 +7378,16 @@ class TaintEngine:
         # names the object by constant address has no variable to seed, and
         # `--source var:VAR` there was a template with nothing to fill in --
         # every spelling of it is rejected by the var: grammar.
-        seed_loc = next((r["seed"] for r in rows if r.get("seed")), None)
+        # The function and the locator must come from the SAME reference: a
+        # locator read off one row and an address off another produced
+        # `-f <producer> --source arg:system:0` for a producer with no
+        # `system` call in it, which exits 2 (round-13 review F32).
+        seeded = next((r for r in rows if r.get("seed")), None)
         # A concrete locator is a COMMAND, not a template: nothing in it is
         # left to fill in, so it must not carry the fill-in-the-blanks marker
         # that tells a reader (and the paste test) it cannot be run.
-        reseed = (f"`bn taint forward -f {seed_at} --source {seed_loc}`"
-                  if seed_loc else None)
+        reseed = (f"`bn taint forward -f {seeded['address']} "
+                  f"--source {seeded['seed']}`" if seeded else None)
         parts = []
         if rows:
             where = ", ".join(
@@ -7312,6 +7421,11 @@ class TaintEngine:
                 "unread_callee_body": (
                     "an in-binary callee body Binary Ninja did not analyse "
                     "(re-run after `bn decompile <callee> --force-analysis`)"),
+                "object_search_budget": (
+                    "the bound on how far back the search for an ENCLOSING "
+                    "object may look, so storage this write may be inside "
+                    "was never examined -- this bound is internal, "
+                    "`--max-depth` does not move it"),
                 "object_extent_unproven": (
                     "an object with no recovered type that is written PAST "
                     "the next symbol in the layout -- so where it ends, and "
@@ -7756,8 +7870,20 @@ class TaintEngine:
                             sorted(k for k in known if not (refs and k == own)), known)
                     else:
                         refs, reach = self._global_refs_reachable(cfn, ga, budget)
-                        if ga in self._global_extent_unproven \
+                        if ga in self._global_search_truncated \
                                 and reach["cause"] is None:
+                            # F29: the search for an enclosing object ran out
+                            # of budget with storage unexamined.
+                            reach = dict(reach, status="truncated",
+                                         cause="object_search_budget")
+                        if ga in self._global_extent_unproven and refs \
+                                and reach["cause"] is None:
+                            # Doubt about where the object ENDS qualifies the
+                            # readers it found; on its own it is not a
+                            # boundary, or every unbounded copy into a global
+                            # would raise one with nothing behind it. A
+                            # search that ran out of budget (above) is
+                            # different: there the doubt IS the finding.
                             # BN21-OBJ-01: the object's own extent is not
                             # established, so "these are its references" is
                             # not established either.
@@ -7797,6 +7923,7 @@ class TaintEngine:
                         "function_budget": "global_reference_budget",
                         "reference_sweep_budget": "global_reference_budget",
                         "object_extent_unproven": "global_object_extent",
+                        "object_search_budget": "global_object_search",
                         "pointer_scan_budget": "pointer_scan_budget",
                         "pointer_return_depth": "pointer_return_depth",
                     }.get(str(reach["cause"]))

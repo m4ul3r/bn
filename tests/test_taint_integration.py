@@ -2825,3 +2825,122 @@ def test_global_continuation_alias_chains_write_sites_and_ambiguity(tmp_path,
                 if r["access"] in ("call_arg", "load")]
         assert rows, (fn, leaves)
         assert all(r["offset_known"] is False for r in rows), (fn, rows)
+
+
+_COUNTEREXAMPLE_SRC = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline))
+char initialized[128] = "seed";
+extern char initialized_tail[64];
+__asm__(".globl initialized_tail\n.set initialized_tail,initialized+64\n"
+        ".type initialized_tail,@object\n.size initialized_tail,64\n");
+N void interior_reader(void) { system(initialized_tail + 16); }
+N void initialized_known(char *s) { memcpy(initialized, s, 112); interior_reader(); }
+N void initialized_unknown(char *s, size_t n) { memcpy(initialized, s, n); interior_reader(); }
+N void initialized_small(char *s) { memcpy(initialized, s, 16); interior_reader(); }
+char large_packet[2097280];
+extern char far_tail[64];
+__asm__(".globl far_tail\n.set far_tail,large_packet+1048640\n"
+        ".type far_tail,@object\n.size far_tail,64\n");
+N void far_reader(void) {
+    char *p = malloc(sizeof large_packet);
+    memcpy(p, large_packet, sizeof large_packet);
+    system(p + 1048640);
+    free(p);
+}
+N void far_case(char *s) { memcpy(far_tail, s, 32); far_reader(); }
+char tracked[128] = "seed";
+volatile int selector;
+N char *choose_formals(char *p, char *q, int n) { return n ? p : q; }
+N char *formal_producer(void) { return choose_formals(tracked + 8, tracked + 24, selector); }
+N void formal_consumer(void) { system(formal_producer()); }
+N void formal_case(char *s) { memcpy(tracked, s, 64); formal_consumer(); }
+char adjacent_a[64] = "safe";
+char adjacent_b[64] = "seed";
+N void adjacent_reader(void) { system(adjacent_a); }
+N void adjacent_case(char *s) { memcpy(adjacent_b, s, 16); adjacent_reader(); }
+N char *phi_producer(void) {
+    char *p;
+    if (selector) p = tracked + 8; else p = tracked + selector;
+    return p;
+}
+N void phi_consumer(void) { system(phi_producer()); }
+N void advice_case(char *s) { memcpy(tracked, s, 64); phi_consumer(); }
+int main(int argc, char **argv) { return argc > 100 ? argv[0][0] : 0; }
+"""
+
+
+def test_global_continuation_object_evidence_budgets_and_advice(tmp_path,
+                                                                shared_bn):
+    """Round-13 review F28, F29, F30, F31 and F32 on a real stripped build.
+
+    F28: an inferred initialiser width is a LOWER bound -- a 112-byte copy
+    into `char initialized[128] = "seed"` crosses its interior alias, and a
+    runtime length stays unbounded rather than clipped to `char[0x5]`.
+    F29: reaching the enclosing-object search window is a BOUND, disclosed
+    as `object_search_budget`, never as "nothing encloses it".
+    F30: a wrapper that may return either formal has no single displacement.
+    F31: a type a HUMAN applied IS where the object ends.
+    F32: the re-seed command's function and locator come from one reference,
+    and it runs."""
+    src = tmp_path / "r3counter.c"
+    src.write_text(_COUNTEREXAMPLE_SRC)
+    binary = tmp_path / "r3counter"
+    _compile(src, binary, ["-fno-builtin", "-fno-inline", "-fno-stack-protector", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # F28: both the known and the unknown copy reach the interior reader
+    for fn in ("initialized_known", "initialized_unknown"):
+        result, leaves = gmc(fn)
+        [leaf] = leaves
+        assert [r["display_name"] for r in leaf["references"]] == [
+            "interior_reader"], (fn, leaf)
+        assert leaf["references"][0]["offset"] == 80, (fn, leaf)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+    result, leaves = gmc("initialized_small")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+    # F29: the window is a bound, and reaching it blocks
+    result, leaves = gmc("far_case")
+    [leaf] = leaves
+    assert leaf["reachability"]["cause"] == "object_search_budget", leaf
+    assert "global_object_search" in result["stats"]["truncation_cause"], result
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # F30: either formal may come back, so the displacement is unknown
+    result, leaves = gmc("formal_case")
+    row = next(r for lf in leaves for r in lf["references"]
+               if r["display_name"] == "formal_consumer")
+    assert row["offset_known"] is False, leaves
+
+    # F31: an INFERRED width does not separate them, a USER type does
+    result, leaves = gmc("adjacent_case")
+    assert leaves and result["diagnostics"]["safe_to_report_all_clear"] is False
+    for name in ("adjacent_a", "adjacent_b"):
+        applied = _bn_json(shared_bn, "-t", target, "data", "retype", name,
+                           "char[64]")
+        assert applied["results"][0]["status"] == "verified", applied
+    result, leaves = gmc("adjacent_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+    # F32: the advice names the function its locator belongs to, and runs
+    result, leaves = gmc("advice_case")
+    [leaf] = leaves
+    rows = leaf["references"]
+    assert rows[0]["seed"] is None, rows
+    seeded = next(r for r in rows if r["seed"])
+    assert leaf["reseed"] == (
+        f"`bn taint forward -f {seeded['address']} --source {seeded['seed']}`")
+    ran = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                   "-f", seeded["address"], "--source", seeded["seed"])
+    assert [s["sink"]["class"] for s in ran["reached_sinks"]] == ["command_injection"]

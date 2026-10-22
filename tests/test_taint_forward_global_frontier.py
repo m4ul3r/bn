@@ -250,15 +250,19 @@ def test_a_clean_sibling_global_is_not_disclosed(models):
     hot = _reader("hot_hook", 0x401200, G_DIR, 0x401210)
     cool = _reader("cool_hook", 0x401300, G_OTHER, 0x401310)
     instrs = [
-        FInstr(0, 0x401104, "MLIL_CALL_SSA", "strcpy(g_dir, argv#0)", reads=[argv0],
-               dest=_gptr(STRCPY), params=[_gptr(G_DIR), _var(argv0)]),
-        FInstr(1, 0x401108, "MLIL_CALL_SSA", "strcpy(g_other, 0x402000)",
-               dest=_gptr(STRCPY), params=[_gptr(G_OTHER), _gptr(0x402000)]),
+        # Bounded copies: this control is about WHICH global is disclosed,
+        # not about what an unbounded write may reach past its destination.
+        FInstr(0, 0x401104, "MLIL_CALL_SSA", "strncpy(g_dir, argv#0, 0x10)",
+               reads=[argv0], dest=_gptr(STRNCPY),
+               params=[_gptr(G_DIR), _var(argv0), _const(0x10)]),
+        FInstr(1, 0x401108, "MLIL_CALL_SSA", "strncpy(g_other, 0x402000, 0x10)",
+               dest=_gptr(STRNCPY),
+               params=[_gptr(G_OTHER), _gptr(0x402000), _const(0x10)]),
         FInstr(2, 0x40110c, "MLIL_CALL_SSA", "cool_hook()", dest=_gptr(0x401300), params=[]),
         FInstr(3, 0x401110, "MLIL_CALL_SSA", "hot_hook()", dest=_gptr(0x401200), params=[]),
     ]
     func = GFunc("main", 0x401100, FSSAFunc(instrs), params=[argv])
-    bv = FGlobalBV({STRCPY: "strcpy", SYSTEM: "system",
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system",
                     0x401200: "hot_hook", 0x401300: "cool_hook"},
                    funcs={0x401200: hot, 0x401300: cool},
                    refs={G_DIR: [FRef(hot, 0x401210)],
@@ -464,15 +468,18 @@ def test_two_tainted_globals_are_disclosed_separately(models):
     hook_a = _reader("hook_a", 0x401200, G_DIR, 0x401210)
     hook_b = _reader("hook_b", 0x401300, G_OTHER, 0x401310)
     instrs = [
-        FInstr(0, 0x401104, "MLIL_CALL_SSA", "strcpy(g_dir, argv#0)", reads=[argv0],
-               dest=_gptr(STRCPY), params=[_gptr(G_DIR), _var(argv0)]),
-        FInstr(1, 0x401108, "MLIL_CALL_SSA", "strcpy(g_other, argv#0)", reads=[argv0],
-               dest=_gptr(STRCPY), params=[_gptr(G_OTHER), _var(argv0)]),
+        # Bounded copies: this control is about ONE leaf per (call, global).
+        FInstr(0, 0x401104, "MLIL_CALL_SSA", "strncpy(g_dir, argv#0, 0x10)",
+               reads=[argv0], dest=_gptr(STRNCPY),
+               params=[_gptr(G_DIR), _var(argv0), _const(0x10)]),
+        FInstr(1, 0x401108, "MLIL_CALL_SSA", "strncpy(g_other, argv#0, 0x10)",
+               reads=[argv0], dest=_gptr(STRNCPY),
+               params=[_gptr(G_OTHER), _var(argv0), _const(0x10)]),
         FInstr(2, 0x40110c, "MLIL_CALL_SSA", "hook_a()", dest=_gptr(0x401200), params=[]),
         FInstr(3, 0x401110, "MLIL_CALL_SSA", "hook_b()", dest=_gptr(0x401300), params=[]),
     ]
     func = GFunc("main", 0x401100, FSSAFunc(instrs), params=[argv])
-    bv = FGlobalBV({STRCPY: "strcpy", SYSTEM: "system",
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system",
                     0x401200: "hook_a", 0x401300: "hook_b"},
                    funcs={0x401200: hook_a, 0x401300: hook_b},
                    refs={G_DIR: [FRef(hook_a, 0x401210)],
@@ -1351,9 +1358,12 @@ def test_a_phi_selected_pointer_with_one_reading_use_still_blocks(models):
 # --------------------------------------------------------------------------
 
 class FDataVar:
-    def __init__(self, address, width):
+    def __init__(self, address, width, auto=True):
         self.address = address
         self.type = type("T", (), {"width": width})()
+        # BN marks the variables it discovered itself; a type the USER
+        # applied is authoritative about where the object ends.
+        self.auto_discovered = auto
 
 
 class FExtentBV(FGlobalBV):
@@ -1368,21 +1378,23 @@ class FExtentBV(FGlobalBV):
     """
 
     def __init__(self, addr_names, funcs=None, refs=None, objects=None,
-                 interior=(), section=None, **kw):
+                 interior=(), section=None, authoritative=(), **kw):
         super().__init__(addr_names, funcs, refs, **kw)
         self._objects = objects or {}
         self._interior = sorted(interior)
         self._section = section
+        self._authoritative = set(authoritative)
 
     def get_data_var_at(self, addr):
         addr = int(addr)
         if addr in self._interior:
             return FDataVar(addr, 0)
         for base, width in self._objects.items():
+            auto = base not in self._authoritative
             if width and base <= addr < base + width:
-                return FDataVar(base, width)
+                return FDataVar(base, width, auto)
             if not width and base == addr:
-                return FDataVar(base, 0)
+                return FDataVar(base, 0, auto)
         return None
 
     def get_next_data_var_after(self, addr):
@@ -2454,11 +2466,23 @@ def test_a_copy_within_the_layout_bound_keeps_the_neighbour_disjoint(models):
     assert result["diagnostics"]["safe_to_report_all_clear"] is True
 
 
-def test_a_typed_object_is_not_second_guessed_by_an_overflowing_copy(models):
-    # A recovered type IS an answer about the object's extent. A copy longer
-    # than it is an overflow -- the sink machinery's business, not evidence
-    # that the neighbour is part of this object.
+def test_an_inferred_type_never_bounds_an_overflowing_copy(models):
+    # Round-13 review F28: BN sizes an initialised buffer from the bytes it
+    # can see, so a copy longer than that width is EVIDENCE about the
+    # object, not an overflow of it. Reading the inferred width as the
+    # object's end hid a reader past it.
+    func, bv = _alias_program(96, 80, objects={G_DIR: 5, G_MID: 5})
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["display_name"] == "alias_reader", leaf
+    assert leaf["references"][0]["offset"] == 80, leaf
+
+
+def test_a_user_applied_type_is_where_the_object_ends(models):
+    # ...but a type a HUMAN applied is authoritative: the copy overflows it,
+    # which is the sink machinery's business, and the neighbour stays a
+    # separate object (round-13 review F31).
     func, bv = _alias_program(96, 80, objects={G_DIR: 64, G_MID: 64})
+    bv._authoritative = {G_DIR, G_MID}
     assert _leaves(_forward(bv, func, models)) == []
 
 
@@ -3156,7 +3180,8 @@ def test_an_exhausted_alias_search_is_disclosed(models, monkeypatch):
                    objects=aliases, section=(0x404000, 0x405000))
     result = _forward(bv, func, models)
     [leaf] = _leaves(result)
-    assert leaf["reachability"]["cause"] == "object_extent_unproven", leaf
+    assert leaf["reachability"]["cause"] == "object_search_budget", leaf
+    assert "global_object_search" in result["stats"]["truncation_cause"]
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
@@ -3216,3 +3241,123 @@ def test_a_wrapper_returning_two_displacements_has_neither(models):
     eng = te.TaintEngine(FGlobalBV({0x401200: "choose"},
                                    funcs={0x401200: helper}), models)
     assert eng._fn_returned_param_offset(helper, 0) is None
+
+
+# --------------------------------------------------------------------------
+# round-13 review F28/F29/F30/F32
+# --------------------------------------------------------------------------
+
+def _crossing_program(write_len, read_at=80):
+    """A copy into the object's BASE that crosses its interior alias, and a
+    reader of the alias past the crossing point."""
+    consumer = _interior_reader("interior_reader", 0x401200, G_DIR + read_at,
+                                0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(write_len)] if write_len is not None
+        else [_var(FSSA(FVar("n"), 0))])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401200: "interior_reader"},
+                   funcs={0x401200: consumer},
+                   refs={G_DIR + read_at: [FRef(consumer, 0x401210)],
+                         G_DIR: [FRef(func, 0x401104)]},
+                   # the inferred initialiser prefix, the alias, a neighbour
+                   objects={G_DIR: 5, G_TAIL: 0, G_OTHER: 0},
+                   section=(0x404000, 0x405000))
+    return func, bv
+
+
+def test_a_known_copy_crossing_an_interior_alias_is_followed(models):
+    # Round-13 review F28: 112 bytes into an object BN sized `char[0x5]`
+    # from its initialiser. The copy is evidence about the object, so the
+    # reader past the alias is inside it -- reading the inferred width as
+    # the object's end cleared the run.
+    func, bv = _crossing_program(112)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "interior_reader", leaf
+    assert leaf["references"][0]["offset"] == 80, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_an_unknown_copy_length_is_not_clipped_by_the_inferred_width(models):
+    # ...and a runtime length stays unbounded rather than being clipped to
+    # the one width BN could infer.
+    func, bv = _crossing_program(None)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "interior_reader", leaf
+    assert leaf["reachability"]["cause"] == "object_extent_unproven", leaf
+
+
+def test_a_copy_that_does_not_reach_the_alias_stays_silent(models):
+    func, bv = _crossing_program(16)
+    assert _leaves(_forward(bv, func, models)) == []
+
+
+def test_an_alias_search_cut_by_its_window_is_disclosed(models, monkeypatch):
+    # Round-13 review F29: the window is a BOUND. Stopping at it without
+    # saying so turned "I did not look that far" into "nothing encloses it".
+    monkeypatch.setattr(te.TaintEngine, "_ALIAS_WINDOW", 8)
+    func, bv = _interval_program(_spanning_reader("base", 0x401200, G_DIR, 112))
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["reachability"]["cause"] == "object_search_budget", leaf
+    assert "global_object_search" in result["stats"]["truncation_cause"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_wrapper_returning_either_formal_has_no_single_offset(models):
+    # Round-13 review F30: `choose(p, q, n)` hands back EITHER actual, and
+    # the caller passes `g + 8` and `g + 24`. Returning on the first match
+    # reported +8 as certain.
+    p, q, n = FVar("p"), FVar("q"), FVar("n")
+    p0, q0 = FSSA(p, 0), FSSA(q, 0)
+    helper = GFunc("choose", 0x401200, FSSAFunc([
+        FInstr(0, 0x401200, "MLIL_IF", "if (n)"),
+        FInstr(1, 0x401208, "MLIL_RET", "return p#0", reads=[p0], src=[_var(p0)]),
+        FInstr(2, 0x401210, "MLIL_RET", "return q#0", reads=[q0], src=[_var(q0)]),
+    ]), params=[p, q, n])
+    r = FSSA(FVar("r"), 1)
+    caller = FSSAFunc([
+        FInstr(0, 0x401300, "MLIL_CALL_SSA", "r#1 = choose(g + 8, g + 24, sel)",
+               writes=[r], dest=_gptr(0x401200),
+               params=[FExpr("MLIL_ADD", "g + 8", left=_gptr(G_DIR), right=_const(8)),
+                       FExpr("MLIL_ADD", "g + 24", left=_gptr(G_DIR), right=_const(24)),
+                       _const(0)]),
+    ])
+    eng = te.TaintEngine(FGlobalBV({0x401200: "choose"},
+                                   funcs={0x401200: helper}), models)
+    assert eng._global_ptr_offset(caller, _var(r), G_DIR) is None
+
+
+def test_the_reseed_command_comes_from_one_reference(models):
+    # Round-13 review F32: the leaf lists a RETURN row with no locator
+    # first, then the consumer that has one. Taking the address from the
+    # first row and the locator from the second produced a command that
+    # exits 2 -- `system` is not called in the producer.
+    producer = GFunc("producer", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_RET", "return g", src=[_gptr(G_DIR)]),
+    ]), params=[])
+    q = FSSA(FVar("q"), 1)
+    consumer = GFunc("consumer", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "q#1 = producer()", writes=[q],
+               dest=_gptr(0x401200), params=[]),
+        FInstr(1, 0x401318, "MLIL_CALL_SSA", "system(q#1)", reads=[q],
+               dest=_gptr(SYSTEM), params=[_var(q)]),
+    ]), params=[], callees=[producer])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401200: "producer", 0x401300: "consumer"},
+                   funcs={0x401200: producer, 0x401300: consumer},
+                   refs={G_DIR: [FRef(producer, 0x401210)]})
+    [leaf] = _leaves(_forward(bv, func, models))
+    rows = leaf["references"]
+    assert [r["display_name"] for r in rows] == ["producer", "consumer"], rows
+    assert rows[0]["seed"] is None and rows[1]["seed"] == "arg:system:0", rows
+    # the command names the function the locator belongs to, not the first row
+    assert leaf["reseed"] == (
+        f"`bn taint forward -f {rows[1]['address']} --source arg:system:0`")
