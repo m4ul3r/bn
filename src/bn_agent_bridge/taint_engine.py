@@ -350,6 +350,11 @@ class TaintEngine:
         # verdict inside the callee's body, so a helper called from many
         # sites is classified once.
         self._param_access_cache: dict[tuple[int, int], tuple] = {}
+        # global address -> the object's byte extent, typed or inferred.
+        self._global_extent_cache: dict[int, int] = {}
+        # function start -> (indirect targets this run can pin, unresolved
+        # indirect call addresses) inside that body.
+        self._indirect_sites_cache: dict[int, tuple] = {}
 
     # -- shared resolution ------------------------------------------------
 
@@ -1217,9 +1222,15 @@ class TaintEngine:
             return (hk, f"heap_{hex(hk[1])}")
         return None
 
-    def _global_addr(self, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
+    def _global_addr(self, ssaf: Any, expr: Any, depth: int = 0, *,
+                     canon: bool = True) -> int | None:
         """The base address of a writable global/static buffer *expr* points at, or
-        None. Follows an SSA copy chain to a constant pointer."""
+        None. Follows an SSA copy chain to a constant pointer.
+
+        ``canon=False`` returns the constant the expression actually names,
+        without folding it to its data variable's base -- what an INTERIOR
+        reference needs when the view has no type for the object and BN
+        invented a second data variable at the referenced offset."""
         if expr is None or depth > 6:
             return None
         if "CONST_PTR" in op_name(expr):
@@ -1231,6 +1242,8 @@ class TaintEngine:
                 addr = int(c)
             except Exception:
                 return None
+            if not canon:
+                return addr if self._is_writable(addr) else None
             return self._canon_global(addr)
         if is_ssa_var(expr):
             try:
@@ -1238,7 +1251,8 @@ class TaintEngine:
             except Exception:
                 d = None
             if d is not None:
-                return self._global_addr(ssaf, getattr(d, "src", None), depth + 1)
+                return self._global_addr(ssaf, getattr(d, "src", None), depth + 1,
+                                         canon=canon)
             return None
         reads = expr_reads(expr)
         if len(reads) == 1:
@@ -1247,7 +1261,8 @@ class TaintEngine:
             except Exception:
                 d = None
             if d is not None:
-                return self._global_addr(ssaf, getattr(d, "src", None), depth + 1)
+                return self._global_addr(ssaf, getattr(d, "src", None), depth + 1,
+                                         canon=canon)
         return None
 
     def _canon_global(self, addr: int) -> int | None:
@@ -5358,16 +5373,76 @@ class TaintEngine:
     # review F2: the cap used to turn an unfinished search into an all-clear).
     _GLOBAL_REACH_FUNCS = 512
 
+    # Widest span a global with no recovered type may be assumed to cover
+    # when its extent has to be inferred from layout.
+    _GLOBAL_EXTENT_FALLBACK = 1 << 16
+
     def _global_extent(self, ga: int) -> int:
-        """Byte width of the data variable at *ga*, bounded, else 1."""
+        """Byte width of the global object based at *ga*.
+
+        The data variable's own type first. A stripped binary usually has no
+        type for it -- BN reports `void`, width 0 -- and answering 1 there
+        excluded every consumer whose code reference sits at an interior
+        address, which is the whole point of asking (round-3 review I1). So
+        when the type cannot say, the LAYOUT does: the object runs to the
+        next data variable, or to the end of its section, whichever comes
+        first, bounded. That is exactly where a disjoint neighbour begins, so
+        the neighbour's references are still outside."""
+        cached = self._global_extent_cache.get(ga)
+        if cached is not None:
+            return cached
+        extent = 0
         getdv = getattr(self.bv, "get_data_var_at", None)
-        if not callable(getdv):
-            return 1
-        try:
-            width = getattr(getattr(getdv(ga), "type", None), "width", None)
-            return max(1, min(int(width), 1 << 20))
-        except Exception:
-            return 1
+        if callable(getdv):
+            try:
+                width = getattr(getattr(getdv(ga), "type", None), "width", None)
+                extent = int(width) if width else 0
+            except Exception:
+                extent = 0
+        if extent <= 0:
+            bounds: list[int] = []
+            nxt = getattr(self.bv, "get_next_data_var_after", None)
+            getsym = getattr(self.bv, "get_symbol_at", None)
+            if callable(nxt):
+                # The next data variable that carries a SYMBOL. An untyped
+                # global makes BN invent a bare data variable at each offset
+                # something references, so stopping at the first data
+                # variable would cut the object at its own first interior
+                # reference -- the very reference being looked for.
+                addr = ga
+                for _ in range(64):
+                    try:
+                        nxt_addr = getattr(nxt(addr), "address", None)
+                    except Exception:
+                        break
+                    if nxt_addr is None or int(nxt_addr) <= addr:
+                        break
+                    addr = int(nxt_addr)
+                    named = None
+                    if callable(getsym):
+                        try:
+                            named = getsym(addr)
+                        except Exception:
+                            named = None
+                    if named is not None or not callable(getsym):
+                        bounds.append(addr)
+                        break
+            getsecs = getattr(self.bv, "get_sections_at", None)
+            if callable(getsecs):
+                try:
+                    for sec in (getsecs(ga) or []):
+                        end = getattr(sec, "end", None)
+                        if end is not None and int(end) > ga:
+                            bounds.append(int(end))
+                except Exception:
+                    pass
+            # No type AND no layout to infer from: claim nothing. Widening
+            # on a view that cannot answer would sweep a neighbouring
+            # object's references into this one.
+            extent = (min(bounds) - ga) if bounds else 1
+        extent = max(1, min(int(extent), self._GLOBAL_EXTENT_FALLBACK))
+        self._global_extent_cache[ga] = extent
+        return extent
 
     def _global_use_offset(self, expr: Any, ga: int) -> int:
         """Byte offset INSIDE the global at *ga* that *expr* names, else 0.
@@ -5388,7 +5463,9 @@ class TaintEngine:
                     value = int(raw)
                 except (TypeError, ValueError):
                     value = None
-                if value is not None and value >= ga and self._canon_global(value) == ga:
+                if value is not None and ga <= value and (
+                        value < ga + self._global_extent(ga)
+                        or self._canon_global(value) == ga):
                     off = value - ga
                     best = off if best is None else min(best, off)
             for attr in ("src", "dest", "left", "right", "params"):
@@ -5546,6 +5623,23 @@ class TaintEngine:
                 defn = None
             if defn is None:
                 return False
+            if self._is_call(defn):
+                # `p = memcpy(dst, ..)` hands BACK its destination: the model
+                # says `arg:0 -> ret`, so the result is that same object and
+                # `p + 1` still points into it (round-3 review I3). Without
+                # this the alias looked like a fresh pointer and a consumer
+                # reading through it was cleared as write-only.
+                params = self._call_params(defn)
+                _k, model = lookup_model(
+                    self.models, self._callee_name(self._resolve_direct_target(defn)))
+                for rule in ((model or {}).get("propagates") or ()):
+                    if str(rule.get("to") or "") not in ("ret", "*ret"):
+                        continue
+                    idx = _try_arg_index(str(rule.get("from") or ""))
+                    if idx is not None and idx < len(params) and self._ptr_resolves(
+                            ssaf, params[idx], base, depth + 1, seen):
+                        return True
+                return False
             srcs = getattr(defn, "src", None)
             if not isinstance(srcs, (list, tuple)):
                 srcs = [] if srcs is None else [srcs]
@@ -5607,7 +5701,20 @@ class TaintEngine:
         return any(self._expr_loads(ssaf, s, base, depth + 1) for s in subs)
 
     def _global_base(self, ssaf: Any, ga: int):
-        return lambda e: self._global_addr(ssaf, e) == ga
+        """The root test for the global OBJECT based at *ga*.
+
+        Its own base, or any address inside its extent: `g + 4` is still `g`,
+        and on a view with no type for the object BN folds that interior
+        address to a data variable of its own, so the canonical test alone
+        misses it (round-3 review I1)."""
+        extent = self._global_extent(ga)
+
+        def base(expr: Any) -> bool:
+            if self._global_addr(ssaf, expr) == ga:
+                return True
+            raw = self._global_addr(ssaf, expr, canon=False)
+            return raw is not None and ga <= raw < ga + extent
+        return base
 
     def _may_be_global(self, ssaf: Any, expr: Any, ga: int) -> bool:
         return self._ptr_resolves(ssaf, expr, self._global_base(ssaf, ga))
@@ -5637,6 +5744,11 @@ class TaintEngine:
             return "unknown"
         tok = f"*arg:{idx}"
         written = read = False
+        if tok in (model.get("reads_dest") or ()):
+            # An APPEND reads its destination to find where to append
+            # (round-3 review I4): `strcat(g, "suffix")` consumes g's bytes
+            # before it writes any, so its destination is never write-only.
+            read = True
         if tok in (model.get("writes") or ()):
             written = True
         for rule in (model.get("propagates") or ()):
@@ -5839,6 +5951,42 @@ class TaintEngine:
         self._global_access_cache[key] = out
         return out
 
+    def _indirect_sites(self, fn: Any) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """``(pinned targets, unresolved call addresses)`` for the indirect
+        calls in *fn*.
+
+        BN's ``Function.callees`` lists resolved edges only, so a body whose
+        whole job is `cb()` looks like a leaf to a call-graph walk (round-3
+        review I2). Each indirect site is re-resolved the way the forward
+        walk resolves one -- an agent ``--resolve-map`` pin first, then the
+        value set -- and whatever still does not resolve is named, so the
+        walk reports "I could not follow this" instead of "there is nothing
+        here"."""
+        key = int(getattr(fn, "start", 0))
+        cached = self._indirect_sites_cache.get(key)
+        if cached is not None:
+            return cached
+        pinned: list[int] = []
+        unresolved: list[int] = []
+        try:
+            instrs = self._instrs(self._ssa_func(fn))
+        except TaintError:
+            instrs = []
+        for ins in instrs:
+            if not self._is_call(ins) or self._resolve_direct_target(ins) is not None:
+                continue
+            addr = int(getattr(ins, "address", 0))
+            targets = tuple(self.resolve_map.get(addr) or ()) or tuple(
+                self._call_targets_from_pvs(
+                    getattr(getattr(ins, "dest", None), "possible_values", None)))
+            if targets:
+                pinned.extend(int(t) for t in targets)
+            else:
+                unresolved.append(addr)
+        out = (tuple(pinned), tuple(unresolved))
+        self._indirect_sites_cache[key] = out
+        return out
+
     def _global_refs_reachable(self, fn: Any, ga: int, budget: int) -> tuple[tuple, dict]:
         """``(reads, reach)`` for the global at *ga* as seen from *fn*.
 
@@ -5879,6 +6027,7 @@ class TaintEngine:
             return cached
         found: dict[int, tuple] = {}
         unread: dict[int, str] = {}
+        opaque: list[int] = []
         # `seen` is what the walk has QUEUED (the bound that keeps a dense
         # graph finite); `done` is what it actually examined. Only the latter
         # can rule a reference out -- a function discovered on the last wave
@@ -5912,6 +6061,19 @@ class TaintEngine:
                     callees = list(getattr(cur, "callees", None) or ())
                 except Exception:
                     callees = []
+                # I2: `callees` lists resolved edges only. Follow the indirect
+                # sites this run CAN pin, and name the ones it cannot --
+                # inside real BODIES only. A PLT stub is a register-indirect
+                # jump through the GOT by construction; counting it as a call
+                # bn failed to resolve would raise this boundary on every
+                # library call in the walk.
+                pinned, unpinned = (
+                    self._indirect_sites(cur) if self._is_internal(cur) else ((), ()))
+                opaque.extend(unpinned)
+                for taddr in pinned:
+                    pinned_fn = function_at(self.bv, taddr)
+                    if pinned_fn is not None:
+                        callees.append(pinned_fn)
                 for callee in callees:
                     nstart = getattr(callee, "start", None)
                     if nstart is None:
@@ -5933,6 +6095,10 @@ class TaintEngine:
             # Every function BN records a reference from was examined, so the
             # bound that stopped the walk cannot have hidden a reader.
             cut = None
+        if opaque and cut is None:
+            # I2: control left the examined region through a call bn could
+            # not name, so "no reader is reachable" was never established.
+            cut = "unresolved_call_target"
         if unread:
             # An unread descendant outranks a budget: the walk did not stop
             # early, it walked INTO something it could not read (F9).
@@ -5940,6 +6106,7 @@ class TaintEngine:
         status = self._reach_status(cut, len(done), unexamined, known)
         status["unread_bodies"] = [
             {"name": unread[k], "address": hex(k)} for k in sorted(unread)]
+        status["unresolved_calls"] = [hex(a) for a in sorted(set(opaque))[:8]]
         out = (tuple(sorted((st, a, k, o) for st, (a, k, o) in found.items())),
                status)
         self._global_reach[key] = out
@@ -5965,6 +6132,7 @@ class TaintEngine:
             "unexamined_references_total": len(unexamined),
             "unexamined_references": [hex(a) for a in unexamined[:8]],
             "unread_bodies": [],
+            "unresolved_calls": [],
             "unexamined_reference_sites": [
                 {"name": str(getattr(function_at(self.bv, s), "name", None)
                              or self._callee_name(s) or hex(s)),
@@ -6037,6 +6205,9 @@ class TaintEngine:
                 for b in (reach.get("unread_bodies") or []))
             if unread_named:
                 bound += f" -- {unread_named}"
+            opaque_named = ", ".join(reach.get("unresolved_calls") or [])
+            if opaque_named:
+                bound += f" (unresolved call(s) at {opaque_named})"
             unreached = ", ".join(
                 f"{r.get('name')} @ {r.get('at')}"
                 for r in (reach.get("unexamined_reference_sites") or [])) or "n/a"

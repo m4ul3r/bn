@@ -1893,3 +1893,141 @@ def test_global_continuation_unresolved_callback_is_a_boundary(tmp_path, shared_
     assert leaf["callee"]["display_name"] == "base_consumer", leaf
     assert leaf["references"][0]["access"] == "call_arg", leaf
     assert leaf["reachability"]["cause"] is None, leaf
+
+
+_ACCESS_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[64];
+char neighbour_bytes[64] = "/bin/true";
+__attribute__((noinline)) int alias_consumer(void) { char *p = memcpy(global_bytes, "x", 1); return system(p + 1); }
+__attribute__((noinline)) int concat_consumer(void) { strcat(global_bytes, "suffix"); return 0; }
+__attribute__((noinline)) int reset_consumer(void) { memset(global_bytes, 0, 64); return 0; }
+__attribute__((noinline)) int consumer(void) { return system(global_bytes); }
+__attribute__((noinline)) int dispatch(int (*cb)(void)) { return cb(); }
+__attribute__((noinline)) int offset_consumer(void) { return system(global_bytes + 4); }
+__attribute__((noinline)) int neighbour_consumer(void) { return system(neighbour_bytes + 8); }
+__attribute__((noinline)) int alias_case(const char *s) { memcpy(global_bytes, s, 16); return alias_consumer(); }
+__attribute__((noinline)) int concat_case(const char *s) { memcpy(global_bytes, s, 16); return concat_consumer(); }
+__attribute__((noinline)) int reset_case(const char *s) { memcpy(global_bytes, s, 16); return reset_consumer(); }
+__attribute__((noinline)) int wrapped_indirect_case(const char *s, int (*cb)(void)) { memcpy(global_bytes, s, 16); return dispatch(cb); }
+__attribute__((noinline)) int clean_wrapped_indirect_case(const char *s, int (*cb)(void)) {
+    char local[64]; memcpy(local, s, 16); return dispatch(cb) + local[0];
+}
+__attribute__((noinline)) int offset_case(const char *s) { memcpy(global_bytes, s, 16); return offset_consumer(); }
+__attribute__((noinline)) int neighbour_case(const char *s) { memcpy(global_bytes, s, 16); return neighbour_consumer(); }
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    return alias_case(argv[1]) + concat_case(argv[1]) + reset_case(argv[1])
+         + wrapped_indirect_case(argv[1], consumer)
+         + clean_wrapped_indirect_case(argv[1], consumer)
+         + offset_case(argv[1]) + neighbour_case(argv[1]);
+}
+"""
+
+
+def _access_target(tmp_path, shared_bn, *, debug: bool):
+    """The access-shape fixture, built with or without debug types."""
+    name = "accesses" if debug else "accesses_nodbg"
+    src = tmp_path / f"{name}.c"
+    src.write_text(_ACCESS_SRC)
+    binary = tmp_path / name
+    cc = ["-fno-builtin"] if debug else ["-fno-builtin", "-g0"]
+    _compile(src, binary, cc)
+    return shared_bn.load(binary, copy=False)
+
+
+@pytest.mark.parametrize("debug", [True, False], ids=["typed", "stripped"])
+def test_global_continuation_interior_reader_without_debug_types(tmp_path, shared_bn,
+                                                                 debug):
+    """Round-3 review I1: a stripped global still has an extent.
+
+    With no debug type BN reports the object as `void`, width 0, and invents
+    a bare data variable at the offset the consumer references -- so taking
+    the type's word for it made the extent one byte, the reference sweep
+    missed the consumer and the interior pointer folded to a different
+    "object". The layout answers instead: the object runs to the next data
+    variable that carries a SYMBOL, which is where the neighbour begins."""
+    target = _access_target(tmp_path, shared_bn, debug=debug)
+
+    def forward(fn):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0")
+
+    result = forward("offset_case")
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "global_memory_continuation"]
+    assert leaf["references"][0]["display_name"] == "offset_consumer", leaf
+    assert leaf["references"][0]["offset"] == 4, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result
+
+    neighbour = forward("neighbour_case")
+    assert [lf for lf in neighbour["leaves"]
+            if lf["kind"] == "global_memory_continuation"] == [], neighbour["leaves"]
+    assert neighbour["diagnostics"]["safe_to_report_all_clear"] is True, neighbour
+
+
+def test_global_continuation_callback_behind_a_wrapper(tmp_path, shared_bn):
+    """Round-3 review I2: `Function.callees` lists resolved edges only.
+
+    `dispatch(cb)` is a leaf to a call-graph walk, so a callback reached
+    through it answered "nothing reads the global". Each indirect site in a
+    walked BODY is re-resolved the way the forward walk resolves one; what
+    still does not resolve is named."""
+    target = _access_target(tmp_path, shared_bn, debug=True)
+
+    def forward(fn, *extra):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0", *extra)
+
+    result = forward("wrapped_indirect_case")
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "global_memory_continuation"]
+    assert leaf["reachability"]["cause"] == "unresolved_call_target", leaf
+    assert leaf["reachability"]["unresolved_calls"], leaf["reachability"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result
+
+    # the control: no tainted global, same wrapper and callback
+    clean = forward("clean_wrapped_indirect_case")
+    assert [lf for lf in clean["leaves"]
+            if lf["kind"] == "global_memory_continuation"] == [], clean["leaves"]
+
+    # --resolve-map pins the dispatcher's own callsite: the walk follows it
+    rmap = tmp_path / "wrapped_rmap.json"
+    rmap.write_text(json.dumps({
+        _indirect_call_addr(shared_bn, "dispatch", "accesses"):
+            [_resolve_addr(shared_bn, "consumer")]}))
+    pinned = forward("wrapped_indirect_case", "--resolve-map", str(rmap))
+    [leaf] = [lf for lf in pinned["leaves"]
+              if lf["kind"] == "global_memory_continuation"]
+    assert leaf["reachability"]["cause"] is None, leaf
+    assert [r["display_name"] for r in leaf["references"]] == ["consumer"], leaf
+
+
+def test_global_continuation_returned_alias_and_append_destinations(tmp_path, shared_bn):
+    """Round-3 review I3/I4.
+
+    I3: `p = memcpy(g, "x", 1); system(p + 1)` -- the model says `arg:0 ->
+    ret`, so the result IS the destination and the consumer reads the bytes
+    the one-byte copy did not overwrite. I4: `strcat(g, "suffix")` walks g's
+    existing bytes to find the terminator, so an append destination is never
+    write-only. The genuine `memset` reset stays silent."""
+    target = _access_target(tmp_path, shared_bn, debug=True)
+
+    def forward(fn):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0")
+
+    for fn, consumer in (("alias_case", "alias_consumer"),
+                         ("concat_case", "concat_consumer")):
+        result = forward(fn)
+        [leaf] = [lf for lf in result["leaves"]
+                  if lf["kind"] == "global_memory_continuation"]
+        assert [r["display_name"] for r in leaf["references"]] == [consumer], (fn, leaf)
+        assert leaf["references"][0]["access"] == "call_arg", (fn, leaf)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, result)
+
+    reset = forward("reset_case")
+    assert [lf for lf in reset["leaves"]
+            if lf["kind"] == "global_memory_continuation"] == [], reset["leaves"]
+    assert reset["diagnostics"]["safe_to_report_all_clear"] is True, reset

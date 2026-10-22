@@ -41,6 +41,7 @@ G_DIR = 0x404060        # the global the copy fills
 G_OTHER = 0x404160      # a second, unrelated global
 STRNCPY, STRCPY, SPRINTF, MEMCPY, SYSTEM = 0x401030, 0x401040, 0x401050, 0x401060, 0x401070
 MEMSET = 0x401080
+STRCAT = 0x401090
 
 
 @pytest.fixture
@@ -1352,17 +1353,50 @@ class FDataVar:
 
 class FExtentBV(FGlobalBV):
     """``FGlobalBV`` plus data variables, so a global has an EXTENT and an
-    interior address canonicalizes back to its base."""
+    interior address canonicalizes back to its base.
 
-    def __init__(self, addr_names, funcs=None, refs=None, objects=None, **kw):
+    ``objects`` maps base -> width; a width of 0 is the STRIPPED shape (BN
+    reports `void`), where the extent has to come from the layout: the next
+    data variable that carries a symbol, or the section end. ``interior``
+    lists bare data variables BN invented at referenced offsets, which carry
+    no symbol and must not cut the object short.
+    """
+
+    def __init__(self, addr_names, funcs=None, refs=None, objects=None,
+                 interior=(), section=None, **kw):
         super().__init__(addr_names, funcs, refs, **kw)
         self._objects = objects or {}
+        self._interior = sorted(interior)
+        self._section = section
 
     def get_data_var_at(self, addr):
+        addr = int(addr)
+        if addr in self._interior:
+            return FDataVar(addr, 0)
         for base, width in self._objects.items():
-            if base <= int(addr) < base + width:
+            if width and base <= addr < base + width:
                 return FDataVar(base, width)
+            if not width and base == addr:
+                return FDataVar(base, 0)
         return None
+
+    def get_next_data_var_after(self, addr):
+        starts = sorted(set(self._objects) | set(self._interior))
+        for a in starts:
+            if a > int(addr):
+                return FDataVar(a, self._objects.get(a, 0))
+        return None
+
+    def get_symbol_at(self, addr):
+        if int(addr) in self._interior or int(addr) not in self._objects:
+            return None
+        return type("Sym", (), {"name": f"obj_{int(addr):x}", "address": int(addr)})()
+
+    def get_sections_at(self, addr):
+        if self._section and self._section[0] <= int(addr) < self._section[1]:
+            return [type("S", (), {"start": self._section[0],
+                                   "end": self._section[1]})()]
+        return []
 
     def get_code_refs(self, addr, length=None):
         lo, hi = int(addr), int(addr) + (int(length) if length else 1)
@@ -1381,7 +1415,7 @@ def _interior_reader(name, start, addr, at):
     ]), params=[])
 
 
-def _interior_program(consumer, refs, objects):
+def _interior_program(consumer, refs, objects, **kw):
     func, _argv = _copy_then_call(
         0x401104, STRNCPY, G_DIR,
         call_sites=[(0x401108, _gptr(int(consumer.start)), [])],
@@ -1389,7 +1423,7 @@ def _interior_program(consumer, refs, objects):
     bv = FExtentBV({STRNCPY: "strncpy", SYSTEM: "system",
                     int(consumer.start): consumer.name},
                    funcs={int(consumer.start): consumer},
-                   refs=refs, objects=objects)
+                   refs=refs, objects=objects, **kw)
     return func, bv
 
 
@@ -1491,3 +1525,155 @@ def test_a_wrapper_over_fully_analysed_callees_stays_silent(models):
     result = _forward(bv, func, models)
     assert _leaves(result) == [], result["leaves"]
     assert result["stats"]["analysis_incomplete"] is False
+
+
+# --------------------------------------------------------------------------
+# round-3 review I1: an UNTYPED global still has an extent
+# --------------------------------------------------------------------------
+
+def test_an_interior_reader_of_an_untyped_global_blocks(models):
+    # Round-3 review I1: a stripped binary gives BN no type for the object
+    # (`void`, width 0), and BN then invents a bare data variable at the very
+    # offset the consumer references. Taking the type's word for it made the
+    # extent one byte -- so the reference sweep missed the consumer and the
+    # interior pointer folded to a different "object" -- and the run cleared.
+    consumer = _interior_reader("offset_consumer", 0x401200, G_DIR + 4, 0x401210)
+    func, bv = _interior_program(
+        consumer, {G_DIR + 4: [FRef(consumer, 0x401210)]},
+        {G_DIR: 0, G_DIR + 64: 0},            # both untyped
+        interior=[G_DIR + 4], section=(G_DIR - 0x20, G_DIR + 0x80))
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["global"]["address"] == hex(G_DIR), leaf
+    assert leaf["references"][0]["offset"] == 4, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_an_untyped_neighbour_object_is_still_disjoint(models):
+    # The layout bound stops at the next data variable that carries a SYMBOL,
+    # which is exactly where the neighbouring object begins.
+    neighbour = G_DIR + 64
+    consumer = _interior_reader("neighbour_consumer", 0x401200, neighbour + 8, 0x401210)
+    func, bv = _interior_program(
+        consumer, {neighbour + 8: [FRef(consumer, 0x401210)]},
+        {G_DIR: 0, neighbour: 0},
+        interior=[neighbour + 8], section=(G_DIR - 0x20, G_DIR + 0x80))
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+# --------------------------------------------------------------------------
+# round-3 review I2: a callback behind a wrapper
+# --------------------------------------------------------------------------
+
+def _dispatcher(name, start, call_at=0x401310):
+    """`int dispatch(cb) { return cb(); }` -- BN lists no callees for it."""
+    cb = FVar("cb")
+    cb0 = FSSA(cb, 0)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, call_at, "MLIL_CALL_SSA", "cb#0()", reads=[cb0],
+               dest=_var(cb0), params=[]),
+    ]), params=[cb])
+
+
+def test_a_callback_behind_a_wrapper_is_a_boundary(models):
+    # Round-3 review I2: the reachability walk follows `Function.callees`,
+    # which lists resolved edges only -- so a dispatcher whose whole job is
+    # `cb()` looked like a leaf and the walk answered "nothing reads it".
+    reader = _reader("consumer", 0x401500, G_DIR, 0x401510)
+    dispatch = _dispatcher("dispatch", 0x401300)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system",
+                    0x401300: "dispatch", 0x401500: "consumer"},
+                   funcs={0x401300: dispatch, 0x401500: reader},
+                   refs={G_DIR: [FRef(reader, 0x401510)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["reachability"]["cause"] == "unresolved_call_target", leaf
+    assert leaf["reachability"]["unresolved_calls"] == [hex(0x401310)], leaf
+    assert hex(0x401310) in leaf["detail"], leaf["detail"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # --resolve-map pins the dispatcher's callsite: the walk follows it and
+    # reports the real consumer instead of the unresolved boundary.
+    engine = te.TaintEngine(bv, models,
+                            resolve_map={hex(0x401310): [hex(0x401500)]})
+    pinned = engine.forward(func, [te.parse_locator("param:0")])
+    [leaf] = _leaves(pinned)
+    assert leaf["reachability"]["cause"] is None, leaf
+    assert leaf["references"][0]["display_name"] == "consumer", leaf
+
+
+def test_a_wrapper_with_no_indirect_call_is_not_a_boundary(models):
+    # The control: an ordinary analysed wrapper with only resolved edges
+    # leaves the answer standing.
+    quiet = _quiet("wrapper", 0x401300, callees=[_quiet("leafy", 0x401500)])
+    reader = _reader("consumer", 0x401600, G_DIR, 0x401610)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401300: "wrapper",
+                    0x401600: "consumer"},
+                   funcs={0x401300: quiet, 0x401600: reader},
+                   refs={G_DIR: [FRef(reader, 0x401610)]})
+    assert _leaves(_forward(bv, func, models)) == []
+
+
+# --------------------------------------------------------------------------
+# round-3 review I3/I4: returned destination aliases and append destinations
+# --------------------------------------------------------------------------
+
+def test_a_returned_destination_alias_is_the_same_object(models):
+    # Round-3 review I3: `p = memcpy(g, "x", 1); system(p + 1)`. The model
+    # says `arg:0 -> ret`, so the result IS the destination and `p + 1`
+    # still points into the tainted bytes -- the copy overwrote only byte 0.
+    p = FVar("p")
+    p1 = FSSA(p, 1)
+    consumer = GFunc("alias_consumer", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_CALL_SSA", "p#1 = memcpy(g, 'x', 1)", writes=[p1],
+               dest=_gptr(MEMCPY),
+               params=[_gptr(G_DIR), _gptr(0x402000), _const(1)]),
+        FInstr(1, 0x401218, "MLIL_CALL_SSA", "system(p#1 + 1)", reads=[p1],
+               dest=_gptr(SYSTEM),
+               params=[FExpr("MLIL_ADD", "p#1 + 1", left=_var(p1), right=_const(1))]),
+    ]), params=[])
+    func, bv = _after_copy(consumer)
+    bv._names[MEMCPY] = "memcpy"
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert leaf["references"][0]["at"] == hex(0x401218), leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_an_append_destination_is_a_reader(models):
+    # Round-3 review I4: strcat walks the destination's existing bytes to
+    # find the terminator, so its destination is never write-only. The
+    # model says so with `reads_dest`.
+    consumer = _modeled_call("concat_consumer", 0x401200, STRCAT,
+                             [_gptr(G_DIR), _gptr(0x402000)])
+    func, bv = _after_copy(consumer)
+    bv._names[STRCAT] = "strcat"
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # ...and the model carries the claim, so a user overlay can state it too
+    assert te.TaintEngine._model_arg_role(models["strcat"], 0) == "read"
+    assert te.TaintEngine._model_arg_role(models["memset"], 0) == "write"
+
+
+def test_a_true_reset_destination_stays_write_only(models):
+    # The control for I4: memset genuinely writes without reading, so a
+    # helper whose only use of the global is `memset(g, 0, 64)` is silent.
+    consumer = _modeled_call("reset_consumer", 0x401200, MEMSET,
+                             [_gptr(G_DIR), _const(0), _const(64)])
+    func, bv = _after_copy(consumer)
+    bv._names[MEMSET] = "memset"
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
