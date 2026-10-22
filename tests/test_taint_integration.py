@@ -2117,3 +2117,96 @@ def test_global_continuation_initialised_global_and_fortified_appends(tmp_path,
     assert [lf for lf in reset["leaves"]
             if lf["kind"] == "global_memory_continuation"] == [], reset["leaves"]
     assert reset["diagnostics"]["safe_to_report_all_clear"] is True, reset
+
+
+_REVIEW_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[64];
+char large_global[131072];
+char neighbour_bytes[64] = "/bin/true";
+__attribute__((noinline)) int large_reader(void) { return system(large_global + 100000); }
+__attribute__((noinline)) int huge_reader(void) {
+    __asm__ volatile(".rept 70000\n nop\n .endr\n");
+    return system(global_bytes);
+}
+__asm__(".globl veneer\n.type veneer,@function\nveneer:\n jmp huge_reader\n.size veneer,.-veneer\n");
+__asm__(".globl veneer2\n.type veneer2,@function\nveneer2:\n jmp veneer\n.size veneer2,.-veneer2\n");
+extern int veneer(void);
+extern int veneer2(void);
+__attribute__((noinline)) void reset(void) { memset(global_bytes, 0, 64); }
+__attribute__((noinline)) char *reset_ret(void) { return memset(global_bytes, 0, 64); }
+__attribute__((noinline)) int use_reset_ret(void) { char *p = reset_ret(); return system(p); }
+__attribute__((noinline)) int large_case(const char *s) { memcpy(large_global, s, 110000); return large_reader(); }
+__attribute__((noinline)) int veneer_case(const char *s) { memcpy(global_bytes, s, 16); return veneer(); }
+__attribute__((noinline)) int veneer2_case(const char *s) { memcpy(global_bytes, s, 16); return veneer2(); }
+__attribute__((noinline)) int plt_case(const char *s) { memcpy(global_bytes, s, 16); return puts(neighbour_bytes); }
+__attribute__((noinline)) int reset_ignore_case(const char *s) { memcpy(global_bytes, s, 16); reset(); return 0; }
+__attribute__((noinline)) int reset_ret_ignore_case(const char *s) { memcpy(global_bytes, s, 16); reset_ret(); return 0; }
+__attribute__((noinline)) int reset_ret_used_case(const char *s) { memcpy(global_bytes, s, 16); return use_reset_ret(); }
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    return large_case(argv[1]) + veneer_case(argv[1]) + veneer2_case(argv[1])
+         + plt_case(argv[1]) + reset_ignore_case(argv[1])
+         + reset_ret_ignore_case(argv[1]) + reset_ret_used_case(argv[1]);
+}
+"""
+
+
+@pytest.mark.parametrize("debug", [True, False], ids=["typed", "stripped"])
+def test_global_continuation_large_objects_veneers_and_returned_pointers(tmp_path,
+                                                                        shared_bn,
+                                                                        debug):
+    """Round-3 review F15, F16 and F17 on one binary, typed and stripped.
+
+    F15: a 128 KiB buffer whose reader is at `+100000` -- the sweep used to
+    clip every object to 64 KiB and never enumerate it.
+    F16: a veneer onto an in-binary body BN measured and skipped keeps the
+    unread-consumer boundary and the analysis-incomplete signal; a genuine
+    PLT thunk onto an import stays external.
+    F17: returning a pointer is not reading its bytes. A write-only helper
+    whose return the caller discards is silent; when the caller CONSUMES the
+    returned pointer the boundary is reported at that consumer."""
+    name = "review" if debug else "review_nodbg"
+    src = tmp_path / f"{name}.c"
+    src.write_text(_REVIEW_SRC)
+    binary = tmp_path / name
+    _compile(src, binary, ["-fno-builtin"] + ([] if debug else ["-g0"]))
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # F15
+    result, leaves = gmc("large_case")
+    [leaf] = leaves
+    assert leaf["references"][0]["display_name"] == "large_reader", leaf
+    assert leaf["references"][0]["offset"] == 100000, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result
+
+    # F16: one hop and two, then the genuine external thunk control
+    for fn in ("veneer_case", "veneer2_case"):
+        result, leaves = gmc(fn)
+        [leaf] = leaves
+        assert leaf["reachability"]["cause"] == "unread_callee_body", (fn, leaf)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, result)
+        assert result["stats"]["analysis_incomplete"] is True, (fn, result["stats"])
+        assert "huge_reader" in result["stats"]["analysis_incomplete_functions"], \
+            (fn, result["stats"])
+    result, leaves = gmc("plt_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result
+
+    # F17: ignored returns are silent, a consumed one blocks at the consumer
+    for fn in ("reset_ignore_case", "reset_ret_ignore_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, (fn, result)
+    result, leaves = gmc("reset_ret_used_case")
+    [leaf] = leaves
+    assert leaf["references"][0]["display_name"] == "use_reset_ret", leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result

@@ -1757,3 +1757,198 @@ def test_a_fortified_append_consumer_blocks(models):
     [leaf] = _leaves(result)
     assert leaf["references"][0]["access"] == "call_arg", leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+# --------------------------------------------------------------------------
+# round-3 review F15: no silent cap on how much of an object is swept
+# --------------------------------------------------------------------------
+
+BIG = 1 << 17          # 128 KiB, past the old 64 KiB cap
+FAR = 100000           # the offset the consumer reads
+
+
+def test_a_reader_past_the_old_cap_is_found(models):
+    # The sweep used to clip every object to 64 KiB, so a reader of
+    # `g + 100000` in a 128 KiB buffer was never enumerated and the run
+    # cleared (round-3 review F15). The object's own extent governs now.
+    consumer = _interior_reader("large_reader", 0x401200, G_DIR + FAR, 0x401210)
+    func, bv = _interior_program(
+        consumer, {G_DIR + FAR: [FRef(consumer, 0x401210)]},
+        {G_DIR: BIG}, section=(G_DIR, G_DIR + BIG))
+    eng = te.TaintEngine(bv, models)
+    assert eng._global_extent(G_DIR) == BIG
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["offset"] == FAR, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_the_sweep_asks_in_range_chunks_not_per_byte(models):
+    # Range-aware queries, one per chunk, never one per byte.
+    asked: list[tuple] = []
+
+    class CountingBV(FExtentBV):
+        def get_code_refs(self, addr, length=None):
+            asked.append((int(addr), int(length or 1)))
+            return super().get_code_refs(addr, length)
+
+    consumer = _interior_reader("large_reader", 0x401200, G_DIR + FAR, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0xff)])
+    bv = CountingBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "large_reader"},
+                    funcs={0x401200: consumer},
+                    refs={G_DIR + FAR: [FRef(consumer, 0x401210)]},
+                    objects={G_DIR: BIG}, section=(G_DIR, G_DIR + BIG))
+    assert _leaves(_forward(bv, func, models)), "the far reader must be found"
+    assert asked, asked
+    assert len(asked) <= 1 + BIG // te.TaintEngine._GLOBAL_REF_CHUNK, asked
+    assert all(span > 1 for _at, span in asked), asked
+
+
+def test_an_object_past_the_sweep_budget_is_disclosed(models, monkeypatch):
+    # An object too large for the chunk budget leaves "these are all the
+    # references" unestablished -- a truncated sweep, never an all-clear.
+    monkeypatch.setattr(te.TaintEngine, "_GLOBAL_REF_CHUNKS", 1)
+    consumer = _interior_reader("far_reader", 0x401200, G_DIR + FAR, 0x401210)
+    func, bv = _interior_program(
+        consumer, {G_DIR + FAR: [FRef(consumer, 0x401210)]},
+        {G_DIR: BIG}, section=(G_DIR, G_DIR + BIG))
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["reachability"]["cause"] == "reference_sweep_budget", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+# --------------------------------------------------------------------------
+# round-3 review F16: a veneer onto an unread body
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("hops", [1, 2])
+def test_a_veneer_onto_an_unread_body_is_disclosed(models, hops):
+    # The veneer resolves, but its target is an in-binary body BN measured
+    # and skipped. Calling the resolved target "external" lost both the
+    # boundary and the analysis-incomplete signal the SAME body gets when it
+    # is called directly (round-3 review F16).
+    unread_fn = _skipped("huge_reader", 0x401500)
+    funcs = {0x401500: unread_fn}
+    names = {STRNCPY: "strncpy", SYSTEM: "system", 0x401500: "huge_reader"}
+    nxt = 0x401500
+    for i in range(hops):
+        start = 0x401300 + i * 0x20
+        veneer = _thunk(f"veneer{i}", start, nxt)
+        funcs[start] = veneer
+        names[start] = veneer.name
+        nxt = start
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(nxt), [])], params_extra=[_const(0xff)])
+    bv = FGlobalBV(names, funcs=funcs, refs={G_DIR: [FRef(unread_fn, 0x401510)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["callee"]["display_name"] == "huge_reader", leaf
+    assert leaf["reachability"]["cause"] == "unread_callee_body", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert result["stats"]["analysis_incomplete"] is True
+    assert "huge_reader" in result["stats"]["analysis_incomplete_functions"]
+
+
+# --------------------------------------------------------------------------
+# round-3 review F17: returning a pointer is not reading its bytes
+# --------------------------------------------------------------------------
+
+def _ret_helper(name, start, at=0x401210):
+    """`char *reset_ret(void) { return memset(g, 0, 64); }`."""
+    r = FSSA(FVar("r"), 1)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", "r#1 = memset(g, 0, 64)", writes=[r],
+               dest=_gptr(MEMSET), params=[_gptr(G_DIR), _const(0), _const(64)]),
+        FInstr(1, at + 8, "MLIL_RET", "return r#1", reads=[r], src=[_var(r)]),
+    ]), params=[])
+
+
+def _ignores_result(name, start, helper_start, at=0x401310):
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", f"{hex(helper_start)}()",
+               dest=_gptr(helper_start), params=[]),
+        FInstr(1, at + 8, "MLIL_RET", "return 0", src=[_const(0)]),
+    ]), params=[])
+
+
+def _uses_result(name, start, helper_start, at=0x401310, use_at=0x401318, phi=False):
+    p = FVar("p")
+    p1, p2, p3 = FSSA(p, 1), FSSA(p, 2), FSSA(p, 3)
+    instrs = [
+        FInstr(0, at, "MLIL_CALL_SSA", f"p#1 = {hex(helper_start)}()", writes=[p1],
+               dest=_gptr(helper_start), params=[]),
+    ]
+    if phi:
+        instrs += [
+            FInstr(1, at + 4, "MLIL_SET_VAR_SSA", "p#2 = other",
+                   writes=[p2], src=_gptr(G_OTHER)),
+            FInstr(2, at + 8, "MLIL_VAR_PHI", "p#3 = phi(p#1, p#2)",
+                   writes=[p3], src=[p1, p2]),
+            FInstr(3, use_at, "MLIL_CALL_SSA", "system(p#3)", reads=[p3],
+                   dest=_gptr(SYSTEM), params=[_var(p3)]),
+        ]
+    else:
+        instrs.append(
+            FInstr(1, use_at, "MLIL_CALL_SSA", "system(p#1)", reads=[p1],
+                   dest=_gptr(SYSTEM), params=[_var(p1)]))
+    return GFunc(name, start, FSSAFunc(instrs), params=[])
+
+
+def _ret_program(caller, helper):
+    caller.callees = [helper]
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(int(caller.start)), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", MEMSET: "memset",
+                    int(caller.start): caller.name, int(helper.start): helper.name},
+                   funcs={int(caller.start): caller, int(helper.start): helper},
+                   refs={G_DIR: [FRef(helper, 0x401210)]})
+    return func, bv
+
+
+def test_a_write_only_helper_whose_return_is_ignored_is_silent(models):
+    # Round-3 review F17: BN recovers `reset` as `return memset(g, 0, 64)`,
+    # but returning the POINTER is not reading the bytes -- and the caller
+    # discards it. The old classifier called the RET a read and raised a
+    # blocking frontier on a helper that only writes.
+    helper = _ret_helper("reset_ret", 0x401200)
+    caller = _ignores_result("reset_ignore", 0x401300, 0x401200)
+    func, bv = _ret_program(caller, helper)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    assert te.TaintEngine(bv, models)._global_access(helper, G_DIR)[1] == "write_only"
+
+
+@pytest.mark.parametrize("phi", [False, True], ids=["assigned", "phi"])
+def test_a_returned_pointer_the_caller_consumes_blocks_at_the_consumer(models, phi):
+    # ...and when the caller DOES consume the returned pointer -- directly or
+    # through a branch merge -- the boundary is reported at that consumer,
+    # not at the helper that merely handed the address back.
+    helper = _ret_helper("reset_ret", 0x401200)
+    caller = _uses_result("use_reset_ret", 0x401300, 0x401200, phi=phi)
+    func, bv = _ret_program(caller, helper)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "use_reset_ret", leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert leaf["references"][0]["at"] == hex(0x401318), leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_returning_the_global_itself_is_still_an_escape(models):
+    # The control for the RET rule: a helper that returns the ADDRESS (not a
+    # call's residual alias) still escapes it, and that is disclosed.
+    helper = GFunc("expose", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_RET", "return g", src=[_gptr(G_DIR)]),
+    ]), params=[])
+    caller = _ignores_result("expose_caller", 0x401300, 0x401200)
+    func, bv = _ret_program(caller, helper)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["access"] == "return", leaf
+    assert "may read" in leaf["detail"], leaf["detail"]

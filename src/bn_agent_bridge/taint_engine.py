@@ -266,9 +266,14 @@ _NO_RESOLVE_MAP: Any = object()
 # Global-access kinds (`_global_access`) the walk SAW read the bytes, as
 # opposed to the ones that only mean "it could" -- an address materialised
 # with no classifiable use, a call whose handling of the bytes is unknown, a
-# reference the scan could not find, a body whose IL could not be read. The
-# frontier's prose says "reads" only for the first set (round-3 review F5).
-_PROVEN_GLOBAL_READS = frozenset({"load", "call_arg", "return", "address_escape"})
+# reference the scan could not find, a body whose IL could not be read, and
+# the two ESCAPES (`return`, `address_escape`), which hand the address
+# somewhere else rather than read through it. The frontier's prose says
+# "reads" only for the first set (round-3 review F5/F17).
+_PROVEN_GLOBAL_READS = frozenset({"load", "call_arg"})
+
+# Sentinel for a memo whose value may legitimately be None.
+_MISSING: Any = object()
 
 
 def _code(text: Any) -> str:
@@ -336,7 +341,12 @@ class TaintEngine:
         # VIEW, so they outlive the per-source re-runs of `_forward_run`, and
         # both are only ever consulted for a global the walk already tainted --
         # a targeted xref query, not a whole-program solve.
+        self._canon_global_cache: dict[int, int | None] = {}
+        self._ssa_def_cache: dict[tuple, Any] = {}
         self._global_refs: dict[int, dict[int, int]] = {}
+        # globals whose reference sweep hit its chunk budget, so "no further
+        # references" was never established for them.
+        self._global_refs_truncated: set[int] = set()
         self._global_reach: dict[tuple[int, int, int], tuple] = {}
         # (function start, global) -> the first use that can READ the global,
         # or (None, "write_only"). Per function body, so a write-only helper
@@ -1270,6 +1280,14 @@ class TaintEngine:
         offsets into one buffer share a taint location) and require it be writable,
         so rodata strings / code pointers are not treated as buffers. Permissive
         when the BinaryView lacks these APIs (the unit-test fakes)."""
+        cached = self._canon_global_cache.get(addr, _MISSING)
+        if cached is not _MISSING:
+            return cached
+        out = self._canon_global_uncached(addr)
+        self._canon_global_cache[addr] = out
+        return out
+
+    def _canon_global_uncached(self, addr: int) -> int | None:
         getdv = getattr(self.bv, "get_data_var_at", None)
         if getdv is not None:
             try:
@@ -5373,9 +5391,15 @@ class TaintEngine:
     # review F2: the cap used to turn an unfinished search into an all-clear).
     _GLOBAL_REACH_FUNCS = 512
 
-    # Widest span a global with no recovered type may be assumed to cover
-    # when its extent has to be inferred from layout.
-    _GLOBAL_EXTENT_FALLBACK = 1 << 16
+    # Span of ONE object a reference sweep will ask BN for in a single
+    # range query. A larger object is swept in consecutive chunks; the
+    # object's own extent is never clipped to this (round-3 review F15: a
+    # 128 KiB buffer whose reader sits at +100000 was silently excluded).
+    _GLOBAL_REF_CHUNK = 1 << 16
+    # Chunks one object may be swept in before the sweep gives up. Reaching
+    # it is DISCLOSED as a truncated reference search, never answered as
+    # "nothing references it".
+    _GLOBAL_REF_CHUNKS = 1024
 
     def _global_extent(self, ga: int) -> int:
         """Byte width of the global object based at *ga*.
@@ -5447,7 +5471,7 @@ class TaintEngine:
         # object's references into this one.
         laid_out = (min(bounds) - ga) if bounds else 0
         extent = max(typed, laid_out, 1)
-        extent = max(1, min(int(extent), self._GLOBAL_EXTENT_FALLBACK))
+        extent = max(1, int(extent))
         self._global_extent_cache[ga] = extent
         return extent
 
@@ -5484,6 +5508,36 @@ class TaintEngine:
             stack.extend((s, depth + 1) for s in (getattr(node, "operands", None) or ()))
         return best or 0
 
+    def _names_global(self, expr: Any, ga: int, depth: int = 0) -> bool:
+        """Whether *expr* carries a CONSTANT inside the global at *ga*.
+
+        A pure constant scan: no SSA definitions are followed, so asking it
+        of every instruction in a body stays linear. It answers the two
+        questions a chain walk cannot be afforded for -- "is the object
+        named in this call outside any recovered argument" and "is it named
+        by a use this scan could not classify"."""
+        if expr is None or depth > 10:
+            return False
+        raw = getattr(expr, "constant", None)
+        if raw is not None:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and (
+                    ga <= value < ga + self._global_extent(ga)
+                    or self._canon_global(value) == ga):
+                return True
+        for attr in ("src", "dest", "left", "right", "params"):
+            sub = getattr(expr, attr, None)
+            if isinstance(sub, (list, tuple)):
+                if any(self._names_global(x, ga, depth + 1) for x in sub):
+                    return True
+            elif sub is not None and self._names_global(sub, ga, depth + 1):
+                return True
+        return any(self._names_global(x, ga, depth + 1)
+                   for x in (getattr(expr, "operands", None) or ()))
+
     def _global_ref_functions(self, ga: int) -> dict[int, int]:
         """``{function start: lowest referencing address}`` for every code
         reference to the global OBJECT based at *ga*, read from BN's own
@@ -5508,17 +5562,31 @@ class TaintEngine:
         if cached is not None:
             return cached
         out: dict[int, int] = {}
+        self._global_refs_truncated.discard(ga)
         get_refs = getattr(self.bv, "get_code_refs", None)
         if callable(get_refs):
             extent = self._global_extent(ga)
             refs: list[Any] = []
-            try:
-                refs = list(get_refs(int(ga), extent) or [])
-            except Exception:
+            # One range query per chunk -- BN's own range-aware API, never a
+            # byte at a time -- until the object is covered. An object too
+            # large for the chunk budget is RECORDED as a truncated sweep so
+            # the caller discloses it instead of answering "no references".
+            covered, chunks = 0, 0
+            while covered < extent:
+                if chunks >= self._GLOBAL_REF_CHUNKS:
+                    self._global_refs_truncated.add(ga)
+                    break
+                span = min(self._GLOBAL_REF_CHUNK, extent - covered)
+                start_at = int(ga) + covered
                 try:
-                    refs = list(get_refs(int(ga)) or [])
+                    refs.extend(get_refs(start_at, span) or [])
                 except Exception:
-                    refs = []
+                    try:
+                        refs.extend(get_refs(start_at) or [])
+                    except Exception:
+                        pass
+                covered += span
+                chunks += 1
             for ref in refs:
                 start = getattr(getattr(ref, "function", None), "start", None)
                 if start is None:
@@ -5602,9 +5670,38 @@ class TaintEngine:
     # point at the same object: SSA copies, PHI merges, widening/narrowing
     # casts and constant or register displacement.
     _PTR_CARRY_OPS = ("ADD", "SUB", "ZX", "SX", "VAR_SSA", "VAR_ALIASED", "PHI")
+    # One SSA hop costs TWO levels here (the reading expression, then the
+    # variable), and an unoptimised body stacks several before a call -- so
+    # the budget is sized for a copy chain, not for a handful of nodes.
+    # Stepping into a callee's returns costs a whole block of it, which is
+    # what bounds the nesting.
+    _PTR_RESOLVE_DEPTH = 48
+    _PTR_RETURN_STEP = 16
+    # Expression nodes ONE resolution may visit. The walk fans out across
+    # every operand, so a deep budget without a node budget is exponential
+    # on a wide tree; this keeps a single question linear in practice.
+    _PTR_RESOLVE_NODES = 512
+
+    def _ssa_def(self, ssaf: Any, var: Any) -> Any:
+        """``get_ssa_var_definition`` memoised for one walk.
+
+        The pointer walk asks for the same definitions over and over as it
+        follows a long copy chain from every instruction in a body; each ask
+        is a Binary Ninja API call."""
+        key = (id(ssaf), var_key(var), getattr(var, "version", None))
+        hit = self._ssa_def_cache.get(key, _MISSING)
+        if hit is not _MISSING:
+            return hit
+        try:
+            defn = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            defn = None
+        self._ssa_def_cache[key] = defn
+        return defn
 
     def _ptr_resolves(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
-                      seen: set | None = None) -> bool:
+                      seen: set | None = None, *, alias: bool = True,
+                      budget: list | None = None) -> bool:
         """Whether *expr* may hold a pointer *base* accepts.
 
         Follows SSA definitions generally -- so EVERY arm of a PHI merge is
@@ -5614,9 +5711,18 @@ class TaintEngine:
         (round-3 review F4). It never answers False from a shape it did not
         understand: an unrecognised expression simply contributes nothing,
         and every caller's default is "consumer"."""
-        if expr is None or depth > 12:
+        if budget is None:
+            budget = [self._PTR_RESOLVE_NODES]
+        if expr is None or depth > self._PTR_RESOLVE_DEPTH or budget[0] <= 0:
             return False
+        budget[0] -= 1
         seen = set() if seen is None else seen
+        idx = getattr(expr, "expr_index", None)
+        if idx is not None:
+            node = ("expr", int(idx))
+            if node in seen:
+                return False
+            seen.add(node)
         if base(expr):
             return True
         if is_ssa_var(expr):
@@ -5624,13 +5730,16 @@ class TaintEngine:
             if key in seen:
                 return False
             seen.add(key)
-            try:
-                defn = ssaf.get_ssa_var_definition(expr)
-            except Exception:
-                defn = None
+            defn = self._ssa_def(ssaf, expr)
             if defn is None:
                 return False
             if self._is_call(defn):
+                if not alias:
+                    # The RETURN of a pointer is not a read of its bytes:
+                    # when the question is "does this RET hand the object
+                    # back", a call's returned alias is exactly what must not
+                    # count (round-3 review F17).
+                    return False
                 # `p = memcpy(dst, ..)` hands BACK its destination: the model
                 # says `arg:0 -> ret`, so the result is that same object and
                 # `p + 1` still points into it (round-3 review I3). Without
@@ -5644,13 +5753,22 @@ class TaintEngine:
                         continue
                     idx = _try_arg_index(str(rule.get("from") or ""))
                     if idx is not None and idx < len(params) and self._ptr_resolves(
-                            ssaf, params[idx], base, depth + 1, seen):
+                            ssaf, params[idx], base, depth + 1, seen, alias=alias,
+                            budget=budget):
                         return True
-                return False
+                # No model, or none that names the return: a body may still
+                # hand the pointer back (`char *reset_ret(void) { return
+                # memset(g, 0, n); }`). Ask it, so the CALLER's use of the
+                # result is the read that blocks (round-3 review F17).
+                body, _unread = self._callee_body(defn)
+                return body is not None and self._fn_returns_pointer(
+                    body, base, depth + self._PTR_RETURN_STEP, budget=budget)
             srcs = getattr(defn, "src", None)
             if not isinstance(srcs, (list, tuple)):
                 srcs = [] if srcs is None else [srcs]
-            return any(self._ptr_resolves(ssaf, s, base, depth + 1, seen) for s in srcs)
+            return any(self._ptr_resolves(ssaf, s, base, depth + 1, seen,
+                                          alias=alias, budget=budget)
+                       for s in srcs)
         if not hasattr(expr, "operation"):
             return False
         if not any(tok in op_name(expr) for tok in self._PTR_CARRY_OPS):
@@ -5664,17 +5782,67 @@ class TaintEngine:
                 subs.append(sub)
         subs.extend(expr_reads(expr))
         subs.extend(getattr(expr, "operands", None) or ())
-        return any(self._ptr_resolves(ssaf, s, base, depth + 1, seen) for s in subs)
+        return any(self._ptr_resolves(ssaf, s, base, depth + 1, seen,
+                                      alias=alias, budget=budget)
+                   for s in subs)
 
-    def _expr_mentions(self, ssaf: Any, expr: Any, base: Any, depth: int = 0) -> bool:
-        """Whether any sub-expression of *expr* may be the tracked pointer."""
-        if expr is None or depth > 10:
+    @staticmethod
+    def _ret_sources(ins: Any) -> list[Any]:
+        """A RET's returned expressions as a list.
+
+        BN hands `MLIL_RET.src` back as a list on some builds and as a
+        GENERATOR on others; treating a generator as one opaque operand made
+        every `return <pointer>` resolve to nothing."""
+        srcs = getattr(ins, "src", None)
+        if srcs is None:
+            return []
+        if isinstance(srcs, (list, tuple)):
+            return list(srcs)
+        if hasattr(srcs, "operation"):
+            return [srcs]
+        try:
+            return list(srcs)
+        except TypeError:
+            return [srcs]
+
+    def _fn_returns_pointer(self, fn: Any, base: Any, depth: int = 0,
+                            budget: list | None = None) -> bool:
+        """Whether *fn* returns a pointer *base* accepts.
+
+        A callee that hands the object's address back does not read its
+        bytes -- the caller that consumes the result does, and this is what
+        lets the caller's own scan see it (round-3 review F17)."""
+        if depth > self._PTR_RESOLVE_DEPTH:
+            return False
+        try:
+            ssaf = self._ssa_func(fn)
+            instrs = self._instrs(ssaf)
+        except TaintError:
+            return False
+        for ins in instrs:
+            if "RET" not in op_name(ins):
+                continue
+            if any(self._ptr_resolves(ssaf, s, base, depth + 1, budget=budget)
+                   for s in self._ret_sources(ins)):
+                return True
+        return False
+
+    def _expr_mentions(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
+                       budget: list | None = None) -> bool:
+        """Whether any sub-expression of *expr* may be the tracked pointer.
+
+        One node budget is shared across the whole walk: giving each
+        sub-expression its own turned a function with a long accumulator
+        chain into a quadratic sweep over BN's API."""
+        if budget is None:
+            budget = [self._PTR_RESOLVE_NODES]
+        if expr is None or depth > 10 or budget[0] <= 0:
             return False
         if is_ssa_var(expr):
-            return self._ptr_resolves(ssaf, expr, base)
+            return self._ptr_resolves(ssaf, expr, base, budget=budget)
         if not hasattr(expr, "operation"):
             return False
-        if self._ptr_resolves(ssaf, expr, base):
+        if self._ptr_resolves(ssaf, expr, base, budget=budget):
             return True
         subs: list[Any] = []
         for attr in ("src", "dest", "left", "right", "params"):
@@ -5684,18 +5852,22 @@ class TaintEngine:
             elif sub is not None:
                 subs.append(sub)
         subs.extend(getattr(expr, "operands", None) or ())
-        return any(self._expr_mentions(ssaf, s, base, depth + 1) for s in subs)
+        return any(self._expr_mentions(ssaf, s, base, depth + 1, budget) for s in subs)
 
-    def _expr_loads(self, ssaf: Any, expr: Any, base: Any, depth: int = 0) -> bool:
+    def _expr_loads(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
+                    budget: list | None = None) -> bool:
         """Whether any sub-expression of *expr* LOADS through the pointer.
 
         A store's destination is reached only through ``operands``, where it
         is an address expression and not a load, so ``[p] = 0`` answers False
         while ``[p] = [p] + 1`` and ``x = [q]`` (``q = p``) answer True."""
-        if expr is None or depth > 10 or not hasattr(expr, "operation"):
+        if budget is None:
+            budget = [self._PTR_RESOLVE_NODES]
+        if expr is None or depth > 10 or budget[0] <= 0 \
+                or not hasattr(expr, "operation"):
             return False
-        if "LOAD" in op_name(expr) \
-                and self._ptr_resolves(ssaf, getattr(expr, "src", None), base):
+        if "LOAD" in op_name(expr) and self._ptr_resolves(
+                ssaf, getattr(expr, "src", None), base, budget=budget):
             return True
         subs: list[Any] = []
         for attr in ("src", "left", "right", "params"):
@@ -5705,10 +5877,15 @@ class TaintEngine:
             elif sub is not None:
                 subs.append(sub)
         subs.extend(getattr(expr, "operands", None) or ())
-        return any(self._expr_loads(ssaf, s, base, depth + 1) for s in subs)
+        return any(self._expr_loads(ssaf, s, base, depth + 1, budget) for s in subs)
 
     def _global_base(self, ssaf: Any, ga: int):
         """The root test for the global OBJECT based at *ga*.
+
+        Deliberately independent of *ssaf*: it tests ONE expression node (a
+        constant pointer), while the def-chain walking is `_ptr_resolves`'s
+        job. That lets the same predicate be applied inside another
+        function's IL when a call's returned pointer has to be followed.
 
         Its own base, or any address inside its extent: `g + 4` is still `g`,
         and on a view with no type for the object BN folds that interior
@@ -5717,9 +5894,9 @@ class TaintEngine:
         extent = self._global_extent(ga)
 
         def base(expr: Any) -> bool:
-            if self._global_addr(ssaf, expr) == ga:
+            if self._global_addr(None, expr) == ga:
                 return True
-            raw = self._global_addr(ssaf, expr, canon=False)
+            raw = self._global_addr(None, expr, canon=False)
             return raw is not None and ga <= raw < ga + extent
         return base
 
@@ -5840,7 +6017,8 @@ class TaintEngine:
         return self._ptr_resolves(ssaf, src, base)
 
     def _pointer_access(self, fn: Any, base: Any, *, fallback: int | None,
-                        depth: int = 0, offset_of: Any = None) -> tuple:
+                        depth: int = 0, offset_of: Any = None,
+                        names_object: Any = None) -> tuple:
         """``(address, kind)`` of the first use inside *fn* that can READ the
         bytes the tracked pointer addresses, or ``(None, "write_only")`` ONLY
         when every terminal use is a proven write into them.
@@ -5883,7 +6061,7 @@ class TaintEngine:
                     # In the instruction but in no RECOVERED argument: BN
                     # under-recovered this call's arity, so what the callee
                     # does with the bytes is unknown, not a read.
-                    if self._expr_mentions(ssaf, ins, base):
+                    if names_object is not None and names_object(ins):
                         return verdict(ins, "unknown_call_arg")
                     continue
                 body, unread_body = self._callee_body(ins)
@@ -5908,11 +6086,16 @@ class TaintEngine:
                     continue                      # no body to contradict it
                 return verdict(ins, "unknown_call_arg")
             if "RET" in opn:
-                srcs = getattr(ins, "src", None)
-                if not isinstance(srcs, (list, tuple)):
-                    srcs = [] if srcs is None else [srcs]
-                if any(self._ptr_resolves(ssaf, s, base) for s in srcs):
+                srcs = self._ret_sources(ins)
+                # Returning the POINTER is not reading the bytes, and the
+                # caller -- which this same scan classifies -- is where any
+                # read of them happens. `alias=False` keeps the genuine
+                # escape (`return g;`) while dropping the residual alias BN
+                # recovers for a tail `return memset(g, 0, n);`, whose value
+                # the caller usually discards (round-3 review F17).
+                if any(self._ptr_resolves(ssaf, s, base, alias=False) for s in srcs):
                     return verdict(ins, "return")
+                continue
             if "STORE" in opn:
                 dest_hit = self._ptr_resolves(ssaf, getattr(ins, "dest", None), base)
                 src_hit = self._expr_mentions(ssaf, getattr(ins, "src", None), base)
@@ -5925,11 +6108,11 @@ class TaintEngine:
                     return verdict(ins, "load" if self._expr_loads(ssaf, ins, base)
                                    else "address_escape")
                 continue
-            if self._expr_mentions(ssaf, ins, base):
-                if self._expr_loads(ssaf, ins, base):
-                    return verdict(ins, "load")
-                if self._is_pointer_carry(ssaf, ins, base):
-                    continue          # moved, not used: see the terminal uses
+            if self._expr_loads(ssaf, ins, base):
+                return verdict(ins, "load")
+            if self._is_pointer_carry(ssaf, ins, base):
+                continue              # moved, not used: see the terminal uses
+            if names_object is not None and names_object(ins):
                 return verdict(ins, "unclassified")
         # Nothing read-capable. A body with a proven write and nothing else
         # is a write-only use; a body where this scan accounted for no use at
@@ -5954,7 +6137,8 @@ class TaintEngine:
         out = self._pointer_access(
             fn, self._global_base(ssaf, ga),
             fallback=self._global_ref_functions(ga).get(key[0]),
-            offset_of=lambda ins: self._global_use_offset(ins, ga))
+            offset_of=lambda ins: self._global_use_offset(ins, ga),
+            names_object=lambda ins: self._names_global(ins, ga))
         self._global_access_cache[key] = out
         return out
 
@@ -6060,7 +6244,17 @@ class TaintEngine:
                     for site in self._native_global_refs(cur, ga)[:1]:
                         found.setdefault(cs, (site, "unreadable", 0))
                     continue
-                if cs in known and cs not in found:
+                calls_reference = False
+                try:
+                    calls_reference = any(
+                        int(getattr(c, "start", -1)) in known
+                        for c in (getattr(cur, "callees", None) or ()))
+                except Exception:
+                    calls_reference = False
+                if (cs in known or calls_reference) and cs not in found:
+                    # A function that CALLS one of the references may be
+                    # handed the object's address back and read through it,
+                    # without naming the address itself (F17).
                     at, kind, off = self._global_access(cur, ga)
                     if at is not None:
                         found[cs] = (at, kind, off)
@@ -6202,6 +6396,10 @@ class TaintEngine:
                 "unresolved_call_target": (
                     "an indirect call whose target bn could not resolve "
                     "(pin it with --resolve-map and re-run)"),
+                "reference_sweep_budget": (
+                    "the bound on how much of one object's address range the "
+                    "reference sweep will ask for, so references past it were "
+                    "never enumerated"),
                 "unread_callee_body": (
                     "an in-binary callee body Binary Ninja did not analyse "
                     "(re-run after `bn decompile <callee> --force-analysis`)"),
@@ -6474,7 +6672,8 @@ class TaintEngine:
             # call's targets each time -- memoize them per call site.
             pending = [ga for ga in sorted(live_globals)
                        if (addr, ga) not in global_frontiers_seen
-                       and self._global_ref_functions(ga)]
+                       and (self._global_ref_functions(ga)
+                            or ga in self._global_refs_truncated)]
             if not pending:
                 return
             cands = global_call_targets.get(addr)
@@ -6532,9 +6731,25 @@ class TaintEngine:
                     # call, as before.
                     resolved = self._follow_thunk_cached(cfn)
                     if resolved is not None:
-                        if not self._is_internal(resolved):
+                        rstart = int(getattr(resolved, "start", 0))
+                        if self._is_internal(resolved):
+                            cfn = resolved
+                        elif str(self._not_internal_reason(resolved) or "").startswith(
+                                "analysis_skipped:") and lookup_model(
+                                    self.models, self._callee_name(rstart))[1] is None:
+                            # A veneer onto an IN-BINARY body BN measured and
+                            # skipped. Following the thunk and then calling
+                            # the result "external" lost both the boundary
+                            # and the analysis-incomplete signal that the
+                            # SAME body gets when it is called directly
+                            # (round-3 review F16). Keep the resolved target
+                            # and fail closed on it.
+                            cfn = resolved
+                            unread = "unread_callee_body"
+                            self._analysis_incomplete.add(
+                                str(getattr(resolved, "name", None) or hex(rstart)))
+                        else:
                             continue      # a PLT stub onto an import: external
-                        cfn = resolved
                     elif reason == "thunk":
                         unread = "unresolved_thunk"
                     elif self._unanalysed_body_phrase(reason) is not None \
@@ -6579,6 +6794,13 @@ class TaintEngine:
                             sorted(k for k in known if not (refs and k == own)), known)
                     else:
                         refs, reach = self._global_refs_reachable(cfn, ga, budget)
+                        if ga in self._global_refs_truncated \
+                                and reach["cause"] is None:
+                            # F15: the object is larger than the reference
+                            # sweep's chunk budget, so "these are all the
+                            # references" was never established.
+                            reach = dict(reach, status="truncated",
+                                         cause="reference_sweep_budget")
                         for body in reach.get("unread_bodies") or ():
                             # F9: a wrapper around an unread consumer is the
                             # same hole as calling it directly.
