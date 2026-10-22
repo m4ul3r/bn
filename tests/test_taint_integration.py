@@ -1569,9 +1569,182 @@ int main(int argc, char **argv) { return argc > 1 ? transfer(argv[1]) : 0; }
                       "-f", "transfer", "--source", "param:0")
     [leaf] = [lf for lf in result["leaves"]
               if lf["kind"] == "global_memory_continuation"]
-    assert leaf["references"] == [], leaf
     assert leaf["reachability"]["cause"] == "unread_callee_body", leaf
     assert "force-analysis" in leaf["detail"], leaf
+    # Native reference evidence stands behind the boundary: BN records no code
+    # reference OUT of a body it never analysed, so the leaf names the
+    # reference sites for this global that the walk could not reach, with the
+    # function and instruction address of each.
+    sites = leaf["reachability"]["unexamined_reference_sites"]
+    assert sites, leaf["reachability"]
+    assert all({"name", "address", "at"} <= set(site) for site in sites), sites
+    for site in sites:
+        listing = _bn_json(shared_bn, "-t", target, "disasm", site["address"])["text"]
+        assert f"{int(leaf['global']['address'], 16):x}" in listing.lower(), (site, listing)
     assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
     assert result["stats"]["analysis_incomplete"] is True, result["stats"]
     assert "huge_reader" in result["stats"]["analysis_incomplete_functions"], result["stats"]
+
+
+def test_global_continuation_follows_derived_pointers_into_the_consumer(tmp_path, shared_bn):
+    """Round-3 review F4: `g + i` and `cond ? g : other` still point at `g`.
+
+    A consumer that indexes the global, or selects it on one branch, hands
+    the same bytes to `system`. Resolving only a bare constant pointer read
+    both as write-only and cleared the run."""
+    src = tmp_path / "derivedcont.c"
+    src.write_text(r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[64];
+char other_bytes[64] = "/bin/true";
+__attribute__((noinline)) int offset_reader(int i) { return system(global_bytes + i); }
+__attribute__((noinline)) int cond_reader(int f) { return system(f ? global_bytes : other_bytes); }
+__attribute__((noinline)) int other_reader(int i) { return system(other_bytes + i); }
+__attribute__((noinline)) int offset_case(const char *s) { memcpy(global_bytes, s, 16); return offset_reader(4); }
+__attribute__((noinline)) int cond_case(const char *s) { memcpy(global_bytes, s, 16); return cond_reader(1); }
+__attribute__((noinline)) int other_case(const char *s) { memcpy(global_bytes, s, 16); return other_reader(4); }
+int main(int argc, char **argv) {
+    return argc > 1 ? offset_case(argv[1]) + cond_case(argv[1]) + other_case(argv[1]) : 0;
+}
+""")
+    binary = tmp_path / "derivedcont"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0")
+
+    for fn, reader in (("offset_case", "offset_reader"), ("cond_case", "cond_reader")):
+        result = forward(fn)
+        [leaf] = [lf for lf in result["leaves"]
+                  if lf["kind"] == "global_memory_continuation"]
+        assert [r["display_name"] for r in leaf["references"]] == [reader], (fn, leaf)
+        assert leaf["references"][0]["access"] != "write_only", (fn, leaf)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, result)
+
+    # the control: the same shapes over a DIFFERENT global say nothing
+    control = forward("other_case")
+    assert [lf for lf in control["leaves"]
+            if lf["kind"] == "global_memory_continuation"] == [], control["leaves"]
+
+
+def test_global_continuation_unmodeled_callee_is_an_honest_unknown(tmp_path, shared_bn):
+    """Round-3 review F5: an unmodeled callee handed the global is unknown.
+
+    Nothing here saw it consume the bytes, so the boundary is disclosed as
+    `unknown_call_arg` and the prose says "may read" -- neither a claimed
+    read nor a clear."""
+    src = tmp_path / "unknowncont.c"
+    src.write_text(r"""
+#include <string.h>
+char global_bytes[64];
+__attribute__((noinline)) void app_blob(char *p) { p[1] = p[0]; }
+__attribute__((noinline)) void handoff(void) { app_blob(global_bytes); }
+__attribute__((noinline)) int transfer(const char *s) {
+    memcpy(global_bytes, s, 16); handoff(); return 0;
+}
+int main(int argc, char **argv) { return argc > 1 ? transfer(argv[1]) : 0; }
+""")
+    binary = tmp_path / "unknowncont"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                      "-f", "transfer", "--source", "param:0")
+
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "global_memory_continuation"]
+    assert leaf["references"][0]["access"] in ("unknown_call_arg", "address_taken"), leaf
+    assert "may read" in leaf["detail"], leaf["detail"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+
+
+def test_global_continuation_partial_overlay_is_not_a_no_read_guarantee(tmp_path, shared_bn):
+    """Round-3 review F7: a model is additive flow evidence, not a promise.
+
+    `copy_and_use(dst, src)` hands `dst` to `system` BEFORE the copy an
+    overlay describes. Reading `{"propagates": [{"from": "*arg:1", "to":
+    "*arg:0"}]}` as "and it reads nothing else" cleared the run; the body is
+    the authority, so the same query answers the same way with and without
+    the overlay."""
+    src = tmp_path / "additivecont.c"
+    src.write_text(r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[64];
+__attribute__((noinline)) void copy_and_use(char *dst, const char *src) {
+    system(dst);
+    memcpy(dst, src, 16);
+}
+__attribute__((noinline)) void consumer(void) {
+    copy_and_use(global_bytes, "safe constant bytes");
+}
+__attribute__((noinline)) int transfer(const char *s) {
+    memcpy(global_bytes, s, 16); consumer(); return 0;
+}
+int main(int argc, char **argv) { return argc > 1 ? transfer(argv[1]) : 0; }
+""")
+    binary = tmp_path / "additivecont"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+    overlay = tmp_path / "overlay.json"
+    overlay.write_text(json.dumps(
+        {"copy_and_use": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}}))
+
+    for extra in ([], ["--models", str(overlay)]):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", "transfer", "--source", "param:0", *extra)
+        [leaf] = [lf for lf in result["leaves"]
+                  if lf["kind"] == "global_memory_continuation"]
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (extra, result)
+        assert [r["display_name"] for r in leaf["references"]] == ["consumer"], leaf
+        assert leaf["references"][0]["access"] == "unknown_call_arg", leaf
+
+
+def test_global_continuation_phi_selected_write_destination_is_silent(tmp_path, shared_bn):
+    """Round-3 review F5: following the pointer to its terminal uses.
+
+    A helper whose entire effect is `p = flag ? g : other; memset(p, 0, 64)`
+    reads nothing: the `lea` that materialises the destination is not an
+    access. The reading and read-write twins still block."""
+    src = tmp_path / "phiwocont.c"
+    src.write_text(r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[64];
+char other_global[64];
+__attribute__((noinline)) void phi_reset(int f) { char *p = f ? global_bytes : other_global; memset(p, 0, 64); }
+__attribute__((noinline)) void phi_copy_reset(int f) { char *p = f ? global_bytes : other_global; memcpy(p, "safe", 5); }
+__attribute__((noinline)) void phi_read(int f) { char *p = f ? global_bytes : other_global; system(p); }
+__attribute__((noinline)) void phi_rw(int f) { char *p = f ? global_bytes : other_global; memcpy(p, p, 8); }
+__attribute__((noinline)) int phi_reset_case(const char *s) { memcpy(global_bytes, s, 16); phi_reset(1); return 0; }
+__attribute__((noinline)) int phi_copy_reset_case(const char *s) { memcpy(global_bytes, s, 16); phi_copy_reset(1); return 0; }
+__attribute__((noinline)) int phi_read_case(const char *s) { memcpy(global_bytes, s, 16); phi_read(1); return 0; }
+__attribute__((noinline)) int phi_rw_case(const char *s) { memcpy(global_bytes, s, 16); phi_rw(1); return 0; }
+int main(int argc, char **argv) {
+    return argc > 1 ? phi_reset_case(argv[1]) + phi_copy_reset_case(argv[1])
+                      + phi_read_case(argv[1]) + phi_rw_case(argv[1]) : 0;
+}
+""")
+    binary = tmp_path / "phiwocont"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0")
+
+    for fn in ("phi_reset_case", "phi_copy_reset_case"):
+        quiet = forward(fn)
+        assert [lf for lf in quiet["leaves"]
+                if lf["kind"] == "global_memory_continuation"] == [], (fn, quiet["leaves"])
+        assert quiet["diagnostics"]["safe_to_report_all_clear"] is True, (fn, quiet)
+
+    for fn, reader in (("phi_read_case", "phi_read"), ("phi_rw_case", "phi_rw")):
+        loud = forward(fn)
+        [leaf] = [lf for lf in loud["leaves"]
+                  if lf["kind"] == "global_memory_continuation"]
+        assert leaf["references"][0]["display_name"] == reader, (fn, leaf)
+        assert leaf["references"][0]["access"] == "call_arg", (fn, leaf)
+        assert loud["diagnostics"]["safe_to_report_all_clear"] is False, (fn, loud)

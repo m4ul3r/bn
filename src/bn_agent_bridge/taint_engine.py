@@ -263,6 +263,13 @@ class _BufferSeed:
 # supplied JSON `null` document is invalid, not an omission.
 _NO_RESOLVE_MAP: Any = object()
 
+# Global-access kinds (`_global_access`) the walk SAW read the bytes, as
+# opposed to the ones that only mean "it could" -- an address materialised
+# with no classifiable use, a call whose handling of the bytes is unknown, a
+# reference the scan could not find, a body whose IL could not be read. The
+# frontier's prose says "reads" only for the first set (round-3 review F5).
+_PROVEN_GLOBAL_READS = frozenset({"load", "call_arg", "return", "address_escape"})
+
 
 def _code(text: Any) -> str:
     """*text* as inline code in leaf prose -- unless it carries a backtick
@@ -335,6 +342,14 @@ class TaintEngine:
         # or (None, "write_only"). Per function body, so a write-only helper
         # is classified once however many calls reach it.
         self._global_access_cache: dict[tuple[int, int], tuple] = {}
+        # (function start, global) -> addresses a bounded native decode of an
+        # unread body found the global at. Only ever filled for a callee whose
+        # MLIL does not exist.
+        self._native_refs_cache: dict[tuple[int, int], tuple] = {}
+        # (callee start, parameter index) -> that parameter's own access
+        # verdict inside the callee's body, so a helper called from many
+        # sites is classified once.
+        self._param_access_cache: dict[tuple[int, int], tuple] = {}
 
     # -- shared resolution ------------------------------------------------
 
@@ -5380,61 +5395,131 @@ class TaintEngine:
         self._global_refs[ga] = out
         return out
 
-    def _expr_loads_global(self, ssaf: Any, expr: Any, ga: int, depth: int = 0) -> bool:
-        """Whether any sub-expression of *expr* LOADS through an address that
-        resolves to the global at *ga*.
+    # Bytes of ONE unread body a native search will read before giving up.
+    # It only ever runs for a callee whose MLIL does not exist, and only for
+    # a global the walk already tainted, and the answer is cached.
+    _NATIVE_SCAN_BYTES = 1 << 20
 
-        A store's destination is reached only through ``operands``, where it
-        is an address expression and not a load, so ``[g] = 0`` answers False
-        while ``[g] = [g] + 1`` and ``x = [p]`` (``p = g``) answer True."""
-        if expr is None or depth > 10 or not hasattr(expr, "operation"):
+    def _native_global_refs(self, fn: Any, ga: int) -> tuple[int, ...]:
+        """Addresses inside *fn* where a bounded NATIVE read finds the global
+        at *ga* materialised (round-3 review F6).
+
+        BN records no code references out of a body it never analysed, so the
+        code-reference DB cannot speak for an unread consumer. The bytes can:
+        search the function's own range for the address's little-endian
+        encodings -- an architecture-level read that does not depend on
+        analysis -- and walk each hit back to the instruction that contains
+        it, so the evidence is an instruction address and not a raw offset.
+        A linear decode is deliberately not used: the body is unread BECAUSE
+        it is enormous, and the materialisation is usually at its end.
+
+        Returns ``()`` when the view cannot be read -- the frontier is
+        emitted either way; only the evidence attached to it is lost."""
+        key = (int(getattr(fn, "start", 0)), int(ga))
+        cached = self._native_refs_cache.get(key)
+        if cached is not None:
+            return cached
+        read = getattr(self.bv, "read", None)
+        out: list[int] = []
+        if callable(read):
+            start = int(getattr(fn, "start", 0))
+            end = getattr(fn, "highest_address", None)
+            span = (int(end) - start + 16) if end is not None and int(end) > start \
+                else self._NATIVE_SCAN_BYTES
+            span = max(1, min(span, self._NATIVE_SCAN_BYTES))
+            try:
+                data = bytes(read(start, span) or b"")
+            except Exception:
+                data = b""
+            needles = set()
+            if 0 <= ga < 1 << 32:
+                needles.add(ga.to_bytes(4, "little", signed=False))
+            if 0 <= ga < 1 << 64:
+                needles.add(ga.to_bytes(8, "little", signed=False))
+            length_at = getattr(self.bv, "get_instruction_length", None)
+            seen: set[int] = set()
+            for needle in sorted(needles, key=len, reverse=True):
+                pos = data.find(needle)
+                while pos >= 0 and len(out) < 8:
+                    hit = start + pos
+                    site = hit
+                    if callable(length_at):
+                        for back in range(1, 16):
+                            try:
+                                size = int(length_at(hit - back) or 0)
+                            except Exception:
+                                break
+                            if size > back:
+                                site = hit - back
+                                break
+                    if site not in seen:
+                        seen.add(site)
+                        out.append(site)
+                    pos = data.find(needle, pos + 1)
+        result = tuple(sorted(out))
+        self._native_refs_cache[key] = result
+        return result
+
+    # Expression shapes a POINTER can be carried through without ceasing to
+    # point at the same object: SSA copies, PHI merges, widening/narrowing
+    # casts and constant or register displacement.
+    _PTR_CARRY_OPS = ("ADD", "SUB", "ZX", "SX", "VAR_SSA", "VAR_ALIASED", "PHI")
+
+    def _ptr_resolves(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
+                      seen: set | None = None) -> bool:
+        """Whether *expr* may hold a pointer *base* accepts.
+
+        Follows SSA definitions generally -- so EVERY arm of a PHI merge is
+        tried, not just a lone reader -- plus pointer arithmetic in either
+        operand order and widening/narrowing casts, because `p + off`,
+        `off + p` and `(char *)p - 4` all still point into the same object
+        (round-3 review F4). It never answers False from a shape it did not
+        understand: an unrecognised expression simply contributes nothing,
+        and every caller's default is "consumer"."""
+        if expr is None or depth > 12:
             return False
-        if "LOAD" in op_name(expr) \
-                and self._global_addr(ssaf, getattr(expr, "src", None)) == ga:
+        seen = set() if seen is None else seen
+        if base(expr):
             return True
+        if is_ssa_var(expr):
+            key = (var_key(expr), getattr(expr, "version", None))
+            if key in seen:
+                return False
+            seen.add(key)
+            try:
+                defn = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                defn = None
+            if defn is None:
+                return False
+            srcs = getattr(defn, "src", None)
+            if not isinstance(srcs, (list, tuple)):
+                srcs = [] if srcs is None else [srcs]
+            return any(self._ptr_resolves(ssaf, s, base, depth + 1, seen) for s in srcs)
+        if not hasattr(expr, "operation"):
+            return False
+        if not any(tok in op_name(expr) for tok in self._PTR_CARRY_OPS):
+            return False
         subs: list[Any] = []
-        for attr in ("src", "left", "right", "params"):
+        for attr in ("left", "right", "src"):
             sub = getattr(expr, attr, None)
             if isinstance(sub, (list, tuple)):
                 subs.extend(sub)
             elif sub is not None:
                 subs.append(sub)
+        subs.extend(expr_reads(expr))
         subs.extend(getattr(expr, "operands", None) or ())
-        return any(self._expr_loads_global(ssaf, s, ga, depth + 1) for s in subs)
+        return any(self._ptr_resolves(ssaf, s, base, depth + 1, seen) for s in subs)
 
-    def _may_be_global(self, ssaf: Any, expr: Any, ga: int, depth: int = 0) -> bool:
-        """Whether *expr* may hold the address of the global at *ga*.
-
-        ``_global_addr`` follows a single-reader copy chain; this also looks
-        THROUGH an SSA PHI, because a pointer a branch selected is still that
-        pointer (round-3 review R1: `p = cond ? g : other; system(p)` resolved
-        to nothing and the consumer read as write-only)."""
-        if expr is None or depth > 8:
+    def _expr_mentions(self, ssaf: Any, expr: Any, base: Any, depth: int = 0) -> bool:
+        """Whether any sub-expression of *expr* may be the tracked pointer."""
+        if expr is None or depth > 10:
             return False
-        if self._global_addr(ssaf, expr) == ga:
-            return True
-        var = expr if is_ssa_var(expr) else None
-        if var is None:
-            reads = expr_reads(expr)
-            var = reads[0] if len(reads) == 1 else None
-        if var is None:
+        if is_ssa_var(expr):
+            return self._ptr_resolves(ssaf, expr, base)
+        if not hasattr(expr, "operation"):
             return False
-        try:
-            defn = ssaf.get_ssa_var_definition(var)
-        except Exception:
-            defn = None
-        if defn is None or "PHI" not in op_name(defn):
-            return False
-        srcs = getattr(defn, "src", None)
-        if not isinstance(srcs, (list, tuple)):
-            srcs = [] if srcs is None else [srcs]
-        return any(self._may_be_global(ssaf, s, ga, depth + 1) for s in srcs)
-
-    def _expr_mentions_global(self, ssaf: Any, expr: Any, ga: int, depth: int = 0) -> bool:
-        """Whether any sub-expression of *expr* may be the global at *ga*."""
-        if expr is None or depth > 10 or not hasattr(expr, "operation"):
-            return False
-        if self._may_be_global(ssaf, expr, ga):
+        if self._ptr_resolves(ssaf, expr, base):
             return True
         subs: list[Any] = []
         for attr in ("src", "dest", "left", "right", "params"):
@@ -5444,116 +5529,248 @@ class TaintEngine:
             elif sub is not None:
                 subs.append(sub)
         subs.extend(getattr(expr, "operands", None) or ())
-        return any(self._expr_mentions_global(ssaf, s, ga, depth + 1) for s in subs)
+        return any(self._expr_mentions(ssaf, s, base, depth + 1) for s in subs)
+
+    def _expr_loads(self, ssaf: Any, expr: Any, base: Any, depth: int = 0) -> bool:
+        """Whether any sub-expression of *expr* LOADS through the pointer.
+
+        A store's destination is reached only through ``operands``, where it
+        is an address expression and not a load, so ``[p] = 0`` answers False
+        while ``[p] = [p] + 1`` and ``x = [q]`` (``q = p``) answer True."""
+        if expr is None or depth > 10 or not hasattr(expr, "operation"):
+            return False
+        if "LOAD" in op_name(expr) \
+                and self._ptr_resolves(ssaf, getattr(expr, "src", None), base):
+            return True
+        subs: list[Any] = []
+        for attr in ("src", "left", "right", "params"):
+            sub = getattr(expr, attr, None)
+            if isinstance(sub, (list, tuple)):
+                subs.extend(sub)
+            elif sub is not None:
+                subs.append(sub)
+        subs.extend(getattr(expr, "operands", None) or ())
+        return any(self._expr_loads(ssaf, s, base, depth + 1) for s in subs)
+
+    def _global_base(self, ssaf: Any, ga: int):
+        return lambda e: self._global_addr(ssaf, e) == ga
+
+    def _may_be_global(self, ssaf: Any, expr: Any, ga: int) -> bool:
+        return self._ptr_resolves(ssaf, expr, self._global_base(ssaf, ga))
+
+    def _expr_mentions_global(self, ssaf: Any, expr: Any, ga: int) -> bool:
+        return self._expr_mentions(ssaf, expr, self._global_base(ssaf, ga))
+
+    def _expr_loads_global(self, ssaf: Any, expr: Any, ga: int) -> bool:
+        return self._expr_loads(ssaf, expr, self._global_base(ssaf, ga))
 
     @staticmethod
-    def _model_write_only_arg(model: dict[str, Any] | None, idx: int) -> bool:
-        """Whether *model* says argument *idx* is a destination the callee
-        only WRITES through -- ``*arg:idx`` is a propagate/write target and
-        never a propagate source, and the model reports no sink on it.
+    def _model_arg_role(model: dict[str, Any] | None, idx: int) -> str:
+        """What *model* says the callee does with the BYTES argument *idx*
+        points at: ``"write"`` (a destination it fills), ``"read"`` (a source
+        it consumes, a declared sink operand, or a vararg folded into the
+        destination) or ``"unknown"`` (round-3 review F5).
 
-        This is what tells `memset(g, 0, 64)` and `memcpy(g, "safe", 5)`
-        apart from `system(g)` and `snprintf(buf, n, "%s", g)` (round-3
-        review R2: a modeled write destination is not a reader). An unmodeled
-        callee has no such promise, so it is never write-only here."""
+        Destination and source roles are decided SEPARATELY, and a read-write
+        argument is a read: `memcpy(g, g, 8)` consumes the bytes even though
+        arg0 is also the destination.
+
+        A ``"write"`` here is the model's own, ADDITIVE claim -- never a
+        promise that the callee reads nothing else (round-3 review F7). Only
+        :meth:`_param_destination_only` can turn it into a write-only verdict
+        for a callee this binary has a body for."""
         if not model:
-            return False
+            return "unknown"
         tok = f"*arg:{idx}"
-        rules = list(model.get("propagates") or ())
-        written = tok in (model.get("writes") or ())
-        for rule in rules:
+        written = read = False
+        if tok in (model.get("writes") or ()):
+            written = True
+        for rule in (model.get("propagates") or ()):
             if str(rule.get("to") or "") == tok:
                 written = True
             if str(rule.get("from") or "") == tok:
-                return False
+                read = True
         varargs = model.get("varargs") or {}
         if str(varargs.get("to") or "") == tok:
             written = True
-        if idx >= int(varargs.get("first_index", 1 << 30)):
-            return False        # a vararg the model folds INTO the destination
-        sink = model.get("sink") or {}
-        if idx in (sink.get("tainted_args") or ()):
+        first = varargs.get("first_index")
+        if first is not None and idx >= int(first):
+            read = True          # a vararg the model folds INTO the destination
+        if idx in ((model.get("sink") or {}).get("tainted_args") or ()):
+            read = True
+        if read:
+            return "read"
+        return "write" if written else "unknown"
+
+    def _callee_body(self, ins: Any) -> tuple[Any | None, bool]:
+        """``(body, unread)`` for the call *ins*: the in-binary body it runs
+        (following a thunk), and whether BN measured an in-binary body here
+        and skipped analysing it.
+
+        ``unread`` matters because a model on such a callee is still only an
+        overlay: there IS a body, and nothing read it (round-3 review F7)."""
+        taddr = self._resolve_direct_target(ins)
+        if taddr is None:
+            return None, False
+        cfn = function_at(self.bv, taddr)
+        if cfn is None:
+            return None, False
+        if self._is_internal(cfn):
+            return cfn, False
+        resolved = self._follow_thunk_cached(cfn)
+        if resolved is not None and self._is_internal(resolved):
+            return resolved, False
+        reason = str(self._not_internal_reason(cfn) or "")
+        return None, reason.startswith("analysis_skipped:")
+
+    def _param_destination_only(self, callee: Any, idx: int, depth: int = 0) -> bool:
+        """Whether *callee*'s own body only WRITES through parameter *idx*.
+
+        A model is additive flow evidence; a body is the authority (#807, and
+        round-3 review F7: a partial ``{"propagates": [...]}`` overlay read as
+        "and it reads nothing else" suppressed a real consumer --
+        ``copy_and_use(dst, src)`` whose body calls ``system(dst)`` BEFORE the
+        copy the overlay describes). So when the callee has an analysed body,
+        the write-only question is asked of that body, with the same
+        classifier the global uses, rooted at the parameter."""
+        if depth > 2:
             return False
-        return written
+        try:
+            pv = self._param_var(callee, idx)
+        except Exception:
+            pv = None
+        if pv is None:
+            return False
+        key = (int(getattr(callee, "start", 0)), int(idx))
+        cached = self._param_access_cache.get(key)
+        if cached is None:
+            pkey = var_key(pv)
+            cached = self._pointer_access(
+                callee, lambda e: is_ssa_var(e) and var_key(e) == pkey,
+                fallback=None, depth=depth + 1)
+            self._param_access_cache[key] = cached
+        return cached[1] == "write_only"
 
-    def _global_access(self, fn: Any, ga: int) -> tuple[int | None, str]:
-        """``(address, kind)`` of the first use of the global at *ga* inside
-        *fn* that can READ its bytes, or ``(None, "write_only")`` ONLY when
-        every use in the body is proven to write into it.
+    def _is_pointer_carry(self, ssaf: Any, ins: Any, base: Any) -> bool:
+        """`p = g`, `p = q + 4`, `p = phi(..)`: the pointer is MOVED, not used.
 
-        The default is "consumer": a mention this classifier cannot account
-        for as a write is read-capable, because the cost of a wrong "it only
-        writes" is the false all-clear this frontier exists to withhold
-        (round-3 review R1). Kinds: ``load`` (the bytes are loaded),
-        ``call_arg`` (the address is handed to a call that is not a modeled
-        write destination), ``address_escape`` (the address is stored into
-        memory), ``return``, ``address_taken`` (the address is materialised
-        and the use is not otherwise classifiable), ``unclassified`` (BN
-        records a reference this scan could not find) and ``unreadable`` (the
-        body's MLIL could not be read at all)."""
-        key = (int(getattr(fn, "start", 0)), int(ga))
-        cached = self._global_access_cache.get(key)
-        if cached is not None:
-            return cached
-        fallback = self._global_ref_functions(ga).get(key[0])
+        Materialising an address is not an access -- the access happens at
+        the terminal uses of the resulting value, which this same scan
+        classifies (round-3 review F5: a write-only `memset(p, 0, 64)` helper
+        was called a reader because the `lea` that built `p` came first)."""
+        opn = op_name(ins)
+        if "SET_VAR" not in opn and "VAR_PHI" not in opn:
+            return False
+        src = getattr(ins, "src", None)
+        if isinstance(src, (list, tuple)):
+            return any(self._ptr_resolves(ssaf, s, base) for s in src)
+        return self._ptr_resolves(ssaf, src, base)
+
+    def _pointer_access(self, fn: Any, base: Any, *, fallback: int | None,
+                        depth: int = 0) -> tuple[int | None, str]:
+        """``(address, kind)`` of the first use inside *fn* that can READ the
+        bytes the tracked pointer addresses, or ``(None, "write_only")`` ONLY
+        when every terminal use is a proven write into them.
+
+        The default is "consumer": a use this classifier cannot account for
+        as a write is read-capable, because the cost of a wrong "it only
+        writes" is the false all-clear this frontier exists to withhold.
+        Kinds: ``load`` (the bytes are loaded), ``call_arg`` (the pointer
+        reaches an argument whose callee READS it -- by a model, where there
+        is no body to contradict it), ``unknown_call_arg`` (it reaches a call
+        whose handling of those bytes is not known: an unmodeled callee, a
+        role nothing states, a body that could not be read, or an argument
+        Binary Ninja did not recover -- an honest unknown, never a claimed
+        read and never a clear), ``address_escape`` (the address is stored
+        into memory), ``return``, ``unclassified`` (a reference this scan
+        could not account for) and ``unreadable`` (the body's MLIL could not
+        be read at all)."""
         try:
             ssaf = self._ssa_func(fn)
             instrs = self._instrs(ssaf)
         except TaintError:
-            out: tuple[int | None, str] = (fallback, "unreadable")
-            self._global_access_cache[key] = out
-            return out
+            return (fallback, "unreadable")
         wrote = False
-        out = None
         for ins in instrs:
             opn = op_name(ins)
             at = int(getattr(ins, "address", 0))
             if self._is_call(ins):
                 params = self._call_params(ins)
                 hit = [i for i, p in enumerate(params)
-                       if self._may_be_global(ssaf, p, ga)]
-                if hit:
-                    _key, model = lookup_model(
-                        self.models, self._callee_name(self._resolve_direct_target(ins)))
-                    if all(self._model_write_only_arg(model, i) for i in hit):
+                       if self._ptr_resolves(ssaf, p, base)]
+                if not hit:
+                    # In the instruction but in no RECOVERED argument: BN
+                    # under-recovered this call's arity, so what the callee
+                    # does with the bytes is unknown, not a read.
+                    if self._expr_mentions(ssaf, ins, base):
+                        return (at, "unknown_call_arg")
+                    continue
+                body, unread_body = self._callee_body(ins)
+                if body is not None:
+                    # The body is the authority; a model is only an overlay on
+                    # it (#807 / F7). Ask the body itself.
+                    if all(self._param_destination_only(body, i, depth) for i in hit):
                         wrote = True
                         continue
-                    out = (at, "call_arg")
-                    break
-                if self._expr_mentions_global(ssaf, ins, ga):
-                    out = (at, "call_arg")
-                    break
-                continue
+                    return (at, "unknown_call_arg")
+                if unread_body:
+                    # There IS an in-binary body and nothing read it, so no
+                    # model on this name can promise it only writes (F7).
+                    return (at, "unknown_call_arg")
+                _key, model = lookup_model(
+                    self.models, self._callee_name(self._resolve_direct_target(ins)))
+                roles = [self._model_arg_role(model, i) for i in hit]
+                if "read" in roles:
+                    return (at, "call_arg")       # a modeled source operand
+                if all(r == "write" for r in roles):
+                    wrote = True                  # a modeled destination, and
+                    continue                      # no body to contradict it
+                return (at, "unknown_call_arg")
             if "RET" in opn:
                 srcs = getattr(ins, "src", None)
                 if not isinstance(srcs, (list, tuple)):
                     srcs = [] if srcs is None else [srcs]
-                if any(self._may_be_global(ssaf, s, ga) for s in srcs):
-                    out = (at, "return")
-                    break
+                if any(self._ptr_resolves(ssaf, s, base) for s in srcs):
+                    return (at, "return")
             if "STORE" in opn:
-                dest_hit = self._may_be_global(ssaf, getattr(ins, "dest", None), ga)
-                src_hit = self._expr_mentions_global(ssaf, getattr(ins, "src", None), ga)
+                dest_hit = self._ptr_resolves(ssaf, getattr(ins, "dest", None), base)
+                src_hit = self._expr_mentions(ssaf, getattr(ins, "src", None), base)
                 if dest_hit and not src_hit:
-                    wrote = True       # `g[i] = <value that is not g>`
+                    wrote = True       # `p[i] = <value that is not p>`
                     continue
                 if dest_hit or src_hit:
-                    # `g[i] = g[j] + 1` reads, and `*p = &g` escapes the
+                    # `p[i] = p[j] + 1` reads, and `*q = p` escapes the
                     # address to memory this walk cannot follow.
-                    out = (at, "load" if self._expr_loads_global(ssaf, ins, ga)
-                           else "address_escape")
-                    break
+                    return (at, "load" if self._expr_loads(ssaf, ins, base)
+                            else "address_escape")
                 continue
-            if self._expr_mentions_global(ssaf, ins, ga):
-                out = (at, "load" if self._expr_loads_global(ssaf, ins, ga)
-                       else "address_taken")
-                break
-        if out is None:
-            # Nothing read-capable. A body with a proven write and nothing
-            # else is a write-only reference; a body where this scan found no
-            # mention at all contradicts BN's own code reference, so it is
-            # disclosed rather than cleared.
-            out = (None, "write_only") if wrote else (fallback, "unclassified")
+            if self._expr_mentions(ssaf, ins, base):
+                if self._expr_loads(ssaf, ins, base):
+                    return (at, "load")
+                if self._is_pointer_carry(ssaf, ins, base):
+                    continue          # moved, not used: see the terminal uses
+                return (at, "unclassified")
+        # Nothing read-capable. A body with a proven write and nothing else
+        # is a write-only use; a body where this scan accounted for no use at
+        # all is disclosed rather than cleared.
+        return (None, "write_only") if wrote else (fallback, "unclassified")
+
+    def _global_access(self, fn: Any, ga: int) -> tuple[int | None, str]:
+        """:meth:`_pointer_access` rooted at the global at *ga*, cached."""
+        key = (int(getattr(fn, "start", 0)), int(ga))
+        cached = self._global_access_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            ssaf = self._ssa_func(fn)
+        except TaintError:
+            out: tuple[int | None, str] = (
+                self._global_ref_functions(ga).get(key[0]), "unreadable")
+            self._global_access_cache[key] = out
+            return out
+        out = self._pointer_access(
+            fn, self._global_base(ssaf, ga),
+            fallback=self._global_ref_functions(ga).get(key[0]))
         self._global_access_cache[key] = out
         return out
 
@@ -5581,7 +5798,7 @@ class TaintEngine:
         unresolved indirect edge simply contributes no successor."""
         known = self._global_ref_functions(ga)
         if not known:
-            return (), self._reach_status(None, 0, [])
+            return (), self._reach_status(None, 0, [], {})
         start = int(getattr(fn, "start", 0))
         key = (start, int(ga), int(budget))
         cached = self._global_reach.get(key)
@@ -5633,12 +5850,22 @@ class TaintEngine:
             # bound that stopped the walk cannot have hidden a reader.
             cut = None
         out = (tuple(sorted((s, a, k) for s, (a, k) in found.items())),
-               self._reach_status(cut, len(done), unexamined))
+               self._reach_status(cut, len(done), unexamined, known))
         self._global_reach[key] = out
         return out
 
     def _reach_status(self, cause: str | None, examined: int,
-                      unexamined: list[int]) -> dict[str, Any]:
+                      unexamined: list[int],
+                      sites: dict[int, int] | None = None) -> dict[str, Any]:
+        """The structured status of one reachability search.
+
+        ``unexamined_reference_sites`` is the NATIVE evidence that the answer
+        is unfinished: for every function BN records a reference to this
+        global from that the walk never examined, the function and the
+        instruction address of that reference. An unread callee body records
+        no code reference of its own, so these sites are what stands behind
+        its boundary (round-3 review F6)."""
+        sites = sites or {}
         return {
             "status": "complete" if cause is None else "truncated",
             "cause": cause,
@@ -5646,6 +5873,11 @@ class TaintEngine:
             "function_budget": self._GLOBAL_REACH_FUNCS,
             "unexamined_references_total": len(unexamined),
             "unexamined_references": [hex(a) for a in unexamined[:8]],
+            "unexamined_reference_sites": [
+                {"name": str(getattr(function_at(self.bv, s), "name", None)
+                             or self._callee_name(s) or hex(s)),
+                 "address": hex(s), "at": hex(sites.get(s, s))}
+                for s in unexamined[:8]],
         }
 
     def _global_continuation_leaf(self, ins: Any, ga: int, callee_fn: Any,
@@ -5654,10 +5886,11 @@ class TaintEngine:
         """The blocking frontier for tainted global bytes crossing a call the
         walk does not carry them across (IC03 / TT-PILOT-FW03-01).
 
-        Two shapes, one kind: named readers in ``references``, or -- when the
-        reachability search was truncated before it could rule a reader out --
-        an empty ``references`` whose ``reachability`` block carries the exact
-        bound that stopped it and the references it never reached."""
+        Named references and a truncated search are not alternatives: an
+        unread callee body carries BOTH -- the native code reference proving
+        it touches this global, and the fact that its use of the bytes could
+        not be read. ``access`` says which, and the prose never claims a read
+        it did not see."""
         rows = []
         for start, at, kind in references[:8]:
             rfn = function_at(self.bv, start)
@@ -5670,34 +5903,42 @@ class TaintEngine:
                    "no argument of this call carries taint, so it is not descended")
         seed_at = rows[0]["address"] if rows else hex(int(getattr(callee_fn, "start", 0)))
         reseed = command_template(f"bn taint forward -f {seed_at} --source var:VAR")
+        parts = []
         if rows:
             where = ", ".join(f"{r['display_name']} @ {r['at']} ({r['access']})" for r in rows)
-            detail = (
+            verb = ("reads" if any(r["access"] in _PROVEN_GLOBAL_READS for r in rows)
+                    else "may read")
+            parts.append(
                 f"tainted bytes were copied into the writable global {hex(ga)}, and code "
-                f"reachable from this call reads it ({where}). Taint is tracked per "
-                f"function, and {crossed}: what those bytes reach past this point is NOT "
-                f"followed -- a 'no sinks reached' result here is not proof of safety. "
-                f"Read every reference with `bn xrefs {hex(ga)}`, then re-seed inside the "
-                f"consumer on the value it loads ({reseed})")
+                f"reachable from this call {verb} it ({where}).")
         else:
+            parts.append(
+                f"tainted bytes were copied into the writable global {hex(ga)}, and this "
+                f"call crosses into code whose use of it could not be read.")
+        if reach.get("status") == "truncated":
             bound = {
                 "depth_budget": "the configured interprocedural depth",
                 "unresolved_thunk": "an in-binary thunk whose tail call did not resolve",
                 "unread_callee_body": (
-                    "an in-binary callee body Binary Ninja never analysed "
+                    "an in-binary callee body Binary Ninja did not analyse "
                     "(re-run after `bn decompile <callee> --force-analysis`)"),
             }.get(str(reach.get("cause")),
                   f"the {reach.get('function_budget')}-function reachability bound")
-            detail = (
-                f"tainted bytes were copied into the writable global {hex(ga)}, and the "
-                f"search for code reading it past this call stopped at {bound} after "
+            unreached = ", ".join(
+                f"{r.get('name')} @ {r.get('at')}"
+                for r in (reach.get("unexamined_reference_sites") or [])) or "n/a"
+            parts.append(
+                f"The search for code reading it past this call stopped at {bound} after "
                 f"{reach.get('functions_examined')} function(s), with "
                 f"{reach.get('unexamined_references_total')} referencing function(s) never "
-                f"examined ({', '.join(reach.get('unexamined_references') or []) or 'n/a'}). "
-                f"Whether those bytes reach a sink past this call is UNKNOWN, not clear: "
-                f"taint is tracked per function and {crossed}. List every reference with "
-                f"`bn xrefs {hex(ga)}` and audit them, or raise --max-depth and re-run "
-                f"({reseed} seeds a consumer directly)")
+                f"examined ({unreached}), so whether those bytes reach a sink past this "
+                f"call is UNKNOWN, not clear.")
+        parts.append(
+            f"Taint is tracked per function, and {crossed}: what those bytes reach past "
+            f"this point is NOT followed -- a 'no sinks reached' result here is not proof "
+            f"of safety. List every reference with `bn xrefs {hex(ga)}` and audit them, "
+            f"then re-seed inside the consumer on the value it loads ({reseed}).")
+        detail = " ".join(parts)
         return {
             "kind": "global_memory_continuation",
             "address": hex(int(getattr(ins, "address", 0))),
@@ -5980,16 +6221,19 @@ class TaintEngine:
                         cfn = resolved
                     elif reason == "thunk":
                         unread = "unresolved_thunk"
-                    elif str(reason).startswith("analysis_skipped:"):
-                        # BN says, explicitly, that it did not analyse this
-                        # IN-BINARY body (oversized past
-                        # analysis.limits.maxFunctionSize, a failed lift). Its
-                        # references cannot be read, so what the global
-                        # reaches past this call is unknown, not clear.
-                        # `no_mlil` is deliberately NOT here: that is the
-                        # degenerate shape (a stub, a view that hands back a
-                        # function with no IL at all), which the external and
-                        # unmodeled-callee machinery already owns.
+                    elif self._unanalysed_body_phrase(reason) is not None \
+                            and lookup_model(self.models,
+                                             self._callee_name(int(taddr)))[1] is None:
+                        # An IN-BINARY body whose MLIL this run cannot read --
+                        # BN skipped it (oversized past
+                        # analysis.limits.maxFunctionSize, a failed lift) or
+                        # produced none at all. Its references cannot be
+                        # classified, so "nothing reads the global" is not an
+                        # answer and the walk must not continue to an
+                        # all-clear (round-3 review F6). A MODELED name is
+                        # excluded: a libc/kernel callee behind an import stub
+                        # has no body by construction and its model owns the
+                        # story, exactly as the descent treats it.
                         unread = "unread_callee_body"
                         self._analysis_incomplete.add(
                             str(getattr(cfn, "name", None) or hex(int(taddr))))
@@ -5997,8 +6241,26 @@ class TaintEngine:
                         continue
                 for ga in list(pending):
                     if unread is not None:
-                        refs, reach = (), self._reach_status(
-                            unread, 0, sorted(self._global_ref_functions(ga)))
+                        # Evidence for a body whose IL does not exist: BN
+                        # records no code reference FROM a function it never
+                        # analysed, so the code-reference DB cannot speak for
+                        # it. A bounded native decode can -- and does not
+                        # depend on analysis. Whatever it finds is cited
+                        # `unreadable`, so the prose says "may read", never
+                        # "reads"; the references the walk never reached are
+                        # listed beside it.
+                        known = self._global_ref_functions(ga)
+                        own = int(getattr(cfn, "start", 0))
+                        if own in known:
+                            sites = (known[own],)
+                        elif unread == "unread_callee_body":
+                            sites = self._native_global_refs(cfn, ga)
+                        else:
+                            sites = ()
+                        refs = tuple((own, a, "unreadable") for a in sites[:8])
+                        reach = self._reach_status(
+                            unread, 0,
+                            sorted(k for k in known if not (refs and k == own)), known)
                     else:
                         refs, reach = self._global_refs_reachable(cfn, ga, budget)
                     if not refs and reach["status"] != "truncated":
