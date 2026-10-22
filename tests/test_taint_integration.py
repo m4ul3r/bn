@@ -1748,3 +1748,148 @@ int main(int argc, char **argv) {
         assert leaf["references"][0]["display_name"] == reader, (fn, leaf)
         assert leaf["references"][0]["access"] == "call_arg", (fn, leaf)
         assert loud["diagnostics"]["safe_to_report_all_clear"] is False, (fn, loud)
+
+
+_BOUNDARY_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+char global_bytes[64];
+char neighbour_bytes[64] = "/bin/true";
+__attribute__((noinline)) int offset_consumer(void) { return system(global_bytes + 4); }
+__attribute__((noinline)) int base_consumer(void) { return system(global_bytes); }
+__attribute__((noinline)) int neighbour_consumer(void) { return system(neighbour_bytes + 8); }
+__attribute__((noinline)) int huge_reader(void) {
+    __asm__ volatile(".rept 70000\n nop\n .endr\n");
+    return system(global_bytes);
+}
+__attribute__((noinline)) int wrapper(void) { return huge_reader() + 1; }
+__attribute__((noinline)) int wrapper2(void) { return wrapper() + 1; }
+__attribute__((noinline)) int offset_case(const char *s) { memcpy(global_bytes, s, 16); return offset_consumer(); }
+__attribute__((noinline)) int base_case(const char *s) { memcpy(global_bytes, s, 16); return base_consumer(); }
+__attribute__((noinline)) int neighbour_case(const char *s) { memcpy(global_bytes, s, 16); return neighbour_consumer(); }
+__attribute__((noinline)) int unread_case(const char *s) { memcpy(global_bytes, s, 16); return huge_reader(); }
+__attribute__((noinline)) int wrapped_unread_case(const char *s) { memcpy(global_bytes, s, 16); return wrapper(); }
+__attribute__((noinline)) int deep_unread_case(const char *s) { memcpy(global_bytes, s, 16); return wrapper2(); }
+__attribute__((noinline)) int indirect_case(const char *s, int (*cb)(void)) { memcpy(global_bytes, s, 16); return cb(); }
+__attribute__((noinline)) int clean_indirect_case(const char *s, int (*cb)(void)) {
+    char local[64]; memcpy(local, s, 16); return cb() + local[0];
+}
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    return offset_case(argv[1]) + base_case(argv[1]) + neighbour_case(argv[1])
+         + unread_case(argv[1]) + wrapped_unread_case(argv[1]) + deep_unread_case(argv[1])
+         + indirect_case(argv[1], base_consumer) + clean_indirect_case(argv[1], base_consumer);
+}
+"""
+
+
+def _boundary_target(tmp_path, shared_bn):
+    """One binary carrying every round-3 boundary shape (F8/F9/F10).
+
+    Built per test rather than per module: `shared_bn` is function-scoped so
+    exactly one target is open while a test runs, which is what lets these
+    commands omit `--target`.
+    """
+    src = tmp_path / "boundaries.c"
+    src.write_text(_BOUNDARY_SRC)
+    binary = tmp_path / "boundaries"
+    _compile(src, binary, ["-fno-builtin"])
+    return shared_bn.load(binary, copy=False), tmp_path
+
+
+def _gmc(result):
+    return [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
+
+
+def test_global_continuation_interior_reference_blocks_with_its_offset(tmp_path, shared_bn):
+    """Round-3 review F8: `system(g + 4)` reads the copied bytes.
+
+    BN records that code reference at the INTERIOR address, so asking only
+    about the object's base found no consumer and cleared the run. The whole
+    object is asked for now, and the leaf reports the base plus the offset
+    the consumer actually named. A DISJOINT neighbouring object is not swept
+    in with it."""
+    target, _tmp = _boundary_target(tmp_path, shared_bn)
+
+    def forward(fn):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0")
+
+    offset = forward("offset_case")
+    [leaf] = _gmc(offset)
+    assert leaf["references"][0]["display_name"] == "offset_consumer", leaf
+    assert leaf["references"][0]["offset"] == 4, leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert offset["diagnostics"]["safe_to_report_all_clear"] is False, offset
+
+    base = forward("base_case")
+    [leaf] = _gmc(base)
+    assert leaf["references"][0]["offset"] == 0, leaf
+
+    # the disjoint control: the consumer reads the NEXT object
+    neighbour = forward("neighbour_case")
+    assert _gmc(neighbour) == [], neighbour["leaves"]
+    assert neighbour["diagnostics"]["safe_to_report_all_clear"] is True, neighbour
+
+
+def test_global_continuation_unread_consumer_behind_a_wrapper(tmp_path, shared_bn):
+    """Round-3 review F9: the hole is the unread body, not its position.
+
+    `huge_reader` is past `analysis.limits.maxFunctionSize`; calling it
+    directly already disclosed the boundary, but an ordinary wrapper -- at
+    one hop or two -- walked straight through it to a clean all-clear."""
+    target, _tmp = _boundary_target(tmp_path, shared_bn)
+
+    def forward(fn):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0")
+
+    for fn in ("unread_case", "wrapped_unread_case", "deep_unread_case"):
+        result = forward(fn)
+        [leaf] = _gmc(result)
+        assert leaf["reachability"]["cause"] == "unread_callee_body", (fn, leaf)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, result)
+        assert result["stats"]["analysis_incomplete"] is True, (fn, result["stats"])
+        assert "huge_reader" in result["stats"]["analysis_incomplete_functions"], \
+            (fn, result["stats"])
+        if fn != "unread_case":
+            assert [b["name"] for b in leaf["reachability"]["unread_bodies"]] \
+                == ["huge_reader"], (fn, leaf)
+            assert "huge_reader" in leaf["detail"], (fn, leaf["detail"])
+
+
+def test_global_continuation_unresolved_callback_is_a_boundary(tmp_path, shared_bn):
+    """Round-3 review F10: an unresolved zero-argument callback.
+
+    No argument carries taint, so the existing indirect frontier says
+    nothing -- but the tainted global is live and this binary has code that
+    reads it, and nothing proves the unknown target is not that code.
+    Pinning the site with `--resolve-map` replaces the boundary with the real
+    target's answer; a run with no tainted global stays silent."""
+    target, tmp = _boundary_target(tmp_path, shared_bn)
+
+    def forward(fn, *extra):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0", *extra)
+
+    unresolved = forward("indirect_case")
+    [leaf] = _gmc(unresolved)
+    assert leaf["callee"] is None, leaf
+    assert leaf["reachability"]["cause"] == "unresolved_call_target", leaf
+    assert leaf["reachability"]["unexamined_reference_sites"], leaf["reachability"]
+    assert unresolved["diagnostics"]["safe_to_report_all_clear"] is False, unresolved
+
+    # no tainted global, same unresolved callback: nothing to disclose
+    clean = forward("clean_indirect_case")
+    assert _gmc(clean) == [], clean["leaves"]
+
+    # --resolve-map refines the boundary into the real target's answer
+    rmap = tmp / "rmap.json"
+    rmap.write_text(json.dumps({
+        _indirect_call_addr(shared_bn, "indirect_case", "boundaries"):
+            [_resolve_addr(shared_bn, "base_consumer")]}))
+    pinned = forward("indirect_case", "--resolve-map", str(rmap))
+    [leaf] = _gmc(pinned)
+    assert leaf["callee"]["display_name"] == "base_consumer", leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert leaf["reachability"]["cause"] is None, leaf

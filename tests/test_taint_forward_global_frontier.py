@@ -174,7 +174,7 @@ def test_keyable_global_copy_into_zero_arg_consumer_emits_continuation(models):
     assert leaf["callee"]["address"] == hex(hook.start)
     assert leaf["references"] == [{"name": "run_hook", "display_name": "run_hook",
                                    "address": hex(hook.start), "at": hex(0x401210),
-                                   "access": "call_arg"}]
+                                   "access": "call_arg", "offset": 0}]
     assert leaf["reachability"]["status"] == "complete"
     assert leaf["call_descended"] is False
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
@@ -311,20 +311,60 @@ def test_no_code_ref_api_fabricates_no_frontier(models):
     assert _leaves(result) == [], result["leaves"]
 
 
-def test_unresolved_indirect_call_is_not_a_global_continuation(models):
-    # The target does not resolve, so there is no body whose references could
-    # be read: the engine's existing indirect frontier owns that call, and no
-    # global boundary is invented for it.
+def test_an_unresolved_zero_argument_callback_is_a_blocking_boundary(models):
+    # Round-3 review F10: control leaves for somewhere bn could not name,
+    # with tainted global bytes live and code in this binary that references
+    # them. Nothing proves the target is not one of those readers, so the
+    # boundary is disclosed -- silence here is the false all-clear.
     fp = FVar("fp")
     fp1 = FSSA(fp, 1)
     hook = _reader("run_hook", 0x401200, G_DIR, 0x401210)
     func, _argv = _copy_then_call(
-        0x401104, STRCPY, G_DIR,
-        call_sites=[(0x401108, _var(fp1), [])])
-    bv = FGlobalBV({STRCPY: "strcpy", SYSTEM: "system", 0x401200: "run_hook"},
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _var(fp1), [])], params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "run_hook"},
                    funcs={0x401200: hook}, refs={G_DIR: [FRef(hook, 0x401210)]})
     result = _forward(bv, func, models)
-    assert _leaves(result) == [], result["leaves"]
+    [leaf] = _leaves(result)
+    assert leaf["callee"] is None, leaf
+    assert leaf["dest_expr"] == "fp#1", leaf
+    assert leaf["reachability"]["cause"] == "unresolved_call_target"
+    assert [s["address"] for s in leaf["reachability"]["unexamined_reference_sites"]] \
+        == [hex(0x401200)], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_an_unresolved_callback_without_a_live_global_stays_silent(models):
+    # The control: no tainted global, so there is nothing for the unknown
+    # target to read and no global boundary is invented for it.
+    fp = FVar("fp")
+    fp1 = FSSA(fp, 1)
+    dst = FVar("dst")
+    hook = _reader("run_hook", 0x401200, G_DIR, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+        call_sites=[(0x401108, _var(fp1), [])], params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "run_hook"},
+                   funcs={0x401200: hook}, refs={G_DIR: [FRef(hook, 0x401210)]})
+    assert _leaves(_forward(bv, func, models)) == []
+
+
+def test_a_resolved_map_target_replaces_the_unresolved_boundary(models):
+    # --resolve-map pins the callback, so the walk answers with the real
+    # target instead of the unresolved-target boundary.
+    fp = FVar("fp")
+    fp1 = FSSA(fp, 1)
+    hook = _reader("run_hook", 0x401200, G_DIR, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _var(fp1), [])], params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "run_hook"},
+                   funcs={0x401200: hook}, refs={G_DIR: [FRef(hook, 0x401210)]})
+    engine = te.TaintEngine(bv, models, resolve_map={hex(0x401108): [hex(0x401200)]})
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    [leaf] = _leaves(result)
+    assert leaf["callee"]["address"] == hex(0x401200), leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
 
 
 # --------------------------------------------------------------------------
@@ -805,7 +845,8 @@ def test_a_mixed_write_then_read_reference_is_a_consumer(models):
     [leaf] = _leaves(result)
     assert leaf["references"][0] == {
         "name": "overwrite_then_run", "display_name": "overwrite_then_run",
-        "address": hex(0x401200), "at": hex(0x401218), "access": "call_arg"}
+        "address": hex(0x401200), "at": hex(0x401218), "access": "call_arg",
+        "offset": 0}
 
 
 
@@ -984,7 +1025,7 @@ def test_an_unanalysed_in_binary_consumer_is_disclosed(models):
     # -- marked `unreadable`, so the prose says "may read", never "reads".
     assert leaf["references"] == [{"name": "huge_reader", "display_name": "huge_reader",
                                    "address": hex(0x401200), "at": hex(0x401210),
-                                   "access": "unreadable"}], leaf
+                                   "access": "unreadable", "offset": 0}], leaf
     assert "may read" in leaf["detail"]
     assert leaf["reachability"]["cause"] == "unread_callee_body"
     assert leaf["reachability"]["status"] == "truncated"
@@ -1297,3 +1338,156 @@ def test_a_phi_selected_pointer_with_one_reading_use_still_blocks(models):
     [leaf] = _leaves(_forward(bv, func, models))
     assert leaf["references"][0]["access"] == "call_arg", leaf
     assert leaf["references"][0]["at"] == hex(0x40121c), leaf
+
+
+# --------------------------------------------------------------------------
+# round-3 review F8: an interior reference is a reference to the object
+# --------------------------------------------------------------------------
+
+class FDataVar:
+    def __init__(self, address, width):
+        self.address = address
+        self.type = type("T", (), {"width": width})()
+
+
+class FExtentBV(FGlobalBV):
+    """``FGlobalBV`` plus data variables, so a global has an EXTENT and an
+    interior address canonicalizes back to its base."""
+
+    def __init__(self, addr_names, funcs=None, refs=None, objects=None, **kw):
+        super().__init__(addr_names, funcs, refs, **kw)
+        self._objects = objects or {}
+
+    def get_data_var_at(self, addr):
+        for base, width in self._objects.items():
+            if base <= int(addr) < base + width:
+                return FDataVar(base, width)
+        return None
+
+    def get_code_refs(self, addr, length=None):
+        lo, hi = int(addr), int(addr) + (int(length) if length else 1)
+        out = []
+        for ref_addr, rows in self._refs.items():
+            if lo <= int(ref_addr) < hi:
+                out.extend(rows)
+        return out
+
+
+def _interior_reader(name, start, addr, at):
+    """`system(g + 4)` -- the constant pointer names the object's interior."""
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", f"system({hex(addr)})",
+               dest=_gptr(SYSTEM), params=[_gptr(addr)]),
+    ]), params=[])
+
+
+def _interior_program(consumer, refs, objects):
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(int(consumer.start)), [])],
+        params_extra=[_const(0xff)])
+    bv = FExtentBV({STRNCPY: "strncpy", SYSTEM: "system",
+                    int(consumer.start): consumer.name},
+                   funcs={int(consumer.start): consumer},
+                   refs=refs, objects=objects)
+    return func, bv
+
+
+def test_a_consumer_of_an_interior_address_blocks_with_its_offset(models):
+    # Round-3 review F8: the copy fills g[0..63] and the consumer reads
+    # `g + 4`. BN records that code reference at the INTERIOR address, so
+    # asking only about the base found nothing and cleared the run.
+    consumer = _interior_reader("offset_consumer", 0x401200, G_DIR + 4, 0x401210)
+    func, bv = _interior_program(
+        consumer, {G_DIR + 4: [FRef(consumer, 0x401210)]},
+        {G_DIR: 64, G_OTHER: 64})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["global"]["address"] == hex(G_DIR), leaf
+    assert leaf["references"][0]["offset"] == 4, leaf
+    assert leaf["references"][0]["at"] == hex(0x401210), leaf
+    assert hex(4) in leaf["detail"], leaf["detail"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_consumer_of_the_base_address_reports_offset_zero(models):
+    consumer = _interior_reader("base_consumer", 0x401200, G_DIR, 0x401210)
+    func, bv = _interior_program(
+        consumer, {G_DIR: [FRef(consumer, 0x401210)]}, {G_DIR: 64, G_OTHER: 64})
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["offset"] == 0, leaf
+
+
+def test_a_disjoint_adjacent_object_is_not_the_tainted_global(models):
+    # The neighbouring object starts one byte past the end of the tainted
+    # one. Sweeping refs by extent must not reach into it.
+    adjacent = G_DIR + 64
+    consumer = _interior_reader("neighbour_consumer", 0x401200, adjacent + 8, 0x401210)
+    func, bv = _interior_program(
+        consumer, {adjacent + 8: [FRef(consumer, 0x401210)]},
+        {G_DIR: 64, adjacent: 64})
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+# --------------------------------------------------------------------------
+# round-3 review F9: an unread consumer behind a wrapper, at any depth
+# --------------------------------------------------------------------------
+
+def _skipped(name, start):
+    fn = GFunc(name, start, FSSAFunc([]), params=[])
+    fn.analysis_skipped = True
+    fn.analysis_skip_reason = type("R", (), {"name": "ExceedFunctionSizeSkipReason"})()
+    return fn
+
+
+@pytest.mark.parametrize("hops", [1, 2])
+def test_an_unread_consumer_behind_a_wrapper_is_disclosed(models, hops):
+    # Round-3 review F9: the immediate callee is an ordinary analysed
+    # wrapper; the body nothing could read sits one or two calls further on.
+    # Walking THROUGH it and answering "no reader" is the same hole as
+    # calling it directly.
+    unread_fn = _skipped("huge_reader", 0x401500)
+    chain = [unread_fn]
+    for i in range(hops):
+        chain.append(_quiet(f"wrapper{i}", 0x401300 + i * 0x20, callees=[chain[-1]]))
+    head = chain[-1]
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(int(head.start)), [])], params_extra=[_const(0xff)])
+    names = {STRNCPY: "strncpy", SYSTEM: "system"}
+    funcs = {}
+    for fn in chain:
+        names[int(fn.start)] = fn.name
+        funcs[int(fn.start)] = fn
+    hook = _reader("other_reader", 0x401600, G_DIR, 0x401610)
+    names[0x401600] = "other_reader"
+    funcs[0x401600] = hook
+    bv = FGlobalBV(names, funcs=funcs, refs={G_DIR: [FRef(hook, 0x401610)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["reachability"]["cause"] == "unread_callee_body", leaf
+    assert [b["name"] for b in leaf["reachability"]["unread_bodies"]] == ["huge_reader"]
+    assert "huge_reader" in leaf["detail"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert result["stats"]["analysis_incomplete"] is True
+    assert "huge_reader" in result["stats"]["analysis_incomplete_functions"]
+
+
+def test_a_wrapper_over_fully_analysed_callees_stays_silent(models):
+    # The control: every descendant was read and none of them touches the
+    # tainted global, so the answer stands.
+    leafy = _quiet("leafy", 0x401500)
+    wrapper = _quiet("wrapper", 0x401300, callees=[leafy])
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0xff)])
+    hook = _reader("other_reader", 0x401600, G_DIR, 0x401610)
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401300: "wrapper",
+                    0x401500: "leafy", 0x401600: "other_reader"},
+                   funcs={0x401300: wrapper, 0x401500: leafy, 0x401600: hook},
+                   refs={G_DIR: [FRef(hook, 0x401610)]})
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["stats"]["analysis_incomplete"] is False

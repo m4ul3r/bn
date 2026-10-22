@@ -5358,10 +5358,59 @@ class TaintEngine:
     # review F2: the cap used to turn an unfinished search into an all-clear).
     _GLOBAL_REACH_FUNCS = 512
 
+    def _global_extent(self, ga: int) -> int:
+        """Byte width of the data variable at *ga*, bounded, else 1."""
+        getdv = getattr(self.bv, "get_data_var_at", None)
+        if not callable(getdv):
+            return 1
+        try:
+            width = getattr(getattr(getdv(ga), "type", None), "width", None)
+            return max(1, min(int(width), 1 << 20))
+        except Exception:
+            return 1
+
+    def _global_use_offset(self, expr: Any, ga: int) -> int:
+        """Byte offset INSIDE the global at *ga* that *expr* names, else 0.
+
+        `system(g + 4)` lifts to a constant pointer at the interior address;
+        the taint key is the object's base, so the leaf reports the base and
+        this offset rather than losing which bytes the consumer reached
+        (round-3 review F8)."""
+        best: int | None = None
+        stack: list[tuple[Any, int]] = [(expr, 0)]
+        while stack:
+            node, depth = stack.pop()
+            if node is None or depth > 10:
+                continue
+            raw = getattr(node, "constant", None)
+            if raw is not None:
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    value = None
+                if value is not None and value >= ga and self._canon_global(value) == ga:
+                    off = value - ga
+                    best = off if best is None else min(best, off)
+            for attr in ("src", "dest", "left", "right", "params"):
+                sub = getattr(node, attr, None)
+                if isinstance(sub, (list, tuple)):
+                    stack.extend((s, depth + 1) for s in sub)
+                elif sub is not None:
+                    stack.append((sub, depth + 1))
+            stack.extend((s, depth + 1) for s in (getattr(node, "operands", None) or ()))
+        return best or 0
+
     def _global_ref_functions(self, ga: int) -> dict[int, int]:
         """``{function start: lowest referencing address}`` for every code
-        reference to the global at *ga*, read from BN's own code-reference DB
-        (the source `bn xrefs` reads).
+        reference to the global OBJECT based at *ga*, read from BN's own
+        code-reference DB (the source `bn xrefs` reads).
+
+        The whole object is asked for, not just its first byte: a consumer
+        that names `g + 4` has its code reference recorded at the interior
+        address, and `_canon_global` folds that back to this base, so missing
+        it left an ordinary indexed reader undiscovered (round-3 review F8).
+        The width is the data variable's own, so a DISJOINT neighbouring
+        object's references are not swept in.
 
         ``{}`` whenever that DB cannot answer -- a view with no
         ``get_code_refs`` (the unit fakes, a partially loaded view), a raising
@@ -5369,7 +5418,7 @@ class TaintEngine:
         the caller stays silent rather than inventing a boundary, because the
         alternative is a frontier on every call after any global write.
 
-        A reference here is any mention of the address; whether the function
+        A reference here is any mention of the object; whether the function
         can READ the bytes is decided by :meth:`_global_access`."""
         cached = self._global_refs.get(ga)
         if cached is not None:
@@ -5377,10 +5426,15 @@ class TaintEngine:
         out: dict[int, int] = {}
         get_refs = getattr(self.bv, "get_code_refs", None)
         if callable(get_refs):
+            extent = self._global_extent(ga)
+            refs: list[Any] = []
             try:
-                refs = list(get_refs(int(ga)) or [])
+                refs = list(get_refs(int(ga), extent) or [])
             except Exception:
-                refs = []
+                try:
+                    refs = list(get_refs(int(ga)) or [])
+                except Exception:
+                    refs = []
             for ref in refs:
                 start = getattr(getattr(ref, "function", None), "start", None)
                 if start is None:
@@ -5667,7 +5721,7 @@ class TaintEngine:
         return self._ptr_resolves(ssaf, src, base)
 
     def _pointer_access(self, fn: Any, base: Any, *, fallback: int | None,
-                        depth: int = 0) -> tuple[int | None, str]:
+                        depth: int = 0, offset_of: Any = None) -> tuple:
         """``(address, kind)`` of the first use inside *fn* that can READ the
         bytes the tracked pointer addresses, or ``(None, "write_only")`` ONLY
         when every terminal use is a proven write into them.
@@ -5689,7 +5743,15 @@ class TaintEngine:
             ssaf = self._ssa_func(fn)
             instrs = self._instrs(ssaf)
         except TaintError:
-            return (fallback, "unreadable")
+            return (fallback, "unreadable", 0)
+
+        def verdict(ins: Any, kind: str) -> tuple:
+            """`(address, kind, offset)` -- the offset names WHICH bytes of
+            the object the use reached (F8); 0 when it is the base or when
+            the tracked pointer is not an object with a base."""
+            return (int(getattr(ins, "address", 0)), kind,
+                    int(offset_of(ins)) if offset_of is not None else 0)
+
         wrote = False
         for ins in instrs:
             opn = op_name(ins)
@@ -5703,7 +5765,7 @@ class TaintEngine:
                     # under-recovered this call's arity, so what the callee
                     # does with the bytes is unknown, not a read.
                     if self._expr_mentions(ssaf, ins, base):
-                        return (at, "unknown_call_arg")
+                        return verdict(ins, "unknown_call_arg")
                     continue
                 body, unread_body = self._callee_body(ins)
                 if body is not None:
@@ -5712,26 +5774,26 @@ class TaintEngine:
                     if all(self._param_destination_only(body, i, depth) for i in hit):
                         wrote = True
                         continue
-                    return (at, "unknown_call_arg")
+                    return verdict(ins, "unknown_call_arg")
                 if unread_body:
                     # There IS an in-binary body and nothing read it, so no
                     # model on this name can promise it only writes (F7).
-                    return (at, "unknown_call_arg")
+                    return verdict(ins, "unknown_call_arg")
                 _key, model = lookup_model(
                     self.models, self._callee_name(self._resolve_direct_target(ins)))
                 roles = [self._model_arg_role(model, i) for i in hit]
                 if "read" in roles:
-                    return (at, "call_arg")       # a modeled source operand
+                    return verdict(ins, "call_arg")   # a modeled source operand
                 if all(r == "write" for r in roles):
                     wrote = True                  # a modeled destination, and
                     continue                      # no body to contradict it
-                return (at, "unknown_call_arg")
+                return verdict(ins, "unknown_call_arg")
             if "RET" in opn:
                 srcs = getattr(ins, "src", None)
                 if not isinstance(srcs, (list, tuple)):
                     srcs = [] if srcs is None else [srcs]
                 if any(self._ptr_resolves(ssaf, s, base) for s in srcs):
-                    return (at, "return")
+                    return verdict(ins, "return")
             if "STORE" in opn:
                 dest_hit = self._ptr_resolves(ssaf, getattr(ins, "dest", None), base)
                 src_hit = self._expr_mentions(ssaf, getattr(ins, "src", None), base)
@@ -5741,22 +5803,25 @@ class TaintEngine:
                 if dest_hit or src_hit:
                     # `p[i] = p[j] + 1` reads, and `*q = p` escapes the
                     # address to memory this walk cannot follow.
-                    return (at, "load" if self._expr_loads(ssaf, ins, base)
-                            else "address_escape")
+                    return verdict(ins, "load" if self._expr_loads(ssaf, ins, base)
+                                   else "address_escape")
                 continue
             if self._expr_mentions(ssaf, ins, base):
                 if self._expr_loads(ssaf, ins, base):
-                    return (at, "load")
+                    return verdict(ins, "load")
                 if self._is_pointer_carry(ssaf, ins, base):
                     continue          # moved, not used: see the terminal uses
-                return (at, "unclassified")
+                return verdict(ins, "unclassified")
         # Nothing read-capable. A body with a proven write and nothing else
         # is a write-only use; a body where this scan accounted for no use at
         # all is disclosed rather than cleared.
-        return (None, "write_only") if wrote else (fallback, "unclassified")
+        return (None, "write_only", 0) if wrote else (fallback, "unclassified", 0)
 
-    def _global_access(self, fn: Any, ga: int) -> tuple[int | None, str]:
-        """:meth:`_pointer_access` rooted at the global at *ga*, cached."""
+    def _global_access(self, fn: Any, ga: int) -> tuple:
+        """:meth:`_pointer_access` rooted at the global at *ga*, cached.
+
+        Returns ``(address, kind, offset)``; the offset says which bytes of
+        the object the use reached (F8)."""
         key = (int(getattr(fn, "start", 0)), int(ga))
         cached = self._global_access_cache.get(key)
         if cached is not None:
@@ -5764,25 +5829,26 @@ class TaintEngine:
         try:
             ssaf = self._ssa_func(fn)
         except TaintError:
-            out: tuple[int | None, str] = (
-                self._global_ref_functions(ga).get(key[0]), "unreadable")
+            out: tuple = (self._global_ref_functions(ga).get(key[0]), "unreadable", 0)
             self._global_access_cache[key] = out
             return out
         out = self._pointer_access(
             fn, self._global_base(ssaf, ga),
-            fallback=self._global_ref_functions(ga).get(key[0]))
+            fallback=self._global_ref_functions(ga).get(key[0]),
+            offset_of=lambda ins: self._global_use_offset(ins, ga))
         self._global_access_cache[key] = out
         return out
 
     def _global_refs_reachable(self, fn: Any, ga: int, budget: int) -> tuple[tuple, dict]:
         """``(reads, reach)`` for the global at *ga* as seen from *fn*.
 
-        ``reads`` is ``((function start, address, access kind), ...)`` for the
-        functions that can READ the global and sit within *budget* further
-        call levels of *fn* (level 0 is *fn* itself), ordered by function
-        address so one leaf is byte-identical across the fixpoint's repeated
-        visits. A function whose every reference is a store into the global
-        is not a read and is left out (F3).
+        ``reads`` is ``((function start, address, kind, offset), ...)`` for
+        the functions that can READ the global and sit within *budget*
+        further call levels of *fn* (level 0 is *fn* itself), ordered by
+        function address so one leaf is byte-identical across the fixpoint's
+        repeated visits. A function whose every reference is a store into the
+        global is not a read and is left out (F3), and ``offset`` names which
+        bytes of the object the use reached (F8).
 
         ``reach`` is the structured status of the search:
         ``complete`` -- the walk ran out of call-graph, or every function that
@@ -5792,6 +5858,13 @@ class TaintEngine:
         functions left ``unexamined`` -- the walk stopped early with
         somewhere the bytes could still be read unvisited, so "no reader" is
         NOT an answer and the caller must disclose it (F2).
+
+        A reachable in-binary DESCENDANT whose body BN never analysed is
+        itself a truncation: its own references cannot be classified, so a
+        wrapper around an unread consumer answers ``unread_callee_body``
+        exactly as the immediate callee does (round-3 review F9), and the
+        functions are returned in ``reach["unread_bodies"]`` so the caller
+        can record them as analysis-incomplete.
 
         The walk follows BN's ``Function.callees`` edges only -- a resolved
         call graph, the same evidence `bn dataflow callgraph` renders. An
@@ -5804,7 +5877,8 @@ class TaintEngine:
         cached = self._global_reach.get(key)
         if cached is not None:
             return cached
-        found: dict[int, tuple[int, str]] = {}
+        found: dict[int, tuple] = {}
+        unread: dict[int, str] = {}
         # `seen` is what the walk has QUEUED (the bound that keeps a dense
         # graph finite); `done` is what it actually examined. Only the latter
         # can rule a reference out -- a function discovered on the last wave
@@ -5820,10 +5894,20 @@ class TaintEngine:
             for cur in wave:
                 cs = int(getattr(cur, "start", 0))
                 done.add(cs)
+                reason = str(self._not_internal_reason(cur) or "")
+                if reason.startswith("analysis_skipped:") and lookup_model(
+                        self.models, self._callee_name(cs))[1] is None:
+                    # F9: an in-binary descendant BN measured and skipped.
+                    # Nothing read its references, so the walk past it proves
+                    # nothing -- whatever depth it sits at.
+                    unread[cs] = str(getattr(cur, "name", None) or hex(cs))
+                    for site in self._native_global_refs(cur, ga)[:1]:
+                        found.setdefault(cs, (site, "unreadable", 0))
+                    continue
                 if cs in known and cs not in found:
-                    at, kind = self._global_access(cur, ga)
+                    at, kind, off = self._global_access(cur, ga)
                     if at is not None:
-                        found[cs] = (at, kind)
+                        found[cs] = (at, kind, off)
                 try:
                     callees = list(getattr(cur, "callees", None) or ())
                 except Exception:
@@ -5849,8 +5933,15 @@ class TaintEngine:
             # Every function BN records a reference from was examined, so the
             # bound that stopped the walk cannot have hidden a reader.
             cut = None
-        out = (tuple(sorted((s, a, k) for s, (a, k) in found.items())),
-               self._reach_status(cut, len(done), unexamined, known))
+        if unread:
+            # An unread descendant outranks a budget: the walk did not stop
+            # early, it walked INTO something it could not read (F9).
+            cut = "unread_callee_body"
+        status = self._reach_status(cut, len(done), unexamined, known)
+        status["unread_bodies"] = [
+            {"name": unread[k], "address": hex(k)} for k in sorted(unread)]
+        out = (tuple(sorted((st, a, k, o) for st, (a, k, o) in found.items())),
+               status)
         self._global_reach[key] = out
         return out
 
@@ -5873,6 +5964,7 @@ class TaintEngine:
             "function_budget": self._GLOBAL_REACH_FUNCS,
             "unexamined_references_total": len(unexamined),
             "unexamined_references": [hex(a) for a in unexamined[:8]],
+            "unread_bodies": [],
             "unexamined_reference_sites": [
                 {"name": str(getattr(function_at(self.bv, s), "name", None)
                              or self._callee_name(s) or hex(s)),
@@ -5892,38 +5984,59 @@ class TaintEngine:
         not be read. ``access`` says which, and the prose never claims a read
         it did not see."""
         rows = []
-        for start, at, kind in references[:8]:
+        for start, at, kind, offset in references[:8]:
             rfn = function_at(self.bv, start)
             nm = str(getattr(rfn, "name", None) or self._callee_name(start) or hex(start))
             rows.append({"name": nm,
                          "display_name": (_display_name(rfn) or nm) if rfn is not None else nm,
-                         "address": hex(start), "at": hex(at), "access": kind})
+                         "address": hex(start), "at": hex(at), "access": kind,
+                         "offset": int(offset)})
         crossed = ("this call is descended with its tainted argument(s) only"
                    if descended else
                    "no argument of this call carries taint, so it is not descended")
-        seed_at = rows[0]["address"] if rows else hex(int(getattr(callee_fn, "start", 0)))
+        if rows:
+            seed_at = rows[0]["address"]
+        elif callee_fn is not None:
+            seed_at = hex(int(getattr(callee_fn, "start", 0)))
+        else:
+            sites = reach.get("unexamined_reference_sites") or []
+            seed_at = str(sites[0].get("address")) if sites else hex(ga)
         reseed = command_template(f"bn taint forward -f {seed_at} --source var:VAR")
         parts = []
         if rows:
-            where = ", ".join(f"{r['display_name']} @ {r['at']} ({r['access']})" for r in rows)
+            where = ", ".join(
+                f"{r['display_name']} @ {r['at']}"
+                + (f" (+{hex(r['offset'])})" if r["offset"] else "")
+                + f" ({r['access']})" for r in rows)
             verb = ("reads" if any(r["access"] in _PROVEN_GLOBAL_READS for r in rows)
                     else "may read")
             parts.append(
                 f"tainted bytes were copied into the writable global {hex(ga)}, and code "
                 f"reachable from this call {verb} it ({where}).")
         else:
+            crossing = ("this call's target did not resolve"
+                        if reach.get("cause") == "unresolved_call_target"
+                        else "this call crosses into code whose use of it could not be read")
             parts.append(
-                f"tainted bytes were copied into the writable global {hex(ga)}, and this "
-                f"call crosses into code whose use of it could not be read.")
+                f"tainted bytes were copied into the writable global {hex(ga)}, and "
+                f"{crossing}.")
         if reach.get("status") == "truncated":
             bound = {
                 "depth_budget": "the configured interprocedural depth",
                 "unresolved_thunk": "an in-binary thunk whose tail call did not resolve",
+                "unresolved_call_target": (
+                    "an indirect call whose target bn could not resolve "
+                    "(pin it with --resolve-map and re-run)"),
                 "unread_callee_body": (
                     "an in-binary callee body Binary Ninja did not analyse "
                     "(re-run after `bn decompile <callee> --force-analysis`)"),
             }.get(str(reach.get("cause")),
                   f"the {reach.get('function_budget')}-function reachability bound")
+            unread_named = ", ".join(
+                f"{b.get('name')} @ {b.get('address')}"
+                for b in (reach.get("unread_bodies") or []))
+            if unread_named:
+                bound += f" -- {unread_named}"
             unreached = ", ".join(
                 f"{r.get('name')} @ {r.get('at')}"
                 for r in (reach.get("unexamined_reference_sites") or [])) or "n/a"
@@ -5943,9 +6056,11 @@ class TaintEngine:
             "kind": "global_memory_continuation",
             "address": hex(int(getattr(ins, "address", 0))),
             "global": {"address": hex(ga), "label": f"glob_{hex(ga)}"},
-            "callee": {"name": str(getattr(callee_fn, "name", "?")),
-                       "display_name": _display_name(callee_fn) or str(getattr(callee_fn, "name", "?")),
-                       "address": hex(int(getattr(callee_fn, "start", 0)))},
+            "callee": None if callee_fn is None else {
+                "name": str(getattr(callee_fn, "name", "?")),
+                "display_name": (_display_name(callee_fn)
+                                 or str(getattr(callee_fn, "name", "?"))),
+                "address": hex(int(getattr(callee_fn, "start", 0)))},
             "references": rows,
             "reachability": reach,
             "call_descended": bool(descended),
@@ -6194,6 +6309,29 @@ class TaintEngine:
                             getattr(getattr(ins, "dest", None), "possible_values", None)))
                 global_call_targets[addr] = cands
             if not cands:
+                # F10: control leaves this function for somewhere bn could not
+                # name, with tainted global bytes live and code in this binary
+                # that references them. Nothing proves the target is not one
+                # of those readers, so the boundary is disclosed rather than
+                # skipped. Only when no ARGUMENT carries taint: an indirect
+                # call that does carry one already raises
+                # `indirect_call_unresolved`, and two leaves for one call
+                # would say the same thing twice. Pinning the site with
+                # --resolve-map (or a value set bn can pin) replaces this with
+                # the real target's answer.
+                if descended:
+                    return
+                for ga in list(pending):
+                    known = self._global_ref_functions(ga)
+                    reach = self._reach_status(
+                        "unresolved_call_target", 0, sorted(known), known)
+                    global_frontiers_seen.add((addr, ga))
+                    pending.remove(ga)
+                    leaf = self._global_continuation_leaf(
+                        ins, ga, None, (), descended, reach)
+                    leaf["dest_expr"] = str(getattr(ins, "dest", ""))
+                    if leaf not in leaves:
+                        leaves.append(leaf)
                 return
             budget = max(0, max_depth - depth)
             for taddr in cands:
@@ -6257,12 +6395,16 @@ class TaintEngine:
                             sites = self._native_global_refs(cfn, ga)
                         else:
                             sites = ()
-                        refs = tuple((own, a, "unreadable") for a in sites[:8])
+                        refs = tuple((own, a, "unreadable", 0) for a in sites[:8])
                         reach = self._reach_status(
                             unread, 0,
                             sorted(k for k in known if not (refs and k == own)), known)
                     else:
                         refs, reach = self._global_refs_reachable(cfn, ga, budget)
+                        for body in reach.get("unread_bodies") or ():
+                            # F9: a wrapper around an unread consumer is the
+                            # same hole as calling it directly.
+                            self._analysis_incomplete.add(str(body.get("name")))
                     if not refs and reach["status"] != "truncated":
                         continue
                     global_frontiers_seen.add((addr, ga))
