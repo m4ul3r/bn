@@ -450,14 +450,18 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         seed = (f" ({command_template(forward(inside, 'var:VAR'))})" if inside else "")
         head = ("taint reached no modeled sink HERE, but it was copied into the writable "
                 f"global(s) {', '.join(globals_at)}")
-        if reads:
-            return (f"{head}, which code reachable from a call this walk made reads "
-                    f"({', '.join(reads)}); those bytes are not followed across the call. "
-                    f"Read every reference with `bn xrefs {globals_at[0]}` and re-seed "
-                    f"inside the consumer on the value it loads{seed}")
         truncated_at = sorted({str((lf.get("reachability") or {}).get("cause"))
                                for lf in crossed
                                if (lf.get("reachability") or {}).get("status") == "truncated"})
+        if reads:
+            # A named reader and a truncated search are not alternatives: say
+            # both, so the advice never reads as "and that is all of them".
+            cut = (f" The search was also TRUNCATED ({', '.join(truncated_at)}), so "
+                   f"further references may exist." if truncated_at else "")
+            return (f"{head}, which code reachable from a call this walk made reads "
+                    f"({', '.join(reads)}); those bytes are not followed across the call."
+                    f"{cut} Read every reference with `bn xrefs {globals_at[0]}` and "
+                    f"re-seed inside the consumer on the value it loads{seed}")
         return (f"{head}, and the search for code reading it past a call this walk made "
                 f"was TRUNCATED ({', '.join(truncated_at) or 'bound reached'}) with "
                 f"references unexamined -- whether those bytes reach a sink is unknown, "

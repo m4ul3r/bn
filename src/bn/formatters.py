@@ -5008,8 +5008,14 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"{_shown_name(r, mangled=mangled) or '?'} @ {r.get('at', '?')}"
             + (f" ({r['access']})" if r.get("access") else "")
             for r in refs)
-        if where:
+        truncated = str(reach.get("status")) == "truncated"
+        if where and not truncated:
             middle = f"  (read by {where})"
+        elif where:
+            # A named reader and an unfinished search are not alternatives:
+            # the row says both, so it never reads as "and that is all".
+            middle = (f"  (read by {where}; reachability truncated:"
+                      f" {reach.get('cause', '?')})")
         else:
             # No reader is NAMED because the search never finished: say which
             # bound stopped it and how much it left unexamined, so the row is

@@ -1952,3 +1952,197 @@ def test_returning_the_global_itself_is_still_an_escape(models):
     [leaf] = _leaves(_forward(bv, func, models))
     assert leaf["references"][0]["access"] == "return", leaf
     assert "may read" in leaf["detail"], leaf["detail"]
+
+
+# --------------------------------------------------------------------------
+# round-3 review F18/F19: provenance through chains of returning wrappers
+# --------------------------------------------------------------------------
+
+READ = 0x4010b0
+
+
+def _relay(name, start, inner_start, at=0x401210):
+    """`char *relay(void) { return inner(); }` -- it names no global itself."""
+    r = FSSA(FVar("r"), 1)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", f"r#1 = {hex(inner_start)}()", writes=[r],
+               dest=_gptr(inner_start), params=[]),
+        FInstr(1, at + 8, "MLIL_RET", "return r#1", reads=[r], src=[_var(r)]),
+    ]), params=[])
+
+
+def _arg_reset(name, start, at=0x401210):
+    """`char *reset_arg(char *p) { return memset(p, 0, 1); }`."""
+    p = FVar("p")
+    p0, r = FSSA(p, 0), FSSA(FVar("r"), 1)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", "r#1 = memset(p#0, 0, 1)", reads=[p0], writes=[r],
+               dest=_gptr(MEMSET), params=[_var(p0), _const(0), _const(1)]),
+        FInstr(1, at + 8, "MLIL_RET", "return r#1", reads=[r], src=[_var(r)]),
+    ]), params=[p])
+
+
+def _reads_offset(name, start, helper_start, args=(), at=0x401310, use_at=0x401318):
+    """`system(helper(..) + 8)` -- the read is at an offset the reset missed."""
+    q = FSSA(FVar("q"), 1)
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, at, "MLIL_CALL_SSA", f"q#1 = {hex(helper_start)}(..)", writes=[q],
+               dest=_gptr(helper_start), params=list(args)),
+        FInstr(1, use_at, "MLIL_CALL_SSA", "system(q#1 + 8)", reads=[q],
+               dest=_gptr(SYSTEM),
+               params=[FExpr("MLIL_ADD", "q#1 + 8", left=_var(q), right=_const(8))]),
+    ]), params=[])
+
+
+def _chain_program(chain, consumer, refs_from):
+    """`main` copies into G_DIR, then calls *consumer*; *chain* are the
+    helpers it reaches. Only *refs_from* names the global."""
+    names = {STRNCPY: "strncpy", SYSTEM: "system", MEMSET: "memset", READ: "read"}
+    funcs = {}
+    for fn in [*chain, consumer]:
+        names[int(fn.start)] = fn.name
+        funcs[int(fn.start)] = fn
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(int(consumer.start)), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV(names, funcs=funcs,
+                   refs={G_DIR: [FRef(refs_from, 0x401210)]})
+    return func, bv
+
+
+@pytest.mark.parametrize("hops", [1, 2, 3])
+def test_a_chain_of_returning_wrappers_keeps_the_provenance(models, hops):
+    # Round-3 review F18: `reset_ret` returns `memset(g, 0, 1)`, a relay
+    # returns that, and the consumer reads `+ 8` -- bytes the one-byte reset
+    # never touched. Only `reset_ret` names the global, so a walk that
+    # classified just the naming functions reported a clean run.
+    inner = _ret_helper("reset_ret", 0x401200)
+    chain = [inner]
+    nxt = 0x401200
+    for i in range(hops - 1):
+        relay = _relay(f"relay{i}", 0x401400 + i * 0x20, nxt)
+        chain.append(relay)
+        nxt = int(relay.start)
+    consumer = _reads_offset("use_ret", 0x401300, nxt)
+    consumer.callees = [chain[-1]]
+    for i in range(len(chain) - 1, 0, -1):
+        chain[i].callees = [chain[i - 1]]
+    func, bv = _chain_program(chain, consumer, inner)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "use_ret", leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert leaf["references"][0]["at"] == hex(0x401318), leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_helper_returning_its_own_parameter_remaps_to_the_actual(models):
+    # Round-3 review F19: `reset_arg(char *p) { return memset(p, 0, 1); }`
+    # names no global -- inside it the object is a FORMAL. The caller passes
+    # the global and reads `+ 8` through the result, so the actual has to be
+    # mapped onto the formal and back.
+    helper = _arg_reset("reset_arg", 0x401200)
+    consumer = _reads_offset("use_arg_ret", 0x401300, 0x401200, args=[_gptr(G_DIR)])
+    consumer.callees = [helper]
+    func, bv = _chain_program([helper], consumer, consumer)
+    eng = te.TaintEngine(bv, models)
+    assert eng._fn_returned_params(helper) == (0,)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert leaf["references"][0]["at"] == hex(0x401318), leaf
+
+
+def test_a_chain_whose_result_is_ignored_stays_silent(models):
+    # The control: the same chain, but nothing consumes what comes back.
+    inner = _ret_helper("reset_ret", 0x401200)
+    relay = _relay("relay", 0x401400, 0x401200)
+    relay.callees = [inner]
+    consumer = _ignores_result("ignore_ret", 0x401300, 0x401400)
+    consumer.callees = [relay]
+    func, bv = _chain_program([inner, relay], consumer, inner)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_partial_reset_does_not_sanitize_the_whole_object(models):
+    # A one-byte `memset` is a write to byte 0, not a proof that the object
+    # holds nothing: the read at `+8` is still a read of tainted bytes.
+    inner = _ret_helper("reset_ret", 0x401200)
+    consumer = _reads_offset("use_ret", 0x401300, 0x401200)
+    consumer.callees = [inner]
+    func, bv = _chain_program([inner], consumer, inner)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+
+
+def test_the_scan_budget_is_disclosed_not_silently_cleared(models, monkeypatch):
+    # The walk's node pool is per function scan; running out must leave an
+    # honest "could not finish classifying", never a clean answer.
+    monkeypatch.setattr(te.TaintEngine, "_PTR_SCAN_NODES", 0)
+    func, hook, bv = _globalflow(extra_copy_params=[_const(0xff)])
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["access"] == "unclassified", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+# --------------------------------------------------------------------------
+# round-3 review F20: a source model's output buffer is a WRITE
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name,idx,role", [
+    ("read", 1, "write"), ("recv", 1, "write"), ("fgets", 0, "write"),
+    ("memset", 0, "write"), ("system", 0, "read"), ("strcat", 0, "read"),
+    ("memcpy", 1, "read"),
+])
+def test_model_argument_roles(models, name, idx, role):
+    assert te.TaintEngine._model_arg_role(models[name], idx) == role, (name, idx)
+
+
+def test_a_read_output_destination_is_not_a_consumer(models):
+    # Round-3 review F20: `read(0, g, 64)` FILLS g. The role lives in the
+    # model's `sources`, which the role test never consulted, so the call
+    # came back "unknown" and raised a blocking frontier on a refill.
+    helper = _modeled_call("refill", 0x401200, READ,
+                           [_const(0), _gptr(G_DIR), _const(64)])
+    func, bv = _after_copy(helper)
+    bv._names[READ] = "read"
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_read_followed_by_a_use_of_the_global_still_blocks(models):
+    # ...and a refill followed by a genuine read of the bytes is a consumer.
+    helper = GFunc("refill_then_read", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_CALL_SSA", "read(0, g, 64)",
+               dest=_gptr(READ), params=[_const(0), _gptr(G_DIR), _const(64)]),
+        FInstr(1, 0x401218, "MLIL_CALL_SSA", "system(g)",
+               dest=_gptr(SYSTEM), params=[_gptr(G_DIR)]),
+    ]), params=[])
+    func, bv = _after_copy(helper)
+    bv._names[READ] = "read"
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert leaf["references"][0]["at"] == hex(0x401218), leaf
+
+
+def test_an_in_binary_body_still_outranks_a_source_model(models):
+    # F7 stands: a model never speaks for a callee this binary has a body
+    # for. A local `read`-named body that hands the buffer to system is a
+    # consumer, whatever its name's model says.
+    body = GFunc("read", 0x401400, FSSAFunc([
+        FInstr(0, 0x401410, "MLIL_CALL_SSA", "system(p#0)",
+               reads=[FSSA(FVar("p"), 0)], dest=_gptr(SYSTEM),
+               params=[_var(FSSA(FVar("p"), 0))]),
+    ]), params=[FVar("fd"), FVar("p"), FVar("n")])
+    helper = _modeled_call("refill", 0x401200, 0x401400,
+                           [_const(0), _gptr(G_DIR), _const(64)])
+    func, bv = _after_copy(helper)
+    bv._names[0x401400] = "read"
+    bv._funcs[0x401400] = body
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["access"] == "unknown_call_arg", leaf

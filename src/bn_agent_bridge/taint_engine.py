@@ -343,6 +343,7 @@ class TaintEngine:
         # a targeted xref query, not a whole-program solve.
         self._canon_global_cache: dict[int, int | None] = {}
         self._ssa_def_cache: dict[tuple, Any] = {}
+        self._returned_params_cache: dict[int, tuple] = {}
         self._global_refs: dict[int, dict[int, int]] = {}
         # globals whose reference sweep hit its chunk budget, so "no further
         # references" was never established for them.
@@ -5675,12 +5676,17 @@ class TaintEngine:
     # the budget is sized for a copy chain, not for a handful of nodes.
     # Stepping into a callee's returns costs a whole block of it, which is
     # what bounds the nesting.
-    _PTR_RESOLVE_DEPTH = 48
+    _PTR_RESOLVE_DEPTH = 96
     _PTR_RETURN_STEP = 16
+    # Expression nodes ONE function scan may visit, shared across its
+    # instructions: the walk fans out across every operand, so a depth
+    # budget alone is exponential on a wide tree. Exhausting it is
+    # DISCLOSED, never answered as "nothing here".
+    _PTR_SCAN_NODES = 50000
     # Expression nodes ONE resolution may visit. The walk fans out across
     # every operand, so a deep budget without a node budget is exponential
     # on a wide tree; this keeps a single question linear in practice.
-    _PTR_RESOLVE_NODES = 512
+    _PTR_RESOLVE_NODES = 50000
 
     def _ssa_def(self, ssaf: Any, var: Any) -> Any:
         """``get_ssa_var_definition`` memoised for one walk.
@@ -5761,8 +5767,20 @@ class TaintEngine:
                 # memset(g, 0, n); }`). Ask it, so the CALLER's use of the
                 # result is the read that blocks (round-3 review F17).
                 body, _unread = self._callee_body(defn)
-                return body is not None and self._fn_returns_pointer(
-                    body, base, depth + self._PTR_RETURN_STEP, budget=budget)
+                if body is None:
+                    return False
+                if self._fn_returns_pointer(
+                        body, base, depth + self._PTR_RETURN_STEP, budget=budget):
+                    return True
+                # ...or it hands back one of its own parameters, in which
+                # case the result is whatever THIS call passed there (F19).
+                for pidx in self._fn_returned_params(body):
+                    if pidx < len(params) and self._ptr_resolves(
+                            ssaf, params[pidx], base,
+                            depth + self._PTR_RETURN_STEP, seen,
+                            alias=alias, budget=budget):
+                        return True
+                return False
             srcs = getattr(defn, "src", None)
             if not isinstance(srcs, (list, tuple)):
                 srcs = [] if srcs is None else [srcs]
@@ -5804,6 +5822,38 @@ class TaintEngine:
             return list(srcs)
         except TypeError:
             return [srcs]
+
+    def _fn_returned_params(self, fn: Any) -> tuple[int, ...]:
+        """Parameter indices *fn* may hand back as its return value.
+
+        `char *reset_arg(char *p) { return memset(p, 0, 1); }` returns its
+        own destination, so at the call site the result is whatever the
+        CALLER passed -- the remapping the alias needs (round-3 review F19).
+        Searching the callee's body for the global's address instead finds
+        nothing: inside the callee it is a formal parameter."""
+        key = int(getattr(fn, "start", 0))
+        cached = self._returned_params_cache.get(key)
+        if cached is not None:
+            return cached
+        out: list[int] = []
+        ssaf = None
+        instrs: list[Any] = []
+        formals: list[Any] = []
+        try:
+            ssaf = self._ssa_func(fn)
+            instrs = self._instrs(ssaf)
+            formals = list(getattr(fn, "parameter_vars", []) or [])
+        except TaintError:
+            pass
+        rets = [ins for ins in instrs if "RET" in op_name(ins)]
+        for idx, formal in enumerate(formals):
+            root = (lambda k: lambda e: is_ssa_var(e) and var_key(e) == k)(var_key(formal))
+            if any(self._ptr_resolves(ssaf, src, root)
+                   for ins in rets for src in self._ret_sources(ins)):
+                out.append(idx)
+        result = tuple(out)
+        self._returned_params_cache[key] = result
+        return result
 
     def _fn_returns_pointer(self, fn: Any, base: Any, depth: int = 0,
                             budget: list | None = None) -> bool:
@@ -5928,6 +5978,14 @@ class TaintEngine:
             return "unknown"
         tok = f"*arg:{idx}"
         written = read = False
+        for rule in (model.get("sources") or ()):
+            if str(rule.get("to") or "") == tok:
+                # A source model's output buffer is what the callee FILLS --
+                # `read(fd, g, 64)` writes g, it does not consume the bytes
+                # already there (round-3 review F20). Declared in `sources`
+                # rather than `propagates`, so asking only the propagate
+                # rules left the role unstated and the call "unknown".
+                written = True
         if tok in (model.get("reads_dest") or ()):
             # An APPEND reads its destination to find where to append
             # (round-3 review I4): `strcat(g, "suffix")` consumes g's bytes
@@ -6001,7 +6059,8 @@ class TaintEngine:
             self._param_access_cache[key] = cached
         return cached[1] == "write_only"
 
-    def _is_pointer_carry(self, ssaf: Any, ins: Any, base: Any) -> bool:
+    def _is_pointer_carry(self, ssaf: Any, ins: Any, base: Any,
+                          budget: list | None = None) -> bool:
         """`p = g`, `p = q + 4`, `p = phi(..)`: the pointer is MOVED, not used.
 
         Materialising an address is not an access -- the access happens at
@@ -6013,8 +6072,8 @@ class TaintEngine:
             return False
         src = getattr(ins, "src", None)
         if isinstance(src, (list, tuple)):
-            return any(self._ptr_resolves(ssaf, s, base) for s in src)
-        return self._ptr_resolves(ssaf, src, base)
+            return any(self._ptr_resolves(ssaf, s, base, budget=budget) for s in src)
+        return self._ptr_resolves(ssaf, src, base, budget=budget)
 
     def _pointer_access(self, fn: Any, base: Any, *, fallback: int | None,
                         depth: int = 0, offset_of: Any = None,
@@ -6050,13 +6109,21 @@ class TaintEngine:
                     int(offset_of(ins)) if offset_of is not None else 0)
 
         wrote = False
+        scan = [self._PTR_SCAN_NODES]
+
+        def resolves(expr: Any, *, alias: bool = True) -> bool:
+            return self._ptr_resolves(ssaf, expr, base, alias=alias, budget=scan)
+
         for ins in instrs:
             opn = op_name(ins)
             at = int(getattr(ins, "address", 0))
+            if scan[0] <= 0:
+                # The scan ran out before it could account for the rest of
+                # this body: say so rather than answer "nothing here".
+                return verdict(ins, "unclassified")
             if self._is_call(ins):
                 params = self._call_params(ins)
-                hit = [i for i, p in enumerate(params)
-                       if self._ptr_resolves(ssaf, p, base)]
+                hit = [i for i, p in enumerate(params) if resolves(p)]
                 if not hit:
                     # In the instruction but in no RECOVERED argument: BN
                     # under-recovered this call's arity, so what the callee
@@ -6093,24 +6160,26 @@ class TaintEngine:
                 # escape (`return g;`) while dropping the residual alias BN
                 # recovers for a tail `return memset(g, 0, n);`, whose value
                 # the caller usually discards (round-3 review F17).
-                if any(self._ptr_resolves(ssaf, s, base, alias=False) for s in srcs):
+                if any(resolves(s, alias=False) for s in srcs):
                     return verdict(ins, "return")
                 continue
             if "STORE" in opn:
-                dest_hit = self._ptr_resolves(ssaf, getattr(ins, "dest", None), base)
-                src_hit = self._expr_mentions(ssaf, getattr(ins, "src", None), base)
+                dest_hit = resolves(getattr(ins, "dest", None))
+                src_hit = self._expr_mentions(ssaf, getattr(ins, "src", None), base,
+                                              budget=scan)
                 if dest_hit and not src_hit:
                     wrote = True       # `p[i] = <value that is not p>`
                     continue
                 if dest_hit or src_hit:
                     # `p[i] = p[j] + 1` reads, and `*q = p` escapes the
                     # address to memory this walk cannot follow.
-                    return verdict(ins, "load" if self._expr_loads(ssaf, ins, base)
+                    return verdict(ins, "load"
+                                   if self._expr_loads(ssaf, ins, base, budget=scan)
                                    else "address_escape")
                 continue
-            if self._expr_loads(ssaf, ins, base):
+            if self._expr_loads(ssaf, ins, base, budget=scan):
                 return verdict(ins, "load")
-            if self._is_pointer_carry(ssaf, ins, base):
+            if self._is_pointer_carry(ssaf, ins, base, budget=scan):
                 continue              # moved, not used: see the terminal uses
             if names_object is not None and names_object(ins):
                 return verdict(ins, "unclassified")
@@ -6244,17 +6313,13 @@ class TaintEngine:
                     for site in self._native_global_refs(cur, ga)[:1]:
                         found.setdefault(cs, (site, "unreadable", 0))
                     continue
-                calls_reference = False
-                try:
-                    calls_reference = any(
-                        int(getattr(c, "start", -1)) in known
-                        for c in (getattr(cur, "callees", None) or ()))
-                except Exception:
-                    calls_reference = False
-                if (cs in known or calls_reference) and cs not in found:
-                    # A function that CALLS one of the references may be
-                    # handed the object's address back and read through it,
-                    # without naming the address itself (F17).
+                if cs not in found:
+                    # EVERY examined function is classified, not just the
+                    # ones BN records a reference from: a pointer handed back
+                    # through a CHAIN of returning wrappers reaches a reader
+                    # that never names the address itself (round-3 review
+                    # F18). A function with no use of the object answers with
+                    # no address and costs one bounded scan.
                     at, kind, off = self._global_access(cur, ga)
                     if at is not None:
                         found[cs] = (at, kind, off)

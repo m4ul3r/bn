@@ -1429,7 +1429,10 @@ def test_global_continuation_discloses_an_exhausted_reachability_budget(tmp_path
     [leaf] = [lf for lf in result["leaves"]
               if lf["kind"] == "global_memory_continuation"]
     reach = leaf["reachability"]
-    assert leaf["references"] == [], leaf
+    # No reader is NAMED -- a body whose own scan ran out of nodes may still
+    # be cited as `unclassified`, which claims nothing about what it reads.
+    assert all(r["access"] not in ("load", "call_arg")
+               for r in leaf["references"]), leaf
     assert reach["status"] == "truncated" and reach["cause"] == "function_budget", leaf
     assert reach["functions_examined"] == reach["function_budget"], leaf
     assert reach["unexamined_references_total"] >= 1, leaf
@@ -2208,5 +2211,88 @@ def test_global_continuation_large_objects_veneers_and_returned_pointers(tmp_pat
     result, leaves = gmc("reset_ret_used_case")
     [leaf] = leaves
     assert leaf["references"][0]["display_name"] == "use_reset_ret", leaf
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result
+
+
+_RELAY_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+char global_bytes[64];
+__attribute__((noinline)) char *reset_ret(void) { return memset(global_bytes, 0, 1); }
+__attribute__((noinline)) char *relay_ret(void) { return reset_ret(); }
+__attribute__((noinline)) char *relay2_ret(void) { return relay_ret(); }
+__attribute__((noinline)) char *reset_arg(char *p) { return memset(p, 0, 1); }
+__attribute__((noinline)) int use_relay_ret(void) { return system(relay_ret() + 8); }
+__attribute__((noinline)) int use_relay2_ret(void) { return system(relay2_ret() + 8); }
+__attribute__((noinline)) int use_arg_ret(void) { char *p = reset_arg(global_bytes); return system(p + 8); }
+__attribute__((noinline)) int ignore_relay_ret(void) { relay_ret(); return 0; }
+__attribute__((noinline)) void refill(void) { read(0, global_bytes, 64); }
+__attribute__((noinline)) void refill_then_read(void) { read(0, global_bytes, 64); system(global_bytes); }
+__attribute__((noinline)) void reset_only(void) { memset(global_bytes, 0, 64); }
+__attribute__((noinline)) int relay_ret_case(const char *s) { memcpy(global_bytes, s, 64); return use_relay_ret(); }
+__attribute__((noinline)) int relay2_ret_case(const char *s) { memcpy(global_bytes, s, 64); return use_relay2_ret(); }
+__attribute__((noinline)) int arg_ret_case(const char *s) { memcpy(global_bytes, s, 64); return use_arg_ret(); }
+__attribute__((noinline)) int ignore_case(const char *s) { memcpy(global_bytes, s, 64); return ignore_relay_ret(); }
+__attribute__((noinline)) int refill_case(const char *s) { memcpy(global_bytes, s, 64); refill(); return 0; }
+__attribute__((noinline)) int refill_read_case(const char *s) { memcpy(global_bytes, s, 64); refill_then_read(); return 0; }
+__attribute__((noinline)) int reset_only_case(const char *s) { memcpy(global_bytes, s, 64); reset_only(); return 0; }
+int main(int argc, char **argv) {
+    if (argc < 2) return 0;
+    return relay_ret_case(argv[1]) + relay2_ret_case(argv[1]) + arg_ret_case(argv[1])
+         + ignore_case(argv[1]) + refill_case(argv[1]) + refill_read_case(argv[1])
+         + reset_only_case(argv[1]);
+}
+"""
+
+
+@pytest.mark.parametrize("debug", [True, False], ids=["typed", "stripped"])
+def test_global_continuation_returned_aliases_and_source_destinations(tmp_path,
+                                                                     shared_bn, debug):
+    """Round-3 review F18, F19 and F20.
+
+    F18: the global's address comes back through a CHAIN of returning
+    wrappers -- only the innermost helper names it -- and the consumer reads
+    `+ 8`, bytes the one-byte reset never touched. A partial write is not
+    whole-object sanitisation.
+    F19: `reset_arg(char *p)` returns its own FORMAL, so the actual the
+    caller passed has to be mapped onto it and back.
+    F20: `read(0, g, 64)` FILLS g; its role lives in the model's `sources`,
+    and reading that role is what stops a refill raising a false frontier.
+    An ignored return, and a full `memset` reset, stay silent."""
+    name = "relay" if debug else "relay_nodbg"
+    src = tmp_path / f"{name}.c"
+    src.write_text(_RELAY_SRC)
+    binary = tmp_path / name
+    _compile(src, binary, ["-fno-builtin", "-fno-inline"] + ([] if debug else ["-g0"]))
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # F18 / F19: the boundary is reported at the downstream consumer
+    for fn, consumer in (("relay_ret_case", "use_relay_ret"),
+                         ("relay2_ret_case", "use_relay2_ret"),
+                         ("arg_ret_case", "use_arg_ret")):
+        result, leaves = gmc(fn)
+        [leaf] = leaves
+        assert [r["display_name"] for r in leaf["references"]] == [consumer], (fn, leaf)
+        assert leaf["references"][0]["access"] == "call_arg", (fn, leaf)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, result)
+
+    # ...and an ignored return, a refill and a full reset are silent
+    for fn in ("ignore_case", "refill_case", "reset_only_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, (fn, result)
+
+    # F20 control: a refill followed by a genuine read of the bytes blocks
+    result, leaves = gmc("refill_read_case")
+    [leaf] = leaves
+    assert [r["display_name"] for r in leaf["references"]] == ["refill_then_read"], leaf
     assert leaf["references"][0]["access"] == "call_arg", leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False, result
