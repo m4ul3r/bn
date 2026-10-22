@@ -206,6 +206,16 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
                 "coverage/escape solve is unfinished; seed closer to the sink "
                 "or inspect the writes and unresolved calls named in the "
                 "address_of_local_unresolved leaf")
+    if "global_reference_budget" in causes:
+        # IC03 / round-3 review F2: the bounded call-graph search for code
+        # that reads a tainted global ran out of its function budget with
+        # referencing functions unexamined, so "nothing reads it" was never
+        # established. No depth or recursion bound was hit, so the generic
+        # string would name the wrong knob.
+        return ("the search for code reading a tainted global exhausted its "
+                "function budget with references unexamined -- audit the "
+                "references named in the global_memory_continuation leaf "
+                "(`bn xrefs <global>`) or seed taint inside a consumer")
     return "depth/recursion cutoff"
 
 
@@ -427,8 +437,9 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
     crossed = [lf for lf in leaves if lf.get("kind") == "global_memory_continuation"]
     if crossed:
         # IC03: the most actionable zero-sink frontier there is -- the bytes
-        # have a known address and the references that read them are named, so
-        # the advice points at them rather than at this function.
+        # have a known address, so the advice points at them rather than at
+        # this function. A leaf whose reachability search was TRUNCATED names
+        # no reader (there may be one); it gets the bound and the xref audit.
         globals_at = sorted({str((lf.get("global") or {}).get("address"))
                              for lf in crossed if isinstance(lf.get("global"), dict)})
         reads = sorted({str(r.get("at")) for lf in crossed
@@ -437,12 +448,21 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                        for r in (lf.get("references") or [])
                        if isinstance(r, dict) and r.get("address")), None)
         seed = (f" ({command_template(forward(inside, 'var:VAR'))})" if inside else "")
-        return ("taint reached no modeled sink HERE, but it was copied into the writable "
-                f"global(s) {', '.join(globals_at)}, which code reachable from a call this "
-                f"walk made references ({', '.join(reads)}); those bytes are not followed "
-                f"across the call. Read the references with "
-                f"`bn xrefs {globals_at[0]}` and re-seed inside the consumer on the value "
-                f"it loads{seed}")
+        head = ("taint reached no modeled sink HERE, but it was copied into the writable "
+                f"global(s) {', '.join(globals_at)}")
+        if reads:
+            return (f"{head}, which code reachable from a call this walk made reads "
+                    f"({', '.join(reads)}); those bytes are not followed across the call. "
+                    f"Read every reference with `bn xrefs {globals_at[0]}` and re-seed "
+                    f"inside the consumer on the value it loads{seed}")
+        truncated_at = sorted({str((lf.get("reachability") or {}).get("cause"))
+                               for lf in crossed
+                               if (lf.get("reachability") or {}).get("status") == "truncated"})
+        return (f"{head}, and the search for code reading it past a call this walk made "
+                f"was TRUNCATED ({', '.join(truncated_at) or 'bound reached'}) with "
+                f"references unexamined -- whether those bytes reach a sink is unknown, "
+                f"not clear. Audit every reference with `bn xrefs {globals_at[0]}`, or "
+                f"raise --max-depth and re-run")
     if by_kind.get("coarse_memory_store", 0) or by_kind.get("pointer_escape", 0):
         # The coarse leaf exists precisely because the destination could not be
         # keyed, so no var: names it; the template seeds a value read back.

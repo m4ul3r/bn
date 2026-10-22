@@ -1276,11 +1276,15 @@ int main(int argc, char **argv) {
         return any(f"{addr:x}" in ln.lower() for ln in lines(listing))
 
     assert mentions(written, g_dir) and mentions(read_back, g_dir), leaf["global"]
-    # ...and the cited reference address is an instruction of the consumer that
-    # names that very global.
+    # ...and the cited reference is an instruction of the consumer, classified
+    # by what it does with the bytes: `snprintf` is handed the address, so the
+    # site named is that CALL, not the lea/mov that merely materialises the
+    # pointer (round-3 review F3 -- a reference is only a consumer when it can
+    # read, and the leaf cites the use that reads).
+    assert leaf["references"][0]["access"] == "call_arg", leaf
     cited = [ln for ln in lines(read_back)
              if ln.lower().startswith(leaf["references"][0]["at"].lower() + " ")]
-    assert cited and f"{g_dir:x}" in cited[0].lower(), (cited, leaf)
+    assert cited and "call" in cited[0].lower(), (cited, leaf)
 
     # The reference the frontier cites really loads that global: the consumer
     # seeded on it reaches the modeled sink the forward run stopped short of.
@@ -1289,4 +1293,156 @@ int main(int argc, char **argv) {
     assert any(s["sink"]["callee"] == "system" for s in inside["reached_sinks"]), inside
 
     # Advice is runnable or marked as a template, like every other frontier.
+    assert sum(_run_or_check_template(shared_bn, _forward_prose(result))) >= 1
+
+
+def test_global_continuation_follows_a_thunk_to_its_consumer(tmp_path, shared_bn):
+    """Round-3 review F1: a veneer is not a body, but it is not a dead end.
+
+    `transfer` copies the source bytes into a global and then calls a
+    one-instruction tail-call veneer with no arguments. The veneer jumps to a
+    consumer that hands the identical global to `system`. The reachability
+    question must be asked of the RESOLVED target -- direct and multi-hop --
+    the same way the descent resolves thunks, not dropped because the call's
+    immediate target has no body."""
+    src = tmp_path / "thunkcont.c"
+    src.write_text(r"""
+#include <stdlib.h>
+#include <string.h>
+char global_buffer[64];
+__attribute__((noinline)) int consumer(void) { return system(global_buffer); }
+__asm__(".globl veneer\n.type veneer,@function\nveneer:\n jmp consumer\n.size veneer,.-veneer\n");
+__asm__(".globl veneer2\n.type veneer2,@function\nveneer2:\n jmp veneer\n.size veneer2,.-veneer2\n");
+extern int veneer(void);
+extern int veneer2(void);
+__attribute__((noinline)) int transfer(const char *src) {
+    memcpy(global_buffer, src, 16);
+    return veneer();
+}
+__attribute__((noinline)) int transfer2(const char *src) {
+    memcpy(global_buffer, src, 16);
+    return veneer2();
+}
+int main(int argc, char **argv) {
+    return argc > 1 ? transfer(argv[1]) + transfer2(argv[1]) : 0;
+}
+""")
+    binary = tmp_path / "thunkcont"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+    consumer_at = _resolve_addr(shared_bn, "consumer")
+
+    for fn in ("transfer", "transfer2"):          # one hop, then two
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        [leaf] = [lf for lf in result["leaves"]
+                  if lf["kind"] == "global_memory_continuation"]
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, result)
+        # the RESOLVED body is named, not the veneer, and it is where the
+        # global is read
+        assert leaf["callee"]["address"] == consumer_at, (fn, leaf)
+        assert [r["display_name"] for r in leaf["references"]] == ["consumer"], leaf
+        assert leaf["references"][0]["access"] == "call_arg", leaf
+
+        listing = _bn_json(shared_bn, "-t", target, "disasm", "consumer")["text"]
+        assert f"{int(leaf['global']['address'], 16):x}" in listing.lower(), leaf
+
+
+def test_global_continuation_write_only_reference_is_not_a_consumer(tmp_path, shared_bn):
+    """Round-3 review F3: `g[0] = 0` reads nothing.
+
+    Two functions copy into the same global; one then calls a helper whose
+    only reference to it is a store, the other a helper that hands it to
+    `system`. Only the second is a continuation -- a reference is not a
+    consumer unless it can READ the bytes."""
+    src = tmp_path / "writeonlycont.c"
+    src.write_text(r"""
+#include <stdlib.h>
+#include <string.h>
+char live_bytes[64];
+__attribute__((noinline)) void write_only(void) { live_bytes[0] = 0; }
+__attribute__((noinline)) void reader(void) { system(live_bytes); }
+__attribute__((noinline)) int writer_case(const char *src) {
+    memcpy(live_bytes, src, 16); write_only(); return 0;
+}
+__attribute__((noinline)) int reader_case(const char *src) {
+    memcpy(live_bytes, src, 16); reader(); return 0;
+}
+int main(int argc, char **argv) {
+    return argc > 1 ? writer_case(argv[1]) + reader_case(argv[1]) : 0;
+}
+""")
+    binary = tmp_path / "writeonlycont"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0")
+
+    quiet = forward("writer_case")
+    assert quiet["leaves"] == [], quiet["leaves"]
+    assert quiet["diagnostics"]["safe_to_report_all_clear"] is True, quiet["diagnostics"]
+
+    # the store really is the only reference in that helper
+    listing = _bn_json(shared_bn, "-t", target, "disasm", "write_only")["text"]
+    assert "call" not in listing.lower(), listing
+
+    loud = forward("reader_case")
+    [leaf] = [lf for lf in loud["leaves"] if lf["kind"] == "global_memory_continuation"]
+    assert leaf["references"][0]["display_name"] == "reader", leaf
+    assert loud["diagnostics"]["safe_to_report_all_clear"] is False, loud["diagnostics"]
+
+
+def test_global_continuation_discloses_an_exhausted_reachability_budget(tmp_path, shared_bn):
+    """Round-3 review F2: the function budget must never read as an all-clear.
+
+    `fanout` has more direct callees than the reachability walk will enqueue,
+    and the consumer of the tainted global is the last of them. The walk
+    cannot reach it, so the answer is UNKNOWN: a blocking frontier carrying
+    the bound, how much it examined and which references it never reached,
+    plus a truncated run with the matching cause -- not silence."""
+    width = 513
+    body = [
+        "#include <stdlib.h>", "#include <string.h>",
+        "char global_buffer[64];",
+        "__attribute__((noinline)) int consumer(void) { return system(global_buffer); }",
+    ]
+    body += [f"__attribute__((noinline)) int q{i}(int v) {{ return v + {i}; }}"
+             for i in range(width - 1)]
+    body += ["__attribute__((noinline)) int fanout(int v) {", "    int t = 0;"]
+    body += [f"    t += q{i}(v);" for i in range(width - 1)]
+    body += ["    t += consumer();", "    return t;", "}"]
+    body += [
+        "__attribute__((noinline)) int transfer(const char *src) {",
+        "    memcpy(global_buffer, src, 16); return fanout(1);", "}",
+        "int main(int argc, char **argv) { return argc > 1 ? transfer(argv[1]) : 0; }",
+    ]
+    src = tmp_path / "fanoutcont.c"
+    src.write_text("\n".join(body) + "\n")
+    binary = tmp_path / "fanoutcont"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                      "-f", "transfer", "--source", "param:0")
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "global_memory_continuation"]
+    reach = leaf["reachability"]
+    assert leaf["references"] == [], leaf
+    assert reach["status"] == "truncated" and reach["cause"] == "function_budget", leaf
+    assert reach["functions_examined"] == reach["function_budget"], leaf
+    assert reach["unexamined_references_total"] >= 1, leaf
+    assert _resolve_addr(shared_bn, "consumer") in reach["unexamined_references"], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+    assert result["stats"]["truncated"] is True, result["stats"]
+    assert "global_reference_budget" in result["stats"]["truncation_cause"], result["stats"]
+    assert "TRUNCATED" in result["diagnostics"]["next_action"], result["diagnostics"]
+
+    # text says the same thing, and every command it prints runs or is marked
+    rendered = shared_bn.run("-t", target, "taint", "forward", "-f", "transfer",
+                             "--source", "param:0", "--verbose", timeout=120.0)
+    assert rendered.returncode == 0, rendered.stderr
+    assert "reachability truncated" in rendered.stdout, rendered.stdout
+    assert "function_budget" in rendered.stdout, rendered.stdout
     assert sum(_run_or_check_template(shared_bn, _forward_prose(result))) >= 1

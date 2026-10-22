@@ -172,7 +172,9 @@ def test_keyable_global_copy_into_zero_arg_consumer_emits_continuation(models):
     assert leaf["global"] == {"address": hex(G_DIR), "label": f"glob_{hex(G_DIR)}"}
     assert leaf["callee"]["address"] == hex(hook.start)
     assert leaf["references"] == [{"name": "run_hook", "display_name": "run_hook",
-                                   "address": hex(hook.start), "at": hex(0x401210)}]
+                                   "address": hex(hook.start), "at": hex(0x401210),
+                                   "access": "call_arg"}]
+    assert leaf["reachability"]["status"] == "complete"
     assert leaf["call_descended"] is False
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
     assert KIND in BLOCKING_LEAF_KINDS
@@ -377,10 +379,19 @@ def test_transitive_consumer_within_the_depth_budget(models):
     assert leaf["callee"]["address"] == hex(0x401300)        # the call boundary
     assert leaf["references"][0]["address"] == hex(0x401400)  # where it is read
 
-    # ... and the same program with no descent budget left reaches nothing, so
-    # the frontier is not claimed beyond what the walk itself would cover.
+    # ... and with no descent budget left the walk cannot reach deep_hook, so
+    # it must NOT answer "nothing reads it": the boundary is disclosed as a
+    # TRUNCATED reachability answer naming the bound and what it never
+    # examined, and the run is marked truncated with the matching cause
+    # (round-3 review F2 -- the same rule the function budget follows).
     capped = _forward(bv, func, models, max_depth=0)
-    assert _leaves(capped) == [], capped["leaves"]
+    [cut] = _leaves(capped)
+    assert cut["references"] == [], cut
+    assert cut["reachability"]["status"] == "truncated"
+    assert cut["reachability"]["cause"] == "depth_budget"
+    assert cut["reachability"]["unexamined_references"] == [hex(0x401400)]
+    assert capped["stats"]["truncated"] is True
+    assert "max_depth" in capped["stats"]["truncation_cause"]
 
 
 def test_recursive_call_graph_terminates(models):
@@ -489,13 +500,16 @@ def test_text_rendering_names_the_global_the_call_and_the_reference():
         "global": {"address": "0x404060", "label": "glob_0x404060"},
         "callee": {"name": "run_hook", "display_name": "run_hook", "address": "0x401200"},
         "references": [{"name": "run_hook", "display_name": "run_hook",
-                        "address": "0x401200", "at": "0x401210"}],
+                        "address": "0x401200", "at": "0x401210", "access": "call_arg"}],
+        "reachability": {"status": "complete", "cause": None,
+                         "functions_examined": 1, "function_budget": 512,
+                         "unexamined_references_total": 0, "unexamined_references": []},
         "call_descended": False,
         "detail": "the bytes are not followed past this call",
     }
     line = formatters._render_leaf_line(leaf)
     assert KIND in line and "0x401108" in line and "0x404060" in line
-    assert "run_hook" in line and "0x401210" in line
+    assert "run_hook" in line and "0x401210" in line and "call_arg" in line
     assert "the bytes are not followed past this call" in line
 
     # --mangled prints the raw symbol for the callee AND for the reference, the
@@ -516,3 +530,296 @@ def test_text_rendering_names_the_global_the_call_and_the_reference():
     assert formatters._leaf_group_key(leaf) != formatters._leaf_group_key(other)
     rows = [r for r in formatters._render_grouped_leaves([leaf, other]) if KIND in r]
     assert len(rows) == 2 and not any("leaves]" in r for r in rows), rows
+
+
+def test_text_rendering_of_a_truncated_reachability_row():
+    # A row that names no reader must say WHY, with the bound and what it
+    # never examined -- otherwise it reads as "a boundary with nothing behind
+    # it", which is the all-clear this frontier exists to withhold.
+    leaf = {
+        "kind": KIND,
+        "address": "0x401108",
+        "global": {"address": "0x404060", "label": "glob_0x404060"},
+        "callee": {"name": "fanout", "display_name": "fanout", "address": "0x401200"},
+        "references": [],
+        "reachability": {"status": "truncated", "cause": "function_budget",
+                         "functions_examined": 512, "function_budget": 512,
+                         "unexamined_references_total": 1,
+                         "unexamined_references": ["0x401900"]},
+        "call_descended": False,
+        "detail": "the search was truncated",
+    }
+    line = formatters._render_leaf_line(leaf)
+    assert "truncated" in line and "function_budget" in line
+    assert "512/512" in line and "1 reference(s) unexamined" in line
+
+
+# --------------------------------------------------------------------------
+# F1 (round-3 review): a resolvable in-binary thunk is not a dead end
+# --------------------------------------------------------------------------
+
+def _thunk(name, start, target_start, *, is_thunk=True, resolvable=True):
+    """A single-instruction tail-call veneer, the shape `follow_thunk` takes.
+
+    ``resolvable=False`` keeps BN's thunk flag but gives the body a second
+    instruction, so the shared resolver declines it."""
+    instrs = [FInstr(0, start, "MLIL_TAILCALL_SSA", f"jump({hex(target_start)})",
+                     dest=_gptr(target_start), params=[])]
+    if not resolvable:
+        instrs.append(FInstr(1, start + 4, "MLIL_RET", "return"))
+    return GFunc(name, start, FSSAFunc(instrs), params=[], is_thunk=is_thunk)
+
+
+def _behind(chain, reader_start=0x401500, reader_at=0x401510):
+    """`main` copies into G_DIR then calls the head of a veneer *chain* that
+    ends at a reader of G_DIR. Returns (func, bv)."""
+    reader = _reader("consumer", reader_start, G_DIR, reader_at)
+    funcs = {reader_start: reader}
+    names = {STRNCPY: "strncpy", SYSTEM: "system", reader_start: "consumer"}
+    nxt = reader_start
+    for i, start in enumerate(reversed(chain)):
+        veneer = _thunk(f"veneer{len(chain) - i}", start, nxt)
+        funcs[start] = veneer
+        names[start] = veneer.name
+        nxt = start
+    head = chain[0]
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(head), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV(names, funcs=funcs, refs={G_DIR: [FRef(reader, reader_at)]})
+    return func, bv
+
+
+def test_a_direct_thunk_to_the_consumer_is_followed(models):
+    # main -> veneer (a one-instruction tail call) -> consumer, which hands
+    # the tainted global to system. The veneer is not a BODY, so the check
+    # used to drop it and report a clean run; it must resolve the veneer with
+    # the same helper the descent uses.
+    func, bv = _behind([0x401300])
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["callee"]["address"] == hex(0x401500)        # the resolved body
+    assert leaf["references"][0]["at"] == hex(0x401510)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_multi_hop_thunk_chain_to_the_consumer_is_followed(models):
+    # veneer1 -> veneer2 -> consumer: `follow_thunk` walks the whole chain.
+    func, bv = _behind([0x401300, 0x401400])
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["callee"]["address"] == hex(0x401500)
+    assert leaf["references"][0]["at"] == hex(0x401510)
+
+
+def test_an_unresolved_in_binary_thunk_fails_closed(models):
+    # BN marks it a thunk but the shared resolver cannot take its body, so
+    # its references cannot be read: "nothing reads the global" is not an
+    # answer here, and the boundary is disclosed as truncated.
+    reader = _reader("consumer", 0x401500, G_DIR, 0x401510)
+    veneer = _thunk("veneer", 0x401300, 0x401500, resolvable=False)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system",
+                    0x401300: "veneer", 0x401500: "consumer"},
+                   funcs={0x401300: veneer, 0x401500: reader},
+                   refs={G_DIR: [FRef(reader, 0x401510)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"] == [], leaf
+    assert leaf["reachability"]["cause"] == "unresolved_thunk"
+    assert leaf["reachability"]["unexamined_references"] == [hex(0x401500)]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert "global_reference_budget" in result["stats"]["truncation_cause"]
+
+
+def test_a_thunk_onto_an_import_stays_external(models):
+    # A PLT stub resolving to an import is not a body this walk could read,
+    # and the unmodeled/modeled-callee machinery owns that call as before --
+    # no global boundary is invented for it.
+    imported = GFunc("system", 0x401500, FSSAFunc([]), params=[],
+                     symbol_type="ImportedFunctionSymbol")
+    veneer = _thunk("system@plt", 0x401300, 0x401500)
+    hook = _reader("run_hook", 0x401600, G_DIR, 0x401610)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", 0x401300: "system@plt", 0x401500: "system",
+                    0x401600: "run_hook"},
+                   funcs={0x401300: veneer, 0x401500: imported, 0x401600: hook},
+                   refs={G_DIR: [FRef(hook, 0x401610)]})
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+
+
+# --------------------------------------------------------------------------
+# F2 (round-3 review): the reachability bound is tri-state, never a clear
+# --------------------------------------------------------------------------
+
+def _fanout(n_callees, *, reader_last=True):
+    """`main` copies into G_DIR then calls `fanout`, which has *n_callees*
+    direct callees; the reader of G_DIR is the last of them."""
+    reader = _reader("consumer", 0x402000, G_DIR, 0x402010)
+    filler = [_quiet(f"q{i}", 0x410000 + i * 0x10) for i in range(n_callees - 1)]
+    callees = [*filler, reader] if reader_last else [reader, *filler]
+    fan = _quiet("fanout", 0x401300, callees=callees)
+    names = {STRNCPY: "strncpy", SYSTEM: "system", 0x401300: "fanout",
+             0x402000: "consumer"}
+    funcs = {0x401300: fan, 0x402000: reader}
+    for q in filler:
+        names[q.start] = q.name
+        funcs[q.start] = q
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0xff)])
+    return func, FGlobalBV(names, funcs=funcs, refs={G_DIR: [FRef(reader, 0x402010)]})
+
+
+def test_fanout_inside_the_function_budget_finds_the_consumer(models):
+    # 511 callees + the call's own target = exactly the 512-function bound.
+    func, bv = _fanout(511)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["at"] == hex(0x402010)
+    assert leaf["reachability"]["status"] == "complete"
+    assert result["stats"]["truncated"] is False
+
+
+@pytest.mark.parametrize("n", [512, 513])
+def test_fanout_past_the_function_budget_discloses_the_truncation(models, n):
+    # One function over the bound and the reader is never examined. The old
+    # behaviour was silence -- zero sinks, zero leaves, a true all-clear.
+    func, bv = _fanout(n)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"] == [], leaf
+    reach = leaf["reachability"]
+    assert reach["status"] == "truncated" and reach["cause"] == "function_budget"
+    assert reach["functions_examined"] == 512 and reach["function_budget"] == 512
+    assert reach["unexamined_references"] == [hex(0x402000)]
+    assert reach["unexamined_references_total"] == 1
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert result["stats"]["truncated"] is True
+    assert "global_reference_budget" in result["stats"]["truncation_cause"]
+    assert "function budget" in result["diagnostics"]["next_action"] \
+        or "TRUNCATED" in result["diagnostics"]["next_action"]
+
+
+def test_a_bound_that_hides_nothing_is_still_complete(models):
+    # The bound is hit, but every function BN records a reference from was
+    # already examined -- so it cannot have hidden a reader and the answer
+    # stands. Without this the frontier would fire on any wide call graph.
+    func, bv = _fanout(600, reader_last=False)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["at"] == hex(0x402010)
+    assert leaf["reachability"]["status"] == "complete"
+    assert result["stats"]["truncated"] is False
+
+
+# --------------------------------------------------------------------------
+# F3 (round-3 review): a reference is a consumer only if it can READ
+# --------------------------------------------------------------------------
+
+def _store_only(name, start, global_addr, at):
+    """`g[0] = 0` and nothing else: a reference that cannot read the bytes."""
+    instrs = [FInstr(0, at, "MLIL_STORE_SSA", f"[{hex(global_addr)}].b = 0",
+                     dest=_gptr(global_addr), src=_const(0))]
+    return GFunc(name, start, FSSAFunc(instrs), params=[])
+
+
+def _load_only(name, start, global_addr, at):
+    """`x = g[0]`: a plain load of the global's bytes."""
+    v = FSSA(FVar("x"), 1)
+    instrs = [FInstr(0, at, "MLIL_SET_VAR_SSA", f"x#1 = [{hex(global_addr)}]",
+                     writes=[v],
+                     src=FExpr("MLIL_LOAD_SSA", f"[{hex(global_addr)}]",
+                               src=_gptr(global_addr)))]
+    return GFunc(name, start, FSSAFunc(instrs), params=[])
+
+
+def _modify(name, start, global_addr, at):
+    """`g[0] += 1`: a read-modify-write still reads."""
+    load = FExpr("MLIL_LOAD_SSA", f"[{hex(global_addr)}]", src=_gptr(global_addr))
+    instrs = [FInstr(0, at, "MLIL_STORE_SSA", f"[{hex(global_addr)}].b = .. + 1",
+                     dest=_gptr(global_addr),
+                     src=FExpr("MLIL_ADD", "load + 1", left=load, right=_const(1)))]
+    return GFunc(name, start, FSSAFunc(instrs), params=[])
+
+
+def _mixed(name, start, global_addr, store_at, read_at):
+    """A store into the global followed by a call that is handed its address."""
+    instrs = [
+        FInstr(0, store_at, "MLIL_STORE_SSA", f"[{hex(global_addr)}].b = 0",
+               dest=_gptr(global_addr), src=_const(0)),
+        FInstr(1, read_at, "MLIL_CALL_SSA", f"system({hex(global_addr)})",
+               dest=_gptr(SYSTEM), params=[_gptr(global_addr)]),
+    ]
+    return GFunc(name, start, FSSAFunc(instrs), params=[])
+
+
+def _after_copy(callee):
+    """`main`: strcpy(G_DIR, argv[0]) then call *callee* with no arguments."""
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR,
+        call_sites=[(0x401108, _gptr(int(callee.start)), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", int(callee.start): callee.name},
+                   funcs={int(callee.start): callee},
+                   refs={G_DIR: [FRef(callee, 0x401210)]})
+    return func, bv
+
+
+def test_a_write_only_reference_is_not_a_consumer(models):
+    # `g[0] = 0` consumes nothing. Naming it a consumer manufactures a
+    # blocking frontier the base engine never had, on a program where the
+    # bytes genuinely go nowhere.
+    func, bv = _after_copy(_store_only("write_only", 0x401200, G_DIR, 0x401210))
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+@pytest.mark.parametrize("build,access", [
+    (_load_only, "load"),
+    (_modify, "load"),
+])
+def test_a_reading_reference_is_a_consumer(models, build, access):
+    func, bv = _after_copy(build("reader", 0x401200, G_DIR, 0x401210))
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["access"] == access
+    assert leaf["references"][0]["at"] == hex(0x401210)
+
+
+def test_a_mixed_write_then_read_reference_is_a_consumer(models):
+    # The store alone would be write-only; the call that is handed the
+    # address is what makes it a consumer, and the leaf cites THAT site.
+    func, bv = _after_copy(_mixed("overwrite_then_run", 0x401200, G_DIR,
+                                  0x401210, 0x401218))
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0] == {
+        "name": "overwrite_then_run", "display_name": "overwrite_then_run",
+        "address": hex(0x401200), "at": hex(0x401218), "access": "call_arg"}
+
+
+def test_a_body_whose_il_cannot_be_read_stays_a_consumer(models):
+    # Conservative in the other direction: a referencing function with no
+    # MLIL cannot be proven write-only, so it is disclosed rather than
+    # silently cleared.
+    opaque = GFunc("opaque", 0x401200, FSSAFunc([]), params=[])
+    opaque.mlil = None
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "opaque"},
+                   funcs={0x401200: opaque}, refs={G_DIR: [FRef(opaque, 0x401210)]})
+    # A body with no MLIL is also not an internal descent target, so this call
+    # never reaches the global question at all -- the existing external/unread
+    # machinery owns it. What must NOT happen is the CLASSIFIER quietly
+    # calling it write-only, which would clear a reference it never read.
+    _forward(bv, func, models)
+    at, kind = te.TaintEngine(bv, models)._global_access(opaque, G_DIR)
+    assert (at, kind) == (0x401210, "unreadable"), (at, kind)

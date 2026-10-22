@@ -5003,13 +5003,28 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
         cal = _field_dict(leaf, "callee")
         glob = _field_dict(leaf, "global")
         refs = [r for r in _field_list(leaf, "references") if isinstance(r, dict)]
+        reach = _field_dict(leaf, "reachability")
         where = ", ".join(
-            f"{_shown_name(r, mangled=mangled) or '?'} @ {r.get('at', '?')}" for r in refs)
+            f"{_shown_name(r, mangled=mangled) or '?'} @ {r.get('at', '?')}"
+            + (f" ({r['access']})" if r.get("access") else "")
+            for r in refs)
+        if where:
+            middle = f"  (read by {where})"
+        else:
+            # No reader is NAMED because the search never finished: say which
+            # bound stopped it and how much it left unexamined, so the row is
+            # not read as "a boundary with nothing behind it".
+            middle = (f"  (reachability {reach.get('status', '?')}:"
+                      f" {reach.get('cause', '?')},"
+                      f" {reach.get('functions_examined', '?')}/"
+                      f"{reach.get('function_budget', '?')} function(s) examined,"
+                      f" {reach.get('unexamined_references_total', '?')} reference(s)"
+                      f" unexamined)")
         return (
             f"  global_memory_continuation @ {leaf.get('address')}"
             f"  global={glob.get('address', '?')}"
             f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
-            + (f"  (referenced by {where})" if where else "")
+            + middle
             + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
         )
     if kind == "caller_sites_truncated":

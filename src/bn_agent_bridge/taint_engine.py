@@ -331,6 +331,10 @@ class TaintEngine:
         # a targeted xref query, not a whole-program solve.
         self._global_refs: dict[int, dict[int, int]] = {}
         self._global_reach: dict[tuple[int, int, int], tuple] = {}
+        # (function start, global) -> the first use that can READ the global,
+        # or (None, "write_only"). Per function body, so a write-only helper
+        # is classified once however many calls reach it.
+        self._global_access_cache: dict[tuple[int, int], tuple] = {}
 
     # -- shared resolution ------------------------------------------------
 
@@ -5331,9 +5335,12 @@ class TaintEngine:
         return targets_from_pvs(pvs)
 
     # Bound on the call graph walked to answer ONE global-continuation
-    # question. The depth budget is the descent the walk itself would have
-    # made; this cap keeps a densely connected binary from turning that
-    # question into a program-wide sweep.
+    # question: at most this many functions, the call's own target included.
+    # The depth budget beside it is the descent the walk itself would have
+    # made. Exhausting EITHER bound while a function that references the
+    # global is still unexamined is DISCLOSED as a truncated reachability
+    # answer -- never silently reported as "nothing reads it" (round-3
+    # review F2: the cap used to turn an unfinished search into an all-clear).
     _GLOBAL_REACH_FUNCS = 512
 
     def _global_ref_functions(self, ga: int) -> dict[int, int]:
@@ -5345,7 +5352,10 @@ class TaintEngine:
         ``get_code_refs`` (the unit fakes, a partially loaded view), a raising
         call, refs with no owning function. An absent answer is NOT evidence:
         the caller stays silent rather than inventing a boundary, because the
-        alternative is a frontier on every call after any global write."""
+        alternative is a frontier on every call after any global write.
+
+        A reference here is any mention of the address; whether the function
+        can READ the bytes is decided by :meth:`_global_access`."""
         cached = self._global_refs.get(ga)
         if cached is not None:
             return cached
@@ -5370,68 +5380,218 @@ class TaintEngine:
         self._global_refs[ga] = out
         return out
 
-    def _global_refs_reachable(self, fn: Any, ga: int, budget: int) -> tuple:
-        """``((function start, referencing address), ...)`` for the functions
-        that reference the global at *ga* and sit within *budget* further call
-        levels of *fn* (level 0 is *fn* itself), ordered by function address so
-        one leaf is byte-identical across the fixpoint's repeated visits.
+    def _expr_loads_global(self, ssaf: Any, expr: Any, ga: int, depth: int = 0) -> bool:
+        """Whether any sub-expression of *expr* LOADS through an address that
+        resolves to the global at *ga*.
+
+        A store's destination is reached only through ``operands``, where it
+        is an address expression and not a load, so ``[g] = 0`` answers False
+        while ``[g] = [g] + 1`` and ``x = [p]`` (``p = g``) answer True."""
+        if expr is None or depth > 10 or not hasattr(expr, "operation"):
+            return False
+        if "LOAD" in op_name(expr) \
+                and self._global_addr(ssaf, getattr(expr, "src", None)) == ga:
+            return True
+        subs: list[Any] = []
+        for attr in ("src", "left", "right", "params"):
+            sub = getattr(expr, attr, None)
+            if isinstance(sub, (list, tuple)):
+                subs.extend(sub)
+            elif sub is not None:
+                subs.append(sub)
+        subs.extend(getattr(expr, "operands", None) or ())
+        return any(self._expr_loads_global(ssaf, s, ga, depth + 1) for s in subs)
+
+    def _global_access(self, fn: Any, ga: int) -> tuple[int | None, str]:
+        """``(address, kind)`` of the first use of the global at *ga* inside
+        *fn* that can READ its bytes, or ``(None, "write_only")`` when every
+        use is proven to be a store INTO it (round-3 review F3: a function
+        whose only reference is ``g[0] = 0`` consumes nothing, and naming it
+        a consumer manufactures a frontier the base engine never had).
+
+        Kinds, all conservative in the "could the bytes escape here" sense:
+        ``load`` (the bytes are loaded), ``call_arg`` (the address is handed
+        to a call, which may read it), ``address_escape`` (the address is
+        stored into memory), ``return`` (the address is returned) and
+        ``unreadable`` -- a body whose MLIL this run cannot read at all, which
+        stays a disclosed consumer rather than a silent drop."""
+        key = (int(getattr(fn, "start", 0)), int(ga))
+        cached = self._global_access_cache.get(key)
+        if cached is not None:
+            return cached
+        fallback = self._global_ref_functions(ga).get(key[0])
+        try:
+            ssaf = self._ssa_func(fn)
+            instrs = self._instrs(ssaf)
+        except TaintError:
+            out: tuple[int | None, str] = (fallback, "unreadable")
+            self._global_access_cache[key] = out
+            return out
+        out = (None, "write_only")
+        for ins in instrs:
+            opn = op_name(ins)
+            kind: str | None = None
+            if self._is_call(ins):
+                if any(self._global_addr(ssaf, p) == ga
+                       for p in self._call_params(ins)):
+                    kind = "call_arg"
+            elif "RET" in opn:
+                srcs = getattr(ins, "src", None)
+                if not isinstance(srcs, (list, tuple)):
+                    srcs = [] if srcs is None else [srcs]
+                if any(self._global_addr(ssaf, s) == ga for s in srcs):
+                    kind = "return"
+            elif "STORE" in opn \
+                    and self._global_addr(ssaf, getattr(ins, "src", None)) == ga:
+                # `*p = &g`: the address leaves through memory, so the bytes
+                # are reachable from somewhere this walk cannot see.
+                kind = "address_escape"
+            if kind is None and self._expr_loads_global(ssaf, ins, ga):
+                kind = "load"
+            if kind is not None:
+                out = (int(getattr(ins, "address", 0)), kind)
+                break
+        self._global_access_cache[key] = out
+        return out
+
+    def _global_refs_reachable(self, fn: Any, ga: int, budget: int) -> tuple[tuple, dict]:
+        """``(reads, reach)`` for the global at *ga* as seen from *fn*.
+
+        ``reads`` is ``((function start, address, access kind), ...)`` for the
+        functions that can READ the global and sit within *budget* further
+        call levels of *fn* (level 0 is *fn* itself), ordered by function
+        address so one leaf is byte-identical across the fixpoint's repeated
+        visits. A function whose every reference is a store into the global
+        is not a read and is left out (F3).
+
+        ``reach`` is the structured status of the search:
+        ``complete`` -- the walk ran out of call-graph, or every function that
+        references the global was examined, so "no reader" is an answer; or
+        ``truncated`` with ``cause`` ``depth_budget``/``function_budget``,
+        ``functions_examined``/``function_budget`` and the referencing
+        functions left ``unexamined`` -- the walk stopped early with
+        somewhere the bytes could still be read unvisited, so "no reader" is
+        NOT an answer and the caller must disclose it (F2).
 
         The walk follows BN's ``Function.callees`` edges only -- a resolved
         call graph, the same evidence `bn dataflow callgraph` renders. An
-        unresolved indirect edge simply contributes no successor: this answers
-        "a reference IS reachable", never "no reference exists"."""
+        unresolved indirect edge simply contributes no successor."""
         known = self._global_ref_functions(ga)
         if not known:
-            return ()
+            return (), self._reach_status(None, 0, [])
         start = int(getattr(fn, "start", 0))
-        key = (start, ga, int(budget))
+        key = (start, int(ga), int(budget))
         cached = self._global_reach.get(key)
         if cached is not None:
             return cached
-        found: dict[int, int] = {}
+        found: dict[int, tuple[int, str]] = {}
+        # `seen` is what the walk has QUEUED (the bound that keeps a dense
+        # graph finite); `done` is what it actually examined. Only the latter
+        # can rule a reference out -- a function discovered on the last wave
+        # and then dropped by the depth bound was never looked at.
         seen = {start}
-        level, wave = 0, [fn]
-        while wave and level <= budget and len(seen) <= self._GLOBAL_REACH_FUNCS:
+        done: set[int] = set()
+        wave, level, cut = [fn], 0, None
+        while wave:
+            if level > budget:
+                cut = "depth_budget"
+                break
             nxt = []
             for cur in wave:
-                at = known.get(int(getattr(cur, "start", 0)))
-                if at is not None:
-                    found.setdefault(int(getattr(cur, "start", 0)), at)
+                cs = int(getattr(cur, "start", 0))
+                done.add(cs)
+                if cs in known and cs not in found:
+                    at, kind = self._global_access(cur, ga)
+                    if at is not None:
+                        found[cs] = (at, kind)
                 try:
                     callees = list(getattr(cur, "callees", None) or ())
                 except Exception:
                     callees = []
                 for callee in callees:
-                    cs = getattr(callee, "start", None)
-                    if cs is None:
+                    nstart = getattr(callee, "start", None)
+                    if nstart is None:
                         continue
-                    cs = int(cs)
-                    if cs in seen:
+                    nstart = int(nstart)
+                    if nstart in seen:
                         continue
-                    seen.add(cs)
+                    if len(seen) >= self._GLOBAL_REACH_FUNCS:
+                        cut = "function_budget"
+                        continue
+                    seen.add(nstart)
                     nxt.append(callee)
+            # The budget stops DISCOVERY, never examination: everything
+            # already queued is still looked at, so the bound only hides what
+            # it genuinely refused to enqueue.
             wave, level = nxt, level + 1
-        out = tuple(sorted(found.items()))
+        unexamined = sorted(set(known) - done)
+        if not unexamined:
+            # Every function BN records a reference from was examined, so the
+            # bound that stopped the walk cannot have hidden a reader.
+            cut = None
+        out = (tuple(sorted((s, a, k) for s, (a, k) in found.items())),
+               self._reach_status(cut, len(done), unexamined))
         self._global_reach[key] = out
         return out
 
+    def _reach_status(self, cause: str | None, examined: int,
+                      unexamined: list[int]) -> dict[str, Any]:
+        return {
+            "status": "complete" if cause is None else "truncated",
+            "cause": cause,
+            "functions_examined": int(examined),
+            "function_budget": self._GLOBAL_REACH_FUNCS,
+            "unexamined_references_total": len(unexamined),
+            "unexamined_references": [hex(a) for a in unexamined[:8]],
+        }
+
     def _global_continuation_leaf(self, ins: Any, ga: int, callee_fn: Any,
-                                  references: tuple, descended: bool) -> dict[str, Any]:
+                                  references: tuple, descended: bool,
+                                  reach: dict[str, Any]) -> dict[str, Any]:
         """The blocking frontier for tainted global bytes crossing a call the
-        walk does not carry them across (IC03 / TT-PILOT-FW03-01)."""
+        walk does not carry them across (IC03 / TT-PILOT-FW03-01).
+
+        Two shapes, one kind: named readers in ``references``, or -- when the
+        reachability search was truncated before it could rule a reader out --
+        an empty ``references`` whose ``reachability`` block carries the exact
+        bound that stopped it and the references it never reached."""
         rows = []
-        for start, at in references[:8]:
+        for start, at, kind in references[:8]:
             rfn = function_at(self.bv, start)
             nm = str(getattr(rfn, "name", None) or self._callee_name(start) or hex(start))
             rows.append({"name": nm,
                          "display_name": (_display_name(rfn) or nm) if rfn is not None else nm,
-                         "address": hex(start), "at": hex(at)})
-        where = ", ".join(f"{r['display_name']} @ {r['at']}" for r in rows)
+                         "address": hex(start), "at": hex(at), "access": kind})
         crossed = ("this call is descended with its tainted argument(s) only"
                    if descended else
                    "no argument of this call carries taint, so it is not descended")
-        reseed = command_template(
-            f"bn taint forward -f {rows[0]['address']} --source var:VAR")
+        seed_at = rows[0]["address"] if rows else hex(int(getattr(callee_fn, "start", 0)))
+        reseed = command_template(f"bn taint forward -f {seed_at} --source var:VAR")
+        if rows:
+            where = ", ".join(f"{r['display_name']} @ {r['at']} ({r['access']})" for r in rows)
+            detail = (
+                f"tainted bytes were copied into the writable global {hex(ga)}, and code "
+                f"reachable from this call reads it ({where}). Taint is tracked per "
+                f"function, and {crossed}: what those bytes reach past this point is NOT "
+                f"followed -- a 'no sinks reached' result here is not proof of safety. "
+                f"Read every reference with `bn xrefs {hex(ga)}`, then re-seed inside the "
+                f"consumer on the value it loads ({reseed})")
+        else:
+            bound = ("the configured interprocedural depth"
+                     if reach.get("cause") == "depth_budget" else
+                     "an unresolved in-binary thunk"
+                     if reach.get("cause") == "unresolved_thunk" else
+                     f"the {reach.get('function_budget')}-function reachability bound")
+            detail = (
+                f"tainted bytes were copied into the writable global {hex(ga)}, and the "
+                f"search for code reading it past this call stopped at {bound} after "
+                f"{reach.get('functions_examined')} function(s), with "
+                f"{reach.get('unexamined_references_total')} referencing function(s) never "
+                f"examined ({', '.join(reach.get('unexamined_references') or []) or 'n/a'}). "
+                f"Whether those bytes reach a sink past this call is UNKNOWN, not clear: "
+                f"taint is tracked per function and {crossed}. List every reference with "
+                f"`bn xrefs {hex(ga)}` and audit them, or raise --max-depth and re-run "
+                f"({reseed} seeds a consumer directly)")
         return {
             "kind": "global_memory_continuation",
             "address": hex(int(getattr(ins, "address", 0))),
@@ -5440,15 +5600,10 @@ class TaintEngine:
                        "display_name": _display_name(callee_fn) or str(getattr(callee_fn, "name", "?")),
                        "address": hex(int(getattr(callee_fn, "start", 0)))},
             "references": rows,
+            "reachability": reach,
             "call_descended": bool(descended),
             "il_text": str(ins),
-            "detail": (
-                f"tainted bytes were copied into the writable global {hex(ga)}, and code "
-                f"reachable from this call references it ({where}). Taint is tracked per "
-                f"function, and {crossed}: what those bytes reach past this point is NOT "
-                f"followed -- a 'no sinks reached' result here is not proof of safety. "
-                f"Read every reference with `bn xrefs {hex(ga)}`, then re-seed inside the "
-                f"consumer on the value it loads ({reseed})"),
+            "detail": detail,
         }
 
     def _run_forward(self, func: Any, locators: list[dict[str, Any]], depth: int,
@@ -5663,12 +5818,14 @@ class TaintEngine:
         def note_global_continuation(ins: Any, target: int | None, descended: bool) -> None:
             """Disclose tainted global bytes crossing a call boundary (IC03).
 
-            One leaf per (call address, global address), emitted only when a
-            RESOLVED in-binary target can reach a reference to that global
-            within the descent budget this walk has left. An unresolved
-            indirect call has no body whose references could be read, so none
-            is invented for it -- the existing ``indirect_call_unresolved``
-            frontier owns that call."""
+            One leaf per (call address, global address). It is emitted when a
+            resolved in-binary target -- following a PLT/veneer thunk with the
+            same shared resolver the descent uses (round-3 review F1) -- can
+            reach a function that READS that global, and also when the
+            reachability search was truncated before it could rule a reader
+            out (F2). An unresolved indirect call has no body whose references
+            could be read, so none is invented for it -- the existing
+            ``indirect_call_unresolved`` frontier owns that call."""
             addr = int(getattr(ins, "address", 0))
             # Cheapest filter first: a global already disclosed at this call,
             # or one BN records no reference to anywhere, asks nothing of the
@@ -5694,17 +5851,47 @@ class TaintEngine:
             budget = max(0, max_depth - depth)
             for taddr in cands:
                 cfn = function_at(self.bv, taddr)
-                if cfn is None or not self._is_internal(cfn):
+                if cfn is None:
                     continue
+                unresolved_thunk = False
+                if not self._is_internal(cfn):
+                    # A .plt/veneer thunk is not a body, but it is not a dead
+                    # end either: resolve it with the same helper the descent
+                    # uses (#807), so a global consumed behind a thunk is not
+                    # dropped (F1). An IN-BINARY thunk whose tail call does not
+                    # resolve fails CLOSED: its references cannot be read, so
+                    # "nothing reads the global" is not an answer. A resolved
+                    # import is external -- the model/unmodeled-callee
+                    # machinery owns that call, as before.
+                    resolved = self._follow_thunk_cached(cfn)
+                    if resolved is not None and self._is_internal(resolved):
+                        cfn = resolved
+                    elif resolved is None and self._not_internal_reason(cfn) == "thunk":
+                        unresolved_thunk = True
+                    else:
+                        continue
                 for ga in list(pending):
-                    refs = self._global_refs_reachable(cfn, ga, budget)
-                    if not refs:
+                    if unresolved_thunk:
+                        refs, reach = (), self._reach_status(
+                            "unresolved_thunk", 0, sorted(self._global_ref_functions(ga)))
+                    else:
+                        refs, reach = self._global_refs_reachable(cfn, ga, budget)
+                    if not refs and reach["status"] != "truncated":
                         continue
                     global_frontiers_seen.add((addr, ga))
                     pending.remove(ga)
-                    leaf = self._global_continuation_leaf(ins, ga, cfn, refs, descended)
+                    leaf = self._global_continuation_leaf(
+                        ins, ga, cfn, refs, descended, reach)
                     if leaf not in leaves:
                         leaves.append(leaf)
+                    if reach["status"] == "truncated":
+                        # The run's coverage really is incomplete: say so with
+                        # the cause, so `truncated`/`truncation_cause` and the
+                        # remediation agree with the leaf (F2).
+                        self._truncated = True
+                        self._truncation_causes.add(
+                            "max_depth" if reach["cause"] == "depth_budget"
+                            else "global_reference_budget")
 
         def cons_return(ins: Any, reason: str) -> bool:
             nonlocal reached_return
