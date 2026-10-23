@@ -4107,3 +4107,260 @@ def test_a_callee_write_effect_composes_through_the_call_graph(tmp_path,
     result, leaves = gmc("before_case")
     assert leaves == [], leaves
     assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+_FRAME_ORDER_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[128] __attribute__((section(".tracked"))) = "seed";
+volatile int flag;
+volatile int counter;
+N void reader(void) { system(tracked); }
+N int fill(char *s) { memcpy(tracked, s, 64); return counter; }
+N int store(char *s) { tracked[0] = s[0]; return counter; }
+N int padded_before(char *s) { int a = counter; a += counter; a += counter; a += counter; reader(); return fill(s) + a; }
+N int long_child(char *s) { int a = counter; a += counter; a += counter; a += counter; a += counter; a += counter; a += counter; a += counter; memcpy(tracked, s, 64); return a; }
+N int short_before(char *s) { reader(); return long_child(s); }
+N int sibling(char *s) { int st = 0; if (flag) reader(); else st = fill(s); return st; }
+N int after(char *s) { int st = fill(s); reader(); return st; }
+N int before_store(char *s) { int a = counter; a += counter; a += counter; reader(); return store(s) + a; }
+int main(int c, char **v) { return c > 1 ? padded_before(v[1]) : 0; }
+"""
+
+_TAIL_RETURN_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline))
+char tracked[128] = "seed";
+char clean[128] = "safe";
+volatile int choice;
+N char *choose(char *p, char *q, int n) { return n ? p : q; }
+N char *producer_equal(void) { return choose(tracked + 8, tracked + 8, choice); }
+N char *producer_clean(void) { return choose(clean + 8, clean + 8, choice); }
+N void consume_equal(void) { system(producer_equal()); }
+N void consume_clean(void) { system(producer_clean()); }
+N void equal_case(char *s) { memcpy(tracked, s, 64); consume_equal(); }
+N void clean_case(char *s) { memcpy(tracked, s, 64); consume_clean(); }
+int main(void) { return 0; }
+"""
+
+_ZERO_LEN_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+extern unsigned char mid;
+__asm__(".globl mid\n.set mid,tracked+16\n.type mid,@object\n.size mid,1\n");
+N void chain_reader(void) { system(tracked + 80); }
+N void zero_case(char *s) { memcpy(tracked, s, 0); chain_reader(); }
+N void known_case(char *s) { memcpy(tracked, s, 96); chain_reader(); }
+N void runtime_case(char *s, size_t n) { memcpy(tracked, s, n); chain_reader(); }
+int main(void) { return 0; }
+"""
+
+
+def _chain_source(levels: int = 12) -> str:
+    """`useN` reads the pointer a chain of N returning relays hands back."""
+    relays = "".join(
+        f"N char *relay{i}(void) {{ return relay{i - 1}(); }}\n"
+        for i in range(1, levels + 1))
+    uses = "".join(
+        f"N void use{i}(void) {{ system(relay{i}() + 24); }}\n"
+        f"N void chain{i}(char *s) {{ memcpy(payload, s, 64); use{i}(); }}\n"
+        for i in range(0, levels + 1, 2))
+    return f"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char payload[256] __attribute__((section(".payload"))) = "seed";
+N char *relay0(void) {{ return memset(payload, 0, 1); }}
+{relays}{uses}int main(void) {{ return 0; }}
+"""
+
+
+def _layout_source(count: int) -> str:
+    """A 1024-byte object with *count* anonymous interior data variables,
+    followed by a separately NAMED neighbour in the same section."""
+    touches = "".join(f"  x += (unsigned char)big[{8 * (i + 1)}];\n"
+                      for i in range(count))
+    return f"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char big[1024] __attribute__((section(".pair"))) = "seed";
+char neighbour[64] __attribute__((section(".pair"))) = "safe";
+N unsigned probe(void) {{
+  unsigned x = 0;
+{touches}  return x;
+}}
+N void reader(void) {{ system(neighbour); }}
+N void case_root(char *s) {{ memcpy(big, s, 1); reader(); }}
+int main(void) {{ return 0; }}
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_callee_write_cannot_precede_a_reader_that_ran_first(tmp_path,
+                                                               shared_bn, opt):
+    """Round-22 review TIME-01: the merge copied the CALLEE's own IL
+    indices into the caller, where an unrelated (or out-of-range) index
+    answered "this write reaches that read" about a reader the caller had
+    already run."""
+    src = tmp_path / f"r6order{opt[-1]}.c"
+    src.write_text(_FRAME_ORDER_SRC)
+    binary = tmp_path / f"r6order{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("padded_before", "short_before", "before_store", "sibling"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+    result, leaves = gmc("after")
+    assert any(r["display_name"] == "reader"
+               for lf in leaves for r in lf["references"]), result
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_tail_returned_alias_is_still_a_continuation(tmp_path, shared_bn,
+                                                       opt):
+    """Round-22 review RETURN-01: at -O2 `producer_equal` tail-jumps into
+    `choose`, and returned-pointer inference scanned only `RET` ops -- so
+    the alias the caller hands to `system` disappeared and the run
+    cleared."""
+    src = tmp_path / f"r6tail{opt[-1]}.c"
+    src.write_text(_TAIL_RETURN_SRC)
+    binary = tmp_path / f"r6tail{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    result, leaves = gmc("equal_case")
+    assert any(r["display_name"] == "consume_equal"
+               for lf in leaves for r in lf["references"]), result
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # the same shape over ANOTHER object stays silent
+    result, leaves = gmc("clean_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_an_exhausted_pointer_return_scan_is_never_unused(tmp_path, shared_bn):
+    """Round-22 review DEPTH-01 (reopened BN21-BOUND-03): past four relays
+    the scan spent its pointer-return depth, then classified the reference
+    `unused` because a later pass saw no CHANGE in the cause."""
+    src = tmp_path / "r6chain.c"
+    src.write_text(_chain_source(12))
+    binary = tmp_path / "r6chain"
+    _compile(src, binary, ["-O0", "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    for level in (0, 2, 4, 6, 8, 10, 12):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", f"chain{level}", "--source", "param:0",
+                          "--max-depth", "64")
+        leaves = [lf for lf in result["leaves"]
+                  if lf["kind"] == "global_memory_continuation"]
+        assert leaves, (level, result["stats"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, level
+        if level >= 6:
+            # past the bound the answer is UNKNOWN, and says so
+            assert "pointer_return_depth" in leaves[0]["reachability"]["causes"], \
+                (level, leaves[0]["reachability"])
+            assert "pointer_return_depth" in result["stats"]["truncation_cause"]
+
+
+def test_two_scan_bounds_both_reach_the_aggregate(tmp_path, shared_bn):
+    """Round-22 review CAUSE-01: one search, two references, two DIFFERENT
+    scan bounds -- the aggregate took the first kind and dropped the
+    other."""
+    # A body that TOUCHES the object and then does enough work to spend the
+    # scan's node pool, beside a relay chain that spends the pointer-return
+    # depth: one search, two different bounds.
+    work = "".join(f"  n += {i};\n" for i in range(1600))
+    src = tmp_path / "r6both.c"
+    src.write_text(_chain_source(6).replace(
+        "int main(void) { return 0; }",
+        f"""volatile int count_value;
+N int noisy(void) {{
+  memset(payload, 0, 1);
+  int n = count_value;
+{work}  return n;
+}}
+N void both(void) {{ use6(); noisy(); }}
+N void combined_case(char *s) {{ memcpy(payload, s, 64); both(); }}
+int main(void) {{ return 0; }}
+"""))
+    binary = tmp_path / "r6both"
+    _compile(src, binary, ["-O0", "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                      "-f", "combined_case", "--source", "param:0",
+                      "--max-depth", "64", timeout=300.0)
+    causes = {c for lf in result["leaves"]
+              for c in (lf.get("reachability") or {}).get("causes") or ()}
+    assert {"pointer_return_depth", "pointer_scan_budget"} <= causes, causes
+    assert {"pointer_return_depth", "pointer_scan_budget"} <= \
+        set(result["stats"]["truncation_cause"]), result["stats"]
+
+
+def test_a_zero_length_copy_writes_no_tainted_bytes(tmp_path, shared_bn):
+    """Round-22 review ZERO-01: `memcpy(g, s, 0)` was read as "no length
+    stated", which is the WIDEST write there is -- so an empty copy raised
+    a proven-read continuation 80 bytes into the object."""
+    src = tmp_path / "r6zero.c"
+    src.write_text(_ZERO_LEN_SRC)
+    binary = tmp_path / "r6zero"
+    _compile(src, binary, ["-O0", "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn, *extra):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0", *extra)
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    result, leaves = gmc("zero_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    # a real length still reaches the reader, and an unknown one still blocks
+    for fn in ("known_case", "runtime_case"):
+        _result, leaves = gmc(fn)
+        assert any(r["display_name"] == "chain_reader"
+                   for lf in leaves for r in lf["references"]), (fn, leaves)
+
+
+@pytest.mark.parametrize("count", [63, 65], ids=["under", "over"])
+def test_the_layout_walk_keeps_a_named_neighbour(tmp_path, shared_bn, count):
+    """Round-22 review LAYOUT-01: the next-neighbour walk stepped over at
+    most 64 anonymous interior variables, then took the SECTION end as the
+    object's end -- swallowing a separately named neighbour whole, with no
+    uncertainty recorded, so a one-byte copy "reached" a reader of that
+    neighbour."""
+    src = tmp_path / f"r6layout{count}.c"
+    src.write_text(_layout_source(count))
+    binary = tmp_path / f"r6layout{count}"
+    _compile(src, binary, ["-O0", "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0",
+                           "-fno-toplevel-reorder"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                      "-f", "case_root", "--source", "param:0")
+    leaves = [lf for lf in result["leaves"]
+              if lf["kind"] == "global_memory_continuation"]
+    assert leaves == [], (count, leaves)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True

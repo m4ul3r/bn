@@ -4678,3 +4678,149 @@ def test_a_nested_helper_that_fills_another_object_raises_no_continuation(
     func, bv = _nested_writer_program(depth=3, taken=False)
     result = _forward(bv, func, models)
     assert _leaves(result) == [], result["leaves"]
+
+
+# --------------------------------------------------------------------------
+# round-22 review TIME-01/RETURN-01/DEPTH-01/CAUSE-01/ZERO-01/LAYOUT-01
+# --------------------------------------------------------------------------
+
+def _reader_then_fill_program(reader_first=True):
+    """`case(s)` either reads the global and THEN fills it, or the reverse.
+
+    The helper's own write sits at ITS index 0; the caller's reader is at a
+    higher index, so a callee index interpreted in the caller's CFG makes
+    the write look earlier than it is.
+    """
+    s_var = FVar("s")
+    s0 = FSSA(s_var, 0)
+    child = GFunc("fill", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "memcpy(g, s#0, 0x40)",
+               reads=[s0], dest=_gptr(MEMCPY),
+               params=[_gptr(G_DIR), _var(s0), _const(0x40)]),
+        FInstr(1, 0x401314, "MLIL_RET", "return 0", src=[_const(0)]),
+    ]), params=[s_var])
+    reader = _reader("reader", 0x401200, G_DIR, 0x401210)
+    arg = FVar("arg")
+    arg0 = FSSA(arg, 0)
+    read_ins = FInstr(0, 0x401104, "MLIL_CALL_SSA", "reader()",
+                      dest=_gptr(0x401200), params=[])
+    fill_ins = FInstr(1, 0x401108, "MLIL_CALL_SSA", "fill(arg#0)",
+                      reads=[arg0], dest=_gptr(0x401300), params=[_var(arg0)])
+    body = [read_ins, fill_ins] if reader_first else [fill_ins, read_ins]
+    for i, ins in enumerate(body):
+        ins.instr_index = i
+    func = GFunc("case", 0x401100, FSSAFunc([
+        *body,
+        FInstr(2, 0x40110c, "MLIL_RET", "return 0", src=[_const(0)]),
+    ]), params=[arg], callees=[child, reader])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401200: "reader", 0x401300: "fill"},
+                   funcs={0x401200: reader, 0x401300: child},
+                   refs={G_DIR: [FRef(reader, 0x401210)]})
+    return func, bv
+
+
+def test_a_callee_write_does_not_reach_an_earlier_reader(models):
+    # Round-22 review TIME-01: the merge copied the CALLEE's own IL indices
+    # into the caller, where index 0 sits BEFORE the reader -- so a write
+    # that happens afterwards was reported as reaching it.
+    func, bv = _reader_then_fill_program(reader_first=True)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+
+
+def test_a_callee_write_still_reaches_a_later_reader(models):
+    # The positive control: fill first, read after.
+    func, bv = _reader_then_fill_program(reader_first=False)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert [r["display_name"] for r in leaf["references"]] == ["reader"], leaf
+
+
+def _tail_return_program(returns_tracked=True):
+    """`producer()` TAIL-CALLS `choose(p, q)`, which returns a formal; the
+    consumer hands the result to `system`."""
+    p_var, q_var = FVar("p"), FVar("q")
+    p0, q0 = FSSA(p_var, 0), FSSA(q_var, 0)
+    choose = GFunc("choose", 0x401500, FSSAFunc([
+        FInstr(0, 0x401510, "MLIL_RET", "return p#0", reads=[p0],
+               src=[_var(p0)]),
+    ]), params=[p_var, q_var])
+    arg = G_DIR + 8 if returns_tracked else G_OTHER + 8
+    producer = GFunc("producer", 0x401400, FSSAFunc([
+        FInstr(0, 0x401410, "MLIL_TAILCALL_SSA", "tailcall choose(g + 8, g + 8)",
+               dest=_gptr(0x401500),
+               params=[_gptr(arg), _gptr(arg)]),
+    ]), params=[], callees=[choose])
+    producer.is_thunk = True
+    r1 = FSSA(FVar("r"), 1)
+    consumer = GFunc("consume", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "r#1 = producer()", writes=[r1],
+               dest=_gptr(0x401400), params=[]),
+        FInstr(1, 0x401318, "MLIL_CALL_SSA", "system(r#1)", reads=[r1],
+               dest=_gptr(SYSTEM), params=[_var(r1)]),
+    ]), params=[], callees=[producer])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401300: "consume",
+                    0x401400: "producer", 0x401500: "choose"},
+                   funcs={0x401300: consumer, 0x401400: producer,
+                          0x401500: choose},
+                   refs={G_DIR: [FRef(producer, 0x401410)]}
+                   if returns_tracked else {G_OTHER: [FRef(producer, 0x401410)]})
+    return func, bv
+
+
+def test_a_tail_call_is_a_return_for_pointer_inference(models):
+    # Round-22 review RETURN-01: returned-pointer inference scanned only
+    # ops containing `RET`, and a tail return is not one -- so the alias
+    # the consumer hands to `system` disappeared.
+    func, bv = _tail_return_program(returns_tracked=True)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert [r["display_name"] for r in leaf["references"]] == ["consume"], leaf
+
+
+def test_a_tail_call_returning_another_object_stays_silent(models):
+    func, bv = _tail_return_program(returns_tracked=False)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+
+
+def test_an_exhausted_pointer_return_depth_is_not_unused(models, monkeypatch):
+    # Round-22 review DEPTH-01: the scan spent its pointer-return depth and
+    # then classified the reference `unused`, because the later pass saw no
+    # CHANGE in the cause and never marked contact.
+    monkeypatch.setattr(te.TaintEngine, "_PTR_RESOLVE_DEPTH", 1)
+    inner = _ret_helper("reset_ret", 0x401200)
+    relay = _relay("relay", 0x401400, 0x401200)
+    relay.callees = [inner]
+    consumer = _reads_offset("use_ret", 0x401300, 0x401400)
+    consumer.callees = [relay]
+    func, bv = _chain_program([inner, relay], consumer, inner)
+    result = _forward(bv, func, models)
+    leaves = _leaves(result)
+    assert leaves, result["leaves"]
+    assert any("pointer_return_depth" in (lf["reachability"]["causes"] or ())
+               for lf in leaves), [lf["reachability"] for lf in leaves]
+    assert "pointer_return_depth" in result["stats"]["truncation_cause"]
+
+
+@pytest.mark.parametrize("length,blocking", [(0, False), (0x40, True)],
+                         ids=["zero", "nonzero"])
+def test_a_zero_length_copy_taints_nothing(models, length, blocking):
+    # Round-22 review ZERO-01: a length the program states as ZERO was read
+    # as "no length stated", which is the WIDEST write there is.
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(length)])
+    reader = _reader("reader", 0x401200, G_DIR, 0x401210)
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR: [FRef(reader, 0x401210)]})
+    eng = te.TaintEngine(bv, models)
+    result = eng.forward(func, [te.parse_locator("param:0")])
+    assert bool(_leaves(result)) is blocking, result["leaves"]
+    if not blocking:
+        # and no unbounded footprint was recorded for the empty copy
+        assert G_DIR not in eng._global_write_unbounded

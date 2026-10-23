@@ -434,6 +434,7 @@ class TaintEngine:
         self._touches_region_cache: dict[tuple, bool] = {}
         self._readable_il_cache: dict[int, bool] = {}
         self._import_stub_cache: dict[int, bool] = {}
+        self._global_layout_truncated: set[int] = set()
         self._param_stack: set[tuple[int, int]] = set()
         self._direct_callee_cache: dict[int, tuple] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
@@ -5414,7 +5415,6 @@ class TaintEngine:
         # A global the callee wrote is an effect on the program, not on its
         # frame: it crosses back out with the summary (round-21 review F56).
         out["globals"] = sub.get("globals", frozenset())
-        out["global_sites"] = sub.get("global_sites", {})
         if not sub["reached_return"]:
             lost = self._valueless_return_leaf(ins, callee_fn, tainted_args, caller_instrs)
             if lost is not None:
@@ -5638,6 +5638,10 @@ class TaintEngine:
     # global is still unexamined is DISCLOSED as a truncated reachability
     # answer -- never silently reported as "nothing reads it" (round-3
     # review F2: the cap used to turn an unfinished search into an all-clear).
+    # How many anonymous interior data variables the next-neighbour walk
+    # will step over before it gives up and says so (round-22 LAYOUT-01).
+    _LAYOUT_SCAN_STEPS = 4096
+
     _GLOBAL_REACH_FUNCS = 512
 
     # Span of ONE object a reference sweep will ask BN for in a single
@@ -5689,12 +5693,23 @@ class TaintEngine:
             # variable would cut the object at its own first interior
             # reference -- the very reference being looked for.
             addr = ga
-            for _ in range(64):
+            # The walk steps over the anonymous data variables BN invents at
+            # every interior reference, looking for the next SYMBOLLED
+            # neighbour. A fixed 64 steps was both too few and silent about
+            # it: past 64 interior variables the walk gave up, the section
+            # end became the object's end, and a separately named
+            # neighbour was swallowed whole with no uncertainty recorded
+            # (round-22 review LAYOUT-01). The budget is the shared one the
+            # rest of the search spends, and running out is DISCLOSED.
+            exhausted = True
+            for _ in range(self._LAYOUT_SCAN_STEPS):
                 try:
                     nxt_addr = getattr(nxt(addr), "address", None)
                 except Exception:
+                    exhausted = False      # the view has nothing more to say
                     break
                 if nxt_addr is None or int(nxt_addr) <= addr:
+                    exhausted = False      # the end of the data: a real bound
                     break
                 addr = int(nxt_addr)
                 named = None
@@ -5705,7 +5720,10 @@ class TaintEngine:
                         named = None
                 if named is not None or not callable(getsym):
                     bounds.append(addr)
+                    exhausted = False
                     break
+            if exhausted:
+                self._global_layout_truncated.add(ga)
         getsecs = getattr(self.bv, "get_sections_at", None)
         if callable(getsecs):
             try:
@@ -5813,6 +5831,19 @@ class TaintEngine:
             self._global_write_span[ga] = offset + size
             self._invalidate_object(ga)
 
+    def _copy_length_is_zero(self, ssaf: Any, params: list,
+                             model: dict[str, Any] | None) -> bool:
+        """Whether this modeled copy states a length of exactly zero.
+
+        Distinct from a length nothing states (unknown, and conservatively
+        unbounded) and from a negative constant (huge as an unsigned size).
+        """
+        idx = self._model_len_index(model)
+        if idx is None or idx >= len(params):
+            return False
+        n = self._int_const(params[idx])
+        return n is not None and int(n) == 0
+
     def _note_write_span(self, ssaf: Any, params: list, idx: int,
                          model: dict[str, Any] | None) -> None:
         """Record how far a modeled copy writes into a global object.
@@ -5837,11 +5868,19 @@ class TaintEngine:
         # states makes the interval UNBOUNDED -- `memcpy(g, s, n)` may have
         # filled everything after its destination, and claiming it stopped
         # at the one length that WAS constant is the clearing direction.
+        if n is not None and int(n) == 0:
+            # A length the program states as ZERO writes no bytes. Reading
+            # it as "no length" made it the widest write there is, and a
+            # `memcpy(g, s, 0)` raised a proven-read continuation at a
+            # reader 80 bytes in (round-22 review ZERO-01). A NEGATIVE
+            # constant is not this case: as an unsigned size it is huge, so
+            # it stays on the unbounded side below.
+            return
         ranges = self._global_tainted_ranges.setdefault(ga, [])
-        interval = (offset, None if n is None or int(n) <= 0 else offset + int(n))
+        interval = (offset, None if n is None or int(n) < 0 else offset + int(n))
         if interval not in ranges:
             ranges.append(interval)
-        if n is None or int(n) <= 0:
+        if n is None or int(n) < 0:
             # An unbounded write is evidence about the object too: it is
             # recorded so the extent stops being clipped by an inferred
             # initialiser width (F28).
@@ -6278,16 +6317,40 @@ class TaintEngine:
             formals = list(getattr(fn, "parameter_vars", []) or [])
         except TaintError:
             pass
-        rets = [ins for ins in instrs if "RET" in op_name(ins)]
+        rets = [ins for ins in instrs
+                if "RET" in op_name(ins) or "TAILCALL" in op_name(ins)]
         for idx, formal in enumerate(formals):
             root = (lambda k: lambda e: is_ssa_var(e) and var_key(e) == k)(var_key(formal))
             if any(self._ptr_resolves(ssaf, src, root)
-                   for ins in rets for src in self._ret_sources(ins)):
+                   for ins in rets for src in self._return_exprs(ins)):
                 out.append(idx)
         self._returned_params_active.discard(key)
         result = tuple(out)
         self._returned_params_cache[key] = result
         return result
+
+    def _return_exprs(self, ins: Any, depth: int = 0) -> list:
+        """The expressions a return-LIKE instruction hands back.
+
+        A `MLIL_TAILCALL` is a return: the value its caller receives is the
+        value the tail-called body returns. Scanning only ops containing
+        `RET` lost every alias an optimised tail return carried, so an O2
+        `return choose(g + 8, g + 8, sel);` produced no returned pointer at
+        all and the run cleared (round-22 review RETURN-01). The callee's
+        returned FORMALS are mapped back onto this call's actuals, so the
+        composition is the caller's own expression."""
+        opn = op_name(ins)
+        if "RET" in opn:
+            return list(self._ret_sources(ins))
+        if "TAILCALL" not in opn or depth > 4:
+            return []
+        taddr = self._resolve_direct_target(ins)
+        callee = function_at(self.bv, taddr) if taddr is not None else None
+        if callee is None:
+            return []
+        params = self._call_params(ins)
+        return [params[i] for i in self._fn_returned_params(callee)
+                if i < len(params)]
 
     def _fn_returns_pointer(self, fn: Any, base: Any, depth: int = 0,
                             budget: _ScanBudget | None = None) -> bool:
@@ -6306,11 +6369,26 @@ class TaintEngine:
         except TaintError:
             return False
         for ins in instrs:
-            if "RET" not in op_name(ins):
+            opn = op_name(ins)
+            if "RET" not in opn and "TAILCALL" not in opn:
                 continue
             if any(self._ptr_resolves(ssaf, s, base, depth + 1, budget=budget)
-                   for s in self._ret_sources(ins)):
+                   for s in self._return_exprs(ins)):
                 return True
+            if "TAILCALL" in opn:
+                # `return choose(g + 8, g + 8, sel);` compiled to a tail
+                # jump returns whatever the CALLEE returns -- including an
+                # address the callee materialises itself, which no actual
+                # of this call carries (round-22 review RETURN-01).
+                taddr = self._resolve_direct_target(ins)
+                callee = function_at(self.bv, taddr) if taddr is not None else None
+                if callee is not None and self._is_internal(callee) \
+                        and int(getattr(callee, "start", 0)) != int(
+                            getattr(fn, "start", -1)) \
+                        and self._fn_returns_pointer(
+                            callee, base, depth + self._PTR_RETURN_STEP,
+                            budget=budget):
+                    return True
         return False
 
     def _expr_mentions(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
@@ -6865,13 +6943,20 @@ class TaintEngine:
         # Nothing read-capable. A body with a proven write and nothing else
         # is a write-only use; a body where this scan accounted for no use at
         # all is disclosed rather than cleared.
-        if scan.cause is not None and touched:
+        if scan.cause == "pointer_return_depth" or (
+                scan.cause is not None and touched):
             # A bound was reached somewhere in this body, so "every use is a
             # proven write" and "no use at all" are both claims this scan did
             # not establish (BN21-BOUND-02/03) -- but ONLY where the scan
             # actually met this object. A scalar-only body (`cycle_a(n - 1)`)
             # never touches the pointer at all, so a bound reached while
             # walking its calls says nothing about it (round-18 review F43).
+            # The RETURN-pointer bound is different: it is only ever spent
+            # descending a callee that CAN return an address (F43's own
+            # gate), so spending it is contact with the question whether or
+            # not a later pass re-resolved anything -- `use6`/`use8`/`use12`
+            # answered `unused` with the cause sitting right there
+            # (round-22 review DEPTH-01).
             return _Use(fallback if fallback is not None else first_at,
                         _SCAN_CAUSE_KINDS[scan.cause], 0, None, None, True)
         if wrote:
@@ -7277,6 +7362,7 @@ class TaintEngine:
         self._global_write_span.clear()
         self._global_tainted_ranges.clear()
         self._global_write_unbounded.clear()
+        self._global_layout_truncated.clear()
         self._global_keyed_offsets.clear()
         self._global_extent_unproven.clear()
         self._global_search_truncated.clear()
@@ -7837,8 +7923,14 @@ class TaintEngine:
             # I2: control left the examined region through a call bn could
             # not name, so "no reader is reachable" was never established.
             cut = "unresolved_call_target"
-        scan_cut = next((_SCAN_KIND_CAUSES[u.kind] for _a, u in
-                         sorted(found.items()) if u.kind in _SCAN_KIND_CAUSES), None)
+        scan_cuts = sorted({_SCAN_KIND_CAUSES[u.kind] for _a, u in
+                            sorted(found.items())
+                            if u.kind in _SCAN_KIND_CAUSES})
+        # Two references can exhaust two DIFFERENT scan bounds in one
+        # search -- a pointer-return depth here, the node pool there. Taking
+        # the first kind reported one and dropped the other from the
+        # aggregate (round-22 review CAUSE-01).
+        scan_cut = scan_cuts[0] if scan_cuts else None
         if scan_cut and cut is None:
             # BN21-BOUND-02/03: a classification that ran out of nodes, or out
             # of internal return-pointer depth, did not finish -- so "these
@@ -7853,7 +7945,7 @@ class TaintEngine:
         # an exhausted pointer-scan pool, or an unread body replacing the
         # function budget, left `stats` reporting a COMPLETE run (round-21
         # review F59).
-        bounds = [c for c in (cut, scan_cut,
+        bounds = [c for c in (cut, *scan_cuts,
                               "unresolved_call_target" if opaque else None,
                               "unread_callee_body" if unread else None,
                               budget_cut if unexamined else None) if c]
@@ -8023,6 +8115,12 @@ class TaintEngine:
                 "unread_callee_body": (
                     "an in-binary callee body Binary Ninja did not analyse "
                     "(re-run after `bn decompile <callee> --force-analysis`)"),
+                "object_layout_budget": (
+                    "the bound on how many anonymous interior data "
+                    "variables the search for this object's next NAMED "
+                    "neighbour will step over, so where it ends rests on "
+                    "the section rather than on a named boundary -- this "
+                    "bound is internal, `--max-depth` does not move it"),
                 "object_search_budget": (
                     "the bound on how far back the search for an ENCLOSING "
                     "object may look, so storage this write may be inside "
@@ -8569,6 +8667,13 @@ class TaintEngine:
                             # established, so "these are its references" is
                             # not established either.
                             reach = self._with_cause(reach, "object_extent_unproven")
+                        if ga in self._global_layout_truncated:
+                            # The walk for this object's next named
+                            # neighbour ran out, so where it ends -- and
+                            # which references belong to it -- rest on the
+                            # section, not on a boundary anything named
+                            # (round-22 review LAYOUT-01).
+                            reach = self._with_cause(reach, "object_layout_budget")
                         if ga in self._global_refs_truncated:
                             # F15: the object is larger than the reference
                             # sweep's chunk budget, so "these are all the
@@ -8608,6 +8713,7 @@ class TaintEngine:
                         # F48's chain bound was disclosed by the leaf and
                         # absent here, so `stats` read COMPLETE (F58).
                         "thunk_chain_budget": "global_veneer_chain",
+                        "object_layout_budget": "global_object_layout",
                     }
                     for _cause in (reach.get("causes")
                                    or [reach.get("cause")]):
@@ -9233,9 +9339,15 @@ class TaintEngine:
                         if hit is not None and state_key not in continuation_state:
                             continuation_state[state_key] = (hit, addr, ins)
                             changed = True
+            empty_copy = self._copy_length_is_zero(ssaf, params, model)
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
                 frm = rule.get("from")
+                if empty_copy and str(to or "").startswith("*arg:"):
+                    # Zero bytes copied is zero bytes written: the
+                    # destination buffer carries nothing away from this
+                    # call (round-22 review ZERO-01).
+                    continue
                 hit = self._token_hit_node(ssaf, params, frm, tainted)
                 applied = False
                 if hit is not None:
@@ -9711,11 +9823,17 @@ class TaintEngine:
                             descend_outparam_elems |= set(d.get("out_param_elems") or ())
                             for _ga in sorted(d.get("globals") or ()):
                                 # The callee's write happened; where the
-                                # CALLER can see it is at this call site.
-                                for _site in (d.get("global_sites")
-                                              or {}).get(_ga) or ():
-                                    live_global_sites.setdefault(
-                                        int(_ga), set()).add(_site)
+                                # CALLER can see it is THIS call site, and
+                                # nowhere else. Copying the callee's own IL
+                                # indices in made them answer
+                                # `_il_reaches` questions about the
+                                # caller's CFG, where an unrelated index --
+                                # or one past the end, which answers
+                                # "reaches" conservatively -- put the write
+                                # BEFORE a reader that runs first
+                                # (round-22 review TIME-01). `taint_node`
+                                # records the callsite below; that is the
+                                # only site this frame can speak for.
                                 taint_node((("global", int(_ga)), None),
                                            f"glob_{hex(int(_ga))}", ins,
                                            f"global written by {nm or hex(taddr)}",
@@ -10220,9 +10338,9 @@ class TaintEngine:
                 # `write_child(s)` filling `tracked` and returning an
                 # unrelated status left the caller's later `reader()` with
                 # nothing live, and the run cleared (round-21 review F56).
+                # The WHERE does not cross: each caller rebases the effect
+                # onto its own callsite (round-22 review TIME-01).
                 "globals": frozenset(live_globals),
-                "global_sites": {ga: set(sites) for ga, sites
-                                 in live_global_sites.items()},
                 "findings": findings, "leaves": leaves, "assumptions": assumptions,
                 "diag": diag}
 
