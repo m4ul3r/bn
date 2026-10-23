@@ -4132,8 +4132,11 @@ _TAIL_RETURN_SRC = r"""
 #include <stdlib.h>
 #include <string.h>
 #define N __attribute__((noinline))
-char tracked[128] = "seed";
-char clean[128] = "safe";
+/* separate sections: an ABUTTING neighbour read by an unbounded `system`
+   is deliberately conservative (round-10 C1), which is not what this
+   control is about. */
+char tracked[128] __attribute__((section(".tracked"))) = "seed";
+char clean[128] __attribute__((section(".clean"))) = "safe";
 volatile int choice;
 N char *choose(char *p, char *q, int n) { return n ? p : q; }
 N char *producer_equal(void) { return choose(tracked + 8, tracked + 8, choice); }
