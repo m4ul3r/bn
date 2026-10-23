@@ -2944,3 +2944,104 @@ def test_global_continuation_object_evidence_budgets_and_advice(tmp_path,
     ran = _bn_json(shared_bn, "-t", target, "taint", "forward",
                    "-f", seeded["address"], "--source", seeded["seed"])
     assert [s["sink"]["class"] for s in ran["reached_sinks"]] == ["command_injection"]
+
+
+_CHALLENGE_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#define N __attribute__((noinline))
+char chain[256] = "seed";
+extern char alias16[240], alias32[224], alias64[192];
+__asm__(".globl alias16\n.set alias16,chain+16\n.type alias16,@object\n.size alias16,240\n"
+        ".globl alias32\n.set alias32,chain+32\n.type alias32,@object\n.size alias32,224\n"
+        ".globl alias64\n.set alias64,chain+64\n.type alias64,@object\n.size alias64,192\n");
+char form[128] = "seed";
+char clean[128] = "safe";
+volatile int selector;
+N void chain_reader(void) { system(alias64 + 16); }
+N int constant_only(void) { return 7; }
+N void chain_known(char *s) { memcpy(chain, s, 112); chain_reader(); }
+N void chain_unknown(char *s, size_t n) { memcpy(chain, s, n); chain_reader(); }
+N void chain_short(char *s) { memcpy(chain, s, 16); chain_reader(); }
+N void chain_strcpy(char *s) { strcpy(chain, s); chain_reader(); }
+N void chain_sprintf(char *s) { sprintf(chain, "%s", s); chain_reader(); }
+N void chain_no_reader(char *s, size_t n) { memcpy(chain, s, n); constant_only(); }
+N char *mixed(char *p, int n) { return n ? p : form + 24; }
+N char *producer_mixed(void) { return mixed(form + 8, selector); }
+N void consume_mixed(void) { system(producer_mixed()); }
+N void mixed_case(char *s) { memcpy(form, s, 64); consume_mixed(); }
+N char *identity(char *p) { return p; }
+N int ignore_identity(void) { identity(form); return 7; }
+N void identity_case(char *s) { memcpy(form, s, 64); ignore_identity(); }
+N void use_identity(void) { system(identity(form)); }
+N void used_identity_case(char *s) { memcpy(form, s, 64); use_identity(); }
+char window[2097408];
+extern char exact[64];
+__asm__(".globl exact\n.set exact,window+1048576\n.type exact,@object\n.size exact,64\n");
+N void window_reader(void) { char *p = malloc(sizeof window); memcpy(p, window, sizeof window); system(p + 1048576); free(p); }
+N void exact_case(char *s) { memcpy(exact, s, 32); window_reader(); }
+N int exact_no_reader(char *s) { memcpy(exact, s, 32); return constant_only(); }
+int main(int argc, char **argv) { return argc > 100 ? argv[0][0] : 0; }
+"""
+
+
+def test_global_continuation_alias_runs_joins_and_pointer_only_callees(
+        tmp_path, shared_bn):
+    """Round-14 review F33, F34, F35, F36 and F37 on a real stripped build.
+
+    F33: three interior aliases do not stop the walk short of a reader past
+    the last one, for a known, an unknown and a sink-firing copy alike.
+    F34/F35: the alias search's own bounds are disclosed where a reader
+    could hide behind them, and NOT where the callee names no global at all.
+    F36: a body returning either a formal or the object by name has two
+    feasible displacements, so it has none.
+    F37: a callee that only hands the pointer back reads nothing; a caller
+    that consumes the result is still the boundary."""
+    src = tmp_path / "r3chain.c"
+    src.write_text(_CHALLENGE_SRC)
+    binary = tmp_path / "r3chain"
+    _compile(src, binary, ["-fno-builtin", "-fno-inline", "-fno-stack-protector", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # F33: every copy that can reach +80 finds the reader past three aliases
+    for fn in ("chain_known", "chain_unknown", "chain_strcpy", "chain_sprintf"):
+        result, leaves = gmc(fn)
+        assert any(r["display_name"] == "chain_reader" and r["offset"] == 80
+                   for lf in leaves for r in lf["references"]), (fn, leaves)
+    # ...and one that stops short, or has no reader, does not
+    for fn in ("chain_short", "chain_no_reader"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+    # F34/F35: the search bound is disclosed where it can hide a reader...
+    result, leaves = gmc("exact_case")
+    assert [lf["reachability"]["cause"] for lf in leaves] == [
+        "object_search_budget"], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    # ...and not where the callee names no global at all
+    result, leaves = gmc("exact_no_reader")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+    # F36: {formal, object-by-name} is two displacements, so neither is exact
+    result, leaves = gmc("mixed_case")
+    row = next(r for lf in leaves for r in lf["references"]
+               if r["display_name"] == "consume_mixed")
+    assert row["offset_known"] is False, leaves
+
+    # F37: a discarded pointer-only callee reads nothing; a used one blocks
+    result, leaves = gmc("identity_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    result, leaves = gmc("used_identity_case")
+    assert any(r["display_name"] == "use_identity"
+               for lf in leaves for r in lf["references"]), leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False

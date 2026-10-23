@@ -424,6 +424,7 @@ class TaintEngine:
         self._global_tainted_ranges: dict[int, list[tuple]] = {}
         self._global_write_unbounded: set[int] = set()
         self._global_search_truncated: set[int] = set()
+        self._touches_global_cache: dict[int, bool] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
         self._global_extent_unproven: set[int] = set()
         self._ssa_def_cache: dict[tuple, Any] = {}
@@ -6366,7 +6367,12 @@ class TaintEngine:
                 callee, lambda e: is_ssa_var(e) and var_key(e) == pkey,
                 fallback=None, depth=depth + 1)
             self._param_access_cache[key] = cached
-        return cached[1] == "write_only"
+        # Round-14 review F37: `char *identity(char *p) { return p; }` reads
+        # nothing. Returning the pointer is not a use of the bytes (round-3
+        # review F17 established that for the global's own scan), and what
+        # the CALLER does with the result is classified by the caller's own
+        # scan -- which follows the returned alias.
+        return cached[1] in ("write_only", "return")
 
     def _is_pointer_carry(self, ssaf: Any, ins: Any, base: Any,
                           budget: _ScanBudget | None = None) -> bool:
@@ -6717,12 +6723,19 @@ class TaintEngine:
             if inner is None:
                 return None
             answers.add(actual + inner)
+        # A body may ALSO return the object by name on another path --
+        # `return n ? p : tracked + 24` -- which is a second feasible
+        # displacement, not a fallback for when the formals say nothing
+        # (round-14 review F36).
+        direct = self._fn_return_offset_rooted(body, root, depth + 1)
+        if direct is not None:
+            answers.add(direct)
         if answers:
             # `choose(p, q, n)` may hand back EITHER formal: two feasible
             # actuals are two displacements, so there is no single one
             # (round-13 review F30).
             return answers.pop() if len(answers) == 1 else None
-        return self._fn_return_offset_rooted(body, root, depth + 1)
+        return None
 
     def _global_root(self, ga: int):
         """Leaf test for the object at *ga*: the displacement a constant
@@ -6900,11 +6913,10 @@ class TaintEngine:
             return out
         section = self._section_names(ga)
         found: list[int] = []
-        exhausted = False
+        exhausted = True          # cleared only by a reason to STOP looking
         at = int(ga)
-        for _ in range(self._ALIAS_HOPS * 4):
+        for _ in range(self._ALIAS_HOPS * 64):
             if len(found) >= self._ALIAS_HOPS:
-                exhausted = True
                 break
             try:
                 got = prev(at)
@@ -6912,13 +6924,13 @@ class TaintEngine:
                 break
             addr = got if isinstance(got, int) else getattr(got, "address", None)
             if addr is None or int(addr) >= at:
+                exhausted = False   # the section ran out: nothing left to see
                 break
             at = int(addr)
             if ga - at > self._ALIAS_WINDOW:
                 # A bound reached is not evidence: an object whose base lies
                 # further back than the window is still an object this write
                 # may be inside (round-13 review F29).
-                exhausted = True
                 break
             try:
                 named = getsym(at)
@@ -6927,7 +6939,11 @@ class TaintEngine:
             if named is None:
                 continue        # a bare interior variable BN invented
             if self._section_names(at) != section:
-                break           # another section is another object
+                exhausted = False   # another section is another object
+                break
+            if self._authoritative_width(at) and at + self._authoritative_width(at) <= ga:
+                exhausted = False   # a human said where that object ends
+                break
             found.append(at)
         out = (found, exhausted)
         self._alias_chain_cache[ga] = out
@@ -6971,7 +6987,7 @@ class TaintEngine:
             return 0
         at, seen_named, end = int(ga), 0, 0
         section = self._section_names(ga)
-        for _ in range(self._ALIAS_HOPS):
+        for _ in range(self._ALIAS_HOPS * 8):
             try:
                 got = nxt(at)
             except Exception:
@@ -6987,11 +7003,102 @@ class TaintEngine:
                     continue
             except Exception:
                 break
+            if self._typed_width(at):
+                # BN recovered SOMETHING there -- an initialiser, a scalar --
+                # so that address holds an object of its own. An alias comes
+                # back `void`: nothing is known about it because it names
+                # the inside of this one. Stop before a neighbour with
+                # content of its own.
+                break
             seen_named += 1
             end = at - ga
-            if seen_named >= 2:
+            if seen_named >= self._ALIAS_HOPS:
                 break
-        return end
+        # The LAST named symbol's own storage is part of the run: an alias
+        # at `+64` of a 256-byte object is followed by a reader at `+80`,
+        # so stopping at the symbol itself excluded the reader (round-14
+        # review F33). Carry on to where the run ends.
+        return end + self._trailing_extent(ga + end) if end else 0
+
+    def _trailing_extent(self, at: int) -> int:
+        """How far the LAST symbol in a contiguous run reaches: to the next
+        SYMBOLLED data variable, else to the end of its section.
+
+        Not to the next data variable of any kind: an untyped object makes
+        BN invent a bare variable at each offset something references, so
+        stopping at one cuts the run at the very reference being looked for
+        (the same rule `_global_extent`'s layout bound applies)."""
+        nxt = getattr(self.bv, "get_next_data_var_after", None)
+        getsym = getattr(self.bv, "get_symbol_at", None)
+        if callable(nxt) and callable(getsym):
+            cur = at
+            for _ in range(self._ALIAS_HOPS * 8):
+                try:
+                    got = nxt(cur)
+                except Exception:
+                    break
+                addr = got if isinstance(got, int) else getattr(got, "address", None)
+                if addr is None or int(addr) <= cur:
+                    break
+                cur = int(addr)
+                try:
+                    if getsym(cur) is not None:
+                        return cur - at
+                except Exception:
+                    break
+        getsecs = getattr(self.bv, "get_sections_at", None)
+        if callable(getsecs):
+            try:
+                for sec in (getsecs(at) or []):
+                    end = getattr(sec, "end", None)
+                    if end is not None and int(end) > at:
+                        return int(end) - at
+            except Exception:
+                pass
+        return 1
+
+    def _touches_any_global(self, fn: Any) -> bool:
+        """Whether *fn* names ANY writable global address at all.
+
+        The cheap question behind "could an unexamined object matter here":
+        a body with no global operand reads no object's bytes, whatever the
+        alias search did not get to (round-14 review F35)."""
+        key = int(getattr(fn, "start", 0))
+        cached = self._touches_global_cache.get(key)
+        if cached is not None:
+            return cached
+        found = False
+        try:
+            for ins in self._instrs(self._ssa_func(fn)):
+                for const in self._instruction_constants(ins):
+                    if self._canon_global(const) is not None:
+                        found = True
+                        break
+                if found:
+                    break
+        except TaintError:
+            found = True        # a body that cannot be read claims nothing
+        self._touches_global_cache[key] = found
+        return found
+
+    def _instruction_constants(self, ins: Any, depth: int = 0) -> list:
+        """Every integer constant an instruction's operands name."""
+        out: list[int] = []
+        stack = [(ins, 0)]
+        while stack:
+            node, d = stack.pop()
+            if node is None or d > 8:
+                continue
+            value = self._int_const(node)
+            if value is not None:
+                out.append(int(value))
+            for attr in ("src", "dest", "left", "right", "params", "operands"):
+                sub = getattr(node, attr, None)
+                if isinstance(sub, (list, tuple)):
+                    stack.extend((one, d + 1) for one in sub)
+                elif sub is not None and hasattr(sub, "operation"):
+                    stack.append((sub, d + 1))
+        return out
 
     def _authoritative_width(self, ga: int) -> int:
         """The width of a type a HUMAN applied to this object, else 0.
@@ -7050,9 +7157,13 @@ class TaintEngine:
         tainted = self._tainted_ranges(ga)
         start = int(getattr(fn, "start", 0))
         candidates, exhausted = self._preceding_objects(ga)
-        if exhausted:
+        if exhausted and self._touches_any_global(fn):
             # The enumeration stopped with plausible enclosing objects
-            # unexamined, so "nothing encloses it" was never established.
+            # unexamined, so "nothing encloses it" was never established --
+            # but only where it could MATTER. A fully analysed body that
+            # names no global at all reads no object, enclosing or not, so
+            # the unexamined storage cannot change its answer (round-14
+            # review F35).
             self._global_search_truncated.add(ga)
         for pb in candidates:
             if start not in self._global_ref_functions(pb):
@@ -8726,6 +8837,12 @@ class TaintEngine:
                             k = int(vto.split("arg:", 1)[1])
                             if k < len(params):
                                 propagated.add(k)
+                                # A printf-family destination is written too,
+                                # by a length no model states: the object's
+                                # extent must stop being clipped by what BN
+                                # inferred, exactly as for a copy (round-14
+                                # review F33).
+                                self._note_write_span(ssaf, params, k, model)
                     if eff_vsink is not None:
                         # record under the real param index i so this shares the
                         # recorded_sinks / top-level dedup with any static sink.

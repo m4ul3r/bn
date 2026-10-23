@@ -3361,3 +3361,166 @@ def test_the_reseed_command_comes_from_one_reference(models):
     # the command names the function the locator belongs to, not the first row
     assert leaf["reseed"] == (
         f"`bn taint forward -f {rows[1]['address']} --source arg:system:0`")
+
+
+# --------------------------------------------------------------------------
+# round-14 review F33/F34/F35/F36/F37
+# --------------------------------------------------------------------------
+
+def _alias_run_program(write_len, read_at=80, reader_kind="span"):
+    """An object with THREE interior aliases and a reader past the last."""
+    aliases = {G_DIR: 5, G_DIR + 16: 0, G_DIR + 32: 0, G_DIR + 64: 0,
+               G_OTHER: 5}
+    consumer = _interior_reader("run_reader", 0x401200, G_DIR + read_at, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(write_len)] if write_len is not None
+        else [_var(FSSA(FVar("n"), 0))])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "run_reader"},
+                   funcs={0x401200: consumer},
+                   refs={G_DIR + read_at: [FRef(consumer, 0x401210)],
+                         G_DIR: [FRef(func, 0x401104)]},
+                   objects=aliases, interior=[G_DIR + read_at],
+                   section=(0x404000, 0x405000))
+    return func, bv
+
+
+@pytest.mark.parametrize("length", [112, None])
+def test_a_write_reaches_past_every_interior_alias(models, length):
+    # Round-14 review F33: `chain[256]` carries aliases at +16, +32 and +64,
+    # and the reader is at +80. Stopping the forward run at the SECOND
+    # symbol excluded it, so an unknown-length copy cleared.
+    func, bv = _alias_run_program(length)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "run_reader", leaf
+    assert leaf["references"][0]["offset"] == 80, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_short_write_still_stops_before_the_reader(models):
+    func, bv = _alias_run_program(16)
+    assert _leaves(_forward(bv, func, models)) == []
+
+
+def test_the_run_stops_at_a_neighbour_with_recovered_content(models):
+    # An alias comes back `void` -- nothing is known about it because it
+    # names the inside of this object. A neighbour BN recovered a type for
+    # holds content of its own, and the run ends there.
+    consumer = _interior_reader("other_reader", 0x401200, G_OTHER, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, STRCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])])
+    bv = FExtentBV({STRCPY: "strcpy", SYSTEM: "system", 0x401200: "other_reader"},
+                   funcs={0x401200: consumer},
+                   refs={G_OTHER: [FRef(consumer, 0x401210)],
+                         G_DIR: [FRef(func, 0x401104)]},
+                   objects={G_DIR: 5, G_OTHER: 5},
+                   section=(0x404000, 0x405000))
+    assert _leaves(_forward(bv, func, models)) == []
+
+
+def test_a_predecessor_walk_that_runs_out_of_steps_is_exhausted(models,
+                                                                monkeypatch):
+    # Round-14 review F34: the unnamed-predecessor loop could END on its own
+    # iteration limit without recording that it had, which restored a false
+    # all-clear on the object it never reached.
+    monkeypatch.setattr(te.TaintEngine, "_ALIAS_HOPS", 1)
+    interior = [G_DIR + 8 * i for i in range(1, 40)]
+    bv = FExtentBV({}, objects={G_DIR: 0, G_TAIL: 0}, interior=interior,
+                   section=(0x404000, 0x405000))
+    found, exhausted = te.TaintEngine(bv, models)._preceding_objects(G_TAIL)
+    assert exhausted is True, found
+
+
+def test_a_callee_that_names_no_global_is_not_a_budget_frontier(models,
+                                                                monkeypatch):
+    # Round-14 review F35: a fully analysed body that touches no global at
+    # all reads no object, enclosing or not -- an unfinished alias search
+    # cannot change that answer, so it must not manufacture a boundary.
+    monkeypatch.setattr(te.TaintEngine, "_ALIAS_HOPS", 1)
+    quiet = _quiet("constant_only", 0x401200)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_TAIL),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(32)])
+    bv = FExtentBV({MEMCPY: "memcpy", 0x401200: "constant_only"},
+                   funcs={0x401200: quiet},
+                   refs={G_TAIL: [FRef(func, 0x401104)]},
+                   objects={G_DIR: 0, G_DIR + 16: 0, G_TAIL: 0},
+                   section=(0x404000, 0x405000))
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_constant_return_arm_is_another_feasible_offset(models):
+    # Round-14 review F36: `mixed(p, n) { return n ? p : g + 24; }` called
+    # with `g + 8` has feasible offsets {8, 24}. Joining only the FORMALS
+    # published +8 as exact.
+    p, n = FVar("p"), FVar("n")
+    p0 = FSSA(p, 0)
+    helper = GFunc("mixed", 0x401200, FSSAFunc([
+        FInstr(0, 0x401200, "MLIL_IF", "if (n)"),
+        FInstr(1, 0x401208, "MLIL_RET", "return p#0", reads=[p0], src=[_var(p0)]),
+        FInstr(2, 0x401210, "MLIL_RET", "return g + 24",
+               src=[FExpr("MLIL_ADD", "g + 24", left=_gptr(G_DIR),
+                          right=_const(24))]),
+    ]), params=[p, n])
+    r = FSSA(FVar("r"), 1)
+    caller = FSSAFunc([
+        FInstr(0, 0x401300, "MLIL_CALL_SSA", "r#1 = mixed(g + 8, sel)",
+               writes=[r], dest=_gptr(0x401200),
+               params=[FExpr("MLIL_ADD", "g + 8", left=_gptr(G_DIR),
+                             right=_const(8)), _const(0)]),
+    ])
+    eng = te.TaintEngine(FGlobalBV({0x401200: "mixed"},
+                                   funcs={0x401200: helper}), models)
+    assert eng._global_ptr_offset(caller, _var(r), G_DIR) is None
+
+
+def _identity_program(consume):
+    """`char *identity(char *p) { return p; }` called, result used or not."""
+    p = FVar("p")
+    p0 = FSSA(p, 0)
+    helper = GFunc("identity", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_RET", "return p#0", reads=[p0], src=[_var(p0)]),
+    ]), params=[p])
+    q = FSSA(FVar("q"), 1)
+    body = [FInstr(0, 0x401310, "MLIL_CALL_SSA", "q#1 = identity(g)", writes=[q],
+                   dest=_gptr(0x401200), params=[_gptr(G_DIR)])]
+    if consume:
+        body.append(FInstr(1, 0x401318, "MLIL_CALL_SSA", "system(q#1)",
+                           reads=[q], dest=_gptr(SYSTEM), params=[_var(q)]))
+    else:
+        body.append(FInstr(1, 0x401318, "MLIL_RET", "return 7",
+                           src=[_const(7)]))
+    consumer = GFunc("caller", 0x401300, FSSAFunc(body), params=[],
+                     callees=[helper])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401200: "identity", 0x401300: "caller"},
+                   funcs={0x401200: helper, 0x401300: consumer},
+                   refs={G_DIR: [FRef(consumer, 0x401310)]})
+    return func, bv
+
+
+def test_a_callee_that_only_hands_the_pointer_back_reads_nothing(models):
+    # Round-14 review F37: `identity(p)` dereferences nothing. Returning the
+    # pointer is not a use of the bytes, and a caller that DISCARDS the
+    # result consumes nothing either.
+    func, bv = _identity_program(consume=False)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_consumed_identity_result_still_blocks(models):
+    # ...and when the caller DOES use what came back, that use is the
+    # boundary -- which is where the caller's own scan finds it.
+    func, bv = _identity_program(consume=True)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["access"] == "call_arg", leaf
+    assert leaf["references"][0]["at"] == hex(0x401318), leaf
