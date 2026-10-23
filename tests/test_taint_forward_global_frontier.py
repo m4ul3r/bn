@@ -3404,21 +3404,31 @@ def test_a_short_write_still_stops_before_the_reader(models):
     assert _leaves(_forward(bv, func, models)) == []
 
 
-def test_the_run_stops_at_a_neighbour_with_recovered_content(models):
-    # An alias comes back `void` -- nothing is known about it because it
-    # names the inside of this object. A neighbour BN recovered a type for
-    # holds content of its own, and the run ends there.
+def test_the_run_stops_at_a_user_typed_neighbour(models):
+    # A type BN INFERRED says nothing about boundaries -- one byte access
+    # at `g + 32` makes that alias an auto-discovered `uint8_t`, and
+    # stopping there hid the reader past it (round-16 review F33). A type a
+    # HUMAN applied is where the object ends, so the run stops.
     consumer = _interior_reader("other_reader", 0x401200, G_OTHER, 0x401210)
-    func, _argv = _copy_then_call(
-        0x401104, STRCPY, _gptr(G_DIR),
-        call_sites=[(0x401108, _gptr(0x401200), [])])
-    bv = FExtentBV({STRCPY: "strcpy", SYSTEM: "system", 0x401200: "other_reader"},
-                   funcs={0x401200: consumer},
-                   refs={G_OTHER: [FRef(consumer, 0x401210)],
-                         G_DIR: [FRef(func, 0x401104)]},
-                   objects={G_DIR: 5, G_OTHER: 5},
-                   section=(0x404000, 0x405000))
+
+    def program(authoritative):
+        func, _argv = _copy_then_call(
+            0x401104, STRCPY, _gptr(G_DIR),
+            call_sites=[(0x401108, _gptr(0x401200), [])])
+        bv = FExtentBV({STRCPY: "strcpy", SYSTEM: "system",
+                        0x401200: "other_reader"},
+                       funcs={0x401200: consumer},
+                       refs={G_OTHER: [FRef(consumer, 0x401210)],
+                             G_DIR: [FRef(func, 0x401104)]},
+                       objects={G_DIR: 5, G_OTHER: 5},
+                       authoritative=authoritative,
+                       section=(0x404000, 0x405000))
+        return func, bv
+
+    func, bv = program({G_OTHER})
     assert _leaves(_forward(bv, func, models)) == []
+    func, bv = program(())
+    assert _leaves(_forward(bv, func, models)) != []
 
 
 def test_a_predecessor_walk_that_runs_out_of_steps_is_exhausted(models,
@@ -3524,3 +3534,125 @@ def test_a_consumed_identity_result_still_blocks(models):
     [leaf] = _leaves(_forward(bv, func, models))
     assert leaf["references"][0]["access"] == "call_arg", leaf
     assert leaf["references"][0]["at"] == hex(0x401318), leaf
+
+
+# --------------------------------------------------------------------------
+# round-16 review F33/F38/F36
+# --------------------------------------------------------------------------
+
+def test_an_access_inferred_type_on_an_alias_is_not_a_boundary(models):
+    # Round-16 review F33: one byte access at `g + 32` makes that alias an
+    # auto-discovered `uint8_t`. Stopping the forward run there hid the
+    # reader at +80 for every copy whose length is not constant.
+    aliases = {G_DIR: 5, G_DIR + 16: 0, G_DIR + 32: 1, G_DIR + 64: 0,
+               G_OTHER: 5}
+    consumer = _interior_reader("run_reader", 0x401200, G_DIR + 80, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, STRCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])])
+    bv = FExtentBV({STRCPY: "strcpy", SYSTEM: "system", 0x401200: "run_reader"},
+                   funcs={0x401200: consumer},
+                   refs={G_DIR + 80: [FRef(consumer, 0x401210)],
+                         G_DIR: [FRef(func, 0x401104)]},
+                   objects=aliases, interior=[G_DIR + 80],
+                   section=(0x404000, 0x405000))
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["display_name"] == "run_reader", leaf
+    assert leaf["references"][0]["offset"] == 80, leaf
+
+
+def _branching_callee(name, start, order, kind="call"):
+    """`if (n) return p; <use of p>; return NULL;` in either arm order."""
+    p, n = FVar("p"), FVar("n")
+    p0 = FSSA(p, 0)
+    ret = FInstr(0, start + 8, "MLIL_RET", "return p#0", reads=[p0],
+                 src=[_var(p0)])
+    if kind == "call":
+        use = FInstr(0, start + 16, "MLIL_CALL_SSA", "system(p#0)", reads=[p0],
+                     dest=_gptr(SYSTEM), params=[_var(p0)])
+    else:
+        use = FInstr(0, start + 16, "MLIL_SET_VAR_SSA", "x#1 = [p#0].b",
+                     reads=[p0], writes=[FSSA(FVar("x"), 1)],
+                     src=FExpr("MLIL_LOAD_SSA", "[p#0].b", src=_var(p0)))
+    arms = [ret, use] if order == "return_first" else [use, ret]
+    instrs = [FInstr(0, start, "MLIL_IF", "if (n)"), *arms,
+              FInstr(0, start + 24, "MLIL_RET", "return 0", src=[_const(0)])]
+    for i, ins in enumerate(instrs):
+        ins.instr_index = i
+    return GFunc(name, start, FSSAFunc(instrs), params=[p, n])
+
+
+@pytest.mark.parametrize("order", ["return_first", "use_first"])
+@pytest.mark.parametrize("kind", ["call", "load"])
+def test_a_branch_that_reads_outranks_a_branch_that_returns(models, order, kind):
+    # Round-16 review F38: BN lists `if (n) return p;` before the other
+    # arm's `system(p)`, so answering "destination only" from the FIRST use
+    # called a body that reaches a sink a non-reader.
+    helper = _branching_callee("conditional", 0x401200, order, kind)
+    caller = GFunc("ignore_conditional", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "conditional(g, sel)",
+               dest=_gptr(0x401200), params=[_gptr(G_DIR), _const(0)]),
+        FInstr(1, 0x401318, "MLIL_RET", "return 7", src=[_const(7)]),
+    ]), params=[], callees=[helper])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401200: "conditional", 0x401300: "ignore_conditional"},
+                   funcs={0x401200: helper, 0x401300: caller},
+                   refs={G_DIR: [FRef(caller, 0x401310)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "ignore_conditional", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def _multi_arm_helper(name, start, arms):
+    """A callee returning the formal or the object at several offsets."""
+    p, n = FVar("p"), FVar("n")
+    p0 = FSSA(p, 0)
+    instrs = [FInstr(0, start, "MLIL_IF", "if (n)")]
+    for i, arm in enumerate(arms):
+        if arm == "formal":
+            instrs.append(FInstr(0, start + 8 * (i + 1), "MLIL_RET",
+                                 "return p#0", reads=[p0], src=[_var(p0)]))
+        elif arm == "dynamic":
+            instrs.append(FInstr(0, start + 8 * (i + 1), "MLIL_RET",
+                                 "return g + sel",
+                                 src=[FExpr("MLIL_ADD", "g + sel",
+                                            left=_gptr(G_DIR),
+                                            right=FExpr("MLIL_LOAD_SSA", "[sel]",
+                                                        src=_gptr(G_OTHER)))]))
+        else:
+            instrs.append(FInstr(0, start + 8 * (i + 1), "MLIL_RET",
+                                 f"return g + {arm}",
+                                 src=[FExpr("MLIL_ADD", f"g + {arm}",
+                                            left=_gptr(G_DIR),
+                                            right=_const(arm))]))
+    for i, ins in enumerate(instrs):
+        ins.instr_index = i
+    return GFunc(name, start, FSSAFunc(instrs), params=[p, n])
+
+
+@pytest.mark.parametrize("arms,expected", [
+    (["formal", 24, 40], None),          # three feasible displacements
+    (["formal", "dynamic"], None),       # one of them not a constant
+    ([24, "formal"], None),              # reversed order
+    (["formal", 8], 8),                  # every route agrees
+    (["formal"], 8),                     # only the formal route
+])
+def test_a_rooted_return_route_joins_with_the_formals(models, arms, expected):
+    # Round-16 review F36: "no rooted route" and "a rooted route whose
+    # displacement is not one value" are different answers -- the second
+    # makes the result unknown however exact the formal route is.
+    helper = _multi_arm_helper("mixed", 0x401200, arms)
+    r = FSSA(FVar("r"), 1)
+    caller = FSSAFunc([
+        FInstr(0, 0x401300, "MLIL_CALL_SSA", "r#1 = mixed(g + 8, sel)",
+               writes=[r], dest=_gptr(0x401200),
+               params=[FExpr("MLIL_ADD", "g + 8", left=_gptr(G_DIR),
+                             right=_const(8)), _const(0)]),
+    ])
+    eng = te.TaintEngine(FGlobalBV({0x401200: "mixed"},
+                                   funcs={0x401200: helper}), models)
+    assert eng._global_ptr_offset(caller, _var(r), G_DIR) == expected

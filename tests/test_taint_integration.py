@@ -3045,3 +3045,106 @@ def test_global_continuation_alias_runs_joins_and_pointer_only_callees(
     assert any(r["display_name"] == "use_identity"
                for lf in leaves for r in lf["references"]), leaves
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+_R16_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#define N __attribute__((noinline))
+volatile int selector;
+volatile unsigned char seen;
+char chain[256] __attribute__((section(".chain"))) = "seed";
+extern char alias16[240], alias64[192];
+extern unsigned char alias32;
+__asm__(".globl alias16\n.set alias16,chain+16\n.type alias16,@object\n.size alias16,240\n"
+        ".globl alias32\n.set alias32,chain+32\n.type alias32,@object\n.size alias32,1\n"
+        ".globl alias64\n.set alias64,chain+64\n.type alias64,@object\n.size alias64,192\n");
+N void type_alias(void) { seen = alias32; }
+N void chain_reader(void) { system(alias64 + 16); }
+N void typed_known(char *s) { memcpy(chain, s, 112); chain_reader(); }
+N void typed_unknown(char *s, size_t n) { memcpy(chain, s, n); chain_reader(); }
+N void typed_strcpy(char *s) { strcpy(chain, s); chain_reader(); }
+N void typed_sprintf(char *s) { sprintf(chain, "%s", s); chain_reader(); }
+N void typed_short(char *s) { memcpy(chain, s, 16); chain_reader(); }
+char tracked[128] __attribute__((section(".track"))) = "seed";
+N char *conditional(char *p, int n) { if (n) return p + 1; system(p); return p + 2; }
+N char *conditional_reverse(char *p, int n) { if (n) { system(p); return p + 2; } return p + 1; }
+N char *early_likely(char *p, int n) { if (__builtin_expect(n != 0, 0)) return p; system(p); return NULL; }
+N char *identity(char *p) { return p; }
+N int ignore_conditional(void) { conditional(tracked, selector); return 7; }
+N int ignore_reverse(void) { conditional_reverse(tracked, selector); return 7; }
+N int ignore_likely(void) { early_likely(tracked, selector); return 7; }
+N int ignore_identity(void) { identity(tracked); return 7; }
+N char *mixed3(char *p, int n) { if (n == 1) return p; if (n == 2) return tracked + 24; return tracked + 40; }
+N char *mixed_dynamic(char *p, int n) { return n ? p : tracked + selector; }
+N char *mixed_agree(char *p, int n) { return n ? p : tracked + 8; }
+N char *producer3(void) { return mixed3(tracked + 8, selector); }
+N char *producer_dynamic(void) { return mixed_dynamic(tracked + 8, selector); }
+N char *producer_agree(void) { return mixed_agree(tracked + 8, selector); }
+N void consume3(void) { system(producer3()); }
+N void consume_dynamic(void) { system(producer_dynamic()); }
+N void consume_agree(void) { system(producer_agree()); }
+#define C(name,fn) N void name(char *s) { memcpy(tracked, s, 64); fn(); }
+C(conditional_case, ignore_conditional)
+C(reverse_case, ignore_reverse)
+C(likely_case, ignore_likely)
+C(identity_case, ignore_identity)
+C(mixed3_case, consume3)
+C(dynamic_case, consume_dynamic)
+C(agree_case, consume_agree)
+int main(void) { return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1"], ids=["O0", "O1"])
+def test_global_continuation_auto_types_branches_and_return_routes(
+        tmp_path, shared_bn, opt):
+    """Round-16 review F33, F38 and F36 on real stripped builds.
+
+    F33: a type BN INFERRED from an access (`uint8_t` at `chain + 32`) is
+    not an object boundary, so an unknown-length or sink-firing copy still
+    reaches the reader past it.
+    F38: "writes only through this parameter" is a verdict over EVERY
+    feasible use, not the first one BN happens to list.
+    F36: a rooted return route that is present but ambiguous makes the
+    displacement unknown, however exact the formal route is."""
+    src = tmp_path / f"r3r16{opt[-1]}.c"
+    src.write_text(_R16_SRC)
+    binary = tmp_path / f"r3r16{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-fno-inline",
+                           "-fno-optimize-sibling-calls", "-fno-stack-protector", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # F33: the auto-typed alias does not end the object
+    for fn in ("typed_known", "typed_unknown", "typed_strcpy", "typed_sprintf"):
+        result, leaves = gmc(fn)
+        assert any(r["display_name"] == "chain_reader" and r["offset"] == 80
+                   for lf in leaves for r in lf["references"]), (fn, leaves)
+    result, leaves = gmc("typed_short")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+    # F38: a sink on the other arm outranks a pointer-return arm
+    for fn in ("conditional_case", "reverse_case", "likely_case"):
+        result, leaves = gmc(fn)
+        assert leaves, (fn, result["diagnostics"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+    result, leaves = gmc("identity_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+    # F36: three arms, and a dynamic arm, are both unknown; agreement is not
+    for fn in ("mixed3_case", "dynamic_case"):
+        row = next(r for lf in gmc(fn)[1] for r in lf["references"]
+                   if r["access"] == "call_arg")
+        assert row["offset_known"] is False, fn
+    row = next(r for lf in gmc("agree_case")[1] for r in lf["references"]
+               if r["access"] == "call_arg")
+    assert (row["offset"], row["offset_known"]) == (8, True), row

@@ -6363,9 +6363,19 @@ class TaintEngine:
         cached = self._param_access_cache.get(key)
         if cached is None:
             pkey = var_key(pv)
+            root = (lambda k: lambda e: is_ssa_var(e) and var_key(e) == k)(pkey)
             cached = self._pointer_access(
-                callee, lambda e: is_ssa_var(e) and var_key(e) == pkey,
-                fallback=None, depth=depth + 1)
+                callee, root, fallback=None, depth=depth + 1)
+            if cached[1] == "return":
+                # EVERY feasible use decides this, never the first one. BN
+                # lists `if (n) return p;` before the `system(p)` on the
+                # other arm, so answering from the first use called a body
+                # that calls a sink "writes only" (round-16 review F38).
+                uses: list = []
+                self._pointer_access(callee, root, fallback=None,
+                                     depth=depth + 1, collect=uses)
+                if any(use.kind != "return" for use in uses):
+                    cached = next(use for use in uses if use.kind != "return")
             self._param_access_cache[key] = cached
         # Round-14 review F37: `char *identity(char *p) { return p; }` reads
         # nothing. Returning the pointer is not a use of the bytes (round-3
@@ -6726,9 +6736,14 @@ class TaintEngine:
         # A body may ALSO return the object by name on another path --
         # `return n ? p : tracked + 24` -- which is a second feasible
         # displacement, not a fallback for when the formals say nothing
-        # (round-14 review F36).
-        direct = self._fn_return_offset_rooted(body, root, depth + 1)
-        if direct is not None:
+        # (round-14 review F36). "No such path" and "a path whose
+        # displacement is not one value" are DIFFERENT answers: the second
+        # makes the whole result unknown however exact the formals are
+        # (round-16 review F36).
+        rooted, direct = self._fn_return_routes(body, root, depth + 1)
+        if rooted and direct is None:
+            return None
+        if rooted:
             answers.add(direct)
         if answers:
             # `choose(p, q, n)` may hand back EITHER formal: two feasible
@@ -6776,18 +6791,27 @@ class TaintEngine:
     def _fn_return_offset_rooted(self, fn: Any, root: Any,
                                  depth: int = 0) -> int | None:
         """The displacement from *root* that *fn* RETURNS, if it returns one."""
+        return self._fn_return_routes(fn, root, depth)[1]
+
+    def _fn_return_routes(self, fn: Any, root: Any,
+                          depth: int = 0) -> tuple[bool, int | None]:
+        """``(a return path reaches *root*, its displacement or None)``.
+
+        Tri-state on purpose: a body with no such path says nothing about
+        the answer, while one whose path has no single displacement makes
+        the answer unknown (round-16 review F36)."""
         if depth > self._PTR_RESOLVE_DEPTH:
-            return None
+            return (False, None)
         key = (int(getattr(fn, "start", 0)), id(root))
         if key in self._return_offset_active:
-            return None
+            return (False, None)
         self._return_offset_active.add(key)
         try:
             ssaf = self._ssa_func(fn)
             instrs = self._instrs(ssaf)
         except TaintError:
             self._return_offset_active.discard(key)
-            return None
+            return (False, None)
         try:
             # EVERY return that can carry this pointer, joined: a wrapper
             # returning `p + 8` on one path and `p + 24` on another has no
@@ -6797,8 +6821,8 @@ class TaintEngine:
                     for src in self._ret_sources(ins)
                     if self._ptr_resolves(ssaf, src, lambda e: root(e) is not None)]
             if not arms:
-                return None
-            return self._merge_offsets(ssaf, arms, root, depth, set())
+                return (False, None)
+            return (True, self._merge_offsets(ssaf, arms, root, depth, set()))
         finally:
             self._return_offset_active.discard(key)
 
@@ -7003,12 +7027,12 @@ class TaintEngine:
                     continue
             except Exception:
                 break
-            if self._typed_width(at):
-                # BN recovered SOMETHING there -- an initialiser, a scalar --
-                # so that address holds an object of its own. An alias comes
-                # back `void`: nothing is known about it because it names
-                # the inside of this one. Stop before a neighbour with
-                # content of its own.
+            if self._authoritative_width(at):
+                # Only a type a HUMAN applied ends this object's storage.
+                # A type BN inferred says nothing about boundaries: one
+                # byte access at `chain + 32` makes that alias an
+                # auto-discovered `uint8_t`, and stopping there hid the
+                # reader past it (round-16 review F33).
                 break
             seen_named += 1
             end = at - ga
