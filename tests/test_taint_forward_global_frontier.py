@@ -19,6 +19,8 @@ frontier is never a blanket "a global was written" marker.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 from test_taint_engine import (
     FBV,
@@ -4395,6 +4397,7 @@ def test_the_extent_remediation_names_a_real_command(models, monkeypatch):
     if leaf["reachability"]["cause"] == "object_extent_unproven":
         assert f"`bn data retype {hex(G_DIR)} char[112]`" in leaf["detail"], \
             leaf["detail"]
+        assert "MINIMUM" in leaf["detail"]
         assert "bn retype" not in leaf["detail"]
 
 
@@ -4530,3 +4533,148 @@ def test_a_second_bound_does_not_erase_the_first(models):
     assert "global_reference_budget" in result["stats"]["truncation_cause"], \
         result["stats"]
     assert result["stats"]["truncated"] is True
+
+
+@pytest.mark.parametrize("written", [0x60, 0x70], ids=["tight", "wide"])
+def test_the_advertised_size_covers_every_offset_the_leaf_cites(models,
+                                                                monkeypatch,
+                                                                written):
+    # Round-21 review F57, second half: a type ENDS the object, so a size
+    # that stopped short of a reference this leaf cites would DELETE that
+    # reference the moment the command is applied. Whatever the write
+    # length, the advertised size covers every offset the leaf names.
+    monkeypatch.setattr(te.TaintEngine, "_ALIAS_HOPS", 1)
+    reader = _reader("reader", 0x401200, G_DIR + 0x50, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(written)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR: [FRef(func, 0x401104)],
+                         G_DIR + 0x50: [FRef(reader, 0x401210)]},
+                   objects={G_DIR: 0, G_DIR + 16: 0},
+                   section=(0x404000, 0x405000))
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["reachability"]["cause"] == "object_extent_unproven", leaf
+    size = int(re.search(r"char\[(\d+)\]", leaf["detail"]).group(1))
+    cited = max(r["offset"] for r in leaf["references"] if r["offset_known"])
+    assert size > cited, (size, cited, leaf["detail"])
+    assert "MINIMUM" in leaf["detail"]
+
+
+def test_an_object_bound_is_kept_beside_another_frontier_cause(models,
+                                                               monkeypatch):
+    # Round-21 review F59: the object's extent was in doubt AND the search
+    # hit a second bound. The later cause used to be dropped because a
+    # primary one was already set, so `stats` reported one and forgot the
+    # other.
+    monkeypatch.setattr(te.TaintEngine, "_ALIAS_HOPS", 1)
+    reader = _reader("reader", 0x401200, G_DIR + 0x50, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0x70)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR: [FRef(func, 0x401104)],
+                         G_DIR + 0x50: [FRef(reader, 0x401210)]},
+                   objects={G_DIR: 0, G_DIR + 16: 0},
+                   section=(0x404000, 0x405000))
+    eng = te.TaintEngine(bv, models)
+    real = eng._global_refs_reachable
+
+    def with_opaque(fn, ga, budget):
+        refs, _reach = real(fn, ga, budget)
+        return refs, eng._reach_status("unresolved_call_target", 1,
+                                       [0x401200], {}, causes=[
+                                           "unresolved_call_target"])
+
+    eng._global_refs_reachable = with_opaque
+    [leaf] = _leaves(eng.forward(func, [te.parse_locator("param:0")]))
+    causes = leaf["reachability"]["causes"]
+    assert "unresolved_call_target" in causes, causes
+    assert "object_extent_unproven" in causes, causes
+    assert "global_object_extent" in \
+        eng.forward(func, [te.parse_locator("param:0")])["stats"][
+            "truncation_cause"]
+
+
+def test_an_unreadable_thunk_keeps_its_single_cause(models):
+    # Round-21 review F59: the object's extent was in doubt AND the callee
+    # was a thunk nothing could read. The second cause used to overwrite
+    # the first, so `stats` reported one bound and forgot the other.
+    reader = _reader("reader", 0x401500, G_DIR, 0x401510)
+    veneer = GFunc("veneer", 0x401300, FSSAFunc([]), params=[], is_thunk=True)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x70)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401300: "veneer", 0x401500: "reader"},
+                   funcs={0x401300: veneer, 0x401500: reader},
+                   refs={G_DIR: [FRef(func, 0x401104), FRef(reader, 0x401510)]},
+                   objects={G_DIR: 0, G_DIR + 16: 0},
+                   section=(0x404000, 0x405000))
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["reachability"]["cause"] == "unresolved_thunk", leaf
+    assert leaf["reachability"]["causes"] == ["unresolved_thunk"], leaf
+
+
+def _nested_writer_program(depth=3, taken=True):
+    """`case(s)` calls a chain of helpers; the innermost fills the global,
+    and the caller then calls a zero-argument reader."""
+    reader = _reader("reader", 0x401200, G_DIR, 0x401210)
+    s_var = FVar("s")
+    s0 = FSSA(s_var, 0)
+    inner = GFunc("fill", 0x401900, FSSAFunc([
+        FInstr(0, 0x401910, "MLIL_CALL_SSA", "memcpy(g, s#0, 0x70)",
+               reads=[s0], dest=_gptr(MEMCPY),
+               params=[_gptr(G_DIR if taken else G_OTHER), _var(s0),
+                       _const(0x70)]),
+        FInstr(1, 0x401914, "MLIL_RET", "return", src=[_const(0)]),
+    ]), params=[s_var])
+    funcs = {0x401200: reader, 0x401900: inner}
+    names = {MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader",
+             0x401900: "fill"}
+    nxt, prev = 0x401900, inner
+    for i in range(depth):
+        start = 0x401600 + i * 0x40
+        a = FVar("a")
+        a0 = FSSA(a, 0)
+        wrap = GFunc(f"wrap{i}", start, FSSAFunc([
+            FInstr(0, start + 8, "MLIL_CALL_SSA", "callee(a#0)", reads=[a0],
+                   dest=_gptr(nxt), params=[_var(a0)]),
+            FInstr(1, start + 12, "MLIL_RET", "return", src=[_const(0)]),
+        ]), params=[a], callees=[prev])
+        funcs[start], names[start] = wrap, wrap.name
+        nxt, prev = start, wrap
+    arg = FVar("arg")
+    arg0 = FSSA(arg, 0)
+    func = GFunc("case", 0x401100, FSSAFunc([
+        FInstr(0, 0x401104, "MLIL_CALL_SSA", "wrap(arg#0)", reads=[arg0],
+               dest=_gptr(nxt), params=[_var(arg0)]),
+        FInstr(1, 0x401108, "MLIL_CALL_SSA", "reader()",
+               dest=_gptr(0x401200), params=[]),
+        FInstr(2, 0x40110c, "MLIL_RET", "return", src=[_const(0)]),
+    ]), params=[arg], callees=[prev, reader])
+    bv = FGlobalBV(names, funcs=funcs, refs={G_DIR: [FRef(reader, 0x401210)]})
+    return func, bv
+
+
+def test_a_global_filled_three_levels_down_still_reaches_the_reader(models):
+    # Round-21 review F56: the effect composes through nesting -- each
+    # level merges its callee's global writes before its own successors run.
+    func, bv = _nested_writer_program(depth=3, taken=True)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert [r["display_name"] for r in leaf["references"]] == ["reader"], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_nested_helper_that_fills_another_object_raises_no_continuation(
+        models):
+    # The control: the innermost helper fills a DIFFERENT object, so the
+    # reader of this one is not a continuation -- the effect that crosses
+    # back out is the object that was actually written.
+    func, bv = _nested_writer_program(depth=3, taken=False)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]

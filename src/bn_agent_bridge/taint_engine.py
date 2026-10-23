@@ -7868,6 +7868,17 @@ class TaintEngine:
         self._global_reach[key] = out
         return out
 
+    def _with_cause(self, reach: dict[str, Any], cause: str) -> dict[str, Any]:
+        """*reach* plus one more bound this search is known to have reached.
+
+        Precedence picks what the prose leads with; it does not decide what
+        the run HIT. An object bound arriving after a budget used to be
+        dropped on the floor, and `stats` then reported only one of them
+        (round-21 review F59)."""
+        return dict(reach, status="truncated",
+                    cause=reach.get("cause") or cause,
+                    causes=sorted({*(reach.get("causes") or ()), cause}))
+
     def _reach_status(self, cause: str | None, examined: int,
                       unexamined: list[int],
                       sites: dict[int, int] | None = None,
@@ -7900,7 +7911,7 @@ class TaintEngine:
                 for s in unexamined[:8]],
         }
 
-    def _extent_remedy(self, ga: int) -> str:
+    def _extent_remedy(self, ga: int, rows: list | None = None) -> str:
         """How to establish this object's extent -- without inventing it.
 
         A TYPE is authoritative: it ends the object, and every reference
@@ -7911,6 +7922,13 @@ class TaintEngine:
         into an all-clear (round-21 review F57). That case gets the
         question, not a command."""
         proven = int(self._global_write_span.get(ga) or 0)
+        for row in rows or ():
+            # A type ENDS the object, so a size that stops short of a
+            # reference this leaf cites would delete that reference -- the
+            # command has to cover every offset the run established.
+            if not row.get("offset_known"):
+                continue
+            proven = max(proven, int(row.get("offset") or 0) + 1)
         if ga in self._global_write_unbounded or proven <= 0:
             return ("(the write's length is not a constant, so how far it "
                     "reaches is not established either -- no size here is "
@@ -7918,10 +7936,11 @@ class TaintEngine:
                     "references past it. Establish the object's real size, "
                     "then bind it with the data-retype mutation, spelled "
                     f"bn data retype {hex(ga)} char[<size>], and re-run)")
-        return (f"(this write reaches {hex(proven)} bytes, so the object is "
-                f"at least that wide -- bind its real size, which may be "
-                f"larger, with `bn data retype {hex(ga)} char[{proven}]` "
-                f"and re-run)")
+        return (f"(the bytes this run established reach {hex(proven)}, so "
+                f"the object is at least that wide -- `bn data retype "
+                f"{hex(ga)} char[{proven}]` binds that MINIMUM, which is "
+                f"the lower bound and not the real size; widen it to the "
+                f"object's true extent before relying on it, and re-run)")
 
     def _global_continuation_leaf(self, ins: Any, ga: int, callee_fn: Any,
                                   references: tuple, descended: bool,
@@ -8013,7 +8032,7 @@ class TaintEngine:
                     "an object with no recovered type that is written PAST "
                     "the next symbol in the layout -- so where it ends, and "
                     "which references belong to it, are not established "
-                    + self._extent_remedy(ga)),
+                    + self._extent_remedy(ga, rows)),
                 "pointer_scan_budget": (
                     "the bound on how many expression nodes ONE function's "
                     "pointer scan may visit, so what the rest of that body "
@@ -8514,8 +8533,8 @@ class TaintEngine:
                                     # The chain outran its allowance, so the
                                     # bodies past it were never asked: that
                                     # is a bound, not an all-clear (F48).
-                                    reach = self._reach_status(
-                                        "thunk_chain_budget", len(hops), [], {})
+                                    reach = self._with_cause(
+                                        reach, "thunk_chain_budget")
                         if not refs and veneer is not cfn:
                             # The VENEER is where the tainted global becomes
                             # an argument: `relay_reader()` materialises `g`
@@ -8531,14 +8550,15 @@ class TaintEngine:
                             if vrefs:
                                 refs, reach = vrefs, vreach
                         if ga in self._global_search_truncated \
-                                and reach["cause"] is None \
                                 and (refs or self._touches_object_region(cfn, ga)):
                             # F29: the search for an enclosing object ran out
-                            # of budget with storage unexamined.
-                            reach = dict(reach, status="truncated",
-                                         cause="object_search_budget")
-                        if ga in self._global_extent_unproven and refs \
-                                and reach["cause"] is None:
+                            # of budget with storage unexamined. It is
+                            # RECORDED whether or not another bound already
+                            # leads the prose -- bounds are a set, and one
+                            # frontier cause must not delete another
+                            # (round-21 review F59).
+                            reach = self._with_cause(reach, "object_search_budget")
+                        if ga in self._global_extent_unproven and refs:
                             # Doubt about where the object ENDS qualifies the
                             # readers it found; on its own it is not a
                             # boundary, or every unbounded copy into a global
@@ -8548,15 +8568,12 @@ class TaintEngine:
                             # BN21-OBJ-01: the object's own extent is not
                             # established, so "these are its references" is
                             # not established either.
-                            reach = dict(reach, status="truncated",
-                                         cause="object_extent_unproven")
-                        if ga in self._global_refs_truncated \
-                                and reach["cause"] is None:
+                            reach = self._with_cause(reach, "object_extent_unproven")
+                        if ga in self._global_refs_truncated:
                             # F15: the object is larger than the reference
                             # sweep's chunk budget, so "these are all the
                             # references" was never established.
-                            reach = dict(reach, status="truncated",
-                                         cause="reference_sweep_budget")
+                            reach = self._with_cause(reach, "reference_sweep_budget")
                         for body in reach.get("unread_bodies") or ():
                             # F9: a wrapper around an unread consumer is the
                             # same hole as calling it directly.

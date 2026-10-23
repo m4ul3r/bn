@@ -4049,3 +4049,61 @@ def test_a_second_frontier_cause_does_not_erase_an_exhausted_bound(tmp_path,
     assert mixed["stats"]["truncated"] is True, mixed["stats"]
     assert "pointer_scan_budget" in mixed["stats"]["truncation_cause"], \
         mixed["stats"]
+
+
+_EFFECTS_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char clean[256] __attribute__((section(".clean"))) = "safe";
+volatile int status_src;
+volatile int flag;
+N void reader(void) { system(tracked); }
+N int fill(char *s) { memcpy(tracked, s, 112); return status_src; }
+N int fill_other(char *s) { memcpy(clean, s, 112); return status_src; }
+N int wrap2(char *s) { return fill(s); }
+N int wrap1(char *s) { return wrap2(s); }
+N int nested_case(char *s) { int st = wrap1(s); reader(); return st; }
+N int other_nested_case(char *s) { int st = fill_other(s); reader(); return st; }
+N int recurse(char *s, int n) { if (n) return recurse(s, n - 1); return fill(s); }
+N int recursive_case(char *s) { int st = recurse(s, 3); reader(); return st; }
+N int branch_case(char *s) { int st = 0; if (flag) st = fill(s); reader(); return st; }
+N int before_case(char *s) { reader(); return fill(s); }
+int main(int c, char **v) { if (c > 1) return nested_case(v[1]); return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_callee_write_effect_composes_through_the_call_graph(tmp_path,
+                                                               shared_bn, opt):
+    """Round-21 review F56, composed: the effect a helper has on a global
+    crosses back out at the callsite and is visible to everything the
+    caller does AFTERWARDS -- through three levels of wrappers, through
+    recursion, and on a conditional path -- without leaking BACKWARDS to a
+    reader that already ran."""
+    src = tmp_path / f"r5eff{opt[-1]}.c"
+    src.write_text(_EFFECTS_SRC)
+    binary = tmp_path / f"r5eff{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("nested_case", "recursive_case", "branch_case"):
+        _result, leaves = gmc(fn)
+        assert any(r["display_name"] == "reader"
+                   for lf in leaves for r in lf["references"]), (fn, leaves)
+
+    # the helper fills ANOTHER object...
+    result, leaves = gmc("other_nested_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    # ...and a reader that ran BEFORE the write is not a continuation of it
+    result, leaves = gmc("before_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
