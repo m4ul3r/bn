@@ -7183,21 +7183,29 @@ class TaintEngine:
         return None
 
     def _arm_is_nearby_pointer(self, ssaf: Any, arm: Any, root: Any) -> bool:
-        """Whether *arm* is a constant pointer into the same STORAGE as the
-        object *root* describes, without being inside it yet."""
+        """Whether *arm* is a CONSTANT pointer into the same storage as the
+        object this root describes, without being inside it yet.
+
+        Such an arm is not infeasible, only not there YET: a later
+        adjustment can bring it in (`choose(g + 48, g + 64)` then `+ 16`),
+        so dropping it certified the surviving arm (round-25 review F68).
+        An arm that is already inside, and one that names other storage
+        entirely, are both unaffected."""
+        base_ga = getattr(root, "ga", None)
+        if base_ga is None:
+            return False
         value = self._int_const(arm)
         if value is None:
             value = self._global_addr(ssaf, arm, canon=False)
         if value is None:
-            return False
-        base = self._canon_global(int(value))
-        if base is None:
-            return False
+            return False            # not a constant: nothing is claimed
+        if root(arm) is not None:
+            return False            # already inside the object
         try:
-            return self._section_names(int(value)) == self._section_names(
-                int(getattr(root, "__self__", None) or 0)) or True
+            return self._section_names(int(value)) == \
+                self._section_names(int(base_ga))
         except Exception:
-            return True
+            return False
 
     def _call_offset(self, ssaf: Any, defn: Any, root: Any, depth: int,
                      seen: set) -> int | None:
@@ -7271,6 +7279,7 @@ class TaintEngine:
                 return None
             value = int(value)
             return value - ga if ga <= value < ga + extent else None
+        root.ga = int(ga)
         return root
 
     def _global_ptr_offset(self, ssaf: Any, expr: Any, ga: int) -> int | None:
