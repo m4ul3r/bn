@@ -43,27 +43,14 @@ def _build_wheel(tree: Path, out_dir: Path) -> Path:
     if uv is None:
         pytest.skip("uv is required to build the wheel")
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    def build(*extra: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [uv, "build", *extra, "--wheel", "--out-dir", str(out_dir), str(tree)],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-            check=False,
-        )
-
-    # What is under test is THIS tree's packaging configuration, not PyPI
-    # reachability: the build backend named in `build-system.requires` is the
-    # same pinned version every run, so a warm uv cache can supply it. Try
-    # the cache first and only reach for the network when it cannot, so a
-    # host with no DNS still exercises the pins instead of erroring out on
-    # `Failed to fetch https://pypi.org/simple/uv-build/`.
-    result = build("--offline")
-    if result.returncode != 0:
-        online = build()
-        result = online if online.returncode == 0 else result
+    result = subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(out_dir), str(tree)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        check=False,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
     wheels = sorted(out_dir.glob("*.whl"))
