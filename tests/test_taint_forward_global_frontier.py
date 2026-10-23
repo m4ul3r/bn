@@ -4396,3 +4396,137 @@ def test_the_extent_remediation_names_a_real_command(models, monkeypatch):
         assert f"`bn data retype {hex(G_DIR)} char[112]`" in leaf["detail"], \
             leaf["detail"]
         assert "bn retype" not in leaf["detail"]
+
+
+# --------------------------------------------------------------------------
+# round-21 review F56/F57/F58/F59
+# --------------------------------------------------------------------------
+
+def _child_writer_program(child_writes_tracked=True):
+    """`case(s)` calls a helper that fills a global and returns a STATUS,
+    then calls a zero-argument reader of that global."""
+    s_var = FVar("s")
+    s0 = FSSA(s_var, 0)
+    st = FSSA(FVar("st"), 1)
+    target = G_DIR if child_writes_tracked else G_OTHER
+    child = GFunc("write_child", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "memcpy(g, s#0, 0x70)",
+               reads=[s0], dest=_gptr(MEMCPY),
+               params=[_gptr(target), _var(s0), _const(0x70)]),
+        FInstr(1, 0x401318, "MLIL_RET", "return 0", src=[_const(0)]),
+    ]), params=[s_var])
+    reader = _reader("reader", 0x401200, G_DIR, 0x401210)
+    arg = FVar("arg")
+    arg0 = FSSA(arg, 0)
+    func = GFunc("child_case", 0x401100, FSSAFunc([
+        FInstr(0, 0x401104, "MLIL_CALL_SSA", "st#1 = write_child(arg#0)",
+               reads=[arg0], writes=[st], dest=_gptr(0x401300),
+               params=[_var(arg0)]),
+        FInstr(1, 0x401108, "MLIL_CALL_SSA", "reader()",
+               dest=_gptr(0x401200), params=[]),
+        FInstr(2, 0x40110c, "MLIL_RET", "return st#1", reads=[st],
+               src=[_var(st)]),
+    ]), params=[arg], callees=[child, reader])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401200: "reader", 0x401300: "write_child"},
+                   funcs={0x401200: reader, 0x401300: child},
+                   refs={G_DIR: [FRef(reader, 0x401210)]})
+    return func, bv
+
+
+def test_a_global_filled_by_a_descended_helper_reaches_the_caller(models):
+    # Round-21 review F56: `write_child(s)` fills the global and returns an
+    # unrelated status. The write is an effect on the PROGRAM, but
+    # `live_globals` is per function and the summary did not carry it, so
+    # the caller's later `reader()` saw nothing live and the run cleared.
+    func, bv = _child_writer_program(child_writes_tracked=True)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert [r["display_name"] for r in leaf["references"]] == ["reader"], leaf
+    assert leaf["address"] == hex(0x401108)         # the call that crosses
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_helper_that_fills_another_global_leaves_the_run_clear(models):
+    # The control: the helper writes a DIFFERENT object, so the reader of
+    # this one is not a continuation.
+    func, bv = _child_writer_program(child_writes_tracked=False)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_an_unproven_extent_advises_no_fabricated_size(models, monkeypatch):
+    # Round-21 review F57: for a runtime-length copy the remediation printed
+    # `char[1]`, which a reader could apply -- and an authoritative width of
+    # one byte turned a real continuation into an all-clear.
+    monkeypatch.setattr(te.TaintEngine, "_ALIAS_HOPS", 1)
+    reader = _reader("reader", 0x401200, G_DIR + 0x50, 0x401210)
+    n = FSSA(FVar("n"), 0)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_var(n)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR: [FRef(func, 0x401104)],
+                         G_DIR + 0x50: [FRef(reader, 0x401210)]},
+                   objects={G_DIR: 0, G_DIR + 16: 0},
+                   section=(0x404000, 0x405000))
+    [leaf] = _leaves(_forward(bv, func, models))
+    detail = leaf["detail"]
+    if leaf["reachability"]["cause"] == "object_extent_unproven":
+        assert "char[1]`" not in detail, detail
+        # no retype COMMAND is advertised for a length nothing established
+        assert not [c for c in re.findall(r"`(bn [^`]+)`", detail)
+                    if "retype" in c], detail
+        assert "bn data retype" in detail          # the real spelling, in prose
+        assert "not a constant" in detail
+
+
+def test_an_exhausted_veneer_chain_reaches_the_aggregate_stats(models):
+    # Round-21 review F58: the chain bound was disclosed by the leaf and
+    # absent from `stats`, so a consumer reading stats alone saw a COMPLETE
+    # run. Every bound a leaf can carry has to map into the aggregate.
+    func, hook, bv = _globalflow(extra_copy_params=[_const(0xff)])
+    eng = te.TaintEngine(bv, models)
+    real = eng._global_refs_reachable
+
+    def exhausted(fn, ga, budget):
+        refs, _reach = real(fn, ga, budget)
+        return refs, eng._reach_status("thunk_chain_budget", 8,
+                                       [int(hook.start)], {})
+
+    eng._global_refs_reachable = exhausted
+    result = eng.forward(func, [te.parse_locator("param:0")])
+    [leaf] = _leaves(result)
+    assert leaf["reachability"]["cause"] == "thunk_chain_budget"
+    assert result["stats"]["truncated"] is True, result["stats"]
+    assert "global_veneer_chain" in result["stats"]["truncation_cause"], \
+        result["stats"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_second_bound_does_not_erase_the_first(models):
+    # Round-21 review F59: an unread callee body replaced the exhausted
+    # function budget as THE cause, and `stats` then reported a complete
+    # run. Precedence decides what the prose leads with, not what the run
+    # is known to have hit.
+    func, bv = _fanout(600)
+    skipped = GFunc("huge_helper", 0x403000, FSSAFunc([]), params=[])
+    skipped.analysis_skipped = True
+    skipped.analysis_skip_reason = type(
+        "R", (), {"name": "ExceedFunctionSizeSkipReason"})()
+    fan = bv._funcs[0x401300]
+    fan.callees = [skipped, *fan.callees]
+    bv._funcs[0x403000] = skipped
+    bv._names[0x403000] = "huge_helper"
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    causes = leaf["reachability"]["causes"]
+    # the unread body leads the prose...
+    assert leaf["reachability"]["cause"] == "unread_callee_body", causes
+    # ...and the budget the walk also ran out of is still on the record
+    assert "function_budget" in causes, causes
+    assert "global_reference_budget" in result["stats"]["truncation_cause"], \
+        result["stats"]
+    assert result["stats"]["truncated"] is True

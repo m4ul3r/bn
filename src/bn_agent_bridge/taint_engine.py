@@ -5411,6 +5411,10 @@ class TaintEngine:
         out["reached_return"] = sub["reached_return"]
         out["out_params"] = sub.get("out_params", frozenset())
         out["out_param_elems"] = sub.get("out_param_elems", frozenset())
+        # A global the callee wrote is an effect on the program, not on its
+        # frame: it crosses back out with the summary (round-21 review F56).
+        out["globals"] = sub.get("globals", frozenset())
+        out["global_sites"] = sub.get("global_sites", {})
         if not sub["reached_return"]:
             lost = self._valueless_return_leaf(ins, callee_fn, tainted_args, caller_instrs)
             if lost is not None:
@@ -7748,10 +7752,11 @@ class TaintEngine:
         # and then dropped by the depth bound was never looked at.
         seen = {start}
         done: set[int] = set()
+        budget_cut: str | None = None
         wave, level, cut = [fn], 0, None
         while wave:
             if level > budget:
-                cut = "depth_budget"
+                cut = budget_cut = "depth_budget"
                 break
             nxt = []
             for cur in wave:
@@ -7815,7 +7820,7 @@ class TaintEngine:
                     if nstart in seen:
                         continue
                     if len(seen) >= self._GLOBAL_REACH_FUNCS:
-                        cut = "function_budget"
+                        cut = budget_cut = "function_budget"
                         continue
                     seen.add(nstart)
                     nxt.append(callee)
@@ -7843,7 +7848,17 @@ class TaintEngine:
             # An unread descendant outranks a budget: the walk did not stop
             # early, it walked INTO something it could not read (F9).
             cut = "unread_callee_body"
-        status = self._reach_status(cut, len(done), unexamined, known)
+        # PRECEDENCE decides what the prose leads with; it must not delete
+        # the other bounds this search reached. An unresolved hook replacing
+        # an exhausted pointer-scan pool, or an unread body replacing the
+        # function budget, left `stats` reporting a COMPLETE run (round-21
+        # review F59).
+        bounds = [c for c in (cut, scan_cut,
+                              "unresolved_call_target" if opaque else None,
+                              "unread_callee_body" if unread else None,
+                              budget_cut if unexamined else None) if c]
+        status = self._reach_status(cut, len(done), unexamined, known,
+                                    causes=bounds)
         status["unread_bodies"] = [
             {"name": unread[k], "address": hex(k)} for k in sorted(unread)]
         status["unresolved_calls"] = [hex(a) for a in sorted(set(opaque))[:8]]
@@ -7855,7 +7870,8 @@ class TaintEngine:
 
     def _reach_status(self, cause: str | None, examined: int,
                       unexamined: list[int],
-                      sites: dict[int, int] | None = None) -> dict[str, Any]:
+                      sites: dict[int, int] | None = None,
+                      causes: list[str] | None = None) -> dict[str, Any]:
         """The structured status of one reachability search.
 
         ``unexamined_reference_sites`` is the NATIVE evidence that the answer
@@ -7868,6 +7884,9 @@ class TaintEngine:
         return {
             "status": "complete" if cause is None else "truncated",
             "cause": cause,
+            # Every bound this search reached, not only the one the prose
+            # leads with: `stats` is derived from these (round-21 review F59).
+            "causes": sorted({c for c in (causes or [cause]) if c}),
             "functions_examined": int(examined),
             "function_budget": self._GLOBAL_REACH_FUNCS,
             "unexamined_references_total": len(unexamined),
@@ -7880,6 +7899,29 @@ class TaintEngine:
                  "address": hex(s), "at": hex(sites.get(s, s))}
                 for s in unexamined[:8]],
         }
+
+    def _extent_remedy(self, ga: int) -> str:
+        """How to establish this object's extent -- without inventing it.
+
+        A TYPE is authoritative: it ends the object, and every reference
+        past it stops belonging to it. So a size may only be printed when
+        the evidence proves one. A runtime-length copy (`memcpy(g, s, n)`)
+        proves nothing about where `g` ends, and the fallback `char[1]` it
+        used to print was applied by a reader and turned a real continuation
+        into an all-clear (round-21 review F57). That case gets the
+        question, not a command."""
+        proven = int(self._global_write_span.get(ga) or 0)
+        if ga in self._global_write_unbounded or proven <= 0:
+            return ("(the write's length is not a constant, so how far it "
+                    "reaches is not established either -- no size here is "
+                    "evidence, and binding a short one would HIDE the "
+                    "references past it. Establish the object's real size, "
+                    "then bind it with the data-retype mutation, spelled "
+                    f"bn data retype {hex(ga)} char[<size>], and re-run)")
+        return (f"(this write reaches {hex(proven)} bytes, so the object is "
+                f"at least that wide -- bind its real size, which may be "
+                f"larger, with `bn data retype {hex(ga)} char[{proven}]` "
+                f"and re-run)")
 
     def _global_continuation_leaf(self, ins: Any, ga: int, callee_fn: Any,
                                   references: tuple, descended: bool,
@@ -7971,12 +8013,7 @@ class TaintEngine:
                     "an object with no recovered type that is written PAST "
                     "the next symbol in the layout -- so where it ends, and "
                     "which references belong to it, are not established "
-                    f"(give the global a type that covers it -- at least the "
-                    f"{hex(max(int(self._global_write_span.get(ga) or 0), 1))} "
-                    f"bytes this write reaches -- with `bn data retype "
-                    f"{hex(ga)} "
-                    f"char[{max(int(self._global_write_span.get(ga) or 0), 1)}]`"
-                    f", then re-run)"),
+                    + self._extent_remedy(ga)),
                 "pointer_scan_budget": (
                     "the bound on how many expression nodes ONE function's "
                     "pointer scan may visit, so what the rest of that body "
@@ -8542,7 +8579,7 @@ class TaintEngine:
                     # too. Each was disclosed by the leaf and absent from the
                     # aggregate, so a consumer reading `stats` alone saw a
                     # COMPLETE run.
-                    aggregate = {
+                    names = {
                         "depth_budget": "max_depth",
                         "function_budget": "global_reference_budget",
                         "reference_sweep_budget": "global_reference_budget",
@@ -8550,10 +8587,17 @@ class TaintEngine:
                         "object_search_budget": "global_object_search",
                         "pointer_scan_budget": "pointer_scan_budget",
                         "pointer_return_depth": "pointer_return_depth",
-                    }.get(str(reach["cause"]))
-                    if aggregate:
-                        self._truncated = True
-                        self._truncation_causes.add(aggregate)
+                        "parameter_scan_budget": "parameter_scan_budget",
+                        # F48's chain bound was disclosed by the leaf and
+                        # absent here, so `stats` read COMPLETE (F58).
+                        "thunk_chain_budget": "global_veneer_chain",
+                    }
+                    for _cause in (reach.get("causes")
+                                   or [reach.get("cause")]):
+                        aggregate = names.get(str(_cause))
+                        if aggregate:
+                            self._truncated = True
+                            self._truncation_causes.add(aggregate)
 
         def cons_return(ins: Any, reason: str) -> bool:
             nonlocal reached_return
@@ -9648,6 +9692,17 @@ class TaintEngine:
                             ret_tainted = ret_tainted or d["reached_return"]
                             descend_outparams |= set(d.get("out_params") or ())
                             descend_outparam_elems |= set(d.get("out_param_elems") or ())
+                            for _ga in sorted(d.get("globals") or ()):
+                                # The callee's write happened; where the
+                                # CALLER can see it is at this call site.
+                                for _site in (d.get("global_sites")
+                                              or {}).get(_ga) or ():
+                                    live_global_sites.setdefault(
+                                        int(_ga), set()).add(_site)
+                                taint_node((("global", int(_ga)), None),
+                                           f"glob_{hex(int(_ga))}", ins,
+                                           f"global written by {nm or hex(taddr)}",
+                                           list(d.get("handoff_node") or []))
                         elif md is None and rmd is None:
                             # Genuinely unmodeled: no model anywhere in the chain (the
                             # call site's own included), so the conservative external
@@ -10142,6 +10197,15 @@ class TaintEngine:
 
         return {"reached_return": reached_return, "out_params": frozenset(out_params),
                 "out_param_elems": frozenset(out_param_elems),
+                # The globals this body made tainted. A write into a global
+                # is an effect on the PROGRAM, not on this function's
+                # frame, so it has to cross back out with the summary --
+                # `write_child(s)` filling `tracked` and returning an
+                # unrelated status left the caller's later `reader()` with
+                # nothing live, and the run cleared (round-21 review F56).
+                "globals": frozenset(live_globals),
+                "global_sites": {ga: set(sites) for ga, sites
+                                 in live_global_sites.items()},
                 "findings": findings, "leaves": leaves, "assumptions": assumptions,
                 "diag": diag}
 

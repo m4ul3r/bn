@@ -3897,3 +3897,155 @@ N void extent_reader(void) { system(chain + 0x50); }
 N void extent_case(char *s) { memcpy(chain, s, 112); extent_reader(); }
 int main(void) { return 0; }
 """
+
+
+_CHILD_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char clean[256] __attribute__((section(".clean"))) = "safe";
+volatile int status_src;
+N void reader(void) { system(tracked); }
+N int write_child(char *s) { memcpy(tracked, s, 112); return status_src; }
+N int store_child(char *s) { tracked[0] = s[0]; return status_src; }
+N int other_child(char *s) { memcpy(clean, s, 112); return status_src; }
+N int child_case(char *s) { int st = write_child(s); reader(); return st; }
+N int store_case(char *s) { int st = store_child(s); reader(); return st; }
+N int other_case(char *s) { int st = other_child(s); reader(); return st; }
+int main(int c, char **v) { if (c > 1) return child_case(v[1]); return 0; }
+"""
+
+_REMEDY_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+extern unsigned char mid;
+__asm__(".globl mid\n.set mid,tracked+16\n.type mid,@object\n.size mid,1\n");
+N void reader(void) { system(tracked + 80); }
+N void runtime_case(char *s, size_t n) { memcpy(tracked, s, n); reader(); }
+N void fixed_case(char *s) { memcpy(tracked, s, 112); reader(); }
+int main(void) { return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_global_filled_by_a_descended_helper_reaches_the_caller(tmp_path,
+                                                                  shared_bn,
+                                                                  opt):
+    """Round-21 review F56: `write_child(s)` fills the global and returns an
+    unrelated status; the caller then calls a zero-argument reader of it.
+
+    The write is an effect on the PROGRAM, but `live_globals` is per
+    function and the callee summary did not carry it, so the caller saw
+    nothing live and the run cleared."""
+    src = tmp_path / f"r5child{opt[-1]}.c"
+    src.write_text(_CHILD_SRC)
+    binary = tmp_path / f"r5child{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("child_case", "store_case"):
+        result, leaves = gmc(fn)
+        assert any(r["display_name"] == "reader"
+                   for lf in leaves for r in lf["references"]), (fn, result)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # the control: the helper fills ANOTHER object
+    result, leaves = gmc("other_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_the_extent_remediation_never_fabricates_a_width(tmp_path, shared_bn,
+                                                         opt):
+    """Round-21 review F57: for a runtime-length copy the advice printed
+    `char[1]`, and applying that authoritative width erased a real
+    continuation. A size is printed only where the evidence proves one, and
+    applying THAT one keeps the reader disclosed."""
+    src = tmp_path / f"r5rem{opt[-1]}.c"
+    src.write_text(_REMEDY_SRC)
+    binary = tmp_path / f"r5rem{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    result, leaves = gmc("runtime_case")
+    assert leaves, result
+    detail = leaves[0]["detail"]
+    assert "char[1]`" not in detail, detail
+    assert not [c for c in re.findall(r"`(bn [^`]+)`", detail)
+                if "retype" in c], detail
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # the proven-extent case prints a command; running it keeps the reader
+    result, leaves = gmc("fixed_case")
+    cmds = [c for c in re.findall(r"`(bn [^`]+)`", leaves[0]["detail"])
+            if "retype" in c]
+    assert cmds, leaves[0]["detail"]
+    res = shared_bn.run(*shlex.split(cmds[0])[1:])
+    assert res.returncode == 0, res.stderr
+    result, leaves = gmc("fixed_case")
+    assert any(r["display_name"] == "reader"
+               for lf in leaves for r in lf["references"]), result
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def _scanpool_source(statements: int = 1500) -> str:
+    body = "".join(f"  t[{i % 200}] ^= (char)(t[{(i + 7) % 200}] + {i});\n"
+                   for i in range(statements))
+    return f"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+void (*volatile hook)(void);
+N void churn(char *t) {{
+{body}}}
+N void plain(void) {{ churn(tracked); system(tracked); }}
+N void mixed(void) {{ churn(tracked); system(tracked); hook(); }}
+N void plain_case(char *s) {{ memcpy(tracked, s, 112); plain(); }}
+N void mixed_case(char *s) {{ memcpy(tracked, s, 112); mixed(); }}
+int main(void) {{ return 0; }}
+"""
+
+
+def test_a_second_frontier_cause_does_not_erase_an_exhausted_bound(tmp_path,
+                                                                   shared_bn):
+    """Round-21 review F59: adding a trailing unresolved `hook()` replaced
+    `pointer_scan_budget` as THE cause, and `stats` then reported a
+    complete run with no truncation at all."""
+    src = tmp_path / "r5scan.c"
+    src.write_text(_scanpool_source())
+    binary = tmp_path / "r5scan"
+    _compile(src, binary, ["-O0", "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def run(fn):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward",
+                        "-f", fn, "--source", "param:0", timeout=300.0)
+
+    plain = run("plain_case")
+    assert plain["stats"]["truncated"] is True, plain["stats"]
+    assert "pointer_scan_budget" in plain["stats"]["truncation_cause"]
+
+    mixed = run("mixed_case")
+    leaf = next(lf for lf in mixed["leaves"]
+                if lf["kind"] == "global_memory_continuation")
+    assert "pointer_scan_budget" in leaf["reachability"]["causes"], leaf
+    assert mixed["stats"]["truncated"] is True, mixed["stats"]
+    assert "pointer_scan_budget" in mixed["stats"]["truncation_cause"], \
+        mixed["stats"]
