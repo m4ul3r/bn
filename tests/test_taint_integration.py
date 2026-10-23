@@ -3450,3 +3450,211 @@ def test_an_exhausted_alias_search_is_reader_specific(tmp_path, shared_bn,
     result, leaves = gmc("unknown_case")
     assert any(r["display_name"] == "reader"
                for lf in leaves for r in lf["references"]), (count, leaves)
+
+
+_MULTIHOP_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char clean[256] __attribute__((section(".clean"))) = "safe";
+N void reader(void) { system(tracked); }
+N void relay1(void) { reader(); }
+N void relay2(void) { relay1(); }
+N void unrelated(void) { system(clean); }
+N void direct(char *s) { memcpy(tracked, s, 112); reader(); }
+N void onehop(char *s) { memcpy(tracked, s, 112); relay1(); }
+N void twohop(char *s) { memcpy(tracked, s, 112); relay2(); }
+N void store_copy(char *s) { tracked[0] = s[0]; relay2(); }
+N void sink_copy(char *s) { strcpy(tracked, s); relay2(); }
+N void unrelated_case(char *s) { memcpy(tracked, s, 112); unrelated(); }
+N void plt_case(char *s) { memcpy(tracked, s, 112); abort(); }
+int main(int c, char **v) { if (c > 1) twohop(v[1]); return 0; }
+"""
+
+_REMAP_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char clean[256] __attribute__((section(".clean"))) = "safe";
+N void write_read(char *dst, char *command) { memset(dst, 0, 4); system(command); }
+N void swap(char *a, char *b) { write_read(b, a); }
+N void bound_clean(void) { swap(clean, tracked); }
+N void write_only_case(char *s) { memcpy(tracked, s, 112); bound_clean(); }
+N void consumer(void) { swap(tracked, clean); }
+N void read_case(char *s) { memcpy(tracked, s, 112); consumer(); }
+int main(void) { return 0; }
+"""
+
+_INDIRECT_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char clean[256] __attribute__((section(".clean"))) = "safe";
+void (*volatile hook)(void);
+N void reader(void) { system(tracked); }
+N void quiet(void) { system(clean); }
+N void store_case(char *s) { tracked[0] = s[0]; hook(); }
+N void copy_case(char *s) { memcpy(tracked, s, 112); hook(); }
+int main(void) { hook = reader; return 0; }
+"""
+
+
+def _gmc_leaves(result):
+    return [lf for lf in result["leaves"]
+            if lf["kind"] == "global_memory_continuation"]
+
+
+def _build_case(tmp_path, shared_bn, stem, source, opt):
+    src = tmp_path / f"{stem}{opt[-1]}.c"
+    src.write_text(source)
+    binary = tmp_path / f"{stem}{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    return shared_bn.load(binary, copy=False)
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_multi_hop_veneer_chain_keeps_the_body_that_reads(tmp_path,
+                                                            shared_bn, opt):
+    """Round-19 review F44: `relay2 -> relay1 -> reader -> system` resolves
+    to an IMPORT, and answering with that end point discarded `reader` --
+    the one body that reads the tainted object -- so the run cleared."""
+    target = _build_case(tmp_path, shared_bn, "r3hop", _MULTIHOP_SRC, opt)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, _gmc_leaves(result)
+
+    for fn in ("direct", "onehop", "twohop", "store_copy", "sink_copy"):
+        result, leaves = gmc(fn)
+        assert any(r["display_name"] == "reader"
+                   for lf in leaves for r in lf["references"]), (fn, result)
+        assert (result.get("diagnostics") or {}).get(
+            "safe_to_report_all_clear") is not True, fn
+
+    # ...and `strcpy` keeps its own sink beside the continuation
+    result, _ = gmc("sink_copy")
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == \
+        ["overflow_unbounded"], result["reached_sinks"]
+
+    # A chain that reads ANOTHER object, and a plain import, stay silent
+    for fn in ("unrelated_case", "plt_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_an_argument_swapping_veneer_binds_by_its_own_signature(tmp_path,
+                                                                shared_bn, opt):
+    """Round-19 review F47: `swap(a, b)` tail-calls `write_read(b, a)`, so
+    the call's argument indices mean what SWAP's signature says. Classifying
+    them against the resolved body's unchanged index read parameter 1 of
+    `write_read` -- the command -- and a write-only global became a
+    blocking consumer."""
+    target = _build_case(tmp_path, shared_bn, "r3remap", _REMAP_SRC, opt)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, _gmc_leaves(result)
+
+    # tracked reaches only the memset DESTINATION; `clean` is what is read
+    result, leaves = gmc("write_only_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+    # the mirror image -- the swap hands TRACKED to the command slot
+    result, leaves = gmc("read_case")
+    assert any(r["display_name"] == "consumer"
+               for lf in leaves for r in lf["references"]), result
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_register_indirect_tail_jump_is_a_call_boundary(tmp_path,
+                                                          shared_bn, opt):
+    """Round-19 review F45: an optimised `jmp reg` is where control leaves
+    the function, but BN lifts it as a JUMP rather than a call, so the
+    tainted global crossed it with nothing disclosed."""
+    target = _build_case(tmp_path, shared_bn, "r3ind", _INDIRECT_SRC, opt)
+
+    def gmc(fn, *extra):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0", *extra)
+        return result, _gmc_leaves(result)
+
+    for fn in ("store_case", "copy_case"):
+        result, leaves = gmc(fn)
+        assert leaves, (fn, result)
+        assert any(lf["reachability"]["cause"] == "unresolved_call_target"
+                   for lf in leaves), (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # the same boundary takes a pin: naming the real target REFINES it...
+    jump_at = int(gmc("store_case")[1][0]["address"], 16)
+    pin = tmp_path / f"r3pin{opt[-1]}.json"
+    pin.write_text(json.dumps({hex(jump_at): ["reader"]}))
+    result, leaves = gmc("store_case", "--resolve-map", str(pin))
+    assert any(r["display_name"] == "reader"
+               for lf in leaves for r in lf["references"]), result
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # ...and a target that reads ANOTHER object clears the run
+    pin.write_text(json.dumps({hex(jump_at): ["quiet"]}))
+    result, leaves = gmc("store_case", "--resolve-map", str(pin))
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def _section_source(count: int) -> str:
+    sets = "".join(
+        f'extern unsigned char a{j};\n'
+        f'__asm__(".globl a{j}\\n.set a{j},chain+{j * 16}\\n'
+        f'.type a{j},@object\\n.size a{j},1\\n");\n' for j in range(1, count + 1))
+    return f"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char chain[8192] __attribute__((section(".chain"))) = "seed";
+char clean[256] __attribute__((section(".clean"))) = "safe";
+{sets}N void reader(void) {{ system((char *)&a{count} + 8); }}
+N void unrelated(void) {{ system(clean); }}
+N void bounded_case(char *s, size_t n) {{ memcpy(chain, s, (n & 1023) + 1); reader(); }}
+N void unrelated_case(char *s, size_t n) {{ memcpy(chain, s, (n & 1023) + 1); unrelated(); }}
+int main(void) {{ return 0; }}
+"""
+
+
+@pytest.mark.parametrize("count", [63, 65], ids=["under", "over"])
+def test_an_exhausted_alias_search_stops_at_the_section_boundary(tmp_path,
+                                                                 shared_bn,
+                                                                 count):
+    """Round-19 review F46: a section boundary is a hard object boundary.
+
+    Past the alias limit the forward window ran off the end of `.chain` and
+    attributed the FOLLOWING `.clean` global to the written object, so a
+    function reading only `clean` became a blocking continuation."""
+    src = tmp_path / f"r3sec{count}.c"
+    src.write_text(_section_source(count))
+    binary = tmp_path / f"r3sec{count}"
+    _compile(src, binary, ["-O0", "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, _gmc_leaves(result)
+
+    result, leaves = gmc("unrelated_case")
+    assert leaves == [], (count, leaves)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+    # the real reader inside the object is disclosed, at an offset within it
+    result, leaves = gmc("bounded_case")
+    offsets = [r["offset"] for lf in leaves for r in lf["references"]
+               if r["display_name"] == "reader"]
+    assert offsets and all(0 <= o < 8192 for o in offsets), (count, leaves)

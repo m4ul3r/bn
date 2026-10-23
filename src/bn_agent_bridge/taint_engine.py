@@ -398,6 +398,7 @@ class TaintEngine:
         # engine's lifetime -- avoids re-materializing a veneer's MLIL on every
         # candidate visit (forward) and every callsite scan (backward).
         self._thunk_cache: dict[int, Any] = {}
+        self._thunk_chain_cache: dict[int, list] = {}
         # Per-function unlifted-instruction scan, cached by function start (#206).
         self._unimpl_cache: dict[int, list[int]] = {}
         # _buffer_target is purely STRUCTURAL (it resolves a pointer expr to its
@@ -426,6 +427,8 @@ class TaintEngine:
         self._global_search_truncated: set[int] = set()
         self._touches_global_cache: dict[int, bool] = {}
         self._touches_region_cache: dict[tuple, bool] = {}
+        self._readable_il_cache: dict[int, bool] = {}
+        self._import_stub_cache: dict[int, bool] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
         self._global_extent_unproven: set[int] = set()
         self._ssa_def_cache: dict[tuple, Any] = {}
@@ -3890,6 +3893,45 @@ class TaintEngine:
             }
         return out
 
+    def _thunk_chain(self, fn: Any, limit: int = 8) -> list:
+        """The ordered veneer chain starting at *fn*: every body control
+        passes through, not just the end of it.
+
+        `relay2 -> relay1 -> reader -> system` resolves to an IMPORT, and
+        answering with that end point discarded `reader`, which is the body
+        that reads the tainted object (round-19 review F44). Each hop's own
+        body is readable, so each hop is kept and the caller decides which
+        one carries the evidence."""
+        key = int(getattr(fn, "start", 0))
+        cached = self._thunk_chain_cache.get(key)
+        if cached is not None:
+            return cached
+        chain: list = []
+        seen: set[int] = set()
+        cur = fn
+        for _ in range(limit):
+            start = int(getattr(cur, "start", 0))
+            if start in seen:
+                break
+            seen.add(start)
+            chain.append(cur)
+            try:
+                instrs = self._instrs(self._ssa_func(cur))
+            except TaintError:
+                break
+            nxt = None
+            for ins in instrs:
+                if not self._is_call(ins):
+                    continue
+                taddr = self._resolve_direct_target(ins)
+                nxt = function_at(self.bv, taddr) if taddr is not None else None
+                break
+            if nxt is None or int(getattr(nxt, "start", 0)) in seen:
+                break
+            cur = nxt
+        self._thunk_chain_cache[key] = chain
+        return chain
+
     def _follow_thunk_cached(self, fn: Any) -> Any | None:
         """``follow_thunk`` memoized per resolved function start address."""
         if fn is None:
@@ -6405,11 +6447,56 @@ class TaintEngine:
             return None, False
         if self._is_internal(cfn):
             return cfn, False
+        # A veneer may PERMUTE its arguments -- `swap(a, b)` tail-calling
+        # `write_read(b, a)` -- so the call's own indices mean what the
+        # CALLED function's signature says, not the resolved target's.
+        # Answering with the target read parameter 1 of a body whose
+        # parameter 1 is something else, and a write-only global became a
+        # consumer (round-19 review F47). The veneer's body is readable, so
+        # it is the right one to ask; its own call is classified in turn.
+        if self._has_readable_il(cfn) and not self._is_import_stub(cfn):
+            # The veneer's own body is what the call's argument indices
+            # mean, so it is the one to ask: `swap(a, b)` tail-calling
+            # `write_read(b, a)` PERMUTES them, and classifying them against
+            # the resolved body's unchanged index read the command slot
+            # instead of the destination (round-19 review F47).
+            return cfn, False
         resolved = self._follow_thunk_cached(cfn)
         if resolved is not None and self._is_internal(resolved):
             return resolved, False
         reason = str(self._not_internal_reason(cfn) or "")
         return None, reason.startswith("analysis_skipped:")
+
+    def _is_import_stub(self, fn: Any) -> bool:
+        """Whether this body is an IMPORT's stub rather than a real veneer.
+
+        A PLT stub (`jmp [memset@GOT]`) carries the import's symbol and no
+        work of its own, so the model owns that call -- asking its body
+        "does it only write through parameter 0" answers "it may read", and
+        a write-only destination became a consumer. An in-binary veneer --
+        `swap(a, b)` tail-calling `write_read(b, a)` -- is a real body with
+        its own signature and is asked directly (round-19 review F47)."""
+        return self._not_internal_reason(fn) == "import"
+
+    def _has_readable_il(self, fn: Any) -> bool:
+        """Whether this body's MLIL can be read at all (a veneer's can)."""
+        key = int(getattr(fn, "start", 0))
+        cached = self._readable_il_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            out = bool(self._instrs(self._ssa_func(fn)))
+        except TaintError:
+            out = False
+        self._readable_il_cache[key] = out
+        return out
+
+    # How many nested "does this body only WRITE through that parameter"
+    # questions one answer may need. A veneer chain adds a level per hop --
+    # `bound_clean -> swap -> write_read` is already three -- and running out
+    # answers "it may read", which turned a write-only global into a
+    # consumer (round-19 review F47).
+    _PARAM_ONLY_DEPTH = 8
 
     def _param_destination_only(self, callee: Any, idx: int, depth: int = 0) -> bool:
         """Whether *callee*'s own body only WRITES through parameter *idx*.
@@ -6421,7 +6508,7 @@ class TaintEngine:
         copy the overlay describes). So when the callee has an analysed body,
         the write-only question is asked of that body, with the same
         classifier the global uses, rooted at the parameter."""
-        if depth > 2:
+        if depth > self._PARAM_ONLY_DEPTH:
             return False
         try:
             pv = self._param_var(callee, idx)
@@ -7158,15 +7245,18 @@ class TaintEngine:
                 # window -- and record that the enumeration itself did not
                 # finish.
                 exhausted = True
-                end = max(end, self._section_remainder(ga))
-                break
+                # Clamp to this object's OWN section: the storage past it
+                # belongs to another section, so no write here can have
+                # reached it (round-19 review F46).
+                return (max(end, self._section_remainder(ga)), exhausted)
         # The LAST named symbol's own storage is part of the run: an alias
         # at `+64` of a 256-byte object is followed by a reader at `+80`,
         # so stopping at the symbol itself excluded the reader (round-14
         # review F33). Carry on to where the run ends.
         if not end:
             return (0, exhausted)
-        return (end + self._trailing_extent(ga + end), exhausted)
+        return (min(end + self._trailing_extent(ga + end),
+                    self._section_remainder(ga) or (end + 1)), exhausted)
 
     def _section_remainder(self, ga: int) -> int:
         """How much of *ga*'s own section lies past it, bounded by the
@@ -8121,7 +8211,8 @@ class TaintEngine:
                             unread = "unread_callee_body"
                             self._analysis_incomplete.add(
                                 str(getattr(resolved, "name", None) or hex(rstart)))
-                        elif any(self._global_access(cfn, ga).at is not None
+                        elif any(self._global_access(hop, ga).at is not None
+                                 for hop in self._thunk_chain(cfn)
                                  for ga in pending):
                             # BN calls a one-line `void reader(void) {
                             # system(g + 80); }` a THUNK once the compiler
@@ -8186,6 +8277,20 @@ class TaintEngine:
                             sorted(k for k in known if not (refs and k == own)), known)
                     else:
                         refs, reach = self._global_refs_reachable(cfn, ga, budget)
+                        if not refs:
+                            # Every body control passes through, in order:
+                            # `relay2 -> relay1 -> reader` resolves to an
+                            # import, and answering with the end point
+                            # discarded the hop that reads the object
+                            # (round-19 review F44).
+                            for hop in self._thunk_chain(veneer):
+                                if hop is cfn:
+                                    continue
+                                hrefs, hreach = self._global_refs_reachable(
+                                    hop, ga, budget)
+                                if hrefs:
+                                    refs, reach = hrefs, hreach
+                                    break
                         if not refs and veneer is not cfn:
                             # The VENEER is where the tainted global becomes
                             # an argument: `relay_reader()` materialises `g`
@@ -9082,6 +9187,15 @@ class TaintEngine:
             changed = False
             for ins in instrs:
                 opn = op_name(ins)
+                if live_globals and "JUMP" in opn and not self._is_call(ins) \
+                        and self._resolve_direct_target(ins) is None:
+                    # An optimised `jmp reg` IS where control leaves this
+                    # function -- BN lifts it as a JUMP, not a call, so the
+                    # continuation question was never asked and a tainted
+                    # global crossed it silently (round-19 review F45). The
+                    # same resolution applies: a `--resolve-map` pin names
+                    # the real target, and nothing pinned is disclosed.
+                    note_global_continuation(ins, None, False)
 
                 # #206 flow-sensitive honesty: a tainted value that reaches an
                 # unlifted/unimplemented instruction passes through an op BN's

@@ -4003,3 +4003,155 @@ def test_a_pointer_returning_recursion_still_discloses_its_depth(models,
     result = _forward(bv, func, models)
     assert any(r["access"] == "pointer_depth_exhausted"
                for lf in _leaves(result) for r in lf["references"]), result["leaves"]
+
+
+# --------------------------------------------------------------------------
+# round-19 review F44/F45/F47
+# --------------------------------------------------------------------------
+
+def test_a_chain_that_ends_at_an_import_keeps_the_hop_that_reads(models):
+    # Round-19 review F44: `relay2 -> relay1 -> reader -> system` RESOLVES
+    # to the import, and answering with that end point discarded `reader`,
+    # the one body that reads the tainted object, so the run cleared.
+    imported = GFunc("system", SYSTEM, FSSAFunc([]), params=[],
+                     symbol_type="ImportedFunctionSymbol")
+    reader = _reader("reader", 0x401500, G_DIR, 0x401510)
+    relay1 = _thunk("relay1", 0x401400, 0x401500)
+    relay2 = _thunk("relay2", 0x401300, 0x401400)
+    relay1.callees, relay2.callees = [reader], [relay1]
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401300: "relay2",
+                    0x401400: "relay1", 0x401500: "reader"},
+                   funcs={SYSTEM: imported, 0x401300: relay2,
+                          0x401400: relay1, 0x401500: reader},
+                   refs={G_DIR: [FRef(reader, 0x401510)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert [r["display_name"] for r in leaf["references"]] == ["reader"], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_chain_whose_hops_read_nothing_stays_silent(models):
+    # The control: the same shape with no reader anywhere in it.
+    imported = GFunc("system", SYSTEM, FSSAFunc([]), params=[],
+                     symbol_type="ImportedFunctionSymbol")
+    quiet = _quiet("quiet", 0x401500)
+    relay1 = _thunk("relay1", 0x401400, 0x401500)
+    relay2 = _thunk("relay2", 0x401300, 0x401400)
+    relay1.callees, relay2.callees = [quiet], [relay1]
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401300: "relay2",
+                    0x401400: "relay1", 0x401500: "quiet"},
+                   funcs={SYSTEM: imported, 0x401300: relay2,
+                          0x401400: relay1, 0x401500: quiet},
+                   refs={})
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def _tail_jump_program(resolve_to=None):
+    """`main` fills the global and ends in `jmp reg` -- an MLIL JUMP."""
+    reader = _reader("reader", 0x401500, G_DIR, 0x401510)
+    quiet = _reader("quiet", 0x401600, G_OTHER, 0x401610)
+    hook = FSSA(FVar("hook"), 1)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[], params_extra=[_const(0xff)])
+    body = func.mlil.ssa_form.instructions
+    body.append(FInstr(len(body), 0x401120, "MLIL_JUMP", "jump(hook#1)",
+                       reads=[hook], dest=_var(hook)))
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system",
+                    0x401500: "reader", 0x401600: "quiet"},
+                   funcs={0x401500: reader, 0x401600: quiet},
+                   refs={G_DIR: [FRef(reader, 0x401510)],
+                         G_OTHER: [FRef(quiet, 0x401610)]})
+    return func, bv
+
+
+def test_a_register_indirect_tail_jump_is_a_boundary(models):
+    # Round-19 review F45: an optimised `jmp reg` is where control leaves
+    # the function, but BN lifts it as a JUMP rather than a call, so the
+    # question was never asked and the tainted global crossed it silently.
+    func, bv = _tail_jump_program()
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["address"] == hex(0x401120), leaf
+    assert leaf["reachability"]["cause"] == "unresolved_call_target"
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize("pinned,reads", [(0x401500, True), (0x401600, False)])
+def test_a_pinned_tail_jump_is_resolved_like_a_call(models, pinned, reads):
+    # The same boundary takes a pin: the named target decides it, exactly
+    # as for an indirect CALL.
+    func, bv = _tail_jump_program()
+    engine = te.TaintEngine(bv, models,
+                            resolve_map={hex(0x401120): [hex(pinned)]})
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    leaves = _leaves(result)
+    if reads:
+        assert [r["display_name"] for r in leaves[0]["references"]] == ["reader"]
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    else:
+        assert leaves == [], leaves
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def _swap_program(swap_args=True):
+    """`bound(…)` calls `swap(clean, tracked)`; `swap(a, b)` tail-calls
+    `write_read(b, a)`, which only WRITES through its first parameter."""
+    dst, cmd = FVar("dst"), FVar("cmd")
+    dst0, cmd0 = FSSA(dst, 0), FSSA(cmd, 0)
+    write_read = GFunc("write_read", 0x401500, FSSAFunc([
+        FInstr(0, 0x401510, "MLIL_CALL_SSA", "memset(dst#0, 0, 4)",
+               reads=[dst0], dest=_gptr(MEMSET),
+               params=[_var(dst0), _const(0), _const(4)]),
+        FInstr(1, 0x401514, "MLIL_CALL_SSA", "system(cmd#0)",
+               reads=[cmd0], dest=_gptr(SYSTEM), params=[_var(cmd0)]),
+    ]), params=[dst, cmd])
+    a, b = FVar("a"), FVar("b")
+    a0, b0 = FSSA(a, 0), FSSA(b, 0)
+    fwd = [_var(b0), _var(a0)] if swap_args else [_var(a0), _var(b0)]
+    swap = GFunc("swap", 0x401400, FSSAFunc([
+        FInstr(0, 0x401410, "MLIL_TAILCALL_SSA", "tailcall write_read",
+               reads=[a0, b0], dest=_gptr(0x401500), params=fwd),
+    ]), params=[a, b], callees=[write_read])
+    swap.is_thunk = True
+    bound = GFunc("bound", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "swap(clean, tracked)",
+               dest=_gptr(0x401400),
+               params=[_gptr(G_OTHER), _gptr(G_DIR)]),
+    ]), params=[], callees=[swap])
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", MEMSET: "memset",
+                    0x401300: "bound", 0x401400: "swap", 0x401500: "write_read"},
+                   funcs={0x401300: bound, 0x401400: swap, 0x401500: write_read},
+                   refs={G_DIR: [FRef(bound, 0x401310)],
+                         G_OTHER: [FRef(bound, 0x401310)]})
+    return func, bv
+
+
+def test_an_argument_swapping_veneer_binds_by_its_own_signature(models):
+    # Round-19 review F47: the veneer PERMUTES its arguments, so the call's
+    # indices mean what SWAP's signature says. Classifying them against the
+    # resolved body's unchanged index read `write_read`'s command slot, and
+    # a write-only global became a blocking consumer.
+    func, bv = _swap_program(swap_args=True)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_veneer_that_forwards_the_read_slot_is_a_consumer(models):
+    # The mirror image: no swap, so the tainted global IS the command.
+    func, bv = _swap_program(swap_args=False)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
