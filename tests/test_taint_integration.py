@@ -3261,3 +3261,72 @@ def test_global_continuation_attribution_is_source_order_invariant(
     assert counts("long_first") == counts("short_first")
     alone = [counts("only_long"), counts("only_short")]
     assert alone[1] == [] or sum(alone[1]) == 0, alone
+
+
+_STORE_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline))
+char chain[256] __attribute__((section(".chain"))) = "seed";
+extern char mid[192];
+__asm__(".globl mid\n.set mid,chain+64\n.type mid,@object\n.size mid,192\n");
+char other[128] __attribute__((section(".other"))) = "safe";
+N void reader(void) { system(chain + 80); }
+N void other_reader(void) { system(other); }
+N int quiet(void) { return 7; }
+N void inlined_case(char *s) { memcpy(chain, s, 112); reader(); }
+N void inlined_short_case(char *s) { memcpy(chain, s, 16); reader(); }
+N void interior_case(char *s) { memcpy(chain + 64, s, 32); reader(); }
+N void multi_store_case(char *s) { memcpy(chain, s, 48); memcpy(chain + 48, s, 48); reader(); }
+N void no_reader_case(char *s) { memcpy(chain, s, 112); quiet(); }
+N void other_case(char *s) { memcpy(chain, s, 112); other_reader(); }
+N void sink_copy_case(char *s) { strcpy(chain, s); reader(); }
+int main(void) { return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_global_continuation_direct_stores_match_modeled_copies(tmp_path,
+                                                                shared_bn, opt):
+    """A tainted DIRECT store into a known writable global is global
+    provenance, not a coarse-memory hole.
+
+    An inlined `memcpy` is a run of stores: at -O1 and -O2 the compiler
+    emits one, and the continuation it produces has to be the one the
+    modeled call produces at -O0. The span those stores wrote is what
+    decides, so a short run stays silent, and a reader of a DIFFERENT
+    object or no reader at all is silent at every level. The copy note and
+    the sink of a `strcpy` are reported together.
+    """
+    src = tmp_path / f"r3store{opt[-1]}.c"
+    src.write_text(_STORE_SRC)
+    binary = tmp_path / f"r3store{opt[-1]}"
+    _compile(src, binary, [opt, "-fno-builtin", "-fno-inline",
+                           "-fno-stack-protector", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("inlined_case", "interior_case", "multi_store_case"):
+        result, leaves = gmc(fn)
+        assert any(r["display_name"] == "reader"
+                   for lf in leaves for r in lf["references"]), (fn, result)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+        assert not [lf for lf in result["leaves"]
+                    if lf["kind"] == "coarse_memory_store"], (fn, result["leaves"])
+    for fn in ("no_reader_case", "other_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+    # the sink and the copy into the destination are reported together
+    result, leaves = gmc("sink_copy_case")
+    assert [s["sink"]["class"] for s in result["reached_sinks"]], result
+    assert any(r["display_name"] == "reader"
+               for lf in leaves for r in lf["references"]), leaves
+    assert any("copied into the destination" in a
+               for a in result["assumptions"]), result["assumptions"]

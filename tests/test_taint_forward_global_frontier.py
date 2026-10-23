@@ -3780,3 +3780,92 @@ def test_isolated_runs_agree_with_the_shared_engine(models):
         fresh = te.TaintEngine(bv, models)
         leaves = _leaves(fresh.forward(fn, [te.parse_locator("param:0")]))
         assert bool(leaves) is expected, (fn.name, leaves)
+
+
+# --------------------------------------------------------------------------
+# campaign close-out: a DIRECT store into a known writable global
+# --------------------------------------------------------------------------
+
+def _store_program(stores, read_at=80, dest_expr=None):
+    """`main(argv)`: store the tainted parameter into the global at each
+    (offset, size), then call a reader of `g + read_at`."""
+    reader = _interior_reader("reader", 0x401200, G_DIR + read_at, 0x401210)
+    argv = FVar("argv")
+    argv0 = FSSA(argv, 0)
+    instrs = []
+    for i, (offset, size) in enumerate(stores):
+        dest = dest_expr if dest_expr is not None else _gptr(G_DIR + offset)
+        ins = FInstr(i, 0x401104 + 4 * i, "MLIL_STORE_SSA",
+                     f"[{hex(G_DIR + offset)}] = argv#0", reads=[argv0],
+                     dest=dest)
+        ins.size = size
+        instrs.append(ins)
+    instrs.append(FInstr(len(instrs), 0x401180, "MLIL_CALL_SSA", "reader()",
+                         dest=_gptr(0x401200), params=[]))
+    for i, ins in enumerate(instrs):
+        ins.instr_index = i
+    func = GFunc("main", 0x401100, FSSAFunc(instrs), params=[argv],
+                 callees=[reader])
+    bv = FExtentBV({SYSTEM: "system", 0x401200: "reader"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR + read_at: [FRef(reader, 0x401210)],
+                         G_DIR: [FRef(func, 0x401104)]},
+                   objects={G_DIR: 5, G_TAIL: 0, G_OTHER: 5},
+                   # BN invents a bare data variable at each referenced
+                   # interior address; the fake mirrors that.
+                   interior=[G_DIR + read_at] + [G_DIR + off for off, _ in stores
+                                                 if off],
+                   section=(0x404000, 0x405000))
+    return func, bv
+
+
+def test_a_direct_store_into_a_global_is_global_provenance(models):
+    # An inlined `memcpy` is a run of stores. Dropping them to
+    # `coarse_memory_store` left the continuation machinery nothing to work
+    # from, so the same flow a modeled copy discloses vanished.
+    func, bv = _store_program([(0, 16), (16, 16), (32, 16), (48, 16),
+                               (64, 16), (80, 16), (96, 16)])
+    result = _forward(bv, func, models, source="param:0")
+    [leaf] = _leaves(result)
+    assert leaf["global"]["address"] == hex(G_DIR), leaf
+    assert leaf["references"][0]["display_name"] == "reader", leaf
+    assert leaf["references"][0]["offset"] == 80, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert not [lf for lf in result["leaves"]
+                if lf["kind"] == "coarse_memory_store"], result["leaves"]
+
+
+def test_a_store_run_that_stops_short_is_silent(models):
+    # The span the stores wrote is what decides, exactly as a copy's length
+    # does: two 8-byte stores do not reach +80.
+    func, bv = _store_program([(0, 8), (8, 8)])
+    result = _forward(bv, func, models, source="param:0")
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_an_interior_store_is_keyed_to_the_containing_object(models):
+    func, bv = _store_program([(64, 32)], read_at=80)
+    [leaf] = _leaves(_forward(bv, func, models, source="param:0"))
+    assert leaf["global"]["address"] == hex(G_DIR), leaf
+    assert leaf["global"]["written_offsets"] == ["0x40"], leaf
+
+
+def test_a_store_through_an_unkeyable_pointer_stays_coarse(models):
+    # The control the campaign item must not disturb: a pointer the engine
+    # cannot correlate is still a coarse-memory frontier, not a global.
+    opaque = FExpr("MLIL_VAR_SSA", "rax#1", reads=[FSSA(FVar("rax"), 1)])
+    func, bv = _store_program([(0, 16)], dest_expr=opaque)
+    result = _forward(bv, func, models, source="param:0")
+    assert _leaves(result) == [], result["leaves"]
+    assert [lf["kind"] for lf in result["leaves"]] == ["coarse_memory_store"], \
+        result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_store_run_records_the_span_it_wrote(models):
+    func, bv = _store_program([(0, 16), (16, 16)])
+    eng = te.TaintEngine(bv, models)
+    eng.forward(func, [te.parse_locator("param:0")])
+    assert eng._global_write_span.get(G_DIR) == 32
+    assert sorted(eng._global_tainted_ranges[G_DIR]) == [(0, 16), (16, 32)]

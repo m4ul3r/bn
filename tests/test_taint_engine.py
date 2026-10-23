@@ -2719,11 +2719,13 @@ def test_forward_notes_tainted_memcpy_source(models):
                for a in result["assumptions"]), result["assumptions"]
 
 
-def test_forward_no_copy_note_when_source_is_already_a_sink(models):
-    # strcpy flags its SOURCE (arg 1) as a sink, so forward already reports it --
-    # the #44 copy note must NOT also fire there (it would be redundant and its
-    # "not itself flagged as a sink" wording would be false). The note is for the
-    # silent case (memcpy) only.
+def test_forward_copy_note_and_sink_coexist(models):
+    # strcpy flags its SOURCE (arg 1) as a sink AND fills its destination.
+    # Suppressing the copy note there hid the propagation behind the sink --
+    # the destination still holds those bytes, and a reader of them is a
+    # separate finding from the copy itself (campaign item, closed in the
+    # round-17 follow-up). Only the WORDING tracks the sink: the note never
+    # claims "not flagged" about an operand that was.
     src = FVar("src"); dst = FVar("dst")
     src1 = FSSA(src, 1)
     instrs = [
@@ -2739,9 +2741,12 @@ def test_forward_no_copy_note_when_source_is_already_a_sink(models):
     # strcpy's tainted source IS a real sink (arg 1) ...
     assert any(s["sink"]["callee"] == "strcpy" and s["sink"]["tainted_arg_index"] == 1
                for s in result["reached_sinks"]), result["reached_sinks"]
-    # ... so no redundant copy note is emitted for it
-    assert not any("copied into the destination" in a for a in result["assumptions"]), \
-        result["assumptions"]
+    # ... and the copy into the destination is reported beside it
+    note = next((a for a in result["assumptions"]
+                 if "copied into the destination" in a), None)
+    assert note is not None, result["assumptions"]
+    assert "also reported as a sink of this call" in note, note
+    assert "not itself flagged as a sink" not in note, note
 
 
 def test_forward_no_copy_note_when_dest_is_unkeyable(models):

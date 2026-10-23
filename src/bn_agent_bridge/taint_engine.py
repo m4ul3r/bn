@@ -5696,6 +5696,35 @@ class TaintEngine:
                     return None
         return None
 
+    def _note_store_span(self, ssaf: Any, dest: Any, ga: int, ins: Any) -> None:
+        """Record the bytes a DIRECT store wrote into the object at *ga*.
+
+        The same evidence a modeled copy's length gives: an inlined
+        `memcpy` is a run of stores, and their spans together say how far
+        the write reached."""
+        raw = self._global_addr(ssaf, dest, canon=False)
+        offset = (int(raw) - ga) if raw is not None and int(raw) >= ga else 0
+        try:
+            size = int(getattr(ins, "size", 0) or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if offset:
+            # WHICH bytes this store reached, reported beside the object --
+            # the same field a modeled copy into an interior address fills.
+            self._global_keyed_offsets.setdefault(ga, set()).add(offset)
+        ranges = self._global_tainted_ranges.setdefault(ga, [])
+        interval = (offset, offset + size) if size > 0 else (offset, None)
+        if interval not in ranges:
+            ranges.append(interval)
+        if size <= 0:
+            if ga not in self._global_write_unbounded:
+                self._global_write_unbounded.add(ga)
+                self._invalidate_object(ga)
+            return
+        if offset + size > int(self._global_write_span.get(ga) or 0):
+            self._global_write_span[ga] = offset + size
+            self._invalidate_object(ga)
+
     def _note_write_span(self, ssaf: Any, params: list, idx: int,
                          model: dict[str, Any] | None) -> None:
         """Record how far a modeled copy writes into a global object.
@@ -8013,6 +8042,18 @@ class TaintEngine:
                             unread = "unread_callee_body"
                             self._analysis_incomplete.add(
                                 str(getattr(resolved, "name", None) or hex(rstart)))
+                        elif any(self._global_access(cfn, ga).at is not None
+                                 for ga in pending):
+                            # BN calls a one-line `void reader(void) {
+                            # system(g + 80); }` a THUNK once the compiler
+                            # turns it into a tail jump, and following it to
+                            # the import made the whole body external -- so
+                            # the bytes it reads were never disclosed. Its
+                            # own body IS readable and does reference the
+                            # tainted object, so it is kept as the callee.
+                            # A genuine PLT stub references nothing and
+                            # still falls through to external.
+                            pass
                         else:
                             continue      # a PLT stub onto an import: external
                     elif reason == "thunk":
@@ -8807,19 +8848,24 @@ class TaintEngine:
                             src_i = int(frm.split("arg:", 1)[1])
                         except Exception:
                             src_i = None
-                        # Only when the source operand is NOT already a reported
-                        # sink of this model: that is exactly the memcpy/memmove
-                        # case #44 flags (source silently propagated, never
-                        # reported). strcpy/strcpy_s already flag their source arg
-                        # as a sink, so it shows up in reached_sinks and needs no
-                        # note -- and the "not flagged" wording would be false.
+                        # A source operand that ALSO fires this model's sink is
+                        # two facts, not one: the copy still happened, and the
+                        # destination still holds those bytes. Suppressing the
+                        # copy note there (because `strcpy` flags its source)
+                        # hid the propagation behind the sink -- the half of
+                        # #44 that stayed open. Only the WORDING changes with
+                        # the sink: the note never claims "not flagged" about
+                        # an operand that was.
                         sink_args = (model.get("sink") or {}).get("tainted_args") or []
-                        if src_i is not None and src_i >= 1 and src_i not in sink_args:
+                        if src_i is not None and src_i >= 1:
+                            tail = ("also reported as a sink of this call"
+                                    if src_i in sink_args
+                                    else "not itself flagged as a sink")
                             add_assumption(
                                 f"tainted buffer copied into the destination of "
                                 f"{self._prose_name(name or '?')} at {hex(int(getattr(ins, 'address', 0)))} "
                                 f"(arg{src_i} -> arg0); propagated to the destination, "
-                                f"not itself flagged as a sink")
+                                f"{tail}")
             # #863: a model may decline to claim its callee's real destinations
             # for a STRUCTURAL reason rather than an arity one -- vsscanf writes
             # through the va_list in arg2, which this engine has no resolver for,
@@ -9437,6 +9483,22 @@ class TaintEngine:
                             if taint_node(node, var_label(pv), ins, "store into tainted buffer (memory_approx)", reads):
                                 changed = True
                                 add_assumption("memory aliasing modeled coarsely via pointer-base/AddressOf (memory_approx)")
+                        elif (gs := self._global_addr(ssaf, dest)) is not None:
+                            # A direct store into a known writable global is the
+                            # SAME event a modeled copy records -- an inlined
+                            # `memcpy` at -O1 is a run of these -- so it is keyed
+                            # by the object and records the bytes it wrote.
+                            # Falling to `coarse_memory_store` instead left the
+                            # continuation machinery with nothing to work from
+                            # (campaign item, closed here).
+                            self._note_store_span(ssaf, dest, gs, ins)
+                            if taint_node(((("global", gs)), None), f"glob_{hex(gs)}",
+                                          ins, "store into tainted global "
+                                          "(object base, global_approx)", reads):
+                                changed = True
+                                add_assumption(
+                                    "global buffer aliasing modeled coarsely by "
+                                    "object base (global_approx)")
                         elif self._heap_buffer_key(ssaf, dest) is not None:
                             # store through a HEAP pointer (an escape/encode helper
                             # writing a derived buffer): key the buffer by its alloc
