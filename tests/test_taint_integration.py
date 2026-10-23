@@ -4764,3 +4764,110 @@ def test_a_bounded_read_of_an_abutting_neighbour_is_disjoint(tmp_path,
     for fn in ("unbounded_root", "over_root"):
         _result, leaves = gmc(fn)
         assert leaves, fn
+
+
+_SCOPE_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char gap[256] __attribute__((section(".same"))) = "gap";
+char other[256] __attribute__((section(".same"))) = "other";
+char output[512] __attribute__((section(".out"))) = "out";
+volatile int choice;
+extern char middle[];
+__asm__(".globl middle\n.set middle,tracked+64\n.type middle,@object\n.size middle,1\n");
+N void bounded_reader(void) { strlcpy(output, tracked, 1); }
+N void wide_chk_reader(void) { __wmemcpy_chk((wchar_t *)output, (wchar_t *)tracked, 32, 256); }
+N char *choose_pointer(void) { return choice ? middle : other + 8; }
+N char *advance16(char *p) { return p + 16; }
+N void phi_reader(void) { system(advance16(choose_pointer())); }
+N void strl_case(char *s) { memcpy(middle, s, 64); bounded_reader(); }
+N void wide_chk_case(char *s) { memcpy(middle, s, 64); wide_chk_reader(); }
+N void phi_case(char *s) { memcpy(middle, s, 64); phi_reader(); }
+int main(void) { return 0; }
+"""
+
+_PE_WIDE_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] = "seed";
+volatile unsigned short seen;
+N void byte88_reader(void) { seen = *(unsigned short *)(tracked + 88); }
+N void byte62_reader(void) { seen = *(unsigned short *)(tracked + 62); }
+N void pe_case(char *s) { wmemcpy((wchar_t *)tracked, (wchar_t *)s, 32); byte88_reader(); }
+N void pe_inside_case(char *s) { wmemcpy((wchar_t *)tracked, (wchar_t *)s, 32); byte62_reader(); }
+int main(void) { return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_bounded_copy_capacity_does_not_bound_its_source(tmp_path,
+                                                           shared_bn, opt):
+    """Round-26 review F70, F71 and F73.
+
+    `strlcpy(dst, src, 1)` states a DESTINATION capacity and still reads
+    the whole source string; `__wmemcpy_chk` counts WIDE characters like
+    its unfortified spelling; and a PHI arm naming a separate object with
+    other storage between it and this one is disjoint, not "not there
+    yet"."""
+    src = tmp_path / f"r10scope{opt[-1]}.c"
+    src.write_text(_SCOPE_SRC)
+    binary = tmp_path / f"r10scope{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin",
+                           "-fno-inline", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("strl_case", "wide_chk_case"):
+        result, leaves = gmc(fn)
+        assert leaves, (fn, result["stats"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # F73: only one arm can be this object, so its offset IS established
+    _result, leaves = gmc("phi_case")
+    row = next(r for lf in leaves for r in lf["references"]
+               if r["display_name"] == "phi_reader")
+    assert (row["offset"], row["offset_known"]) == (16, True), row
+
+
+def test_a_wide_count_follows_the_target_wchar_abi(tmp_path, shared_bn):
+    """Round-26 review F72: `wchar_t` is 2 bytes on Windows, so
+    `wmemcpy(g, s, 32)` writes 64 bytes there -- scaling from the pointer
+    width invented a 128-byte footprint and blocked a read of bytes the
+    program never wrote."""
+    cc = shutil.which("x86_64-w64-mingw32-gcc")
+    if cc is None:
+        refuse_silent_skip("x86_64-w64-mingw32-gcc is required for the PE64 ABI")
+        pytest.skip("no mingw cross compiler")
+    src = tmp_path / "r10pe.c"
+    src.write_text(_PE_WIDE_SRC)
+    binary = tmp_path / "r10pe.exe"
+    result = subprocess.run(
+        [cc, "-O0", "-g0", "-fno-builtin", "-fno-inline",
+         str(src), "-o", str(binary)],
+        capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        res = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                       "-f", fn, "--source", "param:0")
+        return res, [lf for lf in res["leaves"]
+                     if lf["kind"] == "global_memory_continuation"]
+
+    # 32 wide characters cover bytes [0, 64): +88 is outside, +62 inside
+    result, leaves = gmc("pe_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    _result, leaves = gmc("pe_inside_case")
+    assert any(r["display_name"] == "byte62_reader"
+               for lf in leaves for r in lf["references"]), leaves

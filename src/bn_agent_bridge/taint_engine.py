@@ -5822,20 +5822,47 @@ class TaintEngine:
         "wmemcpy", "wmemmove", "wmempcpy", "wmemset", "wcsncpy", "wcpncpy",
         "wcsncat", "wcsnlen", "wcsncmp", "wcsnicmp", "wcsxfrm",
     })
+    # The fortified spellings count the same units; leaving them out let
+    # `__wmemcpy_chk(d, s, 32)` read as 32 bytes (round-26 review F71).
+    _WIDE_ELEMENT_COUNTS = _WIDE_ELEMENT_COUNTS | frozenset(
+        f"{n}_chk" for n in _WIDE_ELEMENT_COUNTS)
 
     def _count_scale(self, name: str | None) -> int:
         """Bytes per unit of a modeled count for *name*."""
         base = (name or "").split("@", 1)[0].lstrip("_")
         if base not in self._WIDE_ELEMENT_COUNTS:
             return 1
+        return self._wchar_width()
+
+    def _wchar_width(self) -> int:
+        """Bytes in this TARGET's `wchar_t`.
+
+        It is an ABI property, not a pointer width: Windows is 2 bytes at
+        both 32 and 64 bits, the SysV platforms 4. Scaling from the address
+        size invented a 128-byte footprint for a 64-byte PE64 copy and
+        raised a continuation at a byte the program never wrote (round-26
+        review F72). The platform's own `wchar_t` is asked first; the
+        platform NAME decides when the view cannot answer."""
+        cached = getattr(self, "_wchar_width_cache", None)
+        if cached is not None:
+            return cached
+        width = None
+        plat = getattr(self.bv, "platform", None)
         try:
-            width = int(getattr(self.bv.arch, "address_size", 8))
+            typ = (getattr(plat, "types", None) or {}).get("wchar_t")
+            if typ is not None and int(getattr(typ, "width", 0) or 0) > 0:
+                width = int(typ.width)
         except Exception:
-            width = 8
-        # `wchar_t` is 4 bytes everywhere this tool analyses 64-bit ELF and
-        # 2 on Windows; the WIDER reading is the conservative one for a
-        # footprint, so it is used unless the view says 32-bit.
-        return 4 if width >= 8 else 2
+            width = None
+        if width is None:
+            name = str(getattr(plat, "name", "") or "").lower()
+            view = str(getattr(getattr(self.bv, "view_type", None), "lower",
+                               lambda: "")() or "").lower()
+            windows = ("windows" in name or "win" in name.split("-")[0]
+                       or view in ("pe", "coff"))
+            width = 2 if windows else 4
+        self._wchar_width_cache = width
+        return width
 
     @staticmethod
     def _model_len_scope(model: dict[str, Any] | None) -> set[int] | None:
@@ -7201,11 +7228,27 @@ class TaintEngine:
             return False            # not a constant: nothing is claimed
         if root(arm) is not None:
             return False            # already inside the object
-        try:
-            return self._section_names(int(value)) == \
-                self._section_names(int(base_ga))
-        except Exception:
+        # Same SECTION is far too coarse: a named neighbour several objects
+        # away is disjoint storage, and treating it as "not there yet" lost
+        # an exact offset the other arm established (round-26 review F73).
+        # The test is the object analysis's own: both must canonicalise to
+        # the same object, or the arm must sit inside the object that
+        # ENCLOSES this one (an interior alias's base).
+        canon_arm = self._canon_global(int(value))
+        canon_root = self._canon_global(int(base_ga))
+        if canon_arm is None or canon_root is None:
             return False
+        if canon_arm == canon_root:
+            return True
+        # ...or one is storage that ENCLOSES the other, which is the same
+        # relation the object analysis uses for an interior alias. A named
+        # neighbour with other objects between it and this one is disjoint
+        # storage, not an arm an adjustment can bring in.
+        for inner, outer in ((canon_root, canon_arm), (canon_arm, canon_root)):
+            candidates, _exhausted = self._preceding_objects(inner)
+            if outer in candidates:
+                return True
+        return False
 
     def _call_offset(self, ssaf: Any, defn: Any, root: Any, depth: int,
                      seen: set) -> int | None:
@@ -7819,6 +7862,29 @@ class TaintEngine:
         except Exception:
             return 0
 
+    def _use_misses_tainted(self, ga: int, use: Any) -> bool:
+        """Whether this use provably touches NONE of the bytes this run
+        tainted in the object at *ga*.
+
+        Only where everything is established: the write footprint is
+        bounded and complete, and the use carries a known offset AND a
+        known span. `wmemcpy(g, s, 32)` writes 64 bytes on a 2-byte
+        `wchar_t` target, so a 16-bit load at +88 reads bytes this run
+        never wrote (round-26 review F72). Anything unknown keeps the
+        object-level answer."""
+        if not use.offset_known or not use.span:
+            return False
+        if ga in self._global_write_unbounded:
+            return False
+        ranges = self._global_tainted_ranges.get(ga) or ()
+        if not ranges:
+            return False
+        lo, hi = int(use.offset), int(use.offset) + int(use.span)
+        for rlo, rhi in ranges:
+            if rhi is None or (lo < int(rhi) and hi > int(rlo)):
+                return False
+        return True
+
     def _tainted_ranges(self, ga: int) -> list[tuple[int, int]]:
         """The byte intervals of the object at *ga* this run has tainted,
         absolute. Falls back to the whole object when no copy named a
@@ -8111,7 +8177,8 @@ class TaintEngine:
                     # no address and costs one bounded scan.
                     use = self._global_access(cur, ga)
                     if use.at is not None:
-                        found[cs] = use
+                        if not self._use_misses_tainted(ga, use):
+                            found[cs] = use
                 try:
                     callees = list(getattr(cur, "callees", None) or ())
                 except Exception:

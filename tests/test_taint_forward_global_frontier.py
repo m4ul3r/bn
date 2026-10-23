@@ -46,6 +46,8 @@ MEMSET = 0x401080
 STRCAT = 0x401090
 STRCAT_CHK = 0x4010a0
 SNPRINTF = 0x4010b0     # a count that bounds the DESTINATION only
+STRLCPY = 0x4010d0      # ...as does strlcpy's capacity
+WMEMCPY_CHK = 0x4010e0  # a fortified count, still in wide ELEMENTS
 WMEMCPY = 0x4010c0      # a count stated in wide ELEMENTS
 G_PREV = G_DIR - 0x40   # the clean object abutting G_DIR
 
@@ -5158,3 +5160,44 @@ def test_returning_a_neighbour_is_not_a_use_of_its_bytes(models):
     # the overlapping and unbounded controls for this shape are exercised
     # on real BN (tests/test_taint_integration.py), where the layout the
     # interval test reads is the linker's rather than the fixture's.
+
+
+# --------------------------------------------------------------------------
+# round-26 review F70/F71/F72
+# --------------------------------------------------------------------------
+
+def test_a_bounded_copy_capacity_does_not_bound_its_source(models):
+    # Round-26 review F70: `strlcpy(dst, src, 1)` states a DESTINATION
+    # capacity and still reads the whole source string, so the capacity
+    # must not become the source's read span.
+    eng = te.TaintEngine(FGlobalBV({STRLCPY: "strlcpy"}), models)
+    ins = FInstr(0, 0x401210, "MLIL_CALL_SSA", "strlcpy(out, g, 1)",
+                 dest=_gptr(STRLCPY),
+                 params=[_gptr(G_OTHER), _gptr(G_DIR), _const(1)])
+    assert eng._model_span(ins, [1]) is None        # the source: unbounded
+    assert eng._model_span(ins, [0]) == 1           # the destination: 1 byte
+
+
+def test_a_fortified_wide_count_is_still_measured_in_elements(models):
+    # Round-26 review F71: the `_chk` spellings count the same units.
+    eng = te.TaintEngine(FGlobalBV({WMEMCPY_CHK: "__wmemcpy_chk"}), models)
+    ins = FInstr(0, 0x401210, "MLIL_CALL_SSA",
+                 "__wmemcpy_chk(out, g, 32, 256)", dest=_gptr(WMEMCPY_CHK),
+                 params=[_gptr(G_OTHER), _gptr(G_DIR), _const(32), _const(256)])
+    assert eng._model_span(ins, [1]) == 32 * eng._wchar_width()
+
+
+@pytest.mark.parametrize("platform,width", [("windows-x86_64", 2),
+                                            ("linux-x86_64", 4)],
+                         ids=["pe64", "elf64"])
+def test_the_wide_element_width_follows_the_target_abi(models, platform,
+                                                       width):
+    # Round-26 review F72: `wchar_t` is an ABI property, not a pointer
+    # width -- scaling from the address size invented a 128-byte footprint
+    # for a 64-byte PE64 copy.
+    bv = FGlobalBV({WMEMCPY: "wmemcpy"})
+    bv.platform = type("P", (), {"name": platform, "types": {}})()
+    eng = te.TaintEngine(bv, models)
+    assert eng._wchar_width() == width
+    assert eng._count_scale("wmemcpy") == width
+    assert eng._count_scale("memcpy") == 1
