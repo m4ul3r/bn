@@ -447,6 +447,7 @@ class TaintEngine:
         self._global_layout_truncated: set[int] = set()
         self._ret_ptr_stack: set[int] = set()
         self._reaches_object_cache: dict[tuple[int, int], bool] = {}
+        self._named_boundary_cache: dict[tuple[int, int], bool] = {}
         self._param_stack: set[tuple[int, int]] = set()
         self._direct_callee_cache: dict[int, tuple] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
@@ -7240,15 +7241,52 @@ class TaintEngine:
             return False
         if canon_arm == canon_root:
             return True
-        # ...or one is storage that ENCLOSES the other, which is the same
-        # relation the object analysis uses for an interior alias. A named
-        # neighbour with other objects between it and this one is disjoint
-        # storage, not an arm an adjustment can bring in.
-        for inner, outer in ((canon_root, canon_arm), (canon_arm, canon_root)):
-            candidates, _exhausted = self._preceding_objects(inner)
-            if outer in candidates:
-                return True
-        return False
+        # ...or the two sit in ONE run of storage: no other NAMED object
+        # between them. A same-section neighbour with named objects in
+        # between is disjoint storage, whatever the enclosing-candidate
+        # search admits, and treating it as "not there yet" erased the
+        # offset the only feasible arm established (round-27 review F73).
+        return not self._named_boundary_between(int(value), int(base_ga))
+
+    def _named_boundary_between(self, a: int, b: int) -> bool:
+        """Whether a NAMED data variable lies strictly between *a* and *b*.
+
+        That is the boundary the object analysis respects everywhere else:
+        an interior alias is part of the same storage, a named neighbour
+        begins other storage."""
+        lo, hi = (a, b) if a <= b else (b, a)
+        if lo == hi:
+            return False
+        key = (lo, hi)
+        cached = self._named_boundary_cache.get(key)
+        if cached is not None:
+            return cached
+        nxt = getattr(self.bv, "get_next_data_var_after", None)
+        getsym = getattr(self.bv, "get_symbol_at", None)
+        out = False
+        if callable(nxt):
+            addr = lo
+            for _ in range(self._LAYOUT_SCAN_STEPS):
+                try:
+                    nxt_addr = getattr(nxt(addr), "address", None)
+                except Exception:
+                    break
+                if nxt_addr is None or int(nxt_addr) <= addr:
+                    break
+                addr = int(nxt_addr)
+                if addr >= hi:
+                    break
+                named = None
+                if callable(getsym):
+                    try:
+                        named = getsym(addr)
+                    except Exception:
+                        named = None
+                if named is not None:
+                    out = True
+                    break
+        self._named_boundary_cache[key] = out
+        return out
 
     def _call_offset(self, ssaf: Any, defn: Any, root: Any, depth: int,
                      seen: set) -> int | None:

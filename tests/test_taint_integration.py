@@ -4771,7 +4771,10 @@ _SCOPE_SRC = r"""
 #include <string.h>
 #include <wchar.h>
 #define N __attribute__((noinline,noclone))
-char tracked[256] __attribute__((section(".tracked"))) = "seed";
+/* ONE section for all three objects: a distinct neighbour must be told
+   apart by the named boundaries between them, not by the section
+   (round-27 review F73). */
+char tracked[256] __attribute__((section(".same"))) = "seed";
 char gap[256] __attribute__((section(".same"))) = "gap";
 char other[256] __attribute__((section(".same"))) = "other";
 char output[512] __attribute__((section(".out"))) = "out";
@@ -4786,6 +4789,9 @@ N void phi_reader(void) { system(advance16(choose_pointer())); }
 N void strl_case(char *s) { memcpy(middle, s, 64); bounded_reader(); }
 N void wide_chk_case(char *s) { memcpy(middle, s, 64); wide_chk_reader(); }
 N void phi_case(char *s) { memcpy(middle, s, 64); phi_reader(); }
+N char *choose_inside(void) { return choice ? middle : tracked + 48; }
+N void inside_reader(void) { system(advance16(choose_inside())); }
+N void inside_case(char *s) { memcpy(middle, s, 64); inside_reader(); }
 int main(void) { return 0; }
 """
 
@@ -4832,11 +4838,18 @@ def test_a_bounded_copy_capacity_does_not_bound_its_source(tmp_path,
         assert leaves, (fn, result["stats"])
         assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
-    # F73: only one arm can be this object, so its offset IS established
+    # F73: the other arm names a DISTINCT object in the same section, with
+    # named objects between it and this one, so only one arm can be this
+    # object and its offset IS established
     _result, leaves = gmc("phi_case")
     row = next(r for lf in leaves for r in lf["references"]
                if r["display_name"] == "phi_reader")
     assert (row["offset"], row["offset_known"]) == (16, True), row
+    # ...while an arm inside THIS object's own storage keeps the join open
+    _result, leaves = gmc("inside_case")
+    row = next(r for lf in leaves for r in lf["references"]
+               if r["display_name"] == "inside_reader")
+    assert row["offset_known"] is False, row
 
 
 def test_a_wide_count_follows_the_target_wchar_abi(tmp_path, shared_bn):
