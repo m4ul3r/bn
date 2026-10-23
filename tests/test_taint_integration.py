@@ -4650,3 +4650,117 @@ def test_a_zero_length_read_is_not_an_access(tmp_path, shared_bn, opt):
     for fn in ("one_case", "n_case"):
         _result, leaves = gmc(fn)
         assert leaves, fn
+
+
+_SPAN_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <wchar.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char output[256] __attribute__((section(".out"))) = "out";
+volatile int choice;
+extern char middle[];
+__asm__(".globl middle\n.set middle,tracked+64\n.type middle,@object\n.size middle,1\n");
+N void zero_reader(void) { snprintf(output, 0, tracked); }
+N void one_reader(void) { snprintf(output, 1, tracked); }
+N void wide_reader(void) { wmemcpy((wchar_t *)output, (wchar_t *)tracked, 32); }
+N void byte88_reader(void) { output[0] = tracked[88]; }
+N char *choose_pointer(void) { return choice ? tracked + 48 : tracked + 64; }
+N char *advance16(char *p) { return p + 16; }
+N void phi_reader(void) { system(advance16(choose_pointer())); }
+N void zero_case(char *s) { memcpy(tracked, s, 128); zero_reader(); }
+N void narrow_case(char *s) { memcpy(middle, s, 64); one_reader(); }
+N void wide_read_case(char *s) { memcpy(middle, s, 64); wide_reader(); }
+N void wide_write_case(char *s) { wmemcpy((wchar_t *)tracked, (wchar_t *)s, 32); byte88_reader(); }
+N void phi_case(char *s) { memcpy(middle, s, 64); phi_reader(); }
+int main(void) { return 0; }
+"""
+
+_ABUT_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char first[64] __attribute__((section(".both"))) = "one";
+char second[64] __attribute__((section(".both"))) = "two";
+char output[256] __attribute__((section(".out"))) = "out";
+N char *pointer(void) { return first; }
+N void bounded(void) { memcpy(output, pointer(), 64); }
+N void unbounded(void) { system(pointer()); }
+N void over_read(void) { memcpy(output, pointer(), 128); }
+N void direct(void) { memcpy(output, first, 64); }
+N void bounded_root(char *s) { memcpy(second, s, 64); bounded(); }
+N void unbounded_root(char *s) { memcpy(second, s, 64); unbounded(); }
+N void over_root(char *s) { memcpy(second, s, 64); over_read(); }
+N void direct_root(char *s) { memcpy(second, s, 64); direct(); }
+int main(void) { return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_modeled_count_bounds_the_argument_it_describes(tmp_path, shared_bn,
+                                                          opt):
+    """Round-25 review F66 and F67: `snprintf(dst, size, fmt)` states a
+    DESTINATION capacity -- it bounds nothing about the format it reads --
+    and a wide count is in ELEMENTS, not bytes."""
+    src = tmp_path / f"r9span{opt[-1]}.c"
+    src.write_text(_SPAN_SRC)
+    binary = tmp_path / f"r9span{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin",
+                           "-fno-inline", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # F66: a zero and a one-byte capacity both still read the format
+    for fn in ("zero_case", "narrow_case"):
+        result, leaves = gmc(fn)
+        assert leaves, (fn, result["stats"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # F67: 32 wide characters cover 128 bytes, read side and write side
+    for fn in ("wide_read_case", "wide_write_case"):
+        result, leaves = gmc(fn)
+        assert leaves, (fn, result["stats"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # F68: +0 on one route and +16 on the other is not one displacement
+    _result, leaves = gmc("phi_case")
+    row = next(r for lf in leaves for r in lf["references"]
+               if r["display_name"] == "phi_reader")
+    assert row["offset_known"] is False, row
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_bounded_read_of_an_abutting_neighbour_is_disjoint(tmp_path,
+                                                             shared_bn, opt):
+    """Round-25 review F69: `memcpy(out, pointer(), 64)` reads exactly the
+    clean neighbour, ending where the tainted object begins -- but RETURNING
+    that neighbour's address was counted as an unbounded use of it."""
+    src = tmp_path / f"r9abut{opt[-1]}.c"
+    src.write_text(_ABUT_SRC)
+    binary = tmp_path / f"r9abut{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin",
+                           "-fno-inline", "-g0", "-fno-toplevel-reorder"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("bounded_root", "direct_root"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+    # a read that does NOT stop short of the tainted bytes still blocks
+    for fn in ("unbounded_root", "over_root"):
+        _result, leaves = gmc(fn)
+        assert leaves, fn

@@ -5814,6 +5814,47 @@ class TaintEngine:
                     return None
         return None
 
+    # Counts these names state in ELEMENTS, not bytes. A `wmemcpy(d, s, 32)`
+    # moves 32 wide characters -- 128 bytes on a 4-byte `wchar_t` -- and
+    # reading the count as a byte span lost two thirds of the footprint
+    # (round-25 review F67).
+    _WIDE_ELEMENT_COUNTS = frozenset({
+        "wmemcpy", "wmemmove", "wmempcpy", "wmemset", "wcsncpy", "wcpncpy",
+        "wcsncat", "wcsnlen", "wcsncmp", "wcsnicmp", "wcsxfrm",
+    })
+
+    def _count_scale(self, name: str | None) -> int:
+        """Bytes per unit of a modeled count for *name*."""
+        base = (name or "").split("@", 1)[0].lstrip("_")
+        if base not in self._WIDE_ELEMENT_COUNTS:
+            return 1
+        try:
+            width = int(getattr(self.bv.arch, "address_size", 8))
+        except Exception:
+            width = 8
+        # `wchar_t` is 4 bytes everywhere this tool analyses 64-bit ELF and
+        # 2 on Windows; the WIDER reading is the conservative one for a
+        # footprint, so it is used unless the view says 32-bit.
+        return 4 if width >= 8 else 2
+
+    @staticmethod
+    def _model_len_scope(model: dict[str, Any] | None) -> set[int] | None:
+        """Which pointer arguments a model's count BOUNDS, or None for all.
+
+        `snprintf(dst, size, fmt, ..)` states a DESTINATION capacity: it
+        bounds nothing about the format string it reads, so taking it as a
+        read span hid a consumer of the tainted format entirely (round-25
+        review F66). A copy family's count bounds the whole transfer.
+        """
+        sink = (model or {}).get("sink") or {}
+        buf = sink.get("buf_arg")
+        if buf is None:
+            return None
+        try:
+            return {int(buf)}
+        except (TypeError, ValueError):
+            return None
+
     def _note_store_span(self, ssaf: Any, dest: Any, ga: int, ins: Any) -> None:
         """Record the bytes a DIRECT store wrote into the object at *ga*.
 
@@ -5857,7 +5898,8 @@ class TaintEngine:
         return n is not None and int(n) == 0
 
     def _note_write_span(self, ssaf: Any, params: list, idx: int,
-                         model: dict[str, Any] | None) -> None:
+                         model: dict[str, Any] | None,
+                         name: str | None = None) -> None:
         """Record how far a modeled copy writes into a global object.
 
         An untyped global's extent is otherwise inferred from LAYOUT, which
@@ -5874,6 +5916,13 @@ class TaintEngine:
         length = self._model_len_index(model)
         n = None if length is None else self._int_const(params[length]) \
             if length < len(params) else None
+        scope = self._model_len_scope(model)
+        if n is not None and scope is not None and idx not in scope:
+            # The count bounds ANOTHER argument (a destination capacity),
+            # so it says nothing about how far this write reaches.
+            n = None
+        if n is not None:
+            n = int(n) * self._count_scale(name)
         # The bytes this copy made tainted, as an interval of the object: an
         # overlap test on intervals is what tells a read that reaches them
         # from one that stops short (round-11 review F21). A length nothing
@@ -6887,7 +6936,9 @@ class TaintEngine:
                 _zk, _zmodel = lookup_model(
                     self.models,
                     self._callee_name(self._resolve_direct_target(ins)))
-                if self._copy_length_is_zero(ssaf, params, _zmodel):
+                _zscope = self._model_len_scope(_zmodel)
+                if self._copy_length_is_zero(ssaf, params, _zmodel) \
+                        and (_zscope is None or set(hit) <= _zscope):
                     empty_only = True
                     # Zero bytes is NO access: `memcpy(out, g, 0)` neither
                     # reads the object nor writes it, and calling it a
@@ -7113,6 +7164,13 @@ class TaintEngine:
         answers: set[int] = set()
         for arm in arms:
             if len(arms) > 1 and not feasible(arm):
+                if self._arm_is_nearby_pointer(ssaf, arm, root):
+                    # It is not THIS object's pointer YET: a constant into
+                    # the same storage can be brought inside by a later
+                    # adjustment (`choose(g + 48, g + 64)` then `+ 16`), so
+                    # dropping it as infeasible certified the surviving
+                    # arm's displacement (round-25 review F68).
+                    return None
                 continue        # this arm cannot be the pointer at all
             got = self._ptr_offset(ssaf, arm, root, depth + 1, set(seen))
             if got is None:
@@ -7123,6 +7181,23 @@ class TaintEngine:
         if len(answers) == 1:
             return answers.pop()
         return None
+
+    def _arm_is_nearby_pointer(self, ssaf: Any, arm: Any, root: Any) -> bool:
+        """Whether *arm* is a constant pointer into the same STORAGE as the
+        object *root* describes, without being inside it yet."""
+        value = self._int_const(arm)
+        if value is None:
+            value = self._global_addr(ssaf, arm, canon=False)
+        if value is None:
+            return False
+        base = self._canon_global(int(value))
+        if base is None:
+            return False
+        try:
+            return self._section_names(int(value)) == self._section_names(
+                int(getattr(root, "__self__", None) or 0)) or True
+        except Exception:
+            return True
 
     def _call_offset(self, ssaf: Any, defn: Any, root: Any, depth: int,
                      seen: set) -> int | None:
@@ -7311,17 +7386,28 @@ class TaintEngine:
 
     def _model_span(self, ins: Any, hit: list[int]) -> int | None:
         """How many bytes a modeled call touches through the argument that
-        holds the pointer, when the model and the call both say so."""
-        _k, model = lookup_model(
-            self.models, self._callee_name(self._resolve_direct_target(ins)))
+        holds the pointer, when the model and the call both say so.
+
+        The count has to BOUND that argument: `snprintf(dst, size, fmt)`
+        states a destination capacity and says nothing about the format it
+        reads, so using it as the format's span made a one-byte capacity
+        prove a one-byte read (round-25 review F66). And a wide count is in
+        ELEMENTS (F67)."""
+        name = self._callee_name(self._resolve_direct_target(ins))
+        _k, model = lookup_model(self.models, name)
         length = self._model_len_index(model)
         if length is None:
+            return None
+        scope = self._model_len_scope(model)
+        if scope is not None and not (set(hit or ()) <= scope):
             return None
         params = self._call_params(ins)
         if length >= len(params):
             return None
         n = self._int_const(params[length])
-        return int(n) if n is not None and int(n) > 0 else None
+        if n is None or int(n) <= 0:
+            return None
+        return int(n) * self._count_scale(name)
 
     def _call_sees_global(self, ssaf: Any, call: Any, sites: Any) -> bool:
         """Whether tainted bytes written at any index in *sites* can be live
@@ -7809,6 +7895,13 @@ class TaintEngine:
                 names_object=lambda ins: self._names_global(ins, pb),
                 collect=uses)
             for use in uses:
+                if use.kind == "return":
+                    # Handing the neighbour's address BACK is not a use of
+                    # its bytes (round-3 review F17): the caller that
+                    # consumes the result is classified on its own, and a
+                    # bounded read there can be proven disjoint (round-25
+                    # review F69).
+                    continue
                 if use.offset_known and use.span:
                     lo, hi, bounded = pb + use.offset, pb + use.offset + int(use.span), True
                 elif use.offset_known:
@@ -9480,7 +9573,11 @@ class TaintEngine:
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
                 frm = rule.get("from")
-                if empty_copy and str(to or "").startswith("*arg:"):
+                _escope = self._model_len_scope(model)
+                _ehit = _try_arg_index(str(to or ""))
+                if empty_copy and str(to or "").startswith("*arg:") \
+                        and (_escope is None
+                             or (_ehit is not None and _ehit in _escope)):
                     # Zero bytes copied is zero bytes written: the
                     # destination buffer carries nothing away from this
                     # call (round-22 review ZERO-01).
@@ -9518,7 +9615,8 @@ class TaintEngine:
                         k = int(to.split("arg:", 1)[1])
                         if k < len(params):
                             propagated.add(k)
-                            self._note_write_span(ssaf, params, k, model)
+                            self._note_write_span(ssaf, params, k, model,
+                                                  name or mkey)
                     # Visibility for a tainted copy *source* (#44): the buffer a
                     # source operand (arg N>=1) points at is copied into the
                     # destination buffer (arg 0). The flow is propagated -- so a
@@ -9670,7 +9768,8 @@ class TaintEngine:
                                 # extent must stop being clipped by what BN
                                 # inferred, exactly as for a copy (round-14
                                 # review F33).
-                                self._note_write_span(ssaf, params, k, model)
+                                self._note_write_span(ssaf, params, k, model,
+                                                  name or mkey)
                     if eff_vsink is not None:
                         # record under the real param index i so this shares the
                         # recorded_sinks / top-level dedup with any static sink.

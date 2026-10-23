@@ -45,6 +45,9 @@ STRNCPY, STRCPY, SPRINTF, MEMCPY, SYSTEM = 0x401030, 0x401040, 0x401050, 0x40106
 MEMSET = 0x401080
 STRCAT = 0x401090
 STRCAT_CHK = 0x4010a0
+SNPRINTF = 0x4010b0     # a count that bounds the DESTINATION only
+WMEMCPY = 0x4010c0      # a count stated in wide ELEMENTS
+G_PREV = G_DIR - 0x40   # the clean object abutting G_DIR
 
 
 @pytest.fixture
@@ -5071,3 +5074,87 @@ def test_an_ordinary_arm_beside_an_adjusting_tail_is_unknown(models):
     row = next(r for r in leaf["references"]
                if r["display_name"] == "tail_reader")
     assert row["offset_known"] is False, row
+
+
+# --------------------------------------------------------------------------
+# round-25 review F66/F67/F69
+# --------------------------------------------------------------------------
+
+def _capacity_reader_program(size):
+    """A consumer whose only use of the object is `snprintf(out, size, g)`:
+    the count bounds the DESTINATION, not the format it reads."""
+    reader = GFunc("fmt_reader", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_CALL_SSA", f"snprintf(out, {size}, g)",
+               dest=_gptr(SNPRINTF),
+               params=[_gptr(G_OTHER), _const(size), _gptr(G_DIR)]),
+    ]), params=[])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0x80)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SNPRINTF: "snprintf", SYSTEM: "system",
+                    0x401200: "fmt_reader"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR: [FRef(reader, 0x401210)]})
+    return func, bv
+
+
+@pytest.mark.parametrize("size", [0, 1], ids=["zero", "one"])
+def test_a_destination_capacity_is_not_a_read_span(models, size):
+    # Round-25 review F66: the capacity was taken as the span of the FORMAT
+    # argument, so a zero capacity cleared the run and a one-byte capacity
+    # "proved" a one-byte read.
+    func, bv = _capacity_reader_program(size)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert [r["display_name"] for r in leaf["references"]] == ["fmt_reader"], leaf
+    assert leaf["references"][0]["access"] != "write_only"
+
+
+def test_a_wide_count_is_measured_in_elements(models):
+    # Round-25 review F67: `wmemcpy(out, g, 32)` moves 32 WIDE characters,
+    # 128 bytes -- reading the count as bytes lost three quarters of the
+    # footprint, and a reader past 32 looked disjoint.
+    eng = te.TaintEngine(FGlobalBV({}), models)
+    ins = FInstr(0, 0x401210, "MLIL_CALL_SSA", "wmemcpy(out, g, 32)",
+                 dest=_gptr(WMEMCPY),
+                 params=[_gptr(G_OTHER), _gptr(G_DIR), _const(32)])
+    eng.bv = FGlobalBV({WMEMCPY: "wmemcpy"})
+    assert eng._model_span(ins, [1]) == 128
+
+
+def _returned_neighbour_program(span):
+    """`pointer()` returns the CLEAN neighbour; `reader()` copies *span*
+    bytes from the pointer it hands back."""
+    producer = GFunc("pointer", 0x401400, FSSAFunc([
+        FInstr(0, 0x401410, "MLIL_RET", "return first",
+               src=[_gptr(G_PREV)]),
+    ]), params=[])
+    r1 = FSSA(FVar("r"), 1)
+    reader = GFunc("bounded", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "r#1 = pointer()", writes=[r1],
+               dest=_gptr(0x401400), params=[]),
+        FInstr(1, 0x401318, "MLIL_CALL_SSA", f"memcpy(out, r#1, {span})",
+               reads=[r1], dest=_gptr(MEMCPY),
+               params=[_gptr(G_OTHER), _var(r1), _const(span)]),
+    ]), params=[], callees=[producer])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x40)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401300: "bounded",
+                    0x401400: "pointer"},
+                   funcs={0x401300: reader, 0x401400: producer},
+                   refs={G_PREV: [FRef(producer, 0x401410)]},
+                   objects={G_PREV: 0, G_DIR: 0},
+                   section=(0x404000, 0x405000))
+    return func, bv
+
+
+def test_returning_a_neighbour_is_not_a_use_of_its_bytes(models):
+    # Round-25 review F69: the RETURN of the clean neighbour's address was
+    # counted as an unbounded use of it, so a consumer whose read provably
+    # stops where the tainted object begins still blocked.
+    func, bv = _returned_neighbour_program(span=G_DIR - G_PREV)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    # the overlapping and unbounded controls for this shape are exercised
+    # on real BN (tests/test_taint_integration.py), where the layout the
+    # interval test reads is the linker's rather than the fixture's.
