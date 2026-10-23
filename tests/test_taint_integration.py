@@ -4364,3 +4364,161 @@ def test_the_layout_walk_keeps_a_named_neighbour(tmp_path, shared_bn, count):
               if lf["kind"] == "global_memory_continuation"]
     assert leaves == [], (count, leaves)
     assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+_IMPORT_TAIL_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char clean[256] __attribute__((section(".clean"))) = "safe";
+volatile unsigned char seen;
+N char *refill(void) { return fgets(tracked, 2, stdin); }
+N char *reset(void) { return memset(tracked, 0, 1); }
+N char *copy(char *s) { return memcpy(tracked, s, 1); }
+N char *loader(void) { return strcpy(tracked, "x"); }
+N void use_refill(void) { system(refill() + 8); }
+N void use_reset(void) { system(reset() + 8); }
+N void use_copy(char *s) { system(copy(s) + 8); }
+N void use_load(void) { system(loader() + 8); }
+N void ignored(void) { refill(); seen = 1; }
+N char *refill_clean(void) { return fgets(clean, 2, stdin); }
+N void use_clean(void) { system(refill_clean() + 8); }
+N void refill_case(char *s) { memcpy(tracked, s, 64); use_refill(); }
+N void reset_case(char *s) { memcpy(tracked, s, 64); use_reset(); }
+N void copy_case(char *s) { memcpy(tracked, s, 64); use_copy(s); }
+N void load_case(char *s) { memcpy(tracked, s, 64); use_load(); }
+N void ignored_case(char *s) { memcpy(tracked, s, 64); ignored(); }
+N void clean_case(char *s) { memcpy(tracked, s, 64); use_clean(); }
+int main(void) { return 0; }
+"""
+
+_MIXED_RETURN_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+volatile int choice;
+N char *direct_far(void) { return tracked + 80; }
+N char *mixed(void) { if (choice) return tracked + 8; return direct_far(); }
+N char *equal(void) { if (choice) return tracked + 8; return tracked + 8; }
+N void mixed_reader(void) { system(mixed()); }
+N void equal_reader(void) { system(equal()); }
+N void mixed_case(char *s) { memcpy(tracked, s, 128); mixed_reader(); }
+N void equal_case(char *s) { memcpy(tracked, s, 128); equal_reader(); }
+int main(void) { return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_tail_return_into_a_modeled_import_keeps_its_alias(tmp_path,
+                                                             shared_bn, opt):
+    """Round-23 review F60: `return fgets(g, 2, stdin);` compiled to a tail
+    jump returns the DESTINATION the model names, and the caller's
+    `result + 8` points into that object -- the tail path asked only for an
+    in-binary body's returned formals, found none, and the run cleared."""
+    src = tmp_path / f"r7imp{opt[-1]}.c"
+    src.write_text(_IMPORT_TAIL_SRC)
+    binary = tmp_path / f"r7imp{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin",
+                           "-fno-inline", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("refill_case", "reset_case", "copy_case", "load_case"):
+        result, leaves = gmc(fn)
+        assert leaves, (fn, result["stats"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # the return is DISCARDED, and the same shape over another object
+    for fn in ("ignored_case", "clean_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"], ids=["O0", "O2"])
+def test_a_mixed_ordinary_and_tail_return_joins_both_offsets(tmp_path,
+                                                             shared_bn, opt):
+    """Round-23 review F61: one arm returns `g + 8`, the other tail-returns
+    a body handing back `g + 80`. The displacement join gathered only `RET`
+    instructions, so one branch's offset was reported as EXACT."""
+    src = tmp_path / f"r7mix{opt[-1]}.c"
+    src.write_text(_MIXED_RETURN_SRC)
+    binary = tmp_path / f"r7mix{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin",
+                           "-fno-inline", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def rows(fn, name):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return [r for lf in result["leaves"]
+                for r in lf.get("references", [])
+                if r["display_name"] == name]
+
+    [mixed] = rows("mixed_case", "mixed_reader")
+    assert mixed["offset_known"] is False, mixed
+    [equal] = rows("equal_case", "equal_reader")
+    assert (equal["offset"], equal["offset_known"]) == (8, True), equal
+
+
+def _layout_bound_source(count: int) -> str:
+    touches = "".join(f"  x += (unsigned char)big[{8 * (i + 1)}];\n"
+                      for i in range(count))
+    return f"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char big[65536] __attribute__((section(".pair"))) = "seed";
+char neighbour[64] __attribute__((section(".pair"))) = "safe";
+volatile unsigned char seen;
+N unsigned probe(void) {{
+  unsigned x = 0;
+{touches}  return x;
+}}
+N int quiet(void) {{ return 7; }}
+N void reader(void) {{ system(big + 4096); }}
+N void quiet_case(char *s) {{ memcpy(big, s, 1); seen = (unsigned char)quiet(); }}
+N void read_case(char *s) {{ memcpy(big, s, 8192); reader(); }}
+int main(void) {{ return 0; }}
+"""
+
+
+@pytest.mark.parametrize("count", [4095, 4097], ids=["under", "over"])
+def test_the_layout_bound_speaks_only_where_a_reader_could_hide(tmp_path,
+                                                                shared_bn,
+                                                                count):
+    """Round-23 review F62: the new layout bound was attached to every
+    frontier question about the object, so a callee whose whole body is
+    `return 7;` became a blocking continuation once the walk ran out."""
+    src = tmp_path / f"r7lay{count}.c"
+    src.write_text(_layout_bound_source(count))
+    binary = tmp_path / f"r7lay{count}"
+    _compile(src, binary, ["-O0", "-U_FORTIFY_SOURCE", "-fno-builtin",
+                           "-g0", "-fno-toplevel-reorder"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0", timeout=300.0)
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    result, leaves = gmc("quiet_case")
+    assert leaves == [], (count, leaves)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+    # the genuine interior reader stays blocking at either side of the bound
+    result, leaves = gmc("read_case")
+    assert any(r["display_name"] == "reader"
+               for lf in leaves for r in lf["references"]), (count, leaves)
+    if count > 4096:
+        assert "object_layout_budget" in leaves[0]["reachability"]["causes"]
+        assert "global_object_layout" in result["stats"]["truncation_cause"]

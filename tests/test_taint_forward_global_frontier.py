@@ -4824,3 +4824,152 @@ def test_a_zero_length_copy_taints_nothing(models, length, blocking):
     if not blocking:
         # and no unbounded footprint was recorded for the empty copy
         assert G_DIR not in eng._global_write_unbounded
+
+
+# --------------------------------------------------------------------------
+# round-23 review F60/F61/F62
+# --------------------------------------------------------------------------
+
+def _import_tail_program(dest=None):
+    """`producer()` TAIL-RETURNS a modeled import that hands back its
+    destination; the consumer reads through `result + 8`."""
+    dest = G_DIR if dest is None else dest
+    producer = GFunc("refill", 0x401400, FSSAFunc([
+        FInstr(0, 0x401410, "MLIL_TAILCALL_SSA", "tailcall memset(g, 0, 1)",
+               dest=_gptr(MEMSET),
+               params=[_gptr(dest), _const(0), _const(1)]),
+    ]), params=[])
+    producer.is_thunk = True
+    r1 = FSSA(FVar("r"), 1)
+    consumer = GFunc("use_refill", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "r#1 = refill()", writes=[r1],
+               dest=_gptr(0x401400), params=[]),
+        FInstr(1, 0x401318, "MLIL_CALL_SSA", "system(r#1 + 8)", reads=[r1],
+               dest=_gptr(SYSTEM),
+               params=[FExpr("MLIL_ADD", "r#1 + 8", left=_var(r1),
+                             right=_const(8))]),
+    ]), params=[], callees=[producer])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", MEMSET: "memset", SYSTEM: "system",
+                    0x401300: "use_refill", 0x401400: "refill"},
+                   funcs={0x401300: consumer, 0x401400: producer},
+                   refs={dest: [FRef(producer, 0x401410)]})
+    return func, bv
+
+
+def test_a_tail_return_into_a_modeled_import_keeps_its_destination(models):
+    # Round-23 review F60: the model says this import returns its
+    # DESTINATION, so the caller's `result + 8` points into the object --
+    # the tail path asked only for an in-binary body's returned formals.
+    func, bv = _import_tail_program()
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert [r["display_name"] for r in leaf["references"]] == ["use_refill"], leaf
+
+
+def test_a_tail_return_filling_another_object_stays_silent(models):
+    func, bv = _import_tail_program(dest=G_OTHER)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+
+
+def _mixed_route_program(far_offset=0x50):
+    """`mixed()` returns `g + 8` on one arm and TAIL-RETURNS a body that
+    hands back `g + far_offset` on the other."""
+    far = GFunc("direct_far", 0x401500, FSSAFunc([
+        FInstr(0, 0x401510, "MLIL_RET", f"return g + {far_offset}",
+               src=[_gptr(G_DIR + far_offset)]),
+    ]), params=[])
+    mixed = GFunc("mixed", 0x401400, FSSAFunc([
+        FInstr(0, 0x401410, "MLIL_RET", "return g + 8",
+               src=[_gptr(G_DIR + 8)]),
+        FInstr(1, 0x401418, "MLIL_TAILCALL_SSA", "tailcall direct_far()",
+               dest=_gptr(0x401500), params=[]),
+    ]), params=[], callees=[far])
+    r1 = FSSA(FVar("r"), 1)
+    consumer = GFunc("mixed_reader", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "r#1 = mixed()", writes=[r1],
+               dest=_gptr(0x401400), params=[]),
+        FInstr(1, 0x401318, "MLIL_CALL_SSA", "system(r#1)", reads=[r1],
+               dest=_gptr(SYSTEM), params=[_var(r1)]),
+    ]), params=[], callees=[mixed])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x80)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401300: "mixed_reader", 0x401400: "mixed",
+                    0x401500: "direct_far"},
+                   funcs={0x401300: consumer, 0x401400: mixed,
+                          0x401500: far},
+                   refs={G_DIR: [FRef(mixed, 0x401410)]})
+    return func, bv
+
+
+def test_a_tail_route_joins_the_displacement_lattice(models):
+    # Round-23 review F61: the join gathered only `RET` instructions, so
+    # the ordinary arm's +8 was reported as EXACT while the tail arm's +80
+    # was equally feasible.
+    func, bv = _mixed_route_program(far_offset=0x50)
+    [leaf] = _leaves(_forward(bv, func, models))
+    row = next(r for r in leaf["references"]
+               if r["display_name"] == "mixed_reader")
+    assert row["offset_known"] is False, row
+
+
+def test_agreeing_routes_still_report_an_exact_offset(models):
+    # The control: both routes land on +8, so the offset IS established.
+    func, bv = _mixed_route_program(far_offset=8)
+    [leaf] = _leaves(_forward(bv, func, models))
+    row = next(r for r in leaf["references"]
+               if r["display_name"] == "mixed_reader")
+    assert (row["offset"], row["offset_known"]) == (8, True), row
+
+
+def _layout_truncated_engine(bv, models):
+    """An engine whose layout walk reports that it ran out, every time."""
+    eng = te.TaintEngine(bv, models)
+    real = eng._global_extent
+
+    def marked(ga):
+        out = real(ga)
+        eng._global_layout_truncated.add(int(ga))
+        return out
+
+    eng._global_extent = marked
+    return eng
+
+
+def test_the_layout_bound_is_not_attached_to_a_quiet_callee(models):
+    # Round-23 review F62: the bound was attached to every frontier
+    # question about the object, so a callee whose body touches no global
+    # at all became a blocking continuation once the walk ran out.
+    quiet = _quiet("quiet", 0x401200)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(1)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "quiet"},
+                   funcs={0x401200: quiet},
+                   refs={G_DIR: [FRef(func, 0x401104)]})
+    eng = _layout_truncated_engine(bv, models)
+    result = eng.forward(func, [te.parse_locator("param:0")])
+    assert _leaves(result) == [], result["leaves"]
+    assert "global_object_layout" not in result["stats"]["truncation_cause"]
+
+
+def test_the_layout_bound_still_speaks_for_a_real_reader(models):
+    # ...while a callee that READS this object keeps the bound, and the
+    # aggregate names it.
+    reader = _reader("reader", 0x401200, G_DIR, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0x70)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR: [FRef(reader, 0x401210)]})
+    eng = _layout_truncated_engine(bv, models)
+    result = eng.forward(func, [te.parse_locator("param:0")])
+    [leaf] = _leaves(result)
+    assert "object_layout_budget" in (leaf["reachability"]["causes"] or ()), \
+        leaf["reachability"]
+    assert "global_object_layout" in result["stats"]["truncation_cause"]

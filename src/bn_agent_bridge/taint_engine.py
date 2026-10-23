@@ -6356,12 +6356,28 @@ class TaintEngine:
         if "TAILCALL" not in opn or depth > 4:
             return []
         taddr = self._resolve_direct_target(ins)
-        callee = function_at(self.bv, taddr) if taddr is not None else None
-        if callee is None:
+        if taddr is None:
             return []
         params = self._call_params(ins)
-        return [params[i] for i in self._fn_returned_params(callee)
-                if i < len(params)]
+        out: list = []
+        # A tail return into a MODELED import hands back what the model
+        # says: `fgets`/`memcpy`/`memset` return their DESTINATION, so
+        # `return fgets(g, 2, stdin);` returns that object. Asking only for
+        # an in-binary body's returned formals found nothing there, and the
+        # caller's `result + 8` looked like a fresh pointer (round-23
+        # review F60).
+        _k, model = lookup_model(self.models, self._callee_name(taddr))
+        for rule in ((model or {}).get("propagates") or ()):
+            if str(rule.get("to") or "") not in ("ret", "*ret"):
+                continue
+            idx = _try_arg_index(str(rule.get("from") or ""))
+            if idx is not None and idx < len(params):
+                out.append(params[idx])
+        callee = function_at(self.bv, taddr)
+        if callee is not None:
+            out.extend(params[i] for i in self._fn_returned_params(callee)
+                       if i < len(params))
+        return out
 
     def _fn_returns_pointer(self, fn: Any, base: Any, depth: int = 0,
                             budget: _ScanBudget | None = None) -> bool:
@@ -7215,12 +7231,42 @@ class TaintEngine:
             # returning `p + 8` on one path and `p + 24` on another has no
             # single displacement, and taking the first one reported a
             # certainty it did not have (round-12 review F27).
-            arms = [src for ins in instrs if "RET" in op_name(ins)
-                    for src in self._ret_sources(ins)
+            # EVERY route out of this body, including a TAIL return: the
+            # alias-existence walk follows those, so leaving them out of
+            # the displacement join reported one branch's offset as exact
+            # while the other arm was feasible (round-23 review F61). One
+            # abstraction answers both questions.
+            arms = [src for ins in instrs
+                    if "RET" in op_name(ins) or "TAILCALL" in op_name(ins)
+                    for src in self._return_exprs(ins)
                     if self._ptr_resolves(ssaf, src, lambda e: root(e) is not None)]
+            tails = [ins for ins in instrs if "TAILCALL" in op_name(ins)]
+            if not arms and not tails:
+                return (False, None)
+            offset = self._merge_offsets(ssaf, arms, root, depth, set()) \
+                if arms else None
+            for ins in tails:
+                # A tail route whose own displacement this walk cannot
+                # establish makes the join UNKNOWN rather than leaving the
+                # other arm's offset standing as exact.
+                taddr = self._resolve_direct_target(ins)
+                callee = function_at(self.bv, taddr) if taddr is not None else None
+                if callee is None or not self._is_internal(callee) \
+                        or int(getattr(callee, "start", 0)) == int(
+                            getattr(fn, "start", -1)):
+                    continue
+                reaches, tail_off = self._fn_return_routes(
+                    callee, root, depth + self._PTR_RETURN_STEP)
+                if not reaches:
+                    continue
+                if not arms:
+                    arms = [ins]
+                    offset = tail_off
+                elif tail_off is None or offset is None or tail_off != offset:
+                    offset = None
             if not arms:
                 return (False, None)
-            return (True, self._merge_offsets(ssaf, arms, root, depth, set()))
+            return (True, offset)
         finally:
             self._return_offset_active.discard(key)
 
@@ -8696,7 +8742,9 @@ class TaintEngine:
                             # established, so "these are its references" is
                             # not established either.
                             reach = self._with_cause(reach, "object_extent_unproven")
-                        if ga in self._global_layout_truncated:
+                        if ga in self._global_layout_truncated \
+                                and (refs or unread is not None
+                                     or self._touches_object_region(cfn, ga)):
                             # The walk for this object's next named
                             # neighbour ran out, so where it ends -- and
                             # which references belong to it -- rest on the
