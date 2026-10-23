@@ -4973,3 +4973,101 @@ def test_the_layout_bound_still_speaks_for_a_real_reader(models):
     assert "object_layout_budget" in (leaf["reachability"]["causes"] or ()), \
         leaf["reachability"]
     assert "global_object_layout" in result["stats"]["truncation_cause"]
+
+
+# --------------------------------------------------------------------------
+# round-24 review F63/F64/F65
+# --------------------------------------------------------------------------
+
+def test_a_zero_length_modeled_read_is_not_a_reference(models):
+    # Round-24 review F65: `memcpy(out, g, 0)` reads no byte of the object,
+    # yet the consumer was classified as a proven read and blocked.
+    zero = GFunc("zero_reader", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_CALL_SSA", "memcpy(out, g, 0)",
+               dest=_gptr(MEMCPY),
+               params=[_gptr(G_OTHER), _gptr(G_DIR), _const(0)]),
+    ]), params=[])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "zero_reader"},
+                   funcs={0x401200: zero},
+                   refs={G_DIR: [FRef(zero, 0x401210)]})
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_one_byte_modeled_read_is_still_a_reference(models):
+    # The control: one byte IS a read of those bytes.
+    one = GFunc("one_reader", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_CALL_SSA", "memcpy(out, g, 1)",
+               dest=_gptr(MEMCPY),
+               params=[_gptr(G_OTHER), _gptr(G_DIR), _const(1)]),
+    ]), params=[])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "one_reader"},
+                   funcs={0x401200: one},
+                   refs={G_DIR: [FRef(one, 0x401210)]})
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert [r["display_name"] for r in leaf["references"]] == ["one_reader"], leaf
+
+
+def _adjusting_tail_program(mixed=False):
+    """`tail()` TAIL-CALLS `advance(g + 8)`, and `advance(p)` returns
+    `p + 80`: the caller's pointer is at +88."""
+    p_var = FVar("p")
+    p0 = FSSA(p_var, 0)
+    advance = GFunc("advance", 0x401500, FSSAFunc([
+        FInstr(0, 0x401510, "MLIL_RET", "return p#0 + 80", reads=[p0],
+               src=[FExpr("MLIL_ADD", "p#0 + 80", left=_var(p0),
+                          right=_const(80))]),
+    ]), params=[p_var])
+    body = [FInstr(0, 0x401410, "MLIL_TAILCALL_SSA", "tailcall advance(g + 8)",
+                   dest=_gptr(0x401500), params=[_gptr(G_DIR + 8)])]
+    if mixed:
+        body.insert(0, FInstr(0, 0x401408, "MLIL_RET", "return g + 8",
+                              src=[_gptr(G_DIR + 8)]))
+        body[1] = FInstr(1, 0x401410, "MLIL_TAILCALL_SSA",
+                         "tailcall advance(g + 8)", dest=_gptr(0x401500),
+                         params=[_gptr(G_DIR + 8)])
+    producer = GFunc("tail", 0x401400, FSSAFunc(body), params=[],
+                     callees=[advance])
+    r1 = FSSA(FVar("r"), 1)
+    consumer = GFunc("tail_reader", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "r#1 = tail()", writes=[r1],
+               dest=_gptr(0x401400), params=[]),
+        FInstr(1, 0x401318, "MLIL_CALL_SSA", "system(r#1)", reads=[r1],
+               dest=_gptr(SYSTEM), params=[_var(r1)]),
+    ]), params=[], callees=[producer])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x80)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401300: "tail_reader", 0x401400: "tail",
+                    0x401500: "advance"},
+                   funcs={0x401300: consumer, 0x401400: producer,
+                          0x401500: advance},
+                   refs={G_DIR: [FRef(producer, 0x401410)]})
+    return func, bv
+
+
+def test_a_tail_return_composes_the_callee_adjustment(models):
+    # Round-24 review F64: the tail summary kept only the ACTUAL's
+    # displacement, so `advance(g + 8)` returning `p + 80` certified +8.
+    func, bv = _adjusting_tail_program(mixed=False)
+    [leaf] = _leaves(_forward(bv, func, models))
+    row = next(r for r in leaf["references"]
+               if r["display_name"] == "tail_reader")
+    assert (row["offset"], row["offset_known"]) == (88, True), row
+
+
+def test_an_ordinary_arm_beside_an_adjusting_tail_is_unknown(models):
+    # +8 on one route and +88 on the other is not one displacement.
+    func, bv = _adjusting_tail_program(mixed=True)
+    [leaf] = _leaves(_forward(bv, func, models))
+    row = next(r for r in leaf["references"]
+               if r["display_name"] == "tail_reader")
+    assert row["offset_known"] is False, row

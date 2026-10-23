@@ -4522,3 +4522,128 @@ def test_the_layout_bound_speaks_only_where_a_reader_could_hide(tmp_path,
     if count > 4096:
         assert "object_layout_budget" in leaves[0]["reachability"]["causes"]
         assert "global_object_layout" in result["stats"]["truncation_cause"]
+
+
+_RETURNED_ALIAS_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char output[256] __attribute__((section(".out"))) = "out";
+volatile int choice;
+#ifdef INTERIOR_ALIAS
+extern char middle[];
+__asm__(".globl middle\n.set middle,tracked+64\n.type middle,@object\n.size middle,1\n");
+#endif
+N char *advance(char *p) { return p + 80; }
+N char *tail(void) { return advance(tracked + 8); }
+N char *mixed(void) { if (choice) return tracked + 8; return advance(tracked + 8); }
+N char *direct(void) { return tracked + 88; }
+N char *far_clean(void) { return output + 8; }
+N void tail_reader(void) { system(tail()); }
+N void mixed_reader(void) { system(mixed()); }
+N void direct_reader(void) { system(direct()); }
+N void clean_reader(void) { system(far_clean()); }
+N void zero_reader(void) { memcpy(output, tracked, 0); }
+N void one_reader(void) { memcpy(output, tracked, 1); }
+N void n_reader(size_t n) { memcpy(output, tracked, n); }
+#ifdef INTERIOR_ALIAS
+N void tail_case(char *s) { memcpy(middle, s, 64); tail_reader(); }
+N void mixed_case(char *s) { memcpy(middle, s, 64); mixed_reader(); }
+N void direct_case(char *s) { memcpy(middle, s, 64); direct_reader(); }
+N void clean_case(char *s) { memcpy(middle, s, 64); clean_reader(); }
+#else
+N void tail_case(char *s) { memcpy(tracked, s, 128); tail_reader(); }
+N void mixed_case(char *s) { memcpy(tracked, s, 128); mixed_reader(); }
+N void direct_case(char *s) { memcpy(tracked, s, 128); direct_reader(); }
+N void clean_case(char *s) { memcpy(tracked, s, 128); clean_reader(); }
+#endif
+N void zero_case(char *s) { memcpy(tracked, s, 128); zero_reader(); }
+N void one_case(char *s) { memcpy(tracked, s, 128); one_reader(); }
+N void n_case(char *s, size_t n) { memcpy(tracked, s, 128); n_reader(n); }
+int main(void) { return 0; }
+"""
+
+
+def _returned_alias_target(tmp_path, shared_bn, opt, interior):
+    stem = f"r8ret{opt[-1]}{'i' if interior else 'p'}"
+    src = tmp_path / f"{stem}.c"
+    src.write_text(_RETURNED_ALIAS_SRC)
+    binary = tmp_path / stem
+    flags = [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-fno-inline", "-g0"]
+    if interior:
+        flags.append("-DINTERIOR_ALIAS")
+    _compile(src, binary, flags)
+    return shared_bn.load(binary, copy=False)
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_returned_pointer_into_a_written_interior_alias_blocks(tmp_path,
+                                                                 shared_bn,
+                                                                 opt):
+    """Round-24 review F63: the write names `middle = tracked + 64` and the
+    consumer receives `advance(tracked + 8)` from a CALL, naming nothing
+    itself -- so the overlap test's direct-reference prefilter dropped it
+    and the run cleared."""
+    target = _returned_alias_target(tmp_path, shared_bn, opt, interior=True)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("tail_case", "mixed_case", "direct_case"):
+        result, leaves = gmc(fn)
+        assert leaves, (fn, result["stats"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # a returned pointer into a DISJOINT object is still not a continuation
+    result, leaves = gmc("clean_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_tail_return_composes_the_callee_adjustment(tmp_path, shared_bn,
+                                                      opt):
+    """Round-24 review F64: `advance(p) = p + 80` tail-called with
+    `tracked + 8` reaches +88, but the tail summary kept only the actual's
+    displacement and certified +8 as EXACT."""
+    target = _returned_alias_target(tmp_path, shared_bn, opt, interior=False)
+
+    def rows(fn, name):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return [r for lf in result["leaves"]
+                for r in lf.get("references", [])
+                if r["display_name"] == name]
+
+    [tail] = rows("tail_case", "tail_reader")
+    assert (tail["offset"], tail["offset_known"]) == (88, True), tail
+    [direct] = rows("direct_case", "direct_reader")
+    assert (direct["offset"], direct["offset_known"]) == (88, True), direct
+    # +8 on one route and +88 on the other is not one displacement
+    [mixed] = rows("mixed_case", "mixed_reader")
+    assert mixed["offset_known"] is False, mixed
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_zero_length_read_is_not_an_access(tmp_path, shared_bn, opt):
+    """Round-24 review F65: `memcpy(out, g, 0)` reads no byte of `g`, yet
+    the consumer was reported as a proven blocking read."""
+    target = _returned_alias_target(tmp_path, shared_bn, opt, interior=False)
+
+    def gmc(fn, *extra):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0", *extra)
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    result, leaves = gmc("zero_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    # one byte, and a length nothing states, still block
+    for fn in ("one_case", "n_case"):
+        _result, leaves = gmc(fn)
+        assert leaves, fn

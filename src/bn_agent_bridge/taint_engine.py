@@ -446,6 +446,7 @@ class TaintEngine:
         self._import_stub_cache: dict[int, bool] = {}
         self._global_layout_truncated: set[int] = set()
         self._ret_ptr_stack: set[int] = set()
+        self._reaches_object_cache: dict[tuple[int, int], bool] = {}
         self._param_stack: set[tuple[int, int]] = set()
         self._direct_callee_cache: dict[int, tuple] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
@@ -6834,6 +6835,7 @@ class TaintEngine:
 
         wrote = False
         touched = False
+        empty_only = False
         first_at = int(getattr(instrs[0], "address", 0)) if instrs else None
         scan = _ScanBudget(self._PTR_SCAN_NODES)
 
@@ -6881,6 +6883,18 @@ class TaintEngine:
                         hit_use = emit(verdict(ins, "unknown_call_arg"))
                         if hit_use is not None:
                             return hit_use
+                    continue
+                _zk, _zmodel = lookup_model(
+                    self.models,
+                    self._callee_name(self._resolve_direct_target(ins)))
+                if self._copy_length_is_zero(ssaf, params, _zmodel):
+                    empty_only = True
+                    # Zero bytes is NO access: `memcpy(out, g, 0)` neither
+                    # reads the object nor writes it, and calling it a
+                    # proven read produced a blocking continuation for a
+                    # consumer that touches nothing (round-24 review F65).
+                    # An unknown length, and a negative constant (huge as an
+                    # unsigned size), stay on the conservative side.
                     continue
                 span = None if span_of is None else span_of(ins, hit)
                 body, unread_body = self._callee_body(ins)
@@ -7006,6 +7020,11 @@ class TaintEngine:
                         _SCAN_CAUSE_KINDS[scan.cause], 0, None, None, True)
         if wrote:
             return _Use(None, "write_only", 0, None, None, True)
+        if empty_only:
+            # The body's only contact with this object is a copy of ZERO
+            # bytes: it neither reads nor writes it, so there is no
+            # reference here to report (round-24 review F65).
+            return _Use(None, "unused", 0, None, None, True)
         if fallback is None:
             # Reaching here means the scan finished with no terminal use of
             # this pointer and no bound reached: the body DROPS the formal
@@ -7240,33 +7259,50 @@ class TaintEngine:
                     if "RET" in op_name(ins) or "TAILCALL" in op_name(ins)
                     for src in self._return_exprs(ins)
                     if self._ptr_resolves(ssaf, src, lambda e: root(e) is not None)]
-            tails = [ins for ins in instrs if "TAILCALL" in op_name(ins)]
-            if not arms and not tails:
-                return (False, None)
-            offset = self._merge_offsets(ssaf, arms, root, depth, set()) \
-                if arms else None
-            for ins in tails:
-                # A tail route whose own displacement this walk cannot
-                # establish makes the join UNKNOWN rather than leaving the
-                # other arm's offset standing as exact.
+            tails = []
+            for ins in instrs:
+                if "TAILCALL" not in op_name(ins):
+                    continue
+                if any(self._ptr_resolves(ssaf, src,
+                                          lambda e: root(e) is not None)
+                       for src in self._return_exprs(ins)):
+                    tails.append(ins)
+                    continue
+                # The tail-called body may hand the object back by NAME,
+                # carrying no actual of this call at all.
                 taddr = self._resolve_direct_target(ins)
                 callee = function_at(self.bv, taddr) if taddr is not None else None
-                if callee is None or not self._is_internal(callee) \
-                        or int(getattr(callee, "start", 0)) == int(
+                if callee is not None and self._is_internal(callee) \
+                        and int(getattr(callee, "start", 0)) != int(
                             getattr(fn, "start", -1)):
-                    continue
-                reaches, tail_off = self._fn_return_routes(
-                    callee, root, depth + self._PTR_RETURN_STEP)
-                if not reaches:
-                    continue
-                if not arms:
-                    arms = [ins]
-                    offset = tail_off
-                elif tail_off is None or offset is None or tail_off != offset:
-                    offset = None
-            if not arms:
+                    reaches, _off = self._fn_return_routes(
+                        callee, root, depth + self._PTR_RETURN_STEP)
+                    if reaches:
+                        tails.append(ins)
+            # The ORDINARY arms are joined first; a tail route contributes
+            # the displacement the CALL's result carries, which is the
+            # callee's own adjustment composed with the actual's -- taking
+            # the actual alone dropped `advance(p) = p + 80` and certified
+            # `+8` where the program reaches `+88` (round-24 review F64).
+            ordinary = [src for ins in instrs if "RET" in op_name(ins)
+                        for src in self._ret_sources(ins)
+                        if self._ptr_resolves(ssaf, src,
+                                              lambda e: root(e) is not None)]
+            answers: set[int | None] = set()
+            if ordinary:
+                answers.add(self._merge_offsets(ssaf, ordinary, root, depth,
+                                                set()))
+            for ins in tails:
+                answers.add(self._call_offset(ssaf, ins, root,
+                                              depth + self._PTR_RETURN_STEP,
+                                              set()))
+            if not arms and not tails:
                 return (False, None)
-            return (True, offset)
+            if len(answers) == 1:
+                return (True, answers.pop())
+            # Several feasible routes with different (or unknown)
+            # displacements: the offset is not established.
+            return (True, None)
         finally:
             self._return_offset_active.discard(key)
 
@@ -7697,6 +7733,23 @@ class TaintEngine:
                   if hi is None or hi > lo]
         return ranges or [(ga, ga + self._global_extent(ga))]
 
+    def _reaches_object(self, fn: Any, ga: int) -> bool:
+        """Whether *fn*'s own expressions resolve to the object at *ga*.
+
+        The code-reference DB answers "does this body NAME that address",
+        which a consumer handed the pointer by a call does not; this asks
+        the classifier, which follows returned and formal aliases."""
+        key = (int(getattr(fn, "start", 0)), int(ga))
+        cached = self._reaches_object_cache.get(key)
+        if cached is None:
+            self._reaches_object_cache[key] = False   # cycle guard
+            try:
+                cached = self._global_access(fn, ga).at is not None
+            except TaintError:
+                cached = False
+            self._reaches_object_cache[key] = cached
+        return cached
+
     def _overlap_access(self, fn: Any, ssaf: Any, ga: int) -> Any:
         """A use of a NEIGHBOURING object whose bytes reach into *ga*.
 
@@ -7724,8 +7777,15 @@ class TaintEngine:
             # review F35).
             self._global_search_truncated.add(ga)
         for pb in candidates:
-            if start not in self._global_ref_functions(pb):
-                continue        # this body does not touch that object at all
+            if start not in self._global_ref_functions(pb) \
+                    and not self._reaches_object(fn, pb):
+                # No code reference FROM this body, and no route by which
+                # its own expressions resolve to that object either. A
+                # consumer that receives the address from a CALL names
+                # nothing, so requiring a direct reference dropped
+                # `system(advance(tracked + 8))` against a write to
+                # `middle = tracked + 64` (round-24 review F63).
+                continue
             authoritative = self._authoritative_width(pb)
             if authoritative and pb + authoritative <= ga:
                 # A type a HUMAN applied is an answer about where that
