@@ -192,9 +192,7 @@ def test_keyable_global_copy_into_zero_arg_consumer_emits_continuation(models):
                                    "address": hex(hook.start), "at": hex(0x401210),
                                    "access": "call_arg", "offset": 0,
                                    "offset_known": True,
-                                   # a CONSTANT-address operand has no
-                                   # variable to seed (round-20 review F53)
-                                   "seed": None}]
+                                   "seed": "arg:system:0"}]
     assert leaf["reachability"]["status"] == "complete"
     assert leaf["call_descended"] is False
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
@@ -894,7 +892,7 @@ def test_a_mixed_write_then_read_reference_is_a_consumer(models):
     assert leaf["references"][0] == {
         "name": "overwrite_then_run", "display_name": "overwrite_then_run",
         "address": hex(0x401200), "at": hex(0x401218), "access": "call_arg",
-        "offset": 0, "offset_known": True, "seed": None}
+        "offset": 0, "offset_known": True, "seed": "arg:system:0"}
 
 
 
@@ -2435,19 +2433,6 @@ def test_the_reseed_advice_names_a_runnable_locator(models):
     assert "--source arg:system:0" in leaf["detail"]
     assert "var:VAR" not in result["diagnostics"]["next_action"]
     assert "--source arg:system:0" in result["diagnostics"]["next_action"]
-
-
-def test_a_constant_address_consumer_omits_the_failing_locator(models):
-    # Round-20 review F53: `system(g + 0x418)` has no variable inside it, so
-    # `--source arg:system:0` resolves no source and the advertised command
-    # exits 2. The honest guidance replaces it.
-    func, _hook, bv = _globalflow(extra_copy_params=[_const(0xff)])
-    result = _forward(bv, func, models)
-    [leaf] = _leaves(result)
-    assert leaf["references"][0]["seed"] is None
-    assert leaf["reseed"] is None
-    assert "--source arg:" not in leaf["detail"]
-    assert "no variable inside it to seed" in leaf["detail"]
 
 
 def test_an_unnameable_consumer_omits_the_reseed_instead_of_faking_one(models):

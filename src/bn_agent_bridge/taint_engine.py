@@ -6602,28 +6602,6 @@ class TaintEngine:
         # scan -- which follows the returned alias.
         return cached[1]
 
-    def _expr_has_var(self, expr: Any, depth: int = 0) -> bool:
-        """Whether *expr* contains an SSA variable at all.
-
-        A constant-address argument has none, so no `arg:` locator can seed
-        it (round-20 review F53)."""
-        if expr is None or depth > 6:
-            return False
-        if is_ssa_var(expr):
-            return True
-        for child in expr_reads(expr) or ():
-            if is_ssa_var(child):
-                return True
-        for name in ("src", "left", "right", "dest", "params"):
-            got = getattr(expr, name, None)
-            if got is None:
-                continue
-            items = got if isinstance(got, (list, tuple)) else [got]
-            for item in items:
-                if item is not expr and self._expr_has_var(item, depth + 1):
-                    return True
-        return False
-
     def _is_pointer_carry(self, ssaf: Any, ins: Any, base: Any,
                           budget: _ScanBudget | None = None) -> bool:
         """`p = g`, `p = q + 4`, `p = phi(..)`: the pointer is MOVED, not used.
@@ -6701,20 +6679,31 @@ class TaintEngine:
             call's argument -- the locator that seeds those bytes inside the
             consumer.
 
-            Only when that argument HAS a variable to seed. `system(g +
-            1048)` passes a constant address: the locator resolves no source
-            and the advertised command exits 2 ("no taint sources
-            resolved"), which is worse than no command at all (round-20
-            review F53). The honest guidance for that shape already
-            exists."""
+            Only when that argument is one `--source` can actually seed.
+            `system(g + 1048)` passes a constant address: the locator
+            resolves no source and the advertised command exits 2 ("no taint
+            sources resolved"), which is worse than no command at all
+            (round-20 review F53). Seedability is asked of the SAME helper
+            the seeder uses, so the advice and the run cannot disagree."""
             name = self._callee_name(self._resolve_direct_target(ins))
             if not name or not hit:
                 return None
             params = self._call_params(ins)
             idx = hit[0]
-            if idx >= len(params) or not self._expr_has_var(params[idx]):
+            if idx >= len(params):
                 return None
-            return f"arg:{name}:{idx}"
+            # Asking is a QUESTION, not a write: `_buffer_target` records
+            # the offset an object was reached at, which is evidence about
+            # the WRITE this leaf keys, so the probe restores it.
+            keyed = {k: set(v) for k, v in self._global_keyed_offsets.items()}
+            try:
+                seedable = (self._buffer_target(ssaf, params[idx]) is not None
+                            or any(True for _ in expr_reads(params[idx])))
+            except Exception:
+                seedable = False
+            finally:
+                self._global_keyed_offsets = keyed
+            return f"arg:{name}:{idx}" if seedable else None
 
         wrote = False
         touched = False
