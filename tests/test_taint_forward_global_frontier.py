@@ -3869,3 +3869,137 @@ def test_a_store_run_records_the_span_it_wrote(models):
     eng.forward(func, [te.parse_locator("param:0")])
     assert eng._global_write_span.get(G_DIR) == 32
     assert sorted(eng._global_tainted_ranges[G_DIR]) == [(0, 16), (16, 32)]
+
+
+# --------------------------------------------------------------------------
+# round-18 review F41/F42/F43
+# --------------------------------------------------------------------------
+
+def _veneer_program(consumer_reads_global=False):
+    """`relay()` materialises the global and tail-jumps into `invoke(p)`."""
+    p = FVar("p")
+    p0 = FSSA(p, 0)
+    invoke = GFunc("invoke", 0x401400, FSSAFunc([
+        FInstr(0, 0x401410, "MLIL_CALL_SSA", "system(p#0)", reads=[p0],
+               dest=_gptr(SYSTEM), params=[_var(p0)]),
+    ]), params=[p])
+    relay = GFunc("relay_reader", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_TAILCALL_SSA", "tailcall invoke(g)",
+               dest=_gptr(0x401400),
+               params=[_gptr(G_DIR if consumer_reads_global else G_OTHER)]),
+    ]), params=[], callees=[invoke])
+    relay.is_thunk = True
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0x70)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401200: "relay_reader", 0x401400: "invoke"},
+                   funcs={0x401200: relay, 0x401400: invoke},
+                   # BN records the reference only where the veneer really
+                   # names this object.
+                   refs={G_DIR: [FRef(relay, 0x401210)]}
+                   if consumer_reads_global else
+                   {G_OTHER: [FRef(relay, 0x401210)]})
+    return func, bv
+
+
+def test_a_veneer_that_binds_the_global_is_the_boundary(models):
+    # Round-18 review F41: `relay_reader()` materialises the tainted global
+    # and tail-jumps into `invoke(p)`, whose body names no global at all.
+    # Replacing the veneer with its target dropped that binding and the run
+    # cleared.
+    func, bv = _veneer_program(consumer_reads_global=True)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "relay_reader", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_veneer_that_binds_another_object_stays_silent(models):
+    # The control: the veneer hands a DIFFERENT global across, so these
+    # bytes are not what the consumer reads.
+    func, bv = _veneer_program(consumer_reads_global=False)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_an_exhausted_alias_search_spares_a_callee_of_another_object(models,
+                                                                     monkeypatch):
+    # Round-18 review F42: the search bound is reader-specific. A callee
+    # whose only global lives in ANOTHER section reads nothing of this
+    # object, whatever the enumeration did not reach.
+    monkeypatch.setattr(te.TaintEngine, "_ALIAS_HOPS", 1)
+    quiet = _reader("quiet", 0x401200, G_OTHER, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_TAIL),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(32)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "quiet"},
+                   funcs={0x401200: quiet},
+                   refs={G_TAIL: [FRef(func, 0x401104)],
+                         G_OTHER: [FRef(quiet, 0x401210)]},
+                   objects={G_DIR: 0, G_DIR + 16: 0, G_TAIL: 0, G_OTHER: 0},
+                   section=(0x404000, G_OTHER))
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def _scalar_recursion_program(return_width):
+    """`int cycle_a(int n) { return n ? cycle_b(n - 1) : constant(); }`."""
+    n = FVar("n")
+    n0 = FSSA(n, 0)
+    rtype = type("T", (), {"width": return_width})()
+
+    def cycle(name, start, other):
+        r = FSSA(FVar("r"), 1)
+        fn = GFunc(name, start, FSSAFunc([
+            FInstr(0, start + 4, "MLIL_CALL_SSA", f"r#1 = {hex(other)}(n#0 - 1)",
+                   reads=[n0], writes=[r], dest=_gptr(other),
+                   params=[FExpr("MLIL_SUB", "n#0 - 1", left=_var(n0),
+                                 right=_const(1))]),
+            FInstr(1, start + 8, "MLIL_RET", "return r#1", reads=[r],
+                   src=[_var(r)]),
+        ]), params=[n])
+        fn.return_type = rtype
+        return fn
+
+    a = cycle("cycle_a", 0x401200, 0x401300)
+    b = cycle("cycle_b", 0x401300, 0x401200)
+    a.callees, b.callees = [b], [a]
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [_const(3)])],
+        params_extra=[_const(0x40)])
+    bv = FGlobalBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401200: "cycle_a", 0x401300: "cycle_b"},
+                   funcs={0x401200: a, 0x401300: b},
+                   refs={G_DIR: [FRef(a, 0x401204)]})
+    return func, bv
+
+
+def test_scalar_only_recursion_is_not_a_pointer_question(models, monkeypatch):
+    # Round-18 review F43: `int cycle_a(int n)` cannot hand back an address,
+    # so the depth its mutual recursion burns is not uncertainty about a
+    # pointer -- it was reported as `pointer_depth_exhausted`.
+    monkeypatch.setattr(te.TaintEngine, "_PTR_RESOLVE_DEPTH", 2)
+    func, bv = _scalar_recursion_program(return_width=4)
+    result = _forward(bv, func, models)
+    assert not any(r["access"] == "pointer_depth_exhausted"
+                   for lf in _leaves(result) for r in lf["references"]), result["leaves"]
+    assert "pointer_return_depth" not in result["stats"]["truncation_cause"]
+
+
+def test_a_pointer_returning_recursion_still_discloses_its_depth(models,
+                                                                 monkeypatch):
+    # ...while a body that CAN return an address still discloses the bound.
+    monkeypatch.setattr(te.TaintEngine, "_PTR_RESOLVE_DEPTH", 1)
+    inner = _ret_helper("reset_ret", 0x401200)
+    relay = _relay("relay", 0x401400, 0x401200)
+    relay.callees = [inner]
+    consumer = _reads_offset("use_ret", 0x401300, 0x401400)
+    consumer.callees = [relay]
+    func, bv = _chain_program([inner, relay], consumer, inner)
+    result = _forward(bv, func, models)
+    assert any(r["access"] == "pointer_depth_exhausted"
+               for lf in _leaves(result) for r in lf["references"]), result["leaves"]

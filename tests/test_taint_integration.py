@@ -3330,3 +3330,123 @@ def test_global_continuation_direct_stores_match_modeled_copies(tmp_path,
                for lf in leaves for r in lf["references"]), leaves
     assert any("copied into the destination" in a
                for a in result["assumptions"]), result["assumptions"]
+
+
+_TAIL_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#define N __attribute__((noinline,noclone))
+char shared[256] __attribute__((section(".shared"))) = "seed";
+char plain[256] __attribute__((section(".plain"))) = "safe";
+volatile unsigned char seen;
+N int invoke(char *p) { int r = puts("marker"); system(p); return r + 1; }
+N int relay_reader(void) { return invoke(shared); }
+N void tail_case(char *s) { memcpy(shared, s, 112); relay_reader(); }
+N void tail_store_case(char *s) { shared[0] = s[0]; relay_reader(); }
+N int plt_only(void) { return puts("hello"); }
+N void plt_case(char *s) { memcpy(shared, s, 112); plt_only(); }
+N void quiet(void) { seen = 7; }
+N void no_reader(char *s) { memcpy(shared, s, 112); quiet(); }
+N int constant(void) { return 7; }
+N int cycle_b(int);
+N int cycle_a(int n) { return n ? cycle_b(n - 1) : constant(); }
+N int cycle_b(int n) { return n ? cycle_a(n - 1) : constant(); }
+N int recursion_case(char *s) { memcpy(shared, s, 64); return cycle_a(3); }
+int main(int c, char **v) { if (c > 1) tail_case(v[1]); return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_global_continuation_veneers_quiet_callees_and_scalar_recursion(
+        tmp_path, shared_bn, opt):
+    """Round-18 review F41, F42 and F43 on real stripped builds.
+
+    F41: a veneer that materialises the tainted global and tail-jumps into
+    an internal consumer IS the boundary -- resolving it to the target
+    dropped the argument binding and cleared the run.
+    F42: a callee whose only global lives elsewhere is not a continuation,
+    whatever the alias search did not reach.
+    F43: scalar-only mutual recursion is not a pointer question.
+    """
+    src = tmp_path / f"r3tail{opt[-1]}.c"
+    src.write_text(_TAIL_SRC)
+    binary = tmp_path / f"r3tail{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin",
+                           "-fno-optimize-sibling-calls", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # F41: the modeled copy and the direct store both reach the veneer
+    for fn in ("tail_case", "tail_store_case"):
+        result, leaves = gmc(fn)
+        assert any(r["display_name"] == "relay_reader"
+                   for lf in leaves for r in lf["references"]), (fn, result)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+
+    # ...while a thunk-shaped callee that reads nothing of it stays silent
+    for fn in ("plt_case", "no_reader", "recursion_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+    # F43: no pointer-depth uncertainty from a scalar cycle
+    result, _leaves_ = gmc("recursion_case")
+    assert "pointer_return_depth" not in result["stats"]["truncation_cause"]
+
+
+def _alias_quiet_source(count: int) -> str:
+    sets = "".join(
+        f'extern unsigned char a{j};\n'
+        f'__asm__(".globl a{j}\\n.set a{j},chain+{j * 16}\\n'
+        f'.type a{j},@object\\n.size a{j},1\\n");\n' for j in range(1, count + 1))
+    return f"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char chain[8192] __attribute__((section(".chain"))) = "seed";
+volatile unsigned char seen;
+{sets}N void reader(void) {{ system((char *)&a{count} + 8); }}
+N void quiet(void) {{ seen = 1; }}
+N void unknown_case(char *s, size_t n) {{ memcpy(chain, s, n); reader(); }}
+N void quiet_case(char *s, size_t n) {{ memcpy(chain, s, n); quiet(); }}
+N void short_case(char *s) {{ memcpy(chain, s, 8); reader(); }}
+int main(void) {{ return 0; }}
+"""
+
+
+@pytest.mark.parametrize("count", [63, 65], ids=["under", "over"])
+def test_an_exhausted_alias_search_is_reader_specific(tmp_path, shared_bn,
+                                                      count):
+    """Round-18 review F42: the alias bound is not an unconditional leaf.
+
+    A callee whose only global is a byte in ANOTHER section reads nothing of
+    the written object, at 63 aliases and at 65 alike; the real reader past
+    them is still disclosed.
+    """
+    src = tmp_path / f"r3aliasq{count}.c"
+    src.write_text(_alias_quiet_source(count))
+    binary = tmp_path / f"r3aliasq{count}"
+    _compile(src, binary, ["-O2", "-U_FORTIFY_SOURCE", "-fno-builtin",
+                           "-fno-optimize-sibling-calls", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    result, leaves = gmc("quiet_case")
+    assert leaves == [], (count, leaves)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    result, leaves = gmc("short_case")
+    assert leaves == [], (count, leaves)
+    result, leaves = gmc("unknown_case")
+    assert any(r["display_name"] == "reader"
+               for lf in leaves for r in lf["references"]), (count, leaves)

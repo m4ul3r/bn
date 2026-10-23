@@ -425,6 +425,7 @@ class TaintEngine:
         self._global_write_unbounded: set[int] = set()
         self._global_search_truncated: set[int] = set()
         self._touches_global_cache: dict[int, bool] = {}
+        self._touches_region_cache: dict[tuple, bool] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
         self._global_extent_unproven: set[int] = set()
         self._ssa_def_cache: dict[tuple, Any] = {}
@@ -6063,6 +6064,12 @@ class TaintEngine:
                 # memset(g, 0, n); }`). Ask it, so the CALLER's use of the
                 # result is the read that blocks (round-3 review F17).
                 body, _unread = self._callee_body(defn)
+                if body is not None and not self._returns_pointerish(body):
+                    # `int cycle_a(int n)` cannot hand back an address, so
+                    # following its returns is not a pointer question at all
+                    # -- and the depth it would burn is not uncertainty about
+                    # one (round-18 review F43).
+                    return False
                 bodies = [body] if body is not None else [
                     # An indirect site the agent PINNED with --resolve-map is
                     # resolved for the reachability walk already; the alias
@@ -6128,6 +6135,29 @@ class TaintEngine:
             return list(srcs)
         except TypeError:
             return [srcs]
+
+    def _returns_pointerish(self, fn: Any) -> bool:
+        """Whether *fn*'s return value could be an address at all.
+
+        A declared return narrower than a pointer cannot carry one, so
+        following its return paths is not a pointer question; a view that
+        says nothing is treated as pointer-capable."""
+        rtype = getattr(fn, "return_type", None)
+        width = getattr(rtype, "width", None) if rtype is not None else None
+        if width is None:
+            return True
+        try:
+            width = int(width)
+        except (TypeError, ValueError):
+            return True
+        if width == 0:
+            return True
+        size = getattr(getattr(self.bv, "arch", None), "address_size", None)
+        try:
+            size = int(size) if size else 8
+        except (TypeError, ValueError):
+            size = 8
+        return width >= size
 
     def _fn_returned_params(self, fn: Any) -> tuple[int, ...]:
         """Parameter indices *fn* may hand back as its return value.
@@ -6504,14 +6534,24 @@ class TaintEngine:
             return f"arg:{name}:{hit[0]}" if name and hit else None
 
         wrote = False
+        touched = False
         first_at = int(getattr(instrs[0], "address", 0)) if instrs else None
         scan = _ScanBudget(self._PTR_SCAN_NODES)
 
         def resolves(expr: Any, *, alias: bool = True) -> bool:
-            return self._ptr_resolves(ssaf, expr, base, alias=alias, budget=scan)
+            nonlocal touched
+            before = scan.cause
+            got = self._ptr_resolves(ssaf, expr, base, alias=alias, budget=scan)
+            if got or scan.cause != before:
+                # A bound reached while following THIS expression is contact
+                # with the question, even though the answer never came.
+                touched = True
+            return got
 
         def emit(use: Any) -> Any:
             """Return the first use, or gather every one of them."""
+            nonlocal touched
+            touched = True
             if collect is None:
                 return use
             collect.append(use)
@@ -6532,6 +6572,8 @@ class TaintEngine:
             if self._is_call(ins):
                 params = self._call_params(ins)
                 hit = [i for i, p in enumerate(params) if resolves(p)]
+                if hit:
+                    touched = True
                 if not hit:
                     # In the instruction but in no RECOVERED argument: BN
                     # under-recovered this call's arity, so what the callee
@@ -6598,6 +6640,8 @@ class TaintEngine:
                 dest_hit = resolves(getattr(ins, "dest", None))
                 src_hit = self._expr_mentions(ssaf, getattr(ins, "src", None), base,
                                               budget=scan)
+                if dest_hit or src_hit:
+                    touched = True
                 if dest_hit and not src_hit:
                     wrote = True       # `p[i] = <value that is not p>`
                     continue
@@ -6622,6 +6666,7 @@ class TaintEngine:
                     return hit_use
                 continue
             if self._is_pointer_carry(ssaf, ins, base, budget=scan):
+                touched = True
                 continue              # moved, not used: see the terminal uses
             if names_object is not None and names_object(ins):
                 hit_use = emit(verdict(ins, "unclassified"))
@@ -6632,10 +6677,13 @@ class TaintEngine:
         # Nothing read-capable. A body with a proven write and nothing else
         # is a write-only use; a body where this scan accounted for no use at
         # all is disclosed rather than cleared.
-        if scan.cause is not None:
+        if scan.cause is not None and touched:
             # A bound was reached somewhere in this body, so "every use is a
             # proven write" and "no use at all" are both claims this scan did
-            # not establish (BN21-BOUND-02/03).
+            # not establish (BN21-BOUND-02/03) -- but ONLY where the scan
+            # actually met this object. A scalar-only body (`cycle_a(n - 1)`)
+            # never touches the pointer at all, so a bound reached while
+            # walking its calls says nothing about it (round-18 review F43).
             return _Use(fallback if fallback is not None else first_at,
                         _SCAN_CAUSE_KINDS[scan.cause], 0, None, None, True)
         if wrote:
@@ -7171,6 +7219,35 @@ class TaintEngine:
                 pass
         return 1
 
+    def _touches_object_region(self, fn: Any, ga: int) -> bool:
+        """Whether *fn* names any address that could be part of *ga*'s own
+        storage -- the same section, within the alias window.
+
+        The question behind "could the storage this search did not reach
+        matter here": a body whose only global is a byte in another section
+        reads nothing of THIS object, whatever the alias enumeration missed
+        (round-18 review F42)."""
+        key = (int(getattr(fn, "start", 0)), int(ga))
+        cached = self._touches_region_cache.get(key)
+        if cached is not None:
+            return cached
+        section = self._section_names(ga)
+        found = False
+        try:
+            for ins in self._instrs(self._ssa_func(fn)):
+                for const in self._instruction_constants(ins):
+                    if self._canon_global(const) is None:
+                        continue
+                    if self._section_names(const) == section:
+                        found = True
+                        break
+                if found:
+                    break
+        except TaintError:
+            found = True        # a body that cannot be read claims nothing
+        self._touches_region_cache[key] = found
+        return found
+
     def _touches_any_global(self, fn: Any) -> bool:
         """Whether *fn* names ANY writable global address at all.
 
@@ -7271,7 +7348,7 @@ class TaintEngine:
         tainted = self._tainted_ranges(ga)
         start = int(getattr(fn, "start", 0))
         candidates, exhausted = self._preceding_objects(ga)
-        if exhausted and self._touches_any_global(fn):
+        if exhausted and self._touches_object_region(fn, ga):
             # The enumeration stopped with plausible enclosing objects
             # unexamined, so "nothing encloses it" was never established --
             # but only where it could MATTER. A fully analysed body that
@@ -8011,6 +8088,8 @@ class TaintEngine:
                 if cfn is None:
                     continue
                 unread: str | None = None
+                veneer = cfn          # the body the CALL names, before any
+                                      # thunk resolution replaces it
                 reason = self._not_internal_reason(cfn)
                 if reason is not None:
                     # A .plt/veneer thunk is not a body, but it is not a dead
@@ -8107,9 +8186,23 @@ class TaintEngine:
                             sorted(k for k in known if not (refs and k == own)), known)
                     else:
                         refs, reach = self._global_refs_reachable(cfn, ga, budget)
+                        if not refs and veneer is not cfn:
+                            # The VENEER is where the tainted global becomes
+                            # an argument: `relay_reader()` materialises `g`
+                            # and tail-jumps into `invoke(p)`, whose body
+                            # names no global at all. Replacing the veneer
+                            # with its target dropped that binding and the
+                            # run cleared (round-18 review F41). Ask the
+                            # veneer's own body, which the classifier reads
+                            # as readily, and keep whichever answer HAS
+                            # evidence.
+                            vrefs, vreach = self._global_refs_reachable(
+                                veneer, ga, budget)
+                            if vrefs:
+                                refs, reach = vrefs, vreach
                         if ga in self._global_search_truncated \
                                 and reach["cause"] is None \
-                                and (refs or self._touches_any_global(cfn)):
+                                and (refs or self._touches_object_region(cfn, ga)):
                             # F29: the search for an enclosing object ran out
                             # of budget with storage unexamined.
                             reach = dict(reach, status="truncated",
