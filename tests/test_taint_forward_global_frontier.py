@@ -3656,3 +3656,127 @@ def test_a_rooted_return_route_joins_with_the_formals(models, arms, expected):
     eng = te.TaintEngine(FGlobalBV({0x401200: "mixed"},
                                    funcs={0x401200: helper}), models)
     assert eng._global_ptr_offset(caller, _var(r), G_DIR) == expected
+
+
+# --------------------------------------------------------------------------
+# round-17 review F39: an alias COUNT never decides where an object ends
+# --------------------------------------------------------------------------
+
+def _alias_count_program(count, write_len, read_at=1048, with_reader=True):
+    """An object with *count* interior aliases and a reader past them all."""
+    base = 0x404000
+    objects = {base: 5}
+    for i in range(count):
+        objects[base + 16 * (i + 1)] = 0
+    objects[base + 0x2000] = 5          # a neighbour past the object
+    consumer = (_interior_reader("far_reader", 0x401200, base + read_at, 0x401210)
+                if with_reader else _quiet("quiet", 0x401200))
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(base),
+        call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(write_len)] if write_len is not None
+        else [_var(FSSA(FVar("n"), 0))])
+    refs = {base: [FRef(func, 0x401104)]}
+    if with_reader:
+        refs[base + read_at] = [FRef(consumer, 0x401210)]
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system",
+                    0x401200: consumer.name},
+                   funcs={0x401200: consumer}, refs=refs, objects=objects,
+                   interior=[base + read_at] if with_reader else [],
+                   section=(0x404000, 0x410000))
+    return func, bv
+
+
+@pytest.mark.parametrize("count", [63, 64, 65, 256])
+def test_an_unknown_write_finds_a_reader_past_any_alias_count(models, count):
+    # Round-17 review F39: the 65th interior symbol ended the forward run,
+    # so a reader past it was excluded and the run cleared. Running out of
+    # ALIASES is a bound on the enumeration, not a statement about where
+    # the object ends -- coverage continues to the credible boundary and
+    # the bound itself is named.
+    func, bv = _alias_count_program(count, None)
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["display_name"] == "far_reader", leaf
+    assert leaf["references"][0]["offset"] == 1048, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    if count > 64:
+        assert leaf["reachability"]["cause"] == "object_search_budget", leaf
+
+
+def test_a_known_write_past_the_alias_count_is_not_a_search_bound(models):
+    # A constant length is evidence of its own: the extent comes from the
+    # copy, and the alias enumeration never has to finish.
+    func, bv = _alias_count_program(256, 2048)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"][0]["display_name"] == "far_reader", leaf
+    assert leaf["reachability"]["cause"] == "object_extent_unproven", leaf
+
+
+@pytest.mark.parametrize("count", [64, 256])
+def test_a_short_write_or_a_quiet_callee_stays_silent_past_the_count(models,
+                                                                     count):
+    func, bv = _alias_count_program(count, 16)
+    assert _leaves(_forward(bv, func, models)) == []
+    func, bv = _alias_count_program(count, None, with_reader=False)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+# --------------------------------------------------------------------------
+# round-17 review F40: one run's writes never reach the next run
+# --------------------------------------------------------------------------
+
+def _two_source_program():
+    """`long_copy` fills 112 bytes, `short_copy` fills 8; one reader at +80."""
+    reader = _interior_reader("reader", 0x401200, G_DIR + 80, 0x401210)
+    funcs = {0x401200: reader}
+
+    def case(name, start, length):
+        argv = FVar("argv")
+        argv0 = FSSA(argv, 0)
+        fn = GFunc(name, start, FSSAFunc([
+            FInstr(0, start + 4, "MLIL_CALL_SSA",
+                   f"memcpy(g, argv#0, {length})", reads=[argv0],
+                   dest=_gptr(MEMCPY),
+                   params=[_gptr(G_DIR), _var(argv0), _const(length)]),
+            FInstr(1, start + 8, "MLIL_CALL_SSA", "reader()",
+                   dest=_gptr(0x401200), params=[]),
+        ]), params=[argv], callees=[reader])
+        funcs[start] = fn
+        return fn
+
+    long_case = case("long_case", 0x401100, 112)
+    short_case = case("short_case", 0x401300, 8)
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader",
+                    0x401100: "long_case", 0x401300: "short_case"},
+                   funcs=funcs,
+                   refs={G_DIR + 80: [FRef(reader, 0x401210)],
+                         G_DIR: [FRef(long_case, 0x401104)]},
+                   objects={G_DIR: 5, G_TAIL: 0, G_OTHER: 5},
+                   interior=[G_DIR + 80], section=(0x404000, 0x405000))
+    return long_case, short_case, bv
+
+
+@pytest.mark.parametrize("order", ["long_first", "short_first"])
+def test_a_runs_writes_do_not_reach_the_next_run(models, order):
+    # Round-17 review F40: the extent a LONG source's write established --
+    # and every reachability and access answer derived from it -- survived
+    # into the next source's run, so a by-source walk attributed the
+    # long source's frontier to the short one whenever it ran first.
+    long_case, short_case, bv = _two_source_program()
+    eng = te.TaintEngine(bv, models)
+    order = [long_case, short_case] if order == "long_first" else [short_case, long_case]
+    got = {fn.name: _leaves(eng.forward(fn, [te.parse_locator("param:0")]))
+           for fn in order}
+    assert got["long_case"], got
+    assert got["short_case"] == [], got["short_case"]
+
+
+def test_isolated_runs_agree_with_the_shared_engine(models):
+    long_case, short_case, bv = _two_source_program()
+    for fn, expected in ((long_case, True), (short_case, False)):
+        fresh = te.TaintEngine(bv, models)
+        leaves = _leaves(fresh.forward(fn, [te.parse_locator("param:0")]))
+        assert bool(leaves) is expected, (fn.name, leaves)

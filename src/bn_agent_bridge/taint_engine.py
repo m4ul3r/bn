@@ -3547,6 +3547,12 @@ class TaintEngine:
         can be isolated for per-source attribution (#5)."""
         # Per-run analysis state (each per-callsite re-run is independent):
         self._cache: dict[tuple, Any] = {}          # (func_start, frozenset(params)) -> summary
+        # Everything this run learns about an object comes from the writes
+        # THIS run made, so it cannot survive into the next one: a
+        # by-source walk ran the long source first and the short source
+        # inherited its extent, which made attribution depend on the order
+        # the sources were enumerated in (round-17 review F40).
+        self._reset_object_evidence()
         self._funcs_visited: set[int] = set()
         self._max_depth_seen = 0
         self._truncated = False
@@ -5643,8 +5649,13 @@ class TaintEngine:
             # A copy whose LENGTH nothing states may have filled everything
             # after its destination; the object runs at least through the
             # storage the next symbols name (round-13 review F28).
-            written = max(written, self._forward_window(ga))
+            reach, alias_cut = self._forward_window(ga)
+            written = max(written, reach)
             self._global_extent_unproven.add(ga)
+            if alias_cut:
+                # The alias enumeration itself ran out -- a different bound
+                # from the range sweep's, and one the leaf must name (F39).
+                self._global_search_truncated.add(ga)
         if 0 < laid_out < written:
             # BN21-OBJ-01: the object has no recovered type, so its end was
             # guessed from LAYOUT -- and an ALIAS symbol inside it
@@ -6984,6 +6995,28 @@ class TaintEngine:
         except Exception:
             return ()
 
+    def _reset_object_evidence(self) -> None:
+        """Drop everything derived from a PREVIOUS run's global writes.
+
+        The immutable analysis caches (thunk resolution, SSA definitions,
+        which bodies name a global at all) stay: they describe the binary,
+        not what a source wrote into it."""
+        self._global_write_span.clear()
+        self._global_tainted_ranges.clear()
+        self._global_write_unbounded.clear()
+        self._global_keyed_offsets.clear()
+        self._global_extent_unproven.clear()
+        self._global_search_truncated.clear()
+        self._global_refs_truncated.clear()
+        # ...and the answers computed FROM them.
+        self._global_extent_cache.clear()
+        self._canon_global_cache.clear()
+        self._global_refs.clear()
+        self._global_reach.clear()
+        self._global_access_cache.clear()
+        self._param_access_cache.clear()
+        self._alias_chain_cache.clear()
+
     def _invalidate_object(self, ga: int) -> None:
         """New evidence about ONE object's extent: drop what was derived
         from the old one, for that object only. Clearing every cached sweep
@@ -6999,17 +7032,21 @@ class TaintEngine:
         for key in [k for k in self._global_access_cache if k[1] == ga]:
             del self._global_access_cache[key]
 
-    def _forward_window(self, ga: int) -> int:
-        """How far the storage the NEXT symbols name reaches past *ga*.
+    def _forward_window(self, ga: int) -> tuple[int, bool]:
+        """``(how far the NEXT symbols' storage reaches past *ga*, the alias
+        enumeration ran out)``.
 
         What an unbounded write into this object may have filled: the object
         runs at least through the symbols that follow it contiguously, which
-        is where an interior alias of it lives."""
+        is where an interior alias of it lives. An ALIAS COUNT never decides
+        where it ends -- running out of them is reported, not answered
+        (round-17 review F39)."""
         nxt = getattr(self.bv, "get_next_data_var_after", None)
         getsym = getattr(self.bv, "get_symbol_at", None)
         if not callable(nxt) or not callable(getsym):
-            return 0
+            return (0, False)
         at, seen_named, end = int(ga), 0, 0
+        exhausted = False
         section = self._section_names(ga)
         for _ in range(self._ALIAS_HOPS * 8):
             try:
@@ -7037,12 +7074,36 @@ class TaintEngine:
             seen_named += 1
             end = at - ga
             if seen_named >= self._ALIAS_HOPS:
+                # An ALIAS COUNT must not decide where an object ends: the
+                # 65th interior symbol excluded a reader past it and the run
+                # cleared (round-17 review F39). Cover the rest of the
+                # credible storage -- to the section's end, bounded by the
+                # window -- and record that the enumeration itself did not
+                # finish.
+                exhausted = True
+                end = max(end, self._section_remainder(ga))
                 break
         # The LAST named symbol's own storage is part of the run: an alias
         # at `+64` of a 256-byte object is followed by a reader at `+80`,
         # so stopping at the symbol itself excluded the reader (round-14
         # review F33). Carry on to where the run ends.
-        return end + self._trailing_extent(ga + end) if end else 0
+        if not end:
+            return (0, exhausted)
+        return (end + self._trailing_extent(ga + end), exhausted)
+
+    def _section_remainder(self, ga: int) -> int:
+        """How much of *ga*'s own section lies past it, bounded by the
+        window -- the credible storage an unfinished alias enumeration
+        leaves unaccounted for."""
+        getsecs = getattr(self.bv, "get_sections_at", None)
+        if not callable(getsecs):
+            return 0
+        try:
+            ends = [int(getattr(sec, "end", 0)) for sec in (getsecs(int(ga)) or [])]
+        except Exception:
+            return 0
+        ends = [end - ga for end in ends if end > ga]
+        return min(max(ends, default=0), self._ALIAS_WINDOW)
 
     def _trailing_extent(self, at: int) -> int:
         """How far the LAST symbol in a contiguous run reaches: to the next
@@ -8006,7 +8067,8 @@ class TaintEngine:
                     else:
                         refs, reach = self._global_refs_reachable(cfn, ga, budget)
                         if ga in self._global_search_truncated \
-                                and reach["cause"] is None:
+                                and reach["cause"] is None \
+                                and (refs or self._touches_any_global(cfn)):
                             # F29: the search for an enclosing object ran out
                             # of budget with storage unexamined.
                             reach = dict(reach, status="truncated",

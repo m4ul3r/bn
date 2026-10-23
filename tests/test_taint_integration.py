@@ -3148,3 +3148,116 @@ def test_global_continuation_auto_types_branches_and_return_routes(
     row = next(r for lf in gmc("agree_case")[1] for r in lf["references"]
                if r["access"] == "call_arg")
     assert (row["offset"], row["offset_known"]) == (8, True), row
+
+
+def _alias_count_source(count: int) -> str:
+    decls = ", ".join(f"a{i}[16]" % () for i in range(count))
+    sets = "\n".join(
+        f'        ".globl a{i}\\n.set a{i},chain+{16 * (i + 1)}\\n'
+        f'.type a{i},@object\\n.size a{i},16\\n"' for i in range(count))
+    return f"""
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#define N __attribute__((noinline))
+char chain[4096] __attribute__((section(".chain"))) = "seed";
+extern char {decls};
+__asm__(
+{sets});
+char after[64] __attribute__((section(".after"))) = "safe";
+N void far_reader(void) {{ system(chain + 1048); }}
+N int quiet(void) {{ return 7; }}
+N void known_case(char *s) {{ memcpy(chain, s, 2048); far_reader(); }}
+N void unknown_case(char *s, size_t k) {{ memcpy(chain, s, k); far_reader(); }}
+N void strcpy_case(char *s) {{ strcpy(chain, s); far_reader(); }}
+N void sprintf_case(char *s) {{ sprintf(chain, "%s", s); far_reader(); }}
+N void short_case(char *s) {{ memcpy(chain, s, 16); far_reader(); }}
+N void no_reader_case(char *s, size_t k) {{ memcpy(chain, s, k); quiet(); }}
+int main(void) {{ return 0; }}
+"""
+
+
+@pytest.mark.parametrize("count", [64, 65], ids=["at-the-limit", "one-past"])
+def test_global_continuation_survives_any_interior_alias_count(tmp_path,
+                                                               shared_bn, count):
+    """Round-17 review F39 on a real stripped build.
+
+    Running out of ALIASES bounds the enumeration; it does not establish
+    where the object ends. Coverage continues to the credible boundary, the
+    bound is named, and the short-write and no-reader controls stay silent.
+    """
+    src = tmp_path / f"r3alias{count}.c"
+    src.write_text(_alias_count_source(count))
+    binary = tmp_path / f"r3alias{count}"
+    _compile(src, binary, ["-fno-builtin", "-fno-inline", "-fno-stack-protector", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("known_case", "unknown_case", "strcpy_case", "sprintf_case"):
+        result, leaves = gmc(fn)
+        assert any(r["display_name"] == "far_reader" and r["offset"] == 1048
+                   for lf in leaves for r in lf["references"]), (fn, leaves)
+        # A run that reaches a sink carries no all-clear gate at all.
+        assert (result.get("diagnostics") or {}).get(
+            "safe_to_report_all_clear") is not True, fn
+    if count > 64:
+        _result, leaves = gmc("unknown_case")
+        assert leaves[0]["reachability"]["cause"] == "object_search_budget", leaves
+    for fn in ("short_case", "no_reader_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+
+
+_ATTRIBUTION_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline))
+char chain[256] __attribute__((section(".chain"))) = "seed";
+extern char mid[192];
+__asm__(".globl mid\n.set mid,chain+64\n.type mid,@object\n.size mid,192\n");
+N void reader(void) { system(chain + 80); }
+N void long_first(void) { char *a = getenv("A"); char *b = getenv("B"); memcpy(chain, a, 112); memcpy(chain, b, 8); reader(); }
+N void short_first(void) { char *b = getenv("B"); char *a = getenv("A"); memcpy(chain, a, 112); memcpy(chain, b, 8); reader(); }
+N void only_short(void) { char *b = getenv("B"); memcpy(chain, b, 8); reader(); }
+N void only_long(void) { char *a = getenv("A"); memcpy(chain, a, 112); reader(); }
+int main(void) { return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1"], ids=["O0", "O1"])
+def test_global_continuation_attribution_is_source_order_invariant(
+        tmp_path, shared_bn, opt):
+    """Round-17 review F40 on real stripped builds.
+
+    Each per-source run starts from its own object evidence: the extent a
+    112-byte write established, and everything derived from it, must not
+    survive into the 8-byte source's run. The same two sources therefore
+    get the same answer whichever order they are enumerated in, and each
+    agrees with running that source alone.
+    """
+    src = tmp_path / f"r3attrib{opt[-1]}.c"
+    src.write_text(_ATTRIBUTION_SRC)
+    binary = tmp_path / f"r3attrib{opt[-1]}"
+    _compile(src, binary, [opt, "-fno-builtin", "-fno-inline",
+                           "-fno-stack-protector", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def counts(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "ret:getenv")
+        per = result.get("by_source") or {}
+        return sorted(
+            len([lf for lf in (rows.get("leaves") or [])
+                 if lf["kind"] == "global_memory_continuation"])
+            for rows in per.values() if isinstance(rows, dict))
+
+    assert counts("long_first") == counts("short_first")
+    alone = [counts("only_long"), counts("only_short")]
+    assert alone[1] == [] or sum(alone[1]) == 0, alone
