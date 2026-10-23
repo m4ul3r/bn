@@ -325,7 +325,7 @@ class _ScanBudget:
     read out as "nothing here" (BN21-BOUND-02/03), so the budget carries the
     cause back and the classifier turns it into a frontier."""
 
-    __slots__ = ("nodes", "cause")
+    __slots__ = ("nodes", "cause", "pointer_route")
 
     # A pointer-return chain costs `_PTR_RETURN_STEP` levels per hop, so the
     # depth limit is a WRAPPER-CHAIN limit, not a CLI `--max-depth`. Reaching
@@ -333,6 +333,7 @@ class _ScanBudget:
     def __init__(self, nodes: int) -> None:
         self.nodes = int(nodes)
         self.cause: str | None = None
+        self.pointer_route = False
 
     def spend(self) -> bool:
         """Charge one node; False once the allowance is gone."""
@@ -342,8 +343,17 @@ class _ScanBudget:
         self.nodes -= 1
         return True
 
-    def depth_exhausted(self) -> None:
+    def depth_exhausted(self, *, pointer_route: bool = False) -> None:
+        """Charge the internal wrapper-chain bound.
+
+        ``pointer_route`` marks the spend as having happened while
+        descending a body that CAN return an address -- the only shape
+        where the bound says anything about this pointer. A generic
+        expression walk that merely ran deep (scalar recursion, round-18
+        review F43) sets the cause without claiming that."""
         self.cause = self.cause or "pointer_return_depth"
+        if pointer_route:
+            self.pointer_route = True
 
 
 class _SalvageList(list):
@@ -435,6 +445,7 @@ class TaintEngine:
         self._readable_il_cache: dict[int, bool] = {}
         self._import_stub_cache: dict[int, bool] = {}
         self._global_layout_truncated: set[int] = set()
+        self._ret_ptr_stack: set[int] = set()
         self._param_stack: set[tuple[int, int]] = set()
         self._direct_callee_cache: dict[int, tuple] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
@@ -6361,12 +6372,27 @@ class TaintEngine:
         lets the caller's own scan see it (round-3 review F17)."""
         if depth > self._PTR_RESOLVE_DEPTH:
             if budget is not None:
-                budget.depth_exhausted()
+                # Reached only past the `_returns_pointerish` gate above:
+                # this IS a pointer-return question that ran out of hops
+                # (round-22 review DEPTH-01).
+                budget.depth_exhausted(pointer_route=True)
             return False
+        key = int(getattr(fn, "start", 0))
+        if key in self._ret_ptr_stack:
+            # A CYCLE in the return descent (`cycle_a` <-> `cycle_b`).
+            # Going round again cannot produce an address this chain does
+            # not already hand back, so this is an answer, not a bound --
+            # charging the depth here is what made scalar mutual recursion
+            # look like an unfinished pointer question (round-18 review
+            # F43, kept honest while round-22's DEPTH-01 restores the bound
+            # for chains that genuinely run out of hops).
+            return False
+        self._ret_ptr_stack.add(key)
         try:
             ssaf = self._ssa_func(fn)
             instrs = self._instrs(ssaf)
         except TaintError:
+            self._ret_ptr_stack.discard(key)
             return False
         for ins in instrs:
             opn = op_name(ins)
@@ -6374,6 +6400,7 @@ class TaintEngine:
                 continue
             if any(self._ptr_resolves(ssaf, s, base, depth + 1, budget=budget)
                    for s in self._return_exprs(ins)):
+                self._ret_ptr_stack.discard(key)
                 return True
             if "TAILCALL" in opn:
                 # `return choose(g + 8, g + 8, sel);` compiled to a tail
@@ -6388,7 +6415,9 @@ class TaintEngine:
                         and self._fn_returns_pointer(
                             callee, base, depth + self._PTR_RETURN_STEP,
                             budget=budget):
+                    self._ret_ptr_stack.discard(key)
                     return True
+        self._ret_ptr_stack.discard(key)
         return False
 
     def _expr_mentions(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
@@ -6943,7 +6972,7 @@ class TaintEngine:
         # Nothing read-capable. A body with a proven write and nothing else
         # is a write-only use; a body where this scan accounted for no use at
         # all is disclosed rather than cleared.
-        if scan.cause == "pointer_return_depth" or (
+        if (scan.cause == "pointer_return_depth" and scan.pointer_route) or (
                 scan.cause is not None and touched):
             # A bound was reached somewhere in this body, so "every use is a
             # proven write" and "no use at all" are both claims this scan did
