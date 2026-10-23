@@ -474,7 +474,8 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                     else "may use")
             return (f"{head}, which code reachable from a call this walk made {verb} "
                     f"({', '.join(reads)}); those bytes are not followed across the call."
-                    f"{cut} Read every reference with `bn xrefs {globals_at[0]}`"
+                    f"{cut} xrefs answers for ONE address: query the sites "
+                    f"the leaves cite, starting with `bn xrefs {globals_at[0]}`"
                     + (f" and re-seed inside the consumer on the value it loads{seed}"
                        if seed else
                        " and audit them by hand: the consumer reads those bytes by"
@@ -487,7 +488,8 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         return (f"{head}, and the search for code reading it past a call this walk made "
                 f"was TRUNCATED ({', '.join(truncated_at) or 'bound reached'}) with "
                 f"references unexamined -- whether those bytes reach a sink is unknown, "
-                f"not clear. Audit every reference with `bn xrefs {globals_at[0]}`"
+                f"not clear. xrefs answers for ONE address: audit the sites "
+                f"the leaves cite, starting with `bn xrefs {globals_at[0]}`"
                 f"{widen}")
     if by_kind.get("coarse_memory_store", 0) or by_kind.get("pointer_escape", 0):
         # The coarse leaf exists precisely because the destination could not be

@@ -3658,3 +3658,242 @@ def test_an_exhausted_alias_search_stops_at_the_section_boundary(tmp_path,
     offsets = [r["offset"] for lf in leaves for r in lf["references"]
                if r["display_name"] == "reader"]
     assert offsets and all(0 <= o < 8192 for o in offsets), (count, leaves)
+
+
+def _core2_source(relay_hops: int = 32, perm_hops: int = 24) -> str:
+    """A chain fixture: long veneer relays, an argument-dropping wrapper, a
+    long write-only permutation, and a callee that tail-jumps indirectly."""
+    relays = "".join(f"N void relay{i}(void) {{ relay{i - 1}(); }}\n"
+                     for i in range(1, relay_hops + 1))
+    perm = "".join(f"N void w{i}(char *a, char *b) {{ w{i - 1}(b, a); }}\n"
+                   for i in range(1, perm_hops + 1))
+    return f"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char clean[256] __attribute__((section(".clean"))) = "safe";
+void (*volatile hook)(void);
+N void relay0(void) {{ system(tracked); }}
+{relays}N void w0(char *a, char *b) {{ memset(a, 0, 4); system(b); }}
+{perm}N void write_read(char *dst, char *command) {{ memset(dst, 0, 4); system(command); }}
+N void drop(char *a, char *b) {{ (void)a; write_read(b, clean); }}
+N void dropbind(void) {{ drop(tracked, clean); }}
+N void dispatch(void) {{ hook(); }}
+N void quiet(void) {{ system(clean); }}
+N void copy7(char *s) {{ memcpy(tracked, s, 112); relay7(); }}
+N void copy8(char *s) {{ memcpy(tracked, s, 112); relay8(); }}
+N void copy12(char *s) {{ memcpy(tracked, s, 112); relay12(); }}
+N void copy32(char *s) {{ memcpy(tracked, s, 112); relay32(); }}
+N void store12(char *s) {{ tracked[0] = s[0]; relay12(); }}
+N void material12(char *s) {{ char *p = tracked; memcpy(p, s, 112); relay12(); }}
+N void sink12(char *s) {{ strcpy(tracked, s); relay12(); }}
+N void dropcase(char *s) {{ memcpy(tracked, s, 112); dropbind(); }}
+N void wcase8(char *s) {{ memcpy(tracked, s, 112); w8(tracked, clean); }}
+N void wcase9(char *s) {{ memcpy(tracked, s, 112); w9(clean, tracked); }}
+N void wcase24(char *s) {{ memcpy(tracked, s, 112); w24(tracked, clean); }}
+N void copy_nested(char *s) {{ memcpy(tracked, s, 112); dispatch(); }}
+N void store_nested(char *s) {{ tracked[0] = s[0]; dispatch(); }}
+N void sink_nested(char *s) {{ strcpy(tracked, s); dispatch(); }}
+int main(int c, char **v) {{ hook = relay0; if (c > 1) copy12(v[1]); return 0; }}
+"""
+
+
+@pytest.fixture(scope="module")
+def _core2_build(tmp_path_factory):
+    """One build of the chain fixture per optimisation level, shared by the
+    round-20 tests (each build is a few seconds of compile + analysis)."""
+    root = tmp_path_factory.mktemp("r4core")
+    out = {}
+    src = root / "core2.c"
+    src.write_text(_core2_source())
+    for opt in ("-O0", "-O1", "-O2"):
+        binary = root / f"core2{opt[-1]}"
+        _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+        out[opt] = binary
+    return out
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_long_veneer_chain_is_followed_to_the_reader(shared_bn, _core2_build,
+                                                       opt):
+    """Round-20 review F48: the chain walk stopped after eight bodies and
+    went quiet, so a twelve-hop relay to `system(tracked)` cleared."""
+    target = shared_bn.load(_core2_build[opt])
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0", "--max-depth", "64")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("copy7", "copy8", "copy12", "copy32", "store12", "material12"):
+        result, leaves = gmc(fn)
+        assert any(r["display_name"] == "relay0"
+                   for lf in leaves for r in lf["references"]), (fn, result)
+        assert (result.get("diagnostics") or {}).get(
+            "safe_to_report_all_clear") is not True, fn
+
+    # the sink-firing copy keeps BOTH its sink and the continuation
+    result, leaves = gmc("sink12")
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == \
+        ["overflow_unbounded"], result["reached_sinks"]
+    assert any(r["display_name"] == "relay0"
+               for lf in leaves for r in lf["references"]), leaves
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_an_indirect_tail_jump_inside_a_callee_is_a_boundary(tmp_path,
+                                                             shared_bn,
+                                                             _core2_build, opt):
+    """Round-20 review F49: the jump is one level down, inside `dispatch()`,
+    where the reachability sweep walked past it as if the body were a leaf."""
+    target = shared_bn.load(_core2_build[opt])
+
+    def gmc(fn, *extra):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0", *extra)
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("copy_nested", "store_nested", "sink_nested"):
+        result, leaves = gmc(fn)
+        assert any(lf["reachability"]["cause"] == "unresolved_call_target"
+                   for lf in leaves), (fn, result)
+        assert (result.get("diagnostics") or {}).get(
+            "safe_to_report_all_clear") is not True, fn
+
+    # the nested site takes a pin exactly like a call: the real target
+    # refines the leaf, a target that reads another object clears the run
+    il = shared_bn.run("-t", target, "il", "dispatch", "--view", "mlil",
+                       "--ssa")
+    assert il.returncode == 0, il.stderr
+    site = next(int(line.split()[0], 16) for line in il.stdout.splitlines()
+                if "(" in line and line.strip().startswith("0x"))
+    pin = tmp_path / f"r4pin{opt[-1]}.json"
+    pin.write_text(json.dumps({hex(site): ["relay0"]}))
+    result, leaves = gmc("copy_nested", "--resolve-map", str(pin))
+    assert any(r["display_name"] == "relay0"
+               for lf in leaves for r in lf["references"]), result
+    pin.write_text(json.dumps({hex(site): ["quiet"]}))
+    result, leaves = gmc("copy_nested", "--resolve-map", str(pin))
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_dropped_or_permuted_write_only_argument_is_not_a_consumer(
+        shared_bn, _core2_build, opt):
+    """Round-20 review F50 and F51: `drop(a, b)` ignores `a` entirely, and
+    the permutation chains hand the tracked object only to a memset
+    destination -- neither reads it, at any chain length."""
+    target = shared_bn.load(_core2_build[opt])
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0", "--max-depth", "64")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    for fn in ("dropcase", "wcase8", "wcase9", "wcase24"):
+        _result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+
+
+def _writer_source(count: int) -> str:
+    sets = "".join(
+        f'extern unsigned char a{j};\n'
+        f'__asm__(".globl a{j}\\n.set a{j},chain+{j * 16}\\n'
+        f'.type a{j},@object\\n.size a{j},1\\n");\n' for j in range(1, count + 1))
+    return f"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char chain[8192] __attribute__((section(".chain"))) = "seed";
+char clean[256] __attribute__((section(".clean"))) = "safe";
+{sets}N void reader(void) {{ system((char *)&a{count} + 8); }}
+N void writer(void) {{ memset(chain, 0, 64); }}
+N void unrelated(void) {{ system(clean); }}
+N void reader_case(char *s, size_t n) {{ memcpy(chain, s, (n & 1023) + 1); reader(); }}
+N void writer_case(char *s, size_t n) {{ memcpy(chain, s, (n & 1023) + 1); writer(); }}
+int main(void) {{ return 0; }}
+"""
+
+
+@pytest.mark.parametrize("count", [63, 65], ids=["under", "over"])
+def test_an_exhausted_alias_search_spares_a_write_only_callee(tmp_path,
+                                                              shared_bn, count):
+    """Round-20 review F52: `writer()` only runs `memset(chain, 0, 64)`.
+
+    Past the alias limit the fallback asked whether the callee TOUCHES this
+    object's storage, which a write does, so the bound alone turned a
+    write-only callee into a blocking consumer."""
+    src = tmp_path / f"r4w{count}.c"
+    src.write_text(_writer_source(count))
+    binary = tmp_path / f"r4w{count}"
+    _compile(src, binary, ["-O0", "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    result, leaves = gmc("writer_case")
+    assert leaves == [], (count, leaves)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    # the genuine interior reader past the same aliases still blocks
+    _result, leaves = gmc("reader_case")
+    assert any(r["display_name"] == "reader"
+               for lf in leaves for r in lf["references"]), (count, leaves)
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_every_command_a_continuation_prints_actually_runs(tmp_path, shared_bn,
+                                                           opt):
+    """Round-20 review F53/F54/F55: advice is only advice if it RUNS.
+
+    The reseed locator was advertised for constant-address operands that no
+    `--source` can resolve, the xrefs claim named one address and promised
+    every reference, and the remediation named a `bn retype` command that
+    does not exist."""
+    src = tmp_path / f"r4advice{opt[-1]}.c"
+    src.write_text(_ADVICE_SRC)
+    binary = tmp_path / f"r4advice{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    ran = 0
+    for fn in ("interior_case", "extent_case"):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        texts = [lf.get("detail") for lf in result["leaves"]]
+        texts += [lf.get("reseed") for lf in result["leaves"]]
+        texts.append((result.get("diagnostics") or {}).get("next_action"))
+        seen: set[str] = set()
+        for text in texts:
+            for cmd in re.findall(r"`(bn [^`]+)`", text or ""):
+                if cmd in seen:
+                    continue
+                seen.add(cmd)
+                argv = shlex.split(cmd)
+                assert argv[0] == "bn"
+                res = shared_bn.run(*argv[1:])
+                assert res.returncode == 0, (cmd, res.returncode, res.stderr)
+                ran += 1
+    assert ran >= 4, ran
+
+
+_ADVICE_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char chain[8192] __attribute__((section(".chain"))) = "seed";
+char tail[256] __attribute__((section(".chain"))) = "next";
+N void interior_reader(void) { system(chain + 0x50); }
+N void interior_case(char *s) { memcpy(chain, s, 112); interior_reader(); }
+N void extent_reader(void) { system(chain + 0x50); }
+N void extent_case(char *s) { memcpy(chain, s, 112); extent_reader(); }
+int main(void) { return 0; }
+"""

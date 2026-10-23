@@ -105,6 +105,19 @@ def _reader(name, start, global_addr, read_at, *, callees=()):
     return GFunc(name, start, FSSAFunc(instrs), params=[], callees=callees)
 
 
+def _var_reader(name, start, global_addr, read_at, *, callees=()):
+    """A consumer that LOADS the object into a variable first -- the shape
+    an `arg:` locator can seed, unlike a constant-address operand."""
+    p1 = FSSA(FVar("p"), 1)
+    instrs = [
+        FInstr(0, read_at - 4, "MLIL_SET_VAR_SSA", f"p#1 = {hex(global_addr)}",
+               writes=[p1], src=_gptr(global_addr)),
+        FInstr(1, read_at, "MLIL_CALL_SSA", "system(p#1)", reads=[p1],
+               dest=_gptr(SYSTEM), params=[_var(p1)]),
+    ]
+    return GFunc(name, start, FSSAFunc(instrs), params=[], callees=callees)
+
+
 def _quiet(name, start, *, callees=()):
     """A callee that touches no global at all."""
     instrs = [FInstr(0, start, "MLIL_RET", "return 0")]
@@ -179,7 +192,9 @@ def test_keyable_global_copy_into_zero_arg_consumer_emits_continuation(models):
                                    "address": hex(hook.start), "at": hex(0x401210),
                                    "access": "call_arg", "offset": 0,
                                    "offset_known": True,
-                                   "seed": "arg:system:0"}]
+                                   # a CONSTANT-address operand has no
+                                   # variable to seed (round-20 review F53)
+                                   "seed": None}]
     assert leaf["reachability"]["status"] == "complete"
     assert leaf["call_descended"] is False
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
@@ -665,12 +680,36 @@ def test_a_multi_hop_thunk_chain_to_the_consumer_is_followed(models):
     assert leaf["references"][0]["at"] == hex(0x401510)
 
 
-def test_an_unresolved_in_binary_thunk_fails_closed(models):
-    # BN marks it a thunk but the shared resolver cannot take its body, so
-    # its references cannot be read: "nothing reads the global" is not an
-    # answer here, and the boundary is disclosed as truncated.
+def test_an_unresolved_in_binary_thunk_is_read_as_a_body(models):
+    # BN marks it a thunk and the shared resolver cannot take its body --
+    # but the body is READABLE, so it is read rather than failed closed on:
+    # the tail call it makes names the consumer (round-20 review F51, where
+    # an argument-swapping veneer declined by the resolver was reported as
+    # an opaque boundary with no evidence at all).
     reader = _reader("consumer", 0x401500, G_DIR, 0x401510)
     veneer = _thunk("veneer", 0x401300, 0x401500, resolvable=False)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system",
+                    0x401300: "veneer", 0x401500: "consumer"},
+                   funcs={0x401300: veneer, 0x401500: reader},
+                   refs={G_DIR: [FRef(reader, 0x401510)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert [r["display_name"] for r in leaf["references"]] == ["consumer"], leaf
+    assert leaf["references"][0]["at"] == hex(0x401510)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    # Reading a body is not a BUDGET: the run is not mislabelled as depth-
+    # or budget-truncated.
+    assert result["stats"]["truncation_cause"] == [], result["stats"]
+
+
+def test_a_thunk_with_no_readable_body_still_fails_closed(models):
+    # The shape that genuinely cannot be read: BN marks it a thunk and
+    # there is no IL at all, so "nothing reads the global" is not an answer.
+    reader = _reader("consumer", 0x401500, G_DIR, 0x401510)
+    veneer = GFunc("veneer", 0x401300, FSSAFunc([]), params=[], is_thunk=True)
     func, _argv = _copy_then_call(
         0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
         params_extra=[_const(0xff)])
@@ -684,9 +723,6 @@ def test_an_unresolved_in_binary_thunk_fails_closed(models):
     assert leaf["reachability"]["cause"] == "unresolved_thunk"
     assert leaf["reachability"]["unexamined_references"] == [hex(0x401500)]
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
-    # An unreadable callee is not a BUDGET: the leaf carries the whole story,
-    # and the run is not mislabelled as depth- or budget-truncated.
-    assert result["stats"]["truncation_cause"] == [], result["stats"]
 
 
 def test_a_thunk_onto_an_import_stays_external(models):
@@ -858,7 +894,7 @@ def test_a_mixed_write_then_read_reference_is_a_consumer(models):
     assert leaf["references"][0] == {
         "name": "overwrite_then_run", "display_name": "overwrite_then_run",
         "address": hex(0x401200), "at": hex(0x401218), "access": "call_arg",
-        "offset": 0, "offset_known": True, "seed": "arg:system:0"}
+        "offset": 0, "offset_known": True, "seed": None}
 
 
 
@@ -2380,19 +2416,38 @@ def test_the_truncation_leaf_blocks_the_all_clear():
 # --------------------------------------------------------------------------
 
 def test_the_reseed_advice_names_a_runnable_locator(models):
-    # `var:VAR` was a template nothing could fill in: the consumer reads the
-    # object by CONSTANT ADDRESS, so it has no variable to seed. The
-    # argument it hands those bytes to does name one.
-    func, hook, bv = _globalflow(extra_copy_params=[_const(0xff)])
+    # `var:VAR` was a template nothing could fill in. A consumer that LOADS
+    # the object into a variable before handing it on does name a locator
+    # `--source` can resolve, so that command is printed.
+    reader = _var_reader("run_hook", 0x401200, G_DIR, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "run_hook"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR: [FRef(reader, 0x401210)]})
     result = _forward(bv, func, models)
     [leaf] = _leaves(result)
     assert leaf["references"][0]["seed"] == "arg:system:0"
     assert leaf["reseed"] == (
-        f"`bn taint forward -f {hex(hook.start)} --source arg:system:0`")
+        f"`bn taint forward -f {hex(0x401200)} --source arg:system:0`")
     assert "var:VAR" not in leaf["detail"]
     assert "--source arg:system:0" in leaf["detail"]
     assert "var:VAR" not in result["diagnostics"]["next_action"]
     assert "--source arg:system:0" in result["diagnostics"]["next_action"]
+
+
+def test_a_constant_address_consumer_omits_the_failing_locator(models):
+    # Round-20 review F53: `system(g + 0x418)` has no variable inside it, so
+    # `--source arg:system:0` resolves no source and the advertised command
+    # exits 2. The honest guidance replaces it.
+    func, _hook, bv = _globalflow(extra_copy_params=[_const(0xff)])
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["references"][0]["seed"] is None
+    assert leaf["reseed"] is None
+    assert "--source arg:" not in leaf["detail"]
+    assert "no variable inside it to seed" in leaf["detail"]
 
 
 def test_an_unnameable_consumer_omits_the_reseed_instead_of_faking_one(models):
@@ -3357,6 +3412,8 @@ def test_the_reseed_command_comes_from_one_reference(models):
     [leaf] = _leaves(_forward(bv, func, models))
     rows = leaf["references"]
     assert [r["display_name"] for r in rows] == ["producer", "consumer"], rows
+    # The producer RETURNS the object (no locator); the consumer hands the
+    # returned VARIABLE to system, which one can seed.
     assert rows[0]["seed"] is None and rows[1]["seed"] == "arg:system:0", rows
     # the command names the function the locator belongs to, not the first row
     assert leaf["reseed"] == (
@@ -4155,3 +4212,202 @@ def test_a_veneer_that_forwards_the_read_slot_is_a_consumer(models):
     [leaf] = _leaves(result)
     assert leaf["references"], leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+# --------------------------------------------------------------------------
+# round-20 review F48/F49/F50/F51/F54/F55
+# --------------------------------------------------------------------------
+
+def test_a_veneer_chain_longer_than_a_handful_still_finds_the_reader(models):
+    # Round-20 review F48: the chain walk stopped after eight bodies and
+    # then said nothing, so a twelve-hop relay onto `system(g)` cleared.
+    imported = GFunc("system", SYSTEM, FSSAFunc([]), params=[],
+                     symbol_type="ImportedFunctionSymbol")
+    reader = _reader("reader", 0x401500, G_DIR, 0x401510)
+    funcs = {SYSTEM: imported, 0x401500: reader}
+    names = {STRNCPY: "strncpy", SYSTEM: "system", 0x401500: "reader"}
+    nxt, prev = 0x401500, reader
+    for i in range(1, 13):
+        start = 0x401500 + i * 0x20
+        veneer = _thunk(f"relay{i}", start, nxt)
+        veneer.callees = [prev]
+        funcs[start], names[start] = veneer, veneer.name
+        nxt, prev = start, veneer
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(nxt), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV(names, funcs=funcs, refs={G_DIR: [FRef(reader, 0x401510)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert [r["display_name"] for r in leaf["references"]] == ["reader"], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_an_indirect_tail_jump_inside_a_callee_is_a_boundary(models):
+    # Round-20 review F49: the jump is one level down, in `dispatch()`,
+    # where the reachability sweep walked past it as if the body were a leaf.
+    reader = _reader("reader", 0x401500, G_DIR, 0x401510)
+    hook = FSSA(FVar("hook"), 1)
+    dispatch = GFunc("dispatch", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_JUMP", "jump(hook#1)", reads=[hook],
+               dest=_var(hook)),
+    ]), params=[])
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system",
+                    0x401300: "dispatch", 0x401500: "reader"},
+                   funcs={0x401300: dispatch, 0x401500: reader},
+                   refs={G_DIR: [FRef(reader, 0x401510)]})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["reachability"]["cause"] == "unresolved_call_target", leaf
+    assert leaf["reachability"]["unresolved_calls"] == [hex(0x401310)], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def _drop_program(forward_tracked: bool):
+    """`bound()` calls `drop(tracked, clean)`; `drop(a, b)` ignores `a`."""
+    dst, cmd = FVar("dst"), FVar("cmd")
+    dst0, cmd0 = FSSA(dst, 0), FSSA(cmd, 0)
+    write_read = GFunc("write_read", 0x401500, FSSAFunc([
+        FInstr(0, 0x401510, "MLIL_CALL_SSA", "memset(dst#0, 0, 4)",
+               reads=[dst0], dest=_gptr(MEMSET),
+               params=[_var(dst0), _const(0), _const(4)]),
+        FInstr(1, 0x401514, "MLIL_CALL_SSA", "system(cmd#0)", reads=[cmd0],
+               dest=_gptr(SYSTEM), params=[_var(cmd0)]),
+    ]), params=[dst, cmd])
+    a, b = FVar("a"), FVar("b")
+    a0, b0 = FSSA(a, 0), FSSA(b, 0)
+    # forwarding `a` into the COMMAND slot is a read of those bytes;
+    # dropping it (and passing `clean` instead) is not
+    fwd = ([_gptr(G_OTHER), _var(a0)] if forward_tracked
+           else [_var(b0), _gptr(G_OTHER)])
+    drop = GFunc("drop", 0x401400, FSSAFunc([
+        FInstr(0, 0x401410, "MLIL_CALL_SSA", "write_read(..)",
+               reads=[b0] + ([a0] if forward_tracked else []),
+               dest=_gptr(0x401500), params=fwd),
+    ]), params=[a, b], callees=[write_read])
+    bound = GFunc("bound", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "drop(tracked, clean)",
+               dest=_gptr(0x401400),
+               params=[_gptr(G_DIR), _gptr(G_OTHER)]),
+    ]), params=[], callees=[drop])
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", MEMSET: "memset",
+                    0x401300: "bound", 0x401400: "drop", 0x401500: "write_read"},
+                   funcs={0x401300: bound, 0x401400: drop, 0x401500: write_read},
+                   refs={G_DIR: [FRef(bound, 0x401310)],
+                         G_OTHER: [FRef(bound, 0x401310)]})
+    return func, bv
+
+
+def test_a_dropped_pointer_argument_reads_nothing(models):
+    # Round-20 review F50: `drop(a, b)` never uses `a`, so the tracked
+    # object it is handed reaches no use at all -- the classifier answered
+    # "unclassified", which reads as "it may read", and invented a leaf.
+    func, bv = _drop_program(forward_tracked=False)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_forwarded_pointer_argument_is_still_a_consumer(models):
+    # The control: the same wrapper forwarding the TRACKED argument into
+    # the command slot is a reader.
+    func, bv = _drop_program(forward_tracked=True)
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert leaf["references"], leaf
+
+
+def test_a_long_write_only_permutation_is_classified_not_abandoned(models):
+    # Round-20 review F51: each hop swaps its two arguments, so the nested
+    # write-only question costs one level per hop. A hidden depth-8 cutoff
+    # answered "it reads" -- a COMPLETE blocking consumer with no bound
+    # named anywhere.
+    dst, cmd = FVar("dst"), FVar("cmd")
+    dst0, cmd0 = FSSA(dst, 0), FSSA(cmd, 0)
+    base = GFunc("w0", 0x401500, FSSAFunc([
+        FInstr(0, 0x401510, "MLIL_CALL_SSA", "memset(dst#0, 0, 4)",
+               reads=[dst0], dest=_gptr(MEMSET),
+               params=[_var(dst0), _const(0), _const(4)]),
+        FInstr(1, 0x401514, "MLIL_CALL_SSA", "system(cmd#0)", reads=[cmd0],
+               dest=_gptr(SYSTEM), params=[_var(cmd0)]),
+    ]), params=[dst, cmd])
+    funcs = {0x401500: base}
+    names = {STRNCPY: "strncpy", SYSTEM: "system", MEMSET: "memset",
+             0x401500: "w0"}
+    nxt, prev = 0x401500, base
+    for i in range(1, 13):
+        start = 0x401500 + i * 0x20
+        a, b = FVar("a"), FVar("b")
+        a0, b0 = FSSA(a, 0), FSSA(b, 0)
+        hop = GFunc(f"w{i}", start, FSSAFunc([
+            FInstr(0, start + 8, "MLIL_CALL_SSA", f"w{i - 1}(b#0, a#0)",
+                   reads=[a0, b0], dest=_gptr(nxt),
+                   params=[_var(b0), _var(a0)]),
+        ]), params=[a, b], callees=[prev])
+        funcs[start], names[start] = hop, hop.name
+        nxt, prev = start, hop
+    # 12 hops of swapping: the tracked object ends at w0's memset DESTINATION
+    args = [_gptr(G_DIR), _gptr(G_OTHER)]
+    caller = GFunc("bound", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "w12(tracked, clean)",
+               dest=_gptr(nxt), params=args),
+    ]), params=[], callees=[prev])
+    funcs[0x401300], names[0x401300] = caller, "bound"
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401300), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV(names, funcs=funcs,
+                   refs={G_DIR: [FRef(caller, 0x401310)],
+                         G_OTHER: [FRef(caller, 0x401310)]})
+    result = _forward(bv, func, models)
+    leaves = _leaves(result)
+    # whichever way it lands, it is never a COMPLETE blocking consumer with
+    # no bound named: either the chain is classified, or the bound is said
+    assert all(lf["reachability"]["status"] == "truncated" for lf in leaves), leaves
+
+
+def test_the_audit_advice_names_one_command_per_cited_address(models):
+    # Round-20 review F54: `bn xrefs` answers for ONE address, so a
+    # base-address invocation does not list an interior reader and must not
+    # claim to.
+    reader = _reader("interior_reader", 0x401200, G_DIR + 0x50, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(0xff)])
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system",
+                    0x401200: "interior_reader"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR: [FRef(reader, 0x401210)]})
+    [leaf] = _leaves(_forward(bv, func, models))
+    assert f"`bn xrefs {hex(G_DIR)}`" in leaf["detail"], leaf["detail"]
+    assert f"`bn xrefs {hex(G_DIR + 0x50)}`" in leaf["detail"], leaf["detail"]
+    assert "every reference" not in leaf["detail"]
+    # no bare, unrunnable command is printed
+    assert "`bn xrefs`" not in leaf["detail"]
+
+
+def test_the_extent_remediation_names_a_real_command(models, monkeypatch):
+    # Round-20 review F55: `bn retype` is not a command; the data-mutation
+    # surface is `bn data retype <address> <type>`, and the size advised is
+    # the extent this write actually reaches.
+    monkeypatch.setattr(te.TaintEngine, "_ALIAS_HOPS", 1)
+    reader = _reader("reader", 0x401200, G_DIR + 0x50, 0x401210)
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0x70)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "reader"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR: [FRef(func, 0x401104)],
+                         G_DIR + 0x50: [FRef(reader, 0x401210)]},
+                   objects={G_DIR: 0, G_DIR + 16: 0},
+                   section=(0x404000, 0x405000))
+    [leaf] = _leaves(_forward(bv, func, models))
+    if leaf["reachability"]["cause"] == "object_extent_unproven":
+        assert f"`bn data retype {hex(G_DIR)} char[112]`" in leaf["detail"], \
+            leaf["detail"]
+        assert "bn retype" not in leaf["detail"]

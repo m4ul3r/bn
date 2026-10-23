@@ -308,6 +308,11 @@ class _Use(NamedTuple):
 _SCAN_CAUSE_KINDS = {
     "pointer_scan_budget": "scan_budget_exhausted",
     "pointer_return_depth": "pointer_depth_exhausted",
+    # A nested "does this body only WRITE through that parameter" question
+    # that ran out of hops. It used to answer False -- "it may read" -- so a
+    # long write-only permutation chain became a COMPLETE blocking consumer
+    # (round-20 review F51).
+    "parameter_scan_budget": "param_budget_exhausted",
 }
 _SCAN_KIND_CAUSES = {v: k for k, v in _SCAN_CAUSE_KINDS.items()}
 
@@ -429,6 +434,8 @@ class TaintEngine:
         self._touches_region_cache: dict[tuple, bool] = {}
         self._readable_il_cache: dict[int, bool] = {}
         self._import_stub_cache: dict[int, bool] = {}
+        self._param_stack: set[tuple[int, int]] = set()
+        self._direct_callee_cache: dict[int, tuple] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
         self._global_extent_unproven: set[int] = set()
         self._ssa_def_cache: dict[tuple, Any] = {}
@@ -494,6 +501,19 @@ class TaintEngine:
 
     def _is_call(self, ins: Any) -> bool:
         return "CALL" in op_name(ins) or "TAILCALL" in op_name(ins)
+
+    def _is_indirect_transfer(self, ins: Any) -> bool:
+        """An optimised `jmp reg`: where control LEAVES this function.
+
+        BN lifts it as a JUMP rather than a call, so every walk that looked
+        for calls stepped straight over it -- in the analysed function
+        (round-19 review F45) and in any body the reachability sweep visits
+        (round-20 review F49). A jump TABLE (`MLIL_JUMP_TO`) stays inside
+        the function and is not one of these."""
+        opn = op_name(ins)
+        return ("JUMP" in opn and "JUMP_TO" not in opn
+                and not self._is_call(ins)
+                and self._resolve_direct_target(ins) is None)
 
     def _unimplemented_addrs(self, func: Any, instrs: list[Any]) -> list[int]:
         """Addresses of instructions BN's lifter could not model in *func*.
@@ -3893,7 +3913,7 @@ class TaintEngine:
             }
         return out
 
-    def _thunk_chain(self, fn: Any, limit: int = 8) -> list:
+    def _thunk_chain(self, fn: Any) -> tuple[tuple, bool]:
         """The ordered veneer chain starting at *fn*: every body control
         passes through, not just the end of it.
 
@@ -3901,15 +3921,25 @@ class TaintEngine:
         answering with that end point discarded `reader`, which is the body
         that reads the tainted object (round-19 review F44). Each hop's own
         body is readable, so each hop is kept and the caller decides which
-        one carries the evidence."""
+        one carries the evidence.
+
+        Returns ``(chain, complete)``. The walk spends the same function
+        allowance the reachability sweep does and is cycle-safe; a fixed
+        eight-body limit silently restored the all-clear it was meant to
+        remove as soon as a chain grew longer (round-20 review F48), so an
+        exhausted walk says so and the caller discloses it."""
         key = int(getattr(fn, "start", 0))
         cached = self._thunk_chain_cache.get(key)
         if cached is not None:
             return cached
         chain: list = []
         seen: set[int] = set()
+        complete = True
         cur = fn
-        for _ in range(limit):
+        for hop in range(self._GLOBAL_REACH_FUNCS + 1):
+            if hop >= self._GLOBAL_REACH_FUNCS:
+                complete = False
+                break
             start = int(getattr(cur, "start", 0))
             if start in seen:
                 break
@@ -3929,8 +3959,19 @@ class TaintEngine:
             if nxt is None or int(getattr(nxt, "start", 0)) in seen:
                 break
             cur = nxt
-        self._thunk_chain_cache[key] = chain
-        return chain
+        out = (tuple(chain), complete)
+        self._thunk_chain_cache[key] = out
+        return out
+
+    def _chain_may_reach(self, fn: Any, pending: Any) -> bool:
+        """Whether any body on *fn*'s veneer chain names one of *pending*,
+        or the chain outran its allowance so the question is still open."""
+        chain, complete = self._thunk_chain(fn)
+        for hop in chain:
+            for ga in pending:
+                if self._global_access(hop, ga).at is not None:
+                    return True
+        return not complete
 
     def _follow_thunk_cached(self, fn: Any) -> Any | None:
         """``follow_thunk`` memoized per resolved function start address."""
@@ -6491,15 +6532,37 @@ class TaintEngine:
         self._readable_il_cache[key] = out
         return out
 
-    # How many nested "does this body only WRITE through that parameter"
-    # questions one answer may need. A veneer chain adds a level per hop --
-    # `bound_clean -> swap -> write_read` is already three -- and running out
-    # answers "it may read", which turned a write-only global into a
-    # consumer (round-19 review F47).
-    _PARAM_ONLY_DEPTH = 8
+    def _param_use_verdict(self, callee: Any, idx: int, depth: int = 0) -> str:
+        """``"no_read"`` / ``"read"`` / ``"unknown"`` for parameter *idx*.
 
-    def _param_destination_only(self, callee: Any, idx: int, depth: int = 0) -> bool:
-        """Whether *callee*'s own body only WRITES through parameter *idx*.
+        The nested question costs one hop per veneer, and an argument
+        permutation chain is as long as the program makes it. A hidden
+        depth-8 cutoff answered "read" -- a COMPLETE blocking consumer with
+        no bound named anywhere (round-20 review F51) -- so the walk spends
+        the same function allowance the rest of the search does and says so
+        when it runs out. A formal the body never uses at all (a DROPPED
+        argument) reads nothing (round-20 review F50)."""
+        if depth > self._GLOBAL_REACH_FUNCS:
+            return "unknown"
+        key = (int(getattr(callee, "start", 0)), int(idx))
+        if key in self._param_stack:
+            # A cycle (`char *f(char *p, int n) { return n ? f(p, n - 1) :
+            # p; }`): re-entering proves nothing new, so the question stays
+            # open and the caller keeps its conservative answer.
+            return "read"
+        self._param_stack.add(key)
+        try:
+            kind = self._param_destination_only(callee, idx, depth)
+        finally:
+            self._param_stack.discard(key)
+        if kind in ("write_only", "return", "unused"):
+            return "no_read"
+        if kind in _SCAN_KIND_CAUSES or kind == "budget":
+            return "unknown"
+        return "read"
+
+    def _param_destination_only(self, callee: Any, idx: int, depth: int = 0) -> str:
+        """How *callee*'s own body uses parameter *idx* -- the raw scan kind.
 
         A model is additive flow evidence; a body is the authority (#807, and
         round-3 review F7: a partial ``{"propagates": [...]}`` overlay read as
@@ -6508,14 +6571,12 @@ class TaintEngine:
         copy the overlay describes). So when the callee has an analysed body,
         the write-only question is asked of that body, with the same
         classifier the global uses, rooted at the parameter."""
-        if depth > self._PARAM_ONLY_DEPTH:
-            return False
         try:
             pv = self._param_var(callee, idx)
         except Exception:
             pv = None
         if pv is None:
-            return False
+            return "budget"
         key = (int(getattr(callee, "start", 0)), int(idx))
         cached = self._param_access_cache.get(key)
         if cached is None:
@@ -6539,7 +6600,29 @@ class TaintEngine:
         # review F17 established that for the global's own scan), and what
         # the CALLER does with the result is classified by the caller's own
         # scan -- which follows the returned alias.
-        return cached[1] in ("write_only", "return")
+        return cached[1]
+
+    def _expr_has_var(self, expr: Any, depth: int = 0) -> bool:
+        """Whether *expr* contains an SSA variable at all.
+
+        A constant-address argument has none, so no `arg:` locator can seed
+        it (round-20 review F53)."""
+        if expr is None or depth > 6:
+            return False
+        if is_ssa_var(expr):
+            return True
+        for child in expr_reads(expr) or ():
+            if is_ssa_var(child):
+                return True
+        for name in ("src", "left", "right", "dest", "params"):
+            got = getattr(expr, name, None)
+            if got is None:
+                continue
+            items = got if isinstance(got, (list, tuple)) else [got]
+            for item in items:
+                if item is not expr and self._expr_has_var(item, depth + 1):
+                    return True
+        return False
 
     def _is_pointer_carry(self, ssaf: Any, ins: Any, base: Any,
                           budget: _ScanBudget | None = None) -> bool:
@@ -6616,9 +6699,22 @@ class TaintEngine:
         def arg_seed(ins: Any, hit: list[int]) -> str | None:
             """`arg:<callee>:<index>` for a pointer that reaches a named
             call's argument -- the locator that seeds those bytes inside the
-            consumer."""
+            consumer.
+
+            Only when that argument HAS a variable to seed. `system(g +
+            1048)` passes a constant address: the locator resolves no source
+            and the advertised command exits 2 ("no taint sources
+            resolved"), which is worse than no command at all (round-20
+            review F53). The honest guidance for that shape already
+            exists."""
             name = self._callee_name(self._resolve_direct_target(ins))
-            return f"arg:{name}:{hit[0]}" if name and hit else None
+            if not name or not hit:
+                return None
+            params = self._call_params(ins)
+            idx = hit[0]
+            if idx >= len(params) or not self._expr_has_var(params[idx]):
+                return None
+            return f"arg:{name}:{idx}"
 
         wrote = False
         touched = False
@@ -6676,8 +6772,20 @@ class TaintEngine:
                 if body is not None:
                     # The body is the authority; a model is only an overlay on
                     # it (#807 / F7). Ask the body itself.
-                    if all(self._param_destination_only(body, i, depth) for i in hit):
+                    verdicts = [self._param_use_verdict(body, i, depth)
+                                for i in hit]
+                    if all(v == "no_read" for v in verdicts):
                         wrote = True
+                        continue
+                    if any(v == "unknown" for v in verdicts):
+                        # The nested question ran out of hops: that is a
+                        # bound, and it is named rather than reported as a
+                        # finished "it reads" (round-20 review F51).
+                        scan.cause = scan.cause or "parameter_scan_budget"
+                        hit_use = emit(verdict(ins, "param_budget_exhausted",
+                                               arg_seed(ins, hit), span=span))
+                        if hit_use is not None:
+                            return hit_use
                         continue
                     kind = "unknown_call_arg"
                 elif unread_body:
@@ -6775,6 +6883,14 @@ class TaintEngine:
                         _SCAN_CAUSE_KINDS[scan.cause], 0, None, None, True)
         if wrote:
             return _Use(None, "write_only", 0, None, None, True)
+        if fallback is None:
+            # Reaching here means the scan finished with no terminal use of
+            # this pointer and no bound reached: the body DROPS the formal
+            # (`drop(a, b)` forwards only `b`; at -O0 it still spills `a` to
+            # a stack slot, which is a carry, not a use). "Unclassified"
+            # answered "it may read" and invented a blocking consumer
+            # (round-20 review F50).
+            return _Use(None, "unused", 0, None, None, True)
         return _Use(fallback, "unclassified", 0, None, None, True)
 
     def _ptr_offset(self, ssaf: Any, expr: Any, root: Any, depth: int = 0,
@@ -7316,7 +7432,11 @@ class TaintEngine:
         The question behind "could the storage this search did not reach
         matter here": a body whose only global is a byte in another section
         reads nothing of THIS object, whatever the alias enumeration missed
-        (round-18 review F42)."""
+        (round-18 review F42). Nor does a body whose every use of this
+        object's storage is a PROVEN WRITE -- `writer()` doing
+        `memset(chain, 0, 64)` and nothing else was turned into a blocking
+        consumer by the alias bound alone (round-20 review F52). The
+        classifier answers that before any fallback does."""
         key = (int(getattr(fn, "start", 0)), int(ga))
         cached = self._touches_region_cache.get(key)
         if cached is not None:
@@ -7326,9 +7446,12 @@ class TaintEngine:
         try:
             for ins in self._instrs(self._ssa_func(fn)):
                 for const in self._instruction_constants(ins):
-                    if self._canon_global(const) is None:
+                    canon = self._canon_global(const)
+                    if canon is None:
                         continue
-                    if self._section_names(const) == section:
+                    if self._section_names(const) != section:
+                        continue
+                    if self._global_access(fn, canon).at is not None:
                         found = True
                         break
                 if found:
@@ -7522,6 +7645,34 @@ class TaintEngine:
         self._global_access_cache[key] = out
         return out
 
+    def _direct_callees(self, fn: Any) -> tuple:
+        """The functions *fn* calls by a resolvable DIRECT target.
+
+        BN's ``callees`` is the authority, but it is empty for some veneers
+        whose body plainly names its target; reading the body adds evidence
+        and never removes any."""
+        key = int(getattr(fn, "start", 0))
+        cached = self._direct_callee_cache.get(key)
+        if cached is not None:
+            return cached
+        out: list = []
+        try:
+            instrs = self._instrs(self._ssa_func(fn))
+        except TaintError:
+            instrs = []
+        for ins in instrs:
+            if not self._is_call(ins):
+                continue
+            taddr = self._resolve_direct_target(ins)
+            if taddr is None:
+                continue
+            tfn = function_at(self.bv, taddr)
+            if tfn is not None and int(getattr(tfn, "start", 0)) != key:
+                out.append(tfn)
+        got = tuple(out)
+        self._direct_callee_cache[key] = got
+        return got
+
     def _indirect_sites(self, fn: Any) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """``(pinned targets, unresolved call addresses)`` for the indirect
         calls in *fn*.
@@ -7544,7 +7695,10 @@ class TaintEngine:
         except TaintError:
             instrs = []
         for ins in instrs:
-            if not self._is_call(ins) or self._resolve_direct_target(ins) is not None:
+            if self._is_call(ins):
+                if self._resolve_direct_target(ins) is not None:
+                    continue
+            elif not self._is_indirect_transfer(ins):
                 continue
             addr = int(getattr(ins, "address", 0))
             targets = tuple(self.resolve_map.get(addr) or ()) or tuple(
@@ -7645,6 +7799,12 @@ class TaintEngine:
                     callees = list(getattr(cur, "callees", None) or ())
                 except Exception:
                     callees = []
+                # A veneer BN did not record an edge for still CALLS
+                # something, and its target is right there in the body.
+                for extra in self._direct_callees(cur):
+                    if all(int(getattr(c, "start", -1)) != int(
+                            getattr(extra, "start", -2)) for c in callees):
+                        callees.append(extra)
                 # I2: `callees` lists resolved edges only. Follow the indirect
                 # sites this run CAN pin, and name the ones it cannot --
                 # inside real BODIES only. A PLT stub is a register-indirect
@@ -7822,7 +7982,12 @@ class TaintEngine:
                     "an object with no recovered type that is written PAST "
                     "the next symbol in the layout -- so where it ends, and "
                     "which references belong to it, are not established "
-                    "(give the global a type with `bn retype` and re-run)"),
+                    f"(give the global a type that covers it -- at least the "
+                    f"{hex(max(int(self._global_write_span.get(ga) or 0), 1))} "
+                    f"bytes this write reaches -- with `bn data retype "
+                    f"{hex(ga)} "
+                    f"char[{max(int(self._global_write_span.get(ga) or 0), 1)}]`"
+                    f", then re-run)"),
                 "pointer_scan_budget": (
                     "the bound on how many expression nodes ONE function's "
                     "pointer scan may visit, so what the rest of that body "
@@ -7856,10 +8021,30 @@ class TaintEngine:
                   if reseed else
                   " the consumer reaches those bytes by constant address, so there is no"
                   " variable inside it to seed: audit the references by hand.")
+        # `bn xrefs` answers for ONE address, so a base-address invocation
+        # does not list an interior reader and must not claim to (round-20
+        # review F54). Name the addresses this leaf actually cites, deduped,
+        # and say plainly that others may exist.
+        cited: list[int] = []
+        unknown_offsets = False
+        for r in rows:
+            if r["offset_known"]:
+                a = ga + int(r["offset"])
+                if a not in cited:
+                    cited.append(a)
+            else:
+                unknown_offsets = True
+        if ga not in cited:
+            cited.insert(0, ga)
+        xrefs = ", ".join(f"`bn xrefs {hex(a)}`" for a in cited[:8])
+        tail = ("; xrefs answers for ONE address, so other bytes of this "
+                "object need their own query"
+                + (" -- and at least one reference here reached an offset this "
+                   "walk could not establish" if unknown_offsets else ""))
         parts.append(
             f"Taint is tracked per function, and {crossed}: what those bytes reach past "
             f"this point is NOT followed -- a 'no sinks reached' result here is not proof "
-            f"of safety. List every reference with `bn xrefs {hex(ga)}` and audit them,"
+            f"of safety. Audit the references this leaf cites with {xrefs}{tail},"
             f"{advice}")
         detail = " ".join(parts)
         return {
@@ -8211,9 +8396,7 @@ class TaintEngine:
                             unread = "unread_callee_body"
                             self._analysis_incomplete.add(
                                 str(getattr(resolved, "name", None) or hex(rstart)))
-                        elif any(self._global_access(hop, ga).at is not None
-                                 for hop in self._thunk_chain(cfn)
-                                 for ga in pending):
+                        elif self._chain_may_reach(cfn, pending):
                             # BN calls a one-line `void reader(void) {
                             # system(g + 80); }` a THUNK once the compiler
                             # turns it into a tail jump, and following it to
@@ -8226,6 +8409,14 @@ class TaintEngine:
                             pass
                         else:
                             continue      # a PLT stub onto an import: external
+                    elif reason == "thunk" and self._has_readable_il(cfn) \
+                            and not self._is_import_stub(cfn):
+                        # The shared resolver declines a veneer that does
+                        # work before its tail call (an argument swap), but
+                        # its body IS readable -- so it is read, rather than
+                        # failed closed on as if nothing about it could be
+                        # known (round-20 review F51).
+                        pass
                     elif reason == "thunk":
                         unread = "unresolved_thunk"
                     elif self._unanalysed_body_phrase(reason) is not None and (
@@ -8283,7 +8474,8 @@ class TaintEngine:
                             # import, and answering with the end point
                             # discarded the hop that reads the object
                             # (round-19 review F44).
-                            for hop in self._thunk_chain(veneer):
+                            hops, hops_complete = self._thunk_chain(veneer)
+                            for hop in hops:
                                 if hop is cfn:
                                     continue
                                 hrefs, hreach = self._global_refs_reachable(
@@ -8291,6 +8483,13 @@ class TaintEngine:
                                 if hrefs:
                                     refs, reach = hrefs, hreach
                                     break
+                            else:
+                                if not hops_complete and not refs:
+                                    # The chain outran its allowance, so the
+                                    # bodies past it were never asked: that
+                                    # is a bound, not an all-clear (F48).
+                                    reach = self._reach_status(
+                                        "thunk_chain_budget", len(hops), [], {})
                         if not refs and veneer is not cfn:
                             # The VENEER is where the tainted global becomes
                             # an argument: `relay_reader()` materialises `g`
@@ -9187,8 +9386,7 @@ class TaintEngine:
             changed = False
             for ins in instrs:
                 opn = op_name(ins)
-                if live_globals and "JUMP" in opn and not self._is_call(ins) \
-                        and self._resolve_direct_target(ins) is None:
+                if live_globals and self._is_indirect_transfer(ins):
                     # An optimised `jmp reg` IS where control leaves this
                     # function -- BN lifts it as a JUMP, not a call, so the
                     # continuation question was never asked and a tainted
