@@ -5260,3 +5260,90 @@ def test_a_structured_reseed_command_runs_where_it_was_produced(tmp_path,
         subprocess.run(
             [*_BN_CLI, "session", "stop", other, "--discard-unsaved"],
             capture_output=True, text=True, timeout=60.0, env=env)
+
+
+#: A `-static` cross build is the point of this fixture: a dynamically
+#: linked one has no in-binary body for the library function the model also
+#: covers, which is the whole shape under test.
+_CROSS_ANALYSIS_TIMEOUT = 300.0
+
+_WIDE_AARCH64_SRC = r"""
+#include <string.h>
+#include <wchar.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+char output[256] __attribute__((section(".out"))) = "out";
+N void byte88_reader(void) { output[0] = tracked[88]; }
+N void wide_write_case(char *s) { wmemcpy((wchar_t *)tracked, (wchar_t *)s, 32);
+                                  byte88_reader(); }
+int main(void) { return 0; }
+"""
+
+
+def _aarch64_binary(tmp_path, opt: str):
+    """Cross-build the wide-copy probe, or refuse to disappear quietly."""
+    cc = shutil.which("aarch64-linux-gnu-gcc")
+    if cc is None:
+        refuse_silent_skip(
+            "aarch64-linux-gnu-gcc not available, so the AArch64 taint determinism "
+            "guard did not run; install the cross toolchain (Debian/Ubuntu: "
+            "gcc-aarch64-linux-gnu)")
+    src = tmp_path / f"r12wide{opt[-1]}.c"
+    src.write_text(_WIDE_AARCH64_SRC)
+    binary = tmp_path / f"r12wide{opt[-1]}"
+    build = subprocess.run(
+        [cc, opt, "-g0", "-U_FORTIFY_SOURCE", "-fno-builtin", "-fno-inline",
+         "-no-pie", "-static", str(src), "-o", str(binary)],
+        capture_output=True, text=True, timeout=180)
+    if build.returncode != 0:
+        raise FixtureBuildError(
+            f"aarch64 cross-compile failed (exit {build.returncode}): {build.stderr}")
+    return binary
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_repeated_taint_requests_on_a_fresh_view_agree(tmp_path, shared_bn, opt):
+    """BN25-META-01, on the architecture and build shape that found it.
+
+    A `-static` AArch64 build has an in-binary `__wmemcpy` stub, and Binary
+    Ninja only decides that it IS a stub while it lifts it. The FIRST
+    request on a freshly analysed view therefore used to descend into it
+    and raise an `unmodeled_callee` frontier for the very call whose model
+    it had just applied, while every later request resolved the thunk and
+    did not -- so an identical query answered differently depending on what
+    had run before, and the text spelling (asked second) disagreed with the
+    JSON one.
+
+    The first request here is the TEXT one, deliberately: on a cold view it
+    is the one that would have seen the extra leaf.
+    """
+    binary = _aarch64_binary(tmp_path, opt)
+    target = shared_bn.load(binary, copy=False, timeout=_CROSS_ANALYSIS_TIMEOUT)
+    args = ("-t", target, "taint", "forward", "-f", "wide_write_case",
+            "--source", "param:0")
+
+    rendered = shared_bn.run(*args, timeout=180.0)
+    assert rendered.returncode == 0, rendered.stderr
+    raw = [shared_bn.run(*args, "--format", "json", timeout=180.0)
+           for _ in range(3)]
+    for one in raw:
+        assert one.returncode == 0, one.stderr
+    # the raw bridge result, byte for byte, for three identical requests
+    assert raw[0].stdout == raw[1].stdout == raw[2].stdout, [r.stdout for r in raw]
+
+    result = json.loads(raw[0].stdout)
+    kinds = sorted(lf["kind"] for lf in result["leaves"])
+    # the modeled copy is recognised AS modeled...
+    assert any("wmemcpy" in a and "propagate" in a
+               for a in result["assumptions"]), result["assumptions"]
+    # ...so it is not ALSO reported as an unmodeled callee
+    assert kinds == ["global_memory_continuation"], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert result["diagnostics"]["frontier"]["unresolved"] == 0
+
+    # ...and the text spelling asked FIRST says the same thing
+    assert f"frontiers ({len(kinds)})" in rendered.stdout, rendered.stdout
+    assert f"{len(kinds)} tainted frontier(s)" in rendered.stdout, rendered.stdout
+    assert "unmodeled call(s) reached: no" in rendered.stdout, rendered.stdout
+    for kind in set(kinds):
+        assert kind in rendered.stdout, (kind, rendered.stdout)

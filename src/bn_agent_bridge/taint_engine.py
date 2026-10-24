@@ -5128,12 +5128,22 @@ class TaintEngine:
         if stype in {"ImportedFunctionSymbol", "LibraryFunctionSymbol",
                      "ImportAddressSymbol", "ExternalSymbol"}:
             return "import"
-        if getattr(fn, "is_thunk", False):
-            return "thunk"
+        # The BODY is materialised BEFORE the thunk flag is read. BN decides
+        # `is_thunk` while it lifts a function, so on a freshly loaded view
+        # it answers False for a stub that IS one -- and then True for every
+        # caller that asks after something lifted it. Two identical taint
+        # requests disagreed on exactly that: the first descended into the
+        # static `__wmemcpy` stub and raised a frontier for it, the second
+        # resolved the thunk and did not (BN25-META-01). Lifting first makes
+        # the verdict a property of the binary rather than of what ran
+        # before it; the flag is analysis-timing dependent everywhere, which
+        # `_same_name_stub_functions` says of its own criterion too.
         try:
             has_body = len(list(fn.mlil.instructions)) > 0
         except Exception:
             has_body = False
+        if getattr(fn, "is_thunk", False):
+            return "thunk"
         if has_body:
             return None
         if getattr(fn, "analysis_skipped", False):
@@ -5443,10 +5453,30 @@ class TaintEngine:
             lost = self._valueless_return_leaf(ins, callee_fn, tainted_args, caller_instrs)
             if lost is not None:
                 out["leaves"].append(lost)
-        if not ssa_writes(ins) and "TAILCALL" not in op_name(ins):
+        if not ssa_writes(ins) and "TAILCALL" not in op_name(ins) \
+                and not self._call_result_is_modeled(ins, callee_fn):
             out["leaves"].append(self._dropped_result_leaf(ins, callee_fn, tainted_args,
                                                            caller_fn))
         return out
+
+    def _call_result_is_modeled(self, ins: Any, callee_fn: Any) -> bool:
+        """Whether a MODEL already states what this call hands back.
+
+        The body is still the authority on what it DOES (#807), which is why
+        it was descended; but the leaf above exists because BN recovered no
+        result and the return channel is therefore unknown. For a modeled
+        callee it is not unknown: `wmemcpy`'s rules say the result is its
+        destination, and that propagation ran at this very call site -- so
+        raising an "unmodeled callee" frontier beside it reported the same
+        call as both modeled and unmodeled (BN25-META-01)."""
+        for name in (self._callee_name(self._resolve_direct_target(ins)),
+                     str(getattr(callee_fn, "name", "") or "") or None):
+            if not name:
+                continue
+            _key, model = lookup_model(self.models, name)
+            if model and not model_is_benign_marker(model):
+                return True
+        return False
 
     def _dropped_result_leaf(self, ins: Any, callee_fn: Any, tainted_args: dict,
                              caller_fn: Any) -> dict[str, Any]:
