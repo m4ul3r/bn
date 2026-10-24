@@ -7036,7 +7036,15 @@ class TaintEngine:
                 # recovers for a tail `return memset(g, 0, n);`, whose value
                 # the caller usually discards (round-3 review F17).
                 if any(resolves(s, alias=False) for s in srcs):
-                    hit_use = emit(verdict(ins, "return"))
+                    # WHICH bytes it hands back is part of the answer: the
+                    # instruction itself names no constant, so leaving the
+                    # expression out reported the object's BASE as an
+                    # established offset for `return middle + 80` and the
+                    # interval test could never rule it out (round-30
+                    # review F75).
+                    returned = next(
+                        (s for s in srcs if resolves(s, alias=False)), None)
+                    hit_use = emit(verdict(ins, "return", expr=returned))
                     if hit_use is not None:
                         return hit_use
                 continue
@@ -7250,7 +7258,18 @@ class TaintEngine:
             # this object's; where it does admit it, the join goes to
             # unknown, which is the honest direction.
             candidates, _exhausted = self._preceding_objects(canon_root)
-            return canon_arm in candidates
+            if canon_arm not in candidates:
+                return False
+            # ...and within reach: an adjustment that brings a pointer INTO
+            # this object cannot travel further than the object is wide, so
+            # a distinct global further below than that is not an arm this
+            # route can land inside -- counting it turned two provably
+            # clean arms into a blocking unknown (round-30 review F75).
+            try:
+                reach = int(self._global_extent(canon_root))
+            except Exception:
+                return True
+            return (int(base_ga) - int(value)) <= max(reach, 1)
         # ABOVE it, an enclosing candidate is not the question -- every
         # later object lists this one as a predecessor -- so the test is
         # the boundary: no NAMED object between them, the arm's own symbol
@@ -7933,16 +7952,23 @@ class TaintEngine:
         `wchar_t` target, so a 16-bit load at +88 reads bytes this run
         never wrote (round-26 review F72). Anything unknown keeps the
         object-level answer."""
-        if not use.offset_known or not use.span:
+        if not use.offset_known:
             return False
         if ga in self._global_write_unbounded:
             return False
         ranges = self._global_tainted_ranges.get(ga) or ()
         if not ranges:
             return False
-        lo, hi = int(use.offset), int(use.offset) + int(use.span)
+        lo = int(use.offset)
+        # A read with no stated length runs FORWARD until it stops, so a
+        # start at or past every tainted range still touches none of them:
+        # `system(g + 80)` after `memcpy(g, s, 16)` reads bytes this run
+        # never wrote (round-30 review F76). Only the end is unknown.
+        hi = None if not use.span else lo + int(use.span)
         for rlo, rhi in ranges:
-            if rhi is None or (lo < int(rhi) and hi > int(rlo)):
+            if rhi is None:
+                return False
+            if lo < int(rhi) and (hi is None or hi > int(rlo)):
                 return False
         return True
 

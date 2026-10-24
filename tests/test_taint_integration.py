@@ -4906,3 +4906,74 @@ def test_a_wide_count_follows_the_target_wchar_abi(tmp_path, shared_bn):
     _result, leaves = gmc("pe_inside_case")
     assert any(r["display_name"] == "byte62_reader"
                for lf in leaves for r in lf["references"]), leaves
+
+
+_MISS_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char lower[256] __attribute__((section(".same"))) = "low";
+char tracked[256] __attribute__((section(".same"))) = "seed";
+char upper[256] __attribute__((section(".same"))) = "up";
+volatile int choice;
+volatile unsigned char seen;
+extern char middle[];
+__asm__(".globl middle\n.set middle,tracked+64\n.type middle,@object\n.size middle,1\n");
+N char *choose_miss(void) { return choice ? middle + 80 : lower + 8; }
+N char *choose_hit(void) { return choice ? middle + 8 : lower + 8; }
+N void miss_reader(void) { seen = *choose_miss(); }
+N void hit_reader(void) { seen = *choose_hit(); }
+N void direct_miss_reader(void) { seen = *(middle + 80); }
+N void far_string_reader(void) { system(tracked + 80); }
+N void inline_miss_case(char *s) { memcpy(middle, s, 64); miss_reader(); }
+N void inline_hit_case(char *s) { memcpy(middle, s, 64); hit_reader(); }
+N void direct_miss_case(char *s) { memcpy(middle, s, 64); direct_miss_reader(); }
+N void short_copy_case(char *s) { memcpy(tracked, s, 16); far_string_reader(); }
+N void long_copy_case(char *s) { memcpy(tracked, s, 128); far_string_reader(); }
+N void unknown_copy_case(char *s, size_t n) { memcpy(tracked, s, n); far_string_reader(); }
+int main(void) { return 0; }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_read_that_misses_every_tainted_byte_is_not_a_reference(tmp_path,
+                                                                  shared_bn,
+                                                                  opt):
+    """Round-30 review F75 and F76.
+
+    A distinct global further below than this object is wide is not an arm
+    a route can land inside, and a FORWARD string read that starts past
+    every tainted byte touches none of them -- the end being unknown does
+    not make the start unknown."""
+    src = tmp_path / f"r11miss{opt[-1]}.c"
+    src.write_text(_MISS_SRC)
+    binary = tmp_path / f"r11miss{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin",
+                           "-fno-inline", "-g0", "-fno-toplevel-reorder"])
+    target = shared_bn.load(binary, copy=False)
+
+    def gmc(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "global_memory_continuation"]
+
+    # neither arm can reach the written bytes, directly or through the PHI
+    for fn in ("inline_miss_case", "direct_miss_case"):
+        result, leaves = gmc(fn)
+        assert leaves == [], (fn, leaves)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+
+    # ...while an arm that lands INSIDE the written bytes still blocks
+    _result, leaves = gmc("inline_hit_case")
+    assert leaves, leaves
+
+    # a string read starting past a 16-byte copy reads none of it
+    result, leaves = gmc("short_copy_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    # ...while a copy that reaches it, and a length nothing states, block
+    for fn in ("long_copy_case", "unknown_copy_case"):
+        _result, leaves = gmc(fn)
+        assert any(r["display_name"] == "far_string_reader"
+                   for lf in leaves for r in lf["references"]), (fn, leaves)

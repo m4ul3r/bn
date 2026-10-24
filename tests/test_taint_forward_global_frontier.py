@@ -1481,10 +1481,16 @@ def _interior_reader(name, start, addr, at):
 
 
 def _interior_program(consumer, refs, objects, copy_len=0x20, **kw):
+    # `copy_len=None` is a length nothing states, so the write's footprint
+    # is unbounded -- what a test needs when its reader sits far past any
+    # constant length (a read that provably misses every tainted byte is
+    # no longer a reference, round-30 review F76).
+    length = _const(copy_len) if copy_len is not None else _var(
+        FSSA(FVar("n"), 0))
     func, _argv = _copy_then_call(
         0x401104, STRNCPY, G_DIR,
         call_sites=[(0x401108, _gptr(int(consumer.start)), [])],
-        params_extra=[_const(copy_len)])
+        params_extra=[length])
     bv = FExtentBV({STRNCPY: "strncpy", SYSTEM: "system",
                     int(consumer.start): consumer.name},
                    funcs={int(consumer.start): consumer},
@@ -1838,7 +1844,7 @@ def test_a_reader_past_the_old_cap_is_found(models):
     consumer = _interior_reader("large_reader", 0x401200, G_DIR + FAR, 0x401210)
     func, bv = _interior_program(
         consumer, {G_DIR + FAR: [FRef(consumer, 0x401210)]},
-        {G_DIR: BIG}, section=(G_DIR, G_DIR + BIG))
+        {G_DIR: BIG}, copy_len=None, section=(G_DIR, G_DIR + BIG))
     eng = te.TaintEngine(bv, models)
     assert eng._global_extent(G_DIR) == BIG
     result = _forward(bv, func, models)
@@ -1859,7 +1865,8 @@ def test_the_sweep_asks_in_range_chunks_not_per_byte(models):
     consumer = _interior_reader("large_reader", 0x401200, G_DIR + FAR, 0x401210)
     func, _argv = _copy_then_call(
         0x401104, STRNCPY, G_DIR,
-        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(0xff)])
+        call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_var(FSSA(FVar("n"), 0))])
     bv = CountingBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "large_reader"},
                     funcs={0x401200: consumer},
                     refs={G_DIR + FAR: [FRef(consumer, 0x401210)]},
