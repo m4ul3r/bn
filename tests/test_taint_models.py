@@ -1390,3 +1390,41 @@ def test_catalog_op_refuses_a_malformed_user_model():
     # reports the malformed token instead of listing it.
     with pytest.raises(tm.TaintError, match=r"`propagates.to` is '\*arg:-1'"):
         tm.load_models(extra={"models": {"app_fn": {"propagates": [{"from": "arg:0", "to": "*arg:-1"}]}}})
+
+
+# --- required indices are never null (round-2 review) --------------------------
+
+@pytest.mark.parametrize("first_index", ["<missing>", None, True, False, "2", "+2", -1, 256, 2.0])
+def test_varargs_first_index_is_required_and_canonical(first_index):
+    va = {"to": "*arg:0"}
+    if first_index != "<missing>":
+        va["first_index"] = first_index
+    with pytest.raises(tm.TaintError) as ei:
+        tm.load_models(extra={"app_fmt": {"varargs": va}})
+    msg = str(ei.value)
+    assert "model 'app_fmt'" in msg and "`varargs.first_index` is required" in msg, msg
+
+
+@pytest.mark.parametrize("field,model", [
+    ("continuation.null_arg", {"propagates": [{"from": "*arg:0", "to": "ret"}],
+                               "continuation": {"null_arg": None}}),
+    ("max_from_arg", {"propagates": [{"from": "*arg:0", "to": "ret"}],
+                      "return_bound": {"max_from_arg": None}}),
+    ("first_dest", {"sink": {"class": "c", "format_arg": 1, "first_dest": None}}),
+    ("append.dest", {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                     "append": {"dest": None, "src": 1}}),
+    ("ret_offset.count_arg", {"propagates": [{"from": "arg:0", "to": "ret"}],
+                              "ret_offset": {"count_arg": None}}),
+])
+def test_a_present_required_index_is_never_null(field, model):
+    with pytest.raises(tm.TaintError, match=field.replace(".", r"\.")):
+        tm.load_models(extra={"app_fn": model})
+
+
+def test_optional_sink_indices_may_be_null():
+    # `len_arg`, `buf_arg`, `format_arg` and `pointer_args` are optional; the
+    # engine reads a null as absent, so null stays accepted.
+    ok = tm.load_models(extra={"app_send": {"sink": {
+        "class": "net_write", "tainted_args": [1], "len_arg": None, "buf_arg": None,
+        "format_arg": None, "pointer_args": None}}})
+    assert ok["app_send"]["sink"]["len_arg"] is None

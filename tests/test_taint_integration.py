@@ -5539,3 +5539,71 @@ __attribute__((noinline)) void call_model_emit(size_t input) { model_emit(input)
         assert "model 'model_emit'" in out and "`propagates.to`" in out, out
         assert "non-negative decimal argument index" in out, out
         assert "Traceback" not in out and "internal error" not in out, out
+
+
+def test_scanf_optional_slots_and_repeated_contexts_on_real_bn(tmp_path, shared_bn):
+    """Round-2 review. (F3) A fully recovered sscanf call has no missing
+    output: the builtin model's unrolled `*arg:2..5` slots past the call are
+    optional varargs. Only a format proving more destinations than recovered
+    is a boundary. (F4) One missing output reached through two argument
+    contexts of the same callee site is ONE leaf with both sources."""
+    src = tmp_path / "scan_ctx.c"
+    src.write_text("""
+#include <stdio.h>
+extern void split_emit(const char *a, const char *b);
+__attribute__((noinline)) int parse_none(const char *s) { return sscanf(s, "token"); }
+__attribute__((noinline)) int parse_one(const char *s) { int a; return sscanf(s, "%d", &a); }
+__attribute__((noinline)) int parse_two(const char *s) { int a, b; return sscanf(s, "%d %d", &a, &b); }
+__attribute__((noinline)) int parse_four(const char *s) {
+    int a, b, c, d; return sscanf(s, "%d %d %d %d", &a, &b, &c, &d);
+}
+__attribute__((noinline)) int child(const char *a, const char *b) { split_emit(a, b); return 0; }
+__attribute__((noinline)) int repeated_contexts(const char *s) {
+    return child(s, "clean") + child("clean", s);
+}
+""")
+    binary = tmp_path / "scan_ctx.so"
+    _compile(src, binary, ["-shared", "-fPIC", "-fno-inline", "-Wno-format"])
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn, *extra):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                        "--source", "param:0", *extra)
+
+    for fn in ("parse_none", "parse_one", "parse_two", "parse_four"):
+        result = forward(fn)
+        kinds = [lf["kind"] for lf in result["leaves"]]
+        assert "model_destination_unrecovered" not in kinds, (fn, result["leaves"])
+        assert "format_destination_unrecovered" not in kinds, (fn, result["leaves"])
+
+    models = tmp_path / "split.json"
+    models.write_text(json.dumps({"split_emit": {"propagates": [
+        {"from": "arg:0", "to": "*arg:6"}, {"from": "arg:1", "to": "*arg:6"}]}}))
+    result = forward("repeated_contexts", "--models", str(models))
+    leaves = [lf for lf in result["leaves"] if lf["kind"] == "model_destination_unrecovered"]
+    assert len(leaves) == 1, leaves
+    assert [s["from"] for s in leaves[0]["sources"]] == ["arg:0", "arg:1"], leaves
+    assert result["diagnostics"]["frontier"]["by_kind"]["model_destination_unrecovered"] == 1
+
+
+def test_null_varargs_index_is_refused_by_the_cli(tmp_path, shared_bn):
+    """Round-2 review: `varargs.first_index: null` loaded, then crashed the
+    walk. It is refused at load, by forward and by the catalog alike."""
+    src = tmp_path / "fmt.c"
+    src.write_text("""
+#include <stddef.h>
+extern void app_fmt(char *out, const char *fmt, ...);
+__attribute__((noinline)) void call_fmt(const char *s) { char b[16]; app_fmt(b, "%s", s); }
+""")
+    binary = tmp_path / "fmt.so"
+    _compile(src, binary, ["-shared", "-fPIC", "-fno-inline"])
+    target = shared_bn.load(binary, copy=False)
+    models = tmp_path / "bad.json"
+    models.write_text(json.dumps({"app_fmt": {"varargs": {"first_index": None, "to": "*arg:0"}}}))
+    for command in (("taint", "forward", "-f", "call_fmt", "--source", "param:0"),
+                    ("taint", "models", "--role", "propagator")):
+        res = shared_bn.run("-t", target, *command, "--models", str(models))
+        out = res.stderr + res.stdout
+        assert res.returncode == 2, (command, res.returncode, out)
+        assert "model 'app_fmt'" in out and "`varargs.first_index` is required" in out, out
+        assert "Traceback" not in out and "internal error" not in out, out

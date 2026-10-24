@@ -360,8 +360,11 @@ def _validate_model_arguments(name: str, model: dict[str, Any], source: str) -> 
     if "varargs" in model:
         va = _need_obj("varargs", model["varargs"])
         _need_token("varargs.to", va.get("to"), ("arg", "*arg", "ret", "*ret"))
-        if va.get("first_index") is not None:
-            _need_index("varargs.first_index", va["first_index"])
+        # Required: the engine starts the varargs run here, and a missing or
+        # null index crashed the walk (round-2 review).
+        if model_arg_index(va.get("first_index")) is None:
+            _fail("`varargs.first_index` is required: the first argument the varargs run "
+                  f"reads, {index}; got {va.get('first_index', '<missing>')!r}")
     if "continuation" in model:
         _need_index("continuation.null_arg", _need_obj("continuation", model["continuation"]).get("null_arg"))
     for field in ("writes", "reads_dest"):

@@ -382,6 +382,61 @@ class _SalvageList(list):
         super().extend(items)
         self._keep.extend(items)
 
+    def __setitem__(self, index: Any, item: Any) -> None:
+        # A merged leaf replaces its earlier copy in the run; the buffer keeps
+        # both and the result assembly collapses them (`merge_unrecovered_leaves`).
+        super().__setitem__(index, item)
+        self._keep.append(item)
+
+
+_UNRECOVERED = "model_destination_unrecovered"
+
+
+def _unrecovered_key(leaf: dict[str, Any]) -> tuple:
+    """One missing output: the call site, the callee and the declared destination."""
+    cal = leaf.get("callee") if isinstance(leaf.get("callee"), dict) else {}
+    return (leaf.get("address"), cal.get("address") or cal.get("name"), leaf.get("destination"))
+
+
+def _source_order(src: Any) -> tuple:
+    if not isinstance(src, dict):
+        return ("~", repr(src), "")
+    return (str(src.get("from")), str(src.get("tainted")), str(src.get("continued_from") or ""))
+
+
+def _add_leaf(leaves: list, leaf: Any, *, dedupe: bool = True) -> None:
+    """Add *leaf* to *leaves*. A ``model_destination_unrecovered`` boundary
+    whose (call site, callee, destination) is already present is the SAME
+    missing output reached again -- from another source, rule or descended
+    argument context -- so its sources merge, in a stable order, into a COPY
+    of the present leaf: the earlier object may be shared with a cached callee
+    summary or another callsite's ``by_source`` row, which must not acquire
+    evidence it did not observe. Other leaves are appended unless an equal one
+    is present (``dedupe``) or always (``dedupe=False``)."""
+    if isinstance(leaf, dict) and leaf.get("kind") == _UNRECOVERED:
+        key = _unrecovered_key(leaf)
+        for i, lf in enumerate(leaves):
+            if isinstance(lf, dict) and lf.get("kind") == _UNRECOVERED and _unrecovered_key(lf) == key:
+                merged = list(lf.get("sources") or [])
+                for src in leaf.get("sources") or []:
+                    if src not in merged:
+                        merged.append(src)
+                merged.sort(key=_source_order)
+                if merged != lf.get("sources"):
+                    leaves[i] = {**lf, "sources": merged}
+                return
+    if not dedupe or leaf not in leaves:
+        leaves.append(leaf)
+
+
+def merge_unrecovered_leaves(leaves: list) -> list:
+    """*leaves* with every repeated missing-output boundary collapsed into one
+    (see :func:`_add_leaf`); every other leaf is kept as it is, in order."""
+    out: list = []
+    for lf in leaves:
+        _add_leaf(out, lf, dedupe=False)
+    return out
+
 
 class TaintEngine:
     def __init__(
@@ -2981,8 +3036,9 @@ class TaintEngine:
                     if fi is not None and fi < len(params) and fi not in from_idxs:
                         from_idxs.append(fi)
             va = model.get("varargs")
-            if va is not None and _try_arg_index(str(va.get("to") or "")) in hit:
-                for fi in range(max(int(va.get("first_index", 0)), 0), len(params)):
+            if isinstance(va, dict) and _try_arg_index(str(va.get("to") or "")) in hit \
+                    and model_arg_index(va.get("first_index")) is not None:
+                for fi in range(va["first_index"], len(params)):
                     if fi not in from_idxs:
                         from_idxs.append(fi)
             is_source = any(
@@ -3668,6 +3724,9 @@ class TaintEngine:
                    "assumptions": [
                 f"analysis of {func.name} truncated: Python recursion limit reached "
                 "while propagating taint (possible unresolved cycle); results incomplete"]}
+        # A missing output reached from several contexts (or kept twice by the
+        # recursion salvage) is ONE boundary with merged sources.
+        sub["leaves"] = merge_unrecovered_leaves(sub["leaves"])
         # collapse any duplicate sink reports (same callee/site/arg) that distinct
         # resolved targets or arg-set growth may have produced
         seen_sink: set[tuple] = set()
@@ -3855,8 +3914,7 @@ class TaintEngine:
             findings.append(f)
         leaves: list[dict[str, Any]] = []
         for lf in union_leaves:
-            if lf not in leaves:
-                leaves.append(lf)
+            _add_leaf(leaves, lf)
         assumptions: list[str] = []
         for a in union_assumptions:
             if a not in assumptions:
@@ -6036,7 +6094,7 @@ class TaintEngine:
         n = None if length is None else self._int_const(params[length]) \
             if length < len(params) else None
         append = (model or {}).get("append")
-        if isinstance(append, dict) and int(append.get("dest", -1)) == idx:
+        if isinstance(append, dict) and model_arg_index(append.get("dest")) == idx:
             # An append writes AT THE TERMINATOR it finds, so its count is
             # not a footprint from the base: `strncat(g, s, 1)` put a
             # tainted byte at +64 in a 64-character string, and recording
@@ -9035,9 +9093,9 @@ class TaintEngine:
             _co = (_cmodel or {}).get("continuation")
             if _co is None:
                 continue
-            _ci = int(_co.get("null_arg", 0))
+            _ci = model_arg_index(_co.get("null_arg", 0))
             _cp = self._call_params(_cand)
-            if _ci < len(_cp) and self._int_const(_cp[_ci]) != 0:
+            if _ci is not None and _ci < len(_cp) and self._int_const(_cp[_ci]) != 0:
                 reset_candidates.setdefault(_ckey or _cname or "?", []).append(
                     (int(getattr(_cand, "address", 0)), _cand, _cp, _ci))
 
@@ -9571,23 +9629,34 @@ class TaintEngine:
                 di = _try_arg_index(dest_tok)
                 if di is None or di < len(params):
                     return
+                if model.get("arity_capped"):
+                    # An arity-capped model unrolls OPTIONAL slots (sscanf's
+                    # `*arg:2..5`): a rule past the call's arguments names a
+                    # destination this call need not have, not one BN dropped.
+                    # What says an argument exists is the call's own constant
+                    # format; when it writes more destinations than were
+                    # recovered, that shortfall is the boundary (#1050 round 8).
+                    short = self._format_destination_shortfall(
+                        ins, ssaf, mkey or name or "?", model, params)
+                    if short is not None and short not in leaves:
+                        leaves.append(short)
+                    return
                 taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
                 callee_ref = hex(int(taddr)) if taddr is not None else None
                 at = hex(addr)
+                callee = str(name or mkey or "?")
                 src = {"from": str(src_tok), "tainted": node_label(hit, why)}
                 if continued_from is not None:
                     # A continuation call reads no argument for this: the
                     # source is the state an earlier call set.
                     src["continued_from"] = hex(int(continued_from))
-                for lf in leaves:
-                    if (lf.get("kind") == "model_destination_unrecovered"
-                            and lf.get("address") == at and lf.get("destination") == dest_tok
-                            and (lf.get("callee") or {}).get("address") == callee_ref):
-                        if src not in lf["sources"]:
-                            lf["sources"].append(src)
-                        return
+                probe = {"kind": _UNRECOVERED, "address": at, "destination": dest_tok,
+                         "callee": {"name": callee, "address": callee_ref}, "sources": [src]}
+                if any(isinstance(lf, dict) and lf.get("kind") == _UNRECOVERED
+                       and _unrecovered_key(lf) == _unrecovered_key(probe) for lf in leaves):
+                    _add_leaf(leaves, probe)    # merges the source into a copy
+                    return
                 variadic, advice = self._arg_recovery_advice(taddr)
-                callee = str(name or mkey or "?")
                 fn_ref = hex(int(getattr(func, "start", 0)))
                 leaves.append({
                     "kind": "model_destination_unrecovered",
@@ -10293,8 +10362,8 @@ class TaintEngine:
             # params, so no format-string parsing is needed; arg_taint already covers
             # both a tainted scalar (%d) and a pointer to a tainted buffer (%s).
             va = model.get("varargs")
-            if va is not None:
-                base = int(va.get("first_index", 0))
+            base = model_arg_index((va or {}).get("first_index")) if isinstance(va, dict) else None
+            if base is not None:
                 vto = va.get("to")
                 vsink = model.get("sink") if va.get("sink") else None
                 eff_vsink = vsink
@@ -10625,8 +10694,9 @@ class TaintEngine:
                             for f in d["findings"]:
                                 findings.append(_tag_unconditional_flow(f, d.get("handoff_node") or []))
                             for lf in d["leaves"]:
-                                if lf not in leaves:
-                                    leaves.append(lf)
+                                # One callee site reached from several argument
+                                # contexts is one missing output (round-2 review).
+                                _add_leaf(leaves, lf)
                             for a in d["assumptions"]:
                                 add_assumption(a)
                             ret_tainted = ret_tainted or d["reached_return"]
