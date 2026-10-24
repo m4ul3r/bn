@@ -4999,6 +4999,21 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"dropped arg(s) {_field_list(leaf, 'dropped_args')})"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
+    if kind == "unread_callee_body":
+        cal = _field_dict(leaf, "callee")
+        args = _field_list(leaf, "tainted_args")
+        via = leaf.get("via")
+        return (
+            f"  unread_callee_body @ {leaf.get('address')}"
+            f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
+            + (f"  (via {via})" if via else "")
+            + f"  (tainted arg(s) {args}; {leaf.get('skip_reason', '?')}"
+            # Whether a model covered the call is the POINT of this leaf: the
+            # overlay is exactly what used to hide the unread body, so a reader
+            # must see both facts on the one row (IC05).
+            + ("; modeled" if leaf.get("modeled") else "") + ")"
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+        )
     if kind == "global_memory_continuation":
         cal = _field_dict(leaf, "callee")
         glob = _field_dict(leaf, "global")
@@ -5088,6 +5103,11 @@ def _leaf_group_key(leaf: Any) -> tuple:
         return (kind, str(leaf.get("base")), str(leaf.get("offset")))
     if kind == "arg_under_recovered":
         return (kind, str(_field_dict(leaf, "callee").get("name", "?")))
+    if kind == "unread_callee_body":
+        # One unread body reached at one call site is ONE hole, however many
+        # tainted-argument contexts the fixpoint reached it from.
+        return (kind, str(leaf.get("address")),
+                str(_field_dict(leaf, "callee").get("address")))
     if kind == "global_memory_continuation":
         # The global IS the identity here: two calls that hand two different
         # globals past the walk are two boundaries an agent must chase

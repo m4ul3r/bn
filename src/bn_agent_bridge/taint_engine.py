@@ -5301,6 +5301,79 @@ class TaintEngine:
             return "Binary Ninja produced no MLIL for it"
         return None
 
+    def _unread_body_target(self, cfn: Any, resolved: Any | None) -> tuple[Any, str] | None:
+        """The in-binary body this call RUNS that Binary Ninja MEASURED and
+        declined to analyse.
+
+        ``(function, reason)`` for the first of the thunk-resolved target and
+        the call's own target BN skipped (an oversized body past
+        ``analysis.limits.maxFunctionSize``, a failed lift it measured), else
+        None. The resolved target comes first because a veneer's own name
+        (``j_huge_body``) is not the function whose body went unread, and the
+        result names what an agent would have to analyse.
+
+        ``no_mlil`` is deliberately NOT one of these, exactly as on the global
+        continuation path (IC03 round 2): a function record with no body at all
+        is the EXTERNAL machinery's degenerate shape -- BN measured nothing --
+        and claiming an unread in-binary body there would mark every modeled
+        external call incomplete. It keeps the treatment it already had: named
+        for what it is, and recorded, on the unmodeled arm (#1001 item 3/#811).
+        """
+        for fn in (resolved, cfn):
+            if fn is None:
+                continue
+            reason = str(self._not_internal_reason(fn) or "")
+            if reason.startswith("analysis_skipped:"):
+                return fn, reason
+        return None
+
+    def _unread_body_leaf(self, ins: Any, fn: Any, reason: str,
+                          tainted_args: Any, *, via_name: str | None,
+                          modeled: bool) -> dict[str, Any]:
+        """The blocking frontier for tainted arguments entering an in-binary
+        body Binary Ninja did not analyse (IC05 / BN6-C008).
+
+        Body coverage is a property of the BINARY, never of the model DB: a
+        model is an overlay on a body, and a truthful partial overlay
+        (``arg:0 -> ret``) states one relation without establishing that the
+        rest of the body was read. The leaf is therefore emitted whether or
+        not a model covers this call, and says which of the two it is, so a
+        reader is never told the overlay settled the question.
+        """
+        at = hex(int(getattr(fn, "start", 0)))
+        name = str(getattr(fn, "name", None) or self._callee_name(int(getattr(fn, "start", 0)))
+                   or at)
+        # `reason` is always a measured skip here (`_unread_body_target` admits
+        # nothing else), so the phrase and the prose name are both total.
+        phrase = self._unanalysed_body_phrase(reason)
+        args = sorted(tainted_args)
+        shown = self._prose_function(fn)
+        through = (f" through {self._prose_name(via_name)}" if via_name else "")
+        overlay = (" a model describes this call, but a model is an overlay on a body, "
+                   "not a substitute for reading one, so what else this body does with "
+                   "the bytes is unknown;" if modeled else "")
+        return {
+            "kind": "unread_callee_body",
+            "address": hex(int(getattr(ins, "address", 0))),
+            "callee": {"name": name,
+                       "display_name": _display_name(fn) or name,
+                       "address": at},
+            # The raw `_not_internal_reason` string, so a consumer can tell an
+            # oversized body from a failed lift without parsing prose.
+            "skip_reason": reason,
+            # Whether a model matched this call. A consumer that sees only the
+            # overlay's positive effects must still see that the body behind
+            # them was never read.
+            "modeled": bool(modeled),
+            "via": str(via_name) if via_name else None,
+            "tainted_args": args,
+            "il_text": str(ins),
+            "detail": (f"tainted argument(s) {args} enter in-binary {shown} @ {at}"
+                       f"{through}, and {phrase} -- its body was never examined, so what "
+                       f"it does with those bytes is UNKNOWN, not clear;{overlay} "
+                       f"re-run after `bn decompile {at} --force-analysis` (may be slow)"),
+        }
+
     def _thunk_tail_targets(self, fn: Any) -> list[Any]:
         """Every function a thunk tail-calls, found on ANY of its instructions
         and in instruction order -- `follow_thunk` only takes a one-instruction
@@ -10693,7 +10766,7 @@ class TaintEngine:
                         # resolved candidate carries a model -- stopping at the veneer
                         # and minting the same false all-clear #807 is about. Descent is
                         # independent of the model: following never costs a model.
-                        rnm = rmk = rmd = None
+                        rnm = rmk = rmd = resolved = None
                         descend_fn = cfn
                         descend_internal = cfn_internal
                         if cfn is not None and not cfn_internal:
@@ -10802,7 +10875,13 @@ class TaintEngine:
                             # (oversized, failed lift) lands here too, and is not
                             # "external". Name it as what it is, with the remedy,
                             # and record it as an unread body (#811). The phrase
-                            # keeps "has no model": taint_result's gate keys on it.
+                            # keeps "has no model": taint_result's gate keys on
+                            # it. This arm still owns the `no_mlil` shape, which
+                            # only EXISTS as an in-binary body when nothing
+                            # modeled the name (see `_unread_body_target`); the
+                            # measured skip below is recorded whether or not a
+                            # model matched, and adding the same name twice to a
+                            # set is a no-op.
                             _reason = self._not_internal_reason(descend_fn)
                             _unread = self._unanalysed_body_phrase(_reason)
                             _who = nm or hex(taddr)
@@ -10874,6 +10953,43 @@ class TaintEngine:
                                 }
                                 if _stop_leaf not in leaves:
                                     leaves.append(_stop_leaf)
+                        # IC05 / BN6-C008: BODY COVERAGE IS INDEPENDENT OF THE
+                        # MODEL DB. The arm above runs only when NOTHING in the
+                        # chain is modeled, so any matching overlay -- a
+                        # truthful `arg:0 -> ret`, an empty `{}`, a reflexive
+                        # rule that states nothing -- erased the unread-body
+                        # accounting and turned an analysis_incomplete,
+                        # non-clear answer into a complete all-clear. A model is
+                        # an overlay on a body (#807): it states what it states
+                        # and never establishes that Binary Ninja read the rest
+                        # of the body. IC03 settled exactly this for the
+                        # tainted-GLOBAL continuation (BN21-REACH-01); this is
+                        # the tainted-ARGUMENT descent it left alone.
+                        #
+                        # Resolution, not model lookup, decides: a veneer is
+                        # followed to the body it fronts (which the arm above
+                        # never classified either, so an unmodeled thunk onto a
+                        # skipped body read as a plain external), an import has
+                        # no in-binary implementation and is never named here,
+                        # and a descended body is read rather than disclosed.
+                        # DISCLOSURE ONLY: the model's propagation and return
+                        # semantics were applied above and are left exactly as
+                        # they are, and nothing is invented for a body nobody
+                        # read.
+                        if not descend_internal:
+                            _unread_target = self._unread_body_target(cfn, resolved)
+                            if _unread_target is not None:
+                                _ufn, _ureason = _unread_target
+                                _uleaf = self._unread_body_leaf(
+                                    ins, _ufn, _ureason, tainted_args,
+                                    # The veneer is named only when the body it
+                                    # fronts is a DIFFERENT function; the name
+                                    # recorded is always the body's own, which
+                                    # is the function an agent must analyse.
+                                    via_name=(nm if _ufn is not cfn else None),
+                                    modeled=(md is not None or rmd is not None))
+                                self._analysis_incomplete.add(str(_uleaf["callee"]["name"]))
+                                _add_leaf(leaves, _uleaf)
                         # EXACTLY ONE entry per resolved CANDIDATE, so the append
                         # sits after the branch chain rather than in each arm. Base
                         # appended through three mutually-exclusive branches; the two

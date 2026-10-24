@@ -2738,6 +2738,148 @@ def test_a_partial_model_never_buys_off_an_unread_body(tmp_path, shared_bn):
             assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
+_IC05_SRC = r"""
+/* IC05 / BN6-C008: public synthetic, analyze only, never execute. */
+#include <stddef.h>
+#include <string.h>
+#define N __attribute__((noinline, noipa))
+/* A single tail jump even in this -O0 build, so Binary Ninja marks it a thunk
+   the way it marks a real PLT/veneer stub. */
+#define TAIL __attribute__((noinline, noipa, optimize("O2")))
+
+extern int system(const char *);
+char scratch[256];
+
+/* Padded past analysis.limits.maxFunctionSize, so Binary Ninja MEASURES this
+   body and declines to analyse it; its tail is a truthful identity return,
+   which is exactly what the overlay below states and all it states. */
+N long unread_body(long token) {
+    __asm__ volatile(".rept 70000\n nop\n .endr\n");
+    return token;
+}
+TAIL long unread_thunk(long token) { return unread_body(token); }
+TAIL long unread_multihop(long token) { return unread_thunk(token); }
+N long wrap_unread(long token) { long r = unread_body(token); return r + 3; }
+N long analysed_body(long token) { system((const char *)token); return token; }
+
+N long call_unread(long token) { long r = unread_body(token); return r + 1; }
+N long call_thunk(long token) { long r = unread_thunk(token); return r + 1; }
+N long call_multihop(long token) { long r = unread_multihop(token); return r + 1; }
+N long call_wrapper(long token) { long r = wrap_unread(token); return r + 1; }
+N long call_analysed(long token) { long r = analysed_body(token); return r + 1; }
+N long call_import(long token) { memset(scratch, (int)token, 16); return token; }
+long (*volatile hook)(long) = unread_body;
+N long call_indirect(long token) { long r = hook(token); return r + 1; }
+
+int main(int argc, char **argv) {
+    (void)argv;
+    return (int)(call_unread(argc) + call_thunk(argc) + call_multihop(argc)
+                 + call_wrapper(argc) + call_analysed(argc) + call_import(argc)
+                 + call_indirect(argc));
+}
+"""
+
+
+def test_a_matching_model_never_certifies_an_unread_argument_callee(tmp_path, shared_bn):
+    """IC05 / BN6-C008 on a real build: the tainted-ARGUMENT descent path.
+
+    BN21-REACH-01 closed this question for tainted GLOBALS (IC03). On the
+    argument path the unread-body accounting still sat inside the branch that
+    runs only when nothing in the call chain is modeled, so ANY matching entry
+    -- a truthful `arg:0 -> ret`, an empty `{}`, a reflexive rule that states
+    nothing -- turned `analysis_incomplete` off and the all-clear on, for a
+    body Binary Ninja never read. Body coverage is a property of the binary.
+    """
+    src = tmp_path / "ic05_unread.c"
+    src.write_text(_IC05_SRC)
+    binary = tmp_path / "ic05_unread"
+    _compile(src, binary, ["-fno-builtin"])
+    overlays = {
+        "partial": {"unread_body": {"propagates": [{"from": "arg:0", "to": "ret"}]}},
+        "empty-entry": {"unread_body": {}},
+        # Accepted, but states no coverage and no return relation at all.
+        "irrelevant": {"unread_body": {"propagates": [{"from": "arg:0", "to": "arg:0"}]}},
+    }
+    files = {}
+    for label, doc in overlays.items():
+        path = tmp_path / f"{label}.json"
+        path.write_text(json.dumps(doc))
+        files[label] = ("--models", str(path))
+    files["no-model"] = ()
+    target = shared_bn.load(binary, copy=False)
+
+    body = _resolve_addr(shared_bn, "unread_body")
+    skipped = _bn_json(shared_bn, "-t", target, "decompile", body)
+    # The falsification bar: a real in-binary FunctionSymbol whose MLIL is
+    # absent because BN measured the body and skipped it -- not an import.
+    assert skipped["analysis_skipped"] is True, skipped
+    assert _bn_json(shared_bn, "-t", target, "function", "info",
+                    body)["imported"] is False, body
+
+    pin = tmp_path / "ic05_rmap.json"
+    pin.write_text(json.dumps(
+        {_indirect_call_addr(shared_bn, "call_indirect", "ic05"): [body]}))
+    routes = {
+        "call_unread": None,
+        "call_thunk": "unread_thunk",
+        "call_multihop": "unread_multihop",
+        "call_wrapper": None,
+        "call_indirect": None,
+    }
+
+    for fn, via in routes.items():
+        pinned = ("--resolve-map", str(pin)) if fn == "call_indirect" else ()
+        for label, extra in files.items():
+            result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                              "--source", "param:0", "--max-depth", "16",
+                              *extra, *pinned)
+            where = (fn, label)
+            assert result["stats"]["analysis_incomplete"] is True, (where, result["stats"])
+            # The BODY is named on every route; a veneer is not the function
+            # an agent has to analyse.
+            assert result["stats"]["analysis_incomplete_functions"] == ["unread_body"], where
+            assert result["diagnostics"]["safe_to_report_all_clear"] is False, where
+            [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "unread_callee_body"]
+            assert leaf["callee"]["name"] == "unread_body", (where, leaf)
+            assert leaf["callee"]["address"] == body, (where, leaf)
+            assert leaf["skip_reason"] == "analysis_skipped:ExceedFunctionSizeSkipReason", leaf
+            assert leaf["tainted_args"] == [0], (where, leaf)
+            assert leaf["modeled"] is (label != "no-model"), (where, leaf)
+            assert leaf["via"] == via, (where, leaf)
+
+    # An import has no in-binary implementation, so there is nothing
+    # incomplete about not reading one.
+    imported = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "call_import",
+                        "--source", "param:0", *files["partial"])
+    assert imported["stats"]["analysis_incomplete"] is False, imported["stats"]
+    assert imported["diagnostics"]["safe_to_report_all_clear"] is True, imported
+
+    # A fully analysed body stays descended and authoritative: only the
+    # descent finds the `system` call inside it.
+    analysed = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "call_analysed",
+                        "--source", "param:0", *files["partial"])
+    assert analysed["stats"]["analysis_incomplete"] is False, analysed["stats"]
+    assert any(s["sink"]["callee"] == "system" for s in analysed["reached_sinks"]), analysed
+
+    # Text mode carries the same two facts, and the printed advice runs as
+    # printed -- then the body IS read, and the boundary is gone. The
+    # disclosure is about coverage, not a gate that can never be satisfied.
+    modeled = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "call_unread",
+                       "--source", "param:0", *files["partial"])
+    text = shared_bn.run("-t", target, "taint", "forward", "-f", "call_unread",
+                         "--source", "param:0", *files["partial"], "--verbose")
+    assert text.returncode == 0, text.stderr
+    assert "NOTE: analysis incomplete" in text.stdout, text.stdout
+    assert "unread_callee_body @" in text.stdout, text.stdout
+
+    ran, _templates = _run_or_check_template(shared_bn, _forward_prose(modeled))
+    assert ran, _forward_prose(modeled)
+    reread = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "call_unread",
+                      "--source", "param:0", *files["partial"], timeout=300.0)
+    assert reread["stats"]["analysis_incomplete"] is False, reread["stats"]
+    assert [lf for lf in reread["leaves"] if lf["kind"] == "unread_callee_body"] == []
+
+
 _OVERLAP_SRC = r"""
 #include <stdio.h>
 #include <stdlib.h>

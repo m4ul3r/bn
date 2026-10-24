@@ -140,6 +140,14 @@ BLOCKING_LEAF_KINDS = frozenset({
     # the rest was never walked -- so the run is explicitly a frontier, not a
     # short clean answer.
     "analysis_truncated",
+    # IC05 / BN6-C008: tainted arguments entered an in-binary callee whose
+    # body Binary Ninja never analysed (oversized past
+    # analysis.limits.maxFunctionSize, or a lift that produced no MLIL). The
+    # call RESOLVED -- this is not an unresolved target -- but nothing read
+    # what the body does with the bytes, so an empty reached_sinks past it is
+    # an absence of evidence. Emitted whether or not a model covers the call:
+    # a model is an overlay on a body, never a substitute for reading one.
+    "unread_callee_body",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -377,6 +385,28 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         return (f"{head}. Reseeding with arg: or call: keys the same pointer and "
                 f"fails the same way; seed a value read from the buffer (var:) or "
                 f"the consuming parser's parameter (param:) instead")
+    unread = [lf for lf in leaves if lf.get("kind") == "unread_callee_body"]
+    if unread:
+        # IC05: the one zero-sink frontier whose remedy CHANGES the next run's
+        # answer -- Binary Ninja never analysed the body, so analysing it and
+        # re-running is the whole fix. It leads because seeding inside a body
+        # that has no MLIL cannot work, and because a model on the name does
+        # not make the advice unnecessary: the overlay is what hid the hole.
+        at = sorted({str((lf.get("callee") or {}).get("address")) for lf in unread
+                     if isinstance(lf.get("callee"), dict)})
+        who = ", ".join(sorted({str((lf.get("callee") or {}).get("display_name")
+                                    or (lf.get("callee") or {}).get("name") or "?")
+                                for lf in unread if isinstance(lf.get("callee"), dict)}))
+        reads = ", ".join(f"`bn decompile {a} --force-analysis`" for a in at if a != "None")
+        overlaid = any(lf.get("modeled") for lf in unread)
+        note = (" A model describes the call, which states what it states and does "
+                "not establish that the body was read."
+                if overlaid else "")
+        return (f"no sink reached, but tainted arguments entered in-binary callee(s) "
+                f"Binary Ninja did not analyse ({who}); their bodies were never "
+                f"examined, so what they do with the bytes is unknown, not clear."
+                f"{note} Analyse them and re-run this query"
+                + (f" ({reads}; may be slow)" if reads else ""))
     callbacks = [lf for lf in leaves if lf.get("kind") == "indirect_call_unchecked"]
     if callbacks and all(lf.get("kind") in ("indirect_call_unchecked", "format_unchecked")
                          for lf in leaves):
@@ -594,7 +624,12 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     # BN6-C009: a declared destination the call does not carry is an
     # unresolved write, so it is counted with the unresolved frontier -- but
     # its callee IS modeled, so it never reads as "an unmodeled call reached".
-    unresolved_n = unmodeled_n + by_kind.get("model_destination_unrecovered", 0)
+    # IC05/BN6-C008 is counted the same way and for the same reason: a callee
+    # body nobody read is a hole in the frontier, but the call RESOLVED and a
+    # model may well describe it, so it must not claim an unmodeled call was
+    # reached.
+    unresolved_n = (unmodeled_n + by_kind.get("model_destination_unrecovered", 0)
+                    + by_kind.get("unread_callee_body", 0))
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
     seed_misanchored_n = sum(by_kind.get(k, 0) for k in _SEED_MISANCHORED_KINDS)
     # An external callee with no taint model returns conservatively tainted
