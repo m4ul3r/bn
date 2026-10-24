@@ -778,32 +778,44 @@ def test_a_tail_call_into_an_unread_body_is_the_same_boundary(overlay):
 # F5: the same evidence for an ANALYSED callee -- a frontier, not an argument
 # --------------------------------------------------------------------------
 
-def _under_recovered_setup(monkeypatch, *, reads_input=True, proven=True,
-                           tainted_value=True):
+def _under_recovered_setup(monkeypatch, *, reads_input=True, proven=(0,),
+                           tainted_value=True, resolve_map=None, via_thunk=False):
     """A call whose MLIL carries no arguments into an ANALYSED callee whose
-    recovered arity is short of the convention's argument registers."""
+    recovered arity is short of the convention's argument registers.
+
+    ``proven`` names the argument indices whose register the IL can answer
+    for; the engine decides which of those actually carry taint.
+    """
     p = FVar("p", ident=40)
     p0 = FSSA(p, 0)
     callee = FFunc("consumer", ANALYSED, FSSAFunc([
         FInstr(0, ANALYSED + 4, "MLIL_RET", "return", reads=[], src=[])]), params=[])
     callee.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi"])
+    funcs = {ANALYSED: callee}
+    names = {ANALYSED: "consumer"}
+    target = ANALYSED
+    if via_thunk:
+        funcs[VENEER] = _veneer("j_consumer", VENEER, ANALYSED)
+        names[VENEER] = "j_consumer"
+        target = VENEER
     call = FInstr(0, CALL, "MLIL_CALL_SSA", "consumer()", reads=[], writes=[],
-                  dest=_ptr(ANALYSED), params=[])
+                  dest=_ptr(target), params=[])
     call.il_basic_block = []
     entry = FFunc("caller", ENTRY, FSSAFunc([call]), params=[p])
     entry.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi"])
-    bv = FBV({ANALYSED: "consumer"}, funcs={ANALYSED: callee})
+    bv = FBV(names, funcs=funcs)
     bv.arch = types.SimpleNamespace(get_reg_index=lambda r: {"rdi": 0, "rsi": 1}[r])
     bv.platform = types.SimpleNamespace(
         default_calling_convention=types.SimpleNamespace(int_arg_regs=["rdi", "rsi"]))
-    engine = te.TaintEngine(bv, te.load_models())
+    engine = te.TaintEngine(bv, te.load_models(), resolve_map=resolve_map or {})
     monkeypatch.setattr(engine, "_reg_reads_as_input",
                         lambda c, r: reads_input, raising=False)
     value = p0 if tainted_value else FSSA(FVar("other", ident=61), 1)
     monkeypatch.setattr(
         engine, "_abi_arg_operands",
-        lambda f, i, idx, allow_entry=False: (
-            [te._RegisterOperand(value, "rdi")] if proven and idx == 0 else []),
+        lambda f, i, idx, allow_entry=False, entry_only=False: (
+            [te._RegisterOperand(value, ["rdi", "rsi"][idx])]
+            if idx in proven else []),
         raising=False)
     return engine, entry
 
@@ -828,9 +840,52 @@ def test_an_unchanged_entry_register_an_analysed_callee_reads_is_a_frontier(monk
     assert result["reached_sinks"] == [], result
 
 
+def test_a_clean_first_missing_argument_does_not_hide_a_tainted_later_one(monkeypatch):
+    # Review F8: the scan stopped at the first missing register. A clean one
+    # there silently dropped a tainted argument behind it.
+    engine, entry = _under_recovered_setup(monkeypatch, proven=(1,))
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"] if lf.get("cause") == "arg_under_recovered"]
+    assert leaf["tainted_args"] == [1], leaf
+    assert leaf["register"] == "rsi", leaf
+    assert leaf["argument_index"] == 1, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_every_proven_missing_argument_lands_in_one_frontier(monkeypatch):
+    engine, entry = _under_recovered_setup(monkeypatch, proven=(0, 1))
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"] if lf.get("cause") == "arg_under_recovered"]
+    assert leaf["tainted_args"] == [0, 1], leaf
+    assert leaf["registers"] == ["rdi", "rsi"], leaf
+    assert [e["index"] for e in leaf["evidence"]] == [0, 1], leaf
+    assert all(e["via"] == "entry_value" for e in leaf["evidence"]), leaf
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"via_thunk": True},
+    {"resolve_map": {hex(CALL): [hex(ANALYSED)]}},
+], ids=["thunk", "resolve-map"])
+def test_a_routed_call_reaches_the_same_analysed_callee(monkeypatch, kwargs):
+    # Review F9: the check resolved only the direct target, so a veneer or an
+    # agent-pinned site reported an all-clear for the very same body.
+    if "resolve_map" in kwargs:
+        engine, entry = _under_recovered_setup(monkeypatch, **kwargs)
+        # An indirect site the value set cannot pin: only the map resolves it.
+        entry.mlil.ssa_form.instructions[0].dest = FExpr(
+            "MLIL_VAR_SSA", "hook#1", reads=[], possible_values=FPVS("Undetermined"))
+    else:
+        engine, entry = _under_recovered_setup(monkeypatch, **kwargs)
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"] if lf.get("cause") == "arg_under_recovered"]
+    assert leaf["callee"]["name"] == "consumer", leaf
+    assert leaf["argument_index"] == 0, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
 @pytest.mark.parametrize("kwargs, why", [
     ({"reads_input": False}, "the callee never consumes that register"),
-    ({"proven": False}, "nothing proves what the register holds"),
+    ({"proven": ()}, "nothing proves what the register holds"),
     ({"tainted_value": False}, "the register holds an untainted value"),
 ], ids=["not-consumed", "unproven", "untainted"])
 def test_the_under_recovery_frontier_does_not_fire_without_evidence(monkeypatch,
@@ -840,3 +895,122 @@ def test_the_under_recovery_frontier_does_not_fire_without_evidence(monkeypatch,
     assert [lf for lf in result["leaves"]
             if lf.get("cause") == "arg_under_recovered"] == [], why
     assert result["diagnostics"]["safe_to_report_all_clear"] is True, why
+
+
+# --------------------------------------------------------------------------
+# F6: the CFG closure must terminate on a loop
+# --------------------------------------------------------------------------
+
+class _WrappedBlock(_LBlock):
+    """A block whose predecessor edges hand back a FRESH Python object for the
+    same native block every time -- which is what Binary Ninja does."""
+
+    def __init__(self, instrs, index, incoming=()):
+        super().__init__(instrs)
+        self.index = index
+        self._incoming = list(incoming)
+
+    @property
+    def incoming_edges(self):
+        return [types.SimpleNamespace(source=_WrappedBlock(list(b), b.index,
+                                                           b._incoming))
+                for b in self._incoming]
+
+    @incoming_edges.setter
+    def incoming_edges(self, value):
+        self._incoming = [e.source for e in value]
+
+
+def test_the_cfg_closure_terminates_on_a_loop_of_fresh_wrappers():
+    # Review F6: BN materialises a new Python object for the same native block
+    # on every access, so deduping on `id()` walked one loop header forever.
+    header = _WrappedBlock([_lins(0, CALL - 16, _SET_OP, reg="rax")], index=0)
+    body = _WrappedBlock([_lins(1, CALL - 8, _SET_OP, reg="rax")], index=1,
+                         incoming=[header])
+    header._incoming = [body]          # a cycle, through fresh wrappers
+    call = _lins(2, CALL, _CALL_OP)
+    call_bb = _WrappedBlock([call], index=2, incoming=[body])
+    call.il_basic_block = call_bb
+
+    blocks, looped = te._taint_il_mod._reaching_blocks(call_bb)
+    assert sorted(b.index for b in blocks) == [0, 1], blocks
+    assert looped is False
+    # ...and the register still carries the entry value: nothing on the way in
+    # is a call.
+    assert te._taint_il_mod._entry_value_survives(call, _FAKE_BN) is True
+
+
+def test_a_call_anywhere_on_the_loop_refuses_the_entry_value():
+    header = _WrappedBlock([_lins(0, CALL - 16, _CALL_OP)], index=0)
+    body = _WrappedBlock([_lins(1, CALL - 8, _SET_OP, reg="rax")], index=1,
+                         incoming=[header])
+    header._incoming = [body]
+    call = _lins(2, CALL, _CALL_OP)
+    call_bb = _WrappedBlock([call], index=2, incoming=[body])
+    call.il_basic_block = call_bb
+    assert te._taint_il_mod._entry_value_survives(call, _FAKE_BN) is False
+
+
+def test_blocks_of_different_functions_are_different_blocks():
+    # The key is the owning function plus the block's own index: two functions
+    # both have a block 0, and collapsing them would lose a whole body.
+    def _bb(start, index):
+        block = _LBlock([])
+        block.index = index
+        block.function = types.SimpleNamespace(
+            source_function=types.SimpleNamespace(start=start))
+        return block
+
+    assert te._taint_il_mod._block_key(_bb(0x1000, 0)) \
+        != te._taint_il_mod._block_key(_bb(0x2000, 0))
+    assert te._taint_il_mod._block_key(_bb(0x1000, 0)) \
+        == te._taint_il_mod._block_key(_bb(0x1000, 0))
+
+
+# --------------------------------------------------------------------------
+# F7: a recovered PREFIX says nothing about the arguments past it
+# --------------------------------------------------------------------------
+
+def _prefix_program(*, entry_answers):
+    """`call_unread(p)`: `unread_body(0)` -- BN recovered argument 0 as a
+    constant and nothing else, while the seed rides argument 1."""
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    call = FInstr(0, CALL, "MLIL_CALL_SSA", "unread_body(0)", reads=[], writes=[],
+                  dest=_ptr(BODY), params=[FExpr("MLIL_CONST", "0", constant=0)])
+    entry = FFunc("call_unread", ENTRY, FSSAFunc([call]), params=[p])
+    entry.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi"])
+    body = _skipped("unread_body", BODY)
+    body.parameter_vars = [FVar("x", ident=96), FVar("y", ident=97)]
+    engine = te.TaintEngine(FBV({BODY: "unread_body"}, funcs={BODY: body}),
+                            te.load_models())
+    engine._abi_arg_operands = (
+        lambda f, i, idx, allow_entry=False, entry_only=False: (
+            [te._RegisterOperand(p0, "rsi")]
+            if idx == 1 and entry_only == entry_answers else []))
+    return engine, entry
+
+
+def test_a_tainted_argument_past_a_recovered_prefix_is_disclosed():
+    # Review F7: recovery was all-or-nothing, so a call BN recovered PART of
+    # -- a constant argument 0 with the seed riding argument 1 -- certified the
+    # unread body as complete and clear.
+    engine, entry = _prefix_program(entry_answers=True)
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+    [leaf] = _boundaries(result)
+    assert leaf["tainted_args"] == [1], leaf
+    assert leaf["abi_recovered_args"] == [1], leaf
+    assert result["stats"]["analysis_incomplete_functions"] == ["unread_body"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_written_register_past_a_recovered_prefix_is_not_an_argument():
+    # The must-not-fire twin, and the reason the leg is entry-only there: BN
+    # recovers from the registers WRITTEN at the call site, so a register past
+    # its prefix that the body writes is scratch as often as an argument -- at
+    # -O0 a compiler stages the second argument through `rdx` on its way to
+    # `rsi`, and reading that as "argument 2" invents one.
+    engine, entry = _prefix_program(entry_answers=False)
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+    assert _boundaries(result) == [], result["leaves"]
+    assert result["stats"]["analysis_incomplete"] is False, result["stats"]

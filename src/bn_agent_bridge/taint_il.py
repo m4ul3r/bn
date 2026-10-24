@@ -58,6 +58,62 @@ def _call_like_ops(bn: Any) -> set:
         "LLIL_TAILCALL_SSA")} - {None}
 
 
+# A backwards CFG closure visits at most this many blocks. The key below makes
+# the walk terminate on its own; the cap is the belt to that braces, so a view
+# whose blocks answer no stable key at all still cannot spin.
+_CFG_CLOSURE_BLOCKS = 4096
+
+
+def _block_key(block: Any) -> tuple:
+    """Stable identity for a basic block ACROSS the wrappers BN hands out.
+
+    Binary Ninja materialises a fresh Python object for the same native basic
+    block on every access, so `id()` identifies the wrapper, not the block: a
+    closure that dedupes on it revisits one loop header forever (review F6).
+    The native identity is the owning function plus the block's own index /
+    instruction range; `id()` is the last resort, for the synthetic test fakes
+    that have neither.
+    """
+    owner = getattr(block, "function", None)
+    fn = getattr(owner, "source_function", None) or owner
+    home = getattr(fn, "start", None)
+    home = int(home) if isinstance(home, int) else None
+    index = getattr(block, "index", None)
+    if isinstance(index, int):
+        return ("index", home, index)
+    start, end = getattr(block, "start", None), getattr(block, "end", None)
+    if isinstance(start, int) and isinstance(end, int):
+        return ("range", home, start, end)
+    return ("id", id(block))
+
+
+def _reaching_blocks(call_bb: Any) -> tuple[list, bool]:
+    """``(blocks, looped)`` -- every block that can reach *call_bb*, and whether
+    *call_bb* can reach ITSELF (it lies on a cycle, so its own later
+    instructions may also have run first)."""
+    call_key = _block_key(call_bb)
+    out: list = []
+    seen: set = set()
+    frontier = [getattr(e, "source", None)
+                for e in (getattr(call_bb, "incoming_edges", None) or [])]
+    looped = False
+    while frontier and len(seen) < _CFG_CLOSURE_BLOCKS:
+        block = frontier.pop()
+        if block is None:
+            continue
+        key = _block_key(block)
+        if key == call_key:
+            looped = True
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(block)
+        frontier += [getattr(e, "source", None)
+                     for e in (getattr(block, "incoming_edges", None) or [])]
+    return out, looped
+
+
 def _entry_value_survives(call_ins: Any, bn: Any) -> bool:
     """Whether NOTHING that can run before *call_ins* may have clobbered a
     caller-saved register.
@@ -81,28 +137,19 @@ def _entry_value_survives(call_ins: Any, bn: Any) -> bool:
     if call_bb is None:
         return False
     call_idx = int(getattr(call_ins, "instr_index", -1))
-    # Backwards CFG closure: every block that can reach the call's block.
-    reaching: list = [call_bb]
-    seen: set[int] = {id(call_bb)}
-    i = 0
-    while i < len(reaching):
-        for edge in (getattr(reaching[i], "incoming_edges", None) or []):
-            src = getattr(edge, "source", None)
-            if src is not None and id(src) not in seen:
-                seen.add(id(src))
-                reaching.append(src)
-        i += 1
-    looped = any(id(getattr(e, "source", None)) in seen
-                 for e in (getattr(call_bb, "incoming_edges", None) or []))
-    for bb in reaching:
-        for ins in bb:
-            if getattr(ins, "operation", None) not in call_ops:
-                continue
-            idx = int(getattr(ins, "instr_index", -1))
-            if bb is call_bb and idx == call_idx:
-                continue
-            if bb is not call_bb or idx < call_idx or looped:
+    earlier, looped = _reaching_blocks(call_bb)
+    for block in earlier:
+        for ins in block:
+            if getattr(ins, "operation", None) in call_ops:
                 return False
+    for ins in call_bb:
+        if getattr(ins, "operation", None) not in call_ops:
+            continue
+        idx = int(getattr(ins, "instr_index", -1))
+        if idx == call_idx:
+            continue
+        if idx < call_idx or looped:
+            return False
     return True
 
 

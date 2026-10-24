@@ -2812,13 +2812,48 @@ N long calls_analysed(long a) {
     return r + 1;
 }
 
+/* BN recovers argument 0 (a constant it sees written) and nothing else; the
+   seed rides argument 1, which the call site never writes. */
+N long prefix_entry(long a, long b) {
+    if (a == 5 || b == 7) return 0;
+    long r = unread_body(7, b);
+    return r + 1;
+}
+
+/* A loop before the call: the backwards CFG closure walks a cycle. */
+N long loop_entry(long a, long b) {
+    if (a == 5 || b == 7) return 0;
+    for (volatile int i = 0; i < 4; i++) { }
+    long r = unread_body(a, b);
+    return r + 1;
+}
+
+/* An analysed callee that consumes BOTH argument registers, reached with a
+   constant in the first and the seed in the second. */
+N long two_arg_consumer(long a, long b) { system((const char *)b); return a + b; }
+N long calls_second(long a) {
+    if (a == 5) return 0;
+    long r = two_arg_consumer(0, a);
+    return r + 1;
+}
+
+/* The analysed callee behind a veneer, and behind a pinnable indirect site. */
+TAIL long analysed_thunk(long a) { return analysed_body(a); }
+N long calls_analysed_thunk(long a) {
+    if (a == 5) return 0;
+    long r = analysed_thunk(a);
+    return r + 1;
+}
+
 int main(int argc, char **argv) {
     (void)argv;
     return (int)(call_unread(argc) + call_thunk(argc) + call_multihop(argc)
                  + call_wrapper(argc) + call_analysed(argc) + call_import(argc)
                  + call_indirect(argc) + two_contexts(argc) + other_arg(argc)
                  + constant_only(argc) + abi_entry(argc, argc)
-                 + tail_entry(argc, argc) + calls_analysed(argc));
+                 + tail_entry(argc, argc) + calls_analysed(argc)
+                 + prefix_entry(argc, argc) + loop_entry(argc, argc)
+                 + calls_second(argc) + calls_analysed_thunk(argc));
 }
 """
 
@@ -3060,6 +3095,22 @@ def test_an_argument_an_optimised_call_drops_is_recovered_from_its_register(
         if not modeled["reached_sinks"]:
             assert modeled["diagnostics"]["safe_to_report_all_clear"] is False, overlay
 
+    # A recovered PREFIX says nothing about the arguments past it: BN recovers
+    # the constant argument 0 it sees written and misses argument 1, which the
+    # call site never writes because the seed is already in its register.
+    prefix = forward("prefix_entry", "param:1")
+    leaf = boundary(prefix)
+    assert leaf["tainted_args"] == [1], leaf
+    assert leaf["abi_recovered_args"] == [1], leaf
+    assert prefix["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # A loop before the call: the backwards CFG closure walks a cycle of blocks
+    # Binary Ninja hands out as a fresh Python object each time. It terminates,
+    # and the answer is still honest.
+    looped = forward("loop_entry")
+    assert boundary(looped)["callee"]["name"] == "unread_body", looped
+    assert looped["diagnostics"]["safe_to_report_all_clear"] is False
+
     # Binary Ninja DID recover this call's arguments (it writes both registers
     # at the call site), so nothing is recovered on top of them -- and its own
     # recovery still carries the seed into the boundary.
@@ -3102,9 +3153,9 @@ def test_an_under_recovered_argument_into_an_analysed_callee_is_a_frontier(
     _compile(src, binary, ["-O2", "-fno-builtin", "-g0"])
     target = shared_bn.load(binary, copy=False)
 
-    def forward():
+    def forward(fn="calls_analysed"):
         return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f",
-                        "calls_analysed", "--source", "param:0", "--max-depth", "16")
+                        fn, "--source", "param:0", "--max-depth", "16")
 
     def frontiers(result):
         return [lf for lf in result["leaves"]
@@ -3131,6 +3182,28 @@ def test_an_under_recovered_argument_into_an_analysed_callee_is_a_frontier(
     # value the analysed function was entered with.
     assert leaf["via"] == "entry_value", leaf
     assert after["diagnostics"]["safe_to_report_all_clear"] is False, after
+
+    # Review F9: a veneer routes to the SAME analysed body, and the check must
+    # follow the candidate seam the descent uses rather than the direct target
+    # alone.
+    routed = forward("calls_analysed_thunk")
+    [leaf] = frontiers(routed)
+    assert leaf["callee"]["name"] == "analysed_body", leaf
+    assert leaf["argument_index"] == 0, leaf
+    assert routed["diagnostics"]["safe_to_report_all_clear"] is False, routed
+
+    # Review F8: the first missing argument is a CONSTANT and the seed rides
+    # the second. Stopping at the first missing register dropped it silently.
+    proto = shared_bn.run("-t", target, "proto", "set", "two_arg_consumer",
+                          "void two_arg_consumer(void)", "--format", "json")
+    assert proto.returncode == 0, proto.stderr
+    later = forward("calls_second")
+    [leaf] = frontiers(later)
+    assert leaf["callee"]["name"] == "two_arg_consumer", leaf
+    assert leaf["tainted_args"] == [1], leaf
+    assert leaf["register"] == "rsi", leaf
+    assert leaf["argument_index"] == 1, leaf
+    assert later["diagnostics"]["safe_to_report_all_clear"] is False, later
 
 
 _OVERLAP_SRC = r"""
