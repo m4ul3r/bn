@@ -2939,8 +2939,11 @@ def test_global_continuation_object_evidence_budgets_and_advice(tmp_path,
     rows = leaf["references"]
     assert rows[0]["seed"] is None, rows
     seeded = next(r for r in rows if r["seed"])
+    # ...carrying this call's own routing, so the string RUNS where it was
+    # produced instead of picking a bridge of its own (BN23-ADVICE-01).
     assert leaf["reseed"] == (
-        f"`bn taint forward -f {seeded['address']} --source {seeded['seed']}`")
+        f"`bn -i {shared_bn.instance_id} -t {shlex.quote(str(target))} "
+        f"taint forward -f {seeded['address']} --source {seeded['seed']}`")
     ran = _bn_json(shared_bn, "-t", target, "taint", "forward",
                    "-f", seeded["address"], "--source", seeded["seed"])
     assert [s["sink"]["class"] for s in ran["reached_sinks"]] == ["command_injection"]
@@ -5022,7 +5025,7 @@ int main(void) { return 0; }
 """
 
 
-_SPAN_SRC = r"""
+_APPEND_END_SRC = r"""
 #define _GNU_SOURCE
 #include <stdlib.h>
 #include <string.h>
@@ -5152,7 +5155,7 @@ def test_an_append_is_not_a_base_relative_bounded_copy(tmp_path, shared_bn,
     terminator is. The count bounds neither the destination scan -- which
     runs over the existing string whatever n says, including 0 -- nor the
     position the appended bytes land at."""
-    target = _taint_target(tmp_path, shared_bn, _SPAN_SRC, "r11span", opt)
+    target = _taint_target(tmp_path, shared_bn, _APPEND_END_SRC, "r11span", opt)
 
     # the appended byte lands at the terminator at +64, not at the base
     for case in ("append_one", "append_chk_one"):
@@ -5185,7 +5188,7 @@ def test_an_end_returning_copy_is_not_the_destination_base(tmp_path, shared_bn,
     enough to resolve that end exactly, so the consumer's `+ 8` is at +9 --
     and where the call does NOT state it, the displacement is unknown
     rather than the base."""
-    target = _taint_target(tmp_path, shared_bn, _SPAN_SRC, "r11span", opt)
+    target = _taint_target(tmp_path, shared_bn, _APPEND_END_SRC, "r11span", opt)
     for case, reader in (("endcopy_case", "endcopy_reader"),
                          ("endstring_case", "endstring_reader"),
                          ("endfind_case", "endfind_reader")):
