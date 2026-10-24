@@ -4454,15 +4454,33 @@ class TaintEngine:
     def _format_destination_shortfall(self, ins: Any, ssaf: Any, callee: str, model: Any,
                                       params: list[Any]) -> dict | None:
         """A blocking `format_destination_unrecovered` leaf when the call's fully
-        read constant format writes more destinations than BN recovered
-        arguments for (#1050 review round 8): a forwarded incoming pointer left
-        in its argument register is passed, yet BN's MLIL call does not list it,
-        so it was never seeded. The missing arguments are not guessed and the
-        model range is not widened; the gap is disclosed by count. It only
-        adds a leaf, never removes a seed (round 9 removed destination
-        trimming). The constant-format test checks only the format's START
-        address: a format whose suffix lies in writable storage can be
-        under-counted, which then yields no leaf, as on base."""
+        read constant format writes a destination that was never seeded.
+
+        Two independent shortfalls are compared here, because the format is
+        evidence of its own (#1050 review round 8; IC04 follow-up):
+
+        * **unrecovered** -- BN's MLIL call lists fewer arguments than the
+          format writes; a forwarded incoming pointer left in its argument
+          register is passed, yet never appears in ``params``.
+        * **unmodeled** -- the model's unrolled destination run ends before the
+          format does, even when BN recovered every argument. An arity-capped
+          model unrolls a fixed run ``*arg:first..first+N-1``; a five-conversion
+          format with a four-slot run loses the fifth output even though the
+          call's fifth destination is a perfectly recovered argument, and the
+          old rule-vs-params comparison never even ran for it because no rule
+          named that index.
+
+        The required destinations come from the format alone: a suppressed
+        ``%*`` conversion consumes no destination, ``%n`` does, a ``%%`` is
+        literal, and a format that is not a fully read constant (or uses POSIX
+        ``%n$`` positions) proves nothing and yields no leaf. An optional slot
+        past a shorter format stays silent: fewer conversions than the model's
+        run is exactly the capped shape, not a loss. Missing arguments are not
+        guessed and the model range is not widened; the gap is disclosed by
+        count. It only adds a leaf, never removes a seed (round 9 removed
+        destination trimming). The constant-format test checks only the
+        format's START address: a format whose suffix lies in writable storage
+        can be under-counted, which then yields no leaf, as on base."""
         sink = (model or {}).get("sink") or {}
         fa, first = sink.get("format_arg"), sink.get("first_dest")
         if fa is None or first is None or int(fa) >= len(params):
@@ -4474,24 +4492,46 @@ class TaintEngine:
         if any(s.positional for s in specs):
             return None
         first = int(first)
-        dest_end = first + sum(1 for s in specs if not s.suppressed)
-        if dest_end <= len(params):
+        # Destination ARGUMENT indices, in format order. A suppressed
+        # conversion consumes no argument, so it advances neither k nor the
+        # destination index; %n is an ordinary assigning conversion.
+        required: list[int] = []
+        for spec in specs:
+            if spec.suppressed:
+                continue
+            required.append(first + len(required))
+        if not required:
             return None
-        missing = dest_end - len(params)
+        modeled_dests: set[int] = set()
+        for role in ("sources", "propagates"):
+            for rule in (model or {}).get(role) or []:
+                to = rule.get("to")
+                if isinstance(to, str) and to.startswith("*arg:"):
+                    idx = _try_arg_index(to)
+                    if idx is not None:
+                        modeled_dests.add(idx)
+        recovered = sum(1 for i in required if i < len(params))
+        modeled = sum(1 for i in required if i in modeled_dests)
+        covered = sum(1 for i in required if i < len(params) and i in modeled_dests)
+        missing = len(required) - covered
+        if missing <= 0:
+            return None
         at = hex(int(getattr(ins, "address", 0)))
         return {
             "kind": "format_destination_unrecovered",
             "address": at,
             "callee": str(callee),
             "il_text": str(ins),
-            "destinations": dest_end - first,
-            "recovered": max(0, len(params) - first),
+            "destinations": len(required),
+            "recovered": recovered,
+            "modeled": modeled,
             "missing": missing,
             "detail": (
                 f"{self._prose_name(callee)}() at {at}: its constant format writes "
-                f"{dest_end - first} destination(s) but Binary Ninja recovered only "
-                f"{max(0, len(params) - first)} of those arguments, so {missing} "
-                f"destination(s) were not seeded -- what they receive is unchecked"),
+                f"{len(required)} destination(s); the model enumerates {modeled} of "
+                f"them and Binary Ninja recovered {recovered} of those arguments, so "
+                f"{missing} destination(s) were not seeded -- what they receive is "
+                f"unchecked"),
         }
 
     def _unchecked_indirect_calls(self, instrs: list[Any], fills: list[Any], callee: str,
@@ -9572,6 +9612,19 @@ class TaintEngine:
             per resolved target so distinct indirect targets each record once."""
             changed = False
             propagated: set[int] = set()
+
+            if (model or {}).get("arity_capped"):
+                # The format is evidence independent of the rule loop. An
+                # arity-capped run is a fixed unrolling, so a format that
+                # proves MORE destinations than the run enumerates loses the
+                # tail even when BN recovered every one of those arguments
+                # (no *arg:N rule reaches the unrecovered-destination path to
+                # notice it). Compare here, once per call site, rather than
+                # only inside a REACHED rule that happens to name the index.
+                short = self._format_destination_shortfall(
+                    ins, ssaf, mkey or name or "?", model, params)
+                if short is not None and short not in leaves:
+                    leaves.append(short)
 
             def apply_token(tok, parents):
                 # Tail calls have no SSA result: a modeled return instead exits
