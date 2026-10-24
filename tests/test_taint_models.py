@@ -1294,3 +1294,99 @@ def test_scanf_arity_residual_marker_in_weak_seed_set_851():
         "scanf_arity_residual must be in _WEAK_SEED_ASSUMPTION_MARKERS so a "
         "residual-arity assumption withholds safe_to_report_all_clear"
     )
+
+
+# --- one argument grammar for every model role (IC04 review) ------------------
+
+from bn_agent_bridge import taint_models as tm
+
+_BAD_TOKENS = ["arg:-1", "arg:+1", "arg:01", "arg: 1", "arg:1 ", "arg:", "arg:x", "arg:1.0",
+               "arg:256", "arg:99999999999999999999", "arg:١", "ARG:1", "argv:1", ""]
+
+
+def _ptr(tok: str) -> str:
+    return "*" + tok if tok.startswith("arg") else tok
+
+
+@pytest.mark.parametrize("tok", _BAD_TOKENS)
+@pytest.mark.parametrize("field,make", [
+    ("propagates.from", lambda t: {"propagates": [{"from": t, "to": "ret"}]}),
+    ("propagates.to", lambda t: {"propagates": [{"from": "arg:0", "to": t}]}),
+    ("propagates.to", lambda t: {"propagates": [{"from": "arg:0", "to": _ptr(t)}]}),
+    ("sources.to", lambda t: {"sources": [{"to": _ptr(t)}]}),
+    ("varargs.to", lambda t: {"varargs": {"first_index": 1, "to": _ptr(t)}}),
+    ("writes", lambda t: {"writes": [_ptr(t)]}),
+    ("reads_dest", lambda t: {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                              "reads_dest": [_ptr(t)]}),
+])
+def test_every_role_refuses_a_malformed_argument_token(tok, field, make):
+    with pytest.raises(tm.TaintError) as ei:
+        tm.load_models(extra={"app_fn": make(tok)})
+    msg = str(ei.value)
+    assert "model 'app_fn'" in msg and f"`{field}" in msg, msg
+    assert "non-negative" in msg, msg
+
+
+@pytest.mark.parametrize("bad", [-1, 256, 10**20, True, "1", 1.0])
+@pytest.mark.parametrize("field,make", [
+    ("sink.tainted_args", lambda v: {"sink": {"class": "c", "tainted_args": [v]}}),
+    ("sink.len_arg", lambda v: {"sink": {"class": "c", "len_arg": v}}),
+    ("sink.buf_arg", lambda v: {"sink": {"class": "c", "tainted_args": [0], "buf_arg": v}}),
+    ("sink.pointer_args", lambda v: {"sink": {"class": "c", "tainted_args": [0], "pointer_args": [v]}}),
+    ("sink.format_arg", lambda v: {"sink": {"class": "c", "format_arg": v, "first_dest": 300}}),
+    ("varargs.first_index", lambda v: {"varargs": {"first_index": v, "to": "*arg:0"}}),
+    ("continuation.null_arg", lambda v: {"propagates": [{"from": "*arg:0", "to": "ret"}],
+                                         "continuation": {"null_arg": v}}),
+    ("string_args", lambda v: {"sink": {"class": "c", "tainted_args": [0]}, "string_args": [v]}),
+    ("append.dest", lambda v: {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                               "append": {"dest": v, "src": 1}}),
+    ("ret_offset.count_arg", lambda v: {"propagates": [{"from": "arg:0", "to": "ret"}],
+                                        "ret_offset": {"count_arg": v}}),
+])
+def test_every_index_field_refuses_a_non_index(bad, field, make):
+    model = make(bad)
+    with pytest.raises(tm.TaintError) as ei:
+        tm.load_models(extra={"app_fn": model})
+    msg = str(ei.value)
+    assert "model 'app_fn'" in msg and field.split(".")[0] in msg, msg
+
+
+def test_return_bound_refuses_a_negative_index():
+    with pytest.raises(tm.TaintError, match="max_from_arg"):
+        tm.load_models(extra={"read": {"return_bound": {"max_from_arg": -1}}})
+
+
+def test_the_grammar_accepts_every_documented_form():
+    ok = tm.load_models(extra={
+        "app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"},
+                                    {"from": "arg:255", "to": "arg:0"},
+                                    {"from": "arg:0", "to": "ret"},
+                                    {"from": "*arg:0", "to": "*ret"}],
+                     "reads_dest": ["*arg:0"], "string_args": [0, 1],
+                     "append": {"dest": 0, "src": 1}, "ret_offset": {"count_arg": 2}},
+        "app_recv": {"sources": [{"to": "*arg:1"}, {"to": "arg:0"}, {"to": "ret"},
+                                 {"to": "*ret"}, {"to": "*iovec:1"}]},
+        "app_fmt": {"varargs": {"first_index": 2, "to": "*arg:0"}},
+        "app_tok": {"propagates": [{"from": "*arg:0", "to": "ret"}],
+                    "continuation": {"null_arg": 0}},
+        "app_zero": {"writes": ["*arg:0"]},
+    })
+    assert ok["app_copy"]["propagates"][1]["from"] == "arg:255"
+
+
+def test_builtin_catalog_satisfies_the_grammar():
+    # The packaged DB is validated on every load; the engine's own guard
+    # accepts the merged map too.
+    models = tm.load_models()
+    tm.validate_model_arguments(models, source="builtin")
+    tokens = [r[k] for m in models.values() if isinstance(m, dict)
+              for role in ("sources", "propagates") for r in m.get(role) or [] for k in ("from", "to")
+              if k in r]
+    assert tokens and all(t in ("ret", "*ret") or tm.parse_model_token(t) for t in tokens)
+
+
+def test_catalog_op_refuses_a_malformed_user_model():
+    # `bn taint models --models FILE` is the documented overlay check: it
+    # reports the malformed token instead of listing it.
+    with pytest.raises(tm.TaintError, match=r"`propagates.to` is '\*arg:-1'"):
+        tm.load_models(extra={"models": {"app_fn": {"propagates": [{"from": "arg:0", "to": "*arg:-1"}]}}})

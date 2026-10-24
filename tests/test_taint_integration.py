@@ -5461,3 +5461,81 @@ __attribute__((noinline)) void call_model_fill(size_t input) {
     filled = forward("call_model_fill", "--models", str(models))
     assert [f["sink"]["callee"] for f in filled["reached_sinks"]] == ["system"], filled
     assert not [lf for lf in filled["leaves"] if lf["kind"] == "model_destination_unrecovered"]
+
+
+def test_continuation_into_unrecovered_destination_is_a_boundary(tmp_path, shared_bn):
+    """IC04 review: a continuation rule reached through carried state used to
+    drop a declared output BN did not recover at the NULL call -- leaves=[],
+    all-clear -- even though the walk said the state continued there. The
+    later clean reset must not erase that boundary; a reset before the NULL
+    call still kills the continuation."""
+    src = tmp_path / "continuation.c"
+    src.write_text("""
+extern void stateful();
+__attribute__((noinline)) void continuation_reset(const char *src) {
+    char out[32];
+    stateful(src, out);
+    stateful(0);
+    stateful("clean", out);
+}
+__attribute__((noinline)) void reset_first(const char *src) {
+    char out[32];
+    stateful(src, out);
+    stateful("clean", out);
+    stateful(0);
+}
+""")
+    binary = tmp_path / "continuation.so"
+    _compile(src, binary, ["-std=gnu17", "-shared", "-fPIC", "-fno-inline"])
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps({"stateful": {
+        "propagates": [{"from": "arg:0", "to": "*arg:1"}], "continuation": {"null_arg": 0}}}))
+    target = shared_bn.load(binary, copy=False)
+    calls = _bn_json(shared_bn, "-t", target, "callsites", "stateful",
+                     "--within", "continuation_reset")["items"]
+    null_call = sorted(c["call_addr"] for c in calls)[1]
+    first_call = sorted(c["call_addr"] for c in calls)[0]
+
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "continuation_reset",
+                      "--source", "param:0", "--models", str(models))
+    leaves = [lf for lf in result["leaves"] if lf["kind"] == "model_destination_unrecovered"]
+    assert [(lf["address"], lf["destination"]) for lf in leaves] == [(null_call, "*arg:1")], \
+        result["leaves"]
+    assert leaves[0]["sources"][0]["continued_from"] == first_call, leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+    outputs = _run_diagnostic_commands(shared_bn, result["diagnostics"]["next_action"])
+    assert any("stateful" in out for out in outputs), outputs
+
+    killed = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "reset_first",
+                      "--source", "param:0", "--models", str(models))
+    assert not [lf for lf in killed["leaves"] if lf["kind"] == "model_destination_unrecovered"], \
+        killed["leaves"]
+
+
+@pytest.mark.parametrize("command", [
+    ("taint", "forward", "-f", "call_model_emit", "--source", "param:0"),
+    ("taint", "models", "--role", "propagator"),
+])
+def test_malformed_model_tokens_are_refused_by_the_cli(tmp_path, shared_bn, command):
+    """IC04 review: `*arg:-1` passed validation and a reached rule wrote
+    through the call's LAST argument; `*arg:x` raised mid-walk. Every public
+    model path now refuses the file, naming the model, field and grammar."""
+    src = tmp_path / "emit.c"
+    src.write_text("""
+#include <stddef.h>
+extern void model_emit(size_t input);
+__attribute__((noinline)) void call_model_emit(size_t input) { model_emit(input); }
+""")
+    binary = tmp_path / "emit.so"
+    _compile(src, binary, ["-shared", "-fPIC", "-fno-inline"])
+    target = shared_bn.load(binary, copy=False)
+    for token in ("*arg:-1", "*arg:x", "*arg:01"):
+        models = tmp_path / "bad.json"
+        models.write_text(json.dumps(
+            {"model_emit": {"propagates": [{"from": "arg:0", "to": token}]}}))
+        res = shared_bn.run("-t", target, *command, "--models", str(models))
+        assert res.returncode not in (0, 1), (token, res.returncode, res.stdout, res.stderr)
+        out = res.stderr + res.stdout
+        assert "model 'model_emit'" in out and "`propagates.to`" in out, out
+        assert "non-negative decimal argument index" in out, out
+        assert "Traceback" not in out and "internal error" not in out, out

@@ -307,10 +307,54 @@ def test_return_plus_missing_output(models):
     assert [lf["destination"] for lf in _missing(result)] == ["*arg:1"]
 
 
-@pytest.mark.parametrize("to", ["*argv:1", "buf", "*ret:1", ""])
-def test_non_argument_destination_token_is_not_a_missing_output(models, to):
-    models["model_emit"] = _rules(("arg:0", to))
-    assert _missing(_forward(models, _one_arg_emit_func())) == []
+_MALFORMED = ["*argv:1", "buf", "*ret:1", "", "*arg:x", "arg:", "*arg:-1", "arg:-1",
+              "*arg:+1", "*arg:01", "*arg: 1", "*arg:256", "*arg:99999999999999999999",
+              "*arg:1\n", 5, None]
+
+
+def _engine_with_raw_rule(models, frm, to):
+    """An engine built from valid models whose `model_emit` rule is then
+    replaced by raw, unvalidated data -- trusted data that skipped the loader."""
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    engine = te.TaintEngine(_bv(), models)
+    engine.models["model_emit"] = {"propagates": [{"from": frm, "to": to}]}
+    return engine
+
+
+@pytest.mark.parametrize("to", _MALFORMED)
+def test_malformed_destination_token_never_raises_or_selects_an_argument(models, to):
+    engine = _engine_with_raw_rule(models, "arg:0", to)
+    result = engine.forward(_one_arg_emit_func(), [te.parse_locator("param:0")])
+    # Not a missing output, not a write through some OTHER argument.
+    assert result["leaves"] == [], result["leaves"]
+
+
+@pytest.mark.parametrize("frm", ["arg:-1", "*arg:-1", "arg:x", "arg:01", 7, None])
+def test_malformed_source_token_never_reads_another_argument(models, frm):
+    # `arg:-1` read params[-1] -- the only recovered argument, the tainted one
+    # -- so a rule whose source names no argument propagated into the return.
+    inp, i0 = _var("input")
+    r, r1 = _var("r", 1)
+    func = FFunc("call_model_emit", F_ADDR, FSSAFunc([
+        _call(0, SITE, EMIT, "model_emit", [FExpr("MLIL_VAR_SSA", "input#0", reads=[i0])],
+              writes=[r1]),
+        _call(1, SITE + 0x10, SYSTEM, "system", [FExpr("MLIL_VAR_SSA", "r#1", reads=[r1])]),
+        _ret(2, SITE + 0x20),
+    ]), params=[inp])
+    engine = _engine_with_raw_rule(models, frm, "ret")
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+
+
+@pytest.mark.parametrize("bad", [
+    {"propagates": [{"from": "arg:0", "to": "*arg:-1"}]},
+    {"sink": {"class": "x", "tainted_args": [-1]}},
+    {"continuation": {"null_arg": -1}, "propagates": [{"from": "arg:0", "to": "ret"}]},
+])
+def test_engine_refuses_malformed_models_it_is_handed(models, bad):
+    models["model_emit"] = bad
+    with pytest.raises(te.TaintError, match="model 'model_emit'"):
+        te.TaintEngine(_bv(), models)
 
 
 def test_model_for_an_absent_callee_is_irrelevant(models):
@@ -349,3 +393,150 @@ def test_text_names_callee_destination_source_and_gate(models):
     assert "declared destination *arg:1 unavailable" in row
     assert "recovered 1 arg(s)" in row
     assert "reached source(s) arg:0=input" in row
+
+
+# --------------------------------------------------------------------------
+# continuation rules: the carried state is the reached source
+# --------------------------------------------------------------------------
+
+STATEFUL = 0x401070    # external `stateful(s, out)`; stateful(NULL) continues
+
+
+class _Block:
+    """One straight-line IL block: instruction indices [start, end)."""
+
+    def __init__(self, start, end):
+        self.start, self.end = start, end
+        self.outgoing_edges = []
+        self.dominators = [self]
+
+
+def _stateful_model(*dests: str, ret: bool = False) -> dict:
+    rules = [{"from": "arg:0", "to": d} for d in dests]
+    if ret:
+        rules.append({"from": "arg:0", "to": "ret"})
+    return {"propagates": rules, "continuation": {"null_arg": 0}}
+
+
+def _stateful_func(*, first_tainted=True, reset=None, null_args=1, null_writes=False):
+    """f(src): stateful(src|"x", &out); [reset]; stateful(NULL[, &out2]) [reset] ...
+
+    ``reset`` places a clean ``stateful("clean", &out)`` "before" or "after"
+    the NULL call; one straight-line block, so the reset's position decides
+    whether it lies on every path from the tainted call to the NULL call."""
+    src, s0 = _var("src")
+    out, out2 = FVar("out"), FVar("out2")
+    t, t1 = _var("t", 1)
+    first = _call(0, 0x401110, STATEFUL, "stateful",
+                  [FExpr("MLIL_VAR_SSA", "src#0", reads=[s0]) if first_tainted else _const(0x402000),
+                   FExpr("MLIL_ADDRESS_OF", "&out", src=out)])
+    null_params = [FExpr("MLIL_CONST", "0", constant=0)]
+    if null_args == 2:
+        null_params.append(FExpr("MLIL_ADDRESS_OF", "&out2", src=out2))
+    cont = _call(0, 0x401120, STATEFUL, "stateful", null_params,
+                 writes=[t1] if null_writes else None)
+    clean = _call(0, 0x401130, STATEFUL, "stateful",
+                  [_const(0x402010), FExpr("MLIL_ADDRESS_OF", "&out", src=out)])
+    instrs = [first]
+    if reset == "before":
+        instrs.append(clean)
+    instrs.append(cont)
+    if reset == "after":
+        instrs.append(clean)
+    if null_args == 2:
+        instrs.append(_call(0, 0x401140, SYSTEM, "system",
+                            [FExpr("MLIL_ADDRESS_OF", "&out2", src=out2)]))
+    instrs.append(_ret(0, 0x401150))
+    block = _Block(0, len(instrs))
+    for n, ins in enumerate(instrs):
+        ins.instr_index = n
+        ins.il_basic_block = block
+    return FFunc("continuation_reset", 0x401100, FSSAFunc(instrs), params=[src])
+
+
+def _cont_forward(models, func, funcs=None):
+    bv = FBV({EMIT: "model_emit", SYSTEM: "system", STATEFUL: "stateful"}, funcs)
+    return te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+
+
+def test_continuation_into_unrecovered_destination_survives_a_later_reset(models):
+    # The review's shape: stateful(src, out); stateful(NULL); stateful("clean", out).
+    # The NULL call continues the tainted state (the reset comes after it),
+    # so `arg:0 -> *arg:1` is reached there with no argument 1 to write.
+    models["stateful"] = _stateful_model("*arg:1")
+    result = _cont_forward(models, _stateful_func(reset="after"))
+
+    [leaf] = _missing(result)
+    assert leaf["address"] == "0x401120"
+    assert leaf["callee"]["name"] == "stateful" and leaf["destination"] == "*arg:1"
+    assert leaf["recovered_params"] == 1
+    assert leaf["sources"] == [{"from": "arg:0", "tainted": "src",
+                                "continued_from": "0x401110"}]
+    # The reset after the NULL call cleans the state at return, so nothing
+    # else blocks: the boundary alone withholds the all-clear.
+    diag = result["diagnostics"]
+    assert [lf["kind"] for lf in result["leaves"]] == [KIND]
+    assert diag["safe_to_report_all_clear"] is False
+    assert diag["frontier"]["unresolved"] == 1 and diag["frontier"]["by_kind"] == {KIND: 1}
+    assert "*arg:1 of stateful at 0x401120" in diag["next_action"]
+    assert f"`bn proto get {hex(STATEFUL)}`" in diag["next_action"]
+
+    text = formatters._render_taint_text(result)
+    row = next(ln for ln in text.splitlines() if ln.startswith(f"  {KIND} @ 0x401120"))
+    assert "reached source(s) arg:0=src (state set at 0x401110)" in row, row
+
+
+def test_continuation_reset_before_the_null_call_kills_it(models):
+    models["stateful"] = _stateful_model("*arg:1")
+    result = _cont_forward(models, _stateful_func(reset="before"))
+    assert result["leaves"] == []
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_continuation_without_tainted_state_stays_silent(models):
+    models["stateful"] = _stateful_model("*arg:1")
+    result = _cont_forward(models, _stateful_func(first_tainted=False, reset="after"))
+    assert result["leaves"] == []
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_complete_continuation_still_propagates_to_its_destination(models):
+    # stateful(NULL, &out2) recovered both arguments: the state lands in out2
+    # and reaches system(&out2), with no boundary.
+    models["stateful"] = _stateful_model("*arg:1")
+    result = _cont_forward(models, _stateful_func(reset="after", null_args=2))
+    assert _missing(result) == []
+    assert [s["sink"]["callee"] for s in result["reached_sinks"]] == ["system"], result
+
+
+def test_continuation_multiple_missing_destinations_and_return(models):
+    models["stateful"] = _stateful_model("*arg:1", "*arg:2", ret=True)
+    result = _cont_forward(models, _stateful_func(reset="after", null_writes=True))
+    got = sorted((lf["address"], lf["destination"]) for lf in _missing(result))
+    # The NULL call is missing both outputs; the first call recovered arg 1
+    # but not arg 2, so its own reached rule is a boundary at its own site.
+    assert got == [("0x401110", "*arg:2"), ("0x401120", "*arg:1"), ("0x401120", "*arg:2")], got
+    cont = [lf for lf in _missing(result) if lf["address"] == "0x401120"]
+    assert all(lf["sources"][0]["continued_from"] == "0x401110" for lf in cont), cont
+    first = next(lf for lf in _missing(result) if lf["address"] == "0x401110")
+    assert "continued_from" not in first["sources"][0], first
+    # The return state still propagates beside the boundaries.
+    assert result["diagnostics"]["last_use"]["label"] == "t#1", result["diagnostics"]
+
+
+def test_continuation_boundary_in_a_descended_callee(models):
+    models["stateful"] = _stateful_model("*arg:1")
+    inner = _stateful_func(reset="after")
+    inner.mlil.ssa_form.instructions[-1].src = [FExpr("MLIL_CONST", "0", constant=0)]
+    x, x0 = _var("x")
+    y, y1 = _var("y", 1)
+    outer = FFunc("outer", G_ADDR, FSSAFunc([
+        _call(0, G_ADDR + 0x10, 0x401100, "continuation_reset",
+              [FExpr("MLIL_VAR_SSA", "x#0", reads=[x0])], writes=[y1]),
+        _ret(1, G_ADDR + 0x15),
+    ]), params=[x])
+    result = _cont_forward(models, outer, funcs={0x401100: inner})
+    [leaf] = _missing(result)
+    assert leaf["address"] == "0x401120" and leaf["function"]["address"] == "0x401100"
+    assert leaf["sources"][0]["continued_from"] == "0x401110"
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False

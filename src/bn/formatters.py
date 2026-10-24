@@ -5056,6 +5056,7 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
     if kind == "model_destination_unrecovered":
         cal = _field_dict(leaf, "callee")
         srcs = ", ".join(f"{s.get('from', '?')}={s.get('tainted', '?')}"
+                         + (f" (state set at {s['continued_from']})" if s.get("continued_from") else "")
                          for s in _field_list(leaf, "sources") if isinstance(s, dict))
         return (
             f"  model_destination_unrecovered @ {leaf.get('address')}"
