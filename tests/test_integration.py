@@ -5808,16 +5808,18 @@ class TestStringScanSeesCodeOnly1045:
         assert row["strings"][0]["inline"] is True, row
 
     def test_a_literal_holding_a_url_keeps_both_raw_operands(self, shared_bn, tmp_path):
-        # Round 5: BN renders the embedded quotes unescaped, and the regex read
-        # the URL's `//` as a comment: both operands were lost and the arity
-        # notes landed inside the literal. Base names "abc" and "x".
+        # Round 5: the regex read the URL's `//` as a comment: both operands
+        # were lost and the arity notes landed inside the literal. Base names
+        # "abc" and "x".
         result = self._decompile_probe(shared_bn, tmp_path, (
             "#include <string.h>\n"
             "__attribute__((noinline)) int probe(const char *s) "
             '{ return strcmp("<a href=\\"http://x\\">", "abc") + strcmp(s, "x"); }\n'
             "int main(int c, char **v) { return probe(v[0]); }\n"))
         [line] = [line for line in result["text"].splitlines() if "http://x" in line]
-        assert '"<a href="http://x">", 0x' in line, line  # the literal is intact
+        # The literal is intact and still followed by its raw operand, however
+        # this core escapes the embedded quotes.
+        assert re.search(r'http://x[^,]*", 0x[0-9a-f]+', line), line
         assert line.index("/* bn:") > line.index("http://x"), line
         [row] = [row for row in result["warning_rows"] if row["code"] == "string"]
         assert sorted(s["value"] for s in row["strings"]) == ["abc", "x"], row

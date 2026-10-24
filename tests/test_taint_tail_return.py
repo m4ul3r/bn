@@ -163,3 +163,110 @@ def test_a_no_result_call_with_tainted_arguments_is_always_a_frontier_1034(calle
     assert "bn disasm 0x1000" in str(leaf)
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
+
+
+# --------------------------------------------------------------------------
+# BN25-META-01: one call cannot be both modeled and unmodeled, and the
+# verdict must not depend on what ran before it.
+# --------------------------------------------------------------------------
+
+def _modeled_body_program(name, overlay=None):
+    """main(n) calls an IN-BINARY body named *name* with no recovered result.
+
+    The static shape: a `-static` build has a real body for the library
+    function a model also covers, so the body is descended (#807) while the
+    model's rules run at the same call site."""
+    n, p = FVar("n"), FVar("p")
+    ns, ps = FSSA(n, 0), FSSA(p, 0)
+    body = FFunc(name, 0x2000, FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_RET", "return p", reads=[ps], src=[_value(ps)])]),
+        params=[p])
+    main = FFunc("main", 0x1000, FSSAFunc([
+        FInstr(0, 0x1010, "MLIL_CALL_SSA", f"{name}(n)", reads=[ns], writes=[],
+               params=[_value(ns)], dest=_const(0x2000))]), params=[n])
+    return (main, FBV({0x2000: name}, {0x1000: main, 0x2000: body}),
+            te.load_models(overlay))
+
+
+def _dropped_for(name, overlay=None):
+    main, bv, models = _modeled_body_program(name, overlay)
+    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
+    return _dropped(result), result
+
+
+@pytest.mark.parametrize("name", ["wmemcpy", "fgets"])
+def test_a_model_that_states_the_return_channel_is_not_also_unmodeled(name):
+    """`wmemcpy` propagates its destination to `ret` and `fgets` SOURCES
+    `ret`: either way the model answers what the call hands back, which is
+    the only question the frontier asks. Reporting both said the same call
+    was modeled and unmodeled at once (BN25-META-01)."""
+    dropped, result = _dropped_for(name)
+    assert dropped == [], result["leaves"]
+
+
+@pytest.mark.parametrize(("label", "overlay"), [
+    ("no model", None),
+    # a declared SINK says what is dangerous to pass in, not what comes
+    # back. Declared on an argument this call does NOT taint, so the
+    # frontier is the only thing withholding the all-clear.
+    ("sink only", {"project_helper": {
+        "sink": {"tainted_args": [1], "class": "command_injection",
+                 "detail": "tainted command"}}}),
+    # ...and an argument-only source/propagation describes the buffers
+    ("arg-only source", {"project_helper": {"sources": [{"to": "*arg:0"}]}}),
+    ("arg-only propagate", {"project_helper": {
+        "propagates": [{"from": "*arg:0", "to": "*arg:1"}]}}),
+])
+def test_a_model_without_return_semantics_keeps_the_frontier(label, overlay):
+    """The frontier exists because the RETURN is unknown. A model that says
+    nothing about it leaves it unknown, so suppressing on the mere presence
+    of one turned a required frontier into an all-clear."""
+    dropped, result = _dropped_for("project_helper", overlay)
+    assert dropped, (label, result["leaves"])
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, label
+
+
+@pytest.mark.parametrize(("label", "overlay"), [
+    ("arg -> ret", {"project_helper": {
+        "propagates": [{"from": "arg:0", "to": "ret"}]}}),
+    ("source -> ret", {"project_helper": {"sources": [{"to": "ret"}]}}),
+])
+def test_a_return_rule_on_any_model_suppresses_the_frontier(label, overlay):
+    dropped, _result = _dropped_for("project_helper", overlay)
+    assert dropped == [], label
+
+
+class _LateThunk:
+    """A function whose ``is_thunk`` flag only becomes True once Binary
+    Ninja has lifted it -- which is how BN really behaves on a freshly
+    analysed view."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._lifted = False
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    @property
+    def is_thunk(self):
+        return self._lifted
+
+    @property
+    def mlil(self):
+        self._lifted = True
+        return self._inner.mlil
+
+
+def test_a_thunk_is_recognised_before_anything_else_lifted_it():
+    """BN25-META-01: asking the timing-dependent flag BEFORE the body was
+    lifted answered False for a stub that IS one, so the first request
+    descended into it and every later one did not -- two identical
+    requests, two different results."""
+    stub = _LateThunk(FFunc("__wmemcpy", 0x2000, FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_TAILCALL_SSA", "tailcall memcpy", reads=[],
+               params=[], dest=_const(0x3000))]), params=[FVar("p")]))
+    engine = te.TaintEngine(FBV({0x2000: "__wmemcpy"}, {0x2000: stub}),
+                            te.load_models())
+    assert engine._not_internal_reason(stub) == "thunk"
+    assert engine._not_internal_reason(stub) == "thunk"

@@ -51,37 +51,199 @@ def reaching_reg_def(call_ins: Any, reg: str, bn: Any) -> Any | None:
     return None
 
 
+def _call_like_ops(bn: Any) -> set:
+    Op = bn.LowLevelILOperation
+    return {getattr(Op, n, None) for n in (
+        "LLIL_CALL_SSA", "LLIL_SYSCALL_SSA", "LLIL_INTRINSIC_SSA",
+        "LLIL_TAILCALL_SSA")} - {None}
+
+
+# A backwards CFG closure visits at most this many blocks. The key below makes
+# the walk terminate on its own; the cap is the belt to that braces, so a view
+# whose blocks answer no stable key at all still cannot spin.
+_CFG_CLOSURE_BLOCKS = 4096
+
+
+def _block_key(block: Any) -> tuple:
+    """Stable identity for a basic block ACROSS the wrappers BN hands out.
+
+    Binary Ninja materialises a fresh Python object for the same native basic
+    block on every access, so `id()` identifies the wrapper, not the block: a
+    closure that dedupes on it revisits one loop header forever (review F6).
+    The native identity is the owning function plus the block's own index /
+    instruction range; `id()` is the last resort, for the synthetic test fakes
+    that have neither.
+    """
+    owner = getattr(block, "function", None)
+    fn = getattr(owner, "source_function", None) or owner
+    home = getattr(fn, "start", None)
+    home = int(home) if isinstance(home, int) else None
+    index = getattr(block, "index", None)
+    if isinstance(index, int):
+        return ("index", home, index)
+    start, end = getattr(block, "start", None), getattr(block, "end", None)
+    if isinstance(start, int) and isinstance(end, int):
+        return ("range", home, start, end)
+    return ("id", id(block))
+
+
+def _reaching_blocks(call_bb: Any) -> tuple[list, bool, bool]:
+    """``(blocks, looped, complete)`` -- every block that can reach *call_bb*,
+    whether *call_bb* can reach ITSELF (it lies on a cycle, so its own later
+    instructions may also have run first), and whether the closure FINISHED.
+
+    ``complete`` is False when the block budget stopped the walk with work
+    still pending. A caller asserting what ran before this call must refuse on
+    that: an unexamined predecessor is exactly where the clobbering call would
+    be, so a capped scan proves nothing (review F10).
+    """
+    call_key = _block_key(call_bb)
+    out: list = []
+    seen: set = set()
+    frontier = [getattr(e, "source", None)
+                for e in (getattr(call_bb, "incoming_edges", None) or [])]
+    looped = False
+    while frontier:
+        if len(seen) >= _CFG_CLOSURE_BLOCKS:
+            return out, looped, False
+        block = frontier.pop()
+        if block is None:
+            continue
+        key = _block_key(block)
+        if key == call_key:
+            looped = True
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(block)
+        frontier += [getattr(e, "source", None)
+                     for e in (getattr(block, "incoming_edges", None) or [])]
+    return out, looped, True
+
+
+def _entry_value_state(call_ins: Any, bn: Any) -> str:
+    """``"entry"`` / ``"clobbered"`` / ``"budget"`` for the value an untouched
+    register holds where *call_ins* runs.
+
+    Used only after :func:`reaching_reg_def` has established that the register
+    has no definition at all reaching the call, which means it still holds the
+    value the function was entered with -- *unless* something ran in between
+    that the IL does not name as a definition. The one such thing is another
+    call: a callee may clobber any caller-saved register, and no definition in
+    this function records it.
+
+    So ``"clobbered"`` is answered whenever any call/syscall/intrinsic can
+    execute before this one. "Can execute before" is taken from the CFG, not
+    from instruction order: every block that REACHES the call's block may run
+    first, and a block on a cycle through the call reaches itself, so a loop
+    body's later call is caught too. Nothing is inferred from a calling
+    convention's clobber list.
+
+    ``"budget"`` is the third state (review F10): the predecessor closure ran
+    out of its block budget with work pending. What it did not look at is
+    exactly where a clobbering call would be, so the scan establishes nothing
+    either way -- and the caller is told that, rather than being handed a
+    positive it could not earn.
+    """
+    call_ops = _call_like_ops(bn)
+    call_bb = getattr(call_ins, "il_basic_block", None)
+    if call_bb is None:
+        return "clobbered"
+    call_idx = int(getattr(call_ins, "instr_index", -1))
+    earlier, looped, complete = _reaching_blocks(call_bb)
+    for block in earlier:
+        for ins in block:
+            if getattr(ins, "operation", None) in call_ops:
+                return "clobbered"
+    if not complete:
+        return "budget"
+    for ins in call_bb:
+        if getattr(ins, "operation", None) not in call_ops:
+            continue
+        idx = int(getattr(ins, "instr_index", -1))
+        if idx == call_idx:
+            continue
+        if idx < call_idx or looped:
+            return "clobbered"
+    return "entry"
+
+
+def _entry_value_survives(call_ins: Any, bn: Any) -> bool:
+    """Whether the register provably still carries the function's entry value.
+
+    The boolean face of :func:`_entry_value_state`: an exhausted scan is not a
+    survival, so it answers False for that too.
+    """
+    return _entry_value_state(call_ins, bn) == "entry"
+
+
+def argument_register_provenance(func: Any, addr: int, reg: str,
+                                 bn: Any) -> tuple[str, list[tuple[Any, Any]]]:
+    """What the ABI argument register *reg* carries into the call at *addr*.
+
+    ``("defined", seeds)`` -- a dominating LLIL-SSA definition reaches the
+    call; ``seeds`` are its ``(mlil_ssa_var, mlil_instr)`` bridges, the values
+    a slice can follow. ``("entry", [])`` -- nothing defines the register and
+    nothing that can run first may have clobbered it, so it still holds the
+    value the function was ENTERED with (the ``rdi#0``-unchanged shape an
+    optimised build leaves when the callee has no prototype to recover
+    arguments from). ``("budget", [])`` -- the predecessor closure ran out of
+    its block budget, so whether anything clobbered the register was never
+    established (review F10). ``("unproven", [])`` -- there is no LLIL to read,
+    the call is not in it, or a call may have clobbered the register: nothing
+    is claimed.
+    """
+    lssa = getattr(getattr(func, "llil", None), "ssa_form", None)
+    if lssa is None:
+        return ("unproven", [])
+    try:
+        site_ops = _call_like_ops(bn)
+        for block in lssa:
+            for ins in block:
+                if int(getattr(ins, "address", -1)) != int(addr):
+                    continue
+                # A TAIL call is a call: an optimised `return f(p)` leaves the
+                # arguments exactly where they already are, which is precisely
+                # the shape this answers for. Matching only `LLIL_CALL_SSA`
+                # left every tail call unrecovered (review F4).
+                if getattr(ins, "operation", None) not in site_ops:
+                    continue
+                definition = reaching_reg_def(ins, reg, bn)
+                if definition is None:
+                    state = _entry_value_state(ins, bn)
+                    return (state if state in ("entry", "budget") else "unproven", [])
+                if getattr(definition, "operation", None) in _call_like_ops(bn):
+                    # The reaching "definition" is another CALL that lists this
+                    # register among its outputs -- i.e. it CLOBBERED it. Its
+                    # MLIL mapping writes the call's RESULT variable, which is
+                    # the return register's value and says nothing about an
+                    # ARGUMENT register. Bridging to it would hand the walk the
+                    # wrong value entirely; a clobbered register is unproven.
+                    return ("unproven", [])
+                seeds: list[tuple[Any, Any]] = []
+                mapped = getattr(definition, "mlil", None)
+                mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
+                if mssa is not None:
+                    for w in (getattr(mssa, "vars_written", None) or []):
+                        if is_ssa_var(w):
+                            seeds.append((w, mssa))
+                return ("defined", seeds)
+    except Exception:
+        return ("unproven", [])
+    return ("unproven", [])
+
+
 def reaching_arg_seed_vars(func: Any, addr: int, reg: str,
                            bn: Any) -> list[tuple[Any, Any]]:
     """Find the call at ``addr`` in *func*'s LLIL-SSA and recover ``reg``'s
     reaching definition (:func:`reaching_reg_def`), bridged to the MLIL SSA
     variable(s) that hold it -- the seeds a backward walk / trace can slice.
     Returns ``[(mlil_ssa_var, mlil_instr), ...]``; ``[]`` when not recoverable
-    (e.g. no LLIL, as in the unit fakes)."""
-    lssa = getattr(getattr(func, "llil", None), "ssa_form", None)
-    if lssa is None:
-        return []
-    seeds: list[tuple[Any, Any]] = []
-    try:
-        for block in lssa:
-            for ins in block:
-                if int(getattr(ins, "address", -1)) != int(addr):
-                    continue
-                if getattr(ins, "operation", None) != bn.LowLevelILOperation.LLIL_CALL_SSA:
-                    continue
-                definition = reaching_reg_def(ins, reg, bn)
-                if definition is None:
-                    continue
-                mapped = getattr(definition, "mlil", None)
-                mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
-                if mssa is None:
-                    continue
-                for w in (getattr(mssa, "vars_written", None) or []):
-                    if is_ssa_var(w):
-                        seeds.append((w, mssa))
-    except Exception:
-        return seeds
-    return seeds
+    (e.g. no LLIL, as in the unit fakes). A register carrying the function's
+    own ENTRY value has no definition to slice, so it is not one of these --
+    :func:`argument_register_provenance` is the caller that distinguishes it."""
+    return argument_register_provenance(func, addr, reg, bn)[1]
 
 
 # --------------------------------------------------------------------------

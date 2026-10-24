@@ -2126,3 +2126,45 @@ def test_machine_error_format_does_not_leak_into_the_next_parse(capsys):
     second = capsys.readouterr()
     assert second.out == ""
     assert "--definitely-not-a-flag" in second.err
+
+
+def test_taint_leaf_reseed_command_is_bound_to_this_invocation():
+    """BN23-ADVICE-01: a leaf's `reseed` is an executable `bn taint forward …`,
+    so with several bridges open the structured field exited 2 while the same
+    command quoted in `detail` prose ran."""
+    value = {"leaves": [{
+        "reseed": "`bn taint forward -f 0x401100 --source arg:system:0`",
+        "suggested_source": "arg:system:0",
+        "seed": "0x401100",
+    }]}
+    bn.cli._contextualize_diagnostic_hints(value, target="-local sample", instance="X1")
+    leaf = value["leaves"][0]
+    assert leaf["reseed"] == (
+        "`bn -i X1 '--target=-local sample' taint forward -f 0x401100"
+        " --source arg:system:0`")
+    assert leaf["suggested_source"] == "arg:system:0"
+    assert leaf["seed"] == "0x401100"
+
+
+@pytest.mark.parametrize(("command", "expected"), [
+    ("taint forward -f 0x401100 -i other",
+     "'--target=-local sample' taint forward -f 0x401100 -i other"),
+    ("taint forward -f 0x401100 --target='other target'",
+     "-i X1 taint forward -f 0x401100 --target='other target'"),
+    ("taint forward -f 0x401100 -i other -t 'other target'",
+     "taint forward -f 0x401100 -i other -t 'other target'"),
+])
+def test_reseed_that_already_routes_keeps_one_selector_each(command, expected):
+    value = {"leaves": [{"reseed": f"`bn {command}`",
+                         "detail": f"Reseed with `bn {command}`."}]}
+    bn.cli._contextualize_diagnostic_hints(value, target="-local sample", instance="X1")
+    leaf = value["leaves"][0]
+    assert leaf["reseed"] == f"`bn {expected}`"
+    assert leaf["detail"] == f"Reseed with `bn {expected}`."
+
+
+def test_reseed_is_untouched_when_the_call_routed_nothing():
+    reseed = "`bn taint forward -f 0x401100 --source arg:system:0`"
+    value = {"leaves": [{"reseed": reseed}]}
+    bn.cli._contextualize_diagnostic_hints(value, target=None, instance=None)
+    assert value["leaves"][0]["reseed"] == reseed

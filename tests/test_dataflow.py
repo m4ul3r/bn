@@ -306,17 +306,21 @@ _BACKWARD_CAPPED = {
                 "slice": []}],
     "leaves": [{"kind": "caller_sites_truncated", "address": "0x800",
                 "function": {"name": "use_len", "address": "0x800"},
-                "callers_total": 20, "callers_followed": 16, "callers_dropped": 4,
-                "note": ("caller-site cap: the ascent followed 16 of 20 callers "
-                         "(0 of the 16 sites the cap let through could not be "
-                         "followed, 4 left past the cap) -- an origin reachable "
-                         "only from an unfollowed caller is missing from this "
-                         "slice")}],
+                "callers_total": 20, "callers_fully_followed": 16,
+                "callers_partially_followed": 0, "callers_unfollowed": 4,
+                "callers_dropped": 4, "demands_total": 20, "demands_unfollowed": 4,
+                "reasons": {"caller_cap": 4}, "partially_followed": [],
+                "note": ("caller-site cap: of 20 distinct caller reference(s), the "
+                         "ascent fully followed 16 (every demanded formal), partially "
+                         "followed 0 and followed none of 4; 4 of 20 (reference, "
+                         "formal) demand(s) unfollowed: 4 caller_cap -- an origin "
+                         "reachable only from an unfollowed caller is missing from "
+                         "this slice")}],
     # The wording is the engine's own (`_bw_note_caller_cap`), copied rather than
     # paraphrased: a fixture that drifts from the envelope it stands for renders
     # prose no run can produce, and the renderer assertions stop describing the
     # real thing (#810 review).
-    "assumptions": ["use_len has 20 callers; caller ascent followed 16, capped at 16"],
+    "assumptions": ["use_len has 20 callers; caller ascent fully followed 16, capped at 16"],
     "stats": {"leaves": 1, "slices": 1, "truncated": True,
               "truncation_cause": ["caller_cap"]},
     "soundness": "x",
@@ -331,7 +335,7 @@ def test_render_taint_backward_truncated_is_not_a_complete_result():
     assert "verdict: INCOMPLETE" in text
     assert "caller-site cap reached" in text
     assert "caller_sites_truncated @ 0x800" in text
-    assert "16 of 20 caller(s) followed; 4 dropped" in text
+    assert "20 caller reference(s): 16 fully followed, 0 partially, 4 not followed; 4 dropped" in text
 
 
 def test_render_taint_backward_memory_chain_cut_names_its_cause_928r3():
@@ -361,24 +365,6 @@ def test_render_taint_backward_complete_run_keeps_old_text():
     text = _render_taint_text(value)
     assert "INCOMPLETE" not in text
     assert "caller_sites_truncated" not in text
-
-
-def test_render_taint_backward_bounded_sink_is_success_not_unseeded():
-    # #310: a provably-bounded (constant-length) sink renders under "provably
-    # bounded", NOT "UNSEEDED SINKS" -- it's a successful conclusion.
-    value = {
-        "direction": "backward",
-        "function": {"name": "f", "address": "0x401189"},
-        "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
-        "slices": [],
-        "sink_status": [{"kind": "arg", "callee": "memcpy", "index": 2,
-                         "seeded": False, "bounded": True,
-                         "note": "arg 2 of memcpy is a compile-time constant -- provably bounded"}],
-        "leaves": [], "assumptions": [], "soundness": "x",
-    }
-    text = _render_taint_text(value)
-    assert "provably bounded (1)" in text
-    assert "UNSEEDED SINKS" not in text
 
 
 def test_render_taint_groups_repeated_leaves():
@@ -1001,3 +987,66 @@ def test_taint_forward_forwards_a_null_resolve_map_as_present(monkeypatch, capsy
     params = [c for c in calls if c["op"] == "taint"][0]["params"]
     assert "resolve_map" in params and params["resolve_map"] is None
     assert params["resolve_map_path"] == str(rmap)
+
+
+def test_render_taint_text_shows_every_blocking_frontier_kind():
+    """BN25-META-01's formatter half: whatever the bridge returns, the text
+    surface must render the SAME leaves the JSON does -- all of them, with
+    counts that agree -- so a disagreement between the two spellings can
+    only come from the result, never from the rendering."""
+    value = {
+        "function": {"name": "wide_write_case", "address": "0x400810"},
+        "direction": "forward",
+        "sources": [{"kind": "param", "index": 0}],
+        "reached_sinks": [],
+        "leaves": [
+            {"kind": "unmodeled_callee", "address": "0x400818",
+             "callee": {"name": "__wmemcpy", "display_name": "__wmemcpy",
+                        "address": "0x40a2d0"},
+             "tainted_args": [0, 1], "cause": "return_value_unrecovered",
+             "note": "Binary Ninja recovered no result for this call"},
+            {"kind": "global_memory_continuation", "address": "0x40081c",
+             "global": {"address": "0x491948", "label": "glob_0x491948"},
+             "references": [], "detail": "code reachable from this call reads it"},
+        ],
+        "diagnostics": {
+            "safe_to_report_all_clear": False,
+            "frontier": {"unresolved": 1, "coarse_memory": 1, "seed_misanchored": 0,
+                         "by_kind": {"unmodeled_callee": 1,
+                                     "global_memory_continuation": 1}},
+        },
+        "assumptions": [],
+        "soundness": "may-analysis",
+    }
+    text = _render_taint_text(value, full=True)
+    assert "frontiers (2)" in text
+    assert "2 tainted frontier(s)" in text
+    assert "unmodeled_callee @ 0x400818" in text
+    assert "global_memory_continuation @ 0x40081c" in text
+
+
+def test_render_taint_text_frontier_count_follows_the_leaves():
+    """The same result with only the continuation renders one frontier --
+    the count is the leaves', not a constant either spelling invents."""
+    value = {
+        "function": {"name": "wide_write_case", "address": "0x400810"},
+        "direction": "forward",
+        "sources": [{"kind": "param", "index": 0}],
+        "reached_sinks": [],
+        "leaves": [
+            {"kind": "global_memory_continuation", "address": "0x40081c",
+             "global": {"address": "0x491948", "label": "glob_0x491948"},
+             "references": [], "detail": "code reachable from this call reads it"},
+        ],
+        "diagnostics": {
+            "safe_to_report_all_clear": False,
+            "frontier": {"unresolved": 0, "coarse_memory": 1, "seed_misanchored": 0,
+                         "by_kind": {"global_memory_continuation": 1}},
+        },
+        "assumptions": [],
+        "soundness": "may-analysis",
+    }
+    text = _render_taint_text(value, full=True)
+    assert "frontiers (1)" in text
+    assert "1 tainted frontier(s)" in text
+    assert "unmodeled_callee" not in text

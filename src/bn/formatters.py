@@ -4999,14 +4999,91 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"dropped arg(s) {_field_list(leaf, 'dropped_args')})"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
+    if kind == "unread_callee_body":
+        cal = _field_dict(leaf, "callee")
+        args = _field_list(leaf, "tainted_args")
+        via = leaf.get("via")
+        return (
+            f"  unread_callee_body @ {leaf.get('address')}"
+            f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
+            + (f"  (via {via})" if via else "")
+            + f"  (tainted arg(s) {args}; {leaf.get('skip_reason', '?')}"
+            # Which arguments the MLIL call did NOT carry: the reader must be
+            # able to tell an argument Binary Ninja recovered from one the
+            # calling convention's register proved.
+            + (f"; ABI-recovered arg(s) {_field_list(leaf, 'abi_recovered_args')}"
+               if leaf.get("abi_recovered_args") else "")
+            # Whether a model covered the call is the POINT of this leaf: the
+            # overlay is exactly what used to hide the unread body, so a reader
+            # must see both facts on the one row (IC05).
+            + ("; modeled" if leaf.get("modeled") else "") + ")"
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+        )
+    if kind == "global_memory_continuation":
+        cal = _field_dict(leaf, "callee")
+        glob = _field_dict(leaf, "global")
+        refs = [r for r in _field_list(leaf, "references") if isinstance(r, dict)]
+        reach = _field_dict(leaf, "reachability")
+        where = ", ".join(
+            f"{_shown_name(r, mangled=mangled) or '?'} @ {r.get('at', '?')}"
+            + (f" ({r['access']})" if r.get("access") else "")
+            for r in refs)
+        truncated = str(reach.get("status")) == "truncated"
+        # BN21-BOUND-02: a reference the scan could not account for is not a
+        # reader this walk identified; only a PROVEN read says "read by".
+        verb = "read by" if leaf.get("reads_proven") else "may be read by"
+        if where and not truncated:
+            middle = f"  ({verb} {where})"
+        elif where:
+            # A named reader and an unfinished search are not alternatives:
+            # the row says both, so it never reads as "and that is all".
+            middle = (f"  ({verb} {where}; reachability truncated:"
+                      f" {reach.get('cause', '?')})")
+        else:
+            # No reader is NAMED because the search never finished: say which
+            # bound stopped it and how much it left unexamined, so the row is
+            # not read as "a boundary with nothing behind it".
+            middle = (f"  (reachability {reach.get('status', '?')}:"
+                      f" {reach.get('cause', '?')},"
+                      f" {reach.get('functions_examined', '?')}/"
+                      f"{reach.get('function_budget', '?')} function(s) examined,"
+                      f" {reach.get('unexamined_references_total', '?')} reference(s)"
+                      f" unexamined)")
+        return (
+            f"  global_memory_continuation @ {leaf.get('address')}"
+            f"  global={glob.get('address', '?')}"
+            # WHICH bytes were written: an interior copy is the same object,
+            # and naming the offset keeps a partial write from reading as
+            # coverage of the whole object (round-3 review R1).
+            + (f"(+{', +'.join(str(o) for o in _field_list(glob, 'written_offsets'))})"
+               if _field_list(glob, "written_offsets") else "")
+            + f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
+            + middle
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+        )
     if kind == "caller_sites_truncated":
         fn = _field_dict(leaf, "function")
         return (
             f"  caller_sites_truncated @ {leaf.get('address')}"
             f"  -> {_shown_name(fn, mangled=mangled) or '?'} @ {fn.get('address', '?')}"
-            f"  ({leaf.get('callers_followed', '?')} of {leaf.get('callers_total', '?')} "
-            f"caller(s) followed; {leaf.get('callers_dropped', '?')} dropped)"
+            f"  ({leaf.get('callers_total', '?')} caller reference(s): "
+            f"{leaf.get('callers_fully_followed', '?')} fully followed, "
+            f"{leaf.get('callers_partially_followed', '?')} partially, "
+            f"{leaf.get('callers_unfollowed', '?')} not followed; "
+            f"{leaf.get('callers_dropped', '?')} dropped)"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+        )
+    if kind == "model_destination_unrecovered":
+        cal = _field_dict(leaf, "callee")
+        srcs = ", ".join(f"{s.get('from', '?')}={s.get('tainted', '?')}"
+                         + (f" (state set at {s['continued_from']})" if s.get("continued_from") else "")
+                         for s in _field_list(leaf, "sources") if isinstance(s, dict))
+        return (
+            f"  model_destination_unrecovered @ {leaf.get('address')}"
+            f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address') or '?'}"
+            f"  (declared destination {leaf.get('destination', '?')} unavailable: "
+            f"recovered {leaf.get('recovered_params', '?')} arg(s); reached source(s) {srcs or '?'})"
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
         )
     return (
         f"  {kind} @ {leaf.get('address')}  [{leaf.get('dest_expr', leaf.get('il_text', ''))}]"
@@ -5015,8 +5092,8 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
 
 
 def _leaf_group_key(leaf: Any) -> tuple:
-    """Collapse near-identical frontier leaves: one group per callee for
-    unmodeled calls, per (base, offset) for field loads, per kind otherwise."""
+    """Group calls by callee, field loads by slot, caller frontiers by function
+    and measured coverage, and other near-identical frontiers by kind."""
     if not isinstance(leaf, dict):
         # Group malformed leaves by (type, repr): a type key can't collide with a
         # real `kind` string, and keying on the repr too means two DISTINCT
@@ -5031,6 +5108,32 @@ def _leaf_group_key(leaf: Any) -> tuple:
         return (kind, str(leaf.get("base")), str(leaf.get("offset")))
     if kind == "arg_under_recovered":
         return (kind, str(_field_dict(leaf, "callee").get("name", "?")))
+    if kind == "unread_callee_body":
+        # One unread body reached at one call site is ONE hole, however many
+        # tainted-argument contexts the fixpoint reached it from.
+        return (kind, str(leaf.get("address")),
+                str(_field_dict(leaf, "callee").get("address")))
+    if kind == "global_memory_continuation":
+        # The global IS the identity here: two calls that hand two different
+        # globals past the walk are two boundaries an agent must chase
+        # separately, not one "[2 leaves]" row under the first address.
+        return (kind, str(_field_dict(leaf, "global").get("address")),
+                str(_field_dict(leaf, "callee").get("address")))
+    if kind == "caller_sites_truncated":
+        fn = _field_dict(leaf, "function")
+        # The reason tally's identity is its (reason, count) pairs, never the
+        # order its keys arrived in.
+        reasons = tuple(sorted((str(k), repr(v)) for k, v in _field_dict(leaf, "reasons").items()))
+        return (kind, str(fn.get("address") or leaf.get("address")), str(fn.get("name")),
+                *(str(leaf.get(k)) for k in (
+                    "callers_total", "callers_fully_followed", "callers_partially_followed",
+                    "callers_unfollowed", "callers_dropped", "demands_unfollowed")),
+                reasons)
+    if kind == "model_destination_unrecovered":
+        # One row per callee and declared destination: two missing outputs of
+        # one call are two writes to chase, never one "[2 leaves]" row.
+        return (kind, str(_field_dict(leaf, "callee").get("address")),
+                str(_field_dict(leaf, "callee").get("name")), str(leaf.get("destination")))
     return (kind,)
 
 
@@ -5398,7 +5501,11 @@ def _render_backward_diagnostics(diag: dict[str, Any]) -> list[str]:
     _fr = (f"  frontier: {_stated_count(fr, 'unresolved')} unresolved, "
            f"{_stated_count(fr, 'coarse_memory')} coarse-memory")
     _dropped = _count_field(fr, "dropped_callers")
-    if _dropped:
+    _unmeasured = _count_field(fr, "dropped_callers_unmeasured")
+    if _unmeasured:
+        _fr += (f", at least {_dropped} dropped-caller-site(s) ({_unmeasured} caller "
+                "frontier(s) carried no readable count)")
+    elif _dropped:
         _fr += f", {_dropped} dropped-caller-site(s)"
     out.append(_fr)
     if "safe_to_report_complete_slice" in diag:
@@ -5409,6 +5516,89 @@ def _render_backward_diagnostics(diag: dict[str, Any]) -> list[str]:
             out.append(f"    reason: {diag['complete_slice_reason']}")
     if diag.get("next_action"):
         out.append(f"  next: {diag['next_action']}")
+    return out
+
+
+# The per-site statuses a backward run writes, and how many site rows the text
+# view lists before it counts the rest (the caller-example bound, MAX_CALLERS).
+_SINK_SITE_STATUSES = ("seeded", "constant", "demand", "unseeded", "truncated")
+_SINK_SITE_EXAMPLES = 16
+
+
+def _sink_site_line(row: dict[str, Any]) -> str:
+    """One complete text line for a backward ``sink_status`` row."""
+    address = row.get("address")
+    if isinstance(address, int) and not isinstance(address, bool):
+        address = hex(address)
+    # Presence, not truth: a site at address 0 is still a site.
+    site = f" @ {address}" if address is not None else ""
+    status = row.get("status")
+    if status in _SINK_SITE_STATUSES:
+        tag = f"[{status}]"
+    else:
+        # An older bridge's row (`bounded`, no status) or a foreign status: say
+        # so rather than rendering it as one of the statuses this view knows.
+        _record_skew("status")
+        tag = "[? no status]" if status is None else f"[? unrecognised status {status!r}]"
+    evidence = ""
+    note = row.get("note") or ""
+    if status == "constant":
+        scalar = _field_dict(row, "scalar")
+        value = scalar.get("value")
+        if (scalar.get("kind") == "constant" and isinstance(value, int)
+                and not isinstance(value, bool)):
+            shown = f"{value:#x}"
+        else:
+            # Only an integer is a scalar count: a flag or a string is not one.
+            _record_skew("scalar")
+            shown = "? (unreadable)"
+        if row.get("destination_fit", "unproved") != "unproved":
+            _record_skew("destination_fit")
+        # A finite count never proves a destination fits, so the capacity
+        # verdict does not depend on the scalar evidence being readable.
+        evidence = f" scalar={shown}; destination capacity=unproved"
+        note = ""
+    return f"  {_describe_loc(row)}{site} {tag}{evidence} {note}".rstrip()
+
+
+def _render_sink_sites(value: Any) -> list[str]:
+    """The backward ``sink sites`` block: bounded complete example rows plus the
+    exact count of every row it does not list. JSON keeps every site.
+
+    The examples include the first row of each status, so a status present
+    anywhere in the run is visible in text; the rest are listed in order."""
+    raw = _field_list(value, "sink_status")
+    if not raw:
+        return []
+    rows = _row_list(value, "sink_status")
+    kept: set[int] = set()
+    firsts: set[str] = set()
+    for i, row in enumerate(rows):
+        status = row.get("status")
+        key = repr(status)
+        if key not in firsts and len(kept) < _SINK_SITE_EXAMPLES:
+            firsts.add(key)
+            kept.add(i)
+    for i in range(len(rows)):
+        if len(kept) >= _SINK_SITE_EXAMPLES:
+            break
+        kept.add(i)
+    out = ["", f"sink sites ({len(raw)}):"]
+    out.extend(_sink_site_line(rows[i]) for i in sorted(kept))
+    omitted: dict[str, int] = {}
+    for i, row in enumerate(rows):
+        if i not in kept:
+            status = row.get("status")
+            label = status if status in _SINK_SITE_STATUSES else "unrecognised"
+            omitted[label] = omitted.get(label, 0) + 1
+    if omitted:
+        out.append(
+            f"  ... {sum(omitted.values())} more sink site(s) not listed: "
+            + ", ".join(f"{n} {s}" for s, n in sorted(omitted.items()))
+            + " (--format json lists every site)")
+    if len(raw) > len(rows):
+        out.append(f"  ! {len(raw) - len(rows)} sink_status row(s) unreadable, not listed "
+                   "(--format json)")
     return out
 
 
@@ -5523,6 +5713,8 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                 f"(seed {sink.get('seed', '?')})   {sig}   "
                 f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} "
                 f"unresolved={unresolved}}}{xn}".rstrip())
+            if origin.get("function"):
+                lines.append(f"  origin function: {origin['function']}")
             if full:
                 lines.append(
                     f"  slice for {_sink_callee_text(sink, mangled=mangled) or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
@@ -5544,23 +5736,7 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                 for step in _field_list(sl, "slice"):
                     if isinstance(step, dict):
                         lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
-        status = _field_list(value, "sink_status")
-        # A constant-length sink is "provably bounded" -- a SUCCESS, not a failed
-        # seed -- so report it apart from genuinely-unseeded sinks (#310). A
-        # malformed (non-dict) status row is neither.
-        bounded = [s for s in status if isinstance(s, dict) and s.get("bounded")]
-        unseeded = [s for s in status
-                    if isinstance(s, dict) and not s.get("seeded", True) and not s.get("bounded")]
-        if bounded:
-            lines.append("")
-            lines.append(f"provably bounded ({len(bounded)}):")
-            for s in bounded:
-                lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'constant length, nothing to slice')}")
-        if unseeded:
-            lines.append("")
-            lines.append(f"UNSEEDED SINKS ({len(unseeded)}):")
-            for s in unseeded:
-                lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'could not seed')}")
+        lines.extend(_render_sink_sites(value))
         # #812: backward's completeness gate, rendered for every backward run
         # that carries one. Leaving it JSON-only would repeat the asymmetry #810
         # fixed for the truncation verdict -- a text reader could not tell a

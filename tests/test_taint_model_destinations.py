@@ -1,0 +1,885 @@
+"""Forward taint: a reached model rule whose declared destination is unrecovered.
+
+A model propagation rule such as ``arg:0 -> *arg:1`` states that the callee
+writes its input through its second argument. When Binary Ninja recovered only
+the first argument for a call, ``_apply_to_token`` had nothing to write and the
+unkeyed-store disclosure nothing to name: both returned early on the missing
+index, so the declared output vanished and the run reported no leaf and
+``safe_to_report_all_clear: true`` (BN6-C009).
+
+The fix discloses the write as a blocking ``model_destination_unrecovered``
+leaf -- callee, call site, declared destination and the reached rule source --
+without guessing a pointer for it. It fires only for a REACHED rule whose
+destination index is beyond the call's recovered arguments: a recovered
+destination keeps its existing outcome (keyed, already tainted, or
+``coarse_memory_store``), and a rule whose source never carried taint stays
+silent.
+"""
+from __future__ import annotations
+
+import pytest
+from test_taint_engine import FBV, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar, te
+
+from bn import formatters
+from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+
+KIND = "model_destination_unrecovered"
+
+EMIT = 0x401030        # external `model_emit`, the modeled callee
+SYSTEM = 0x401040      # external `system`, a modeled sink
+GETBUF = 0x401050      # external `get_buf`, an opaque pointer producer
+OTHER = 0x401060       # external `other_emit`, modeled but never called
+F_ADDR = 0x4018af      # call_model_emit(input)
+G_ADDR = 0x401900      # outer(input) -> call_model_emit(input)
+SITE = 0x4018c6        # the model_emit call inside call_model_emit
+
+
+@pytest.fixture
+def models():
+    return te.load_models()
+
+
+def _var(name: str, version: int = 0):
+    v = FVar(name)
+    return v, FSSA(v, version)
+
+
+def _const(addr: int) -> FExpr:
+    return FExpr("MLIL_CONST_PTR", hex(addr), constant=addr)
+
+
+def _call(index: int, addr: int, target: int, callee: str, args: list[FExpr],
+          writes: list | None = None) -> FInstr:
+    text = f"{callee}({', '.join(str(a) for a in args)})"
+    if writes:
+        text = f"{writes[0].var.name}#{writes[0].version} = {text}"
+    return FInstr(index, addr, "MLIL_CALL_SSA", text,
+                  reads=[r for a in args for r in a.vars_read], writes=list(writes or []),
+                  dest=_const(target), params=list(args))
+
+
+def _ret(index: int, addr: int, reads=()) -> FInstr:
+    return FInstr(index, addr, "MLIL_RET", "return", reads=list(reads))
+
+
+def _bv(funcs=None) -> FBV:
+    return FBV({EMIT: "model_emit", SYSTEM: "system", GETBUF: "get_buf",
+                OTHER: "other_emit"}, funcs)
+
+
+def _one_arg_emit_func(name: str = "call_model_emit", start: int = F_ADDR,
+                       site: int = SITE, extra: list | None = None) -> FFunc:
+    """``name(input) { model_emit(input); }`` -- BN recovered ONE argument."""
+    inp, i0 = _var("input")
+    instrs = [_call(0, site, EMIT, "model_emit", [FExpr("MLIL_VAR_SSA", "input#0", reads=[i0])])]
+    instrs += list(extra or [])
+    instrs.append(_ret(len(instrs), site + 5))
+    return FFunc(name, start, FSSAFunc(instrs), params=[inp])
+
+
+def _forward(models, func, source="param:0", funcs=None):
+    return te.TaintEngine(_bv(funcs), models).forward(func, [te.parse_locator(source)])
+
+
+def _missing(result) -> list[dict]:
+    return [lf for lf in result["leaves"] if lf.get("kind") == KIND]
+
+
+def _rules(*pairs: tuple[str, str]) -> dict:
+    return {"propagates": [{"from": f, "to": t} for f, t in pairs]}
+
+
+# --------------------------------------------------------------------------
+# the defect: a reached rule into an unrecovered destination
+# --------------------------------------------------------------------------
+
+def test_root_call_reached_rule_into_unrecovered_pointee_blocks_all_clear(models):
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    result = _forward(models, _one_arg_emit_func())
+
+    [leaf] = _missing(result)
+    assert leaf["address"] == hex(SITE)
+    assert leaf["callee"] == {"name": "model_emit", "display_name": "model_emit",
+                              "address": hex(EMIT)}
+    assert leaf["function"]["address"] == hex(F_ADDR)
+    assert leaf["destination"] == "*arg:1" and leaf["destination_index"] == 1
+    assert leaf["recovered_params"] == 1
+    assert leaf["sources"] == [{"from": "arg:0", "tainted": "input"}]
+    # No pointer was fabricated for the missing argument: nothing was keyed
+    # or tainted for it, and no other frontier stands in for it.
+    assert [lf["kind"] for lf in result["leaves"]] == [KIND]
+    assert result["reached_sinks"] == []
+
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is False
+    assert KIND in diag["all_clear_reason"]
+    assert diag["frontier"]["by_kind"] == {KIND: 1}
+    assert diag["frontier"]["unresolved"] == 1
+    assert diag["frontier"]["coarse_memory"] == 0
+    # The callee is modeled: an unresolved write is not an unmodeled call.
+    assert diag["unmodeled_calls_reached"] is False
+    assert KIND in BLOCKING_LEAF_KINDS
+
+
+def test_scalar_output_destination_unrecovered_is_disclosed_too(models):
+    models["model_emit"] = _rules(("arg:0", "arg:1"))
+    [leaf] = _missing(_forward(models, _one_arg_emit_func()))
+    assert leaf["destination"] == "arg:1" and leaf["destination_index"] == 1
+
+
+def test_descended_call_discloses_unrecovered_destination(models):
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    inner = _one_arg_emit_func()
+    # `return 0`: a valued return, so the hand-off back adds no frontier of its own.
+    inner.mlil.ssa_form.instructions[-1].src = [FExpr("MLIL_CONST", "0", constant=0)]
+    x, x0 = _var("x")
+    y, y1 = _var("y", 1)
+    outer = FFunc("outer", G_ADDR, FSSAFunc([
+        _call(0, G_ADDR + 0x10, F_ADDR, "call_model_emit",
+              [FExpr("MLIL_VAR_SSA", "x#0", reads=[x0])], writes=[y1]),
+        _ret(1, G_ADDR + 0x15),
+    ]), params=[x])
+
+    result = _forward(models, outer, funcs={F_ADDR: inner})
+
+    [leaf] = _missing(result)
+    assert leaf["address"] == hex(SITE)
+    assert leaf["function"] == {"name": "call_model_emit", "display_name": "call_model_emit",
+                                "address": hex(F_ADDR)}
+    assert leaf["sources"] == [{"from": "arg:0", "tainted": "input"}]
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is False
+    assert [lf["kind"] for lf in result["leaves"]] == [KIND]
+    assert f"`bn disasm {hex(F_ADDR)}`" in diag["next_action"]
+
+
+def test_distinct_missing_outputs_kept_identical_rules_and_sources_merged(models):
+    models["model_emit"] = _rules(
+        ("arg:0", "*arg:1"),
+        ("arg:0", "*arg:1"),      # an identical rule: the same write, once
+        ("*arg:0", "*arg:1"),     # another reached source of the same write
+        ("arg:0", "*arg:2"),      # a second missing output
+        ("arg:0", "arg:3"),       # a third, scalar
+    )
+    result = _forward(models, _one_arg_emit_func())
+
+    leaves = _missing(result)
+    assert sorted(lf["destination"] for lf in leaves) == ["*arg:1", "*arg:2", "arg:3"]
+    one = next(lf for lf in leaves if lf["destination"] == "*arg:1")
+    # Merged sources are listed in one stable order, whatever order found them.
+    assert one["sources"] == [{"from": "*arg:0", "tainted": "input"},
+                              {"from": "arg:0", "tainted": "input"}]
+    assert result["diagnostics"]["frontier"]["by_kind"] == {KIND: 3}
+    assert result["diagnostics"]["frontier"]["unresolved"] == 3
+
+    # Text keeps the three writes apart rather than one "[3 leaves]" row.
+    text = formatters._render_taint_text(result)
+    rows = [ln for ln in text.splitlines() if ln.startswith(f"  {KIND} @")]
+    assert len(rows) == 3, text
+    assert "[3 leaves]" not in text
+    for dest in ("*arg:1", "*arg:2", "arg:3"):
+        assert any(f"declared destination {dest} unavailable" in r for r in rows), rows
+
+
+def test_repeated_call_sites_each_disclosed(models):
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    _, i0 = _var("input")
+    second = _call(1, SITE + 0x10, EMIT, "model_emit",
+                   [FExpr("MLIL_VAR_SSA", "input#0", reads=[i0])])
+    func = _one_arg_emit_func()
+    func.mlil.ssa_form.instructions.insert(1, second)
+    # Both calls read the same tainted input variable, so the second is reached.
+    second.vars_read = func.mlil.ssa_form.instructions[0].vars_read
+    second.params = func.mlil.ssa_form.instructions[0].params
+
+    result = _forward(models, func)
+    assert sorted(lf["address"] for lf in _missing(result)) == [hex(SITE), hex(SITE + 0x10)]
+    text = formatters._render_taint_text(result)
+    assert "[2 leaves]" in text, text   # one destination, two sites: one grouped row
+
+
+def test_varargs_destination_unrecovered_is_disclosed(models):
+    models["model_emit"] = {"varargs": {"first_index": 0, "to": "*arg:2"}}
+    [leaf] = _missing(_forward(models, _one_arg_emit_func()))
+    assert leaf["destination"] == "*arg:2"
+    assert leaf["sources"] == [{"from": "arg:0", "tainted": "input"}]
+
+
+# --------------------------------------------------------------------------
+# must not fire
+# --------------------------------------------------------------------------
+
+def test_unreached_rule_source_stays_silent(models):
+    # The rule's source is the unrecovered arg 2: it never carried taint.
+    models["model_emit"] = _rules(("arg:2", "*arg:1"))
+    result = _forward(models, _one_arg_emit_func())
+    assert result["leaves"] == []
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_rule_source_recovered_but_untainted_stays_silent(models):
+    # outer(a, b) { model_emit(b); } seeded at param:0: arg 0 of the call is clean.
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    a, _ = _var("a")
+    b, b0 = _var("b")
+    func = FFunc("two", F_ADDR, FSSAFunc([
+        _call(0, SITE, EMIT, "model_emit", [FExpr("MLIL_VAR_SSA", "b#0", reads=[b0])]),
+        _ret(1, SITE + 5),
+    ]), params=[a, b])
+    result = _forward(models, func, "param:0")
+    assert _missing(result) == []
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def _two_arg_emit_func(dest: FExpr, pre: list | None = None, post: list | None = None,
+                       extra_params: list | None = None) -> FFunc:
+    inp, i0 = _var("input")
+    instrs = list(pre or [])
+    instrs.append(_call(len(instrs), SITE, EMIT, "model_emit",
+                        [FExpr("MLIL_VAR_SSA", "input#0", reads=[i0]), dest]))
+    instrs += list(post or [])
+    instrs.append(_ret(len(instrs), SITE + 0x40))
+    for n, ins in enumerate(instrs):
+        ins.instr_index = n
+    return FFunc("call_model_emit", F_ADDR, FSSAFunc(instrs), params=[inp, *(extra_params or [])])
+
+
+def test_recovered_keyable_destination_propagates_without_false_leaf(models):
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    buf = FVar("buf")
+    func = _two_arg_emit_func(
+        FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+        post=[_call(0, SITE + 0x10, SYSTEM, "system", [FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)])])
+    result = _forward(models, func)
+    assert _missing(result) == []
+    assert result["leaves"] == []
+    # The recovered output still carries the bytes to the downstream sink.
+    assert [s["sink"]["callee"] for s in result["reached_sinks"]] == ["system"], result
+
+
+def test_recovered_destination_already_tainted_is_not_a_missing_output(models):
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    buf = FVar("buf")
+    _, i0 = _var("input")
+    first = _call(0, SITE - 0x10, EMIT, "model_emit",
+                  [FExpr("MLIL_VAR_SSA", "input#0", reads=[i0]),
+                   FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)])
+    func = _two_arg_emit_func(FExpr("MLIL_ADDRESS_OF", "&buf", src=buf), pre=[first])
+    first.vars_read = func.mlil.ssa_form.instructions[1].vars_read
+    first.params[0] = func.mlil.ssa_form.instructions[1].params[0]
+    result = _forward(models, func)
+    # The second write lands in a keyed buffer the first already tainted:
+    # benign, neither a missing output nor a coarse store.
+    assert result["leaves"] == []
+
+
+def test_recovered_unkeyable_destination_stays_coarse_memory_store(models):
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    p, p1 = _var("p", 1)
+    getbuf = _call(0, SITE - 0x10, GETBUF, "get_buf", [], writes=[p1])
+    func = _two_arg_emit_func(FExpr("MLIL_VAR_SSA", "p#1", reads=[p1]), pre=[getbuf])
+    result = _forward(models, func)
+    assert _missing(result) == []
+    assert "coarse_memory_store" in [lf["kind"] for lf in result["leaves"]]
+
+
+def test_return_plus_missing_output(models):
+    models["model_emit"] = _rules(("arg:0", "ret"), ("arg:0", "*arg:1"))
+    inp, i0 = _var("input")
+    r, r1 = _var("r", 1)
+    func = FFunc("call_model_emit", F_ADDR, FSSAFunc([
+        _call(0, SITE, EMIT, "model_emit", [FExpr("MLIL_VAR_SSA", "input#0", reads=[i0])],
+              writes=[r1]),
+        _ret(1, SITE + 5),
+    ]), params=[inp])
+    result = _forward(models, func)
+    # The return channel propagated as before ...
+    assert result["diagnostics"]["last_use"]["label"] == "r#1"
+    # ... and the declared output it could not carry is still disclosed.
+    assert [lf["destination"] for lf in _missing(result)] == ["*arg:1"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # With the return reaching a sink, the run has findings AND the leaf.
+    s = _call(1, SITE + 0x10, SYSTEM, "system", [FExpr("MLIL_VAR_SSA", "r#1", reads=[r1])])
+    func.mlil.ssa_form.instructions.insert(1, s)
+    func.mlil.ssa_form.instructions[2].instr_index = 2
+    result = _forward(models, func)
+    assert [f["sink"]["callee"] for f in result["reached_sinks"]] == ["system"]
+    assert [lf["destination"] for lf in _missing(result)] == ["*arg:1"]
+
+
+_MALFORMED = ["*argv:1", "buf", "*ret:1", "", "*arg:x", "arg:", "*arg:-1", "arg:-1",
+              "*arg:+1", "*arg:01", "*arg: 1", "*arg:256", "*arg:99999999999999999999",
+              "*arg:1\n", 5, None]
+
+
+def _engine_with_raw_rule(models, frm, to):
+    """An engine built from valid models whose `model_emit` rule is then
+    replaced by raw, unvalidated data -- trusted data that skipped the loader."""
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    engine = te.TaintEngine(_bv(), models)
+    engine.models["model_emit"] = {"propagates": [{"from": frm, "to": to}]}
+    return engine
+
+
+@pytest.mark.parametrize("to", _MALFORMED)
+def test_malformed_destination_token_never_raises_or_selects_an_argument(models, to):
+    engine = _engine_with_raw_rule(models, "arg:0", to)
+    result = engine.forward(_one_arg_emit_func(), [te.parse_locator("param:0")])
+    # Not a missing output, not a write through some OTHER argument.
+    assert result["leaves"] == [], result["leaves"]
+
+
+@pytest.mark.parametrize("frm", ["arg:-1", "*arg:-1", "arg:x", "arg:01", 7, None])
+def test_malformed_source_token_never_reads_another_argument(models, frm):
+    # `arg:-1` read params[-1] -- the only recovered argument, the tainted one
+    # -- so a rule whose source names no argument propagated into the return.
+    inp, i0 = _var("input")
+    r, r1 = _var("r", 1)
+    func = FFunc("call_model_emit", F_ADDR, FSSAFunc([
+        _call(0, SITE, EMIT, "model_emit", [FExpr("MLIL_VAR_SSA", "input#0", reads=[i0])],
+              writes=[r1]),
+        _call(1, SITE + 0x10, SYSTEM, "system", [FExpr("MLIL_VAR_SSA", "r#1", reads=[r1])]),
+        _ret(2, SITE + 0x20),
+    ]), params=[inp])
+    engine = _engine_with_raw_rule(models, frm, "ret")
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+
+
+@pytest.mark.parametrize("bad", [
+    {"propagates": [{"from": "arg:0", "to": "*arg:-1"}]},
+    {"sink": {"class": "x", "tainted_args": [-1]}},
+    {"continuation": {"null_arg": -1}, "propagates": [{"from": "arg:0", "to": "ret"}]},
+])
+def test_engine_refuses_malformed_models_it_is_handed(models, bad):
+    models["model_emit"] = bad
+    with pytest.raises(te.TaintError, match="model 'model_emit'"):
+        te.TaintEngine(_bv(), models)
+
+
+def test_model_for_an_absent_callee_is_irrelevant(models):
+    models["other_emit"] = _rules(("arg:0", "*arg:1"))
+    result = _forward(models, _one_arg_emit_func())
+    assert _missing(result) == []
+
+
+# --------------------------------------------------------------------------
+# advice and text
+# --------------------------------------------------------------------------
+
+def test_next_action_and_leaf_advice_name_runnable_reads(models):
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    result = _forward(models, _one_arg_emit_func())
+    [leaf] = _missing(result)
+    action = result["diagnostics"]["next_action"]
+    assert "*arg:1 of model_emit at " + hex(SITE) in action
+    assert f"`bn proto get {hex(EMIT)}`" in action
+    assert f"`bn disasm {hex(F_ADDR)}`" in action
+    assert "template" not in action      # every command runs as printed
+    # The view cannot say whether model_emit is variadic: the advice reads first.
+    assert leaf["callee_variadic"] is None
+    assert f"`bn proto get {hex(EMIT)}`" in leaf["recovery_advice"]
+    assert "undetermined" in leaf["recovery_advice"]
+
+
+def test_text_names_callee_destination_source_and_gate(models):
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    text = formatters._render_taint_text(_forward(models, _one_arg_emit_func()))
+    assert "frontier: 1 unresolved, 0 coarse-memory" in text
+    assert "safe_to_report_all_clear: false" in text
+    assert "unmodeled call(s) reached: no" in text
+    row = next(ln for ln in text.splitlines() if ln.startswith(f"  {KIND} @ {hex(SITE)}"))
+    assert f"-> model_emit @ {hex(EMIT)}" in row
+    assert "declared destination *arg:1 unavailable" in row
+    assert "recovered 1 arg(s)" in row
+    assert "reached source(s) arg:0=input" in row
+
+
+# --------------------------------------------------------------------------
+# continuation rules: the carried state is the reached source
+# --------------------------------------------------------------------------
+
+STATEFUL = 0x401070    # external `stateful(s, out)`; stateful(NULL) continues
+
+
+class _Block:
+    """One straight-line IL block: instruction indices [start, end)."""
+
+    def __init__(self, start, end):
+        self.start, self.end = start, end
+        self.outgoing_edges = []
+        self.dominators = [self]
+
+
+def _stateful_model(*dests: str, ret: bool = False) -> dict:
+    rules = [{"from": "arg:0", "to": d} for d in dests]
+    if ret:
+        rules.append({"from": "arg:0", "to": "ret"})
+    return {"propagates": rules, "continuation": {"null_arg": 0}}
+
+
+def _stateful_func(*, first_tainted=True, reset=None, null_args=1, null_writes=False):
+    """f(src): stateful(src|"x", &out); [reset]; stateful(NULL[, &out2]) [reset] ...
+
+    ``reset`` places a clean ``stateful("clean", &out)`` "before" or "after"
+    the NULL call; one straight-line block, so the reset's position decides
+    whether it lies on every path from the tainted call to the NULL call."""
+    src, s0 = _var("src")
+    out, out2 = FVar("out"), FVar("out2")
+    t, t1 = _var("t", 1)
+    first = _call(0, 0x401110, STATEFUL, "stateful",
+                  [FExpr("MLIL_VAR_SSA", "src#0", reads=[s0]) if first_tainted else _const(0x402000),
+                   FExpr("MLIL_ADDRESS_OF", "&out", src=out)])
+    null_params = [FExpr("MLIL_CONST", "0", constant=0)]
+    if null_args == 2:
+        null_params.append(FExpr("MLIL_ADDRESS_OF", "&out2", src=out2))
+    cont = _call(0, 0x401120, STATEFUL, "stateful", null_params,
+                 writes=[t1] if null_writes else None)
+    clean = _call(0, 0x401130, STATEFUL, "stateful",
+                  [_const(0x402010), FExpr("MLIL_ADDRESS_OF", "&out", src=out)])
+    instrs = [first]
+    if reset == "before":
+        instrs.append(clean)
+    instrs.append(cont)
+    if reset == "after":
+        instrs.append(clean)
+    if null_args == 2:
+        instrs.append(_call(0, 0x401140, SYSTEM, "system",
+                            [FExpr("MLIL_ADDRESS_OF", "&out2", src=out2)]))
+    instrs.append(_ret(0, 0x401150))
+    block = _Block(0, len(instrs))
+    for n, ins in enumerate(instrs):
+        ins.instr_index = n
+        ins.il_basic_block = block
+    return FFunc("continuation_reset", 0x401100, FSSAFunc(instrs), params=[src])
+
+
+def _cont_forward(models, func, funcs=None):
+    bv = FBV({EMIT: "model_emit", SYSTEM: "system", STATEFUL: "stateful"}, funcs)
+    return te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+
+
+def test_continuation_into_unrecovered_destination_survives_a_later_reset(models):
+    # The review's shape: stateful(src, out); stateful(NULL); stateful("clean", out).
+    # The NULL call continues the tainted state (the reset comes after it),
+    # so `arg:0 -> *arg:1` is reached there with no argument 1 to write.
+    models["stateful"] = _stateful_model("*arg:1")
+    result = _cont_forward(models, _stateful_func(reset="after"))
+
+    [leaf] = _missing(result)
+    assert leaf["address"] == "0x401120"
+    assert leaf["callee"]["name"] == "stateful" and leaf["destination"] == "*arg:1"
+    assert leaf["recovered_params"] == 1
+    assert leaf["sources"] == [{"from": "arg:0", "tainted": "src",
+                                "continued_from": "0x401110"}]
+    # The reset after the NULL call cleans the state at return, so nothing
+    # else blocks: the boundary alone withholds the all-clear.
+    diag = result["diagnostics"]
+    assert [lf["kind"] for lf in result["leaves"]] == [KIND]
+    assert diag["safe_to_report_all_clear"] is False
+    assert diag["frontier"]["unresolved"] == 1 and diag["frontier"]["by_kind"] == {KIND: 1}
+    assert "*arg:1 of stateful at 0x401120" in diag["next_action"]
+    assert f"`bn proto get {hex(STATEFUL)}`" in diag["next_action"]
+
+    text = formatters._render_taint_text(result)
+    row = next(ln for ln in text.splitlines() if ln.startswith(f"  {KIND} @ 0x401120"))
+    assert "reached source(s) arg:0=src (state set at 0x401110)" in row, row
+
+
+def test_continuation_reset_before_the_null_call_kills_it(models):
+    models["stateful"] = _stateful_model("*arg:1")
+    result = _cont_forward(models, _stateful_func(reset="before"))
+    assert result["leaves"] == []
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_continuation_without_tainted_state_stays_silent(models):
+    models["stateful"] = _stateful_model("*arg:1")
+    result = _cont_forward(models, _stateful_func(first_tainted=False, reset="after"))
+    assert result["leaves"] == []
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_complete_continuation_still_propagates_to_its_destination(models):
+    # stateful(NULL, &out2) recovered both arguments: the state lands in out2
+    # and reaches system(&out2), with no boundary.
+    models["stateful"] = _stateful_model("*arg:1")
+    result = _cont_forward(models, _stateful_func(reset="after", null_args=2))
+    assert _missing(result) == []
+    assert [s["sink"]["callee"] for s in result["reached_sinks"]] == ["system"], result
+
+
+def test_continuation_multiple_missing_destinations_and_return(models):
+    models["stateful"] = _stateful_model("*arg:1", "*arg:2", ret=True)
+    result = _cont_forward(models, _stateful_func(reset="after", null_writes=True))
+    got = sorted((lf["address"], lf["destination"]) for lf in _missing(result))
+    # The NULL call is missing both outputs; the first call recovered arg 1
+    # but not arg 2, so its own reached rule is a boundary at its own site.
+    assert got == [("0x401110", "*arg:2"), ("0x401120", "*arg:1"), ("0x401120", "*arg:2")], got
+    cont = [lf for lf in _missing(result) if lf["address"] == "0x401120"]
+    assert all(lf["sources"][0]["continued_from"] == "0x401110" for lf in cont), cont
+    first = next(lf for lf in _missing(result) if lf["address"] == "0x401110")
+    assert "continued_from" not in first["sources"][0], first
+    # The return state still propagates beside the boundaries.
+    assert result["diagnostics"]["last_use"]["label"] == "t#1", result["diagnostics"]
+
+
+def test_continuation_boundary_in_a_descended_callee(models):
+    models["stateful"] = _stateful_model("*arg:1")
+    inner = _stateful_func(reset="after")
+    inner.mlil.ssa_form.instructions[-1].src = [FExpr("MLIL_CONST", "0", constant=0)]
+    x, x0 = _var("x")
+    y, y1 = _var("y", 1)
+    outer = FFunc("outer", G_ADDR, FSSAFunc([
+        _call(0, G_ADDR + 0x10, 0x401100, "continuation_reset",
+              [FExpr("MLIL_VAR_SSA", "x#0", reads=[x0])], writes=[y1]),
+        _ret(1, G_ADDR + 0x15),
+    ]), params=[x])
+    result = _cont_forward(models, outer, funcs={0x401100: inner})
+    [leaf] = _missing(result)
+    assert leaf["address"] == "0x401120" and leaf["function"]["address"] == "0x401100"
+    assert leaf["sources"][0]["continued_from"] == "0x401110"
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+# --------------------------------------------------------------------------
+# arity-capped models: unrolled slots past the call are optional, not missing
+# --------------------------------------------------------------------------
+
+SSCANF = 0x401090
+FMT_AT = 0x402100
+
+
+class _StrBV(FBV):
+    """FBV that resolves the one constant format string, read-only."""
+
+    def __init__(self, names, strings, funcs=None):
+        super().__init__(names, funcs)
+        self._strings = strings
+
+    def read(self, addr, length):
+        s = self._strings.get(int(addr))
+        return (s.encode("latin-1") + b"\x00") if s is not None else b""
+
+
+def _sscanf_func(fmt, ndest, callee="sscanf", *, const_fmt=True):
+    """parse(src): <callee>(src#0, fmt, &d0, .., &d{ndest-1}) -- BN recovered
+    every actual argument."""
+    src, s0 = _var("src")
+    fmt_arg = (FExpr("MLIL_CONST_PTR", repr(fmt), constant=FMT_AT) if const_fmt
+               else FExpr("MLIL_VAR_SSA", "fmt#0", reads=[FSSA(FVar("fmt"), 0)]))
+    params = [FExpr("MLIL_VAR_SSA", "src#0", reads=[s0]), fmt_arg]
+    params += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}")) for i in range(ndest)]
+    instrs = [_call(0, 0x4011a0, SSCANF, callee, params), _ret(1, 0x4011b0)]
+    func = FFunc("parse", 0x401180, FSSAFunc(instrs), params=[src])
+    return func, _StrBV({SSCANF: callee}, {FMT_AT: fmt})
+
+
+@pytest.mark.parametrize("callee", ["sscanf", "__isoc99_sscanf", "sscanf@plt"])
+@pytest.mark.parametrize(("fmt", "ndest"), [("token", 0), ("%d", 1), ("%d %d", 2),
+                                            ("%d %d %d %d", 4)])
+def test_fully_recovered_sscanf_has_no_missing_output(models, callee, fmt, ndest):
+    # The builtin sscanf model unrolls `*arg:0 -> *arg:2..5`. A call that
+    # passes fewer destinations simply has fewer: its slots past the call are
+    # optional varargs, not outputs Binary Ninja dropped.
+    func, bv = _sscanf_func(fmt, ndest, callee)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    kinds = [lf["kind"] for lf in result["leaves"]]
+    assert KIND not in kinds and "format_destination_unrecovered" not in kinds, result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
+
+
+def test_sscanf_whose_format_proves_a_dropped_destination_is_still_a_boundary(models):
+    # Evidence an argument exists: the constant format writes three
+    # destinations and BN recovered two. That is the format shortfall, by
+    # count -- never a per-slot guess.
+    func, bv = _sscanf_func("%d %d %d", 2)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "format_destination_unrecovered"]
+    assert (leaf["destinations"], leaf["recovered"], leaf["missing"]) == (3, 2, 1)
+    assert not _missing(result)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_sscanf_with_an_unreadable_format_claims_no_missing_slot(models):
+    func, bv = _sscanf_func("%d %d", 2, const_fmt=False)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert not _missing(result)
+
+
+def test_a_five_conversion_dynamic_format_still_claims_no_missing_slot(models):
+    # The format operand is not a read-only constant, so its conversions are
+    # unknown: five conversions may or may not be what it writes, and the
+    # engine does not manufacture a destination to blame. (The separate
+    # `format_unchecked` frontier handles the sink question, not this one.)
+    func, bv = _sscanf_func("%d %d %d %d %d", 4, const_fmt=False)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert not [lf for lf in result["leaves"]
+                if lf["kind"] == "format_destination_unrecovered"]
+
+
+def _num_format(conversions: int) -> str:
+    return " ".join(["%d"] * conversions) if conversions else "token"
+
+
+@pytest.mark.parametrize("conversions", range(0, 5))
+def test_the_model_run_covers_formats_of_0_to_4_conversions_exactly(models, conversions):
+    # 0..4 conversions against the four-slot unrolled run and a call that
+    # passes exactly that many destinations: every format destination is both
+    # enumerated and recovered, so the optional slots past it stay silent.
+    func, bv = _sscanf_func(_num_format(conversions), conversions)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    kinds = [lf["kind"] for lf in result["leaves"]]
+    assert "format_destination_unrecovered" not in kinds, result["leaves"]
+    assert "model_destination_unrecovered" not in kinds, result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
+
+
+@pytest.mark.parametrize(("conversions", "ndest", "recovered", "missing"), [
+    (5, 4, 4, 1),     # BN recovered exactly the four slots the model enumerates
+    (5, 5, 5, 1),     # BN recovered all five; the MODEL is the shortfall
+    (6, 4, 4, 2),
+    (6, 6, 6, 2),     # ...and two recovered arguments the model never names
+])
+def test_a_format_proven_destination_beyond_the_model_run_is_a_boundary(
+        models, conversions, ndest, recovered, missing):
+    # IC04 follow-up (F6): the arity-capped run is unrolled to four
+    # destinations. A five-conversion format with only those four arguments
+    # recovered, or with all five recovered but only four modeled, proves one
+    # output the engine never seeds. It must be disclosed even though NO
+    # *arg:N rule exists at the missing index -- the rule loop can never see
+    # it, and the run used to return a clean all-clear.
+    func, bv = _sscanf_func(_num_format(conversions), ndest)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "format_destination_unrecovered"]
+    assert (leaf["destinations"], leaf["recovered"], leaf["modeled"], leaf["missing"]) == \
+        (conversions, recovered, 4, missing), leaf
+    assert not _missing(result)          # still not a per-slot guess
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_an_unrelated_constant_input_parse_is_not_a_blocking_frontier(models):
+    # `apply_model` runs for every call to a modeled callee. A five-conversion
+    # sscanf whose input is a CONSTANT does not carry the selected source into
+    # its destinations, so its model gap cannot make THIS run unsafe: the run
+    # must stay a clean all-clear instead of growing a frontier just because
+    # the call sits in the function. (The reviewer's clean_forward shape: the
+    # tainted parameter is only returned.)
+    line, l0 = _var("line")
+    fmt_arg = FExpr("MLIL_CONST_PTR", "'%d %d %d %d %7s'", constant=FMT_AT)
+    params = [FExpr("MLIL_CONST_PTR", "'1 2 3 4 x'", constant=0x402200), fmt_arg]
+    params += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}")) for i in range(4)]
+    instrs = [_call(0, 0x4011a0, SSCANF, "sscanf", params),
+              _ret(1, 0x4011b0, reads=[l0])]
+    func = FFunc("clean_forward", 0x401180, FSSAFunc(instrs), params=[line])
+    bv = _StrBV({SSCANF: "sscanf"}, {FMT_AT: "%d %d %d %d %7s"})
+
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert not [lf for lf in result["leaves"]
+                if lf["kind"] == "format_destination_unrecovered"], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
+
+
+def test_a_recovered_fifth_destination_is_still_unmodeled(models):
+    # The same fact from the other side: BN recovered the fifth destination
+    # (the forwarded pointer is a real argument), so this is NOT an argument
+    # recovery shortfall. The model still ends at *arg:5, and no seeded rule
+    # reaches the fifth output. One boundary, disclosed by count.
+    func, bv = _sscanf_func("%d %d %d %d %d", 5)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "format_destination_unrecovered"]
+    assert leaf["recovered"] == 5 and leaf["modeled"] == 4 and leaf["missing"] == 1
+    assert "model_destination_unrecovered" not in {lf["kind"] for lf in result["leaves"]}
+
+
+def test_a_format_proven_shortfall_in_a_descended_callee_is_disclosed(models):
+    # Root and descended calls run the same model application. A parse helper
+    # that receives the tainted string from its caller proves the same
+    # shortfall inside its own body, with the leaf at that body's call site.
+    inner_start, outer_start = 0x401180, 0x401200
+    inner, bv = _sscanf_func("%d %d %d %d %d", 4)
+    inner.start = inner_start
+    inner.name = "parse_inner"
+    inner.mlil.ssa_form.instructions[-1].src = [FExpr("MLIL_CONST", "0", constant=0)]
+    src, s0 = _var("src")
+    ret = FSSA(FVar("ret"), 1)
+    outer = FFunc("outer", outer_start, FSSAFunc([
+        _call(0, outer_start + 0x10, inner_start, "parse_inner",
+              [FExpr("MLIL_VAR_SSA", "src#0", reads=[s0])], writes=[ret]),
+        _ret(1, outer_start + 0x15),
+    ]), params=[src])
+    bv = _StrBV({0x401090: "sscanf"}, {FMT_AT: "%d %d %d %d %d"},
+                funcs={inner_start: inner})
+
+    result = te.TaintEngine(bv, models).forward(outer, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "format_destination_unrecovered"]
+    assert leaf["address"] == "0x4011a0"
+    assert leaf["missing"] == 1
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize(("fmt", "ndest", "destinations", "missing"), [
+    # A suppressed conversion consumes no destination: four assigning
+    # conversions are fully covered by the four-slot run...
+    ("%*d %d %d %d %d", 4, 4, 0),
+    # ...and five assigning ones (one suppressed ahead of them) fall one
+    # short, exactly as if the %* had not been written.
+    ("%*s %d %d %d %d %d", 4, 5, 1),
+    # %n is an ordinary assigning conversion; %*n is not.
+    ("%*n %d %d %d %d", 4, 4, 0),
+    ("%d %d %d %*s %d", 4, 4, 0),
+    ("%d %d %d %n", 3, 4, 1),
+    ("%d %n %d %d", 4, 4, 0),
+    # %% is literal, not a conversion.
+    ("%d%% %d %d %d", 4, 4, 0),
+])
+def test_suppressed_and_percent_n_conversions_are_counted_by_the_format(
+        models, fmt, ndest, destinations, missing):
+    func, bv = _sscanf_func(fmt, ndest)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    got = [lf for lf in result["leaves"]
+           if lf["kind"] == "format_destination_unrecovered"]
+    if missing:
+        [leaf] = got
+        assert (leaf["destinations"], leaf["missing"]) == (destinations, missing), leaf
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    else:
+        assert not got, result["leaves"]
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_positional_format_proves_nothing_and_stays_silent(models):
+    # %n$ positions do not consume arguments in order, so the format cannot
+    # prove which slot a conversion writes -- the same silence as an
+    # unreadable format, never a guess.
+    func, bv = _sscanf_func("%5$d %1$d %2$d %3$d %4$d", 4)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert not [lf for lf in result["leaves"]
+                if lf["kind"] == "format_destination_unrecovered"]
+
+
+def _capped(capped: bool) -> dict:
+    model = {"propagates": [{"from": "*arg:0", "to": "*arg:2"}, {"from": "*arg:0", "to": "*arg:3"}]}
+    if capped:
+        model["arity_capped"] = True
+    return model
+
+
+@pytest.mark.parametrize("capped", [True, False])
+def test_custom_capped_and_uncapped_models(models, capped):
+    # Same rules, same one-destination call: an arity-capped run declares
+    # optional slots, an uncapped model declares *arg:3 as a real output.
+    models["app_scan"] = _capped(capped)
+    func, bv = _sscanf_func("%d", 1, "app_scan")
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert [lf["destination"] for lf in _missing(result)] == ([] if capped else ["*arg:3"])
+
+
+# --------------------------------------------------------------------------
+# one missing output, many contexts: merged once
+# --------------------------------------------------------------------------
+
+SPLIT = 0x4010a0
+CHILD = 0x401170
+SPLIT_SITE = 0x40119b
+
+
+def _repeated_contexts():
+    """outer(src): child(src, "clean"); child("clean", src) -- child(a, b)
+    calls split_emit(a, b), which BN recovered with two arguments."""
+    a, a0 = _var("a")
+    b, b0 = _var("b")
+    child = FFunc("child", CHILD, FSSAFunc([
+        _call(0, SPLIT_SITE, SPLIT, "split_emit", [FExpr("MLIL_VAR_SSA", "a#0", reads=[a0]),
+                                                   FExpr("MLIL_VAR_SSA", "b#0", reads=[b0])]),
+        _ret(1, SPLIT_SITE + 5),
+    ]), params=[a, b])
+    child.mlil.ssa_form.instructions[-1].src = [FExpr("MLIL_CONST", "0", constant=0)]
+    src, s0 = _var("src")
+    r1, r2 = FSSA(FVar("r"), 1), FSSA(FVar("r"), 2)
+    outer = FFunc("repeated_contexts", 0x401200, FSSAFunc([
+        _call(0, 0x401210, CHILD, "child", [FExpr("MLIL_VAR_SSA", "src#0", reads=[s0]),
+                                            _const(0x402010)], writes=[r1]),
+        _call(1, 0x401220, CHILD, "child", [_const(0x402010),
+                                            FExpr("MLIL_VAR_SSA", "src#0", reads=[s0])], writes=[r2]),
+        _ret(2, 0x401230),
+    ]), params=[src])
+    bv = FBV({SPLIT: "split_emit"}, {CHILD: child})
+    return outer, bv
+
+
+def test_one_missing_output_reached_from_two_contexts_is_one_leaf(models):
+    models["split_emit"] = _rules(("arg:0", "*arg:6"), ("arg:1", "*arg:6"))
+    outer, bv = _repeated_contexts()
+    result = te.TaintEngine(bv, models).forward(outer, [te.parse_locator("param:0")])
+    [leaf] = _missing(result)
+    assert (leaf["address"], leaf["callee"]["address"], leaf["destination"]) == \
+        (hex(SPLIT_SITE), hex(SPLIT), "*arg:6")
+    assert leaf["sources"] == [{"from": "arg:0", "tainted": "a"},
+                               {"from": "arg:1", "tainted": "b"}]
+    assert result["diagnostics"]["frontier"]["by_kind"] == {KIND: 1}
+    assert result["stats"]["leaves"] == len(result["leaves"])
+
+
+def test_distinct_destinations_and_sites_stay_separate_across_contexts(models):
+    models["split_emit"] = _rules(("arg:0", "*arg:6"), ("arg:1", "*arg:7"))
+    outer, bv = _repeated_contexts()
+    result = te.TaintEngine(bv, models).forward(outer, [te.parse_locator("param:0")])
+    assert sorted((lf["destination"], lf["sources"][0]["from"]) for lf in _missing(result)) == \
+        [("*arg:6", "arg:0"), ("*arg:7", "arg:1")]
+
+
+SRC_FN = 0x4010b0
+
+
+def test_attributed_union_merges_while_by_source_keeps_its_own_evidence(models):
+    # f(): a = src_fn(); b = src_fn(); split_emit(a, b). `ret:src_fn` runs
+    # once per callsite: each run reaches the missing *arg:6 through its own
+    # argument, the union holds ONE leaf with both, and neither by_source row
+    # claims the other's source.
+    models["src_fn"] = {"sources": [{"to": "ret"}]}
+    models["split_emit"] = _rules(("arg:0", "*arg:6"), ("arg:1", "*arg:6"))
+    a1, b1 = FSSA(FVar("a"), 1), FSSA(FVar("b"), 1)
+    func = FFunc("f", 0x401300, FSSAFunc([
+        _call(0, 0x401310, SRC_FN, "src_fn", [], writes=[a1]),
+        _call(1, 0x401320, SRC_FN, "src_fn", [], writes=[b1]),
+        _call(2, 0x401330, SPLIT, "split_emit", [FExpr("MLIL_VAR_SSA", "a#1", reads=[a1]),
+                                                 FExpr("MLIL_VAR_SSA", "b#1", reads=[b1])]),
+        _ret(3, 0x401340),
+    ]), params=[])
+    bv = FBV({SRC_FN: "src_fn", SPLIT: "split_emit"})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("ret:src_fn")])
+    [leaf] = _missing(result)
+    assert leaf["sources"] == [{"from": "arg:0", "tainted": "a#1"},
+                               {"from": "arg:1", "tainted": "b#1"}]
+    per = {site: [lf["sources"] for lf in row["leaves"] if lf.get("kind") == KIND]
+           for site, row in result["by_source"].items()}
+    assert per == {"0x401310": [[{"from": "arg:0", "tainted": "a#1"}]],
+                   "0x401320": [[{"from": "arg:1", "tainted": "b#1"}]]}, per
+
+
+@pytest.mark.parametrize("raw", [
+    {"varargs": {"to": "*arg:0", "first_index": None}},
+    {"varargs": {"to": "*arg:0"}},
+    {"varargs": {"to": "*arg:0", "first_index": "1"}},
+    {"propagates": [{"from": "*arg:0", "to": "ret"}], "continuation": {"null_arg": None}},
+    {"propagates": [{"from": "*arg:1", "to": "*arg:0"}], "append": {"dest": None, "src": 1}},
+])
+def test_null_or_malformed_required_index_in_trusted_data_never_crashes(models, raw):
+    # The loader refuses these; data that skipped it must not raise mid-walk.
+    models["model_emit"] = _rules(("arg:0", "*arg:1"))
+    engine = te.TaintEngine(_bv(), models)
+    engine.models["model_emit"] = raw
+    result = engine.forward(_one_arg_emit_func(), [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == []
+
+
+def test_engine_refuses_a_null_varargs_index_it_is_handed(models):
+    models["model_emit"] = {"varargs": {"to": "*arg:0", "first_index": None}}
+    with pytest.raises(te.TaintError, match="first_index"):
+        te.TaintEngine(_bv(), models)

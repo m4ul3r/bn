@@ -591,11 +591,21 @@ _FORMAT_LENGTH_MODS = set("hlLqjzt")
 
 def _normalize_libc_name(name: str) -> str:
     """Strip PLT/GOT/import decorations and glibc wrappers from a callee name so
-    ``__isoc99_sscanf`` / ``sscanf@plt`` / ``_sscanf`` all resolve to ``sscanf``."""
+    ``__isoc99_sscanf`` / ``__isoc23_sscanf`` / ``sscanf@plt`` / ``_sscanf`` all
+    resolve to ``sscanf``.
+
+    ``__isoc23_*`` is the C23 export glibc 2.38+ emits for the same call (the
+    versions differ in the conversions they accept, not in their arguments or
+    destinations), so it must land on the canonical spelling here as well as in
+    the taint model lookup -- otherwise the format-family recovery knows the
+    model's callee but not its format argument.
+    """
     n = str(name or "").strip()
     n = n.split("@", 1)[0]           # drop @plt / @got / @GLIBC_* decorations
-    if n.startswith("__isoc99_"):
-        n = n[len("__isoc99_"):]
+    for prefix in ("__isoc99_", "__isoc23_"):
+        if n.startswith(prefix):
+            n = n[len(prefix):]
+            break
     return n.lstrip("_")
 
 

@@ -2719,11 +2719,13 @@ def test_forward_notes_tainted_memcpy_source(models):
                for a in result["assumptions"]), result["assumptions"]
 
 
-def test_forward_no_copy_note_when_source_is_already_a_sink(models):
-    # strcpy flags its SOURCE (arg 1) as a sink, so forward already reports it --
-    # the #44 copy note must NOT also fire there (it would be redundant and its
-    # "not itself flagged as a sink" wording would be false). The note is for the
-    # silent case (memcpy) only.
+def test_forward_copy_note_and_sink_coexist(models):
+    # strcpy flags its SOURCE (arg 1) as a sink AND fills its destination.
+    # Suppressing the copy note there hid the propagation behind the sink --
+    # the destination still holds those bytes, and a reader of them is a
+    # separate finding from the copy itself (campaign item, closed in the
+    # round-17 follow-up). Only the WORDING tracks the sink: the note never
+    # claims "not flagged" about an operand that was.
     src = FVar("src"); dst = FVar("dst")
     src1 = FSSA(src, 1)
     instrs = [
@@ -2739,9 +2741,12 @@ def test_forward_no_copy_note_when_source_is_already_a_sink(models):
     # strcpy's tainted source IS a real sink (arg 1) ...
     assert any(s["sink"]["callee"] == "strcpy" and s["sink"]["tainted_arg_index"] == 1
                for s in result["reached_sinks"]), result["reached_sinks"]
-    # ... so no redundant copy note is emitted for it
-    assert not any("copied into the destination" in a for a in result["assumptions"]), \
-        result["assumptions"]
+    # ... and the copy into the destination is reported beside it
+    note = next((a for a in result["assumptions"]
+                 if "copied into the destination" in a), None)
+    assert note is not None, result["assumptions"]
+    assert "also reported as a sink of this call" in note, note
+    assert "not itself flagged as a sink" not in note, note
 
 
 def test_forward_no_copy_note_when_dest_is_unkeyable(models):
@@ -4113,7 +4118,8 @@ def test_backward_caller_cap_is_leaf_and_truncation(models):
     assert len(caps) == 1, result["leaves"]
     cap = caps[0]
     assert cap["callers_total"] == 20
-    assert cap["callers_followed"] == 16
+    assert cap["callers_fully_followed"] == 16
+    assert (cap["callers_partially_followed"], cap["callers_unfollowed"]) == (0, 4)
     assert cap["callers_dropped"] == 4
     assert cap["function"]["name"] == "use_len"
     # The signal is machine-readable on the envelope, not prose-only ...
@@ -4128,7 +4134,7 @@ def test_backward_caller_cap_is_leaf_and_truncation(models):
     assert len(result["slices"]) == 16
     # The caveat names the MEASURED ascent (this fixture resolves every site, so
     # it equals the cap) -- never the cap constant as if it were coverage.
-    assert any("caller ascent followed 16, capped at 16" in a
+    assert any("caller ascent fully followed 16, capped at 16" in a
                for a in result["assumptions"]), result["assumptions"]
 
 
@@ -4147,18 +4153,18 @@ def test_backward_caller_cap_counts_the_sites_the_ascent_actually_followed(model
     caps = [lf for lf in result["leaves"] if lf.get("kind") == "caller_sites_truncated"]
     assert len(caps) == 1, result["leaves"]
     assert caps[0]["callers_total"] == 20
-    assert caps[0]["callers_followed"] == 6
+    assert caps[0]["callers_fully_followed"] == 6
     assert caps[0]["callers_dropped"] == 14
     # The 6 resolvable sites are exactly the ones that produced slices.
     assert len(result["slices"]) == 6
     # The human-readable half must agree with the machine-readable one.
-    assert any("caller ascent followed 6, capped at 16" in a
+    assert any("caller ascent fully followed 6, capped at 16" in a
                for a in result["assumptions"]), result["assumptions"]
     # ... and the real text frontier (what a human reads) prints the measurement
     # the JSON carries, on an envelope that says INCOMPLETE.
     from bn.formatters import _render_taint_text
     text = _render_taint_text(result)
-    assert "6 of 20 caller(s) followed; 14 dropped" in text
+    assert "20 caller reference(s): 6 fully followed, 0 partially, 14 not followed; 14 dropped" in text
     assert "verdict: INCOMPLETE" in text
 
 
@@ -4175,7 +4181,7 @@ def test_backward_caller_cap_reports_a_zero_ascent_as_zero(models):
     caps = [lf for lf in result["leaves"] if lf.get("kind") == "caller_sites_truncated"]
     assert len(caps) == 1, result["leaves"]
     assert caps[0]["callers_total"] == 20
-    assert caps[0]["callers_followed"] == 0
+    assert caps[0]["callers_fully_followed"] == 0
     assert caps[0]["callers_dropped"] == 20
     assert result["stats"]["truncated"] is True
     assert result["stats"]["truncation_cause"] == ["caller_cap"]
@@ -4239,36 +4245,9 @@ def test_backward_slices_from_memcpy_length(process_func, models):
     assert "0x4011bc" in slice_addrs  # len#2 = len#1 + 4 is on the slice
 
 
-def test_backward_constant_length_sink_is_bounded_not_error(models):
-    # #310: memcpy(&dst, &src, 0x40) -- the length is a compile-time constant, so
-    # there is no def-chain to slice. That is a SUCCESSFUL "provably bounded"
-    # conclusion (the op returns a result; exit 0, --out written), NOT the
-    # all-sinks-failed hard error that looks like a crash to a scripted sweep.
-    bv = FBV({0x401080: "memcpy"})
-    instrs = [
-        FInstr(0, 0x4011db, "MLIL_CALL_SSA", "0x401080(&dst, &src, 0x40)",
-               reads=[], writes=[],
-               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
-               params=[FExpr("MLIL_VAR_SSA", "&dst", reads=[]),
-                       FExpr("MLIL_VAR_SSA", "&src", reads=[]),
-                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
-    ]
-    func = FFunc("copyfixed", 0x401189, FSSAFunc(instrs), params=[])
-    engine = te.TaintEngine(bv, models)
-    result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])  # must NOT raise
-    assert result["direction"] == "backward"
-    assert result["slices"] == []
-    status = result["sink_status"]
-    assert len(status) == 1
-    assert status[0]["bounded"] is True
-    assert status[0]["seeded"] is False
-
-
 def test_backward_constant_pointer_arg_is_seed_error_not_bounded(models):
-    # #310 review (MEDIUM): a constant ADDRESS arg (MLIL_CONST_PTR, e.g. a global
-    # dest/src pointer) is NOT "provably bounded" -- it's an address expression
-    # with no def-chain, which must stay a genuine seed error, not a misleading
-    # bounded-length success. Only a scalar MLIL_CONST is bounded.
+    # An address is not finite scalar evidence. A pointer role demands bytes;
+    # a value role with no scalar reads still refuses.
     bv = FBV({0x401080: "memcpy"})
     instrs = [
         FInstr(0, 0x4011db, "MLIL_CALL_SSA", "0x401080(g_dst, g_src, n)",
@@ -4287,7 +4266,6 @@ def test_backward_constant_pointer_arg_is_seed_error_not_bounded(models):
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
     [leaf] = result["leaves"]
     assert leaf["kind"] == "pointer_demand_not_certified" and leaf["objects"][0]["address"] == "0x500000"
-    assert result["sink_status"][0]["demand_leaf"] is True
     # A VALUE argument with no def-chain stays a genuine seed error.
     with pytest.raises(te.TaintError, match=r"address or fixed expression"):
         engine.backward(func, [te.parse_locator("arg:memcpy:2")])
@@ -4295,7 +4273,7 @@ def test_backward_constant_pointer_arg_is_seed_error_not_bounded(models):
 
 def test_backward_all_genuinely_unseeded_still_hard_errors(models):
     # The contrast: a real seed failure (a callee that isn't called at all) is
-    # still a hard error -- the bounded carve-out must not swallow real failures.
+    # still a hard error -- a constant outcome must not swallow real failures.
     bv = FBV({0x401080: "memcpy"})
     instrs = [
         FInstr(0, 0x4011db, "MLIL_CALL_SSA", "0x401080(&dst, &src, 0x40)",
@@ -4457,7 +4435,6 @@ def test_backward_arg_with_no_variable_reads_says_so(process_func, models):
     # answer is incomplete with its leaf (#931 round 7), not a refusal.
     result = engine.backward(process_func, [te.parse_locator("arg:memcpy:1")])
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result
-    assert "reads no variable in the recovered IL" in result["sink_status"][0]["note"]
     assert [lf["kind"] for lf in result["leaves"]] == ["pointer_demand_not_certified"]
 
 
@@ -8778,6 +8755,89 @@ def test_sscanf_c99_spelling_is_not_bypassed_809(models):
     assert te.lookup_model(models, "__isoc99_sscanf")[0] == "__isoc99_sscanf"
 
 
+@pytest.mark.parametrize(("callee", "key"), [
+    ("__isoc23_sscanf", "sscanf"),
+    ("__isoc23_sscanf@plt", "sscanf"),
+])
+def test_sscanf_c23_spelling_is_not_bypassed_809(models, callee, key):
+    # glibc 2.38+ emits `__isoc23_sscanf` for a C23 translation unit, exactly
+    # as it emits `__isoc99_sscanf` for C99. The alias table makes the same
+    # model apply: the tainted input string still propagates into the second
+    # destination and reaches the command sink, with no unmodeled callee.
+    src = FVar("src", typ="char[0x40]")
+    a = FVar("a", typ="int32_t")
+    b = FVar("b", typ="char[0x40]")
+    SSCANF, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, f"{callee}(&src, fmt, &a, &b)", SSCANF,
+                  [FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+                   FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+                   FExpr("MLIL_ADDRESS_OF", "&a", src=a),
+                   FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+        _ext_call(1, 0x14, "system(&b)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+    ]
+    func = FFunc("parse_cfg_c23", 0x10, FSSAFunc(instrs), params=[src])
+    bv = FBV({SSCANF: callee, SYS: "system"})
+    result = te.TaintEngine(bv, models, unknown_call_policy="stop").forward(
+        func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+    assert not [l for l in result["leaves"] if l["kind"] == "unmodeled_callee"], result["leaves"]
+    assert te.lookup_model(models, callee)[0] == key
+
+
+def test_scanf_c23_spelling_seeds_every_destination_in_the_run_809(models):
+    # The source half: `--source call:__isoc23_scanf` must seed the same
+    # *arg:1..4 destination run as the legacy spelling, because both resolve
+    # to one model. An alias that returned a copy without the sources would
+    # seed nothing and report a confident empty result.
+    a = FVar("a", typ="int32_t")
+    b = FVar("b", typ="char[0x40]")
+    SCANF, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, "__isoc23_scanf(fmt, &a, &b)", SCANF,
+                  [FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+                   FExpr("MLIL_ADDRESS_OF", "&a", src=a),
+                   FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+        _ext_call(1, 0x14, "system(&b)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+    ]
+    func = FFunc("read_cfg_c23", 0x10, FSSAFunc(instrs), params=[])
+    bv = FBV({SCANF: "__isoc23_scanf", SYS: "system"})
+    result = te.TaintEngine(bv, models).forward(
+        func, [te.parse_locator("call:__isoc23_scanf")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+
+
+@pytest.mark.parametrize(("callee", "model_key", "stream"), [
+    ("__isoc23_scanf", "scanf", False),
+    ("__isoc23_fscanf", "fscanf", True),
+])
+def test_c23_call_preset_shortfall_is_reported_once(models, callee, model_key, stream):
+    # The `call:` preset resolves the C23 alias to the canonical model, and the
+    # application-level check names that same key. Seeding a source spelling
+    # used to produce two leaves at one address -- the raw `__isoc23_*` name
+    # from the preset and the canonical key from the model check -- because
+    # dictionary-equality dedup compares the callee string. One shortfall,
+    # one leaf, named by the model the engine actually applied.
+    args = ([FExpr("MLIL_VAR_SSA", "f#0", reads=[FSSA(FVar("f"), 0)])] if stream else [])
+    args.append(FExpr("MLIL_CONST_PTR", "fmt", constant=0x700))
+    args += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}")) for i in range(4)]
+    shown = ", ".join(["f", "fmt"] if stream else ["fmt"] + [f"&d{i}" for i in range(4)])
+    call = _ext_call(0, 0x10, f"{callee}({shown})", 0x900, args)
+    func = FFunc("scan_c23_preset", 0x10, FSSAFunc([call]), params=[])
+    bv = FBVStr({0x900: callee}, strings={0x700: "%d %d %d %d %7s"})
+    result = te.TaintEngine(bv, models).forward(
+        func, [te.parse_locator(f"call:{callee}")])
+
+    short = [lf for lf in result["leaves"]
+             if lf["kind"] == "format_destination_unrecovered"]
+    assert len(short) == 1, short
+    assert short[0]["callee"] == model_key
+    assert (short[0]["destinations"], short[0]["modeled"],
+            short[0]["recovered"], short[0]["missing"]) == (5, 4, 4, 1), short[0]
+
+
 def test_vsscanf_is_a_disclosed_partial_not_a_destination_source_809(models):
     # vsscanf's destinations live inside the va_list (arg2), which the engine
     # cannot walk, so the model is deliberately the honest-partial shape readv
@@ -9491,7 +9551,7 @@ def test_backward_completeness_gate_is_a_decision_not_a_key_812():
     # A blocking frontier leaf means the def-chain was not followed to every
     # origin, and the reason must name the kind so the reader knows which.
     curtailed = tr.backward_diagnostics(
-        [{"kind": "caller_sites_truncated"}], [], sinks_seeded=1, slices=1)
+        [{"kind": "caller_sites_truncated", "callers_dropped": 1}], [], sinks_seeded=1, slices=1)
     assert curtailed["safe_to_report_complete_slice"] is False, curtailed
     assert "caller_sites_truncated" in curtailed["complete_slice_reason"], curtailed
 
@@ -9547,7 +9607,8 @@ def test_backward_frontier_buckets_and_next_action_name_the_actionable_cut_812()
     # Dropped caller sites: counted under their own heading, and the one
     # frontier a user can act on by re-running with a narrower sink.
     dropped = tr.backward_diagnostics(
-        [{"kind": "caller_sites_truncated"}, {"kind": "caller_sites_truncated"}],
+        [{"kind": "caller_sites_truncated", "callers_dropped": 1},
+         {"kind": "caller_sites_truncated", "callers_dropped": 1}],
         [], sinks_seeded=1, slices=1)
     assert dropped["frontier"]["dropped_callers"] == 2, dropped
     assert dropped["frontier"]["unresolved"] == 0, dropped
@@ -9573,7 +9634,7 @@ def test_backward_frontier_buckets_and_next_action_name_the_actionable_cut_812()
     # is the only one the user can act on directly -- and the buckets stay
     # separate rather than collapsing into a single total.
     several = tr.backward_diagnostics(
-        [{"kind": "caller_sites_truncated"}, {"kind": "field_load_unresolved"},
+        [{"kind": "caller_sites_truncated", "callers_dropped": 1}, {"kind": "field_load_unresolved"},
          {"kind": "coarse_memory_store"}], [], sinks_seeded=1, slices=1)
     assert "caller ascent was capped" in several["next_action"], several
     assert several["frontier"]["dropped_callers"] == 1, several
@@ -9611,7 +9672,7 @@ def test_backward_weak_sink_seed_withholds_completeness_812():
     # note the backward walk really does record must not be read as a weak seed,
     # or every capped ascent would be blamed on its seed.
     ordinary = tr.backward_diagnostics(
-        [], ["parse_record has 9 callers; caller ascent followed 4, capped at 4"],
+        [], ["parse_record has 9 callers; caller ascent fully followed 4, capped at 4"],
         sinks_seeded=1, slices=1)
     assert ordinary["safe_to_report_complete_slice"] is True, ordinary
 
@@ -9911,7 +9972,7 @@ def test_backward_unresolved_origin_withholds_completeness_915(models):
     result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
     assert result["slices"], result
     sl = result["slices"][0]
-    assert sl["origin"] == {"kind": "address_of_local_unresolved", "buffer": "cmd"}, sl["origin"]
+    assert {"kind": "address_of_local_unresolved", "buffer": "cmd"}.items() <= sl["origin"].items(), sl["origin"]
     assert sl["metrics"]["traverses_unresolved"] is True
     diag = result["diagnostics"]
     assert diag["safe_to_report_complete_slice"] is False, diag
@@ -10005,7 +10066,7 @@ def test_backward_follows_modeled_fill_of_address_of_local_915(models):
     result = te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:popen:0")])
     assert result["slices"], result
     sl = result["slices"][0]
-    assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "ctx#0"}, sl["origin"]
+    assert (sl["origin"]["kind"], sl["origin"]["index"], sl["origin"]["var"]) == ("parameter", 0, "ctx#0"), sl["origin"]
     reasons = [st.get("reason", "") for st in sl["slice"]]
     assert any("local buffer cmd written by snprintf" in r for r in reasons), reasons
     [leaf] = [l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"]
@@ -10330,7 +10391,7 @@ def test_backward_aliased_terminator_store_does_not_break_the_writer_chain_928()
     pg.sink(cmd)
     result, reasons, aol = _bw(pg.func())
     sl = result["slices"][0]
-    assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}, sl["origin"]
+    assert (sl["origin"]["kind"], sl["origin"]["index"], sl["origin"]["var"]) == ("parameter", 0, "host#0"), sl["origin"]
     assert any("store into local buffer cmd" in r for r in reasons), reasons
     assert any("written by strcpy" in r for r in reasons), reasons
     assert any("written by strcat" in r for r in reasons), reasons
@@ -10350,7 +10411,7 @@ def test_backward_source_fill_outranks_a_later_literal_terminator_928():
     pg.call(_B_STRCAT, [_addr_of(cmd), _cstr(0x700)])
     pg.sink(cmd)
     result, reasons, aol = _bw(pg.func())
-    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["callee"]) == ("source", "read"), result["slices"][0]["origin"]
     assert any("written by read" in r for r in reasons), reasons
     _only_call_fill_leaves(result, aol, "read", "strcat")
 
@@ -10435,7 +10496,7 @@ def test_backward_address_of_operand_of_a_fill_is_a_buffer_not_a_literal_928():
     pg.call(_B_STRCPY, [_addr_of(cmd), _addr_of(other)])
     pg.sink(cmd)
     result, reasons, aol = _bw(pg.func())
-    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["callee"]) == ("source", "read"), result["slices"][0]["origin"]
     assert any("local buffer other written by read" in r for r in reasons), reasons
     assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
@@ -10509,8 +10570,7 @@ def test_backward_escaped_buffer_address_makes_later_unmodeled_calls_opaque_928(
     # not handed &cmd -- neither covers the path, so the 1-byte `cmd[0] = 0`
     # leaves the buffer unproven there too: a second, distinct frontier.
     assert any("no plain store the walk can see writes" in l["detail"] for l in aol), aol
-    assert result["slices"][0]["origin"] == {
-        "kind": "address_of_local_unresolved", "buffer": "cmd", "callee": "fill_global"}
+    assert {"kind": "address_of_local_unresolved", "buffer": "cmd", "callee": "fill_global"}.items() <= result["slices"][0]["origin"].items()
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
     # Guard: a MODELED call after the escape is trusted to its model -- it is
@@ -10541,7 +10601,7 @@ def test_backward_folded_address_of_sink_operand_is_seeded_928():
     result, reasons, aol = _bw(pg.func())
     sl = result["slices"][0]
     assert sl["sink"]["seed"] == "&cmd", sl["sink"]
-    assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "ctx#0"}, sl["origin"]
+    assert (sl["origin"]["kind"], sl["origin"]["index"], sl["origin"]["var"]) == ("parameter", 0, "ctx#0"), sl["origin"]
     assert any("written by snprintf" in r for r in reasons), reasons
     _only_call_fill_leaves(result, aol, "snprintf")
 
@@ -10575,7 +10635,7 @@ def test_backward_caller_ascent_follows_a_folded_address_of_argument_928():
     result, reasons, aol = _bw(callee)
     sl = result["slices"][0]
     assert sl["crossed_functions"] == ["run"], sl
-    assert sl["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}, sl["origin"]
+    assert (sl["origin"]["kind"], sl["origin"]["index"], sl["origin"]["var"]) == ("parameter", 0, "host#0"), sl["origin"]
     assert any("written by snprintf" in r for r in reasons), reasons
     assert not any("trackable scalar" in a for a in result["assumptions"]), result["assumptions"]
     _only_call_fill_leaves(result, aol, "snprintf")
@@ -10745,7 +10805,7 @@ def test_backward_indexed_loop_store_is_a_writer_of_the_buffer_928():
     pg.sink(cmd)
     result, reasons, aol = _bw(pg.func())
     assert any("store into local buffer cmd" in r for r in reasons), reasons
-    assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}, result["slices"][0]["origin"]
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["index"], result["slices"][0]["origin"]["var"]) == ("parameter", 0, "host#0"), result["slices"][0]["origin"]
     assert len(aol) == 1 and "on at least one path" in aol[0]["detail"], result["leaves"]
 
 
@@ -10806,7 +10866,7 @@ def test_backward_store_through_phi_pointer_is_a_writer_928r3():
     assert any("written by read" in r for r in reasons), reasons
     # The parameter the loop xors in is the origin (it outranks the source so
     # the caller ascent is not lost); the source stays in the steps.
-    assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 1, "var": "key#0"}, result["slices"][0]["origin"]
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["index"], result["slices"][0]["origin"]["var"]) == ("parameter", 1, "key#0"), result["slices"][0]["origin"]
     assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
 
@@ -10832,7 +10892,7 @@ def test_backward_store_through_unresolvable_pointer_is_a_blocking_leaf_928r3():
     assert len(aol) == 1 and "may alias" in aol[0]["detail"], result["leaves"]
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False, result["diagnostics"]
     # The stored VALUE is walked too: the parameter is in the slice.
-    assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["index"], result["slices"][0]["origin"]["var"]) == ("parameter", 0, "host#0")
 
     # Guard: the same reload BEFORE any escape cannot alias the buffer. The
     # buffer is initialized by a store, not a call: a call handed &cmd starts
@@ -10870,7 +10930,7 @@ def test_backward_modeled_call_reloading_the_escape_slot_is_a_fill_928r3():
     pg.sink(cmd)
     result, reasons, aol = _bw(pg.func())
     assert any("local buffer cmd written by strcpy" in r for r in reasons), reasons
-    assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "host#0"}, result["slices"][0]["origin"]
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["index"], result["slices"][0]["origin"]["var"]) == ("parameter", 0, "host#0"), result["slices"][0]["origin"]
     _only_call_fill_leaves(result, aol, "strcpy")
 
 
@@ -10955,7 +11015,7 @@ def test_backward_memset_and_bzero_are_literal_fills_928r3():
         result, reasons, aol = _bw(pg.func())
         name = _B_NAMES[zeroer]
         assert any(f"local buffer buf written by {name}" in r for r in reasons), reasons
-        assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
+        assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["callee"]) == ("source", "read"), result["slices"][0]["origin"]
         assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
 
@@ -10974,7 +11034,7 @@ def test_backward_benign_call_handed_the_buffer_is_recorded_not_covering_928r3()
     pg.sink(buf)
     result, reasons, aol = _bw(pg.func())
     assert any("passed to puts (benign model" in r for r in reasons), reasons
-    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["callee"]) == ("source", "read")
     assert len(aol) == 1 and "on at least one path" in aol[0]["detail"], result["leaves"]
 
 
@@ -11016,7 +11076,7 @@ def test_backward_const_ptr_into_writable_storage_is_not_a_literal_928r3():
     bv = FBVStorage(_B_NAMES, ro=[(0x700, 0x800)], rw=[(0x404000, 0x405000)])
     result = te.TaintEngine(bv, te.load_models()).backward(pg.func(), [te.parse_locator("arg:popen:0")])
     sl = result["slices"][0]
-    assert sl["origin"] == {"kind": "global", "address": "0x404040", "buffer": "cmd"}, sl["origin"]
+    assert {"kind": "global", "address": "0x404040", "buffer": "cmd"}.items() <= sl["origin"].items(), sl["origin"]
     assert sl["metrics"]["traverses_unresolved"] is True
     aol = [l for l in result["leaves"] if l["kind"] == "address_of_local_unresolved"]
     glob = [l for l in aol if l.get("global")]
@@ -11049,7 +11109,7 @@ def test_backward_fill_outranks_a_terminator_and_names_a_tainted_length_928r3():
     pg.sink(buf)
     result, reasons, aol = _bw(pg.func())
     assert any("length argument 2 of memcpy bounds" in r for r in reasons), reasons
-    assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "n#0"}, result["slices"][0]["origin"]
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["index"], result["slices"][0]["origin"]["var"]) == ("parameter", 0, "n#0"), result["slices"][0]["origin"]
 
     # A short constant copy and one terminator leave an uncovered suffix (#931).
     pg2 = _BufProgram()
@@ -11057,7 +11117,7 @@ def test_backward_fill_outranks_a_terminator_and_names_a_tainted_length_928r3():
     pg2.aliased_store(buf, 0x10, 0)
     pg2.sink(buf)
     result2, _, _ = _bw(pg2.func())
-    assert result2["slices"][0]["origin"] == {"kind": "address_of_local_unresolved", "buffer": "buf"}
+    assert {"kind": "address_of_local_unresolved", "buffer": "buf"}.items() <= result2["slices"][0]["origin"].items()
     assert not result2["diagnostics"]["safe_to_report_complete_slice"]
 
 
@@ -11075,7 +11135,7 @@ def test_backward_follows_a_modeled_return_that_derives_from_an_argument_928r3()
     result, reasons, aol = _bw(pg.func())
     assert any("return of memcpy derives from its argument 0" in r for r in reasons), reasons
     assert any("local buffer buf written by memcpy" in r for r in reasons), reasons
-    assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 0, "var": "n#0"}, result["slices"][0]["origin"]
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["index"], result["slices"][0]["origin"]["var"]) == ("parameter", 0, "n#0"), result["slices"][0]["origin"]
 
 
 def test_builtin_copy_intrinsics_are_modeled_like_libc_928r3():
@@ -11161,7 +11221,7 @@ def test_backward_variable_offset_address_walks_the_buffer_928r4():
     assert any("local buffer line written by read" in r for r in reasons), reasons
     # The offset is walked too; a parameter origin outranks the source so the
     # caller ascent still runs.
-    assert result["slices"][0]["origin"] == {"kind": "parameter", "index": 1, "var": "off#0"}
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["index"], result["slices"][0]["origin"]["var"]) == ("parameter", 1, "off#0")
     assert aol and not result["diagnostics"]["safe_to_report_complete_slice"]
 
     # Folded into the sink operand (`popen(&line + off#0)`): the buffer is a
@@ -11173,7 +11233,7 @@ def test_backward_variable_offset_address_walks_the_buffer_928r4():
                         _cstr(0x710)], reads=[off0])
     result2, reasons2, _ = _bw(pg2.func())
     seeds = {sl["sink"]["seed"]: sl["origin"] for sl in result2["slices"]}
-    assert seeds.get("&line") == {"kind": "source", "callee": "read"}, seeds
+    assert (seeds.get("&line")["kind"], seeds.get("&line")["callee"]) == ("source", "read"), seeds
     assert any("local buffer line written by read" in r for r in reasons2), reasons2
 
 
@@ -11405,7 +11465,7 @@ def test_annotation_only_overlay_annotates_the_builtin_928r4():
                       FExpr("MLIL_CONST", "0x3f", constant=0x3f)], reads=[fd0])
     pg.sink(buf)
     result = te.TaintEngine(FBV(_B_NAMES), merged).backward(pg.func(), [te.parse_locator("arg:popen:0")])
-    assert result["slices"][0]["origin"] == {"kind": "source", "callee": "read"}, result["slices"][0]["origin"]
+    assert (result["slices"][0]["origin"]["kind"], result["slices"][0]["origin"]["callee"]) == ("source", "read"), result["slices"][0]["origin"]
 
 
 def test_writes_role_renders_a_catalog_row_928r4():

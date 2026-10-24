@@ -24,7 +24,8 @@ Unified diagnostics schema (attached to a zero-sink forward result under
       "last_use": {...} | None,      # last propagated use (label/address/reason)
       "unmodeled_calls_reached": bool,
       "frontier": {
-        "unresolved": int,           # unmodeled_callee / arg_under_recovered / indirect
+        "unresolved": int,           # unmodeled_callee / arg_under_recovered / indirect /
+                                     # model_destination_unrecovered
         "coarse_memory": int,        # coarse_memory_store / pointer_escape
         "seed_misanchored": int,     # #562: source_seed_misanchored / weak_buffer_seed
         "by_kind": {kind: count},
@@ -84,11 +85,16 @@ BLOCKING_LEAF_KINDS = frozenset({
     # unchecked, so an empty reached_sinks is not an all-clear.
     "indirect_call_unchecked",
     # #1050 review round 8: a scanf-family call whose fully read constant
-    # format writes more destinations than BN recovered arguments for. The
-    # missing ones (typically forwarded incoming pointers left in their
-    # argument registers) were never seeded, so an empty result is no
-    # all-clear.
+    # format writes destinations that were never seeded -- either because BN
+    # recovered fewer arguments than the format requires (forwarded incoming
+    # pointers left in their argument registers) or because an arity-capped
+    # model's unrolled destination run ends before the format does. Either way
+    # an empty result is no all-clear.
     "format_destination_unrecovered",
+    # BN6-C009: a reached model rule declares a write into an argument BN did
+    # not recover for that call. No output pointer is guessed, so what the
+    # declared destination receives is unchecked -- not an all-clear.
+    "model_destination_unrecovered",
     # #810: a backward ascent followed only the first N caller sites of a
     # parameter-origin slice; origins reachable only from the dropped callers are
     # absent from the result. Same class as the other frontier leaves: the walk
@@ -123,6 +129,31 @@ BLOCKING_LEAF_KINDS = frozenset({
     # a pointer demand), and a sink a multi-sink query could not seed at all.
     "sink_role_unknown",
     "sink_unseeded",
+    # IC03 / TT-PILOT-FW03-01: tainted bytes reached a keyable writable global
+    # and code reachable from a call references that global. Taint is tracked
+    # per function and nothing but arguments crosses a call, so what those
+    # bytes reach past that boundary was never walked -- an empty
+    # reached_sinks there is not an all-clear.
+    "global_memory_continuation",
+    # Round-3 review R3: the forward walk unwound on Python's recursion limit
+    # (an unresolved cycle). Whatever it had already found is reported, but
+    # the rest was never walked -- so the run is explicitly a frontier, not a
+    # short clean answer.
+    "analysis_truncated",
+    # Review F10: the search for everything that can run before a call ran out
+    # of its block budget, so what an argument register carries into that call
+    # was never established. The blocks it did not read are exactly where a
+    # clobbering call would be, so an empty reached_sinks past it is not an
+    # all-clear.
+    "abi_provenance_budget",
+    # IC05 / BN6-C008: tainted arguments entered an in-binary callee whose
+    # body Binary Ninja never analysed (oversized past
+    # analysis.limits.maxFunctionSize, or a lift that produced no MLIL). The
+    # call RESOLVED -- this is not an unresolved target -- but nothing read
+    # what the body does with the bytes, so an empty reached_sinks past it is
+    # an absence of evidence. Emitted whether or not a model covers the call:
+    # a model is an overlay on a body, never a substitute for reading one.
+    "unread_callee_body",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -184,6 +215,11 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
         return "interprocedural descent hit the depth bound -- raise --max-depth"
     if "recursion" in causes:
         return "Python recursion limit reached (possible unresolved cycle)"
+    if "abi_provenance_budget" in causes:
+        return ("the search for everything that can run before a call ran out of "
+                "its block budget, so what its argument registers carry into that "
+                "call was never established -- narrow the source, or read the "
+                "call's own disassembly for the arguments it passes")
     if "caller_cap" in causes:
         # #812: backward-only cause. Without this branch it fell through to the
         # generic "depth/recursion cutoff" string, which names the wrong knob --
@@ -200,6 +236,16 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
                 "coverage/escape solve is unfinished; seed closer to the sink "
                 "or inspect the writes and unresolved calls named in the "
                 "address_of_local_unresolved leaf")
+    if "global_reference_budget" in causes:
+        # IC03 / round-3 review F2: the bounded call-graph search for code
+        # that reads a tainted global ran out of its function budget with
+        # referencing functions unexamined, so "nothing reads it" was never
+        # established. No depth or recursion bound was hit, so the generic
+        # string would name the wrong knob.
+        return ("the search for code reading a tainted global exhausted its "
+                "function budget with references unexamined -- audit the "
+                "references named in the global_memory_continuation leaf "
+                "(`bn xrefs <global>`) or seed taint inside a consumer")
     return "depth/recursion cutoff"
 
 
@@ -350,6 +396,28 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         return (f"{head}. Reseeding with arg: or call: keys the same pointer and "
                 f"fails the same way; seed a value read from the buffer (var:) or "
                 f"the consuming parser's parameter (param:) instead")
+    unread = [lf for lf in leaves if lf.get("kind") == "unread_callee_body"]
+    if unread:
+        # IC05: the one zero-sink frontier whose remedy CHANGES the next run's
+        # answer -- Binary Ninja never analysed the body, so analysing it and
+        # re-running is the whole fix. It leads because seeding inside a body
+        # that has no MLIL cannot work, and because a model on the name does
+        # not make the advice unnecessary: the overlay is what hid the hole.
+        at = sorted({str((lf.get("callee") or {}).get("address")) for lf in unread
+                     if isinstance(lf.get("callee"), dict)})
+        who = ", ".join(sorted({str((lf.get("callee") or {}).get("display_name")
+                                    or (lf.get("callee") or {}).get("name") or "?")
+                                for lf in unread if isinstance(lf.get("callee"), dict)}))
+        reads = ", ".join(f"`bn decompile {a} --force-analysis`" for a in at if a != "None")
+        overlaid = any(lf.get("modeled") for lf in unread)
+        note = (" A model describes the call, which states what it states and does "
+                "not establish that the body was read."
+                if overlaid else "")
+        return (f"no sink reached, but tainted arguments entered in-binary callee(s) "
+                f"Binary Ninja did not analyse ({who}); their bodies were never "
+                f"examined, so what they do with the bytes is unknown, not clear."
+                f"{note} Analyse them and re-run this query"
+                + (f" ({reads}; may be slow)" if reads else ""))
     callbacks = [lf for lf in leaves if lf.get("kind") == "indirect_call_unchecked"]
     if callbacks and all(lf.get("kind") in ("indirect_call_unchecked", "format_unchecked")
                          for lf in leaves):
@@ -366,10 +434,11 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         seed = (f" ({command_template(forward(fn, 'param:N'))} for a pointer this "
                 f"function forwards)" if fn else "")
         disasm = f" (`bn disasm {shlex.quote(fn)}`)" if fn else ""
-        return ("no sink reached, but a scanf-family call's format writes destinations "
-                f"Binary Ninja did not recover as arguments ({at}), so they were never "
-                f"seeded -- read that call's disassembly{disasm} to find which pointers "
-                f"it passes, and seed each one{seed}")
+        return ("no sink reached, but a scanf-family call's format writes more "
+                f"destinations than the model covers or Binary Ninja recovered as "
+                f"arguments ({at}), so they were never seeded -- read that call's "
+                f"disassembly{disasm} to find which pointers it passes, and seed each "
+                f"one{seed}")
     unchecked = [lf for lf in leaves if lf.get("kind") == "format_unchecked"]
     if unchecked and len(unchecked) == len(leaves):
         at = ", ".join(sorted({str(lf.get("address")) for lf in unchecked}))
@@ -418,6 +487,86 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                 f"and callee argument consumption, or {seed}. Repair a prototype only "
                 "where confirmed extra arguments disagree with a determined "
                 "nonvariadic declaration")
+    crossed = [lf for lf in leaves if lf.get("kind") == "global_memory_continuation"]
+    if by_kind.get("analysis_truncated", 0):
+        return ("the walk unwound on Python's recursion limit (an unresolved cycle): "
+                "what it had already found is reported and the rest was never walked "
+                "-- re-run with a lower `--max-depth` for a bounded, complete answer "
+                "over the region it can finish")
+    if crossed:
+        # IC03: the most actionable zero-sink frontier there is -- the bytes
+        # have a known address, so the advice points at them rather than at
+        # this function. A leaf whose reachability search was TRUNCATED names
+        # no reader (there may be one); it gets the bound and the xref audit.
+        globals_at = sorted({str((lf.get("global") or {}).get("address"))
+                             for lf in crossed if isinstance(lf.get("global"), dict)})
+        reads = sorted({str(r.get("at")) for lf in crossed
+                        for r in (lf.get("references") or []) if isinstance(r, dict)})
+        # R4: the leaf carries a RUNNABLE re-seed when the consumer names a
+        # locator; a constant-address reader names none, and advising
+        # `var:VAR` there was a template nothing could fill in.
+        reseed = next((str(lf.get("reseed")) for lf in crossed if lf.get("reseed")), None)
+        seed = f" ({reseed})" if reseed else ""   # already backticked: a command
+        head = ("taint reached no modeled sink HERE, but it was copied into the writable "
+                f"global(s) {', '.join(globals_at)}")
+        truncated_at = sorted({str((lf.get("reachability") or {}).get("cause"))
+                               for lf in crossed
+                               if (lf.get("reachability") or {}).get("status") == "truncated"})
+        if reads:
+            # A named reader and a truncated search are not alternatives: say
+            # both, so the advice never reads as "and that is all of them".
+            cut = (f" The search was also TRUNCATED ({', '.join(truncated_at)}), so "
+                   f"further references may exist." if truncated_at else "")
+            # BN21-BOUND-02: only a proven read is reported as a read.
+            verb = ("reads" if any(lf.get("reads_proven") for lf in crossed)
+                    else "may use")
+            return (f"{head}, which code reachable from a call this walk made {verb} "
+                    f"({', '.join(reads)}); those bytes are not followed across the call."
+                    f"{cut} xrefs answers for ONE address: query the sites "
+                    f"the leaves cite, starting with `bn xrefs {globals_at[0]}`"
+                    + (f" and re-seed inside the consumer on the value it loads{seed}"
+                       if seed else
+                       " and audit them by hand: the consumer reads those bytes by"
+                       " constant address, so there is no variable inside it to seed"))
+        # BN21-BOUND-03: `--max-depth` moves the CALL-GRAPH bound and nothing
+        # else. Advising it for a bound it cannot move is advice that fails.
+        widen = (" or raise --max-depth and re-run"
+                 if any(c in ("depth_budget", "function_budget") for c in truncated_at)
+                 else " -- this bound is internal, `--max-depth` does not move it")
+        return (f"{head}, and the search for code reading it past a call this walk made "
+                f"was TRUNCATED ({', '.join(truncated_at) or 'bound reached'}) with "
+                f"references unexamined -- whether those bytes reach a sink is unknown, "
+                f"not clear. xrefs answers for ONE address: audit the sites "
+                f"the leaves cite, starting with `bn xrefs {globals_at[0]}`"
+                f"{widen}")
+    unrecovered = [lf for lf in leaves if lf.get("kind") == "model_destination_unrecovered"]
+    if unrecovered:
+        # BN6-C009: the bytes were handed to a declared destination the call
+        # does not carry. The callee's prototype and the call's recovered
+        # arguments answer whether the model or the recovery is short; each
+        # command is a read that runs as printed.
+        def _refs(key: str) -> list[str]:
+            out = set()
+            for lf in unrecovered:
+                v = lf.get(key)
+                if isinstance(v, dict) and v.get("address"):
+                    out.add(str(v["address"]))
+            return sorted(out)
+
+        def _callee(lf: dict[str, Any]) -> str:
+            c = lf.get("callee") if isinstance(lf.get("callee"), dict) else {}
+            return str(c.get("display_name") or c.get("name") or "?")
+        sites = ", ".join(sorted({f"{lf.get('destination')} of {_callee(lf)} at {lf.get('address')}"
+                                  for lf in unrecovered}))
+        reads = ([f"`bn proto get {c}`" for c in _refs("callee")]
+                 + [f"`bn disasm {f}`" for f in _refs("function")])
+        how = f" ({', '.join(reads)})" if reads else ""
+        return ("no sink reached, but a reached model rule declares a write into an argument "
+                f"Binary Ninja did not recover for the call ({sites}); no output pointer is "
+                "assumed, so what that destination receives is unchecked -- compare the model "
+                f"rule with the callee's prototype and the call's recovered arguments{how}, "
+                "then correct the model, or the prototype only on independent evidence, and "
+                "re-run")
     if by_kind.get("coarse_memory_store", 0) or by_kind.get("pointer_escape", 0):
         # The coarse leaf exists precisely because the destination could not be
         # keyed, so no var: names it; the template seeds a value read back.
@@ -477,15 +626,28 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
         k = str(lf.get("kind", "?"))
         by_kind[k] = by_kind.get(k, 0) + 1
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered", "indirect_call_unresolved")
-    COARSE = ("coarse_memory_store", "pointer_escape")
-    unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED)
+    # A global-memory continuation is a MEMORY boundary (the bytes are at a
+    # known address and the walk stops following them), not an unresolved
+    # call: the target resolved, it is the memory hand-off that is not
+    # carried. It belongs in the coarse-memory tally with the other two.
+    COARSE = ("coarse_memory_store", "pointer_escape", "global_memory_continuation")
+    unmodeled_n = sum(by_kind.get(k, 0) for k in UNRESOLVED)
+    # BN6-C009: a declared destination the call does not carry is an
+    # unresolved write, so it is counted with the unresolved frontier -- but
+    # its callee IS modeled, so it never reads as "an unmodeled call reached".
+    # IC05/BN6-C008 is counted the same way and for the same reason: a callee
+    # body nobody read is a hole in the frontier, but the call RESOLVED and a
+    # model may well describe it, so it must not claim an unmodeled call was
+    # reached.
+    unresolved_n = (unmodeled_n + by_kind.get("model_destination_unrecovered", 0)
+                    + by_kind.get("unread_callee_body", 0))
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
     seed_misanchored_n = sum(by_kind.get(k, 0) for k in _SEED_MISANCHORED_KINDS)
     # An external callee with no taint model returns conservatively tainted
     # and is disclosed as an assumption, not a leaf -- fold it into the
     # "unmodeled call reached" signal so a parser behind an import stub counts.
     ext_no_model = any("has no model" in a for a in assumptions)
-    unmodeled_reached = bool(unresolved_n or ext_no_model)
+    unmodeled_reached = bool(unmodeled_n or ext_no_model)
     tainted_values = int(diag.get("tainted_values", 0))
 
     next_action = _forward_next_action(
@@ -525,12 +687,24 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     }
 
 
+def _dropped_reference_count(leaf: dict[str, Any]) -> int | None:
+    """A caller frontier's ``callers_dropped`` when it states a count, else None.
+
+    Only a non-negative integer is a count: a bool, a fraction, a numeric
+    string or a missing key is a leaf this helper cannot measure."""
+    n = leaf.get("callers_dropped")
+    if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+        return n
+    return None
+
+
 def backward_diagnostics(
     leaves: list[dict[str, Any]],
     assumptions: list[str],
     *,
     sinks_seeded: int,
     slices: int,
+    sinks_constant: int = 0,
     unresolved_origins: int = 0,
     truncated: bool = False,
     truncation_cause: list[str] | None = None,
@@ -573,8 +747,9 @@ def backward_diagnostics(
     # Same vocabulary the forward frontier groups by, so one leaf kind never
     # means two things across directions. `caller_sites_truncated` is counted
     # under its own heading: it is not an unresolved callee or a coarse store
-    # but a deliberately abandoned ascent, and conflating it would hide the one
-    # frontier a user can act on by re-running with a narrower sink.
+    # but known callers the ascent did not follow (past the cap, past
+    # --max-depth, unfollowable sites, a stored address), each with its own
+    # remedy, and conflating it would hide the frontier a user can act on.
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered",
                   "indirect_call_unresolved", "field_load_unresolved",
                   "address_of_local_unresolved", "pointer_object_unresolved",
@@ -583,7 +758,17 @@ def backward_diagnostics(
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
-    dropped_callers_n = by_kind.get("caller_sites_truncated", 0)
+    # The producer merges each function's reference identities across all
+    # formal demands into one frontier. Reason/example counts are demand
+    # evidence, not additional dropped caller references. A leaf from another
+    # producer (an older bridge, replay tooling) may carry no readable count:
+    # it still proves at least one dropped reference, so it is counted as one
+    # and disclosed as unmeasured -- never raised on, and never a bool or a
+    # fraction read as a count.
+    caller_leaves = [lf for lf in leaves or [] if lf.get("kind") == "caller_sites_truncated"]
+    dropped_counts = [_dropped_reference_count(lf) for lf in caller_leaves]
+    unmeasured_callers_n = sum(1 for n in dropped_counts if n is None)
+    dropped_callers_n = sum(n for n in dropped_counts if n is not None) + unmeasured_callers_n
 
     blocking = [str(lf.get("kind")) for lf in (leaves or [])
                 if lf.get("kind") in BLOCKING_LEAF_KINDS]
@@ -597,8 +782,8 @@ def backward_diagnostics(
                 seen.append(k)
         complete, reason = False, (
             f"{len(blocking)} frontier leaf(s) ({', '.join(seen)}) remain -- the "
-            "def-chain was not followed to every origin, so this slice is NOT a "
-            "complete account of what reaches the sink")
+            "value origins or consumed pointer bytes remain unaccounted for, so "
+            "this slice is NOT a complete account of what reaches the sink")
     elif unresolved_origins:
         complete, reason = False, (
             f"{int(unresolved_origins)} slice(s) bottomed out at an unresolved "
@@ -623,26 +808,90 @@ def backward_diagnostics(
         complete, reason = False, (
             "the sink seed was incomplete or mis-anchored (see caveats), so the "
             "walk may have started from the wrong value -- NOT a complete slice")
-    elif not sinks_seeded:
+    elif not sinks_seeded and not sinks_constant:
         complete, reason = False, (
             "no sink seeded, so nothing was walked -- an empty slice list here "
             "is a seeding outcome, not a complete answer")
     else:
         complete, reason = True, (
-            "every seeded sink was walked to its origins with no frontier leaf "
-            "and no truncation; still a may-analysis over the recovered IL -- "
-            "not a proof that no other value reaches the sink")
+            "every selected sink site has a scalar origin or finite constant "
+            "with no frontier leaf and no truncation; still a may-analysis over "
+            "the recovered IL, not a destination-capacity or safety proof")
 
-    if dropped_callers_n:
-        next_action = (
-            "the caller ascent was capped, so some calling sites were never "
-            "followed; re-run against a specific caller or narrow the sink to "
-            "see the origins behind the dropped sites")
+    if caller_leaves:
+        # Each reason the ascent left callers unfollowed has its own remedy
+        # (IC01). A leaf with no `reasons` tally is a cap leaf (#810).
+        functions: dict[str, tuple[str, set[str]]] = {}
+        for lf in caller_leaves:
+            fn = lf.get("function") if isinstance(lf.get("function"), dict) else {}
+            reasons = (lf.get("reasons") if isinstance(lf.get("reasons"), dict)
+                       and lf.get("reasons") else {"caller_cap": 1})
+            selector = shlex.quote(str(fn.get("name") or fn.get("address") or "<function>"))
+            function_key = str(fn.get("address") or fn.get("name") or "<function>")
+            if function_key not in functions:
+                functions[function_key] = (selector, set())
+            functions[function_key][1].update(str(r) for r in reasons)
+        selector_counts: dict[str, int] = {}
+        for selector, _ in functions.values():
+            selector_counts[selector] = selector_counts.get(selector, 0) + 1
+        # Bound examples, not evidence: all frontier rows stay in the result.
+        # As with the xrefs preview, show at most three complete targets.
+        def examples(reason: str, operation: str | None = None) -> str:
+            shown: list[str] = []
+            total = 0
+            for function_key, (selector, why) in functions.items():
+                if reason not in why:
+                    continue
+                total += 1
+                if len(shown) < 3:
+                    if selector_counts[selector] > 1:
+                        selector = shlex.quote(function_key)
+                    shown.append(f"`bn {operation} {selector}`" if operation else selector)
+            text = ", ".join(shown)
+            omitted = total - len(shown)
+            if omitted:
+                text += (f" (+{omitted} more affected functions; see full "
+                         "caller_sites_truncated leaves in JSON)")
+            return text
+
+        caller_reasons = {why_one for _, why in functions.values() for why_one in why}
+        advice = []
+        if "caller_cap" in caller_reasons:
+            advice.append(
+                f"for {examples('caller_cap')}: the caller ascent was capped, so some "
+                "calling sites were never followed; re-run against a specific caller "
+                "or narrow the sink to see the origins behind the dropped sites")
+        if "max_depth" in caller_reasons:
+            advice.append(
+                f"for {examples('max_depth')}: the caller ascent stopped at the configured "
+                "depth; re-run with a larger --max-depth to follow the remaining callers")
+        if "indirect_reference" in caller_reasons:
+            advice.append(
+                "function addresses are taken (stored in data or handed on as a value), "
+                "so indirect callers remain unfollowed; inspect "
+                f"{examples('indirect_reference', 'xrefs')} for the references -- slice "
+                "backward from the dispatching caller")
+        # `caller_reasons`, never `reason`: that name holds the completeness
+        # explanation returned below as `complete_slice_reason`.
+        for other in sorted(caller_reasons - {"caller_cap", "max_depth", "indirect_reference"}):
+            advice.append(
+                f"some caller sites could not be followed ({other}); the full leaf's "
+                "`unfollowed` rows name each -- inspect "
+                f"{examples(other, 'callsites')}")
+        next_action = "; ".join(advice)
     elif truncated and truncation_cause:
         # A named cut (the memory-chain budget, a depth bound) has its own
         # remediation; the generic unresolved text below would send the reader
         # to `bn proto set` for a walk that simply ran out of budget (round 3).
         next_action = _truncation_hint(truncation_cause)
+    elif (any("def-chain walk truncated" in str(a) for a in assumptions or [])
+          and not any(lf.get("kind") in UNRESOLVED for lf in leaves or [])):
+        # The engine's def-chain step budget cut a value; its `unresolved`
+        # slice (cause `def_chain_budget`) names what was left unwalked.
+        next_action = (
+            "the def-chain step budget cut the walk before some values reached an "
+            "origin (the `unresolved` slice with cause `def_chain_budget` lists them "
+            "under `unwalked`); slice backward from closer to those values")
     elif unresolved_n:
         unresolved_leaves = [lf for lf in leaves or [] if lf.get("kind") in UNRESOLVED]
         # The forward run is printed only for a buffer a leaf names together
@@ -654,8 +903,8 @@ def backward_diagnostics(
                             and isinstance(lf.get("function"), str) and not lf.get("global")),
                            None)
         next_action = (
-            "the walk bottomed out at an unresolved definition; inspect the frontier "
-            "leaves and argument consumption, or seed inside the producing function")
+            "value origins or consumed pointer bytes remain unresolved; inspect "
+            "the frontier leaves and argument consumption, or seed inside the producing function")
         if buffer_leaf is not None:
             source = shlex.quote(f"var:{buffer_leaf['buffer']}")
             next_action += (
@@ -727,6 +976,11 @@ def backward_diagnostics(
             "the walk crossed a coarse-memory frontier (a pointer/store not "
             "precisely tracked); inspect the frontier leaves or re-seed on the "
             "destination buffer directly")
+    elif not sinks_seeded and sinks_constant:
+        next_action = (
+            "the selected scalar operands are finite constants with no def-chain "
+            "to walk; check destination capacity separately -- a finite count "
+            "does not prove that a copy fits")
     elif not sinks_seeded:
         # Must precede the no-slices branch: with nothing seeded there are also
         # no slices, so the generic "the sink seeded but no slice was produced"
@@ -750,6 +1004,7 @@ def backward_diagnostics(
 
     return {
         "sinks_seeded": int(sinks_seeded),
+        "sinks_constant": int(sinks_constant),
         "slices": int(slices),
         "truncated": bool(truncated),
         "truncation_cause": truncation_cause,
@@ -757,6 +1012,10 @@ def backward_diagnostics(
             "unresolved": unresolved_n,
             "coarse_memory": coarse_n,
             "dropped_callers": dropped_callers_n,
+            # Present only when a caller frontier's count could not be read:
+            # `dropped_callers` is then a lower bound.
+            **({"dropped_callers_unmeasured": unmeasured_callers_n}
+               if unmeasured_callers_n else {}),
             "by_kind": by_kind,
         },
         "next_action": next_action,
