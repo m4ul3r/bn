@@ -5008,6 +5008,11 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
             + (f"  (via {via})" if via else "")
             + f"  (tainted arg(s) {args}; {leaf.get('skip_reason', '?')}"
+            # Which arguments the MLIL call did NOT carry: the reader must be
+            # able to tell an argument Binary Ninja recovered from one the
+            # calling convention's register proved.
+            + (f"; ABI-recovered arg(s) {_field_list(leaf, 'abi_recovered_args')}"
+               if leaf.get("abi_recovered_args") else "")
             # Whether a model covered the call is the POINT of this leaf: the
             # overlay is exactly what used to hide the unread body, so a reader
             # must see both facts on the one row (IC05).

@@ -84,6 +84,18 @@ def _skipped(name, addr, reason="ExceedFunctionSizeSkipReason"):
     return fn
 
 
+def _no_mlil(name, addr):
+    """A DEFINED in-binary function whose implementation MLIL is unavailable.
+
+    Binary Ninja names it a `FunctionSymbol` of this binary -- so the
+    implementation exists here -- and produced no MLIL for it (a lift that
+    failed). The hole is the same as a measured skip: an implementation this
+    binary has, that this walk did not read.
+    """
+    return FFunc(name, addr, FSSAFunc([]), params=[FVar("q", ident=90)],
+                 symbol_type="FunctionSymbol")
+
+
 def _veneer(name, addr, target):
     """A one-instruction tail-call thunk onto *target* -- what BN names
     ``j_<callee>`` for a jump stub."""
@@ -104,16 +116,19 @@ def _calls(name, addr, target, *, param_ident=91):
         params=[q])
 
 
-def _program(route, overlay, *, consume_return=False):
+def _program(route, overlay, *, consume_return=False, body_shape="skipped"):
     """``call_unread(p)`` reaching an unread body by *route*.
 
     Returns ``(entry, bv, models, resolve_map)``. With ``consume_return`` the
     caller hands the call's RESULT to a modeled sink, which is how a model's
     own return semantics are observed to survive the disclosure.
+    ``body_shape`` picks which way the implementation is unavailable: measured
+    and skipped, or defined with no MLIL at all.
     """
     p, result = FVar("p", ident=40), FVar("result", ident=41)
     p0, result1 = FSSA(p, 0), FSSA(result, 1)
-    body = _skipped("unread_body", BODY)
+    body = (_skipped("unread_body", BODY) if body_shape == "skipped"
+            else _no_mlil("unread_body", BODY))
     funcs = {BODY: body}
     names = {BODY: "unread_body", SYSTEM: "system", MEMCPY: "memcpy"}
     resolve_map: dict = {}
@@ -166,8 +181,9 @@ def _program(route, overlay, *, consume_return=False):
     return entry, FBV(names, funcs=funcs), catalog, resolve_map
 
 
-def _forward(route, overlay, *, consume_return=False, max_depth=8, **engine_kwargs):
-    entry, bv, catalog, resolve_map = _program(route, overlay,
+def _forward(route, overlay, *, consume_return=False, max_depth=8,
+             body_shape="skipped", **engine_kwargs):
+    entry, bv, catalog, resolve_map = _program(route, overlay, body_shape=body_shape,
                                                consume_return=consume_return)
     engine = te.TaintEngine(bv, catalog, resolve_map=resolve_map, **engine_kwargs)
     return engine.forward(entry, [te.parse_locator("param:0")], max_depth=max_depth)
@@ -183,13 +199,19 @@ def _boundaries(result):
 
 @pytest.mark.parametrize("route", ["direct", "thunk", "multihop", "wrapper", "pinned"])
 @pytest.mark.parametrize("overlay", list(OVERLAYS), ids=list(OVERLAYS))
-def test_a_matching_model_never_certifies_an_unread_body(route, overlay):
+@pytest.mark.parametrize("body_shape, reason", [
+    ("skipped", "analysis_skipped:ExceedFunctionSizeSkipReason"),
+    ("no-mlil", "no_mlil"),
+], ids=["measured-skip", "no-mlil"])
+def test_a_matching_model_never_certifies_an_unread_body(route, overlay,
+                                                         body_shape, reason):
     # BN6-C008: with ANY matching entry the run reported
     # analysis_incomplete=false, zero leaves and safe_to_report_all_clear=true
     # -- on the identical binary whose unmodeled run withheld the claim. The
     # overlay states one relation; it never establishes that the rest of the
-    # body was read.
-    result = _forward(route, OVERLAYS[overlay])
+    # body was read. Both ways an implementation can be unavailable count:
+    # BN measured the body and skipped it, or it produced no MLIL at all.
+    result = _forward(route, OVERLAYS[overlay], body_shape=body_shape)
     stats, diag = result["stats"], result["diagnostics"]
 
     assert stats["analysis_incomplete"] is True, (route, overlay, stats)
@@ -205,9 +227,28 @@ def test_a_matching_model_never_certifies_an_unread_body(route, overlay):
     # The call site is the one that enters the unread body: for the wrapper
     # route that is the wrapper's own call, not the entry's.
     assert leaf["address"] == hex(WRAPPER + 4 if route == "wrapper" else CALL), leaf
-    assert leaf["skip_reason"] == "analysis_skipped:ExceedFunctionSizeSkipReason", leaf
+    assert leaf["skip_reason"] == reason, leaf
     assert leaf["tainted_args"] == [0], leaf
+    assert leaf["abi_recovered_args"] == [], leaf
     assert leaf["modeled"] is (OVERLAYS[overlay] is not None), leaf
+
+
+def test_a_bodiless_record_with_no_defined_symbol_is_not_an_unread_body():
+    # The external machinery's degenerate shape: an address a NAME is known at,
+    # with no function Binary Ninja defines behind it. There is no in-binary
+    # implementation to read, so there is nothing incomplete about not reading
+    # one -- and marking it would make every modeled external call a permanent
+    # frontier.
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    call = FInstr(0, CALL, "MLIL_CALL_SSA", "memcpy(p#0, s, n)", reads=[p0], writes=[],
+                  dest=_ptr(MEMCPY),
+                  params=[_val(p0), _ptr(0x407000), _ptr(0x408000)])
+    entry = FFunc("call_unread", ENTRY, FSSAFunc([call]), params=[p])
+    result = te.TaintEngine(FBV({MEMCPY: "memcpy"}), te.load_models()).forward(
+        entry, [te.parse_locator("param:0")])
+    assert _boundaries(result) == [], result["leaves"]
+    assert result["stats"]["analysis_incomplete"] is False, result["stats"]
 
 
 @pytest.mark.parametrize("route, veneer", [("thunk", "j_unread_body"),
@@ -311,14 +352,75 @@ def test_text_mode_shows_the_note_the_frontier_row_and_the_modeled_marker():
     assert "safe_to_report_all_clear: false" in text, text
 
 
-def test_one_call_to_one_body_renders_as_one_row():
-    # The fixpoint can reach a call site from several tainted-argument
-    # contexts; that is one hole, not a wall of near-identical rows.
+def _two_context_program(overlay):
+    """``contexts(p)``: ``nested(p, 0)`` and ``nested(0, p)`` -- ONE call to the
+    unread body, reached from two tainted-argument contexts."""
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    a, b = FVar("a", ident=94), FVar("b", ident=95)
+    a0, b0 = FSSA(a, 0), FSSA(b, 0)
+    r0, r1, r2 = (FSSA(FVar(n, ident=i), 1)
+                  for n, i in (("rn", 98), ("r0", 99), ("r1", 100)))
+    nested = FFunc("nested", WRAPPER, FSSAFunc([
+        FInstr(0, WRAPPER + 4, "MLIL_CALL_SSA", "rn#1 = unread_body(a#0, b#0)",
+               reads=[a0, b0], writes=[r0], dest=_ptr(BODY),
+               params=[_val(a0), _val(b0)])]), params=[a, b])
+    zero = FExpr("MLIL_CONST", "0", constant=0)
+    entry = FFunc("contexts", ENTRY, FSSAFunc([
+        FInstr(0, CALL, "MLIL_CALL_SSA", "r0#1 = nested(p#0, 0)", reads=[p0],
+               writes=[r1], dest=_ptr(WRAPPER), params=[_val(p0), zero]),
+        FInstr(1, SINK_CALL, "MLIL_CALL_SSA", "r1#1 = nested(0, p#0)", reads=[p0],
+               writes=[r2], dest=_ptr(WRAPPER), params=[zero, _val(p0)]),
+    ]), params=[p])
+    body = _skipped("unread_body", BODY)
+    body.parameter_vars = [FVar("x", ident=96), FVar("y", ident=97)]
+    bv = FBV({BODY: "unread_body", WRAPPER: "nested"},
+             funcs={BODY: body, WRAPPER: nested})
+    return entry, bv, te.load_models({"unread_body": overlay} if overlay else None)
+
+
+@pytest.mark.parametrize("overlay", [None, PARTIAL], ids=["no-model", "partial"])
+def test_one_call_to_one_body_is_one_boundary_with_every_argument(overlay):
+    # Review F2: the same call, reached from two tainted-argument contexts,
+    # produced TWO leaves -- the unresolved frontier counted 2, and the text
+    # row printed the first context's arguments followed by `[2 leaves]`,
+    # hiding the second's. One unread body at one call site is one hole.
+    entry, bv, catalog = _two_context_program(overlay)
+    result = te.TaintEngine(bv, catalog).forward(entry, [te.parse_locator("param:0")])
+
+    [leaf] = _boundaries(result)
+    assert leaf["address"] == hex(WRAPPER + 4), leaf
+    assert leaf["tainted_args"] == [0, 1], leaf
+    diag = result["diagnostics"]
+    assert diag["frontier"]["by_kind"][KIND] == 1, diag
+    assert diag["frontier"]["unresolved"] == 1, diag
+
+    row = next(line for line in formatters._render_taint_text(result).splitlines()
+               if line.strip().startswith(KIND))
+    assert "[0, 1]" in row, row
+    assert "leaves]" not in row, row
+
+
+def test_two_calls_to_one_body_stay_two_boundaries():
+    # The must-not-overreach twin: distinct call sites are distinct holes, and
+    # merging them would hide one of the two places to look.
     leaf = _boundaries(_forward("direct", PARTIAL))[0]
-    other = {**leaf, "tainted_args": [0, 1]}
-    rows = formatters._render_grouped_leaves([leaf, other])
-    assert rows[0] == "frontiers (2 in 1 group(s)):", rows
-    assert len(rows) == 2, rows
+    elsewhere = {**leaf, "address": hex(SINK_CALL)}
+    leaves: list = []
+    te._add_leaf(leaves, leaf)
+    te._add_leaf(leaves, elsewhere)
+    assert [lf["address"] for lf in leaves] == [hex(CALL), hex(SINK_CALL)]
+
+
+def test_merging_a_boundary_never_mutates_the_leaf_it_merges_into():
+    # The merged copy must not be written back into an object a cached callee
+    # summary (or another callsite's by_source row) may still hold.
+    first = _boundaries(_forward("direct", PARTIAL))[0]
+    leaves: list = []
+    te._add_leaf(leaves, first)
+    te._add_leaf(leaves, {**first, "tainted_args": [2]})
+    assert leaves[0]["tainted_args"] == [0, 2], leaves
+    assert first["tainted_args"] == [0], first
 
 
 # --------------------------------------------------------------------------
@@ -393,3 +495,249 @@ def test_the_global_continuation_boundary_is_not_duplicated(models, hops):
         assert kinds == ["global_memory_continuation"], result["leaves"]
         assert result["leaves"][0]["reachability"]["cause"] == KIND
         assert result["stats"]["analysis_incomplete"] is True
+
+
+# --------------------------------------------------------------------------
+# F3: an argument the MLIL call does not carry, proven by the ABI register
+# --------------------------------------------------------------------------
+
+class _LBlock(list):
+    """An LLIL-SSA basic block: a list of instructions plus CFG edges."""
+
+    def __init__(self, instrs, incoming=()):
+        super().__init__(instrs)
+        self.incoming_edges = [types.SimpleNamespace(source=b) for b in incoming]
+        self.immediate_dominator = None
+        for ins in instrs:
+            ins.il_basic_block = self
+
+
+_CALL_OP = "LLIL_CALL_SSA_OP"
+_SET_OP = "LLIL_SET_REG_SSA_OP"
+_FAKE_BN = types.SimpleNamespace(LowLevelILOperation=types.SimpleNamespace(
+    LLIL_CALL_SSA=_CALL_OP, LLIL_SET_REG_SSA=_SET_OP, LLIL_REG_PHI="LLIL_REG_PHI_OP",
+    LLIL_SYSCALL_SSA="LLIL_SYSCALL_SSA_OP", LLIL_INTRINSIC_SSA="LLIL_INTRINSIC_SSA_OP",
+    LLIL_TAILCALL_SSA="LLIL_TAILCALL_SSA_OP"))
+
+
+def _lins(index, address, operation, *, reg=None, mlil_writes=None):
+    ins = types.SimpleNamespace(instr_index=index, address=address,
+                                operation=operation, output=[])
+    if reg is not None:
+        ins.dest = types.SimpleNamespace(reg=reg)
+    if mlil_writes is not None:
+        ins.mlil = types.SimpleNamespace(
+            ssa_form=types.SimpleNamespace(vars_written=list(mlil_writes)))
+    return ins
+
+
+def _llil_func(blocks):
+    return types.SimpleNamespace(llil=types.SimpleNamespace(ssa_form=list(blocks)))
+
+
+def test_an_unwritten_argument_register_carries_the_entry_value():
+    # `f(p) { unread_body(/* rdi still p */); }` -- nothing defines rdi, and
+    # nothing that can run first may have clobbered it, so the register still
+    # holds what the function was entered with.
+    call = _lins(0, CALL, _CALL_OP)
+    _LBlock([call])
+    kind, seeds = te.argument_register_provenance(
+        _llil_func([[call]]), CALL, "rdi", _FAKE_BN)
+    assert (kind, seeds) == ("entry", [])
+
+
+def test_a_defining_instruction_is_bridged_to_its_mlil_value():
+    v = FSSA(FVar("token", ident=50), 1)
+    setter = _lins(0, CALL - 4, _SET_OP, reg="rdi", mlil_writes=[v])
+    call = _lins(1, CALL, _CALL_OP)
+    _LBlock([setter, call])
+    kind, seeds = te.argument_register_provenance(
+        _llil_func([[setter, call]]), CALL, "rdi", _FAKE_BN)
+    assert kind == "defined"
+    assert [var for var, _ in seeds] == [v]
+
+
+def test_a_call_that_may_have_clobbered_the_register_proves_nothing():
+    # A callee may clobber any caller-saved register and no definition in this
+    # function records it, so the entry value is NOT claimed. Nothing is
+    # inferred from the convention's clobber list.
+    earlier = _lins(0, CALL - 8, _CALL_OP)
+    call = _lins(1, CALL, _CALL_OP)
+    _LBlock([earlier, call])
+    kind, seeds = te.argument_register_provenance(
+        _llil_func([[earlier, call]]), CALL, "rdi", _FAKE_BN)
+    assert (kind, seeds) == ("unproven", [])
+
+
+def test_a_call_later_in_a_loop_body_also_refuses_the_entry_value():
+    # On the second iteration the LATER call runs first. Instruction order is
+    # not execution order, so the CFG decides.
+    call = _lins(0, CALL, _CALL_OP)
+    later = _lins(1, CALL + 8, _CALL_OP)
+    block = _LBlock([call, later])
+    block.incoming_edges = [types.SimpleNamespace(source=block)]
+    kind, _ = te.argument_register_provenance(
+        _llil_func([block]), CALL, "rdi", _FAKE_BN)
+    assert kind == "unproven"
+
+
+def test_a_call_on_a_reaching_branch_refuses_the_entry_value():
+    # The clobbering call is not on the dominator chain, but its block reaches
+    # the call's block, so it may still have run first.
+    other = _lins(0, CALL - 16, _CALL_OP)
+    branch = _LBlock([other])
+    call = _lins(1, CALL, _CALL_OP)
+    _LBlock([call], incoming=[branch])
+    kind, _ = te.argument_register_provenance(
+        _llil_func([branch, [call]]), CALL, "rdi", _FAKE_BN)
+    assert kind == "unproven"
+
+
+def test_a_view_with_no_llil_claims_nothing():
+    assert te.argument_register_provenance(
+        types.SimpleNamespace(llil=None), CALL, "rdi", _FAKE_BN) == ("unproven", [])
+
+
+def _dropped_arg_program(*, overlay=None, extra_instr=None, n_args=1):
+    """`call_unread(p)`: a call to the unread body whose MLIL carries NO
+    parameters -- the shape an optimised build leaves when BN has no prototype
+    for the callee to recover arguments from."""
+    p, q = FVar("p", ident=40), FVar("q", ident=42)
+    p0, q0 = FSSA(p, 0), FSSA(q, 0)
+    params = [p, q][:n_args]
+    call = FInstr(0, CALL, "MLIL_CALL_SSA", "unread_body()", reads=[], writes=[],
+                  dest=_ptr(BODY), params=[])
+    instrs = [call] + list(extra_instr or [])
+    entry = FFunc("call_unread", ENTRY, FSSAFunc(instrs), params=params)
+    entry.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi"])
+    body = _skipped("unread_body", BODY)
+    body.parameter_vars = [FVar("x", ident=96), FVar("y", ident=97)]
+    bv = FBV({BODY: "unread_body", MEMCPY: "memcpy"}, funcs={BODY: body})
+    catalog = te.load_models({"unread_body": overlay} if overlay else None)
+    return entry, bv, catalog, (p0, q0), call
+
+
+def _with_recovered(engine, recovered):
+    """Stand in for the LLIL bridge: `recovered` maps an argument index to the
+    MLIL SSA value its register is proven to carry."""
+    engine._reaching_arg_seeds_via_reg = (
+        lambda f, sites, idx: (["rdi", "rsi"][idx] if idx < 2 else None,
+                               [(recovered[idx], sites[0])] if idx in recovered else []))
+
+
+@pytest.mark.parametrize("overlay", [None, PARTIAL], ids=["no-model", "partial"])
+def test_an_argument_the_call_does_not_carry_still_reaches_the_unread_body(overlay):
+    # The confirmed ABI-provenance gap: BN recovers a call's arguments from the
+    # CALLEE's prototype, and a callee it never analysed has none -- so an
+    # optimised build left `unread_body()` with no arguments and the walk
+    # reported an all-clear while the machine code passed the seeded value in
+    # rdi. The register's own evidence is enough to cross the boundary.
+    entry, bv, catalog, (p0, _q0), _call = _dropped_arg_program(overlay=overlay)
+    engine = te.TaintEngine(bv, catalog)
+    _with_recovered(engine, {0: p0})
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+
+    [leaf] = _boundaries(result)
+    assert leaf["tainted_args"] == [0], leaf
+    assert leaf["abi_recovered_args"] == [0], leaf
+    assert result["stats"]["analysis_incomplete_functions"] == ["unread_body"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert any("calling convention's register(s) rdi" in a
+               for a in result["assumptions"]), result["assumptions"]
+
+
+def test_several_dropped_arguments_are_each_recovered_on_their_own_register():
+    entry, bv, catalog, (p0, q0), _call = _dropped_arg_program(n_args=2)
+    engine = te.TaintEngine(bv, catalog)
+    _with_recovered(engine, {0: p0, 1: q0})
+    result = engine.forward(entry, [te.parse_locator("param:0"),
+                                    te.parse_locator("param:1")])
+    [leaf] = _boundaries(result)
+    assert leaf["tainted_args"] == [0, 1], leaf
+    assert leaf["abi_recovered_args"] == [0, 1], leaf
+
+
+def test_an_untainted_register_recovers_nothing():
+    # The must-not-fire twin: the register is proven, and what it carries is
+    # simply not tainted. No boundary, no caveat, and the run stays clean.
+    entry, bv, catalog, _seeds, _call = _dropped_arg_program()
+    engine = te.TaintEngine(bv, catalog)
+    _with_recovered(engine, {0: FSSA(FVar("unrelated", ident=60), 1)})
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+    assert _boundaries(result) == [], result["leaves"]
+    assert result["stats"]["analysis_incomplete"] is False, result["stats"]
+
+
+def test_nothing_is_recovered_when_the_register_is_unproven():
+    # No LLIL to read (the default for these fakes): the gap is left as it is
+    # rather than guessed at.
+    entry, bv, catalog, _seeds, _call = _dropped_arg_program()
+    result = te.TaintEngine(bv, catalog).forward(entry, [te.parse_locator("param:0")])
+    assert _boundaries(result) == [], result["leaves"]
+    assert result["stats"]["analysis_incomplete"] is False, result["stats"]
+
+
+def test_a_recovered_argument_feeds_the_models_own_propagation():
+    # "Seed model application from that evidence": `arg:0 -> ret` fires on an
+    # argument the call itself does not carry, so the tainted return still
+    # reaches the downstream sink.
+    result_var = FVar("result", ident=43)
+    r1 = FSSA(result_var, 1)
+    sink = FInstr(1, SINK_CALL, "MLIL_CALL_SSA", "memcpy(dst, src, result#1)",
+                  reads=[r1], writes=[], dest=_ptr(MEMCPY),
+                  params=[_ptr(0x407000), _ptr(0x408000), _val(r1)])
+    entry, bv, catalog, (p0, _q0), call = _dropped_arg_program(
+        overlay=PARTIAL, extra_instr=[sink])
+    call.vars_written = [r1]
+    engine = te.TaintEngine(bv, catalog)
+    _with_recovered(engine, {0: p0})
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+    assert any(s["sink"]["class"] == "overflow_len" for s in result["reached_sinks"]), result
+    assert _boundaries(result), result["leaves"]
+
+
+def test_the_recovered_argument_is_disclosed_in_text():
+    entry, bv, catalog, (p0, _q0), _call = _dropped_arg_program(overlay=PARTIAL)
+    engine = te.TaintEngine(bv, catalog)
+    _with_recovered(engine, {0: p0})
+    text = formatters._render_taint_text(engine.forward(
+        entry, [te.parse_locator("param:0")]), full=True)
+    row = next(line for line in text.splitlines() if line.strip().startswith(KIND))
+    assert "ABI-recovered arg(s) [0]" in row, row
+
+
+def test_a_clobbering_call_is_never_read_as_a_definition():
+    # BN lists the registers a call clobbers among its LLIL outputs, and the
+    # MLIL mapping of that call writes its RESULT variable -- the RETURN
+    # register's value, which says nothing about an argument register.
+    # Bridging to it handed the walk the wrong value entirely.
+    v = FSSA(FVar("result", ident=51), 2)
+    earlier = _lins(0, CALL - 8, _CALL_OP, mlil_writes=[v])
+    earlier.output = [types.SimpleNamespace(reg="rdx")]
+    call = _lins(1, CALL, _CALL_OP)
+    _LBlock([earlier, call])
+    kind, seeds = te.argument_register_provenance(
+        _llil_func([[earlier, call]]), CALL, "rdx", _FAKE_BN)
+    assert (kind, seeds) == ("unproven", [])
+
+
+def test_a_call_whose_arguments_binary_ninja_recovered_is_not_second_guessed():
+    # The arity gate: a recovered parameter list IS Binary Ninja's arity
+    # determination. A register past it holds dead scratch as often as an
+    # argument -- at -O0 a compiler stages the second argument through `rdx`
+    # before moving it to `rsi` -- so reading one as "argument 2" of a
+    # two-argument call invents an argument that is not passed.
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    call = FInstr(0, CALL, "MLIL_CALL_SSA", "unread_body(p#0)", reads=[p0],
+                  writes=[], dest=_ptr(BODY), params=[_val(p0)])
+    entry = FFunc("call_unread", ENTRY, FSSAFunc([call]), params=[p])
+    entry.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi"])
+    body = _skipped("unread_body", BODY)
+    body.parameter_vars = [FVar("x", ident=96), FVar("y", ident=97)]
+    engine = te.TaintEngine(FBV({BODY: "unread_body"}, funcs={BODY: body}),
+                            te.load_models())
+    _with_recovered(engine, {1: p0})   # rsi would answer, if it were asked
+    [leaf] = _boundaries(engine.forward(entry, [te.parse_locator("param:0")]))
+    assert leaf["tainted_args"] == [0], leaf
+    assert leaf["abi_recovered_args"] == [], leaf

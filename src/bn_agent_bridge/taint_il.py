@@ -51,17 +51,78 @@ def reaching_reg_def(call_ins: Any, reg: str, bn: Any) -> Any | None:
     return None
 
 
-def reaching_arg_seed_vars(func: Any, addr: int, reg: str,
-                           bn: Any) -> list[tuple[Any, Any]]:
-    """Find the call at ``addr`` in *func*'s LLIL-SSA and recover ``reg``'s
-    reaching definition (:func:`reaching_reg_def`), bridged to the MLIL SSA
-    variable(s) that hold it -- the seeds a backward walk / trace can slice.
-    Returns ``[(mlil_ssa_var, mlil_instr), ...]``; ``[]`` when not recoverable
-    (e.g. no LLIL, as in the unit fakes)."""
+def _call_like_ops(bn: Any) -> set:
+    Op = bn.LowLevelILOperation
+    return {getattr(Op, n, None) for n in (
+        "LLIL_CALL_SSA", "LLIL_SYSCALL_SSA", "LLIL_INTRINSIC_SSA",
+        "LLIL_TAILCALL_SSA")} - {None}
+
+
+def _entry_value_survives(call_ins: Any, bn: Any) -> bool:
+    """Whether NOTHING that can run before *call_ins* may have clobbered a
+    caller-saved register.
+
+    Used only after :func:`reaching_reg_def` has established that the register
+    has no definition at all reaching the call, which means it still holds the
+    value the function was entered with -- *unless* something ran in between
+    that the IL does not name as a definition. The one such thing is another
+    call: a callee may clobber any caller-saved register, and no definition in
+    this function records it.
+
+    So the claim is refused whenever any call/syscall/intrinsic can execute
+    before this one. "Can execute before" is taken from the CFG, not from
+    instruction order: every block that REACHES the call's block may run first,
+    and a block on a cycle through the call reaches itself, so a loop body's
+    later call is caught too. Nothing is inferred from a calling convention's
+    clobber list.
+    """
+    call_ops = _call_like_ops(bn)
+    call_bb = getattr(call_ins, "il_basic_block", None)
+    if call_bb is None:
+        return False
+    call_idx = int(getattr(call_ins, "instr_index", -1))
+    # Backwards CFG closure: every block that can reach the call's block.
+    reaching: list = [call_bb]
+    seen: set[int] = {id(call_bb)}
+    i = 0
+    while i < len(reaching):
+        for edge in (getattr(reaching[i], "incoming_edges", None) or []):
+            src = getattr(edge, "source", None)
+            if src is not None and id(src) not in seen:
+                seen.add(id(src))
+                reaching.append(src)
+        i += 1
+    looped = any(id(getattr(e, "source", None)) in seen
+                 for e in (getattr(call_bb, "incoming_edges", None) or []))
+    for bb in reaching:
+        for ins in bb:
+            if getattr(ins, "operation", None) not in call_ops:
+                continue
+            idx = int(getattr(ins, "instr_index", -1))
+            if bb is call_bb and idx == call_idx:
+                continue
+            if bb is not call_bb or idx < call_idx or looped:
+                return False
+    return True
+
+
+def argument_register_provenance(func: Any, addr: int, reg: str,
+                                 bn: Any) -> tuple[str, list[tuple[Any, Any]]]:
+    """What the ABI argument register *reg* carries into the call at *addr*.
+
+    ``("defined", seeds)`` -- a dominating LLIL-SSA definition reaches the
+    call; ``seeds`` are its ``(mlil_ssa_var, mlil_instr)`` bridges, the values
+    a slice can follow. ``("entry", [])`` -- nothing defines the register and
+    nothing that can run first may have clobbered it, so it still holds the
+    value the function was ENTERED with (the ``rdi#0``-unchanged shape an
+    optimised build leaves when the callee has no prototype to recover
+    arguments from). ``("unproven", [])`` -- there is no LLIL to read, the call
+    is not in it, or a call may have clobbered the register: nothing is
+    claimed.
+    """
     lssa = getattr(getattr(func, "llil", None), "ssa_form", None)
     if lssa is None:
-        return []
-    seeds: list[tuple[Any, Any]] = []
+        return ("unproven", [])
     try:
         for block in lssa:
             for ins in block:
@@ -71,17 +132,38 @@ def reaching_arg_seed_vars(func: Any, addr: int, reg: str,
                     continue
                 definition = reaching_reg_def(ins, reg, bn)
                 if definition is None:
-                    continue
+                    return ("entry" if _entry_value_survives(ins, bn) else "unproven", [])
+                if getattr(definition, "operation", None) in _call_like_ops(bn):
+                    # The reaching "definition" is another CALL that lists this
+                    # register among its outputs -- i.e. it CLOBBERED it. Its
+                    # MLIL mapping writes the call's RESULT variable, which is
+                    # the return register's value and says nothing about an
+                    # ARGUMENT register. Bridging to it would hand the walk the
+                    # wrong value entirely; a clobbered register is unproven.
+                    return ("unproven", [])
+                seeds: list[tuple[Any, Any]] = []
                 mapped = getattr(definition, "mlil", None)
                 mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
-                if mssa is None:
-                    continue
-                for w in (getattr(mssa, "vars_written", None) or []):
-                    if is_ssa_var(w):
-                        seeds.append((w, mssa))
+                if mssa is not None:
+                    for w in (getattr(mssa, "vars_written", None) or []):
+                        if is_ssa_var(w):
+                            seeds.append((w, mssa))
+                return ("defined", seeds)
     except Exception:
-        return seeds
-    return seeds
+        return ("unproven", [])
+    return ("unproven", [])
+
+
+def reaching_arg_seed_vars(func: Any, addr: int, reg: str,
+                           bn: Any) -> list[tuple[Any, Any]]:
+    """Find the call at ``addr`` in *func*'s LLIL-SSA and recover ``reg``'s
+    reaching definition (:func:`reaching_reg_def`), bridged to the MLIL SSA
+    variable(s) that hold it -- the seeds a backward walk / trace can slice.
+    Returns ``[(mlil_ssa_var, mlil_instr), ...]``; ``[]`` when not recoverable
+    (e.g. no LLIL, as in the unit fakes). A register carrying the function's
+    own ENTRY value has no definition to slice, so it is not one of these --
+    :func:`argument_register_provenance` is the caller that distinguishes it."""
+    return argument_register_provenance(func, addr, reg, bn)[1]
 
 
 # --------------------------------------------------------------------------

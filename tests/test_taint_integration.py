@@ -2753,29 +2753,54 @@ char scratch[256];
 /* Padded past analysis.limits.maxFunctionSize, so Binary Ninja MEASURES this
    body and declines to analyse it; its tail is a truthful identity return,
    which is exactly what the overlay below states and all it states. */
-N long unread_body(long token) {
+N long unread_body(long token, long other) {
     __asm__ volatile(".rept 70000\n nop\n .endr\n");
-    return token;
+    return token + other;
 }
-TAIL long unread_thunk(long token) { return unread_body(token); }
+TAIL long unread_thunk(long token) { return unread_body(token, 0); }
 TAIL long unread_multihop(long token) { return unread_thunk(token); }
-N long wrap_unread(long token) { long r = unread_body(token); return r + 3; }
+N long wrap_unread(long token) { long r = unread_body(token, 0); return r + 3; }
 N long analysed_body(long token) { system((const char *)token); return token; }
 
-N long call_unread(long token) { long r = unread_body(token); return r + 1; }
+N long call_unread(long token) { long r = unread_body(token, 0); return r + 1; }
 N long call_thunk(long token) { long r = unread_thunk(token); return r + 1; }
 N long call_multihop(long token) { long r = unread_multihop(token); return r + 1; }
 N long call_wrapper(long token) { long r = wrap_unread(token); return r + 1; }
 N long call_analysed(long token) { long r = analysed_body(token); return r + 1; }
 N long call_import(long token) { memset(scratch, (int)token, 16); return token; }
-long (*volatile hook)(long) = unread_body;
-N long call_indirect(long token) { long r = hook(token); return r + 1; }
+long (*volatile hook)(long, long) = unread_body;
+N long call_indirect(long token) { long r = hook(token, 0); return r + 1; }
+
+/* ONE call to the unread body, reached from two tainted-argument contexts. */
+N long nested(long a, long b) { long r = unread_body(a, b); return r + 1; }
+N long two_contexts(long token) { return nested(token, 0) + nested(0, token); }
+
+/* Both arguments arrive in the registers the call passes them in, so an
+   optimised build writes NEITHER before the call -- and Binary Ninja, with no
+   prototype for the body it never analysed, then recovers no arguments at
+   all for that call site. The guard exists so BN can still recover this
+   function's OWN parameters (it reads them) without writing the registers. */
+N long abi_entry(long a, long b) {
+    if (a == 5 || b == 7) return 0;
+    long r = unread_body(a, b);
+    return r + 1;
+}
+
+/* The seeded value rides argument 1; argument 0 is a constant. */
+N long other_arg(long token) { long r = unread_body(0, token); return r + 1; }
+/* Nothing the seed reaches is passed at all. */
+N long constant_only(long token) {
+    if (token == 3) return 0;
+    long r = unread_body(7, 9);
+    return r + 1;
+}
 
 int main(int argc, char **argv) {
     (void)argv;
     return (int)(call_unread(argc) + call_thunk(argc) + call_multihop(argc)
                  + call_wrapper(argc) + call_analysed(argc) + call_import(argc)
-                 + call_indirect(argc));
+                 + call_indirect(argc) + two_contexts(argc) + other_arg(argc)
+                 + constant_only(argc) + abi_entry(argc, argc));
 }
 """
 
@@ -2878,6 +2903,127 @@ def test_a_matching_model_never_certifies_an_unread_argument_callee(tmp_path, sh
                       "--source", "param:0", *files["partial"], timeout=300.0)
     assert reread["stats"]["analysis_incomplete"] is False, reread["stats"]
     assert [lf for lf in reread["leaves"] if lf["kind"] == "unread_callee_body"] == []
+
+
+def test_one_unread_call_is_one_boundary_with_every_argument_context(tmp_path, shared_bn):
+    """IC05 review F2 on a real build.
+
+    `two_contexts(p)` calls `nested(p, 0)` and `nested(0, p)`, so the ONE call
+    `nested` makes into the unread body is reached from two tainted-argument
+    contexts. That is one hole: it used to be counted twice, and the text row
+    printed the first context's arguments with the second hidden behind a
+    `[2 leaves]` tally.
+    """
+    src = tmp_path / "ic05_contexts.c"
+    src.write_text(_IC05_SRC)
+    binary = tmp_path / "ic05_contexts"
+    _compile(src, binary, ["-fno-builtin"])
+    overlay = tmp_path / "partial.json"
+    overlay.write_text(json.dumps(
+        {"unread_body": {"propagates": [{"from": "arg:0", "to": "ret"}]}}))
+    target = shared_bn.load(binary, copy=False)
+
+    for extra in ((), ("--models", str(overlay))):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f",
+                          "two_contexts", "--source", "param:0", "--max-depth", "16",
+                          *extra)
+        leaves = [lf for lf in result["leaves"] if lf["kind"] == "unread_callee_body"]
+        assert len(leaves) == 1, (extra, result["leaves"])
+        assert leaves[0]["tainted_args"] == [0, 1], leaves[0]
+        frontier = result["diagnostics"]["frontier"]
+        assert frontier["by_kind"]["unread_callee_body"] == 1, frontier
+
+    text = shared_bn.run("-t", target, "taint", "forward", "-f", "two_contexts",
+                         "--source", "param:0", "--max-depth", "16", "--verbose")
+    assert text.returncode == 0, text.stderr
+    row = next(line for line in text.stdout.splitlines()
+               if line.strip().startswith("unread_callee_body"))
+    assert "[0, 1]" in row, row
+    assert "leaves]" not in row, row
+
+
+def test_an_argument_an_optimised_call_drops_is_recovered_from_its_register(
+        tmp_path, shared_bn):
+    """The ABI-provenance gap, on an optimised real build.
+
+    Binary Ninja recovers a call's arguments at the CALL SITE, from the
+    registers it sees written there plus the callee's prototype. A callee it
+    never analysed has no prototype, and a call whose arguments already sit in
+    the registers that pass them writes none -- so `-O2` leaves
+    `unread_body()` with no arguments at all, and the walk reported a clean
+    all-clear at a call the machine code plainly hands the seeded value to.
+
+    Only what the IL proves is recovered: a register with no definition that
+    nothing could have clobbered still carries the function's entry value. A
+    call whose arguments Binary Ninja DID recover is never second-guessed --
+    that recovery is its arity determination, and a register past it holds
+    dead scratch as often as an argument.
+    """
+    src = tmp_path / "ic05_abi.c"
+    src.write_text(_IC05_SRC)
+    binary = tmp_path / "ic05_abi"
+    # `-g0`: with DWARF, Binary Ninja takes the prototype from the debug info
+    # and recovers the arguments itself. The gap is what a stripped optimised
+    # build leaves.
+    _compile(src, binary, ["-O2", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    body = _resolve_addr(shared_bn, "unread_body")
+    assert _bn_json(shared_bn, "-t", target, "decompile",
+                    body)["analysis_skipped"] is True, body
+    # The premise: BN recovered NO arguments for this call site.
+    il = _bn_json(shared_bn, "-t", target, "il", "abi_entry")
+    assert "unread_body()" in json.dumps(il), il
+
+    def forward(fn, *sources):
+        args = []
+        for s in sources or ("param:0",):
+            args += ["--source", s]
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                        *args, "--max-depth", "16")
+
+    def boundary(result):
+        [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "unread_callee_body"]
+        return leaf
+
+    first = forward("abi_entry")
+    leaf = boundary(first)
+    assert leaf["callee"]["name"] == "unread_body", leaf
+    assert leaf["tainted_args"] == [0], leaf
+    assert leaf["abi_recovered_args"] == [0], leaf
+    assert first["stats"]["analysis_incomplete_functions"] == ["unread_body"]
+    assert first["diagnostics"]["safe_to_report_all_clear"] is False
+    assert any("calling convention's register" in a
+               for a in first["assumptions"]), first["assumptions"]
+
+    # A later argument register, and both at once: each index is recovered on
+    # its own register, and an untainted one is simply not claimed.
+    assert boundary(forward("abi_entry", "param:1"))["abi_recovered_args"] == [1]
+    assert boundary(forward("abi_entry", "param:0", "param:1")
+                    )["abi_recovered_args"] == [0, 1]
+
+    # Binary Ninja DID recover this call's arguments (it writes both registers
+    # at the call site), so nothing is recovered on top of them -- and its own
+    # recovery still carries the seed into the boundary.
+    second = forward("other_arg")
+    leaf = boundary(second)
+    assert leaf["tainted_args"] == [1], leaf
+    assert leaf["abi_recovered_args"] == [], leaf
+
+    # The must-not-fire twin: every argument is a constant, so no register
+    # carries the seed and nothing is recovered or disclosed.
+    clean = forward("constant_only")
+    assert [lf for lf in clean["leaves"] if lf["kind"] == "unread_callee_body"] == [], clean
+    assert clean["stats"]["analysis_incomplete"] is False, clean["stats"]
+
+    # Text names the recovered index, so a reader can tell an argument Binary
+    # Ninja recovered from one the calling convention's register proved.
+    text = shared_bn.run("-t", target, "taint", "forward", "-f", "abi_entry",
+                         "--source", "param:0", "--max-depth", "16", "--verbose")
+    assert text.returncode == 0, text.stderr
+    row = next(line for line in text.stdout.splitlines()
+               if line.strip().startswith("unread_callee_body"))
+    assert "ABI-recovered arg(s) [0]" in row, row
 
 
 _OVERLAP_SRC = r"""
