@@ -5408,3 +5408,202 @@ def test_only_a_models_return_rule_answers_what_a_call_hands_back(tmp_path,
     assert leaves == [], result["leaves"]
     assert any("wmemcpy" in a and "propagate" in a
                for a in result["assumptions"]), result["assumptions"]
+
+
+def test_reached_model_rule_into_unrecovered_destination_is_a_boundary(tmp_path, shared_bn):
+    """BN6-C009: a model rule `arg:0 -> *arg:1` reached at a call for which BN
+    recovered ONE argument used to drop its declared output silently -- no
+    leaf, all-clear. It is a blocking `model_destination_unrecovered` leaf that
+    names the callee, call and destination, guesses no pointer, and prints
+    reads that run as printed. A fully recovered keyable output keeps
+    propagating to its sink with no such leaf."""
+    src = tmp_path / "model_dest.c"
+    src.write_text("""
+#include <stddef.h>
+extern void model_emit(size_t input);
+extern void model_fill(size_t input, char *out);
+extern int system(const char *);
+__attribute__((noinline)) void call_model_emit(size_t input) { model_emit(input); }
+__attribute__((noinline)) void call_model_fill(size_t input) {
+    char out[32]; model_fill(input, out); system(out);
+}
+""")
+    binary = tmp_path / "model_dest.so"
+    _compile(src, binary, ["-shared", "-fPIC", "-fno-inline"])
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps({
+        "model_emit": {"propagates": [{"from": "arg:0", "to": "*arg:1"}]},
+        "model_fill": {"propagates": [{"from": "arg:0", "to": "*arg:1"}]},
+    }))
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn, *extra):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                        "--source", "param:0", *extra)
+
+    result = forward("call_model_emit", "--models", str(models))
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "model_destination_unrecovered"]
+    assert leaf["callee"]["name"] == "model_emit", leaf
+    assert leaf["destination"] == "*arg:1" and leaf["recovered_params"] == 1, leaf
+    assert [s["from"] for s in leaf["sources"]] == ["arg:0"], leaf
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is False, diag
+    assert diag["frontier"]["unresolved"] == 1 and diag["unmodeled_calls_reached"] is False, diag
+    outputs = _run_diagnostic_commands(shared_bn, diag["next_action"])
+    assert any("model_emit" in out for out in outputs), outputs
+    assert any(re.search(r"\bcall\b", out) for out in outputs), outputs
+
+    # Without the model nothing claims the destination: no such leaf.
+    plain = forward("call_model_emit")
+    assert not [lf for lf in plain["leaves"] if lf["kind"] == "model_destination_unrecovered"]
+
+    # Control: both arguments recovered, the keyed buffer reaches system().
+    filled = forward("call_model_fill", "--models", str(models))
+    assert [f["sink"]["callee"] for f in filled["reached_sinks"]] == ["system"], filled
+    assert not [lf for lf in filled["leaves"] if lf["kind"] == "model_destination_unrecovered"]
+
+
+def test_continuation_into_unrecovered_destination_is_a_boundary(tmp_path, shared_bn):
+    """IC04 review: a continuation rule reached through carried state used to
+    drop a declared output BN did not recover at the NULL call -- leaves=[],
+    all-clear -- even though the walk said the state continued there. The
+    later clean reset must not erase that boundary; a reset before the NULL
+    call still kills the continuation."""
+    src = tmp_path / "continuation.c"
+    src.write_text("""
+extern void stateful();
+__attribute__((noinline)) void continuation_reset(const char *src) {
+    char out[32];
+    stateful(src, out);
+    stateful(0);
+    stateful("clean", out);
+}
+__attribute__((noinline)) void reset_first(const char *src) {
+    char out[32];
+    stateful(src, out);
+    stateful("clean", out);
+    stateful(0);
+}
+""")
+    binary = tmp_path / "continuation.so"
+    _compile(src, binary, ["-std=gnu17", "-shared", "-fPIC", "-fno-inline"])
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps({"stateful": {
+        "propagates": [{"from": "arg:0", "to": "*arg:1"}], "continuation": {"null_arg": 0}}}))
+    target = shared_bn.load(binary, copy=False)
+    calls = _bn_json(shared_bn, "-t", target, "callsites", "stateful",
+                     "--within", "continuation_reset")["items"]
+    null_call = sorted(c["call_addr"] for c in calls)[1]
+    first_call = sorted(c["call_addr"] for c in calls)[0]
+
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "continuation_reset",
+                      "--source", "param:0", "--models", str(models))
+    leaves = [lf for lf in result["leaves"] if lf["kind"] == "model_destination_unrecovered"]
+    assert [(lf["address"], lf["destination"]) for lf in leaves] == [(null_call, "*arg:1")], \
+        result["leaves"]
+    assert leaves[0]["sources"][0]["continued_from"] == first_call, leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+    outputs = _run_diagnostic_commands(shared_bn, result["diagnostics"]["next_action"])
+    assert any("stateful" in out for out in outputs), outputs
+
+    killed = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "reset_first",
+                      "--source", "param:0", "--models", str(models))
+    assert not [lf for lf in killed["leaves"] if lf["kind"] == "model_destination_unrecovered"], \
+        killed["leaves"]
+
+
+@pytest.mark.parametrize("command", [
+    ("taint", "forward", "-f", "call_model_emit", "--source", "param:0"),
+    ("taint", "models", "--role", "propagator"),
+])
+def test_malformed_model_tokens_are_refused_by_the_cli(tmp_path, shared_bn, command):
+    """IC04 review: `*arg:-1` passed validation and a reached rule wrote
+    through the call's LAST argument; `*arg:x` raised mid-walk. Every public
+    model path now refuses the file, naming the model, field and grammar."""
+    src = tmp_path / "emit.c"
+    src.write_text("""
+#include <stddef.h>
+extern void model_emit(size_t input);
+__attribute__((noinline)) void call_model_emit(size_t input) { model_emit(input); }
+""")
+    binary = tmp_path / "emit.so"
+    _compile(src, binary, ["-shared", "-fPIC", "-fno-inline"])
+    target = shared_bn.load(binary, copy=False)
+    for token in ("*arg:-1", "*arg:x", "*arg:01"):
+        models = tmp_path / "bad.json"
+        models.write_text(json.dumps(
+            {"model_emit": {"propagates": [{"from": "arg:0", "to": token}]}}))
+        res = shared_bn.run("-t", target, *command, "--models", str(models))
+        assert res.returncode not in (0, 1), (token, res.returncode, res.stdout, res.stderr)
+        out = res.stderr + res.stdout
+        assert "model 'model_emit'" in out and "`propagates.to`" in out, out
+        assert "non-negative decimal argument index" in out, out
+        assert "Traceback" not in out and "internal error" not in out, out
+
+
+def test_scanf_optional_slots_and_repeated_contexts_on_real_bn(tmp_path, shared_bn):
+    """Round-2 review. (F3) A fully recovered sscanf call has no missing
+    output: the builtin model's unrolled `*arg:2..5` slots past the call are
+    optional varargs. Only a format proving more destinations than recovered
+    is a boundary. (F4) One missing output reached through two argument
+    contexts of the same callee site is ONE leaf with both sources."""
+    src = tmp_path / "scan_ctx.c"
+    src.write_text("""
+#include <stdio.h>
+extern void split_emit(const char *a, const char *b);
+__attribute__((noinline)) int parse_none(const char *s) { return sscanf(s, "token"); }
+__attribute__((noinline)) int parse_one(const char *s) { int a; return sscanf(s, "%d", &a); }
+__attribute__((noinline)) int parse_two(const char *s) { int a, b; return sscanf(s, "%d %d", &a, &b); }
+__attribute__((noinline)) int parse_four(const char *s) {
+    int a, b, c, d; return sscanf(s, "%d %d %d %d", &a, &b, &c, &d);
+}
+__attribute__((noinline)) int child(const char *a, const char *b) { split_emit(a, b); return 0; }
+__attribute__((noinline)) int repeated_contexts(const char *s) {
+    return child(s, "clean") + child("clean", s);
+}
+""")
+    binary = tmp_path / "scan_ctx.so"
+    _compile(src, binary, ["-shared", "-fPIC", "-fno-inline", "-Wno-format"])
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn, *extra):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                        "--source", "param:0", *extra)
+
+    for fn in ("parse_none", "parse_one", "parse_two", "parse_four"):
+        result = forward(fn)
+        kinds = [lf["kind"] for lf in result["leaves"]]
+        assert "model_destination_unrecovered" not in kinds, (fn, result["leaves"])
+        assert "format_destination_unrecovered" not in kinds, (fn, result["leaves"])
+
+    models = tmp_path / "split.json"
+    models.write_text(json.dumps({"split_emit": {"propagates": [
+        {"from": "arg:0", "to": "*arg:6"}, {"from": "arg:1", "to": "*arg:6"}]}}))
+    result = forward("repeated_contexts", "--models", str(models))
+    leaves = [lf for lf in result["leaves"] if lf["kind"] == "model_destination_unrecovered"]
+    assert len(leaves) == 1, leaves
+    assert [s["from"] for s in leaves[0]["sources"]] == ["arg:0", "arg:1"], leaves
+    assert result["diagnostics"]["frontier"]["by_kind"]["model_destination_unrecovered"] == 1
+
+
+def test_null_varargs_index_is_refused_by_the_cli(tmp_path, shared_bn):
+    """Round-2 review: `varargs.first_index: null` loaded, then crashed the
+    walk. It is refused at load, by forward and by the catalog alike."""
+    src = tmp_path / "fmt.c"
+    src.write_text("""
+#include <stddef.h>
+extern void app_fmt(char *out, const char *fmt, ...);
+__attribute__((noinline)) void call_fmt(const char *s) { char b[16]; app_fmt(b, "%s", s); }
+""")
+    binary = tmp_path / "fmt.so"
+    _compile(src, binary, ["-shared", "-fPIC", "-fno-inline"])
+    target = shared_bn.load(binary, copy=False)
+    models = tmp_path / "bad.json"
+    models.write_text(json.dumps({"app_fmt": {"varargs": {"first_index": None, "to": "*arg:0"}}}))
+    for command in (("taint", "forward", "-f", "call_fmt", "--source", "param:0"),
+                    ("taint", "models", "--role", "propagator")):
+        res = shared_bn.run("-t", target, *command, "--models", str(models))
+        out = res.stderr + res.stdout
+        assert res.returncode == 2, (command, res.returncode, out)
+        assert "model 'app_fmt'" in out and "`varargs.first_index` is required" in out, out
+        assert "Traceback" not in out and "internal error" not in out, out

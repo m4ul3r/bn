@@ -41,6 +41,7 @@ from .taint_models import (  # noqa: F401
     _coerce_model_map, _validate_model_interior, load_models,
     model_overlay_sources, _canonical_cxx_alloc, lookup_model,
     _try_arg_index, model_arg_indices, model_is_benign_marker,
+    model_arg_index, parse_model_token, validate_model_arguments,
 )
 from .taint_il import (  # noqa: F401
     reaching_reg_def, reaching_arg_seed_vars, op_name, is_ssa_var,
@@ -381,6 +382,61 @@ class _SalvageList(list):
         super().extend(items)
         self._keep.extend(items)
 
+    def __setitem__(self, index: Any, item: Any) -> None:
+        # A merged leaf replaces its earlier copy in the run; the buffer keeps
+        # both and the result assembly collapses them (`merge_unrecovered_leaves`).
+        super().__setitem__(index, item)
+        self._keep.append(item)
+
+
+_UNRECOVERED = "model_destination_unrecovered"
+
+
+def _unrecovered_key(leaf: dict[str, Any]) -> tuple:
+    """One missing output: the call site, the callee and the declared destination."""
+    cal = leaf.get("callee") if isinstance(leaf.get("callee"), dict) else {}
+    return (leaf.get("address"), cal.get("address") or cal.get("name"), leaf.get("destination"))
+
+
+def _source_order(src: Any) -> tuple:
+    if not isinstance(src, dict):
+        return ("~", repr(src), "")
+    return (str(src.get("from")), str(src.get("tainted")), str(src.get("continued_from") or ""))
+
+
+def _add_leaf(leaves: list, leaf: Any, *, dedupe: bool = True) -> None:
+    """Add *leaf* to *leaves*. A ``model_destination_unrecovered`` boundary
+    whose (call site, callee, destination) is already present is the SAME
+    missing output reached again -- from another source, rule or descended
+    argument context -- so its sources merge, in a stable order, into a COPY
+    of the present leaf: the earlier object may be shared with a cached callee
+    summary or another callsite's ``by_source`` row, which must not acquire
+    evidence it did not observe. Other leaves are appended unless an equal one
+    is present (``dedupe``) or always (``dedupe=False``)."""
+    if isinstance(leaf, dict) and leaf.get("kind") == _UNRECOVERED:
+        key = _unrecovered_key(leaf)
+        for i, lf in enumerate(leaves):
+            if isinstance(lf, dict) and lf.get("kind") == _UNRECOVERED and _unrecovered_key(lf) == key:
+                merged = list(lf.get("sources") or [])
+                for src in leaf.get("sources") or []:
+                    if src not in merged:
+                        merged.append(src)
+                merged.sort(key=_source_order)
+                if merged != lf.get("sources"):
+                    leaves[i] = {**lf, "sources": merged}
+                return
+    if not dedupe or leaf not in leaves:
+        leaves.append(leaf)
+
+
+def merge_unrecovered_leaves(leaves: list) -> list:
+    """*leaves* with every repeated missing-output boundary collapsed into one
+    (see :func:`_add_leaf`); every other leaf is kept as it is, in order."""
+    out: list = []
+    for lf in leaves:
+        _add_leaf(out, lf, dedupe=False)
+    return out
+
 
 class TaintEngine:
     def __init__(
@@ -398,6 +454,12 @@ class TaintEngine:
         mangled: bool = False,
     ):
         self.bv = bv
+        # The walk selects call arguments by the indices its models state, so
+        # the map it is handed passes the loader's argument grammar again: a
+        # malformed token or a negative index is a TaintError here, never a
+        # ValueError mid-walk or Python's negative indexing picking an
+        # argument from the end of the call (IC04 review).
+        validate_model_arguments(models, source="taint engine models")
         self.models = models
         self._find_variable = find_variable
         self.unknown_call_policy = unknown_call_policy
@@ -2974,8 +3036,9 @@ class TaintEngine:
                     if fi is not None and fi < len(params) and fi not in from_idxs:
                         from_idxs.append(fi)
             va = model.get("varargs")
-            if va is not None and _try_arg_index(str(va.get("to") or "")) in hit:
-                for fi in range(max(int(va.get("first_index", 0)), 0), len(params)):
+            if isinstance(va, dict) and _try_arg_index(str(va.get("to") or "")) in hit \
+                    and model_arg_index(va.get("first_index")) is not None:
+                for fi in range(va["first_index"], len(params)):
                     if fi not in from_idxs:
                         from_idxs.append(fi)
             is_source = any(
@@ -3661,6 +3724,9 @@ class TaintEngine:
                    "assumptions": [
                 f"analysis of {func.name} truncated: Python recursion limit reached "
                 "while propagating taint (possible unresolved cycle); results incomplete"]}
+        # A missing output reached from several contexts (or kept twice by the
+        # recursion salvage) is ONE boundary with merged sources.
+        sub["leaves"] = merge_unrecovered_leaves(sub["leaves"])
         # collapse any duplicate sink reports (same callee/site/arg) that distinct
         # resolved targets or arg-set growth may have produced
         seen_sink: set[tuple] = set()
@@ -3848,8 +3914,7 @@ class TaintEngine:
             findings.append(f)
         leaves: list[dict[str, Any]] = []
         for lf in union_leaves:
-            if lf not in leaves:
-                leaves.append(lf)
+            _add_leaf(leaves, lf)
         assumptions: list[str] = []
         for a in union_assumptions:
             if a not in assumptions:
@@ -4361,6 +4426,30 @@ class TaintEngine:
             "pending_leaf": pending_leaf,
         }
         return True
+
+    def _arg_recovery_advice(self, taddr: int | None) -> tuple[bool | None, str]:
+        """``(callee_variadic, advice)`` for a call whose model declares an
+        argument Binary Ninja did not recover for it (#1001 item 1, BN6-C009).
+
+        The advice is a READ first -- the callee's prototype and the call's
+        argument provenance -- and a prototype repair only on independent
+        evidence: an under-recovered call is as often a recovery limit (or a
+        model that declares the wrong arity) as a wrong declaration."""
+        variadic = _variadic_determination(function_at(self.bv, taddr)) if taddr is not None else None
+        inspect = f"inspect `bn proto get {hex(int(taddr))}` and the call's argument provenance" \
+            if taddr is not None else "resolve the call target and inspect its argument provenance"
+        if variadic is True:
+            advice = ("the callee is already declared variadic; this is incomplete "
+                      "call recovery, not evidence of a prototype defect. Redeclaring "
+                      "the same prototype does not recover its arguments; " + inspect)
+        elif variadic is False:
+            advice = ("the callee is determined nonvariadic; " + inspect
+                      + ", and apply `bn proto set` only if independent evidence "
+                      "demonstrates a declaration discrepancy, then re-run")
+        else:
+            advice = ("the callee's variadic status is undetermined; " + inspect
+                      + " before diagnosing a signature discrepancy or recovery limit")
+        return variadic, advice
 
     def _format_destination_shortfall(self, ins: Any, ssaf: Any, callee: str, model: Any,
                                       params: list[Any]) -> dict | None:
@@ -6005,7 +6094,7 @@ class TaintEngine:
         n = None if length is None else self._int_const(params[length]) \
             if length < len(params) else None
         append = (model or {}).get("append")
-        if isinstance(append, dict) and int(append.get("dest", -1)) == idx:
+        if isinstance(append, dict) and model_arg_index(append.get("dest")) == idx:
             # An append writes AT THE TERMINATOR it finds, so its count is
             # not a footprint from the base: `strncat(g, s, 1)` put a
             # tainted byte at +64 in a 64-character string, and recording
@@ -9004,9 +9093,9 @@ class TaintEngine:
             _co = (_cmodel or {}).get("continuation")
             if _co is None:
                 continue
-            _ci = int(_co.get("null_arg", 0))
+            _ci = model_arg_index(_co.get("null_arg", 0))
             _cp = self._call_params(_cand)
-            if _ci < len(_cp) and self._int_const(_cp[_ci]) != 0:
+            if _ci is not None and _ci < len(_cp) and self._int_const(_cp[_ci]) != 0:
                 reset_candidates.setdefault(_ckey or _cname or "?", []).append(
                     (int(getattr(_cand, "address", 0)), _cand, _cp, _ci))
 
@@ -9503,11 +9592,8 @@ class TaintEngine:
                 # benign "buffer already tainted" case by re-checking _buffer_target.
                 if not (isinstance(dest_tok, str) and dest_tok.startswith("*arg:")):
                     return
-                try:
-                    di = int(dest_tok.split("arg:", 1)[1])
-                except (ValueError, IndexError):
-                    return
-                if di >= len(params) or self._buffer_target(ssaf, params[di]) is not None:
+                di = _try_arg_index(dest_tok)
+                if di is None or di >= len(params) or self._buffer_target(ssaf, params[di]) is not None:
                     return
                 leaf = {
                     "kind": "coarse_memory_store",
@@ -9524,6 +9610,78 @@ class TaintEngine:
                 }
                 if leaf not in leaves:
                     leaves.append(leaf)
+
+            def _note_unrecovered_destination(dest_tok, src_tok, hit, *, continued_from=None):
+                # BN6-C009: a REACHED rule (its source `hit` carries taint) whose
+                # declared destination `arg:N`/`*arg:N` is an argument Binary
+                # Ninja did not recover for THIS call. `_apply_to_token` has
+                # nothing to write and `_note_unkeyed_store` nothing to name, so
+                # the declared output used to vanish with an all-clear. No
+                # pointer is guessed for it (the #1001 register bridge stands
+                # behind REACH only, never behind an object to key): the write is
+                # a blocking boundary, one leaf per call site, callee and
+                # declared destination, its reached rule sources merged in.
+                # A recovered destination never lands here -- keyed and already
+                # tainted is benign, unkeyable is `coarse_memory_store`.
+                if not (isinstance(dest_tok, str)
+                        and (dest_tok.startswith("*arg:") or dest_tok.startswith("arg:"))):
+                    return
+                di = _try_arg_index(dest_tok)
+                if di is None or di < len(params):
+                    return
+                if model.get("arity_capped"):
+                    # An arity-capped model unrolls OPTIONAL slots (sscanf's
+                    # `*arg:2..5`): a rule past the call's arguments names a
+                    # destination this call need not have, not one BN dropped.
+                    # What says an argument exists is the call's own constant
+                    # format; when it writes more destinations than were
+                    # recovered, that shortfall is the boundary (#1050 round 8).
+                    short = self._format_destination_shortfall(
+                        ins, ssaf, mkey or name or "?", model, params)
+                    if short is not None and short not in leaves:
+                        leaves.append(short)
+                    return
+                taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
+                callee_ref = hex(int(taddr)) if taddr is not None else None
+                at = hex(addr)
+                callee = str(name or mkey or "?")
+                src = {"from": str(src_tok), "tainted": node_label(hit, why)}
+                if continued_from is not None:
+                    # A continuation call reads no argument for this: the
+                    # source is the state an earlier call set.
+                    src["continued_from"] = hex(int(continued_from))
+                probe = {"kind": _UNRECOVERED, "address": at, "destination": dest_tok,
+                         "callee": {"name": callee, "address": callee_ref}, "sources": [src]}
+                if any(isinstance(lf, dict) and lf.get("kind") == _UNRECOVERED
+                       and _unrecovered_key(lf) == _unrecovered_key(probe) for lf in leaves):
+                    _add_leaf(leaves, probe)    # merges the source into a copy
+                    return
+                variadic, advice = self._arg_recovery_advice(taddr)
+                fn_ref = hex(int(getattr(func, "start", 0)))
+                leaves.append({
+                    "kind": "model_destination_unrecovered",
+                    "address": at,
+                    "callee": {"name": callee, "display_name": self._prose_name(callee),
+                               "address": callee_ref},
+                    "function": {"name": str(getattr(func, "name", "?")),
+                                 "display_name": _display_name(func) or str(getattr(func, "name", "?")),
+                                 "address": fn_ref},
+                    "il_text": str(ins),
+                    "destination": dest_tok,
+                    "destination_index": di,
+                    "recovered_params": len(params),
+                    "sources": [src],
+                    "callee_variadic": variadic,
+                    "recovery_advice": advice,
+                    "detail": (
+                        f"the model for {self._prose_name(callee)} declares a write into "
+                        f"{dest_tok} and its source was reached, but Binary Ninja recovered "
+                        f"only {len(params)} argument(s) for this call, so the declared "
+                        f"destination arg{di} is unavailable: the write was not followed "
+                        "and no output pointer is assumed -- what it receives is unchecked. "
+                        f"Check the model rule against the callee: {advice}; read the call "
+                        f"in `bn disasm {fn_ref}`"),
+                })
 
             def _sink_arg_reach(argidx: int, sink: dict[str, Any]) -> tuple[list, dict | None]:
                 """``(hit_nodes, arity)`` for a modeled sink's arg.
@@ -9572,20 +9730,7 @@ class TaintEngine:
                 if not hit or not dropped:
                     return hit, None
                 taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
-                variadic = _variadic_determination(function_at(self.bv, taddr)) if taddr is not None else None
-                inspect = f"inspect `bn proto get {hex(int(taddr))}` and the call's argument provenance" \
-                    if taddr is not None else "resolve the call target and inspect its argument provenance"
-                if variadic is True:
-                    advice = ("the callee is already declared variadic; this is incomplete "
-                              "call recovery, not evidence of a prototype defect. Redeclaring "
-                              "the same prototype does not recover its arguments; " + inspect)
-                elif variadic is False:
-                    advice = ("the callee is determined nonvariadic; " + inspect
-                              + ", and apply `bn proto set` only if independent evidence "
-                              "demonstrates a declaration discrepancy, then re-run")
-                else:
-                    advice = ("the callee's variadic status is undetermined; " + inspect
-                              + " before diagnosing a signature discrepancy or recovery limit")
+                variadic, advice = self._arg_recovery_advice(taddr)
                 # `class_from` says what the finding's class rests on:
                 # `recovered_args` -- the checked arg was recovered, so the
                 # in-range classifiers ran on the recovered args and the dropped
@@ -10013,9 +10158,9 @@ class TaintEngine:
                                 self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
             co = model.get("continuation")
             if co is not None:
-                cidx = int(co.get("null_arg", 0))
+                cidx = model_arg_index(co.get("null_arg", 0))
                 ckey = mkey or name or "?"
-                if cidx < len(params):
+                if cidx is not None and cidx < len(params):
                     if self._int_const(params[cidx]) == 0:
                         resets = clean_resets(ckey)
                         for (state_key, _site), (st_node, st_addr, st_ins) in list(
@@ -10046,6 +10191,16 @@ class TaintEngine:
                                     continue
                                 if apply_token(rule.get("to"), [st_node]):
                                     changed = True
+                                else:
+                                    # The carried state is this rule's reached
+                                    # source: a destination it cannot land in is
+                                    # accounted for exactly as on the ordinary
+                                    # propagates path. Observed here, before any
+                                    # later reset, and never retracted by one.
+                                    _note_unkeyed_store(rule.get("to"))
+                                    _note_unrecovered_destination(
+                                        rule.get("to"), rule.get("from"), st_node,
+                                        continued_from=st_addr)
                             # Disclosed after convergence, from the FINAL taint:
                             # which calls are clean resets changes across passes,
                             # and a caveat written mid-fixpoint kept naming a
@@ -10080,6 +10235,7 @@ class TaintEngine:
                         changed = True
                     else:
                         _note_unkeyed_store(to)
+                        _note_unrecovered_destination(to, frm, hit)
                     # #804 asked to gate this bookkeeping on the destination being
                     # KEYABLE (_buffer_target non-None), reading an unkeyable
                     # *arg:N as "no write happened". Deliberately NOT done: the
@@ -10101,8 +10257,8 @@ class TaintEngine:
                     # vanished from reached_sinks entirely. Over-tainting a
                     # caller's buffer costs a reviewable finding; under-tainting
                     # loses the bug.
-                    if to and to.startswith("*arg:"):
-                        k = int(to.split("arg:", 1)[1])
+                    k = _try_arg_index(to) if isinstance(to, str) and to.startswith("*arg:") else None
+                    if k is not None:
                         if k < len(params):
                             propagated.add(k)
                             self._note_write_span(ssaf, params, k, model,
@@ -10128,10 +10284,7 @@ class TaintEngine:
                     dest_keyable = (to == "*arg:0" and len(params) > 0
                                     and self._buffer_target(ssaf, params[0]) is not None)
                     if dest_keyable and isinstance(frm, str) and frm.startswith("*arg:"):
-                        try:
-                            src_i = int(frm.split("arg:", 1)[1])
-                        except Exception:
-                            src_i = None
+                        src_i = _try_arg_index(frm)
                         # A source operand that ALSO fires this model's sink is
                         # two facts, not one: the copy still happened, and the
                         # destination still holds those bytes. Suppressing the
@@ -10209,8 +10362,8 @@ class TaintEngine:
             # params, so no format-string parsing is needed; arg_taint already covers
             # both a tainted scalar (%d) and a pointer to a tainted buffer (%s).
             va = model.get("varargs")
-            if va is not None:
-                base = int(va.get("first_index", 0))
+            base = model_arg_index((va or {}).get("first_index")) if isinstance(va, dict) else None
+            if base is not None:
                 vto = va.get("to")
                 vsink = model.get("sink") if va.get("sink") else None
                 eff_vsink = vsink
@@ -10247,10 +10400,11 @@ class TaintEngine:
                             changed = True
                         else:
                             _note_unkeyed_store(vto)
+                            _note_unrecovered_destination(vto, f"arg:{i}", ht[0])
                         # #804: left ungated for the same reason as the static
                         # propagates loop above -- see the rationale there.
-                        if vto.startswith("*arg:"):
-                            k = int(vto.split("arg:", 1)[1])
+                        k = _try_arg_index(vto) if isinstance(vto, str) and vto.startswith("*arg:") else None
+                        if k is not None:
                             if k < len(params):
                                 propagated.add(k)
                                 # A printf-family destination is written too,
@@ -10540,8 +10694,9 @@ class TaintEngine:
                             for f in d["findings"]:
                                 findings.append(_tag_unconditional_flow(f, d.get("handoff_node") or []))
                             for lf in d["leaves"]:
-                                if lf not in leaves:
-                                    leaves.append(lf)
+                                # One callee site reached from several argument
+                                # contexts is one missing output (round-2 review).
+                                _add_leaf(leaves, lf)
                             for a in d["assumptions"]:
                                 add_assumption(a)
                             ret_tainted = ret_tainted or d["reached_return"]
@@ -11087,11 +11242,11 @@ class TaintEngine:
         """The tainted node satisfying an arg/pointee token, or None. Returning
         the node (not just a bool) lets propagation record provenance so a
         propagated buffer's path links back to the original source."""
-        if not tok or not (tok.startswith("*arg:") or tok.startswith("arg:")):
+        if not isinstance(tok, str) or not (tok.startswith("*arg:") or tok.startswith("arg:")):
             return None
         pointee = tok.startswith("*arg:")
-        idx = int(tok.split("arg:", 1)[1])
-        if idx >= len(params):
+        idx = _try_arg_index(tok)
+        if idx is None or idx >= len(params):
             return None
         expr = params[idx]
         if pointee:
@@ -11111,7 +11266,7 @@ class TaintEngine:
     def _apply_to_token(self, ssaf: Any, ins: Any, params: list[Any], tok: str | None,
                         taint_node, callee: str, parents: list | None = None) -> bool:
         parents = parents or []
-        if not tok:
+        if not tok or not isinstance(tok, str):
             return False
         if tok == "ret":
             done = False
@@ -11148,8 +11303,8 @@ class TaintEngine:
             return done
         if tok.startswith("*arg:") or tok.startswith("arg:"):
             pointee = tok.startswith("*arg:")
-            idx = int(tok.split("arg:", 1)[1])
-            if idx >= len(params):
+            idx = _try_arg_index(tok)
+            if idx is None or idx >= len(params):
                 return False
             if pointee:
                 bt = self._buffer_target(ssaf, params[idx])
@@ -11249,10 +11404,9 @@ class TaintEngine:
                     # buffer to seed here. A msghdr built elsewhere (a parameter)
                     # leaves call: with nothing to seed, and that command failed.
                     _, _rm = lookup_model(self.models, callee)
-                    _hdr = next((int(t.rsplit(":", 1)[1])
-                                 for t in (str(s.get("to") or "")
-                                           for s in (_rm or {}).get("sources") or [])
-                                 if t.startswith("*iovec:") and t.rsplit(":", 1)[1].isdigit()),
+                    _hdr = next((p[1] for p in (parse_model_token(s.get("to"))
+                                                for s in (_rm or {}).get("sources") or [])
+                                 if p is not None and p[0] == "*iovec"),
                                 None)
                     # Exactly the call: path's own criterion for seeding an
                     # iovec buffer: a keyed buffer, or a pointer value to taint.
@@ -11471,11 +11625,10 @@ class TaintEngine:
                         elif to.startswith("*iovec:"):
                             # recvmsg/recvmmsg (#306): the payload lands in the
                             # iovec buffer(s), two pointer hops from the msghdr arg.
-                            try:
-                                hdr_idx = int(to.split(":")[-1])
-                            except (TypeError, ValueError):
-                                hdr_idx = -1
-                            bufs = self._recvmsg_iov_buffers(ssaf, instrs, c, hdr_idx)
+                            parsed = parse_model_token(to)
+                            hdr_idx = parsed[1] if parsed is not None and parsed[0] == "*iovec" else None
+                            bufs = (self._recvmsg_iov_buffers(ssaf, instrs, c, hdr_idx)
+                                    if hdr_idx is not None else [])
                             iov_seeded = False
                             _out_param_seen: set[int] = set()
                             for buf in bufs:

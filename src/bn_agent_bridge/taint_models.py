@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -57,10 +58,9 @@ def _model_buffer_source_args(model: dict[str, Any]) -> frozenset[int]:
         # ``from: "arg:1"``) is NOT a buffer source, and treating it as one would
         # enable the pointer index broadening on a scalar/length arg (#163 review).
         if isinstance(frm, str) and frm.startswith("*arg:"):
-            try:
-                out.add(int(frm[len("*arg:"):]))
-            except ValueError:
-                pass
+            idx = _try_arg_index(frm)
+            if idx is not None:
+                out.add(idx)
     return frozenset(out)
 
 
@@ -75,9 +75,8 @@ def _model_copy_roles(model: dict[str, Any]) -> tuple[int, int] | None:
         if not (isinstance(frm, str) and isinstance(to, str)
                 and frm.startswith("*arg:") and to.startswith("*arg:")):
             continue
-        try:
-            src, dst = int(frm[len("*arg:"):]), int(to[len("*arg:"):])
-        except ValueError:
+        src, dst = _try_arg_index(frm), _try_arg_index(to)
+        if src is None or dst is None:
             continue
         if src != dst:
             roles.add((src, dst))
@@ -106,7 +105,17 @@ def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
             f"{source} must be a JSON object of name->model (or {{\"models\": {{...}}}}); "
             f"got {type(raw).__name__}"
         )
-    for name, model in raw.items():
+    validate_model_map(raw, source=source)
+    return raw
+
+
+def validate_model_map(models: dict[str, Any], *, source: str) -> None:
+    """Validate every model of a bare ``{name: model}`` map, or raise
+    :class:`TaintError` naming the model and field. The one entry point for
+    model validation: the DB loader runs it on each layer, and the engine
+    runs it on the map it is handed, so no malformed token or index ever
+    reaches argument selection."""
+    for name, model in models.items():
         # `_comment*` keys are free-text documentation in the DB (their string
         # values never match a symbol, so lookup_model ignores them); every real
         # model name must map to an object that can carry source/sink/propagate.
@@ -117,7 +126,6 @@ def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
                 f"{source}: model {name!r} must be a JSON object, got {type(model).__name__}"
             )
         _validate_model_interior(name, model, source)
-    return raw
 
 
 # The keys the engine indexes on a model -- a model's ROLE vocabulary. An entry
@@ -181,9 +189,6 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
     def _fail(msg: str) -> None:
         raise TaintError(f"{source}: model {name!r} {msg}")
 
-    def _is_int(v: Any) -> bool:
-        return isinstance(v, int) and not isinstance(v, bool)
-
     if model_is_benign_marker(model):
         return
     misplaced = [k for k in _SINK_ARMING_KEYS if k in model]
@@ -207,37 +212,17 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
             _fail(f"`sink` must be an object, got {type(sink).__name__}")
         if not isinstance(sink.get("class"), str):
             _fail("`sink` requires a string `class`")
-        ta = sink.get("tainted_args")
-        if ta is not None and not (isinstance(ta, list) and all(_is_int(i) for i in ta)):
-            _fail("`sink.tainted_args` must be a list of integers")
         # #443: a bounded-WRITE sink (a wrapped recv/read that writes len bytes into
         # buf) is declared with `len_arg` (the attacker-controlled write length that
         # arms the sink) and optionally `buf_arg` (the destination, for the
-        # provably-bounded downgrade). Both are argument indices.
-        la = sink.get("len_arg")
-        if la is not None and (not _is_int(la) or la < 0):
-            _fail("`sink.len_arg` must be a non-negative integer argument index")
-        ba = sink.get("buf_arg")
-        if ba is not None and (not _is_int(ba) or ba < 0):
-            _fail("`sink.buf_arg` must be a non-negative integer argument index")
-        # #931 round 6: the arguments of a mixed buffer+length sink class the
-        # sink reads bytes through (`write`'s buffer, not its length).
-        pa = sink.get("pointer_args")
-        if pa is not None and not (isinstance(pa, list) and all(_is_int(i) and i >= 0
-                                                                for i in pa)):
-            _fail("`sink.pointer_args` must be a list of non-negative integer argument indices")
-        # #1041 item 4: a FORMAT-GATED sink (scanf's width-less %s) arms on the
-        # constant format at `format_arg`; `first_dest` is the argument the first
-        # assigning conversion writes.
-        fa = sink.get("format_arg")
-        if fa is not None:
-            if not _is_int(fa) or fa < 0:
-                _fail("`sink.format_arg` must be a non-negative integer argument index")
-            fd = sink.get("first_dest")
-            if not _is_int(fd) or fd <= fa:
-                _fail("`sink.format_arg` needs an integer `first_dest` after it (the "
-                      "argument the first assigning conversion writes)")
-        if ta is None and la is None and fa is None:
+        # provably-bounded downgrade). #931 round 6: `pointer_args` are the
+        # arguments of a mixed buffer+length sink class the sink reads bytes
+        # through. #1041 item 4: a FORMAT-GATED sink (scanf's width-less %s)
+        # arms on the constant format at `format_arg`; `first_dest` is the
+        # argument the first assigning conversion writes. All are argument
+        # indices, checked by `_validate_model_arguments`.
+        if sink.get("tainted_args") is None and sink.get("len_arg") is None \
+                and sink.get("format_arg") is None:
             _fail("`sink` requires `tainted_args`, `len_arg` or `format_arg` "
                   "(nothing arms the sink)")
     for key in ("sources", "propagates"):
@@ -262,17 +247,13 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
         if not isinstance(va.get("to"), str):
             _fail("`varargs` needs a string `to` (the `*arg:N` the varargs run is "
                   "formatted into) -- an empty `varargs` declaration arms nothing")
-        fi = va.get("first_index")
-        if fi is not None and not _is_int(fi):
-            _fail("`varargs.first_index` must be an integer")
     if "continuation" in model:
         # A static-state tokenizer (strtok): a call whose `null_arg` is the
         # NULL constant continues the state a previous non-NULL call set.
         co = model["continuation"]
         if not isinstance(co, dict):
             _fail(f"`continuation` must be an object, got {type(co).__name__}")
-        na = co.get("null_arg")
-        if not _is_int(na) or na < 0:
+        if "null_arg" not in co:
             _fail("`continuation.null_arg` must be a non-negative integer argument index")
     if "writes" in model:
         # A literal fill (`bzero`): the callee writes the pointee of `*arg:N`
@@ -284,17 +265,19 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
                   "the callee fills from no argument); an empty `writes` arms nothing "
                   f"-- give it tokens or use {{}} to mark {name} benign")
         for t in ws:
-            if not (isinstance(t, str) and t.startswith("*arg:") and _try_arg_index(t) is not None):
+            parsed = parse_model_token(t)
+            if parsed is None or parsed[0] != "*arg":
                 _fail(f"`writes` entry {t!r} must be a `*arg:N` token (a pointee the callee "
-                      f"fills); a scalar `arg:N` is not written through -- fix the token or "
-                      f"use {{}} to mark {name} benign")
+                      f"fills, N a non-negative decimal argument index); a scalar `arg:N` "
+                      f"is not written through -- fix the token or use {{}} to mark "
+                      f"{name} benign")
     # The three annotation roles: a falsy value (`{}`, `0`, `false`) declares
     # nothing, yet passed as a role, counted as a model and replaced the
     # builtin of the same name with nothing (round 3 P3) -- the residue of
     # the empty-role rule above.
     if "return_bound" in model:
         rb = model["return_bound"]
-        if not isinstance(rb, dict) or not _is_int(rb.get("max_from_arg")) or rb["max_from_arg"] < 0:
+        if not isinstance(rb, dict) or model_arg_index(rb.get("max_from_arg")) is None:
             _fail("`return_bound` must be an object with a non-negative integer "
                   "`max_from_arg` (the argument that bounds the return); an empty "
                   "`return_bound` declares nothing -- give it `max_from_arg` or use {} "
@@ -304,6 +287,121 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
             _fail(f"`{flag}` must be `true` -- `{model[flag]!r}` declares nothing yet "
                   f"would count as an active model; drop the key or use {{}} to mark "
                   f"{name} benign")
+    _validate_model_arguments(name, model, source)
+
+
+def _validate_model_arguments(name: str, model: dict[str, Any], source: str) -> None:
+    """Every argument token and index a model states, against ONE grammar.
+
+    The engine selects call arguments by these: a malformed token raised a
+    ValueError mid-walk, and a negative index picked an argument from the END
+    of the call's recovered list through Python's negative indexing (IC04
+    review). Tokens are ``ret``/``*ret`` or an exact ``arg:N``/``*arg:N``/
+    ``*iovec:N``, each role accepting only the forms it gives meaning to;
+    every index is a non-negative decimal up to ``_MAX_ARG_INDEX``. Only the
+    fields present are checked -- whether a role arms anything is the
+    loader's question (:func:`_validate_model_interior`)."""
+    index = f"a non-negative decimal argument index (0-{_MAX_ARG_INDEX})"
+
+    def _fail(msg: str) -> None:
+        raise TaintError(f"{source}: model {name!r} {msg}")
+
+    def _need_index(field: str, value: Any) -> None:
+        if model_arg_index(value) is None:
+            _fail(f"`{field}` must be {index}, got {value!r}")
+
+    def _need_indices(field: str, value: Any) -> None:
+        if not (isinstance(value, list) and all(model_arg_index(i) is not None for i in value)):
+            _fail(f"`{field}` must be a list of argument indices, each {index}; got {value!r}")
+
+    def _need_token(field: str, token: Any, kinds: tuple[str, ...]) -> None:
+        if token in ("ret", "*ret"):
+            ok = token in kinds
+        else:
+            parsed = parse_model_token(token)
+            ok = parsed is not None and parsed[0] in kinds
+        if not ok:
+            spelled = " / ".join(f"`{k}`" if k in ("ret", "*ret") else f"`{k}:N`" for k in kinds)
+            _fail(f"`{field}` is {token!r}; expected {spelled}, with N {index} written "
+                  f"without a sign, spaces or leading zeros")
+
+    def _need_obj(field: str, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            _fail(f"`{field}` must be an object, got {type(value).__name__}")
+        return value
+
+    def _rules(field: str) -> list[dict[str, Any]]:
+        seq = model.get(field)
+        if not isinstance(seq, list) or not all(isinstance(e, dict) for e in seq):
+            _fail(f"`{field}` must be a list of objects")
+        return seq
+
+    if "sink" in model:
+        sink = _need_obj("sink", model["sink"])
+        for k in ("tainted_args", "pointer_args"):
+            if sink.get(k) is not None:
+                _need_indices(f"sink.{k}", sink[k])
+        for k in ("len_arg", "buf_arg", "format_arg"):
+            if sink.get(k) is not None:
+                _need_index(f"sink.{k}", sink[k])
+        fa = sink.get("format_arg")
+        if fa is not None:
+            fd = sink.get("first_dest")
+            if model_arg_index(fd) is None or fd <= fa:
+                _fail("`sink.format_arg` needs an integer `first_dest` after it (the "
+                      f"argument the first assigning conversion writes), {index}")
+    if "propagates" in model:
+        for e in _rules("propagates"):
+            _need_token("propagates.from", e.get("from"), ("arg", "*arg"))
+            _need_token("propagates.to", e.get("to"), ("arg", "*arg", "ret", "*ret"))
+    if "sources" in model:
+        for e in _rules("sources"):
+            _need_token("sources.to", e.get("to"), ("arg", "*arg", "ret", "*ret", "*iovec"))
+    if "varargs" in model:
+        va = _need_obj("varargs", model["varargs"])
+        _need_token("varargs.to", va.get("to"), ("arg", "*arg", "ret", "*ret"))
+        # Required: the engine starts the varargs run here, and a missing or
+        # null index crashed the walk (round-2 review).
+        if model_arg_index(va.get("first_index")) is None:
+            _fail("`varargs.first_index` is required: the first argument the varargs run "
+                  f"reads, {index}; got {va.get('first_index', '<missing>')!r}")
+    if "continuation" in model:
+        _need_index("continuation.null_arg", _need_obj("continuation", model["continuation"]).get("null_arg"))
+    for field in ("writes", "reads_dest"):
+        if field in model:
+            toks = model[field]
+            if not isinstance(toks, list):
+                _fail(f"`{field}` must be a list of `*arg:N` tokens, got {toks!r}")
+            for t in toks:
+                _need_token(field, t, ("*arg",))
+    if "return_bound" in model:
+        _need_index("return_bound.max_from_arg",
+                    _need_obj("return_bound", model["return_bound"]).get("max_from_arg"))
+    if "string_args" in model:
+        _need_indices("string_args", model["string_args"])
+    if "append" in model:
+        ap = _need_obj("append", model["append"])
+        for k in ("dest", "src"):
+            if k in ap:
+                _need_index(f"append.{k}", ap[k])
+    if "ret_offset" in model:
+        ro = _need_obj("ret_offset", model["ret_offset"])
+        for k in ("count_arg", "string_length_arg", "scan_arg", "stop_arg", "count_arg_limit"):
+            if k in ro:
+                _need_index(f"ret_offset.{k}", ro[k])
+
+
+def validate_model_arguments(models: dict[str, Any], *, source: str) -> None:
+    """:func:`_validate_model_arguments` over a whole ``{name: model}`` map --
+    the guard the engine runs on the map it is handed, so trusted data that
+    skipped the loader still never reaches argument selection malformed."""
+    for name, model in models.items():
+        if str(name).startswith("_comment"):
+            continue
+        if not isinstance(model, dict):
+            raise TaintError(
+                f"{source}: model {name!r} must be a JSON object, got {type(model).__name__}")
+        _validate_model_arguments(name, model, source)
 
 
 def _is_annotation_only(model: Any) -> bool:
@@ -565,12 +663,42 @@ def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, 
     return None, None
 
 
-def _try_arg_index(token: str) -> int | None:
-    """Parse N from a model source token ``arg:N`` / ``*arg:N``; None if malformed."""
-    try:
-        return int(str(token).split("arg:", 1)[1])
-    except (IndexError, ValueError):
+# The one argument-index grammar every model token and index field shares:
+# a non-negative decimal with no sign and no leading zero, at most
+# `_MAX_ARG_INDEX`. A negative index would select an argument from the END of
+# the call's recovered list through Python's negative indexing, and a huge one
+# is an overflow form no calling convention passes -- both are refused rather
+# than parsed (IC04 review).
+_MAX_ARG_INDEX = 255
+_ARG_TOKEN_RE = re.compile(r"(\*?)(arg|iovec):(0|[1-9][0-9]{0,2})")
+
+
+def parse_model_token(token: Any) -> tuple[str, int] | None:
+    """``(kind, N)`` for an exact ``arg:N`` / ``*arg:N`` / ``*iovec:N`` token
+    (``kind`` is ``"arg"``, ``"*arg"`` or ``"*iovec"``); None for anything
+    else, including ``ret``/``*ret`` and every malformed spelling."""
+    if not isinstance(token, str):
         return None
+    m = _ARG_TOKEN_RE.fullmatch(token)
+    if m is None:
+        return None
+    kind, n = m.group(1) + m.group(2), int(m.group(3))
+    if kind == "iovec" or n > _MAX_ARG_INDEX:
+        return None
+    return kind, n
+
+
+def _try_arg_index(token: Any) -> int | None:
+    """N from an exact ``arg:N`` / ``*arg:N`` token; None if malformed."""
+    parsed = parse_model_token(token)
+    return parsed[1] if parsed is not None and parsed[0] in ("arg", "*arg") else None
+
+
+def model_arg_index(value: Any) -> int | None:
+    """*value* when it is a valid argument index field, else None."""
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _MAX_ARG_INDEX:
+        return value
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -599,12 +727,10 @@ def model_arg_indices(models: dict[str, Any], callee: str) -> set[int]:
                 idxs.add(tok)
     sink = model.get("sink") or {}
     for a in (sink.get("tainted_args") or []):
-        try:
-            idxs.add(int(a))
-        except (TypeError, ValueError):
-            pass
-    first = (model.get("varargs") or {}).get("first_index")
-    if isinstance(first, int):
+        if model_arg_index(a) is not None:
+            idxs.add(a)
+    first = model_arg_index((model.get("varargs") or {}).get("first_index"))
+    if first is not None:
         idxs.add(first)
     return idxs
 

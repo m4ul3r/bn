@@ -24,7 +24,8 @@ Unified diagnostics schema (attached to a zero-sink forward result under
       "last_use": {...} | None,      # last propagated use (label/address/reason)
       "unmodeled_calls_reached": bool,
       "frontier": {
-        "unresolved": int,           # unmodeled_callee / arg_under_recovered / indirect
+        "unresolved": int,           # unmodeled_callee / arg_under_recovered / indirect /
+                                     # model_destination_unrecovered
         "coarse_memory": int,        # coarse_memory_store / pointer_escape
         "seed_misanchored": int,     # #562: source_seed_misanchored / weak_buffer_seed
         "by_kind": {kind: count},
@@ -89,6 +90,10 @@ BLOCKING_LEAF_KINDS = frozenset({
     # argument registers) were never seeded, so an empty result is no
     # all-clear.
     "format_destination_unrecovered",
+    # BN6-C009: a reached model rule declares a write into an argument BN did
+    # not recover for that call. No output pointer is guessed, so what the
+    # declared destination receives is unchecked -- not an all-clear.
+    "model_destination_unrecovered",
     # #810: a backward ascent followed only the first N caller sites of a
     # parameter-origin slice; origins reachable only from the dropped callers are
     # absent from the result. Same class as the other frontier leaves: the walk
@@ -491,6 +496,34 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                 f"not clear. xrefs answers for ONE address: audit the sites "
                 f"the leaves cite, starting with `bn xrefs {globals_at[0]}`"
                 f"{widen}")
+    unrecovered = [lf for lf in leaves if lf.get("kind") == "model_destination_unrecovered"]
+    if unrecovered:
+        # BN6-C009: the bytes were handed to a declared destination the call
+        # does not carry. The callee's prototype and the call's recovered
+        # arguments answer whether the model or the recovery is short; each
+        # command is a read that runs as printed.
+        def _refs(key: str) -> list[str]:
+            out = set()
+            for lf in unrecovered:
+                v = lf.get(key)
+                if isinstance(v, dict) and v.get("address"):
+                    out.add(str(v["address"]))
+            return sorted(out)
+
+        def _callee(lf: dict[str, Any]) -> str:
+            c = lf.get("callee") if isinstance(lf.get("callee"), dict) else {}
+            return str(c.get("display_name") or c.get("name") or "?")
+        sites = ", ".join(sorted({f"{lf.get('destination')} of {_callee(lf)} at {lf.get('address')}"
+                                  for lf in unrecovered}))
+        reads = ([f"`bn proto get {c}`" for c in _refs("callee")]
+                 + [f"`bn disasm {f}`" for f in _refs("function")])
+        how = f" ({', '.join(reads)})" if reads else ""
+        return ("no sink reached, but a reached model rule declares a write into an argument "
+                f"Binary Ninja did not recover for the call ({sites}); no output pointer is "
+                "assumed, so what that destination receives is unchecked -- compare the model "
+                f"rule with the callee's prototype and the call's recovered arguments{how}, "
+                "then correct the model, or the prototype only on independent evidence, and "
+                "re-run")
     if by_kind.get("coarse_memory_store", 0) or by_kind.get("pointer_escape", 0):
         # The coarse leaf exists precisely because the destination could not be
         # keyed, so no var: names it; the template seeds a value read back.
@@ -555,14 +588,18 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     # call: the target resolved, it is the memory hand-off that is not
     # carried. It belongs in the coarse-memory tally with the other two.
     COARSE = ("coarse_memory_store", "pointer_escape", "global_memory_continuation")
-    unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED)
+    unmodeled_n = sum(by_kind.get(k, 0) for k in UNRESOLVED)
+    # BN6-C009: a declared destination the call does not carry is an
+    # unresolved write, so it is counted with the unresolved frontier -- but
+    # its callee IS modeled, so it never reads as "an unmodeled call reached".
+    unresolved_n = unmodeled_n + by_kind.get("model_destination_unrecovered", 0)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
     seed_misanchored_n = sum(by_kind.get(k, 0) for k in _SEED_MISANCHORED_KINDS)
     # An external callee with no taint model returns conservatively tainted
     # and is disclosed as an assumption, not a leaf -- fold it into the
     # "unmodeled call reached" signal so a parser behind an import stub counts.
     ext_no_model = any("has no model" in a for a in assumptions)
-    unmodeled_reached = bool(unresolved_n or ext_no_model)
+    unmodeled_reached = bool(unmodeled_n or ext_no_model)
     tainted_values = int(diag.get("tainted_values", 0))
 
     next_action = _forward_next_action(
