@@ -2738,6 +2738,519 @@ def test_a_partial_model_never_buys_off_an_unread_body(tmp_path, shared_bn):
             assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
+_IC05_SRC = r"""
+/* IC05 / BN6-C008: public synthetic, analyze only, never execute. */
+#include <stddef.h>
+#include <string.h>
+#define N __attribute__((noinline, noipa))
+/* A single tail jump even in this -O0 build, so Binary Ninja marks it a thunk
+   the way it marks a real PLT/veneer stub. */
+#define TAIL __attribute__((noinline, noipa, optimize("O2")))
+
+extern int system(const char *);
+char scratch[256];
+
+/* Padded past analysis.limits.maxFunctionSize, so Binary Ninja MEASURES this
+   body and declines to analyse it; its tail is a truthful identity return,
+   which is exactly what the overlay below states and all it states. */
+N long unread_body(long token, long other) {
+    __asm__ volatile(".rept 70000\n nop\n .endr\n");
+    return token + other;
+}
+TAIL long unread_thunk(long token) { return unread_body(token, 0); }
+TAIL long unread_multihop(long token) { return unread_thunk(token); }
+N long wrap_unread(long token) { long r = unread_body(token, 0); return r + 3; }
+N long analysed_body(long token) { system((const char *)token); return token; }
+
+N long call_unread(long token) { long r = unread_body(token, 0); return r + 1; }
+N long call_thunk(long token) { long r = unread_thunk(token); return r + 1; }
+N long call_multihop(long token) { long r = unread_multihop(token); return r + 1; }
+N long call_wrapper(long token) { long r = wrap_unread(token); return r + 1; }
+N long call_analysed(long token) { long r = analysed_body(token); return r + 1; }
+N long call_import(long token) { memset(scratch, (int)token, 16); return token; }
+long (*volatile hook)(long, long) = unread_body;
+N long call_indirect(long token) { long r = hook(token, 0); return r + 1; }
+
+/* ONE call to the unread body, reached from two tainted-argument contexts. */
+N long nested(long a, long b) { long r = unread_body(a, b); return r + 1; }
+N long two_contexts(long token) { return nested(token, 0) + nested(0, token); }
+
+/* Both arguments arrive in the registers the call passes them in, so an
+   optimised build writes NEITHER before the call -- and Binary Ninja, with no
+   prototype for the body it never analysed, then recovers no arguments at
+   all for that call site. The guard exists so BN can still recover this
+   function's OWN parameters (it reads them) without writing the registers. */
+N long abi_entry(long a, long b) {
+    if (a == 5 || b == 7) return 0;
+    long r = unread_body(a, b);
+    return r + 1;
+}
+
+/* An optimised TAIL call: `return unread_body(a, b)` leaves both arguments
+   exactly where they already are, so the call writes no argument register at
+   all -- and Binary Ninja lifts it as a tail call, not an ordinary one. */
+N long tail_entry(long a, long b) {
+    if (a == 5 || b == 7) return 0;
+    return unread_body(a, b);
+}
+
+/* The seeded value rides argument 1; argument 0 is a constant. */
+N long other_arg(long token) { long r = unread_body(0, token); return r + 1; }
+/* Nothing the seed reaches is passed at all. */
+N long constant_only(long token) {
+    if (token == 3) return 0;
+    long r = unread_body(7, 9);
+    return r + 1;
+}
+
+/* An ANALYSED callee reached the same way: the argument is already in its
+   register, so an optimised call site writes none. The guard keeps this
+   function's own parameter recoverable. */
+N long calls_analysed(long a) {
+    if (a == 5) return 0;
+    long r = analysed_body(a);
+    return r + 1;
+}
+
+/* BN recovers argument 0 (a constant it sees written) and nothing else; the
+   seed rides argument 1, which the call site never writes. */
+N long prefix_entry(long a, long b) {
+    if (a == 5 || b == 7) return 0;
+    long r = unread_body(7, b);
+    return r + 1;
+}
+
+/* A loop before the call: the backwards CFG closure walks a cycle. */
+N long loop_entry(long a, long b) {
+    if (a == 5 || b == 7) return 0;
+    for (volatile int i = 0; i < 4; i++) { }
+    long r = unread_body(a, b);
+    return r + 1;
+}
+
+/* An analysed callee that consumes BOTH argument registers, reached with a
+   constant in the first and the seed in the second. */
+N long two_arg_consumer(long a, long b) { system((const char *)b); return a + b; }
+N long calls_second(long a) {
+    if (a == 5) return 0;
+    long r = two_arg_consumer(0, a);
+    return r + 1;
+}
+
+/* The analysed callee behind a veneer, and behind a pinnable indirect site. */
+TAIL long analysed_thunk(long a) { return analysed_body(a); }
+N long calls_analysed_thunk(long a) {
+    if (a == 5) return 0;
+    long r = analysed_thunk(a);
+    return r + 1;
+}
+
+/* An indirect site whose targets the VALUE SET itself pins: a const table of
+   function pointers, both entries reaching the skipped body, with the
+   arguments already in the registers that pass them. */
+static long (*const vs_hooks[2])(long, long) = { unread_body, unread_body };
+N long value_set_entry(long a, long b) {
+    if (a == 5 || b == 7) return 0;
+    return vs_hooks[a & 1](a, b) + 1;
+}
+
+/* A pinnable indirect site into an ANALYSED callee whose FORMALS are correct
+   (nothing redeclares it), at a call that writes no argument register. */
+N long abi_formal_consumer(long a) { system((const char *)a); return a + 1; }
+long (*volatile abi_formal_hook)(long) = abi_formal_consumer;
+N long calls_formal_indirect(long a) {
+    if (a == 5) return 0;
+    long r = abi_formal_hook(a);
+    return r + 1;
+}
+
+int main(int argc, char **argv) {
+    (void)argv;
+    return (int)(call_unread(argc) + call_thunk(argc) + call_multihop(argc)
+                 + call_wrapper(argc) + call_analysed(argc) + call_import(argc)
+                 + call_indirect(argc) + two_contexts(argc) + other_arg(argc)
+                 + constant_only(argc) + abi_entry(argc, argc)
+                 + tail_entry(argc, argc) + calls_analysed(argc)
+                 + prefix_entry(argc, argc) + loop_entry(argc, argc)
+                 + calls_second(argc) + calls_analysed_thunk(argc)
+                 + value_set_entry(argc, argc) + calls_formal_indirect(argc));
+}
+"""
+
+_IC05_OVERLAYS = {
+    "partial": {"unread_body": {"propagates": [{"from": "arg:0", "to": "ret"}]}},
+    "empty-entry": {"unread_body": {}},
+    # Accepted, but states no coverage and no return relation at all.
+    "irrelevant": {"unread_body": {"propagates": [{"from": "arg:0", "to": "arg:0"}]}},
+    # A full overlay that also arms a sink: still no claim about the body.
+    "full": {"unread_body": {"propagates": [{"from": "arg:0", "to": "ret"},
+                                            {"from": "arg:1", "to": "ret"}],
+                             "sink": {"class": "command_injection",
+                                      "tainted_args": [0],
+                                      "detail": "modeled sink"}}},
+}
+
+
+def test_a_matching_model_never_certifies_an_unread_argument_callee(tmp_path, shared_bn):
+    """IC05 / BN6-C008 on a real build: the tainted-ARGUMENT descent path.
+
+    BN21-REACH-01 closed this question for tainted GLOBALS (IC03). On the
+    argument path the unread-body accounting still sat inside the branch that
+    runs only when nothing in the call chain is modeled, so ANY matching entry
+    -- a truthful `arg:0 -> ret`, an empty `{}`, a reflexive rule that states
+    nothing -- turned `analysis_incomplete` off and the all-clear on, for a
+    body Binary Ninja never read. Body coverage is a property of the binary.
+    """
+    src = tmp_path / "ic05_unread.c"
+    src.write_text(_IC05_SRC)
+    binary = tmp_path / "ic05_unread"
+    _compile(src, binary, ["-fno-builtin"])
+    overlays = {
+        "partial": {"unread_body": {"propagates": [{"from": "arg:0", "to": "ret"}]}},
+        "empty-entry": {"unread_body": {}},
+        # Accepted, but states no coverage and no return relation at all.
+        "irrelevant": {"unread_body": {"propagates": [{"from": "arg:0", "to": "arg:0"}]}},
+    }
+    files = {}
+    for label, doc in overlays.items():
+        path = tmp_path / f"{label}.json"
+        path.write_text(json.dumps(doc))
+        files[label] = ("--models", str(path))
+    files["no-model"] = ()
+    target = shared_bn.load(binary, copy=False)
+
+    body = _resolve_addr(shared_bn, "unread_body")
+    skipped = _bn_json(shared_bn, "-t", target, "decompile", body)
+    # The falsification bar: a real in-binary FunctionSymbol whose MLIL is
+    # absent because BN measured the body and skipped it -- not an import.
+    assert skipped["analysis_skipped"] is True, skipped
+    assert _bn_json(shared_bn, "-t", target, "function", "info",
+                    body)["imported"] is False, body
+
+    pin = tmp_path / "ic05_rmap.json"
+    pin.write_text(json.dumps(
+        {_indirect_call_addr(shared_bn, "call_indirect", "ic05"): [body]}))
+    routes = {
+        "call_unread": None,
+        "call_thunk": "unread_thunk",
+        "call_multihop": "unread_multihop",
+        "call_wrapper": None,
+        "call_indirect": None,
+    }
+
+    for fn, via in routes.items():
+        pinned = ("--resolve-map", str(pin)) if fn == "call_indirect" else ()
+        for label, extra in files.items():
+            result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                              "--source", "param:0", "--max-depth", "16",
+                              *extra, *pinned)
+            where = (fn, label)
+            assert result["stats"]["analysis_incomplete"] is True, (where, result["stats"])
+            # The BODY is named on every route; a veneer is not the function
+            # an agent has to analyse.
+            assert result["stats"]["analysis_incomplete_functions"] == ["unread_body"], where
+            assert result["diagnostics"]["safe_to_report_all_clear"] is False, where
+            [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "unread_callee_body"]
+            assert leaf["callee"]["name"] == "unread_body", (where, leaf)
+            assert leaf["callee"]["address"] == body, (where, leaf)
+            assert leaf["skip_reason"] == "analysis_skipped:ExceedFunctionSizeSkipReason", leaf
+            assert leaf["tainted_args"] == [0], (where, leaf)
+            assert leaf["modeled"] is (label != "no-model"), (where, leaf)
+            assert leaf["via"] == via, (where, leaf)
+
+    # An import has no in-binary implementation, so there is nothing
+    # incomplete about not reading one.
+    imported = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "call_import",
+                        "--source", "param:0", *files["partial"])
+    assert imported["stats"]["analysis_incomplete"] is False, imported["stats"]
+    assert imported["diagnostics"]["safe_to_report_all_clear"] is True, imported
+
+    # A fully analysed body stays descended and authoritative: only the
+    # descent finds the `system` call inside it.
+    analysed = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "call_analysed",
+                        "--source", "param:0", *files["partial"])
+    assert analysed["stats"]["analysis_incomplete"] is False, analysed["stats"]
+    assert any(s["sink"]["callee"] == "system" for s in analysed["reached_sinks"]), analysed
+
+    # Text mode carries the same two facts, and the printed advice runs as
+    # printed -- then the body IS read, and the boundary is gone. The
+    # disclosure is about coverage, not a gate that can never be satisfied.
+    modeled = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "call_unread",
+                       "--source", "param:0", *files["partial"])
+    text = shared_bn.run("-t", target, "taint", "forward", "-f", "call_unread",
+                         "--source", "param:0", *files["partial"], "--verbose")
+    assert text.returncode == 0, text.stderr
+    assert "NOTE: analysis incomplete" in text.stdout, text.stdout
+    assert "unread_callee_body @" in text.stdout, text.stdout
+
+    ran, _templates = _run_or_check_template(shared_bn, _forward_prose(modeled))
+    assert ran, _forward_prose(modeled)
+    reread = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "call_unread",
+                      "--source", "param:0", *files["partial"], timeout=300.0)
+    assert reread["stats"]["analysis_incomplete"] is False, reread["stats"]
+    assert [lf for lf in reread["leaves"] if lf["kind"] == "unread_callee_body"] == []
+
+
+def test_one_unread_call_is_one_boundary_with_every_argument_context(tmp_path, shared_bn):
+    """IC05 review F2 on a real build.
+
+    `two_contexts(p)` calls `nested(p, 0)` and `nested(0, p)`, so the ONE call
+    `nested` makes into the unread body is reached from two tainted-argument
+    contexts. That is one hole: it used to be counted twice, and the text row
+    printed the first context's arguments with the second hidden behind a
+    `[2 leaves]` tally.
+    """
+    src = tmp_path / "ic05_contexts.c"
+    src.write_text(_IC05_SRC)
+    binary = tmp_path / "ic05_contexts"
+    _compile(src, binary, ["-fno-builtin"])
+    overlay = tmp_path / "partial.json"
+    overlay.write_text(json.dumps(
+        {"unread_body": {"propagates": [{"from": "arg:0", "to": "ret"}]}}))
+    target = shared_bn.load(binary, copy=False)
+
+    for extra in ((), ("--models", str(overlay))):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f",
+                          "two_contexts", "--source", "param:0", "--max-depth", "16",
+                          *extra)
+        leaves = [lf for lf in result["leaves"] if lf["kind"] == "unread_callee_body"]
+        assert len(leaves) == 1, (extra, result["leaves"])
+        assert leaves[0]["tainted_args"] == [0, 1], leaves[0]
+        frontier = result["diagnostics"]["frontier"]
+        assert frontier["by_kind"]["unread_callee_body"] == 1, frontier
+
+    text = shared_bn.run("-t", target, "taint", "forward", "-f", "two_contexts",
+                         "--source", "param:0", "--max-depth", "16", "--verbose")
+    assert text.returncode == 0, text.stderr
+    row = next(line for line in text.stdout.splitlines()
+               if line.strip().startswith("unread_callee_body"))
+    assert "[0, 1]" in row, row
+    assert "leaves]" not in row, row
+
+
+def test_an_argument_an_optimised_call_drops_is_recovered_from_its_register(
+        tmp_path, shared_bn):
+    """The ABI-provenance gap, on an optimised real build.
+
+    Binary Ninja recovers a call's arguments at the CALL SITE, from the
+    registers it sees written there plus the callee's prototype. A callee it
+    never analysed has no prototype, and a call whose arguments already sit in
+    the registers that pass them writes none -- so `-O2` leaves
+    `unread_body()` with no arguments at all, and the walk reported a clean
+    all-clear at a call the machine code plainly hands the seeded value to.
+
+    Only what the IL proves is recovered: a register with no definition that
+    nothing could have clobbered still carries the function's entry value. A
+    call whose arguments Binary Ninja DID recover is never second-guessed --
+    that recovery is its arity determination, and a register past it holds
+    dead scratch as often as an argument.
+    """
+    src = tmp_path / "ic05_abi.c"
+    src.write_text(_IC05_SRC)
+    binary = tmp_path / "ic05_abi"
+    # `-g0`: with DWARF, Binary Ninja takes the prototype from the debug info
+    # and recovers the arguments itself. The gap is what a stripped optimised
+    # build leaves.
+    _compile(src, binary, ["-O2", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    body = _resolve_addr(shared_bn, "unread_body")
+    assert _bn_json(shared_bn, "-t", target, "decompile",
+                    body)["analysis_skipped"] is True, body
+    # The premise: BN recovered NO arguments for this call site.
+    il = _bn_json(shared_bn, "-t", target, "il", "abi_entry")
+    assert "unread_body()" in json.dumps(il), il
+
+    def forward(fn, *sources):
+        args = []
+        for s in sources or ("param:0",):
+            args += ["--source", s]
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                        *args, "--max-depth", "16")
+
+    def boundary(result):
+        [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "unread_callee_body"]
+        return leaf
+
+    first = forward("abi_entry")
+    leaf = boundary(first)
+    assert leaf["callee"]["name"] == "unread_body", leaf
+    assert leaf["tainted_args"] == [0], leaf
+    assert leaf["abi_recovered_args"] == [0], leaf
+    assert first["stats"]["analysis_incomplete_functions"] == ["unread_body"]
+    assert first["diagnostics"]["safe_to_report_all_clear"] is False
+    assert any("calling convention's register" in a
+               for a in first["assumptions"]), first["assumptions"]
+
+    # A later argument register, and both at once: each index is recovered on
+    # its own register, and an untainted one is simply not claimed.
+    assert boundary(forward("abi_entry", "param:1"))["abi_recovered_args"] == [1]
+    assert boundary(forward("abi_entry", "param:0", "param:1")
+                    )["abi_recovered_args"] == [0, 1]
+
+    # A TAIL call is a call: `return unread_body(a, b)` leaves both arguments
+    # where they are, so BN lifts a tail call carrying no arguments at all.
+    # Matching only ordinary calls left it certifying the skipped body (F4).
+    tail = forward("tail_entry")
+    leaf = boundary(tail)
+    assert leaf["callee"]["name"] == "unread_body", leaf
+    assert leaf["tainted_args"] == [0], leaf
+    assert leaf["abi_recovered_args"] == [0], leaf
+    assert tail["stats"]["analysis_incomplete_functions"] == ["unread_body"]
+    assert tail["diagnostics"]["safe_to_report_all_clear"] is False
+    assert boundary(forward("tail_entry", "param:1"))["abi_recovered_args"] == [1]
+    assert boundary(forward("tail_entry", "param:0", "param:1")
+                    )["abi_recovered_args"] == [0, 1]
+    for overlay in _IC05_OVERLAYS:
+        path = tmp_path / f"tail-{overlay}.json"
+        path.write_text(json.dumps(_IC05_OVERLAYS[overlay]))
+        modeled = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f",
+                           "tail_entry", "--source", "param:0", "--max-depth", "16",
+                           "--models", str(path))
+        assert modeled["stats"]["analysis_incomplete"] is True, (overlay, modeled["stats"])
+        assert boundary(modeled)["abi_recovered_args"] == [0], overlay
+        # The zero-sink gate exists only on a zero-sink run; the sink-bearing
+        # overlay reports its finding instead, and still names the body it
+        # did not read.
+        if not modeled["reached_sinks"]:
+            assert modeled["diagnostics"]["safe_to_report_all_clear"] is False, overlay
+
+    # A recovered PREFIX says nothing about the arguments past it: BN recovers
+    # the constant argument 0 it sees written and misses argument 1, which the
+    # call site never writes because the seed is already in its register.
+    prefix = forward("prefix_entry", "param:1")
+    leaf = boundary(prefix)
+    assert leaf["tainted_args"] == [1], leaf
+    assert leaf["abi_recovered_args"] == [1], leaf
+    assert prefix["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # A loop before the call: the backwards CFG closure walks a cycle of blocks
+    # Binary Ninja hands out as a fresh Python object each time. It terminates,
+    # and the answer is still honest.
+    looped = forward("loop_entry")
+    assert boundary(looped)["callee"]["name"] == "unread_body", looped
+    assert looped["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # Review F11: an indirect site whose targets the VALUE SET itself pins is
+    # routed into the same skipped body, and the gate must consider it exactly
+    # as the descent does.
+    pinned = forward("value_set_entry")
+    assert boundary(pinned)["callee"]["name"] == "unread_body", pinned
+    assert pinned["stats"]["analysis_incomplete_functions"] == ["unread_body"]
+    assert pinned["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # Binary Ninja DID recover this call's arguments (it writes both registers
+    # at the call site), so nothing is recovered on top of them -- and its own
+    # recovery still carries the seed into the boundary.
+    second = forward("other_arg")
+    leaf = boundary(second)
+    assert leaf["tainted_args"] == [1], leaf
+    assert leaf["abi_recovered_args"] == [], leaf
+
+    # The must-not-fire twin: every argument is a constant, so no register
+    # carries the seed and nothing is recovered or disclosed.
+    clean = forward("constant_only")
+    assert [lf for lf in clean["leaves"] if lf["kind"] == "unread_callee_body"] == [], clean
+    assert clean["stats"]["analysis_incomplete"] is False, clean["stats"]
+
+    # Text names the recovered index, so a reader can tell an argument Binary
+    # Ninja recovered from one the calling convention's register proved.
+    text = shared_bn.run("-t", target, "taint", "forward", "-f", "abi_entry",
+                         "--source", "param:0", "--max-depth", "16", "--verbose")
+    assert text.returncode == 0, text.stderr
+    row = next(line for line in text.stdout.splitlines()
+               if line.strip().startswith("unread_callee_body"))
+    assert "ABI-recovered arg(s) [0]" in row, row
+
+
+def test_an_under_recovered_argument_into_an_analysed_callee_is_a_frontier(
+        tmp_path, shared_bn):
+    """Review F5: the same ABI evidence, for a callee that IS analysed.
+
+    `analysed_body` consumes its first argument (it hands it to `system`). Force
+    the recovery miss the way the #381 lane already does — declare it 0-arity —
+    and the call site, which writes no argument register because the value is
+    already in `rdi`, carries no arguments at all. The seeded value provably
+    reaches a register the callee READS as an incoming value, so the walk must
+    not report an all-clear. No formal is invented for the callee and no sink is
+    claimed: the flow stops at a named frontier and says why.
+    """
+    src = tmp_path / "ic05_underrec.c"
+    src.write_text(_IC05_SRC)
+    binary = tmp_path / "ic05_underrec"
+    _compile(src, binary, ["-O2", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn="calls_analysed"):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f",
+                        fn, "--source", "param:0", "--max-depth", "16")
+
+    def frontiers(result):
+        return [lf for lf in result["leaves"]
+                if lf.get("cause") == "arg_under_recovered"]
+
+    # Baseline control: the argument IS recovered, so taint descends and the
+    # `system` sink is found -- no under-recovery frontier at all.
+    before = forward()
+    assert any(s["sink"]["callee"] == "system" for s in before["reached_sinks"]), before
+    assert frontiers(before) == [], before["leaves"]
+
+    proto = shared_bn.run("-t", target, "proto", "set", "analysed_body",
+                          "void analysed_body(void)", "--format", "json")
+    assert proto.returncode == 0, proto.stderr
+
+    after = forward()
+    assert not any(s["sink"]["callee"] == "system" for s in after["reached_sinks"]), after
+    [leaf] = frontiers(after)
+    assert leaf["callee"]["name"] == "analysed_body", leaf
+    assert leaf["register"] == "rdi", leaf
+    assert leaf["argument_index"] == 0, leaf
+    assert leaf["recovered_params"] == 0, leaf
+    # The register was never written at the call site: it still carries the
+    # value the analysed function was entered with.
+    assert leaf["via"] == "entry_value", leaf
+    assert after["diagnostics"]["safe_to_report_all_clear"] is False, after
+
+    # Review F9: a veneer routes to the SAME analysed body, and the check must
+    # follow the candidate seam the descent uses rather than the direct target
+    # alone.
+    routed = forward("calls_analysed_thunk")
+    [leaf] = frontiers(routed)
+    assert leaf["callee"]["name"] == "analysed_body", leaf
+    assert leaf["argument_index"] == 0, leaf
+    assert routed["diagnostics"]["safe_to_report_all_clear"] is False, routed
+
+    # Review F8: the first missing argument is a CONSTANT and the seed rides
+    # the second. Stopping at the first missing register dropped it silently.
+    proto = shared_bn.run("-t", target, "proto", "set", "two_arg_consumer",
+                          "void two_arg_consumer(void)", "--format", "json")
+    assert proto.returncode == 0, proto.stderr
+    later = forward("calls_second")
+    [leaf] = frontiers(later)
+    assert leaf["callee"]["name"] == "two_arg_consumer", leaf
+    assert leaf["tainted_args"] == [1], leaf
+    assert leaf["register"] == "rsi", leaf
+    assert leaf["argument_index"] == 1, leaf
+    assert later["diagnostics"]["safe_to_report_all_clear"] is False, later
+
+    # Review F12: an agent-pinned indirect site into a callee whose FORMALS are
+    # correct. The call itself recovered no arguments, so argument 0 is missing
+    # and must be measured against the CALL, not against the callee's formals
+    # (counting from the formals skipped exactly this index).
+    site = _indirect_call_addr(shared_bn, "calls_formal_indirect", "ic05")
+    pin = tmp_path / "ic05_underrec_rmap.json"
+    pin.write_text(json.dumps(
+        {site: [_resolve_addr(shared_bn, "abi_formal_consumer")]}))
+    mapped = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f",
+                      "calls_formal_indirect", "--source", "param:0",
+                      "--max-depth", "16", "--resolve-map", str(pin))
+    [leaf] = frontiers(mapped)
+    assert leaf["callee"]["name"] == "abi_formal_consumer", leaf
+    assert leaf["argument_index"] == 0, leaf
+    assert leaf["recovered_params"] == 0, leaf
+    assert mapped["diagnostics"]["safe_to_report_all_clear"] is False, mapped
+
+
 _OVERLAP_SRC = r"""
 #include <stdio.h>
 #include <stdlib.h>

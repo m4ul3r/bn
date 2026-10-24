@@ -44,7 +44,8 @@ from .taint_models import (  # noqa: F401
     model_arg_index, parse_model_token, validate_model_arguments,
 )
 from .taint_il import (  # noqa: F401
-    reaching_reg_def, reaching_arg_seed_vars, op_name, is_ssa_var,
+    reaching_reg_def, reaching_arg_seed_vars, argument_register_provenance,
+    op_name, is_ssa_var,
     _FORMAT_SPEC_RE, _count_format_args, var_key, var_label,
     ssa_reads, ssa_writes, expr_reads, function_at, const_target,
     _mlil_ssa, _ssa_instructions, _symbols_by_name, _symbol_by_raw_name,
@@ -390,12 +391,26 @@ class _SalvageList(list):
 
 
 _UNRECOVERED = "model_destination_unrecovered"
+_UNREAD_BODY = "unread_callee_body"
 
 
 def _unrecovered_key(leaf: dict[str, Any]) -> tuple:
     """One missing output: the call site, the callee and the declared destination."""
     cal = leaf.get("callee") if isinstance(leaf.get("callee"), dict) else {}
     return (leaf.get("address"), cal.get("address") or cal.get("name"), leaf.get("destination"))
+
+
+def _unread_body_key(leaf: dict[str, Any]) -> tuple:
+    """One unread body: the call site and the body it runs.
+
+    NOT the tainted arguments -- the fixpoint reaches one call from every
+    argument context that carries taint into it (and a descended callee's
+    summary is re-merged into each caller), so keying on them counted ONE hole
+    as several and let the text row hide every context after the first behind a
+    ``[N leaves]`` tally.
+    """
+    cal = leaf.get("callee") if isinstance(leaf.get("callee"), dict) else {}
+    return (leaf.get("address"), cal.get("address") or cal.get("name"))
 
 
 def _source_order(src: Any) -> tuple:
@@ -411,8 +426,11 @@ def _add_leaf(leaves: list, leaf: Any, *, dedupe: bool = True) -> None:
     argument context -- so its sources merge, in a stable order, into a COPY
     of the present leaf: the earlier object may be shared with a cached callee
     summary or another callsite's ``by_source`` row, which must not acquire
-    evidence it did not observe. Other leaves are appended unless an equal one
-    is present (``dedupe``) or always (``dedupe=False``)."""
+    evidence it did not observe. An ``unread_callee_body`` boundary merges the
+    same way on (call site, body), with the tainted-argument evidence of every
+    context unioned, so one unread body at one call is one leaf and one count.
+    Other leaves are appended unless an equal one is present (``dedupe``) or
+    always (``dedupe=False``)."""
     if isinstance(leaf, dict) and leaf.get("kind") == _UNRECOVERED:
         key = _unrecovered_key(leaf)
         for i, lf in enumerate(leaves):
@@ -424,6 +442,24 @@ def _add_leaf(leaves: list, leaf: Any, *, dedupe: bool = True) -> None:
                 merged.sort(key=_source_order)
                 if merged != lf.get("sources"):
                     leaves[i] = {**lf, "sources": merged}
+                return
+    if isinstance(leaf, dict) and leaf.get("kind") == _UNREAD_BODY:
+        # Same boundary reached again: ONE unread body at ONE call site, with
+        # the argument evidence of every context merged into a copy (IC05
+        # review F2). The prose names the body and the remedy, neither of which
+        # depends on which argument arrived, so only the argument lists merge.
+        key = _unread_body_key(leaf)
+        for i, lf in enumerate(leaves):
+            if isinstance(lf, dict) and lf.get("kind") == _UNREAD_BODY \
+                    and _unread_body_key(lf) == key:
+                merged = sorted({*(lf.get("tainted_args") or []),
+                                 *(leaf.get("tainted_args") or [])})
+                recovered = sorted({*(lf.get("abi_recovered_args") or []),
+                                    *(leaf.get("abi_recovered_args") or [])})
+                if merged != lf.get("tainted_args") \
+                        or recovered != (lf.get("abi_recovered_args") or []):
+                    leaves[i] = {**lf, "tainted_args": merged,
+                                 "abi_recovered_args": recovered}
                 return
     if not dedupe or leaf not in leaves:
         leaves.append(leaf)
@@ -752,6 +788,184 @@ class TaintEngine:
         regs = list(getattr(cc, "int_arg_regs", []) or [])
         if 0 <= idx < len(regs):
             return str(regs[idx])
+        return None
+
+    def _n_arg_registers(self, func: Any) -> int:
+        """How many integer arguments this calling convention passes in
+        registers -- the only indices a dropped argument can be recovered at."""
+        cc = getattr(func, "calling_convention", None)
+        if cc is None:
+            plat = getattr(self.bv, "platform", None)
+            cc = getattr(plat, "default_calling_convention", None)
+        try:
+            return len(list(getattr(cc, "int_arg_regs", []) or []))
+        except Exception:
+            return 0
+
+    def _call_enters_unread_body(self, ins: Any) -> bool:
+        """Whether this call runs an in-binary body whose implementation MLIL
+        is unavailable.
+
+        The one shape with NO prototype to recover arguments from: Binary
+        Ninja never analysed the body, so it cannot say how many arguments the
+        call passes. Everywhere else its recovered parameter list IS its arity
+        determination and is taken as it stands.
+
+        Every target the DESCENT would consider is considered here (review
+        F11): the resolved direct target, an explicit ``--resolve-map`` pin,
+        and the value set's own finite targets -- an optimised indirect call
+        whose targets BN pins is routed into the same skipped body as a direct
+        one, and reading only the direct target let it certify that body.
+        """
+        addr = int(getattr(ins, "address", -1))
+        cache = getattr(self, "_unread_call_cache", None)
+        if cache is None:
+            cache = self._unread_call_cache = {}
+        if addr in cache:
+            return cache[addr]
+        targets = []
+        direct = self._resolve_direct_target(ins)
+        if direct is not None:
+            targets.append(direct)
+        try:
+            targets += list(self.resolve_map.get(addr) or ())
+        except Exception:
+            pass
+        if not targets:
+            targets += self._call_targets_from_pvs(
+                getattr(getattr(ins, "dest", None), "possible_values", None))
+        found = False
+        for taddr in targets:
+            cfn = function_at(self.bv, taddr)
+            if cfn is None:
+                continue
+            resolved = (None if self._is_internal(cfn)
+                        else self._follow_thunk_cached(cfn))
+            if self._unread_body_target(cfn, resolved) is not None:
+                found = True
+                break
+        cache[addr] = found
+        return found
+
+    def _abi_arg_operands(self, func: Any, ins: Any, idx: int, *,
+                          allow_entry: bool = False,
+                          entry_only: bool = False) -> list[Any]:
+        """The value(s) the calling convention's register for argument ``idx``
+        carries INTO this call, as operands the taint check can read -- empty
+        when nothing proves one.
+
+        BN recovers a call's arguments at the call site, from the registers it
+        sees written there plus the callee's prototype. A callee it never
+        analysed has no prototype, and a call whose arguments already sit in
+        the registers that pass them writes none -- so an optimised build
+        leaves the MLIL call with no parameters at all (``unread_body()``) and
+        the walk saw no tainted argument where the machine code plainly passes
+        one. The evidence used here is the IL's own: a dominating LLIL-SSA
+        definition of the argument register, or -- when the register has no
+        definition and nothing that can run first may have clobbered it -- the
+        value the function was entered with, which for argument index ``idx``
+        is this function's own parameter ``idx``. A register a call may have
+        clobbered, a convention that does not pass argument ``idx`` in a
+        register, or a view with no LLIL yields nothing: unproven is never
+        recovered.
+
+        The ENTRY leg is opt-in (``allow_entry``); ``entry_only`` additionally
+        REFUSES a definition. That is what a partially recovered call asks
+        for: BN recovers a call's arguments from the registers WRITTEN at the
+        site, so a register past its recovered prefix that the body writes is
+        scratch as often as an argument -- at -O0 gcc stages the second
+        argument through ``rdx`` before moving it to ``rsi``. A register
+        nothing writes, still holding this function's own incoming parameter,
+        is evidence of a different kind, and it is the one shape BN cannot see
+        at all.
+
+        Memoized per (function, call site, index, leg): the fixpoint revisits
+        every instruction, and this walks the LLIL-SSA CFG.
+        """
+        cache = getattr(self, "_abi_arg_cache", None)
+        if cache is None:
+            cache = self._abi_arg_cache = {}
+        key = (int(getattr(func, "start", 0)), int(getattr(ins, "address", -1)),
+               int(idx), bool(allow_entry), bool(entry_only))
+        if key in cache:
+            return cache[key]
+        cache[key] = out = self._abi_arg_operands_uncached(
+            func, ins, idx, allow_entry=allow_entry, entry_only=entry_only)
+        return out
+
+    def _abi_arg_operands_uncached(self, func: Any, ins: Any, idx: int, *,
+                                   allow_entry: bool,
+                                   entry_only: bool = False) -> list[Any]:
+        # A DEFINITION reaching the register goes through the existing #433
+        # seam, so every consumer of that bridge keeps one implementation.
+        try:
+            reg, seeds = self._reaching_arg_seeds_via_reg(func, [ins], idx)
+        except Exception:
+            return []
+        if seeds and not entry_only:
+            return [_RegisterOperand(var, reg) for var, _site in seeds]
+        if seeds and entry_only:
+            return []
+        if reg is None or not allow_entry:
+            return []
+        # No definition was bridged. That is the register's ENTRY value only
+        # when the IL says nothing defines it and nothing that can run first
+        # may have clobbered it -- asked separately, because an unbridgeable
+        # definition looks the same from here.
+        try:
+            import binaryninja as bn
+        except Exception:
+            return []
+        try:
+            kind, _ = argument_register_provenance(
+                func, int(getattr(ins, "address", -1)), reg, bn)
+        except Exception:
+            return []
+        if kind == "budget":
+            # The predecessor closure ran out of blocks: this call site's ABI
+            # provenance was never established either way. Remembered so the
+            # caller can disclose the hole instead of reading "nothing proven"
+            # as "nothing there" (review F10).
+            sites = getattr(self, "_abi_budget_sites", None)
+            if sites is None:
+                sites = self._abi_budget_sites = set()
+            sites.add((int(getattr(func, "start", 0)),
+                       int(getattr(ins, "address", -1)), int(idx), str(reg)))
+        if kind != "entry":
+            return []
+        pv = self._param_var(func, idx)
+        if pv is None:
+            return []
+        # The ENTRY value of a parameter is its version-0 SSA variable; the
+        # taint check reads SSA variables, and a bare `Variable` is not one.
+        try:
+            entry = bn.SSAVariable(pv, 0)
+        except Exception:
+            return []
+        return [_RegisterOperand(entry, reg)]
+
+    def _abi_token_hit(self, func: Any, ins: Any, params: list,
+                       token: Any, arg_taint: Any) -> tuple | None:
+        """A model source token naming an argument BN dropped from this call,
+        answered from the calling convention's register, or None.
+
+        Only an ``arg:N`` / ``*arg:N`` index PAST what BN recovered is asked:
+        an argument the MLIL call carries is read from the call itself and is
+        never second-guessed here.
+        """
+        if not isinstance(token, str):
+            return None
+        bare = token[1:] if token.startswith("*") else token
+        if not bare.startswith("arg:"):
+            return None
+        idx = _try_arg_index(bare)
+        if idx is None or idx < len(params):
+            return None
+        for operand in self._abi_arg_operands(
+                func, ins, idx, allow_entry=self._call_enters_unread_body(ins)):
+            hit = arg_taint(operand)
+            if hit:
+                return hit[0]
         return None
 
     def _reaching_arg_seeds_via_reg(self, func: Any, sites: list[Any],
@@ -3684,6 +3898,9 @@ class TaintEngine:
         # could still answer safe_to_report_all_clear. Tracked structurally, the
         # same way `_truncated`/`_truncation_causes` are, so a consumer can gate.
         self._analysis_incomplete: set[str] = set()
+        # (function, call site, index, register) whose ABI provenance scan ran
+        # out of budget. Disclosed as a boundary; never read as a positive.
+        self._abi_budget_sites: set[tuple] = set()
         self._only_callsite_addr = only_callsite_addr
         # #559: count the source callsites the seed actually matched, so a
         # zero-result query can report "matched N source callsites" instead of an
@@ -5301,6 +5518,108 @@ class TaintEngine:
             return "Binary Ninja produced no MLIL for it"
         return None
 
+    @staticmethod
+    def _is_defined_function_symbol(fn: Any) -> bool:
+        """Whether BN names this address a DEFINED function of this binary.
+
+        A real ``Function`` always carries a symbol; ``FunctionSymbol`` is the
+        one that means "this binary defines this function here"
+        (``_not_internal_reason`` has already rejected every imported/external
+        symbol type before any caller asks). A record with NO symbol at all is
+        the external machinery's degenerate shape -- an address a name is known
+        at, with nothing measured behind it -- and is not a body this binary
+        has.
+        """
+        sym = getattr(fn, "symbol", None)
+        return str(getattr(getattr(sym, "type", None), "name", "") or "") == "FunctionSymbol"
+
+    def _unread_body_target(self, cfn: Any, resolved: Any | None) -> tuple[Any, str] | None:
+        """The in-binary body this call RUNS whose implementation MLIL is
+        unavailable.
+
+        ``(function, reason)`` for the first of the thunk-resolved target and
+        the call's own target that Binary Ninja defines but cannot show a body
+        for -- it measured the body and skipped it (an oversized function past
+        ``analysis.limits.maxFunctionSize``), or it produced no MLIL at all --
+        else None. The resolved target comes first because a veneer's own name
+        (``j_huge_body``) is not the function whose body went unread, and the
+        result names what an agent would have to analyse.
+
+        Both shapes are the same hole: an implementation this binary HAS and
+        this walk did not read. An import, a stub and an address with no
+        function at all are not -- they have no in-binary implementation to
+        read, so `_not_internal_reason` rejects them first and
+        `_is_defined_function_symbol` rejects a bodiless record with no symbol
+        behind it (which is what a name-only external resolves to).
+        """
+        for fn in (resolved, cfn):
+            if fn is None:
+                continue
+            reason = str(self._not_internal_reason(fn) or "")
+            if reason.startswith("analysis_skipped:"):
+                return fn, reason
+            if reason == "no_mlil" and self._is_defined_function_symbol(fn):
+                return fn, reason
+        return None
+
+    def _unread_body_leaf(self, ins: Any, fn: Any, reason: str,
+                          tainted_args: Any, *, via_name: str | None,
+                          modeled: bool, abi_recovered: Any = ()) -> dict[str, Any]:
+        """The blocking frontier for tainted arguments entering an in-binary
+        body Binary Ninja did not analyse (IC05 / BN6-C008).
+
+        Body coverage is a property of the BINARY, never of the model DB: a
+        model is an overlay on a body, and a truthful partial overlay
+        (``arg:0 -> ret``) states one relation without establishing that the
+        rest of the body was read. The leaf is therefore emitted whether or
+        not a model covers this call, and says which of the two it is, so a
+        reader is never told the overlay settled the question.
+        """
+        at = hex(int(getattr(fn, "start", 0)))
+        name = str(getattr(fn, "name", None) or self._callee_name(int(getattr(fn, "start", 0)))
+                   or at)
+        # `reason` is always an unavailable implementation here
+        # (`_unread_body_target` admits nothing else), so the phrase and the
+        # prose name are both total.
+        phrase = self._unanalysed_body_phrase(reason)
+        args = sorted(tainted_args)
+        shown = self._prose_function(fn)
+        through = (f" through {self._prose_name(via_name)}" if via_name else "")
+        overlay = (" a model describes this call, but a model is an overlay on a body, "
+                   "not a substitute for reading one, so what else this body does with "
+                   "the bytes is unknown;" if modeled else "")
+        return {
+            "kind": "unread_callee_body",
+            "address": hex(int(getattr(ins, "address", 0))),
+            "callee": {"name": name,
+                       "display_name": _display_name(fn) or name,
+                       "address": at},
+            # The raw `_not_internal_reason` string, so a consumer can tell an
+            # oversized body from a failed lift without parsing prose.
+            "skip_reason": reason,
+            # Whether a model matched this call. A consumer that sees only the
+            # overlay's positive effects must still see that the body behind
+            # them was never read.
+            "modeled": bool(modeled),
+            "via": str(via_name) if via_name else None,
+            "tainted_args": args,
+            # Which of those arguments the MLIL call did not carry and the
+            # calling convention's register proved (F3). [] is the ordinary
+            # case: BN recovered every argument itself.
+            "abi_recovered_args": sorted(abi_recovered),
+            "il_text": str(ins),
+            # The argument list is NOT repeated in the prose: one call reached
+            # from several argument contexts is one boundary, and merging two
+            # of them must not leave a sentence naming only the first (review
+            # F2). `tainted_args` carries that evidence, and the text row
+            # prints it.
+            "detail": (f"taint reaches in-binary {shown} @ {at}"
+                       f"{through}, and {phrase} -- its body was never examined, so what "
+                       f"it does with the tainted argument(s) is UNKNOWN, not clear;"
+                       f"{overlay} "
+                       f"re-run after `bn decompile {at} --force-analysis` (may be slow)"),
+        }
+
     def _thunk_tail_targets(self, fn: Any) -> list[Any]:
         """Every function a thunk tail-calls, found on ANY of its instructions
         and in instruction order -- `follow_thunk` only takes a one-instruction
@@ -5683,51 +6002,101 @@ class TaintEngine:
         leaf["cause"] = "return_value_unrecovered"
         return leaf
 
-    def _unrecovered_arg_frontier(self, ins: Any, tainted: set) -> dict[str, Any] | None:
-        """Honest frontier for the #381 silent drop. When a tainted value sits in
-        an ABI argument register that BN did NOT include in this call's recovered
-        params -- the callee's arity was under-recovered (Thumb 0-arity miss /
-        variadic mis-prototype) -- the flow into the callee would otherwise vanish
-        with no breadcrumb (the bare ``continue`` below). Return an
-        ``unmodeled_callee`` frontier leaf when a *missing* arg register (one past
-        the recovered arity) holds a tainted SSA value, else None.
+    def _under_recovered_callees(self, ins: Any) -> list[Any]:
+        """Every ANALYSED in-binary body this call may run.
 
-        Block-local + register-passed only: it inspects the last write to each
-        missing arg register within the call's own basic block (the dominant
-        codegen -- args set immediately before the call). Stack-passed varargs
-        (i386 cdecl) are NOT covered here -- that overlaps #324. Degrades to None
-        on any BN-API shortfall, so it never fabricates a frontier."""
+        The same candidate seam the descent uses (review F9): the resolved
+        direct target, an explicit ``--resolve-map`` pin, or the value set --
+        and a veneer is followed to the body it fronts, because a routed call
+        drops arguments exactly like a direct one. A target with no analysed
+        in-binary body is not one of these: an import has nothing to read, and
+        an unavailable body is the unread-body boundary's business.
+        """
+        addr = int(getattr(ins, "address", -1))
+        targets: list = []
+        direct = self._resolve_direct_target(ins)
+        if direct is not None:
+            targets.append(direct)
         try:
-            target = self._resolve_direct_target(ins)
-            if target is None:
-                return None
-            callee = function_at(self.bv, target)
-            if not self._is_internal(callee):
-                return None
+            targets += list(self.resolve_map.get(addr) or ())
+        except Exception:
+            pass
+        if not targets:
+            targets += self._call_targets_from_pvs(
+                getattr(getattr(ins, "dest", None), "possible_values", None))
+        out: list = []
+        seen: set = set()
+        for taddr in targets:
+            cfn = function_at(self.bv, taddr)
+            if cfn is None:
+                continue
+            if not self._is_internal(cfn):
+                cfn = self._follow_thunk_cached(cfn)
+                if cfn is None or not self._is_internal(cfn):
+                    continue
+            start = int(getattr(cfn, "start", 0))
+            if start not in seen:
+                seen.add(start)
+                out.append(cfn)
+        return out
+
+    def _unrecovered_arg_frontiers(self, func: Any, ins: Any, params: list,
+                                   tainted: set) -> list[dict[str, Any]]:
+        """Honest frontiers for the #381 silent drop. When a tainted value sits
+        in an ABI argument register that BN did NOT include in this call's
+        recovered params -- the callee's arity was under-recovered (Thumb
+        0-arity miss, variadic mis-prototype, or an optimised call site that
+        writes no register because the value is already there) -- the flow into
+        the callee would otherwise vanish with no breadcrumb.
+
+        One leaf per resolved analysed callee, naming EVERY missing argument
+        index proven to carry taint (review F8: stopping at the first missing
+        register dropped a tainted later one whenever the first was clean).
+        "Missing" is measured against what THIS CALL recovered, not against the
+        callee's formals (review F12): a callee with correct formals reached by
+        a call that recovered no arguments has every one of them missing, and
+        counting from the formals skipped exactly those indices.
+        Register-passed only: stack-passed varargs (i386 cdecl) are not covered
+        here -- that overlaps #324. Degrades to [] on any BN-API shortfall, so
+        it never fabricates a frontier.
+        """
+        out: list[dict[str, Any]] = []
+        for callee in self._under_recovered_callees(ins):
+            leaf = self._under_recovered_frontier(func, ins, callee,
+                                                  len(params), tainted)
+            if leaf is not None:
+                out.append(leaf)
+        return out
+
+    def _under_recovered_frontier(self, func: Any, ins: Any, callee: Any,
+                                  recovered: int, tainted: set) -> dict[str, Any] | None:
+        try:
             cc = (getattr(callee, "calling_convention", None)
                   or self.bv.platform.default_calling_convention)
             arg_regs = list(getattr(cc, "int_arg_regs", []) or [])
-            n = len(list(getattr(callee, "parameter_vars", []) or []))
+            n = int(recovered)
             if n >= len(arg_regs):
-                return None  # every ABI arg register is accounted for by a param
+                return None  # every ABI arg register is accounted for already
             arch = self.bv.arch
-            # Only the FIRST unrecovered arg slot (register position == recovered
-            # arity n). Checking higher slots too would false-positive on a legit
-            # low-arity callee whose r1..r3 merely hold tainted leftovers; the
-            # first-missing register being SET UP (written) tainted right before
-            # the call in the call's own block is the tight "BN under-recovered an
-            # actual argument" signal (e.g. Thumb 0-arity: r0 = argv[1]; call f()).
-            try:
-                first_missing = arch.get_reg_index(arg_regs[n])
-            except Exception:
-                return None
-            missing = {first_missing: n}
             blk = getattr(ins, "il_basic_block", None)
             if blk is None:
+                return None
+            # Register storage -> argument position, for every index past the
+            # recovered arity. Each is judged on its OWN evidence; the decisive
+            # gate below is per register, so a legit low-arity callee whose
+            # later registers merely hold leftovers still raises nothing.
+            missing: dict[Any, int] = {}
+            for pos in range(n, len(arg_regs)):
+                try:
+                    missing[arch.get_reg_index(arg_regs[pos])] = pos
+                except Exception:
+                    continue
+            if not missing:
                 return None
             # BN's VariableSourceType.RegisterVariableSourceType == 1 (this module
             # imports no binaryninja symbols, so compare the stable enum int).
             REGISTER_SOURCE = 1
+
             def _reads_tainted(cur: Any) -> bool:
                 for r in ssa_reads(cur):
                     if (var_key(r), getattr(r, "version", None)) in tainted \
@@ -5741,7 +6110,7 @@ class TaintEngine:
             # node OR its defining instruction reads a tainted value (e.g.
             # ``r0 = [argv+4]`` -- the load result isn't auto-tainted, but the
             # argv read is), mirroring the engine's read_taint/arg_taint check.
-            last: dict[int, Any] = {}
+            last: dict[Any, Any] = {}
             for cur in blk:
                 if getattr(cur, "instr_index", -1) >= getattr(ins, "instr_index", -1):
                     break
@@ -5756,10 +6125,8 @@ class TaintEngine:
                     storage = getattr(var, "storage", None)
                     if is_reg and storage in missing:
                         last[storage] = (cur, var_key(w), getattr(w, "version", None))
-            for storage, (cur, key, ver) in last.items():
-                if not ((key, ver) in tainted or (key, None) in tainted or _reads_tainted(cur)):
-                    continue
-                pos = missing[storage]
+            evidence: list[dict[str, Any]] = []
+            for storage, pos in sorted(missing.items(), key=lambda kv: kv[1]):
                 # Decisive gate against false frontiers: only flag when the callee
                 # actually READS this register as an input (read-before-write in its
                 # body). A tainted value merely *sitting* in a non-argument register
@@ -5769,16 +6136,97 @@ class TaintEngine:
                 # is what separates a genuine under-recovered arg from a leftover.
                 if not self._reg_reads_as_input(callee, arg_regs[pos]):
                     continue
-                return self._frontier_leaf(
-                    ins, callee, [pos],
-                    f"in-binary callee {getattr(callee, 'name', '?')} reads arg "
-                    f"register {arg_regs[pos]} as an input but BN recovered only "
-                    f"{n} parameter(s), so a tainted value passed there is not in "
-                    f"the call's args and the flow into the callee was not followed "
-                    f"-- the callee's args were under-recovered (taint #381)")
+                written = last.get(storage)
+                if written is not None:
+                    cur, key, ver = written
+                    if (key, ver) in tainted or (key, None) in tainted \
+                            or _reads_tainted(cur):
+                        evidence.append({"index": pos, "register": str(arg_regs[pos]),
+                                         "via": "block_write"})
+                    continue
+                # Nothing in this block WROTE the register -- and an optimised
+                # build writes nothing when the value is already there. The
+                # register then carries this function's own entry value, which
+                # the IL can prove (no definition reaches the call, and nothing
+                # that may run first could have clobbered it) (review F5).
+                for operand in self._abi_arg_operands(func, ins, pos, allow_entry=True,
+                                                      entry_only=True):
+                    src = getattr(operand, "src", None)
+                    key = var_key(src)
+                    ver = getattr(src, "version", None)
+                    if (key, ver) in tainted or (key, None) in tainted:
+                        evidence.append({"index": pos, "register": str(arg_regs[pos]),
+                                         "via": "entry_value"})
+                        break
+            if evidence:
+                return self._under_recovered_leaf(ins, callee, evidence, n)
         except Exception:
             return None
         return None
+
+    def _under_recovered_leaf(self, ins: Any, callee: Any, evidence: list,
+                              recovered: int) -> dict[str, Any]:
+        """The #381 frontier, with the evidence behind it named.
+
+        ONE leaf per call and callee, listing every missing argument index
+        proven to carry taint. Each row's ``via`` says HOW: ``block_write`` --
+        the call's own block set that register up; ``entry_value`` -- nothing
+        defines it and nothing that could run first may have clobbered it, so
+        it still holds what this function was entered with. No formal is
+        invented for the callee and no sink is claimed: the flow stops here
+        and says so.
+        """
+        rows = sorted(evidence, key=lambda e: int(e["index"]))
+        indices = [int(e["index"]) for e in rows]
+        regs = [str(e["register"]) for e in rows]
+        leaf = self._frontier_leaf(
+            ins, callee, indices,
+            f"in-binary callee {getattr(callee, 'name', '?')} reads arg "
+            f"register(s) {', '.join(regs)} as an input but BN recovered only "
+            f"{recovered} parameter(s), so a tainted value passed there is not in "
+            f"the call's args and the flow into the callee was not followed "
+            f"-- the callee's args were under-recovered (taint #381)")
+        leaf.update(cause="arg_under_recovered", register=regs[0],
+                    argument_index=indices[0], recovered_params=int(recovered),
+                    via=str(rows[0]["via"]), registers=regs, evidence=rows)
+        return leaf
+
+    def _abi_budget_leaf(self, func: Any, ins: Any,
+                         name: str | None) -> dict[str, Any] | None:
+        """The boundary for an ABI provenance scan that ran out of budget.
+
+        The scan asks what an argument register carries into this call by
+        walking every block that can reach it. When that closure is cut short,
+        the blocks it did not read are exactly where a clobbering call would
+        be: it established neither that the register survived nor that it did
+        not. Failing closed means saying so -- a blocking leaf and a run-level
+        truncation cause -- rather than reading the absent positive as "no
+        argument here" (review F10).
+        """
+        sites = getattr(self, "_abi_budget_sites", None) or ()
+        addr = int(getattr(ins, "address", -1))
+        start = int(getattr(func, "start", 0))
+        rows = sorted({(int(i), str(r)) for f, a, i, r in sites
+                       if f == start and a == addr})
+        if not rows:
+            return None
+        self._truncated = True
+        self._truncation_causes.add("abi_provenance_budget")
+        shown = self._prose_name(name) if name else hex(addr)
+        return {
+            "kind": "abi_provenance_budget",
+            "address": hex(addr),
+            "callee": {"name": str(name or hex(addr)), "address": hex(addr)},
+            "argument_indices": [i for i, _r in rows],
+            "registers": [r for _i, r in rows],
+            "il_text": str(ins),
+            "detail": (
+                f"the walk could not establish what argument register(s) "
+                f"{', '.join(r for _i, r in rows)} carry into the call to {shown}: "
+                "the search for everything that can run before this call ran out of "
+                "its block budget, so a tainted value may enter this call unseen -- "
+                "whether it does is UNKNOWN, not clear"),
+        }
 
     def _reg_reads_as_input(self, callee: Any, reg_name: str) -> bool:
         """True if *callee* consumes register *reg_name* as an incoming value --
@@ -9786,13 +10234,23 @@ class TaintEngine:
                 if argidx < len(params):
                     hit = arg_taint(params[argidx])
                 else:
+                    # An argument register with no definition at all still
+                    # carries the function's ENTRY value when nothing that can
+                    # run first may have clobbered it, which the seed bridge
+                    # (a reaching DEFINITION) has nothing to return for. Both
+                    # shapes come back as operands here.
                     try:
-                        reg, seeds = self._reaching_arg_seeds_via_reg(func, [ins], argidx)
+                        operands = self._abi_arg_operands(
+                            func, ins, argidx,
+                            allow_entry=self._call_enters_unread_body(ins))
                     except Exception:
                         return [], None
+                    reg = (operands[0].register if operands
+                           else self._arg_register(func, argidx))
                     hit = []
-                    for v, _site in seeds:
-                        nodes = arg_taint(_RegisterOperand(v, reg))
+                    for _op in operands:
+                        v = _op.src
+                        nodes = arg_taint(_op)
                         if not nodes and self._var_buffer_tainted(ssaf, v, tainted, set(), 0):
                             # A pointer reaching a tainted buffer the store/load
                             # keys do not name (a PHI of allocations): cite it.
@@ -10301,6 +10759,12 @@ class TaintEngine:
                     # call (round-22 review ZERO-01).
                     continue
                 hit = self._token_hit_node(ssaf, params, frm, tainted)
+                if hit is None:
+                    # The source argument is one BN dropped from this call
+                    # (no callee prototype to recover it from). The rule
+                    # still applies when the calling convention's register
+                    # proves the value it carries is tainted.
+                    hit = self._abi_token_hit(func, ins, params, frm, arg_taint)
                 applied = False
                 if hit is not None:
                     applied = apply_token(to, [hit])
@@ -10597,6 +11061,61 @@ class TaintEngine:
 
                     # 3) resolve the target(s) and descend.
                     tainted_args = {i: arg_taint(p) for i, p in enumerate(params) if arg_taint(p)}
+                    # The MLIL call's parameters come from the CALLEE's
+                    # prototype; a callee Binary Ninja never analysed has none,
+                    # so an optimised build leaves `unread_body()` with NO
+                    # arguments at all while the machine code plainly passes
+                    # one, and the walk reported a clean all-clear at a call
+                    # it could see taint enter.
+                    #
+                    # Each MISSING index is asked on its own (review F7): a
+                    # recovered prefix says nothing about the arguments past
+                    # it, and a constant arg 0 with a tainted arg 1 the call
+                    # does not carry is exactly the shape that certified an
+                    # unread body.
+                    #
+                    # What counts as proof depends on what BN already did.
+                    # With NO recovered argument at all it made no arity claim,
+                    # so a dominating definition or an un-clobbered entry value
+                    # both answer. Past a recovered PREFIX only the entry value
+                    # does: BN recovers from the registers written at the call
+                    # site, so a register past the prefix that the body writes
+                    # is scratch as often as an argument -- at -O0 gcc stages
+                    # `b` through `rdx` before moving it to `rsi`, and reading
+                    # `rdx` as "argument 2" of a two-argument call invents one.
+                    # The scan stops at the first register nothing proves,
+                    # because arguments fill the convention's registers in
+                    # order, and nothing is ever inferred from a clobber list.
+                    # Every index recovered this way is disclosed on the
+                    # boundary below and in a caveat, so a reader can tell an
+                    # argument BN recovered from one the ABI proved.
+                    abi_recovered: dict[int, list] = {}
+                    if self._call_enters_unread_body(ins):
+                        for _i in range(len(params), self._n_arg_registers(func)):
+                            _ops = self._abi_arg_operands(
+                                func, ins, _i, allow_entry=True,
+                                entry_only=bool(params))
+                            if not _ops:
+                                break
+                            for _op in _ops:
+                                _hit = arg_taint(_op)
+                                if _hit:
+                                    abi_recovered[_i] = _hit
+                                    break
+                    if abi_recovered:
+                        tainted_args.update(abi_recovered)
+                        add_assumption(
+                            f"call at {hex(int(getattr(ins, 'address', 0)))} to "
+                            f"{self._prose_name(name) if name else 'an unnamed callee'} "
+                            f"recovered tainted argument(s) {sorted(abi_recovered)} from "
+                            f"the calling convention's register(s) "
+                            + ", ".join(str(self._arg_register(func, _i))
+                                        for _i in sorted(abi_recovered))
+                            + f": Binary Ninja recovered {len(params)} argument(s) for "
+                            "this call, fewer than the code passes")
+                    _budget = self._abi_budget_leaf(func, ins, name)
+                    if _budget is not None and _budget not in leaves:
+                        leaves.append(_budget)
                     # IC03 / TT-PILOT-FW03-01: tainted bytes that landed in a
                     # keyable writable global are PROGRAM state. This walk keeps
                     # taint per function and hands nothing but arguments across a
@@ -10614,14 +11133,25 @@ class TaintEngine:
                     if not tainted_args:
                         # The MLIL call recovered no tainted arg -- but BN may have
                         # under-recovered the callee's arity (Thumb 0-arity miss /
-                        # variadic), dropping a tainted arg-register value that never
-                        # appears in `params`. Emit an honest frontier instead of a
-                        # silent false-negative (#381). Unmodeled only: a model that
-                        # armed this call owns that story itself (#577).
-                        if model is None:
-                            fr = self._unrecovered_arg_frontier(ins, tainted)
-                            if fr is not None and fr not in leaves:
+                        # variadic, or an optimised call that writes no argument
+                        # register because the values are already in place),
+                        # dropping a tainted arg-register value that never appears
+                        # in `params`. Emit an honest frontier instead of a silent
+                        # false-negative (#381). Asked for a MODELED call too: a
+                        # model describes what the callee does with the arguments
+                        # it is given, and says nothing about an argument this call
+                        # does not carry -- the gate below is tight enough that a
+                        # model cannot make the hole go away (review F5).
+                        for fr in self._unrecovered_arg_frontiers(func, ins, params,
+                                                                  tainted):
+                            if fr not in leaves:
                                 leaves.append(fr)
+                        # An ABI scan that ran out of budget proves nothing in
+                        # either direction, and this is the branch that would
+                        # otherwise read it as "no tainted argument here".
+                        _budget = self._abi_budget_leaf(func, ins, name)
+                        if _budget is not None and _budget not in leaves:
+                            leaves.append(_budget)
                         continue
                     # descend each callsite once per tainted-arg set (the fixpoint
                     # revisits instructions; without this, findings would duplicate)
@@ -10693,7 +11223,7 @@ class TaintEngine:
                         # resolved candidate carries a model -- stopping at the veneer
                         # and minting the same false all-clear #807 is about. Descent is
                         # independent of the model: following never costs a model.
-                        rnm = rmk = rmd = None
+                        rnm = rmk = rmd = resolved = None
                         descend_fn = cfn
                         descend_internal = cfn_internal
                         if cfn is not None and not cfn_internal:
@@ -10802,7 +11332,13 @@ class TaintEngine:
                             # (oversized, failed lift) lands here too, and is not
                             # "external". Name it as what it is, with the remedy,
                             # and record it as an unread body (#811). The phrase
-                            # keeps "has no model": taint_result's gate keys on it.
+                            # keeps "has no model": taint_result's gate keys on
+                            # it. This arm still owns the `no_mlil` shape, which
+                            # only EXISTS as an in-binary body when nothing
+                            # modeled the name (see `_unread_body_target`); the
+                            # measured skip below is recorded whether or not a
+                            # model matched, and adding the same name twice to a
+                            # set is a no-op.
                             _reason = self._not_internal_reason(descend_fn)
                             _unread = self._unanalysed_body_phrase(_reason)
                             _who = nm or hex(taddr)
@@ -10874,6 +11410,44 @@ class TaintEngine:
                                 }
                                 if _stop_leaf not in leaves:
                                     leaves.append(_stop_leaf)
+                        # IC05 / BN6-C008: BODY COVERAGE IS INDEPENDENT OF THE
+                        # MODEL DB. The arm above runs only when NOTHING in the
+                        # chain is modeled, so any matching overlay -- a
+                        # truthful `arg:0 -> ret`, an empty `{}`, a reflexive
+                        # rule that states nothing -- erased the unread-body
+                        # accounting and turned an analysis_incomplete,
+                        # non-clear answer into a complete all-clear. A model is
+                        # an overlay on a body (#807): it states what it states
+                        # and never establishes that Binary Ninja read the rest
+                        # of the body. IC03 settled exactly this for the
+                        # tainted-GLOBAL continuation (BN21-REACH-01); this is
+                        # the tainted-ARGUMENT descent it left alone.
+                        #
+                        # Resolution, not model lookup, decides: a veneer is
+                        # followed to the body it fronts (which the arm above
+                        # never classified either, so an unmodeled thunk onto a
+                        # skipped body read as a plain external), an import has
+                        # no in-binary implementation and is never named here,
+                        # and a descended body is read rather than disclosed.
+                        # DISCLOSURE ONLY: the model's propagation and return
+                        # semantics were applied above and are left exactly as
+                        # they are, and nothing is invented for a body nobody
+                        # read.
+                        if not descend_internal:
+                            _unread_target = self._unread_body_target(cfn, resolved)
+                            if _unread_target is not None:
+                                _ufn, _ureason = _unread_target
+                                _uleaf = self._unread_body_leaf(
+                                    ins, _ufn, _ureason, tainted_args,
+                                    # The veneer is named only when the body it
+                                    # fronts is a DIFFERENT function; the name
+                                    # recorded is always the body's own, which
+                                    # is the function an agent must analyse.
+                                    via_name=(nm if _ufn is not cfn else None),
+                                    modeled=(md is not None or rmd is not None),
+                                    abi_recovered=sorted(abi_recovered))
+                                self._analysis_incomplete.add(str(_uleaf["callee"]["name"]))
+                                _add_leaf(leaves, _uleaf)
                         # EXACTLY ONE entry per resolved CANDIDATE, so the append
                         # sits after the branch chain rather than in each arm. Base
                         # appended through three mutually-exclusive branches; the two
