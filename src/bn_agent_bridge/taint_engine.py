@@ -447,7 +447,7 @@ class TaintEngine:
         self._global_layout_truncated: set[int] = set()
         self._ret_ptr_stack: set[int] = set()
         self._reaches_object_cache: dict[tuple[int, int], bool] = {}
-        self._named_boundary_cache: dict[tuple[int, int], bool] = {}
+        self._named_boundary_cache: dict[tuple[int, int, bool], bool] = {}
         self._param_stack: set[tuple[int, int]] = set()
         self._direct_callee_cache: dict[int, tuple] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
@@ -7241,11 +7241,22 @@ class TaintEngine:
             return False
         if canon_arm == canon_root:
             return True
-        # ...or the two sit in ONE run of storage: no other NAMED object
-        # between them. A same-section neighbour with named objects in
-        # between is disjoint storage, whatever the enclosing-candidate
-        # search admits, and treating it as "not there yet" erased the
-        # offset the only feasible arm established (round-27 review F73).
+        if int(value) < int(base_ga):
+            # BELOW this object, an arm is part of the same storage when
+            # it is one of the ENCLOSING candidates the overlap test
+            # already uses -- `before = tracked + 48` is, and a NAMED alias
+            # is no less an alias for carrying a symbol (round-29 review
+            # F73). Storage the enclosing search does not admit is not
+            # this object's; where it does admit it, the join goes to
+            # unknown, which is the honest direction.
+            candidates, _exhausted = self._preceding_objects(canon_root)
+            return canon_arm in candidates
+        # ABOVE it, an enclosing candidate is not the question -- every
+        # later object lists this one as a predecessor -- so the test is
+        # the boundary: no NAMED object between them, the arm's own symbol
+        # included, because an arm that names storage of its own IS that
+        # storage (round-27 and round-28 review F73). An alias INSIDE this
+        # object never reaches here; the root test answered it already.
         return not self._named_boundary_between(int(value), int(base_ga))
 
     def _is_named_object(self, addr: int) -> bool:
@@ -7258,7 +7269,8 @@ class TaintEngine:
         except Exception:
             return False
 
-    def _named_boundary_between(self, arm: int, base: int) -> bool:
+    def _named_boundary_between(self, arm: int, base: int,
+                                include_arm: bool = True) -> bool:
         """Whether a NAMED object separates *arm* from the object at *base*.
 
         That is the boundary the object analysis respects everywhere else:
@@ -7268,13 +7280,13 @@ class TaintEngine:
         let `choose(middle, other)` read as one storage and erase the only
         feasible arm's offset (round-28 review F73). The BASE's own symbol
         does not: that is the object being asked about."""
-        if arm != base and self._is_named_object(arm):
+        if include_arm and arm != base and self._is_named_object(arm):
             return True
         a, b = arm, base
         lo, hi = (a, b) if a <= b else (b, a)
         if lo == hi:
             return False
-        key = (int(arm), int(base))
+        key = (int(arm), int(base), bool(include_arm))
         cached = self._named_boundary_cache.get(key)
         if cached is not None:
             return cached

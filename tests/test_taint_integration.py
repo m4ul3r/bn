@@ -4782,7 +4782,11 @@ char gap[256] __attribute__((section(".same"))) = "gap";
 char other[256] __attribute__((section(".same"))) = "other";
 char output[512] __attribute__((section(".out"))) = "out";
 volatile int choice;
+extern char before[];
 extern char middle[];
+/* `before` is a NAMED interior alias of this object's own storage -- a
+   symbol does not make it separate storage (round-29 review F73). */
+__asm__(".globl before\n.set before,tracked+48\n.type before,@object\n.size before,1\n");
 __asm__(".globl middle\n.set middle,tracked+64\n.type middle,@object\n.size middle,1\n");
 N void bounded_reader(void) { strlcpy(output, tracked, 1); }
 N void wide_chk_reader(void) { __wmemcpy_chk((wchar_t *)output, (wchar_t *)tracked, 32, 256); }
@@ -4793,11 +4797,14 @@ N void phi_reader(void) { system(advance16(choose_pointer())); }
 N void strl_case(char *s) { memcpy(middle, s, 64); bounded_reader(); }
 N void wide_chk_case(char *s) { memcpy(middle, s, 64); wide_chk_reader(); }
 N void phi_case(char *s) { memcpy(middle, s, 64); phi_reader(); }
-N char *choose_inside(void) { return choice ? middle : tracked + 48; }
+N char *choose_inside(void) { return choice ? middle : tracked + 40; }
+N char *choose_alias(void) { return choice ? middle : before; }
 N void base_reader(void) { system(advance16(choose_base())); }
 N void inside_reader(void) { system(advance16(choose_inside())); }
+N void alias_reader(void) { system(advance16(choose_alias())); }
 N void base_case(char *s) { memcpy(middle, s, 64); base_reader(); }
 N void inside_case(char *s) { memcpy(middle, s, 64); inside_reader(); }
+N void alias_case(char *s) { memcpy(middle, s, 64); alias_reader(); }
 int main(void) { return 0; }
 """
 
@@ -4830,7 +4837,7 @@ def test_a_bounded_copy_capacity_does_not_bound_its_source(tmp_path,
     src.write_text(_SCOPE_SRC)
     binary = tmp_path / f"r10scope{opt[-1]}"
     _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin",
-                           "-fno-inline", "-g0"])
+                           "-fno-inline", "-g0", "-fno-toplevel-reorder"])
     target = shared_bn.load(binary, copy=False)
 
     def gmc(fn):
@@ -4857,11 +4864,14 @@ def test_a_bounded_copy_capacity_does_not_bound_its_source(tmp_path,
     row = next(r for lf in leaves for r in lf["references"]
                if r["display_name"] == "base_reader")
     assert (row["offset"], row["offset_known"]) == (16, True), row
-    # ...while an arm inside THIS object's own storage keeps the join open
-    _result, leaves = gmc("inside_case")
-    row = next(r for lf in leaves for r in lf["references"]
-               if r["display_name"] == "inside_reader")
-    assert row["offset_known"] is False, row
+    # ...while an arm inside THIS object's own storage keeps the join
+    # open, whether or not that arm carries a SYMBOL of its own
+    for fn, name in (("inside_case", "inside_reader"),
+                     ("alias_case", "alias_reader")):
+        _result, leaves = gmc(fn)
+        row = next(r for lf in leaves for r in lf["references"]
+                   if r["display_name"] == name)
+        assert row["offset_known"] is False, (fn, row)
 
 
 def test_a_wide_count_follows_the_target_wchar_abi(tmp_path, shared_bn):
