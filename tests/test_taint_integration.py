@@ -62,6 +62,28 @@ def _compile(src: Path, out: Path, extra_cflags: list[str] | None = None) -> Non
         )
 
 
+def _dynamic_symbols(path: Path) -> str:
+    """The binary's dynamic symbol table, or a loud build error.
+
+    Used only to prove which libc spelling the compiler actually emitted: an
+    environment where the C23 spelling is absent must skip (loudly under
+    strict mode), never silently pass as if the alias had been exercised.
+    """
+    nm = shutil.which("nm")
+    if nm is None:
+        raise FixtureBuildError(
+            f"'nm' not found; Binary Ninja is installed, so this lane is meant "
+            f"to run, but {path.name}'s imports cannot be inspected. Install binutils."
+        )
+    res = subprocess.run([nm, "-D", str(path)], capture_output=True, text=True,
+                         timeout=120.0)
+    if res.returncode != 0:
+        raise FixtureBuildError(
+            f"nm -D failed for {path.name} (exit {res.returncode}): {res.stderr.strip()}"
+        )
+    return res.stdout
+
+
 def _resolve_addr(bridge, name: str) -> str:
     data = _bn_json(bridge, "function", "search", name)
     # function search returns a paged envelope {kind, items, total, ...} (#59/#275);
@@ -1149,6 +1171,155 @@ int main(void) { char b[16], c[16]; return fwd(0, 0, b, c); }
                 if lf["kind"] == "format_destination_unrecovered"], result
         assert result["diagnostics"]["safe_to_report_all_clear"] is False
         assert _run_or_check_template(shared_bn, _forward_prose(result))[0] >= 1
+
+
+_FIVE_CONVERSION_SOURCE = """
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Five conversions, four modeled destinations. `e` is the format-proven fifth
+   output; the builtin sscanf model's unrolled run ends at *arg:5, so nothing
+   seeds it and `system(e)` is invisible without the format shortfall leaf. */
+__attribute__((noinline)) int parse_five(const char *line) {
+    int a, b, c, d;
+    char e[8];
+    int r = sscanf(line, "%d %d %d %d %7s", &a, &b, &c, &d, e);
+    system(e);
+    return r + a;
+}
+
+/* Exactly four conversions: the modeled run covers the call, so this is the
+   capped optional-slot shape and must stay silent. */
+__attribute__((noinline)) int parse_cap4(const char *line) {
+    int a, b, c, d;
+    return sscanf(line, "%d %d %d %d", &a, &b, &c, &d);
+}
+
+/* The parse input is unrelated to the selected source: `line` is only
+   returned. The five-conversion gap is real but cannot hide a flow from this
+   source, so it must not become a blocking frontier. */
+__attribute__((noinline)) int parse_unrelated(const char *line) {
+    int a, b, c, d;
+    char e[8];
+    int r = sscanf("1 2 3 4 x", "%d %d %d %d %7s", &a, &b, &c, &d, e);
+    return r + (line ? *line : 0);
+}
+
+/* A source-level scanf under C23 (the `call:` preset path). */
+__attribute__((noinline)) int parse_scan_preset(void) {
+    int a, b, c, d;
+    char e[8];
+    return scanf("%d %d %d %d %7s", &a, &b, &c, &d, e) + e[0];
+}
+
+int main(void) {
+    return parse_five("1 2 3 4 x") + parse_cap4("1 2 3 4")
+         + parse_unrelated("z") + parse_scan_preset();
+}
+"""
+
+
+@pytest.mark.parametrize(("cflags", "symbol"), [
+    (["-std=gnu17"], "__isoc99_sscanf"),
+    (["-std=c2x"], "__isoc23_sscanf"),
+], ids=["c99", "c23"])
+def test_format_proven_fifth_destination_withholds_the_all_clear(tmp_path, shared_bn,
+                                                                 cflags, symbol):
+    """F6 on a real binary: four modeled destinations, a five-conversion
+    constant format. The fifth output (`e`, whose `system()` call is the
+    consequence) is lost by the arity-capped model whether BN recovered four
+    arguments or all five (the fifth is a stack argument on x86-64). Before
+    the independent format comparison no rule named that index, so the run was
+    a confident all-clear with the sink invisible."""
+    src = tmp_path / "scan5.c"
+    src.write_text(_FIVE_CONVERSION_SOURCE)
+    binary = tmp_path / ("scan5_" + symbol.lstrip("_"))
+    _compile(src, binary, cflags)
+    imports = _dynamic_symbols(binary)
+    if symbol not in imports:
+        refuse_silent_skip(
+            f"{symbol} is not emitted by this compiler/glibc; the C23 alias is "
+            "exercised by its synthetic symbol control, but this native spelling "
+            "needs glibc 2.38+ and a compiler with -std=c2x"
+        )
+    target = shared_bn.load(binary, copy=False)
+
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_five",
+                      "--source", "param:0")
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "format_destination_unrecovered"]
+    assert (leaf["destinations"], leaf["modeled"], leaf["missing"]) == (5, 4, 1), leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    # The lost fifth destination is not seeded, so its command sink is not
+    # reached -- the leaf is what stops the run from reading as clean.
+    assert not result["reached_sinks"], result["reached_sinks"]
+    assert "model covers or Binary Ninja recovered" in result["diagnostics"]["next_action"]
+
+    capped = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_cap4",
+                      "--source", "param:0")
+    assert not [lf for lf in capped["leaves"]
+                if lf["kind"] == "format_destination_unrecovered"], capped["leaves"]
+    assert capped["diagnostics"]["safe_to_report_all_clear"] is True, capped["diagnostics"]
+
+    unrelated = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                         "-f", "parse_unrelated", "--source", "param:0")
+    # The constant-input parse is unrelated to `--source param:0`, so the new
+    # format shortfall must not become a frontier. (A call that carries more
+    # actual destinations than the model run may still hit the pre-existing
+    # #851 residual assumption; that is not this check's leaf, and `leaves`
+    # stays empty.)
+    assert unrelated["leaves"] == [], unrelated["leaves"]
+
+    if symbol == "__isoc23_scanf":
+        preset = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", "parse_scan_preset", "--source",
+                          "call:__isoc23_scanf")
+        short = [lf for lf in preset["leaves"]
+                 if lf["kind"] == "format_destination_unrecovered"]
+        assert len(short) == 1, short
+        assert short[0]["callee"] == "scanf" and short[0]["missing"] == 1, short[0]
+        assert preset["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_synthetic_c23_alias_symbol_uses_the_same_model(tmp_path, shared_bn):
+    """Portable control for the C23 alias: define `__isoc23_sscanf` in the
+    binary itself (asm label, no libc 2.38 requirement) and call it with a
+    five-conversion constant format. The call resolves to the canonical sscanf
+    model, so the same F6 shortfall is disclosed on any glibc."""
+    src = tmp_path / "synth_c23.c"
+    src.write_text(r"""
+#include <stdio.h>
+#include <stdlib.h>
+
+int synth_sscanf(const char *, const char *, int *, int *, int *, int *, char *)
+    __asm__("__isoc23_sscanf");
+__attribute__((noinline)) int synth_sscanf(const char *s, const char *f,
+                                           int *a, int *b, int *c, int *d, char *e) {
+    return sscanf(s, f, a, b, c, d, e);
+}
+
+__attribute__((noinline)) int parse_synth(const char *line) {
+    int a, b, c, d;
+    char e[8];
+    int r = synth_sscanf(line, "%d %d %d %d %7s", &a, &b, &c, &d, e);
+    system(e);
+    return r + a;
+}
+
+int main(void) { return parse_synth("1 2 3 4 x"); }
+""")
+    binary = tmp_path / "synth_c23"
+    _compile(src, binary)
+    target = shared_bn.load(binary, copy=False)
+
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_synth",
+                      "--source", "param:0")
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "format_destination_unrecovered"]
+    assert (leaf["destinations"], leaf["modeled"], leaf["missing"]) == (5, 4, 1), leaf
+    assert leaf["callee"] == "sscanf"       # the canonical model key, via the alias
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 @pytest.mark.parametrize("arch", ["a64", "x64"])

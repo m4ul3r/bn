@@ -1285,6 +1285,66 @@ def test_scanf_family_models_carry_arity_capped_flag_851():
         )
 
 
+@pytest.mark.parametrize("spelling,canonical", [
+    ("__isoc23_scanf", "scanf"),
+    ("__isoc23_fscanf", "fscanf"),
+    ("__isoc23_sscanf", "sscanf"),
+    ("__isoc23_vsscanf", "vsscanf"),
+    # The decorations lookup_model already handled must keep working through
+    # the alias: a PLT-imported C23 spelling lands on the same model.
+    ("__isoc23_sscanf@plt", "sscanf"),
+    ("_isoc23_sscanf", "sscanf"),
+])
+def test_glibc_c23_scanf_spellings_alias_the_legacy_models(spelling, canonical):
+    # glibc 2.38+ exports __isoc23_* for the scanf family when a translation
+    # unit is built under C23. It is the same call -- same arguments, same
+    # destinations -- so it must resolve to the canonical model by the alias
+    # table, not to a hand-maintained duplicate that can drift in source,
+    # propagation, sink class or arity cap.
+    from bn_agent_bridge.taint_engine import load_models, lookup_model
+    models = load_models()
+    key, model = lookup_model(models, spelling)
+    assert key == canonical
+    assert model is models[canonical], (
+        f"{spelling} must share the {canonical} model object, not a copy"
+    )
+    # The semantics the alias inherits, pinned on the model it shares.
+    if canonical in ("scanf", "fscanf", "sscanf"):
+        assert model.get("arity_capped") is True
+        assert model["sink"]["class"] == "overflow_unbounded"
+        assert model["sink"].get("format_arg") is not None
+    else:
+        assert model.get("destinations_unmodeled") is True
+
+
+def test_c23_scanf_aliases_are_not_catalog_entries_of_their_own():
+    # The catalog is a catalog of MODELS, keyed by the canonical name the
+    # engine reports (and --present annotates). An alias is a way to reach
+    # that model, so the C23 spelling must not appear as a second row that
+    # could describe different semantics.
+    from bn_agent_bridge.taint_engine import load_models
+    models = load_models()
+    cat = build_catalog(models)
+    symbols = {e["symbol"] for e in cat["sources"]}
+    symbols |= {e["symbol"] for e in cat["propagators"]}
+    symbols |= {e["symbol"] for lst in cat["sinks_by_class"].values() for e in lst}
+    assert not any(s.startswith("__isoc23_") for s in symbols), symbols
+    assert {"scanf", "fscanf", "sscanf"} <= symbols
+
+
+def test_c23_scanf_spellings_share_the_variadic_format_recovery():
+    # The read-side format analysis normalizes the same glibc wrappers: the
+    # C23 spelling must find the format argument exactly where the legacy
+    # spelling does, or the model knows the callee but the call evidence and
+    # listing do not know where its format is.
+    from bn_agent_bridge import il_format
+    for spelling, fmt_idx in (("__isoc23_scanf", 0), ("__isoc23_fscanf", 1),
+                              ("__isoc23_sscanf", 1)):
+        assert il_format._variadic_format_family(spelling) == (fmt_idx, True)
+    assert il_format._variadic_format_family("__isoc23_vsscanf") is None  # va_list, not variadic
+    assert il_format._normalize_libc_name("__isoc23_sscanf@plt") == "sscanf"
+
+
 def test_scanf_arity_residual_marker_in_weak_seed_set_851():
     # #851: the engine emits an assumption containing "scanf_arity_residual"
     # when a call has more params than the model covers; taint_result must

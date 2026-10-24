@@ -554,8 +554,8 @@ FMT_AT = 0x402100
 class _StrBV(FBV):
     """FBV that resolves the one constant format string, read-only."""
 
-    def __init__(self, names, strings):
-        super().__init__(names)
+    def __init__(self, names, strings, funcs=None):
+        super().__init__(names, funcs)
         self._strings = strings
 
     def read(self, addr, length):
@@ -606,6 +606,161 @@ def test_sscanf_with_an_unreadable_format_claims_no_missing_slot(models):
     func, bv = _sscanf_func("%d %d", 2, const_fmt=False)
     result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
     assert not _missing(result)
+
+
+def test_a_five_conversion_dynamic_format_still_claims_no_missing_slot(models):
+    # The format operand is not a read-only constant, so its conversions are
+    # unknown: five conversions may or may not be what it writes, and the
+    # engine does not manufacture a destination to blame. (The separate
+    # `format_unchecked` frontier handles the sink question, not this one.)
+    func, bv = _sscanf_func("%d %d %d %d %d", 4, const_fmt=False)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert not [lf for lf in result["leaves"]
+                if lf["kind"] == "format_destination_unrecovered"]
+
+
+def _num_format(conversions: int) -> str:
+    return " ".join(["%d"] * conversions) if conversions else "token"
+
+
+@pytest.mark.parametrize("conversions", range(0, 5))
+def test_the_model_run_covers_formats_of_0_to_4_conversions_exactly(models, conversions):
+    # 0..4 conversions against the four-slot unrolled run and a call that
+    # passes exactly that many destinations: every format destination is both
+    # enumerated and recovered, so the optional slots past it stay silent.
+    func, bv = _sscanf_func(_num_format(conversions), conversions)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    kinds = [lf["kind"] for lf in result["leaves"]]
+    assert "format_destination_unrecovered" not in kinds, result["leaves"]
+    assert "model_destination_unrecovered" not in kinds, result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
+
+
+@pytest.mark.parametrize(("conversions", "ndest", "recovered", "missing"), [
+    (5, 4, 4, 1),     # BN recovered exactly the four slots the model enumerates
+    (5, 5, 5, 1),     # BN recovered all five; the MODEL is the shortfall
+    (6, 4, 4, 2),
+    (6, 6, 6, 2),     # ...and two recovered arguments the model never names
+])
+def test_a_format_proven_destination_beyond_the_model_run_is_a_boundary(
+        models, conversions, ndest, recovered, missing):
+    # IC04 follow-up (F6): the arity-capped run is unrolled to four
+    # destinations. A five-conversion format with only those four arguments
+    # recovered, or with all five recovered but only four modeled, proves one
+    # output the engine never seeds. It must be disclosed even though NO
+    # *arg:N rule exists at the missing index -- the rule loop can never see
+    # it, and the run used to return a clean all-clear.
+    func, bv = _sscanf_func(_num_format(conversions), ndest)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "format_destination_unrecovered"]
+    assert (leaf["destinations"], leaf["recovered"], leaf["modeled"], leaf["missing"]) == \
+        (conversions, recovered, 4, missing), leaf
+    assert not _missing(result)          # still not a per-slot guess
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_an_unrelated_constant_input_parse_is_not_a_blocking_frontier(models):
+    # `apply_model` runs for every call to a modeled callee. A five-conversion
+    # sscanf whose input is a CONSTANT does not carry the selected source into
+    # its destinations, so its model gap cannot make THIS run unsafe: the run
+    # must stay a clean all-clear instead of growing a frontier just because
+    # the call sits in the function. (The reviewer's clean_forward shape: the
+    # tainted parameter is only returned.)
+    line, l0 = _var("line")
+    fmt_arg = FExpr("MLIL_CONST_PTR", "'%d %d %d %d %7s'", constant=FMT_AT)
+    params = [FExpr("MLIL_CONST_PTR", "'1 2 3 4 x'", constant=0x402200), fmt_arg]
+    params += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}")) for i in range(4)]
+    instrs = [_call(0, 0x4011a0, SSCANF, "sscanf", params),
+              _ret(1, 0x4011b0, reads=[l0])]
+    func = FFunc("clean_forward", 0x401180, FSSAFunc(instrs), params=[line])
+    bv = _StrBV({SSCANF: "sscanf"}, {FMT_AT: "%d %d %d %d %7s"})
+
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert not [lf for lf in result["leaves"]
+                if lf["kind"] == "format_destination_unrecovered"], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
+
+
+def test_a_recovered_fifth_destination_is_still_unmodeled(models):
+    # The same fact from the other side: BN recovered the fifth destination
+    # (the forwarded pointer is a real argument), so this is NOT an argument
+    # recovery shortfall. The model still ends at *arg:5, and no seeded rule
+    # reaches the fifth output. One boundary, disclosed by count.
+    func, bv = _sscanf_func("%d %d %d %d %d", 5)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "format_destination_unrecovered"]
+    assert leaf["recovered"] == 5 and leaf["modeled"] == 4 and leaf["missing"] == 1
+    assert "model_destination_unrecovered" not in {lf["kind"] for lf in result["leaves"]}
+
+
+def test_a_format_proven_shortfall_in_a_descended_callee_is_disclosed(models):
+    # Root and descended calls run the same model application. A parse helper
+    # that receives the tainted string from its caller proves the same
+    # shortfall inside its own body, with the leaf at that body's call site.
+    inner_start, outer_start = 0x401180, 0x401200
+    inner, bv = _sscanf_func("%d %d %d %d %d", 4)
+    inner.start = inner_start
+    inner.name = "parse_inner"
+    inner.mlil.ssa_form.instructions[-1].src = [FExpr("MLIL_CONST", "0", constant=0)]
+    src, s0 = _var("src")
+    ret = FSSA(FVar("ret"), 1)
+    outer = FFunc("outer", outer_start, FSSAFunc([
+        _call(0, outer_start + 0x10, inner_start, "parse_inner",
+              [FExpr("MLIL_VAR_SSA", "src#0", reads=[s0])], writes=[ret]),
+        _ret(1, outer_start + 0x15),
+    ]), params=[src])
+    bv = _StrBV({0x401090: "sscanf"}, {FMT_AT: "%d %d %d %d %d"},
+                funcs={inner_start: inner})
+
+    result = te.TaintEngine(bv, models).forward(outer, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "format_destination_unrecovered"]
+    assert leaf["address"] == "0x4011a0"
+    assert leaf["missing"] == 1
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize(("fmt", "ndest", "destinations", "missing"), [
+    # A suppressed conversion consumes no destination: four assigning
+    # conversions are fully covered by the four-slot run...
+    ("%*d %d %d %d %d", 4, 4, 0),
+    # ...and five assigning ones (one suppressed ahead of them) fall one
+    # short, exactly as if the %* had not been written.
+    ("%*s %d %d %d %d %d", 4, 5, 1),
+    # %n is an ordinary assigning conversion; %*n is not.
+    ("%*n %d %d %d %d", 4, 4, 0),
+    ("%d %d %d %*s %d", 4, 4, 0),
+    ("%d %d %d %n", 3, 4, 1),
+    ("%d %n %d %d", 4, 4, 0),
+    # %% is literal, not a conversion.
+    ("%d%% %d %d %d", 4, 4, 0),
+])
+def test_suppressed_and_percent_n_conversions_are_counted_by_the_format(
+        models, fmt, ndest, destinations, missing):
+    func, bv = _sscanf_func(fmt, ndest)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    got = [lf for lf in result["leaves"]
+           if lf["kind"] == "format_destination_unrecovered"]
+    if missing:
+        [leaf] = got
+        assert (leaf["destinations"], leaf["missing"]) == (destinations, missing), leaf
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    else:
+        assert not got, result["leaves"]
+        assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_positional_format_proves_nothing_and_stays_silent(models):
+    # %n$ positions do not consume arguments in order, so the format cannot
+    # prove which slot a conversion writes -- the same silence as an
+    # unreadable format, never a guess.
+    func, bv = _sscanf_func("%5$d %1$d %2$d %3$d %4$d", 4)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert not [lf for lf in result["leaves"]
+                if lf["kind"] == "format_destination_unrecovered"]
 
 
 def _capped(capped: bool) -> dict:

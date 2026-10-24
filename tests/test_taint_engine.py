@@ -8755,6 +8755,89 @@ def test_sscanf_c99_spelling_is_not_bypassed_809(models):
     assert te.lookup_model(models, "__isoc99_sscanf")[0] == "__isoc99_sscanf"
 
 
+@pytest.mark.parametrize(("callee", "key"), [
+    ("__isoc23_sscanf", "sscanf"),
+    ("__isoc23_sscanf@plt", "sscanf"),
+])
+def test_sscanf_c23_spelling_is_not_bypassed_809(models, callee, key):
+    # glibc 2.38+ emits `__isoc23_sscanf` for a C23 translation unit, exactly
+    # as it emits `__isoc99_sscanf` for C99. The alias table makes the same
+    # model apply: the tainted input string still propagates into the second
+    # destination and reaches the command sink, with no unmodeled callee.
+    src = FVar("src", typ="char[0x40]")
+    a = FVar("a", typ="int32_t")
+    b = FVar("b", typ="char[0x40]")
+    SSCANF, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, f"{callee}(&src, fmt, &a, &b)", SSCANF,
+                  [FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+                   FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+                   FExpr("MLIL_ADDRESS_OF", "&a", src=a),
+                   FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+        _ext_call(1, 0x14, "system(&b)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+    ]
+    func = FFunc("parse_cfg_c23", 0x10, FSSAFunc(instrs), params=[src])
+    bv = FBV({SSCANF: callee, SYS: "system"})
+    result = te.TaintEngine(bv, models, unknown_call_policy="stop").forward(
+        func, [te.parse_locator("param:0")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+    assert not [l for l in result["leaves"] if l["kind"] == "unmodeled_callee"], result["leaves"]
+    assert te.lookup_model(models, callee)[0] == key
+
+
+def test_scanf_c23_spelling_seeds_every_destination_in_the_run_809(models):
+    # The source half: `--source call:__isoc23_scanf` must seed the same
+    # *arg:1..4 destination run as the legacy spelling, because both resolve
+    # to one model. An alias that returned a copy without the sources would
+    # seed nothing and report a confident empty result.
+    a = FVar("a", typ="int32_t")
+    b = FVar("b", typ="char[0x40]")
+    SCANF, SYS = 0x900, 0x901
+    instrs = [
+        _ext_call(0, 0x10, "__isoc23_scanf(fmt, &a, &b)", SCANF,
+                  [FExpr("MLIL_CONST_PTR", "0x700", constant=0x700),
+                   FExpr("MLIL_ADDRESS_OF", "&a", src=a),
+                   FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+        _ext_call(1, 0x14, "system(&b)", SYS,
+                  [FExpr("MLIL_ADDRESS_OF", "&b", src=b)]),
+    ]
+    func = FFunc("read_cfg_c23", 0x10, FSSAFunc(instrs), params=[])
+    bv = FBV({SCANF: "__isoc23_scanf", SYS: "system"})
+    result = te.TaintEngine(bv, models).forward(
+        func, [te.parse_locator("call:__isoc23_scanf")])
+    assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
+
+
+@pytest.mark.parametrize(("callee", "model_key", "stream"), [
+    ("__isoc23_scanf", "scanf", False),
+    ("__isoc23_fscanf", "fscanf", True),
+])
+def test_c23_call_preset_shortfall_is_reported_once(models, callee, model_key, stream):
+    # The `call:` preset resolves the C23 alias to the canonical model, and the
+    # application-level check names that same key. Seeding a source spelling
+    # used to produce two leaves at one address -- the raw `__isoc23_*` name
+    # from the preset and the canonical key from the model check -- because
+    # dictionary-equality dedup compares the callee string. One shortfall,
+    # one leaf, named by the model the engine actually applied.
+    args = ([FExpr("MLIL_VAR_SSA", "f#0", reads=[FSSA(FVar("f"), 0)])] if stream else [])
+    args.append(FExpr("MLIL_CONST_PTR", "fmt", constant=0x700))
+    args += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}")) for i in range(4)]
+    shown = ", ".join(["f", "fmt"] if stream else ["fmt"] + [f"&d{i}" for i in range(4)])
+    call = _ext_call(0, 0x10, f"{callee}({shown})", 0x900, args)
+    func = FFunc("scan_c23_preset", 0x10, FSSAFunc([call]), params=[])
+    bv = FBVStr({0x900: callee}, strings={0x700: "%d %d %d %d %7s"})
+    result = te.TaintEngine(bv, models).forward(
+        func, [te.parse_locator(f"call:{callee}")])
+
+    short = [lf for lf in result["leaves"]
+             if lf["kind"] == "format_destination_unrecovered"]
+    assert len(short) == 1, short
+    assert short[0]["callee"] == model_key
+    assert (short[0]["destinations"], short[0]["modeled"],
+            short[0]["recovered"], short[0]["missing"]) == (5, 4, 4, 1), short[0]
+
+
 def test_vsscanf_is_a_disclosed_partial_not_a_destination_source_809(models):
     # vsscanf's destinations live inside the va_list (arg2), which the engine
     # cannot walk, so the model is deliberately the honest-partial shape readv
