@@ -661,6 +661,28 @@ def test_a_format_proven_destination_beyond_the_model_run_is_a_boundary(
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
+def test_an_unrelated_constant_input_parse_is_not_a_blocking_frontier(models):
+    # `apply_model` runs for every call to a modeled callee. A five-conversion
+    # sscanf whose input is a CONSTANT does not carry the selected source into
+    # its destinations, so its model gap cannot make THIS run unsafe: the run
+    # must stay a clean all-clear instead of growing a frontier just because
+    # the call sits in the function. (The reviewer's clean_forward shape: the
+    # tainted parameter is only returned.)
+    line, l0 = _var("line")
+    fmt_arg = FExpr("MLIL_CONST_PTR", "'%d %d %d %d %7s'", constant=FMT_AT)
+    params = [FExpr("MLIL_CONST_PTR", "'1 2 3 4 x'", constant=0x402200), fmt_arg]
+    params += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}")) for i in range(4)]
+    instrs = [_call(0, 0x4011a0, SSCANF, "sscanf", params),
+              _ret(1, 0x4011b0, reads=[l0])]
+    func = FFunc("clean_forward", 0x401180, FSSAFunc(instrs), params=[line])
+    bv = _StrBV({SSCANF: "sscanf"}, {FMT_AT: "%d %d %d %d %7s"})
+
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert not [lf for lf in result["leaves"]
+                if lf["kind"] == "format_destination_unrecovered"], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
+
+
 def test_a_recovered_fifth_destination_is_still_unmodeled(models):
     # The same fact from the other side: BN recovered the fifth destination
     # (the forwarded pointer is a real argument), so this is NOT an argument

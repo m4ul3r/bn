@@ -9621,10 +9621,30 @@ class TaintEngine:
                 # (no *arg:N rule reaches the unrecovered-destination path to
                 # notice it). Compare here, once per call site, rather than
                 # only inside a REACHED rule that happens to name the index.
-                short = self._format_destination_shortfall(
-                    ins, ssaf, mkey or name or "?", model, params)
-                if short is not None and short not in leaves:
-                    leaves.append(short)
+                #
+                # Relevance gate: `apply_model` runs for EVERY call to a
+                # modeled callee, so a constant-input parse unrelated to the
+                # selected source must not block the run's all-clear. The
+                # shortfall only matters when taint reaches an argument this
+                # model reads its destinations FROM (sscanf's input string,
+                # `*arg:0`) or a declared tainted/destination input. A
+                # source-only scanf/fscanf has neither -- its stdin/stream is
+                # not an argument -- so its `call:` preset (which seeds the
+                # run) is the path that discloses the shortfall.
+                input_args: set[int] = set()
+                for rule in model.get("propagates") or []:
+                    frm = rule.get("from")
+                    if isinstance(frm, str) and frm.startswith(("*arg:", "arg:")):
+                        idx = _try_arg_index(frm)
+                        if idx is not None:
+                            input_args.add(idx)
+                input_args.update(i for i in (model.get("sink") or {}).get("tainted_args") or []
+                                  if isinstance(i, int) and not isinstance(i, bool))
+                if any(i < len(params) and arg_taint(params[i]) for i in input_args):
+                    short = self._format_destination_shortfall(
+                        ins, ssaf, mkey or name or "?", model, params)
+                    if short is not None and short not in leaves:
+                        leaves.append(short)
 
             def apply_token(tok, parents):
                 # Tail calls have no SSA result: a modeled return instead exits
@@ -11643,7 +11663,7 @@ class TaintEngine:
                 elif len(calls) > 1:
                     add_assumption(f"{len(calls)} callsites of {self._prose_name(callee)}; seeded from all")
                 self._seed_callsites += len(calls)   # #559 frontier diagnostics
-                _, model = lookup_model(self.models, callee)
+                mkey, model = lookup_model(self.models, callee)
                 src_defs = (model or {}).get("sources") or []
                 if not src_defs:
                     raise TaintError(
@@ -11653,7 +11673,14 @@ class TaintEngine:
                     )
                 for c in calls:
                     params = self._call_params(c)
-                    short = self._format_destination_shortfall(c, ssaf, callee, model, params)
+                    # Name the canonical model key, not the raw locator: the
+                    # application-level check uses the key too, so the two
+                    # paths produce the SAME leaf dict and dictionary-equality
+                    # dedup keeps one at a call site. With the raw spelling
+                    # (`call:__isoc23_scanf`) the same shortfall used to be
+                    # reported twice, once under each name.
+                    short = self._format_destination_shortfall(
+                        c, ssaf, mkey or callee, model, params)
                     if short is not None:
                         add_leaf(short)
                     for sd in src_defs:

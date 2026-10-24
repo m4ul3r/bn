@@ -1196,7 +1196,27 @@ __attribute__((noinline)) int parse_cap4(const char *line) {
     return sscanf(line, "%d %d %d %d", &a, &b, &c, &d);
 }
 
-int main(void) { return parse_five("1 2 3 4 x") + parse_cap4("1 2 3 4"); }
+/* The parse input is unrelated to the selected source: `line` is only
+   returned. The five-conversion gap is real but cannot hide a flow from this
+   source, so it must not become a blocking frontier. */
+__attribute__((noinline)) int parse_unrelated(const char *line) {
+    int a, b, c, d;
+    char e[8];
+    int r = sscanf("1 2 3 4 x", "%d %d %d %d %7s", &a, &b, &c, &d, e);
+    return r + (line ? *line : 0);
+}
+
+/* A source-level scanf under C23 (the `call:` preset path). */
+__attribute__((noinline)) int parse_scan_preset(void) {
+    int a, b, c, d;
+    char e[8];
+    return scanf("%d %d %d %d %7s", &a, &b, &c, &d, e) + e[0];
+}
+
+int main(void) {
+    return parse_five("1 2 3 4 x") + parse_cap4("1 2 3 4")
+         + parse_unrelated("z") + parse_scan_preset();
+}
 """
 
 
@@ -1241,6 +1261,25 @@ def test_format_proven_fifth_destination_withholds_the_all_clear(tmp_path, share
     assert not [lf for lf in capped["leaves"]
                 if lf["kind"] == "format_destination_unrecovered"], capped["leaves"]
     assert capped["diagnostics"]["safe_to_report_all_clear"] is True, capped["diagnostics"]
+
+    unrelated = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                         "-f", "parse_unrelated", "--source", "param:0")
+    # The constant-input parse is unrelated to `--source param:0`, so the new
+    # format shortfall must not become a frontier. (A call that carries more
+    # actual destinations than the model run may still hit the pre-existing
+    # #851 residual assumption; that is not this check's leaf, and `leaves`
+    # stays empty.)
+    assert unrelated["leaves"] == [], unrelated["leaves"]
+
+    if symbol == "__isoc23_scanf":
+        preset = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", "parse_scan_preset", "--source",
+                          "call:__isoc23_scanf")
+        short = [lf for lf in preset["leaves"]
+                 if lf["kind"] == "format_destination_unrecovered"]
+        assert len(short) == 1, short
+        assert short[0]["callee"] == "scanf" and short[0]["missing"] == 1, short[0]
+        assert preset["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def test_a_synthetic_c23_alias_symbol_uses_the_same_model(tmp_path, shared_bn):

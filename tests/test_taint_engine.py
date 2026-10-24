@@ -8809,6 +8809,35 @@ def test_scanf_c23_spelling_seeds_every_destination_in_the_run_809(models):
     assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
 
 
+@pytest.mark.parametrize(("callee", "model_key", "stream"), [
+    ("__isoc23_scanf", "scanf", False),
+    ("__isoc23_fscanf", "fscanf", True),
+])
+def test_c23_call_preset_shortfall_is_reported_once(models, callee, model_key, stream):
+    # The `call:` preset resolves the C23 alias to the canonical model, and the
+    # application-level check names that same key. Seeding a source spelling
+    # used to produce two leaves at one address -- the raw `__isoc23_*` name
+    # from the preset and the canonical key from the model check -- because
+    # dictionary-equality dedup compares the callee string. One shortfall,
+    # one leaf, named by the model the engine actually applied.
+    args = ([FExpr("MLIL_VAR_SSA", "f#0", reads=[FSSA(FVar("f"), 0)])] if stream else [])
+    args.append(FExpr("MLIL_CONST_PTR", "fmt", constant=0x700))
+    args += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}")) for i in range(4)]
+    shown = ", ".join(["f", "fmt"] if stream else ["fmt"] + [f"&d{i}" for i in range(4)])
+    call = _ext_call(0, 0x10, f"{callee}({shown})", 0x900, args)
+    func = FFunc("scan_c23_preset", 0x10, FSSAFunc([call]), params=[])
+    bv = FBVStr({0x900: callee}, strings={0x700: "%d %d %d %d %7s"})
+    result = te.TaintEngine(bv, models).forward(
+        func, [te.parse_locator(f"call:{callee}")])
+
+    short = [lf for lf in result["leaves"]
+             if lf["kind"] == "format_destination_unrecovered"]
+    assert len(short) == 1, short
+    assert short[0]["callee"] == model_key
+    assert (short[0]["destinations"], short[0]["modeled"],
+            short[0]["recovered"], short[0]["missing"]) == (5, 4, 4, 1), short[0]
+
+
 def test_vsscanf_is_a_disclosed_partial_not_a_destination_source_809(models):
     # vsscanf's destinations live inside the va_list (arg2), which the engine
     # cannot walk, so the model is deliberately the honest-partial shape readv
