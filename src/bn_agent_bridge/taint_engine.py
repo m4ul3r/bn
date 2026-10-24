@@ -5460,22 +5460,31 @@ class TaintEngine:
         return out
 
     def _call_result_is_modeled(self, ins: Any, callee_fn: Any) -> bool:
-        """Whether a MODEL already states what this call hands back.
+        """Whether a model states THIS CALL'S RETURN CHANNEL.
 
-        The body is still the authority on what it DOES (#807), which is why
-        it was descended; but the leaf above exists because BN recovered no
-        result and the return channel is therefore unknown. For a modeled
-        callee it is not unknown: `wmemcpy`'s rules say the result is its
-        destination, and that propagation ran at this very call site -- so
-        raising an "unmodeled callee" frontier beside it reported the same
-        call as both modeled and unmodeled (BN25-META-01)."""
+        The body is still the authority on what the callee DOES (#807),
+        which is why it was descended; but the leaf above exists because BN
+        recovered no result and the return is therefore unknown. A rule
+        that writes `ret`/`*ret` answers exactly that question --
+        `wmemcpy`'s result is its destination, `fgets`'s is a source -- and
+        that rule ran at this very call site, so a frontier beside it
+        reported one call as modeled and unmodeled at once (BN25-META-01).
+
+        Nothing else counts. A sink class, a write, a read, an argument-only
+        source or propagation, or the mere PRESENCE of a model say nothing
+        about the value handed back, and taking them for an answer would
+        turn a required frontier into an all-clear."""
         for name in (self._callee_name(self._resolve_direct_target(ins)),
                      str(getattr(callee_fn, "name", "") or "") or None):
             if not name:
                 continue
             _key, model = lookup_model(self.models, name)
-            if model and not model_is_benign_marker(model):
-                return True
+            if not model:
+                continue
+            for group in ("sources", "propagates"):
+                for rule in (model.get(group) or ()):
+                    if str((rule or {}).get("to") or "") in ("ret", "*ret"):
+                        return True
         return False
 
     def _dropped_result_leaf(self, ins: Any, callee_fn: Any, tainted_args: dict,

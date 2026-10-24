@@ -170,7 +170,7 @@ def test_a_no_result_call_with_tainted_arguments_is_always_a_frontier_1034(calle
 # verdict must not depend on what ran before it.
 # --------------------------------------------------------------------------
 
-def _modeled_body_program(name):
+def _modeled_body_program(name, overlay=None):
     """main(n) calls an IN-BINARY body named *name* with no recovered result.
 
     The static shape: a `-static` build has a real body for the library
@@ -184,22 +184,56 @@ def _modeled_body_program(name):
     main = FFunc("main", 0x1000, FSSAFunc([
         FInstr(0, 0x1010, "MLIL_CALL_SSA", f"{name}(n)", reads=[ns], writes=[],
                params=[_value(ns)], dest=_const(0x2000))]), params=[n])
-    return main, FBV({0x2000: name}, {0x1000: main, 0x2000: body}), te.load_models()
+    return (main, FBV({0x2000: name}, {0x1000: main, 0x2000: body}),
+            te.load_models(overlay))
 
 
-def test_a_modeled_callee_is_not_also_reported_unmodeled():
-    """The model states what the call hands back, so the frontier that
-    exists for an UNKNOWN return channel does not apply to it. Reporting
-    both said the same call was modeled and unmodeled at once."""
-    main, bv, models = _modeled_body_program("wmemcpy")
+def _dropped_for(name, overlay=None):
+    main, bv, models = _modeled_body_program(name, overlay)
     result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
-    assert _dropped(result) == [], result["leaves"]
+    return _dropped(result), result
 
 
-def test_an_unmodeled_callee_still_raises_the_dropped_result_frontier():
-    main, bv, models = _modeled_body_program("project_helper")
-    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
-    assert _dropped(result), result["leaves"]
+@pytest.mark.parametrize("name", ["wmemcpy", "fgets"])
+def test_a_model_that_states_the_return_channel_is_not_also_unmodeled(name):
+    """`wmemcpy` propagates its destination to `ret` and `fgets` SOURCES
+    `ret`: either way the model answers what the call hands back, which is
+    the only question the frontier asks. Reporting both said the same call
+    was modeled and unmodeled at once (BN25-META-01)."""
+    dropped, result = _dropped_for(name)
+    assert dropped == [], result["leaves"]
+
+
+@pytest.mark.parametrize(("label", "overlay"), [
+    ("no model", None),
+    # a declared SINK says what is dangerous to pass in, not what comes
+    # back. Declared on an argument this call does NOT taint, so the
+    # frontier is the only thing withholding the all-clear.
+    ("sink only", {"project_helper": {
+        "sink": {"tainted_args": [1], "class": "command_injection",
+                 "detail": "tainted command"}}}),
+    # ...and an argument-only source/propagation describes the buffers
+    ("arg-only source", {"project_helper": {"sources": [{"to": "*arg:0"}]}}),
+    ("arg-only propagate", {"project_helper": {
+        "propagates": [{"from": "*arg:0", "to": "*arg:1"}]}}),
+])
+def test_a_model_without_return_semantics_keeps_the_frontier(label, overlay):
+    """The frontier exists because the RETURN is unknown. A model that says
+    nothing about it leaves it unknown, so suppressing on the mere presence
+    of one turned a required frontier into an all-clear."""
+    dropped, result = _dropped_for("project_helper", overlay)
+    assert dropped, (label, result["leaves"])
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, label
+
+
+@pytest.mark.parametrize(("label", "overlay"), [
+    ("arg -> ret", {"project_helper": {
+        "propagates": [{"from": "arg:0", "to": "ret"}]}}),
+    ("source -> ret", {"project_helper": {"sources": [{"to": "ret"}]}}),
+])
+def test_a_return_rule_on_any_model_suppresses_the_frontier(label, overlay):
+    dropped, _result = _dropped_for("project_helper", overlay)
+    assert dropped == [], label
 
 
 class _LateThunk:

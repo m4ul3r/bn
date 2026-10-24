@@ -5276,6 +5276,8 @@ char output[256] __attribute__((section(".out"))) = "out";
 N void byte88_reader(void) { output[0] = tracked[88]; }
 N void wide_write_case(char *s) { wmemcpy((wchar_t *)tracked, (wchar_t *)s, 32);
                                   byte88_reader(); }
+N void project_helper(char *d, const char *s) { d[0] = s[0]; d[88] = s[1]; }
+N void helper_case(char *s) { project_helper(tracked, s); byte88_reader(); }
 int main(void) { return 0; }
 """
 
@@ -5347,3 +5349,62 @@ def test_repeated_taint_requests_on_a_fresh_view_agree(tmp_path, shared_bn, opt)
     assert "unmodeled call(s) reached: no" in rendered.stdout, rendered.stdout
     for kind in set(kinds):
         assert kind in rendered.stdout, (kind, rendered.stdout)
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_only_a_models_return_rule_answers_what_a_call_hands_back(tmp_path,
+                                                                  shared_bn,
+                                                                  opt):
+    """BN25-META-01's second half, scoped.
+
+    The `return_value_unrecovered` frontier exists because Binary Ninja
+    recovered no result for the call, so the return channel is unknown.
+    A model answers that ONLY by writing `ret`/`*ret`: a sink class says
+    what is dangerous to pass IN, and an argument-only source or
+    propagation describes the buffers -- neither says what comes back, and
+    taking either for an answer turns a required frontier into an
+    all-clear.
+    """
+    binary = _aarch64_binary(tmp_path, opt)
+    target = shared_bn.load(binary, copy=False, timeout=_CROSS_ANALYSIS_TIMEOUT)
+
+    def overlay(name, body):
+        path = tmp_path / f"{name}{opt[-1]}.json"
+        path.write_text(json.dumps({"project_helper": body}))
+        return ["--models", str(path)]
+
+    def dropped(fn, *extra):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", fn, "--source", "param:0", *extra)
+        return result, [lf for lf in result["leaves"]
+                        if lf.get("cause") == "return_value_unrecovered"]
+
+    # no model, a sink-only model, and argument-only rules all leave the
+    # return unknown: the frontier stands and the run is not an all-clear
+    for label, extra in (
+            ("no model", []),
+            ("sink only", overlay("sink", {
+                "sink": {"tainted_args": [0], "class": "command_injection",
+                         "detail": "tainted command to project_helper"}})),
+            ("arg-only source", overlay("argsrc", {
+                "sources": [{"to": "*arg:0"}]})),
+            ("arg-only propagate", overlay("argprop", {
+                "propagates": [{"from": "*arg:1", "to": "*arg:0"}]}))):
+        result, leaves = dropped("helper_case", *extra)
+        assert leaves, (label, result["leaves"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, label
+
+    # ...while a rule that DOES define the return channel answers it
+    for label, extra in (
+            ("arg -> ret", overlay("argret", {
+                "propagates": [{"from": "arg:0", "to": "ret"}]})),
+            ("source -> ret", overlay("srcret", {"sources": [{"to": "ret"}]}))):
+        _result, leaves = dropped("helper_case", *extra)
+        assert leaves == [], (label, leaves)
+
+    # ...which is what the builtin `wmemcpy` rules do for the modeled copy,
+    # so its frontier stays suppressed with no overlay in play
+    result, leaves = dropped("wide_write_case")
+    assert leaves == [], result["leaves"]
+    assert any("wmemcpy" in a and "propagate" in a
+               for a in result["assumptions"]), result["assumptions"]
