@@ -4999,6 +4999,48 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"dropped arg(s) {_field_list(leaf, 'dropped_args')})"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
+    if kind == "global_memory_continuation":
+        cal = _field_dict(leaf, "callee")
+        glob = _field_dict(leaf, "global")
+        refs = [r for r in _field_list(leaf, "references") if isinstance(r, dict)]
+        reach = _field_dict(leaf, "reachability")
+        where = ", ".join(
+            f"{_shown_name(r, mangled=mangled) or '?'} @ {r.get('at', '?')}"
+            + (f" ({r['access']})" if r.get("access") else "")
+            for r in refs)
+        truncated = str(reach.get("status")) == "truncated"
+        # BN21-BOUND-02: a reference the scan could not account for is not a
+        # reader this walk identified; only a PROVEN read says "read by".
+        verb = "read by" if leaf.get("reads_proven") else "may be read by"
+        if where and not truncated:
+            middle = f"  ({verb} {where})"
+        elif where:
+            # A named reader and an unfinished search are not alternatives:
+            # the row says both, so it never reads as "and that is all".
+            middle = (f"  ({verb} {where}; reachability truncated:"
+                      f" {reach.get('cause', '?')})")
+        else:
+            # No reader is NAMED because the search never finished: say which
+            # bound stopped it and how much it left unexamined, so the row is
+            # not read as "a boundary with nothing behind it".
+            middle = (f"  (reachability {reach.get('status', '?')}:"
+                      f" {reach.get('cause', '?')},"
+                      f" {reach.get('functions_examined', '?')}/"
+                      f"{reach.get('function_budget', '?')} function(s) examined,"
+                      f" {reach.get('unexamined_references_total', '?')} reference(s)"
+                      f" unexamined)")
+        return (
+            f"  global_memory_continuation @ {leaf.get('address')}"
+            f"  global={glob.get('address', '?')}"
+            # WHICH bytes were written: an interior copy is the same object,
+            # and naming the offset keeps a partial write from reading as
+            # coverage of the whole object (round-3 review R1).
+            + (f"(+{', +'.join(str(o) for o in _field_list(glob, 'written_offsets'))})"
+               if _field_list(glob, "written_offsets") else "")
+            + f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
+            + middle
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+        )
     if kind == "caller_sites_truncated":
         fn = _field_dict(leaf, "function")
         return (
@@ -5034,6 +5076,12 @@ def _leaf_group_key(leaf: Any) -> tuple:
         return (kind, str(leaf.get("base")), str(leaf.get("offset")))
     if kind == "arg_under_recovered":
         return (kind, str(_field_dict(leaf, "callee").get("name", "?")))
+    if kind == "global_memory_continuation":
+        # The global IS the identity here: two calls that hand two different
+        # globals past the walk are two boundaries an agent must chase
+        # separately, not one "[2 leaves]" row under the first address.
+        return (kind, str(_field_dict(leaf, "global").get("address")),
+                str(_field_dict(leaf, "callee").get("address")))
     if kind == "caller_sites_truncated":
         fn = _field_dict(leaf, "function")
         # The reason tally's identity is its (reason, count) pairs, never the

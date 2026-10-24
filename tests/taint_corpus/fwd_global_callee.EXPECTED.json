@@ -1,0 +1,10 @@
+{
+  "description": "a bounded copy fills a writable global and a later no-argument call reaches a modeled sink through it: a global_memory_continuation frontier, never an all-clear",
+  "lang": "c",
+  "cflags": ["-fno-builtin"],
+  "forward": [
+    {"function": "main", "source": "param:1",
+     "leaves": [{"kind": "global_memory_continuation"}],
+     "all_clear": false}
+  ]
+}

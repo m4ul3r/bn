@@ -123,6 +123,17 @@ BLOCKING_LEAF_KINDS = frozenset({
     # a pointer demand), and a sink a multi-sink query could not seed at all.
     "sink_role_unknown",
     "sink_unseeded",
+    # IC03 / TT-PILOT-FW03-01: tainted bytes reached a keyable writable global
+    # and code reachable from a call references that global. Taint is tracked
+    # per function and nothing but arguments crosses a call, so what those
+    # bytes reach past that boundary was never walked -- an empty
+    # reached_sinks there is not an all-clear.
+    "global_memory_continuation",
+    # Round-3 review R3: the forward walk unwound on Python's recursion limit
+    # (an unresolved cycle). Whatever it had already found is reported, but
+    # the rest was never walked -- so the run is explicitly a frontier, not a
+    # short clean answer.
+    "analysis_truncated",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -200,6 +211,16 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
                 "coverage/escape solve is unfinished; seed closer to the sink "
                 "or inspect the writes and unresolved calls named in the "
                 "address_of_local_unresolved leaf")
+    if "global_reference_budget" in causes:
+        # IC03 / round-3 review F2: the bounded call-graph search for code
+        # that reads a tainted global ran out of its function budget with
+        # referencing functions unexamined, so "nothing reads it" was never
+        # established. No depth or recursion bound was hit, so the generic
+        # string would name the wrong knob.
+        return ("the search for code reading a tainted global exhausted its "
+                "function budget with references unexamined -- audit the "
+                "references named in the global_memory_continuation leaf "
+                "(`bn xrefs <global>`) or seed taint inside a consumer")
     return "depth/recursion cutoff"
 
 
@@ -418,6 +439,58 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                 f"and callee argument consumption, or {seed}. Repair a prototype only "
                 "where confirmed extra arguments disagree with a determined "
                 "nonvariadic declaration")
+    crossed = [lf for lf in leaves if lf.get("kind") == "global_memory_continuation"]
+    if by_kind.get("analysis_truncated", 0):
+        return ("the walk unwound on Python's recursion limit (an unresolved cycle): "
+                "what it had already found is reported and the rest was never walked "
+                "-- re-run with a lower `--max-depth` for a bounded, complete answer "
+                "over the region it can finish")
+    if crossed:
+        # IC03: the most actionable zero-sink frontier there is -- the bytes
+        # have a known address, so the advice points at them rather than at
+        # this function. A leaf whose reachability search was TRUNCATED names
+        # no reader (there may be one); it gets the bound and the xref audit.
+        globals_at = sorted({str((lf.get("global") or {}).get("address"))
+                             for lf in crossed if isinstance(lf.get("global"), dict)})
+        reads = sorted({str(r.get("at")) for lf in crossed
+                        for r in (lf.get("references") or []) if isinstance(r, dict)})
+        # R4: the leaf carries a RUNNABLE re-seed when the consumer names a
+        # locator; a constant-address reader names none, and advising
+        # `var:VAR` there was a template nothing could fill in.
+        reseed = next((str(lf.get("reseed")) for lf in crossed if lf.get("reseed")), None)
+        seed = f" ({reseed})" if reseed else ""   # already backticked: a command
+        head = ("taint reached no modeled sink HERE, but it was copied into the writable "
+                f"global(s) {', '.join(globals_at)}")
+        truncated_at = sorted({str((lf.get("reachability") or {}).get("cause"))
+                               for lf in crossed
+                               if (lf.get("reachability") or {}).get("status") == "truncated"})
+        if reads:
+            # A named reader and a truncated search are not alternatives: say
+            # both, so the advice never reads as "and that is all of them".
+            cut = (f" The search was also TRUNCATED ({', '.join(truncated_at)}), so "
+                   f"further references may exist." if truncated_at else "")
+            # BN21-BOUND-02: only a proven read is reported as a read.
+            verb = ("reads" if any(lf.get("reads_proven") for lf in crossed)
+                    else "may use")
+            return (f"{head}, which code reachable from a call this walk made {verb} "
+                    f"({', '.join(reads)}); those bytes are not followed across the call."
+                    f"{cut} xrefs answers for ONE address: query the sites "
+                    f"the leaves cite, starting with `bn xrefs {globals_at[0]}`"
+                    + (f" and re-seed inside the consumer on the value it loads{seed}"
+                       if seed else
+                       " and audit them by hand: the consumer reads those bytes by"
+                       " constant address, so there is no variable inside it to seed"))
+        # BN21-BOUND-03: `--max-depth` moves the CALL-GRAPH bound and nothing
+        # else. Advising it for a bound it cannot move is advice that fails.
+        widen = (" or raise --max-depth and re-run"
+                 if any(c in ("depth_budget", "function_budget") for c in truncated_at)
+                 else " -- this bound is internal, `--max-depth` does not move it")
+        return (f"{head}, and the search for code reading it past a call this walk made "
+                f"was TRUNCATED ({', '.join(truncated_at) or 'bound reached'}) with "
+                f"references unexamined -- whether those bytes reach a sink is unknown, "
+                f"not clear. xrefs answers for ONE address: audit the sites "
+                f"the leaves cite, starting with `bn xrefs {globals_at[0]}`"
+                f"{widen}")
     if by_kind.get("coarse_memory_store", 0) or by_kind.get("pointer_escape", 0):
         # The coarse leaf exists precisely because the destination could not be
         # keyed, so no var: names it; the template seeds a value read back.
@@ -477,7 +550,11 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
         k = str(lf.get("kind", "?"))
         by_kind[k] = by_kind.get(k, 0) + 1
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered", "indirect_call_unresolved")
-    COARSE = ("coarse_memory_store", "pointer_escape")
+    # A global-memory continuation is a MEMORY boundary (the bytes are at a
+    # known address and the walk stops following them), not an unresolved
+    # call: the target resolved, it is the memory hand-off that is not
+    # carried. It belongs in the coarse-memory tally with the other two.
+    COARSE = ("coarse_memory_store", "pointer_escape", "global_memory_continuation")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
     seed_misanchored_n = sum(by_kind.get(k, 0) for k in _SEED_MISANCHORED_KINDS)
