@@ -7248,16 +7248,33 @@ class TaintEngine:
         # offset the only feasible arm established (round-27 review F73).
         return not self._named_boundary_between(int(value), int(base_ga))
 
-    def _named_boundary_between(self, a: int, b: int) -> bool:
-        """Whether a NAMED data variable lies strictly between *a* and *b*.
+    def _is_named_object(self, addr: int) -> bool:
+        """Whether a SYMBOL names the storage beginning at *addr*."""
+        getsym = getattr(self.bv, "get_symbol_at", None)
+        if not callable(getsym):
+            return False
+        try:
+            return getsym(int(addr)) is not None
+        except Exception:
+            return False
+
+    def _named_boundary_between(self, arm: int, base: int) -> bool:
+        """Whether a NAMED object separates *arm* from the object at *base*.
 
         That is the boundary the object analysis respects everywhere else:
         an interior alias is part of the same storage, a named neighbour
-        begins other storage."""
+        begins other storage. The ARM's own address counts -- an arm that
+        IS a named global's base is that object, and excluding the endpoint
+        let `choose(middle, other)` read as one storage and erase the only
+        feasible arm's offset (round-28 review F73). The BASE's own symbol
+        does not: that is the object being asked about."""
+        if arm != base and self._is_named_object(arm):
+            return True
+        a, b = arm, base
         lo, hi = (a, b) if a <= b else (b, a)
         if lo == hi:
             return False
-        key = (lo, hi)
+        key = (int(arm), int(base))
         cached = self._named_boundary_cache.get(key)
         if cached is not None:
             return cached
@@ -7276,13 +7293,7 @@ class TaintEngine:
                 addr = int(nxt_addr)
                 if addr >= hi:
                     break
-                named = None
-                if callable(getsym):
-                    try:
-                        named = getsym(addr)
-                    except Exception:
-                        named = None
-                if named is not None:
+                if self._is_named_object(addr):
                     out = True
                     break
         self._named_boundary_cache[key] = out

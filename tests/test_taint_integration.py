@@ -4775,6 +4775,9 @@ _SCOPE_SRC = r"""
    apart by the named boundaries between them, not by the section
    (round-27 review F73). */
 char tracked[256] __attribute__((section(".same"))) = "seed";
+/* `adjacent` follows `tracked` with NOTHING named in between, so the arm's
+   OWN symbol is the only boundary there is (round-28 review F73). */
+char adjacent[256] __attribute__((section(".same"))) = "next";
 char gap[256] __attribute__((section(".same"))) = "gap";
 char other[256] __attribute__((section(".same"))) = "other";
 char output[512] __attribute__((section(".out"))) = "out";
@@ -4784,13 +4787,16 @@ __asm__(".globl middle\n.set middle,tracked+64\n.type middle,@object\n.size midd
 N void bounded_reader(void) { strlcpy(output, tracked, 1); }
 N void wide_chk_reader(void) { __wmemcpy_chk((wchar_t *)output, (wchar_t *)tracked, 32, 256); }
 N char *choose_pointer(void) { return choice ? middle : other + 8; }
+N char *choose_base(void) { return choice ? middle : adjacent; }
 N char *advance16(char *p) { return p + 16; }
 N void phi_reader(void) { system(advance16(choose_pointer())); }
 N void strl_case(char *s) { memcpy(middle, s, 64); bounded_reader(); }
 N void wide_chk_case(char *s) { memcpy(middle, s, 64); wide_chk_reader(); }
 N void phi_case(char *s) { memcpy(middle, s, 64); phi_reader(); }
 N char *choose_inside(void) { return choice ? middle : tracked + 48; }
+N void base_reader(void) { system(advance16(choose_base())); }
 N void inside_reader(void) { system(advance16(choose_inside())); }
+N void base_case(char *s) { memcpy(middle, s, 64); base_reader(); }
 N void inside_case(char *s) { memcpy(middle, s, 64); inside_reader(); }
 int main(void) { return 0; }
 """
@@ -4844,6 +4850,12 @@ def test_a_bounded_copy_capacity_does_not_bound_its_source(tmp_path,
     _result, leaves = gmc("phi_case")
     row = next(r for lf in leaves for r in lf["references"]
                if r["display_name"] == "phi_reader")
+    assert (row["offset"], row["offset_known"]) == (16, True), row
+    # the same holds when the distinct arm IS that global's base, with no
+    # storage in between -- the arm's own symbol is the boundary
+    _result, leaves = gmc("base_case")
+    row = next(r for lf in leaves for r in lf["references"]
+               if r["display_name"] == "base_reader")
     assert (row["offset"], row["offset_known"]) == (16, True), row
     # ...while an arm inside THIS object's own storage keeps the join open
     _result, leaves = gmc("inside_case")
