@@ -4977,3 +4977,283 @@ def test_a_read_that_misses_every_tainted_byte_is_not_a_reference(tmp_path,
         _result, leaves = gmc(fn)
         assert any(r["display_name"] == "far_string_reader"
                    for lf in leaves for r in lf["references"]), (fn, leaves)
+
+
+_STORAGE_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char previous[256] __attribute__((section(".same"))) = "prev";
+char tracked[256] __attribute__((section(".same"))) = "seed";
+char adjacent[256] __attribute__((section(".same"))) = "next";
+char elsewhere[256] __attribute__((section(".other"))) = "other";
+volatile int choice;
+extern char before[], middle[], upper[];
+__asm__(".globl before\n.set before,tracked+48\n.type before,@object\n.size before,1\n"
+        ".globl middle\n.set middle,tracked+64\n.type middle,@object\n.size middle,1\n"
+        ".globl upper\n.set upper,tracked+144\n.type upper,@object\n.size upper,1\n");
+N char *pick(char *p, char *q) { return choice ? p : q; }
+N char *plus16(char *p) { return p + 16; }
+N char *back32(char *p) { return p - 32; }
+N char *only_upper(void) { return upper; }
+N char *only_elsewhere(void) { return elsewhere + 144; }
+N char *joined(void) { return choice ? middle : upper; }
+N char *formal_below(void) { return pick(before, middle); }
+N char *formal_equal(void) { return pick(middle, middle); }
+N char *formal_previous(void) { return pick(middle, previous); }
+N char *formal_adjacent(void) { return pick(middle, adjacent); }
+N void upper_reader(void) { system(back32(only_upper())); }
+N void joined_reader(void) { system(back32(joined())); }
+N void elsewhere_reader(void) { system(back32(only_elsewhere())); }
+N void direct_reader(void) { system(tracked + 112); }
+N void below_reader(void) { system(plus16(formal_below())); }
+N void equal_reader(void) { system(plus16(formal_equal())); }
+N void previous_reader(void) { system(plus16(formal_previous())); }
+N void adjacent_reader(void) { system(plus16(formal_adjacent())); }
+N void upper_case(char *s) { memcpy(middle, s, 64); upper_reader(); }
+N void joined_case(char *s) { memcpy(middle, s, 64); joined_reader(); }
+N void elsewhere_case(char *s) { memcpy(middle, s, 64); elsewhere_reader(); }
+N void direct_case(char *s) { memcpy(middle, s, 64); direct_reader(); }
+N void below_case(char *s) { memcpy(middle, s, 64); below_reader(); }
+N void equal_case(char *s) { memcpy(middle, s, 64); equal_reader(); }
+N void previous_case(char *s) { memcpy(middle, s, 64); previous_reader(); }
+N void adjacent_case(char *s) { memcpy(middle, s, 64); adjacent_reader(); }
+int main(void) { return 0; }
+"""
+
+
+_SPAN_SRC = r"""
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+char tracked[256] __attribute__((section(".tracked"))) = {[0 ... 63]='A'};
+volatile unsigned char observed;
+volatile int choice;
+extern char middle[];
+__asm__(".globl middle\n.set middle,tracked+64\n.type middle,@object\n.size middle,1\n");
+N void read64(void) { observed = tracked[64]; }
+N void append_one(char *s) { strncat(tracked, s, 1); read64(); }
+N void append_chk_one(char *s) { __strncat_chk(tracked, s, 1, 256); read64(); }
+N void copy_one(char *s) { memcpy(tracked + 64, s, 1); read64(); }
+N void copy_base(char *s) { memcpy(tracked, s, 1); read64(); }
+N void scan_one(void) { strncat(tracked, "x", 1); }
+N void scan_zero(void) { strncat(tracked, "x", 0); }
+N void scan_one_case(char *s) { memcpy(middle, s, 64); scan_one(); }
+N void scan_zero_case(char *s) { memcpy(middle, s, 64); scan_zero(); }
+N void empty_copy(void) { memcpy(tracked, "x", 0); }
+N void empty_copy_case(char *s) { memcpy(middle, s, 64); empty_copy(); }
+N char *endcopy(void) { return mempcpy(tracked, "X", 1); }
+N char *endstring(void) { return stpcpy(tracked, "X"); }
+N char *endfind(void) { return memccpy(tracked, "X", 'X', 1); }
+N char *endunknown(void) { return stpcpy(tracked, choice ? "AB" : "ABCD"); }
+N void endcopy_reader(void) { system(endcopy() + 8); }
+N void endstring_reader(void) { system(endstring() + 8); }
+N void endfind_reader(void) { char *p = endfind(); if (p) system(p + 8); }
+N void endunknown_reader(void) { system(endunknown() + 8); }
+N void endcopy_case(char *s) { memcpy(tracked, s, 128); endcopy_reader(); }
+N void endstring_case(char *s) { memcpy(tracked, s, 128); endstring_reader(); }
+N void endfind_case(char *s) { memcpy(tracked, s, 128); endfind_reader(); }
+N void endunknown_case(char *s) { memcpy(tracked, s, 128); endunknown_reader(); }
+int main(void) { return 0; }
+"""
+
+
+_FORTIFIED_SRC = r"""
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#define N __attribute__((noinline,noclone))
+extern char *__fgets_chk(char *, size_t, int, FILE *);
+char tracked[256] __attribute__((section(".tracked"))) = "seed";
+N char *fortified(void) { return __fgets_chk(tracked, 256, 2, stdin); }
+N char *fortified_tail(void) { return __fgets_chk(tracked, 256, 2, stdin); }
+N char *plain(void) { return fgets(tracked, 2, stdin); }
+N void fortified_reader(void) { char *p = fortified(); if (p) system(p + 8); }
+N void tail_reader(void) { char *p = fortified_tail(); if (p) system(p + 8); }
+N void plain_reader(void) { char *p = plain(); if (p) system(p + 8); }
+N void ignored_reader(void) { (void)fortified(); }
+N void fortified_case(char *s) { memcpy(tracked, s, 64); fortified_reader(); }
+N void tail_case(char *s) { memcpy(tracked, s, 64); tail_reader(); }
+N void plain_case(char *s) { memcpy(tracked, s, 64); plain_reader(); }
+N void ignored_case(char *s) { memcpy(tracked, s, 64); ignored_reader(); }
+int main(void) { return 0; }
+"""
+
+
+def _taint_target(tmp_path, shared_bn, source: str, stem: str, opt: str):
+    src = tmp_path / f"{stem}{opt[-1]}.c"
+    src.write_text(source)
+    binary = tmp_path / f"{stem}{opt[-1]}"
+    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin",
+                           "-fno-inline", "-g0", "-fno-toplevel-reorder"])
+    return shared_bn.load(binary, copy=False)
+
+
+def _gmc_rows(shared_bn, target, fn, *extra):
+    """``(leaves, (display_name, offset, offset_known) rows, all-clear)``."""
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                      "--source", "param:0", *extra)
+    leaves = [lf for lf in result["leaves"]
+              if lf["kind"] == "global_memory_continuation"]
+    rows = [(r["display_name"], r["offset"], r["offset_known"])
+            for lf in leaves for r in lf["references"]]
+    return leaves, rows, result["diagnostics"]["safe_to_report_all_clear"]
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_one_objects_interior_aliases_are_one_storage(tmp_path, shared_bn, opt):
+    """BN23-ALIAS-01 and BN23-JOIN-01.
+
+    `before`, `middle` and `upper` name the inside of ONE declared object,
+    so a pointer taken from any of them and adjusted composes back into
+    the bytes a write to `middle` tainted. The objects next door -- the
+    one before it, the one after it, and one in another section -- are
+    separate storage however close their bases."""
+    target = _taint_target(tmp_path, shared_bn, _STORAGE_SRC, "r11store", opt)
+
+    # the upper alias, adjusted back INTO the written bytes
+    _leaves, rows, clear = _gmc_rows(shared_bn, target, "upper_case")
+    assert ("upper_reader", 48, True) in rows, rows
+    assert clear is False
+    # ...the same displacement the direct spelling reports
+    _leaves, rows, _clear = _gmc_rows(shared_bn, target, "direct_case")
+    assert ("direct_reader", 48, True) in rows, rows
+    # ...and a join of the two feasible arms is not one of them
+    leaves, rows, clear = _gmc_rows(shared_bn, target, "joined_case")
+    assert leaves and clear is False, leaves
+    assert all(known is False for _name, _off, known in rows
+               if _name == "joined_reader"), rows
+
+    # a returned FORMAL composes the same way: 0 and 16 are both feasible
+    leaves, rows, _clear = _gmc_rows(shared_bn, target, "below_case",
+                                     "--max-depth", "64")
+    assert leaves, leaves
+    assert ("below_reader", 0, False) in rows, rows
+    # ...while arms that agree, and arms in other objects, keep +16 exact
+    for case, reader in (("equal_case", "equal_reader"),
+                         ("previous_case", "previous_reader"),
+                         ("adjacent_case", "adjacent_reader")):
+        _leaves, rows, _clear = _gmc_rows(shared_bn, target, case,
+                                          "--max-depth", "64")
+        assert (reader, 16, True) in rows, (case, rows)
+
+    # another section is another object, adjusted or not
+    leaves, _rows, clear = _gmc_rows(shared_bn, target, "elsewhere_case")
+    assert leaves == [] and clear is True, leaves
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_an_append_is_not_a_base_relative_bounded_copy(tmp_path, shared_bn,
+                                                       opt):
+    """BN23-APPEND-01.
+
+    `strncat(dst, src, n)` copies at most n bytes OF SRC to wherever dst's
+    terminator is. The count bounds neither the destination scan -- which
+    runs over the existing string whatever n says, including 0 -- nor the
+    position the appended bytes land at."""
+    target = _taint_target(tmp_path, shared_bn, _SPAN_SRC, "r11span", opt)
+
+    # the appended byte lands at the terminator at +64, not at the base
+    for case in ("append_one", "append_chk_one"):
+        _leaves, rows, clear = _gmc_rows(shared_bn, target, case)
+        assert ("read64", 64, True) in rows, (case, rows)
+        assert clear is False, case
+    # ...which the direct one-byte copy at +64 has always reported
+    _leaves, rows, _clear = _gmc_rows(shared_bn, target, "copy_one")
+    assert ("read64", 64, True) in rows, rows
+    # ...and a one-byte copy at the BASE still reaches nothing at +64
+    leaves, _rows, clear = _gmc_rows(shared_bn, target, "copy_base")
+    assert leaves == [] and clear is True, leaves
+
+    # the destination scan reads the tainted bytes whatever the count says
+    for case in ("scan_one_case", "scan_zero_case"):
+        leaves, _rows, clear = _gmc_rows(shared_bn, target, case)
+        assert leaves and clear is False, (case, leaves)
+    # ...while a genuine zero-length COPY still touches nothing
+    leaves, _rows, clear = _gmc_rows(shared_bn, target, "empty_copy_case")
+    assert leaves == [] and clear is True, leaves
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_an_end_returning_copy_is_not_the_destination_base(tmp_path, shared_bn,
+                                                           opt):
+    """BN23-ENDPTR-01.
+
+    `mempcpy` returns dest + n, `stpcpy` the terminator it wrote and
+    `memccpy` one past the byte it stopped at. Each of these calls states
+    enough to resolve that end exactly, so the consumer's `+ 8` is at +9 --
+    and where the call does NOT state it, the displacement is unknown
+    rather than the base."""
+    target = _taint_target(tmp_path, shared_bn, _SPAN_SRC, "r11span", opt)
+    for case, reader in (("endcopy_case", "endcopy_reader"),
+                         ("endstring_case", "endstring_reader"),
+                         ("endfind_case", "endfind_reader")):
+        _leaves, rows, clear = _gmc_rows(shared_bn, target, case)
+        assert (reader, 9, True) in rows, (case, rows)
+        assert clear is False, case
+    _leaves, rows, clear = _gmc_rows(shared_bn, target, "endunknown_case")
+    assert ("endunknown_reader", 0, False) in rows, rows
+    assert clear is False
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
+def test_a_fortified_fgets_hands_its_destination_back(tmp_path, shared_bn, opt):
+    """BN23-FORTIFY-01.
+
+    `__fgets_chk` returns its destination exactly as `fgets` does, so a
+    guarded `p + 8` after a two-byte refill still names byte 8 of the
+    object the root copied into."""
+    target = _taint_target(tmp_path, shared_bn, _FORTIFIED_SRC, "r11fort", opt)
+    for case, reader in (("fortified_case", "fortified_reader"),
+                         ("tail_case", "tail_reader"),
+                         ("plain_case", "plain_reader")):
+        _leaves, rows, clear = _gmc_rows(shared_bn, target, case)
+        assert (reader, 8, True) in rows, (case, rows)
+        assert clear is False, case
+    # a return nothing uses reads nothing
+    leaves, _rows, clear = _gmc_rows(shared_bn, target, "ignored_case")
+    assert leaves == [] and clear is True, leaves
+
+
+def test_a_structured_reseed_command_runs_where_it_was_produced(tmp_path,
+                                                                shared_bn):
+    """BN23-ADVICE-01.
+
+    `leaves[].reseed` is an executable command, not a locator: a caller
+    that selected an instance and a target explicitly must be able to run
+    the string it is handed. With a second bridge alive the unrouted
+    spelling refuses, which is what this proves the routed one does not.
+    """
+    target = _taint_target(tmp_path, shared_bn, _STORAGE_SRC, "r11seed", "-O0")
+    env = shared_bn.env()
+    started = subprocess.run(
+        [*_BN_CLI, "session", "start", str(tmp_path / "r11seed0"),
+         "--format", "json"],
+        capture_output=True, text=True, timeout=180.0, env=env)
+    assert started.returncode == 0, started.stderr
+    other = json.loads(started.stdout)["instance_id"]
+    try:
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                          "-f", "upper_case", "--source", "param:0")
+        reseed = next(lf["reseed"] for lf in result["leaves"] if lf.get("reseed"))
+        command = shlex.split(reseed.strip("`"))
+        assert command[0] == "bn", reseed
+        assert shared_bn.instance_id in command, reseed
+
+        ran = subprocess.run([*_BN_CLI, *command[1:]], capture_output=True,
+                             text=True, timeout=180.0, env=env)
+        assert ran.returncode == 0, f"{reseed}\n{ran.stderr}\n{ran.stdout}"
+
+        # ...and the same command without this call's routing cannot pick a
+        # bridge at all, which is the failure the routing prevents.
+        bare = [word for index, word in enumerate(command[1:])
+                if word not in (shared_bn.instance_id, target, "-i", "-t")
+                and command[1:][index - 1] not in ("-i", "-t")]
+        refused = subprocess.run([*_BN_CLI, *bare], capture_output=True,
+                                 text=True, timeout=180.0, env=env)
+        assert refused.returncode == 2, (bare, refused.stdout, refused.stderr)
+    finally:
+        subprocess.run(
+            [*_BN_CLI, "session", "stop", other, "--discard-unsaved"],
+            capture_output=True, text=True, timeout=60.0, env=env)

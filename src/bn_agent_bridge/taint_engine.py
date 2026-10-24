@@ -300,6 +300,11 @@ class _Use(NamedTuple):
     seed: str | None
     span: int | None
     offset_known: bool
+    # Whether the callee reads this pointer FORWARD to a terminator it
+    # finds -- a NUL-terminated string argument. Only such a read can be
+    # ruled out from its START alone when its length is unknown; a pointer
+    # handed to something that may index either way cannot (BN23/F76).
+    forward: bool = False
 
 
 # What a reached pointer-scan bound is REPORTED as. Both are blocking: the
@@ -448,6 +453,12 @@ class TaintEngine:
         self._ret_ptr_stack: set[int] = set()
         self._reaches_object_cache: dict[tuple[int, int], bool] = {}
         self._named_boundary_cache: dict[tuple[int, int, bool], bool] = {}
+        # Object sizes the BINARY ITSELF declares (ELF `st_size`), which is
+        # what tells an interior ALIAS from the next object along; built
+        # once from the raw image, never from this run's evidence.
+        self._declared_objects: list[tuple[int, int]] | None = None
+        self._credible_object_cache: dict[int, int | None] = {}
+        self._same_storage_cache: dict[tuple[int, int], bool] = {}
         self._param_stack: set[tuple[int, int]] = set()
         self._direct_callee_cache: dict[int, tuple] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
@@ -5874,6 +5885,16 @@ class TaintEngine:
         read span hid a consumer of the tainted format entirely (round-25
         review F66). A copy family's count bounds the whole transfer.
         """
+        append = (model or {}).get("append")
+        if isinstance(append, dict) and append.get("src") is not None:
+            # `strncat(dst, src, n)` copies at most n bytes OF SRC. The
+            # destination scan runs to the terminator whatever n says, so
+            # taking the count as its span bounded a 64-byte existing
+            # string to one byte and cleared the run (BN23-APPEND-01).
+            try:
+                return {int(append["src"])}
+            except (TypeError, ValueError):
+                return None
         sink = (model or {}).get("sink") or {}
         buf = sink.get("buf_arg")
         if buf is None:
@@ -5944,6 +5965,23 @@ class TaintEngine:
         length = self._model_len_index(model)
         n = None if length is None else self._int_const(params[length]) \
             if length < len(params) else None
+        append = (model or {}).get("append")
+        if isinstance(append, dict) and int(append.get("dest", -1)) == idx:
+            # An append writes AT THE TERMINATOR it finds, so its count is
+            # not a footprint from the base: `strncat(g, s, 1)` put a
+            # tainted byte at +64 in a 64-character string, and recording
+            # `[0, 1)` made a reader of that byte disjoint and cleared the
+            # run (BN23-APPEND-01). A count of ZERO appends nothing, which
+            # is the one case this does know.
+            if n is not None and int(n) == 0:
+                return
+            ranges = self._global_tainted_ranges.setdefault(ga, [])
+            if (offset, None) not in ranges:
+                ranges.append((offset, None))
+            if ga not in self._global_write_unbounded:
+                self._global_write_unbounded.add(ga)
+                self._invalidate_object(ga)
+            return
         scope = self._model_len_scope(model)
         if n is not None and scope is not None and idx not in scope:
             # The count bounds ANOTHER argument (a destination capacity),
@@ -6608,14 +6646,28 @@ class TaintEngine:
         Its own base, or any address inside its extent: `g + 4` is still `g`,
         and on a view with no type for the object BN folds that interior
         address to a data variable of its own, so the canonical test alone
-        misses it (round-3 review I1)."""
+        misses it (round-3 review I1).
+
+        Storage ABOVE this subobject counts too: `upper` names the inside
+        of the object `middle` is an alias of, so a body that takes it and
+        subtracts 32 reaches `middle + 48`, and asking only about this
+        subobject's own extent answered "names nothing here" and cleared
+        the run (BN23-ALIAS-01). WHICH bytes it then reaches is the
+        offset's question, not this one's. Storage BELOW is deliberately
+        not claimed here: a read that starts in an enclosing object is
+        :meth:`_overlap_access`'s question, which weighs its length
+        against the tainted interval and discloses an unbounded one
+        (round-11 review F21)."""
         extent = self._global_extent(ga)
 
         def base(expr: Any) -> bool:
             if self._global_addr(None, expr) == ga:
                 return True
             raw = self._global_addr(None, expr, canon=False)
-            return raw is not None and ga <= raw < ga + extent
+            if raw is None:
+                return False
+            return (ga <= raw < ga + extent) or (
+                raw > ga and self._same_storage(raw, ga))
         return base
 
     def _may_be_global(self, ssaf: Any, expr: Any, ga: int) -> bool:
@@ -6626,6 +6678,27 @@ class TaintEngine:
 
     def _expr_loads_global(self, ssaf: Any, expr: Any, ga: int) -> bool:
         return self._expr_loads(ssaf, expr, self._global_base(ssaf, ga))
+
+    def _model_reads_forward(self, ins: Any, hit: list[int]) -> bool:
+        """Whether every argument of this call that holds the pointer is a
+        NUL-terminated string the callee reads FORWARD.
+
+        That is the one shape whose length may be unknown and still prove
+        non-overlap from its start: `system(g + 80)` cannot reach bytes
+        below +80 however far it runs, while a pointer handed to something
+        that may index either way proves nothing (round-30 review F76)."""
+        if not hit:
+            return False
+        _key, model = lookup_model(
+            self.models, self._callee_name(self._resolve_direct_target(ins)))
+        declared = (model or {}).get("string_args")
+        if not isinstance(declared, (list, tuple)):
+            return False
+        try:
+            forward = {int(one) for one in declared}
+        except (TypeError, ValueError):
+            return False
+        return set(int(i) for i in hit) <= forward
 
     @staticmethod
     def _model_arg_role(model: dict[str, Any] | None, idx: int) -> str:
@@ -6856,7 +6929,8 @@ class TaintEngine:
             return _Use(fallback, "unreadable", 0, None, None, True)
 
         def verdict(ins: Any, kind: str, seed: str | None = None,
-                    expr: Any = None, span: int | None = None) -> Any:
+                    expr: Any = None, span: int | None = None,
+                    forward: bool = False) -> Any:
             """The offset names WHICH bytes of the object the use reached
             (F8), and ``offset_known`` says whether it was ESTABLISHED.
 
@@ -6877,7 +6951,7 @@ class TaintEngine:
             elif offset_of is not None:
                 offset = int(offset_of(ins))
             return _Use(int(getattr(ins, "address", 0)), kind, offset, seed,
-                        span, known)
+                        span, known, forward)
 
         def arg_seed(ins: Any, hit: list[int]) -> str | None:
             """`arg:<callee>:<index>` for a pointer that reaches a named
@@ -6976,6 +7050,7 @@ class TaintEngine:
                     # unsigned size), stay on the conservative side.
                     continue
                 span = None if span_of is None else span_of(ins, hit)
+                forward = self._model_reads_forward(ins, hit)
                 body, unread_body = self._callee_body(ins)
                 kind = None
                 if body is not None:
@@ -7023,7 +7098,7 @@ class TaintEngine:
                              self._resolve_direct_target(ins)))[1], i) == "read"),
                     hit[0])
                 hit_use = emit(verdict(ins, kind, arg_seed(ins, hit),
-                                       params[read_hit], span))
+                                       params[read_hit], span, forward))
                 if hit_use is not None:
                     return hit_use
                 continue
@@ -7199,14 +7274,14 @@ class TaintEngine:
 
         answers: set[int] = set()
         for arm in arms:
+            # An arm OUTSIDE the queried subobject but inside the same
+            # storage is not infeasible, only not there yet: a later
+            # adjustment composes (`choose(before, middle)` then `+ 16` is
+            # 0 or 16, `upper` then `- 32` is +48). The root answers that
+            # for the whole storage, so there is no prefilter here to drop
+            # one of them -- which certified the survivor's displacement
+            # (round-25 review F68, BN23-JOIN-01/ALIAS-01).
             if len(arms) > 1 and not feasible(arm):
-                if self._arm_is_nearby_pointer(ssaf, arm, root):
-                    # It is not THIS object's pointer YET: a constant into
-                    # the same storage can be brought inside by a later
-                    # adjustment (`choose(g + 48, g + 64)` then `+ 16`), so
-                    # dropping it as infeasible certified the surviving
-                    # arm's displacement (round-25 review F68).
-                    return None
                 continue        # this arm cannot be the pointer at all
             got = self._ptr_offset(ssaf, arm, root, depth + 1, set(seen))
             if got is None:
@@ -7218,65 +7293,171 @@ class TaintEngine:
             return answers.pop()
         return None
 
-    def _arm_is_nearby_pointer(self, ssaf: Any, arm: Any, root: Any) -> bool:
-        """Whether *arm* is a CONSTANT pointer into the same storage as the
-        object this root describes, without being inside it yet.
+    def _declared_object_table(self) -> list[tuple[int, int]]:
+        """``(address, size)`` for every object the IMAGE declares a size
+        for, nearest-first per address.
 
-        Such an arm is not infeasible, only not there YET: a later
-        adjustment can bring it in (`choose(g + 48, g + 64)` then `+ 16`),
-        so dropping it certified the surviving arm (round-25 review F68).
-        An arm that is already inside, and one that names other storage
-        entirely, are both unaffected."""
-        base_ga = getattr(root, "ga", None)
-        if base_ga is None:
-            return False
-        value = self._int_const(arm)
-        if value is None:
-            value = self._global_addr(ssaf, arm, canon=False)
-        if value is None:
-            return False            # not a constant: nothing is claimed
-        if root(arm) is not None:
-            return False            # already inside the object
-        # Same SECTION is far too coarse: a named neighbour several objects
-        # away is disjoint storage, and treating it as "not there yet" lost
-        # an exact offset the other arm established (round-26 review F73).
-        # The test is the object analysis's own: both must canonicalise to
-        # the same object, or the arm must sit inside the object that
-        # ENCLOSES this one (an interior alias's base).
-        canon_arm = self._canon_global(int(value))
-        canon_root = self._canon_global(int(base_ga))
-        if canon_arm is None or canon_root is None:
-            return False
-        if canon_arm == canon_root:
+        An interior alias and the next object along look identical in the
+        layout -- both are a symbol a few dozen bytes on -- so the layout
+        alone cannot say which storage an address belongs to. The ELF
+        symbol table can: `.set middle, tracked + 64` declares one byte
+        while `tracked` declares 256, so `middle`, `before` and `upper`
+        are all INSIDE one object and the neighbour after it is not
+        (BN23-ALIAS-01/JOIN-01). Images that declare nothing -- a stripped
+        binary, PE -- get an empty table and the boundary rules below.
+        """
+        if self._declared_objects is not None:
+            return self._declared_objects
+        table: list[tuple[int, int]] = []
+        try:
+            table = self._read_elf_object_sizes()
+        except Exception:
+            table = []
+        table.sort()
+        self._declared_objects = table
+        return table
+
+    # ELF data symbols only (`STT_OBJECT`), and only where the image states
+    # a size: a zero `st_size` says nothing, which is not the same as 0.
+    _ELF_STT_OBJECT = 1
+
+    def _read_elf_object_sizes(self) -> list[tuple[int, int]]:
+        """The `(address, size)` pairs an ELF image's symbol tables state."""
+        import struct
+
+        raw_view = getattr(self.bv, "parent_view", None)
+        read = getattr(raw_view, "read", None)
+        if not callable(read):
+            return []
+        head = read(0, 64) or b""
+        if len(head) < 64 or head[:4] != b"\x7fELF":
+            return []
+        wide = head[4] == 2
+        little = head[5] == 1
+        end = "<" if little else ">"
+        if wide:
+            shoff, = struct.unpack_from(end + "Q", head, 0x28)
+            shentsize, shnum = struct.unpack_from(end + "HH", head, 0x3A)
+        else:
+            shoff, = struct.unpack_from(end + "I", head, 0x20)
+            shentsize, shnum = struct.unpack_from(end + "HH", head, 0x2E)
+        if not shoff or not shnum or shentsize < (64 if wide else 40):
+            return []
+        table = read(shoff, shentsize * shnum) or b""
+        if len(table) < shentsize * shnum:
+            return []
+        sections: list[tuple[int, int, int, int, int]] = []
+        for i in range(shnum):
+            at = i * shentsize
+            if wide:
+                s_type, = struct.unpack_from(end + "I", table, at + 4)
+                offset, size = struct.unpack_from(end + "QQ", table, at + 0x18)
+                link, = struct.unpack_from(end + "I", table, at + 0x28)
+                entsize, = struct.unpack_from(end + "Q", table, at + 0x38)
+            else:
+                s_type, = struct.unpack_from(end + "I", table, at + 4)
+                offset, size = struct.unpack_from(end + "II", table, at + 0x10)
+                link, = struct.unpack_from(end + "I", table, at + 0x18)
+                entsize, = struct.unpack_from(end + "I", table, at + 0x24)
+            sections.append((int(s_type), int(offset), int(size), int(link),
+                             int(entsize)))
+        out: list[tuple[int, int]] = []
+        for s_type, offset, size, link, entsize in sections:
+            # SHT_SYMTAB (2) and SHT_DYNSYM (11).
+            if s_type not in (2, 11) or not entsize or link >= len(sections):
+                continue
+            blob = read(offset, size) or b""
+            step = 24 if wide else 16
+            for at in range(0, min(len(blob), size) - entsize + 1, entsize):
+                if wide:
+                    info = blob[at + 4]
+                    value, st_size = struct.unpack_from(end + "QQ", blob, at + 8)
+                else:
+                    info = blob[at + 12]
+                    value, st_size = struct.unpack_from(end + "II", blob, at + 4)
+                if (info & 0xF) != self._ELF_STT_OBJECT or not st_size:
+                    continue
+                if value:
+                    out.append((int(value), int(st_size)))
+            del step
+        return out
+
+    def _credible_object(self, addr: int) -> int | None:
+        """The base of the widest DECLARED object containing *addr*.
+
+        The widest, because an alias declares its own byte and the object
+        it names the inside of declares the whole buffer; the question
+        here is which STORAGE the address belongs to."""
+        addr = int(addr)
+        cached = self._credible_object_cache.get(addr)
+        if cached is not None or addr in self._credible_object_cache:
+            return cached
+        best: tuple[int, int] | None = None
+        for base, size in self._declared_object_table():
+            if base > addr:
+                break
+            if addr < base + size and (best is None or size > best[1]):
+                best = (base, size)
+        out = None if best is None else best[0]
+        self._credible_object_cache[addr] = out
+        return out
+
+    def _same_storage(self, addr: int, ga: int) -> bool:
+        """Whether a constant pointer at *addr* names the same storage as
+        the object at *ga* -- the relation every affine question is asked
+        against.
+
+        A shared credible enclosing object decides it outright: an interior
+        alias below the queried subobject (`before = tracked + 48`) and one
+        above it (`upper = tracked + 144`, adjusted back) are the same
+        bytes, while the object next door is not, however close its base
+        (BN23-ALIAS-01/JOIN-01, round-30 review F75). Where the image
+        declares no sizes the LAYOUT answers as before: below, a distinct
+        named object strictly between the two separates them; above, an arm
+        that is itself a named object's base IS that object."""
+        addr, ga = int(addr), int(ga)
+        if addr == ga:
             return True
-        if int(value) < int(base_ga):
-            # BELOW this object, an arm is part of the same storage when
-            # it is one of the ENCLOSING candidates the overlap test
-            # already uses -- `before = tracked + 48` is, and a NAMED alias
-            # is no less an alias for carrying a symbol (round-29 review
-            # F73). Storage the enclosing search does not admit is not
-            # this object's; where it does admit it, the join goes to
-            # unknown, which is the honest direction.
-            candidates, _exhausted = self._preceding_objects(canon_root)
-            if canon_arm not in candidates:
-                return False
-            # ...and within reach: an adjustment that brings a pointer INTO
-            # this object cannot travel further than the object is wide, so
-            # a distinct global further below than that is not an arm this
-            # route can land inside -- counting it turned two provably
-            # clean arms into a blocking unknown (round-30 review F75).
-            try:
-                reach = int(self._global_extent(canon_root))
-            except Exception:
-                return True
-            return (int(base_ga) - int(value)) <= max(reach, 1)
-        # ABOVE it, an enclosing candidate is not the question -- every
-        # later object lists this one as a predecessor -- so the test is
-        # the boundary: no NAMED object between them, the arm's own symbol
-        # included, because an arm that names storage of its own IS that
-        # storage (round-27 and round-28 review F73). An alias INSIDE this
-        # object never reaches here; the root test answered it already.
-        return not self._named_boundary_between(int(value), int(base_ga))
+        key = (addr, ga)
+        cached = self._same_storage_cache.get(key)
+        if cached is not None:
+            return cached
+        if (abs(addr - ga) > self._ALIAS_WINDOW
+                or self._canon_global(addr) is None
+                or self._section_names(addr) != self._section_names(ga)):
+            # Nothing claims an arbitrary integer is a pointer at all: it
+            # must address data this view knows, in this object's section,
+            # within the window an alias of one object can span. Without
+            # that, `p + 80` offered 80 as a constant pointer and the
+            # composed displacement became nonsense.
+            self._same_storage_cache[key] = False
+            return False
+        here, there = self._credible_object(addr), self._credible_object(ga)
+        if here is not None or there is not None:
+            # One of them is inside storage the image sized: then they
+            # share it or they do not, and a declared size is the last
+            # word either way.
+            out = here is not None and here == there
+        elif addr < ga:
+            # No declared size anywhere: the layout answers, with the same
+            # enclosing-candidate search the overlap test uses. An object
+            # that may enclose this one, with no distinct named object
+            # strictly between, is the same storage; anything else is a
+            # neighbour (round-30 review F75).
+            canon_arm = self._canon_global(addr)
+            candidates, _exhausted = self._preceding_objects(
+                self._canon_global(ga) or ga)
+            out = (canon_arm is not None and canon_arm in candidates
+                   and not self._named_boundary_between(addr, ga,
+                                                        include_arm=False))
+        else:
+            # ABOVE, with nothing declared, there is no evidence of shared
+            # storage at all: every later object lists this one as a
+            # predecessor, so claiming it would merge neighbours. The
+            # subobject's own extent is then the answer, as before.
+            out = False
+        self._same_storage_cache[key] = out
+        return out
 
     def _is_named_object(self, addr: int) -> bool:
         """Whether a SYMBOL names the storage beginning at *addr*."""
@@ -7339,8 +7520,8 @@ class TaintEngine:
         one of its FORMALS (possibly displaced -- `return p + 16`), and a
         body whose returns name the object itself."""
         params = self._call_params(defn)
-        _k, model = lookup_model(
-            self.models, self._callee_name(self._resolve_direct_target(defn)))
+        name = self._callee_name(self._resolve_direct_target(defn))
+        _k, model = lookup_model(self.models, name)
         for rule in ((model or {}).get("propagates") or ()):
             if str(rule.get("to") or "") not in ("ret", "*ret"):
                 continue
@@ -7348,7 +7529,17 @@ class TaintEngine:
             if arg is not None and arg < len(params):
                 got = self._ptr_offset(ssaf, params[arg], root, depth + 1, seen)
                 if got is not None:
-                    return got
+                    # An `arg:N -> ret` rule says the result is a pointer
+                    # into that argument's object -- NOT that it equals it.
+                    # `mempcpy` hands back dest + n and `stpcpy` the
+                    # terminator it found, so reading the alias as equality
+                    # certified the base for a pointer the program had
+                    # already advanced (BN23-ENDPTR-01).
+                    delta, stated = self._model_ret_delta(model, defn, params,
+                                                          name)
+                    if stated and delta is None:
+                        return None
+                    return got + int(delta or 0)
         body, _unread = self._callee_body(defn)
         if body is None:
             return None
@@ -7391,6 +7582,83 @@ class TaintEngine:
             return answers.pop() if len(answers) == 1 else None
         return None
 
+    def _model_ret_delta(self, model: dict[str, Any] | None, ins: Any,
+                         params: list, name: str | None) -> tuple[int | None, bool]:
+        """``(displacement the returned pointer carries, the model states
+        one)``.
+
+        Most `arg:N -> ret` models hand the destination straight back, so
+        no statement means zero. The end-returning family is different:
+        `mempcpy` returns dest + n, which is exact when the count is, and
+        `stpcpy`/`memccpy` return wherever the data ended, which is
+        unknown unless THIS call's operands prove it (BN23-ENDPTR-01)."""
+        spec = (model or {}).get("ret_offset")
+        if not isinstance(spec, dict):
+            return (0, False)
+        count_arg = spec.get("count_arg")
+        if count_arg is not None:
+            idx = int(count_arg)
+            if idx >= len(params):
+                return (None, True)
+            n = self._int_const(params[idx])
+            if n is None or int(n) < 0:
+                return (None, True)
+            return (int(n) * self._count_scale(name), True)
+        scan_arg = spec.get("string_length_arg")
+        if scan_arg is not None:
+            text = self._constant_bytes(params[int(scan_arg)]
+                                        if int(scan_arg) < len(params) else None)
+            if text is None:
+                return (None, True)
+            return (len(text), True)
+        scan_arg = spec.get("scan_arg")
+        if scan_arg is None:
+            return (None, True)
+        stop = spec.get("stop_arg")
+        limit = spec.get("count_arg_limit")
+        text = self._constant_bytes(params[int(scan_arg)]
+                                    if int(scan_arg) < len(params) else None,
+                                    terminated=False)
+        stop_value = None if stop is None or int(stop) >= len(params) \
+            else self._int_const(params[int(stop)])
+        bound = None if limit is None or int(limit) >= len(params) \
+            else self._int_const(params[int(limit)])
+        if text is None or stop_value is None or bound is None or int(bound) < 0:
+            return (None, True)
+        window = text[:int(bound)]
+        found = window.find(bytes([int(stop_value) & 0xFF]))
+        if found < 0:
+            # The byte is not in the bytes it may copy, so this call
+            # returns NULL -- no pointer into the object at all.
+            return (None, True)
+        return (found + 1, True)
+
+    def _constant_bytes(self, expr: Any, terminated: bool = True,
+                        limit: int = 4096) -> bytes | None:
+        """The bytes a CONSTANT pointer operand addresses, or None.
+
+        Only a literal the image itself holds: a `char *` that is not a
+        constant address, or storage the view cannot read, proves nothing
+        about where a copy of it ends."""
+        if expr is None:
+            return None
+        addr = self._int_const(expr)
+        if addr is None:
+            return None
+        read = getattr(self.bv, "read", None)
+        if not callable(read):
+            return None
+        try:
+            blob = read(int(addr), limit) or b""
+        except Exception:
+            return None
+        if not blob:
+            return None
+        if not terminated:
+            return bytes(blob)
+        cut = blob.find(b"\x00")
+        return None if cut < 0 else bytes(blob[:cut])
+
     def _global_root(self, ga: int):
         """Leaf test for the object at *ga*: the displacement a constant
         pointer into it names."""
@@ -7401,7 +7669,15 @@ class TaintEngine:
             if value is None:
                 return None
             value = int(value)
-            return value - ga if ga <= value < ga + extent else None
+            if ga <= value < ga + extent:
+                return value - ga
+            # Outside the subobject but inside the same STORAGE: a signed
+            # displacement, because an adjustment composes onto it and may
+            # bring it back in (`upper - 32` is `middle + 48`). Whether
+            # those bytes are the tainted ones is the interval test's
+            # question, asked once the chain has been composed, not a
+            # reason to answer "not this object" here (BN23-ALIAS-01).
+            return value - ga if self._same_storage(value, ga) else None
         root.ga = int(ga)
         return root
 
@@ -7960,11 +8236,23 @@ class TaintEngine:
         if not ranges:
             return False
         lo = int(use.offset)
-        # A read with no stated length runs FORWARD until it stops, so a
-        # start at or past every tainted range still touches none of them:
+        # A read the model says is FORWARD runs from here until it stops,
+        # so a start at or past every tainted range touches none of them:
         # `system(g + 80)` after `memcpy(g, s, 16)` reads bytes this run
-        # never wrote (round-30 review F76). Only the end is unknown.
-        hi = None if not use.span else lo + int(use.span)
+        # never wrote (round-30 review F76). Only its END is unknown. A
+        # length nothing states on a use whose DIRECTION nothing states is
+        # not that case and keeps the object-level answer.
+        if use.kind == "return":
+            # Handing the POINTER back touches no bytes (round-3 review
+            # F17): what it can reach is the one position it names, and the
+            # caller that consumes it is classified on its own. So a
+            # returned `middle + 80` is an escape of bytes this run never
+            # wrote, while `return g` is an escape of the tainted ones.
+            hi = lo + 1
+        elif not use.span and not use.forward:
+            return False
+        else:
+            hi = None if not use.span else lo + int(use.span)
         for rlo, rhi in ranges:
             if rhi is None:
                 return False

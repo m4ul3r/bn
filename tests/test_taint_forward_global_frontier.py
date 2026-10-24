@@ -5208,3 +5208,259 @@ def test_the_wide_element_width_follows_the_target_abi(models, platform,
     assert eng._wchar_width() == width
     assert eng._count_scale("wmemcpy") == width
     assert eng._count_scale("memcpy") == 1
+
+
+# --------------------------------------------------------------------------
+# round-30 rework: BN23-ALIAS-01/JOIN-01 (storage), APPEND-01 (spans),
+# ENDPTR-01 (returned displacements) and F76 (forward reads)
+# --------------------------------------------------------------------------
+
+STRNCAT = 0x4010f0
+MEMPCPY = 0x401100
+STPCPY = 0x401110
+MEMCCPY = 0x401120
+
+#: A 64-bit little-endian ELF image holding nothing but a symbol table, which
+#: is where an object's DECLARED size comes from.
+def _elf_with_object_sizes(objects):
+    import struct
+    names = b"\x00"
+    syms = b""
+    for name, (addr, size) in objects.items():
+        offset = len(names)
+        names += name.encode() + b"\x00"
+        # st_name, st_info (STT_OBJECT), st_other, st_shndx, st_value, st_size
+        syms += struct.pack("<IBBHQQ", offset, 1, 0, 1, addr, size)
+    head = bytearray(64)
+    head[:4] = b"\x7fELF"
+    head[4], head[5] = 2, 1
+    symtab_off, strtab_off = 0x1000, 0x2000
+    shoff = 0x3000
+    struct.pack_into("<Q", head, 0x28, shoff)
+    struct.pack_into("<HHH", head, 0x3A, 64, 3, 0)
+    blob = bytearray(shoff + 3 * 64)
+    blob[:64] = head
+    blob.extend(b"\x00" * 64)
+    for index, (s_type, offset, size, link, entsize) in enumerate((
+            (0, 0, 0, 0, 0),                                  # SHT_NULL
+            (2, symtab_off, len(syms), 2, 24),                # SHT_SYMTAB
+            (3, strtab_off, len(names), 0, 0))):              # SHT_STRTAB
+        at = shoff + index * 64
+        struct.pack_into("<I", blob, at + 4, s_type)
+        struct.pack_into("<QQ", blob, at + 0x18, offset, size)
+        struct.pack_into("<I", blob, at + 0x28, link)
+        struct.pack_into("<Q", blob, at + 0x38, entsize)
+    out = bytearray(max(len(blob), strtab_off + len(names)))
+    out[:len(blob)] = blob
+    out[symtab_off:symtab_off + len(syms)] = syms
+    out[strtab_off:strtab_off + len(names)] = names
+    return bytes(out)
+
+
+class FRawView:
+    def __init__(self, image):
+        self._image = image
+
+    def read(self, offset, length):
+        return self._image[int(offset):int(offset) + int(length)]
+
+
+class FDeclaredBV(FExtentBV):
+    """A view whose IMAGE declares object sizes, as an ELF symbol table does."""
+
+    def __init__(self, *args, declared=None, **kw):
+        super().__init__(*args, **kw)
+        self.parent_view = FRawView(_elf_with_object_sizes(declared or {}))
+
+
+def _storage_engine(models, declared):
+    bv = FDeclaredBV({}, objects={G_DIR: 0x100, G_OTHER: 0x100},
+                     section=(0x404000, 0x405000), declared=declared)
+    return te.TaintEngine(bv, models)
+
+
+def test_a_declared_object_tells_an_interior_alias_from_a_neighbour(models):
+    # BN23-ALIAS-01/JOIN-01: `middle` and `upper` name the inside of ONE
+    # declared object; `neighbour` begins its own, however close its base.
+    eng = _storage_engine(models, {
+        "tracked": (G_DIR, 256), "neighbour": (G_OTHER, 256)})
+    middle, upper = G_DIR + 0x40, G_DIR + 0x90
+    assert eng._credible_object(middle) == G_DIR
+    assert eng._same_storage(upper, middle) is True        # above, same object
+    assert eng._same_storage(G_DIR + 0x10, middle) is True   # below, same one
+    assert eng._same_storage(G_OTHER, middle) is False     # the next object
+    assert eng._same_storage(G_OTHER + 0x20, middle) is False
+
+
+def test_without_declared_sizes_only_an_enclosing_candidate_is_the_same(models):
+    # The layout fallback: an object that may ENCLOSE this one, with no
+    # distinct named object strictly between, is the same storage. Anything
+    # above, where every later object lists this one as a predecessor, is
+    # not claimed at all.
+    eng = _storage_engine(models, {})
+    assert eng._same_storage(G_DIR + 0x40, G_DIR) is False
+    assert eng._same_storage(0x1234, G_DIR) is False       # not data at all
+
+
+def _append_program(count, *, reader_offset, target=STRNCAT, name="strncat",
+                    dest_offset=0):
+    """`main` copies argv into g, then appends *count* tainted bytes to it."""
+    reader = _reader("append_reader", 0x401200, G_DIR + reader_offset, 0x401210)
+    func, argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(0x40)])
+    instrs = func.mlil.ssa_form.instructions
+    instrs.insert(1, FInstr(
+        1, 0x401106, "MLIL_CALL_SSA", f"{name}(g, argv#0, {count})",
+        reads=[FSSA(argv, 0)], writes=[], dest=_gptr(target),
+        params=[_gptr(G_DIR + dest_offset), _var(FSSA(argv, 0)),
+                _const(count)]))
+    for index, ins in enumerate(instrs):
+        ins.instr_index = index
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", target: name,
+                    0x401200: "append_reader"},
+                   funcs={0x401200: reader},
+                   refs={G_DIR + reader_offset: [FRef(reader, 0x401210)]},
+                   objects={G_DIR: 0}, section=(0x404000, 0x405000))
+    return func, bv
+
+
+def _append_scan_program(count, target=STRNCAT, name="strncat"):
+    """The append is the ONLY use of the object: `main` taints `g + 0x40`
+    and then appends a literal to `g`, whose destination scan has to walk
+    over those bytes to find the terminator."""
+    appender = GFunc("appender", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_CALL_SSA", f"{name}(g, lit, {count})",
+               writes=[], dest=_gptr(target),
+               params=[_gptr(G_DIR), _gptr(0x402000), _const(count)]),
+    ]), params=[])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR + 0x40),
+        call_sites=[(0x401108, _gptr(0x401200), [])],
+        params_extra=[_const(0x10)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", target: name,
+                    0x401200: "appender"},
+                   funcs={0x401200: appender},
+                   refs={G_DIR: [FRef(appender, 0x401210)]},
+                   objects={G_DIR: 0x100}, section=(0x404000, 0x405000))
+    return func, bv
+
+
+@pytest.mark.parametrize("count", [1, 0])
+def test_an_append_count_does_not_bound_the_destination_scan(models, count):
+    # BN23-APPEND-01: the count bounds the appended SOURCE. The destination
+    # scan runs to the terminator whatever it says -- including zero, which
+    # appends nothing and still reads what is there.
+    func, bv = _append_scan_program(count)
+    result = _forward(bv, func, models)
+    assert _leaves(result), result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_bounded_copys_count_still_bounds_its_own_read(models):
+    # ...which is an APPEND's property, not every count's: `memcpy(g, lit,
+    # 1)` reads one byte of the object and stops (round-11 review F21).
+    func, bv = _append_scan_program(1, target=MEMCPY, name="memcpy")
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+
+
+def test_an_append_writes_at_the_terminator_not_the_base(models):
+    # A one-byte append is not `[base, base + 1)`: the byte lands wherever
+    # the existing string ends, so a reader past the count is not disjoint.
+    func, bv = _append_program(1, reader_offset=0x40)
+    assert _leaves(_forward(bv, func, models)), "the appended byte may be here"
+
+
+def test_a_zero_length_copy_still_touches_nothing(models):
+    # ...while a genuine zero-length COPY of the same tainted bytes to the
+    # same address writes none of them (round-24 review F65).
+    func, bv = _append_program(0, reader_offset=0x40, target=MEMCPY,
+                               name="memcpy", dest_offset=0x40)
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+
+
+def _end_return_program(target, name, params, *, use_delta=8):
+    """`producer()` returns an end pointer; the consumer adds *use_delta*."""
+    r0, r1 = FSSA(FVar("r"), 0), FSSA(FVar("r"), 1)
+    producer = GFunc("producer", 0x401400, FSSAFunc([
+        FInstr(0, 0x401410, "MLIL_CALL_SSA", f"r#0 = {name}(g, ..)",
+               writes=[r0], dest=_gptr(target), params=params),
+        FInstr(1, 0x401418, "MLIL_RET", "return r#0", reads=[r0],
+               src=[_var(r0)]),
+    ]), params=[])
+    consumer = GFunc("end_reader", 0x401300, FSSAFunc([
+        FInstr(0, 0x401310, "MLIL_CALL_SSA", "r#1 = producer()", writes=[r1],
+               dest=_gptr(0x401400), params=[]),
+        FInstr(1, 0x401318, "MLIL_CALL_SSA", f"system(r#1 + {use_delta})",
+               reads=[r1], dest=_gptr(SYSTEM),
+               params=[FExpr("MLIL_ADD", f"r#1 + {use_delta}", left=_var(r1),
+                             right=_const(use_delta))]),
+    ]), params=[], callees=[producer])
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401300), [])], params_extra=[_const(0x80)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", target: name,
+                    0x401300: "end_reader", 0x401400: "producer"},
+                   funcs={0x401300: consumer, 0x401400: producer},
+                   refs={G_DIR: [FRef(producer, 0x401410)]},
+                   objects={G_DIR: 0}, section=(0x404000, 0x405000))
+    return func, bv
+
+
+def test_mempcpy_returns_the_end_of_what_it_copied(models):
+    # BN23-ENDPTR-01: `mempcpy(g, src, 1)` hands back g + 1, so the
+    # consumer's + 8 is at +9 -- not at the base's +8.
+    func, bv = _end_return_program(
+        MEMPCPY, "mempcpy", [_gptr(G_DIR), _gptr(0x402000), _const(1)])
+    [leaf] = _leaves(_forward(bv, func, models))
+    row = next(r for r in leaf["references"] if r["display_name"] == "end_reader")
+    assert (row["offset"], row["offset_known"]) == (9, True), row
+
+
+def test_an_unprovable_end_pointer_is_unknown_not_the_base(models):
+    # `stpcpy(g, p)` returns the terminator it wrote. Where the source is
+    # not a literal this walk can read, that is unknown -- and an unknown
+    # displacement is not the object's base.
+    func, bv = _end_return_program(
+        STPCPY, "stpcpy", [_gptr(G_DIR), _var(FSSA(FVar("p"), 0))])
+    [leaf] = _leaves(_forward(bv, func, models))
+    row = next(r for r in leaf["references"] if r["display_name"] == "end_reader")
+    assert row["offset_known"] is False, row
+
+
+def _past_the_write_program(reader, count=0x10):
+    func, _argv = _copy_then_call(
+        0x401104, MEMCPY, _gptr(G_DIR),
+        call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(count)])
+    bv = FExtentBV({MEMCPY: "memcpy", SYSTEM: "system", MEMPCPY: "mempcpy",
+                    0x401200: reader.name},
+                   funcs={0x401200: reader},
+                   refs={G_DIR + 0x50: [FRef(reader, 0x401210)]},
+                   objects={G_DIR: 0x100}, section=(0x404000, 0x405000))
+    return func, bv
+
+
+def test_a_forward_string_read_starting_past_the_write_is_silent(models):
+    # Round-30 review F76: `system(g + 80)` after a 16-byte copy reads
+    # bytes this run never wrote; only the END of that read is unknown.
+    func, bv = _past_the_write_program(
+        _reader("string_reader", 0x401200, G_DIR + 0x50, 0x401210))
+    result = _forward(bv, func, models)
+    assert _leaves(result) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_an_unknown_length_read_of_unstated_direction_still_blocks(models):
+    # ...while a pointer handed to a call whose handling of those bytes is
+    # not modeled proves nothing about where it reads.
+    opaque = GFunc("opaque_reader", 0x401200, FSSAFunc([
+        FInstr(0, 0x401210, "MLIL_CALL_SSA", "unknown(g + 0x50)", writes=[],
+               dest=_gptr(0x401900), params=[_gptr(G_DIR + 0x50)]),
+    ]), params=[])
+    func, bv = _past_the_write_program(opaque)
+    result = _forward(bv, func, models)
+    assert _leaves(result), result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
