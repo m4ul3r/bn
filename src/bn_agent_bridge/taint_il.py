@@ -124,11 +124,16 @@ def argument_register_provenance(func: Any, addr: int, reg: str,
     if lssa is None:
         return ("unproven", [])
     try:
+        site_ops = _call_like_ops(bn)
         for block in lssa:
             for ins in block:
                 if int(getattr(ins, "address", -1)) != int(addr):
                     continue
-                if getattr(ins, "operation", None) != bn.LowLevelILOperation.LLIL_CALL_SSA:
+                # A TAIL call is a call: an optimised `return f(p)` leaves the
+                # arguments exactly where they already are, which is precisely
+                # the shape this answers for. Matching only `LLIL_CALL_SSA`
+                # left every tail call unrecovered (review F4).
+                if getattr(ins, "operation", None) not in site_ops:
                     continue
                 definition = reaching_reg_def(ins, reg, bn)
                 if definition is None:

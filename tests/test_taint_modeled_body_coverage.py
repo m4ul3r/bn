@@ -598,15 +598,16 @@ def test_a_view_with_no_llil_claims_nothing():
         types.SimpleNamespace(llil=None), CALL, "rdi", _FAKE_BN) == ("unproven", [])
 
 
-def _dropped_arg_program(*, overlay=None, extra_instr=None, n_args=1):
+def _dropped_arg_program(*, overlay=None, extra_instr=None, n_args=1, tail=False):
     """`call_unread(p)`: a call to the unread body whose MLIL carries NO
     parameters -- the shape an optimised build leaves when BN has no prototype
-    for the callee to recover arguments from."""
+    for the callee to recover arguments from. With ``tail`` the call is the
+    optimised `return unread_body(...)` form BN lifts as a tail call."""
     p, q = FVar("p", ident=40), FVar("q", ident=42)
     p0, q0 = FSSA(p, 0), FSSA(q, 0)
     params = [p, q][:n_args]
-    call = FInstr(0, CALL, "MLIL_CALL_SSA", "unread_body()", reads=[], writes=[],
-                  dest=_ptr(BODY), params=[])
+    call = FInstr(0, CALL, "MLIL_TAILCALL_SSA" if tail else "MLIL_CALL_SSA",
+                  "unread_body()", reads=[], writes=[], dest=_ptr(BODY), params=[])
     instrs = [call] + list(extra_instr or [])
     entry = FFunc("call_unread", ENTRY, FSSAFunc(instrs), params=params)
     entry.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi"])
@@ -741,3 +742,101 @@ def test_a_call_whose_arguments_binary_ninja_recovered_is_not_second_guessed():
     [leaf] = _boundaries(engine.forward(entry, [te.parse_locator("param:0")]))
     assert leaf["tainted_args"] == [0], leaf
     assert leaf["abi_recovered_args"] == [], leaf
+
+
+# --------------------------------------------------------------------------
+# F4: a tail call is a call
+# --------------------------------------------------------------------------
+
+def test_a_tail_call_site_is_read_like_any_other_call():
+    # `return f(p)` leaves the arguments where they are, which is exactly the
+    # shape the entry-value leg answers for -- and matching only
+    # `LLIL_CALL_SSA` left every tail call unrecovered.
+    call = _lins(0, CALL, _FAKE_BN.LowLevelILOperation.LLIL_TAILCALL_SSA)
+    _LBlock([call])
+    kind, seeds = te.argument_register_provenance(
+        _llil_func([[call]]), CALL, "rdi", _FAKE_BN)
+    assert (kind, seeds) == ("entry", [])
+
+
+@pytest.mark.parametrize("overlay", list(OVERLAYS), ids=list(OVERLAYS))
+def test_a_tail_call_into_an_unread_body_is_the_same_boundary(overlay):
+    entry, bv, catalog, (p0, _q0), _call = _dropped_arg_program(
+        overlay=OVERLAYS[overlay], tail=True)
+    engine = te.TaintEngine(bv, catalog)
+    _with_recovered(engine, {0: p0})
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+
+    [leaf] = _boundaries(result)
+    assert leaf["tainted_args"] == [0], leaf
+    assert leaf["abi_recovered_args"] == [0], leaf
+    assert result["stats"]["analysis_incomplete_functions"] == ["unread_body"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+# --------------------------------------------------------------------------
+# F5: the same evidence for an ANALYSED callee -- a frontier, not an argument
+# --------------------------------------------------------------------------
+
+def _under_recovered_setup(monkeypatch, *, reads_input=True, proven=True,
+                           tainted_value=True):
+    """A call whose MLIL carries no arguments into an ANALYSED callee whose
+    recovered arity is short of the convention's argument registers."""
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    callee = FFunc("consumer", ANALYSED, FSSAFunc([
+        FInstr(0, ANALYSED + 4, "MLIL_RET", "return", reads=[], src=[])]), params=[])
+    callee.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi"])
+    call = FInstr(0, CALL, "MLIL_CALL_SSA", "consumer()", reads=[], writes=[],
+                  dest=_ptr(ANALYSED), params=[])
+    call.il_basic_block = []
+    entry = FFunc("caller", ENTRY, FSSAFunc([call]), params=[p])
+    entry.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi"])
+    bv = FBV({ANALYSED: "consumer"}, funcs={ANALYSED: callee})
+    bv.arch = types.SimpleNamespace(get_reg_index=lambda r: {"rdi": 0, "rsi": 1}[r])
+    bv.platform = types.SimpleNamespace(
+        default_calling_convention=types.SimpleNamespace(int_arg_regs=["rdi", "rsi"]))
+    engine = te.TaintEngine(bv, te.load_models())
+    monkeypatch.setattr(engine, "_reg_reads_as_input",
+                        lambda c, r: reads_input, raising=False)
+    value = p0 if tainted_value else FSSA(FVar("other", ident=61), 1)
+    monkeypatch.setattr(
+        engine, "_abi_arg_operands",
+        lambda f, i, idx, allow_entry=False: (
+            [te._RegisterOperand(value, "rdi")] if proven and idx == 0 else []),
+        raising=False)
+    return engine, entry
+
+
+def test_an_unchanged_entry_register_an_analysed_callee_reads_is_a_frontier(monkeypatch):
+    # The confirmed missed-taint case: the seeded value is still in `rdi`, the
+    # call writes nothing (it is already there), BN recovered no parameters,
+    # and the analysed callee READS that register as an incoming value. The
+    # flow was dropped with no sink and no frontier at all.
+    engine, entry = _under_recovered_setup(monkeypatch)
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+
+    [leaf] = [lf for lf in result["leaves"] if lf.get("cause") == "arg_under_recovered"]
+    assert leaf["kind"] == "unmodeled_callee", leaf
+    assert leaf["callee"]["name"] == "consumer", leaf
+    assert leaf["register"] == "rdi", leaf
+    assert leaf["argument_index"] == 0, leaf
+    assert leaf["recovered_params"] == 0, leaf
+    assert leaf["via"] == "entry_value", leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    # No formal is invented and no sink is claimed.
+    assert result["reached_sinks"] == [], result
+
+
+@pytest.mark.parametrize("kwargs, why", [
+    ({"reads_input": False}, "the callee never consumes that register"),
+    ({"proven": False}, "nothing proves what the register holds"),
+    ({"tainted_value": False}, "the register holds an untainted value"),
+], ids=["not-consumed", "unproven", "untainted"])
+def test_the_under_recovery_frontier_does_not_fire_without_evidence(monkeypatch,
+                                                                    kwargs, why):
+    engine, entry = _under_recovered_setup(monkeypatch, **kwargs)
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+    assert [lf for lf in result["leaves"]
+            if lf.get("cause") == "arg_under_recovered"] == [], why
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, why

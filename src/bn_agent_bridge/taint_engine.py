@@ -838,7 +838,8 @@ class TaintEngine:
         cache[addr] = found
         return found
 
-    def _abi_arg_operands(self, func: Any, ins: Any, idx: int) -> list[Any]:
+    def _abi_arg_operands(self, func: Any, ins: Any, idx: int, *,
+                          allow_entry: bool = False) -> list[Any]:
         """The value(s) the calling convention's register for argument ``idx``
         carries INTO this call, as operands the taint check can read -- empty
         when nothing proves one.
@@ -858,24 +859,29 @@ class TaintEngine:
         register, or a view with no LLIL yields nothing: unproven is never
         recovered.
 
-        The ENTRY leg answers only for a call into a body whose MLIL is
-        unavailable. Anywhere else BN recovered what it recovered, and an
-        un-clobbered register past its parameter list is as likely to hold a
-        dead value as an argument.
+        The ENTRY leg is opt-in (``allow_entry``). The call branch asks for it
+        only for a call into a body whose MLIL is unavailable -- anywhere else
+        BN recovered what it recovered, and an un-clobbered register past its
+        parameter list is as likely to hold a dead value as an argument. The
+        #381 under-recovery frontier asks for it with a stricter gate of its
+        own: the callee must READ that register as an incoming value.
 
-        Memoized per (function, call site, index): the fixpoint revisits every
-        instruction, and this walks the LLIL-SSA CFG.
+        Memoized per (function, call site, index, leg): the fixpoint revisits
+        every instruction, and this walks the LLIL-SSA CFG.
         """
         cache = getattr(self, "_abi_arg_cache", None)
         if cache is None:
             cache = self._abi_arg_cache = {}
-        key = (int(getattr(func, "start", 0)), int(getattr(ins, "address", -1)), int(idx))
+        key = (int(getattr(func, "start", 0)), int(getattr(ins, "address", -1)),
+               int(idx), bool(allow_entry))
         if key in cache:
             return cache[key]
-        cache[key] = out = self._abi_arg_operands_uncached(func, ins, idx)
+        cache[key] = out = self._abi_arg_operands_uncached(
+            func, ins, idx, allow_entry=allow_entry)
         return out
 
-    def _abi_arg_operands_uncached(self, func: Any, ins: Any, idx: int) -> list[Any]:
+    def _abi_arg_operands_uncached(self, func: Any, ins: Any, idx: int, *,
+                                   allow_entry: bool) -> list[Any]:
         # A DEFINITION reaching the register goes through the existing #433
         # seam, so every consumer of that bridge keeps one implementation.
         try:
@@ -884,15 +890,12 @@ class TaintEngine:
             return []
         if seeds:
             return [_RegisterOperand(var, reg) for var, _site in seeds]
-        if reg is None:
+        if reg is None or not allow_entry:
             return []
         # No definition was bridged. That is the register's ENTRY value only
         # when the IL says nothing defines it and nothing that can run first
         # may have clobbered it -- asked separately, because an unbridgeable
-        # definition looks the same from here -- and only for the one callee
-        # shape BN could not read a prototype from.
-        if not self._call_enters_unread_body(ins):
-            return []
+        # definition looks the same from here.
         try:
             import binaryninja as bn
         except Exception:
@@ -932,7 +935,8 @@ class TaintEngine:
         idx = _try_arg_index(bare)
         if idx is None or idx < len(params):
             return None
-        for operand in self._abi_arg_operands(func, ins, idx):
+        for operand in self._abi_arg_operands(
+                func, ins, idx, allow_entry=self._call_enters_unread_body(ins)):
             hit = arg_taint(operand)
             if hit:
                 return hit[0]
@@ -5969,7 +5973,8 @@ class TaintEngine:
         leaf["cause"] = "return_value_unrecovered"
         return leaf
 
-    def _unrecovered_arg_frontier(self, ins: Any, tainted: set) -> dict[str, Any] | None:
+    def _unrecovered_arg_frontier(self, func: Any, ins: Any,
+                                  tainted: set) -> dict[str, Any] | None:
         """Honest frontier for the #381 silent drop. When a tainted value sits in
         an ABI argument register that BN did NOT include in this call's recovered
         params -- the callee's arity was under-recovered (Thumb 0-arity miss /
@@ -6055,16 +6060,50 @@ class TaintEngine:
                 # is what separates a genuine under-recovered arg from a leftover.
                 if not self._reg_reads_as_input(callee, arg_regs[pos]):
                     continue
-                return self._frontier_leaf(
-                    ins, callee, [pos],
-                    f"in-binary callee {getattr(callee, 'name', '?')} reads arg "
-                    f"register {arg_regs[pos]} as an input but BN recovered only "
-                    f"{n} parameter(s), so a tainted value passed there is not in "
-                    f"the call's args and the flow into the callee was not followed "
-                    f"-- the callee's args were under-recovered (taint #381)")
+                return self._under_recovered_leaf(
+                    ins, callee, pos, arg_regs[pos], n, "block_write")
+            # Nothing in this block WROTE the first missing argument register --
+            # and an optimised build writes nothing when the value is already
+            # there. The register then carries this function's own entry value,
+            # which the IL can prove (no definition reaches the call, and
+            # nothing that may run first could have clobbered it). Same
+            # decisive gate: the callee must READ that register as an incoming
+            # value, so a tainted leftover in a register nobody consumes is
+            # still not a dropped argument (review F5).
+            if first_missing not in last and self._reg_reads_as_input(callee, arg_regs[n]):
+                for operand in self._abi_arg_operands(func, ins, n, allow_entry=True):
+                    src = getattr(operand, "src", None)
+                    key = var_key(src)
+                    ver = getattr(src, "version", None)
+                    if (key, ver) in tainted or (key, None) in tainted:
+                        return self._under_recovered_leaf(
+                            ins, callee, n, arg_regs[n], n, "entry_value")
         except Exception:
             return None
         return None
+
+    def _under_recovered_leaf(self, ins: Any, callee: Any, pos: int, reg: str,
+                              recovered: int, via: str) -> dict[str, Any]:
+        """The #381 frontier, with the evidence behind it named.
+
+        ``via`` says HOW the register was shown to carry the tainted value:
+        ``block_write`` -- the call's own block set it up; ``entry_value`` --
+        nothing defines it and nothing that could run first may have clobbered
+        it, so it still holds what this function was entered with. No formal
+        is invented for the callee and no sink is claimed: the flow stops here
+        and says so.
+        """
+        leaf = self._frontier_leaf(
+            ins, callee, [pos],
+            f"in-binary callee {getattr(callee, 'name', '?')} reads arg "
+            f"register {reg} as an input but BN recovered only "
+            f"{recovered} parameter(s), so a tainted value passed there is not in "
+            f"the call's args and the flow into the callee was not followed "
+            f"-- the callee's args were under-recovered (taint #381)")
+        leaf.update(cause="arg_under_recovered", register=str(reg),
+                    argument_index=int(pos), recovered_params=int(recovered),
+                    via=str(via))
+        return leaf
 
     def _reg_reads_as_input(self, callee: Any, reg_name: str) -> bool:
         """True if *callee* consumes register *reg_name* as an incoming value --
@@ -10078,7 +10117,9 @@ class TaintEngine:
                     # (a reaching DEFINITION) has nothing to return for. Both
                     # shapes come back as operands here.
                     try:
-                        operands = self._abi_arg_operands(func, ins, argidx)
+                        operands = self._abi_arg_operands(
+                            func, ins, argidx,
+                            allow_entry=self._call_enters_unread_body(ins))
                     except Exception:
                         return [], None
                     reg = (operands[0].register if operands
@@ -10924,7 +10965,8 @@ class TaintEngine:
                     abi_recovered: dict[int, list] = {}
                     if not params and self._call_enters_unread_body(ins):
                         for _i in range(self._n_arg_registers(func)):
-                            _ops = self._abi_arg_operands(func, ins, _i)
+                            _ops = self._abi_arg_operands(func, ins, _i,
+                                                          allow_entry=True)
                             if not _ops:
                                 break
                             for _op in _ops:
@@ -10960,14 +11002,18 @@ class TaintEngine:
                     if not tainted_args:
                         # The MLIL call recovered no tainted arg -- but BN may have
                         # under-recovered the callee's arity (Thumb 0-arity miss /
-                        # variadic), dropping a tainted arg-register value that never
-                        # appears in `params`. Emit an honest frontier instead of a
-                        # silent false-negative (#381). Unmodeled only: a model that
-                        # armed this call owns that story itself (#577).
-                        if model is None:
-                            fr = self._unrecovered_arg_frontier(ins, tainted)
-                            if fr is not None and fr not in leaves:
-                                leaves.append(fr)
+                        # variadic, or an optimised call that writes no argument
+                        # register because the values are already in place),
+                        # dropping a tainted arg-register value that never appears
+                        # in `params`. Emit an honest frontier instead of a silent
+                        # false-negative (#381). Asked for a MODELED call too: a
+                        # model describes what the callee does with the arguments
+                        # it is given, and says nothing about an argument this call
+                        # does not carry -- the gate below is tight enough that a
+                        # model cannot make the hole go away (review F5).
+                        fr = self._unrecovered_arg_frontier(func, ins, tainted)
+                        if fr is not None and fr not in leaves:
+                            leaves.append(fr)
                         continue
                     # descend each callsite once per tainted-arg set (the fixpoint
                     # revisits instructions; without this, findings would duplicate)

@@ -2786,6 +2786,14 @@ N long abi_entry(long a, long b) {
     return r + 1;
 }
 
+/* An optimised TAIL call: `return unread_body(a, b)` leaves both arguments
+   exactly where they already are, so the call writes no argument register at
+   all -- and Binary Ninja lifts it as a tail call, not an ordinary one. */
+N long tail_entry(long a, long b) {
+    if (a == 5 || b == 7) return 0;
+    return unread_body(a, b);
+}
+
 /* The seeded value rides argument 1; argument 0 is a constant. */
 N long other_arg(long token) { long r = unread_body(0, token); return r + 1; }
 /* Nothing the seed reaches is passed at all. */
@@ -2795,14 +2803,37 @@ N long constant_only(long token) {
     return r + 1;
 }
 
+/* An ANALYSED callee reached the same way: the argument is already in its
+   register, so an optimised call site writes none. The guard keeps this
+   function's own parameter recoverable. */
+N long calls_analysed(long a) {
+    if (a == 5) return 0;
+    long r = analysed_body(a);
+    return r + 1;
+}
+
 int main(int argc, char **argv) {
     (void)argv;
     return (int)(call_unread(argc) + call_thunk(argc) + call_multihop(argc)
                  + call_wrapper(argc) + call_analysed(argc) + call_import(argc)
                  + call_indirect(argc) + two_contexts(argc) + other_arg(argc)
-                 + constant_only(argc) + abi_entry(argc, argc));
+                 + constant_only(argc) + abi_entry(argc, argc)
+                 + tail_entry(argc, argc) + calls_analysed(argc));
 }
 """
+
+_IC05_OVERLAYS = {
+    "partial": {"unread_body": {"propagates": [{"from": "arg:0", "to": "ret"}]}},
+    "empty-entry": {"unread_body": {}},
+    # Accepted, but states no coverage and no return relation at all.
+    "irrelevant": {"unread_body": {"propagates": [{"from": "arg:0", "to": "arg:0"}]}},
+    # A full overlay that also arms a sink: still no claim about the body.
+    "full": {"unread_body": {"propagates": [{"from": "arg:0", "to": "ret"},
+                                            {"from": "arg:1", "to": "ret"}],
+                             "sink": {"class": "command_injection",
+                                      "tainted_args": [0],
+                                      "detail": "modeled sink"}}},
+}
 
 
 def test_a_matching_model_never_certifies_an_unread_argument_callee(tmp_path, shared_bn):
@@ -3002,6 +3033,33 @@ def test_an_argument_an_optimised_call_drops_is_recovered_from_its_register(
     assert boundary(forward("abi_entry", "param:0", "param:1")
                     )["abi_recovered_args"] == [0, 1]
 
+    # A TAIL call is a call: `return unread_body(a, b)` leaves both arguments
+    # where they are, so BN lifts a tail call carrying no arguments at all.
+    # Matching only ordinary calls left it certifying the skipped body (F4).
+    tail = forward("tail_entry")
+    leaf = boundary(tail)
+    assert leaf["callee"]["name"] == "unread_body", leaf
+    assert leaf["tainted_args"] == [0], leaf
+    assert leaf["abi_recovered_args"] == [0], leaf
+    assert tail["stats"]["analysis_incomplete_functions"] == ["unread_body"]
+    assert tail["diagnostics"]["safe_to_report_all_clear"] is False
+    assert boundary(forward("tail_entry", "param:1"))["abi_recovered_args"] == [1]
+    assert boundary(forward("tail_entry", "param:0", "param:1")
+                    )["abi_recovered_args"] == [0, 1]
+    for overlay in _IC05_OVERLAYS:
+        path = tmp_path / f"tail-{overlay}.json"
+        path.write_text(json.dumps(_IC05_OVERLAYS[overlay]))
+        modeled = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f",
+                           "tail_entry", "--source", "param:0", "--max-depth", "16",
+                           "--models", str(path))
+        assert modeled["stats"]["analysis_incomplete"] is True, (overlay, modeled["stats"])
+        assert boundary(modeled)["abi_recovered_args"] == [0], overlay
+        # The zero-sink gate exists only on a zero-sink run; the sink-bearing
+        # overlay reports its finding instead, and still names the body it
+        # did not read.
+        if not modeled["reached_sinks"]:
+            assert modeled["diagnostics"]["safe_to_report_all_clear"] is False, overlay
+
     # Binary Ninja DID recover this call's arguments (it writes both registers
     # at the call site), so nothing is recovered on top of them -- and its own
     # recovery still carries the seed into the boundary.
@@ -3024,6 +3082,55 @@ def test_an_argument_an_optimised_call_drops_is_recovered_from_its_register(
     row = next(line for line in text.stdout.splitlines()
                if line.strip().startswith("unread_callee_body"))
     assert "ABI-recovered arg(s) [0]" in row, row
+
+
+def test_an_under_recovered_argument_into_an_analysed_callee_is_a_frontier(
+        tmp_path, shared_bn):
+    """Review F5: the same ABI evidence, for a callee that IS analysed.
+
+    `analysed_body` consumes its first argument (it hands it to `system`). Force
+    the recovery miss the way the #381 lane already does — declare it 0-arity —
+    and the call site, which writes no argument register because the value is
+    already in `rdi`, carries no arguments at all. The seeded value provably
+    reaches a register the callee READS as an incoming value, so the walk must
+    not report an all-clear. No formal is invented for the callee and no sink is
+    claimed: the flow stops at a named frontier and says why.
+    """
+    src = tmp_path / "ic05_underrec.c"
+    src.write_text(_IC05_SRC)
+    binary = tmp_path / "ic05_underrec"
+    _compile(src, binary, ["-O2", "-fno-builtin", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+
+    def forward():
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f",
+                        "calls_analysed", "--source", "param:0", "--max-depth", "16")
+
+    def frontiers(result):
+        return [lf for lf in result["leaves"]
+                if lf.get("cause") == "arg_under_recovered"]
+
+    # Baseline control: the argument IS recovered, so taint descends and the
+    # `system` sink is found -- no under-recovery frontier at all.
+    before = forward()
+    assert any(s["sink"]["callee"] == "system" for s in before["reached_sinks"]), before
+    assert frontiers(before) == [], before["leaves"]
+
+    proto = shared_bn.run("-t", target, "proto", "set", "analysed_body",
+                          "void analysed_body(void)", "--format", "json")
+    assert proto.returncode == 0, proto.stderr
+
+    after = forward()
+    assert not any(s["sink"]["callee"] == "system" for s in after["reached_sinks"]), after
+    [leaf] = frontiers(after)
+    assert leaf["callee"]["name"] == "analysed_body", leaf
+    assert leaf["register"] == "rdi", leaf
+    assert leaf["argument_index"] == 0, leaf
+    assert leaf["recovered_params"] == 0, leaf
+    # The register was never written at the call site: it still carries the
+    # value the analysed function was entered with.
+    assert leaf["via"] == "entry_value", leaf
+    assert after["diagnostics"]["safe_to_report_all_clear"] is False, after
 
 
 _OVERLAP_SRC = r"""
