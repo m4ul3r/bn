@@ -4362,6 +4362,30 @@ class TaintEngine:
         }
         return True
 
+    def _arg_recovery_advice(self, taddr: int | None) -> tuple[bool | None, str]:
+        """``(callee_variadic, advice)`` for a call whose model declares an
+        argument Binary Ninja did not recover for it (#1001 item 1, BN6-C009).
+
+        The advice is a READ first -- the callee's prototype and the call's
+        argument provenance -- and a prototype repair only on independent
+        evidence: an under-recovered call is as often a recovery limit (or a
+        model that declares the wrong arity) as a wrong declaration."""
+        variadic = _variadic_determination(function_at(self.bv, taddr)) if taddr is not None else None
+        inspect = f"inspect `bn proto get {hex(int(taddr))}` and the call's argument provenance" \
+            if taddr is not None else "resolve the call target and inspect its argument provenance"
+        if variadic is True:
+            advice = ("the callee is already declared variadic; this is incomplete "
+                      "call recovery, not evidence of a prototype defect. Redeclaring "
+                      "the same prototype does not recover its arguments; " + inspect)
+        elif variadic is False:
+            advice = ("the callee is determined nonvariadic; " + inspect
+                      + ", and apply `bn proto set` only if independent evidence "
+                      "demonstrates a declaration discrepancy, then re-run")
+        else:
+            advice = ("the callee's variadic status is undetermined; " + inspect
+                      + " before diagnosing a signature discrepancy or recovery limit")
+        return variadic, advice
+
     def _format_destination_shortfall(self, ins: Any, ssaf: Any, callee: str, model: Any,
                                       params: list[Any]) -> dict | None:
         """A blocking `format_destination_unrecovered` leaf when the call's fully
@@ -9525,6 +9549,63 @@ class TaintEngine:
                 if leaf not in leaves:
                     leaves.append(leaf)
 
+            def _note_unrecovered_destination(dest_tok, src_tok, hit):
+                # BN6-C009: a REACHED rule (its source `hit` carries taint) whose
+                # declared destination `arg:N`/`*arg:N` is an argument Binary
+                # Ninja did not recover for THIS call. `_apply_to_token` has
+                # nothing to write and `_note_unkeyed_store` nothing to name, so
+                # the declared output used to vanish with an all-clear. No
+                # pointer is guessed for it (the #1001 register bridge stands
+                # behind REACH only, never behind an object to key): the write is
+                # a blocking boundary, one leaf per call site, callee and
+                # declared destination, its reached rule sources merged in.
+                # A recovered destination never lands here -- keyed and already
+                # tainted is benign, unkeyable is `coarse_memory_store`.
+                if not (isinstance(dest_tok, str)
+                        and (dest_tok.startswith("*arg:") or dest_tok.startswith("arg:"))):
+                    return
+                di = _try_arg_index(dest_tok)
+                if di is None or di < len(params):
+                    return
+                taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
+                callee_ref = hex(int(taddr)) if taddr is not None else None
+                at = hex(addr)
+                src = {"from": str(src_tok), "tainted": node_label(hit, why)}
+                for lf in leaves:
+                    if (lf.get("kind") == "model_destination_unrecovered"
+                            and lf.get("address") == at and lf.get("destination") == dest_tok
+                            and (lf.get("callee") or {}).get("address") == callee_ref):
+                        if src not in lf["sources"]:
+                            lf["sources"].append(src)
+                        return
+                variadic, advice = self._arg_recovery_advice(taddr)
+                callee = str(name or mkey or "?")
+                fn_ref = hex(int(getattr(func, "start", 0)))
+                leaves.append({
+                    "kind": "model_destination_unrecovered",
+                    "address": at,
+                    "callee": {"name": callee, "display_name": self._prose_name(callee),
+                               "address": callee_ref},
+                    "function": {"name": str(getattr(func, "name", "?")),
+                                 "display_name": _display_name(func) or str(getattr(func, "name", "?")),
+                                 "address": fn_ref},
+                    "il_text": str(ins),
+                    "destination": dest_tok,
+                    "destination_index": di,
+                    "recovered_params": len(params),
+                    "sources": [src],
+                    "callee_variadic": variadic,
+                    "recovery_advice": advice,
+                    "detail": (
+                        f"the model for {self._prose_name(callee)} declares a write into "
+                        f"{dest_tok} and its source was reached, but Binary Ninja recovered "
+                        f"only {len(params)} argument(s) for this call, so the declared "
+                        f"destination arg{di} is unavailable: the write was not followed "
+                        "and no output pointer is assumed -- what it receives is unchecked. "
+                        f"Check the model rule against the callee: {advice}; read the call "
+                        f"in `bn disasm {fn_ref}`"),
+                })
+
             def _sink_arg_reach(argidx: int, sink: dict[str, Any]) -> tuple[list, dict | None]:
                 """``(hit_nodes, arity)`` for a modeled sink's arg.
 
@@ -9572,20 +9653,7 @@ class TaintEngine:
                 if not hit or not dropped:
                     return hit, None
                 taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
-                variadic = _variadic_determination(function_at(self.bv, taddr)) if taddr is not None else None
-                inspect = f"inspect `bn proto get {hex(int(taddr))}` and the call's argument provenance" \
-                    if taddr is not None else "resolve the call target and inspect its argument provenance"
-                if variadic is True:
-                    advice = ("the callee is already declared variadic; this is incomplete "
-                              "call recovery, not evidence of a prototype defect. Redeclaring "
-                              "the same prototype does not recover its arguments; " + inspect)
-                elif variadic is False:
-                    advice = ("the callee is determined nonvariadic; " + inspect
-                              + ", and apply `bn proto set` only if independent evidence "
-                              "demonstrates a declaration discrepancy, then re-run")
-                else:
-                    advice = ("the callee's variadic status is undetermined; " + inspect
-                              + " before diagnosing a signature discrepancy or recovery limit")
+                variadic, advice = self._arg_recovery_advice(taddr)
                 # `class_from` says what the finding's class rests on:
                 # `recovered_args` -- the checked arg was recovered, so the
                 # in-range classifiers ran on the recovered args and the dropped
@@ -10080,6 +10148,7 @@ class TaintEngine:
                         changed = True
                     else:
                         _note_unkeyed_store(to)
+                        _note_unrecovered_destination(to, frm, hit)
                     # #804 asked to gate this bookkeeping on the destination being
                     # KEYABLE (_buffer_target non-None), reading an unkeyable
                     # *arg:N as "no write happened". Deliberately NOT done: the
@@ -10247,6 +10316,7 @@ class TaintEngine:
                             changed = True
                         else:
                             _note_unkeyed_store(vto)
+                            _note_unrecovered_destination(vto, f"arg:{i}", ht[0])
                         # #804: left ungated for the same reason as the static
                         # propagates loop above -- see the rationale there.
                         if vto.startswith("*arg:"):

@@ -5053,6 +5053,17 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"{leaf.get('callers_dropped', '?')} dropped)"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
+    if kind == "model_destination_unrecovered":
+        cal = _field_dict(leaf, "callee")
+        srcs = ", ".join(f"{s.get('from', '?')}={s.get('tainted', '?')}"
+                         for s in _field_list(leaf, "sources") if isinstance(s, dict))
+        return (
+            f"  model_destination_unrecovered @ {leaf.get('address')}"
+            f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address') or '?'}"
+            f"  (declared destination {leaf.get('destination', '?')} unavailable: "
+            f"recovered {leaf.get('recovered_params', '?')} arg(s); reached source(s) {srcs or '?'})"
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+        )
     return (
         f"  {kind} @ {leaf.get('address')}  [{leaf.get('dest_expr', leaf.get('il_text', ''))}]"
         + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
@@ -5092,6 +5103,11 @@ def _leaf_group_key(leaf: Any) -> tuple:
                     "callers_total", "callers_fully_followed", "callers_partially_followed",
                     "callers_unfollowed", "callers_dropped", "demands_unfollowed")),
                 reasons)
+    if kind == "model_destination_unrecovered":
+        # One row per callee and declared destination: two missing outputs of
+        # one call are two writes to chase, never one "[2 leaves]" row.
+        return (kind, str(_field_dict(leaf, "callee").get("address")),
+                str(_field_dict(leaf, "callee").get("name")), str(leaf.get("destination")))
     return (kind,)
 
 
