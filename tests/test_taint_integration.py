@@ -2845,6 +2845,25 @@ N long calls_analysed_thunk(long a) {
     return r + 1;
 }
 
+/* An indirect site whose targets the VALUE SET itself pins: a const table of
+   function pointers, both entries reaching the skipped body, with the
+   arguments already in the registers that pass them. */
+static long (*const vs_hooks[2])(long, long) = { unread_body, unread_body };
+N long value_set_entry(long a, long b) {
+    if (a == 5 || b == 7) return 0;
+    return vs_hooks[a & 1](a, b) + 1;
+}
+
+/* A pinnable indirect site into an ANALYSED callee whose FORMALS are correct
+   (nothing redeclares it), at a call that writes no argument register. */
+N long abi_formal_consumer(long a) { system((const char *)a); return a + 1; }
+long (*volatile abi_formal_hook)(long) = abi_formal_consumer;
+N long calls_formal_indirect(long a) {
+    if (a == 5) return 0;
+    long r = abi_formal_hook(a);
+    return r + 1;
+}
+
 int main(int argc, char **argv) {
     (void)argv;
     return (int)(call_unread(argc) + call_thunk(argc) + call_multihop(argc)
@@ -2853,7 +2872,8 @@ int main(int argc, char **argv) {
                  + constant_only(argc) + abi_entry(argc, argc)
                  + tail_entry(argc, argc) + calls_analysed(argc)
                  + prefix_entry(argc, argc) + loop_entry(argc, argc)
-                 + calls_second(argc) + calls_analysed_thunk(argc));
+                 + calls_second(argc) + calls_analysed_thunk(argc)
+                 + value_set_entry(argc, argc) + calls_formal_indirect(argc));
 }
 """
 
@@ -3111,6 +3131,14 @@ def test_an_argument_an_optimised_call_drops_is_recovered_from_its_register(
     assert boundary(looped)["callee"]["name"] == "unread_body", looped
     assert looped["diagnostics"]["safe_to_report_all_clear"] is False
 
+    # Review F11: an indirect site whose targets the VALUE SET itself pins is
+    # routed into the same skipped body, and the gate must consider it exactly
+    # as the descent does.
+    pinned = forward("value_set_entry")
+    assert boundary(pinned)["callee"]["name"] == "unread_body", pinned
+    assert pinned["stats"]["analysis_incomplete_functions"] == ["unread_body"]
+    assert pinned["diagnostics"]["safe_to_report_all_clear"] is False
+
     # Binary Ninja DID recover this call's arguments (it writes both registers
     # at the call site), so nothing is recovered on top of them -- and its own
     # recovery still carries the seed into the boundary.
@@ -3204,6 +3232,23 @@ def test_an_under_recovered_argument_into_an_analysed_callee_is_a_frontier(
     assert leaf["register"] == "rsi", leaf
     assert leaf["argument_index"] == 1, leaf
     assert later["diagnostics"]["safe_to_report_all_clear"] is False, later
+
+    # Review F12: an agent-pinned indirect site into a callee whose FORMALS are
+    # correct. The call itself recovered no arguments, so argument 0 is missing
+    # and must be measured against the CALL, not against the callee's formals
+    # (counting from the formals skipped exactly this index).
+    site = _indirect_call_addr(shared_bn, "calls_formal_indirect", "ic05")
+    pin = tmp_path / "ic05_underrec_rmap.json"
+    pin.write_text(json.dumps(
+        {site: [_resolve_addr(shared_bn, "abi_formal_consumer")]}))
+    mapped = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f",
+                      "calls_formal_indirect", "--source", "param:0",
+                      "--max-depth", "16", "--resolve-map", str(pin))
+    [leaf] = frontiers(mapped)
+    assert leaf["callee"]["name"] == "abi_formal_consumer", leaf
+    assert leaf["argument_index"] == 0, leaf
+    assert leaf["recovered_params"] == 0, leaf
+    assert mapped["diagnostics"]["safe_to_report_all_clear"] is False, mapped
 
 
 _OVERLAP_SRC = r"""

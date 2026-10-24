@@ -87,17 +87,25 @@ def _block_key(block: Any) -> tuple:
     return ("id", id(block))
 
 
-def _reaching_blocks(call_bb: Any) -> tuple[list, bool]:
-    """``(blocks, looped)`` -- every block that can reach *call_bb*, and whether
-    *call_bb* can reach ITSELF (it lies on a cycle, so its own later
-    instructions may also have run first)."""
+def _reaching_blocks(call_bb: Any) -> tuple[list, bool, bool]:
+    """``(blocks, looped, complete)`` -- every block that can reach *call_bb*,
+    whether *call_bb* can reach ITSELF (it lies on a cycle, so its own later
+    instructions may also have run first), and whether the closure FINISHED.
+
+    ``complete`` is False when the block budget stopped the walk with work
+    still pending. A caller asserting what ran before this call must refuse on
+    that: an unexamined predecessor is exactly where the clobbering call would
+    be, so a capped scan proves nothing (review F10).
+    """
     call_key = _block_key(call_bb)
     out: list = []
     seen: set = set()
     frontier = [getattr(e, "source", None)
                 for e in (getattr(call_bb, "incoming_edges", None) or [])]
     looped = False
-    while frontier and len(seen) < _CFG_CLOSURE_BLOCKS:
+    while frontier:
+        if len(seen) >= _CFG_CLOSURE_BLOCKS:
+            return out, looped, False
         block = frontier.pop()
         if block is None:
             continue
@@ -111,12 +119,12 @@ def _reaching_blocks(call_bb: Any) -> tuple[list, bool]:
         out.append(block)
         frontier += [getattr(e, "source", None)
                      for e in (getattr(block, "incoming_edges", None) or [])]
-    return out, looped
+    return out, looped, True
 
 
-def _entry_value_survives(call_ins: Any, bn: Any) -> bool:
-    """Whether NOTHING that can run before *call_ins* may have clobbered a
-    caller-saved register.
+def _entry_value_state(call_ins: Any, bn: Any) -> str:
+    """``"entry"`` / ``"clobbered"`` / ``"budget"`` for the value an untouched
+    register holds where *call_ins* runs.
 
     Used only after :func:`reaching_reg_def` has established that the register
     has no definition at all reaching the call, which means it still holds the
@@ -125,23 +133,31 @@ def _entry_value_survives(call_ins: Any, bn: Any) -> bool:
     call: a callee may clobber any caller-saved register, and no definition in
     this function records it.
 
-    So the claim is refused whenever any call/syscall/intrinsic can execute
-    before this one. "Can execute before" is taken from the CFG, not from
-    instruction order: every block that REACHES the call's block may run first,
-    and a block on a cycle through the call reaches itself, so a loop body's
-    later call is caught too. Nothing is inferred from a calling convention's
-    clobber list.
+    So ``"clobbered"`` is answered whenever any call/syscall/intrinsic can
+    execute before this one. "Can execute before" is taken from the CFG, not
+    from instruction order: every block that REACHES the call's block may run
+    first, and a block on a cycle through the call reaches itself, so a loop
+    body's later call is caught too. Nothing is inferred from a calling
+    convention's clobber list.
+
+    ``"budget"`` is the third state (review F10): the predecessor closure ran
+    out of its block budget with work pending. What it did not look at is
+    exactly where a clobbering call would be, so the scan establishes nothing
+    either way -- and the caller is told that, rather than being handed a
+    positive it could not earn.
     """
     call_ops = _call_like_ops(bn)
     call_bb = getattr(call_ins, "il_basic_block", None)
     if call_bb is None:
-        return False
+        return "clobbered"
     call_idx = int(getattr(call_ins, "instr_index", -1))
-    earlier, looped = _reaching_blocks(call_bb)
+    earlier, looped, complete = _reaching_blocks(call_bb)
     for block in earlier:
         for ins in block:
             if getattr(ins, "operation", None) in call_ops:
-                return False
+                return "clobbered"
+    if not complete:
+        return "budget"
     for ins in call_bb:
         if getattr(ins, "operation", None) not in call_ops:
             continue
@@ -149,8 +165,17 @@ def _entry_value_survives(call_ins: Any, bn: Any) -> bool:
         if idx == call_idx:
             continue
         if idx < call_idx or looped:
-            return False
-    return True
+            return "clobbered"
+    return "entry"
+
+
+def _entry_value_survives(call_ins: Any, bn: Any) -> bool:
+    """Whether the register provably still carries the function's entry value.
+
+    The boolean face of :func:`_entry_value_state`: an exhausted scan is not a
+    survival, so it answers False for that too.
+    """
+    return _entry_value_state(call_ins, bn) == "entry"
 
 
 def argument_register_provenance(func: Any, addr: int, reg: str,
@@ -163,9 +188,11 @@ def argument_register_provenance(func: Any, addr: int, reg: str,
     nothing that can run first may have clobbered it, so it still holds the
     value the function was ENTERED with (the ``rdi#0``-unchanged shape an
     optimised build leaves when the callee has no prototype to recover
-    arguments from). ``("unproven", [])`` -- there is no LLIL to read, the call
-    is not in it, or a call may have clobbered the register: nothing is
-    claimed.
+    arguments from). ``("budget", [])`` -- the predecessor closure ran out of
+    its block budget, so whether anything clobbered the register was never
+    established (review F10). ``("unproven", [])`` -- there is no LLIL to read,
+    the call is not in it, or a call may have clobbered the register: nothing
+    is claimed.
     """
     lssa = getattr(getattr(func, "llil", None), "ssa_form", None)
     if lssa is None:
@@ -184,7 +211,8 @@ def argument_register_provenance(func: Any, addr: int, reg: str,
                     continue
                 definition = reaching_reg_def(ins, reg, bn)
                 if definition is None:
-                    return ("entry" if _entry_value_survives(ins, bn) else "unproven", [])
+                    state = _entry_value_state(ins, bn)
+                    return (state if state in ("entry", "budget") else "unproven", [])
                 if getattr(definition, "operation", None) in _call_like_ops(bn):
                     # The reaching "definition" is another CALL that lists this
                     # register among its outputs -- i.e. it CLOBBERED it. Its

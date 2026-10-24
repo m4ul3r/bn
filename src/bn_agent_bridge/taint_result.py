@@ -140,6 +140,12 @@ BLOCKING_LEAF_KINDS = frozenset({
     # the rest was never walked -- so the run is explicitly a frontier, not a
     # short clean answer.
     "analysis_truncated",
+    # Review F10: the search for everything that can run before a call ran out
+    # of its block budget, so what an argument register carries into that call
+    # was never established. The blocks it did not read are exactly where a
+    # clobbering call would be, so an empty reached_sinks past it is not an
+    # all-clear.
+    "abi_provenance_budget",
     # IC05 / BN6-C008: tainted arguments entered an in-binary callee whose
     # body Binary Ninja never analysed (oversized past
     # analysis.limits.maxFunctionSize, or a lift that produced no MLIL). The
@@ -209,6 +215,11 @@ def _truncation_hint(truncation_cause: list[str] | None) -> str:
         return "interprocedural descent hit the depth bound -- raise --max-depth"
     if "recursion" in causes:
         return "Python recursion limit reached (possible unresolved cycle)"
+    if "abi_provenance_budget" in causes:
+        return ("the search for everything that can run before a call ran out of "
+                "its block budget, so what its argument registers carry into that "
+                "call was never established -- narrow the source, or read the "
+                "call's own disassembly for the arguments it passes")
     if "caller_cap" in causes:
         # #812: backward-only cause. Without this branch it fell through to the
         # generic "depth/recursion cutoff" string, which names the wrong knob --

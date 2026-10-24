@@ -932,9 +932,9 @@ def test_the_cfg_closure_terminates_on_a_loop_of_fresh_wrappers():
     call_bb = _WrappedBlock([call], index=2, incoming=[body])
     call.il_basic_block = call_bb
 
-    blocks, looped = te._taint_il_mod._reaching_blocks(call_bb)
+    blocks, looped, complete = te._taint_il_mod._reaching_blocks(call_bb)
     assert sorted(b.index for b in blocks) == [0, 1], blocks
-    assert looped is False
+    assert (looped, complete) == (False, True)
     # ...and the register still carries the entry value: nothing on the way in
     # is a call.
     assert te._taint_il_mod._entry_value_survives(call, _FAKE_BN) is True
@@ -1014,3 +1014,110 @@ def test_a_written_register_past_a_recovered_prefix_is_not_an_argument():
     result = engine.forward(entry, [te.parse_locator("param:0")])
     assert _boundaries(result) == [], result["leaves"]
     assert result["stats"]["analysis_incomplete"] is False, result["stats"]
+
+
+# --------------------------------------------------------------------------
+# F10: an exhausted predecessor scan proves nothing
+# --------------------------------------------------------------------------
+
+def _chain_before_call(length):
+    """A straight-line chain of *length* predecessor blocks ending at a call,
+    with a clobbering call in the FIRST block of the chain."""
+    blocks = [_WrappedBlock([_lins(0, 0x1000, _CALL_OP)], index=0)]
+    for i in range(1, length):
+        blocks.append(_WrappedBlock([_lins(i, 0x1000 + i, _SET_OP, reg="rax")],
+                                    index=i, incoming=[blocks[-1]]))
+    call = _lins(length, CALL, _CALL_OP)
+    call_bb = _WrappedBlock([call], index=length, incoming=[blocks[-1]])
+    call.il_basic_block = call_bb
+    return call
+
+
+def test_a_closure_that_finishes_sees_the_clobbering_call():
+    cap = te._taint_il_mod._CFG_CLOSURE_BLOCKS
+    call = _chain_before_call(cap)          # exactly the budget: it finishes
+    assert te._taint_il_mod._entry_value_state(call, _FAKE_BN) == "clobbered"
+
+
+def test_an_exhausted_closure_never_certifies_the_entry_value(monkeypatch):
+    # Review F10: the cap silently turned "I did not look" into "nothing was
+    # there", so a clobbering call one block past the budget was certified as
+    # an untouched entry value.
+    cap = te._taint_il_mod._CFG_CLOSURE_BLOCKS
+    call = _chain_before_call(cap + 2)      # one past: the scan is cut short
+    _blocks, _looped, complete = te._taint_il_mod._reaching_blocks(
+        call.il_basic_block)
+    assert complete is False
+    assert te._taint_il_mod._entry_value_state(call, _FAKE_BN) == "budget"
+    assert te._taint_il_mod._entry_value_survives(call, _FAKE_BN) is False
+    assert te.argument_register_provenance(
+        _llil_func([[call]]), CALL, "rdi", _FAKE_BN) == ("budget", [])
+
+
+def test_an_exhausted_provenance_scan_is_disclosed_and_blocks_the_gate():
+    # Nothing is guessed either way: the hole is a blocking boundary and a
+    # run-level truncation cause.
+    entry, bv, catalog, _seeds, _call = _dropped_arg_program()
+    engine = te.TaintEngine(bv, catalog)
+    engine._reaching_arg_seeds_via_reg = lambda f, sites, idx: (
+        ["rdi", "rsi"][idx] if idx < 2 else None, [])
+    engine._abi_arg_operands = lambda f, i, idx, allow_entry=False, entry_only=False: (
+        engine._abi_budget_sites.add((int(f.start), CALL, idx, "rdi")) or [])
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+
+    [leaf] = [lf for lf in result["leaves"]
+              if lf["kind"] == "abi_provenance_budget"]
+    assert leaf["address"] == hex(CALL), leaf
+    assert leaf["registers"] == ["rdi"], leaf
+    assert "block budget" in leaf["detail"], leaf
+    assert result["stats"]["truncated"] is True, result["stats"]
+    assert "abi_provenance_budget" in result["stats"]["truncation_cause"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert "abi_provenance_budget" in BLOCKING_LEAF_KINDS
+
+
+# --------------------------------------------------------------------------
+# F11: the unread-body gate uses the descent's whole candidate seam
+# --------------------------------------------------------------------------
+
+def test_a_value_set_target_is_a_candidate_for_the_unread_body_gate():
+    # Review F11: an optimised indirect call whose targets the value set pins
+    # routes into the same skipped body as a direct one, and reading only the
+    # direct target let it certify that body.
+    p = FVar("p", ident=40)
+    p0 = FSSA(p, 0)
+    call = FInstr(0, CALL, "MLIL_CALL_SSA", "hook()", reads=[], writes=[],
+                  dest=FExpr("MLIL_VAR_SSA", "hook#1", reads=[],
+                             possible_values=FPVS("InSetOfValues", values=[BODY])),
+                  params=[])
+    entry = FFunc("call_indirect", ENTRY, FSSAFunc([call]), params=[p])
+    entry.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi"])
+    body = _skipped("unread_body", BODY)
+    body.parameter_vars = [FVar("x", ident=96)]
+    engine = te.TaintEngine(FBV({BODY: "unread_body"}, funcs={BODY: body}),
+                            te.load_models())
+    assert engine._call_enters_unread_body(call) is True
+    _with_recovered(engine, {0: p0})
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+    [leaf] = _boundaries(result)
+    assert leaf["callee"]["name"] == "unread_body", leaf
+    assert leaf["abi_recovered_args"] == [0], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+# --------------------------------------------------------------------------
+# F12: "missing" is measured against what the CALL recovered
+# --------------------------------------------------------------------------
+
+def test_a_callee_with_correct_formals_still_has_missing_arguments(monkeypatch):
+    # Review F12: the scan started at the callee's FORMAL count, so a callee
+    # with correct formals reached by a call that recovered no arguments had
+    # its own indices skipped and reported an all-clear.
+    engine, entry = _under_recovered_setup(monkeypatch, proven=(0,))
+    callee = engine.bv._funcs[ANALYSED]
+    callee.parameter_vars = [FVar("x", ident=70), FVar("y", ident=71)]
+    result = engine.forward(entry, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"] if lf.get("cause") == "arg_under_recovered"]
+    assert leaf["argument_index"] == 0, leaf
+    assert leaf["recovered_params"] == 0, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False

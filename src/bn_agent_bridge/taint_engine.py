@@ -810,6 +810,12 @@ class TaintEngine:
         Ninja never analysed the body, so it cannot say how many arguments the
         call passes. Everywhere else its recovered parameter list IS its arity
         determination and is taken as it stands.
+
+        Every target the DESCENT would consider is considered here (review
+        F11): the resolved direct target, an explicit ``--resolve-map`` pin,
+        and the value set's own finite targets -- an optimised indirect call
+        whose targets BN pins is routed into the same skipped body as a direct
+        one, and reading only the direct target let it certify that body.
         """
         addr = int(getattr(ins, "address", -1))
         cache = getattr(self, "_unread_call_cache", None)
@@ -825,6 +831,9 @@ class TaintEngine:
             targets += list(self.resolve_map.get(addr) or ())
         except Exception:
             pass
+        if not targets:
+            targets += self._call_targets_from_pvs(
+                getattr(getattr(ins, "dest", None), "possible_values", None))
         found = False
         for taddr in targets:
             cfn = function_at(self.bv, taddr)
@@ -912,6 +921,16 @@ class TaintEngine:
                 func, int(getattr(ins, "address", -1)), reg, bn)
         except Exception:
             return []
+        if kind == "budget":
+            # The predecessor closure ran out of blocks: this call site's ABI
+            # provenance was never established either way. Remembered so the
+            # caller can disclose the hole instead of reading "nothing proven"
+            # as "nothing there" (review F10).
+            sites = getattr(self, "_abi_budget_sites", None)
+            if sites is None:
+                sites = self._abi_budget_sites = set()
+            sites.add((int(getattr(func, "start", 0)),
+                       int(getattr(ins, "address", -1)), int(idx), str(reg)))
         if kind != "entry":
             return []
         pv = self._param_var(func, idx)
@@ -3879,6 +3898,9 @@ class TaintEngine:
         # could still answer safe_to_report_all_clear. Tracked structurally, the
         # same way `_truncated`/`_truncation_causes` are, so a consumer can gate.
         self._analysis_incomplete: set[str] = set()
+        # (function, call site, index, register) whose ABI provenance scan ran
+        # out of budget. Disclosed as a boundary; never read as a positive.
+        self._abi_budget_sites: set[tuple] = set()
         self._only_callsite_addr = only_callsite_addr
         # #559: count the source callsites the seed actually matched, so a
         # zero-result query can report "matched N source callsites" instead of an
@@ -6018,7 +6040,7 @@ class TaintEngine:
                 out.append(cfn)
         return out
 
-    def _unrecovered_arg_frontiers(self, func: Any, ins: Any,
+    def _unrecovered_arg_frontiers(self, func: Any, ins: Any, params: list,
                                    tainted: set) -> list[dict[str, Any]]:
         """Honest frontiers for the #381 silent drop. When a tainted value sits
         in an ABI argument register that BN did NOT include in this call's
@@ -6030,26 +6052,31 @@ class TaintEngine:
         One leaf per resolved analysed callee, naming EVERY missing argument
         index proven to carry taint (review F8: stopping at the first missing
         register dropped a tainted later one whenever the first was clean).
+        "Missing" is measured against what THIS CALL recovered, not against the
+        callee's formals (review F12): a callee with correct formals reached by
+        a call that recovered no arguments has every one of them missing, and
+        counting from the formals skipped exactly those indices.
         Register-passed only: stack-passed varargs (i386 cdecl) are not covered
         here -- that overlaps #324. Degrades to [] on any BN-API shortfall, so
         it never fabricates a frontier.
         """
         out: list[dict[str, Any]] = []
         for callee in self._under_recovered_callees(ins):
-            leaf = self._under_recovered_frontier(func, ins, callee, tainted)
+            leaf = self._under_recovered_frontier(func, ins, callee,
+                                                  len(params), tainted)
             if leaf is not None:
                 out.append(leaf)
         return out
 
     def _under_recovered_frontier(self, func: Any, ins: Any, callee: Any,
-                                  tainted: set) -> dict[str, Any] | None:
+                                  recovered: int, tainted: set) -> dict[str, Any] | None:
         try:
             cc = (getattr(callee, "calling_convention", None)
                   or self.bv.platform.default_calling_convention)
             arg_regs = list(getattr(cc, "int_arg_regs", []) or [])
-            n = len(list(getattr(callee, "parameter_vars", []) or []))
+            n = int(recovered)
             if n >= len(arg_regs):
-                return None  # every ABI arg register is accounted for by a param
+                return None  # every ABI arg register is accounted for already
             arch = self.bv.arch
             blk = getattr(ins, "il_basic_block", None)
             if blk is None:
@@ -6163,6 +6190,43 @@ class TaintEngine:
                     argument_index=indices[0], recovered_params=int(recovered),
                     via=str(rows[0]["via"]), registers=regs, evidence=rows)
         return leaf
+
+    def _abi_budget_leaf(self, func: Any, ins: Any,
+                         name: str | None) -> dict[str, Any] | None:
+        """The boundary for an ABI provenance scan that ran out of budget.
+
+        The scan asks what an argument register carries into this call by
+        walking every block that can reach it. When that closure is cut short,
+        the blocks it did not read are exactly where a clobbering call would
+        be: it established neither that the register survived nor that it did
+        not. Failing closed means saying so -- a blocking leaf and a run-level
+        truncation cause -- rather than reading the absent positive as "no
+        argument here" (review F10).
+        """
+        sites = getattr(self, "_abi_budget_sites", None) or ()
+        addr = int(getattr(ins, "address", -1))
+        start = int(getattr(func, "start", 0))
+        rows = sorted({(int(i), str(r)) for f, a, i, r in sites
+                       if f == start and a == addr})
+        if not rows:
+            return None
+        self._truncated = True
+        self._truncation_causes.add("abi_provenance_budget")
+        shown = self._prose_name(name) if name else hex(addr)
+        return {
+            "kind": "abi_provenance_budget",
+            "address": hex(addr),
+            "callee": {"name": str(name or hex(addr)), "address": hex(addr)},
+            "argument_indices": [i for i, _r in rows],
+            "registers": [r for _i, r in rows],
+            "il_text": str(ins),
+            "detail": (
+                f"the walk could not establish what argument register(s) "
+                f"{', '.join(r for _i, r in rows)} carry into the call to {shown}: "
+                "the search for everything that can run before this call ran out of "
+                "its block budget, so a tainted value may enter this call unseen -- "
+                "whether it does is UNKNOWN, not clear"),
+        }
 
     def _reg_reads_as_input(self, callee: Any, reg_name: str) -> bool:
         """True if *callee* consumes register *reg_name* as an incoming value --
@@ -11049,6 +11113,9 @@ class TaintEngine:
                                         for _i in sorted(abi_recovered))
                             + f": Binary Ninja recovered {len(params)} argument(s) for "
                             "this call, fewer than the code passes")
+                    _budget = self._abi_budget_leaf(func, ins, name)
+                    if _budget is not None and _budget not in leaves:
+                        leaves.append(_budget)
                     # IC03 / TT-PILOT-FW03-01: tainted bytes that landed in a
                     # keyable writable global are PROGRAM state. This walk keeps
                     # taint per function and hands nothing but arguments across a
@@ -11075,9 +11142,16 @@ class TaintEngine:
                         # it is given, and says nothing about an argument this call
                         # does not carry -- the gate below is tight enough that a
                         # model cannot make the hole go away (review F5).
-                        for fr in self._unrecovered_arg_frontiers(func, ins, tainted):
+                        for fr in self._unrecovered_arg_frontiers(func, ins, params,
+                                                                  tainted):
                             if fr not in leaves:
                                 leaves.append(fr)
+                        # An ABI scan that ran out of budget proves nothing in
+                        # either direction, and this is the branch that would
+                        # otherwise read it as "no tainted argument here".
+                        _budget = self._abi_budget_leaf(func, ins, name)
+                        if _budget is not None and _budget not in leaves:
+                            leaves.append(_budget)
                         continue
                     # descend each callsite once per tainted-arg set (the fixpoint
                     # revisits instructions; without this, findings would duplicate)
