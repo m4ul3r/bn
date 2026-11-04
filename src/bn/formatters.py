@@ -5161,17 +5161,25 @@ def _text_width() -> int:
 
 def _wrap_row(row: str, width: int) -> list[str]:
     """*row* hard-wrapped at *width*, continuation lines indented four past the
-    row's own indent. A backticked command is never split: it is the one span
-    a reader pastes, so it moves to the next line whole (and runs past the
-    width only when it alone is wider)."""
+    row's own indent. Only the prose after a row's first `  -- ` wraps: the
+    head before it -- kind, address, callee and the parenthetical facts
+    (tainted args, skip reason, ABI-recovered args, modeled) -- stays on the
+    first line whole, so a reader or a grep that takes a frontier's first line
+    gets every fact it states (it runs past the width only when it alone is
+    wider). A backticked command is never split either: it is the one span a
+    reader pastes, so it moves to the next line whole."""
     if len(row) <= width:
         return [row]
     indent = row[:len(row) - len(row.lstrip(" "))]
     glue = "\x00"
+    body = row.strip()
+    head, sep, tail = body.partition("  -- ")
+    if sep:
+        body = head.replace(" ", glue) + glue * 2 + "-- " + tail
     # The space before a command glues too, so `next: <command>` stays one
     # line, and a `[N leaves]` count stays one token a reader can grep for.
     protected = re.sub(r" ?`[^`]*`|\[\d+ leaves\]",
-                       lambda m: m.group(0).replace(" ", glue), row.strip())
+                       lambda m: m.group(0).replace(" ", glue), body)
     lines = textwrap.wrap(protected, width=width, initial_indent=indent,
                           subsequent_indent=indent + "    ", break_long_words=False,
                           break_on_hyphens=False)

@@ -109,11 +109,32 @@ def test_every_frontier_row_wraps_at_the_width(width):
     other = {"kind": "pointer_escape", "address": "0x401300", "buffer": "heap_0x401290",
              "detail": LONG_DETAIL}
     lines = _render_grouped_leaves(_session_log_leaves() + [other], width=width, full=True)
-    long = [line for line in lines if len(line) > width and "`" not in line]
+    # Only a row's fact head (before its `  -- ` prose) may run past the
+    # width, and only when it alone is wider; prose always wraps.
+    long = [line for line in lines
+            if len(line) > width and "`" not in line
+            and len(line.split("  -- ")[0]) <= width]
     assert not long, long
     # Wrapping never splits a command: each one is whole on its own row.
     for line in lines:
         assert line.count("`") % 2 == 0, line
+
+
+def test_a_wrapped_row_keeps_every_fact_on_its_first_line():
+    """The parenthetical facts of a frontier row -- tainted args, skip reason,
+    ABI-recovered args, modeled -- are what a reader (or a grep over first
+    lines) acts on; only the trailing prose wraps."""
+    leaf = {"kind": "unread_callee_body", "address": "0x401230",
+            "callee": {"name": "decode_frame", "display_name": "decode_frame",
+                       "address": "0x402400"},
+            "tainted_args": [0], "skip_reason": "body too large", "modeled": True,
+            "abi_recovered_args": [2], "detail": LONG_DETAIL}
+    lines = _render_grouped_leaves([leaf], width=80)
+    first = next(line for line in lines if "unread_callee_body @" in line)
+    for fact in ("tainted arg(s) [0]", "body too large", "ABI-recovered arg(s) [2]",
+                 "modeled"):
+        assert fact in first, first
+    assert len(lines) > 2 and all(len(line) <= 80 for line in lines[2:])
 
 
 def test_rendered_follow_up_carries_the_invocation_routing():
