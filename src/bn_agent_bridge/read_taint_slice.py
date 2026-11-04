@@ -51,7 +51,7 @@ from . import taint_engine as _taint
 from . import vars as vars_mod
 from ._shared import OperationFailure, _parse_address, _validate_bool, is_imported_function
 from .bridge_state import require_analysis
-from .read_taint_models import build_catalog
+from .read_taint_models import PRESENCE_CATALOG_NOTE, model_catalog
 from .read_listing import _analysis_state_fields
 from .target_hint import positional_selector
 
@@ -64,7 +64,9 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
     try:
         # `user_models` carries project-internal wrapper models supplied via
         # `taint --models <file>` (#317); merged over the builtin/override DB.
-        models = _taint.load_models(extra=params.get("user_models"))
+        models = _taint.load_models(extra=params.get("user_models"),
+                                    extra_via=params.get("user_models_via"),
+                                    extra_path=params.get("user_models_path"))
     except _taint.TaintError as exc:
         # A broken builtin DB or BN_TAINT_MODELS override is now loud instead
         # of silently producing false negatives (#97).
@@ -74,7 +76,8 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
     # mid-run can't desync the reported sources from what was actually used.
     model_sources = _taint.model_overlay_sources(
         params.get("user_models"), user_models_path=params.get("user_models_path"),
-        user_models_via=params.get("user_models_via"))
+        user_models_via=params.get("user_models_via"),
+        env_overridden_path=params.get("user_models_env_overridden"))
 
     def _find_variable(fn, sel):
         var, _is_param = vars_mod._find_variable_selector(fn, sel)
@@ -143,6 +146,21 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
         # "body could not be read" hole is a DIFFERENT and narrower condition
         # and is reported separately in stats.analysis_incomplete.
         result.update(_analysis_state_fields(bv))
+        # W07-10/W05-05: an opt-in run must be told apart from a default one
+        # by its result alone. `run_params` echoed only the depth/iteration/
+        # unknown-call knobs, so a run with an extra sink class, a pinned
+        # indirect call or a model overlay read exactly like one without.
+        run_params = result.setdefault("run_params", {})
+        if direction == "forward":
+            run_params["sink_classes"] = sorted(
+                {str(c) for c in params.get("enabled_sink_classes") or []})
+        run_params["resolve_map"] = (
+            {"path": _map_path, "entries": len(engine.resolve_map)}
+            if "resolve_map" in params else None)
+        # The overlays actually merged, as the disclosure above names them;
+        # the builtin DB is always loaded and an overridden env file was not.
+        run_params["models"] = [s for s in model_sources
+                                if s.get("kind") not in ("builtin", "env_not_loaded")]
     return result
 
 
@@ -161,17 +179,9 @@ def _taint_models_op(ctx, selector, params: dict[str, Any]):
             "unsupported",
             "--present/--callsites need a target: presence is defined against a loaded binary")
     try:
-        models = _taint.load_models(extra=params.get("user_models"))
+        catalog, models = model_catalog(params)
     except _taint.TaintError as exc:
         raise OperationFailure("unsupported", str(exc)) from exc
-    catalog = build_catalog(models, role=params.get("role"), sink_class=params.get("class"))
-    catalog["overlays"] = _taint.model_overlay_sources(
-        params.get("user_models"), user_models_path=params.get("user_models_path"),
-        user_models_via=params.get("user_models_via"))
-    catalog["items"] = ([{"role": "source", **s} for s in catalog["sources"]]
-                        + [{"role": "sink", **e}
-                           for lst in catalog["sinks_by_class"].values() for e in lst]
-                        + [{"role": "propagator", **p} for p in catalog["propagators"]])
     if selector is not None:
         bv = ctx._resolve_view(selector)
         present_keys, info = _present_models(bv, models, want_callsites, all_sites=all_sites)
@@ -353,6 +363,34 @@ def _disasm_at(bv, addr: int) -> str:
         return ""
 
 
+# Binary Ninja's loaders add this ExternalSection to EVERY view, holding one
+# placeholder symbol per compiler builtin its MLIL may synthesise
+# (`__builtin_memcpy`, `__builtin_strcpy`, ...). The placeholder proves nothing
+# about the binary; the builtin is in it only where code references it (a
+# store run BN lifted to an inline builtin call).
+_SYNTHETIC_SECTIONS = frozenset({".synthetic_builtins"})
+
+
+def _synthetic_unreferenced(bv, name: str) -> bool:
+    """True when every symbol spelled *name* is a synthetic-builtin placeholder
+    and no code references any of them, so the name must not mark its model
+    present. A view that cannot answer (no symbol lookup, no section map) keeps
+    the name, as before."""
+    syms = getattr(bv, "get_symbols_by_name", lambda n: [])(name) or []
+    addrs = {int(getattr(s, "address", 0)) for s in syms}
+    if not addrs:
+        return False
+    for addr in addrs:
+        try:
+            sections = bv.get_sections_at(addr) or []
+        except Exception:
+            return False
+        if not any(str(getattr(s, "name", "")) in _SYNTHETIC_SECTIONS for s in sections):
+            return False
+    get_refs = getattr(bv, "get_code_refs", lambda a: [])
+    return not any(list(get_refs(addr) or []) for addr in addrs)
+
+
 def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
     """Map the binary's symbols to model keys via the engine's own normalization;
     return ``(present model-key set, {model-key: info})`` where ``info`` carries
@@ -383,7 +421,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
     keyed: dict[str, list[Any]] = {}
     for nm in names:
         key, _model = _taint.lookup_model(models, nm)
-        if not key:
+        if not key or _synthetic_unreferenced(bv, nm):
             continue
         present.add(key)
         raw_names.setdefault(key, set()).add(nm)
@@ -474,6 +512,15 @@ def _annotate_presence(catalog, present_keys, info, present_only):
             del catalog["sinks_by_class"][cls]
     catalog["propagators"] = [e for e in catalog["propagators"] if (_mark(e) or not present_only)]
     catalog["items"] = [e for e in catalog["items"] if (_mark(e) or not present_only)]
+    # Only now does the catalog describe a binary: claim presence, and count the
+    # distinct modeled names (within the role/class filter) that matched one of
+    # its symbols. Zero is the stripped-target case the docs describe -- "no
+    # modeled name matched", not "no sinks" -- so it is machine-readable here and
+    # the text renderer prints that hint from it.
+    catalog["presence_catalog"] = True
+    catalog["catalog_note"] = PRESENCE_CATALOG_NOTE
+    catalog["present_model_count"] = len(
+        {e["symbol"] for e in catalog["items"] if e.get("present")})
 
 
 def _ssa_vars_from(vars_list: list) -> list[SSAVariable]:

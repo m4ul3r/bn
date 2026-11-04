@@ -287,6 +287,21 @@ def _code(text: Any) -> str:
     return json.dumps(t) if "`" in t else f"`{t}`"
 
 
+# Instructions a leaf's `bn disasm <call> --linear N` advice reads from a call
+# site: the call and what follows it. Whole-function `disasm` of a large
+# handler was a 136 KB answer to a question about one call (W05-04).
+_CALL_WINDOW = 8
+
+
+def _function_ref(func: Any) -> dict[str, str]:
+    """A leaf's ``function``: one object shape for every leaf kind (W07-11).
+    It was a bare hex string on most backward leaves and an object on the
+    caller frontier, so a consumer had to branch on the type to read it."""
+    name = str(getattr(func, "name", "?"))
+    return {"name": name, "display_name": _display_name(func) or name,
+            "address": hex(int(getattr(func, "start", 0) or 0))}
+
+
 class _Use(NamedTuple):
     """One classified use of a tracked pointer inside one function.
 
@@ -5675,7 +5690,7 @@ class TaintEngine:
         return sub
 
     @staticmethod
-    def _frontier_leaf(ins: Any, callee_fn: Any, tainted_arg_indices, note: str) -> dict[str, Any]:
+    def _frontier_leaf(ins: Any, callee_fn: Any, tainted_arg_indices, detail: str) -> dict[str, Any]:
         """An honest "taint stopped here" leaf for an unmodeled in-binary callee
         that was NOT descended into (no mappable params, depth bound, recursion
         cycle, or an unanalyzable body). Extends the existing leaves[] honesty
@@ -5687,7 +5702,7 @@ class TaintEngine:
                        "display_name": _display_name(callee_fn) or "?",
                        "address": hex(int(getattr(callee_fn, "start", 0)))},
             "tainted_args": sorted(tainted_arg_indices),
-            "note": note,
+            "detail": detail,
         }
 
     def _arg_under_recovered_leaf(self, ins: Any, callee_fn: Any, dropped: list,
@@ -5720,7 +5735,7 @@ class TaintEngine:
                 "recovered_params": n_params, "dropped_args": sorted(dropped),
                 "stack_dropped_args": [i for i in sorted(dropped) if cc is not None and i >= len(arg_regs)],
                 "cause": "varargs_not_followed", "callee_variadic": True,
-                "note": self._varargs_tail_note(self._prose_function(callee_fn), n_params, dropped,
+                "detail": self._varargs_tail_note(self._prose_function(callee_fn), n_params, dropped,
                                                 hex(int(getattr(callee_fn, "start", 0)))),
             }
         try:
@@ -5767,19 +5782,19 @@ class TaintEngine:
         if variadic is None:
             return {
                 **common, "cause": "prototype_status_unknown", "callee_variadic": None,
-                "note": (f"tainted arg(s) {confirmed} passed to {self._prose_function(callee_fn)} "
-                         f"exceed its {n_params} recovered named parameter(s); these flows "
-                         f"were NOT followed. Variadic status is undetermined: inspect the "
-                         f"callee prototype and argument consumption before diagnosing a "
-                         f"signature discrepancy or a tracking limitation."),
+                "detail": (f"tainted arg(s) {confirmed} passed to {self._prose_function(callee_fn)} "
+                           f"exceed its {n_params} recovered named parameter(s); these flows "
+                           f"were NOT followed. Variadic status is undetermined: inspect the "
+                           f"callee prototype and argument consumption before diagnosing a "
+                           f"signature discrepancy or a tracking limitation."),
             }
         return {
             **common, "cause": "signature_under_recovered", "callee_variadic": False,
-            "note": (f"tainted arg(s) {confirmed} passed to {self._prose_function(callee_fn)} "
-                     f"exceed its {n_params} recovered parameter(s), and the callee is "
-                     f"determined nonvariadic. The confirmed extra arguments disagree with "
-                     f"that declaration; their flow was NOT followed. Recover the real "
-                     f"prototype and apply `bn proto set {shlex.quote(name)} \"<prototype>\"`, then re-run."),
+            "detail": (f"tainted arg(s) {confirmed} passed to {self._prose_function(callee_fn)} "
+                       f"exceed its {n_params} recovered parameter(s), and the callee is "
+                       f"determined nonvariadic. The confirmed extra arguments disagree with "
+                       f"that declaration; their flow was NOT followed. Recover the real "
+                       f"prototype and apply `bn proto set {shlex.quote(name)} \"<prototype>\"`, then re-run."),
         }
 
     @staticmethod
@@ -5800,8 +5815,7 @@ class TaintEngine:
 
     def _descend(self, ins: Any, callee_fn: Any, tainted_args: dict, why: dict,
                  depth: int, max_depth: int, *, via: str | None = None,
-                 caller_instrs: list | None = None,
-                 caller_fn: Any = None) -> dict[str, Any]:
+                 caller_instrs: list | None = None) -> dict[str, Any]:
         """Recurse into a (direct or resolved-indirect) internal callee and return
         its findings with a caller-side path prefix prepended, plus whether it
         propagates taint to its return.
@@ -5826,7 +5840,7 @@ class TaintEngine:
             if variadic is True:
                 # #948: every tainted arg is in a correctly-variadic tail.
                 leaf.update(cause="varargs_not_followed", callee_variadic=True,
-                            note=self._varargs_tail_note(
+                            detail=self._varargs_tail_note(
                                 self._prose_function(callee_fn), n_params, list(tainted_args),
                                 hex(int(getattr(callee_fn, "start", 0)))))
                 out["assumptions"].append(
@@ -5835,7 +5849,7 @@ class TaintEngine:
             else:
                 if variadic is False:
                     leaf.update(cause="signature_under_recovered",
-                                note=leaf["note"] + " Recovered call arguments exceed a determined "
+                                detail=leaf["detail"] + " Recovered call arguments exceed a determined "
                                 "nonvariadic declaration: recover the actual signature with "
                                 f"`bn proto set {shlex.quote(callee_fn.name)} \"<prototype>\"` and re-run.")
                 else:
@@ -5853,7 +5867,7 @@ class TaintEngine:
             out["leaves"].append(self._frontier_leaf(
                 ins, callee_fn, tainted_args,
                 f"tainted data passed to in-binary callee with no model; depth bound "
-                f"({max_depth}) stopped descent -- investigate or raise --depth"))
+                f"({max_depth}) stopped descent -- investigate or raise --max-depth"))
             return out
         sub = self._summarize(callee_fn, valid, depth + 1, max_depth)
         first_hit = tainted_args[sorted(valid)[0]][0]
@@ -5903,8 +5917,7 @@ class TaintEngine:
                 out["leaves"].append(lost)
         if not ssa_writes(ins) and "TAILCALL" not in op_name(ins) \
                 and not self._call_result_is_modeled(ins, callee_fn):
-            out["leaves"].append(self._dropped_result_leaf(ins, callee_fn, tainted_args,
-                                                           caller_fn))
+            out["leaves"].append(self._dropped_result_leaf(ins, callee_fn, tainted_args))
         return out
 
     def _call_result_is_modeled(self, ins: Any, callee_fn: Any) -> bool:
@@ -5935,8 +5948,8 @@ class TaintEngine:
                         return True
         return False
 
-    def _dropped_result_leaf(self, ins: Any, callee_fn: Any, tainted_args: dict,
-                             caller_fn: Any) -> dict[str, Any]:
+    def _dropped_result_leaf(self, ins: Any, callee_fn: Any,
+                             tainted_args: dict) -> dict[str, Any]:
         """#1034 item 5, at the call site (#1050 review round 9): BN's MLIL gives
         a descended call with tainted arguments NO result, so whatever the
         callee returns is not followed. Whether the caller uses the return
@@ -5945,14 +5958,13 @@ class TaintEngine:
         blocking frontier. The cost: a void callee that receives tainted
         arguments withholds the all-clear too."""
         call_at = hex(int(getattr(ins, "address", 0)))
-        fn_at = hex(int(getattr(caller_fn, "start", 0) if caller_fn is not None
-                        else getattr(ins, "address", 0)))
         leaf = self._frontier_leaf(
             ins, callee_fn, tainted_args,
             f"tainted arg(s) {sorted(tainted_args)} passed to "
             f"{self._prose_function(callee_fn)} at {call_at}: Binary Ninja recovered no "
             f"result for this call; bn does not check whether the caller uses the return "
-            f"register -- check the disassembly after the call with `bn disasm {fn_at}`")
+            f"register -- check the instructions after the call with "
+            f"`bn disasm {call_at} --linear {_CALL_WINDOW}`")
         leaf["cause"] = "return_value_unrecovered"
         return leaf
 
@@ -5992,13 +6004,15 @@ class TaintEngine:
         else:
             return None
         at = hex(int(getattr(callee_fn, "start", 0)))
+        call_at = hex(int(getattr(ins, "address", 0)))
         leaf = self._frontier_leaf(
             ins, callee_fn, tainted_args,
             f"tainted arg(s) {sorted(tainted_args)} passed to "
             f"{self._prose_function(callee_fn)}, whose returns Binary Ninja recovered "
             f"with no value, while {consumer}: whether the arguments reach that value "
             f"is unknown (a register the body leaves unchanged is not modeled) -- read "
-            f"the body with `bn disasm {at}`")
+            f"the call with `bn disasm {call_at} --linear {_CALL_WINDOW}` and the "
+            f"callee's entry with `bn disasm {at} --linear {_CALL_WINDOW}`")
         leaf["cause"] = "return_value_unrecovered"
         return leaf
 
@@ -11280,7 +11294,7 @@ class TaintEngine:
                                 changed = True
                         if descend_internal:
                             d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth,
-                                              via=via, caller_instrs=instrs, caller_fn=func)
+                                              via=via, caller_instrs=instrs)
                             # Round-3 blocker: `_descend`'s rebuild strips per-finding
                             # taint-graph context, so a finding's provenance can only be
                             # re-checked HERE, against the CALLER's own why-chain, using
@@ -11403,10 +11417,10 @@ class TaintEngine:
                                                                 else str(_who)),
                                                "address": hex(int(taddr))},
                                     "tainted_args": sorted(tainted_args.keys()),
-                                    "note": ("--unknown-call stop: taint reached this unmodeled "
-                                             + _stop_desc
-                                             + " and was NOT propagated through it; flow past "
-                                             "this call is not analyzed -- NOT an all-clear"),
+                                    "detail": ("--unknown-call stop: taint reached this unmodeled "
+                                               + _stop_desc
+                                               + " and was NOT propagated through it; flow past "
+                                               "this call is not analyzed -- NOT an all-clear"),
                                 }
                                 if _stop_leaf not in leaves:
                                     leaves.append(_stop_leaf)
@@ -12771,7 +12785,7 @@ class TaintEngine:
         # answer is not complete: a blocking leaf per refused sink.
         for s, msg in errors:
             leaf = {"kind": "sink_unseeded", "locator": format_locator(s),
-                    "function": hex(int(func.start)),
+                    "function": _function_ref(func),
                     **({"address": s["address"]} if "address" in s else {}),
                     "detail": (f"the sink {format_locator(s)} was not sliced ({msg}), so "
                                f"this multi-sink result does not account for it and is "
@@ -12968,7 +12982,7 @@ class TaintEngine:
                 "kind": kind,
                 "address": hex(int(getattr(at, "address", 0))),
                 ("pointer" if kind == _POINTER_LEAF else "buffer"): label,
-                "function": fn_ref,
+                "function": _function_ref(func),
                 **extra,
                 "il_text": str(at),
                 "detail": detail,
@@ -14043,7 +14057,7 @@ class TaintEngine:
         leaf = {
             "kind": "pointer_demand_not_certified" if role == "pointer" else "sink_role_unknown",
             "address": hex(int(getattr(sink_ins, "address", 0) or 0)),
-            "function": fn_ref,
+            "function": _function_ref(func),
             "operand": shown,
             "objects": uniq,
             "il_text": str(sink_ins),
@@ -14580,9 +14594,7 @@ class TaintEngine:
         if leaf is None:
             leaf = {
                 "kind": "caller_sites_truncated", "address": hex(start),
-                "function": {"name": str(getattr(func, "name", "?")),
-                             "display_name": _display_name(func) or "?",
-                             "address": hex(start)},
+                "function": _function_ref(func),
             }
             state["leaf"] = leaf
             self._bw_leaves.append(leaf)
@@ -14601,8 +14613,8 @@ class TaintEngine:
             "partially_followed": [
                 {"address": hex(a), "followed_params": sorted(f), "unfollowed_params": sorted(m)}
                 for a, f, m in partial[:MAX_CALLERS]],
-            "note": (note + " -- an origin reachable only from an unfollowed caller "
-                     "is missing from this slice"),
+            "detail": (note + " -- an origin reachable only from an unfollowed caller "
+                       "is missing from this slice"),
         })
 
     def _seed_backward(self, func, ssaf, instrs, sink) -> list[tuple]:

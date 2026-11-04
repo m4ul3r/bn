@@ -959,7 +959,7 @@ def _forward_prose(result) -> str:
     parts = [str((result.get("diagnostics") or {}).get("next_action") or "")]
     parts += [str(a) for a in result.get("assumptions") or []]
     for leaf in result.get("leaves") or []:
-        parts += [str(leaf.get(k) or "") for k in ("note", "detail")]
+        parts.append(str(leaf.get("detail") or ""))
     return "\n".join(parts)
 
 
@@ -6291,3 +6291,125 @@ __attribute__((noinline)) void call_fmt(const char *s) { char b[16]; app_fmt(b, 
         assert res.returncode == 2, (command, res.returncode, out)
         assert "model 'app_fmt'" in out and "`varargs.first_index` is required" in out, out
         assert "Traceback" not in out and "internal error" not in out, out
+
+
+_LOG_SERVER_SRC = r"""
+#include <string.h>
+#include <stdio.h>
+#define N __attribute__((noinline, noipa))
+char log_buf[32];
+char log_tail[32];
+N void flush_log(void) { puts(log_buf); }
+N void emit_record(int k) { puts(log_buf + k); }
+N void rotate_log(void) { log_tail[0] = 0; }
+N void consume(const char *p) { if (p[0] == 'x') puts("x"); }
+N void serve(char *p) {
+    memcpy(log_buf, p, 48);      /* past the next symbol: the extent is unproven */
+    flush_log();
+    emit_record(1);
+    emit_record(2);
+    consume(p);                  /* a call BN gives no result */
+    rotate_log();
+}
+int main(int argc, char **argv) { if (argc > 1) serve(argv[1]); return 0; }
+"""
+
+
+def test_forward_frontier_verdict_advice_and_text_on_a_real_build(tmp_path, shared_bn,
+                                                                monkeypatch):
+    """P1-08, P2-04 and the W07/W05 papercuts on one real build.
+
+    One write into an untyped global stays live across three later calls, so
+    the walk records a continuation leaf per call and its extent truncation;
+    a void call with a tainted argument gets the return frontier. The text
+    names the cause (not `@depth N`), prints ONE block for the global with
+    one routed command, wraps at the terminal width, and every leaf command
+    runs as printed."""
+    from bn.taint_truncation import TRUNCATION_CAUSES
+
+    src = tmp_path / "logsrv.c"
+    src.write_text(_LOG_SERVER_SRC)
+    binary = tmp_path / "logsrv"
+    _compile(src, binary, ["-O2", "-U_FORTIFY_SOURCE", "-D_FORTIFY_SOURCE=0",
+                           "-fno-builtin", "-fno-inline", "-g0"])
+    target = shared_bn.load(binary, copy=False)
+    forward = ("-t", target, "taint", "forward", "-f", "serve", "--source", "param:0")
+
+    result = _bn_json(shared_bn, *forward, "--sink-class", "file_write")
+    causes = result["stats"]["truncation_cause"]
+    assert "global_object_extent" in causes, result["stats"]
+    assert result["run_params"]["sink_classes"] == ["file_write"], result["run_params"]
+    assert result["run_params"]["resolve_map"] is None
+    assert result["run_params"]["models"] == []
+    assert all("note" not in leaf for leaf in result["leaves"]), result["leaves"]
+    gmc = [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
+    assert len(gmc) >= 2 and len({lf["global"]["address"] for lf in gmc}) == 1, gmc
+
+    # The return frontier points at a bounded window AT the call, and it runs.
+    [lost] = [lf for lf in result["leaves"] if lf.get("cause") == "return_value_unrecovered"]
+    [command] = re.findall(r"`bn ([^`]+)`", lost["detail"])
+    words = shlex.split(command)
+    assert "disasm" in words and lost["address"] in words and "--linear" in words, command
+    assert _run_or_check_template(shared_bn, lost["detail"]) == (1, 0)
+
+    monkeypatch.setenv("COLUMNS", "100")
+    rendered = shared_bn.run(*forward, timeout=120.0)
+    assert rendered.returncode == 0, rendered.stderr
+    lines = rendered.stdout.splitlines()
+    verdict = next(line for line in lines if line.startswith("verdict:"))
+    assert "@depth" not in verdict, verdict
+    for cause in causes:
+        assert TRUNCATION_CAUSES[cause].what in verdict, (cause, verdict)
+    start = next(i for i, line in enumerate(lines) if line.startswith("frontiers ("))
+    end = next((i for i in range(start, len(lines)) if not lines[i]), len(lines))
+    frontier = lines[start:end]
+    headers = [line for line in frontier if "global_memory_continuation @" in line]
+    assert len(headers) == 1 and f"[{len(gmc)} leaves]" in headers[0], frontier
+    assert all(len(line) <= 100 or "`" in line for line in frontier), frontier
+    block = "\n".join(frontier)
+    assert len(re.findall(r"`bn [^`]+`", block.split("unmodeled_callee")[0])) == 1, block
+    # Every command the text prints carries this invocation's routing, and
+    # the frontier block's own command runs as printed.
+    printed = re.findall(r"`(bn [^`]+)`", rendered.stdout)
+    assert printed
+    for line in printed:
+        assert f"-i {shared_bn.instance_id}" in line and "-t " in line, line
+    assert _run_or_check_template(shared_bn, block.split("unmodeled_callee")[0])[0] == 1
+
+    # A depth cut names the flag that exists.
+    capped = _bn_json(shared_bn, *forward, "--max-depth", "0")
+    cut = [lf for lf in capped["leaves"] if "depth bound" in str(lf.get("detail"))]
+    assert cut, capped["leaves"]
+    for leaf in cut:
+        assert "--max-depth" in leaf["detail"] and " --depth" not in leaf["detail"], leaf
+
+    # --estimate-output never offers --max-depth as the way to bound the read.
+    est = shared_bn.run(*forward, "--estimate-output", "--format", "json", timeout=120.0)
+    assert est.returncode == 0, est.stderr
+    rerun = json.loads(est.stdout)["rerun"]
+    assert "--out" in rerun and "smaller" not in rerun, rerun
+
+
+def test_models_catalog_on_an_all_unnamed_target_marks_no_synthetic_builtin(tmp_path,
+                                                                            shared_bn):
+    """W04-08 / W12-05: Binary Ninja adds a `.synthetic_builtins` placeholder
+    for every compiler builtin to each view. On a fully stripped freestanding
+    build no code references them, so no `__builtin_*` model is present, the
+    count says no modeled name matched, and text prints the hint."""
+    src = tmp_path / "bare.c"
+    src.write_text(r"""
+void _start(void) {
+    __asm__ volatile("mov $60, %eax\n\txor %edi, %edi\n\tsyscall");
+}
+""")
+    binary = tmp_path / "bare"
+    _compile(src, binary, ["-nostdlib", "-static", "-s", "-ffreestanding"])
+    target = shared_bn.load(binary, copy=False)
+    catalog = _bn_json(shared_bn, "-t", target, "taint", "models", "--present")
+    assert catalog["presence_catalog"] is True
+    assert catalog["present_model_count"] == 0, catalog
+    present = [e for e in catalog["items"] if e.get("present")]
+    assert not any(str(e.get("symbol", "")).startswith("__builtin_") for e in present), present
+    text = shared_bn.run("-t", target, "taint", "models", "--present")
+    assert text.returncode == 0, text.stderr
+    assert "no modeled name matched" in text.stdout, text.stdout

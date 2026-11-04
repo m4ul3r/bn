@@ -3769,7 +3769,7 @@ class TestTaintUnderRecoveredArgFrontier:
             return json.loads(out_file.read_text()).get("leaves", [])
 
         def _frontiers(leaves):
-            return [l for l in leaves if "under-recovered" in str(l.get("note", ""))]
+            return [l for l in leaves if "under-recovered" in str(l.get("detail", ""))]
 
         # Baseline: build_cmd recovered with its arg -> no #381 frontier.
         assert _frontiers(_taint_leaves()) == []

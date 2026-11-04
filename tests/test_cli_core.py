@@ -199,12 +199,30 @@ def test_every_command_with_a_size_lever_names_it_instead_of_only_out():
     the write-to-a-file fallback.
     """
     for path in (
-        ("read",), ("trace",), ("taint", "forward"), ("taint", "backward"),
+        ("read",), ("trace",),
         ("evidence", "orient"), ("evidence", "surface"), ("evidence", "table"),
     ):
         hint = bn.cli._slice_hint_for_command(path, True) or ""
         assert "smaller" in hint, (path, hint)
         assert hint != "rerun with --out <path> to write it to a file", (path, hint)
+
+
+@pytest.mark.parametrize("direction", ["forward", "backward"])
+def test_taint_max_depth_is_never_offered_as_the_output_slice(direction):
+    """W07-09: taint's `--max-depth` changes which calls the walk descends, and
+    a tighter cap can GROW the frontier list, so the estimate and spill advice
+    must not name it as the way to bound the read. Taint has no slicing flag;
+    the advice is the file, and the depth flag is named only as not-a-slice."""
+    path = ("taint", direction)
+    for text_format in (True, False):
+        hint = bn.cli._slice_hint_for_command(path, text_format) or ""
+        assert "--out" in hint and "smaller" not in hint, hint
+    locator = "--source" if direction == "forward" else "--sink"
+    args = bn.cli.build_parser().parse_args(
+        ["taint", direction, "-f", "parse_frame", locator, "param:0",
+         "--max-depth", "3", "--estimate-output"])
+    hint = bn.cli._slice_hint_for_args(args, "text") or ""
+    assert "--out" in hint and "smaller" not in hint, hint
 
 
 def test_an_admin_path_envelope_carries_the_derived_hint(monkeypatch, capsys, tmp_path):

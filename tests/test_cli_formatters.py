@@ -379,7 +379,7 @@ def test_render_arg_under_recovered_leaf():
     leaf = {"kind": "arg_under_recovered", "address": "0x40130a",
             "callee": {"name": "_M_create", "address": "0x3000"},
             "recovered_params": 1, "dropped_args": [1],
-            "note": 'tainted arg(s) [1] ... apply `bn proto set _M_create "<prototype>"` ...'}
+            "detail": 'tainted arg(s) [1] ... apply `bn proto set _M_create "<prototype>"` ...'}
     out = "\n".join(_render_grouped_leaves([leaf]))
     assert "arg_under_recovered @ 0x40130a" in out
     assert "_M_create" in out
@@ -391,7 +391,7 @@ def test_arg_under_recovered_leaves_group_per_callee():
     from bn.formatters import _render_grouped_leaves
     mk = lambda addr: {"kind": "arg_under_recovered", "address": addr,
                        "callee": {"name": "f", "address": "0x3000"},
-                       "recovered_params": 1, "dropped_args": [1], "note": "n"}
+                       "recovered_params": 1, "dropped_args": [1], "detail": "n"}
     out = "\n".join(_render_grouped_leaves([mk("0x10"), mk("0x20")]))
     assert "[2 leaves]" in out                             # two call sites of f collapse
 

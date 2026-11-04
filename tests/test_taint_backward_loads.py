@@ -495,11 +495,12 @@ def test_discovery_cut_keeps_loop_carried_escaped_call_frontier():
 
 
 @pytest.mark.parametrize("leaf, command", [
-    ({"buffer": "buf", "function": "0x401136"},
+    ({"buffer": "buf", "function": {"name": "read_line", "address": "0x401136"}},
      "`bn taint forward -f 0x401136 --source var:buf`"),
-    ({"buffer": "line buf", "function": "0x401136"},
+    ({"buffer": "line buf", "function": {"name": "read_line", "address": "0x401136"}},
      "`bn taint forward -f 0x401136 --source 'var:line buf'`"),
-    ({"buffer": "rdi#1", "function": "0x401136", "global": "0x404060"}, None),
+    ({"buffer": "rdi#1", "function": {"name": "read_line", "address": "0x401136"},
+      "global": "0x404060"}, None),
     ({"buffer": "buf"}, None),
 ])
 def test_backward_next_action_prints_only_a_complete_forward_command(leaf, command):

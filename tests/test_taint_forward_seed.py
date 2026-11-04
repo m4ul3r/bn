@@ -119,7 +119,7 @@ def test_unkeyed_buffer_advice_never_sends_the_agent_to_the_other_locator_1041(m
     for command in re.findall(r"`(bn [^`]+)`", advice):
         assert not any(word.startswith(("call:", "arg:")) for word in shlex.split(command)), advice
     for leaf in _misanchored(result):
-        assert "call:" not in leaf["note"] or "the same way" in leaf["note"], leaf
+        assert "call:" not in leaf["detail"] or "the same way" in leaf["detail"], leaf
 
 
 def test_call_preset_with_a_correlating_slot_keeps_its_flow_and_no_seed_leaf_1041(models):

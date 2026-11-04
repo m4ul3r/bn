@@ -160,7 +160,6 @@ def test_a_no_result_call_with_tainted_arguments_is_always_a_frontier_1034(calle
     [leaf] = _dropped(result)
     assert leaf["kind"] == "unmodeled_callee"
     assert "return_register" not in leaf and "return_register_use" not in leaf
-    assert "bn disasm 0x1000" in str(leaf)
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 

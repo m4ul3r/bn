@@ -152,6 +152,101 @@ def test_present_callsites_dedups_aliased_addresses():
     assert _addrs(mc[0]) == {"0x400"}
 
 
+class _Sec:
+    def __init__(self, name):
+        self.name = name
+
+
+class _BVSynthetic(_BVSpellings):
+    """BN's per-view builtin placeholders (`__builtin_memcpy`, `__builtin_strcpy`)
+    in its synthetic-builtins section, one of them referenced by a lifted inline
+    builtin, plus a real `system` import elsewhere with no callers."""
+    _SECTIONS = {0x9000: ".synthetic_builtins", 0x9008: ".synthetic_builtins",
+                 0x5000: ".extern"}
+
+    def __init__(self, refs=None):
+        self.functions = []
+        self._syms = {"__builtin_memcpy": [_Sym("__builtin_memcpy", 0x9000)],
+                      "__builtin_strcpy": [_Sym("__builtin_strcpy", 0x9008)],
+                      "system": [_Sym("system", 0x5000)]}
+        self._refs = refs or {}
+
+    def get_symbols(self):
+        return [s for lst in self._syms.values() for s in lst]
+
+    def get_sections_at(self, a):
+        return [_Sec(self._SECTIONS[a])] if a in self._SECTIONS else []
+
+
+def _present_symbols(res):
+    return {e["symbol"] for e in res["items"] if e.get("present")}
+
+
+def test_unreferenced_synthetic_builtins_are_not_present():
+    # The placeholders exist on every view, so with no code reference they prove
+    # nothing; a real import with no callers still counts.
+    res = rts._taint_models_op(_CtxWithBV(_BVSynthetic()), "active",
+                               {"present": True, "callsites": True})
+    assert _present_symbols(res) == {"system"}
+    # A placeholder BN DID reference (an inline builtin it lifted) is present.
+    res = rts._taint_models_op(_CtxWithBV(_BVSynthetic({0x9000: [_Ref(0x400)]})), "active",
+                               {"present": True})
+    assert _present_symbols(res) == {"system", "__builtin_memcpy"}
+
+
+class _BVStripped(_BVSynthetic):
+    """Every function auto-named, nothing modeled but the placeholders."""
+    def __init__(self):
+        super().__init__()
+        self.functions = [_FakeFn("sub_401000"), _FakeFn("sub_401200")]
+        del self._syms["system"]
+
+
+def test_presence_walk_counts_matched_models():
+    stripped = rts._taint_models_op(_CtxWithBV(_BVStripped()), "active", {"present": True})
+    assert stripped["presence_catalog"] is True
+    assert stripped["present_model_count"] == 0
+    assert stripped["items"] == []
+    named = rts._taint_models_op(_CtxWithBV(_FakeBV(["memcpy", "system"])), "active",
+                                 {"role": "sink"})
+    assert named["present_model_count"] == 2
+
+
+def test_no_target_catalog_claims_no_presence():
+    res = rts._taint_models_op(_CtxNoView(), None, {})
+    assert res["presence_catalog"] is False
+    assert "present_model_count" not in res
+    assert not any("present" in e for e in res["items"])
+    # A presence walk is what switches the claim (and its note) on.
+    walked = rts._taint_models_op(_CtxWithBV(_FakeBV(["memcpy"])), "active", {})
+    assert walked["presence_catalog"] is True
+    assert walked["catalog_note"] != res["catalog_note"]
+
+
+_ROLELESS_SINK = {"app_recv": {"sink": {"class": "overflow_len"}, "bogus_key": 1}}
+
+
+@pytest.mark.parametrize("via", ["$BN_TAINT_MODELS", "--models"])
+def test_bad_user_model_refusal_names_the_knob_that_supplied_it(via):
+    with pytest.raises(rts.OperationFailure) as err:
+        rts._taint_models_op(_CtxNoView(), None, {
+            "user_models": _ROLELESS_SINK, "user_models_path": "/proj/models.json",
+            "user_models_via": via})
+    assert f"({via} /proj/models.json)" in str(err.value)
+
+
+def test_overridden_env_file_is_disclosed_as_not_loaded(monkeypatch):
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    res = rts._taint_models_op(_CtxNoView(), None, {
+        "user_models": {"app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}},
+        "user_models_path": "/proj/flag.json", "user_models_via": "--models",
+        "user_models_env_overridden": "/proj/env.json"})
+    kinds = {o["kind"]: o for o in res["overlays"]}
+    assert kinds["user"]["via"] == "--models"
+    assert kinds["env_not_loaded"] == {"kind": "env_not_loaded", "env": "BN_TAINT_MODELS",
+                                       "path": "/proj/env.json", "overridden_by": "--models"}
+
+
 def test_builtin_catalog_covers_fortify_and_exec_sinks():
     # #372 guard, relocated from the retired sink-sweep SINK_RE to the single
     # source of truth: the model DB must flag the FORTIFY (*_chk) family and bare
@@ -283,8 +378,9 @@ def test_recv_overflow_comment_names_pread_603():
 
 def test_build_catalog_marks_non_findings_555():
     cat = build_catalog(_MODELS)
-    # Top-level: loud, machine-readable "this is a catalog, not findings".
-    assert cat["presence_catalog"] is True
+    # Top-level: loud, machine-readable "this is a catalog, not findings". A bare
+    # model list has not been checked against any binary, so it claims no presence.
+    assert cat["presence_catalog"] is False
     assert cat["is_finding"] is False
     assert "NOT taint findings" in cat["catalog_note"]
     # Every sink entry is a non-finding and carries conditional wording.
