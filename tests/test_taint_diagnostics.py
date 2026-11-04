@@ -94,3 +94,90 @@ def test_modeled_sink_recovery_advice_respects_variadic_status(monkeypatch, vari
             assert "already declared variadic" in text
         elif variadic is None:
             assert "undetermined" in text
+
+
+def _unwound_forward(monkeypatch, salvaged: list[dict]) -> dict:
+    """A forward run whose walk hits the recursion limit after salvaging
+    *salvaged* -- the shape a deep alias scan produced on large entry points."""
+    p = FVar("p", ident=1)
+    function = FFunc("dispatch", 0x1000,
+                     FSSAFunc([FInstr(0, 0x1004, "MLIL_RET", "return", reads=[])]),
+                     params=[p])
+    engine = te.TaintEngine(FBV({}), te.load_models())
+
+    def unwind(*_a, **_k):
+        engine._salvage["leaves"].extend(salvaged)
+        raise RecursionError
+
+    monkeypatch.setattr(engine, "_run_forward", unwind)
+    return engine.forward(function, [te.parse_locator("param:0")])
+
+
+def test_unwound_walk_seed_reach_is_unmeasured_and_propagation_read_off_the_result(monkeypatch):
+    continuation = {"kind": "global_memory_continuation", "address": "0x1010",
+                    "callee": {"name": "flush_log", "address": "0x2000"},
+                    "global": {"address": "0x6010", "label": "log_buf"}}
+    result = _unwound_forward(monkeypatch, [continuation])
+    assert result["stats"]["truncation_cause"] == ["recursion"]
+    diag = result["diagnostics"]
+    # Nothing was measured, so no count is claimed ...
+    assert diag["tainted_values"] is None
+    # ... and the continuation leaf in the same result is proof of propagation.
+    assert diag["propagated"] is True
+    assert diag["safe_to_report_all_clear"] is False
+
+
+def test_unwound_walk_with_only_its_marker_does_not_claim_propagation(monkeypatch):
+    result = _unwound_forward(monkeypatch, [])
+    diag = result["diagnostics"]
+    assert diag["tainted_values"] is None
+    assert diag["propagated"] is False
+
+
+def test_finished_dead_seed_is_measured_and_not_propagated():
+    # The control: a walk that FINISHED and whose seed reached nothing keeps
+    # its measured count, and the result says it did not propagate.
+    diag = te.forward_zero_diagnostics(
+        {"leaves": [], "assumptions": [], "diag": {"tainted_values": 1, "last_use": None}},
+        seed_callsites=0)
+    assert diag["tainted_values"] == 1
+    assert diag["propagated"] is False
+
+
+def test_forward_text_never_reports_a_dead_seed_beside_propagation_proof(monkeypatch):
+    from bn.formatters import _render_taint_text
+
+    continuation = {"kind": "global_memory_continuation", "address": "0x1010",
+                    "callee": {"name": "flush_log", "address": "0x2000"},
+                    "global": {"address": "0x6010", "label": "log_buf"}}
+    proven = _render_taint_text(_unwound_forward(monkeypatch, [continuation])).splitlines()
+    dead = _render_taint_text({
+        "direction": "forward", "function": {"name": "dispatch", "address": "0x1000"},
+        "sources": ["param:0"], "reached_sinks": [], "leaves": [], "stats": {},
+        "diagnostics": te.forward_zero_diagnostics(
+            {"leaves": [], "assumptions": [], "diag": {"tainted_values": 1, "last_use": None}},
+            seed_callsites=0)}).splitlines()
+
+    def line(lines: list[str], head: str) -> str:
+        return next(x for x in lines if x.strip().startswith(head))
+
+    # The seed and last-use lines of a result that proves propagation differ
+    # from those of a finished dead seed: the claim follows the result.
+    assert line(proven, "seed:") != line(dead, "seed:")
+    assert line(proven, "last propagated use:") != line(dead, "last propagated use:")
+
+
+@pytest.mark.parametrize("cause, widens", [("depth_budget", True), ("function_budget", False),
+                                           ("object_extent_unproven", False)])
+def test_continuation_advice_offers_max_depth_only_for_the_depth_bound(cause, widens):
+    # `--max-depth` moves the call-graph bound and nothing else: the
+    # reachability search's own function budget is internal, and advising the
+    # flag for it was advice that could not change the next run.
+    leaf = {"kind": "global_memory_continuation", "address": "0x1010",
+            "callee": {"name": "flush_log", "address": "0x2000"},
+            "global": {"address": "0x6010", "label": "log_buf"}, "references": [],
+            "reachability": {"status": "truncated", "cause": cause}}
+    diag = te.forward_zero_diagnostics(
+        {"leaves": [leaf], "assumptions": [], "diag": {"tainted_values": 3, "last_use": None}},
+        seed_callsites=0, function="0x1000")
+    assert ("raise --max-depth" in diag["next_action"]) is widens

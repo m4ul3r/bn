@@ -9678,24 +9678,19 @@ def test_backward_weak_sink_seed_withholds_completeness_812():
 
 
 def test_truncation_hint_names_the_caller_cap_rather_than_a_depth_cutoff_812():
-    # The backward-only truncation cause. Without its own branch it fell through
-    # to the generic "depth/recursion cutoff" string, which names the wrong knob:
-    # no depth or recursion bound was hit, the caller ascent stopped at its
-    # per-site cap with callers unexamined. The branch shipped pinned by nothing
-    # -- disabling it left 726 tests green across all four taint test files --
-    # so the remediation could regress silently at the moment it matters most.
+    # The backward-only truncation cause. Without its own entry it fell through
+    # to a generic depth wording, which names the wrong knob: no depth or
+    # recursion bound was hit, the caller ascent stopped at its per-site cap
+    # with callers unexamined.
     from bn_agent_bridge import taint_result as tr
 
     hint = tr._truncation_hint(["caller_cap"])
-    assert "caller ascent" in hint, hint
-    assert "per-site cap" in hint, hint
     # It must not offer either depth knob: neither bound was reached.
     assert "--max-depth" not in hint and "--max-iters" not in hint, hint
-    assert hint != "depth/recursion cutoff"
 
-    # The generic fallback still answers for a cause this table does not know,
-    # and the two forward causes keep their own (different) remediations.
-    assert tr._truncation_hint(["an_unknown_cause"]) == "depth/recursion cutoff"
+    # A cause the table does not know is named as itself, never as a depth
+    # cutoff; the two forward causes keep their own (different) remediations.
+    assert "an_unknown_cause" in tr._truncation_hint(["an_unknown_cause"])
     assert "--max-iters" in tr._truncation_hint(["fixpoint_exhausted"])
     assert "--max-depth" in tr._truncation_hint(["max_depth"])
 

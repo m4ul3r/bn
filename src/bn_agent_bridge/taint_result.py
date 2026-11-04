@@ -20,7 +20,9 @@ Unified diagnostics schema (attached to a zero-sink forward result under
     {
       # --- #571 descriptive frontier (kept, unchanged) ---
       "source_callsites": int,       # matched source callsites the seed hit
-      "tainted_values": int,         # tainted SSA values produced
+      "tainted_values": int | None,  # tainted SSA values produced; None when the
+                                     # walk did not finish (nothing was measured)
+      "propagated": bool,            # the RESULT shows the seed reached something
       "last_use": {...} | None,      # last propagated use (label/address/reason)
       "unmodeled_calls_reached": bool,
       "frontier": {
@@ -44,7 +46,7 @@ Reconciliation notes:
   - #571's ``next_action`` (single string) is the ONE suggestion field. #562's
     ``suggested_next`` list is NOT re-introduced (no competing field); its
     seed-reseed guidance is folded into ``next_action`` (top priority) and the
-    ``source_seed_misanchored`` leaf's own ``suggested_source``/``note``.
+    ``source_seed_misanchored`` leaf's own ``suggested_source``/``detail``.
   - ``safe_to_report_all_clear`` lives INSIDE the zero-sink diagnostics block --
     the only context where "is this an all-clear?" is a live question. A run
     WITH findings has something to triage (``reached_sinks`` non-empty), so no
@@ -54,6 +56,8 @@ from __future__ import annotations
 
 import shlex
 from typing import Any
+
+from .taint_truncation import describe_truncation_cause
 
 # Leaf kinds that mean "taint stopped somewhere attacker-relevant" -- an empty
 # reached_sinks list carrying any of these is NEVER an all-clear. The seed-side
@@ -159,6 +163,10 @@ BLOCKING_LEAF_KINDS = frozenset({
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
 # weak ``arg:<recv*>:N`` seed that did not key the filled buffer (#562/#306).
 _SEED_MISANCHORED_KINDS = frozenset({"source_seed_misanchored", "weak_buffer_seed"})
+# Leaves that do not show tainted data reached anything: the unwind marker of
+# a walk that hit the recursion limit, and a seed that did not key its buffer.
+# Every other frontier is a place the seed's taint got to.
+_NO_PROPAGATION_KINDS = _SEED_MISANCHORED_KINDS | {"analysis_truncated"}
 
 # Substrings in ASSUMPTIONS that mean the seed was incomplete / wrong-shape even
 # when no structured leaf was produced (e.g. the recvmsg scatter-gather nudge or
@@ -201,52 +209,17 @@ def _assumption_has_weak_seed(assumptions: list[str]) -> bool:
 
 
 def _truncation_hint(truncation_cause: list[str] | None) -> str:
-    """Human remediation clause for a truncated run, keyed by cause (#579/#576).
+    """Human remediation clause for a truncated run, one per cause (#579/#576).
 
-    The two causes need DIFFERENT next actions -- a fixpoint that exhausted its
-    per-function iteration budget is fixed with ``--max-iters``, while an
-    interprocedural depth cutoff is fixed with ``--max-depth`` -- so a consumer
-    that saw only "depth/recursion" was told the wrong remediation."""
-    causes = list(truncation_cause or [])
-    if "fixpoint_exhausted" in causes:
-        return ("intra-function fixpoint exhausted its iteration budget before "
-                "converging -- raise --max-iters or narrow the source")
-    if "max_depth" in causes:
-        return "interprocedural descent hit the depth bound -- raise --max-depth"
-    if "recursion" in causes:
-        return "Python recursion limit reached (possible unresolved cycle)"
-    if "abi_provenance_budget" in causes:
-        return ("the search for everything that can run before a call ran out of "
-                "its block budget, so what its argument registers carry into that "
-                "call was never established -- narrow the source, or read the "
-                "call's own disassembly for the arguments it passes")
-    if "caller_cap" in causes:
-        # #812: backward-only cause. Without this branch it fell through to the
-        # generic "depth/recursion cutoff" string, which names the wrong knob --
-        # no depth or recursion bound was hit, the caller ascent stopped at its
-        # per-site cap with callers unexamined.
-        return ("the backward caller ascent hit its per-site cap -- some calling "
-                "sites were never followed; narrow the sink or inspect the "
-                "capped sites named in the caller_sites_truncated leaf")
-    if "memory_chain" in causes:
-        # A cut may interrupt discovery or a fixed-point sweep. Existing
-        # writer rows need not be missing for the proof to be incomplete.
-        return ("the backward proof through a local buffer's writers exhausted "
-                "its shared memory-chain budget -- graph discovery or the "
-                "coverage/escape solve is unfinished; seed closer to the sink "
-                "or inspect the writes and unresolved calls named in the "
-                "address_of_local_unresolved leaf")
-    if "global_reference_budget" in causes:
-        # IC03 / round-3 review F2: the bounded call-graph search for code
-        # that reads a tainted global ran out of its function budget with
-        # referencing functions unexamined, so "nothing reads it" was never
-        # established. No depth or recursion bound was hit, so the generic
-        # string would name the wrong knob.
-        return ("the search for code reading a tainted global exhausted its "
-                "function budget with references unexamined -- audit the "
-                "references named in the global_memory_continuation leaf "
-                "(`bn xrefs <global>`) or seed taint inside a consumer")
-    return "depth/recursion cutoff"
+    Read from the vocabulary the CLI verdict line also reads
+    (:mod:`taint_truncation`): each cause needs its OWN next action -- an
+    unconverged fixpoint ``--max-iters``, a depth cutoff ``--max-depth``, an
+    internal search budget only a narrower seed -- and a cause the table does
+    not know is named as itself, never as a depth cutoff."""
+    causes = list(dict.fromkeys(str(c) for c in truncation_cause or []))
+    if not causes:
+        return "cause not stated"
+    return "; ".join(describe_truncation_cause(c) for c in causes)
 
 
 def _derive_all_clear(
@@ -346,7 +319,7 @@ def command_template(command: str) -> str:
 
 def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int],
                          unmodeled_reached: bool, ext_no_model: bool,
-                         tainted_values: int, function: str | None) -> str:
+                         tainted_values: int | None, function: str | None) -> str:
     """The single suggested next step for a zero-sink forward run.
 
     Every command it prints in backticks either runs as printed (the function
@@ -490,9 +463,10 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
     crossed = [lf for lf in leaves if lf.get("kind") == "global_memory_continuation"]
     if by_kind.get("analysis_truncated", 0):
         return ("the walk unwound on Python's recursion limit (an unresolved cycle): "
-                "what it had already found is reported and the rest was never walked "
-                "-- re-run with a lower `--max-depth` for a bounded, complete answer "
-                "over the region it can finish")
+                "what it had already found is reported and the rest was never walked, "
+                "so an empty result here is not evidence the seed stopped -- re-run "
+                "seeded closer to the code of interest; the limit is internal and no "
+                "flag raises it")
     if crossed:
         # IC03: the most actionable zero-sink frontier there is -- the bytes
         # have a known address, so the advice points at them rather than at
@@ -529,9 +503,10 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                        " and audit them by hand: the consumer reads those bytes by"
                        " constant address, so there is no variable inside it to seed"))
         # BN21-BOUND-03: `--max-depth` moves the CALL-GRAPH bound and nothing
-        # else. Advising it for a bound it cannot move is advice that fails.
+        # else -- not the reachability search's own function budget either.
+        # Advising it for a bound it cannot move is advice that fails.
         widen = (" or raise --max-depth and re-run"
-                 if any(c in ("depth_budget", "function_budget") for c in truncated_at)
+                 if "depth_budget" in truncated_at
                  else " -- this bound is internal, `--max-depth` does not move it")
         return (f"{head}, and the search for code reading it past a call this walk made "
                 f"was TRUNCATED ({', '.join(truncated_at) or 'bound reached'}) with "
@@ -574,6 +549,11 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         return ("taint escaped through a coarse-memory frontier (a pointer/store not "
                 "precisely tracked); inspect the frontier leaves or seed a value read "
                 f"back from those bytes{seed}")
+    if tainted_values is None:
+        # No seed reach was recorded (the walk did not finish), so a dead seed
+        # and a cut walk look alike here: say neither.
+        return ("how far the seed reached was not recorded; inspect the frontier "
+                "leaves before drawing any conclusion from this result")
     if tainted_values <= 1:
         return ("the source seeded but produced no further tainted uses; verify the "
                 "`--source` locator matches the intended value")
@@ -613,6 +593,11 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     commands the next action prints (#1033 item 6). ``buffer_seed`` says a
     ``call:``/``arg:`` source seeded a buffer its model fills (a receive-family
     seed): an all-clear then carries :data:`RECEIVE_ALL_CLEAR_CAVEAT`."""
+    # Seed reach is MEASURED only by a walk that finished: the top run records
+    # it as `diag`. A walk that unwound (the recursion salvage) recorded none,
+    # and reading that absence as "0 values, the seed did not propagate" put
+    # a claim beside leaves that prove the opposite. Unmeasured stays None.
+    measured = sub.get("diag") is not None
     diag = sub.get("diag") or {}
     leaves = sub.get("leaves") or []
     assumptions = sub.get("assumptions") or []
@@ -648,7 +633,13 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     # "unmodeled call reached" signal so a parser behind an import stub counts.
     ext_no_model = any("has no model" in a for a in assumptions)
     unmodeled_reached = bool(unmodeled_n or ext_no_model)
-    tainted_values = int(diag.get("tainted_values", 0))
+    tainted_values = int(diag.get("tainted_values", 0)) if measured else None
+    # Whether the seed went anywhere, read off the result itself: a recorded
+    # use, more values than the seed, or any frontier other than the unwind
+    # marker and a seed-side refusal (each of those is a place tainted data
+    # reached).
+    propagated = (bool(diag.get("last_use")) or (tainted_values or 0) > 1
+                  or any(k not in _NO_PROPAGATION_KINDS for k in by_kind))
 
     next_action = _forward_next_action(
         leaves, by_kind=by_kind, unmodeled_reached=unmodeled_reached,
@@ -662,6 +653,7 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     return {
         "source_callsites": int(seed_callsites),
         "tainted_values": tainted_values,
+        "propagated": propagated,
         "last_use": diag.get("last_use"),
         "unmodeled_calls_reached": unmodeled_reached,
         # Additive: the distinct truncation cause(s), so a zero-sink consumer

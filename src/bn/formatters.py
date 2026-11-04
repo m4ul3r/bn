@@ -9,6 +9,7 @@ import shlex
 from typing import Any, Callable, Iterator, Sequence
 
 from .target_hint import instance_option, open_target_lines, target_option, target_row
+from .taint_truncation import describe_truncation_cause
 from .transport import BridgeError
 
 # FAILED_MUTATION_STATUSES is DEFINED in `mutation_statuses`, a stdlib-only leaf
@@ -5217,43 +5218,27 @@ def _render_taint_path(steps: list[Any]) -> list[str]:
 
 
 def _taint_truncation_note(stats: dict[str, Any]) -> str:
-    """Verdict-line truncation clause that names the CAUSE (#579/#576).
+    """Verdict-line truncation clause that names every CAUSE (#579/#576).
 
-    A fixpoint-exhaustion truncation and an interprocedural depth cutoff share
-    the run-level ``truncated`` flag but mean different things: the former's
-    ``max_depth`` stat is 0 (a same-function iteration limit), so the historical
-    ``truncated @depth 0`` misreported it as a depth-recursion cutoff. Render each
-    cause distinctly with its own remediation. When ``truncation_cause`` is absent
-    (an older bridge), preserve the historical ``@depth N`` wording verbatim."""
+    Each cause renders as itself with its own remediation, read from the one
+    vocabulary the bridge's all-clear reason also reads (``taint_truncation``):
+    the global-memory continuation's search budgets used to fall through to a
+    ``truncated @depth N`` clause and send the reader to ``--max-depth``, the
+    one knob that cannot move them. A cause the table does not know is named
+    verbatim, never as a depth cutoff. Only a bridge that predates
+    ``truncation_cause`` altogether keeps the historical ``@depth N`` wording,
+    because there no cause was stated."""
     if not stats.get("truncated"):
         return ""
-    causes = _field_list(stats, "truncation_cause")
+    causes = [str(c) for c in _field_list(stats, "truncation_cause")]
     if not causes:
         return f" · truncated @depth {stats.get('max_depth')}"
     parts: list[str] = []
-    if "max_depth" in causes:
-        parts.append(f"@depth {stats.get('max_depth')} "
-                     "(interprocedural depth bound; raise --max-depth)")
-    if "fixpoint_exhausted" in causes:
-        parts.append("fixpoint unconverged (intra-function iteration budget "
-                     "exhausted; raise --max-iters or narrow the source)")
-    if "recursion" in causes:
-        parts.append("recursion limit (possible unresolved cycle)")
-    if "caller_cap" in causes:
-        # #810: the backward caller ascent follows only the first N caller sites of
-        # a parameter-origin slice; the rest are dropped (no knob raises the cap).
-        # Name the cause and where the dropped count lives -- the frontier leaf.
-        parts.append("caller-site cap reached (not every caller was followed; "
-                     "see the caller_sites_truncated frontier)")
-    if "memory_chain" in causes:
-        # The shared graph-discovery/fixed-point allowance was exhausted;
-        # the cut can mean missing writers OR an unfinished proof.
-        parts.append("memory-chain budget exhausted while proving a local "
-                     "buffer's writers (discovery or fixed-point solve unfinished; "
-                     "seed closer to the sink -- see the "
-                     "address_of_local_unresolved frontier)")
-    if not parts:
-        return f" · truncated @depth {stats.get('max_depth')}"
+    for cause in dict.fromkeys(causes):
+        clause = describe_truncation_cause(cause)
+        # The depth a depth cut happened at is the one number its remedy needs.
+        parts.append(f"@depth {stats.get('max_depth')} ({clause})"
+                     if cause == "max_depth" else clause)
     return " · truncated " + "; ".join(parts)
 
 
@@ -5426,9 +5411,13 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     fr = _field_dict(diag, "frontier")
     lu = _field_dict(diag, "last_use")
     out = ["diagnostics:"]
+    # A walk that did not finish measured no seed reach (`tainted_values` is
+    # null); printing the absent count as 0 claimed the seed went nowhere.
+    _tv = diag.get("tainted_values", 0)
     out.append(
         f"  seed: matched {diag.get('source_callsites', 0)} source callsite(s), "
-        f"produced {diag.get('tainted_values', 0)} tainted value(s)")
+        + (f"produced {_tv} tainted value(s)" if _tv is not None
+           else "tainted values not measured (the walk did not finish)"))
     # #805/#812: a per-callsite attributed union has no single last use, so the
     # scalar is deliberately null there and `last_use_by_source` carries the
     # real answer per callsite. Rendering only the scalar would print "seed did
@@ -5449,6 +5438,11 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
                     f"    {_addr}: {_ud.get('label', '?')} @ {_ud.get('address', '?')}{_r}")
             else:
                 out.append(f"    {_addr}: <none — this callsite did not propagate>")
+    elif diag.get("propagated"):
+        # No use was recorded, but the result's own frontier shows the seed
+        # got somewhere (P1-08): never "did not propagate" beside that proof.
+        out.append("  last propagated use: <not recorded — the frontier below shows "
+                   "the seed propagated>")
     else:
         out.append("  last propagated use: <none — seed did not propagate>")
     out.append(
