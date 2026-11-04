@@ -228,6 +228,34 @@ def test_render_taint_discloses_model_sources_in_text():
     assert "models: builtin + --models proj.json (2 model(s))" in text
 
 
+def _forward_with_sources(model_sources):
+    return {"direction": "forward", "function": {"name": "process", "address": "0x401189"},
+            "sources": [{"kind": "param", "index": 0}], "reached_sinks": [],
+            "model_sources": model_sources, "soundness": "x"}
+
+
+def test_render_model_sources_labels_an_env_supplied_overlay_by_its_knob():
+    text = _render_taint_text(_forward_with_sources([
+        {"kind": "builtin", "path": "/builtin/models.json"},
+        {"kind": "user", "via": "$BN_TAINT_MODELS", "count": 1, "path": "/proj/env.json"},
+    ]))
+    [line] = [ln for ln in text.splitlines() if ln.startswith("models:")]
+    assert "$BN_TAINT_MODELS /proj/env.json (1 model(s))" in line
+    assert "--models" not in line
+
+
+def test_render_model_sources_names_an_overridden_env_file_as_not_loaded():
+    text = _render_taint_text(_forward_with_sources([
+        {"kind": "builtin", "path": "/builtin/models.json"},
+        {"kind": "user", "via": "--models", "count": 1, "path": "/proj/flag.json"},
+        {"kind": "env_not_loaded", "env": "BN_TAINT_MODELS", "path": "/proj/env.json",
+         "overridden_by": "--models"},
+    ]))
+    [line] = [ln for ln in text.splitlines() if ln.startswith("models:")]
+    assert "--models /proj/flag.json (1 model(s))" in line
+    assert "/proj/env.json NOT loaded" in line
+
+
 def test_render_taint_forward_frontier_message():
     # reached_sinks empty BUT an unmodeled_callee frontier leaf -> the terminal
     # line must be frontier-aware, not the bare "no sinks reached" (#8).
@@ -753,28 +781,60 @@ def test_taint_forward_malformed_env_models_is_loud(monkeypatch, capsys, tmp_pat
     assert rc != 0   # BridgeError -> non-zero
 
 
-def test_taint_forward_missing_env_models_is_silently_ignored(monkeypatch, capsys, tmp_path):
-    # #615 review (New finding 2 / F9 correction): a MISSING $BN_TAINT_MODELS
-    # file is silently ignored per-invocation -- matching the bridge's own
-    # spawn-time handling of the identical variable (`taint_models_path()`,
-    # `if override_path.exists()`) -- not a hard exit-2 like a malformed file
-    # or a missing EXPLICIT --models typo (below). Overturns the old assertion
-    # that a nonexistent env-referenced file was loud (#615 review).
+_MODELS_COMMANDS = {
+    "forward": ["taint", "forward", "-f", "h", "--source", "param:0", "--target", "active"],
+    "backward": ["taint", "backward", "-f", "h", "--sink", "arg:memcpy:2", "--target", "active"],
+    "models": ["taint", "models"],
+}
+
+
+def _refusal(monkeypatch, capsys, argv):
+    """(exit code, parsed --format json error envelope) for a run that must be
+    refused before anything reaches a bridge."""
+    def _no_bridge(*_a, **_k):
+        raise AssertionError("a refused model file must not reach the bridge")
+    monkeypatch.setattr(bn.cli, "send_request", _no_bridge)
+    rc = bn.cli.main([*argv, "--format", "json"])
+    return rc, json.loads(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("command", sorted(_MODELS_COMMANDS))
+def test_missing_env_models_file_is_refused_like_a_missing_models_flag(
+        monkeypatch, capsys, tmp_path, command):
+    # An env-sourced typo used to degrade silently to "builtin only" at exit 0.
+    # It is now refused exactly as a missing --models file is: same exit code,
+    # same envelope keys, the knob named in the message.
+    argv = _MODELS_COMMANDS[command]
+    flag_rc, flag_env = _refusal(monkeypatch, capsys,
+                                 [*argv, "--models", str(tmp_path / "nope_flag.json")])
     monkeypatch.setenv("BN_TAINT_MODELS", str(tmp_path / "nope_env.json"))
-    fake, calls = _fake({"taint": {"direction": "forward", "function": {"name": "h", "address": "0x1"},
+    env_rc, env_env = _refusal(monkeypatch, capsys, argv)
+    assert env_rc == flag_rc == 2
+    assert env_env.keys() == flag_env.keys()
+    assert "$BN_TAINT_MODELS" in env_env["error"] and "nope_env.json" in env_env["error"]
+
+
+def test_taint_forward_both_set_forwards_the_overridden_env_path(monkeypatch, capsys, tmp_path):
+    # --models wins (documented); the env file is not read -- even a missing one
+    # is no refusal -- but its path rides along so the disclosure can name it.
+    flag_file = tmp_path / "flag_models.json"
+    flag_file.write_text(json.dumps({"flag_copy": {"sink": {"class": "overflow_len",
+                                                            "tainted_args": [1]}}}))
+    monkeypatch.setenv("BN_TAINT_MODELS", str(tmp_path / "absent_env.json"))
+    fake, calls = _fake({"taint": {"direction": "forward", "function": {"name": "p", "address": "0x1"},
                                    "sources": [], "reached_sinks": [], "leaves": [],
                                    "assumptions": [], "soundness": "x"}})
     monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0", "--target", "active"])
+    rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0",
+                      "--models", str(flag_file), "--target", "active"])
     assert rc == 0
-    call = [c for c in calls if c["op"] == "taint"][0]
-    assert "user_models" not in call["params"]
+    params = [c for c in calls if c["op"] == "taint"][0]["params"]
+    assert params["user_models_via"] == "--models"
+    assert params["user_models_env_overridden"] == str(tmp_path / "absent_env.json")
 
 
 def test_taint_forward_missing_models_flag_stays_loud(monkeypatch, capsys, tmp_path):
-    # #615 review: an EXPLICIT --models typo is a loud error, unlike an
-    # ambient $BN_TAINT_MODELS pointing nowhere (above) -- the user directly
-    # named this file, so a silent skip would hide a real mistake.
+    # #615 review: an EXPLICIT --models typo is a loud error.
     fake, _ = _fake({"taint": {}})
     monkeypatch.setattr(bn.cli, "send_request", fake)
     rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0", "--target", "active",
@@ -816,7 +876,44 @@ def test_render_backward_origin_via_spill():
     assert "origin: parameter var_n#5 (via spill)" in text
 
 
-def test_taint_models_command_dumps_catalog(monkeypatch, capsys):
+def _no_bridge(monkeypatch):
+    """Make every bridge call fail the way a multi-instance checkout without -i
+    does, so a passing run proves no bridge was needed."""
+    def _refuse(*_a, **_k):
+        raise bn.cli.BridgeError("Multiple Binary Ninja bridge instances are associated "
+                                 "with this project; pass -i/--instance <id>")
+    monkeypatch.setattr(bn.cli, "send_request", _refuse)
+
+
+def _bridge_catalog(params):
+    """What the bridge op answers for a target-free request, JSON-normalized."""
+    from bn_agent_bridge import read_taint_slice as rts
+    return json.loads(json.dumps(rts._taint_models_op(None, None, params)))
+
+
+@pytest.mark.parametrize("argv,params", [
+    ([], {}),
+    (["--role", "sink", "--class", "overflow_len"], {"role": "sink", "class": "overflow_len"}),
+])
+def test_taint_models_no_target_catalog_needs_no_bridge(monkeypatch, capsys, argv, params):
+    _no_bridge(monkeypatch)
+    rc = bn.cli.main(["taint", "models", *argv, "--format", "json"])
+    assert rc == 0
+    local = json.loads(capsys.readouterr().out)
+    assert local == _bridge_catalog(params)              # same shape as the bridge path
+    assert local["presence_catalog"] is False            # no binary walked, no presence claim
+    assert "present_model_count" not in local
+    assert not any("present" in e for e in local["items"])
+
+    rc = bn.cli.main(["taint", "models", *argv])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "memcpy" in out and "[present]" not in out and "[absent]" not in out
+    from bn.read_taint_models import CATALOG_NOTE
+    assert f"NOTE: {CATALOG_NOTE}" in out
+
+
+def test_taint_models_with_an_instance_still_asks_that_bridge(monkeypatch, capsys):
     fake, calls = _fake({"taint_models": {
         "sources": [{"symbol": "recv", "to": "*arg:1, ret"}],
         "sinks_by_class": {"overflow_len": [{"symbol": "memcpy", "tainted_args": [2],
@@ -824,12 +921,12 @@ def test_taint_models_command_dumps_catalog(monkeypatch, capsys):
         "propagators": [{"symbol": "strlen", "from_to": "*arg:0->ret"}],
         "overlays": [{"kind": "builtin", "path": "/x/taint_models.json"}], "items": []}})
     monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "models"])
+    rc = bn.cli.main(["-i", "inst-a", "taint", "models", "--role", "sink"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "recv" in out and "memcpy" in out and "overflow_len" in out
     call = [c for c in calls if c["op"] == "taint_models"][0]
-    assert call["params"] == {}                          # no filters -> empty params
+    assert call["target"] is None and call["params"] == {"role": "sink"}
 
 
 def test_taint_models_command_forwards_filters(monkeypatch, capsys):
@@ -858,50 +955,76 @@ def test_taint_models_present_auto_selects_single_target(monkeypatch, capsys):
     assert call["params"] == {"present": True}
 
 
-def test_taint_models_catalog_only_needs_no_target(monkeypatch, capsys):
-    # Regression: catalog-only mode (no --present/--callsites) must NOT require a
-    # target -- it forwards target=None so the whole model DB dumps with none open.
-    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
-                                          "overlays": [], "items": []}})
-    monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "models", "--role", "sink"])
-    assert rc == 0
-    call = [c for c in calls if c["op"] == "taint_models"][0]
-    assert call["target"] is None
+def _model_file(path, name):
+    path.write_text(json.dumps({name: {"sink": {"class": "overflow_len", "tainted_args": [1]}}}))
+    return path
 
 
-
-def test_taint_models_command_forwards_user_models(monkeypatch, capsys, tmp_path):
-    # #615 review F7: `bn taint models` -- the "confirm an overlay landed"
-    # check -- must accept --models like taint forward/backward, so an agent
-    # confirming a project overlay landed sees the SAME overlay taint would use.
-    mfile = tmp_path / "models.json"
-    mfile.write_text(json.dumps({"app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]}}}))
-    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
-                                          "overlays": [], "items": []}})
-    monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "models", "--models", str(mfile)])
-    assert rc == 0
-    call = [c for c in calls if c["op"] == "taint_models"][0]
-    assert call["params"]["user_models"]["app_copy"]["sink"]["class"] == "overflow_len"
-    assert call["params"]["user_models_path"] == str(mfile)
-    assert call["params"]["user_models_via"] == "--models"
+def _user_overlays(overlays):
+    return [o for o in overlays if o["kind"] in ("user", "env_not_loaded")]
 
 
-def test_taint_models_command_reads_user_models_from_env(monkeypatch, capsys, tmp_path):
-    # #615 review F7: BN_TAINT_MODELS (no --models flag) must also reach
-    # `bn taint models`, matching `taint forward`/`taint backward`.
-    mfile = tmp_path / "env_models.json"
-    mfile.write_text(json.dumps({"app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]}}}))
-    monkeypatch.setenv("BN_TAINT_MODELS", str(mfile))
-    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
-                                          "overlays": [], "items": []}})
-    monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "models"])
-    assert rc == 0
-    call = [c for c in calls if c["op"] == "taint_models"][0]
-    assert call["params"]["user_models"]["app_copy"]["sink"]["class"] == "overflow_len"
-    assert call["params"]["user_models_via"] == "$BN_TAINT_MODELS"
+def test_taint_models_no_target_honors_models_flag_and_env(monkeypatch, capsys, tmp_path):
+    # #615 review F7: `bn taint models` -- the "confirm an overlay landed" check --
+    # honors --models / $BN_TAINT_MODELS like taint forward/backward, and labels
+    # each overlay by the knob that supplied it, in JSON and text.
+    _no_bridge(monkeypatch)
+    flag = _model_file(tmp_path / "flag.json", "app_flag_copy")
+    env = _model_file(tmp_path / "env.json", "app_env_copy")
+
+    def _run(*argv):
+        assert bn.cli.main(["taint", "models", "--role", "sink", *argv, "--format", "json"]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert bn.cli.main(["taint", "models", "--role", "sink", *argv]) == 0
+        [line] = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("models:")]
+        return result, {e["symbol"] for e in result["items"]}, line
+
+    result, syms, line = _run("--models", str(flag))
+    assert _user_overlays(result["overlays"]) == [
+        {"kind": "user", "via": "--models", "count": 1, "path": str(flag)}]
+    assert "app_flag_copy" in syms
+    assert f"--models {flag} (1 model(s))" in line
+
+    monkeypatch.setenv("BN_TAINT_MODELS", str(env))
+    result, syms, line = _run()
+    assert _user_overlays(result["overlays"]) == [
+        {"kind": "user", "via": "$BN_TAINT_MODELS", "count": 1, "path": str(env)}]
+    assert "app_env_copy" in syms
+    assert f"$BN_TAINT_MODELS {env} (1 model(s))" in line and "--models" not in line
+
+    # Both set: the flag wins (documented) and the env file is disclosed, not dropped.
+    result, syms, line = _run("--models", str(flag))
+    assert _user_overlays(result["overlays"]) == [
+        {"kind": "user", "via": "--models", "count": 1, "path": str(flag)},
+        {"kind": "env_not_loaded", "env": "BN_TAINT_MODELS", "path": str(env),
+         "overridden_by": "--models"}]
+    assert "app_flag_copy" in syms and "app_env_copy" not in syms
+    assert str(env) in line
+
+
+def test_taint_models_text_prints_the_no_match_hint_on_an_all_unnamed_target():
+    # bn-vr documents that an empty presence catalog on a stripped target means
+    # "no modeled name matched", not "no sinks"; the text must say so.
+    from bn.formatters import _render_taint_models_text
+    from bn_agent_bridge import read_taint_slice as rts
+
+    class _Ctx:
+        def _resolve_view(self, _sel):
+            class _BV:
+                functions = [type("F", (), {"name": "sub_401000"})()]
+
+                def get_symbols(self):
+                    return []
+            return _BV()
+
+    stripped = rts._taint_models_op(_Ctx(), "active", {"role": "sink", "present": True})
+    hint = [ln for ln in _render_taint_models_text(stripped).splitlines()
+            if ln.startswith("no modeled name matched")]
+    assert len(hint) == 1
+    named = dict(stripped, present_model_count=3)
+    assert not any(ln.startswith("no modeled name matched")
+                   for ln in _render_taint_models_text(named).splitlines())
+
 
 
 def test_dataflow_defuse_renders_the_dropped_call_arg_disclosure_797(monkeypatch, capsys):

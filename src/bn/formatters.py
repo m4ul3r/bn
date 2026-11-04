@@ -5813,6 +5813,13 @@ def _render_taint_models_text(value: Any, *, mangled: bool = False,
     if note:
         lines.append("NOTE: " + str(note))
         lines.append("")
+    # The stripped-target case the bn-vr skill documents: a presence walk that
+    # matched no modeled name says nothing about whether the binary has sinks.
+    if value.get("present_model_count") == 0:
+        lines.append("no modeled name matched a symbol in this binary: its sinks may be "
+                     "unnamed (stripped) internal helpers, so this is not an all-clear -- "
+                     "review internal copy/format/exec helpers by hand")
+        lines.append("")
     srcs = _field_list(value, "sources")
     if srcs:
         lines.append(f"sources ({len(srcs)}):")
@@ -5860,11 +5867,10 @@ def _render_taint_models_text(value: Any, *, mangled: bool = False,
                 lines.append(f"  {p!r}")
                 continue
             lines.append(f"  {p.get('symbol', '<unknown>')}  {p.get('from_to', '')}")
-    ov = _field_list(value, "overlays")
-    if ov:
+    msrc = _render_model_sources(_field_list(value, "overlays"))
+    if msrc:
         lines.append("")
-        lines.append("overlays: " + ", ".join(
-            str(_as_dict(o).get("path", _as_dict(o).get("kind", "?"))) for o in ov))
+        lines.append(msrc)
     return "\n".join(lines) if lines else _empty_result("models matching the filter")
 
 
@@ -5957,10 +5963,14 @@ def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False,
 def _render_model_sources(sources: Any) -> str:
     """#415: one-line disclosure of the active taint-model overlays in TEXT mode
     (the default), so an agent can confirm a ``--models`` / ``BN_TAINT_MODELS``
-    overlay landed without parsing JSON or restarting the bridge."""
+    overlay landed without parsing JSON or restarting the bridge. A user overlay
+    is labelled by the knob that supplied it (``via``), and a
+    ``$BN_TAINT_MODELS`` file that ``--models`` overrode (``env_not_loaded``)
+    is named as NOT loaded rather than left out."""
     if not isinstance(sources, list):
         return ""
     parts: list[str] = []
+    skipped: list[str] = []
     for s in sources:
         if not isinstance(s, dict):
             continue
@@ -5972,13 +5982,22 @@ def _render_model_sources(sources: Any) -> str:
         elif kind == "override_default":
             parts.append(f"override ({s.get('path')})")
         elif kind == "user":
-            loc = s.get("path") or s.get("via", "--models")
+            via = s.get("via") or "--models"
+            loc = f"{via} {s['path']}" if s.get("path") else str(via)
             # #915: `count` is the role-bearing entries; a benign `{}` marker
             # armed nothing and is shown as what it is, not as a model.
             benign = s.get("benign")
             tail = f", {benign} benign" if benign else ""
-            parts.append(f"--models {loc} ({s.get('count', 0)} model(s){tail})")
-    return ("models: " + " + ".join(parts)) if parts else ""
+            parts.append(f"{loc} ({s.get('count', 0)} model(s){tail})")
+        elif kind == "env_not_loaded":
+            skipped.append(f"${s.get('env', 'BN_TAINT_MODELS')} {s.get('path')} NOT loaded "
+                           f"({s.get('overridden_by', '--models')} overrides it)")
+        elif s.get("path") or kind:
+            parts.append(str(s.get("path") or kind))
+    line = ("models: " + " + ".join(parts)) if parts else ""
+    if skipped:
+        line = "; ".join(([line] if line else []) + skipped)
+    return line
 
 
 def _describe_loc(loc: Any) -> str:
