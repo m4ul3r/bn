@@ -1923,7 +1923,7 @@ class TaintEngine:
                     c = getattr(val, "value", val)
                 try:
                     return (("gload", int(c)), 0)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return None
             return None
         if "CONST_PTR" in op:
@@ -1939,7 +1939,7 @@ class TaintEngine:
                 c = getattr(val, "value", val)
             try:
                 return (("gconst", int(c)), 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
         if op in ("MLIL_ADD", "MLIL_SUB"):
             left = getattr(expr, "left", None)
@@ -4569,7 +4569,7 @@ class TaintEngine:
                 c = getattr(v, "value", v)
             try:
                 return int(c)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
         if is_ssa_var(expr):
             try:
@@ -5389,7 +5389,7 @@ class TaintEngine:
             c = getattr(expr, "constant", None)
             try:
                 return int(c) if c is not None else None
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
         return None
 
@@ -6653,7 +6653,7 @@ class TaintEngine:
             if raw is not None:
                 try:
                     value = int(raw)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     value = None
                 if value is not None and ga <= value and (
                         value < ga + self._global_extent(ga)
@@ -6683,7 +6683,9 @@ class TaintEngine:
         if raw is not None:
             try:
                 value = int(raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError: an MLIL FLOAT constant can be `inf`, which
+                # names no address and used to escape the whole op (P1-03).
                 value = None
             if value is not None and (
                     ga <= value < ga + self._global_extent(ga)
