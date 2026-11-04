@@ -279,6 +279,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
         params,
         require_target=True,
         contextual_hints=True,
+        # The frontier block prints its own `bn xrefs` follow-up (P2-04).
+        route_rendered_commands=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
                                                     mangled=args.mangled)),
         stem="taint-forward",
@@ -330,6 +332,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
         params,
         require_target=True,
         contextual_hints=True,
+        route_rendered_commands=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
                                                     mangled=args.mangled)),
         stem="taint-backward",

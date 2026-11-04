@@ -583,7 +583,6 @@ def test_text_rendering_names_the_global_the_call_and_the_reference():
     line = formatters._render_leaf_line(leaf)
     assert KIND in line and "0x401108" in line and "0x404060" in line
     assert "run_hook" in line and "0x401210" in line and "call_arg" in line
-    assert "the bytes are not followed past this call" in line
 
     # --mangled prints the raw symbol for the callee AND for the reference, the
     # same name pair every other leaf row carries (#978).

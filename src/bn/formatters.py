@@ -6,6 +6,8 @@ import functools
 import json
 import re
 import shlex
+import shutil
+import textwrap
 from typing import Any, Callable, Iterator, Sequence
 
 from .target_hint import instance_option, open_target_lines, target_option, target_row
@@ -5021,47 +5023,7 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
         )
     if kind == "global_memory_continuation":
-        cal = _field_dict(leaf, "callee")
-        glob = _field_dict(leaf, "global")
-        refs = [r for r in _field_list(leaf, "references") if isinstance(r, dict)]
-        reach = _field_dict(leaf, "reachability")
-        where = ", ".join(
-            f"{_shown_name(r, mangled=mangled) or '?'} @ {r.get('at', '?')}"
-            + (f" ({r['access']})" if r.get("access") else "")
-            for r in refs)
-        truncated = str(reach.get("status")) == "truncated"
-        # BN21-BOUND-02: a reference the scan could not account for is not a
-        # reader this walk identified; only a PROVEN read says "read by".
-        verb = "read by" if leaf.get("reads_proven") else "may be read by"
-        if where and not truncated:
-            middle = f"  ({verb} {where})"
-        elif where:
-            # A named reader and an unfinished search are not alternatives:
-            # the row says both, so it never reads as "and that is all".
-            middle = (f"  ({verb} {where}; reachability truncated:"
-                      f" {reach.get('cause', '?')})")
-        else:
-            # No reader is NAMED because the search never finished: say which
-            # bound stopped it and how much it left unexamined, so the row is
-            # not read as "a boundary with nothing behind it".
-            middle = (f"  (reachability {reach.get('status', '?')}:"
-                      f" {reach.get('cause', '?')},"
-                      f" {reach.get('functions_examined', '?')}/"
-                      f"{reach.get('function_budget', '?')} function(s) examined,"
-                      f" {reach.get('unexamined_references_total', '?')} reference(s)"
-                      f" unexamined)")
-        return (
-            f"  global_memory_continuation @ {leaf.get('address')}"
-            f"  global={glob.get('address', '?')}"
-            # WHICH bytes were written: an interior copy is the same object,
-            # and naming the offset keeps a partial write from reading as
-            # coverage of the whole object (round-3 review R1).
-            + (f"(+{', +'.join(str(o) for o in _field_list(glob, 'written_offsets'))})"
-               if _field_list(glob, "written_offsets") else "")
-            + f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
-            + middle
-            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
-        )
+        return "\n".join(_render_continuation_group([leaf], mangled=mangled))
     if kind == "caller_sites_truncated":
         fn = _field_dict(leaf, "function")
         return (
@@ -5115,11 +5077,12 @@ def _leaf_group_key(leaf: Any) -> tuple:
         return (kind, str(leaf.get("address")),
                 str(_field_dict(leaf, "callee").get("address")))
     if kind == "global_memory_continuation":
-        # The global IS the identity here: two calls that hand two different
-        # globals past the walk are two boundaries an agent must chase
-        # separately, not one "[2 leaves]" row under the first address.
-        return (kind, str(_field_dict(leaf, "global").get("address")),
-                str(_field_dict(leaf, "callee").get("address")))
+        # The FACT is the global: one write of tainted bytes into it, then
+        # every later call the walk crossed with it live. Keying on the call
+        # too printed one row per (call site x global) -- 45 rows for three
+        # globals (P2-04) -- so one group per global lists its call sites.
+        # Two different globals stay two groups an agent must chase apart.
+        return (kind, str(_field_dict(leaf, "global").get("address")))
     if kind == "caller_sites_truncated":
         fn = _field_dict(leaf, "function")
         # The reason tally's identity is its (reason, count) pairs, never the
@@ -5138,21 +5101,25 @@ def _leaf_group_key(leaf: Any) -> tuple:
     return (kind,)
 
 
-def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12, mangled: bool = False) -> list[str]:
+def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12, mangled: bool = False,
+                           full: bool = False, width: int | None = None) -> list[str]:
     """Render unresolved leaves grouped by kind/callee with counts and a top-N
     cap (full detail stays in --format json) so real binaries don't flood the
-    text output with a wall of near-identical leaves (#160)."""
+    text output with a wall of near-identical leaves (#160). A global-memory
+    continuation group renders as a structured block; with a ``width`` (the
+    forward view passes the terminal's) every row is hard-wrapped to it, so
+    no frontier is a 2 KB line."""
     groups: dict[tuple, dict[str, Any]] = {}
     order: list[tuple] = []
     for leaf in leaves:
         gk = _leaf_group_key(leaf)
         g = groups.get(gk)
         if g is None:
-            groups[gk] = {"rep": leaf, "count": 1}
+            groups[gk] = {"rep": leaf, "members": [leaf]}
             order.append(gk)
         else:
-            g["count"] += 1
-    order.sort(key=lambda gk: groups[gk]["count"], reverse=True)
+            g["members"].append(leaf)
+    order.sort(key=lambda gk: len(groups[gk]["members"]), reverse=True)
     total = len(leaves)
     ngroups = len(order)
     hdr = f"frontiers ({total}"
@@ -5162,17 +5129,137 @@ def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12, mangled: bool 
     out = [hdr]
     for gk in order[:top_n]:
         g = groups[gk]
+        count = len(g["members"])
+        if gk[0] == "global_memory_continuation":
+            out.extend(_render_continuation_group(g["members"], mangled=mangled, full=full))
+            continue
         line = _render_leaf_line(g["rep"], mangled=mangled)
-        if g["count"] > 1:
+        if count > 1:
             # Spelled out, never `x{count}`: on AArch64 `x3` is a register (#959).
-            line += f"  [{g['count']} leaves]"
+            line += f"  [{count} leaves]"
         out.append(line)
     if ngroups > top_n:
         hidden = order[top_n:]
-        hidden_leaves = sum(groups[gk]["count"] for gk in hidden)
+        hidden_leaves = sum(len(groups[gk]["members"]) for gk in hidden)
         out.append(
             f"  ... and {len(hidden)} more group(s) ({hidden_leaves} leaf(s)); "
             "see --format json for the full list")
+    if width is None:
+        return out
+    return [wrapped for row in out for wrapped in _wrap_row(row, width)]
+
+
+# How many call sites / readers a continuation block lists before it counts
+# the rest; JSON keeps every one.
+_CONTINUATION_EXAMPLES = 4
+
+
+def _text_width() -> int:
+    """The terminal's width for wrapped rows: `$COLUMNS`, the tty, else 100."""
+    return max(40, shutil.get_terminal_size((100, 24)).columns)
+
+
+def _wrap_row(row: str, width: int) -> list[str]:
+    """*row* hard-wrapped at *width*, continuation lines indented four past the
+    row's own indent. A backticked command is never split: it is the one span
+    a reader pastes, so it moves to the next line whole (and runs past the
+    width only when it alone is wider)."""
+    if len(row) <= width:
+        return [row]
+    indent = row[:len(row) - len(row.lstrip(" "))]
+    glue = "\x00"
+    # The space before a command glues too, so `next: <command>` stays one
+    # line, and a `[N leaves]` count stays one token a reader can grep for.
+    protected = re.sub(r" ?`[^`]*`|\[\d+ leaves\]",
+                       lambda m: m.group(0).replace(" ", glue), row.strip())
+    lines = textwrap.wrap(protected, width=width, initial_indent=indent,
+                          subsequent_indent=indent + "    ", break_long_words=False,
+                          break_on_hyphens=False)
+    return [line.replace(glue, " ") for line in lines] or [row]
+
+
+def _counted(items: list[str], what: str) -> str:
+    """The first examples of *items* and how many more there are."""
+    shown = ", ".join(items[:_CONTINUATION_EXAMPLES])
+    rest = len(items) - _CONTINUATION_EXAMPLES
+    return shown + (f" (+{rest} more {what})" if rest > 0 else "")
+
+
+def _render_continuation_group(leaves: list[dict[str, Any]], *, mangled: bool = False,
+                               full: bool = False) -> list[str]:
+    """One global's continuation frontier as a block (P2-04): a header (kind,
+    first call site, global, verdict, leaf count), then the call sites it was
+    live across, its readers, the bound that cut the search, and ONE follow-up
+    command. Readers, sites and causes are the union over the group's leaves;
+    the prose ``detail`` (which repeats all of it) prints only under --verbose."""
+    rep = leaves[0]
+    glob = _field_dict(rep, "global")
+    offsets = sorted({str(o) for lf in leaves
+                      for o in _field_list(_field_dict(lf, "global"), "written_offsets")})
+    sites: list[str] = []
+    for lf in leaves:
+        cal = _field_dict(lf, "callee")
+        site = f"{lf.get('address')} -> {_shown_name(cal, mangled=mangled) or '?'}"
+        if site not in sites:
+            sites.append(site)
+    readers: list[str] = []
+    for lf in leaves:
+        for r in _field_list(lf, "references"):
+            if not isinstance(r, dict):
+                continue
+            # The offset as the scan established it: unknown is `+?`, never
+            # rendered as the object's first byte.
+            off = r.get("offset")
+            where = ("+?" if r.get("offset_known") is False
+                     else (f"+{off:#x}" if isinstance(off, int) and off else ""))
+            reader = (f"{_shown_name(r, mangled=mangled) or '?'} @ {r.get('at', '?')}"
+                      + (f" ({where})" if where else "")
+                      + (f" ({r['access']})" if r.get("access") else ""))
+            if reader not in readers:
+                readers.append(reader)
+    reaches = [_field_dict(lf, "reachability") for lf in leaves]
+    cut = [r for r in reaches if str(r.get("status")) == "truncated"]
+    causes: list[str] = []
+    for r in cut:
+        for c in _field_list(r, "causes") or [r.get("cause")]:
+            if c is not None and str(c) not in causes:
+                causes.append(str(c))
+    # BN21-BOUND-02: a reference the scan could not account for is not a
+    # reader this walk identified; only a PROVEN read says "read by".
+    proven = any(lf.get("reads_proven") for lf in leaves)
+    verb = "read by" if proven else "may be read by"
+    verdict = (f"{verb} {len(readers)} reference(s)" if readers else "reader not named")
+    verdict += "; reachability truncated" if cut else "; reachability complete"
+    head = (f"  global_memory_continuation @ {rep.get('address')}"
+            f"  global={glob.get('address', '?')}"
+            # WHICH bytes were written: an interior copy is the same object,
+            # and naming the offset keeps a partial write from reading as
+            # coverage of the whole object (round-3 review R1).
+            + (f"(+{', +'.join(offsets)})" if offsets else "")
+            # Spelled out, never `x{count}`: on AArch64 `x3` is a register (#959).
+            # Ahead of the verdict, so a wrapped header keeps it on its first line.
+            + (f"  [{len(leaves)} leaves]" if len(leaves) > 1 else "")
+            + f"  -- {verdict}")
+    out = [head, f"      live across call(s): {_counted(sites, 'call site(s)')}"]
+    if readers:
+        out.append(f"      {verb}: {_counted(readers, 'reference(s)')}")
+    if cut:
+        # A named reader and an unfinished search are not alternatives: the
+        # block says both, so it never reads as "and that is all of them".
+        def _most(key: str) -> Any:
+            values = [r.get(key) for r in cut if isinstance(r.get(key), int)]
+            return max(values) if values else "?"
+        out.append(f"      reachability truncated: {', '.join(causes) or '?'} "
+                   f"({_most('functions_examined')}/{_most('function_budget')} "
+                   f"function(s) examined, {_most('unexamined_references_total')} "
+                   "reference(s) unexamined)")
+    reseed = next((str(lf["reseed"]) for lf in leaves if lf.get("reseed")), None)
+    if reseed:
+        out.append(f"      next: {reseed}")
+    elif glob.get("address"):
+        out.append(f"      next: `{_bn_command('xrefs', str(glob['address']))}`")
+    if full and rep.get("detail"):
+        out.append(f"      detail: {rep['detail']}")
     return out
 
 
@@ -5781,7 +5868,11 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
     leaves = _field_list(value, "leaves")
     if leaves:
         lines.append("")
-        lines.extend(_render_grouped_leaves(leaves, mangled=mangled))
+        # P2-04: forward frontier rows reached 2 KB on one line; they wrap at
+        # the terminal's width. The backward view keeps its own row layout.
+        lines.extend(_render_grouped_leaves(
+            leaves, mangled=mangled, full=full,
+            width=_text_width() if direction == "forward" else None))
     assumptions = _field_list(value, "assumptions")
     if assumptions:
         lines.append("")
