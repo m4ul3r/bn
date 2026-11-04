@@ -4971,7 +4971,7 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"  unmodeled_callee @ {leaf.get('address')}"
             f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
             f"  (tainted arg(s) {args})"
-            + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
         )
     if kind == "pointer_escape":
         return (
@@ -4998,7 +4998,7 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
             f"  (recovered {leaf.get('recovered_params', '?')} param(s); "
             f"dropped arg(s) {_field_list(leaf, 'dropped_args')})"
-            + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
         )
     if kind == "unread_callee_body":
         cal = _field_dict(leaf, "callee")
@@ -5072,7 +5072,7 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"{leaf.get('callers_partially_followed', '?')} partially, "
             f"{leaf.get('callers_unfollowed', '?')} not followed; "
             f"{leaf.get('callers_dropped', '?')} dropped)"
-            + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
         )
     if kind == "model_destination_unrecovered":
         cal = _field_dict(leaf, "callee")

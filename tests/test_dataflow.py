@@ -239,7 +239,7 @@ def test_render_taint_forward_frontier_message():
         "leaves": [{"kind": "unmodeled_callee", "address": "0x1008",
                     "callee": {"name": "parse_event", "address": "0x3000"},
                     "tainted_args": [0],
-                    "note": "tainted data passed to in-binary callee with no model; investigate"}],
+                    "detail": "tainted data passed to in-binary callee with no model; investigate"}],
         "assumptions": [],
         "soundness": "may-analysis",
     }
@@ -310,12 +310,12 @@ _BACKWARD_CAPPED = {
                 "callers_partially_followed": 0, "callers_unfollowed": 4,
                 "callers_dropped": 4, "demands_total": 20, "demands_unfollowed": 4,
                 "reasons": {"caller_cap": 4}, "partially_followed": [],
-                "note": ("caller-site cap: of 20 distinct caller reference(s), the "
-                         "ascent fully followed 16 (every demanded formal), partially "
-                         "followed 0 and followed none of 4; 4 of 20 (reference, "
-                         "formal) demand(s) unfollowed: 4 caller_cap -- an origin "
-                         "reachable only from an unfollowed caller is missing from "
-                         "this slice")}],
+                "detail": ("caller-site cap: of 20 distinct caller reference(s), the "
+                           "ascent fully followed 16 (every demanded formal), partially "
+                           "followed 0 and followed none of 4; 4 of 20 (reference, "
+                           "formal) demand(s) unfollowed: 4 caller_cap -- an origin "
+                           "reachable only from an unfollowed caller is missing from "
+                           "this slice")}],
     # The wording is the engine's own (`_bw_note_caller_cap`), copied rather than
     # paraphrased: a fixture that drifts from the envelope it stands for renders
     # prose no run can produce, and the renderer assertions stop describing the
@@ -1004,7 +1004,7 @@ def test_render_taint_text_shows_every_blocking_frontier_kind():
              "callee": {"name": "__wmemcpy", "display_name": "__wmemcpy",
                         "address": "0x40a2d0"},
              "tainted_args": [0, 1], "cause": "return_value_unrecovered",
-             "note": "Binary Ninja recovered no result for this call"},
+             "detail": "Binary Ninja recovered no result for this call"},
             {"kind": "global_memory_continuation", "address": "0x40081c",
              "global": {"address": "0x491948", "label": "glob_0x491948"},
              "references": [], "detail": "code reachable from this call reads it"},

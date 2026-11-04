@@ -679,6 +679,14 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     }
 
 
+def _leaf_function_at(leaf: dict[str, Any]) -> str | None:
+    """The address of the function a leaf names (``function.address``), the
+    selector a printed command runs against; None when the leaf names none."""
+    fn = leaf.get("function")
+    address = fn.get("address") if isinstance(fn, dict) else None
+    return address if isinstance(address, str) and address else None
+
+
 def _dropped_reference_count(leaf: dict[str, Any]) -> int | None:
     """A caller frontier's ``callers_dropped`` when it states a count, else None.
 
@@ -892,7 +900,7 @@ def backward_diagnostics(
         buffer_leaf = next((lf for lf in unresolved_leaves
                             if lf.get("kind") == "address_of_local_unresolved"
                             and isinstance(lf.get("buffer"), str) and lf.get("buffer")
-                            and isinstance(lf.get("function"), str) and not lf.get("global")),
+                            and _leaf_function_at(lf) and not lf.get("global")),
                            None)
         next_action = (
             "value origins or consumed pointer bytes remain unresolved; inspect "
@@ -900,12 +908,12 @@ def backward_diagnostics(
         if buffer_leaf is not None:
             source = shlex.quote(f"var:{buffer_leaf['buffer']}")
             next_action += (
-                f", or re-run `bn taint forward -f {buffer_leaf['function']} "
+                f", or re-run `bn taint forward -f {_leaf_function_at(buffer_leaf)} "
                 f"--source {source}` on the buffer")
         call_leaf = next((lf for lf in unresolved_leaves
                           if lf.get("kind") in ("address_of_local_unresolved",
                                                 "pointer_object_unresolved")
-                          and isinstance(lf.get("function"), str)
+                          and _leaf_function_at(lf)
                           and any(isinstance(c, str) and c and not c.startswith("__builtin_")
                                   for c in lf.get("calls") or [])), None)
         if call_leaf is not None:
@@ -915,27 +923,27 @@ def backward_diagnostics(
                 ". No call's write extent proves a buffer initialised (#931); check "
                 "by hand that the call's destination and length cover the bytes the "
                 f"sink reads: `bn callsites {shlex.quote(callee)} --within "
-                f"{call_leaf['function']}` prints it with its arguments")
+                f"{_leaf_function_at(call_leaf)}` prints it with its arguments")
         proof_leaf = next((lf for lf in unresolved_leaves
                            if lf.get("kind") == "region_store_proof_not_certified"
-                           and isinstance(lf.get("function"), str)), None)
+                           and _leaf_function_at(lf)), None)
         if proof_leaf is not None:
             next_action += (
                 ". Stores cover the consumed bytes, but a store proof is reported, "
                 "not certified (#931), and covered bytes do not establish a NUL "
                 "terminator: check by hand that the consumer reads only those bytes "
                 "of the whole object -- "
-                f"`bn il {proof_leaf['function']} --view mlil` shows the stores and "
+                f"`bn il {_leaf_function_at(proof_leaf)} --view mlil` shows the stores and "
                 "the pointer arithmetic")
         demand_leaf = next((lf for lf in unresolved_leaves
                             if lf.get("kind") == "pointer_demand_not_certified"
-                            and isinstance(lf.get("function"), str)), None)
+                            and _leaf_function_at(lf)), None)
         if demand_leaf is not None:
             next_action += (
                 ". The sink reads through a pointer, so it is never complete (#931): "
                 "the leaf's `objects` lists every object the pointer may read; check "
                 "each by hand -- "
-                f"`bn il {demand_leaf['function']} --view mlil`")
+                f"`bn il {_leaf_function_at(demand_leaf)} --view mlil`")
         if any(lf.get("kind") == "sink_role_unknown" for lf in unresolved_leaves):
             # #931 round 8: guidance only -- no generated overlay or re-run.
             next_action += (
@@ -1078,15 +1086,16 @@ def misanchored_recv_leaf(
             "arg: and call: seeds key it the same way; seed a value read from "
             "the buffer with var:, or the consuming parser's parameter with "
             "param:, instead")
+    # One human sentence per leaf, under `detail` like every other kind: what
+    # was missed, then why it is not an all-clear and what to seed instead.
     leaf: dict[str, Any] = {
         "kind": "source_seed_misanchored",
         "callee": base,
         "arg_index": arg_index,
         "reason": reason,
         "seed": seed,
-        "detail": detail,
+        "detail": f"{detail}. {note}",
         "suggested_source": suggest,
-        "note": note,
     }
     if address is not None:
         leaf["address"] = address
@@ -1115,17 +1124,15 @@ def indirect_pointer_slot_leaf(
         f"arg:{base}:{arg_index} buffer pointer is loaded indirectly (from a "
         f"global/struct slot); the seed anchors to the pointer value, not the "
         f"pointee, and was not correlated with a later re-load of the same slot "
-        f"-- a flow that re-loads the pointer and parses it may be missed")
+        f"-- a flow that re-loads the pointer and parses it may be missed. NOT an "
+        f"all-clear -- seed the parser entry directly with param:N or a value read "
+        f"from the filled buffer with var:")
     leaf: dict[str, Any] = {
         "kind": "source_seed_misanchored",
         "callee": base,
         "arg_index": arg_index,
         "detail": detail,
         "suggested_source": f"param:N (seed the parser entry directly)",
-        "note": (
-            "NOT an all-clear -- the indirect-load pointer slot was not "
-            "correlated forward; seed the parser entry directly with param:N "
-            "or a value read from the filled buffer with var:"),
     }
     if slot is not None:
         leaf["slot"] = str(slot)

@@ -1039,7 +1039,7 @@ def test_thunk_with_several_tail_calls_names_each_and_stop_note_reads_once_1001(
             "`bn decompile 0xc00`, `bn decompile 0xd00`") in result["assumptions"]
     stopped = te.TaintEngine(bv, models, unknown_call_policy="stop").forward(
         func, [te.parse_locator("param:0")])
-    note = next(l["note"] for l in stopped["leaves"] if l["kind"] == "unmodeled_callee")
+    note = next(l["detail"] for l in stopped["leaves"] if l["kind"] == "unmodeled_callee")
     assert note.startswith("--unknown-call stop: taint reached this unmodeled thunk "
                            "(in-binary fetch_input is a thunk"), note
     assert note.count("in-binary") == 1, note
@@ -1086,8 +1086,8 @@ def test_taint_into_a_correct_varargs_tail_is_not_a_prototype_defect_948(models)
     result = te.TaintEngine(bv, models).forward(handler, [te.parse_locator("param:0")])
     leaf = next(l for l in result["leaves"] if l["kind"] == "unmodeled_callee")
     assert leaf["cause"] == "varargs_not_followed" and leaf["callee_variadic"] is True
-    assert "proto set" not in leaf["note"]
-    assert "already variadic" in leaf["note"] and "1 named" in leaf["note"]
+    assert "proto set" not in leaf["detail"]
+    assert "already variadic" in leaf["detail"] and "1 named" in leaf["detail"]
     diag = result["diagnostics"]
     # Still a frontier: an untracked varargs flow is never an all-clear.
     assert diag["safe_to_report_all_clear"] is False
@@ -1106,7 +1106,7 @@ def test_partial_drop_into_a_varargs_tail_does_not_ask_to_declare_varargs_948(mo
     leaf = engine._arg_under_recovered_leaf(call, app_log, [1, 3], 1)
     assert leaf["dropped_args"] == [1, 3] and leaf["stack_dropped_args"] == [3]
     assert leaf["cause"] == "varargs_not_followed"
-    assert "proto set" not in leaf["note"] and "declare it variadic" not in leaf["note"]
+    assert "proto set" not in leaf["detail"] and "declare it variadic" not in leaf["detail"]
 
 
 def test_forward_modeled_sink_full_arity_untainted_stays_all_clear(models):
@@ -3882,7 +3882,7 @@ def test_forward_unmodeled_in_binary_callee_records_frontier_leaf(models):
     assert leaf["callee"] == {"name": "parse_event", "display_name": "parse_event",
                               "address": "0x3000"}
     assert leaf["tainted_args"] == [0]                                  # arg 0 carried taint
-    assert leaf.get("note")                                            # human guidance present
+    assert leaf.get("detail")                                          # human guidance present
 
 
 def _frontier_depth_program():
