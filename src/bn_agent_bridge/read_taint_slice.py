@@ -143,6 +143,21 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
         # "body could not be read" hole is a DIFFERENT and narrower condition
         # and is reported separately in stats.analysis_incomplete.
         result.update(_analysis_state_fields(bv))
+        # W07-10/W05-05: an opt-in run must be told apart from a default one
+        # by its result alone. `run_params` echoed only the depth/iteration/
+        # unknown-call knobs, so a run with an extra sink class, a pinned
+        # indirect call or a model overlay read exactly like one without.
+        run_params = result.setdefault("run_params", {})
+        if direction == "forward":
+            run_params["sink_classes"] = sorted(
+                {str(c) for c in params.get("enabled_sink_classes") or []})
+        run_params["resolve_map"] = (
+            {"path": _map_path, "entries": len(engine.resolve_map)}
+            if "resolve_map" in params else None)
+        # The overlays actually merged, as the disclosure above names them;
+        # the builtin DB is always loaded and an overridden env file was not.
+        run_params["models"] = [s for s in model_sources
+                                if s.get("kind") not in ("builtin", "env_not_loaded")]
     return result
 
 
