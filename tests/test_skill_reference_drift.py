@@ -1455,3 +1455,28 @@ def test_go_rename_reference_lists_exactly_the_flags_it_takes():
         f"all of them; the parser defines {sorted(own)} beyond the shared flags "
         f"and the aliases the document declares ({aliases})"
     )
+
+
+def test_reading_names_every_taint_leaf_kind_and_truncation_cause():
+    """Every blocking frontier leaf kind and every truncation cause the engine
+    can emit is documented in `reading.md`, and no doc still promises the
+    `sink_status` `bounded` key the backward engine no longer emits (P2-13).
+
+    An undocumented leaf kind is a frontier an agent cannot interpret, so it
+    reads the result as noise; an undocumented cause sends it to `--max-depth`
+    for a bound that flag does not move."""
+    from bn.taint_truncation import TRUNCATION_CAUSES
+    from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+
+    reading = READING.read_text(encoding="utf-8")
+    missing_kinds = sorted(k for k in BLOCKING_LEAF_KINDS if f"`{k}`" not in reading)
+    assert not missing_kinds, f"reading.md never names leaf kind(s) {missing_kinds}"
+    missing_causes = sorted(c for c in TRUNCATION_CAUSES if f"`{c}`" not in reading)
+    assert not missing_causes, f"reading.md never names truncation cause(s) {missing_causes}"
+
+    vr = REFERENCE.parent.parent / "bn-vr" / "SKILL.md"
+    stale = re.compile(r"`sink_status(?:\[\])?`[^.\n]*`bounded`")
+    for doc in (READING, SKILL, vr):
+        text = doc.read_text(encoding="utf-8")
+        assert "`bounded: true`" not in text, f"{doc.name} documents `bounded: true`"
+        assert not stale.search(text), f"{doc.name} documents a sink_status `bounded` key"
