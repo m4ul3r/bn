@@ -300,10 +300,11 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help=f"Sink to slice from (repeatable, at least one required). {_SINK_LOCATOR_HELP}"),
              arg("--max-depth", dest="max_depth", type=_depth_int, default=8,
                  help="Max interprocedural depth to follow slices up into callers (default: 8; "
-                      "0 = intraprocedural only). A caller ascent cut here is reported as a "
-                      "caller_sites_truncated leaf (reason max_depth); "
-                      "the in-function def-chain walk caps at 64 steps, and a cut there ends "
-                      "the value at an `unresolved` slice origin with cause def_chain_budget."),
+                      "0 = intraprocedural only); callers it stops short of are named in a "
+                      "caller_sites_truncated leaf (reason max_depth) and the cut sets "
+                      "stats.truncated (truncation_cause max_depth) with an assumption. The "
+                      "in-function def-chain walk caps at 64 steps, and a cut there ends the "
+                      "value at an `unresolved` slice origin with cause def_chain_budget."),
              arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
                  help="JSON file mapping indirect call addresses to target lists; a "
                       "target is an address or a function name (resolved as -f is): "

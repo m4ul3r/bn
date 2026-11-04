@@ -183,7 +183,8 @@ def test_corpus_target(expected_path, tmp_path, shared_bn):
         result = _bn_json(shared_bn, *bwd)
         _assert_assumptions_contain(result, case.get("assumptions_contain"), stem)
         assert result["slices"], f"{stem}: backward produced no slices"
-        kinds = {sl["origin"]["kind"] for sl in result["slices"]}
+        # Every origin of every slice path: one path may end at several.
+        kinds = {o["kind"] for sl in result["slices"] for o in sl["origins"]}
         assert kinds & set(case["origin_kinds"]), \
             f"{stem}: backward origin {kinds} not in {case['origin_kinds']}"
         assert not (kinds & set(case.get("forbid_origin_kinds", []))), \
@@ -800,12 +801,75 @@ def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, share
     target = shared_bn.load(binary, copy=False)
     result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "deser",
                       "--sink", "arg:memcpy:2")
-    origins = [sl["origin"] for sl in result["slices"]]
+    origins = [o for sl in result["slices"] for o in sl["origins"]]
     assert len(origins) == 2, result
     assert all(o["kind"] == "field_load_unresolved" for o in origins), origins
     reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
     assert any("reaching store to field" in r for r in reasons), reasons
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2"])
+def test_out_param_local_read_under_a_conversion_is_never_complete(tmp_path, shared_bn, opt):
+    """P2-01: a memcpy length read back from a local an in-binary helper
+    wrote through `&width`, lifted as `width_1 = zx.q(width @ mem#k)`, came
+    back origin `entry`, no leaf and a complete slice. The read is the local's
+    contents, so the helper is its unmodeled writer, exactly as for a bare
+    by-name read."""
+    binary = tmp_path / f"bw_outparam_width{opt}"
+    _compile(CORPUS / "bw_outparam_width.c", binary, [opt, "-fno-inline"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_field",
+                      "--sink", "arg:memcpy:2")
+    leaves = [lf for lf in result["leaves"] if lf["kind"] == "address_of_local_unresolved"]
+    # The conversion form this fixture exists for is what BN lifted.
+    assert any("zx." in lf["il_text"] and "width @ mem#" in lf["il_text"] for lf in leaves), \
+        result["leaves"]
+    assert {lf["buffer"] for lf in leaves} == {"width"}, leaves
+    origins = [o for sl in result["slices"] for o in sl["origins"]]
+    assert ("address_of_local_unresolved", "width", "parse_width") in {
+        (o["kind"], o.get("buffer"), o.get("callee")) for o in origins}, origins
+    assert not any(o["kind"] == "entry" for o in origins), origins
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_every_caller_site_is_followed_or_named_and_the_cap_is_address_ordered(tmp_path, shared_bn):
+    """P1-06 / P2-14: `quote_arg` has ten call sites, two of which reach one
+    `pick_name()` origin in `edit_entry` (directly and through `open_alt`);
+    rows keyed on the origin kept one site per origin and named neither of
+    the others. `put_word` has twenty: the cap follows the sixteen lowest
+    addresses and names the other four, in address order."""
+    binary = tmp_path / "bw_caller_sites"
+    _compile(CORPUS / "bw_caller_sites.c", binary, ["-fno-inline"])
+    target = shared_bn.load(binary, copy=False)
+
+    def call_sites(callee):
+        rows = _bn_json(shared_bn, "-t", target, "callsites", callee)["items"]
+        return {r["call_addr"]: r["containing_function"]["name"] for r in rows}
+
+    def ascent(fn, sink, param):
+        result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn, "--sink", sink)
+        followed = {st["address"] for sl in result["slices"] for st in sl["slice"]
+                    if st.get("reason") == f"passed as arg {param} to {fn}"}
+        leaves = [lf for lf in result["leaves"]
+                  if lf["kind"] == "caller_sites_truncated" and lf["function"]["name"] == fn]
+        return result, followed, leaves
+
+    quote_sites = call_sites("quote_arg")
+    assert len(quote_sites) == 10, quote_sites
+    _, followed, leaves = ascent("quote_arg", "arg:strcpy:1", 0)
+    named = {row["address"] for lf in leaves for row in lf["unfollowed"]}
+    assert followed | named == set(quote_sites), sorted(set(quote_sites) - followed - named)
+    assert {quote_sites[a] for a in followed} >= {"edit_entry", "open_alt"}, followed
+
+    word_sites = sorted(call_sites("put_word"), key=lambda a: int(a, 16))
+    assert len(word_sites) == 20, word_sites
+    result, followed, leaves = ascent("put_word", "arg:memcpy:2", 1)
+    assert followed == set(word_sites[:16]), sorted(followed)
+    [leaf] = leaves
+    assert [row["address"] for row in leaf["unfollowed"]] == word_sites[16:]
+    assert (leaf["unfollowed_total"], leaf["reasons"]) == (4, {"caller_cap": 4})
+    assert result["stats"]["truncation_cause"] == ["caller_cap"]
 
 
 def test_modeled_write_with_an_unrecovered_pointer_is_a_possible_writer(tmp_path, shared_bn):

@@ -731,9 +731,10 @@ def backward_diagnostics(
     its slices ARE the result, and their completeness is a live question whether
     there are none, one, or many.
 
-    ``unresolved_origins`` is the number of slices whose ``origin.kind`` is
-    ``unresolved`` -- the walk's own admission that the def-chain bottomed out
-    at a definition it could not classify (an ``&local`` it did not follow, a
+    ``unresolved_origins`` is the number of slice origins (entries of every
+    slice's ``origins[]``) whose ``kind`` is ``unresolved`` -- the walk's own
+    admission that the def-chain bottomed out at a definition it could not
+    classify (an ``&local`` it did not follow, a
     load it could not key). That admission lives on the SLICE, not in
     ``leaves``, so a leaf-only gate answered ``safe_to_report_complete_slice:
     true`` beside ``traverses_unresolved: true`` and ``frontier.unresolved: 0``

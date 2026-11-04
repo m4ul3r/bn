@@ -94,7 +94,8 @@ def _caller_leaves(result):
 
 
 def _origins(result):
-    return [sl["origin"] for sl in result["slices"]]
+    """Every origin the run reached: one slice path may end at several."""
+    return [o for sl in result["slices"] for o in sl["origins"]]
 
 
 def _advice_commands(advice: str, operation: str) -> list[list[str]]:
@@ -575,6 +576,10 @@ def test_caller_depth_cut_is_structured_incompleteness_beside_a_resolved_sibling
     assert leaf["reasons"] == {"max_depth": len(leaf["unfollowed"])}
     assert leaf["callers_fully_followed"] == 0
     assert "--max-depth" in result["diagnostics"]["next_action"]
+    # A depth-bound cut is run truncation, like the caller cap (W02-08).
+    assert result["stats"]["truncated"] is True
+    assert result["stats"]["truncation_cause"] == ["max_depth"]
+    assert any("--max-depth" in a and cut_in in a for a in result["assumptions"]), result["assumptions"]
     if depth == 1:
         # the literal sibling was resolved; the cut is still disclosed
         assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in _origins(result))
@@ -588,6 +593,92 @@ def test_larger_caller_depth_reaches_the_root_and_removes_the_boundary():
     assert _caller_leaves(result) == []
     rooted = [sl for sl in result["slices"] if sl["origin"].get("var") == "argc#0"]
     assert rooted and rooted[0]["crossed_functions"] == ["sink_copy", "middle_copy"]
+
+
+# --------------------------------------------------------------------------
+# P1-06 / P2-14: every call site is followed or named; the cap is
+# address-ordered and names what it dropped
+# --------------------------------------------------------------------------
+
+def _followed_sites(result, callee):
+    return {st["address"] for sl in result["slices"] for st in sl["slice"]
+            if st.get("reason") == f"passed as arg 2 to {callee}"}
+
+
+def _named_sites(result):
+    return {row["address"] for lf in _caller_leaves(result) for row in lf["unfollowed"]}
+
+
+def test_every_call_site_of_a_wrapper_is_followed_or_named():
+    # `quote_len(dst, src, n) { memcpy(dst, src, n); }` with ten call sites:
+    # six pass a literal, `pass_twice` hands ONE getpid() result to two
+    # sites, `pass_result` passes another call's result and `pass_fixed` a
+    # constant address. Rows keyed on the origin alone kept `pass_twice`'s
+    # first site and dropped its second with no disclosure (P1-06).
+    sink = _length_sink("quote_len", 0x800, 20)
+    callers = [_caller(f"literal_{i}", 0xa00 + 0x100 * i, 0xa10 + 0x100 * i, sink.start,
+                       _const(16 + i)) for i in range(6)]
+    r1, r2 = FSSA(FVar("r", ident=40), 1), FSSA(FVar("q", ident=41), 1)
+    twice = FFunc("pass_twice", 0x1000, FSSAFunc([
+        _call(0, 0x1004, _GETPID, [], writes=[r1]),
+        _call(1, 0x1010, sink.start, [_const(0), _const(0), _var(r1)]),
+        _call(2, 0x1014, sink.start, [_const(0), _const(0), _var(r1)]),
+    ]))
+    result_arg = FFunc("pass_result", 0x1100, FSSAFunc([
+        _call(0, 0x1104, _GETPID, [], writes=[r2]),
+        _call(1, 0x1108, sink.start, [_const(0), _const(0), _var(r2)]),
+    ]))
+    fixed = _caller("pass_fixed", 0x1200, 0x1210, sink.start,
+                    FExpr("MLIL_CONST_PTR", "0x7000", constant=0x7000))
+    sites = ([FSite(c, 0xa10 + 0x100 * i) for i, c in enumerate(callers)]
+             + [FSite(twice, 0x1010), FSite(twice, 0x1014), FSite(result_arg, 0x1108),
+                FSite(fixed, 0x1210)])
+    sink.caller_sites = list(reversed(sites))
+    result = _backward(sink, {**_NAMES, sink.start: sink.name})
+
+    every = {hex(s.address) for s in sites}
+    followed, named = _followed_sites(result, "quote_len"), _named_sites(result)
+    assert len(every) == 10
+    assert followed | named == every, sorted(every - followed - named)
+    assert {"0x1010", "0x1014", "0x1108"} <= followed
+    assert named == {"0x1210"}
+    getpid_rows = [sl for sl in result["slices"]
+                   if any(o.get("callee") == "getpid" and o.get("function") == "0x1000"
+                          for o in sl["origins"])]
+    assert len(getpid_rows) == 2
+
+
+def _capped_wrapper(n_callers, order):
+    sink = _length_sink("put_len", 0x800, 20)
+    sites = [FSite(_caller(f"caller_{i:02d}", 0x10000 + 0x100 * i, 0x10010 + 0x100 * i,
+                           sink.start, _const(i + 1)), 0x10010 + 0x100 * i)
+             for i in range(n_callers)]
+    # Two enumerations of the same callers: BN's order differs between a raw
+    # ELF and its saved database.
+    sink.caller_sites = (sites if order == "ascending" else
+                         sites[1::2] + list(reversed(sites[0::2])))
+    return sink, sites
+
+
+@pytest.mark.parametrize("n_callers", [20, 40])
+def test_caller_cap_follows_address_order_and_names_every_dropped_site(n_callers):
+    results = {}
+    for order in ("ascending", "shuffled"):
+        sink, sites = _capped_wrapper(n_callers, order)
+        results[order] = _backward(sink, {**_NAMES, sink.start: sink.name})
+    by_address = [hex(s.address) for s in sites]
+    for result in results.values():
+        assert _followed_sites(result, "put_len") == set(by_address[:16])
+        (leaf,) = _caller_leaves(result)
+        assert leaf["reasons"] == {"caller_cap": n_callers - 16}
+        assert leaf["unfollowed_total"] == n_callers - 16
+        rows = leaf["unfollowed"]
+        assert [r["address"] for r in rows] == by_address[16:32]
+        assert [r["caller"] for r in rows] == [f"caller_{i:02d}" for i in range(16, min(n_callers, 32))]
+        assert result["stats"]["truncated"] is True
+        assert result["stats"]["truncation_cause"] == ["caller_cap"]
+    assert results["ascending"]["slices"] == results["shuffled"]["slices"]
+    assert _caller_leaves(results["ascending"]) == _caller_leaves(results["shuffled"])
 
 
 # --------------------------------------------------------------------------
@@ -1055,10 +1146,9 @@ def test_each_callers_budget_cut_is_its_own_slice():
     result = _backward(accept, {**_NAMES, 0x800: "accept_size"}, "arg:malloc:0",
                        engine_depth=4)
 
-    cuts = [sl for sl in result["slices"] if sl["origin"].get("cause") == "def_chain_budget"]
-    assert sorted(sl["origin"]["function"] for sl in cuts) == ["0x3000", "0x3100"], cuts
-    assert all(sl["origin"]["unwalked"] == ["v2#1"] for sl in cuts), cuts
-    assert all("reached_via_call_sites" not in sl for sl in cuts), cuts
+    cuts = [o for o in _origins(result) if o.get("cause") == "def_chain_budget"]
+    assert sorted(o["function"] for o in cuts) == ["0x3000", "0x3100"], cuts
+    assert all(o["unwalked"] == ["v2#1"] for o in cuts), cuts
     assert _gate(result) is False, result["diagnostics"]
 
 
@@ -1846,8 +1936,8 @@ def test_real_bn_direct_ascent_reaches_runtime_boundary_beside_a_callback(tmp_pa
     (leaf,) = _caller_leaves(direct)
     assert {r["caller"] for r in leaf["unfollowed"]} == {"_start"}
     assert set(leaf["reasons"]) == {"indirect_reference"}
-    assert [(sl["origin"]["kind"], sl["origin"].get("index"), sl["crossed_functions"])
-            for sl in direct["slices"]] == [("parameter", 0, ["put_len"])]
+    assert [(o["kind"], o.get("index"), sl["crossed_functions"])
+            for sl in direct["slices"] for o in sl["origins"]] == [("parameter", 0, ["put_len"])]
 
     callback = _bn_backward(shared_bn, target, "copy_handler", "arg:memcpy:2")
     assert callback["diagnostics"]["safe_to_report_complete_slice"] is False
@@ -1866,14 +1956,13 @@ def test_real_bn_budget_cuts_are_per_path_and_per_caller(tmp_path, shared_bn):
     for fn, root_index in [("dag", 0), ("dag_reverse", 0),
                            ("shared_load", 1), ("shared_load_reverse", 1)]:
         result = _bn_backward(shared_bn, target, fn, "arg:malloc:0")
-        origins = [sl["origin"] for sl in result["slices"]]
+        origins = _origins(result)
         assert [(o["kind"], o.get("index")) for o in origins] == [("parameter", root_index)], (fn, origins)
         assert result["diagnostics"]["safe_to_report_complete_slice"] is True, (fn, result["diagnostics"])
 
     # Two callers whose chains the budget really cuts: two frontiers, one per caller.
     result = _bn_backward(shared_bn, target, "accept_size", "arg:malloc:0")
-    cuts = [sl["origin"] for sl in result["slices"]
-            if sl["origin"].get("cause") == "def_chain_budget"]
+    cuts = [o for o in _origins(result) if o.get("cause") == "def_chain_budget"]
     assert len({c["function"] for c in cuts}) == 2, cuts
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
@@ -1891,7 +1980,7 @@ def test_real_bn_recursive_back_edge_keeps_its_producers(tmp_path, shared_bn):
     for fn, root in [("pid_producer", {"kind": "call", "callee": "getpid"}),
                      ("recv_producer", {"kind": "source", "callee": "recv"})]:
         result = _bn_backward(shared_bn, target, fn, "arg:malloc:0")
-        origins = [sl["origin"] for sl in result["slices"]]
+        origins = _origins(result)
         assert any(o.get("kind") == "constant" and o.get("value") == 16 for o in origins), (fn, origins)
         assert any(root.items() <= o.items() for o in origins), (fn, origins)
         assert not any(o.get("kind") == "parameter" for o in origins), (fn, origins)
@@ -1902,8 +1991,8 @@ def test_real_bn_recursive_back_edge_keeps_its_producers(tmp_path, shared_bn):
     assert "getpid" in text.stdout and "constant" in text.stdout, text.stdout
 
     remap = _bn_backward(shared_bn, target, "remap_copy", "arg:malloc:0")
-    origins = [(sl["origin"].get("kind"), sl["origin"].get("value"), sl["crossed_functions"])
-               for sl in remap["slices"]]
+    origins = [(o.get("kind"), o.get("value"), sl["crossed_functions"])
+               for sl in remap["slices"] for o in sl["origins"]]
     assert ("constant", 7, ["remap_copy"]) in origins, origins
     assert any(k == "parameter" and crossed == ["remap_copy", "remap_copy"]
                for k, _, crossed in origins), origins
@@ -1924,19 +2013,19 @@ def test_real_bn_mutual_recursion_keeps_the_back_edge_producer(tmp_path, shared_
 
     for fn in ("remap_a", "direct_remap"):
         result = _bn_backward(shared_bn, target, fn, "arg:malloc:0")
-        origins = [sl["origin"] for sl in result["slices"]]
+        origins = _origins(result)
         assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in origins), (fn, origins)
         assert any(getpid.items() <= o.items() for o in origins), (fn, origins)
         params = [o for o in origins if o["kind"] == "parameter"]
         assert len(params) == 1 and params[0]["index"] == 0, (fn, origins)
         crossed = {tuple(sl["crossed_functions"]) for sl in result["slices"]
-                   if sl["origin"]["kind"] == "parameter"}
+                   if any(o["kind"] == "parameter" for o in sl["origins"])}
         assert all(c and c[-1] == fn for c in crossed), (fn, crossed)  # start_*'s formal
         assert result["diagnostics"]["safe_to_report_complete_slice"] is True
 
     pure = _bn_backward(shared_bn, target, "pure_a", "arg:malloc:0")
-    origins = [(sl["origin"].get("kind"), sl["origin"].get("callee"), sl["crossed_functions"])
-               for sl in pure["slices"]]
+    origins = [(o.get("kind"), o.get("callee"), sl["crossed_functions"])
+               for sl in pure["slices"] for o in sl["origins"]]
     assert any(k == "call" and callee == "getpid" for k, callee, _ in origins), origins
     # the sink's own formal, not a pure_b one: the cycle's root
     assert [c for k, _, c in origins if k == "parameter"] == [[]], origins
@@ -1959,7 +2048,7 @@ def test_real_bn_extra_entry_into_the_cycle_keeps_getpid(tmp_path, shared_bn):
         for depth in ("4", "8", "16"):
             result = _bn_backward(shared_bn, target, "remap_a", "arg:malloc:0",
                                   "--max-depth", depth)
-            origins = [sl["origin"] for sl in result["slices"]]
+            origins = _origins(result)
             assert any(o.get("kind") == "call" and o.get("callee") == "getpid" for o in origins), (variant, depth, origins)
             assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in origins), (variant, depth, origins)
             if extra:
@@ -1984,17 +2073,17 @@ def test_real_bn_cycle_entered_through_another_member_has_no_internal_origin(tmp
     for depth in ("4", "8", "16"):
         for fn in ("cycle_a", "direct"):
             result = _bn_backward(shared_bn, rotation, fn, "arg:malloc:0", "--max-depth", depth)
-            origins = [sl["origin"] for sl in result["slices"]]
+            origins = _origins(result)
             assert [(o["kind"], o.get("value")) for o in origins] == [("constant", 43)], (fn, depth, origins)
             assert result["diagnostics"]["safe_to_report_complete_slice"] is True
         result = _bn_backward(shared_bn, remap, "remap_a", "arg:malloc:0", "--max-depth", depth)
-        origins = [sl["origin"] for sl in result["slices"]]
+        origins = _origins(result)
         for root in ({"kind": "constant", "value": 43}, {"kind": "constant", "value": 47}, getpid):
             assert any(root.items() <= o.items() for o in origins), (depth, origins)
         assert not any(o["kind"] == "parameter" for o in origins), (depth, origins)
         assert result["diagnostics"]["safe_to_report_complete_slice"] is True
         direct = _bn_backward(shared_bn, remap, "direct", "arg:malloc:0", "--max-depth", depth)
-        origins = [sl["origin"] for sl in direct["slices"]]
+        origins = _origins(direct)
         assert any(getpid.items() <= o.items() for o in origins) and any(o.get("kind") == "constant" and o.get("value") == 47 for o in origins), (depth, origins)
         assert not any(o["kind"] == "parameter" for o in origins), (depth, origins)
 
