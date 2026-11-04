@@ -9,6 +9,7 @@ there fails here until it is given a meaning and a remedy.
 from __future__ import annotations
 
 import ast
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -19,29 +20,153 @@ from bn.taint_truncation import TRUNCATION_CAUSES
 BRIDGE = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge"
 
 
-def _enclosing_functions(tree: ast.AST) -> dict[ast.AST, ast.AST]:
-    parent: dict[ast.AST, ast.AST] = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parent[child] = node
-    return parent
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)
 
 
-def _assigned(scope: ast.AST, name: str) -> list[ast.expr]:
-    return [n.value for n in ast.walk(scope)
-            if isinstance(n, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == name for t in n.targets)]
+class _Unresolved(Exception):
+    """A producer argument this crawler cannot reduce to string literals."""
+
+
+def _bound_names(target: ast.expr) -> set[str]:
+    """The names an assignment target BINDS: a name, or the names of a
+    (nested) tuple/list -- never one used inside a subscript or attribute
+    target (`state[key] = v` binds nothing called `key`)."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return set().union(*(_bound_names(e) for e in target.elts))
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    return set()
+
+
+class _Crawler:
+    """Reduce the argument of every ``*truncation_causes.add(...)`` call in one
+    module to the set of string literals it can hold.
+
+    Followed: a literal; a conditional expression; a name bound by assignment
+    (also tuple-unpacked from a literal tuple) or by a ``for`` loop over a
+    literal collection or a dict literal's ``keys()``/``values()``/``items()``;
+    ``D.get(...)`` and ``D[...]`` on a dict literal (every value). A name is
+    looked up in its own function, then in each enclosing scope out to the
+    module. Anything else -- a parameter, a computed value -- raises
+    :class:`_Unresolved`, which the test reports with the call site: a
+    producer the crawler silently skipped is exactly how a cause escapes."""
+
+    def __init__(self, tree: ast.AST) -> None:
+        self.parent: dict[ast.AST, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                self.parent[child] = node
+
+    def scopes(self, node: ast.AST) -> list[ast.AST]:
+        out = []
+        while node in self.parent:
+            node = self.parent[node]
+            if isinstance(node, _SCOPES):
+                out.append(node)
+        return out
+
+    def owner(self, node: ast.AST) -> ast.AST:
+        return self.scopes(node)[0]
+
+    def bindings(self, name: str, at: ast.AST) -> tuple[ast.AST, list[ast.AST]]:
+        """The nearest scope binding *name* and its binding nodes."""
+        for scope in self.scopes(at):
+            args = getattr(scope, "args", None)
+            params = ({a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+                      if args is not None else set())
+            if name in params:
+                raise _Unresolved(f"{name!r} is a parameter of {getattr(scope, 'name', '<lambda>')}")
+            found = [n for n in ast.walk(scope)
+                     if isinstance(n, (ast.Assign, ast.For, ast.comprehension))
+                     and self.owner(n) is scope
+                     and name in _bound_names(n.targets[0] if isinstance(n, ast.Assign)
+                                              else n.target)]
+            if found:
+                return scope, found
+        raise _Unresolved(f"no binding for {name!r}")
+
+    def dict_literal(self, expr: ast.expr) -> ast.Dict:
+        if isinstance(expr, ast.Dict):
+            return expr
+        if isinstance(expr, ast.Name):
+            _scope, found = self.bindings(expr.id, expr)
+            tables = [n.value for n in found if isinstance(n, ast.Assign)
+                      and isinstance(n.value, ast.Dict)]
+            if len(tables) == len(found):
+                return tables[0] if len(tables) == 1 else ast.Dict(
+                    keys=[k for t in tables for k in t.keys],
+                    values=[v for t in tables for v in t.values])
+        raise _Unresolved(f"{ast.unparse(expr)} is not a dict literal")
+
+    def strings(self, expr: ast.expr) -> set[str]:
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return {expr.value}
+        if isinstance(expr, ast.IfExp):
+            return self.strings(expr.body) | self.strings(expr.orelse)
+        if isinstance(expr, ast.Name):
+            out: set[str] = set()
+            _scope, found = self.bindings(expr.id, expr)
+            for node in found:
+                out |= self.bound(node, expr.id)
+            return out
+        if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+                and expr.func.attr == "get"):
+            return self.values(self.dict_literal(expr.func.value))
+        if isinstance(expr, ast.Subscript):
+            return self.values(self.dict_literal(expr.value))
+        raise _Unresolved(ast.unparse(expr))
+
+    def values(self, table: ast.Dict) -> set[str]:
+        return set().union(*(self.strings(v) for v in table.values))
+
+    def keys(self, table: ast.Dict) -> set[str]:
+        return set().union(*(self.strings(k) for k in table.keys if k is not None))
+
+    def bound(self, node: ast.AST, name: str) -> set[str]:
+        """What binding *node* puts in *name*."""
+        if isinstance(node, ast.Assign):
+            target, value = node.targets[0], node.value
+            if isinstance(target, ast.Name):
+                return self.strings(value)
+            if isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple):
+                i = [isinstance(t, ast.Name) and t.id == name for t in target.elts].index(True)
+                return self.strings(value.elts[i])
+            raise _Unresolved(ast.unparse(node))
+        target, it = node.target, node.iter
+        if isinstance(target, ast.Name):
+            return self.elements(it)
+        if (isinstance(target, ast.Tuple) and isinstance(it, ast.Call)
+                and isinstance(it.func, ast.Attribute) and it.func.attr == "items"):
+            i = [isinstance(t, ast.Name) and t.id == name for t in target.elts].index(True)
+            table = self.dict_literal(it.func.value)
+            return self.keys(table) if i == 0 else self.values(table)
+        if isinstance(target, ast.Tuple) and isinstance(it, (ast.List, ast.Tuple, ast.Set)):
+            i = [isinstance(t, ast.Name) and t.id == name for t in target.elts].index(True)
+            return set().union(*(self.strings(e.elts[i]) for e in it.elts))
+        raise _Unresolved(f"for {ast.unparse(target)} in {ast.unparse(it)}")
+
+    def elements(self, it: ast.expr) -> set[str]:
+        if isinstance(it, (ast.List, ast.Tuple, ast.Set)):
+            return set().union(*(self.strings(e) for e in it.elts))
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute):
+            if it.func.attr == "keys":
+                return self.keys(self.dict_literal(it.func.value))
+            if it.func.attr == "values":
+                return self.values(self.dict_literal(it.func.value))
+        if isinstance(it, (ast.Name, ast.Dict)):
+            return self.keys(self.dict_literal(it))
+        raise _Unresolved(f"iteration over {ast.unparse(it)}")
 
 
 def _cause_literals(path: Path) -> set[str]:
     """Every string a ``*truncation_causes.add(...)`` call in *path* can add.
 
-    A literal argument is taken as is; a name is followed to the mapping it is
-    looked up in (``aggregate = names.get(cause)``) and every value of that
-    mapping counts. A producer shape this cannot follow fails loudly rather
-    than being skipped -- a skipped producer is exactly how a cause escapes."""
+    A producer shape :class:`_Crawler` cannot follow fails with its call site
+    named rather than being skipped."""
     tree = ast.parse(path.read_text())
-    parent = _enclosing_functions(tree)
+    crawler = _Crawler(tree)
     found: set[str] = set()
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -50,22 +175,12 @@ def _cause_literals(path: Path) -> set[str]:
                 and node.func.value.attr.endswith("truncation_causes")):
             continue
         (arg,) = node.args
-        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-            found.add(arg.value)
-            continue
-        scope = node
-        while not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            scope = parent[scope]
-        assert isinstance(arg, ast.Name), (path.name, node.lineno, ast.unparse(arg))
-        (value,) = _assigned(scope, arg.id)
-        assert (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
-                and value.func.attr == "get" and isinstance(value.func.value, ast.Name)), \
-            (path.name, node.lineno, ast.unparse(value))
-        (table,) = _assigned(scope, value.func.value.id)
-        assert isinstance(table, ast.Dict), (path.name, node.lineno)
-        for v in table.values:
-            assert isinstance(v, ast.Constant) and isinstance(v.value, str), ast.unparse(v)
-            found.add(v.value)
+        try:
+            found |= crawler.strings(arg)
+        except _Unresolved as exc:
+            pytest.fail(f"{path.name}:{node.lineno}: cannot tell which truncation cause "
+                        f"`{ast.unparse(node)}` records ({exc}); pass a literal or a "
+                        "name bound to literals, or teach this crawler the shape")
     return found
 
 
@@ -80,6 +195,46 @@ def test_every_engine_truncation_cause_is_in_the_shared_vocabulary():
     assert "global_object_extent" in causes
     missing = sorted(causes - set(TRUNCATION_CAUSES))
     assert not missing, f"engine truncation causes with no verdict entry: {missing}"
+
+_PRODUCERS = textwrap.dedent('''
+    TABLE = {"x": "from_module_table"}
+    class Engine:
+        def run(self, reach):
+            names = {"a": "from_get"}
+            self._truncation_causes.add("from_literal")
+            aggregate = names.get(reach)
+            self._truncation_causes.add(aggregate)
+            self._truncation_causes.add(TABLE[reach])
+            bounds = {"from_items": "prose"}
+            for cause, _text in bounds.items():
+                self._bw_truncation_causes.add(cause)
+            for c in ("from_loop",):
+                self._truncation_causes.add(c)
+            first, _second = "from_unpack", "unused"
+            self._truncation_causes.add(first)
+            def inner():
+                self._truncation_causes.add(aggregate)
+            self._truncation_causes.add("brand_new_budget" if reach else "from_literal")
+''')
+
+
+def test_the_crawler_follows_every_producer_shape_and_surfaces_a_new_cause(tmp_path):
+    module = tmp_path / "engine.py"
+    module.write_text(_PRODUCERS)
+    causes = _cause_literals(module)
+    assert causes == {"from_literal", "from_get", "from_module_table", "from_items",
+                      "from_loop", "from_unpack", "brand_new_budget"}
+    # A cause the table does not know is exactly what the main test reports.
+    assert "brand_new_budget" in causes - set(TRUNCATION_CAUSES)
+
+
+def test_the_crawler_refuses_a_cause_it_cannot_follow_naming_the_call_site(tmp_path):
+    module = tmp_path / "engine.py"
+    module.write_text("class E:\n    def run(self, cause):\n"
+                      "        self._truncation_causes.add(cause)\n")
+    with pytest.raises(pytest.fail.Exception, match=r"engine\.py:3: .*parameter"):
+        _cause_literals(module)
+
 
 
 @pytest.mark.parametrize("cause", sorted(set(TRUNCATION_CAUSES) - {"max_depth"}))

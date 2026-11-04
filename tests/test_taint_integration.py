@@ -6437,37 +6437,63 @@ __attribute__((noinline)) void call_fmt(const char *s) { char b[16]; app_fmt(b, 
 
 
 _LOG_SERVER_SRC = r"""
-#include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #define N __attribute__((noinline, noipa))
 char log_buf[32];
-char log_tail[32];
+char log_ring[2097280];
+extern char log_tail[64];
+/* An interior symbol a megabyte into the ring: the search for the object
+   enclosing a write there runs out of its window (an internal budget). */
+__asm__(".globl log_tail\n.set log_tail,log_ring+1048640\n"
+        ".type log_tail,@object\n.size log_tail,64\n");
 N void flush_log(void) { puts(log_buf); }
 N void emit_record(int k) { puts(log_buf + k); }
-N void rotate_log(void) { log_tail[0] = 0; }
+N void drain_ring(void) {
+    char *p = malloc(sizeof log_ring);
+    memcpy(p, log_ring, sizeof log_ring);
+    puts(p + 1048640);
+    free(p);
+}
 N void consume(const char *p) { if (p[0] == 'x') puts("x"); }
 N void serve(char *p) {
-    memcpy(log_buf, p, 48);      /* past the next symbol: the extent is unproven */
-    flush_log();
+    memcpy(log_buf, p, 16);
+    memcpy(log_tail, p, 32);
+    flush_log();                 /* both globals stay live across four calls */
     emit_record(1);
     emit_record(2);
+    drain_ring();
     consume(p);                  /* a call BN gives no result */
-    rotate_log();
+    puts("done");
 }
 int main(int argc, char **argv) { if (argc > 1) serve(argv[1]); return 0; }
 """
+
+
+def _frontier_blocks(frontier: list[str]) -> list[list[str]]:
+    """Rendered frontier rows split into one block per row head (2-space
+    indent); wrapped and body lines are indented deeper."""
+    blocks: list[list[str]] = []
+    for line in frontier[1:]:
+        if line.startswith("  ") and not line.startswith("   "):
+            blocks.append([line])
+        else:
+            blocks[-1].append(line)
+    return blocks
 
 
 def test_forward_frontier_verdict_advice_and_text_on_a_real_build(tmp_path, shared_bn,
                                                                 monkeypatch):
     """P1-08, P2-04 and the W07/W05 papercuts on one real build.
 
-    One write into an untyped global stays live across three later calls, so
-    the walk records a continuation leaf per call and its extent truncation;
-    a void call with a tainted argument gets the return frontier. The text
-    names the cause (not `@depth N`), prints ONE block for the global with
-    one routed command, wraps at the terminal width, and every leaf command
-    runs as printed."""
+    Two globals written once stay live across four later calls, so the walk
+    records a continuation leaf per (call, global), and the write at an
+    interior symbol deep inside a large object runs the enclosing-object
+    search out of its internal budget; a void call with a tainted argument
+    gets the return frontier. The text names the cause with its own remedy
+    (not `@depth N`), prints ONE block per global with one routed command,
+    wraps at the terminal width, and every leaf command runs as printed."""
     from bn.taint_truncation import TRUNCATION_CAUSES
 
     src = tmp_path / "logsrv.c"
@@ -6480,13 +6506,18 @@ def test_forward_frontier_verdict_advice_and_text_on_a_real_build(tmp_path, shar
 
     result = _bn_json(shared_bn, *forward, "--sink-class", "file_write")
     causes = result["stats"]["truncation_cause"]
-    assert "global_object_extent" in causes, result["stats"]
+    # A truncation that is NOT the depth bound, rendered through the table.
+    assert set(causes) - {"max_depth"}, result["stats"]
+    assert set(causes) <= set(TRUNCATION_CAUSES), causes
     assert result["run_params"]["sink_classes"] == ["file_write"], result["run_params"]
     assert result["run_params"]["resolve_map"] is None
     assert result["run_params"]["models"] == []
     assert all("note" not in leaf for leaf in result["leaves"]), result["leaves"]
     gmc = [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
-    assert len(gmc) >= 2 and len({lf["global"]["address"] for lf in gmc}) == 1, gmc
+    per_global: dict[str, int] = {}
+    for lf in gmc:
+        per_global[lf["global"]["address"]] = per_global.get(lf["global"]["address"], 0) + 1
+    assert len(per_global) == 2 and max(per_global.values()) >= 2, gmc
 
     # The return frontier points at a bounded window AT the call, and it runs.
     [lost] = [lf for lf in result["leaves"] if lf.get("cause") == "return_value_unrecovered"]
@@ -6503,21 +6534,29 @@ def test_forward_frontier_verdict_advice_and_text_on_a_real_build(tmp_path, shar
     assert "@depth" not in verdict, verdict
     for cause in causes:
         assert TRUNCATION_CAUSES[cause].what in verdict, (cause, verdict)
+        assert TRUNCATION_CAUSES[cause].remedy in verdict, (cause, verdict)
     start = next(i for i, line in enumerate(lines) if line.startswith("frontiers ("))
     end = next((i for i in range(start, len(lines)) if not lines[i]), len(lines))
     frontier = lines[start:end]
-    headers = [line for line in frontier if "global_memory_continuation @" in line]
-    assert len(headers) == 1 and f"[{len(gmc)} leaves]" in headers[0], frontier
-    assert all(len(line) <= 100 or "`" in line for line in frontier), frontier
-    block = "\n".join(frontier)
-    assert len(re.findall(r"`bn [^`]+`", block.split("unmodeled_callee")[0])) == 1, block
+    # Only a row's fact head may run past the width; its prose wraps.
+    assert all(len(line) <= 100 or "`" in line or len(line.split("  -- ")[0]) > 100
+               for line in frontier), frontier
+    blocks = [b for b in _frontier_blocks(frontier)
+              if "global_memory_continuation @" in b[0]]
+    # One block per global, its count the leaves that global carries, and
+    # exactly one follow-up command in it.
+    assert len(blocks) == len(per_global), frontier
+    for address, count in per_global.items():
+        [block] = [b for b in blocks if f"global={address}" in b[0]]
+        assert (f"[{count} leaves]" in block[0]) is (count > 1), block
+        assert len(re.findall(r"`bn [^`]+`", "\n".join(block))) == 1, block
     # Every command the text prints carries this invocation's routing, and
     # the frontier block's own command runs as printed.
     printed = re.findall(r"`(bn [^`]+)`", rendered.stdout)
     assert printed
     for line in printed:
         assert f"-i {shared_bn.instance_id}" in line and "-t " in line, line
-    assert _run_or_check_template(shared_bn, block.split("unmodeled_callee")[0])[0] == 1
+    assert _run_or_check_template(shared_bn, "\n".join(blocks[0]))[0] == 1
 
     # A depth cut names the flag that exists.
     capped = _bn_json(shared_bn, *forward, "--max-depth", "0")
