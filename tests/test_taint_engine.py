@@ -11505,3 +11505,53 @@ def test_benign_model_handed_the_buffer_is_disclosed_928r4():
     result2 = te.TaintEngine(FBV(_B_NAMES), models).backward(pg2.func(), [te.parse_locator("arg:popen:0")])
     assert _store_proof_only(result2), result2["leaves"]
     assert any("passed to my_fill" in a for a in result2["assumptions"]), result2["assumptions"]
+
+
+def _out_param_count(wrapper):
+    """``copy_count(src) { helper(src, &bits); n = <wrapper>(bits @ mem#1);
+    memcpy(.., .., n); }`` -- the length is read BY NAME from a local an
+    in-binary helper wrote through an out-pointer, bare or under a wrapper."""
+    src, src0 = _var("src", 0, ident=31)
+    bits = FVar("bits", ident=32, typ="int32_t")
+    bits1 = FSSA(bits, 1)
+    n, n1 = _var("n", 1, ident=33)
+    pg = _BufProgram("copy_count", params=[src])
+    pg.call(_B_HELPER, [FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]), _addr_of(bits)], reads=[src0])
+    read = FExpr("MLIL_VAR_ALIASED", "bits @ mem#1", reads=[bits1], src=bits1)
+    value = {
+        "bare": read,
+        "zx": FExpr("MLIL_ZX", "zx.q(bits @ mem#1)", reads=[bits1], src=read),
+        "sx": FExpr("MLIL_SX", "sx.q(bits @ mem#1)", reads=[bits1], src=read),
+        "low_part": FExpr("MLIL_LOW_PART", "bits @ mem#1.w", reads=[bits1], src=read),
+        "arith": _plus(FExpr("MLIL_ZX", "zx.q(bits @ mem#1)", reads=[bits1], src=read),
+                       FExpr("MLIL_CONST", "7", constant=7), "zx.q(bits @ mem#1) + 7"),
+    }[wrapper]
+    _set(pg, n1, f"n#1 = {value}", value, reads=[bits1]).ssa_memory_version = 1
+    pg.call(_B_MEMCPY, [_cstr(0x5000), _cstr(0x6000), FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])],
+            reads=[n1])
+    return pg.func()
+
+
+def _local_read_verdict(result):
+    leaves = sorted((lf["kind"], lf.get("buffer")) for lf in result["leaves"])
+    origins = [(o["kind"], o.get("buffer"), o.get("callee"))
+               for sl in result["slices"] for o in sl.get("origins") or [sl["origin"]]]
+    return leaves, origins, result["diagnostics"]["safe_to_report_complete_slice"]
+
+
+@pytest.mark.parametrize("wrapper", ["zx", "sx", "low_part", "arith"])
+def test_backward_wrapped_aliased_local_read_is_classified_as_the_bare_read(wrapper):
+    # P2-01: `n = zx.q(bits @ mem#1)` after `helper(src, &bits)` came back
+    # origin `entry`, no leaf, a complete slice -- the conversion hid the
+    # by-name read, so `bits#1` was walked as an SSA value with no definition.
+    # The bare read names the helper as an opaque writer of `bits`.
+    bare = te.TaintEngine(FBV(_B_NAMES), te.load_models()).backward(
+        _out_param_count("bare"), [te.parse_locator("arg:memcpy:2")])
+    wrapped = te.TaintEngine(FBV(_B_NAMES), te.load_models()).backward(
+        _out_param_count(wrapper), [te.parse_locator("arg:memcpy:2")])
+    leaves, origins, complete = _local_read_verdict(bare)
+    assert ("address_of_local_unresolved", "bits") in leaves
+    assert ("address_of_local_unresolved", "bits", "helper") in origins
+    assert complete is False
+    assert _local_read_verdict(wrapped) == (leaves, origins, complete)
+    assert all(origin[0] != "entry" for origin in _local_read_verdict(wrapped)[1])

@@ -809,6 +809,30 @@ def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, share
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
+@pytest.mark.parametrize("opt", ["-O1", "-O2"])
+def test_out_param_local_read_under_a_conversion_is_never_complete(tmp_path, shared_bn, opt):
+    """P2-01: a memcpy length read back from a local an in-binary helper
+    wrote through `&width`, lifted as `width_1 = zx.q(width @ mem#k)`, came
+    back origin `entry`, no leaf and a complete slice. The read is the local's
+    contents, so the helper is its unmodeled writer, exactly as for a bare
+    by-name read."""
+    binary = tmp_path / f"bw_outparam_width{opt}"
+    _compile(CORPUS / "bw_outparam_width.c", binary, [opt, "-fno-inline"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_field",
+                      "--sink", "arg:memcpy:2")
+    leaves = [lf for lf in result["leaves"] if lf["kind"] == "address_of_local_unresolved"]
+    # The conversion form this fixture exists for is what BN lifted.
+    assert any("zx." in lf["il_text"] and "width @ mem#" in lf["il_text"] for lf in leaves), \
+        result["leaves"]
+    assert {lf["buffer"] for lf in leaves} == {"width"}, leaves
+    origins = [o for sl in result["slices"] for o in sl["origins"]]
+    assert ("address_of_local_unresolved", "width", "parse_width") in {
+        (o["kind"], o.get("buffer"), o.get("callee")) for o in origins}, origins
+    assert not any(o["kind"] == "entry" for o in origins), origins
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
 def test_every_caller_site_is_followed_or_named_and_the_cap_is_address_ordered(tmp_path, shared_bn):
     """P1-06 / P2-14: `quote_arg` has ten call sites, two of which reach one
     `pick_name()` origin in `edit_entry` (directly and through `open_alt`);

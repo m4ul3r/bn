@@ -2672,6 +2672,33 @@ class TaintEngine:
             out.extend(TaintEngine._outer_loads(c, depth + 1))
         return out
 
+    @staticmethod
+    def _outer_aliased(expr: Any, depth: int = 0) -> list[Any]:
+        """The by-name reads of address-taken locals a value expression is
+        built from: every ``MLIL_VAR_ALIASED`` / ``MLIL_VAR_ALIASED_FIELD``
+        sub-expression not nested inside a load's address or an address-of --
+        the bare ``bits @ mem#2``, the same read under a conversion
+        (``zx.q(bits @ mem#2)``, ``sx.q``, ``low_part``) or arithmetic. Each is
+        the local's CONTENTS at that memory version, never an SSA value with a
+        definition of its own (P2-01: under ``zx.q`` it was walked as one, found
+        none, and came back a complete ``entry`` origin)."""
+        if expr is None or depth > 8:
+            return []
+        op = op_name(expr)
+        if op in ("MLIL_VAR_ALIASED", "MLIL_VAR_ALIASED_FIELD"):
+            return [expr]
+        if "LOAD" in op or "ADDRESS_OF" in op or "CONST" in op:
+            return []
+        kids = [c for c in (getattr(expr, a, None) for a in ("src", "left", "right"))
+                if hasattr(c, "operation")]
+        if not kids:
+            kids = [c for c in (getattr(expr, "operands", None) or [])
+                    if hasattr(c, "operation")]
+        out: list[Any] = []
+        for c in kids:
+            out.extend(TaintEngine._outer_aliased(c, depth + 1))
+        return out
+
     def _address_terms(self, expr: Any) -> tuple[list[Any], list[int]]:
         """The ``(locals, const_addrs)`` an address expression is BUILT ON: every
         ``&v`` / ``&v:field`` and every ``CONST_PTR`` that is a term of its
@@ -13715,28 +13742,16 @@ class TaintEngine:
             if walked or glob:
                 _walk_expr(defn, src_expr, d, mv, expr_reads(src_expr), anchor)
                 return
-            if src_expr is not None and op_name(src_expr) in ("MLIL_VAR_ALIASED",
-                                                               "MLIL_VAR_ALIASED_FIELD"):
-                # `i = buf[0] @ mem#k`: a read of an address-taken local BY
-                # NAME -- the bytes are the buffer's contents at this
-                # instruction's memory version, so the writers on that chain
-                # are the value's producers (the xor-loop `buf[i] ^= key[i]`
-                # reads the `read` fill through exactly this shape; round 3).
-                # A consumer that reads through the value read back reads
-                # through the stored values, at an unknown offset.
-                aliased = getattr(src_expr, "src", None)
-                aliased = getattr(aliased, "var", aliased)
-                if aliased is not None:
-                    _walk_local_buffer(defn, aliased, d, self._mem_in(defn),
-                                       _read_region(src_expr),
-                                       None if anchor is None else (None, None))
-                    return
-            if src_expr is not None and self._outer_loads(src_expr):
+            if src_expr is not None and (self._outer_aliased(src_expr)
+                                         or self._outer_loads(src_expr)):
                 # A definition that READS MEMORY -- a bare LOAD, or one under
                 # a conversion or arithmetic (`sx.q([p+0xc].d)`, #1041 item 2):
                 # the value is the loaded bytes, never the pointer they were
                 # loaded through. Walking the address instead named the
-                # pointer's allocator as the origin of a complete slice.
+                # pointer's allocator as the origin of a complete slice. A
+                # by-name read of an address-taken local (`i = buf[0] @
+                # mem#k`, round 3; `zx.q(bits @ mem#k)`, P2-01) reads the
+                # local's contents the same way: see `_walk_expr`.
                 _walk_expr(defn, src_expr, d, mv, ssa_reads(defn), anchor)
                 return
             reads = ssa_reads(defn)
@@ -13777,18 +13792,31 @@ class TaintEngine:
         def _walk_expr(at, expr, d, mv, reads, anchor=None):
             """Walk the value expression *expr* of instruction *at*: each
             memory read in it through the writers of the loaded bytes
-            (``_follow_load``), and as SSA values only the *reads* OUTSIDE
-            those loads' addresses. *anchor* is the consumer's demand on what
-            the value points to; through a load it survives only as a demand
-            at an unknown offset (the loaded pointer's target)."""
+            (``_follow_load``), each by-name read of an address-taken local
+            through the writers of the local (``_walk_local_buffer`` at *at*'s
+            memory version), and as SSA values only the *reads* OUTSIDE those.
+            *anchor* is the consumer's demand on what the value points to;
+            through a load or a local read back it survives only as a demand
+            at an unknown offset (the read pointer's target)."""
             loads = self._outer_loads(expr)
+            aliased = [(ae, getattr(getattr(ae, "src", None), "var", getattr(ae, "src", None)))
+                       for ae in self._outer_aliased(expr)]
+            aliased = [(ae, local) for ae, local in aliased if local is not None]
             rest = list(reads)
-            for ld in loads:
-                for r in expr_reads(ld):
+            for sub in [*loads, *(ae for ae, _ in aliased)]:
+                for r in expr_reads(sub):
                     if r in rest:
                         rest.remove(r)
+            demand = None if anchor is None else (None, None)
             for ld in loads:
-                _follow_load(at, ld, d, None if anchor is None else (None, None))
+                _follow_load(at, ld, d, demand)
+            for ae, local in aliased:
+                # `i = buf[0] @ mem#k` (round 3), `zx.q(bits @ mem#k)`
+                # (P2-01): the bytes are the local's contents at this
+                # instruction's memory version, so the writers on that chain
+                # -- an in-binary helper handed `&bits` among them -- are the
+                # value's producers.
+                _walk_local_buffer(at, local, d, self._mem_in(at), _read_region(ae), demand)
             for r in rest:
                 walk(r, d + 1, mv, anchor)
 
