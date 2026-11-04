@@ -569,6 +569,10 @@ class TaintEngine:
         # global -> the preceding objects whose unbounded use was returned
         # as an `overlap_unverified` candidate against it.
         self._unverified_neighbours: dict[int, set[int]] = {}
+        # global -> the first DIRECT store of a tainted value into it this run
+        # made (in any function the walk entered): the write a seeded
+        # function's exit must not leave unfollowed (P1-04).
+        self._global_direct_stores: dict[int, Any] = {}
         self._ssa_def_cache: dict[tuple, Any] = {}
         self._returned_params_cache: dict[int, tuple] = {}
         self._returned_params_active: set[int] = set()
@@ -8683,6 +8687,7 @@ class TaintEngine:
         self._global_keyed_offsets.clear()
         self._global_extent_unproven.clear()
         self._unverified_neighbours.clear()
+        self._global_direct_stores.clear()
         self._global_search_truncated.clear()
         self._global_refs_truncated.clear()
         # ...and the answers computed FROM them.
@@ -9562,6 +9567,112 @@ class TaintEngine:
                          "offset_known": bool(offset_known),
                          "seed": str(seed or "") or None})
         return rows, unfinished
+
+    def _unfollowed_global_leaf(self, func: Any, ga: int, write_ins: Any,
+                                leaves: list) -> dict[str, Any] | None:
+        """The blocking frontier for a tainted global still live when the
+        seeded function returns (P1-04).
+
+        Keying a direct store into a global as `global_approx` replaced the
+        `coarse_memory_store` frontier it used to be with a non-blocking
+        assumption, and the continuation only speaks at CALLS made after the
+        write -- so `g_len = read(..)` in a writer with no later call, read
+        by `memcpy(dst, buf, g_len)` elsewhere, answered all-clear where the
+        unkeyed store had withheld it. The walk never ascends past the
+        seeded function, so every function OTHER than it that can read the
+        object is code the walk does not follow; when such a reader exists
+        -- or the reference sweep did not finish -- the store stays the
+        blocking `coarse_memory_store` it always was, now naming the global
+        and the unfollowed readers. A continuation leaf already raised for
+        this global points at the same audit and suffices. A view with no
+        code-reference API proves nothing either way and stays silent, the
+        rule the continuation itself follows.
+
+        ONE reader is what makes the store blocking, so the classifier runs
+        until it finds one; the other referencing functions are listed by
+        the code reference BN records for them -- an established reference,
+        never a claimed read -- rather than each paying a full pointer scan
+        for a fact the verdict does not depend on."""
+        gtxt = hex(int(ga))
+        if any(lf.get("kind") == "global_memory_continuation"
+               and isinstance(lf.get("global"), dict)
+               and lf["global"].get("address") == gtxt for lf in leaves):
+            return None
+        if not callable(getattr(self.bv, "get_code_refs", None)):
+            return None
+        own = int(getattr(func, "start", 0))
+        found: list[tuple] = []
+        others: list[tuple[int, int]] = []
+        for start, site in sorted(self._global_ref_functions(ga).items()):
+            if start == own:
+                continue        # its own re-reads were walked
+            if found:
+                others.append((start, site))
+                continue
+            rfn = function_at(self.bv, start)
+            if rfn is None:
+                found.append((start, site, "unreadable", 0, "", True))
+                continue
+            use = self._global_access(rfn, ga)
+            if use.at is None or self._use_misses_tainted(ga, use):
+                continue        # writes it, or provably reads other bytes
+            found.append((start, use.at, use.kind, use.offset, use.seed or "",
+                          use.offset_known))
+        swept = ga not in self._global_refs_truncated
+        if not found and swept:
+            return None
+        rows, _unfinished = self._global_reference_rows(ga, tuple(found))
+        if rows:
+            proven = any(r["access"] in _PROVEN_GLOBAL_READS for r in rows)
+            where = ", ".join(
+                f"{r['display_name']} @ {r['at']}"
+                + (f" (+{hex(r['offset'])})" if r["offset"] and r["offset_known"]
+                   else (" (+?)" if not r["offset_known"] else ""))
+                + f" ({r['access']})" for r in rows)
+            readers = (f"code the walk never examined "
+                       f"{'reads' if proven else 'may read'} it ({where})")
+        else:
+            readers = "its reference sweep did not finish, so who reads it is unknown"
+        listed = [{"name": str(getattr(function_at(self.bv, s), "name", None)
+                               or self._callee_name(s) or hex(s)),
+                   "address": hex(s), "at": hex(a)} for s, a in others[:8]]
+        if others:
+            readers += (f", and {len(others)} more function(s) reference it ("
+                        + ", ".join(f"{o['name']} @ {o['at']}" for o in listed)
+                        + (", ..." if len(others) > len(listed) else "") + ")")
+        if not swept and rows:
+            readers += ", and its reference sweep did not finish"
+        seeded = next((r for r in rows if r.get("seed")), None)
+        advice = (f" then re-seed inside a reader on the value it loads "
+                  f"(`bn taint forward -f {seeded['address']} --source {seeded['seed']}`)."
+                  if seeded else
+                  " a reader names those bytes by constant address, so there is no"
+                  " variable inside it to seed: audit the references by hand.")
+        dest = getattr(write_ins, "dest", None) if "STORE" in op_name(write_ins) else None
+        return {
+            "kind": "coarse_memory_store",
+            "address": hex(int(getattr(write_ins, "address", 0))),
+            "dest_expr": str(dest) if dest is not None else gtxt,
+            "il_text": str(write_ins),
+            "global": {"address": gtxt, "label": f"glob_{gtxt}",
+                       "written_offsets": [
+                           hex(o) for o in
+                           sorted(self._global_keyed_offsets.get(ga) or ())[:8]]},
+            "references": rows,
+            "reads_proven": any(r["access"] in _PROVEN_GLOBAL_READS for r in rows),
+            # The other functions BN records a reference from, at that
+            # reference, unclassified -- the same shape the continuation's
+            # reachability uses for references it did not examine.
+            "unexamined_reference_sites": listed,
+            "unexamined_references_total": len(others),
+            "detail": (
+                f"tainted value stored into the writable global {gtxt}, and "
+                f"{self._prose_function(func)} returns with it live: {readers}. "
+                "The walk does not follow a global past the function the run was "
+                "seeded in, so downstream reads of these bytes are not followed -- "
+                "a 'no sinks reached' result here is not proof of safety. Audit "
+                f"them with `bn xrefs {gtxt}`;{advice}"),
+        }
 
     def _global_continuation_leaf(self, ins: Any, ga: int, callee_fn: Any,
                                   references: tuple, descended: bool,
@@ -11842,6 +11953,10 @@ class TaintEngine:
                             # continuation machinery with nothing to work from
                             # (campaign item, closed here).
                             self._note_store_span(ssaf, dest, gs, ins)
+                            # P1-04: the store the unkeyed path used to report
+                            # as a blocking `coarse_memory_store`; the seeded
+                            # function's exit asks whether it is followed.
+                            self._global_direct_stores.setdefault(gs, ins)
                             if taint_node(((("global", gs)), None), f"glob_{hex(gs)}",
                                           ins, "store into tainted global "
                                           "(object base, global_approx)", reads):
@@ -12077,6 +12192,21 @@ class TaintEngine:
                 pl = slot.get("pending_leaf")
                 if pl is not None and pl not in leaves:
                     leaves.append(pl)
+
+        # P1-04: a global a DIRECT store tainted, still live when the SEEDED
+        # function returns, is read -- if at all -- by code the walk never
+        # reaches (it does not ascend past the seed). Before such a store was
+        # keyed it was a blocking `coarse_memory_store`; keying it must not
+        # turn that into an all-clear. Descended runs hand their globals back
+        # to the caller instead, which asks the question at its own exit.
+        if top:
+            for ga in sorted(live_globals):
+                store = self._global_direct_stores.get(ga)
+                if store is None:
+                    continue
+                leaf = self._unfollowed_global_leaf(func, ga, store, leaves)
+                if leaf is not None and leaf not in leaves:
+                    leaves.append(leaf)
 
         # #559: for the top run, capture the seed-frontier facts a zero-result
         # query needs to explain WHY the frontier stopped -- how many SSA values

@@ -52,6 +52,79 @@ def models():
 
 
 # --------------------------------------------------------------------------
+# P1-04: a tainted global the walk does not follow stays a blocking frontier
+# --------------------------------------------------------------------------
+
+def _store_fn(name, start):
+    """`void name(int n) { g = n; }` -- the tainted value stored DIRECTLY into
+    the global, then return: no call after the write, so no continuation can
+    be asked."""
+    n = FVar("n")
+    n0 = FSSA(n, 0)
+    store = FInstr(0, start + 4, "MLIL_STORE_SSA", f"[{hex(G_DIR)}].d = n#0",
+                   reads=[n0], dest=_gptr(G_DIR))
+    store.size = 4
+    ret = FInstr(1, start + 8, "MLIL_RET", "return")
+    return GFunc(name, start, FSSAFunc([store, ret]), params=[n])
+
+
+def _fill_program(*, other_reader=True, via_helper=False):
+    """`fill(n)` stores into the global itself, or hands `n` to a helper that
+    does; `use()` -- never called by the walk -- reads it."""
+    use = _reader("use", 0x401200, G_DIR, 0x401210)
+    writer = _store_fn("fill_helper" if via_helper else "fill",
+                       0x401300 if via_helper else 0x401100)
+    names = {MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "use"}
+    funcs = {0x401200: use}
+    func = writer
+    if via_helper:
+        n = FVar("n")
+        n0 = FSSA(n, 0)
+        call = FInstr(0, 0x401104, "MLIL_CALL_SSA", "fill_helper(n#0)", reads=[n0],
+                      dest=_gptr(0x401300), params=[_var(n0)])
+        func = GFunc("fill", 0x401100,
+                     FSSAFunc([call, FInstr(1, 0x401108, "MLIL_RET", "return")]),
+                     params=[n], callees=[writer])
+        names[0x401300] = "fill_helper"
+        funcs[0x401300] = writer
+    refs = {G_DIR: [FRef(writer, int(writer.start) + 4)]}
+    if other_reader:
+        refs[G_DIR].append(FRef(use, 0x401210))
+    return func, FGlobalBV(names, funcs=funcs, refs=refs)
+
+
+@pytest.mark.parametrize("via_helper", [False, True], ids=["seeded", "descended"])
+def test_a_global_left_tainted_for_an_unwalked_reader_blocks(models, via_helper):
+    func, bv = _fill_program(via_helper=via_helper)
+    result = _forward(bv, func, models, source="param:0")
+    assert result["reached_sinks"] == []
+    [leaf] = _leaves(result, COARSE)
+    # At the store itself -- inside the helper when the helper wrote it.
+    assert leaf["address"] == hex(0x401304 if via_helper else 0x401104), leaf
+    assert leaf["global"]["address"] == hex(G_DIR), leaf
+    assert [(r["display_name"], r["at"]) for r in leaf["references"]] == \
+        [("use", hex(0x401210))], leaf
+    assert leaf["reads_proven"] is True, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_global_no_other_function_reads_stays_clear(models):
+    # The precision boundary: only the writer itself references the object,
+    # so nothing past its return can read those bytes.
+    func, bv = _fill_program(other_reader=False)
+    result = _forward(bv, func, models, source="param:0")
+    assert result["leaves"] == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_view_that_cannot_list_references_invents_no_frontier(models):
+    func, bv = _fill_program()
+    bv.get_code_refs = None
+    result = _forward(bv, func, models, source="param:0")
+    assert _leaves(result, COARSE) == [], result["leaves"]
+
+
+# --------------------------------------------------------------------------
 # P1-05: an unbounded use of a preceding neighbour is a candidate, not a read
 # --------------------------------------------------------------------------
 

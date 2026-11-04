@@ -1467,6 +1467,66 @@ int main(int argc, char **argv) {
     assert sum(_run_or_check_template(shared_bn, _forward_prose(result))) >= 1
 
 
+def _nm_address(path: Path, name: str) -> int:
+    """A defined symbol's address from the binary's own symbol table."""
+    nm = shutil.which("nm")
+    if nm is None:
+        raise FixtureBuildError(
+            f"'nm' not found; Binary Ninja is installed, so this lane is meant "
+            f"to run, but {path.name}'s symbols cannot be read. Install binutils.")
+    res = subprocess.run([nm, str(path)], capture_output=True, text=True, timeout=120.0)
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2] == name:
+            return int(parts[0], 16)
+    raise FixtureBuildError(f"{name} not defined in {path.name}: {res.stderr.strip()}")
+
+
+def test_global_store_frontier_and_declared_neighbour(tmp_path, shared_bn):
+    """P1-04 / P1-05 on `taint_corpus/fwd_global_store_exit.c`.
+
+    `fill` stores the tainted `read()` count into `g_len` and returns; `use`
+    copies with that length, but the walk never ascends past `fill`.
+    `fill_then_log` does the same and then calls `log_banner`, whose only
+    global is `g_banner` -- laid out immediately before `g_len`, declared 16
+    bytes, read by an `fputs` of unstated length.
+
+    Base (632891c9): both seeds end in an unkeyed `coarse_memory_store` at the
+    store with `safe_to_report_all_clear: false`, and no continuation.
+    Head (b075c82c): the keyed store is only a `global_approx` assumption, so
+    `fill` answers `safe_to_report_all_clear: true` with no leaf, while
+    `fill_then_log` raises two `global_memory_continuation` leaves at the
+    `log_banner` call citing `log_banner` as a proven (`call_arg`) reader of
+    `g_len` and `g_buf` -- neither of which it touches.
+    Fixed: the store is a blocking `coarse_memory_store` naming `g_len` and
+    `use` at the instruction BN records the reference at, and `log_banner` is
+    cited by nothing."""
+    binary = tmp_path / "fwd_global_store_exit"
+    _compile(CORPUS / "fwd_global_store_exit.c", binary)
+    target = shared_bn.load(binary, copy=False)
+    g_len = _nm_address(binary, "g_len")
+    xrefs = _bn_json(shared_bn, "-t", target, "xrefs", hex(g_len))
+    use_sites = {r["address"] for r in xrefs["items"]
+                 if r.get("kind") == "code" and r.get("function") == "use"}
+    assert use_sites, xrefs
+
+    for fn in ("fill", "fill_then_log"):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", "call:read")
+        assert result["reached_sinks"] == [], (fn, result["reached_sinks"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, \
+            (fn, result["diagnostics"])
+        [store] = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"
+                   and (lf.get("global") or {}).get("address") == hex(g_len)]
+        [row] = store["references"]
+        assert (row["display_name"], row["access"]) == ("use", "load"), (fn, store)
+        assert row["at"] in use_sites, (fn, row, use_sites)
+        # The neighbour's reader is a reader of the neighbour only.
+        assert not [lf for lf in result["leaves"]
+                    if lf["kind"] == "global_memory_continuation"], (fn, result["leaves"])
+        assert not [r for lf in result["leaves"] for r in (lf.get("references") or [])
+                    if r.get("display_name") == "log_banner"], (fn, result["leaves"])
+
 
 def test_global_continuation_follows_a_thunk_to_its_consumer(tmp_path, shared_bn):
     """Round-3 review F1: a veneer is not a body, but it is not a dead end.
@@ -4015,7 +4075,19 @@ def test_global_continuation_direct_stores_match_modeled_copies(tmp_path,
     for fn in ("no_reader_case", "other_case"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+        stores = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
+        if opt == "-O0":
+            # a modeled copy: only a call after it is asked about `chain`
+            assert stores == [], (fn, stores)
+            assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+        else:
+            # P1-04: the inlined copy is a run of DIRECT stores still live when
+            # the case returns, and `reader` -- never walked after it -- reads
+            # them, so the store stays the blocking frontier it was before
+            # direct stores were keyed.
+            assert [r["display_name"] for lf in stores for r in lf["references"]] \
+                == ["reader"], (fn, stores)
+            assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
     # the sink and the copy into the destination are reported together
     result, leaves = gmc("sink_copy_case")

@@ -74,6 +74,7 @@ brittle across compilers/optimisation.
 | `store_member_identity.c` | from #941: a `snprintf` through a phi of `&buf` and a member reload is never proof (all incomplete, the control included, since #931); a store through a truncated pointer writes no byte of buf |
 | `external_member_regions.c` | from #941: field loads through a parameter pointer keep their store-matched origin or frontier (unchanged by the region model). `external_member_regions_o1.c` rebuilds it at -O1 |
 | `fwd_global_callee.c`  | forward: a bounded copy fills a writable global and a later call with NO tainted argument reads it into `system` -- a `global_memory_continuation` frontier naming the global, the call and where it is referenced, never the old zero-sink/zero-leaf all-clear; the callee that touches no global stays silent. Needs `-fno-builtin` so the copy stays a modeled call |
+| `fwd_global_store_exit.c` | forward (dedicated test `test_global_store_frontier_and_declared_neighbour`): a tainted scalar stored directly into a global by a writer with no later call stays a blocking `coarse_memory_store` naming the global and its unwalked reader at BN's reference site; the declared 16-byte neighbour's unbounded `fputs` is never cited as a reader of it |
 
 Backward completeness since #931/#933: a local buffer is checked over the
 region its consumer reads -- from the selected operand's own offset -- and the
