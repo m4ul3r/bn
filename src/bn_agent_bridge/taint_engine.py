@@ -555,12 +555,20 @@ class TaintEngine:
         # what tells an interior ALIAS from the next object along; built
         # once from the raw image, never from this run's evidence.
         self._declared_objects: list[tuple[int, int]] | None = None
-        self._credible_object_cache: dict[int, int | None] = {}
+        self._declared_object_cache: dict[int, tuple[int, int] | None] = {}
+        # Object widths a declaration states (image symbol table or debug
+        # info), per address: facts about the binary, never this run's.
+        self._declared_width_cache: dict[int, int] = {}
         self._same_storage_cache: dict[tuple[int, int], bool] = {}
         self._param_stack: set[tuple[int, int]] = set()
         self._direct_callee_cache: dict[int, tuple] = {}
         self._alias_chain_cache: dict[int, tuple] = {}
-        self._global_extent_unproven: set[int] = set()
+        # global -> WHY its extent is not established (the reasons the
+        # `object_extent_unproven` prose names).
+        self._global_extent_unproven: dict[int, set[str]] = {}
+        # global -> the preceding objects whose unbounded use was returned
+        # as an `overlap_unverified` candidate against it.
+        self._unverified_neighbours: dict[int, set[int]] = {}
         self._ssa_def_cache: dict[tuple, Any] = {}
         self._returned_params_cache: dict[int, tuple] = {}
         self._returned_params_active: set[int] = set()
@@ -1729,7 +1737,14 @@ class TaintEngine:
         `system(g)` reads and a real flow answered all-clear (round-3 review
         R1). An OBJECT is what carries a symbol; a nameless variable inside a
         symbolled object's extent belongs to it, and one that lies outside
-        every extent stays itself, so disjoint neighbours never merge."""
+        every extent stays itself, so disjoint neighbours never merge.
+
+        Storage never spans sections: the walk stops at the first
+        predecessor outside *base*'s own. On a fully stripped static binary
+        the nearest NAMED predecessor of a `.bss` scalar is BN's synthetic
+        `__elf_program_headers`, in no section at all, and folding onto it
+        made the store unkeyable (not writable) -- a constant-address global
+        store degraded to `coarse_memory_store` (P1-05)."""
         getsym = getattr(self.bv, "get_symbol_at", None)
         prev = getattr(self.bv, "get_previous_data_var_before", None)
         if not callable(getsym) or not callable(prev):
@@ -1740,6 +1755,7 @@ class TaintEngine:
         except Exception:
             return base
         at = base
+        section = self._section_names(base)
         for _ in range(64):
             try:
                 got = prev(at)
@@ -1749,6 +1765,8 @@ class TaintEngine:
             if addr is None or int(addr) >= at:
                 return base
             at = int(addr)
+            if self._section_names(at) != section:
+                return base        # another section is another object
             try:
                 named = getsym(at)
             except Exception:
@@ -6297,25 +6315,34 @@ class TaintEngine:
     def _global_extent(self, ga: int) -> int:
         """Byte width of the global object based at *ga*.
 
-        The data variable's own type first. A stripped binary usually has no
-        type for it -- BN reports `void`, width 0 -- and answering 1 there
-        excluded every consumer whose code reference sits at an interior
-        address, which is the whole point of asking (round-3 review I1). So
-        when the type cannot say, the LAYOUT does: the object runs to the
-        next data variable, or to the end of its section, whichever comes
-        first, bounded. That is exactly where a disjoint neighbour begins, so
-        the neighbour's references are still outside."""
+        A DECLARATION first (:meth:`_authoritative_width`): a user type, the
+        image's own `st_size`, or debug info says where the object ends, and
+        nothing inferred widens past it. Without one, the data variable's
+        own type is a lower bound and the LAYOUT says the rest. A stripped
+        binary usually has no type for it -- BN reports `void`, width 0 --
+        and answering 1 there excluded every consumer whose code reference
+        sits at an interior address (round-3 review I1). So the object runs
+        to the next data variable that carries a SYMBOL, or to the end of
+        its section, whichever comes first, bounded. That is exactly where a
+        disjoint neighbour begins, so the neighbour's references are still
+        outside. An object with no symbol of its own has no named neighbour
+        to stop at either: there the next data variable BN recorded -- the
+        next REFERENCED address -- is the bound, never the section's end,
+        which on a stripped binary swept every later object's references
+        into this one (P1-05)."""
         cached = self._global_extent_cache.get(ga)
         if cached is not None:
             return cached
-        typed = 0
-        getdv = getattr(self.bv, "get_data_var_at", None)
-        if callable(getdv):
-            try:
-                width = getattr(getattr(getdv(ga), "type", None), "width", None)
-                typed = int(width) if width else 0
-            except Exception:
-                typed = 0
+        authoritative = self._authoritative_width(ga)
+        if authoritative:
+            # A declaration answers where this object ends; nothing
+            # inferred widens past it (round-13 review F31) -- a write with
+            # no stated length included, which used to extend the object
+            # through every symbol after it (P1-05).
+            extent = max(int(authoritative), 1)
+            self._global_extent_cache[ga] = extent
+            return extent
+        typed = self._typed_width(ga)
         # The recovered type is a LOWER bound, never the last word. Without
         # debug info BN sizes an initialised buffer from the bytes it can
         # see -- `char global_bytes[64] = "seed"` comes back `char[0x5]` --
@@ -6326,6 +6353,12 @@ class TaintEngine:
         bounds: list[int] = []
         nxt = getattr(self.bv, "get_next_data_var_after", None)
         getsym = getattr(self.bv, "get_symbol_at", None)
+        unnamed = False
+        if callable(getsym):
+            try:
+                unnamed = getsym(ga) is None
+            except Exception:
+                unnamed = False
         if callable(nxt):
             # The next data variable that carries a SYMBOL. An untyped
             # global makes BN invent a bare data variable at each offset
@@ -6358,7 +6391,7 @@ class TaintEngine:
                         named = getsym(addr)
                     except Exception:
                         named = None
-                if named is not None or not callable(getsym):
+                if named is not None or not callable(getsym) or unnamed:
                     bounds.append(addr)
                     exhausted = False
                     break
@@ -6383,27 +6416,21 @@ class TaintEngine:
         # reader at +80 fell outside it (BN21-OBJ-01). A copy of 96 bytes at
         # `g` proves `g` is at least 96 wide -- and only a copy that really
         # spans the boundary can merge two neighbours.
-        authoritative = self._authoritative_width(ga)
-        if authoritative:
-            # A type a HUMAN applied answers where this object ends; nothing
-            # inferred widens past it (round-13 review F31).
-            extent = max(int(authoritative), 1)
-            self._global_extent_cache[ga] = extent
-            return extent
         written = int(self._global_write_span.get(ga) or 0)
+        unbounded = 0
         if ga in self._global_write_unbounded:
-            # A copy whose LENGTH nothing states may have filled everything
-            # after its destination; the object runs at least through the
-            # storage the next symbols name (round-13 review F28).
-            reach, alias_cut = self._forward_window(ga)
-            written = max(written, reach)
-            self._global_extent_unproven.add(ga)
+            # A copy whose LENGTH nothing states into an object nothing
+            # declares may have filled everything after its destination;
+            # the object runs at least through the storage the next symbols
+            # name (round-13 review F28) -- which are undeclared too, or the
+            # window would have stopped at them.
+            unbounded, alias_cut = self._forward_window(ga)
             if alias_cut:
                 # The alias enumeration itself ran out -- a different bound
                 # from the range sweep's, and one the leaf must name (F39).
                 self._global_search_truncated.add(ga)
         if 0 < laid_out < written:
-            # BN21-OBJ-01: the object has no recovered type, so its end was
+            # BN21-OBJ-01: the object has no declared size, so its end was
             # guessed from LAYOUT -- and an ALIAS symbol inside it
             # (`.set mid, g + 64`) is a data variable like any other, which
             # halved the object and hid a reader at +80. The program copies
@@ -6412,16 +6439,26 @@ class TaintEngine:
             # clear: the identity/extent is recorded as unproven, and the
             # sweep covers what was actually written so a reader inside it is
             # still named.
-            self._global_extent_unproven.add(ga)
+            self._mark_extent_unproven(ga, "write_past_layout")
+        if ga in self._global_write_unbounded and (not laid_out or laid_out < unbounded):
+            # ...and only then is it a doubt about the extent: a write of
+            # unstated length that stays inside the layout bound says
+            # nothing the layout did not.
+            self._mark_extent_unproven(ga, "unbounded_write")
         # An INFERRED type is a lower bound, never an upper one: BN sizes
         # `char initialized[128] = "seed"` as `char[0x5]`, so a copy of 112
         # bytes into it is evidence about the object, not an overflow of it
-        # (round-13 review F28). Only an authoritative type, handled above,
-        # says where the object ends.
-        extent = max(typed, laid_out, written, 1)
-        extent = max(1, int(extent))
+        # (round-13 review F28). Only a declaration, handled above, says
+        # where the object ends.
+        extent = max(typed, laid_out, written, unbounded, 1)
         self._global_extent_cache[ga] = extent
         return extent
+
+    def _mark_extent_unproven(self, ga: int, reason: str) -> None:
+        """Record WHY the extent of the object at *ga* -- and so which
+        references belong to it -- is not established; the leaf's prose
+        names exactly these reasons and no other."""
+        self._global_extent_unproven.setdefault(int(ga), set()).add(reason)
 
     @staticmethod
     def _model_len_index(model: dict[str, Any] | None) -> int | None:
@@ -7220,14 +7257,18 @@ class TaintEngine:
         subs.extend(getattr(expr, "operands", None) or ())
         return any(self._expr_loads(ssaf, s, base, depth + 1, budget) for s in subs)
 
-    def _load_ptr(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
-                  budget: _ScanBudget | None = None) -> Any:
-        """The ADDRESS expression of the first LOAD through *base*, or None.
+    def _load_node(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
+                   budget: _ScanBudget | None = None) -> Any:
+        """The first LOAD expression through *base*, or None.
 
         `observed = p[8]` reads at +8, and the displacement lives in that
-        address expression -- a load verdict that reported no expression at
-        all fell back to the literal scan and claimed the base (round-11
-        review F22)."""
+        LOAD's address expression -- a load verdict that reported no
+        expression at all fell back to the literal scan and claimed the base
+        (round-11 review F22). The LOAD itself also carries what the
+        enclosing instruction does not: its WIDTH (an `if ([g].d != 0)`
+        has no size of its own, so the read's span was "unknown") and the
+        address of the instruction that performs it (the `cmp`, where BN
+        records the code reference, not the branch it folds into) (P1-05)."""
         if budget is None:
             budget = _ScanBudget(self._PTR_RESOLVE_NODES)
         if expr is None or depth > 10 or not budget.spend() \
@@ -7236,7 +7277,7 @@ class TaintEngine:
         if "LOAD" in op_name(expr):
             src = getattr(expr, "src", None)
             if self._ptr_resolves(ssaf, src, base, budget=budget):
-                return src
+                return expr
         subs: list[Any] = []
         for attr in ("src", "left", "right", "params"):
             sub = getattr(expr, attr, None)
@@ -7246,7 +7287,7 @@ class TaintEngine:
                 subs.append(sub)
         subs.extend(getattr(expr, "operands", None) or ())
         for one in subs:
-            got = self._load_ptr(ssaf, one, base, depth + 1, budget)
+            got = self._load_node(ssaf, one, base, depth + 1, budget)
             if got is not None:
                 return got
         return None
@@ -7546,7 +7587,7 @@ class TaintEngine:
 
         def verdict(ins: Any, kind: str, seed: str | None = None,
                     expr: Any = None, span: int | None = None,
-                    forward: bool = False) -> Any:
+                    forward: bool = False, at: int | None = None) -> Any:
             """The offset names WHICH bytes of the object the use reached
             (F8), and ``offset_known`` says whether it was ESTABLISHED.
 
@@ -7566,8 +7607,21 @@ class TaintEngine:
                     offset = int(resolved)
             elif offset_of is not None:
                 offset = int(offset_of(ins))
-            return _Use(int(getattr(ins, "address", 0)), kind, offset, seed,
-                        span, known, forward)
+            return _Use(int(getattr(ins, "address", 0)) if at is None else int(at),
+                        kind, offset, seed, span, known, forward)
+
+        def load_verdict(ins: Any, node: Any, kind: str = "load") -> Any:
+            """A verdict for a LOAD: cited at the instruction that performs
+            it and as wide as the load itself, falling back to the
+            enclosing instruction where the IL node says nothing."""
+            at = getattr(node, "address", None) if node is not None else None
+            width = getattr(node, "size", None) if node is not None else None
+            if not isinstance(width, int) or width <= 0:
+                width = int(getattr(ins, "size", 0) or 0)
+            return verdict(ins, kind,
+                           expr=getattr(node, "src", None) if node is not None else None,
+                           span=width or None,
+                           at=at if isinstance(at, int) else None)
 
         def arg_seed(ins: Any, hit: list[int]) -> str | None:
             """`arg:<callee>:<index>` for a pointer that reaches a named
@@ -7751,20 +7805,22 @@ class TaintEngine:
                 if dest_hit or src_hit:
                     # `p[i] = p[j] + 1` reads, and `*q = p` escapes the
                     # address to memory this walk cannot follow.
-                    loaded = self._load_ptr(ssaf, ins, base, budget=scan)
-                    hit_use = emit(verdict(
-                        ins, "load" if self._expr_loads(ssaf, ins, base, budget=scan)
-                        else "address_escape",
-                        expr=loaded if loaded is not None
-                        else (getattr(ins, "dest", None) if dest_hit else None),
-                        span=int(getattr(ins, "size", 0) or 0) or None))
+                    node = self._load_node(ssaf, ins, base, budget=scan)
+                    if node is not None and self._expr_loads(ssaf, ins, base, budget=scan):
+                        use = load_verdict(ins, node)
+                    else:
+                        use = verdict(
+                            ins, "load" if self._expr_loads(ssaf, ins, base, budget=scan)
+                            else "address_escape",
+                            expr=getattr(ins, "dest", None) if dest_hit else None,
+                            span=int(getattr(ins, "size", 0) or 0) or None)
+                    hit_use = emit(use)
                     if hit_use is not None:
                         return hit_use
                 continue
             if self._expr_loads(ssaf, ins, base, budget=scan):
-                hit_use = emit(verdict(
-                    ins, "load", expr=self._load_ptr(ssaf, ins, base, budget=scan),
-                    span=int(getattr(ins, "size", 0) or 0) or None))
+                hit_use = emit(load_verdict(
+                    ins, self._load_node(ssaf, ins, base, budget=scan)))
                 if hit_use is not None:
                     return hit_use
                 continue
@@ -7938,7 +7994,14 @@ class TaintEngine:
     _ELF_STT_OBJECT = 1
 
     def _read_elf_object_sizes(self) -> list[tuple[int, int]]:
-        """The `(address, size)` pairs an ELF image's symbol tables state."""
+        """The `(address, size)` pairs an ELF image's symbol tables state,
+        in the VIEW's address space.
+
+        `st_value` is a link-time address: a position-independent image the
+        view loaded at a non-zero base (BN maps PIEs at 0x400000) declares
+        every object 0x400000 below where the view has it, so the table is
+        moved by the load bias -- the view's start against the lowest
+        `PT_LOAD` address -- or it would size the wrong storage."""
         import struct
 
         raw_view = getattr(self.bv, "parent_view", None)
@@ -7977,6 +8040,7 @@ class TaintEngine:
                 entsize, = struct.unpack_from(end + "I", table, at + 0x24)
             sections.append((int(s_type), int(offset), int(size), int(link),
                              int(entsize)))
+        bias = self._elf_load_bias(head, read, wide, end)
         out: list[tuple[int, int]] = []
         for s_type, offset, size, link, entsize in sections:
             # SHT_SYMTAB (2) and SHT_DYNSYM (11).
@@ -7994,29 +8058,61 @@ class TaintEngine:
                 if (info & 0xF) != self._ELF_STT_OBJECT or not st_size:
                     continue
                 if value:
-                    out.append((int(value), int(st_size)))
+                    out.append((int(value) + bias, int(st_size)))
             del step
         return out
 
-    def _credible_object(self, addr: int) -> int | None:
-        """The base of the widest DECLARED object containing *addr*.
+    def _elf_load_bias(self, head: bytes, read: Any, wide: bool, end: str) -> int:
+        """How far the view moved the image: its start minus the lowest
+        `PT_LOAD` virtual address, 0 when either is unknown."""
+        import struct
+
+        try:
+            start = int(getattr(self.bv, "start"))
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        if wide:
+            phoff, = struct.unpack_from(end + "Q", head, 0x20)
+            phentsize, phnum = struct.unpack_from(end + "HH", head, 0x36)
+        else:
+            phoff, = struct.unpack_from(end + "I", head, 0x1C)
+            phentsize, phnum = struct.unpack_from(end + "HH", head, 0x2A)
+        if not phoff or not phnum or phentsize < (56 if wide else 32):
+            return 0
+        table = read(phoff, phentsize * phnum) or b""
+        loads: list[int] = []
+        for i in range(min(phnum, len(table) // phentsize)):
+            at = i * phentsize
+            p_type, = struct.unpack_from(end + "I", table, at)
+            if p_type != 1:          # PT_LOAD
+                continue
+            vaddr, = struct.unpack_from(end + ("Q" if wide else "I"), table,
+                                        at + (0x10 if wide else 0x08))
+            loads.append(int(vaddr))
+        return start - min(loads) if loads else 0
+
+    def _declared_object(self, addr: int) -> tuple[int, int] | None:
+        """``(base, size)`` of the widest DECLARED object containing *addr*.
 
         The widest, because an alias declares its own byte and the object
         it names the inside of declares the whole buffer; the question
         here is which STORAGE the address belongs to."""
         addr = int(addr)
-        cached = self._credible_object_cache.get(addr)
-        if cached is not None or addr in self._credible_object_cache:
-            return cached
+        if addr in self._declared_object_cache:
+            return self._declared_object_cache[addr]
         best: tuple[int, int] | None = None
         for base, size in self._declared_object_table():
             if base > addr:
                 break
             if addr < base + size and (best is None or size > best[1]):
                 best = (base, size)
-        out = None if best is None else best[0]
-        self._credible_object_cache[addr] = out
-        return out
+        self._declared_object_cache[addr] = best
+        return best
+
+    def _credible_object(self, addr: int) -> int | None:
+        """The base of the widest DECLARED object containing *addr*."""
+        found = self._declared_object(addr)
+        return None if found is None else found[0]
 
     def _same_storage(self, addr: int, ga: int) -> bool:
         """Whether a constant pointer at *addr* names the same storage as
@@ -8586,6 +8682,7 @@ class TaintEngine:
         self._global_layout_truncated.clear()
         self._global_keyed_offsets.clear()
         self._global_extent_unproven.clear()
+        self._unverified_neighbours.clear()
         self._global_search_truncated.clear()
         self._global_refs_truncated.clear()
         # ...and the answers computed FROM them.
@@ -8605,7 +8702,8 @@ class TaintEngine:
         globals in a row."""
         self._global_extent_cache.pop(ga, None)
         self._global_refs.pop(ga, None)
-        self._global_extent_unproven.discard(ga)
+        self._global_extent_unproven.pop(ga, None)
+        self._unverified_neighbours.pop(ga, None)
         self._alias_chain_cache.pop(ga, None)
         for key in [k for k in self._global_reach if k[1] == ga]:
             del self._global_reach[key]
@@ -8805,23 +8903,57 @@ class TaintEngine:
         return out
 
     def _authoritative_width(self, ga: int) -> int:
-        """The width of a type a HUMAN applied to this object, else 0.
+        """How far the object at *ga* is DECLARED to reach, else 0.
 
-        BN marks the data variables it discovered itself (`auto_discovered`);
-        a type the user applied is evidence about the object, while one
-        inferred from an initialiser is only a lower bound (round-13 review
-        F31 against F26)."""
+        A declaration ends the object; an inference never does. Three
+        sources declare: a type a HUMAN applied (BN marks the variables it
+        discovered itself `auto_discovered`), the size the image's own
+        symbol table states for the object (`st_size`), and the type the
+        binary's debug info gives it. What BN inferred is only a lower bound
+        -- an initialiser-sized `char[0x5]` for a 64-byte buffer comes back
+        at full confidence, and a one-byte access types an alias `uint8_t`
+        (round-13 review F31 against F26, round-16 F33) -- so BN's type
+        CONFIDENCE is not consulted: it cannot tell those apart from a
+        declared width, while the image and the debug info can. Treating
+        every declared scalar as "no recovered type" made a typed 8-byte
+        global written by an 8-byte store an object of unknown extent whose
+        neighbours' loads were cited as reads of it (P1-05)."""
         getdv = getattr(self.bv, "get_data_var_at", None)
-        if not callable(getdv):
-            return 0
-        try:
-            dv = getdv(ga)
-            if dv is None or getattr(dv, "auto_discovered", True):
-                return 0
-            width = getattr(getattr(dv, "type", None), "width", None)
-            return int(width) if width else 0
-        except Exception:
-            return 0
+        if callable(getdv):
+            try:
+                dv = getdv(ga)
+                if dv is not None and not getattr(dv, "auto_discovered", True):
+                    width = getattr(getattr(dv, "type", None), "width", None)
+                    if width:
+                        return int(width)
+            except Exception:
+                pass
+        return self._declared_width(ga)
+
+    def _declared_width(self, ga: int) -> int:
+        """The storage the BINARY declares from *ga* onward: the rest of the
+        widest symbol-table object containing it, else the width its debug
+        info gives the variable at *ga*, else 0."""
+        ga = int(ga)
+        cached = self._declared_width_cache.get(ga)
+        if cached is not None:
+            return cached
+        width = 0
+        found = self._declared_object(ga)
+        if found is not None:
+            width = found[0] + found[1] - ga
+        else:
+            info = getattr(self.bv, "debug_info", None)
+            lookup = getattr(info, "get_data_variables_by_address", None)
+            if callable(lookup):
+                try:
+                    for row in lookup(ga) or ():
+                        dtype = row[-1] if isinstance(row, tuple) else getattr(row, "type", None)
+                        width = max(width, int(getattr(dtype, "width", 0) or 0))
+                except Exception:
+                    width = 0
+        self._declared_width_cache[ga] = width
+        return width
 
     def _typed_width(self, ga: int) -> int:
         """The width of the object's RECOVERED type, or 0 when it has none."""
@@ -8912,11 +9044,18 @@ class TaintEngine:
         C1). The test is on INTERVALS: the read's addressed bytes against the
         bytes this run tainted. A read whose length is not a constant -- a
         NUL-terminated `system(packet)`, a runtime `memcpy(.., packet, n)` --
-        cannot be shown to stop short, so it overlaps and the leaf says the
-        object's extent is what is unproven (round-11 review F21).
+        or whose displacement is not established cannot be shown to stop
+        short, so it is not ruled out (round-11 review F21) -- but it is not
+        shown to reach these bytes either. It is returned as an
+        ``overlap_unverified`` CANDIDATE, never as the read it names: a load
+        of `stdout` the scan could not bound was cited as a proven read of
+        the tainted global behind it on every real binary tried (P1-05). A
+        use whose interval provably reaches the tainted bytes outranks any
+        candidate.
 
         Only an ABUTTING neighbour is considered: a separate object with a
-        gap after it is not storage this write can have reached."""
+        gap after it is not storage this write can have reached, and one
+        whose DECLARED size ends before *ga* is separate storage."""
         tainted = self._tainted_ranges(ga)
         start = int(getattr(fn, "start", 0))
         candidates, exhausted = self._preceding_objects(ga)
@@ -8928,6 +9067,7 @@ class TaintEngine:
             # the unexamined storage cannot change its answer (round-14
             # review F35).
             self._global_search_truncated.add(ga)
+        unverified: tuple[int, Any] | None = None
         for pb in candidates:
             if start not in self._global_ref_functions(pb) \
                     and not self._reaches_object(fn, pb):
@@ -8940,8 +9080,9 @@ class TaintEngine:
                 continue
             authoritative = self._authoritative_width(pb)
             if authoritative and pb + authoritative <= ga:
-                # A type a HUMAN applied is an answer about where that
-                # object ends -- unlike one BN inferred from an initialiser
+                # A DECLARED size -- a type a human applied, the image's
+                # `st_size`, debug info -- is an answer about where that
+                # object ends, unlike one BN inferred from an initialiser
                 # (round-13 review F31). This object begins past it, so they
                 # are separate storage.
                 continue
@@ -8950,8 +9091,9 @@ class TaintEngine:
             # init_packet[128] = "seed"` comes back `char[0x5]` -- so a type
             # is a LOWER bound on the object and can never prove where it
             # ends (round-12 review F26, the same rule `_global_extent`
-            # applies). Separation is established by SECTION and by the
-            # interval test below, never by a width BN inferred.
+            # applies). Separation is established by SECTION, by a
+            # declaration and by the interval test below, never by a width
+            # BN inferred.
             uses: list = []
             self._pointer_access(
                 fn, self._global_base(ssaf, pb), fallback=None,
@@ -8981,12 +9123,22 @@ class TaintEngine:
                         continue
                     if hi is not None and hi <= tlo:
                         continue
-                    if not bounded:
-                        # Disclose WHY it could not be ruled out, rather than
-                        # presenting an unbounded read as a measured one.
-                        self._global_extent_unproven.add(ga)
-                    return _Use(use.at, use.kind, max(lo, tlo) - ga, use.seed,
-                                use.span, use.offset_known and bounded)
+                    if bounded:
+                        return _Use(use.at, use.kind, max(lo, tlo) - ga,
+                                    use.seed, use.span, use.offset_known)
+                    if unverified is None:
+                        unverified = (pb, _Use(use.at, "overlap_unverified",
+                                               max(lo, tlo) - ga, None,
+                                               use.span, False))
+                    break
+        if unverified is not None:
+            # Disclose WHY it could not be ruled out -- a neighbour's use
+            # this scan could not bound -- rather than presenting it as a
+            # measured read of this object.
+            self._mark_extent_unproven(ga, "neighbour_unbounded_use")
+            self._unverified_neighbours.setdefault(int(ga), set()).add(
+                int(unverified[0]))
+            return unverified[1]
         return None
 
     def _global_access(self, fn: Any, ga: int) -> Any:
@@ -9298,6 +9450,46 @@ class TaintEngine:
                 for s in unexamined[:8]],
         }
 
+    def _extent_unproven_phrase(self, ga: int, rows: list | None = None) -> str:
+        """The ``object_extent_unproven`` bound, naming the REASON the
+        extent is not established -- each one recorded where it arose.
+
+        One sentence used to serve them all ("an object with no recovered
+        type that is written PAST the next symbol"), with a retype of THIS
+        object as the remedy; when the doubt came from a neighbour's
+        unbounded use, the object was typed and written within it, and the
+        advised retype changed nothing (P1-05)."""
+        reasons = self._global_extent_unproven.get(int(ga)) or set()
+        clauses: list[str] = []
+        if "write_past_layout" in reasons:
+            clauses.append(
+                "an object with no declared size that this run wrote PAST the "
+                "next symbol in the layout -- so where it ends, and which "
+                "references belong to it, are not established "
+                + self._extent_remedy(ga, rows))
+        if "unbounded_write" in reasons:
+            clauses.append(
+                "a write of unstated length into an object with no declared "
+                "size, so how far past the next symbol it reached -- and which "
+                "references belong to it -- is not established "
+                + self._extent_remedy(ga, rows))
+        if "neighbour_unbounded_use" in reasons:
+            neighbours = sorted(self._unverified_neighbours.get(int(ga)) or ())
+            named = ", ".join(hex(n) for n in neighbours[:4]) or "a preceding object"
+            retype = (command_template(f"bn data retype {hex(neighbours[0])} char[SIZE]")
+                      if neighbours else "the data-retype mutation")
+            clauses.append(
+                f"a use of the preceding object {named} that this walk could "
+                "not bound -- that object declares no size and the use states "
+                "no length or no offset -- so whether it reaches these bytes "
+                "is not established and the reference is listed as "
+                "overlap_unverified, not as a read (establish that object's "
+                f"real size and bind it, {retype}, then re-run)")
+        if not clauses:
+            clauses.append("an extent this walk could not establish "
+                           + self._extent_remedy(ga, rows))
+        return "; and ".join(clauses)
+
     def _extent_remedy(self, ga: int, rows: list | None = None) -> str:
         """How to establish this object's extent -- without inventing it.
 
@@ -9329,6 +9521,48 @@ class TaintEngine:
                 f"the lower bound and not the real size; widen it to the "
                 f"object's true extent before relying on it, and re-run)")
 
+    def _global_reference_rows(self, ga: int, references: tuple
+                               ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """``(reference rows, unfinished scans)`` for ``(start, at, kind,
+        offset, seed, offset_known)`` uses of the tainted global at *ga*, at
+        most eight of each.
+
+        A row cites a REFERENCE: where the body uses the object. A scan that
+        ran out of a bound did not find one -- it stopped at whatever
+        instruction the budget ran out on, which on real binaries was a
+        stack load or a jump in a function BN records no reference to this
+        object from (P1-05). Such a scan is cited at the function's own code
+        reference when BN records one, and otherwise listed apart as an
+        unfinished scan of that function; the bound itself is in the leaf's
+        reachability causes either way."""
+        sites = self._global_ref_functions(ga)
+        rows: list[dict[str, Any]] = []
+        unfinished: list[dict[str, Any]] = []
+        for start, at, kind, offset, seed, offset_known in references:
+            rfn = function_at(self.bv, start)
+            nm = str(getattr(rfn, "name", None) or self._callee_name(start) or hex(start))
+            shown = (_display_name(rfn) or nm) if rfn is not None else nm
+            if kind in _SCAN_KIND_CAUSES:
+                site = sites.get(int(start))
+                if site is None:
+                    if len(unfinished) < 8:
+                        unfinished.append({"name": nm, "display_name": shown,
+                                           "address": hex(start), "at": hex(at),
+                                           "cause": _SCAN_KIND_CAUSES[kind]})
+                    continue
+                at = site
+            if len(rows) >= 8:
+                continue
+            rows.append({"name": nm, "display_name": shown,
+                         "address": hex(start), "at": hex(at), "access": kind,
+                         "offset": int(offset),
+                         # M1: whether that displacement was ESTABLISHED. A
+                         # pointer whose chain this scan could not follow has
+                         # an UNKNOWN displacement, which is not the base.
+                         "offset_known": bool(offset_known),
+                         "seed": str(seed or "") or None})
+        return rows, unfinished
+
     def _global_continuation_leaf(self, ins: Any, ga: int, callee_fn: Any,
                                   references: tuple, descended: bool,
                                   reach: dict[str, Any]) -> dict[str, Any]:
@@ -9340,19 +9574,7 @@ class TaintEngine:
         it touches this global, and the fact that its use of the bytes could
         not be read. ``access`` says which, and the prose never claims a read
         it did not see."""
-        rows = []
-        for start, at, kind, offset, seed, offset_known in references[:8]:
-            rfn = function_at(self.bv, start)
-            nm = str(getattr(rfn, "name", None) or self._callee_name(start) or hex(start))
-            rows.append({"name": nm,
-                         "display_name": (_display_name(rfn) or nm) if rfn is not None else nm,
-                         "address": hex(start), "at": hex(at), "access": kind,
-                         "offset": int(offset),
-                         # M1: whether that displacement was ESTABLISHED. A
-                         # pointer whose chain this scan could not follow has
-                         # an UNKNOWN displacement, which is not the base.
-                         "offset_known": bool(offset_known),
-                         "seed": str(seed or "") or None})
+        rows, unfinished = self._global_reference_rows(ga, references)
         crossed = ("this call is descended with its tainted argument(s) only"
                    if descended else
                    "no argument of this call carries taint, so it is not descended")
@@ -9390,9 +9612,17 @@ class TaintEngine:
                 f"tainted bytes were copied into the writable global {hex(ga)}, and code "
                 f"reachable from this call {verb} it ({where}).")
         else:
-            crossing = ("this call's target did not resolve"
-                        if reach.get("cause") == "unresolved_call_target"
-                        else "this call crosses into code whose use of it could not be read")
+            if callee_fn is None:
+                crossing = "this call's target did not resolve"
+            elif reach.get("cause") == "unresolved_call_target":
+                # THIS call resolved; an indirect call somewhere past it did
+                # not. Saying the call itself did not resolve sent the
+                # reader to the wrong instruction (P1-05).
+                crossing = ("code reachable from this call makes an indirect "
+                            "call bn could not resolve, so whether it reads it "
+                            "was never established")
+            else:
+                crossing = "this call crosses into code whose use of it could not be read"
             parts.append(
                 f"tainted bytes were copied into the writable global {hex(ga)}, and "
                 f"{crossing}.")
@@ -9421,11 +9651,7 @@ class TaintEngine:
                     "object may look, so storage this write may be inside "
                     "was never examined -- this bound is internal, "
                     "`--max-depth` does not move it"),
-                "object_extent_unproven": (
-                    "an object with no recovered type that is written PAST "
-                    "the next symbol in the layout -- so where it ends, and "
-                    "which references belong to it, are not established "
-                    + self._extent_remedy(ga, rows)),
+                "object_extent_unproven": self._extent_unproven_phrase(ga, rows),
                 "pointer_scan_budget": (
                     "the bound on how many expression nodes ONE function's "
                     "pointer scan may visit, so what the rest of that body "
@@ -9443,6 +9669,9 @@ class TaintEngine:
                 for b in (reach.get("unread_bodies") or []))
             if unread_named:
                 bound += f" -- {unread_named}"
+            if unfinished:
+                bound += " (scan unfinished in " + ", ".join(
+                    f"{u['display_name']} @ {u['address']}" for u in unfinished) + ")"
             opaque_named = ", ".join(reach.get("unresolved_calls") or [])
             if opaque_named:
                 bound += f" (unresolved call(s) at {opaque_named})"
@@ -9506,6 +9735,15 @@ class TaintEngine:
             # or merely could not be ruled out. Every surface renders the one
             # the evidence supports instead of claiming a read it did not see.
             "reads_proven": any(r["access"] in _PROVEN_GLOBAL_READS for r in rows),
+            # P1-05: how many of those rows are a NEIGHBOUR's use this walk
+            # could not bound -- candidates that were not ruled out, never
+            # reads of this object.
+            "unverified_overlaps": sum(
+                1 for r in rows if r["access"] == "overlap_unverified"),
+            # Bodies on the search path whose pointer scan ran out of a bound
+            # before it found any use of the object -- not references, and
+            # never cited as one; the bound is in `reachability.causes`.
+            "unfinished_scans": unfinished,
             "reachability": reach,
             "call_descended": bool(descended),
             "il_text": str(ins),

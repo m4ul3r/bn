@@ -1467,6 +1467,7 @@ int main(int argc, char **argv) {
     assert sum(_run_or_check_template(shared_bn, _forward_prose(result))) >= 1
 
 
+
 def test_global_continuation_follows_a_thunk_to_its_consumer(tmp_path, shared_bn):
     """Round-3 review F1: a veneer is not a body, but it is not a dead end.
 
@@ -2648,14 +2649,15 @@ def test_global_continuation_object_extent_aliases_and_internal_bounds(tmp_path,
         return result, [lf for lf in result["leaves"]
                         if lf["kind"] == "global_memory_continuation"]
 
-    # OBJ-01: the copy spans the alias symbol, so the object's end is not
-    # established -- the reader past it is named AND the doubt is disclosed.
+    # OBJ-01: the copy spans the alias symbol and the reader past it is named.
+    # The image DECLARES `alias_global` 128 bytes (and `alias_middle` as 64 of
+    # them), so where the object ends is established, not unproven (P1-05);
+    # the undeclared shape is covered by the mocked suite.
     result, leaves = gmc("alias_cross_case")
     [leaf] = leaves
     assert [r["display_name"] for r in leaf["references"]] == ["read_alias_middle"], leaf
     assert leaf["references"][0]["offset"] == 80, leaf
-    assert leaf["reachability"]["cause"] == "object_extent_unproven", leaf
-    assert "global_object_extent" in result["stats"]["truncation_cause"], result
+    assert "object_extent_unproven" not in leaf["reachability"]["causes"], leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
     # ...and a copy that stays inside the layout keeps the neighbour disjoint
@@ -3606,9 +3608,11 @@ def test_global_continuation_object_evidence_budgets_and_advice(tmp_path,
                if r["display_name"] == "formal_consumer")
     assert row["offset_known"] is False, leaves
 
-    # F31: an INFERRED width does not separate them, a USER type does
+    # F31: an INFERRED width does not separate them; a DECLARED one does --
+    # the image's own `st_size` (P1-05), and a type a user applies.
     result, leaves = gmc("adjacent_case")
-    assert leaves and result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
     for name in ("adjacent_a", "adjacent_b"):
         applied = _bn_json(shared_bn, "-t", target, "data", "retype", name,
                            "char[64]")
@@ -3893,8 +3897,11 @@ def test_global_continuation_survives_any_interior_alias_count(tmp_path,
         assert (result.get("diagnostics") or {}).get(
             "safe_to_report_all_clear") is not True, fn
     if count > 64:
+        # The image DECLARES `chain`'s size, so running out of aliases bounds
+        # nothing: the declaration says where the object ends (P1-05). The
+        # undeclared shape keeps its `object_search_budget` in the mocked suite.
         _result, leaves = gmc("unknown_case")
-        assert leaves[0]["reachability"]["cause"] == "object_search_budget", leaves
+        assert "object_search_budget" not in leaves[0]["reachability"]["causes"], leaves
     for fn in ("short_case", "no_reader_case"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)

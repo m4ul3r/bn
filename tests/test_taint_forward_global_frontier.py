@@ -2673,8 +2673,8 @@ def test_pointer_return_depth_exhaustion_is_its_own_blocking_bound(models,
     func, bv = _chain_program([inner, relay], consumer, inner)
     result = _forward(bv, func, models)
     [leaf] = _leaves(result)
-    assert any(r["access"] == "pointer_depth_exhausted"
-               for r in leaf["references"]), leaf
+    assert any(u["cause"] == "pointer_return_depth"
+               for u in leaf["unfinished_scans"]), leaf
     assert leaf["reachability"]["cause"] == "pointer_return_depth", leaf
     assert "pointer_return_depth" in result["stats"]["truncation_cause"]
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
@@ -4041,6 +4041,9 @@ def test_scalar_only_recursion_is_not_a_pointer_question(models, monkeypatch):
     monkeypatch.setattr(te.TaintEngine, "_PTR_RESOLVE_DEPTH", 2)
     func, bv = _scalar_recursion_program(return_width=4)
     result = _forward(bv, func, models)
+    assert not any(u["cause"] == "pointer_return_depth"
+                   for lf in _leaves(result) for u in lf["unfinished_scans"]), \
+        result["leaves"]
     assert not any(r["access"] == "pointer_depth_exhausted"
                    for lf in _leaves(result) for r in lf["references"]), result["leaves"]
     assert "pointer_return_depth" not in result["stats"]["truncation_cause"]
@@ -4057,8 +4060,11 @@ def test_a_pointer_returning_recursion_still_discloses_its_depth(models,
     consumer.callees = [relay]
     func, bv = _chain_program([inner, relay], consumer, inner)
     result = _forward(bv, func, models)
-    assert any(r["access"] == "pointer_depth_exhausted"
-               for lf in _leaves(result) for r in lf["references"]), result["leaves"]
+    # The consumer names no address -- the pointer reaches it through the
+    # returning chain -- so the unfinished scan is listed as such, never
+    # cited as a reference at an instruction BN records none at (P1-05).
+    assert any(u["cause"] == "pointer_return_depth" and u["display_name"] == "use_ret"
+               for lf in _leaves(result) for u in lf["unfinished_scans"]), result["leaves"]
 
 
 # --------------------------------------------------------------------------
