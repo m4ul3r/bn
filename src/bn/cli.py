@@ -686,6 +686,7 @@ def command(
     see_also: tuple[str, ...] = (),
     fanout: bool = False,
     estimable: bool = False,
+    analysis_bounds: tuple[str, ...] = (),
 ) -> Callable:
     """Register a CLI command declaratively.
 
@@ -709,6 +710,12 @@ def command(
     ``_emit_result`` (capabilities/doctor/session/plugin/skill/pins) all leave it
     off, so the flag can neither replace an outcome with a byte count nor be
     accepted-and-ignored.
+
+    ``analysis_bounds`` names the flags this command accepts that share a
+    spelling with the slicing vocabulary but bound the ANALYSIS, not the
+    output: taint's ``--max-depth`` changes which calls are descended, and a
+    tighter cap can grow the result rather than shrink it. They are never
+    offered as the way to bound a read, and the hint says so by name.
     """
 
     def decorator(fn: Callable[[argparse.Namespace], int]) -> Callable[[argparse.Namespace], int]:
@@ -738,6 +745,7 @@ def command(
             # silently ignore it (or, worse, on a command whose side effect the
             # estimate then replaces with a byte count).
             "estimable": estimable,
+            "analysis_bounds": tuple(analysis_bounds),
         })
         return fn
 
@@ -851,7 +859,8 @@ def _build_from_commands(root: BnArgumentParser) -> None:
         # parser is built: the hint derivation then needs no parser walk (one
         # build per invocation instead of two) and cannot resolve the wrong
         # subparser. Option strings plus their dest, so a caller's own flag can be
-        # told from an alias pair (`--count`/`--limit` share a dest).
+        # told from an alias pair (`--count`/`--limit` share a dest). A flag the
+        # command declares an ANALYSIS bound is not a slice, whatever its name.
         cmd.set_defaults(
             handler=spec["handler"],
             _command_path=path,
@@ -860,7 +869,9 @@ def _build_from_commands(root: BnArgumentParser) -> None:
                 for action in cmd._actions
                 for option in action.option_strings
                 if option in _SLICE_VOCABULARY_SET
+                and option not in spec["analysis_bounds"]
             ),
+            _analysis_bounds=spec["analysis_bounds"],
         )
 
 
@@ -1321,7 +1332,7 @@ _JSON_ONLY_SLICE_FLAGS: dict[tuple[str, ...], frozenset[str]] = {
 
 def _derive_slice_hint(
     accepted: Iterable[str], text_format: bool, used: Iterable[str] = (),
-    path: tuple[str, ...] = (),
+    path: tuple[str, ...] = (), analysis_bounds: Iterable[str] = (),
 ) -> str | None:
     """The bounding remedy for the flags one command ACCEPTS. Pure; no parser.
 
@@ -1336,9 +1347,13 @@ def _derive_slice_hint(
       told to write a file while their own bound shrank the read by up to 195x.
 
     Returns ``None`` when the command has no bound at all; the caller then prints
-    a flag-free hint rather than inventing one.
+    a flag-free hint rather than inventing one. ``analysis_bounds`` (declared on
+    the command) are dropped from ``accepted`` and, when nothing else slices the
+    read, named as NOT slicing it: a reader looking for a lever reaches for the
+    one in sight, and taint's ``--max-depth`` reshapes the analysis instead.
     """
-    accepted = set(accepted)
+    analysis_bounds = list(analysis_bounds)
+    accepted = set(accepted) - set(analysis_bounds)
     # #889c finding 3: drop the flags this command refuses in text mode, so
     # the hint cannot advise the thing that exits 2.
     if text_format:
@@ -1397,6 +1412,10 @@ def _derive_slice_hint(
         return hint
 
     if "--out" in accepted:
+        if analysis_bounds:
+            return (f"no flag slices this output ({', '.join(analysis_bounds)} bounds "
+                    "the analysis, not the output); rerun with --out <path> to write "
+                    "it to a file")
         return "rerun with --out <path> to write it to a file"
     return None
 
@@ -1414,7 +1433,8 @@ def _slice_hint_for_args(args: argparse.Namespace, fmt: str) -> str | None:
         if getattr(args, dest, None) not in (None, False)
     }
     return _derive_slice_hint(accepted, fmt == "text", used,
-                              tuple(getattr(args, "_command_path", ()) or ()))
+                              tuple(getattr(args, "_command_path", ()) or ()),
+                              getattr(args, "_analysis_bounds", ()))
 
 
 @lru_cache(maxsize=None)
@@ -1426,7 +1446,8 @@ def _slice_hint_for_command(path: tuple[str, ...], text_format: bool) -> str | N
     the_command_it_names` runs the whole registry through it.
     """
     sub = _selected_parser_for_argv(build_parser(), list(path))
-    return _derive_slice_hint(_known_option_strings(sub), text_format, (), path)
+    bounds = next((spec["analysis_bounds"] for spec in _COMMANDS if spec["path"] == path), ())
+    return _derive_slice_hint(_known_option_strings(sub), text_format, (), path, bounds)
 
 
 def _spill_next_step_hint(

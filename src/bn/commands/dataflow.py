@@ -244,7 +244,8 @@ _SINK_LOCATOR_HELP = (
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
              mangled_arg(),
          ],
-         estimable=True)
+         estimable=True,
+         analysis_bounds=("--max-depth",))
 def _taint_forward(args: argparse.Namespace) -> int:
     # --source is argparse-required, so an empty list cannot reach here.
     params: dict[str, Any] = {
@@ -284,8 +285,10 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help=f"Sink to slice from (repeatable, at least one required). {_SINK_LOCATOR_HELP}"),
              arg("--max-depth", dest="max_depth", type=_depth_int, default=8,
                  help="Max interprocedural depth to follow slices up into callers (default: 8; "
-                      "0 = intraprocedural only). The in-function def-chain walk caps at 64 "
-                      "steps; truncation is recorded under assumptions."),
+                      "0 = intraprocedural only). A caller ascent cut here is reported as a "
+                      "caller_sites_truncated leaf (reason max_depth); "
+                      "the in-function def-chain walk caps at 64 steps, and a cut there ends "
+                      "the value at an `unresolved` slice origin with cause def_chain_budget."),
              arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
                  help="JSON file mapping indirect call addresses to target lists; a "
                       "target is an address or a function name (resolved as -f is): "
@@ -295,7 +298,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
              mangled_arg(),
          ],
-         estimable=True)
+         estimable=True,
+         analysis_bounds=("--max-depth",))
 def _taint_backward(args: argparse.Namespace) -> int:
     # --sink is argparse-required, so an empty list cannot reach here.
     params: dict[str, Any] = {
