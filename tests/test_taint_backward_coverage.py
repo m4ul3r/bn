@@ -576,6 +576,10 @@ def test_caller_depth_cut_is_structured_incompleteness_beside_a_resolved_sibling
     assert leaf["reasons"] == {"max_depth": len(leaf["unfollowed"])}
     assert leaf["callers_fully_followed"] == 0
     assert "--max-depth" in result["diagnostics"]["next_action"]
+    # A depth-bound cut is run truncation, like the caller cap (W02-08).
+    assert result["stats"]["truncated"] is True
+    assert result["stats"]["truncation_cause"] == ["max_depth"]
+    assert any("--max-depth" in a and cut_in in a for a in result["assumptions"]), result["assumptions"]
     if depth == 1:
         # the literal sibling was resolved; the cut is still disclosed
         assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in _origins(result))
@@ -592,7 +596,8 @@ def test_larger_caller_depth_reaches_the_root_and_removes_the_boundary():
 
 
 # --------------------------------------------------------------------------
-# P1-06: every call site is followed or named
+# P1-06 / P2-14: every call site is followed or named; the cap is
+# address-ordered and names what it dropped
 # --------------------------------------------------------------------------
 
 def _followed_sites(result, callee):
@@ -641,6 +646,39 @@ def test_every_call_site_of_a_wrapper_is_followed_or_named():
                    if any(o.get("callee") == "getpid" and o.get("function") == "0x1000"
                           for o in sl["origins"])]
     assert len(getpid_rows) == 2
+
+
+def _capped_wrapper(n_callers, order):
+    sink = _length_sink("put_len", 0x800, 20)
+    sites = [FSite(_caller(f"caller_{i:02d}", 0x10000 + 0x100 * i, 0x10010 + 0x100 * i,
+                           sink.start, _const(i + 1)), 0x10010 + 0x100 * i)
+             for i in range(n_callers)]
+    # Two enumerations of the same callers: BN's order differs between a raw
+    # ELF and its saved database.
+    sink.caller_sites = (sites if order == "ascending" else
+                         sites[1::2] + list(reversed(sites[0::2])))
+    return sink, sites
+
+
+@pytest.mark.parametrize("n_callers", [20, 40])
+def test_caller_cap_follows_address_order_and_names_every_dropped_site(n_callers):
+    results = {}
+    for order in ("ascending", "shuffled"):
+        sink, sites = _capped_wrapper(n_callers, order)
+        results[order] = _backward(sink, {**_NAMES, sink.start: sink.name})
+    by_address = [hex(s.address) for s in sites]
+    for result in results.values():
+        assert _followed_sites(result, "put_len") == set(by_address[:16])
+        (leaf,) = _caller_leaves(result)
+        assert leaf["reasons"] == {"caller_cap": n_callers - 16}
+        assert leaf["unfollowed_total"] == n_callers - 16
+        rows = leaf["unfollowed"]
+        assert [r["address"] for r in rows] == by_address[16:32]
+        assert [r["caller"] for r in rows] == [f"caller_{i:02d}" for i in range(16, min(n_callers, 32))]
+        assert result["stats"]["truncated"] is True
+        assert result["stats"]["truncation_cause"] == ["caller_cap"]
+    assert results["ascending"]["slices"] == results["shuffled"]["slices"]
+    assert _caller_leaves(results["ascending"]) == _caller_leaves(results["shuffled"])
 
 
 # --------------------------------------------------------------------------

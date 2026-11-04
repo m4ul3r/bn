@@ -809,6 +809,45 @@ def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, share
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
+def test_every_caller_site_is_followed_or_named_and_the_cap_is_address_ordered(tmp_path, shared_bn):
+    """P1-06 / P2-14: `quote_arg` has ten call sites, two of which reach one
+    `pick_name()` origin in `edit_entry` (directly and through `open_alt`);
+    rows keyed on the origin kept one site per origin and named neither of
+    the others. `put_word` has twenty: the cap follows the sixteen lowest
+    addresses and names the other four, in address order."""
+    binary = tmp_path / "bw_caller_sites"
+    _compile(CORPUS / "bw_caller_sites.c", binary, ["-fno-inline"])
+    target = shared_bn.load(binary, copy=False)
+
+    def call_sites(callee):
+        rows = _bn_json(shared_bn, "-t", target, "callsites", callee)["items"]
+        return {r["call_addr"]: r["containing_function"]["name"] for r in rows}
+
+    def ascent(fn, sink, param):
+        result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn, "--sink", sink)
+        followed = {st["address"] for sl in result["slices"] for st in sl["slice"]
+                    if st.get("reason") == f"passed as arg {param} to {fn}"}
+        leaves = [lf for lf in result["leaves"]
+                  if lf["kind"] == "caller_sites_truncated" and lf["function"]["name"] == fn]
+        return result, followed, leaves
+
+    quote_sites = call_sites("quote_arg")
+    assert len(quote_sites) == 10, quote_sites
+    _, followed, leaves = ascent("quote_arg", "arg:strcpy:1", 0)
+    named = {row["address"] for lf in leaves for row in lf["unfollowed"]}
+    assert followed | named == set(quote_sites), sorted(set(quote_sites) - followed - named)
+    assert {quote_sites[a] for a in followed} >= {"edit_entry", "open_alt"}, followed
+
+    word_sites = sorted(call_sites("put_word"), key=lambda a: int(a, 16))
+    assert len(word_sites) == 20, word_sites
+    result, followed, leaves = ascent("put_word", "arg:memcpy:2", 1)
+    assert followed == set(word_sites[:16]), sorted(followed)
+    [leaf] = leaves
+    assert [row["address"] for row in leaf["unfollowed"]] == word_sites[16:]
+    assert (leaf["unfollowed_total"], leaf["reasons"]) == (4, {"caller_cap": 4})
+    assert result["stats"]["truncation_cause"] == ["caller_cap"]
+
+
 def test_modeled_write_with_an_unrecovered_pointer_is_a_possible_writer(tmp_path, shared_bn):
     """#1053 rounds 2-3: no call is proof that it did not write a field --
     with full recovery recv is a possible writer named in the slice, and when

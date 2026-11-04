@@ -516,7 +516,12 @@ def test_capped_reference_union_uses_all_sites_not_bounded_examples(indirect_cou
     [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "caller_sites_truncated"]
     assert _coverage(leaf) == (20 + indirect_count, 16, 0, 4 + indirect_count, 4 + indirect_count)
     assert leaf["reasons"] == {"caller_cap": 8, "indirect_reference": indirect_count * 2}
-    assert len(leaf["unfollowed"]) == min(16, indirect_count * 2)
+    # Every dropped (site, formal) is a row -- past-cap sites included --
+    # listed in address order up to the bound and counted exactly.
+    assert leaf["unfollowed_total"] == 8 + indirect_count * 2
+    assert len(leaf["unfollowed"]) == min(16, 8 + indirect_count * 2)
+    keys = [(int(row["address"], 16), row["param"]) for row in leaf["unfollowed"]]
+    assert keys == sorted(keys)
     assert result["diagnostics"]["frontier"]["dropped_callers"] == 4 + indirect_count
     assert result["stats"]["truncation_cause"] == ["caller_cap"]
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
@@ -558,7 +563,9 @@ def test_nested_formal_frontier_survives_outer_ascent_without_local_misses():
                                   "param": 2, "reason": "max_depth"}]
     assert result["diagnostics"]["frontier"]["dropped_callers"] == 1
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
-    assert result["stats"]["truncated"] is False
+    # A depth-bound cut is run truncation, as a caller-cap cut is (W02-08).
+    assert result["stats"]["truncated"] is True
+    assert result["stats"]["truncation_cause"] == ["max_depth"]
     # With room to follow the remapped formal, the literal is the root.
     complete = engine.backward(target, [te.parse_locator("arg:memcpy:2")], max_depth=2)
     assert complete["leaves"] == []

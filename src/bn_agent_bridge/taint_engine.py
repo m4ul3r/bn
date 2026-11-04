@@ -14370,7 +14370,14 @@ class TaintEngine:
         ``cycled`` formals, every resolved caller of which was a back edge to
         a demand already being solved upstream: they have no origin of their
         own, and the caller keeps the producers its walk reached instead."""
-        caller_sites = list(getattr(func, "caller_sites", None) or [])
+        # Address order, never BN's enumeration order: which sites the cap
+        # lets through -- and which it drops -- is a property of the binary,
+        # not of how the view was loaded (a raw ELF and its saved `.bndb`
+        # enumerate the same callers differently).
+        caller_sites = sorted(
+            getattr(func, "caller_sites", None) or [],
+            key=lambda s: (int(getattr(s, "address", 0)),
+                           int(getattr(getattr(s, "function", None), "start", -1) or -1)))
         start = int(getattr(func, "start", 0))
         # address -> referencing function (None: a data reference)
         indirect: dict[int, Any] = {}
@@ -14391,23 +14398,25 @@ class TaintEngine:
         except Exception:
             pass
         ascend = depth < max_depth
-        # The cap offers only the first MAX_CALLERS sites, and an offered site
-        # may still be unfollowable; the disclosure reports the measurement,
-        # never the constant (#810).
+        # The cap offers only the first MAX_CALLERS sites in address order, and
+        # an offered site may still be unfollowable; the disclosure reports the
+        # measurement, never the constant (#810).
         considered = caller_sites[:MAX_CALLERS] if ascend else []
         results: list[dict[str, Any]] = []
         rows: list[dict[str, Any]] = []
         misses: set[tuple[int, int, str]] = set()
 
-        def _drop(address: int, caller: Any, pidx: int, reason: str, *, listed: bool = True) -> None:
+        def _drop(address: int, caller: Any, pidx: int, reason: str) -> None:
+            # Every (site, formal, reason) is a row, a site past the cap
+            # included: the leaf lists them in address order up to its
+            # bound and counts all of them.
             key = (int(address), pidx, reason)
             if key in misses:
                 return
             misses.add(key)
-            if listed and len(rows) < MAX_CALLERS:
-                rows.append({"address": hex(int(address)),
-                             "caller": None if caller is None else self._prose_function(caller),
-                             "param": pidx, "reason": reason})
+            rows.append({"address": hex(int(address)),
+                         "caller": None if caller is None else self._prose_function(caller),
+                         "param": pidx, "reason": reason})
 
         cycled: set[int] = set()
         fkey = self._caller_key(func)
@@ -14518,9 +14527,8 @@ class TaintEngine:
 
         for site in caller_sites[len(considered):]:
             for pidx in demands:
-                # Past the cap the sites are counted, not listed (#810).
                 _drop(int(getattr(site, "address", 0)), getattr(site, "function", None), pidx,
-                      "max_depth" if not ascend else "caller_cap", listed=not ascend)
+                      "max_depth" if not ascend else "caller_cap")
         for a, rf in sorted(indirect.items()):
             for pidx in demands:
                 _drop(a, rf, pidx, "indirect_reference")
@@ -14548,8 +14556,15 @@ class TaintEngine:
         (reference, formal) demand counts say how many demands that was.
         Reasons and examples are separate evidence about (reference, formal,
         reason) boundaries, so their tallies may exceed the number of dropped
-        references. Keep full identity internally even when the public
-        examples are capped at MAX_CALLERS.
+        references. Every row is kept; the public ``unfollowed`` list is the
+        first MAX_CALLERS in address order, and ``unfollowed_total`` counts
+        them all.
+
+        A cut the configuration made -- the ``caller_cap`` and the
+        ``max_depth`` bound -- is run truncation: it sets ``stats.truncated``
+        and names its cause in ``truncation_cause`` with an assumption, as
+        forward does for its own bounds. The other reasons are what the
+        binary could not show, disclosed by this leaf alone.
         """
         start = int(func.start)
         state = self._bw_caller_frontiers.get(start)
@@ -14557,7 +14572,7 @@ class TaintEngine:
             state = {
                 "direct": set(), "known": set(), "dropped": set(), "misses": set(),
                 "demanded": {}, "missed": {},
-                "reasons": {}, "examples": {}, "leaf": None, "cap_assumption": None,
+                "reasons": {}, "examples": {}, "leaf": None, "bound_assumptions": {},
             }
             self._bw_caller_frontiers[start] = state
         # Merge after descent into the current accumulator: a recursive ascent
@@ -14575,9 +14590,8 @@ class TaintEngine:
                 state["misses"].add(key)
                 state["reasons"][reason] = state["reasons"].get(reason, 0) + 1
         for row in rows:
-            key = (row["address"], row["param"], row["reason"])
-            if key not in state["examples"] and len(state["examples"]) < MAX_CALLERS:
-                state["examples"][key] = row
+            key = (int(row["address"], 16), row["param"], row["reason"])
+            state["examples"].setdefault(key, row)
         if not state["dropped"]:
             return
 
@@ -14596,19 +14610,27 @@ class TaintEngine:
         reasons = dict(sorted(state["reasons"].items()))
         name = self._prose_function(func)
         capped = "caller_cap" in reasons
-        if capped:
-            self._bw_truncated = True
-            self._bw_truncation_causes.add("caller_cap")
-            assumption = (
+        bounds = {
+            "caller_cap": (
                 f"{name} has {len(state['direct'])} callers; caller ascent fully followed "
                 f"{len(state['direct'] - state['dropped'])}, capped at {MAX_CALLERS} "
-                f"(function {start:#x})")
-            old = state["cap_assumption"]
+                f"(function {start:#x})"),
+            "max_depth": (
+                f"caller ascent of {name} stopped at the --max-depth bound: "
+                f"{len({a for a, _, r in state['misses'] if r == 'max_depth'})} caller "
+                f"reference(s) not followed (function {start:#x})"),
+        }
+        for cause, assumption in bounds.items():
+            if cause not in reasons:
+                continue
+            self._bw_truncated = True
+            self._bw_truncation_causes.add(cause)
+            old = state["bound_assumptions"].get(cause)
             if old != assumption:
                 if old is not None:
                     self._bw_assumptions.remove(old)
                 self._bw_assume(assumption)
-                state["cap_assumption"] = assumption
+                state["bound_assumptions"][cause] = assumption
         note = (
             ("caller-site cap: " if capped else "")
             + f"of {total} distinct caller reference(s), the ascent fully followed {fully} "
@@ -14635,7 +14657,8 @@ class TaintEngine:
             "demands_total": demands_total,
             "demands_unfollowed": demands_unfollowed,
             "reasons": reasons,
-            "unfollowed": list(state["examples"].values()),
+            "unfollowed": [state["examples"][k] for k in sorted(state["examples"])[:MAX_CALLERS]],
+            "unfollowed_total": len(state["examples"]),
             # Which formals each partially followed reference did and did not
             # supply; bounded like `unfollowed`, counted exactly above.
             "partially_followed": [
