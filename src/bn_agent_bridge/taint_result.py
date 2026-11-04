@@ -489,10 +489,18 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                 "nonvariadic declaration")
     crossed = [lf for lf in leaves if lf.get("kind") == "global_memory_continuation"]
     if by_kind.get("analysis_truncated", 0):
-        return ("the walk unwound on Python's recursion limit (an unresolved cycle): "
-                "what it had already found is reported and the rest was never walked "
-                "-- re-run with a lower `--max-depth` for a bounded, complete answer "
-                "over the region it can finish")
+        # The remedy follows WHERE the walk was cut: a bound below that depth
+        # avoids it, while a cut in the seeded function itself recurs at
+        # --max-depth 0 and needs a different seed (P1-02).
+        cut = next((lf for lf in leaves if lf.get("kind") == "analysis_truncated"), {})
+        depth = cut.get("depth")
+        remedy = (f"re-run with `--max-depth {depth - 1}` to finish the region above "
+                  f"the cut (depth {depth})"
+                  if isinstance(depth, int) and depth > 0 else
+                  "no `--max-depth` avoids it -- the cut is in the seeded function "
+                  "itself; seed past it from a callee (`-f <callee> --source param:<n>`)")
+        return ("the walk unwound on Python's recursion limit: what it had already "
+                f"found is reported and the rest was never walked -- {remedy}")
     if crossed:
         # IC03: the most actionable zero-sink frontier there is -- the bytes
         # have a known address, so the advice points at them rather than at

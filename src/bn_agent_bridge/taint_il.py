@@ -178,8 +178,9 @@ def _entry_value_survives(call_ins: Any, bn: Any) -> bool:
     return _entry_value_state(call_ins, bn) == "entry"
 
 
-def argument_register_provenance(func: Any, addr: int, reg: str,
-                                 bn: Any) -> tuple[str, list[tuple[Any, Any]]]:
+def argument_register_provenance(func: Any, addr: int, reg: str, bn: Any, *,
+                                 calls_at: dict[int, Any] | None = None,
+                                 ) -> tuple[str, list[tuple[Any, Any]]]:
     """What the ABI argument register *reg* carries into the call at *addr*.
 
     ``("defined", seeds)`` -- a dominating LLIL-SSA definition reaches the
@@ -193,45 +194,64 @@ def argument_register_provenance(func: Any, addr: int, reg: str,
     established (review F10). ``("unproven", [])`` -- there is no LLIL to read,
     the call is not in it, or a call may have clobbered the register: nothing
     is claimed.
+
+    ``calls_at`` is :func:`llil_call_sites` for *func*, when the caller keeps
+    one: finding the call is then a lookup instead of a scan of the whole
+    function's LLIL, which a walk asking about many calls in one body paid
+    once per question.
     """
+    if calls_at is None:
+        calls_at = llil_call_sites(func, bn)
+    if calls_at is None:
+        return ("unproven", [])
+    # A TAIL call is a call: an optimised `return f(p)` leaves the
+    # arguments exactly where they already are, which is precisely
+    # the shape this answers for. Matching only `LLIL_CALL_SSA`
+    # left every tail call unrecovered (review F4).
+    ins = calls_at.get(int(addr))
+    if ins is None:
+        return ("unproven", [])
+    try:
+        definition = reaching_reg_def(ins, reg, bn)
+        if definition is None:
+            state = _entry_value_state(ins, bn)
+            return (state if state in ("entry", "budget") else "unproven", [])
+        if getattr(definition, "operation", None) in _call_like_ops(bn):
+            # The reaching "definition" is another CALL that lists this
+            # register among its outputs -- i.e. it CLOBBERED it. Its
+            # MLIL mapping writes the call's RESULT variable, which is
+            # the return register's value and says nothing about an
+            # ARGUMENT register. Bridging to it would hand the walk the
+            # wrong value entirely; a clobbered register is unproven.
+            return ("unproven", [])
+        seeds: list[tuple[Any, Any]] = []
+        mapped = getattr(definition, "mlil", None)
+        mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
+        if mssa is not None:
+            for w in (getattr(mssa, "vars_written", None) or []):
+                if is_ssa_var(w):
+                    seeds.append((w, mssa))
+        return ("defined", seeds)
+    except Exception:
+        return ("unproven", [])
+
+
+def llil_call_sites(func: Any, bn: Any) -> dict[int, Any] | None:
+    """``{address: the first call-like LLIL-SSA instruction there}`` for
+    *func*, from one scan; None when it has no readable LLIL-SSA."""
     lssa = getattr(getattr(func, "llil", None), "ssa_form", None)
     if lssa is None:
-        return ("unproven", [])
+        return None
+    out: dict[int, Any] = {}
     try:
         site_ops = _call_like_ops(bn)
         for block in lssa:
             for ins in block:
-                if int(getattr(ins, "address", -1)) != int(addr):
-                    continue
-                # A TAIL call is a call: an optimised `return f(p)` leaves the
-                # arguments exactly where they already are, which is precisely
-                # the shape this answers for. Matching only `LLIL_CALL_SSA`
-                # left every tail call unrecovered (review F4).
-                if getattr(ins, "operation", None) not in site_ops:
-                    continue
-                definition = reaching_reg_def(ins, reg, bn)
-                if definition is None:
-                    state = _entry_value_state(ins, bn)
-                    return (state if state in ("entry", "budget") else "unproven", [])
-                if getattr(definition, "operation", None) in _call_like_ops(bn):
-                    # The reaching "definition" is another CALL that lists this
-                    # register among its outputs -- i.e. it CLOBBERED it. Its
-                    # MLIL mapping writes the call's RESULT variable, which is
-                    # the return register's value and says nothing about an
-                    # ARGUMENT register. Bridging to it would hand the walk the
-                    # wrong value entirely; a clobbered register is unproven.
-                    return ("unproven", [])
-                seeds: list[tuple[Any, Any]] = []
-                mapped = getattr(definition, "mlil", None)
-                mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
-                if mssa is not None:
-                    for w in (getattr(mssa, "vars_written", None) or []):
-                        if is_ssa_var(w):
-                            seeds.append((w, mssa))
-                return ("defined", seeds)
+                if getattr(ins, "operation", None) in site_ops:
+                    out.setdefault(int(getattr(ins, "address", -1)), ins)
     except Exception:
-        return ("unproven", [])
-    return ("unproven", [])
+        return None
+    return out
 
 
 def reaching_arg_seed_vars(func: Any, addr: int, reg: str,
