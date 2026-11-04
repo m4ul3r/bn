@@ -1,13 +1,22 @@
 """IC02: every selected sink site and origin has its own truthful accounting."""
 from __future__ import annotations
 
+import json
+
 import pytest
 from bn.formatters import _render_taint_text
 from bn_agent_bridge.taint_result import backward_diagnostics
 from test_taint_backward_coverage import (
-    _NAMES, _MEMCPY, _RECV, _backward, _call, _const, _length_sink, _var,
+    _GETPID, _MALLOC, _NAMES, _MEMCPY, _RECV, _backward, _call, _caller, _const, _length_sink, _var,
 )
 from test_taint_engine import FBV, FExpr, FFunc, FSite, FSSA, FSSAFunc, FVar, te
+
+
+def _followed_sites(result, callee_name):
+    """The call sites of *callee_name* each slice path ascended through."""
+    return [step["address"] for sl in result["slices"] for step in sl["slice"]
+            if step.get("reason", "").startswith("passed as arg")
+            and step["reason"].endswith(f" to {callee_name}")]
 
 
 def _sites(operands):
@@ -108,10 +117,12 @@ def test_origin_identity_survives_public_slice_dedup(origin_kind, same_function)
                          if ins.dest.constant == sink.start]
     result = _backward(sink, {**_NAMES, sink.start: sink.name})
     rows = result["slices"]
-    assert len(rows) == len(callers)
+    # One row per followed call site: a site is part of its path, so two
+    # sites reaching one origin are two rows, never one that hides a site.
+    assert len(rows) == len(sink.caller_sites)
+    assert sorted(_followed_sites(result, sink.name)) == sorted(hex(s.address) for s in sink.caller_sites)
     assert {r["origin"]["kind"] for r in rows} == {origin_kind}
     assert {r["origin"]["function"] for r in rows} == {hex(c.start) for c in callers}
-    assert [r.get("reached_via_call_sites", 1) for r in rows] == ([2] if same_function else [1, 1])
     assert result["diagnostics"]["safe_to_report_complete_slice"] is True
     text = _render_taint_text(result)
     assert all(hex(c.start) in text for c in callers)
@@ -192,15 +203,15 @@ def test_same_function_field_origins_keep_distinct_global_slots(same_object):
                          if ins.operation.name == "MLIL_CALL_SSA"]
     result = _backward(sink, {**_NAMES, sink.start: sink.name})
     rows = result["slices"]
-    assert len(rows) == (1 if same_object else 2)
+    assert len(rows) == 2
     assert {r["origin"]["base"] for r in rows} == ({"0x4000"} if same_object else {"0x4000", "0x5000"})
     assert all(r["origin"]["function"] == "0xa00" for r in rows)
-    assert [r.get("reached_via_call_sites", 1) for r in rows] == ([2] if same_object else [1, 1])
+    assert sorted(_followed_sites(result, sink.name)) == ["0xa04", "0xa14"]
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
 
 
 @pytest.mark.parametrize("same_function", [False, True])
-def test_literal_origins_keep_function_identity_and_same_origin_collapse(same_function):
+def test_literal_origins_keep_function_identity_one_row_per_site(same_function):
     sink = _length_sink("copy_len", 0x800, 10)
     callers = []
     for i in range(1 if same_function else 2):
@@ -211,11 +222,70 @@ def test_literal_origins_keep_function_identity_and_same_origin_collapse(same_fu
         callers.append(FFunc("caller", start, FSSAFunc(calls)))
     sink.caller_sites = [FSite(c, ins.address) for c in callers for ins in c.mlil.ssa_form.instructions]
     result = _backward(sink, {**_NAMES, sink.start: sink.name})
-    assert len(result["slices"]) == len(callers)
+    assert len(result["slices"]) == len(sink.caller_sites)
     assert {s["origin"]["function"] for s in result["slices"]} == {hex(c.start) for c in callers}
     assert all(s["origin"]["value"] == 64 for s in result["slices"])
-    assert [s.get("reached_via_call_sites", 1) for s in result["slices"]] == ([2] if same_function else [1, 1])
+    assert sorted(_followed_sites(result, sink.name)) == sorted(hex(s.address) for s in sink.caller_sites)
     assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
+def test_one_path_reaching_several_origins_is_one_slice_with_origins():
+    # P2-05: `n = getpid() + rand(); memcpy(.., n)` -- both returns are roots of
+    # one def-chain walk, and each was emitted as its own slice carrying the
+    # byte-identical step list. One path is one row; its origins ride on it.
+    from test_taint_engine import FInstr
+
+    a1, b1, n1 = (FSSA(FVar(v, ident=150 + i), 1) for i, v in enumerate("abn"))
+    fn = FFunc("mix_lengths", 0x800, FSSAFunc([
+        _call(0, 0x804, _GETPID, [], writes=[a1]),
+        _call(1, 0x808, 0x990, [], writes=[b1]),
+        FInstr(2, 0x80c, "MLIL_SET_VAR_SSA", "n#1 = a#1 + b#1", reads=[a1, b1], writes=[n1],
+               src=FExpr("MLIL_ADD", "a#1 + b#1", reads=[a1, b1])),
+        _call(3, 0x810, _MEMCPY, [_const(0), _const(0), _var(n1)]),
+    ]))
+    result = _backward(fn, {**_NAMES, 0x990: "rand", 0x800: "mix_lengths"})
+    [row] = result["slices"]
+    assert {(o["callee"], o["address"]) for o in row["origins"]} == {
+        ("getpid", "0x804"), ("rand", "0x808")}
+    assert row["origin"] == row["origins"][0]
+    assert row["origin_names"]["0x800"]["display_name"] == "mix_lengths"
+    assert result["stats"]["slices"] == 1
+    text = _render_taint_text(result)
+    rows = [ln for ln in text.splitlines() if "memcpy @ 0x810" in ln]
+    assert len(rows) == 1
+    [origins] = [ln for ln in text.splitlines() if "getpid" in ln and "rand" in ln]
+    assert "0x804" in origins and "0x808" in origins and "mix_lengths" in origins
+
+
+def test_text_names_an_origins_function_and_a_constants_value():
+    # W02-07: text printed `origin function: 0x…` -- a bare address, and no
+    # value for a constant origin.
+    sink = _length_sink("copy_len", 0x800, 10)
+    caller = _caller("fixed_len", 0xa00, 0xa10, sink.start, _const(0x40))
+    sink.caller_sites = [FSite(caller, 0xa10)]
+    result = _backward(sink, {**_NAMES, sink.start: sink.name, caller.start: caller.name})
+    [line] = [ln for ln in _render_taint_text(result).splitlines()
+              if "0x40" in ln and "fixed_len" in ln]
+    assert "0xa00" not in line
+
+
+def test_a_call_whose_return_derives_from_an_argument_is_one_step():
+    # W07-16: `t = strchr(s, '/'); malloc(t)` recorded the strchr call twice
+    # ("defined by call" and "return derives from its argument"), and
+    # --verbose printed the same instruction twice.
+    s = FVar("s", ident=170, typ="char*")
+    t1 = FSSA(FVar("t", ident=171, typ="char*"), 1)
+    fn = FFunc("find_sep", 0x800, FSSAFunc([
+        _call(0, 0x804, 0x991, [_var(FSSA(s, 0)), _const(0x2f)], writes=[t1]),
+        _call(1, 0x808, _MALLOC, [_var(t1)]),
+    ]), params=[s])
+    result = _backward(fn, {**_NAMES, 0x991: "strchr"}, "arg:malloc:0")
+    for sl in result["slices"]:
+        at = [(st["address"], st["il_index"]) for st in sl["slice"]]
+        assert len(at) == len(set(at)), sl["slice"]
+        assert sl["metrics"]["steps"] == len(at)
+    calls = [st for sl in result["slices"] for st in sl["slice"] if st["address"] == "0x804"]
+    assert calls and all(st["reason"] == "return of strchr derives from its argument 0" for st in calls)
 
 
 def test_caller_frontier_text_preserves_each_functions_coverage():
@@ -313,8 +383,10 @@ def test_field_origin_identity_includes_slot_offset_and_load_width(difference):
     caller = FFunc("load_fields", 0xa00, FSSAFunc(instructions), params=[fields.m])
     sink.caller_sites = [FSite(caller, 0xa04), FSite(caller, 0xa14)]
     result = _backward(sink, {**_NAMES, sink.start: sink.name})
-    origins = [sl["origin"] for sl in result["slices"]]
-    assert len(origins) == (2 if difference else 1)
+    # Each site is its own path; origin identity is offset and width.
+    assert len(result["slices"]) == 2
+    origins = [o for sl in result["slices"] for o in sl["origins"]]
+    assert len({json.dumps(o, sort_keys=True) for o in origins}) == (2 if difference else 1)
     assert {o["function"] for o in origins} == {"0xa00"}
     assert {o["base"] for o in origins} == {"m#0"}
     assert {o["offset"] for o in origins} == ({"0x8", "0x10"} if difference == "offset" else {"0x8"})

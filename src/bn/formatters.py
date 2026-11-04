@@ -5561,6 +5561,68 @@ def _sink_site_line(row: dict[str, Any]) -> str:
     return f"  {_describe_loc(row)}{site} {tag}{evidence} {note}".rstrip()
 
 
+# Origins one slice path text summarises on its origins line; JSON keeps all.
+_ORIGINS_SHOWN = 8
+
+
+def _backward_origin_name(names: dict[str, Any], raw: str, *, mangled: bool) -> str:
+    """*raw* (a function address or callee an origin names) as text prints
+    it: the slice's ``origin_names`` entry -- display name, or the raw symbol
+    under ``--mangled`` -- else *raw* itself."""
+    entry = _field_dict(names, raw)
+    return _text_value(entry, "name" if mangled else "display_name") or raw
+
+
+def _backward_origin_text(o: dict[str, Any], names: dict[str, Any], *, mangled: bool) -> str:
+    """One origin as ``<kind> <what>[ @ <address>] in <function>``: a constant
+    by its value, a call/source by its callee, anything else by the variable
+    or object it names."""
+    kind = _text_value(o, "kind") or "?"
+    callee = _text_value(o, "callee")
+    address = _text_value(o, "address")
+    var = _text_value(o, "var")
+    if kind == "constant" and o.get("value") is not None:
+        val = o["value"]
+        what = (f"{val:#x}" if isinstance(val, int) and not isinstance(val, bool) else str(val)) + (
+            f" ({var})" if var else "")
+    elif callee:
+        what = _backward_origin_name(names, callee, mangled=mangled) + (
+            f" @ {address}" if address else "")
+    else:
+        what = (var or _text_value(o, "buffer") or _text_value(o, "pointer")
+                or _text_value(o, "base") or address or "")
+    spill = " (via spill)" if o.get("via_spill") else ""
+    function = _text_value(o, "function")
+    where = f" in {_backward_origin_name(names, function, mangled=mangled)}" if function else ""
+    return f"{kind} {what}{spill}".rstrip() + where
+
+
+def _backward_origin_lines(sl: dict[str, Any], *, mangled: bool = False) -> list[str]:
+    """The origins line of one backward slice path (P2-05, W02-07): every
+    origin the path ends at, functions and callees by display name (raw under
+    ``--mangled``), a constant by its value. One origin prints ``origin: …``;
+    several print ``origins (N): …; …``, the first ``_ORIGINS_SHOWN`` of them."""
+    origins = [o for o in _field_list(sl, "origins") if isinstance(o, dict)]
+    if not origins:
+        origins = [o for o in [_field_dict(sl, "origin")] if o]
+    if not origins:
+        return []
+    names = dict(_field_dict(sl, "origin_names"))
+    # A bridge that names only the first origin's callee (no `origin_names`).
+    first_callee = _text_value(origins[0], "callee")
+    first_shown = _text_value(sl, "origin_callee_display_name")
+    if first_callee and first_shown and first_callee not in names:
+        names[first_callee] = {"display_name": first_shown}
+    shown = "; ".join(_backward_origin_text(o, names, mangled=mangled)
+                      for o in origins[:_ORIGINS_SHOWN])
+    more = len(origins) - _ORIGINS_SHOWN
+    if more > 0:
+        shown += f"; (+{more} more, see --format json)"
+    if len(origins) == 1:
+        return [f"  origin: {shown}"]
+    return [f"  origins ({len(origins)}): {shown}"]
+
+
 def _render_sink_sites(value: Any) -> list[str]:
     """The backward ``sink sites`` block: bounded complete example rows plus the
     exact count of every row it does not list. JSON keeps every site.
@@ -5697,39 +5759,24 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                 lines.append(f"  {sl!r}")
                 continue
             sink = _field_dict(sl, "sink")
-            origin = _field_dict(sl, "origin")
             m = _field_dict(sl, "metrics")
             sig = _signature_text(_field_dict(sl, "signature"), mangled=mangled)
-            n = sl.get("reached_via_call_sites", 1)
-            xn = (f"  (reached via {n} callsites)"
-                  if isinstance(n, int) and not isinstance(n, bool) and n > 1 else "")
             unresolved = "y" if m.get("traverses_unresolved") else "n"
             lines.append("")
-            # Compact one line per slice by default; "reached via N callsites" surfaces the engine's existing
-            # per-(seed,sink,origin) call-site count. --full shows origin/crosses/steps.
+            # Compact: one line per distinct slice PATH, then the origins it
+            # ends at (P2-05: one path reached from several origins is one
+            # row, not one identical row per origin). --full adds crosses/steps.
             lines.append(
                 f"  [{sink.get('class') or sink.get('kind') or '?'}] "
                 f"{_sink_callee_text(sink, mangled=mangled) or sink.get('kind') or '?'} @ {sink.get('address')} "
                 f"(seed {sink.get('seed', '?')})   {sig}   "
                 f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} "
-                f"unresolved={unresolved}}}{xn}".rstrip())
-            if origin.get("function"):
-                lines.append(f"  origin function: {origin['function']}")
+                f"unresolved={unresolved}}}".rstrip())
+            lines.extend(_backward_origin_lines(sl, mangled=mangled))
             if full:
                 lines.append(
                     f"  slice for {_sink_callee_text(sink, mangled=mangled) or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
                 )
-                _ok = origin.get("kind")
-                if _ok == "constant" and origin.get("value") is not None:
-                    _val = origin["value"]
-                    _vs = f"{_val:#x}" if isinstance(_val, int) else str(_val)
-                    _extra = _vs + (f" ({origin['var']})" if origin.get("var") else "")
-                else:
-                    _extra = (((sl.get("origin_callee_display_name") if not mangled else None)
-                               or origin.get("callee"))
-                              or origin.get("var") or origin.get("address") or "")
-                _spill = " (via spill)" if origin.get("via_spill") else ""
-                lines.append(f"  origin: {_ok} {_extra}{_spill}".rstrip())
                 crossed = _field_list(sl, "crossed_functions")
                 if crossed:
                     lines.append(f"  crosses: {' <- '.join(str(c) for c in crossed)}")

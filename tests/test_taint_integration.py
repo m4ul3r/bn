@@ -183,7 +183,8 @@ def test_corpus_target(expected_path, tmp_path, shared_bn):
         result = _bn_json(shared_bn, *bwd)
         _assert_assumptions_contain(result, case.get("assumptions_contain"), stem)
         assert result["slices"], f"{stem}: backward produced no slices"
-        kinds = {sl["origin"]["kind"] for sl in result["slices"]}
+        # Every origin of every slice path: one path may end at several.
+        kinds = {o["kind"] for sl in result["slices"] for o in sl["origins"]}
         assert kinds & set(case["origin_kinds"]), \
             f"{stem}: backward origin {kinds} not in {case['origin_kinds']}"
         assert not (kinds & set(case.get("forbid_origin_kinds", []))), \
@@ -800,7 +801,7 @@ def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, share
     target = shared_bn.load(binary, copy=False)
     result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "deser",
                       "--sink", "arg:memcpy:2")
-    origins = [sl["origin"] for sl in result["slices"]]
+    origins = [o for sl in result["slices"] for o in sl["origins"]]
     assert len(origins) == 2, result
     assert all(o["kind"] == "field_load_unresolved" for o in origins), origins
     reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]

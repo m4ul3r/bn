@@ -4331,11 +4331,11 @@ def test_backward_param_seed_ascends_into_caller(models):
     assert ("source", "recv") in origins
 
 
-def test_backward_dedupes_caller_fanout_by_origin(models):
+def test_backward_keeps_every_caller_site_that_reaches_one_origin(models):
     # use_len(dst, src, n): memcpy(dst, src, n). Two caller sites both pass the
     # recv length, so both ascents bottom out at the SAME origin (source recv).
-    # Instead of two near-duplicate slices that repeat the in-function chain, the
-    # result collapses to ONE slice noting it was reached via 2 call sites (#46).
+    # Each site is part of its own path: keying rows on the origin alone (#46)
+    # kept the first site's path and hid the second (P1-06).
     dst = FVar("dst", ident=20); src = FVar("src", ident=21); n = FVar("n", ident=22)
     dst0 = FSSA(dst, 0); src0 = FSSA(src, 0); n0 = FSSA(n, 0)
     use_len = FFunc("use_len", 0x800, FSSAFunc([
@@ -4376,8 +4376,10 @@ def test_backward_dedupes_caller_fanout_by_origin(models):
     result = engine.backward(use_len, [te.parse_locator("param:2")])
 
     source_slices = [s for s in result["slices"] if s["origin"].get("callee") == "recv"]
-    assert len(source_slices) == 1, [s["origin"] for s in result["slices"]]
-    assert source_slices[0].get("reached_via_call_sites") == 2
+    assert len(source_slices) == 2, [s["origin"] for s in result["slices"]]
+    boundaries = sorted(st["address"] for s in source_slices for st in s["slice"]
+                        if st.get("reason") == "passed as arg 2 to use_len")
+    assert boundaries == [hex(CALL_A), hex(CALL_B)]
 
 
 def test_backward_ret_sink_rejected_with_guidance(process_func, models):

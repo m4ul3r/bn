@@ -12651,12 +12651,16 @@ class TaintEngine:
                 continue
             n_before = len(slices)
             sink_slices: list[dict[str, Any]] = []
-            # Collapse near-duplicate slices: the same origin reached through many
-            # caller call-sites otherwise emits one full copy of the ~20-step
-            # in-function chain per caller, which buries the single real origin and
-            # spills to disk. Keep one representative per (seed, sink-site, origin)
-            # and count how many call sites reached it (#46).
-            seen_origin: dict[tuple, dict[str, Any]] = {}
+            # One public slice per distinct PATH (P2-05): every origin whose
+            # path is the same steps through the same functions rides on that
+            # one row's `origins[]` -- several origins in one function share
+            # the function's whole def-chain walk, and repeating it once per
+            # origin multiplied the JSON for no information. Two different
+            # paths stay two rows even when they reach the same origin: a
+            # caller site the ascent followed is part of its path, and keying
+            # rows on the origin alone hid every site after the first that
+            # reached it (P1-06).
+            seen_path: dict[tuple, dict[str, Any]] = {}
             try:
                 for seed_var, sink_ins in seeds:
                     sink_addr = hex(int(getattr(sink_ins, "address", 0)))
@@ -12689,12 +12693,13 @@ class TaintEngine:
                     for sl in self._backward_slice(func, seed_var, 0, max_depth, set(),
                                                    seed_ins=sink_ins, anchor=anchor):
                         o = sl["origin"]
-                        # Every kind's complete provenance participates, including
-                        # nested region/cut facts; display names live outside origin.
-                        key = (seed_label, sink_addr, json.dumps(o, sort_keys=True))
-                        rep = seen_origin.get(key)
+                        key = (seed_label, sink_addr,
+                               json.dumps(sl["steps"], sort_keys=True, default=repr),
+                               tuple(sl["crossed"]))
+                        rep = seen_path.get(key)
                         if rep is not None:
-                            rep["reached_via_call_sites"] = rep.get("reached_via_call_sites", 1) + 1
+                            if o not in rep["origins"]:
+                                rep["origins"].append(o)
                             continue
                         entry = {
                             "sink": {
@@ -12703,11 +12708,14 @@ class TaintEngine:
                                 "address": sink_addr,
                                 "seed": seed_label,
                             },
-                            "origin": sl["origin"],
+                            # `origin` is the first of `origins`, the field a
+                            # single-origin consumer reads.
+                            "origin": o,
+                            "origins": [o],
                             "crossed_functions": sl["crossed"],
                             "slice": sl["steps"],
                         }
-                        seen_origin[key] = entry
+                        seen_path[key] = entry
                         sink_slices.append(entry)
                     if role != "value":
                         self._bw_pointer_demand(
@@ -12782,7 +12790,8 @@ class TaintEngine:
         for sl in slices:
             sm, ss = derive_flow_facts(
                 direction="backward", path=sl.get("slice"), sink=sl.get("sink"),
-                origin=sl.get("origin"), crossed_functions=sl.get("crossed_functions"),
+                origin=sl.get("origin"), origins=sl.get("origins"),
+                crossed_functions=sl.get("crossed_functions"),
                 display=self._display_for_name, symbol=self._raw_symbol_for)
             sl["metrics"] = sm
             sl["signature"] = ss
@@ -12792,11 +12801,12 @@ class TaintEngine:
             if isinstance(_sk, dict) and _sk.get("callee"):
                 _sym, _shown = self._symbol_names(_sk["callee"])
                 sl["sink"] = {**_sk, "callee_symbol": _sym, "callee_display_name": _shown}
-            # The origin's display name rides on the slice, beside `origin`, so
-            # the origin object -- the slice's provenance claim -- is unchanged.
+            # The origins' names ride on the slice, beside them, so each origin
+            # object -- the slice's provenance claim -- is unchanged.
             _og = sl.get("origin")
             if isinstance(_og, dict) and _og.get("callee"):
                 sl["origin_callee_display_name"] = self._display_for_name(_og["callee"])
+            sl["origin_names"] = self._bw_origin_names(sl.get("origins") or [])
         return {
             "direction": "backward",
             "function": {"name": str(func.name), "display_name": _display_name(func),
@@ -12825,10 +12835,11 @@ class TaintEngine:
                 sinks_seeded=sum(1 for s in sink_status if s.get("seeded")),
                 sinks_constant=sum(1 for s in sink_status if s["status"] == "constant"),
                 slices=len(slices),
-                # A slice whose own origin is `unresolved` is the walk admitting
-                # it stopped short; the gate must see it even with no leaf.
+                # An `unresolved` origin -- of any slice, first or not -- is the
+                # walk admitting it stopped short; the gate must see it even
+                # with no leaf.
                 unresolved_origins=sum(
-                    1 for sl in slices if (sl.get("origin") or {}).get("kind") == "unresolved"),
+                    1 for sl in slices for o in sl["origins"] if o.get("kind") == "unresolved"),
                 truncated=self._bw_truncated,
                 truncation_cause=sorted(self._bw_truncation_causes)),
             # #812: configured knobs, echoed as forward does. `max_iters` is
@@ -12842,6 +12853,27 @@ class TaintEngine:
             },
             "soundness": SOUNDNESS,
         }
+
+    def _bw_origin_names(self, origins: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+        """``{raw: {"name", "display_name"}}`` for every function address and
+        callee the slice's *origins* name, so text can say which function an
+        origin is in without a second lookup (W02-07: a bare address)."""
+        names: dict[str, dict[str, str]] = {}
+        for o in origins:
+            fn = o.get("function")
+            if isinstance(fn, str) and fn not in names:
+                try:
+                    f = self.bv.get_function_at(int(fn, 16))
+                except (TypeError, ValueError, AttributeError):
+                    f = None
+                if f is not None:
+                    names[fn] = {"name": str(getattr(f, "name", fn)),
+                                 "display_name": _display_name(f) or str(getattr(f, "name", fn))}
+            callee = o.get("callee")
+            if isinstance(callee, str) and callee not in names:
+                raw, shown = self._symbol_names(callee)
+                names[callee] = {"name": str(raw or callee), "display_name": str(shown or callee)}
+        return names
 
     def _bw_assume(self, msg: str) -> None:
         if msg not in self._bw_assumptions:
@@ -13604,7 +13636,8 @@ class TaintEngine:
                 target = const_target(getattr(defn, "dest", None))
                 name = self._callee_name(target)
                 mkey, model = lookup_model(self.models, name)
-                steps.append(_instr_dict(defn, reason=f"defined by call to {name or 'indirect'}"))
+                call_step = _instr_dict(defn, reason=f"defined by call to {name or 'indirect'}")
+                steps.append(call_step)
                 if model and model.get("sources"):
                     # The representative, ranked (IC01): the outright
                     # assignment left a stale rank a later weak origin could
@@ -13636,11 +13669,18 @@ class TaintEngine:
                     cparams = self._call_params(defn) if rules else []
                     states: list[str] = []
                     dem = _demand_through(anchor, v)
+                    derives: list[int] = []
                     for fi, pointee in rules:
                         if fi is None or fi >= len(cparams):
                             continue
-                        steps.append(_instr_dict(
-                            defn, reason=f"return of {mkey or name} derives from its argument {fi}"))
+                        # The call is ONE step of the slice: what it derives
+                        # from refines that step's reason, never a second
+                        # step on the same instruction (W07-16: `--verbose`
+                        # printed the call twice).
+                        derives.append(fi)
+                        call_step["reason"] = (
+                            f"return of {mkey or name} derives from its argument "
+                            + ", ".join(str(i) for i in derives))
                         # `arg:N -> ret` returns the argument itself, so the
                         # demand carries over; `*arg:N -> ret` returns a
                         # pointer somewhere into it (strchr), at an unknown

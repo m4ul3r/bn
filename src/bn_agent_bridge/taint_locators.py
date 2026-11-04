@@ -269,6 +269,7 @@ def derive_flow_facts(*, direction: str,
                       leaves: list[dict[str, Any]] | None = None,
                       fn_name: str | None = None,
                       origin: dict[str, Any] | None = None,
+                      origins: list[dict[str, Any]] | None = None,
                       crossed_functions: list[str] | None = None,
                       display: Callable[[str], str | None] | None = None,
                       symbol: Callable[[str], str | None] | None = None,
@@ -307,13 +308,18 @@ def derive_flow_facts(*, direction: str,
     for c in crossed[1:]:                            # crossed[0] is the sink's fn
         if c and c not in chain:
             chain.append(c)
-    o = origin or {}
-    source = o.get("callee") or o.get("kind") or "?"
+    # One path may end at several origins (`origins[]`, P2-05): the signature
+    # names their common source, or "multiple" as forward does for several
+    # sources, and the path traverses the unresolved if any of its origins is.
+    every = [o for o in (origins or []) if isinstance(o, dict)] or [origin or {}]
+    labels = list(dict.fromkeys(o.get("callee") or o.get("kind") or "?" for o in every))
+    source = labels[0] if len(labels) == 1 else "multiple"
     sink_callee = (sink or {}).get("callee") or (sink or {}).get("kind")
-    traverses = o.get("kind") in {"unresolved", "indirect_call", "field_load_unresolved",
-                                  "address_of_local_unresolved", "pointer_object_unresolved",
-                                  "object_extent_unknown", "region_store_proof_not_certified",
-                                  "pointer_demand_not_certified", "global"}
+    traverses = any(o.get("kind") in {"unresolved", "indirect_call", "field_load_unresolved",
+                                      "address_of_local_unresolved", "pointer_object_unresolved",
+                                      "object_extent_unknown", "region_store_proof_not_certified",
+                                      "pointer_demand_not_certified", "global"}
+                    for o in every)
     metrics = {"steps": len(steps), "fns_spanned": max(1, len(set(crossed)) + 1),
                "traverses_unresolved": bool(traverses)}
     return metrics, _make_signature(source, chain, None, sink_callee,
