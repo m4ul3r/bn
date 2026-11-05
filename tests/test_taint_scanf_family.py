@@ -47,7 +47,10 @@ def test_a_seed_on_a_call_with_unrecovered_destinations_reports_them(callee, loc
     [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "format_destination_unrecovered"]
     assert (leaf["address"], leaf["destinations"], leaf["recovered"], leaf["missing"]) == \
         ("0x401221", 3, 0, 3), leaf
-    assert leaf["callee"] == "scanf"
+    # `callee` is the symbol the call site calls; the model it was judged by
+    # rides beside it as `model` when that is another name.
+    assert (leaf["callee"], leaf.get("model")) == \
+        (callee, None if callee == "scanf" else "scanf"), leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
@@ -90,9 +93,9 @@ class _SymBV(FBVStr):
 
 @pytest.mark.parametrize("std", ["99", "23"])
 def test_a_finding_on_an_iso_alias_names_the_symbol_the_binary_calls(std):
-    # The finding is keyed by the plain model (`sscanf`); `callee_symbol` is
-    # the spelling the binary imports, as it was while the C99 family had
-    # duplicated models of its own.
+    # `callee` is the spelling the binary imports, as it was while the C99
+    # family had duplicated models of its own; the plain model the finding was
+    # judged by is `model`.
     callee = f"__isoc{std}_sscanf"
     s, d = FVar("s"), FVar("d", typ="char[0x10]")
     s0 = FSSA(s, 0)
@@ -104,5 +107,5 @@ def test_a_finding_on_an_iso_alias_names_the_symbol_the_binary_calls(std):
     func = FFunc("parse", 0x10, FSSAFunc(instrs), params=[s])
     result = te.TaintEngine(_SymBV({SCANF: callee}, strings={FMT: "%s"}), te.load_models()).forward(
         func, [te.parse_locator("param:0")])
-    assert [(f["sink"]["callee"], f["sink"]["callee_symbol"]) for f in result["reached_sinks"]] \
-        == [("sscanf", callee)], result["reached_sinks"]
+    assert [(f["sink"]["callee"], f["sink"]["callee_symbol"], f["sink"].get("model"))
+            for f in result["reached_sinks"]] == [(callee, callee, "sscanf")], result["reached_sinks"]

@@ -8850,12 +8850,12 @@ def test_scanf_c23_spelling_seeds_every_destination_in_the_run_809(models):
     ("__isoc99_fscanf", "fscanf", True),
 ])
 def test_iso_call_preset_shortfall_is_reported_once(models, callee, model_key, stream):
-    # The `call:` preset resolves the C23 alias to the canonical model, and the
-    # application-level check names that same key. Seeding a source spelling
-    # used to produce two leaves at one address -- the raw `__isoc23_*` name
-    # from the preset and the canonical key from the model check -- because
-    # dictionary-equality dedup compares the callee string. One shortfall,
-    # one leaf, named by the model the engine actually applied.
+    # The `call:` preset resolves the ISO alias to the canonical model, and the
+    # application-level check judges the same call. Seeding a source spelling
+    # used to produce two leaves at one address -- one named by the preset,
+    # one by the model check -- because dictionary-equality dedup compares
+    # the callee string. One shortfall, one leaf: `callee` is the symbol the
+    # binary calls, `model` the canonical model the engine applied.
     args = ([FExpr("MLIL_VAR_SSA", "f#0", reads=[FSSA(FVar("f"), 0)])] if stream else [])
     args.append(FExpr("MLIL_CONST_PTR", "fmt", constant=0x700))
     args += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}")) for i in range(4)]
@@ -8869,7 +8869,7 @@ def test_iso_call_preset_shortfall_is_reported_once(models, callee, model_key, s
     short = [lf for lf in result["leaves"]
              if lf["kind"] == "format_destination_unrecovered"]
     assert len(short) == 1, short
-    assert short[0]["callee"] == model_key
+    assert (short[0]["callee"], short[0].get("model")) == (callee, model_key)
     assert (short[0]["destinations"], short[0]["recovered"], short[0]["missing"]) == \
         (5, 4, 1), short[0]
 

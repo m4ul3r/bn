@@ -41,7 +41,7 @@ from .taint_models import (  # noqa: F401
     _BROAD_SOURCE_BYTES, _BROAD_SOURCE_MEMBERS, _BUILTIN_MODELS,
     _model_buffer_source_args, TaintError,
     _coerce_model_map, _validate_model_interior, load_models,
-    model_overlay_sources, _canonical_cxx_alloc, lookup_model, alias_spellings,
+    model_overlay_sources, _canonical_cxx_alloc, lookup_model, alias_spellings, called_name,
     _try_arg_index, model_arg_indices, model_is_benign_marker,
     model_arg_index, parse_model_token, validate_model_arguments,
 )
@@ -3673,7 +3673,7 @@ class TaintEngine:
             elif str(sink.get("class") or "") in ("overflow_len", "fortified_overflow"):
                 len_idxs = [int(i) for i in (sink.get("tainted_args") or []) if isinstance(i, int)]
             len_idxs = [i for i in len_idxs if i < len(params) and i not in from_idxs]
-            writers.append(("fill", defn, mkey or name, params, from_idxs, is_source,
+            writers.append(("fill", defn, called_name(mkey, name), params, from_idxs, is_source,
                             len_idxs, callee))
             if 0 not in hit:
                 return None
@@ -5169,8 +5169,8 @@ class TaintEngine:
         residual = [i for i in required if i < len(params) and i not in modeled_dests]
         at = hex(int(getattr(ins, "address", 0)))
         who = f"{self._prose_name(callee)}() at {at}"
-        common = {"address": at, "callee": str(callee), "il_text": str(ins),
-                  "destinations": len(required)}
+        common = {"address": at, "callee": str(callee), **self._model_field(callee),
+                  "il_text": str(ins), "destinations": len(required)}
         out: list[dict[str, Any]] = []
         if unrecovered:
             out.append({
@@ -11272,6 +11272,10 @@ class TaintEngine:
             behavior of not creating out-params). ``site_taddr`` selects the dedup
             signature: ``(addr, argidx)`` for direct calls, ``(addr, argidx, taddr)``
             per resolved target so distinct indirect targets each record once."""
+            # What a finding or leaf names as `callee`: the symbol the binary
+            # calls when it is an ISO scanf alias of the model, else the model
+            # key (its canonical key rides beside it as `model`).
+            shown = called_name(mkey, name)
             changed = False
             propagated: set[int] = set()
 
@@ -11304,7 +11308,7 @@ class TaintEngine:
                                   if isinstance(i, int) and not isinstance(i, bool))
                 if any(i < len(params) and arg_taint(params[i]) for i in input_args):
                     for short in self._format_destination_shortfall(
-                            ins, ssaf, mkey or name or "?", model, params):
+                            ins, ssaf, shown or "?", model, params):
                         if short not in leaves:
                             leaves.append(short)
 
@@ -11372,7 +11376,7 @@ class TaintEngine:
                     # format; when it writes more destinations than were
                     # recovered, that shortfall is the boundary (#1050 round 8).
                     for short in self._format_destination_shortfall(
-                            ins, ssaf, mkey or name or "?", model, params):
+                            ins, ssaf, shown or "?", model, params):
                         if short not in leaves:
                             leaves.append(short)
                     return
@@ -11497,7 +11501,7 @@ class TaintEngine:
                 gets(): each named destination is injected as an unconditional
                 root, so flows out of it are not attributed to --source."""
                 fa, first = int(sink["format_arg"]), int(sink["first_dest"])
-                prose = self._prose_name(mkey or name or "?")
+                prose = self._prose_name(shown or "?")
                 gate_hit: list = []
                 gate_idx = None
                 for gi in sink.get("tainted_args") or []:
@@ -11526,7 +11530,7 @@ class TaintEngine:
                     leaf = {
                         "kind": "format_unchecked",
                         "address": hex(addr),
-                        "callee": str(mkey or name or "?"),
+                        "callee": str(shown or "?"), **self._model_field(shown),
                         "format_arg": fa,
                         "reason": "positional" if fmt is not None else "not_constant",
                         "detail": (f"{prose}() at {hex(addr)}: its format (arg{fa}) {why_not}, "
@@ -11547,7 +11551,7 @@ class TaintEngine:
                                   f"input token of unbounded length: {listed}")}
                 if gate_idx is not None:
                     findings.append(_tag_unconditional_flow(
-                        self._make_finding(ins, mkey or name, gate_idx, eff, gate_hit, why),
+                        self._make_finding(ins, shown, gate_idx, eff, gate_hit, why),
                         gate_hit))
                     return False
                 hit_nodes = []
@@ -11558,10 +11562,10 @@ class TaintEngine:
                     if dest is not None:
                         node, lbl = (dest[0], None), dest[1]
                     else:
-                        node = (("name", f"{mkey or name}_arg{di}@{hex(addr)}"), None)
+                        node = (("name", f"{shown}_arg{di}@{hex(addr)}"), None)
                         lbl = var_label_of(node)
                     if taint_node(node, lbl, ins,
-                                  f"{mkey or name}(): width-less {d['conversion']} reads an "
+                                  f"{shown}(): width-less {d['conversion']} reads an "
                                   f"unbounded token", []):
                         grew = True
                     unconditional_roots.add(node)
@@ -11571,7 +11575,7 @@ class TaintEngine:
                     f"independently of --source ({listed}; the finding does not require any "
                     f"tracked taint to reach this call)")
                 findings.append(_tag_unconditional_flow(
-                    self._make_finding(ins, mkey or name, None, eff, hit_nodes, why), hit_nodes))
+                    self._make_finding(ins, shown, None, eff, hit_nodes, why), hit_nodes))
                 return grew
 
             sink = model.get("sink")
@@ -11629,10 +11633,10 @@ class TaintEngine:
                             node_lbl = dest[1]
                         else:
                             _tag = _buf_idx if _buf_idx is not None else "undeclared"
-                            node = (("name", f"{mkey or name or 'unbounded_input'}_arg{_tag}@{hex(addr)}"), None)
+                            node = (("name", f"{shown or 'unbounded_input'}_arg{_tag}@{hex(addr)}"), None)
                             node_lbl = var_label_of(node)
                         if taint_node(node, node_lbl, ins,
-                                      f"{mkey or name}(): unbounded read, always unsafe", []):
+                                      f"{shown}(): unbounded read, always unsafe", []):
                             changed = True
                         unconditional_roots.add(node)
                         # P3: three distinct provenance shapes -- do not claim a
@@ -11653,12 +11657,12 @@ class TaintEngine:
                         else:
                             _taint_phrase = "injects no buffer taint (no declared destination) "
                         add_assumption(
-                            f"{self._prose_name(mkey or name)}(): unconditional {sink.get('class') or '?'} sink "
+                            f"{self._prose_name(shown)}(): unconditional {sink.get('class') or '?'} sink "
                             + _taint_phrase
                             + f"at {hex(addr)} independently of --source (always-unsafe API; "
                             "the finding does not require any tracked taint to reach this call)")
                         findings.append(_tag_unconditional_flow(
-                            self._make_finding(ins, mkey or name, None, sink, [node], why), [node]))
+                            self._make_finding(ins, shown, None, sink, [node], why), [node]))
                 # #443: a bounded-write sink (wrapped recv/read) is armed by its
                 # `len_arg` -- an attacker-controlled write length -- in addition to
                 # any explicit `tainted_args`.
@@ -11900,7 +11904,7 @@ class TaintEngine:
                                     f"dropped, {_basis})",
                                 }
                             findings.append(_tag_unconditional_flow(
-                                self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
+                                self._make_finding(ins, shown, argidx, eff_sink, ht, why), ht))
             co = model.get("continuation")
             if co is not None:
                 cidx = model_arg_index(co.get("null_arg", 0))
@@ -12177,7 +12181,7 @@ class TaintEngine:
                         if sig not in recorded_sinks:
                             recorded_sinks.add(sig)
                             findings.append(_tag_unconditional_flow(
-                                self._make_finding(ins, mkey or name, i, eff_vsink, ht, why), ht))
+                                self._make_finding(ins, shown, i, eff_vsink, ht, why), ht))
             return changed, propagated
 
         for _ in range(self.max_iters):
@@ -13249,12 +13253,15 @@ class TaintEngine:
             # P2-12: a format that proves destinations this seed cannot reach
             # is a blocking frontier whichever callee locator named the call
             # -- `call:` seeds the model's run, `ret:`/`arg:` seed less. The
-            # canonical model key names the leaf, so the application-level
-            # check (which uses the key too) dedupes against it.
+            # canonical model key decides the model; each leaf names the
+            # symbol that call site calls, as the application-level check
+            # does, so the two paths build the same leaf and dedupe.
             mkey, model = lookup_model(self.models, callee)
             for c in calls:
+                called = called_name(
+                    mkey, self._callee_name(self._resolve_direct_target(c)) or callee)
                 for short in self._format_destination_shortfall(
-                        c, ssaf, mkey or callee, model, self._call_params(c)):
+                        c, ssaf, called or callee, model, self._call_params(c)):
                     add_leaf(short)
 
         seeded = False
@@ -13724,6 +13731,7 @@ class TaintEngine:
                 # symbol's leading underscore; the real symbol and its demangled
                 # display name ride beside it (always present, like #978's).
                 "callee_symbol": self._symbol_names(callee)[0],
+                **self._model_field(callee),
                 "callee_display_name": self._display_for_name(callee),
                 "address": hex(int(getattr(ins, "address", 0))),
                 "tainted_arg_index": argidx,
@@ -13753,6 +13761,14 @@ class TaintEngine:
             },
             "path": path,
         }
+
+    def _model_field(self, callee: Any) -> dict[str, str]:
+        """``{"model": <canonical key>}`` when the model that matched *callee*
+        is keyed by another name -- an ISO scanf alias (``__isoc99_fscanf``)
+        reports the symbol it calls as ``callee`` and the ``fscanf`` model it
+        was judged by here -- else ``{}``."""
+        key, _ = lookup_model(self.models, str(callee) if callee else None)
+        return {"model": key} if key and key != str(callee) else {}
 
     def _symbol_names(self, name: Any) -> tuple[str, str]:
         """``(raw symbol name, display name)`` for a name a taint result prints
@@ -14482,20 +14498,21 @@ class TaintEngine:
                         f"declaration -- if {self._prose_name(callee)} copies an input into the buffer, "
                         f"model it with `propagates` or the slice is incomplete")
                 elif wkind == "fill":
-                    _, _, mkey, params, from_idxs, is_source, len_idxs, _raw = w
+                    _, _, called, params, from_idxs, is_source, len_idxs, _raw = w
                     steps.append(_instr_dict(
-                        wdefn, reason=f"{noun} {label} written by {self._prose_name(mkey)}"))
+                        wdefn, reason=f"{noun} {label} written by {self._prose_name(called)}"))
                     if is_source:
-                        _set_origin({"kind": "source", "callee": mkey,
+                        _set_origin({"kind": "source", "callee": called,
+                                     **self._model_field(called),
                                      "address": hex(int(wdefn.address))})
                     states = [_follow_input(wdefn, params[i], d, wmv, label,
-                                            f"input {i} of {self._prose_name(mkey)} writing",
+                                            f"input {i} of {self._prose_name(called)} writing",
                                             noun=noun)
                               for i in from_idxs]
                     for i in len_idxs:
                         if expr_reads(params[i]):
                             steps.append(_instr_dict(
-                                wdefn, reason=f"length argument {i} of {self._prose_name(mkey)} bounds "
+                                wdefn, reason=f"length argument {i} of {self._prose_name(called)} bounds "
                                               f"how much of the input lands in {label}"))
                             for r in expr_reads(params[i]):
                                 walk(r, d + 1, wmv)
@@ -14503,7 +14520,8 @@ class TaintEngine:
                         # Every input the model names is an established
                         # constant (a literal format/string): the bytes come
                         # from the call itself.
-                        _set_origin({"kind": "call", "callee": mkey,
+                        _set_origin({"kind": "call", "callee": called,
+                                     **self._model_field(called),
                                      "address": hex(int(wdefn.address))}, weak=1)
                 else:  # opaque: a call may have written the bytes
                     _, _, callee, why = w
@@ -14955,7 +14973,8 @@ class TaintEngine:
                     # The representative, ranked (IC01): the outright
                     # assignment left a stale rank a later weak origin could
                     # undercut; a formal beside it still ascends on its own.
-                    _set_source_origin({"kind": "source", "callee": mkey or name,
+                    _set_source_origin({"kind": "source", "callee": called_name(mkey, name),
+                                        **self._model_field(called_name(mkey, name)),
                                         "address": hex(int(defn.address))})
                     # A modeled source's returned bytes are the source -- but
                     # a return into an object it was handed -- a local
@@ -15008,7 +15027,8 @@ class TaintEngine:
                                      "address": hex(int(defn.address))})
                         _returned_object(defn, v, d, mv, anchor, name, model, fresh=True)
                     elif all(s == "literal" for s in states):
-                        _set_origin({"kind": "call", "callee": mkey or name,
+                        _set_origin({"kind": "call", "callee": called_name(mkey, name),
+                                     **self._model_field(called_name(mkey, name)),
                                      "address": hex(int(defn.address))}, weak=1)
                 return
             steps.append(_instr_dict(defn, reason="definition"))
