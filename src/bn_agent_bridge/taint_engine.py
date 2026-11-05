@@ -9903,16 +9903,27 @@ class TaintEngine:
     # ELF data symbols only (`STT_OBJECT`), and only where the image states
     # a size: a zero `st_size` says nothing, which is not the same as 0.
     _ELF_STT_OBJECT = 1
+    # `e_type` of a fixed-address executable (a PIE or shared object is ET_DYN).
+    _ELF_ET_EXEC = 2
 
     def _read_elf_object_sizes(self) -> list[tuple[int, int]]:
         """The `(address, size)` pairs an ELF image's symbol tables state,
-        in the VIEW's address space.
+        in the VIEW's address space -- and, for a rebased fixed-address
+        image, at its link-time address too.
 
-        `st_value` is a link-time address: a position-independent image the
-        view loaded at a non-zero base (BN maps PIEs at 0x400000) declares
-        every object 0x400000 below where the view has it, so the table is
-        moved by the load bias -- the view's start against the lowest
-        `PT_LOAD` address -- or it would size the wrong storage."""
+        `st_value` is a link-time address. BN maps the whole image by the
+        load bias -- the view's start against the lowest `PT_LOAD` address:
+        a PIE at 0x400000, or any image the user rebased -- so the object's
+        view address is `st_value + bias`, or the table sizes the wrong
+        storage. A position-independent image's code and data reach objects
+        only PC-relatively or through relocations, which BN applies, so the
+        view address is the only one its IL can name. A fixed-address image
+        (`ET_EXEC`) carries no relocations for its absolute references: once
+        rebased, its immediates and initialised pointers still hold
+        `st_value` (measured on BN: `mov esi, imm32` and a `.data` pointer
+        both keep the link address while the symbol moves). So such an
+        object is also keyed at `st_value` -- unless that address is mapped
+        in the view, where it is some other storage's address."""
         import struct
 
         raw_view = getattr(self.bv, "parent_view", None)
@@ -9925,6 +9936,7 @@ class TaintEngine:
         wide = head[4] == 2
         little = head[5] == 1
         end = "<" if little else ">"
+        e_type, = struct.unpack_from(end + "H", head, 0x10)
         if wide:
             shoff, = struct.unpack_from(end + "Q", head, 0x28)
             shentsize, shnum = struct.unpack_from(end + "HH", head, 0x3A)
@@ -9952,6 +9964,7 @@ class TaintEngine:
             sections.append((int(s_type), int(offset), int(size), int(link),
                              int(entsize)))
         bias = self._elf_load_bias(head, read, wide, end)
+        view = self._view_span() if bias and e_type == self._ELF_ET_EXEC else None
         out: list[tuple[int, int]] = []
         for s_type, offset, size, link, entsize in sections:
             # SHT_SYMTAB (2) and SHT_DYNSYM (11).
@@ -9970,8 +9983,17 @@ class TaintEngine:
                     continue
                 if value:
                     out.append((int(value) + bias, int(st_size)))
+                    if view is not None and not view[0] <= int(value) < view[1]:
+                        out.append((int(value), int(st_size)))
             del step
         return out
+
+    def _view_span(self) -> tuple[int, int] | None:
+        """``(start, end)`` the view maps, None when either is unknown."""
+        try:
+            return int(getattr(self.bv, "start")), int(getattr(self.bv, "end"))
+        except (AttributeError, TypeError, ValueError):
+            return None
 
     def _elf_load_bias(self, head: bytes, read: Any, wide: bool, end: str) -> int:
         """How far the view moved the image: its start minus the lowest
