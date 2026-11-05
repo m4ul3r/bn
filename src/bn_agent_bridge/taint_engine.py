@@ -18260,16 +18260,18 @@ class TaintEngine:
                 # variable recovery, which a name-only rename marks
                 # user-defined, and three review rounds forged a store proof.
                 span = f"[{lo:#x}, {hi:#x})" if hi < _REGION_OPEN else f"[{lo:#x}, end)"
+                nul = (f"the NUL stores put at {terminator:#x} only bounds the string read"
+                       if terminator is not None
+                       else "covered bytes do not establish a NUL terminator")
                 _buffer_leaf(
                     defn, label,
                     f"stores the walk can see write every byte of {span} of local "
                     f"buffer {label} on every path, but a region proof from stores is "
                     f"not certified: it rests on BN's recovery of the object's extent "
-                    f"and of the consumer's offset, and covered bytes do not establish "
-                    f"a NUL terminator, so the slice is NOT complete -- "
-                    f"check by hand that the consumer reads only those bytes and that "
-                    f"{label} is the whole object (`bn il {fn_ref} --view mlil` shows "
-                    f"the stores and the pointer arithmetic)",
+                    f"and of the consumer's offset, and {nul}, so the slice is NOT "
+                    f"complete -- check by hand that the consumer reads only those "
+                    f"bytes and that {label} is the whole object (`bn il {fn_ref} "
+                    f"--view mlil` shows the stores and the pointer arithmetic)",
                     kind=_PROOF_LEAF,
                     stores_cover=[lo, hi if hi < _REGION_OPEN else None], **facts)
                 # The origin stays what the writers established (a stored
