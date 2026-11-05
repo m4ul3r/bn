@@ -391,6 +391,14 @@
     "inet_aton": {"propagates": [{"from": "*arg:0", "to": "*arg:1"}, {"from": "*arg:0", "to": "ret"}]},
     "inet_pton": {"propagates": [{"from": "*arg:1", "to": "*arg:2"}, {"from": "*arg:1", "to": "ret"}]},
 
+    "_comment_time_format": "Time formatting (W11-07). Each one reads only the object its argument points at and hands back a pointer to the library's own static result, whose bytes are a function of that object; it writes no caller buffer, so a call is never a writer of a caller's local, even after that local's address escaped. `ret` (not `*ret`) so a backward slice continues into the argument's object instead of naming the call as the bytes' origin -- the same convention as the parser searches above. ctime_r/asctime_r write their second argument and return it.",
+    "ctime":        {"propagates": [{"from": "*arg:0", "to": "ret"}]},
+    "asctime":      {"propagates": [{"from": "*arg:0", "to": "ret"}]},
+    "localtime":    {"propagates": [{"from": "*arg:0", "to": "ret"}]},
+    "gmtime":       {"propagates": [{"from": "*arg:0", "to": "ret"}]},
+    "ctime_r":      {"propagates": [{"from": "*arg:0", "to": "*arg:1"}, {"from": "arg:1", "to": "ret"}]},
+    "asctime_r":    {"propagates": [{"from": "*arg:0", "to": "*arg:1"}, {"from": "arg:1", "to": "ret"}]},
+
     "exit": {}, "abort": {}, "perror": {}, "fflush": {}, "fclose": {}, "puts": {},
     "strcmp": {}, "strncmp": {}, "strcasecmp": {}, "strncasecmp": {},
     "srand": {}, "rand": {}, "time": {}

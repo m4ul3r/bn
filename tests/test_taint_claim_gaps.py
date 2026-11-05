@@ -12,13 +12,18 @@ classes, ``diagnostics.safe_to_report_all_clear`` -- of one fix:
   reads it; a callee filling the caller's global through its pointer
   parameter taints that global; a heap block kept in a global slot carries
   its taint through the reload.
-* P2-08: a struct field store taints that field only.
+* P2-08: a struct field store taints that field only; a load through a
+  member pointing into the same struct reads the field it lands on, or is a
+  ``field_load_unresolved`` frontier when that place is unknown (V1-01).
 * P2-04: one continuation leaf per tainted global, every call in ``sites``.
-* R3 sweep economy: bodies that cannot see the global are not scanned.
+* R3 sweep economy: bodies that cannot see the global are not scanned, and
+  bodies BN's call edges show no reader beyond are not lifted (V2-02).
 
 All names and addresses are invented.
 """
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 from test_taint_engine import FExpr, FInstr, FSSA, FSSAFunc, FVar, te
@@ -608,6 +613,79 @@ def test_a_global_struct_field_store_taints_only_that_field(models):
         ("alloc_size", hex(0x401114))]
 
 
+# V1-01 / V2-01: a member pointing into the same partially tainted struct
+
+def _through_member(name, start, member, field):
+    """`use(struct session *o)`: `c = o-><member>; memcpy(dst, o, c-><field>)`
+    -- the length is loaded through a pointer the struct holds."""
+    o0 = FSSA(FVar("o", typ="struct session*"), 0)
+    c1, n1 = FSSA(FVar("c"), 1), FSSA(FVar("n"), 1)
+    at_member = FExpr("MLIL_ADD", f"o#0 + {member:#x}", reads=[o0], left=_var(o0),
+                      right=_const(member))
+    at_field = FExpr("MLIL_ADD", f"c#1 + {field:#x}", reads=[c1], left=_var(c1),
+                     right=_const(field))
+    dst = FExpr("MLIL_ADDRESS_OF", "&dst", src=FVar("dst", typ="char[0x100]"))
+    return GFunc(name, start, FSSAFunc([
+        FInstr(0, start + 4, "MLIL_SET_VAR_SSA", f"c#1 = [{at_member}].q", reads=[o0],
+               writes=[c1], src=_load(at_member)),
+        FInstr(1, start + 8, "MLIL_SET_VAR_SSA", f"n#1 = [{at_field}].q", reads=[c1],
+               writes=[n1], src=_load(at_field)),
+        FInstr(2, start + 12, "MLIL_CALL_SSA", "memcpy(&dst, o#0, n#1)", reads=[o0, n1],
+               dest=_gptr(MEMCPY), params=[dst, _var(o0), _var(n1)]),
+        FInstr(3, start + 16, "MLIL_RET", "return 0", src=[_const(0)]),
+    ]), params=[o0.var])
+
+
+def _self_pointer_program(known_slot):
+    """`main(arg, k)`: `s.active = &s.slots[0]` (or `&s.slots[k]`) at +0x10,
+    `s.slots[0].len = arg` at +0x28, then `s` handed by address to a reader
+    of `s.active->len` (+8 into the slot) and one of `s.active->spare`
+    (+0x10, clean)."""
+    arg0, k0 = FSSA(FVar("arg"), 0), FSSA(FVar("k"), 0)
+    s = FVar("s", typ="struct session")
+    slot = FExpr("MLIL_ADDRESS_OF_FIELD", "&s.0x20", src=s)
+    slot.offset = 0x20
+    if not known_slot:
+        slot = FExpr("MLIL_ADD", "&s.0x20 + k#0", reads=[k0], left=slot, right=_var(k0))
+    point = FInstr(0, 0x401104, "MLIL_SET_VAR_ALIASED_FIELD", f"s#2.0x10 = {slot}",
+                   reads=list(getattr(slot, "vars_read", []) or []), dest=FSSA(s, 2),
+                   src=slot, prev=FSSA(s, 1), offset=0x10)
+    point.size = 8
+    fill, _s3 = _field_store(1, 0x401108, s, 2, arg0, offset=0x28)
+    hit = _through_member("use_len", 0x401600, 0x10, 0x8)
+    clean = _through_member("use_spare", 0x401700, 0x10, 0x10)
+    instrs = [point, fill]
+    for i, fn in enumerate((hit, clean), start=2):
+        r = FSSA(FVar(f"r{i}"), 1)
+        instrs.append(FInstr(i, 0x401104 + 4 * i, "MLIL_CALL_SSA", f"r{i}#1 = {fn.name}(&s)",
+                             writes=[r], dest=_gptr(fn.start),
+                             params=[FExpr("MLIL_ADDRESS_OF", "&s", src=s)]))
+    instrs.append(_ret(4, 0x401120))
+    func = GFunc("main", 0x401100, FSSAFunc(instrs), params=[arg0.var, k0.var])
+    bv = FGlobalBV({MEMCPY: "memcpy", hit.start: hit.name, clean.start: clean.name},
+                   funcs={hit.start: hit, clean.start: clean})
+    return func, bv
+
+
+def test_a_load_through_a_member_pointing_into_the_struct_reads_its_field(models):
+    func, bv = _self_pointer_program(known_slot=True)
+    result = _forward(bv, func, models)
+    assert [(s["sink"]["class"], s["sink"]["address"]) for s in result["reached_sinks"]] == [
+        ("overflow_len", hex(0x40160c))]
+    assert not [lf for lf in result["leaves"] if lf["kind"] == "field_load_unresolved"], \
+        result["leaves"]
+
+
+def test_a_member_pointing_at_an_unknown_place_in_the_struct_is_a_frontier(models):
+    func, bv = _self_pointer_program(known_slot=False)
+    result = _forward(bv, func, models)
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+    unresolved = {lf["address"] for lf in result["leaves"]
+                  if lf["kind"] == "field_load_unresolved"}
+    assert hex(0x401608) in unresolved and hex(0x401708) in unresolved, result["leaves"]
+    assert _all_clear(result) is False
+
+
 # --------------------------------------------------------------------------
 # P2-04: one continuation leaf per tainted global
 # --------------------------------------------------------------------------
@@ -644,3 +722,75 @@ def test_bodies_that_cannot_see_the_global_do_not_spend_the_sweep(models, monkey
     [leaf] = _leaves(result)
     assert leaf["reachability"]["status"] == "complete", leaf["reachability"]
     assert [r["display_name"] for r in leaf["references"]] == ["consumer"]
+
+
+class FEdgeBV(FExtentBV):
+    """``FExtentBV`` plus BN's recorded call edges: each body's ``call_sites``
+    and ``callers``, and the resolved targets of a call site."""
+
+    def __init__(self, *args, edges=None, **kw):
+        super().__init__(*args, **kw)
+        self._edges = dict(edges or {})
+
+    def get_callees(self, addr, func=None):
+        return list(self._edges.get(int(addr), ()))
+
+
+def _unrelated_breadth(with_edges, n=40):
+    """`main` fills G, then calls `hub`, whose *n* callees touch no global; the
+    only reader of G is `consumer`, called from `elsewhere` -- nowhere `main`
+    reaches."""
+    consumer = _reader("consumer", 0x402000, G, 0x402010)
+    elsewhere = GFunc("elsewhere", 0x402100, FSSAFunc([
+        FInstr(0, 0x402104, "MLIL_CALL_SSA", "consumer()", dest=_gptr(0x402000), params=[])]),
+        params=[], callees=[consumer])
+    quiet = [GFunc(f"q{i}", 0x410000 + i * 0x10,
+                   FSSAFunc([FInstr(0, 0x410000 + i * 0x10, "MLIL_RET", "return 0")]),
+                   params=[]) for i in range(n)]
+    hub = GFunc("hub", 0x401300, FSSAFunc([
+        FInstr(i, 0x401304 + 4 * i, "MLIL_CALL_SSA", f"{q.name}()", dest=_gptr(q.start),
+               params=[]) for i, q in enumerate(quiet)]), params=[], callees=quiet)
+    func = _copy_then_calls(hub)
+    edges = {}
+    if with_edges:
+        for body, callees in ((hub, quiet), (elsewhere, [consumer]), (func, [hub])):
+            body.call_sites = []
+            for c in callees:
+                site = next(int(i.address) for i in body.mlil.ssa_form.instructions
+                            if "CALL" in i.operation.name
+                            and int(getattr(i.dest, "constant", -1)) == c.start)
+                body.call_sites.append(SimpleNamespace(address=site))
+                edges[site] = [c.start]
+                c.callers = [*getattr(c, "callers", []), body]
+        for q in quiet:
+            q.call_sites = []
+        consumer.call_sites, elsewhere.callers = [], []
+    names = {MEMCPY: "memcpy", SYSTEM: "system", hub.start: "hub", consumer.start: "consumer",
+             elsewhere.start: "elsewhere", **{q.start: q.name for q in quiet}}
+    funcs = {hub.start: hub, consumer.start: consumer, elsewhere.start: elsewhere,
+             **{q.start: q for q in quiet}}
+    bv = FEdgeBV(names, funcs=funcs, refs={G: [FRef(consumer, 0x402010)]},
+                 objects={G: G_SIZE}, edges=edges)
+    return func, bv, quiet
+
+
+def test_bodies_no_reader_lies_beyond_are_settled_on_call_edges(models, monkeypatch):
+    # V2-02: when BN's call edges show no possible reader of the global below
+    # a call, the walk answers from the edges -- the same answer as lifting
+    # every body on the way -- and never classifies the unrelated bodies.
+    lifted = []
+    original = te.TaintEngine._not_internal_reason
+
+    def spy(self, fn):
+        lifted.append(getattr(fn, "name", None))
+        return original(self, fn)
+
+    func, bv, _quiet = _unrelated_breadth(with_edges=False)
+    baseline = _forward(bv, func, models)
+    monkeypatch.setattr(te.TaintEngine, "_not_internal_reason", spy)
+    func, bv, quiet = _unrelated_breadth(with_edges=True)
+    result = _forward(bv, func, models)
+    assert result["leaves"] == baseline["leaves"]
+    assert result["reached_sinks"] == baseline["reached_sinks"]
+    assert _all_clear(result) == _all_clear(baseline)
+    assert not {q.name for q in quiet} & set(lifted), lifted

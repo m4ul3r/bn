@@ -7732,3 +7732,38 @@ def test_a_static_the_seeded_function_reads_before_its_store_blocks(tmp_path, sh
                        "--source", "call:read")
     assert not [lf for lf in control["leaves"] if lf["kind"] == "coarse_memory_store"], \
         control["leaves"]
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"], ids=["O0", "O2"])
+def test_a_member_pointing_into_its_own_struct_reads_the_tainted_field(tmp_path, shared_bn,
+                                                                      opt):
+    """V1-01 / V2-01 on `taint_corpus/fwd_struct_selfptr.c` (built with `-g`, so BN
+    types the struct and keeps it one object).
+
+    `main` taints only `data.slots[0].path` and points `data.active` at
+    `data.slots[0]`; `attach_active` opens `s->active->path`. Field-only struct
+    taint read that load as a clean member and reported no sink at all; the
+    true `fopen` in `open_path` must be reached while `touch_log`'s `fopen` of
+    the clean `log` member stays silent. `indexed_entry` points `active` at a
+    slot chosen at run time: the load is a `field_load_unresolved` frontier,
+    never silence."""
+    binary = tmp_path / f"fwd_struct_selfptr{opt[-1]}"
+    _compile(CORPUS / "fwd_struct_selfptr.c", binary, [opt, "-g"])
+    target = shared_bn.load(binary, copy=False)
+    sites = _bn_json(shared_bn, "-t", target, "callsites", "fopen")
+    owner = {row["call_addr"]: row["containing_function"]["name"] for row in sites["items"]}
+    assert sorted(owner.values()) == ["open_path", "touch_log"], owner
+
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                      "--source", "param:1")
+    fopens = [owner.get(hit["sink"]["address"]) for hit in result["reached_sinks"]
+              if hit["sink"]["callee"] == "fopen"]
+    assert fopens == ["open_path"], result["reached_sinks"]
+
+    indexed = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "indexed_entry",
+                       "--source", "param:1")
+    assert not [hit for hit in indexed["reached_sinks"]
+                if owner.get(hit["sink"]["address"]) == "touch_log"], indexed["reached_sinks"]
+    assert "field_load_unresolved" in {lf["kind"] for lf in indexed["leaves"]}, \
+        indexed["leaves"]
+    assert indexed["diagnostics"]["safe_to_report_all_clear"] is False, indexed["diagnostics"]

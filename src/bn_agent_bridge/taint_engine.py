@@ -839,6 +839,15 @@ class TaintEngine:
         # references" was never established for them.
         self._global_refs_truncated: set[int] = set()
         self._global_reach: dict[tuple[int, int, int], tuple] = {}
+        # global -> the bodies that could read it, and the bodies whose call
+        # edges reach one of those (V2-02); (function start, global) -> the
+        # prefilter verdict. Derived from the object's references, so they
+        # go with its extent; BN's call edges alone (`_edges_only_cache`) do
+        # not.
+        self._reader_candidates_cache: dict[int, frozenset | None] = {}
+        self._reader_ancestors_cache: dict[int, frozenset | None] = {}
+        self._may_see_cache: dict[tuple[int, int], bool] = {}
+        self._edges_only_cache: dict[int, bool] = {}
         # (function start, global) -> the first use that can READ the global,
         # or (None, "write_only"). Per function body, so a write-only helper
         # is classified once however many calls reach it.
@@ -2529,15 +2538,118 @@ class TaintEngine:
         return any(lo < hi and rlo < lo + max(int(width), 1)
                    for rlo, hi in ranges)
 
+    @staticmethod
+    def _rebase_object(ranges: Any, ptrs: Any, toff: int | None) -> tuple:
+        """The (tainted ranges, pointer fields) of an object as seen from a
+        pointer to its byte *toff*; ``(None, ())`` when *toff* is unknown
+        -- whatever is read through such a pointer is unresolved."""
+        if toff is None or ranges is None:
+            return (None, ())
+        t = int(toff)
+        return (tuple((lo - t, hi - t) for lo, hi in ranges),
+                tuple((lo - t, hi - t, None if p is None else int(p) - t)
+                      for lo, hi, p in ptrs))
+
+    def _address_into(self, ssaf: Any, expr: Any, depth: int = 0) -> tuple | None:
+        """``(var key, byte offset | None)`` when *expr* is the address of a
+        local variable or of a place inside it (`&s`, `&s.member`,
+        `&s.member + 8`, through SSA copies); the offset is None when a
+        non-constant step makes it unknown. None for anything else."""
+        if expr is None or depth > 8:
+            return None
+        op = op_name(expr)
+        if op in ("MLIL_ADDRESS_OF", "MLIL_ADDRESS_OF_FIELD"):
+            v = getattr(expr, "src", None)
+            if v is None:
+                return None
+            off = getattr(expr, "offset", 0) if op == "MLIL_ADDRESS_OF_FIELD" else 0
+            try:
+                return (var_key(v), int(off or 0))
+            except (TypeError, ValueError):
+                return (var_key(v), None)
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left, right = getattr(expr, "left", None), getattr(expr, "right", None)
+            sides = [(left, right, 1 if op == "MLIL_ADD" else -1)]
+            if op == "MLIL_ADD":
+                sides.append((right, left, 1))
+            for base, other, sign in sides:
+                got = self._address_into(ssaf, base, depth + 1)
+                if got is not None:
+                    c = self._int_const(other)
+                    return (got[0], None if got[1] is None or c is None
+                            else got[1] + sign * c)
+            return None
+        var = expr if is_ssa_var(expr) else (
+            expr_reads(expr)[0] if op == "MLIL_VAR_SSA" and len(expr_reads(expr)) == 1 else None)
+        if var is None:
+            return None
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            d = None
+        if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+            return self._address_into(ssaf, getattr(d, "src", None), depth + 1)
+        return None
+
+    def _ssa_root_offset(self, ssaf: Any, expr: Any, depth: int = 0) -> tuple | None:
+        """``((var key, SSA version), byte offset)`` for an address built from
+        ONE SSA value by copies and constant steps -- the value an alias
+        pointer was loaded into -- or None."""
+        if expr is None or depth > 8:
+            return None
+        op = op_name(expr)
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left, right = getattr(expr, "left", None), getattr(expr, "right", None)
+            rc = self._int_const(right)
+            if rc is not None:
+                got = self._ssa_root_offset(ssaf, left, depth + 1)
+                if got is not None:
+                    return (got[0], got[1] + (rc if op == "MLIL_ADD" else -rc))
+            lc = self._int_const(left)
+            if lc is not None and op == "MLIL_ADD":
+                got = self._ssa_root_offset(ssaf, right, depth + 1)
+                if got is not None:
+                    return (got[0], got[1] + lc)
+            return None
+        var = expr if is_ssa_var(expr) else (
+            expr_reads(expr)[0] if op == "MLIL_VAR_SSA" and len(expr_reads(expr)) == 1 else None)
+        if var is None:
+            return None
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            d = None
+        if d is not None and op_name(d) == "MLIL_SET_VAR_SSA" \
+                and op_name(getattr(d, "src", None)) in ("MLIL_VAR_SSA", "MLIL_ADD", "MLIL_SUB"):
+            got = self._ssa_root_offset(ssaf, getattr(d, "src", None), depth + 1)
+            if got is not None:
+                return got
+        return ((var_key(var), getattr(var, "version", None)), 0)
+
     def _partial_read(self, ssaf: Any, src: Any, field_only: dict,
-                      partial_bases: dict) -> tuple | None:
-        """``(verdict, base key, base label)`` for a read of a partially
-        tainted object, or None when *src* reads no such object. ``verdict``
-        is True (it overlaps a tainted field), False (it reads only other
-        bytes) or ``"unresolved"`` (its offset into the object is not
-        established) -- P2-08."""
+                      partial_bases: dict, ptrs_of: Any = None,
+                      alias_bases: dict | None = None) -> tuple | None:
+        """``(verdict, base key, base label, extra)`` for a read of a
+        partially tainted object, or None when *src* reads no such object.
+        ``verdict`` is True (it overlaps a tainted field), False (it reads
+        only other bytes), ``"unresolved"`` (its offset into the object, or
+        what a pointer into it points at, is not established) or
+        ``"alias"``: it loads a member that holds the address of a place in
+        the SAME object (`s.cur = &s.slots`), and *extra* is that object as
+        seen from the loaded pointer, ``(ranges | None, pointer fields)`` --
+        what is read through it is decided against those (P2-08, V1-01)."""
         if src is None:
             return None
+        ptrs_of = ptrs_of or (lambda _key: ())
+
+        def verdict(key: Any, ranges: Any, ptrs: Any, lo: int, width: int, label: str):
+            if ranges is None:
+                return ("unresolved", key, label, None)
+            for plo, phi, toff in ptrs:
+                if plo == lo and lo < phi:
+                    return ("alias", key, label, self._rebase_object(ranges, ptrs, toff))
+            return (self._overlaps(ranges, lo, width), key, label, None)
+
         sop = op_name(src)
         if sop in ("MLIL_VAR_SSA_FIELD", "MLIL_VAR_ALIASED_FIELD", "MLIL_VAR_FIELD"):
             sv = getattr(src, "src", None)
@@ -2550,8 +2662,8 @@ class TaintEngine:
             try:
                 lo, width = int(getattr(src, "offset", 0)), int(getattr(src, "size", 0) or 1)
             except (TypeError, ValueError):
-                return ("unresolved", key, var_label(sv))
-            return (self._overlaps(ranges, lo, width), key, var_label(sv))
+                return ("unresolved", key, var_label(sv), None)
+            return verdict(key, ranges, ptrs_of(key), lo, width, var_label(sv))
         if "LOAD" not in sop:
             return None
         addr = getattr(src, "src", None)
@@ -2566,24 +2678,39 @@ class TaintEngine:
             bases = () if bo is not None else tuple(
                 (b[0], r) for r in expr_reads(addr)
                 for b in (self._addr_base_offset(ssaf, r),) if b is not None)
-            shape = (bo, bases)
+            root = self._ssa_root_offset(ssaf, addr)
+            # `p->name` is a LOAD_STRUCT whose member offset is an operand
+            # of the load, not part of its address expression.
+            member = getattr(src, "offset", 0) if "STRUCT" in sop else 0
+            try:
+                member = int(member or 0)
+            except (TypeError, ValueError):
+                member = 0
+            if bo is not None:
+                bo = (bo[0], int(bo[1]) + member)
+            if root is not None:
+                root = (root[0], int(root[1]) + member)
+            shape = (bo, bases, root)
             if mk is not None:
                 memo[mk] = shape
-        bo, bases = shape
+        bo, bases, root = shape
         try:
             width = int(getattr(src, "size", 0) or 1)
         except (TypeError, ValueError):
             width = 1
+        if alias_bases and root is not None and root[0] in alias_bases:
+            ranges, ptrs, _parent = alias_bases[root[0]]
+            return verdict(root[0], ranges, ptrs, int(root[1]), width, str(addr))
         if bo is not None:
             ranges = field_only.get(bo[0])
             if ranges is None:
                 ranges = partial_bases.get(bo[0])
             if ranges is None:
                 return None
-            return (self._overlaps(ranges, int(bo[1]), width), bo[0], str(addr))
+            return verdict(bo[0], ranges, ptrs_of(bo[0]), int(bo[1]), width, str(addr))
         for key, r in bases:
             if key in field_only or key in partial_bases:
-                return ("unresolved", key, var_label(r))
+                return ("unresolved", key, var_label(r), None)
         return None
 
     def _addr_base_offset(self, ssaf: Any, expr: Any, depth: int = 0):
@@ -5979,32 +6106,72 @@ class TaintEngine:
         return self._is_allocator_wrapper_body(fn)
 
     def _is_allocator_wrapper_body(self, fn: Any) -> bool:
-        """True if in-binary single-call thin wrapper *fn* forwards its first
-        parameter to a KNOWN allocator's SIZE argument (#307). Strict: exactly one
-        call in the body, to a known allocator, with the wrapper's param 0 at the
-        allocator's size position -- so `acquire(n){ return malloc(n); }` is
-        recognized even when stripped of name and return type, while a helper with
-        no allocator call (or that passes a local, not its param) is not."""
+        """True if in-binary wrapper *fn* forwards its first parameter to a
+        KNOWN allocator's SIZE argument and hands back what that allocator
+        returned (#307, V3-05). A single-call thin wrapper qualifies as such
+        -- `acquire(n){ return malloc(n); }`, even stripped of name and return
+        type; a body with more calls (the `xmalloc` error path: `p =
+        malloc(n); if (!p) fatal(...); return p;`) qualifies only when every
+        return yields the allocator's result. A helper with no allocator call,
+        one that passes a local rather than its param, or one that returns
+        something else (a fixed scratch buffer) is not."""
         if fn is None or not self._is_internal(fn):
             return False
         ssaf = _mlil_ssa(fn)
         if ssaf is None:
             return False
-        calls = [i for i in _ssa_instructions(ssaf) if "CALL" in op_name(i)]
-        if len(calls) != 1:
+        instrs = list(_ssa_instructions(ssaf))
+        calls = [i for i in instrs if "CALL" in op_name(i)]
+        allocs = []
+        for call in calls:
+            base = (self._callee_name(self._resolve_direct_target(call)) or "").split("@", 1)[0].lstrip("_")
+            size_idx = self._ALLOC_SIZE_ARG.get(base)
+            if size_idx is None:
+                canon = _canonical_cxx_alloc(base)
+                size_idx = self._ALLOC_SIZE_ARG.get(canon) if canon else None
+            cparams = self._call_params(call)
+            if size_idx is not None and size_idx < len(cparams) \
+                    and self._resolve_to_param_index(fn, ssaf, cparams[size_idx]) == 0:
+                allocs.append(call)
+        if not allocs:
             return False
-        call = calls[0]
-        base = (self._callee_name(self._resolve_direct_target(call)) or "").split("@", 1)[0].lstrip("_")
-        size_idx = self._ALLOC_SIZE_ARG.get(base)
-        if size_idx is None:
-            canon = _canonical_cxx_alloc(base)
-            size_idx = self._ALLOC_SIZE_ARG.get(canon) if canon else None
-        if size_idx is None:
+        if len(calls) == 1:
+            return True
+        outs = {self._ssa_var_key(w) for c in allocs for w in ssa_writes(c)}
+        rets = [i for i in instrs if op_name(i) in ("MLIL_RET", "MLIL_RET_SSA")]
+        if not outs or not rets:
             return False
-        cparams = self._call_params(call)
-        if size_idx >= len(cparams):
+        return all(srcs and all(self._value_is_one_of(ssaf, s, outs) for s in srcs)
+                   for srcs in (self._ret_sources(r) for r in rets))
+
+    def _value_is_one_of(self, ssaf: Any, expr: Any, keys: set, depth: int = 0) -> bool:
+        """Whether *expr* is, through SSA copies and every arm of a PHI, one of
+        the SSA values whose keys are *keys*."""
+        if expr is None or depth > 12:
             return False
-        return self._resolve_to_param_index(fn, ssaf, cparams[size_idx]) == 0
+        var = self._as_single_ssa_var(expr)
+        if var is None:
+            return False
+        if self._ssa_var_key(var) in keys:
+            return True
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            return False
+        if d is None:
+            return False
+        if op_name(d) == "MLIL_SET_VAR_SSA":
+            return self._value_is_one_of(ssaf, getattr(d, "src", None), keys, depth + 1)
+        if op_name(d) in ("MLIL_SET_VAR_SSA_FIELD", "MLIL_SET_VAR_ALIASED_FIELD"):
+            # A partial write of the variable (BN's `result.xmm0 = 0` ABI
+            # clobber of the vector half after a call) keeps the value the
+            # previous version held in its other bytes.
+            return self._value_is_one_of(ssaf, getattr(d, "prev", None), keys, depth + 1)
+        if "PHI" in op_name(d):
+            arms = list(getattr(d, "src", None) or [])
+            return bool(arms) and all(self._value_is_one_of(ssaf, a, keys, depth + 1)
+                                      for a in arms)
+        return False
 
     def _linear_in_var(self, ssaf: Any, expr: Any, depth: int = 0):
         """Decompose *expr* into ``(canonical_ssa_var, const)`` when it is ``v``,
@@ -6851,8 +7018,10 @@ class TaintEngine:
         """Analyze *callee* with the given tainted parameter indices, caching the
         result per (callee, tainted-param-set) so it is computed once."""
         # P2-08: a parameter pointing at a partially tainted object is its own
-        # context -- which bytes are tainted decides what the body can read.
-        fkey = tuple(sorted((i, tuple(r)) for i, r in (fields or {}).items() if i in param_set))
+        # context -- which bytes are tainted, and which members hold the
+        # address of a place in the same object, decide what the body can
+        # read. *fields* maps a parameter to ``(ranges, pointer fields)``.
+        fkey = tuple(sorted((i, obj) for i, obj in (fields or {}).items() if i in param_set))
         key = (int(callee.start), param_set) if not fkey else (int(callee.start), param_set, fkey)
         if key in self._cache:
             cached = self._cache[key]
@@ -6862,9 +7031,14 @@ class TaintEngine:
                         "frontier": "recursion cycle stopped descent"}
             return cached
         self._cache[key] = None  # mark in-progress (cycle guard)
-        locators = [dict({"kind": "param", "index": i},
-                         **({"fields": list((fields or {})[i])} if (fields or {}).get(i) else {}))
-                    for i in sorted(param_set)]
+        locators = []
+        for i in sorted(param_set):
+            loc: dict[str, Any] = {"kind": "param", "index": i}
+            obj = (fields or {}).get(i)
+            if obj:
+                loc["fields"] = list(obj[0])
+                loc["pointer_fields"] = list(obj[1])
+            locators.append(loc)
         # _run_forward(callee) repoints self._bt_func_token at the callee; restore
         # the caller's token afterward so its fixpoint keeps hitting its own cache
         # entries (the #420 _buffer_target memo is keyed by this token).
@@ -8540,10 +8714,56 @@ class TaintEngine:
         that hands one back. A body with neither has nothing for a pointer
         scan to find, so the reachability walk skips the scan (R3 sweep
         economy: on an ordinary `main` nearly all of the sweep allowance went
-        to classifying such bodies once per tainted global)."""
-        if self._names_global_storage(int(getattr(fn, "start", 0)), ga):
+        to classifying such bodies once per tainted global). Answered once
+        per (function, global) per request (V2-02)."""
+        cache = self._may_see_cache
+        key = (int(getattr(fn, "start", 0)), int(ga))
+        got = cache.get(key)
+        if got is None:
+            readers = None if self.resolve_map else self._reader_candidates(ga)
+            if readers is not None and key[0] not in readers:
+                # Not a body the reference index and caller edges allow to
+                # see the object -- decided without lifting anything.
+                got = False
+            else:
+                got = self._names_global_storage(key[0], ga) or any(
+                    self._may_return_global(c, ga, 0) for c in self._call_successors(fn))
+            cache[key] = got
+        return got
+
+    def _named_beyond(self, ga: int, own: int) -> bool:
+        """Whether any body other than the one at *own* names the storage of
+        the global at *ga*: the object, an object that may enclose it, or a
+        pointer slot holding it (all in the code-reference index). With none,
+        no code past a call of *own* can obtain the object's address but
+        from *own* -- whose reads are its own walk's -- so a continuation
+        question about it is settled without walking any call graph
+        (V2-02). An enclosing-object search that ran out of budget leaves
+        every body possible."""
+        if any(s != own for s in self._global_ref_functions(ga)):
             return True
-        return any(self._may_return_global(c, ga, 0) for c in self._call_successors(fn))
+        candidates, exhausted = self._preceding_objects(ga)
+        if exhausted:
+            return True
+        for pb in candidates:
+            others = [s for s in self._global_ref_functions(pb) if s != own]
+            if not others:
+                continue
+            width = self._authoritative_width(pb)
+            if not (width and pb + width <= ga):
+                return True
+            # DECLARED separate storage: its readers reach these bytes only
+            # by a stated interval running past its end -- the few bodies
+            # that name it are classified directly instead (cached), rather
+            # than walking every call graph that might reach them.
+            for s in others:
+                rfn = function_at(self.bv, s)
+                if rfn is None:
+                    return True
+                use = self._global_access(rfn, ga)
+                if use.at is not None and not self._use_misses_tainted(ga, use):
+                    return True
+        return False
 
     def _names_global_storage(self, start: int, ga: int) -> bool:
         """Whether the body at *start* holds a code reference to the object
@@ -10356,6 +10576,9 @@ class TaintEngine:
         self._canon_global_cache.clear()
         self._global_refs.clear()
         self._global_reach.clear()
+        self._reader_candidates_cache.clear()
+        self._reader_ancestors_cache.clear()
+        self._may_see_cache.clear()
         self._global_access_cache.clear()
         self._param_access_cache.clear()
         self._alias_chain_cache.clear()
@@ -10371,6 +10594,10 @@ class TaintEngine:
         self._global_extent_unproven.pop(ga, None)
         self._unverified_neighbours.pop(ga, None)
         self._alias_chain_cache.pop(ga, None)
+        self._reader_candidates_cache.pop(ga, None)
+        self._reader_ancestors_cache.pop(ga, None)
+        for key in [k for k in self._may_see_cache if k[1] == ga]:
+            del self._may_see_cache[key]
         for key in [k for k in self._global_reach if k[1] == ga]:
             del self._global_reach[key]
         for key in [k for k in self._global_access_cache if k[1] == ga]:
@@ -11007,6 +11234,107 @@ class TaintEngine:
         self._indirect_sites_cache[key] = out
         return out
 
+    def _reader_candidates(self, ga: int) -> frozenset | None:
+        """Every body that could read the global at *ga*: one that names its
+        storage (the object, an object that may enclose it, a pointer slot
+        holding it), and every caller of a body that may hand such a pointer
+        back (a pointer-returning namer, or a pointer-returning caller of
+        one, up to the wrapper-chain bound). Read from the reference index
+        and BN's caller edges; None when that cannot be established (an
+        enclosing-object search that ran out, a view with no caller edges).
+        Cached per global."""
+        cache = self._reader_candidates_cache
+        if ga in cache:
+            return cache[ga]
+        cands, exhausted = self._preceding_objects(ga)
+        names = set(self._global_ref_functions(ga))
+        for pb in cands:
+            names.update(self._global_ref_functions(pb))
+        out: frozenset | None = None
+        if not exhausted:
+            readers: set | None = set(names)
+            frontier = [function_at(self.bv, s) for s in names]
+            returners: set[int] = set()
+            for _level in range(self._PTR_RESOLVE_DEPTH + 1):
+                nxt = []
+                for f in frontier:
+                    if f is None:
+                        readers = None
+                        break
+                    s = int(getattr(f, "start", 0))
+                    if s in returners or not self._returns_pointerish(f):
+                        continue
+                    returners.add(s)
+                    callers = getattr(f, "callers", None)
+                    if callers is None:
+                        readers = None
+                        break
+                    for c in callers:
+                        readers.add(int(getattr(c, "start", 0)))
+                        nxt.append(c)
+                if readers is None or not nxt:
+                    break
+                frontier = nxt
+            else:
+                readers = None      # the wrapper chain outran its bound
+            out = frozenset(readers) if readers is not None else None
+        cache[ga] = out
+        return out
+
+    def _reader_ancestors(self, ga: int) -> frozenset | None:
+        """Every body from which BN's call edges reach a possible reader of
+        the global at *ga* (:meth:`_reader_candidates`, closed over callers).
+        None when the candidates cannot be established or the closure grows
+        past a bound. Cached per global."""
+        cache = self._reader_ancestors_cache
+        if ga in cache:
+            return cache[ga]
+        readers = self._reader_candidates(ga)
+        out: frozenset | None = None
+        if readers is not None:
+            closure: set | None = set(readers)
+            work = [function_at(self.bv, s) for s in readers]
+            while work and closure is not None:
+                f = work.pop()
+                callers = getattr(f, "callers", None) if f is not None else None
+                if callers is None:
+                    closure = None
+                    break
+                for c in callers:
+                    s = int(getattr(c, "start", 0))
+                    if s not in closure:
+                        closure.add(s)
+                        work.append(c)
+                if len(closure) > 8 * self._GLOBAL_REACH_FUNCS:
+                    closure = None
+            out = frozenset(closure) if closure is not None else None
+        cache[ga] = out
+        return out
+
+    def _edges_only(self, fn: Any) -> bool:
+        """Whether BN's recorded call edges speak for every call *fn* makes:
+        a body BN analysed, not flagged a thunk, whose every call site has a
+        resolved target. Anything else (an indirect call, a tail-calling
+        veneer, a skipped body) needs the lifted body. Cached per function."""
+        cache = self._edges_only_cache
+        key = int(getattr(fn, "start", 0))
+        got = cache.get(key)
+        if got is not None:
+            return got
+        got = False
+        get_callees = getattr(self.bv, "get_callees", None)
+        sites = getattr(fn, "call_sites", None)
+        if callable(get_callees) and sites is not None \
+                and getattr(fn, "callees", None) is not None \
+                and not getattr(fn, "analysis_skipped", False) \
+                and not getattr(fn, "is_thunk", False):
+            try:
+                got = all(list(get_callees(site.address, fn) or ()) for site in sites)
+            except Exception:
+                got = False
+        cache[key] = got
+        return got
+
     def _global_refs_reachable(self, fn: Any, ga: int, budget: int) -> tuple[tuple, dict]:
         """``(reads, reach)`` for the global at *ga* as seen from *fn*.
 
@@ -11057,6 +11385,7 @@ class TaintEngine:
         budget_cut: str | None = None
         swept_out = False
         wave, level, cut = [fn], 0, None
+        ancestors = None if self.resolve_map else self._reader_ancestors(ga)
         while wave:
             if level > budget:
                 cut = budget_cut = "depth_budget"
@@ -11071,7 +11400,13 @@ class TaintEngine:
                     break
                 cs = int(getattr(cur, "start", 0))
                 done.add(cs)
-                reason = str(self._not_internal_reason(cur) or "")
+                # V2-02: a body from which BN's call edges reach no possible
+                # reader of the object, and whose every call site BN resolved,
+                # holds nothing the classification below could find: it is
+                # examined on its edges alone, without lifting it.
+                cheap = (ancestors is not None and cs not in ancestors
+                         and self._edges_only(cur))
+                reason = "" if cheap else str(self._not_internal_reason(cur) or "")
                 if reason.startswith("analysis_skipped:"):
                     # BN21-REACH-01: a model is ADDITIVE evidence over a body,
                     # never a substitute for one. Exempting a modeled name
@@ -11088,7 +11423,7 @@ class TaintEngine:
                         found.setdefault(
                             cs, _Use(site, "unreadable", 0, None, None, True))
                     continue
-                if cs not in found:
+                if not cheap and cs not in found:
                     # Not only the functions BN records a reference from: a
                     # pointer handed back through a CHAIN of returning
                     # wrappers reaches a reader that never names the address
@@ -11106,7 +11441,7 @@ class TaintEngine:
                     callees = []
                 # A veneer BN did not record an edge for still CALLS
                 # something, and its target is right there in the body.
-                for extra in self._direct_callees(cur):
+                for extra in (() if cheap else self._direct_callees(cur)):
                     if all(int(getattr(c, "start", -1)) != int(
                             getattr(extra, "start", -2)) for c in callees):
                         callees.append(extra)
@@ -11117,7 +11452,8 @@ class TaintEngine:
                 # bn failed to resolve would raise this boundary on every
                 # library call in the walk.
                 pinned, unpinned = (
-                    self._indirect_sites(cur) if self._is_internal(cur) else ((), ()))
+                    self._indirect_sites(cur) if not cheap and self._is_internal(cur)
+                    else ((), ()))
                 opaque.extend(unpinned)
                 for taddr in pinned:
                     pinned_fn = function_at(self.bv, taddr)
@@ -11891,6 +12227,21 @@ class TaintEngine:
         # `field_load_unresolved` frontier rather than a guess either way.
         field_only: dict = {}
         partial_bases: dict = {}
+        # V1-01: members that hold the address of a place in the SAME object
+        # (`s.cur = &s.slots`): per object key, {(lo, hi): target offset |
+        # None}; for a parameter's object, as handed down by the caller. A
+        # value loaded from such a member is an `alias_bases` pointer: what
+        # is read through it is decided against the object it points into,
+        # keyed by the loaded SSA value, with the tainted node it came from.
+        ptr_fields: dict = {}
+        partial_ptrs: dict = {}
+        alias_bases: dict = {}
+
+        def ptrs_of(key: Any) -> tuple:
+            got = ptr_fields.get(key)
+            if got:
+                return tuple((lo, hi, t) for (lo, hi), t in sorted(got.items()))
+            return partial_ptrs.get(key, ())
         field_store_active = [False]
         # P2-08: globals every tainting write of which was a direct store --
         # each one recorded the bytes it wrote, so a load of OTHER bytes of
@@ -12070,7 +12421,9 @@ class TaintEngine:
             idx = loc.get("index") if isinstance(loc, dict) else None
             if spans and loc.get("kind") == "param" and isinstance(idx, int) \
                     and idx < len(params_list):
-                partial_bases[var_key(params_list[idx])] = tuple(spans)
+                pk = var_key(params_list[idx])
+                partial_bases[pk] = tuple(tuple(r) for r in spans)
+                partial_ptrs[pk] = tuple(tuple(p) for p in loc.get("pointer_fields") or ())
 
         # Honesty signal: a visited function with unlifted instructions is a
         # potential silent dataflow hole -- BN couldn't model those ops, so taint
@@ -12134,6 +12487,8 @@ class TaintEngine:
                     hit.append(node)
             return hit
 
+        own_start = int(getattr(func, "start", 0))
+
         def note_global_continuation(ins: Any, target: int | None, descended: bool) -> None:
             """Disclose tainted global bytes crossing a call boundary (IC03).
 
@@ -12147,13 +12502,17 @@ class TaintEngine:
             ``indirect_call_unresolved`` frontier owns that call."""
             addr = int(getattr(ins, "address", 0))
             # Cheapest filter first: a global already disclosed at this call,
-            # one whose tainting writes cannot reach the call, or one BN
-            # records no reference to anywhere, asks nothing of the call graph.
+            # one whose tainting writes cannot reach the call, or one no body
+            # OTHER than this one names -- its storage, an object that may
+            # enclose it, or a pointer slot holding it (V2-02: settled from
+            # the reference index, before any call graph is walked; this
+            # body's own reads are this walk's) -- asks nothing of the call
+            # graph.
             pending = [ga for ga in sorted(live_globals)
                        if (addr, ga) not in global_frontiers_seen
                        and self._call_sees_global(ssaf, ins,
                                                   live_global_sites.get(ga))
-                       and (self._global_ref_functions(ga)
+                       and (self._named_beyond(ga, own_start)
                             or ga in self._global_refs_truncated)]
             if not pending:
                 return
@@ -13787,22 +14146,30 @@ class TaintEngine:
                                 changed = True
                         if descend_internal:
                             # P2-08: an argument pointing into a partially
-                            # tainted object hands the callee those ranges,
+                            # tainted object hands the callee those ranges
+                            # and the object's self-pointing members (V1-01),
                             # rebased to where the pointer points.
                             arg_fields: dict = {}
-                            if field_only or partial_bases:
+                            if field_only or partial_bases or alias_bases:
                                 for ai in tainted_args:
                                     if ai >= len(params):
                                         continue
-                                    bo = self._addr_base_offset(ssaf, params[ai])
-                                    if bo is None:
-                                        continue
-                                    spans = field_only.get(bo[0])
-                                    if spans is None:
-                                        spans = partial_bases.get(bo[0])
-                                    if spans:
-                                        arg_fields[ai] = tuple(sorted(
-                                            (lo - int(bo[1]), hi - int(bo[1])) for lo, hi in spans))
+                                    root = self._ssa_root_offset(ssaf, params[ai])
+                                    if root is not None and root[0] in alias_bases:
+                                        ranges, ptrs, _parent = alias_bases[root[0]]
+                                        at = int(root[1])
+                                    else:
+                                        bo = self._addr_base_offset(ssaf, params[ai])
+                                        if bo is None:
+                                            continue
+                                        ranges = field_only.get(bo[0])
+                                        if ranges is None:
+                                            ranges = partial_bases.get(bo[0])
+                                        ptrs, at = ptrs_of(bo[0]), int(bo[1])
+                                    if ranges:
+                                        shifted, sptrs = self._rebase_object(
+                                            tuple(sorted(ranges)), ptrs, at)
+                                        arg_fields[ai] = (tuple(sorted(shifted)), tuple(sptrs))
                             d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth,
                                               via=via, caller_instrs=instrs,
                                               fields=arg_fields or None)
@@ -14018,9 +14385,25 @@ class TaintEngine:
                 if opn in ("MLIL_SET_VAR_ALIASED_FIELD", "MLIL_SET_VAR_FIELD"):
                     dest = getattr(ins, "dest", None)
                     if dest is not None and is_ssa_var(dest):
-                        hits = arg_taint(getattr(ins, "src", None))
                         dk = var_key(dest)
                         off = getattr(ins, "offset", 0)
+                        into = self._address_into(ssaf, getattr(ins, "src", None))
+                        if into is not None and into[0] == dk:
+                            # V1-01: `s.cur = &s.slots` -- the member holds an
+                            # address in the same object. That address is not
+                            # attacker data; what is READ through it is, when
+                            # it lands on a tainted member.
+                            try:
+                                lo = int(off)
+                                width = int(getattr(ins, "size", 0)
+                                            or getattr(getattr(ins, "src", None), "size", 0) or 0)
+                            except (TypeError, ValueError):
+                                width = 0
+                            if width > 0:
+                                ptr_fields.setdefault(dk, {})[(lo, lo + width)] = into[1]
+                            hits = []
+                        else:
+                            hits = arg_taint(getattr(ins, "src", None))
                         if hits and (dk in field_only
                                      or not any(n[0] == dk for n in tainted)):
                             # P2-08: the stored value taints THIS field only.
@@ -14057,11 +14440,11 @@ class TaintEngine:
                 # fields were stored to one at a time, or the object a
                 # pointer parameter reaches) carries taint only when the bytes
                 # it reads overlap the tainted fields.
-                if opn == "MLIL_SET_VAR_SSA" and (field_only or partial_bases):
+                if opn == "MLIL_SET_VAR_SSA" and (field_only or partial_bases or alias_bases):
                     part = self._partial_read(ssaf, getattr(ins, "src", None),
-                                              field_only, partial_bases)
+                                              field_only, partial_bases, ptrs_of, alias_bases)
                     if part is not None:
-                        verdict, base_key, base_label = part
+                        verdict, base_key, base_label, extra = part
                         if verdict == "unresolved":
                             leaf = {
                                 "kind": "field_load_unresolved",
@@ -14072,16 +14455,39 @@ class TaintEngine:
                                 "detail": (
                                     f"a load through {base_label}, an object only some of "
                                     "whose fields carry taint, at an offset this walk could "
-                                    "not establish -- whether it reads a tainted field is "
-                                    "unknown, so it is neither followed nor ruled out"),
+                                    "not establish, or through a member pointing into it "
+                                    "at a place it could not establish -- whether it reads "
+                                    "a tainted field is unknown, so it is neither followed "
+                                    "nor ruled out"),
                             }
                             if leaf not in leaves:
                                 leaves.append(leaf)
                             continue
                         if verdict is False:
                             continue
-                        if base_key in field_only:
+                        if base_key in alias_bases:
+                            parent = alias_bases[base_key][2]
+                        else:
                             parent = next((n for n in tainted if n[0] == base_key), None)
+                        if verdict == "alias":
+                            # V1-01: the loaded value points back into the same
+                            # object; reads through it are decided against it.
+                            # The pointer itself carries the object's taint the
+                            # way a pointer parameter to it does, so a call
+                            # handed it is descended.
+                            ranges, ptrs = extra
+                            for w in ssa_writes(ins):
+                                wk = (var_key(w), getattr(w, "version", None))
+                                if alias_bases.get(wk) != (ranges, ptrs, parent):
+                                    alias_bases[wk] = (ranges, ptrs, parent)
+                                    changed = True
+                                if parent is not None and taint_node(
+                                        wk, var_label(w), ins,
+                                        "loads a member pointing into the same partially "
+                                        "tainted object", [parent]):
+                                    changed = True
+                            continue
+                        if base_key in field_only or base_key in alias_bases:
                             for w in ssa_writes(ins):
                                 if parent is not None and taint_node(
                                         (var_key(w), getattr(w, "version", None)),
@@ -14164,6 +14570,21 @@ class TaintEngine:
                                 if taint_node(node, var_label(w), ins, reason, [msrc]):
                                     changed = True
                             add_assumption(assume)
+
+                # P2-08 / V1-01: a pointer to a partially tainted object is
+                # tainted as a VALUE only so the calls handed it are descended.
+                # Storing an untainted value through it (`p->out = f`) writes
+                # no attacker byte; reading the pointer as the store's input
+                # made the whole object the callee's tainted out-param.
+                if "STORE" in opn and not ssa_writes(ins) \
+                        and (partial_bases or alias_bases) \
+                        and not arg_taint(getattr(ins, "src", None)):
+                    dest_expr = getattr(ins, "dest", None)
+                    root = self._ssa_root_offset(ssaf, dest_expr)
+                    bo = self._addr_base_offset(ssaf, dest_expr)
+                    if (root is not None and root[0] in alias_bases) \
+                            or (bo is not None and bo[0] in partial_bases):
+                        continue
 
                 # generic value flow: any tainted value-read taints all writes
                 reads = read_taint(ins)
