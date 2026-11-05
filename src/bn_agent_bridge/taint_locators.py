@@ -106,21 +106,31 @@ def _locator_index(text: str, what: str) -> int:
 
 class ResolveMap(dict):
     """A validated ``--resolve-map``: ``{call_address: [target, ...]}`` that
-    remembers which entries the walk actually consulted at a call it reached.
+    remembers which entries actually routed an indirect transfer.
 
-    Every pin lookup goes through ``get``. A key that is no call site in the
-    walked region (a typo, a call in another function) was accepted and
-    ignored with no trace (W07-14); ``matched`` is what ``run_params`` echoes
-    beside the entry count, so an unmatched pin is visible."""
+    A key that is no call site in the walked region (a typo, a call in another
+    function) was accepted and ignored with no trace (W07-14); ``matched`` is
+    what ``run_params`` echoes beside the entry count, so an unmatched pin is
+    visible. A pin is matched only by ``select`` -- at an indirect call or
+    jump the walk could not resolve itself, where the pinned targets are what
+    it follows, or one through which a source/sink locator anchored its call
+    site. A plain ``get`` (a helper asking what a site is pinned to,
+    discovery asking of every indirect call whether it routes to the
+    locator's callee) or a pin on a DIRECT call, which the walk follows to
+    its real target, matches nothing (R3-02, D5c-01): marking every lookup
+    reported such an inert pin as matched and its warning disappeared."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.matched: set[int] = set()
 
-    def get(self, key: Any, default: Any = None) -> Any:
-        if key in self:
-            self.matched.add(key)
-        return super().get(key, default)
+    def select(self, call: int) -> list[int]:
+        """The targets pinned for the unresolved indirect call or jump at
+        *call*, recording the pin as matched when there are any."""
+        targets = list(self.get(call) or ())
+        if targets:
+            self.matched.add(call)
+        return targets
 
 
 def normalize_resolve_map(raw: Any, *, origin: str = "--resolve-map",

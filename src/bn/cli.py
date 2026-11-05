@@ -18,17 +18,21 @@ from typing import Any, Callable, Iterable
 
 from . import session_state
 from .formatters import (
+    CODE_SPAN_RE,
     FAILED_MUTATION_STATUSES,
     _add_mutation_ok,
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
     _mutation_summary,
     _render_fanout_text,
+    _render_target_choices,
     _render_mutation_summary_text,
     _render_mutation_text,
+    code_span,
     command_routing,
 )
-from .output import (estimate_output_result, exit_outcome, outcome_fields, render_envelope,
-                     render_error, render_value, write_output_result)
+from .output import (RawBytes, estimate_bytes_result, estimate_output_result, exit_outcome,
+                     outcome_fields, render_envelope, render_error, render_value,
+                     write_bytes_result, write_output_result)
 
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
@@ -66,7 +70,7 @@ from .transport import (  # noqa: F401
     validate_instance_id,
     wait_for_teardown,
 )
-from .target_hint import instance_option, respell_for_option
+from .target_hint import SELECT_HINT_LINE, instance_option, respell_for_option
 from .version import (  # noqa: F401
     VERSION, build_id_for_file, build_id_for_package, build_id_for_tree,
 )
@@ -155,27 +159,30 @@ def _resolve_output_format(args: argparse.Namespace) -> str:
     none was given; when an explicit ``--format`` disagrees with the extension,
     honor the explicit choice but warn so it is not a silent footgun.
     """
+    resolved = getattr(args, "_resolved_format", None)
+    if resolved is not None:
+        return resolved     # resolved once per invocation: the note prints once
     fmt = getattr(args, "format", "text")
     out = getattr(args, "out", None)
-    if out is None:
-        return fmt
-    inferred = _OUT_FORMAT_BY_SUFFIX.get(Path(str(out)).suffix.lower())
-    if inferred is None or inferred == fmt:
-        return fmt
-    suffix = Path(str(out)).suffix
-    if getattr(args, "_format_explicit", False):
-        print(
-            f"warning: --out {out} ends in {suffix} but --format {fmt} was given; "
-            f"writing {fmt}. Pass --format {inferred} to write {inferred}.",
-            file=sys.stderr,
-        )
-        return fmt
-    print(
-        f"note: inferring --format {inferred} from the {suffix} --out path; "
-        f"pass an explicit --format to override.",
-        file=sys.stderr,
-    )
-    return inferred
+    inferred = (None if out is None
+                else _OUT_FORMAT_BY_SUFFIX.get(Path(str(out)).suffix.lower()))
+    if inferred is not None and inferred != fmt:
+        suffix = Path(str(out)).suffix
+        if getattr(args, "_format_explicit", False):
+            print(
+                f"warning: --out {out} ends in {suffix} but --format {fmt} was given; "
+                f"writing {fmt}. Pass --format {inferred} to write {inferred}.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"note: inferring --format {inferred} from the {suffix} --out path; "
+                f"pass an explicit --format to override.",
+                file=sys.stderr,
+            )
+            fmt = inferred
+    args._resolved_format = fmt
+    return fmt
 
 
 class BnArgumentParser(argparse.ArgumentParser):
@@ -336,9 +343,9 @@ def _unrecognized_arguments_hint(
       value, not the switch, so the error reads as a bad pattern. Name the
       switch; when the command takes `--query` and none was given, print the
       corrected command.
-    * `--estimate-output` on a dual-role node (`exports`, `types`): the flag is
-      withheld there on purpose (#796 r2, see `_group_paths`), so say so, and
-      print the alias subcommand form when the node has one (`exports list`).
+    * `--estimate-output` on a dual-role node with a non-estimable subcommand
+      (`types`): the flag is withheld there on purpose (#796 r2, see
+      `_estimate_withheld_paths`), so say so.
 
     Printed commands are this argv with the one change applied, so they keep
     every other option the caller passed."""
@@ -361,29 +368,10 @@ def _unrecognized_arguments_hint(
                     f"with --query: {shlex.join(['bn', *fixed])}")
         return f"{switch} is a switch and takes no value; {token!r} is left over"
     path = tuple(getattr(parsed, "_command_path", ()) or ())
-    if "--estimate-output" in extras and path and path in _group_paths():
-        node = next((spec for spec in _COMMANDS if spec["path"] == path), None)
-        # The alias leaf is the child that takes the node's own arguments (the
-        # one registration list `exports`/`exports list` share), so the printed
-        # command keeps every option the caller already passed valid.
-        alias = next((spec["path"][-1] for spec in _COMMANDS
-                      if node is not None and spec["path"][:-1] == path
-                      and spec["args"] == node["args"] and spec.get("estimable")),
-                     None)
-        label = " ".join(path)
-        lead = (f"--estimate-output is not accepted on `bn {label}` itself: it is also "
-                f"a command group, and a flag there would reach its subcommands too")
-        if alias is None:
-            return f"{lead}."
-        for index in range(len(argv) - len(path) + 1):
-            if argv[index:index + len(path)] != list(path):
-                continue
-            if index and _option_takes_value(parsers, argv[index - 1]):
-                continue
-            at = index + len(path)
-            fixed = [*argv[:at], alias, *argv[at:]]
-            return f"{lead}; use the `{label} {alias}` form: {shlex.join(['bn', *fixed])}"
-        return f"{lead}; use `bn {label} {alias} --estimate-output`."
+    if "--estimate-output" in extras and path and path in _estimate_withheld_paths():
+        return (f"--estimate-output is not accepted on `bn {' '.join(path)}` itself: it "
+                "is also a command group with a subcommand that is not an estimable "
+                "read, and a flag there would reach that subcommand too.")
     return None
 
 
@@ -478,9 +466,10 @@ def _common_io_options(
         action=_RecordExplicitFormat,
         help="Output format",
     )
-    out_help = ("Write output to a file instead of stdout (a .json/.ndjson path "
-                "infers --format unless one is given). Relative paths are resolved "
-                "against the invoking shell's cwd, not the bridge's.")
+    out_help = ("Write output to a file instead of stdout; missing parent directories "
+                "are created (a .json/.ndjson path infers --format unless one is "
+                "given). Relative paths are resolved against the invoking shell's "
+                "cwd, not the bridge's.")
     # #796: the preflight half of #409's "bound the next read" -- the size of the
     # payload the caller would otherwise pay for, and the flag that slices it.
     # Advertised ONLY on the commands whose emit path implements it
@@ -777,12 +766,9 @@ def _group_paths() -> frozenset[tuple[str, ...]]:
     Those are the nodes argparse builds as GROUP parsers -- and, for a DUAL-ROLE
     path like ``types``/``exports``, the very same parser object also serves as
     the node's own leaf. A flag attached there is therefore accepted BEFORE the
-    subcommand is dispatched, which is why the estimate flag cannot be advertised
-    on such a node: `bn types --estimate-output declare ...` ran the declaration
-    and printed a byte count over it, and `bn types --estimate-output show X` had
-    the flag clobbered back to ``False`` by the leaf default -- the #251 hazard
-    (a real default on an intermediate-level parser) landing on the one node
-    class where "intermediate" and "leaf" are the same object.
+    subcommand is dispatched (see `_estimate_withheld_paths` for what that
+    means for the estimate flag, and `_build_from_commands` for how a flag
+    given there reaches the subcommand).
 
     Derived from the registry rather than a second hand-kept list, so a new
     command or subcommand cannot reopen the hole silently.
@@ -791,11 +777,28 @@ def _group_paths() -> frozenset[tuple[str, ...]]:
                      for i in range(1, len(spec["path"])))
 
 
+def _estimate_withheld_paths() -> frozenset[tuple[str, ...]]:
+    """Group nodes that cannot carry ``--estimate-output`` (#796 r2).
+
+    A flag on a group parser is accepted BEFORE a subcommand dispatches, so it
+    is withheld from a node with any non-estimable descendant: `bn types
+    --estimate-output declare ...` would run the declaration and print a byte
+    count over it. A node whose every descendant is an estimable read
+    (`exports` and its alias `exports list`) takes the flag like its alias
+    does: it can reach only reads, and `_build_from_commands` carries it to
+    them instead of letting a leaf default clobber it (the #251 hazard)."""
+    return frozenset(
+        path for path in _group_paths()
+        if any(len(spec["path"]) > len(path) and spec["path"][:len(path)] == path
+               and not spec.get("estimable") for spec in _COMMANDS))
+
+
 def _build_from_commands(root: BnArgumentParser) -> None:
     """Populate *root* with subcommands from the ``_COMMANDS`` registry."""
     subparser_actions: dict[tuple[str, ...], argparse._SubParsersAction] = {}
     node_parsers: dict[tuple[str, ...], argparse.ArgumentParser] = {(): root}
     group_paths = _group_paths()
+    estimate_withheld = _estimate_withheld_paths()
 
     def _get_subparsers(parent: tuple[str, ...]) -> argparse._SubParsersAction:
         if parent not in subparser_actions:
@@ -846,12 +849,11 @@ def _build_from_commands(root: BnArgumentParser) -> None:
                 path[-1], help=spec["help"], description=spec["help"])
             node_parsers[path] = cmd
 
-        # A group node never carries the estimate flag, even when the node is also
-        # registered as a leaf (the dual-role `types`/`exports`): see `_group_paths`
-        # for the two live failure shapes that buys.
+        # A group node carries the estimate flag only when every subcommand under
+        # it is an estimable read: see `_estimate_withheld_paths`.
         _common_io_options(cmd, default_format=spec["fmt"],
                            estimable=(bool(spec.get("estimable"))
-                                      and path not in group_paths),
+                                      and path not in estimate_withheld),
                            analysis_bounds=tuple(spec.get("analysis_bounds", ())))
         _instance_option(cmd, listed=spec["routes_instance"])
         # Fan-out is an EXPLICIT allow-list (`fanout=True` on genuine whole-target
@@ -894,6 +896,25 @@ def _build_from_commands(root: BnArgumentParser) -> None:
             _analysis_bounds=spec["analysis_bounds"],
         )
 
+    # A DUAL-ROLE node (registered as a command AND a group: `exports`, `types`)
+    # parses its own options before argparse dispatches a subcommand, and the
+    # subcommand's parser then writes its defaults over the namespace -- so
+    # `bn exports --count list` silently listed and `bn exports --limit 2 list`
+    # silently returned every row (#251's hazard on the node where group and
+    # leaf are one parser). A child option the node defines identically (same
+    # strings, same dest, same default) gets a SUPPRESS default: absent, the
+    # node's identical default stands; given at either level, it is kept.
+    for path in group_paths & {spec["path"] for spec in _COMMANDS}:
+        node_defaults = {(tuple(action.option_strings), action.dest): action.default
+                         for action in node_parsers[path]._actions if action.option_strings}
+        for child_path, child in node_parsers.items():
+            if child_path[:-1] != path:
+                continue
+            for action in child._actions:
+                key = (tuple(action.option_strings), action.dest)
+                if key in node_defaults and node_defaults[key] == action.default:
+                    action.default = argparse.SUPPRESS
+
 
 def _render_result(
     value: Any,
@@ -926,10 +947,15 @@ def _render_result(
     *outcome* is the operation outcome an envelope states (see
     :func:`write_output_result`): the rendered text no longer carries it."""
     if estimate_only:
-        result = _apply_result_transform(
-            lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint,
-                                                   outcome=outcome),
-            value, f"estimate the {stem} output size as {fmt}")
+        if isinstance(value, RawBytes):
+            result = estimate_bytes_result(
+                value.data, fmt=fmt, summary=value.summary, rerun_hint=slice_hint,
+                outcome=outcome_fields(value) if outcome is None else outcome)
+        else:
+            result = _apply_result_transform(
+                lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint,
+                                                       outcome=outcome),
+                value, f"estimate the {stem} output size as {fmt}")
         sys.stdout.write(result.rendered)
         return False
     # Serializing the bridge result parses and walks it too: `json.dumps` on a
@@ -953,11 +979,19 @@ def _render_result(
             f"serialize the {stem} artifact envelope as {fmt}"))
         return bool(artifact.get("spilled"))
 
-    result = _apply_result_transform(
-        lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
-                                           stem=stem, provenance=provenance,
-                                           rerun_hint=slice_hint, outcome=outcome),
-        value, f"serialize the {stem} result as {fmt}")
+    if isinstance(value, RawBytes):
+        # P1-03: a raw byte payload takes the same --out / spill / provenance
+        # decisions as a rendered one; only the final stdout write differs.
+        result = write_bytes_result(
+            value, out_path=out_path, fmt=fmt, stem=stem, provenance=provenance,
+            rerun_hint=slice_hint,
+            outcome=outcome_fields(value) if outcome is None else outcome)
+    else:
+        result = _apply_result_transform(
+            lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
+                                               stem=stem, provenance=provenance,
+                                               rerun_hint=slice_hint, outcome=outcome),
+            value, f"serialize the {stem} result as {fmt}")
     if result.spilled and result.artifact and spill_status is not None:
         # #645: NEVER put a spill envelope on stdout for a mutation. A read that
         # spills is recoverable (re-read the artifact); an atomic write whose result
@@ -1022,7 +1056,11 @@ def _render_result(
                 file=sys.stderr,
             )
         return True
-    sys.stdout.write(result.rendered)
+    if result.raw is not None:
+        sys.stdout.buffer.write(result.raw)
+        sys.stdout.buffer.flush()
+    else:
+        sys.stdout.write(result.rendered)
     if result.near_spill:
         # #409: fit this time, but close to the threshold -- warn so the agent slices
         # the next (larger) read pre-emptively instead of discovering the spill after
@@ -1461,6 +1499,15 @@ def _slice_hint_for_args(args: argparse.Namespace, fmt: str) -> str | None:
     """The derived remedy for the invocation in *args* -- no parser walk."""
     flags = tuple(getattr(args, "_slice_flags", ()))
     accepted = {option for option, _ in flags}
+    mode = getattr(args, "_aggregate_mode", None)
+    if mode is not None:
+        # P3: an aggregate run (`--count`, `imports --summary`) answers once for
+        # the whole target. It refuses the paging flags
+        # (`_refuse_count_only_slices`), `--count` is its mode switch rather
+        # than a size, and a filter (`--min-size`) changes the answer, not the
+        # output's size -- so no slice flag bounds it and the only remedy left
+        # is the file.
+        accepted &= {"--out"}
     used = {
         option for option, dest in flags
         # A store_true default (False) and an unset value (None) both mean "the
@@ -1565,7 +1612,7 @@ def blank_selector(value: Any) -> bool:
 
 def _empty_target_message(
     args: argparse.Namespace,
-    omit_hint: str = "omit --target to use the single open target",
+    omit_hint: str | None = None,
 ) -> str:
     """The refusal for an empty selector, phrased for where it CAME FROM.
 
@@ -1575,6 +1622,11 @@ def _empty_target_message(
     argument they never wrote, and the two sources are cleared in completely
     different ways (`unset BN_TARGET` vs `bn target clear`). Name the source
     and its own remedy instead (#676 item 11).
+
+    *omit_hint* is the caller's own "what omitting the flag does" (a fan-out
+    surveys every target). Without one, the typed refusal says what omitting
+    it would do HERE, which depends on how many targets are open (W10): see
+    `_empty_target_advice`.
     """
     ambient = getattr(args, "_empty_ambient_target", None)
     if ambient:
@@ -1583,10 +1635,39 @@ def _empty_target_message(
             f"{source}: {remedy}. An empty selector is a broken default, not "
             "a request for the default, so nothing was sent."
         )
-    return (
-        f"--target is empty: pass a selector from `bn target list`, or "
-        f"{omit_hint}"
-    )
+    lead = "--target is empty: pass a selector from `bn target list`"
+    if omit_hint is not None:
+        return f"{lead}, or {omit_hint}"
+    return _empty_target_advice(args, lead)
+
+
+def _empty_target_advice(args: argparse.Namespace, lead: str) -> str:
+    """W10: "omit --target to use the single open target" was printed whatever
+    was open, so with several targets the advised rerun hit the multi-target
+    refusal. One peek decides: a sole target keeps that advice, several get
+    the shared `Open targets:` listing (`src/bn/target_hint.py`, the grammar
+    every multi-target refusal prints), none says so. Asked only of a bridge
+    already running -- a refusal must not start one, and with none running
+    there is nothing open to count -- and an unreachable one gets only the
+    lead, with no claim about what is open. The peek names no target, so the
+    empty selector is still never forwarded."""
+    if not list_instances():
+        return f"{lead}."
+    try:
+        targets = unwrap_result(
+            send_request("list_targets", params={}, target=None,
+                         instance_id=getattr(args, "instance", None)),
+            "list_targets")
+    except BridgeError:
+        return f"{lead}."
+    if not isinstance(targets, list):
+        return f"{lead}."
+    if not targets:
+        return f"{lead}; no target is open (`bn load <path>` opens one)."
+    if len(targets) == 1:
+        return f"{lead}, or omit --target to use the single open target"
+    return "\n".join([f"{lead}; {len(targets)} targets are open.", SELECT_HINT_LINE,
+                      _render_target_choices(targets)])
 
 
 def _implicit_target(args: argparse.Namespace,
@@ -1831,6 +1912,9 @@ def _refuse_count_only_slices(args: argparse.Namespace, *, command: str,
             f"{', '.join(offenders)} would be silently ignored. Drop {mode} for "
             f"the paged list, or drop the flags for the {noun}."
         )
+    # The run's remedy hints read this: a mode that refuses the slice flags must
+    # not be told to rerun with them (`_slice_hint_for_args`).
+    args._aggregate_mode = mode
 
 
 def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
@@ -2326,7 +2410,9 @@ def _contextualize_diagnostic_hints(
     from . import commands  # noqa: F401
 
     def route(match: re.Match[str]) -> str:
-        command_text = match.group(1)
+        if not match.group(2).startswith("bn "):
+            return match.group(0)
+        command_text = match.group(2)[len("bn "):]
         try:
             words = shlex.split(command_text)
         except ValueError:
@@ -2375,10 +2461,12 @@ def _contextualize_diagnostic_hints(
                          else shlex.quote(f"--target={target}"))
         if not flags:
             return match.group(0)
-        return "`bn " + " ".join(flags) + " " + command_text + "`"
+        # Through `code_span`: the selector spliced in here may itself carry a
+        # backtick, and a one-backtick fence would then end mid-command (R4-02).
+        return code_span("bn " + " ".join(flags) + " " + command_text)
 
     def route_prose(text: str) -> str:
-        return re.sub(r"`bn ([^`]+)`", route, text)
+        return CODE_SPAN_RE.sub(route, text)
 
     # `summary`/`warnings` are decompile's warning prose (#1045 review): its
     # printed `bn proto get 0x…` / `bn evidence table …` advice needs this

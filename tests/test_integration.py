@@ -5,6 +5,7 @@ the binaryninja module is not available.
 """
 from __future__ import annotations
 
+import base64
 import collections
 import hashlib
 import json
@@ -7457,6 +7458,101 @@ class TestEvidenceVtableLabels1017:
                              "--compact").stdout
         rows = [ln for ln in text.splitlines() if ln.startswith("- ")]
         assert len(rows) == news and all("operator new @ " in row for row in rows)
+
+
+# --- read surface: raw bytes and sliced CFGs (dogfood P1-03, P2-04) ----------
+
+
+def test_raw_byte_read_is_structured_json_and_spills_like_any_read(shared_bn, tmp_path):
+    """P1-03 on a real view: `read --encoding bytes` under `--format json` is a
+    base64 envelope, and under text an armed `BN_SPILL_TOKENS` spills the raw
+    bytes to a `.bin` artifact instead of dumping them."""
+    shared_bn.load(PARSER_BINARY)
+    start = shared_bn.json("function", "info", "parse_record")["function"]["address"]
+    hex_read = shared_bn.json("read", start, "64")
+    envelope = shared_bn.json("read", start, "64", "--encoding", "bytes")
+    assert envelope["encoding"] == "base64" and envelope["length"] == 64
+    assert base64.b64decode(envelope["data"]).hex() == hex_read["hex"]
+    assert envelope["short_read"] is False
+
+    env = {**shared_bn.env(), "BN_SPILL_TOKENS": "1"}
+    res = subprocess.run(
+        [*_BN_CLI, "--instance", shared_bn.instance_id, "read", start, "64",
+         "--encoding", "bytes"], capture_output=True, text=True, timeout=60, env=env)
+    assert res.returncode == 0, res.stderr
+    lines = res.stdout.splitlines()
+    assert "spilled: true" in lines and "format: bytes" in lines
+    [path] = [line.split(": ", 1)[1] for line in lines if line.startswith("path: ")]
+    assert Path(path).read_bytes().hex() == hex_read["hex"]
+
+
+def test_function_cfg_slices_a_real_graph_by_block(shared_bn):
+    """P2-04: `function cfg` pages and windows the graph bridge-side."""
+    shared_bn.load(PARSER_BINARY)
+    full = shared_bn.json("function", "cfg", "parse_record")
+    starts = [block["start"] for block in full["blocks"]]
+    assert full["total_blocks"] == len(starts) >= 4 and full["has_more"] is False
+
+    page = shared_bn.json("function", "cfg", "parse_record", "--offset", "1", "--limit", "2")
+    assert [block["start"] for block in page["blocks"]] == starts[1:3]
+    assert (page["total_blocks"], page["returned"], page["has_more"]) == (len(starts), 2, True)
+
+    second = full["blocks"][1]
+    lo = int(second["insns"][0]["address"], 16)
+    window = shared_bn.json("function", "cfg", "parse_record",
+                            "--address-window", f"{lo:#x}:{lo + 1:#x}")
+    assert [block["start"] for block in window["blocks"]] == [second["start"]]
+    assert window["matched_blocks"] == 1
+
+
+def test_class_size_provenance_is_one_schema_for_rtti_and_declared_classes(shared_bn):
+    """P2-05: a declared-only `class show` card had the nested `size` object
+    but no top-level `size_source`, unlike an RTTI card; rows had neither."""
+    shared_bn.load(CLASSES_BINARY)
+    declared = shared_bn.run("types", "declare",
+                             "struct probe_only_declared { int32_t a; int64_t b; };")
+    assert declared.returncode == 0, declared.stderr
+    card = shared_bn.json("class", "show", "probe_only_declared")
+    assert (card["size"]["source"], card["size_source"], card["size_reason"]) == (
+        "declared_type", "declared_type", None)
+    rows = shared_bn.json("class", "list", "--all", "--limit", "500")["items"]
+    assert rows and all({"size", "size_source", "size_reason"} <= set(row) for row in rows)
+    [row] = [r for r in rows if r["name"] == "probe_only_declared"]
+    assert row["size_source"] == "declared_type"
+
+
+def test_local_pages_and_orient_collections_declare_their_rows(shared_bn):
+    """P3: the `locals` declaration the empty page falls back to covers every
+    key a real page carries, and `evidence orient`'s embedded collections
+    carry `row_fields` like the same pages read on their own."""
+    from bn_agent_bridge._shared import _DECLARED_ROW_FIELDS
+
+    shared_bn.load(HELLO_BINARY)
+    for argv, kind in ((("local", "list", "main"), "locals"),
+                       (("local", "list", "main", "--frame"), "frame")):
+        page = shared_bn.json(*argv)
+        assert page["kind"] == kind and page["items"]
+        assert {key for row in page["items"] for key in row} <= set(_DECLARED_ROW_FIELDS[kind])
+        assert page["row_fields"]
+    orient = shared_bn.json("evidence", "orient")
+    for key in ("strings_sample", "sections"):
+        rows = orient[key]["items"]
+        assert rows and all(set(orient[key]["row_fields"]) <= set(row) for row in rows)
+
+
+@pytest.mark.parametrize("argv", [("read", "--", "-16", "4"), ("read", "-0x10"),
+                                  ("decompile", "--", "-16"),
+                                  # D3-02: an address-window endpoint is an address too.
+                                  ("function", "cfg", "main", "--address-window=-16:16"),
+                                  ("evidence", "function", "main",
+                                   "--address-window=-0x10:0x10")])
+def test_a_negative_address_is_an_exit_2_refusal_on_a_real_view(shared_bn, argv):
+    """W10: BN's own `read` raised on `-16`, which surfaced as an internal
+    error; `-0x10` was searched for as a name."""
+    shared_bn.load(HELLO_BINARY)
+    res = shared_bn.run(*argv)
+    assert res.returncode == 2, res.stdout
+    assert "negative address" in res.stderr and "internal error" not in res.stderr
 
 
 class TestIdentityAcrossARestart:

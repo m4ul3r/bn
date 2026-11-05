@@ -124,6 +124,19 @@ def test_plugin_install_copy_mode(tmp_path):
     )
     assert rc == 0
     assert (destination / "bridge.py").exists()
+    # The taint model module and the builtin DB it reads beside itself are
+    # links into src/bn/ in the source tree; a copy materialises both as
+    # files, and the copied module loads its own copied DB.
+    module, db = destination / "taint_models.py", destination / "taint_models.json"
+    assert module.is_file() and not module.is_symlink()
+    assert db.is_file() and not db.is_symlink()
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("copied_taint_models", module)
+    copied = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(copied)
+    assert copied._BUILTIN_MODELS == db.resolve()
+    assert copied.load_models(honor_env=False)["memcpy"]["sink"]["class"] == "overflow_len"
 
 
 def test_plugin_install_accepts_its_own_install_and_names_a_stale_one(tmp_path, capsys):
@@ -2612,6 +2625,12 @@ def test_target_list_marks_sticky(tmp_session, fake_transport, capsys):
     by_sel = {entry["selector"]: entry for entry in parsed["items"]}
     assert by_sel["foo.so"].get("sticky") is True
     assert "sticky" not in by_sel["bar.so"]
+    # P3: the paging metadata and row schema every collection page states. The
+    # list is every open target, never a page; `sticky` is on one row only.
+    assert (parsed["total"], parsed["returned"], parsed["offset"], parsed["has_more"]) == (
+        2, 2, 0, False)
+    assert parsed["row_fields"] == ["target_id", "selector", "filename"]
+    assert list(parsed["row_fields_optional"]) == ["sticky"]
 
 
 def test_stale_sticky_instance_emits_hint(tmp_session, monkeypatch, capsys):
@@ -2904,6 +2923,36 @@ def test_capabilities_json_index_is_registry_derived(capsys):
     assert "callsites" in by_cmd["xrefs"]["see_also"]
     assert "function search" in by_cmd["function list"]["see_also"]
     assert "function list" in by_cmd["function search"]["see_also"]
+
+
+def test_capabilities_advertise_each_commands_output_surface(capsys):
+    """P3: the index said what each command is for but nothing about its
+    output: an agent could not learn which commands take `--estimate-output`
+    or `--out`, or which flags slice a read, without trial and error. Every
+    advertised capability is checked against the parser that enforces it."""
+    assert bn.cli.main(["capabilities", "--format", "json"]) == 0
+    by_cmd = {it["command"]: it for it in json.loads(capsys.readouterr().out)["items"]}
+
+    assert by_cmd["exports"]["output"] == {
+        "formats": ["json", "text", "ndjson"], "out": True, "estimate_output": True,
+        "paged": True, "slice_flags": ["--limit", "--offset"]}
+    assert by_cmd["types declare"]["output"]["estimate_output"] is False
+    assert by_cmd["decompile"]["output"]["slice_flags"] == ["--lines"]
+    # D3-03: these two page their own rows (`has_more`) without the registry's
+    # `paged` flag; capabilities said `paged: false` beside `--limit/--offset`.
+    for command in ("function cfg", "evidence function"):
+        assert by_cmd[command]["output"]["paged"] is True, command
+        assert {"--limit", "--offset", "--address-window"} <= set(
+            by_cmd[command]["output"]["slice_flags"]), command
+    assert by_cmd["decompile"]["output"]["paged"] is False
+
+    parser = bn.cli.build_parser()
+    for command, item in by_cmd.items():
+        sub = bn.cli._selected_parser_for_argv(parser, command.split())
+        accepts = bn.cli._known_option_strings(sub)
+        assert item["output"]["estimate_output"] == ("--estimate-output" in accepts), command
+        assert set(item["output"]["slice_flags"]) <= accepts, command
+        assert item["output"]["paged"] == ({"--limit", "--offset"} <= accepts), command
 
 
 def test_capabilities_see_also_references_are_valid_commands(capsys):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import importlib
+import json
 import os
 import shutil
 import subprocess
@@ -208,33 +209,37 @@ def _entry_point_drift(wheel: Path) -> list[str]:
 INSTALLED_COMMANDS = frozenset({"bn", "bn-agent"})
 
 
-def _shared_bridge_modules() -> list[Path]:
-    """The bridge modules that are SYMLINKS to their CLI source (#607)."""
+def _shared_bridge_files() -> list[Path]:
+    """The bridge files that are SYMLINKS to their CLI source (#607): modules,
+    and the data a module reads beside itself (`taint_models.json`, which
+    `taint_models._BUILTIN_MODELS` resolves next to `taint_models.py`)."""
     return sorted(
-        path for path in (REPO / "src" / "bn_agent_bridge").glob("*.py")
+        path for path in (REPO / "src" / "bn_agent_bridge").iterdir()
         if path.is_symlink()
     )
 
 
 def _shared_module_drift(wheel: Path) -> list[str]:
-    """Shared modules the wheel ships as something other than the CLI source.
+    """Shared files the wheel ships as something other than the CLI source,
+    in either package.
 
     A missing member counts as drift: a backend that drops the symlink without
     materializing it forks the two programs exactly as quietly as a stale copy
-    does.
+    does, and a data file the build leaves out of `bn/` breaks the CLI's
+    no-target `taint models` catalog the same way.
     """
     problems: list[str] = []
     with zipfile.ZipFile(wheel) as archive:
         shipped = set(archive.namelist())
-        for source in _shared_bridge_modules():
-            member = f"bn_agent_bridge/{source.name}"
-            if member not in shipped:
-                problems.append(f"{source.name}: missing from the wheel")
-            elif archive.read(member) != source.read_bytes():
-                problems.append(
-                    f"{source.name}: the wheel copy differs from "
-                    f"{source.resolve().relative_to(REPO)}"
-                )
+        for source in _shared_bridge_files():
+            for member in (f"bn_agent_bridge/{source.name}", f"bn/{source.resolve().name}"):
+                if member not in shipped:
+                    problems.append(f"{source.name}: {member} missing from the wheel")
+                elif archive.read(member) != source.read_bytes():
+                    problems.append(
+                        f"{source.name}: the wheel copy {member} differs from "
+                        f"{source.resolve().relative_to(REPO)}"
+                    )
     return problems
 
 
@@ -261,17 +266,47 @@ def test_wheel_pins_the_console_entry_points_the_project_declares(wheel):
 
 def test_wheel_materializes_the_shared_bridge_modules_from_their_cli_source(wheel):
     """`src/bn_agent_bridge/{paths,version,proc_identity,socket_evidence,
-    target_hint}.py` are symlinks into `src/bn/`, so the CLI and the bridge agree
-    on layout, version, process identity, socket evidence and the multi-target
-    hint grammar without duplication (#607).
+    target_hint,...}.py` and `taint_models.json` are symlinks into `src/bn/`,
+    so the CLI and the bridge agree on layout, version, process identity,
+    socket evidence, the multi-target hint grammar and the builtin taint
+    models without duplication (#607).
 
     A wheel cannot carry a symlink: the backend materializes a copy, and a build
     that materialized a *stale* one would fork the two programs while every test
     in the tree stayed green, because they read the symlink (#788).
     """
-    shared = _shared_bridge_modules()
-    assert {"paths.py", "version.py"} <= {path.name for path in shared}, shared
+    shared = _shared_bridge_files()
+    assert {"paths.py", "version.py", "taint_models.json"} <= {p.name for p in shared}, shared
     assert _shared_module_drift(wheel) == []
+
+
+def test_the_installed_packages_read_the_builtin_models_they_ship(wheel, tmp_path):
+    """R3 Q2: the builtin model DB is a data file, found by `_BUILTIN_MODELS`
+    next to the importing module. Installed from the wheel -- no source tree,
+    no symlink -- each package must find it inside itself and load it."""
+    root = tmp_path / "site"
+    with zipfile.ZipFile(wheel) as archive:
+        archive.extractall(root)
+    # `-I -S`: no user site and no site-packages, so the editable install of
+    # this checkout cannot answer for the wheel; the extracted wheel is the
+    # only place `bn`/`bn_agent_bridge` can come from.
+    probe = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        "out = {}\n"
+        "for name in ('bn.taint_models', 'bn_agent_bridge.taint_models'):\n"
+        "    module = __import__(name, fromlist=['_'])\n"
+        "    out[name] = [str(module._BUILTIN_MODELS), 'memcpy' in module.load_models()]\n"
+        "print(json.dumps(out))\n"
+    )
+    proc = subprocess.run([sys.executable, "-I", "-S", "-c", probe], capture_output=True,
+                          text=True, cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    found = json.loads(proc.stdout)
+    for package in ("bn", "bn_agent_bridge"):
+        path, has_memcpy = found[f"{package}.taint_models"]
+        assert Path(path) == root / package / "taint_models.json"
+        assert has_memcpy is True
 
 
 def test_the_wheel_content_pins_are_not_vacuous(tmp_path):
@@ -295,9 +330,11 @@ def test_the_wheel_content_pins_are_not_vacuous(tmp_path):
         )
 
     drift = _shared_module_drift(drifted)
-    assert [entry.split(":", 1)[0] for entry in drift] == [
-        path.name for path in _shared_bridge_modules()
+    # Every shared file is named, data included, and each package's member.
+    assert sorted({entry.split(":", 1)[0] for entry in drift}) == [
+        path.name for path in _shared_bridge_files()
     ]
+    assert "taint_models.json: bn/taint_models.json missing from the wheel" in drift
     assert "differs" in next(e for e in drift if e.startswith("version.py"))
     assert "missing from the wheel" in next(e for e in drift if e.startswith("paths.py"))
     assert [entry.split(":", 1)[0] for entry in _entry_point_drift(drifted)] == ["bn-agent"]

@@ -52,7 +52,6 @@ BLOCKING_LEAF_KINDS = frozenset({
     "arg_under_recovered",
     "field_load_unresolved",
     "source_seed_misanchored",
-    "weak_buffer_seed",
     # #206: a tainted value reached an unlifted/unimplemented instruction, so
     # BN's lifter could not model the op and propagation through it is a silent
     # hole -- an empty reached_sinks past it is NOT an all-clear. Emitted
