@@ -4556,7 +4556,9 @@ class TaintEngine:
         ``increments`` are the distinct amounts one trip round the cycle adds
         (`[0, 1]` for a conditional `k++`), or None when an update is not a
         constant addition (`k = k * 2`, `k += n`). None when *var* feeds no
-        such cycle -- a phi of literals with no back edge is a plain choice.
+        such cycle -- a phi of literals with no back edge is a plain choice --
+        or when every trip round it adds exactly 0 (a value the loop only
+        carries is still the literal).
 
         A value slice follows the literal; how many trips the loop makes is
         its CONTROL, which the slice does not follow -- so the literal is
@@ -4622,7 +4624,9 @@ class TaintEngine:
                     stack.append((self._as_single_ssa_var(src), delta, known))
                 else:
                     stack.extend((r, delta, False) for r in expr_reads(src))
-            if cyclic:
+            # Every trip adds exactly 0 (the loop carries the value through
+            # unchanged): the literal IS the value whatever the trip count.
+            if cyclic and not (exact and increments == {0}):
                 return var_label(phi), (sorted(increments) if exact else None)
         return None
 

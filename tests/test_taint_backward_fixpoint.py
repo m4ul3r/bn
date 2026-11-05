@@ -175,7 +175,7 @@ _MEMCPY = 0xc40
 
 
 def _counter_program(shape):
-    """`count(dst, src)`: a length `k` in one of four shapes, then
+    """`count(dst, src)`: a length `k` in one of five shapes, then
     `memcpy(dst, src, k)`.
 
     * ``counter``: `k = 0; loop { if (..) k = k + 1; }` -- the -O0 lift of a
@@ -183,6 +183,7 @@ def _counter_program(shape):
     * ``doubling``: `k = 1; loop { k = k * 2; }` -- a recurrence with no
       constant per-trip increment;
     * ``choice``: `k = c ? 0 : 5` -- a phi of two literals, no cycle;
+    * ``carried``: `k = 7; loop { k = k; }` -- a cycle that never changes it;
     * ``literal``: `k = 16`."""
     from test_taint_engine import FBV, FFunc, FInstr, FSSA, FSSAFunc
 
@@ -221,6 +222,10 @@ def _counter_program(shape):
     elif shape == "choice":
         body = [set_(0, k[1], const(0)), set_(1, k[2], const(5)), phi(2, k[3], k[1], k[2])]
         length = k[3]
+    elif shape == "carried":
+        body = [set_(0, k[1], const(7)), phi(1, k[2], k[1], k[3]),
+                set_(2, k[3], var(k[2]), reads=[k[2]])]
+        length = k[2]
     else:
         body = [set_(0, k[1], const(16))]
         length = k[1]
@@ -266,11 +271,12 @@ def test_a_loop_counters_initializer_is_no_runtime_constant(shape, value, increm
         ["origin:", "recurrence_initializer"]]
 
 
-@pytest.mark.parametrize("shape, values", [("choice", {0, 5}), ("literal", {16})])
-def test_an_acyclic_constant_stays_a_literal_origin(shape, values):
-    # A phi of literals with no cycle, and a plain literal, ARE the value:
-    # constant origins (a choice reports its representative literal), a
-    # complete slice, no recurrence.
+@pytest.mark.parametrize("shape, values", [
+    ("choice", {0, 5}), ("literal", {16}), ("carried", {7})])
+def test_a_literal_that_is_the_value_stays_a_constant_origin(shape, values):
+    # A phi of literals with no cycle, a loop that only carries the literal,
+    # and a plain literal ARE the value: constant origins (a choice reports
+    # its representative literal), a complete slice, no recurrence.
     result = _counter_program(shape)
     origins = _origins(result)
     assert origins and {o["kind"] for o in origins} == {"constant"}, origins
