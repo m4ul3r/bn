@@ -3208,6 +3208,16 @@ N void span_case(char *p) { memcpy(span_global + 40, p, 16); span_reader(); }
 N void fgets_case(char *p) { memcpy(tracked, p, 64); use_fgets_alias(); }
 N void fgets_ignored_case(char *p) { memcpy(tracked, p, 64); ignore_fgets(); }
 N void chain_case(char *p) { memcpy(tracked, p, 64); use_relay4(); }
+char deep_tracked[128] = "seed";
+N char *deep_relay0(void) { return memset(deep_tracked, 0, 1); }
+N char *deep_relay1(void) { return deep_relay0(); }
+N char *deep_relay2(void) { return deep_relay1(); }
+N char *deep_relay3(void) { return deep_relay2(); }
+N char *deep_relay4(void) { return deep_relay3(); }
+N char *deep_relay5(void) { return deep_relay4(); }
+N char *deep_relay6(void) { return deep_relay5(); }
+N void use_deep_relay6(void) { system(deep_relay6() + 24); }
+N void deep_chain_case(char *p) { memcpy(deep_tracked, p, 64); use_deep_relay6(); }
 int main(int argc, char **argv) {
     if (argc < 2) return 0;
     switch (argc) {
@@ -3217,7 +3227,8 @@ int main(int argc, char **argv) {
     case 5: span_case(argv[1]); break;
     case 6: fgets_case(argv[1]); break;
     case 7: fgets_ignored_case(argv[1]); break;
-    default: chain_case(argv[1]); break;
+    case 8: chain_case(argv[1]); break;
+    default: deep_chain_case(argv[1]); break;
     }
     return 0;
 }
@@ -3237,8 +3248,9 @@ def test_global_continuation_object_extent_aliases_and_internal_bounds(tmp_path,
     ALIAS-01: `fgets` hands its destination back, so a partial refill
     followed by `system(p + 8)` reads bytes it never touched; an ignored
     refill is no continuation, its live bytes end in the P2-11.1 exit store.
-    BOUND-03: a returning-wrapper chain past the INTERNAL pointer-return
-    depth is unknown, not "no alias"."""
+    BOUND-03: a returning-wrapper chain within the INTERNAL pointer-return
+    depth is followed to the reader at its end; one past it is unknown, not
+    "no alias"."""
     src = tmp_path / "r3astra.c"
     src.write_text(_ASTRA_SRC)
     binary = tmp_path / "r3astra"
@@ -3287,12 +3299,23 @@ def test_global_continuation_object_extent_aliases_and_internal_bounds(tmp_path,
         == [("use_fgets_alias", 8)], store
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
-    # BOUND-03: the internal return-pointer depth is a disclosed bound
+    # BOUND-03: five returning wrappers are within the internal pointer-return
+    # depth -- the chain resolves and its consumer is the named reader...
     result, leaves = gmc("chain_case")
     [leaf] = leaves
-    assert leaf["reachability"]["cause"] in ("pointer_return_depth", "depth_budget"), leaf
+    assert [(r["display_name"], r["access"], r["offset"]) for r in leaf["references"]] \
+        == [("use_relay4", "call_arg", 24)], leaf
+    assert (leaf["reachability"]["status"], leaf["reachability"]["causes"]) == ("complete", [])
+    assert result["stats"]["truncated"] is False, result
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
-    assert result["stats"]["truncated"] is True, result
+    # ...and seven run past it: the bound is disclosed, never read as "no alias".
+    result, leaves = gmc("deep_chain_case")
+    [leaf] = leaves
+    assert leaf["references"] == [], leaf
+    assert leaf["reachability"]["status"] == "truncated", leaf
+    assert leaf["reachability"]["cause"] == "pointer_return_depth", leaf
+    assert result["stats"]["truncation_cause"] == ["pointer_return_depth"], result["stats"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 _UNREAD_OVERLAY_SRC = r"""
