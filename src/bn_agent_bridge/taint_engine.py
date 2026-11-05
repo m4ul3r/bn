@@ -2264,6 +2264,9 @@ class TaintEngine:
                 # partial write is never read as covering the whole object.
                 self._global_keyed_offsets.setdefault(ga, set()).add(int(raw) - ga)
             return (("global", ga), f"glob_{hex(ga)}")
+        ga = self._indexed_global(ssaf, expr)
+        if ga is not None:
+            return (("global", ga), f"glob_{hex(ga)}")
         hk = self._heap_buffer_key(ssaf, expr)
         if hk is not None:
             return (hk, f"heap_{hex(hk[1])}")
@@ -2311,6 +2314,46 @@ class TaintEngine:
                 return self._global_addr(ssaf, getattr(d, "src", None), depth + 1,
                                          canon=canon)
         return None
+
+    def _indexed_global(self, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
+        """The writable global OBJECT ``g + i`` points into, for an index
+        nothing makes constant, or None.
+
+        A copy into `&buf[strlen(buf)]` of a static buffer lifts to
+        ``0x40c000 + n`` with `n` a call's result. The index selects a byte
+        within the object, so the object is the one coarse key -- as it is
+        for a stack buffer at `&buf + i` and a heap block at `p + i`. Leaving
+        it unkeyed made the write a `coarse_memory_store`: a body that fills
+        the buffer and returns its address handed back a CLEAN pointer once
+        descended, while the same call cut by `--max-depth` was assumed to
+        return taint -- so a deeper run lost the copy of those bytes that a
+        shallower one found (V5-01). Only the left operand of a subtraction
+        points into the object. The offset is unknown; callers record the
+        write as reaching anywhere in it."""
+        if expr is None or depth > 6:
+            return None
+        opn = op_name(expr)
+        if opn in ("MLIL_ADD", "MLIL_SUB"):
+            operands = [getattr(expr, "left", None)]
+            if opn == "MLIL_ADD":
+                operands.append(getattr(expr, "right", None))
+            for operand in operands:
+                ga = self._global_addr(ssaf, operand)
+                if ga is None:
+                    ga = self._indexed_global(ssaf, operand, depth + 1)
+                if ga is not None:
+                    return ga
+            return None
+        var = expr if is_ssa_var(expr) else self._as_single_ssa_var(expr)
+        if var is None:
+            return None
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            return None
+        if d is None or op_name(d) != "MLIL_SET_VAR_SSA":
+            return None
+        return self._indexed_global(ssaf, getattr(d, "src", None), depth + 1)
 
     def _canon_global(self, addr: int) -> int | None:
         """Canonicalize a global address to its data-variable base (so different
@@ -8201,6 +8244,19 @@ class TaintEngine:
             self._global_write_span[ga] = offset + size
             self._invalidate_object(ga)
 
+    def _note_indexed_write(self, ga: int) -> None:
+        """Record a tainted write at an index nothing makes constant into the
+        object at *ga* (:meth:`_indexed_global`): it may have reached any of
+        its bytes, so the interval runs from the base with no end -- an
+        interval at the one place it COULD have landed would let a reader
+        elsewhere in the object be proven disjoint, the clearing direction."""
+        ranges = self._global_tainted_ranges.setdefault(ga, [])
+        if (0, None) not in ranges:
+            ranges.append((0, None))
+        if ga not in self._global_write_unbounded:
+            self._global_write_unbounded.add(ga)
+            self._invalidate_object(ga)
+
     def _copy_length_is_zero(self, ssaf: Any, params: list,
                              model: dict[str, Any] | None) -> bool:
         """Whether this modeled copy states a length of exactly zero.
@@ -8227,6 +8283,9 @@ class TaintEngine:
             return
         ga = self._global_addr(ssaf, params[idx])
         if ga is None:
+            gi = self._indexed_global(ssaf, params[idx])
+            if gi is not None and not self._copy_length_is_zero(ssaf, params, model):
+                self._note_indexed_write(gi)
             return
         raw = self._global_addr(ssaf, params[idx], canon=False)
         offset = (int(raw) - ga) if raw is not None and int(raw) >= ga else 0
@@ -14692,6 +14751,18 @@ class TaintEngine:
                                 if pidx is not None and (pidx, parts[1]) not in out_param_elems:
                                     out_param_elems.add((pidx, parts[1]))
                                     changed = True
+                        elif (gi := self._indexed_global(ssaf, dest)) is not None:
+                            # `g[i] = c` at an index nothing makes constant:
+                            # a write into the object, wherever in it (V5-01).
+                            self._note_indexed_write(gi)
+                            if taint_node(((("global", gi)), None), f"glob_{hex(gi)}",
+                                          ins, "store into tainted global at a "
+                                          "runtime index (object base, global_approx)",
+                                          reads):
+                                changed = True
+                                add_assumption(
+                                    "global buffer aliasing modeled coarsely by "
+                                    "object base (global_approx)")
                         else:
                             # tainted store through a pointer parameter -> out-param
                             pidx = self._resolve_to_param_index(func, ssaf, dest)

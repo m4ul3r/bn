@@ -7338,6 +7338,29 @@ def test_a_tail_call_wrapper_flagged_a_thunk_is_walked(tmp_path, shared_bn):
         assert not any("thunk" in a for a in result["assumptions"]), result["assumptions"]
 
 
+def test_a_deeper_budget_keeps_the_copy_a_shallower_one_reached(tmp_path, shared_bn):
+    """V5-01: `format_name` appends its tainted argument to a static buffer
+    at `strlen` of it and returns the buffer; the recursive `walk` copies the
+    result into a fixed-size global with `__strcpy_chk`. At a depth that cuts
+    `format_name` off its return is assumed tainted and the copy is reached;
+    every deeper budget descended `format_name`, found the write through
+    `buf + n` unkeyed, returned a clean pointer and lost the copy."""
+    binary = tmp_path / "fwd_depth_static_name"
+    _compile(CORPUS / "fwd_depth_static_name.c", binary,
+             ["-O2", "-fno-inline", "-D_FORTIFY_SOURCE=2"])
+    target = shared_bn.load(binary, copy=False)
+    reached = {}
+    for depth in (1, 2, 3, 4, 8):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                          "--source", "param:1", "--max-depth", str(depth))
+        reached[depth] = {(s["sink"]["callee"], s["sink"]["address"])
+                          for s in result["reached_sinks"]}
+    depths = sorted(reached)
+    for shallow, deep in zip(depths, depths[1:]):
+        assert reached[shallow] <= reached[deep], (shallow, deep, reached)
+    assert "__strcpy_chk" in {callee for callee, _ in reached[8]}, reached
+
+
 def _armv7_build(tmp_path, name: str) -> Path:
     cc = shutil.which("arm-linux-gnueabihf-gcc")
     if cc is None:
