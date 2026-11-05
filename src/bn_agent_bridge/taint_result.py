@@ -29,7 +29,7 @@ Unified diagnostics schema (attached to a zero-sink forward result under
         "unresolved": int,           # unmodeled_callee / arg_under_recovered / indirect /
                                      # model_destination_unrecovered
         "coarse_memory": int,        # coarse_memory_store / pointer_escape
-        "seed_misanchored": int,     # #562: source_seed_misanchored / weak_buffer_seed
+        "seed_misanchored": int,     # #562: source_seed_misanchored
         "by_kind": {kind: count},
       },
       "next_action": str,            # single unified suggestion (see below)
@@ -80,7 +80,6 @@ BLOCKING_LEAF_KINDS = frozenset({
     "arg_under_recovered",
     "field_load_unresolved",
     "source_seed_misanchored",
-    "weak_buffer_seed",
     # #206: a tainted value reached an unlifted/unimplemented instruction, so
     # BN's lifter could not model the op and propagation through it is a silent
     # hole -- an empty reached_sinks past it is NOT an all-clear. Emitted
@@ -178,7 +177,7 @@ BLOCKING_LEAF_KINDS = frozenset({
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
 # weak ``arg:<recv*>:N`` seed that did not key the filled buffer (#562/#306).
-_SEED_MISANCHORED_KINDS = frozenset({"source_seed_misanchored", "weak_buffer_seed"})
+_SEED_MISANCHORED_KINDS = frozenset({"source_seed_misanchored"})
 # Leaves that do not show tainted data reached anything (V4-02): the unwind
 # marker of a walk that hit the recursion limit, and every kind the SEED step
 # (or a scan that runs whether or not taint arrived) can emit on its own -- a
@@ -209,7 +208,6 @@ _WEAK_SEED_ASSUMPTION_MARKERS = (
     "recvmsg_iovec_unresolved",
     "recvmsg_out_param",
     "source_seed_misanchored",
-    "weak_buffer_seed",
     # #851: a scanf-family call with more actual destinations than the model's
     # fixed unrolled run; the residual args are unseeded and the all-clear is
     # not safe to report.

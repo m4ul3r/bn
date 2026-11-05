@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import itertools
 import re
 import sys
 import types
@@ -1469,8 +1470,18 @@ def test_reading_names_every_taint_leaf_kind_and_truncation_cause():
     from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
 
     reading = READING.read_text(encoding="utf-8")
-    missing_kinds = sorted(k for k in BLOCKING_LEAF_KINDS if f"`{k}`" not in reading)
-    assert not missing_kinds, f"reading.md never names leaf kind(s) {missing_kinds}"
+    # R4-05: the "Blocking leaf kinds" table both ways -- a row per registered
+    # kind, and no row for a kind the registry (whose every member the engine
+    # constructs, see test_every_engine_leaf_kind_is_classified_for_propagation)
+    # does not have: a stale row passed when only the first direction was asked.
+    section = reading[reading.index("**Blocking leaf kinds**"):]
+    rows = list(itertools.takewhile(
+        lambda line: line.startswith("|"),
+        itertools.dropwhile(lambda line: not line.startswith("|"), section.splitlines())))
+    documented = {kind for row in rows[2:] for kind in re.findall(r"`([a-z_]+)`", row.split("|")[1])}
+    assert documented == set(BLOCKING_LEAF_KINDS), (
+        f"undocumented: {sorted(set(BLOCKING_LEAF_KINDS) - documented)}, "
+        f"documented but never emitted: {sorted(documented - set(BLOCKING_LEAF_KINDS))}")
     missing_causes = sorted(c for c in TRUNCATION_CAUSES if f"`{c}`" not in reading)
     assert not missing_causes, f"reading.md never names truncation cause(s) {missing_causes}"
 

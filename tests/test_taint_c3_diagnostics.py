@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -63,7 +64,6 @@ _LEAF_CLASS = {
     "field_load_unresolved": "reached",
     "seed_unused": "seed",
     "source_seed_misanchored": "seed",
-    "weak_buffer_seed": "seed",
     "indirect_call_unchecked": "seed",
     "format_destination_unrecovered": "seed",
     "scanf_arity_residual": "seed",
@@ -90,14 +90,44 @@ _NON_LEAF_KINDS = {
 }
 
 
+def _kind_values(expr: ast.AST, consts: dict[str, str]) -> set[str]:
+    """The strings a `kind` value expression can evaluate to: a literal, a
+    module constant, either arm of a conditional or boolean -- never the
+    strings a condition merely compares against."""
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return {expr.value}
+    if isinstance(expr, ast.Name):
+        return {consts[expr.id]} if expr.id in consts else set()
+    if isinstance(expr, ast.IfExp):
+        return _kind_values(expr.body, consts) | _kind_values(expr.orelse, consts)
+    if isinstance(expr, ast.BoolOp):
+        return set().union(*(_kind_values(v, consts) for v in expr.values))
+    return set()
+
+
 def _engine_kind_literals() -> set[str]:
-    """Every kind the engine spells: `"kind": "<x>"` literals, and the
-    module-level constants it names leaf kinds through (`_EXTENT_LEAF = ...`)."""
+    """Every kind the engine CONSTRUCTS: the value of a `"kind": ...` dict
+    entry or a `kind=` argument, through module constants
+    (`_EXTENT_LEAF = ...`) and conditional arms (`"a" if p else "b"`).
+    A kind named only in a classification set is not constructed (R4-05)."""
     found: set[str] = set()
     for name in ("taint_engine.py", "taint_result.py"):
-        text = (_SRC / name).read_text()
-        found.update(re.findall(r'"kind":\s*"([a-z_]+)"', text))
-        found.update(re.findall(r'^_[A-Z_]+ = "([a-z_]+)"$', text, re.M))
+        tree = ast.parse((_SRC / name).read_text())
+        consts = {node.targets[0].id: node.value.value for node in tree.body
+                  if isinstance(node, ast.Assign) and len(node.targets) == 1
+                  and isinstance(node.targets[0], ast.Name)
+                  and re.fullmatch(r"_[A-Z_]+", node.targets[0].id)
+                  and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                values = [v for k, v in zip(node.keys, node.values)
+                          if isinstance(k, ast.Constant) and k.value == "kind"]
+            elif isinstance(node, ast.keyword) and node.arg == "kind":
+                values = [node.value]
+            else:
+                continue
+            for value in values:
+                found |= _kind_values(value, consts)
     return found
 
 
@@ -105,6 +135,11 @@ def test_every_engine_leaf_kind_is_classified_for_propagation():
     literals = _engine_kind_literals()
     unregistered = sorted(literals - BLOCKING_LEAF_KINDS - _NON_LEAF_KINDS)
     assert unregistered == [], unregistered
+    # R4-05: and every registered kind has a constructor -- a kind kept only in
+    # the classification sets (and so in the docs the drift test holds to
+    # them) is a frontier no run can produce.
+    unconstructed = sorted(BLOCKING_LEAF_KINDS - literals)
+    assert unconstructed == [], unconstructed
     assert set(_LEAF_CLASS) == set(BLOCKING_LEAF_KINDS), (
         sorted(set(BLOCKING_LEAF_KINDS) ^ set(_LEAF_CLASS)))
     seed_side = {k for k, c in _LEAF_CLASS.items() if c == "seed"}
