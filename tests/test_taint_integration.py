@@ -1392,7 +1392,9 @@ int main(void) { return parse_synth("1 2 3 4 x"); }
                       "--source", "param:0")
     [leaf] = _format_holes(result)
     assert leaf["destinations"] == 5 and _lost(leaf) == 1, leaf
-    assert leaf["callee"] == "sscanf"       # the canonical model key, via the alias
+    # `callee` is the symbol the binary calls; `model` the plain model the
+    # alias resolved to.
+    assert (leaf["callee"], leaf.get("model")) == ("__isoc23_sscanf", "sscanf"), leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
