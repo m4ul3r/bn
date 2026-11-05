@@ -196,3 +196,31 @@ def test_a_quick_load_note_routes_its_refresh_to_the_target_it_loaded():
     bn.cli._contextualize_diagnostic_hints(value, target=None, instance="X1")
     assert _printed_refreshes(value["loaded"][0]["notes"][0]) == [
         ["bn", "-i", "X1", "-t", "second copy", "refresh"]]
+
+
+def test_a_fanout_routes_each_rows_bridge_commands_to_that_row(monkeypatch, capsys):
+    # G3-05: a fan-out never passed a row's reply through the routing pass, so
+    # a command the bridge printed in it -- a result's note, a row's refusal
+    # -- stayed bare, though it names that one row's target. Text renders the
+    # rows stored here.
+    import json
+
+    rows = {"1:1:1": "first copy", "2:2:2": "second copy"}
+
+    def fake(op, **kwargs):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": t, "selector": s}
+                                           for t, s in rows.items()]}
+        if kwargs["target"] == "2:2:2":
+            raise BridgeError("Strings are not available: this target was loaded with "
+                              "--quick (no analysis). Run `bn refresh` first.")
+        return {"ok": True, "result": {
+            "items": [], "total": 0, "offset": 0, "limit": 100, "returned": 0,
+            "has_more": False, "note": "the string set is partial: run `bn refresh`"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    assert bn.cli.main(["-i", "X1", "strings", "--all-targets", "--format", "json"]) == 0
+    printed = {row["target"]: _printed_refreshes(
+        row["result"]["note"] if row["ok"] else row["error"])
+        for row in json.loads(capsys.readouterr().out)["instances"]}
+    assert printed == {t: [["bn", "-i", "X1", "-t", t, "refresh"]] for t in rows}

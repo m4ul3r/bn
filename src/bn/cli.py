@@ -2898,6 +2898,7 @@ def _fanout_call(
         iid, tsel = item
         row: dict[str, Any] = {"instance": iid}
         start = time.monotonic()
+        target = tsel
         try:
             if tsel is None:
                 sub = argparse.Namespace(**vars(args))
@@ -2908,24 +2909,28 @@ def _fanout_call(
                     sub, require_target=require_target,
                     allow_implicit_target=allow_implicit_target,
                 )
-            else:
-                target = tsel
             response = send_request(
                 op, params=request_params, target=target, instance_id=iid, **timeout_kwargs
             )
-            row.update({"target": target, "ok": True,
-                        _RESULT_ROW_KEY: unwrap_result(response, op)})
+            # Every command the bridge's reply prints runs as printed: this
+            # row's instance and target, as on a single call (G3-05).
+            value = unwrap_result(
+                _contextualize_diagnostic_hints(response, target=target, instance=iid), op)
+            row.update({"target": target, "ok": True, _RESULT_ROW_KEY: value})
             # #1037 item 4 review: the default-page note for THIS row, decided
             # from the same reply (the helper is pure), kept beside the rows
             # rather than in them so the fan-out envelope keeps its shape.
-            note = _default_page_note(args, unwrap_result(response, op))
+            note = _default_page_note(args, value)
             if note:
                 page_notes[(iid, target)] = note
         except BridgeError as exc:
             # The row's error is a refusal for ONE (instance, target) call, so
-            # its listing rows are respelled as that call (#1033 item 1).
+            # the commands it prints are routed to that call and its listing
+            # rows are respelled as that call (#1033 item 1).
+            routed = _contextualize_diagnostic_hints(
+                {"error": str(exc)}, target=target, instance=iid)["error"]
             row.update({"target": tsel, "ok": False,
-                        "error": _target_hint_message(args, str(exc), fanout=True, instance=iid)})
+                        "error": _target_hint_message(args, routed, fanout=True, instance=iid)})
         # Per-row wall-clock so an agent can see WHERE a broad survey spent its
         # time, not just that it felt slow (#417).
         row["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
