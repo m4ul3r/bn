@@ -5592,6 +5592,48 @@ def test_forward_keeps_overflow_through_single_call_non_allocator_wrapper_307(mo
     assert memcpy_sinks[0]["class"] == "overflow_len"          # do_log is not an allocator -> no downgrade
 
 
+def _checked_alloc_wrapper(ret_expr, ret_reads):
+    """`checked_get(na)`: `p = malloc(na); if (!p) fatal("oom"); return <ret>` --
+    the error-path shape an allocation wrapper commonly has (V3-05)."""
+    na = FVar("na", ident=1); na0 = FSSA(na, 0)
+    p1 = FSSA(FVar("p"), 1)
+    return FFunc("checked_get", 0x3000, FSSAFunc([
+        FInstr(0, 0x3000, "MLIL_CALL_SSA", "p#1 = malloc(na#0)", reads=[na0], writes=[p1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "na#0", reads=[na0])]),
+        FInstr(1, 0x3008, "MLIL_CALL_SSA", "fatal(\"oom\")",
+               dest=FExpr("MLIL_CONST_PTR", "0x2030", constant=0x2030),
+               params=[FExpr("MLIL_CONST_PTR", "0x405000", constant=0x405000)]),
+        FInstr(2, 0x3010, "MLIL_RET", "return", reads=ret_reads, src=[ret_expr]),
+    ]), params=[na])
+
+
+def _wrapped_copy_class(wrapper, models):
+    n = FVar("n"); n0 = FSSA(n, 0)
+    func = _copy_via_wrapper(0x3000, n0, n0, param=n)
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy", 0x2030: "fatal"}, funcs={0x3000: wrapper})
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    [sink] = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    return sink["class"]
+
+
+def test_a_same_size_copy_through_a_checked_allocation_wrapper_is_bounded(models):
+    # V3-05: `memcpy(checked_get(n), s, n)` duplicating a string -- the wrapper's
+    # error path adds a second call, but every return hands back what malloc
+    # returned, so the copy fits the allocation.
+    p1 = FSSA(FVar("p"), 1)
+    wrapper = _checked_alloc_wrapper(FExpr("MLIL_VAR_SSA", "p#1", reads=[p1]), [p1])
+    assert _wrapped_copy_class(wrapper, models) == "bounded_len"
+
+
+def test_a_checked_wrapper_returning_another_buffer_keeps_the_overflow(models):
+    # Control: the same body returning a fixed buffer instead of the malloc
+    # result is no allocation of the copy's size.
+    wrapper = _checked_alloc_wrapper(
+        FExpr("MLIL_CONST_PTR", "0x404020", constant=0x404020), [])
+    assert _wrapped_copy_class(wrapper, models) == "overflow_len"
+
+
 def _copy_func_calloc(nmemb_expr, size_expr, length_var, *, param):
     # dst = calloc(<nmemb_expr>, <size_expr>); memcpy(dst, src, <length_var>).
     # calloc's total allocation is nmemb*size (two operands), unlike malloc's
@@ -10625,6 +10667,26 @@ def test_backward_escaped_buffer_address_makes_later_unmodeled_calls_opaque_928(
     assert not any(l.get("callee") for l in aol2), result2["leaves"]
     assert not any("snprintf" in r for r in reasons2), reasons2
     assert [l["detail"] for l in aol2 if "no plain store the walk can see writes" in l["detail"]], aol2
+
+
+@pytest.mark.parametrize("callee", ["ctime", "asctime", "localtime", "gmtime"])
+def test_backward_time_formatting_after_an_escape_is_no_writer(callee, monkeypatch):
+    # W11-07: `gp = cmd; s = ctime(&g_stamp); popen(cmd)` -- ctime reads its
+    # argument and returns its own static buffer; it writes nothing the caller
+    # handed it, so it is neither a writer of `cmd` nor the slice's origin.
+    # Unmodeled, it was an opaque writer through the escaped pointer.
+    host = FVar("host", ident=11)
+    cmd = FVar("cmd", typ="char[0x80]")
+    s1 = FSSA(FVar("s"), 1)
+    fmt = 0x908
+    monkeypatch.setitem(_B_NAMES, fmt, callee)
+    pg = _BufProgram(params=[host])
+    pg.store(FExpr("MLIL_CONST_PTR", "0x404050", constant=0x404050), _addr_of(cmd))
+    pg.call(fmt, [FExpr("MLIL_CONST_PTR", "0x404060", constant=0x404060)], writes=[s1])
+    pg.sink(cmd)
+    result, reasons, aol = _bw(pg.func())
+    assert not [l for l in result["leaves"] if l.get("callee") == callee], result["leaves"]
+    assert result["slices"][0]["origin"].get("callee") != callee, result["slices"][0]["origin"]
 
 
 def test_backward_folded_address_of_sink_operand_is_seeded_928():
