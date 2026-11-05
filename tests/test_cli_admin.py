@@ -2611,6 +2611,12 @@ def test_target_list_marks_sticky(tmp_session, fake_transport, capsys):
     by_sel = {entry["selector"]: entry for entry in parsed["items"]}
     assert by_sel["foo.so"].get("sticky") is True
     assert "sticky" not in by_sel["bar.so"]
+    # P3: the paging metadata and row schema every collection page states. The
+    # list is every open target, never a page; `sticky` is on one row only.
+    assert (parsed["total"], parsed["returned"], parsed["offset"], parsed["has_more"]) == (
+        2, 2, 0, False)
+    assert parsed["row_fields"] == ["target_id", "selector", "filename"]
+    assert list(parsed["row_fields_optional"]) == ["sticky"]
 
 
 def test_stale_sticky_instance_emits_hint(tmp_session, monkeypatch, capsys):

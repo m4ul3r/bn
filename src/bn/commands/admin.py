@@ -2118,13 +2118,31 @@ def _target_list(args: argparse.Namespace) -> int:
             if isinstance(item, dict) and _target_matches(item, sticky):
                 item["sticky"] = True
     # Wrap the bare list in the {kind, items} envelope the rest of the CLI's
-    # collection reads use, so an agent doesn't special-case target list (#358).
-    envelope: Any = {"kind": "targets", "items": result if isinstance(result, list) else []}
+    # collection reads use, so an agent doesn't special-case target list (#358)
+    # -- including the paging metadata and row schema those envelopes carry
+    # (P3). The list is never paged: it is every open target, so `has_more` is
+    # false and `total` equals `returned`.
+    rows = [row for row in result if isinstance(row, dict)] if isinstance(result, list) else []
+    envelope: Any = {"kind": "targets", "items": rows, "total": len(rows), "offset": 0,
+                     "returned": len(rows), "has_more": False,
+                     **_target_row_schema(rows)}
     # #996: name the bridge that answered -- a lone instance is used from any cwd.
     if isinstance(response, dict) and isinstance(response.get("instance"), str):
         envelope["instance"] = response["instance"]
     cli._emit_result(args, envelope, text_renderer=_render_target_list_text, stem="targets")
     return 0
+
+
+def _target_row_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """`row_fields` (keys EVERY target row carries, in the first row's order)
+    and `row_fields_optional` (the rest, with the condition that sets them), the
+    contract every bridge collection page states. Derived from the rows, so an
+    empty list claims no field."""
+    fields = [key for key in (rows[0] if rows else {}) if all(key in row for row in rows)]
+    optional = {key: ("the target pinned by `bn target use`" if key == "sticky"
+                      else "present on some rows only")
+                for row in rows for key in row if key not in fields}
+    return {"row_fields": fields, **({"row_fields_optional": optional} if optional else {})}
 
 
 def _target_matches(item: dict[str, Any], selector: str) -> bool:
