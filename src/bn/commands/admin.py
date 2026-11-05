@@ -87,6 +87,11 @@ def _still_loading_notice(path: str, interval: float):
 def _capabilities(args: argparse.Namespace) -> int:
     # Derived entirely from the @command registry -- no hand-maintained second
     # list -- so the index can't drift from the actual command surface (#276).
+    # `output` is read off each command's BUILT parser (P3): what an agent asks
+    # before a large read -- which formats, whether `--out`/`--estimate-output`
+    # exist here, and which flags slice it -- answered by the parser that will
+    # accept or refuse them, not a description of it.
+    parser = cli.build_parser()
     items = [
         {
             "command": " ".join(spec["path"]),
@@ -94,6 +99,8 @@ def _capabilities(args: argparse.Namespace) -> int:
             "help": spec.get("help", ""),
             "requires_target": bool(spec.get("target", False)),
             "default_format": spec.get("fmt", "text"),
+            "output": _output_capabilities(
+                cli._selected_parser_for_argv(parser, list(spec["path"])), spec),
             "prefer_when": spec.get("prefer_when", ""),
             "see_also": list(spec.get("see_also", ())),
         }
@@ -102,6 +109,25 @@ def _capabilities(args: argparse.Namespace) -> int:
     result = {"kind": "capabilities", "items": items, "count": len(items)}
     cli._emit_result(args, result, text_renderer=_render_capabilities_text, stem="capabilities")
     return 0
+
+
+def _output_capabilities(sub: argparse.ArgumentParser, spec: dict[str, Any]) -> dict[str, Any]:
+    """The output surface one command's parser accepts. `slice_flags` are the
+    value-taking flags the command's own size hint draws on (`--limit`,
+    `--lines`, `--length`, ...); a switch such as `exports --count` is a mode,
+    not a bound, and `--out` has its own key."""
+    options = cli._known_option_strings(sub)
+    fmt = next((action for action in sub._actions if "--format" in action.option_strings), None)
+    takes_value = {option for action in sub._actions if action.nargs != 0
+                   for option in action.option_strings}
+    return {
+        "formats": list(fmt.choices) if fmt is not None and fmt.choices else [],
+        "out": "--out" in options,
+        "estimate_output": "--estimate-output" in options,
+        "paged": bool(spec.get("paged")),
+        "slice_flags": sorted({option for option, _ in sub._defaults.get("_slice_flags", ())}
+                              & takes_value - {"--out"}),
+    }
 
 
 def _render_help_index_text(value: Any) -> str:

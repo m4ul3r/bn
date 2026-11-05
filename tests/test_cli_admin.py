@@ -2911,6 +2911,28 @@ def test_capabilities_json_index_is_registry_derived(capsys):
     assert "function list" in by_cmd["function search"]["see_also"]
 
 
+def test_capabilities_advertise_each_commands_output_surface(capsys):
+    """P3: the index said what each command is for but nothing about its
+    output: an agent could not learn which commands take `--estimate-output`
+    or `--out`, or which flags slice a read, without trial and error. Every
+    advertised capability is checked against the parser that enforces it."""
+    assert bn.cli.main(["capabilities", "--format", "json"]) == 0
+    by_cmd = {it["command"]: it for it in json.loads(capsys.readouterr().out)["items"]}
+
+    assert by_cmd["exports"]["output"] == {
+        "formats": ["json", "text", "ndjson"], "out": True, "estimate_output": True,
+        "paged": True, "slice_flags": ["--limit", "--offset"]}
+    assert by_cmd["types declare"]["output"]["estimate_output"] is False
+    assert by_cmd["decompile"]["output"]["slice_flags"] == ["--lines"]
+
+    parser = bn.cli.build_parser()
+    for command, item in by_cmd.items():
+        sub = bn.cli._selected_parser_for_argv(parser, command.split())
+        accepts = bn.cli._known_option_strings(sub)
+        assert item["output"]["estimate_output"] == ("--estimate-output" in accepts), command
+        assert set(item["output"]["slice_flags"]) <= accepts, command
+
+
 def test_capabilities_see_also_references_are_valid_commands(capsys):
     # Integrity: every see_also points at a real registered command (the index
     # is registry-derived, so a stale/typo'd cross-link must fail loudly).
