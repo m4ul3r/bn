@@ -128,9 +128,18 @@ All mutations support `--preview` (apply → capture diffs → revert) and live 
 Request: `{"op": "decompile", "params": {...}, "target": "selector", "id": "uuid"}`
 Response: `{"ok": true, "result": ...}` or `{"ok": false, "error": "..."}`. On an
 `OperationFailure` the `ok: false` envelope also carries `status`, `requested`
-and `observed` describing the structured mutation failure; `requested` and
-`observed` are `{}` when the failure supplied no detail. All three keys are
-omitted entirely for other errors.
+and `observed` describing the structured failure (a mutation's, or a
+cancelled op's `status: "cancelled"`); `requested` and `observed` are `{}`
+when the failure supplied no detail. All three keys are omitted entirely for
+other bridge errors.
+
+The CLI's own `--format json` error object mirrors whatever structure the
+`BridgeError` it caught carries. A client-side request timeout is one that
+carries structure without being a mutation failure: `observed` states what
+the client established (`timed_out`, `request_sent`, `cancel_sent`,
+`polls_cancel`, `cancel_outcome`, `cancelled`, plus the bridge's own
+`observed` when it answered a cancel), and `status` is `"cancelled"` only
+when the bridge confirmed it stopped the op. It is still exit 2.
 
 ## Conventions
 
