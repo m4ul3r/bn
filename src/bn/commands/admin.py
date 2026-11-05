@@ -43,6 +43,7 @@ from ..formatters import (
     _render_target_use_text,
 )
 from ..paths import project_root
+from ..taint_vocabulary import taint_vocabulary
 from ..target_hint import instance_option, target_option
 from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, unwrap_result
 
@@ -82,8 +83,10 @@ def _still_loading_notice(path: str, interval: float):
 
 
 @command("capabilities",
-         help="Index of every command, what it's for, and when to pick it over a neighbor "
-              "(JSON for agents; no target needed)")
+         help="Index of every command, what it's for, and when to pick it over a neighbor, "
+              "plus the taint output vocabulary (`taint`: leaf kinds, truncation causes, "
+              "origin kinds, sink_status statuses, run_params keys) (JSON for agents; no "
+              "target needed)")
 def _capabilities(args: argparse.Namespace) -> int:
     # Derived entirely from the @command registry -- no hand-maintained second
     # list -- so the index can't drift from the actual command surface (#276).
@@ -99,7 +102,10 @@ def _capabilities(args: argparse.Namespace) -> int:
         }
         for spec in sorted(cli._COMMANDS, key=lambda spec: spec["path"])
     ]
-    result = {"kind": "capabilities", "items": items, "count": len(items)}
+    # The taint output vocabulary (V4-05): declared sets and the engine's own
+    # literals, read by the crawler the drift tests use -- never a copy.
+    result = {"kind": "capabilities", "items": items, "count": len(items),
+              "taint": taint_vocabulary()}
     return cli._emit_result(args, result, exit_code=0,
                             text_renderer=_render_capabilities_text, stem="capabilities")
 
