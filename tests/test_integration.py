@@ -7350,3 +7350,14 @@ def test_local_pages_and_orient_collections_declare_their_rows(shared_bn):
     for key in ("strings_sample", "sections"):
         rows = orient[key]["items"]
         assert rows and all(set(orient[key]["row_fields"]) <= set(row) for row in rows)
+
+
+@pytest.mark.parametrize("argv", [("read", "--", "-16", "4"), ("read", "-0x10"),
+                                  ("decompile", "--", "-16")])
+def test_a_negative_address_is_an_exit_2_refusal_on_a_real_view(shared_bn, argv):
+    """W10: BN's own `read` raised on `-16`, which surfaced as an internal
+    error; `-0x10` was searched for as a name."""
+    shared_bn.load(HELLO_BINARY)
+    res = shared_bn.run(*argv)
+    assert res.returncode == 2, res.stdout
+    assert "negative address" in res.stderr and "internal error" not in res.stderr

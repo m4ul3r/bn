@@ -2617,3 +2617,29 @@ def test_an_import_name_reads_its_got_slot_not_the_extern_placeholder_1048(monke
     only_extern = _named_data_bv(
         fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x2080, "puts"))
     assert instance.ctx._resolve_address_operand(only_extern, "puts")[0] == 0x2080
+
+
+@pytest.mark.parametrize("op,params", [
+    ("read", {"address": "-16", "length": 4}),
+    ("read", {"address": "-0x10", "length": 4}),
+    ("read", {"address": -16, "length": 4}),
+    ("decompile", {"identifier": "-0x10"}),
+    ("decompile", {"identifier": "-16"}),
+])
+def test_a_negative_address_is_refused_naming_the_accepted_forms(monkeypatch, op, params):
+    """W10: decimal `-16` reached BN's `read` and came back as its own
+    ValueError (an `internal error`); `-0x10` fell through to a name search
+    ("Symbol/Function not found"). Every spelling is one user-facing refusal
+    naming what an address is."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x1000, "main")
+    bv = _FakeBV(functions=[fn], memory={0x1000: b"\x41\x42\x43\x44"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    response = instance.dispatch({"op": op, "params": params, "target": "active", "id": "w10"})
+
+    assert response["ok"] is False
+    operand = params.get("address", params.get("identifier"))
+    assert response["error"].startswith(f"{operand!r} is a negative address")
+    assert "internal error" not in response["error"]

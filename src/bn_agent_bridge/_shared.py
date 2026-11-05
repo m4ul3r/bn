@@ -786,6 +786,31 @@ def _parse_address(value: Any) -> int:
         ) from None
 
 
+# W10: a number spelled with a minus sign, in either documented address form.
+_NEGATIVE_NUMBER_RE = re.compile(r"-\s*(0[xX][0-9a-fA-F]+|[0-9]+)")
+
+
+def _refuse_negative_address(value: Any) -> None:
+    """Refuse an address OPERAND that is a negative number (W10).
+
+    `_parse_address` is a number parser that also serves offsets (a struct
+    field offset reports its own `>= 0` refusal), so it returns `-16` as
+    parsed. The operand resolvers must not: a decimal `-16` reached
+    `BinaryView.read` and came back as BN's own `ValueError` -- an internal
+    error -- while `-0x10` fell through to a name search that answered
+    "Function not found". Called first by every resolver that turns an operand
+    into an address, so both spellings get one refusal naming the forms an
+    address takes."""
+    negative = (
+        (isinstance(value, int) and not isinstance(value, bool) and value < 0)
+        or (isinstance(value, str) and _NEGATIVE_NUMBER_RE.fullmatch(value.strip()))
+    )
+    if negative:
+        raise ValueError(
+            f"{value!r} is a negative address; pass an address as a decimal or "
+            "0x-prefixed hex value >= 0, or a symbol name")
+
+
 # The two auto-name spellings BN renders for an address with no symbol of its
 # own: `data_<hex>` for an unnamed data variable and `sub_<hex>` for a function
 # (#1042 item 1). Both spell the address they sit at. `j_sub_<hex>` is NOT one:
