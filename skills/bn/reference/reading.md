@@ -35,17 +35,17 @@ bn evidence orient                                   # one-shot triage digest un
 bn evidence surface [--hide-vtables]                 # hidden code surface: init/ctor + vtable/dispatch tables + data- or code-referenced code BN missed
 bn evidence virtual-call --at <addr> [--providers <selector>]   # resolve an imported abstract/interface virtual call to the provider's vtable method
 bn trace <fn> <addr> [--arg N] [--interprocedural]   # backward SSA slice: trace where a call argument originates
-bn dataflow defuse <fn> --var <name|local_id|name#version>   # SSA def site + use sites of one variable
+bn dataflow defuse <fn> --var <name|local_id|name#version> [--mangled]   # SSA def site + use sites of one variable
                                                     # a use that is argument set-up for a call whose
                                                     # recovered model dropped its stack-passed args is
                                                     # reported as a `hint: call ... call-model truncation`
-bn dataflow callgraph <fn> [--direction {callees|callers|both}] [--per-site] [--mangled]   # resolved edges; text: one row per distinct callee/caller with its count and first sites (--per-site: one per call); indirect targets via value-set, one row per site; JSON is per site with `display_name`
-bn dataflow values <fn> --at 0x401234                # value-set (possible values) at an instruction
+bn dataflow callgraph <fn> [--direction {callees|callers|both}] [--per-site] [--mangled]   # resolved edges; text: one row per distinct callee/caller with its count and first sites (--per-site: one per call); indirect targets via value-set, one row per site; callers include indirect calls whose value-set names the function (`kind: indirect`, rendered `(indirect call, value-set)`; off with --no-resolve-indirect); a constant call to a symbol with no function body (`__builtin_memset`) is `direct` with `target.has_body: false`; one row per (site, target); JSON is per site with `display_name`
+bn dataflow values <fn> --at 0x401234[:IL_INDEX] [--mangled]   # value-set (possible values) at an instruction; several MLIL SSA instructions computing a value at one address are refused (`ambiguous_instruction`, candidates listed) -- pick one with `--at ADDR:IL_INDEX` (the [N] structured-il prints); the rest at that address are `other_instructions`
 bn taint models [--role {source|sink|propagator}] [--class overflow_len] [--present] [--callsites [--all-sites]] [--callsite-limit N] [--mangled]   # known sources/sinks; --present needs a target; --callsites lists real calls by application callers (stub/inline rows counted, shown with --all-sites), named by demangled caller unless --mangled; text prints 10 rows per model and counts the rest (--callsite-limit 0 = all)
 bn taint forward -f <fn> --source param:0 [--sink-class recv_overflow]   # untrusted data source→sink across calls (methodology → the `bn-vr` skill); with several --source flags each source is also run alone, and a flow names a source only when exactly that one reaches its sink alone (`source_candidates` lists every source that does; otherwise `multiple`); advice that bn cannot complete is printed as a `template` with UPPER-CASE blanks; a buffer-filling call:/arg: seed gates only unresolved indirect calls in the source function (`indirect_call_unchecked`, syscalls excluded), and its all-clear carries `diagnostics.all_clear_caveats` (see "Receive-buffer coverage" below)
 bn taint backward -f <fn> --sink arg:memcpy:2         # slice a sink's args back to their origin; `sink_status[]` gives each call site's status
 bn function cfg <fn> [--view {asm|mlil|hlil}]        # basic-block graph: blocks, their instructions, and the typed edges between them
-bn function structured-il <fn>                       # flat per-instruction list: op plus vars_read/vars_written, no block partitioning
+bn function structured-il <fn> [--mangled]          # flat per-instruction list: op plus vars_read/vars_written, no block partitioning
 bn proto get <fn>
 bn local list <fn>
 bn local list --frame <fn>                           # stack frame map: one row per distinct stack offset, saved-register/canary markers, bytes to the canary

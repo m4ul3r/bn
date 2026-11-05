@@ -4740,12 +4740,13 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
 
 
 @_discloses
-def _render_structured_il_text(value: Any) -> str:
+def _render_structured_il_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
     form = "ssa" if value.get("ssa") else "non-ssa"
-    lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}  ({value.get('view', 'mlil')} {form})"]
+    lines = [f"{_shown_name(fn, mangled=mangled) or '<unknown>'} @ {fn.get('address', '<unknown>')}  "
+             f"({value.get('view', 'mlil')} {form})"]
     for ins in _field_list(value, "instructions"):
         # A malformed list element (non-dict) must render as fallback text, not
         # crash the whole listing with an AttributeError (#101).
@@ -4764,13 +4765,13 @@ def _render_structured_il_text(value: Any) -> str:
 
 
 @_discloses
-def _render_defuse_text(value: Any) -> str:
+def _render_defuse_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
     var = _field_dict(value, "variable")
     lines = [
-        f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}",
+        f"{_shown_name(fn, mangled=mangled) or '<unknown>'} @ {fn.get('address', '<unknown>')}",
         f"variable: {var.get('ssa', var.get('name', '?'))}  ({var.get('type', '?')})",
     ]
     definition = _field_dict(value, "definition")
@@ -4850,11 +4851,14 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
             if c.get("kind") == "direct":
                 tgt = _field_dict(c, "target")
                 name = _shown_name(tgt, mangled=mangled) or "<unknown>"
+                # A symbol with no function body (a compiler builtin).
+                bodiless = "  (no function body)" if tgt.get("has_body") is False else ""
                 if per_site:
-                    rows.append(f"  {c.get('call_addr')}  direct -> {name} @ {tgt.get('address')}")
+                    rows.append(f"  {c.get('call_addr')}  direct -> {name} @ {tgt.get('address')}"
+                                f"{bodiless}")
                     continue
                 # Rendered spellings, so a malformed field still groups (#619).
-                key = (f"{name}", f"{tgt.get('address')}")
+                key = (f"{name}", f"{tgt.get('address')}{bodiless}")
                 if key not in groups:
                     groups[key] = []
                     rows.append(key)  # a group row, rendered once its sites are known
@@ -4892,11 +4896,14 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
                 continue
             caller = _field_dict(c, "caller")
             name = _shown_name(caller, mangled=mangled) or "<unknown>"
+            # A caller found through an indirect call's value-set, not a
+            # direct reference BN recorded.
+            how = "  (indirect call, value-set)" if c.get("kind") == "indirect" else ""
             if per_site:
                 site = f"{c.get('call_addr')}  " if c.get("call_addr") else ""
-                rows.append(f"  {site}{name} @ {caller.get('address', '?')}")
+                rows.append(f"  {site}{name} @ {caller.get('address', '?')}{how}")
                 continue
-            key = (f"{name}", f"{caller.get('address', '?')}")
+            key = (f"{name}", f"{caller.get('address', '?')}", how)
             if key not in caller_groups:
                 caller_groups[key] = []
                 rows.append(key)
@@ -4914,19 +4921,36 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
             if isinstance(row, tuple):
                 sites = caller_groups[row]
                 lines.append(f"  {row[0]} @ {row[1]}"
-                             + (f"  x{len(sites)}  at {_callgraph_site_list(sites)}" if sites else ""))
+                             + (f"  x{len(sites)}  at {_callgraph_site_list(sites)}" if sites else "")
+                             + row[2])
             else:
                 lines.append(row)
     return "\n".join(lines)
 
 
+def _pv_number(v: Any) -> str:
+    return f"{v:#x}" if isinstance(v, int) and not isinstance(v, bool) else str(v)
+
+
+def _pv_range(r: Any) -> str:
+    """``[0x0..0xff]`` (``step 4`` appended when not 1) for one serialized
+    value range; never the dict's Python repr."""
+    if not isinstance(r, dict):
+        return str(r)
+    step = r.get("step", 1)
+    return (f"[{_pv_number(r.get('start'))}..{_pv_number(r.get('end'))}]"
+            + (f" step {_pv_number(step)}" if step not in (1, None) else ""))
+
+
 @_discloses
-def _render_values_text(value: Any) -> str:
+def _render_values_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
-    lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
-    lines.append(f"at {value.get('at')}: {value.get('expression', '<no instruction at address>')}")
+    lines = [f"{_shown_name(fn, mangled=mangled) or '<unknown>'} @ {fn.get('address', '<unknown>')}"]
+    index = value.get("il_index")
+    where = f"{value.get('at')}:{index}" if isinstance(index, int) and index >= 0 else value.get("at")
+    lines.append(f"at {where}: {value.get('expression', '<no instruction at address>')}")
     value_sets = [("possible values", value)]
     if _field_present(value, "call_destination"):
         destination = _field_dict(value, "call_destination")
@@ -4942,14 +4966,24 @@ def _render_values_text(value: Any) -> str:
             continue
         # Coerce the type before appending value details (#619).
         summary = str(pvs.get("type", "?"))
+        detailed = False
         if "value" in pvs:
-            summary += f"  value={pvs['value']:#x}" if isinstance(pvs["value"], int) else f"  value={pvs['value']}"
-        if pvs.get("values"):
-            summary += f"  values={pvs['values']}"
-        if pvs.get("ranges"):
-            summary += f"  ranges={pvs['ranges']}"
+            summary += f"  value={_pv_number(pvs['value'])}"
+            detailed = True
+        values = _field_list(pvs, "values")
+        if values:
+            summary += "  values={" + ", ".join(_pv_number(v) for v in values) + "}"
+            detailed = True
+        ranges = _field_list(pvs, "ranges")
+        if ranges:
+            summary += "  ranges=" + ", ".join(_pv_range(r) for r in ranges)
+            detailed = True
         lines.append(f"{label}: {summary}")
-        lines.append(f"  raw: {pvs.get('raw', '')}")
+        # BN's own rendering of the set, only for a kind this renderer has no
+        # structured fields for (a lookup table); otherwise it repeats the
+        # line above as a Python repr.
+        if not detailed and pvs.get("type") != "UndeterminedValue" and pvs.get("raw"):
+            lines.append(f"  detail: {pvs['raw']}")
         basis = value_set.get("value_basis")
         if basis == "source_expression" and value_set.get("source_expression"):
             lines.append(f"  of source expression: {value_set['source_expression']}")
@@ -4957,6 +4991,11 @@ def _render_values_text(value: Any) -> str:
             lines.append("  of instruction")
         elif basis == "destination_expression":
             lines.append(f"  of destination expression: {value_set.get('expression')}")
+    others = [o for o in _field_list(value, "other_instructions") if isinstance(o, dict)]
+    if others:
+        lines.append(f"other instructions at {value.get('at')} (select with --at "
+                     f"{value.get('at')}:<il-index>):")
+        lines.extend(f"  [{o.get('il_index')}] {o.get('text', '')}" for o in others)
     return "\n".join(lines)
 
 
