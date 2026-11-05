@@ -15667,6 +15667,13 @@ class TaintEngine:
             self._bw_cycle_hits: list[tuple] = []
             self._bw_entries: list[tuple] = []
 
+        # How many may-alias stores the walk is currently inside (W02-10). A
+        # store through a pointer the walk cannot prove disjoint from a
+        # loaded object is only a POSSIBLE writer of it: what produced that
+        # store's value never represents the slice over the load's own
+        # frontier, which names the object the sink actually read.
+        may_writers = 0
+
         def _set_origin(o, *, weak: int | bool = 0):
             nonlocal origin, origin_rank
             o["function"] = fn_ref
@@ -15676,6 +15683,8 @@ class TaintEngine:
                 rank = int(weak) + 1
             else:
                 rank = 0 if o.get("kind") == "parameter" else 1
+            if may_writers and rank == 1:
+                rank = 2
             if rank == 0:
                 param_origins.setdefault(int(o["index"]), o)
             elif o not in producers:
@@ -16547,7 +16556,10 @@ class TaintEngine:
             ``field_load_unresolved`` frontier -- the slice is not complete.
             *demand* is the consumer's demand on what the LOADED value points
             to (a reloaded pointer the sink reads through); the stored values
-            the walk reaches carry it."""
+            the walk reaches carry it. What a MAY-alias store's value comes
+            from is walked for evidence but never represents the slice: the
+            load's own frontier, which names the object read, does (W02-10)."""
+            nonlocal may_writers
             key = (int(getattr(at, "address", 0) or 0), str(load),
                    getattr(load, "src_memory", None), demand is not None)
             if key in visited_loads:
@@ -16644,8 +16656,12 @@ class TaintEngine:
                         steps.append(_instr_dict(store, reason=reason))
                         value = getattr(store, "src", None)
                         if expr_reads(value) or self._outer_loads(value):
-                            _walk_expr(store, value, d + 1, self._mem_in(store), expr_reads(value),
-                                       demand)
+                            may_writers += kind == "may"
+                            try:
+                                _walk_expr(store, value, d + 1, self._mem_in(store),
+                                           expr_reads(value), demand)
+                            finally:
+                                may_writers -= kind == "may"
                         elif kind == "store":
                             cval = self._int_const(value)
                             if cval is not None:
