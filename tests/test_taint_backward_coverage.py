@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from bn.formatters import _render_taint_text
 from conftest import FixtureBuildError
 from test_taint_backward_loads import _FieldProgram
 from test_taint_engine import FBV, FSSA, FExpr, FFunc, FInstr, FSite, FSSAFunc, FVar, te
@@ -589,10 +590,16 @@ def test_caller_depth_cut_is_structured_incompleteness_beside_a_resolved_sibling
     assert leaf["reasons"] == {"max_depth": len(leaf["unfollowed"])}
     assert leaf["callers_fully_followed"] == 0
     assert "--max-depth" in result["diagnostics"]["next_action"]
-    # A depth-bound cut is run truncation, like the caller cap (W02-08).
+    # A depth-bound cut is run truncation, like the caller cap (W02-08):
+    # recorded in stats and the leaf, never as an assumption, and the text
+    # names the depth it happened at (R2-06).
     assert result["stats"]["truncated"] is True
     assert result["stats"]["truncation_cause"] == ["max_depth"]
-    assert any("--max-depth" in a and cut_in in a for a in result["assumptions"]), result["assumptions"]
+    assert result["stats"]["max_depth"] == depth
+    assert not any("--max-depth" in a for a in result["assumptions"]), result["assumptions"]
+    verdict = next(line for line in _render_taint_text(result).splitlines()
+                   if line.startswith("verdict:"))
+    assert f"truncated @depth {depth} (" in verdict, verdict
     if depth == 1:
         # the literal sibling was resolved; the cut is still disclosed
         assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in _origins(result))

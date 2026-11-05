@@ -15832,6 +15832,9 @@ class TaintEngine:
         # full one.
         self._bw_truncated = False
         self._bw_truncation_causes: set[str] = set()
+        # The deepest caller depth the ascent reached: `stats.max_depth`, as
+        # forward reports it -- the number a depth cut's text names (R2-06).
+        self._bw_depth_seen = 0
         slices: list[dict[str, Any]] = []
 
         # Function-level resolution is sink-independent: a missing MLIL/SSA form
@@ -16059,6 +16062,7 @@ class TaintEngine:
             # (#579/#576) -- a backward run whose caller ascent was capped is
             # INCOMPLETE and must not report from stats as a complete one.
             "stats": {"leaves": len(self._bw_leaves), "slices": len(slices),
+                      "max_depth": self._bw_depth_seen,
                       "truncated": self._bw_truncated,
                       "truncation_cause": sorted(self._bw_truncation_causes)},
             # #812: backward had no diagnostics block at all while forward did,
@@ -16211,6 +16215,7 @@ class TaintEngine:
         an ``arg:`` sink, and for the caller ascent of a parameter the callee
         read through; None when no consumer reads through the seed."""
         self._visits += 1
+        self._bw_depth_seen = max(self._bw_depth_seen, depth)
         self._check_cancelled()
         ssaf = self._ssa_func(func)
         steps: list[dict[str, Any]] = []
@@ -18266,9 +18271,10 @@ class TaintEngine:
 
         A cut the configuration made -- the ``caller_cap`` and the
         ``max_depth`` bound -- is run truncation: it sets ``stats.truncated``
-        and names its cause in ``truncation_cause`` with an assumption, as
-        forward does for its own bounds. The other reasons are what the
-        binary could not show, disclosed by this leaf alone.
+        and names its cause in ``truncation_cause``, and this leaf names the
+        sites. Like every other truncation it is never an ``assumptions``
+        entry. The other reasons are what the binary could not show,
+        disclosed by this leaf alone.
         """
         start = int(func.start)
         state = self._bw_caller_frontiers.get(start)
@@ -18276,7 +18282,7 @@ class TaintEngine:
             state = {
                 "direct": set(), "known": set(), "dropped": set(), "misses": set(),
                 "demanded": {}, "missed": {},
-                "reasons": {}, "examples": {}, "leaf": None, "bound_assumptions": {},
+                "reasons": {}, "examples": {}, "leaf": None,
             }
             self._bw_caller_frontiers[start] = state
         # Merge after descent into the current accumulator: a recursive ascent
@@ -18311,29 +18317,11 @@ class TaintEngine:
         demands_total = sum(len(state["demanded"].get(a, set())) for a in state["known"])
         demands_unfollowed = sum(len(m) for m in state["missed"].values())
         reasons = dict(sorted(state["reasons"].items()))
-        name = self._prose_function(func)
         capped = "caller_cap" in reasons
-        bounds = {
-            "caller_cap": (
-                f"{name} has {len(state['direct'])} callers; caller ascent fully followed "
-                f"{len(state['direct'] - state['dropped'])}, capped at {MAX_CALLERS} "
-                f"(function {start:#x})"),
-            "max_depth": (
-                f"caller ascent of {name} stopped at the --max-depth bound: "
-                f"{len({s for s, _, r in state['misses'] if r == 'max_depth'})} caller "
-                f"reference(s) not followed (function {start:#x})"),
-        }
-        for cause, assumption in bounds.items():
-            if cause not in reasons:
-                continue
-            self._bw_truncated = True
-            self._bw_truncation_causes.add(cause)
-            old = state["bound_assumptions"].get(cause)
-            if old != assumption:
-                if old is not None:
-                    self._bw_assumptions.remove(old)
-                self._bw_assume(assumption)
-                state["bound_assumptions"][cause] = assumption
+        for cause in ("caller_cap", "max_depth"):
+            if cause in reasons:
+                self._bw_truncated = True
+                self._bw_truncation_causes.add(cause)
         note = (
             ("caller-site cap: " if capped else "")
             + f"of {total} distinct caller reference(s), the ascent fully followed {fully} "
