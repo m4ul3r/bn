@@ -5754,8 +5754,10 @@ def test_two_scan_bounds_both_reach_the_aggregate(tmp_path, shared_bn):
     other."""
     # A body that TOUCHES the object and then does enough work to spend the
     # scan's node pool, beside a relay chain that spends the pointer-return
-    # depth: one search, two different bounds.
-    work = "".join(f"  n += {i};\n" for i in range(1600))
+    # depth: one search, two different bounds. Each statement nests one
+    # expression: a sub-expression is now visited once, so a flat `n += i`
+    # run no longer spends the pool (R3 sweep economy).
+    work = "".join(f"  n = (n ^ {i}) + {i};\n" for i in range(1600))
     src = tmp_path / "r6both.c"
     src.write_text(_chain_source(6).replace(
         "int main(void) { return 0; }",

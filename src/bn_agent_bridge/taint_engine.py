@@ -1939,7 +1939,16 @@ class TaintEngine:
         not a recognized heap allocation. (The alloc-in-a-loop boundary -- one call
         address producing distinct buffers per iteration -- is a known over-link
         risk handled separately if the corpus sweep shows it.)"""
-        return self._heap_key_expr(ssaf, expr, 0, set())
+        idx = getattr(expr, "expr_index", None)
+        if idx is None:
+            return self._heap_key_expr(ssaf, expr, 0, set())
+        # Structural (the SSA def graph, never the taint set), asked again at
+        # every fixpoint pass: answered once per expression per request.
+        memo = self.__dict__.setdefault("_heap_keys_memo", {})
+        mk = ("key", id(ssaf), int(idx))
+        if mk not in memo:
+            memo[mk] = self._heap_key_expr(ssaf, expr, 0, set())
+        return memo[mk]
 
     @staticmethod
     def _ssa_var_key(var: Any):
@@ -2538,7 +2547,21 @@ class TaintEngine:
         if "LOAD" not in sop:
             return None
         addr = getattr(src, "src", None)
-        bo = self._addr_base_offset(ssaf, addr)
+        # Where the address points is structural; asked at every fixpoint
+        # pass of every load, so resolved once per expression.
+        idx = getattr(src, "expr_index", None)
+        memo = self.__dict__.setdefault("_heap_keys_memo", {})
+        mk = ("partial", id(ssaf), int(idx)) if isinstance(idx, int) else None
+        shape = memo.get(mk) if mk is not None else None
+        if shape is None:
+            bo = self._addr_base_offset(ssaf, addr)
+            bases = () if bo is not None else tuple(
+                (b[0], r) for r in expr_reads(addr)
+                for b in (self._addr_base_offset(ssaf, r),) if b is not None)
+            shape = (bo, bases)
+            if mk is not None:
+                memo[mk] = shape
+        bo, bases = shape
         try:
             width = int(getattr(src, "size", 0) or 1)
         except (TypeError, ValueError):
@@ -2550,10 +2573,9 @@ class TaintEngine:
             if ranges is None:
                 return None
             return (self._overlaps(ranges, int(bo[1]), width), bo[0], str(addr))
-        for r in expr_reads(addr):
-            b = self._addr_base_offset(ssaf, r)
-            if b is not None and (b[0] in field_only or b[0] in partial_bases):
-                return ("unresolved", b[0], var_label(r))
+        for key, r in bases:
+            if key in field_only or key in partial_bases:
+                return ("unresolved", key, var_label(r))
         return None
 
     def _addr_base_offset(self, ssaf: Any, expr: Any, depth: int = 0):
@@ -8669,6 +8691,32 @@ class TaintEngine:
         self._ret_ptr_stack.discard(key)
         return False
 
+    @staticmethod
+    def _sub_exprs(expr: Any, attrs: tuple) -> list:
+        """The direct sub-expressions of *expr*: the named attributes, then
+        its ``operands``, each ONCE. The two routes name the same children
+        (`src` is also an operand), and walking both visited every child
+        twice -- doubling per level, so a nested address cost the sweep
+        allowance exponentially in its depth (R3 sweep economy)."""
+        subs: list[Any] = []
+        for attr in attrs:
+            sub = getattr(expr, attr, None)
+            if isinstance(sub, (list, tuple)):
+                subs.extend(sub)
+            elif sub is not None:
+                subs.append(sub)
+        subs.extend(getattr(expr, "operands", None) or ())
+        out: list[Any] = []
+        seen: set = set()
+        for s in subs:
+            idx = getattr(s, "expr_index", None)
+            key = ("expr", int(idx)) if isinstance(idx, int) and hasattr(s, "operation") \
+                else ("obj", id(s))
+            if key not in seen:
+                seen.add(key)
+                out.append(s)
+        return out
+
     def _expr_mentions(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
                        budget: _ScanBudget | None = None) -> bool:
         """Whether any sub-expression of *expr* may be the tracked pointer.
@@ -8686,14 +8734,7 @@ class TaintEngine:
             return False
         if self._ptr_resolves(ssaf, expr, base, budget=budget):
             return True
-        subs: list[Any] = []
-        for attr in ("src", "dest", "left", "right", "params"):
-            sub = getattr(expr, attr, None)
-            if isinstance(sub, (list, tuple)):
-                subs.extend(sub)
-            elif sub is not None:
-                subs.append(sub)
-        subs.extend(getattr(expr, "operands", None) or ())
+        subs = self._sub_exprs(expr, ("src", "dest", "left", "right", "params"))
         return any(self._expr_mentions(ssaf, s, base, depth + 1, budget) for s in subs)
 
     def _expr_loads(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
@@ -8711,14 +8752,7 @@ class TaintEngine:
         if "LOAD" in op_name(expr) and self._ptr_resolves(
                 ssaf, getattr(expr, "src", None), base, budget=budget):
             return True
-        subs: list[Any] = []
-        for attr in ("src", "left", "right", "params"):
-            sub = getattr(expr, attr, None)
-            if isinstance(sub, (list, tuple)):
-                subs.extend(sub)
-            elif sub is not None:
-                subs.append(sub)
-        subs.extend(getattr(expr, "operands", None) or ())
+        subs = self._sub_exprs(expr, ("src", "left", "right", "params"))
         return any(self._expr_loads(ssaf, s, base, depth + 1, budget) for s in subs)
 
     def _load_node(self, ssaf: Any, expr: Any, base: Any, depth: int = 0,
@@ -8742,14 +8776,7 @@ class TaintEngine:
             src = getattr(expr, "src", None)
             if self._ptr_resolves(ssaf, src, base, budget=budget):
                 return expr
-        subs: list[Any] = []
-        for attr in ("src", "left", "right", "params"):
-            sub = getattr(expr, attr, None)
-            if isinstance(sub, (list, tuple)):
-                subs.extend(sub)
-            elif sub is not None:
-                subs.append(sub)
-        subs.extend(getattr(expr, "operands", None) or ())
+        subs = self._sub_exprs(expr, ("src", "left", "right", "params"))
         for one in subs:
             got = self._load_node(ssaf, one, base, depth + 1, budget)
             if got is not None:
