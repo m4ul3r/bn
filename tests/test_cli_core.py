@@ -854,16 +854,24 @@ def test_class_and_go_subcommand_groups_have_help():
     assert "Go binary symbol recovery" in help_text
 
 
-def test_class_show_ambiguous_exits_nonzero_keeping_matches(fake_transport, capsys):
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_class_show_ambiguous_is_a_refusal_envelope_keeping_matches(fake_transport, capsys, fmt):
     # #413: an ambiguous leaf still returns the informative matches, but with a
-    # NON-zero exit so a shell/agent can't read it as a clean single-class result.
+    # NON-zero exit so a shell/agent can't read it as a clean single-class
+    # result. P3: in a machine format it is the refusal envelope every other
+    # refusal is (`ok: false`, `status`, `error`), the candidates under
+    # `observed.matches`.
     fake_transport({"class_show": {"ok": True, "result": {
         "ambiguous": True, "query": "Foo",
         "matches": [{"name": "a::Foo"}, {"name": "b::Foo"}]}}})
-    rc = bn.cli.main(["class", "show", "--target", "active", "Foo", "--format", "json"])
+    rc = bn.cli.main(["class", "show", "--target", "active", "Foo", "--format", fmt])
     assert rc == 2
-    out = capsys.readouterr().out
-    assert "a::Foo" in out and "b::Foo" in out
+    [line] = capsys.readouterr().out.splitlines()
+    out = json.loads(line)
+    assert (out["ok"], out["status"], out["requested"]) == (False, "ambiguous_class",
+                                                           {"name": "Foo"})
+    assert [m["name"] for m in out["observed"]["matches"]] == ["a::Foo", "b::Foo"]
+    assert "a::Foo" in out["error"] and "b::Foo" in out["error"]
 
 
 def test_missing_subcommand_prints_exact_help(capsys):
