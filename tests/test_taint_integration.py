@@ -8135,3 +8135,123 @@ def test_trace_reports_observed_truncation_and_quick_view_state(tmp_path, shared
     assert (partial["analysis_state"], partial["partial"]) == ("quick", True)
     # The raw binary was opened, not the database beside it.
     assert Path(quick).suffix != ".bndb", quick
+
+
+def _inline_expansion_target(tmp_path, shared_bn) -> str:
+    """`taint_corpus/inline_expansion.c` at -O2: two constant-size `rep stos`/
+    `rep movs` expansions and one whose length byte comes from the packet."""
+    binary = tmp_path / "inline_expansion"
+    _compile(CORPUS / "inline_expansion.c", binary, ["-O2"])
+    return shared_bn.load(binary, copy=False)
+
+
+def test_an_alignment_split_inline_expansion_is_bounded_not_overflow(tmp_path, shared_bn):
+    """V8-03: `memset(r, 0, sizeof *r)` and `memcpy(d, s, sizeof *d)` inlined
+    as `rep stos`/`rep movs` were `overflow_len` sinks under a tainted pointer
+    -- their count is the constant total split by the pointer's alignment. A
+    length byte read from the packet, expanded the same way, still overflows."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+
+    def sinks(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", "param:0")
+        return [s["sink"] for s in result["reached_sinks"]]
+
+    for fn, callee, intrinsic in (("record_reset", "__builtin_memset", "__memfill_u64"),
+                                  ("record_copy", "__builtin_memcpy", "__memcpy_u64")):
+        [sink] = sinks(fn)
+        assert (sink["callee"], sink["class"], sink["catalog_class"]) == (
+            callee, "bounded_len", "overflow_len"), (fn, sink)
+        assert sink["intrinsic_expansion"]["intrinsic"] == intrinsic
+        assert sink["intrinsic_expansion"]["length_kind"] == "alignment_split"
+        assert int(sink["intrinsic_expansion"]["length_bound"], 16) <= 0x140, sink
+
+    [label] = sinks("copy_label")
+    assert (label["callee"], label["class"]) == ("__builtin_memcpy", "overflow_len"), label
+    assert "intrinsic_expansion" not in label
+
+
+def test_a_tainted_size_inline_memset_overflows_even_when_masked(tmp_path, shared_bn):
+    """G4c P1: `memset(out, 0, (pkt[0] & 0x3ff) + 16)` at -O2 is a `rep stos`
+    whose count adds the packet's masked size to the alignment correction. The
+    mask erased the size's dependency, so the sink read `bounded_len` with
+    `length_bound: 0x408` -- an overflow of any destination shorter than that.
+    It is `overflow_len` with the bound as a fact, and a catalog audit row; the
+    unmasked `memset(out, 0, pkt[0])` (`rep stos` too) stays `overflow_len`."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+
+    def sink_of(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", "param:1")
+        [sink] = [s["sink"] for s in result["reached_sinks"]]
+        return sink
+
+    masked = sink_of("clear_masked")
+    assert (masked["callee"], masked["class"]) == ("__builtin_memset", "overflow_len"), masked
+    assert masked["intrinsic_expansion"] == {
+        "intrinsic": "__memfill_u64", "length_bound": "0x408",
+        "length_kind": "masked_value", "destination_fit": "unproved"}, masked
+    tail = sink_of("clear_tail")
+    assert (tail["callee"], tail["class"]) == ("__builtin_memset", "overflow_len"), tail
+
+    catalog = _bn_json(shared_bn, "-t", target, "taint", "models", "--role", "sink",
+                       "--present", "--callsites", "--all-sites")
+    [entry] = [e for e in catalog["items"] if e["symbol"] == "__builtin_memset"]
+    kinds = {row["function"]: row["kind"] for row in entry["callsites"]}
+    assert (kinds["clear_masked"], kinds["clear_tail"], kinds["record_reset"]) == (
+        "app_caller", "app_caller", "inline_builtin"), kinds
+
+
+def test_an_inline_copy_is_one_backward_sink_site(tmp_path, shared_bn):
+    """V8-04: BN lifts the `rep movs` of an inlined variable-length copy to two
+    `__builtin_memcpy` calls at one address; backward seeded both, emitting two
+    identical `sink_status` rows and every slice twice."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                      "--sink", "arg:__builtin_memcpy:2")
+    [row] = result["sink_status"]
+    assert row["status"] == "seeded", row
+    assert row["slices"] == len(result["slices"]) >= 1
+    assert {sl["sink"]["address"] for sl in result["slices"]} == {row["address"]}
+
+
+def test_inline_expansions_are_listed_by_the_catalog_and_callsites(tmp_path, shared_bn):
+    """V8-06: the variable-length inline copy (the tainted-total `rep movs`)
+    was missing from `taint models --present --callsites --all-sites`, and
+    `callsites __builtin_memcpy` refused the synthetic builtin, so only
+    `taint forward` ever surfaced it. Both now list it where backward seeds it;
+    a fixed-size expansion stays a non-audit `inline_builtin` row."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+    backward = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                        "--sink", "arg:__builtin_memcpy:2")
+    [site] = {row["address"] for row in backward["sink_status"]}
+
+    catalog = _bn_json(shared_bn, "-t", target, "taint", "models", "--role", "sink",
+                       "--present", "--callsites", "--all-sites")
+    kinds = {}
+    for symbol in ("__builtin_memcpy", "__builtin_memset"):
+        [entry] = [e for e in catalog["items"] if e["symbol"] == symbol]
+        kinds.update({(row["function"], row["address"]): row["kind"]
+                      for row in entry["callsites"]})
+    assert kinds[("copy_label", site)] == "app_caller", kinds
+    assert {kind for (fn, _), kind in kinds.items()
+            if fn in ("record_reset", "record_copy")} == {"inline_builtin"}, kinds
+    assert {fn for fn, _ in kinds} >= {"record_reset", "record_copy"}, kinds
+
+    listed = _bn_json(shared_bn, "-t", target, "callsites", "__builtin_memcpy",
+                      "--within", "copy_label")
+    assert [(row["call_addr"], row["call_kind"]) for row in listed["items"]] == [
+        (site, "inline_expansion")]
+
+
+def test_trace_at_an_inline_copy_names_the_builtin_and_its_count_register(tmp_path, shared_bn):
+    """V8-05: `trace` at the `rep movs` taint names `__builtin_memcpy` printed
+    `<unresolved callee>` and the convention's `rdx` for the length; the
+    count of a `rep movs` is `rcx`."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+    backward = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                        "--sink", "arg:__builtin_memcpy:2")
+    [site] = {row["address"] for row in backward["sink_status"]}
+    trace = _bn_json(shared_bn, "-t", target, "trace", "copy_label", site, "--arg", "2")
+    assert trace["callee"] == "__builtin_memcpy"
+    assert trace["arg_label"]["register"] == "rcx"

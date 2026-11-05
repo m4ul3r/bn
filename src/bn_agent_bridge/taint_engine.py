@@ -54,7 +54,7 @@ from .taint_il import (  # noqa: F401
     ssa_reads, ssa_writes, expr_reads, function_at, const_target,
     _mlil_ssa, _ssa_instructions, _symbols_by_name, _symbol_by_raw_name,
     extract_dest_address, targets_from_pvs, follow_thunk, ResolvedTarget,
-    resolve_call_target,
+    resolve_call_target, inline_expansion_length,
 )
 from .taint_locators import (  # noqa: F401
     parse_locator, _locator_index, format_locator, var_label_of,
@@ -6797,6 +6797,27 @@ class TaintEngine:
                 return None
             cur, at = getattr(d, "src", None), getattr(d, "address", None)
         return None
+
+    def _expansion_verdict(self, ssaf: Any, call: Any, params: list[Any], length_idx: int,
+                           model: dict[str, Any]) -> dict[str, Any] | None:
+        """:func:`taint_il.inline_expansion_length` of the call's length, with a
+        ``masked_value`` length checked against the destination it writes:
+        ``destination_fit`` is ``fits``/``exceeds`` when the destination is a
+        fixed-size object (``destination_capacity`` its bytes), else
+        ``unproved``. An ``alignment_split`` length needs no capacity."""
+        verdict = inline_expansion_length(ssaf, call, length_idx, self._ssa_def)
+        if verdict is None or verdict["length_kind"] == "alignment_split":
+            return verdict
+        roles = _model_copy_roles(model)
+        dest_idx = roles[1] if roles else 0
+        cap = (self._buffer_capacity(ssaf, params[dest_idx]) if dest_idx < len(params)
+               else None)
+        size = cap[0] if cap else None
+        if size is None:
+            return {**verdict, "destination_fit": "unproved"}
+        return {**verdict, "destination_capacity": size,
+                "destination_fit": "fits" if int(verdict["length_bound"], 16) <= size
+                else "exceeds"}
 
     def _buffer_capacity(self, ssaf: Any, expr: Any,
                          depth: int = 0) -> tuple[int | None, str, Any] | None:
@@ -14288,7 +14309,39 @@ class TaintEngine:
                             # #443: for a recv-style bounded-write sink the
                             # destination is `buf_arg` (not memcpy's arg0), so the
                             # provably-bounded downgrade checks the right buffer.
-                            if argidx == sink.get("len_arg") and sink.get("buf_arg") is None:
+                            # V8-03 / G4c: an inline string expansion (`rep
+                            # stos`/`rep movs` BN synthesises a `__builtin_*`
+                            # call from) whose count is a constant total split
+                            # by its own pointer's alignment cannot be steered
+                            # by taint: bounded, and nothing below may
+                            # re-headline it. A masked attacker value (`n & 7`)
+                            # is bounded only when the destination holds the
+                            # bound; otherwise it stays an overflow and carries
+                            # the bound as a fact (added after the relabels).
+                            _expansion = (self._expansion_verdict(ssaf, ins, params, argidx, model)
+                                          if classify and sink.get("class") == "overflow_len"
+                                          else None)
+                            if _expansion is not None and (
+                                    _expansion["length_kind"] == "alignment_split"
+                                    or _expansion.get("destination_fit") == "fits"):
+                                _bnd_reason = None
+                                _why = ("a constant total split by pointer alignment -- taint "
+                                        "on the pointer does not reach it"
+                                        if _expansion["length_kind"] == "alignment_split"
+                                        else "an attacker-controlled value's low bits, which the "
+                                        f"{_expansion['destination_capacity']}-byte destination holds")
+                                eff_sink = {
+                                    **sink,
+                                    "class": "bounded_len",
+                                    "intrinsic_expansion": _expansion,
+                                    "detail": (sink.get("detail") or "")
+                                    + f" (inline {_expansion['intrinsic']} expansion: the length "
+                                    f"is at most {_expansion['length_bound']}, {_why})",
+                                    "relabel": ("inline expansion of a constant-size copy/fill"
+                                                if _expansion["length_kind"] == "alignment_split"
+                                                else "masked length within the destination"),
+                                }
+                            elif argidx == sink.get("len_arg") and sink.get("buf_arg") is None:
                                 # Armed by len_arg but NO buf_arg declared: do NOT
                                 # guess arg0 as the destination -- arg0 may be a
                                 # sibling buffer sized to the length while the real
@@ -14339,7 +14392,7 @@ class TaintEngine:
                                 # the length is not provably within.
                                 eff_sink = self._source_side_verdict(
                                     ssaf, params, argidx, mkey, model, eff_sink)
-                            elif classify and sink.get("class") == "overflow_len":
+                            elif classify and eff_sink.get("class") == "overflow_len":
                                 # Length is the return of a modeled receive
                                 # call bounded by a constant count arg
                                 # (n = read(fd, buf, MAX); memcpy(dst, buf, n)):
@@ -14473,6 +14526,11 @@ class TaintEngine:
                                         "build reuses registers, so read them against "
                                         "the IL rather than expecting `cap`/`progress`)",
                                     }
+                            # G4c: a masked attacker length the destination is
+                            # not known to hold keeps its class and carries the
+                            # bound (and the capacity, when known) as a fact.
+                            if _expansion is not None and "intrinsic_expansion" not in eff_sink:
+                                eff_sink = {**eff_sink, "intrinsic_expansion": _expansion}
                             # #980: a finding re-headlined away from its catalog
                             # class names that class, so `taint models` and the
                             # finding are visibly the same sink.
@@ -16813,6 +16871,10 @@ class TaintEngine:
                 # W01-10: the copy length is the return of the modeled fill of
                 # this same source (so no overread_len).
                 **({"src_fill": sink["src_fill"]} if sink.get("src_fill") else {}),
+                # V8-03 / G4c: the inline string expansion and what bounds its
+                # length (alignment split, or a masked value and its fit).
+                **({"intrinsic_expansion": sink["intrinsic_expansion"]}
+                   if sink.get("intrinsic_expansion") else {}),
                 # V7-01: the length is a modeled fill's return nothing on the
                 # path proves a count (its failure -1 is SIZE_MAX here).
                 **({"return_unchecked": True} if sink.get("return_unchecked") else {}),
@@ -16958,11 +17020,18 @@ class TaintEngine:
         # Resolve argument locators into individual call sites BEFORE seeding:
         # one site's SSA reads must never hide another site's constant or missing
         # operand. Non-argument locators and absent calls retain their refusal path.
+        # One row per call site (V8-04, R2-04's rule for caller sites applied to
+        # sinks): BN lifts an inline `rep movs` to two calls at ONE address, one
+        # per direction-flag value, and seeding both re-emitted every slice. A
+        # site is its address; the first call in IL order stands for it.
         selections: list[tuple[dict[str, Any], Any]] = []
         for sink in sinks:
             sites = (self._find_callsites(instrs, sink["callee"], resolve_indirect=True)
                      if sink.get("kind") == "arg" else [])
-            selections.extend((sink, site) for site in sites or [None])
+            by_address: dict[int, Any] = {}
+            for site in sites:
+                by_address.setdefault(int(getattr(site, "address", 0)), site)
+            selections.extend((sink, site) for site in list(by_address.values()) or [None])
         sink_status: list[dict[str, Any]] = []
         errors: list[tuple[dict[str, Any], str]] = []
         for sink, site in selections:
