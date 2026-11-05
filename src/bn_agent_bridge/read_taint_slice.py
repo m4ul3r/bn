@@ -172,8 +172,14 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
         if direction == "forward":
             run_params["sink_classes"] = sorted(
                 {str(c) for c in params.get("enabled_sink_classes") or []})
+        # W07-14: the entries, and which of them a walked call consulted -- a
+        # key that is no call site in the walked region pins nothing, and is
+        # named here instead of vanishing.
+        pins = engine.resolve_map
         run_params["resolve_map"] = (
-            {"path": _map_path, "entries": len(engine.resolve_map)}
+            {"path": _map_path, "entries": len(pins),
+             "matched": [hex(a) for a in sorted(pins.matched)],
+             "unmatched": [hex(a) for a in sorted(set(pins) - pins.matched)]}
             if "resolve_map" in params else None)
         # The overlays actually merged, as the disclosure above names them;
         # the builtin DB is always loaded and an overridden env file was not.
