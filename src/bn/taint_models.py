@@ -913,6 +913,19 @@ def alias_spellings(key: str) -> tuple[str, ...]:
     return tuple(f"__{alias}" for alias, base in _SCANF_ALIASES.items() if base == key)
 
 
+def called_name(key: str | None, name: str | None) -> str | None:
+    """The name a finding reports as its ``callee`` for a call to *name*
+    resolved to model *key*: the symbol the binary calls when it is an ISO
+    scanf alias of the key (``__isoc99_fscanf`` for ``fscanf``), else the key
+    -- the spelling ``callee`` carried before the aliases replaced their own
+    model entries. The canonical key is reported beside it as ``model``."""
+    if key and name:
+        base = str(name).split("@", 1)[0]
+        if _canonical_scanf(base.lstrip("_")) == key:
+            return base
+    return key or name
+
+
 def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, dict[str, Any] | None]:
     """Match a (possibly decorated) symbol name against the model DB.
 

@@ -1351,7 +1351,9 @@ def test_format_proven_fifth_destination_withholds_the_all_clear(tmp_path, share
     preset = _bn_json(shared_bn, "-t", target, "taint", "forward",
                       "-f", "parse_scan_preset", "--source", "call:scanf")
     [short] = _format_holes(preset)
-    assert short["callee"] == "scanf" and _lost(short) == 1, short
+    # The leaf names the symbol the binary calls; the plain model is `model`.
+    called = symbol.replace("sscanf", "scanf")
+    assert (short["callee"], short.get("model"), _lost(short)) == (called, "scanf", 1), short
     assert preset["diagnostics"]["safe_to_report_all_clear"] is False
 
 
@@ -1440,17 +1442,18 @@ def test_forwarded_scanf_destinations_bn_did_not_recover_are_a_frontier(tmp_path
         result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
                           "--source", source)
         holes = [lf for lf in result["leaves"] if lf["kind"] == "format_destination_unrecovered"]
-        assert [(h["callee"], h["destinations"], h["missing"]) for h in holes] == \
-            [("scanf", 3, 3)], (fn, source, result["leaves"])
+        assert [(h["callee"], h.get("model"), h["destinations"], h["missing"]) for h in holes] == \
+            [(f"{spelling}scanf", "scanf", 3, 3)], (fn, source, result["leaves"])
         assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, source)
 
     # The param-seeded twin: the format itself is the sink, and the lost
     # destinations are still named.
     parsed = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_fwd",
                       "--source", "param:0")
-    assert {(s["sink"]["callee"], s["sink"]["callee_symbol"], s["sink"]["class"])
-            for s in parsed["reached_sinks"]} == \
-        {("sscanf", f"{spelling}sscanf", "overflow_unbounded")}, parsed["reached_sinks"]
+    assert {(s["sink"]["callee"], s["sink"]["callee_symbol"], s["sink"].get("model"),
+             s["sink"]["class"]) for s in parsed["reached_sinks"]} == \
+        {(f"{spelling}sscanf", f"{spelling}sscanf", "sscanf", "overflow_unbounded")}, \
+        parsed["reached_sinks"]
     assert [lf["missing"] for lf in parsed["leaves"]
             if lf["kind"] == "format_destination_unrecovered"] == [3], parsed["leaves"]
 
