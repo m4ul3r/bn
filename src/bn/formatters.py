@@ -6202,14 +6202,16 @@ def _presence_tag(e: dict[str, Any]) -> str:
     """` [present]` / ` [absent]` for a catalog row checked against a target,
     naming the spelling that matched when it is not the model's own name
     (W07-15): `scanf [present as __isoc99_scanf]` tells the reader which
-    symbol `xrefs`/`callsites` find, while `call:scanf` still names the call."""
+    symbol `xrefs`/`callsites` find, while `call:scanf` still names the call.
+    That spelling is `resolved_symbol`, the one the bridge selected (R4-03):
+    `accepted_aliases` lists every spelling present, and naming another one --
+    `memcpy@plt` beside an exact `memcpy` -- sent the follow-up to the stub."""
     if "present" not in e:
         return ""
     if not e.get("present"):
         return " [absent]"
-    symbol = e.get("symbol")
-    aliases = [str(a) for a in _field_list(e, "accepted_aliases") if a != symbol]
-    return f" [present as {', '.join(aliases)}]" if aliases else " [present]"
+    resolved = _text_value(e, "resolved_symbol")
+    return f" [present as {resolved}]" if resolved and resolved != e.get("symbol") else " [present]"
 
 
 def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False,
