@@ -5278,7 +5278,8 @@ def _wrap_row(row: str, width: int) -> list[str]:
     first line whole, so a reader or a grep that takes a frontier's first line
     gets every fact it states (it runs past the width only when it alone is
     wider). A backticked command is never split either: it is the one span a
-    reader pastes, so it moves to the next line whole."""
+    reader pastes, so it moves to the next line whole, its text verbatim --
+    every whitespace character in it, a tab in a selector included (D5c-03)."""
     if len(row) <= width:
         return [row]
     indent = row[:len(row) - len(row.lstrip(" "))]
@@ -5287,16 +5288,27 @@ def _wrap_row(row: str, width: int) -> list[str]:
     head, sep, tail = body.partition("  -- ")
     if sep:
         body = head.replace(" ", glue) + glue * 2 + "-- " + tail
-    # The space before a command glues too, so `next: <command>` stays one
-    # line, and a `[N leaves]` count stays one token a reader can grep for. A
-    # command is recognised by its fence (`code_span`), never by "the next
-    # backtick": a selector may carry one (R4-02).
-    protected = re.sub(rf" ?{CODE_SPAN_RE.pattern}|\[\d+ leaves\]",
-                       lambda m: m.group(0).replace(" ", glue), body)
+    # Each command -- with the space before it, so `next: <command>` stays
+    # one line -- is an opaque token while the row wraps, as wide as the
+    # command, and is restored verbatim after: textwrap expands tabs and
+    # breaks at any whitespace, so gluing only its spaces split a selector
+    # holding a tab. A command is recognised by its fence (`code_span`),
+    # never by "the next backtick": a selector may carry one (R4-02).
+    spans: list[str] = []
+
+    def opaque(m: re.Match[str]) -> str:
+        spans.append(m.group(0))
+        tag = f"\x01{len(spans) - 1}"
+        return tag + "\x02" * max(1, len(m.group(0)) - len(tag))
+
+    protected = re.sub(rf" ?{CODE_SPAN_RE.pattern}", opaque, body)
+    # A `[N leaves]` count stays one token a reader can grep for.
+    protected = re.sub(r"\[\d+ leaves\]", lambda m: m.group(0).replace(" ", glue), protected)
     lines = textwrap.wrap(protected, width=width, initial_indent=indent,
                           subsequent_indent=indent + "    ", break_long_words=False,
                           break_on_hyphens=False)
-    return [line.replace(glue, " ") for line in lines] or [row]
+    return [re.sub(r"\x01(\d+)\x02+", lambda m: spans[int(m.group(1))], line)
+            .replace(glue, " ") for line in lines] or [row]
 
 
 def _counted(items: list[str], what: str) -> str:

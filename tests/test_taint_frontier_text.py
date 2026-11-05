@@ -171,12 +171,13 @@ def test_cli_text_frontier_command_keeps_instance_and_target(monkeypatch, capsys
 
 
 @pytest.mark.parametrize("target", ["audit`copy name.bndb", "it's ``two`` ticks.bndb",
-                                    "plain name.bndb", "`edge`"])
+                                    "plain name.bndb", "`edge`", "audit\tcopy.bndb"])
 @pytest.mark.parametrize("width", [40, 60, 100])
 def test_a_routed_command_survives_wrapping_whatever_its_selector_holds(target, width):
     """R4-02: the wrap protection took the first backtick after an opening one
     as the end of a command, so a selector carrying a backtick split the
-    command across two rows. Both the CLI-routed reseed and the renderer's own
+    command across two rows; D5c-03: it glued only spaces, so a tab was
+    expanded and broken at. Both the CLI-routed reseed and the renderer's own
     command are printed as one fenced span; each sits whole on one row and
     shell-parses back to the routing it was given."""
     instance = "audit 7"
