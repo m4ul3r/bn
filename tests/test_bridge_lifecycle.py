@@ -2521,7 +2521,10 @@ def test_a_successor_of_an_old_registry_accepts_no_numeric_selector(monkeypatch,
         lines = str(refused.value).splitlines()
         assert lines[0].startswith("Unknown target selector:")
         assert any("/srv/alpha" in line for line in lines)
-        assert lines[-2:] == [PROCESS_LOCAL_VIEW_ID_NOTE, NUMERIC_VIEW_IDS_OFF_NOTE]
+        # V6-03: only the note for this mode -- "never reuses one" is false
+        # here, beside a listing whose ids restarted at 1.
+        assert lines[-1] == NUMERIC_VIEW_IDS_OFF_NOTE
+        assert PROCESS_LOCAL_VIEW_ID_NOTE not in lines
     assert manager.resolve(row["target_id"]) is alpha
     assert manager.resolve("alpha") is alpha
 

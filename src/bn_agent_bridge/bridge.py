@@ -234,9 +234,12 @@ def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]], *
     else:
         lines.append("No BinaryView targets are open.")
     if _is_numeric_selector(selector):
-        lines.append(PROCESS_LOCAL_VIEW_ID_NOTE)
-        if not numeric_view_ids:
-            lines.append(NUMERIC_VIEW_IDS_OFF_NOTE)
+        # V6-03: one note, for the mode this bridge numbers in. A bridge
+        # restarted without its predecessor's high-water mark restarts its ids
+        # at 1, so "a restarted bridge never reuses one" was false beside the
+        # listing it printed: it reuses them and accepts none of them.
+        lines.append(PROCESS_LOCAL_VIEW_ID_NOTE if numeric_view_ids
+                     else NUMERIC_VIEW_IDS_OFF_NOTE)
     return "\n".join(lines)
 
 
