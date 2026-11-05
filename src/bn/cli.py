@@ -466,6 +466,7 @@ def _common_io_options(
     *,
     default_format: str = "text",
     estimable: bool = False,
+    analysis_bounds: tuple[str, ...] = (),
 ) -> None:
     parser.add_argument(
         "--format",
@@ -496,11 +497,17 @@ def _common_io_options(
     # rather than one of them silently winning.
     exclusive = parser.add_mutually_exclusive_group()
     exclusive.add_argument("--out", type=_resolve_out_path, help=out_help)
+    # A command whose only bounds are ANALYSIS bounds (taint's --max-depth) has
+    # no flag that slices its output; the help says what the runtime advice
+    # (`_slice_hint`) says for it, never "the flag that slices it".
+    remedy = (f"; no flag slices this output ({', '.join(analysis_bounds)} bounds the "
+              "analysis, not the output) -- write it to a file with --out <path>"
+              if analysis_bounds else " and the flag that slices it")
     exclusive.add_argument(
         "--estimate-output", action="store_true", default=False,
         dest="estimate_output",
-        help="Report the estimated token/byte size of this command's output and "
-             "the flag that slices it, INSTEAD of printing or writing it (the read "
+        help="Report the estimated token/byte size of this command's output"
+             f"{remedy}, INSTEAD of printing or writing it (the read "
              "still runs; nothing is written to disk and no spill artifact is "
              "created). Mutually exclusive with --out.",
     )
@@ -832,7 +839,8 @@ def _build_from_commands(root: BnArgumentParser) -> None:
         # for the two live failure shapes that buys.
         _common_io_options(cmd, default_format=spec["fmt"],
                            estimable=(bool(spec.get("estimable"))
-                                      and path not in group_paths))
+                                      and path not in group_paths),
+                           analysis_bounds=tuple(spec.get("analysis_bounds", ())))
         _instance_option(cmd)
         # Fan-out is an EXPLICIT allow-list (`fanout=True` on genuine whole-target
         # read surveys), not inferred from fmt -- several write/side-effecting

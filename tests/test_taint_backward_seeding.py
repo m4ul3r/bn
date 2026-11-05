@@ -578,7 +578,8 @@ def test_nested_formal_frontier_survives_outer_ascent_without_local_misses():
 # the bare reason token, in JSON and text alike.
 @pytest.mark.parametrize("reason", [
     "caller_cap", "max_depth", "indirect_reference", "constant_address",
-    "argument_not_trackable", "arity_short", "no_call_instruction", "caller_unknown"])
+    "argument_not_trackable", "arity_short", "no_call_instruction", "caller_unknown",
+    "crt_entry"])
 def test_completeness_explanation_survives_every_dropped_caller_reason(reason):
     def frontier(why):
         # The frozen HOST-01 shape: one capped function that also lost

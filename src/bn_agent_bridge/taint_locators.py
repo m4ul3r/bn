@@ -266,11 +266,10 @@ def _make_signature(source: Any, chain: list[str], sink_class: str | None,
     }
     # #1001 item 4: the same signature with every function named as `decompile`
     # names it (`rendered_display`), and with the real raw symbols
-    # (`rendered_symbol`, what --mangled prints: the model key drops a C++
-    # symbol's leading underscore, so the sink in `rendered` is not a real
-    # symbol). `rendered` stays the raw, address-free grouping key. Each is
-    # always present when its resolver was given (equal to `rendered` when the
-    # names do not change).
+    # (`rendered_symbol`, what --mangled prints: a locator may name a callee by
+    # its model key, `strcpy_chk`, which is no real symbol). `rendered` stays
+    # the raw, address-free grouping key. Each is always present when its
+    # resolver was given (equal to `rendered` when the names do not change).
     for key, resolve in (("rendered_display", display), ("rendered_symbol", symbol)):
         if resolve is None:
             continue

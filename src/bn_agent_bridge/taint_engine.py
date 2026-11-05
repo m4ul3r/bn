@@ -3050,7 +3050,7 @@ class TaintEngine:
         mkey, model = lookup_model(self.models, name)
         if model and not model_is_benign_marker(model) and any(
                 str(s.get("to") or "").startswith("*arg:") for s in (model.get("sources") or [])):
-            return ("may_source", mkey or name)
+            return ("may_source", called_name(mkey, name))
         return ("opaque",)
 
     def _writer_call_ref(self, call_ins: Any) -> dict[str, Any]:
@@ -4569,6 +4569,13 @@ class TaintEngine:
                     and const_target(getattr(ins, "dest", None)) is None]
         addrs = ", ".join(hex(int(getattr(i, "address", 0))) for i in indirect[:4])
         more = "" if len(indirect) <= 4 else f", +{len(indirect) - 4} more"
+        # `--resolve-map` takes a JSON FILE (V4-04): the hint prints the
+        # document for the listed sites, the same shape as a leaf's
+        # `resolve_map_template`, with only the targets left to fill in.
+        pin = ("--resolve-map FILE, FILE holding "
+               + json.dumps({hex(int(getattr(i, "address", 0))): ["TARGET"]
+                             for i in indirect[:4]})
+               + " (a TARGET is an address or a function name)")
         own = int(getattr(func, "start", 0))
         callers = [c for c in self._caller_refs(
             [s for fn in self._callee_functions(callee)
@@ -4599,8 +4606,7 @@ class TaintEngine:
                 message += (
                     f". {func.name} also has {len(indirect)} indirect call(s) (e.g. "
                     f"{addrs}{more}) that did not resolve to {callee}; only if one of "
-                    f"them dispatches to it, pin it with --resolve-map "
-                    f"<call_addr>=<target_addr>")
+                    f"them dispatches to it, pin it with {pin}")
             return TaintError(message)
         if indirect:
             return TaintError(
@@ -4608,7 +4614,7 @@ class TaintEngine:
                 f"{len(indirect)} indirect call(s) (e.g. {addrs}{more}) that neither "
                 f"value-set nor a --resolve-map pin resolved to {callee} -- if {callee} "
                 f"is dispatched indirectly (vtable/fn-ptr), pin the call to its target "
-                f"with --resolve-map <call_addr>=<target_addr> and seed "
+                f"with {pin} and seed "
                 f"{flag} arg:<target>:<n>. The {seed_kind} callee must name the pinned "
                 f"target: pin to {callee} itself to keep its model, or to the in-binary "
                 f"wrapper that calls {callee} and seed arg:<wrapper>:<n>")
@@ -6103,7 +6109,7 @@ class TaintEngine:
 
     def _fill_return_of_source(self, ssaf: Any, len_expr: Any,
                                src_expr: Any) -> tuple[str, int] | None:
-        """``(model key, call address)`` when the copy length IS the return value
+        """``(called symbol, call address)`` when the copy length IS the return value
         of a modeled fill of the copy's own source pointer, else None (W01-10).
 
         A fill model is one declaring ``return_bound`` (its return counts the
@@ -6144,7 +6150,7 @@ class TaintEngine:
                     and cf is not None and cs is not None and cf[:2] == cs[:2])
         if not same:
             return None
-        return str(mkey or callee), int(getattr(d, "address", 0))
+        return str(called_name(mkey, callee)), int(getattr(d, "address", 0))
 
     # The integer ops whose result wraps in their own width. A length computed
     # by one of them in fewer bytes than the sink's parameter wraps BEFORE the
@@ -9146,15 +9152,43 @@ class TaintEngine:
             return _Use(int(getattr(ins, "address", 0)) if at is None else int(at),
                         kind, offset, seed, span, known, forward)
 
+        def load_seed(ins: Any) -> str | None:
+            """`var:<name>` for the variable a load fills -- the value the
+            reader goes on to use, its input (W07-13) -- or for the variable
+            a plain copy chain moves it into (`rax = [g]; n = rax`), the first
+            one the seeder's own resolver names; else None, so the advice
+            never prints a locator `--source` refuses."""
+            dest = getattr(ins, "dest", None) if "SET_VAR" in op_name(ins) else None
+            for _hop in range(4):
+                name = getattr(getattr(dest, "var", None), "name", None)
+                if not isinstance(name, str) or not name:
+                    return None
+                try:
+                    if self._resolve_var(fn, name) is not None:
+                        return f"var:{name}"
+                except Exception:
+                    pass
+                try:
+                    uses = list(ssaf.get_ssa_var_uses(dest) or [])
+                except Exception:
+                    return None
+                copies = [u for u in uses if "SET_VAR" in op_name(u)
+                          and op_name(getattr(u, "src", None)) == "MLIL_VAR_SSA"]
+                if len(copies) != 1:
+                    return None
+                dest = getattr(copies[0], "dest", None)
+            return None
+
         def load_verdict(ins: Any, node: Any, kind: str = "load") -> Any:
             """A verdict for a LOAD: cited at the instruction that performs
             it and as wide as the load itself, falling back to the
-            enclosing instruction where the IL node says nothing."""
+            enclosing instruction where the IL node says nothing; seeded on
+            the variable it fills (`load_seed`)."""
             at = getattr(node, "address", None) if node is not None else None
             width = getattr(node, "size", None) if node is not None else None
             if not isinstance(width, int) or width <= 0:
                 width = int(getattr(ins, "size", 0) or 0)
-            return verdict(ins, kind,
+            return verdict(ins, kind, load_seed(ins),
                            expr=getattr(node, "src", None) if node is not None else None,
                            span=width or None,
                            at=at if isinstance(at, int) else None)
@@ -9169,13 +9203,22 @@ class TaintEngine:
             resolves no source and the advertised command exits 2 ("no taint
             sources resolved"), which is worse than no command at all
             (round-20 review F53). Seedability is asked of the SAME helper
-            the seeder uses, so the advice and the run cannot disagree."""
+            the seeder uses, so the advice and the run cannot disagree.
+
+            Never an argument the callee's model arms as a sink: seeding
+            `strcpy(d, g)`'s source re-finds that one call in one step and
+            says nothing about what the consumer does with the bytes
+            (W07-13)."""
             name = self._callee_name(self._resolve_direct_target(ins))
             if not name or not hit:
                 return None
             params = self._call_params(ins)
-            idx = hit[0]
-            if idx >= len(params):
+            sink = (lookup_model(self.models, name)[1] or {}).get("sink") or {}
+            armed = {i for i in [*(sink.get("tainted_args") or []),
+                                 sink.get("len_arg"), sink.get("format_arg")]
+                     if model_arg_index(i) is not None}
+            idx = next((i for i in hit if i not in armed), None)
+            if idx is None or idx >= len(params):
                 return None
             # Asking is a QUESTION, not a write: `_buffer_target` records
             # the offset an object was reached at, which is evidence about
@@ -11198,6 +11241,21 @@ class TaintEngine:
                 f"the lower bound and not the real size; widen it to the "
                 f"object's true extent before relying on it, and re-run)")
 
+    def _global_label(self, ga: int) -> str:
+        """The ``global.label`` of a tainted-global leaf: the display name of
+        the data symbol at *ga* (``g_copy``) when it has one, else
+        ``glob_<address>`` (W07-13)."""
+        get = getattr(self.bv, "get_symbol_at", None)
+        try:
+            sym = get(int(ga)) if get is not None else None
+        except Exception:
+            sym = None
+        for attr in ("short_name", "name"):
+            nm = getattr(sym, attr, None) if sym is not None else None
+            if isinstance(nm, str) and nm:
+                return nm
+        return f"glob_{hex(int(ga))}"
+
     def _global_reference_rows(self, ga: int, references: tuple
                                ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """``(reference rows, unfinished scans)`` for ``(start, at, kind,
@@ -11527,7 +11585,7 @@ class TaintEngine:
             "address": hex(int(getattr(write_ins, "address", 0))),
             "dest_expr": str(dest) if dest is not None else gtxt,
             "il_text": str(write_ins),
-            "global": {"address": gtxt, "label": f"glob_{gtxt}",
+            "global": {"address": gtxt, "label": self._global_label(ga),
                        "written_offsets": [
                            hex(o) for o in
                            sorted(self._global_keyed_offsets.get(ga) or ())[:8]]},
@@ -11705,7 +11763,7 @@ class TaintEngine:
         return {
             "kind": "global_memory_continuation",
             "address": hex(int(getattr(ins, "address", 0))),
-            "global": {"address": hex(ga), "label": f"glob_{hex(ga)}",
+            "global": {"address": hex(ga), "label": self._global_label(ga),
                        # WHICH bytes of the object the walk keyed here: an
                        # interior write (`memcpy(g + 8, ..)`) is the same
                        # object, and naming the offset keeps a partial write
@@ -11735,7 +11793,9 @@ class TaintEngine:
             "reachability": reach,
             "call_descended": bool(descended),
             "il_text": str(ins),
-            "reseed": reseed,
+            # Only a seed of the reader's input; absent when there is none
+            # (W07-13) -- the text `next:` then names the xrefs audit.
+            **({"reseed": reseed} if reseed else {}),
             "detail": detail,
         }
 
@@ -12701,14 +12761,14 @@ class TaintEngine:
                         _gl = {
                             "kind": "gated_sink_reached",
                             "address": hex(addr),
-                            "callee": str(mkey or name or "?"),
+                            "callee": str(shown or "?"), **self._model_field(shown),
                             "class": str(sink.get("class") or "?"),
                             "gate": str(_gate),
                             "tainted_args": _armed,
                             "il_text": _gl_text,
                             "detail": (
                                 f"taint reaches arg {', '.join(map(str, _armed))} of "
-                                f"{self._prose_name(mkey or name)}, which arms its "
+                                f"{self._prose_name(shown)}, which arms its "
                                 f"opt-in `{sink.get('class')}` sink; that class is "
                                 f"reported only with `--sink-class {_gate}`, so this "
                                 "run neither reports nor rules it out -- NOT an "
@@ -14492,7 +14552,7 @@ class TaintEngine:
         That run seeds one value and stops: `tainted_values 1`, `last_use
         null`, and the gate used to read the empty result as an all-clear.
         The usual cause is a prototype that does not match the body -- BN
-        recovered `remove_connection_headers(struct orderedmap h @ 0x8)` as a
+        recovered `strip_headers(struct header_map h @ 0x8)` as a
         stack-slot parameter while the code reads the register -- so the
         locator names a value the function never sees."""
         kind = loc.get("kind")
@@ -15124,9 +15184,10 @@ class TaintEngine:
         return {
             "sink": {
                 "callee": callee,
-                # #1001 item 4: `callee` is the MODEL key, which drops a C++
-                # symbol's leading underscore; the real symbol and its demangled
-                # display name ride beside it (always present, like #978's).
+                # `callee` is the symbol the binary calls (`__strcpy_chk`), the
+                # model key it was judged by rides beside it as `model` when it
+                # differs; the raw symbol and its demangled display name are
+                # always present (#1001 item 4, #978).
                 "callee_symbol": self._symbol_names(callee)[0],
                 **self._model_field(callee),
                 "callee_display_name": self._display_for_name(callee),
@@ -15166,10 +15227,10 @@ class TaintEngine:
         }
 
     def _model_field(self, callee: Any) -> dict[str, str]:
-        """``{"model": <canonical key>}`` when the model that matched *callee*
-        is keyed by another name -- an ISO scanf alias (``__isoc99_fscanf``)
-        reports the symbol it calls as ``callee`` and the ``fscanf`` model it
-        was judged by here -- else ``{}``."""
+        """``{"model": <model key>}`` when the model that matched the called
+        symbol *callee* is keyed by another name -- ``strcpy_chk`` for
+        ``__strcpy_chk``, ``fscanf`` for ``__isoc99_fscanf``, ``pwrite`` for
+        ``pwrite64`` -- else ``{}``."""
         key, _ = lookup_model(self.models, str(callee) if callee else None)
         return {"model": key} if key and key != str(callee) else {}
 
@@ -16671,7 +16732,7 @@ class TaintEngine:
                                         "cannot prove disjoint from them")
                     elif kind == "may_source":
                         steps.append(_instr_dict(w[1], reason=f"field may be filled by source {w[2]}"))
-                        _set_origin({"kind": "source", "callee": w[2],
+                        _set_origin({"kind": "source", "callee": w[2], **self._model_field(w[2]),
                                      "address": hex(int(w[1].address))})
                         gaps.append(f"the source {self._writer_call_phrase(self._writer_call_ref(w[1]))} "
                                     "may have written them (no call's write extent is trusted)")
@@ -17198,11 +17259,15 @@ class TaintEngine:
         were skipped with at most a caveat, so a slice that dropped them
         certified itself complete (IC01). Every such (site, formal) is now a
         row of ONE ``caller_sites_truncated`` frontier, with its reason. A
-        caller's literal is not a skip: it is the origin, reached. Process-entry
-        and startup references are ordinary ``indirect_reference`` boundaries
-        too: names, imports, operand roles and optional entry metadata prove
-        neither caller-supplied origins nor completeness. No entry/runtime
-        classifier is consulted, and every known unresolved reference is kept.
+        caller's literal is not a skip: it is the origin, reached. The process
+        entry stub handing the function to an IMPORTED C-runtime start routine
+        as its main callback (`_start -> __libc_start_main(main, ..)`) is a row
+        too, with its own reason ``crt_entry`` (:meth:`_crt_entry_reference`):
+        no caller in this binary exists to slice from, but what the runtime
+        passes is still not proven, so it blocks like every other row. Every
+        other address-taking reference -- a custom entry's dispatcher, an
+        in-binary or static start routine, any other operand or use -- stays
+        ``indirect_reference``, and every known unresolved reference is kept.
         Returns ``(slices, cycled)``: at least one slice per formal -- a
         formal no caller resolved keeps its own parameter slice -- except the
         ``cycled`` formals, every resolved caller of which was a back edge to
@@ -17368,8 +17433,10 @@ class TaintEngine:
                 _drop(int(getattr(site, "address", 0)), getattr(site, "function", None), pidx,
                       "max_depth" if not ascend else "caller_cap")
         for a, rf in sorted(indirect.items()):
+            reason = ("crt_entry" if self._crt_entry_reference(rf, start)
+                      else "indirect_reference")
             for pidx in demands:
-                _drop(a, rf, pidx, "indirect_reference")
+                _drop(a, rf, pidx, reason)
         self._bw_note_unfollowed_callers(
             func, direct=direct, indirect=set(indirect), formals=set(demands),
             rows=rows, misses=misses)
@@ -17379,6 +17446,87 @@ class TaintEngine:
     def _caller_key(func: Any) -> tuple[int, str]:
         """A function's identity in the ascent's demand keys."""
         return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
+
+    # C-runtime start routines whose FIRST operand is the program's main
+    # callback (`__libc_start_main(main, argc, argv, ..)`).
+    _CRT_START_ROUTINES = frozenset({"__libc_start_main", "__uClibc_main"})
+    # Symbol types naming code outside this binary: a GOT slot, a PLT stub BN
+    # bound to an import, an extern. A LibraryFunctionSymbol is a
+    # signature-matched body IN the binary, so it is not one.
+    _EXTERNAL_SYMBOL_TYPES = frozenset({
+        "ImportedFunctionSymbol", "ImportAddressSymbol", "ExternalSymbol"})
+
+    def _crt_entry_reference(self, referrer: Any, target: int) -> bool:
+        """Whether *referrer*'s reference to *target* is the C runtime entry
+        stub's handoff of the program's main (W07-05): *referrer* is the
+        view's entry function (by address), every use of *target*'s address
+        in its IL is operand 0 of a call to an imported C-runtime start
+        routine, and there is at least one. A static or in-binary routine of
+        that name, another operand, a second use (a store, a dispatcher, an
+        offset) or unreadable entry metadata is not proven and returns False:
+        the reference stays an ``indirect_reference``. The answer only names
+        the row's reason; it never removes the row."""
+        if referrer is None or self.bv is None:
+            return False
+        try:
+            entry = getattr(self.bv, "entry_function", None)
+            if entry is None or int(entry.start) != int(referrer.start):
+                return False
+            instrs = self._instrs(self._ssa_func(entry))
+        except Exception:
+            return False
+
+        def is_target(expr: Any) -> bool:
+            if "CONST" not in op_name(expr) and "EXTERN_PTR" not in op_name(expr):
+                return False
+            c = getattr(expr, "constant", None)
+            # An ARM/Thumb code pointer carries the mode in its low bit.
+            return isinstance(c, int) and (c == target or (c & 1 and c & ~1 == target))
+
+        def uses(expr: Any, depth: int = 0) -> int:
+            if expr is None or depth > 32:
+                return 0
+            if isinstance(expr, (list, tuple)):
+                return sum(uses(e, depth + 1) for e in expr)
+            if not hasattr(expr, "operation"):
+                return 0
+            kids = getattr(expr, "operands", None) or [
+                getattr(expr, k, None) for k in ("dest", "src", "params", "left", "right")]
+            return int(is_target(expr)) + sum(uses(e, depth + 1) for e in kids)
+
+        def external(addr: int) -> bool:
+            fn = function_at(self.bv, addr)
+            sym = getattr(fn, "symbol", None) if fn is not None else None
+            if sym is None:
+                sym = self.bv.get_symbol_at(addr)
+            stype = str(getattr(getattr(sym, "type", None), "name", "") or "")
+            return stype in self._EXTERNAL_SYMBOL_TYPES
+
+        def starts_runtime(call: Any) -> bool:
+            dest = getattr(call, "dest", None)
+            if op_name(dest) == "MLIL_IMPORT":
+                slot, imported = getattr(dest, "constant", None), True
+            else:
+                slot = const_target(dest)
+                imported = slot is not None and (
+                    "EXTERN_PTR" in op_name(dest) or external(slot))
+            name = str(self._callee_name(slot) or "").split("@")[0] if imported else ""
+            return name in self._CRT_START_ROUTINES
+
+        handed = 0
+        try:
+            for ins in instrs:
+                n = uses(ins)
+                if not n:
+                    continue
+                params = self._call_params(ins) if self._is_call(ins) else []
+                if n == 1 and params and is_target(params[0]) and starts_runtime(ins):
+                    handed += 1
+                    continue
+                return False
+        except Exception:
+            return False
+        return handed > 0
 
     def _bw_note_unfollowed_callers(
         self, func: Any, *, direct: set[int], indirect: set[int], formals: set[int],

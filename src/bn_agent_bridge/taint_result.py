@@ -179,10 +179,25 @@ BLOCKING_LEAF_KINDS = frozenset({
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
 # weak ``arg:<recv*>:N`` seed that did not key the filled buffer (#562/#306).
 _SEED_MISANCHORED_KINDS = frozenset({"source_seed_misanchored", "weak_buffer_seed"})
-# Leaves that do not show tainted data reached anything: the unwind marker of
-# a walk that hit the recursion limit, and a seed that did not key its buffer.
-# Every other frontier is a place the seed's taint got to.
-_NO_PROPAGATION_KINDS = _SEED_MISANCHORED_KINDS | {"analysis_truncated"}
+# Leaves that do not show tainted data reached anything (V4-02): the unwind
+# marker of a walk that hit the recursion limit, and every kind the SEED step
+# (or a scan that runs whether or not taint arrived) can emit on its own -- a
+# seed nothing reads, a seed that did not key its buffer, the unresolved
+# indirect calls gated after a buffer fill, a seeded scanf-family call whose
+# format proves destinations the seed cannot reach, a scanf-family format
+# that could not be read, and an argument-register scan that ran out of
+# budget ("may enter, unknown"). Every other frontier is a place the seed's
+# taint got to. Each such leaf is also blocking: absence of propagation never
+# reads as an all-clear.
+_NO_PROPAGATION_KINDS = _SEED_MISANCHORED_KINDS | {
+    "analysis_truncated",
+    "seed_unused",
+    "indirect_call_unchecked",
+    "format_destination_unrecovered",
+    "scanf_arity_residual",
+    "format_unchecked",
+    "abi_provenance_budget",
+}
 
 # Substrings in ASSUMPTIONS that mean the seed was incomplete / wrong-shape even
 # when no structured leaf was produced (e.g. the recvmsg scatter-gather nudge or
@@ -844,9 +859,8 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     unmodeled_reached = bool(unmodeled_n or ext_no_model)
     tainted_values = int(diag.get("tainted_values", 0)) if measured else None
     # Whether the seed went anywhere, read off the result itself: a recorded
-    # use, more values than the seed, or any frontier other than the unwind
-    # marker and a seed-side refusal (each of those is a place tainted data
-    # reached).
+    # use, more values than the seed, or any frontier outside
+    # `_NO_PROPAGATION_KINDS` (each of those is a place tainted data reached).
     propagated = (bool(diag.get("last_use")) or (tainted_values or 0) > 1
                   or any(k not in _NO_PROPAGATION_KINDS for k in by_kind))
 
@@ -1029,19 +1043,28 @@ def backward_diagnostics(
             "with no frontier leaf and no truncation; still a may-analysis over "
             "the recovered IL, not a destination-capacity or safety proof")
 
-    if caller_leaves:
-        # Each reason the ascent left callers unfollowed has its own remedy
-        # (IC01). A leaf with no `reasons` tally is a cap leaf (#810).
+    # Each reason the ascent left callers unfollowed has its own remedy
+    # (IC01). A leaf with no `reasons` tally is a cap leaf (#810). A
+    # `crt_entry` row (W07-05) -- the C runtime entry stub handing the function
+    # to the imported start routine -- has no caller in this binary to slice
+    # from, so it has no caller remedy and the run's other frontier advice
+    # speaks; the row still withholds completeness above.
+    advised_callers: list[tuple[dict[str, Any], set[str]]] = []
+    for lf in caller_leaves:
+        reasons = (lf.get("reasons") if isinstance(lf.get("reasons"), dict)
+                   and lf.get("reasons") else {"caller_cap": 1})
+        why = {str(r) for r in reasons} - {"crt_entry"}
+        if why:
+            advised_callers.append((lf, why))
+    if advised_callers:
         functions: dict[str, tuple[str, set[str]]] = {}
-        for lf in caller_leaves:
+        for lf, why in advised_callers:
             fn = lf.get("function") if isinstance(lf.get("function"), dict) else {}
-            reasons = (lf.get("reasons") if isinstance(lf.get("reasons"), dict)
-                       and lf.get("reasons") else {"caller_cap": 1})
             selector = shlex.quote(str(fn.get("name") or fn.get("address") or "<function>"))
             function_key = str(fn.get("address") or fn.get("name") or "<function>")
             if function_key not in functions:
                 functions[function_key] = (selector, set())
-            functions[function_key][1].update(str(r) for r in reasons)
+            functions[function_key][1].update(why)
         selector_counts: dict[str, int] = {}
         for selector, _ in functions.values():
             selector_counts[selector] = selector_counts.get(selector, 0) + 1

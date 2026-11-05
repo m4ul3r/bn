@@ -113,14 +113,20 @@ def _reader(name, start, global_addr, read_at, *, callees=()):
 
 
 def _var_reader(name, start, global_addr, read_at, *, callees=()):
-    """A consumer that LOADS the object into a variable first -- the shape
-    an `arg:` locator can seed, unlike a constant-address operand."""
+    """A consumer that hands the object to a COPY before a sink reads the
+    copy -- `memcpy(buf, p, 64); system(buf)`: the copy's source is the
+    consumer's input, which an `arg:` locator can seed, unlike a sink's own
+    argument (W07-13) or a constant-address operand."""
     p1 = FSSA(FVar("p"), 1)
+    buf = FVar("buf", typ="char[0x40]")
     instrs = [
         FInstr(0, read_at - 4, "MLIL_SET_VAR_SSA", f"p#1 = {hex(global_addr)}",
                writes=[p1], src=_gptr(global_addr)),
-        FInstr(1, read_at, "MLIL_CALL_SSA", "system(p#1)", reads=[p1],
-               dest=_gptr(SYSTEM), params=[_var(p1)]),
+        FInstr(1, read_at, "MLIL_CALL_SSA", "memcpy(&buf, p#1, 0x40)", reads=[p1],
+               dest=_gptr(MEMCPY), params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                                           _var(p1), _const(0x40)]),
+        FInstr(2, read_at + 4, "MLIL_CALL_SSA", "system(&buf)",
+               dest=_gptr(SYSTEM), params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
     ]
     return GFunc(name, start, FSSAFunc(instrs), params=[], callees=callees)
 
@@ -199,7 +205,9 @@ def test_keyable_global_copy_into_zero_arg_consumer_emits_continuation(models):
                                    "address": hex(hook.start), "at": hex(0x401210),
                                    "access": "call_arg", "offset": 0,
                                    "offset_known": True,
-                                   "seed": "arg:system:0"}]
+                                   # the constant address IS system's argument:
+                                   # seeding it restates that sink (W07-13)
+                                   "seed": None}]
     assert leaf["reachability"]["status"] == "complete"
     assert leaf["call_descended"] is False
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
@@ -904,7 +912,7 @@ def test_a_mixed_write_then_read_reference_is_a_consumer(models):
     assert leaf["references"][0] == {
         "name": "overwrite_then_run", "display_name": "overwrite_then_run",
         "address": hex(0x401200), "at": hex(0x401218), "access": "call_arg",
-        "offset": 0, "offset_known": True, "seed": "arg:system:0"}
+        "offset": 0, "offset_known": True, "seed": None}
 
 
 
@@ -2436,25 +2444,32 @@ def test_the_truncation_leaf_blocks_the_all_clear():
 # --------------------------------------------------------------------------
 
 def test_the_reseed_advice_names_a_runnable_locator(models):
-    # `var:VAR` was a template nothing could fill in. A consumer that LOADS
-    # the object into a variable before handing it on does name a locator
-    # `--source` can resolve, so that command is printed.
+    # `var:VAR` was a template nothing could fill in. A consumer that hands
+    # the object to a copy names a locator `--source` can resolve -- the
+    # copy's source, the consumer's input -- so that command is printed.
     reader = _var_reader("run_hook", 0x401200, G_DIR, 0x401210)
     func, _argv = _copy_then_call(
         0x401104, STRNCPY, G_DIR, call_sites=[(0x401108, _gptr(0x401200), [])],
         params_extra=[_const(0xff)])
-    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", 0x401200: "run_hook"},
+    bv = FGlobalBV({STRNCPY: "strncpy", SYSTEM: "system", MEMCPY: "memcpy",
+                    0x401200: "run_hook"},
                    funcs={0x401200: reader},
                    refs={G_DIR: [FRef(reader, 0x401210)]})
     result = _forward(bv, func, models)
     [leaf] = _leaves(result)
-    assert leaf["references"][0]["seed"] == "arg:system:0"
+    assert leaf["references"][0]["seed"] == "arg:memcpy:1"
     assert leaf["reseed"] == (
-        f"`bn taint forward -f {hex(0x401200)} --source arg:system:0`")
+        f"`bn taint forward -f {hex(0x401200)} --source arg:memcpy:1`")
     assert "var:VAR" not in leaf["detail"]
-    assert "--source arg:system:0" in leaf["detail"]
+    assert "--source arg:memcpy:1" in leaf["detail"]
     assert "var:VAR" not in result["diagnostics"]["next_action"]
-    assert "--source arg:system:0" in result["diagnostics"]["next_action"]
+    assert "--source arg:memcpy:1" in result["diagnostics"]["next_action"]
+    # ...and it runs: inside the consumer the seed reaches the sink through
+    # the copy, not in the one step a sink-argument seed would take.
+    inside = te.TaintEngine(bv, models).forward(reader, [te.parse_locator("arg:memcpy:1")])
+    assert [(s["sink"]["callee"], s["sink"]["address"]) for s in inside["reached_sinks"]] \
+        == [("system", hex(0x401214))], inside["reached_sinks"]
+    assert inside["reached_sinks"][0]["metrics"]["steps"] > 1, inside["reached_sinks"]
 
 
 def test_an_unnameable_consumer_omits_the_reseed_instead_of_faking_one(models):
@@ -2473,7 +2488,7 @@ def test_an_unnameable_consumer_omits_the_reseed_instead_of_faking_one(models):
                    refs={G_DIR: [FRef(skipped, 0x401210)]})
     result = _forward(bv, func, models)
     [leaf] = _leaves(result)
-    assert leaf["reseed"] is None, leaf
+    assert "reseed" not in leaf, leaf
     assert "var:VAR" not in leaf["detail"]
     assert "audit the references by hand" in leaf["detail"]
     assert "var:VAR" not in result["diagnostics"]["next_action"]
@@ -3412,12 +3427,16 @@ def test_the_reseed_command_comes_from_one_reference(models):
     producer = GFunc("producer", 0x401200, FSSAFunc([
         FInstr(0, 0x401210, "MLIL_RET", "return g", src=[_gptr(G_DIR)]),
     ]), params=[])
+    buf = FVar("buf", typ="char[0x40]")
     q = FSSA(FVar("q"), 1)
     consumer = GFunc("consumer", 0x401300, FSSAFunc([
         FInstr(0, 0x401310, "MLIL_CALL_SSA", "q#1 = producer()", writes=[q],
                dest=_gptr(0x401200), params=[]),
-        FInstr(1, 0x401318, "MLIL_CALL_SSA", "system(q#1)", reads=[q],
-               dest=_gptr(SYSTEM), params=[_var(q)]),
+        FInstr(1, 0x401318, "MLIL_CALL_SSA", "memcpy(&buf, q#1, 0x40)", reads=[q],
+               dest=_gptr(MEMCPY), params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                                           _var(q), _const(0x40)]),
+        FInstr(2, 0x401320, "MLIL_CALL_SSA", "system(&buf)",
+               dest=_gptr(SYSTEM), params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
     ]), params=[], callees=[producer])
     func, _argv = _copy_then_call(
         0x401104, MEMCPY, _gptr(G_DIR),
@@ -3430,11 +3449,11 @@ def test_the_reseed_command_comes_from_one_reference(models):
     rows = leaf["references"]
     assert [r["display_name"] for r in rows] == ["producer", "consumer"], rows
     # The producer RETURNS the object (no locator); the consumer hands the
-    # returned VARIABLE to system, which one can seed.
-    assert rows[0]["seed"] is None and rows[1]["seed"] == "arg:system:0", rows
+    # returned VARIABLE to a copy, whose source one can seed.
+    assert rows[0]["seed"] is None and rows[1]["seed"] == "arg:memcpy:1", rows
     # the command names the function the locator belongs to, not the first row
     assert leaf["reseed"] == (
-        f"`bn taint forward -f {rows[1]['address']} --source arg:system:0`")
+        f"`bn taint forward -f {rows[1]['address']} --source arg:memcpy:1`")
 
 
 # --------------------------------------------------------------------------

@@ -4,6 +4,6 @@
   "cflags": ["-O2", "-D_FORTIFY_SOURCE=2"],
   "forward": [
     {"function": "process", "source": "arg:read:1",
-     "sinks": [{"callee": "memcpy_chk", "class": "fortified_overflow", "arg": 2}]}
+     "sinks": [{"callee": "__memcpy_chk", "class": "fortified_overflow", "arg": 2}]}
   ]
 }

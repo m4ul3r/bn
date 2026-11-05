@@ -2507,6 +2507,15 @@ def test_disasm_linear_defaults_count_when_flag_given_alone(fake_transport):
     assert calls[-1]["params"] == {"identifier": "0x402020", "linear": 32}
 
 
+def test_disasm_length_is_an_alias_of_linear(fake_transport):
+    # W10-09: `--length N` was rejected as an unrecognized argument.
+    calls = fake_transport({"disasm": {"ok": True, "result": {
+        "linear": True, "function": None, "address": "0x402020", "note": "n", "text": "t"}}})
+    rc = bn.cli.main(["disasm", "0x402020", "--target", "active", "--length", "4"])
+    assert rc == 0
+    assert calls[-1]["params"] == {"identifier": "0x402020", "linear": 4}
+
+
 def test_disasm_linear_works_in_json_format(fake_transport, capsys):
     # unlike --count/--lines (text-only client slicing), --linear is a bridge mode
     # and must work in JSON.
