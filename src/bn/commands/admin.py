@@ -936,16 +936,11 @@ def _skill_install(args: argparse.Namespace) -> int:
     if explicit_refusal:
         result.update(ok=False, error="Skill install refused; no destinations changed.")
         if args.format != "text":
-            # Only an install refusal carries operation failure on its spill
-            # envelope. Shared output envelopes describe file-write success.
-            emission = cli.write_output_result(
+            # A spill envelope states the refusal itself (`ok: false` plus the
+            # `error`), exactly as the in-line payload does.
+            sys.stdout.write(cli.write_output_result(
                 result, fmt=args.format, out_path=None, stem="skill-install"
-            )
-            if emission.spilled and emission.artifact is not None:
-                emission.artifact.update(ok=False, error=result["error"])
-                sys.stdout.write(cli.render_envelope(emission.artifact, args.format))
-            else:
-                sys.stdout.write(emission.rendered)
+            ).rendered)
         print(_render_skill_install_text(result), file=sys.stderr, end="")
         return 2
     cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")

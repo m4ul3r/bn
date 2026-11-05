@@ -896,6 +896,7 @@ def _render_result(
     provenance: dict[str, Any] | None = None,
     slice_hint: str | None = None,
     estimate_only: bool = False,
+    structured: Any = None,
 ) -> bool:
     """Render *value* to stdout; return True iff the output spilled to disk.
 
@@ -908,10 +909,14 @@ def _render_result(
     nothing is written and there is nothing to spill. It sits ABOVE the
     ``artifact_path`` passthrough because an already-materialized artifact
     envelope is a payload like any other -- a caller asking what it costs gets
-    its size, not a re-render of a file it may not have."""
+    its size, not a re-render of a file it may not have.
+
+    *structured* is the payload a text-rendered *value* came from: an envelope's
+    ``ok`` states that payload's outcome, which the rendered text cannot."""
     if estimate_only:
         result = _apply_result_transform(
-            lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint),
+            lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint,
+                                                   structured=structured),
             value, f"estimate the {stem} output size as {fmt}")
         sys.stdout.write(result.rendered)
         return False
@@ -923,7 +928,10 @@ def _render_result(
     # precisely because of this site.
     if out_path is None and isinstance(value, dict) and isinstance(value.get("artifact_path"), str):
         artifact = dict(value)
+        # The bridge wrote this file itself (its `--out`), so delivery happened;
+        # `ok` is the read's own outcome, which the bridge states.
         artifact.setdefault("ok", True)
+        artifact.setdefault("written", True)
         artifact.setdefault("spilled", False)
         for key, val in (provenance or {}).items():   # #653.8
             if val is not None:
@@ -936,7 +944,7 @@ def _render_result(
     result = _apply_result_transform(
         lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
                                            stem=stem, provenance=provenance,
-                                           rerun_hint=slice_hint),
+                                           rerun_hint=slice_hint, structured=structured),
         value, f"serialize the {stem} result as {fmt}")
     if result.spilled and result.artifact and spill_status is not None:
         # #645: NEVER put a spill envelope on stdout for a mutation. A read that
@@ -1141,10 +1149,11 @@ def _emit_result(
         text_renderer, f"render the {stem} result as text",
         advice="Rerun with --format json to see the raw result.")
     fmt = _resolve_output_format(args)
+    shown = result
     if text_renderer is not None and fmt == "text":
-        result = text_renderer(result)
+        shown = text_renderer(result)
     _render_result(
-        result,
+        shown,
         fmt=fmt,
         out_path=args.out,
         stem=stem,
@@ -1153,6 +1162,7 @@ def _emit_result(
         # envelope falls back to the stem guesses while their stderr note uses the
         # derived one, and one run offers two different remedies (dogfood pass 4).
         slice_hint=_slice_hint_for_args(args, fmt),
+        structured=result,
     )
 
 
@@ -2582,14 +2592,16 @@ def _call(
     # accepts (dogfood pass 3: the hand-maintained lists disagreed and named
     # flags that exit 2).
     slice_hint = _slice_hint_for_args(args, fmt)
+    shown = result
     if text_renderer is not None and fmt == "text":
         if route_rendered_commands:
             with command_routing(target=target, instance=getattr(args, "instance", None)):
-                result = text_renderer(result)
+                shown = text_renderer(result)
         else:
-            result = text_renderer(result)
+            shown = text_renderer(result)
     spilled = _render_result(
-        result,
+        shown,
+        structured=result,
         fmt=fmt,
         out_path=None if bridge_writes_output else args.out,
         stem=stem,

@@ -1068,7 +1068,7 @@ def test_estimate_output_result_text_envelope_is_the_artifact_shape_796():
 
     out = estimate_output_result({"items": ["a", "b"], "total": 2}, fmt="text").rendered
 
-    assert out.startswith("ok: true\nestimated: true\n")
+    assert out.startswith("ok: true\nwritten: false\nestimated: true\n")
     fields = _parse_envelope(out)
     assert fields["format"] == "text"
     assert int(fields["tokens"]) > 0 and int(fields["bytes"]) > 0
@@ -1149,3 +1149,77 @@ def test_spill_summary_marks_truncated_key_list(tmp_path, monkeypatch):
                                 out_path=None, stem="narrow")
     assert "keys_truncated" not in small.artifact["summary"]
     assert "keys_total" not in small.artifact["summary"]
+
+
+_REFUSAL = {"ok": False, "error": "refused: two functions match"}
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_out_envelope_ok_is_the_payload_outcome_not_the_write(tmp_path, monkeypatch, fmt):
+    """W07: an `--out` envelope's `ok` is the operation's outcome and `written` is
+    the delivery; a refusal written to a file says `ok: false` and why, where it
+    used to say `ok: true` because the write succeeded."""
+    from bn.output import write_output_result
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    refused = write_output_result(_REFUSAL, fmt=fmt, out_path=tmp_path / "r.json", stem="r")
+    envelope = json.loads(refused.rendered)
+    assert (envelope["ok"], envelope["written"], envelope["error"]) == (
+        False, True, _REFUSAL["error"])
+    assert json.loads((tmp_path / "r.json").read_text())["ok"] is False
+
+    read = json.loads(write_output_result({"items": [1]}, fmt=fmt,
+                                          out_path=tmp_path / "ok.json", stem="ok").rendered)
+    assert (read["ok"], read["written"]) == (True, True)
+    assert "error" not in read
+
+
+def test_out_envelope_reads_a_malformed_ok_as_not_ok(tmp_path):
+    from bn.output import write_output_result
+
+    envelope = write_output_result({"ok": "true"}, fmt="json",
+                                   out_path=tmp_path / "m.json", stem="m").artifact
+    assert envelope["ok"] is False
+
+
+def test_text_out_envelope_takes_the_outcome_from_the_structured_payload(tmp_path):
+    """Text mode writes the RENDERED card, which has no `ok`; the envelope states
+    the outcome of the payload the card was rendered from."""
+    from bn.output import write_output_result
+
+    out = write_output_result("rolled back: apply failed\n", fmt="text",
+                              out_path=tmp_path / "card.txt", stem="card",
+                              structured=_REFUSAL).rendered
+    fields = _parse_envelope(out)
+    assert (fields["ok"], fields["written"], fields["error"]) == (
+        "false", "true", _REFUSAL["error"])
+
+
+def test_spill_envelope_ok_is_the_payload_outcome(tmp_path, monkeypatch):
+    from bn.output import write_output_result
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    payload = {**_REFUSAL, "rows": [f"row-{i:04d}" for i in range(500)]}
+    result = write_output_result(payload, fmt="json", out_path=None, stem="big",
+                                 spill_token_limit=64)
+    envelope = json.loads(result.rendered)
+    assert result.spilled is True
+    assert (envelope["ok"], envelope["written"]) == (False, True)
+
+
+def test_estimate_and_bytes_envelopes_state_written():
+    """Every envelope states the delivery: an estimate writes nothing, and its
+    `ok` is still the measured payload's outcome."""
+    from bn.output import estimate_bytes_result, estimate_output_result
+
+    estimate = json.loads(estimate_output_result(_REFUSAL, fmt="json").rendered)
+    assert (estimate["ok"], estimate["written"], estimate["estimated"]) == (False, False, True)
+    raw = json.loads(estimate_bytes_result(b"\x00\x01", fmt="json").rendered)
+    assert (raw["ok"], raw["written"]) == (True, False)
+
+
+def test_write_bytes_envelope_states_written(tmp_path):
+    from bn.output import write_bytes_result
+
+    envelope = write_bytes_result(b"\x7fELF", out_path=tmp_path / "b.bin", fmt="json").artifact
+    assert (envelope["ok"], envelope["written"]) == (True, True)

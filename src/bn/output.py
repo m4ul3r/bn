@@ -535,6 +535,25 @@ def resolve_spill_limit() -> int | None:
 # simply gets no `rerun` key -- there is no command to name a flag for.
 
 
+def _outcome_fields(value: Any) -> dict[str, Any]:
+    """``ok`` (and a refusal's ``error``) of the payload an envelope stands for.
+
+    An envelope's ``ok`` is the OPERATION's outcome, never the file write's:
+    delivery is ``written``. A failed mutation written through ``--out`` used to
+    print ``ok: true`` on stdout over an artifact whose body said ``ok: false``
+    (W07), so an agent reading only stdout closed its loop on a rolled-back
+    batch. A payload that states no ``ok`` is a read that succeeded; one that
+    states anything but ``true`` is not ok (a malformed ``ok`` must not read as
+    success). A not-ok payload's string ``error`` -- the refusal shape
+    :func:`render_error` emits -- rides along so stdout says why."""
+    if not isinstance(value, dict) or "ok" not in value:
+        return {"ok": True}
+    fields: dict[str, Any] = {"ok": value["ok"] is True}
+    if not fields["ok"] and isinstance(value.get("error"), str):
+        fields["error"] = value["error"]
+    return fields
+
+
 def _artifact_payload(
     *,
     artifact_path: Path,
@@ -542,11 +561,13 @@ def _artifact_payload(
     encoded: bytes,
     token_count: int,
     value: Any,
+    outcome: dict[str, Any],
     spilled: bool,
     provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "ok": True,
+        **outcome,
+        "written": True,
         "spilled": spilled,
         "artifact_path": str(artifact_path),
         "format": fmt,
@@ -587,6 +608,10 @@ def render_artifact_envelope(payload: dict[str, Any]) -> str:
     lines = []
     if "ok" in payload:
         lines.append(f"ok: {str(bool(payload.get('ok'))).lower()}")
+    if "written" in payload:
+        lines.append(f"written: {str(bool(payload.get('written'))).lower()}")
+    if isinstance(payload.get("error"), str):
+        lines.append(f"error: {payload['error']}")
     # #796: a preflight ESTIMATE is not an artifact. It reuses this envelope
     # (bytes/tokens/tokenizer/rerun/summary all mean the same thing) but wrote
     # nothing, so it says so instead of carrying a path that does not exist --
@@ -676,13 +701,18 @@ def write_output_result(
     spill_token_limit: int | None = None,
     provenance: dict[str, Any] | None = None,
     rerun_hint: str | None = None,
+    structured: Any = None,
 ) -> OutputWriteResult:
+    """*structured* is the payload *value* was rendered from, when it is a text
+    rendering: the envelope's ``ok`` is that payload's outcome
+    (:func:`_outcome_fields`), which rendered text no longer carries."""
     # #409: resolve the spill threshold from BN_SPILL_TOKENS when not explicitly set.
     if spill_token_limit is None:
         spill_token_limit = resolve_spill_limit()
     rendered = render_value(value, fmt)
     encoded = rendered.encode("utf-8")
     token_count = estimate_tokens(encoded)
+    outcome = _outcome_fields(value if structured is None else structured)
 
     if out_path is not None:
         try:
@@ -702,6 +732,7 @@ def write_output_result(
             encoded=encoded,
             token_count=token_count,
             value=value,
+            outcome=outcome,
             spilled=False,
             provenance=provenance,
         )
@@ -767,6 +798,7 @@ def write_output_result(
         encoded=encoded,
         token_count=token_count,
         value=value,
+        outcome=outcome,
         spilled=True,
         provenance=provenance,
     )
@@ -824,6 +856,7 @@ def estimate_output_result(
     *,
     fmt: str,
     rerun_hint: str | None = None,
+    structured: Any = None,
 ) -> OutputWriteResult:
     """Preflight an output's size WITHOUT emitting or writing it (#796).
 
@@ -843,11 +876,13 @@ def estimate_output_result(
     parser-derived slicing hint the spill envelope names, and
     ``spill_token_limit`` is stated only when ``BN_SPILL_TOKENS`` is armed, which
     is what makes "this read would have spilled" a comparison the caller can do
-    rather than a claim this module makes."""
+    rather than a claim this module makes. *structured* is as for
+    :func:`write_output_result`."""
     return _estimate_envelope(
         render_value(value, fmt).encode("utf-8"),
         fmt=fmt, payload_format=fmt, summary=_summary(value),
-        rerun_hint=rerun_hint)
+        rerun_hint=rerun_hint,
+        outcome=_outcome_fields(value if structured is None else structured))
 
 
 def estimate_bytes_result(
@@ -873,7 +908,7 @@ def estimate_bytes_result(
     honored it, and its ``--encoding bytes`` half wrote the payload to stdout at
     rc 0 -- one command, two answers to what the flag means."""
     return _estimate_envelope(bytes(data), fmt=fmt, payload_format="bytes",
-                              summary=summary, rerun_hint=rerun_hint)
+                              summary=summary, rerun_hint=rerun_hint, outcome={"ok": True})
 
 
 def _estimate_envelope(
@@ -883,12 +918,16 @@ def _estimate_envelope(
     payload_format: str,
     summary: dict[str, Any] | None,
     rerun_hint: str | None,
+    outcome: dict[str, Any],
 ) -> OutputWriteResult:
     """The one estimate envelope, built once for both payload kinds so the two
-    preflights cannot state the same measurement in two different shapes."""
+    preflights cannot state the same measurement in two different shapes.
+    *outcome* is the measured payload's ``ok`` (:func:`_outcome_fields`); an
+    estimate writes nothing, so ``written`` is false."""
     token_count = estimate_tokens(encoded)
     payload: dict[str, Any] = {
-        "ok": True,
+        **outcome,
+        "written": False,
         "estimated": True,
         "format": payload_format,
         "bytes": len(encoded),
@@ -935,6 +974,7 @@ def write_bytes_result(
         raise OutputWriteError(f"Failed to write --out file {out_path}: {exc}") from exc
     artifact = {
         "ok": True,
+        "written": True,
         "spilled": False,
         "artifact_path": str(out_path),
         "format": "bytes",

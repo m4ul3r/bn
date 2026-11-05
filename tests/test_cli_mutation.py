@@ -5261,9 +5261,13 @@ def test_comment_list_explicit_limit_wins(fake_transport):
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson", "text"])
-def test_failed_mutation_out_envelope_reports_file_write_success(
+def test_failed_mutation_out_envelope_states_the_outcome_and_the_write_apart(
     fake_transport, tmp_path, capsys, monkeypatch, fmt
 ):
+    """W07: the stdout envelope of a failed mutation written through `--out` says
+    `ok: false` like the artifact body does; that the file was delivered is the
+    separate `written: true`. It used to print `ok: true` (the write succeeded)
+    over a body that said `ok: false`."""
     fake_transport({"rename_symbol": {"ok": True, "result": {
         "success": False, "committed": False, "rolled_back": True, "preview": False,
         "results": [{
@@ -5281,13 +5285,14 @@ def test_failed_mutation_out_envelope_reports_file_write_success(
     ]) == 3
     captured = capsys.readouterr()
     if fmt == "text":
-        assert "ok: true" in captured.out.splitlines()
+        lines = captured.out.splitlines()
+        assert "ok: false" in lines and "written: true" in lines
         assert "[verification_failed]" in destination.read_text()
     else:
         envelope = json.loads(captured.out)
-        assert envelope["ok"] is True
+        assert envelope["ok"] is False
+        assert envelope["written"] is True
         assert envelope["spilled"] is False
-        assert "error" not in envelope
         detail = json.loads(destination.read_text())
         assert detail["ok"] is False
         assert detail["results"][0]["status"] == "verification_failed"
