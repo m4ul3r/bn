@@ -827,6 +827,62 @@ def test_pointer_object_kinds_say_what_bn_maps(tmp_path, shared_bn):
         == [("global", True)]
 
 
+_LOOP_ACCUMULATOR_SRC = r"""
+#include <string.h>
+#include <stddef.h>
+#define N __attribute__((noinline))
+N size_t count_copy(char *dst, const char *src, int n) {
+    size_t len = 0;
+    for (int i = 0; i < n; i++)
+        if (src[i]) len += 4;
+    memcpy(dst, src, len);
+    return len;
+}
+N void put(char *dst, const char *src, size_t n) { memcpy(dst, src, n); }
+N size_t fixed_copy(char *dst, const char *src, int n) {
+    size_t len = 0;
+    if (n > 3) len = 1000;
+    put(dst, src, len);
+    return len;
+}
+int main(int c, char **v) { char b[64]; return (int)count_copy(b, v[0], c) + (int)fixed_copy(b, v[0], c); }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_trace_reports_a_loop_accumulators_literal_as_its_start(tmp_path, shared_bn, opt):
+    """V8-02: `trace` rolled a loop-carried length up as `constant` with no
+    caveat, while `taint backward` on the same argument reports a
+    `recurrence_initializer`. Both now apply one recurrence test and report
+    the same fields; a phi of plain literals stays `constant`."""
+    src = tmp_path / "loopacc.c"
+    src.write_text(_LOOP_ACCUMULATOR_SRC)
+    binary = tmp_path / f"loopacc{opt}"
+    _build(["gcc", opt, "-g", "-fno-builtin", "-fno-inline", "-fno-stack-protector",
+            "-fno-optimize-sibling-calls", "-no-pie", str(src), "-o", str(binary)])
+    target = shared_bn.load(binary, copy=False)
+
+    def trace(fn, callee):
+        site = _bn_json(shared_bn, "-t", target, "callsites", callee,
+                        "--within", fn)["items"][0]["call_addr"]
+        return _bn_json(shared_bn, "-t", target, "trace", fn, site, "--arg", "2")
+
+    looped = trace("count_copy", "memcpy")
+    [start] = [s for s in looped["trace"] if s.get("reason") == "recurrence_initializer"]
+    [origin] = [o for sl in _bn_json(shared_bn, "-t", target, "taint", "backward", "-f",
+                                     "count_copy", "--sink", "arg:memcpy:2")["slices"]
+                for o in sl["origins"]]
+    assert origin["kind"] == "recurrence_initializer", origin
+    assert {k: start.get(k) for k in ("value", "var", "phi", "increments")} == \
+        {k: origin.get(k) for k in ("value", "var", "phi", "increments")}
+    assert [g["reason"] for g in looped["frontiers"]] == ["recurrence_initializer"]
+    assert len(looped["assumptions"]) == 1, looped["assumptions"]
+
+    fixed = trace("fixed_copy", "put")
+    assert {g["reason"] for g in fixed["frontiers"]} == {"constant"}, fixed["frontiers"]
+    assert fixed["assumptions"] == []
+
+
 
 def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):
     """#1041 item 2 on the architecture it was found on: two 4-byte

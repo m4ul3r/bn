@@ -114,6 +114,75 @@ def test_every_terminal_kind_is_a_frontier_category(monkeypatch):
         "constant": 1, "field_load": 1, "undefined_or_global": 2}
 
 
+def _ver(base, k):
+    """An SSA variable with BN's `var`/`version` shape, which the recurrence
+    test reads (the plain fake carries only a name)."""
+    v = _FakeSSAVariable(f"{base}#{k}")
+    v.var, v.version = types.SimpleNamespace(name=base), k
+    return v
+
+
+def _accumulator(update_src):
+    """`len#1 = 0; loop { len#2 = phi(len#1, len#4); ...; len#4 = phi(len#2,
+    len#3) }; sink(len#2)` with `len#3 = <update_src>` on the counted path."""
+    l1, l2, l3, l4 = (_ver("len", k) for k in (1, 2, 3, 4))
+    init = _FakeMLILInsn(0x2008, operation="MLIL_SET_VAR_SSA", src=_const(0, 0x2008))
+    head = _FakeMLILInsn(0x2010, operation="MLIL_VAR_PHI", dest=l2, vars_read=[l1, l4])
+    head.src = [l1, l4]
+    upd = _FakeMLILInsn(0x2018, operation="MLIL_SET_VAR_SSA", src=update_src(l2),
+                        vars_read=[l2])
+    join = _FakeMLILInsn(0x201c, operation="MLIL_VAR_PHI", dest=l4, vars_read=[l2, l3])
+    join.src = [l2, l3]
+    defs = {l1: init, l2: head, l3: upd, l4: join}
+    return [init, head, upd, join, _sink(0x2030, l2)], defs
+
+
+def _plus(k):
+    return lambda v: _FakeMLILInsn(0x2018, operation="MLIL_ADD", left=_var(v, 0x2018),
+                                   right=_const(k, 0x2018), vars_read=[v])
+
+
+def test_a_loop_accumulators_literal_is_a_recurrence_start_not_its_value(monkeypatch):
+    # V8-02: `len = 0; for (..) if (..) len += 4; memcpy(d, s, len)`. The
+    # roll-up said `constant [1 step]` with no caveat, so the literal read as
+    # the length; `taint backward` calls the same arm `recurrence_initializer`.
+    instrs, defs = _accumulator(_plus(4))
+    result = _slice(monkeypatch, instrs, defs, 0x2030)
+    [start] = [s for s in result["trace"] if s["ssa_label"] == "len#1"]
+    assert {k: start[k] for k in ("reason", "terminates", "value", "var", "phi", "increments")} \
+        == {"reason": "recurrence_initializer", "terminates": True, "value": 0,
+            "var": "len#1", "phi": "len#2", "increments": [0, 4]}
+    assert [(g["reason"], g["count"]) for g in result["frontiers"]] == \
+        [("recurrence_initializer", 1)]
+    assert result["frontiers"][0]["examples"][0]["increments"] == [0, 4]
+    [caveat] = result["assumptions"]
+    assert caveat in _render_trace_text(result)
+
+
+def test_a_non_constant_trip_step_has_no_increments(monkeypatch):
+    # `len = len * 2`: a recurrence whose per-trip step is not one constant.
+    instrs, defs = _accumulator(lambda v: _FakeMLILInsn(
+        0x2018, operation="MLIL_MUL", left=_var(v, 0x2018), right=_const(2, 0x2018),
+        vars_read=[v]))
+    result = _slice(monkeypatch, instrs, defs, 0x2030)
+    [start] = [s for s in result["trace"] if s["ssa_label"] == "len#1"]
+    assert (start["reason"], start["increments"]) == ("recurrence_initializer", None)
+    assert len(result["assumptions"]) == 1
+
+
+def test_a_phi_of_literals_stays_constants(monkeypatch):
+    # `len = n > 3 ? 16 : 0`: no arm cycles back -- a plain choice.
+    l1, l2, l3 = (_ver("len", k) for k in (1, 2, 3))
+    a = _FakeMLILInsn(0x2008, operation="MLIL_SET_VAR_SSA", src=_const(0, 0x2008))
+    b = _FakeMLILInsn(0x200c, operation="MLIL_SET_VAR_SSA", src=_const(16, 0x200c))
+    phi = _FakeMLILInsn(0x2010, operation="MLIL_VAR_PHI", dest=l3, vars_read=[l1, l2])
+    phi.src = [l1, l2]
+    result = _slice(monkeypatch, [a, b, phi, _sink(0x2030, l3)], {l1: a, l2: b, l3: phi}, 0x2030)
+    assert [(g["reason"], g["count"]) for g in result["frontiers"]] == [("constant", 2)]
+    assert result["assumptions"] == []
+
+
+
 def _out_param_program(fill_sites):
     """`fill(&rec)` at each of *fill_sites*, then `len = rec.len; sink(len)`."""
     rec = _FakeSSAVariable("rec")

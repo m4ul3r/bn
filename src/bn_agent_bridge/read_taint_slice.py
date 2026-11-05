@@ -1101,6 +1101,11 @@ def _build_backward_trace(
     worklist: list[tuple[Any, int, int | None]] = [(v, 0, seed_addr) for v in initial_vars]
     visited: set[Any] = set()
     callee_pending = False
+    # V8-02: a literal arm of a phi that carries a value round a loop is where
+    # the value STARTS, not what it is -- `taint backward`'s own recurrence
+    # test (`_phi_recurrence`) decides it, so the two never disagree.
+    recurrent_arms: dict[Any, dict[str, Any]] = {}
+    engine: list[Any] = []
 
     while worklist and len(trace) < max_depth:
         ssa_var, node_depth, ref_addr = worklist.pop(0)
@@ -1302,9 +1307,19 @@ def _build_backward_trace(
             entry["local"] = str(getattr(taken, "name", None) or taken)
         else:
             reads = _ssa_vars_from(getattr(def_insn, "vars_read", []) or [])
-            const = (_constant_value(getattr(def_insn, "src", None))
-                     if "SET_VAR" in def_op else None)
-            if const is not None:
+            src = getattr(def_insn, "src", None)
+            const = _constant_value(src) if "SET_VAR" in def_op else None
+            init = getattr(src, "constant", None)
+            if const is not None and ssa_var in recurrent_arms \
+                    and isinstance(init, int) and not isinstance(init, bool):
+                # `len = 0; for (..) len += 4;`: the literal is the loop's
+                # starting value; the trip count is control this slice does
+                # not follow.
+                entry["terminates"] = True
+                entry["reason"] = "recurrence_initializer"
+                entry["value"] = init
+                entry.update(recurrent_arms[ssa_var])
+            elif const is not None:
                 # `x = 0`, `p = nullptr`: the value's origin is this literal.
                 entry["terminates"] = True
                 entry["reason"] = "constant"
@@ -1321,6 +1336,8 @@ def _build_backward_trace(
                 # null on ordinary steps: a phi merge is `phi_source`, everything else is
                 # a plain `definition` (#162).
                 entry["reason"] = "phi_source" if "PHI" in def_op else "definition"
+                if "PHI" in def_op:
+                    _note_recurrence(bv, ssa_func, def_insn, engine, recurrent_arms)
         trace.append(entry)
 
         # Still walk any index/offset operand (`&local + i`): a tainted index
@@ -1335,6 +1352,30 @@ def _build_backward_trace(
     return trace, pending
 
 
+def _note_recurrence(bv, ssa_func, phi_insn, engine: list[Any],
+                     recurrent_arms: dict[Any, dict[str, Any]]) -> None:
+    """Record each arm of the phi *phi_insn* as the start of a loop
+    recurrence when ``TaintEngine._phi_recurrence`` -- the test `taint
+    backward` applies (IC08) -- says the phi carries a value round a loop.
+    The fields are backward's ``recurrence_initializer`` origin's: ``var``,
+    ``phi``, ``increments`` (None when a trip's step is not one constant),
+    ``calls`` when an update passes through one, ``search_exhausted`` when the
+    search ran out before ruling a cycle out. *engine* holds the one engine
+    the walk builds, on first need."""
+    if not engine:
+        engine.append(_taint.TaintEngine(bv, _taint.load_models()))
+    rec = engine[0]._phi_recurrence(ssa_func, phi_insn)
+    if rec is None:
+        return
+    phi = _ssa_label(getattr(phi_insn, "dest", None))
+    for arm in getattr(phi_insn, "src", None) or ():
+        if isinstance(arm, SSAVariable) and arm not in recurrent_arms:
+            recurrent_arms[arm] = {
+                "var": _ssa_label(arm), "phi": phi, "increments": rec.increments,
+                **({"calls": list(rec.calls)} if rec.calls else {}),
+                **({"search_exhausted": True} if rec.exhausted else {})}
+
+
 # Compact per-example fields carried into a frontier roll-up (#552). Kept to the
 # machine-consumable subset already present on a terminal step -- never recomputed.
 # Deliberately omits ip_depth_exhausted/call_depth_exhausted: those are
@@ -1344,7 +1385,8 @@ _FRONTIER_EXAMPLE_KEYS = (
     "ssa_label", "address", "depth", "callee", "callee_display_name", "out_param_callee",
     "base", "offset", "width", "function_context", "function_context_display_name",
     "out_param_callee_display_name", "out_param_call_site", "param_index", "param_register",
-    "local", "global_address", "global_name", "value",
+    "local", "global_address", "global_name", "value", "var", "phi", "increments", "calls",
+    "search_exhausted",
 )
 _FRONTIER_EXAMPLE_CAP = 3
 
@@ -1446,6 +1488,21 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
             + "; stores into it (array elements, struct fields) are not followed, so "
             "the bytes the call consumes have no provenance here"
         )
+    # V8-02: a loop's starting value is not the value: how many trips add to
+    # it is the loop's control, which a use-def slice does not follow.
+    for step in trace:
+        if isinstance(step, dict) and step.get("reason") == "recurrence_initializer":
+            inc = step.get("increments")
+            per_trip = (f"adds {', '.join(f'{i:+#x}' for i in inc)} per trip"
+                        if isinstance(inc, list) and inc else "changes each trip by an amount "
+                        "that is not one constant")
+            assumptions.append(
+                f"{step.get('var')} = {hex(step['value'])} is only where the loop "
+                f"recurrence {step.get('phi')} starts; it {per_trip}"
+                + (f" (through {', '.join(step['calls'])})" if step.get("calls") else "")
+                + " and the trip count is not in this slice"
+                + ("; the recurrence search ran out before ruling a cycle out"
+                   if step.get("search_exhausted") else ""))
     return assumptions
 
 
