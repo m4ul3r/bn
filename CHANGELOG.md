@@ -60,13 +60,22 @@ taint output vocabulary.
 - `bn capabilities` rows state each command's output surface (formats,
   `--out`, `--estimate-output`, paging, slice flags); `target list` and
   every collection page state their row schema and paging.
+- `taint forward`: a sink reached only because a global object was tainted by
+  a write at an unknown offset (`rec.tag[i] = c`, then a copy of `rec.note`)
+  carries `sink.object_taint` (`{kind: "unknown_offset", object, store,
+  field_read}`) and an `[object-wide]` tag on its text flow line, so it can be
+  ranked below a field-precise flow; the flow itself is still reported.
 - `CHANGELOG.md`.
 
 ### Changed
 
 - `callee` on every taint row (reached sink, frontier leaf, backward origin,
   per-site slice and `sink_status` row) is the symbol the binary calls;
-  the model key it was judged by is the separate `model` key.
+  the model key it was judged by is the separate `model` key. A consumer that
+  diffs results by `callee` across versions sees every fortified or alias sink
+  change (`strcpy_chk` became `__strcpy_chk`, `fscanf` became
+  `__isoc99_fscanf`): key the comparison on `sink.model`, which keeps the model
+  name, falling back to `callee` when `model` is absent because the two agree.
 - Every leaf's sentence is `detail`, and a leaf's `function` is an object
   `{name, display_name, address}`.
 - `taint models`: a model file with an unknown key, a non-object model or an
@@ -115,3 +124,9 @@ taint output vocabulary.
 - `taint models` presence text names the spelling the bridge selected.
 - A negative address is an exit-2 refusal naming the accepted forms; an
   ambiguous `class show` name is the JSON refusal envelope.
+- A `session stop` that fails because the fallback signal is refused (a host
+  without `os.pidfd_open`) exits 1 with the `{ok: false, ...}` result on
+  stdout and in `--out`, instead of a stderr line and empty stdout.
+- After an old-registry restart, an unknown numeric selector's note names that
+  mode (ids restarted at 1, none accepted) instead of claiming a restarted
+  bridge never reuses ids.
