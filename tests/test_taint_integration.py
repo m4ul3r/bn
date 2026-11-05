@@ -7450,10 +7450,12 @@ def test_a_sink_reached_only_through_an_object_tainted_at_an_unknown_offset_says
     record at an unknown offset, and the copy of `rec.note` that follows was a
     flow indistinguishable from one into `rec.note` itself. It is kept and says
     so: `sink.object_taint` names the store and the field read, and the text
-    flow line is tagged. Copying the string into `rec.note` and back out is
-    field-precise and carries neither."""
+    flow line is tagged. A copy of `rec.note` into another global is no more
+    certain than `rec.note` (G2c). Copying the string into `rec.note` and back
+    out is field-precise and carries neither."""
     binary = tmp_path / "fwd_object_wide"
-    _compile(CORPUS / "fwd_object_wide.c", binary)
+    # -fno-builtin: GCC inlines the fixed-size memcpy even at -O0.
+    _compile(CORPUS / "fwd_object_wide.c", binary, ["-fno-builtin"])
     target = shared_bn.load(binary, copy=False)
     stamp = _bn_json(shared_bn, "-t", target, "function", "info", "stamp")
     span = range(int(stamp["span_start"], 16), int(stamp["span_end"], 16))
@@ -7463,7 +7465,7 @@ def test_a_sink_reached_only_through_an_object_tainted_at_an_unknown_offset_says
                           "--source", "param:0")
         return [hit["sink"] for hit in result["reached_sinks"]]
 
-    for fn in ("object_wide", "object_wide_returned"):
+    for fn in ("object_wide", "object_wide_returned", "object_wide_copied"):
         [sink] = sinks(fn)
         tag = sink["object_taint"]
         assert (tag["kind"], tag["field_read"]) == ("unknown_offset", 32), sink

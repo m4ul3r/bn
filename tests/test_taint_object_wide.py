@@ -15,9 +15,9 @@ from test_taint_forward_global_frontier import FExtentBV, GFunc
 
 from bn.formatters import _render_flow_line
 
-REC, OUT = 0x404800, 0x404c00     # a 64-byte record {tag[32], note[32]}; a destination
-NOTE = 32
-STRCPY = 0x401040
+REC, OUT, TMP = 0x404800, 0x404c00, 0x404e00   # a 64-byte record {tag[32], note[32]};
+NOTE = 32                                      # a destination; a 16-byte scratch copy
+STRCPY, MEMCPY = 0x401040, 0x401050
 STAMP, HELPER, CALLER = 0x401100, 0x401200, 0x401300
 
 
@@ -54,8 +54,8 @@ def _indexed_store(start, v, i):
 
 
 def _bv(*funcs):
-    return FExtentBV({STRCPY: "strcpy"}, funcs={f.start: f for f in funcs},
-                     objects={REC: 64, OUT: 64}, authoritative=[REC, OUT],
+    return FExtentBV({STRCPY: "strcpy", MEMCPY: "memcpy"}, funcs={f.start: f for f in funcs},
+                     objects={REC: 64, OUT: 64, TMP: 16}, authoritative=[REC, OUT, TMP],
                      section=(0x404000, 0x405000))
 
 
@@ -153,3 +153,72 @@ def test_the_flow_line_tags_only_the_object_wide_flow(models):
     tagged = {f["sink"]["address"]: "[object-wide]" in _render_flow_line(f).split()
               for f in result["reached_sinks"]}
     assert tagged == {hex(STAMP + 0x0c): False, hex(STAMP + 0x10): True}
+
+
+def _const(value):
+    return FExpr("MLIL_CONST", hex(value), constant=value)
+
+
+@pytest.mark.parametrize("copied, wide", [("note", True), ("value", False)])
+def test_a_copy_of_an_object_wide_field_stays_object_wide(models, copied, wide):
+    # G2c: `memcpy(tmp, rec.note, 16)` writes `tmp` at a stated offset, but the
+    # bytes it wrote are only as certain as `rec.note`. Copying the tainted
+    # string itself into `tmp` is the field-precise control.
+    v, i = FSSA(FVar("v"), 0), FSSA(FVar("i"), 0)
+    src = _ptr(REC + NOTE) if copied == "note" else _var(v)
+    func = GFunc("copy_on", STAMP, FSSAFunc([
+        *_indexed_store(STAMP, v, i),
+        _call(2, STAMP + 0x0c, MEMCPY, [_ptr(TMP), src, _const(16)]),
+        _call(3, STAMP + 0x10, STRCPY, [_ptr(OUT), _ptr(TMP)]),
+    ]), params=[v.var, i.var])
+    sink = _sinks(_forward(models, func, _bv(func)))[hex(STAMP + 0x10)]
+    if wide:
+        assert sink["object_taint"] == {"kind": "unknown_offset", "object": hex(REC),
+                                        "store": hex(STAMP + 0x08), "field_read": NOTE}
+    else:
+        assert "object_taint" not in sink
+
+
+def _two_parameter_helper(read):
+    """`show(p, q)`: copies its parameter *read* (0 or 1) into `out`."""
+    p, q = FSSA(FVar("p"), 0), FSSA(FVar("q"), 0)
+    return GFunc("show", HELPER, FSSAFunc([
+        _call(0, HELPER + 0x04, STRCPY, [_ptr(OUT), _var((p, q)[read])]),
+        FInstr(1, HELPER + 0x08, "MLIL_RET", "return", src=[]),
+    ]), params=[p.var, q.var])
+
+
+@pytest.mark.parametrize("read, wide", [(0, True), (1, False)])
+def test_a_precise_sibling_argument_does_not_mask_an_object_wide_one(models, read, wide):
+    # G2c: `show(rec.note, v)` after stamping the record -- both arguments are
+    # tainted, the first only object-wide. The helper's sink is marked by the
+    # argument it consumes, not by the call's arguments taken together.
+    v, i = FSSA(FVar("v"), 0), FSSA(FVar("i"), 0)
+    helper = _two_parameter_helper(read)
+    caller = GFunc("caller", CALLER, FSSAFunc([
+        *_indexed_store(CALLER, v, i),
+        _call(2, CALLER + 0x10, HELPER, [_ptr(REC + NOTE), _var(v)]),
+        FInstr(3, CALLER + 0x14, "MLIL_RET", "return", src=[]),
+    ]), params=[v.var, i.var], callees=[helper])
+    sink = _sinks(_forward(models, caller, _bv(helper, caller)))[hex(HELPER + 0x04)]
+    assert ("object_taint" in sink) is wide
+
+
+@pytest.mark.parametrize("wide_first", [True, False])
+def test_a_field_precise_route_to_a_sink_clears_its_object_wide_mark(models, wide_first):
+    # G2c: the same helper sink reached through `rec.note` (object-wide) and
+    # through the tainted string itself (field-precise), in either call order:
+    # one reported flow, and the precise route decides it.
+    v, i = FSSA(FVar("v"), 0), FSSA(FVar("i"), 0)
+    helper = _two_parameter_helper(0)
+    calls = [_ptr(REC + NOTE), _var(v)] if wide_first else [_var(v), _ptr(REC + NOTE)]
+    caller = GFunc("caller", CALLER, FSSAFunc([
+        *_indexed_store(CALLER, v, i),
+        _call(2, CALLER + 0x10, HELPER, [calls[0], _const(0)]),
+        _call(3, CALLER + 0x18, HELPER, [calls[1], _const(0)]),
+        FInstr(4, CALLER + 0x20, "MLIL_RET", "return", src=[]),
+    ]), params=[v.var, i.var], callees=[helper])
+    result = _forward(models, caller, _bv(helper, caller))
+    rows = [f["sink"] for f in result["reached_sinks"] if f["sink"]["address"] == hex(HELPER + 0x04)]
+    assert len(rows) == 1
+    assert "object_taint" not in rows[0]
