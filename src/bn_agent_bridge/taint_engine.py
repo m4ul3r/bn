@@ -62,6 +62,7 @@ from .taint_locators import (  # noqa: F401
 )
 from .taint_result import (  # noqa: F401
     BLOCKING_LEAF_KINDS,
+    coalesce_global_continuations,
     backward_diagnostics,
     command_template,
     forward_zero_diagnostics,
@@ -380,7 +381,7 @@ class _ScanBudget:
     the request's sweep allowance, charged alongside while a classifying
     scan runs inside a continuation sweep."""
 
-    __slots__ = ("nodes", "cause", "pointer_route", "shared")
+    __slots__ = ("nodes", "cause", "pointer_route", "shared", "settled", "cuts")
 
     # A pointer-return chain costs `_PTR_RETURN_STEP` levels per hop, so the
     # depth limit is a WRAPPER-CHAIN limit, not a CLI `--max-depth`. Reaching
@@ -390,6 +391,13 @@ class _ScanBudget:
         self.cause: str | None = None
         self.pointer_route = False
         self.shared = shared
+        # SSA variables this scan already proved can NOT hold the pointer it
+        # asks about, and how many times a cycle cut an answer short: a scan
+        # asks about the same register at every instruction that uses it,
+        # and each ask used to re-walk its whole definition chain (R3 sweep
+        # economy). Only answers no cycle or bound shaped are kept.
+        self.settled: set = set()
+        self.cuts = 0
 
     def spend(self) -> bool:
         """Charge one node; False once the allowance is gone."""
@@ -4542,6 +4550,9 @@ class TaintEngine:
         # A missing output reached from several contexts (or kept twice by the
         # recursion salvage) is ONE boundary with merged sources.
         sub["leaves"] = merge_unrecovered_leaves(sub["leaves"])
+        # P2-04: one global-continuation leaf per tainted global, its call
+        # sites in `sites[]`.
+        sub["leaves"] = coalesce_global_continuations(sub["leaves"])
         # collapse any duplicate sink reports (same callee/site/arg) that distinct
         # resolved targets or arg-set growth may have produced
         seen_sink: set[tuple] = set()
@@ -4749,6 +4760,7 @@ class TaintEngine:
         leaves: list[dict[str, Any]] = []
         for lf in union_leaves:
             _add_leaf(leaves, lf)
+        leaves = coalesce_global_continuations(leaves)
         assumptions: list[str] = []
         for a in union_assumptions:
             if a not in assumptions:
@@ -7574,9 +7586,42 @@ class TaintEngine:
         `off + p` and `(char *)p - 4` all still point into the same object
         (round-3 review F4). It never answers False from a shape it did not
         understand: an unrecognised expression simply contributes nothing,
-        and every caller's default is "consumer"."""
+        and every caller's default is "consumer".
+
+        An SSA variable proved NOT to hold the pointer -- no cycle cut its
+        walk short and no bound was reached -- is settled for the rest of the
+        scan, so the many instructions that use one register ask once."""
         if budget is None:
             budget = _ScanBudget(self._PTR_RESOLVE_NODES)
+        var = expr if is_ssa_var(expr) else (
+            expr_reads(expr)[0] if op_name(expr) == "MLIL_VAR_SSA"
+            and len(expr_reads(expr)) == 1 else None)
+        if var is not None and (id(ssaf), id(base), var_key(var),
+                                getattr(var, "version", None), alias) in budget.settled:
+            return False
+        root = seen is None
+        seen = set() if root else seen
+        cuts = budget.cuts
+        got = self._ptr_resolves_step(ssaf, expr, base, depth, seen,
+                                      alias=alias, budget=budget)
+        if got or budget.cause is not None or budget.nodes <= 0:
+            return got
+        if root:
+            # The whole definition graph under a root ask was explored and
+            # nothing in it holds the pointer: every variable in it is
+            # settled, whatever cycles the walk cut.
+            for k in seen:
+                if k[:1] != ("expr",):
+                    budget.settled.add((id(ssaf), id(base), k[0], k[1], alias))
+        elif var is not None and budget.cuts == cuts:
+            budget.settled.add((id(ssaf), id(base), var_key(var),
+                                getattr(var, "version", None), alias))
+        return got
+
+    def _ptr_resolves_step(self, ssaf: Any, expr: Any, base: Any, depth: int,
+                           seen: set | None, *, alias: bool,
+                           budget: _ScanBudget) -> bool:
+        """:meth:`_ptr_resolves` for one expression, unmemoised."""
         if expr is None:
             return False
         if depth > self._PTR_RESOLVE_DEPTH:
@@ -7591,6 +7636,7 @@ class TaintEngine:
         if idx is not None:
             node = ("expr", int(idx))
             if node in seen:
+                budget.cuts += 1
                 return False
             seen.add(node)
         if base(expr):
@@ -7598,6 +7644,7 @@ class TaintEngine:
         if is_ssa_var(expr):
             key = (var_key(expr), getattr(expr, "version", None))
             if key in seen:
+                budget.cuts += 1
                 return False
             seen.add(key)
             defn = self._ssa_def(ssaf, expr)
@@ -7702,6 +7749,93 @@ class TaintEngine:
             return list(srcs)
         except TypeError:
             return [srcs]
+
+    def _call_successors(self, fn: Any) -> list:
+        """The bodies *fn* can call: BN's edges, direct targets read from the
+        body and indirect sites this run can pin. Cached per function."""
+        cache = self.__dict__.setdefault("_call_successors_cache", {})
+        key = int(getattr(fn, "start", 0))
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            out = list(getattr(fn, "callees", None) or ())
+        except Exception:
+            out = []
+        out.extend(self._direct_callees(fn))
+        if self._is_internal(fn):
+            for taddr in self._indirect_sites(fn)[0]:
+                tfn = function_at(self.bv, taddr)
+                if tfn is not None:
+                    out.append(tfn)
+        cache[key] = out
+        return out
+
+    def _may_see_global(self, fn: Any, ga: int) -> bool:
+        """Whether *fn* can hold a pointer to the global at *ga* at all.
+
+        A body obtains one by naming the object (or a pointer slot holding
+        it -- both are code references BN records) or by calling something
+        that hands one back. A body with neither has nothing for a pointer
+        scan to find, so the reachability walk skips the scan (R3 sweep
+        economy: on an ordinary `main` nearly all of the sweep allowance went
+        to classifying such bodies once per tainted global)."""
+        if self._names_global_storage(int(getattr(fn, "start", 0)), ga):
+            return True
+        return any(self._may_return_global(c, ga, 0) for c in self._call_successors(fn))
+
+    def _names_global_storage(self, start: int, ga: int) -> bool:
+        """Whether the body at *start* holds a code reference to the object
+        at *ga* or to an object that may enclose it (`.set tail, packet + 64`:
+        a reader of `packet` reads `tail`'s bytes). An enclosing-object search
+        that ran out of budget leaves every body possible."""
+        if start in self._global_ref_functions(ga):
+            return True
+        candidates, exhausted = self._preceding_objects(ga)
+        return exhausted or any(start in self._global_ref_functions(pb) for pb in candidates)
+
+    def _may_return_global(self, fn: Any, ga: int, depth: int) -> bool:
+        """Whether calling *fn* can hand back a pointer to the global at *ga*:
+        it may return an address and it, or something it calls, names the
+        object. Past the wrapper-chain bound the answer is yes."""
+        cache = self.__dict__.setdefault("_may_return_cache", {})
+        entry = (int(getattr(fn, "start", 0)), int(ga), "call")
+        if entry in cache:
+            return cache[entry]
+        if not self._returns_pointerish(fn):
+            # Decided from the declared return type alone, before anything
+            # lifts the body: most callees cannot return an address at all.
+            cache[entry] = False
+            return False
+        if not self._is_internal(fn):
+            # A veneer that does work before its tail call (`producer()`
+            # tail-calls `choose(g + 8, ...)`) names the object itself.
+            if self._names_global_storage(int(getattr(fn, "start", 0)), ga):
+                cache[entry] = True
+                return True
+            resolved = self._follow_thunk_cached(fn)
+            if resolved is None or not self._is_internal(resolved):
+                cache[entry] = False
+                return False
+            got = self._may_return_global(resolved, ga, depth)
+            cache[entry] = got
+            return got
+        key = (int(getattr(fn, "start", 0)), int(ga))
+        if key in cache:
+            return cache[key]
+        if depth > self._PTR_RESOLVE_DEPTH:
+            return True
+        if not self._returns_pointerish(fn):
+            cache[key] = False
+            return False
+        if self._names_global_storage(key[0], ga):
+            cache[key] = True
+            return True
+        cache[key] = False          # in progress: a recursive cycle adds nothing
+        got = any(self._may_return_global(c, ga, depth + 1)
+                  for c in self._call_successors(fn))
+        cache[key] = got
+        return got
 
     def _returns_pointerish(self, fn: Any) -> bool:
         """Whether *fn*'s return value could be an address at all.
@@ -10143,13 +10277,14 @@ class TaintEngine:
                             cs, _Use(site, "unreadable", 0, None, None, True))
                     continue
                 if cs not in found:
-                    # EVERY examined function is classified, not just the
-                    # ones BN records a reference from: a pointer handed back
-                    # through a CHAIN of returning wrappers reaches a reader
-                    # that never names the address itself (round-3 review
-                    # F18). A function with no use of the object answers with
-                    # no address and costs one bounded scan.
-                    use = self._global_access(cur, ga)
+                    # Not only the functions BN records a reference from: a
+                    # pointer handed back through a CHAIN of returning
+                    # wrappers reaches a reader that never names the address
+                    # itself (round-3 review F18). A body that neither names
+                    # the object nor calls anything that can return it has
+                    # nothing to find and is not scanned.
+                    use = (self._global_access(cur, ga) if self._may_see_global(cur, ga)
+                           else _Use(None, "unused", 0, None, None, True))
                     if use.at is not None:
                         if not self._use_misses_tainted(ga, use):
                             found[cs] = use

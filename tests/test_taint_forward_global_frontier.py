@@ -509,10 +509,10 @@ def test_two_tainted_globals_are_disclosed_separately(models):
         (hex(0x40110c), hex(G_DIR)), (hex(0x401110), hex(G_OTHER))]
 
 
-def test_one_leaf_per_call_and_global_across_fixpoint_passes(models):
-    # The fixpoint revisits every instruction; the disclosure is per (call,
-    # global), not per pass, and a second call to the SAME consumer is its own
-    # boundary.
+def test_one_leaf_per_global_lists_every_call_it_crossed(models):
+    # P2-04: the fixpoint revisits every instruction, and the global is live
+    # across two calls to the same consumer -- one fact, so ONE leaf whose
+    # `sites` names both calls, each once.
     hook = _reader("run_hook", 0x401200, G_DIR, 0x401210)
     func, _argv = _copy_then_call(
         0x401104, STRCPY, G_DIR,
@@ -520,7 +520,12 @@ def test_one_leaf_per_call_and_global_across_fixpoint_passes(models):
     bv = FGlobalBV({STRCPY: "strcpy", SYSTEM: "system", 0x401200: "run_hook"},
                    funcs={0x401200: hook}, refs={G_DIR: [FRef(hook, 0x401210)]})
     result = _forward(bv, func, models)
-    assert sorted(lf["address"] for lf in _leaves(result)) == [hex(0x401108), hex(0x40110c)]
+    [leaf] = _leaves(result)
+    assert leaf["address"] == hex(0x401108)
+    assert [(s["address"], s["callee"]["name"], s["descended"]) for s in leaf["sites"]] == [
+        (hex(0x401108), "run_hook", False), (hex(0x40110c), "run_hook", False)]
+    assert [r["display_name"] for r in leaf["references"]] == ["run_hook"]
+    assert result["stats"]["leaves"] == len(result["leaves"])
 
 
 # --------------------------------------------------------------------------

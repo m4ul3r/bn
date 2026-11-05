@@ -5206,10 +5206,14 @@ def _render_continuation_group(leaves: list[dict[str, Any]], *, mangled: bool = 
                       for o in _field_list(_field_dict(lf, "global"), "written_offsets")})
     sites: list[str] = []
     for lf in leaves:
-        cal = _field_dict(lf, "callee")
-        site = f"{lf.get('address')} -> {_shown_name(cal, mangled=mangled) or '?'}"
-        if site not in sites:
-            sites.append(site)
+        # A coalesced leaf carries every call it crossed in `sites`.
+        crossed = [s for s in _field_list(lf, "sites") if isinstance(s, dict)] or [
+            {"address": lf.get("address"), "callee": lf.get("callee")}]
+        for s in crossed:
+            cal = _field_dict(s, "callee")
+            site = f"{s.get('address')} -> {_shown_name(cal, mangled=mangled) or '?'}"
+            if site not in sites:
+                sites.append(site)
     readers: list[str] = []
     for lf in leaves:
         for r in _field_list(lf, "references"):
@@ -5257,10 +5261,15 @@ def _render_continuation_group(leaves: list[dict[str, Any]], *, mangled: bool = 
         def _most(key: str) -> Any:
             values = [r.get(key) for r in cut if isinstance(r.get(key), int)]
             return max(values) if values else "?"
+        first = next((s for r in cut for s in _field_list(r, "unexamined_reference_sites")
+                      if isinstance(s, dict)), None)
         out.append(f"      reachability truncated: {', '.join(causes) or '?'} "
                    f"({_most('functions_examined')}/{_most('function_budget')} "
                    f"function(s) examined, {_most('unexamined_references_total')} "
-                   "reference(s) unexamined)")
+                   "reference(s) unexamined"
+                   + (f"; first unexamined: {_shown_name(first, mangled=mangled) or '?'}"
+                      f" @ {first.get('at', first.get('address', '?'))}" if first else "")
+                   + ")")
     reseed = next((str(lf["reseed"]) for lf in leaves if lf.get("reseed")), None)
     if reseed:
         out.append(f"      next: {reseed}")

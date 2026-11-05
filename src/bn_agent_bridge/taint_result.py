@@ -602,6 +602,102 @@ RECEIVE_ALL_CLEAR_CAVEAT = (
     "jumps; check them by seeding the buffer with a var: source, or by hand")
 
 
+def _union(into: list[Any], items: Any, key: Any = None) -> None:
+    """Append each item of *items* not already in *into* (by *key*)."""
+    have = {key(x) if key else repr(x) for x in into}
+    for item in items or ():
+        k = key(item) if key else repr(item)
+        if k not in have:
+            have.add(k)
+            into.append(item)
+
+
+def coalesce_global_continuations(leaves: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One ``global_memory_continuation`` leaf per tainted global.
+
+    The walk discloses the global at every call it stays live across, and
+    each of those used to be a leaf of its own: one fact (tainted bytes in
+    this object, read elsewhere) repeated per call site, 98 leaves for three
+    globals on an ordinary `main` (P2-04). The leaf for a global now carries
+    ``sites`` -- each call it crossed, ``{address, callee, descended}`` --
+    and the union of what those calls established: references, unfinished
+    scans, overlaps, written offsets and ONE reachability (truncated when any
+    search was, with every cause, the most functions any search examined and
+    every reference left unexamined). ``address``/``callee`` stay the first
+    site's. Other leaves pass through in order."""
+    out: list[dict[str, Any]] = []
+    by_global: dict[str, dict[str, Any]] = {}
+    for lf in leaves:
+        if not isinstance(lf, dict) or lf.get("kind") != "global_memory_continuation":
+            out.append(lf)
+            continue
+        glob = lf.get("global") if isinstance(lf.get("global"), dict) else {}
+        ga = str(glob.get("address"))
+        sites = lf.get("sites") or [{"address": lf.get("address"),
+                                     "callee": lf.get("callee"),
+                                     "descended": bool(lf.get("call_descended"))}]
+        rep = by_global.get(ga)
+        if rep is None:
+            rep = dict(lf)
+            rep["global"] = dict(glob)
+            rep["sites"] = list(sites)
+            rep["references"] = list(lf.get("references") or [])
+            rep["reachability"] = dict(lf.get("reachability") or {})
+            by_global[ga] = rep
+            out.append(rep)
+            continue
+        _union(rep["sites"], sites, key=lambda s: str(s.get("address")))
+        had_refs = bool(rep["references"])
+        _union(rep["references"], lf.get("references"),
+               key=lambda r: (str(r.get("address")), str(r.get("at")), str(r.get("access"))))
+        for field in ("unfinished_scans", "unverified_overlaps"):
+            if lf.get(field):
+                merged = list(rep.get(field) or [])
+                _union(merged, lf.get(field))
+                rep[field] = merged
+        offsets = list(rep["global"].get("written_offsets") or [])
+        _union(offsets, glob.get("written_offsets"))
+        if offsets:
+            rep["global"]["written_offsets"] = sorted(offsets, key=repr)
+        if lf.get("reads_proven") and not rep.get("reads_proven"):
+            rep["reads_proven"] = True
+            rep["detail"] = lf.get("detail")
+        elif not had_refs and lf.get("references"):
+            rep["detail"] = lf.get("detail")
+        if not rep.get("reseed") and lf.get("reseed"):
+            rep["reseed"] = lf.get("reseed")
+        _merge_reachability(rep["reachability"], lf.get("reachability") or {})
+    return out
+
+
+def _merge_reachability(into: dict[str, Any], other: dict[str, Any]) -> None:
+    """Fold one call site's reachability search into the global's."""
+    if not other:
+        return
+    if not into:
+        into.update(other)
+        return
+    if other.get("status") == "truncated":
+        if into.get("status") != "truncated":
+            into["cause"] = other.get("cause")
+        into["status"] = "truncated"
+    causes = list(into.get("causes") or [])
+    _union(causes, other.get("causes"))
+    into["causes"] = sorted(str(c) for c in causes)
+    for field in ("functions_examined", "unexamined_references_total"):
+        vals = [v for v in (into.get(field), other.get(field)) if isinstance(v, int)]
+        if vals:
+            into[field] = max(vals)
+    for field in ("unexamined_references", "unread_bodies", "unresolved_calls"):
+        merged = list(into.get(field) or [])
+        _union(merged, other.get(field))
+        into[field] = merged
+    sites = list(into.get("unexamined_reference_sites") or [])
+    _union(sites, other.get("unexamined_reference_sites"),
+           key=lambda s: str(s.get("address")) if isinstance(s, dict) else repr(s))
+    into["unexamined_reference_sites"] = sites
+
+
 def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
                              truncated: bool = False,
                              truncation_cause: list[str] | None = None,
