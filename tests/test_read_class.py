@@ -5854,3 +5854,20 @@ def test_allocation_request_at_tries_each_containing_function_1018():
     assert ctx._allocation_request_at(bv, 0x2020) == _ALLOCATION
     bv.get_functions_containing = lambda addr: [empty]
     assert ctx._allocation_request_at(bv, 0x2020) is None
+
+
+def test_every_class_card_and_row_carries_the_one_size_schema(monkeypatch):
+    """P2-05: a declared-only card returned the nested `size` object but no
+    top-level `size_source` / `size_reason`, and listing rows never carried
+    them, so one consumer had to read provenance two ways."""
+    bv = _declared_bv(Widget=_DeclaredType())
+    ctx = _declared_ctx(monkeypatch, bv)
+
+    card = read_class._class_show(ctx, None, "Widget")
+    assert (card["size"], card["size_source"], card["size_reason"]) == (
+        {"value": "0x10", "source": "declared_type"}, "declared_type", None)
+
+    [row] = [r for r in read_class._class_list(ctx, None, include_all=True)["items"]
+             if r["name"] == "Widget"]
+    assert (row["size"], row["size_source"], row["size_reason"]) == (
+        {"value": "0x10", "source": "declared_type"}, "declared_type", None)

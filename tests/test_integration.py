@@ -7315,3 +7315,19 @@ def test_function_cfg_slices_a_real_graph_by_block(shared_bn):
                             "--address-window", f"{lo:#x}:{lo + 1:#x}")
     assert [block["start"] for block in window["blocks"]] == [second["start"]]
     assert window["matched_blocks"] == 1
+
+
+def test_class_size_provenance_is_one_schema_for_rtti_and_declared_classes(shared_bn):
+    """P2-05: a declared-only `class show` card had the nested `size` object
+    but no top-level `size_source`, unlike an RTTI card; rows had neither."""
+    shared_bn.load(CLASSES_BINARY)
+    declared = shared_bn.run("types", "declare",
+                             "struct probe_only_declared { int32_t a; int64_t b; };")
+    assert declared.returncode == 0, declared.stderr
+    card = shared_bn.json("class", "show", "probe_only_declared")
+    assert (card["size"]["source"], card["size_source"], card["size_reason"]) == (
+        "declared_type", "declared_type", None)
+    rows = shared_bn.json("class", "list", "--all", "--limit", "500")["items"]
+    assert rows and all({"size", "size_source", "size_reason"} <= set(row) for row in rows)
+    [row] = [r for r in rows if r["name"] == "probe_only_declared"]
+    assert row["size_source"] == "declared_type"
