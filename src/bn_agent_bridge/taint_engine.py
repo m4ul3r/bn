@@ -4307,7 +4307,7 @@ class TaintEngine:
                 cov, esc = memo.get(deps[0], ((), False))
                 addrs = escape_addrs.get(deps[0], frozenset())
                 op = op_name(defn)
-                if self._writes_back_what_it_reads(defn):
+                if self._writes_back_what_it_reads(ssaf, defn):
                     # A stack probe (`alloca`'s page touch): no object's
                     # contents change, so it is neither a writer nor an
                     # escape.
@@ -16143,7 +16143,12 @@ class TaintEngine:
     def _argument_registers(self, func: Any) -> frozenset[str] | None:
         """Full-width names of every register *func*'s calling convention
         passes an integer or floating-point argument in, or None when no
-        convention is recoverable."""
+        convention is recoverable.
+
+        A convention that lists no argument register at all passes every
+        argument on the stack (i386 cdecl): that is an answer -- an empty
+        set, so no register's entry value is an unmapped argument -- not the
+        unreadable convention None stands for (R2-02)."""
         cc = getattr(func, "calling_convention", None)
         if cc is None:
             plat = getattr(self.bv, "platform", None)
@@ -16151,11 +16156,12 @@ class TaintEngine:
         if cc is None:
             return None
         try:
-            regs = list(getattr(cc, "int_arg_regs", []) or []) + \
-                list(getattr(cc, "float_arg_regs", []) or [])
+            int_regs = getattr(cc, "int_arg_regs", None)
+            float_regs = getattr(cc, "float_arg_regs", None)
+            if int_regs is None and float_regs is None:
+                return None
+            regs = list(int_regs or []) + list(float_regs or [])
         except Exception:
-            return None
-        if not regs:
             return None
         return frozenset(_full_width_reg(self.bv.arch, str(r)) for r in regs)
 
