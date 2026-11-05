@@ -7387,6 +7387,32 @@ def test_an_unbounded_index_into_a_global_keeps_the_out_of_object_frontier(tmp_p
     assert frontiers == [], masked["leaves"]
 
 
+def test_a_loop_count_length_is_a_recurrence_not_a_constant(tmp_path, shared_bn):
+    """IC08 on `taint_corpus/bw_loop_count.c`: a length `k` that starts at 0
+    and grows on loop trips the comma test picks was a `constant 0` origin
+    of a complete slice; it is a `recurrence_initializer` (value 0,
+    increments 0 or +1) that withholds completeness. Two literals chosen by a
+    branch stay `constant` origins of a complete slice (control)."""
+    binary = tmp_path / "bw_loop_count"
+    _compile(CORPUS / "bw_loop_count.c", binary)
+    target = shared_bn.load(binary, copy=False)
+
+    def slice_of(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
+                          "--sink", "arg:memcpy:2")
+        return result, [o for sl in result["slices"] for o in sl["origins"]]
+
+    counted, origins = slice_of("count_fields")
+    assert [(o["kind"], o.get("value"), o.get("increments")) for o in origins] == [
+        ("recurrence_initializer", 0, [0, 1])], origins
+    assert counted["diagnostics"]["safe_to_report_complete_slice"] is False
+
+    fixed, origins = slice_of("fixed_header")
+    assert origins and {o["kind"] for o in origins} == {"constant"}, origins
+    assert {o["value"] for o in origins} <= {8, 16}
+    assert fixed["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
 def _armv7_build(tmp_path, name: str) -> Path:
     cc = shutil.which("arm-linux-gnueabihf-gcc")
     if cc is None:

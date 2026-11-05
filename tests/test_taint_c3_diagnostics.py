@@ -85,8 +85,8 @@ _LEAF_CLASS = {
 # origins, objects a pointer demand may read, slice steps and model rows.
 _NON_LEAF_KINDS = {
     "call", "constant", "entry", "global", "got_or_extern", "indirect_call",
-    "loaded_pointer", "local", "param", "parameter", "returned", "source",
-    "unknown", "unresolved",
+    "loaded_pointer", "local", "param", "parameter", "recurrence_initializer",
+    "returned", "source", "unknown", "unresolved",
 }
 
 

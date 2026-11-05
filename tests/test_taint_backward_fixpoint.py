@@ -165,3 +165,114 @@ def test_discovery_cut_keeps_nearby_escaped_call_frontier():
     assert not result["diagnostics"]["safe_to_report_complete_slice"]
     assert any(l.get("callee") == "compose" and l["address"] == hex(near.address)
                for l in leaves)
+
+
+# --------------------------------------------------------------------------
+# IC08: a loop counter's initializer is not a runtime constant
+# --------------------------------------------------------------------------
+
+_MEMCPY = 0xc40
+
+
+def _counter_program(shape):
+    """`count(dst, src)`: a length `k` in one of four shapes, then
+    `memcpy(dst, src, k)`.
+
+    * ``counter``: `k = 0; loop { if (..) k = k + 1; }` -- the -O0 lift of a
+      conditional count, `k#2 = phi(k#1, k#4)`, `k#4 = phi(k#2, k#3)`;
+    * ``doubling``: `k = 1; loop { k = k * 2; }` -- a recurrence with no
+      constant per-trip increment;
+    * ``choice``: `k = c ? 0 : 5` -- a phi of two literals, no cycle;
+    * ``literal``: `k = 16`."""
+    from test_taint_engine import FBV, FFunc, FInstr, FSSA, FSSAFunc
+
+    dst, src = FVar("dst", ident=1, typ="char*"), FVar("src", ident=2, typ="char*")
+    kv = FVar("k", ident=3)
+    k = [FSSA(kv, i) for i in range(5)]
+
+    def var(s):
+        return FExpr("MLIL_VAR_SSA", f"k#{s.version}", reads=[s], src=s)
+
+    def const(n):
+        return FExpr("MLIL_CONST", str(n), constant=n)
+
+    def set_(i, dest, src_expr, reads=()):
+        return FInstr(i, 0x100 + 4 * i, "MLIL_SET_VAR_SSA", f"k#{dest.version} = {src_expr}",
+                      reads=list(reads), writes=[dest], dest=dest, src=src_expr)
+
+    def phi(i, dest, *arms):
+        ins = FInstr(i, 0x100 + 4 * i, "MLIL_VAR_PHI",
+                     f"k#{dest.version} = phi({', '.join(f'k#{a.version}' for a in arms)})",
+                     reads=list(arms), writes=[dest])
+        ins.dest, ins.src = dest, list(arms)
+        return ins
+
+    if shape == "counter":
+        body = [set_(0, k[1], const(0)), phi(1, k[2], k[1], k[4]),
+                set_(2, k[3], FExpr("MLIL_ADD", "k#2 + 1", reads=[k[2]], left=var(k[2]),
+                                    right=const(1)), reads=[k[2]]),
+                phi(3, k[4], k[2], k[3])]
+        length = k[2]
+    elif shape == "doubling":
+        body = [set_(0, k[1], const(1)), phi(1, k[2], k[1], k[3]),
+                set_(2, k[3], FExpr("MLIL_MUL", "k#2 * 2", reads=[k[2]], left=var(k[2]),
+                                    right=const(2)), reads=[k[2]])]
+        length = k[2]
+    elif shape == "choice":
+        body = [set_(0, k[1], const(0)), set_(1, k[2], const(5)), phi(2, k[3], k[1], k[2])]
+        length = k[3]
+    else:
+        body = [set_(0, k[1], const(16))]
+        length = k[1]
+    d0, s0 = FSSA(dst, 0), FSSA(src, 0)
+    body.append(FInstr(len(body), 0x200, "MLIL_CALL_SSA", f"memcpy(dst#0, src#0, k#{length.version})",
+                       reads=[d0, s0, length],
+                       dest=FExpr("MLIL_CONST_PTR", hex(_MEMCPY), constant=_MEMCPY),
+                       params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[d0]),
+                               FExpr("MLIL_VAR_SSA", "src#0", reads=[s0]), var(length)]))
+    func = FFunc("count", 0x100, FSSAFunc(body), params=[dst, src])
+    return te.TaintEngine(FBV({_MEMCPY: "memcpy"}), te.load_models()).backward(
+        func, [te.parse_locator("arg:memcpy:2")])
+
+
+def _origins(result):
+    return [o for sl in result["slices"] for o in sl["origins"]]
+
+
+@pytest.mark.parametrize("shape, value, increments", [
+    ("counter", 0, [0, 1]),
+    ("doubling", 1, None),
+])
+def test_a_loop_counters_initializer_is_no_runtime_constant(shape, value, increments):
+    # IC08: `k = 0; for (..) if (..) k++; memcpy(dst, src, k)`. The literal
+    # is only where the count STARTS; how far it climbs is decided by the
+    # loop's control, which a value slice does not follow. It is a
+    # `recurrence_initializer` carrying the value and the per-trip
+    # increments, never a `constant` origin of a complete slice.
+    result = _counter_program(shape)
+    [origin] = _origins(result)
+    assert origin["kind"] == "recurrence_initializer", origin
+    assert (origin["value"], origin["var"], origin["increments"]) == (value, "k#1", increments)
+    assert origin["phi"] == "k#2"
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    # The full slice keeps the phi and the increment it walked.
+    steps = {st["address"] for sl in result["slices"] for st in sl["slice"]}
+    assert {"0x100", "0x104", "0x108"} <= steps
+    # The compact text names the kind, never a `constant` origin.
+    from bn.formatters import _render_taint_text
+    lines = _render_taint_text(result).splitlines()
+    assert any("recurrence_initializer → memcpy" in line for line in lines), lines
+    assert [line.split()[:2] for line in lines if line.strip().startswith("origin:")] == [
+        ["origin:", "recurrence_initializer"]]
+
+
+@pytest.mark.parametrize("shape, values", [("choice", {0, 5}), ("literal", {16})])
+def test_an_acyclic_constant_stays_a_literal_origin(shape, values):
+    # A phi of literals with no cycle, and a plain literal, ARE the value:
+    # constant origins (a choice reports its representative literal), a
+    # complete slice, no recurrence.
+    result = _counter_program(shape)
+    origins = _origins(result)
+    assert origins and {o["kind"] for o in origins} == {"constant"}, origins
+    assert {o["value"] for o in origins} <= values
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True

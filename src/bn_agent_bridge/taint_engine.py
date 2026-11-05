@@ -4489,6 +4489,88 @@ class TaintEngine:
                 return i
         return None
 
+    # SSA definitions a recurrence search follows from one phi before it
+    # stops looking; a loop body's update chain is short.
+    _RECURRENCE_NODES = 64
+
+    def _recurrence_of(self, ssaf: Any, var: Any) -> tuple[str, list[int] | None] | None:
+        """``(phi, increments)`` when *var* -- a variable a literal defines --
+        initialises a loop-carried value: an arm of a phi whose other arms
+        reach that same phi back through the loop body's definitions
+        (`k#2 = phi(k#1, k#4)`, `k#4 = phi(k#2, k#3)`, `k#3 = k#2 + 1`).
+        ``increments`` are the distinct amounts one trip round the cycle adds
+        (`[0, 1]` for a conditional `k++`), or None when an update is not a
+        constant addition (`k = k * 2`, `k += n`). None when *var* feeds no
+        such cycle -- a phi of literals with no back edge is a plain choice.
+
+        A value slice follows the literal; how many trips the loop makes is
+        its CONTROL, which the slice does not follow -- so the literal is
+        where the value starts, not what it is (IC08)."""
+        try:
+            uses = list(ssaf.get_ssa_var_uses(var) or ())
+        except Exception:
+            return None
+        own = (var_key(var), getattr(var, "version", None))
+        for use in uses:
+            if op_name(use) != "MLIL_VAR_PHI":
+                continue
+            phi = getattr(use, "dest", None)
+            if phi is None:
+                continue
+            target = (var_key(phi), getattr(phi, "version", None))
+            increments: set[int] = set()
+            exact = True
+            cyclic = False
+            stack = [(s, 0, True) for s in (getattr(use, "src", None) or ())
+                     if (var_key(s), getattr(s, "version", None)) != own]
+            seen: set = set()
+            budget = self._RECURRENCE_NODES
+            while stack and budget > 0:
+                budget -= 1
+                cur, delta, known = stack.pop()
+                key = (var_key(cur), getattr(cur, "version", None))
+                if key == target:
+                    cyclic = True
+                    if known:
+                        increments.add(delta)
+                    else:
+                        exact = False
+                    continue
+                if (key, delta, known) in seen:
+                    continue
+                seen.add((key, delta, known))
+                try:
+                    d = ssaf.get_ssa_var_definition(cur)
+                except Exception:
+                    d = None
+                if d is None:
+                    continue
+                opn = op_name(d)
+                if opn == "MLIL_VAR_PHI":
+                    stack.extend((s, delta, known) for s in (getattr(d, "src", None) or ()))
+                    continue
+                if opn != "MLIL_SET_VAR_SSA":
+                    continue
+                src = getattr(d, "src", None)
+                sop = op_name(src)
+                left, right = getattr(src, "left", None), getattr(src, "right", None)
+                if sop in ("MLIL_ADD", "MLIL_SUB") and is_ssa_var(self._as_single_ssa_var(left)) \
+                        and self._int_const(right) is not None:
+                    step = int(self._int_const(right))
+                    stack.append((self._as_single_ssa_var(left),
+                                  delta + (step if sop == "MLIL_ADD" else -step), known))
+                elif sop == "MLIL_ADD" and is_ssa_var(self._as_single_ssa_var(right)) \
+                        and self._int_const(left) is not None:
+                    stack.append((self._as_single_ssa_var(right),
+                                  delta + int(self._int_const(left)), known))
+                elif sop in _COPY_OPS and self._as_single_ssa_var(src) is not None:
+                    stack.append((self._as_single_ssa_var(src), delta, known))
+                else:
+                    stack.extend((r, delta, False) for r in expr_reads(src))
+            if cyclic:
+                return var_label(phi), (sorted(increments) if exact else None)
+        return None
+
     @staticmethod
     def _whole_field_prev(defn: Any) -> tuple | None:
         """``(var_key, version)`` of the previous version a
@@ -16269,6 +16351,9 @@ class TaintEngine:
                 # with no leaf.
                 unresolved_origins=sum(
                     1 for sl in slices for o in sl["origins"] if o.get("kind") == "unresolved"),
+                recurrence_origins=sum(
+                    1 for sl in slices for o in sl["origins"]
+                    if o.get("kind") == "recurrence_initializer"),
                 truncated=self._bw_truncated,
                 truncation_cause=sorted(self._bw_truncation_causes)),
             # #812: configured knobs, echoed as forward does. `max_iters` is
@@ -17352,7 +17437,16 @@ class TaintEngine:
             if not reads:
                 src0 = getattr(defn, "src", None)
                 cval = self._int_const(src0)
-                if cval is not None:
+                recurrence = self._recurrence_of(ssaf, v) if cval is not None else None
+                if recurrence is not None:
+                    # The literal is only where a loop-carried value STARTS
+                    # (`k = 0; for (..) if (..) k++`): how far it climbs is
+                    # decided by the loop's control, which a value slice
+                    # does not follow. Not a runtime constant (IC08).
+                    _set_origin({"kind": "recurrence_initializer", "value": cval,
+                                 "var": var_label(v), "phi": recurrence[0],
+                                 "increments": recurrence[1]}, weak=True)
+                elif cval is not None:
                     _set_origin({"kind": "constant", "value": cval, "var": var_label(v)},
                                 weak=True)
                 elif anchor is not None and op_name(src0) in ("MLIL_IMPORT", "MLIL_EXTERN_PTR"):

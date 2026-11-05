@@ -815,6 +815,7 @@ def backward_diagnostics(
     slices: int,
     sinks_constant: int = 0,
     unresolved_origins: int = 0,
+    recurrence_origins: int = 0,
     truncated: bool = False,
     truncation_cause: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -849,6 +850,12 @@ def backward_diagnostics(
     true`` beside ``traverses_unresolved: true`` and ``frontier.unresolved: 0``
     on the same result. It is counted in ``frontier.unresolved`` and withholds
     the claim like any blocking leaf.
+
+    ``recurrence_origins`` counts origins of kind ``recurrence_initializer``:
+    the literal a loop-carried value starts from. The value slice reaches it,
+    but the value also depends on the loop's trip count -- control flow, which
+    backward slicing does not track -- so it withholds the claim too, and the
+    advice points at the loop's exit condition (IC08).
     """
     by_kind: dict[str, int] = {}
     for lf in leaves or []:
@@ -901,6 +908,13 @@ def backward_diagnostics(
             "definition (origin.kind == 'unresolved') -- the def-chain was not "
             "followed to its origin, so this slice is NOT a complete account of "
             "what reaches the sink")
+    elif recurrence_origins:
+        complete, reason = False, (
+            f"{int(recurrence_origins)} origin(s) are a loop recurrence's "
+            "initializer (origin.kind == 'recurrence_initializer'): the value "
+            "starts from that literal and is updated on the loop's trips, and how many "
+            "trips the loop makes is control flow this value slice does not "
+            "follow -- NOT evidence that the value is a runtime constant")
     elif truncated:
         complete, reason = False, (
             f"analysis truncated ({_truncation_hint(truncation_cause)}) -- "
@@ -1116,6 +1130,18 @@ def backward_diagnostics(
         next_action = (
             "the sink seeded but no slice was produced; confirm the --sink "
             "locator names the operand you meant")
+    elif recurrence_origins:
+        # Value flow reached the literal a loop-carried value starts from;
+        # how many trips the loop makes -- the rest of the value -- is its
+        # control, which no value slice follows (IC08).
+        next_action = (
+            "the slice reached its origins, but a recurrence_initializer origin "
+            "is only where a loop-carried value starts (its value and per-trip "
+            "increments are in the origin): the final value depends on how many "
+            "times the loop ran, which value-flow slicing does not follow -- read "
+            "the loop's exit condition in the MLIL of the origin's function and "
+            "slice the values it reads before treating the count as "
+            "attacker-independent")
     else:
         next_action = (
             "the slice reached its origins; classify each origin (parameter / "

@@ -5770,6 +5770,17 @@ def _backward_origin_text(o: dict[str, Any], names: dict[str, Any], *, mangled: 
         val = o["value"]
         what = (f"{val:#x}" if isinstance(val, int) and not isinstance(val, bool) else str(val)) + (
             f" ({var})" if var else "")
+    elif kind == "recurrence_initializer":
+        # The literal a loop-carried value starts from, its per-trip
+        # increments, and that the trip count is not in the slice (IC08).
+        val = o.get("value")
+        start = f"{val:#x}" if isinstance(val, int) and not isinstance(val, bool) else str(val)
+        steps = _field_list(o, "increments")
+        ints = [s for s in steps if isinstance(s, int) and not isinstance(s, bool)]
+        step = ("/".join(f"{s:+d}" for s in ints) if ints and len(ints) == len(steps)
+                else "non-constant")
+        what = (f"{var or '?'} = {start} looping through {_text_value(o, 'phi') or '?'} "
+                f"(per-trip {step}; trip count not in this slice)")
     elif callee:
         what = _backward_origin_name(names, callee, mangled=mangled) + (
             f" @ {address}" if address else "")
