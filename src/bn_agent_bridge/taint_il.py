@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import il_format
+
 
 def reaching_reg_def(call_ins: Any, reg: str, bn: Any) -> Any | None:
     """Nearest dominating LLIL-SSA definition of register ``reg`` reaching
@@ -661,3 +663,146 @@ def resolve_call_target(bv: Any, call_insn: Any, *, follow_thunks: bool = False)
 
     return ResolvedTarget(int(getattr(fn, "start", 0)), fn, via, thunk_chain)
 
+
+
+# An alignment clears at most this many low bits: `p & ~0xfff` aligns a pointer
+# to a page, a wider mask is not an alignment an inline expansion emits.
+_ALIGN_MASK_BITS = 12
+
+# How many nested operations/definitions the expansion-length walk follows; an
+# expansion's count is a handful of instructions from its pointer.
+_RESIDUE_DEPTH = 24
+
+
+def inline_expansion_length(ssaf: Any, addr: int, length: Any,
+                            ssa_def: Any) -> dict[str, Any] | None:
+    """``{"intrinsic", "length_bound"}`` when the call at *addr* is an inline
+    string expansion (:func:`il_format.inline_expansion_intrinsics`) whose
+    *length* operand (MLIL SSA) is a constant total split by pointer alignment
+    (:func:`expansion_length_bound`); else None. A real call is never one,
+    whatever it is named. *ssa_def* is ``(ssaf, var) -> definition``."""
+    intrinsics = il_format.inline_expansion_intrinsics(getattr(ssaf, "source_function", None), addr)
+    if not intrinsics:
+        return None
+    bound = expansion_length_bound(ssaf, length, ssa_def)
+    if bound is None:
+        return None
+    return {"intrinsic": il_format.intrinsic_name(intrinsics), "length_bound": hex(bound)}
+
+
+def expansion_length_bound(ssaf: Any, expr: Any, ssa_def: Any) -> int | None:
+    """The largest count an inline string expansion's length operand can take
+    when it is built ONLY from constants and pointer-alignment residues; None
+    when any other value contributes.
+
+    gcc expands a constant-size ``memset``/``memcpy`` into a head store, a tail
+    store and a ``rep stos``/``rep movs`` over the aligned middle, whose count is
+    the constant total corrected by how far the destination sits from its
+    alignment: ``(p - ((p + 8) & ~7) + TOTAL) >> 3``. The pointer cancels, so the
+    count is the constant, whatever the pointer holds -- taint on the POINTER
+    says nothing about it. The same expansion of a variable size adds the size
+    (``n + (p - align(p + 8)) >> 3``), and that operand stays unbounded here, so
+    a tainted total still reports. Recognised from the arithmetic itself: an
+    aligned value minus the pointer it was aligned from, a low-bit mask
+    (``n & 7``), shifts and constant offsets."""
+    val = _residue_interval(ssaf, expr, ssa_def, {}, 0)
+    if val is None:
+        return None
+    base, lo, hi = val
+    return hi if base is None and lo >= 0 else None
+
+
+def _residue_interval(ssaf: Any, expr: Any, ssa_def: Any, memo: dict,
+                      depth: int) -> tuple[Any, int, int] | None:
+    """``(base, lo, hi)``: *expr* is ``base + k`` with ``lo <= k <= hi``, *base*
+    an opaque value's identity (None for a pure constant). None when *expr* is
+    not built from one base, constants, alignment masks and shifts (see
+    :func:`expansion_length_bound`). *memo* holds each variable's answer for
+    one evaluation."""
+    if expr is None or depth > _RESIDUE_DEPTH:
+        return None
+    op = op_name(expr)
+    if "CONST" in op:
+        c = getattr(expr, "constant", None)
+        return (None, int(c), int(c)) if isinstance(c, int) else None
+    if op in ("MLIL_ZX", "MLIL_SX", "MLIL_LOW_PART"):
+        return _residue_interval(ssaf, getattr(expr, "src", None), ssa_def, memo, depth + 1)
+    if op in ("MLIL_VAR_SSA", "MLIL_VAR_SSA_FIELD"):
+        if op == "MLIL_VAR_SSA_FIELD" and int(getattr(expr, "offset", 0) or 0) != 0:
+            return None
+        return _residue_of_var(ssaf, getattr(expr, "src", None), ssa_def, memo, depth + 1)
+    left, right = getattr(expr, "left", None), getattr(expr, "right", None)
+    if op == "MLIL_AND":
+        width = 8 * int(getattr(expr, "size", 0) or 8)
+        for mask_side, other in ((right, left), (left, right)):
+            m = getattr(mask_side, "constant", None) if "CONST" in op_name(mask_side) else None
+            if not isinstance(m, int):
+                continue
+            # BN hands an alignment mask over signed (`& -8` for `& ~7`).
+            m &= (1 << width) - 1
+            limit = 1 << _ALIGN_MASK_BITS
+            if 0 < m < limit and m & (m + 1) == 0:
+                return (None, 0, m)  # a low-bit residue: `n & 7`, `-p & 7`
+            low = ~m & ((1 << width) - 1)
+            if 0 < low < limit and low & (low + 1) == 0:
+                val = _residue_interval(ssaf, other, ssa_def, memo, depth + 1)
+                # aligning down moves the value back by at most `low`
+                return None if val is None else (val[0], val[1] - low, val[2])
+        return None
+    if op in ("MLIL_ADD", "MLIL_SUB"):
+        a = _residue_interval(ssaf, left, ssa_def, memo, depth + 1)
+        b = _residue_interval(ssaf, right, ssa_def, memo, depth + 1)
+        if a is None or b is None:
+            return None
+        if op == "MLIL_ADD":
+            if a[0] is not None and b[0] is not None:
+                return None
+            return (a[0] if a[0] is not None else b[0], a[1] + b[1], a[2] + b[2])
+        if a[0] == b[0]:
+            base = None
+        elif b[0] is None:
+            base = a[0]
+        else:
+            return None
+        return (base, a[1] - b[2], a[2] - b[1])
+    if op in ("MLIL_LSR", "MLIL_ASR", "MLIL_LSL"):
+        k = getattr(right, "constant", None) if "CONST" in op_name(right) else None
+        val = _residue_interval(ssaf, left, ssa_def, memo, depth + 1)
+        if not isinstance(k, int) or val is None or val[0] is not None or val[1] < 0:
+            return None
+        if op == "MLIL_LSL":
+            return (None, val[1] << k, val[2] << k)
+        return (None, val[1] >> k, val[2] >> k)
+    return None
+
+
+def _residue_of_var(ssaf: Any, var: Any, ssa_def: Any, memo: dict,
+                    depth: int) -> tuple[Any, int, int] | None:
+    """:func:`_residue_interval` of an SSA variable: its definition when that
+    is arithmetic the interval follows, every arm of a phi whose arms share one
+    base, else the variable itself as an opaque base (a parameter, a load, a
+    call result, a phi of unrelated values, a loop-carried value, a definition
+    past the depth bound). Memoised per evaluation, so every read of a variable
+    gets one answer -- two reads of one opaque value cancel, reads of different
+    ones never do -- and a variable on a loop is opaque, never revisited."""
+    if not is_ssa_var(var):
+        return None
+    key = (var_key(var), getattr(var, "version", None))
+    if key in memo:
+        return memo[key]
+    opaque = (key, 0, 0)
+    memo[key] = opaque  # a cycle back to this variable sees it opaque
+    result = opaque
+    defn = ssa_def(ssaf, var) if depth <= _RESIDUE_DEPTH else None
+    dop = op_name(defn) if defn is not None else ""
+    if dop == "MLIL_VAR_PHI":
+        arms = [_residue_of_var(ssaf, v, ssa_def, memo, depth + 1)
+                for v in (getattr(defn, "src", None) or [])]
+        if arms and all(a is not None for a in arms) and len({a[0] for a in arms}) == 1:
+            result = (arms[0][0], min(a[1] for a in arms), max(a[2] for a in arms))
+    elif dop == "MLIL_SET_VAR_SSA":
+        val = _residue_interval(ssaf, getattr(defn, "src", None), ssa_def, memo, depth + 1)
+        if val is not None:
+            result = val
+    memo[key] = result
+    return result

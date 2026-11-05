@@ -8068,7 +8068,8 @@ def test_inline_expansions_are_listed_by_the_catalog_and_callsites(tmp_path, sha
     """V8-06: the variable-length inline copy (the tainted-total `rep movs`)
     was missing from `taint models --present --callsites --all-sites`, and
     `callsites __builtin_memcpy` refused the synthetic builtin, so only
-    `taint forward` ever surfaced it. Both now list it where backward seeds it."""
+    `taint forward` ever surfaced it. Both now list it where backward seeds it;
+    a fixed-size expansion stays a non-audit `inline_builtin` row."""
     target = _inline_expansion_target(tmp_path, shared_bn)
     backward = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
                         "--sink", "arg:__builtin_memcpy:2")
@@ -8076,9 +8077,15 @@ def test_inline_expansions_are_listed_by_the_catalog_and_callsites(tmp_path, sha
 
     catalog = _bn_json(shared_bn, "-t", target, "taint", "models", "--role", "sink",
                        "--present", "--callsites", "--all-sites")
-    [entry] = [e for e in catalog["items"] if e["symbol"] == "__builtin_memcpy"]
-    rows = {row["address"]: (row["function"], row["kind"]) for row in entry["callsites"]}
-    assert rows[site] == ("copy_label", "app_caller"), rows
+    kinds = {}
+    for symbol in ("__builtin_memcpy", "__builtin_memset"):
+        [entry] = [e for e in catalog["items"] if e["symbol"] == symbol]
+        kinds.update({(row["function"], row["address"]): row["kind"]
+                      for row in entry["callsites"]})
+    assert kinds[("copy_label", site)] == "app_caller", kinds
+    assert {kind for (fn, _), kind in kinds.items()
+            if fn in ("record_reset", "record_copy")} == {"inline_builtin"}, kinds
+    assert {fn for fn, _ in kinds} >= {"record_reset", "record_copy"}, kinds
 
     listed = _bn_json(shared_bn, "-t", target, "callsites", "__builtin_memcpy",
                       "--within", "copy_label")

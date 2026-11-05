@@ -195,7 +195,7 @@ def _taint_models_op(ctx, selector, params: dict[str, Any]):
     top-level ``presence_catalog``/``is_finding`` markers (#555)."""
     present_only = bool(params.get("present"))
     # #958: `--all-sites` shows the non-audit rows (import stubs, self stubs,
-    # constant-argument inline builtins) that are otherwise only counted.
+    # fixed-length inline builtins) that are otherwise only counted.
     all_sites = bool(params.get("all_sites"))
     want_callsites = bool(params.get("callsites")) or all_sites
     if (present_only or want_callsites) and selector is None:
@@ -324,11 +324,12 @@ def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int]) -
 
     * ``"call"``   -- a call or tail branch whose target is one of *targets*,
       or an instruction BN's MLIL synthesised a builtin call from with an
-      argument the model flags that is not a constant (an inline `rep movs`
-      whose length is computed, V8-06);
+      argument the model flags that taint can arm (an inline `rep movs` whose
+      length adds a variable size, V8-06);
     * ``"inline"`` -- not a call in LLIL, but BN's MLIL synthesised an inline
-      builtin call there (`str xzr, ...` runs lifted to `__builtin_memset`) and
-      every argument the model flags is a constant, so no taint can arm it;
+      builtin call there (`str xzr, ...` runs lifted to `__builtin_memset`, a
+      fixed-size `rep stos`) and every argument the model flags is settled
+      (:func:`_flagged_arg_settled`), so no taint can arm it;
     * ``"data"``   -- anything else: the `adrp` that loads the GOT page the
       import's slot sits on, the stub's own `ldr`/`add` of its slot;
     * ``None``     -- the view cannot answer (no function, no IL API), so the
@@ -368,10 +369,28 @@ def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int]) -
         return "data"
     for call in synthesised:
         params = list(getattr(call, "params", []) or [])
-        flagged = [params[i] for i in flagged_args if 0 <= i < len(params)]
-        if not flagged or not all("CONST" in il_format._il_op_name(p) for p in flagged):
+        flagged = [i for i in flagged_args if 0 <= i < len(params)]
+        if not flagged or not all(_flagged_arg_settled(fn, addr, call, i) for i in flagged):
             return "call"
     return "inline"
+
+
+def _flagged_arg_settled(fn, addr: int, call, index: int) -> bool:
+    """Whether no taint can arm argument *index* of a synthesised builtin call:
+    a constant, or the length of an inline string expansion that is a constant
+    total split by pointer alignment (the bound forward taint reports such a
+    site with, V8-03) -- gcc's `rep stos` of a fixed-size `memset`."""
+    param = list(getattr(call, "params", []) or [])[index]
+    if "CONST" in il_format._il_op_name(param):
+        return True
+    try:
+        ssa_call = call.ssa_form
+        ssaf = fn.mlil.ssa_form
+        ssa_param = list(ssa_call.params)[index]
+    except Exception:
+        return False
+    return _taint.inline_expansion_length(
+        ssaf, addr, ssa_param, lambda f, v: f.get_ssa_var_definition(v)) is not None
 
 
 def _flagged_args(model: dict[str, Any] | None) -> list[int]:
@@ -439,7 +458,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
     `memcpy` "callsites" for a binary with three. An import stub's own forwarding
     jump (the x86 `.plt.sec` `jmp [GOT]`) is not a caller either, and AArch64's
     `br x17` never was one, so neither is counted and the count is the same on
-    both. The remaining non-audit rows (self stubs and constant-argument inline
+    both. The remaining non-audit rows (self stubs and fixed-length inline
     builtins) are counted but, unless ``all_sites``, left out of ``callsites``
     so the list is the work queue it is used as."""
     present: set[str] = set()

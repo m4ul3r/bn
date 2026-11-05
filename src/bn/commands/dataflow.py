@@ -373,7 +373,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
              arg("--callsites", action="store_true", default=False,
                  help="With --present: expand each present model's call sites (application callers only)"),
              arg("--all-sites", action="store_true", default=False,
-                 help="With --callsites: also list the self-stub and constant-argument "
+                 help="With --callsites: also list the self-stub and fixed-length "
                       "inline-builtin rows that are otherwise only counted (implies --callsites)"),
              arg("--callsite-limit", dest="callsite_limit", type=_callsite_limit_int, default=10,
                  metavar="N",

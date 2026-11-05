@@ -39,19 +39,27 @@ def _intrinsic(name):
                            intrinsic=SimpleNamespace(name=name), params=[], address=SITE)
 
 
-def _fill(length_of, *, intrinsic=True, pointer_phi=False):
+def _fill(length_of, *, intrinsic=True, pointer_phi=None):
     """``fill(p, n)``: ``len#1 = length_of(p, n#0); __builtin_memset(p, 0, len#1)``
     at SITE, an inline `rep stos` expansion unless *intrinsic* is False (then
-    the instruction there is a real call). *pointer_phi* makes the pointer
-    ``p#1 = ϕ(p#0, n#0)`` -- a register the expansion reads after a branch."""
+    the instruction there is a real call). *pointer_phi* makes the pointer a
+    phi: ``"branch"`` is ``p#1 = ϕ(p#0, n#0)``, a register read after a
+    branch; ``"loop"`` is ``p#1 = ϕ(p#0, p#2)`` with ``p#2 = ϕ(p#1, n#0)``, the
+    pointer of an inner and outer loop whose phis feed each other."""
     p, n = FVar("p"), FVar("n")
     p0, n0 = FSSA(p, 0), FSSA(n, 0)
     a1, len1 = FSSA(FVar("a"), 1), FSSA(FVar("len"), 1)
     instrs = []
-    if pointer_phi:
+    if pointer_phi == "branch":
         ptr = FSSA(p, 1)
         instrs.append(FInstr(len(instrs), 0x1008, "MLIL_VAR_PHI", "p#1 = ϕ(p#0, n#0)",
                              reads=[p0, n0], writes=[ptr], src=[p0, n0]))
+    elif pointer_phi == "loop":
+        ptr, p2 = FSSA(p, 1), FSSA(p, 2)
+        instrs.append(FInstr(len(instrs), 0x1008, "MLIL_VAR_PHI", "p#1 = ϕ(p#0, p#2)",
+                             reads=[p0, p2], writes=[ptr], src=[p0, p2]))
+        instrs.append(FInstr(len(instrs), 0x1030, "MLIL_VAR_PHI", "p#2 = ϕ(p#1, n#0)",
+                             reads=[ptr, n0], writes=[p2], src=[ptr, n0]))
     else:
         ptr = p0
     aligned = _bin("MLIL_AND", _bin("MLIL_ADD", _v(ptr), _const(8), "p + 8"),
@@ -120,10 +128,12 @@ def test_an_alignment_split_length_over_a_tainted_pointer_is_bounded(models, len
                                            "length_bound": hex(bound)}
 
 
-def test_an_aligned_pointer_that_is_a_phi_still_cancels(models):
-    # The pointer the expansion aligns is a phi of unrelated values: one value
-    # read twice, so it cancels like a parameter does.
-    sink = _memset_sink(models, *_fill(_aligned_total, pointer_phi=True), "param:0")
+@pytest.mark.parametrize("phi", ["branch", "loop"])
+def test_an_aligned_pointer_that_is_a_phi_still_cancels(models, phi):
+    # The pointer the expansion aligns is a phi -- of unrelated values, or of
+    # loops feeding each other: one value read twice, so it cancels like a
+    # parameter does, and a phi cycle is walked once.
+    sink = _memset_sink(models, *_fill(_aligned_total, pointer_phi=phi), "param:0")
     assert sink["class"] == "bounded_len"
     assert sink["intrinsic_expansion"]["length_bound"] == hex(0x138)
 

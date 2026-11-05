@@ -6257,7 +6257,7 @@ def _sink_arg_spec(e: dict[str, Any]) -> str:
 
 
 _HIDDEN_KIND_LABELS = {"self_stub": "self stub",
-                       "inline_builtin": "constant-argument inline builtin"}
+                       "inline_builtin": "fixed-length inline builtin"}
 
 
 def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = False,
