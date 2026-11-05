@@ -6316,10 +6316,12 @@ class TaintEngine:
         srcs = [roles[0]]
         src_expr, len_expr = params[srcs[0]], params[length_idx]
         cap = self._buffer_capacity(ssaf, src_expr)
-        # W01-10: `n = recv(fd, buf, MAX, 0); memcpy(dst, buf, n)` reads back only
-        # the bytes the fill wrote into this same source -- its model bounds the
-        # return by the count it wrote -- so the length cannot over-read it,
-        # whatever the source's recovered size.
+        # W01-10: `n = recv(fd, buf, MAX, 0); if (n <= 0) return; memcpy(dst, buf, n)`
+        # reads back only the bytes the fill wrote into this same source -- its
+        # model bounds a successful return by the count it wrote -- so the length
+        # cannot over-read it, whatever the source's recovered size. Without the
+        # guard the failure return (-1) is SIZE_MAX here (R3-01), so the gate
+        # does not open and the copy is sized like any other.
         fill = self._fill_return_of_source(ssaf, len_expr, src_expr)
         if fill is not None:
             _fill_callee, _fill_at = fill
@@ -6363,15 +6365,20 @@ class TaintEngine:
     def _fill_return_of_source(self, ssaf: Any, len_expr: Any,
                                src_expr: Any) -> tuple[str, int] | None:
         """``(called symbol, call address)`` when the copy length IS the return value
-        of a modeled fill of the copy's own source pointer, else None (W01-10).
+        of a modeled fill of the copy's own source pointer AND the copy proves
+        that return a byte count, else None (W01-10, R3-01).
 
         A fill model is one declaring ``return_bound`` (its return counts the
         bytes it wrote); its buffer is the sink's ``buf_arg``, else its single
         ``*arg:N`` source. The length may reach the return through copies and
         width extensions only -- any arithmetic on it stops the proof. The
-        source must be the very pointer the fill was given: the same SSA value,
-        or the same object at the same offset (equal buffer key AND equal
-        capacity description, which carries the offset)."""
+        return bound holds only when the fill SUCCEEDED: a failure returns -1,
+        which a sign extension turns into SIZE_MAX, so the length must be
+        proven non-negative in the return's own width where the copy uses it
+        (:meth:`_proven_non_negative`). The source must be the very pointer
+        the fill was given: the same SSA value, or the same object at the
+        same offset (equal buffer key AND equal capacity description, which
+        carries the offset)."""
         chain = self._def_chain(ssaf, len_expr)
         var = self._as_single_ssa_var(chain[-1]) if chain else None
         if var is None:
@@ -6385,6 +6392,8 @@ class TaintEngine:
         callee = self._callee_name(self._resolve_direct_target(d))
         mkey, model = lookup_model(self.models, callee)
         if not model or not model.get("return_bound"):
+            return None
+        if not self._proven_non_negative(len_expr, getattr(chain[-1], "size", None)):
             return None
         buf_idx = (model.get("sink") or {}).get("buf_arg")
         if buf_idx is None:
@@ -6404,6 +6413,29 @@ class TaintEngine:
         if not same:
             return None
         return str(called_name(mkey, callee)), int(getattr(d, "address", 0))
+
+    def _proven_non_negative(self, expr: Any, width: Any) -> bool:
+        """True when BN's value set for *expr* places every value in
+        ``[0, 2**(8*width - 1))`` -- non-negative read as a *width*-byte signed
+        integer, so no failure return hides behind a widening. The set BN
+        states for an operand is narrowed by the branches dominating its use
+        (measured: `if (n <= 0) return;` before the copy gives ``1..0x7fffffff``,
+        no guard ``-0x80000000..0x7fffffff``), which is what makes it the
+        proof of a guard. An unknown width or an unstated set proves nothing."""
+        if not isinstance(width, int) or width <= 0:
+            return False
+        pvs = getattr(expr, "possible_values", None)
+        kind = str(getattr(getattr(pvs, "type", None), "name", ""))
+        if kind in ("ConstantValue", "ConstantPointerValue"):
+            values = [int(pvs.value)]
+        elif kind in ("UnsignedRangeValue", "SignedRangeValue"):
+            values = [int(r.start) for r in pvs.ranges] + [int(r.end) for r in pvs.ranges]
+        elif kind == "InSetOfValues":
+            values = [int(v) for v in pvs.values]
+        else:
+            return False
+        limit = 1 << (8 * width - 1)
+        return bool(values) and all(0 <= v < limit for v in values)
 
     # The integer ops whose result wraps in their own width. A length computed
     # by one of them in fewer bytes than the sink's parameter wraps BEFORE the

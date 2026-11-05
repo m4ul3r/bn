@@ -75,3 +75,37 @@ def test_a_link_address_the_view_maps_is_not_claimed_for_the_moved_object(models
     eng = _image_engine(models, e_type=ET_EXEC, link_base=0x400000, view_start=0x401000,
                         view_end=0x407000, objects={"g": (0x404060, 8)})
     assert eng._declared_object_table() == [(0x405060, 8)]
+
+
+# ---------------------------------------------------------------------------
+# R3-01: a fill's return bounds the copy only once it is a byte count
+# ---------------------------------------------------------------------------
+
+def _values(kind, start, end):
+    pvs = FPVS(kind)
+    pvs.ranges = [SimpleNamespace(start=start, end=end, step=1)]
+    return pvs
+
+
+@pytest.mark.parametrize("at_copy", [
+    None,                                                  # BN states nothing
+    _values("SignedRangeValue", -0x80000000, 0x7fffffff),  # no guard: -1 possible
+    _values("UnsignedRangeValue", 0, 0xffffffff),          # zx of a 32-bit -1
+], ids=["no-value-set", "unguarded", "zero-extended"])
+def test_an_unchecked_fill_return_still_overreads_its_source(models, at_copy):
+    # `n = recv(fd, buf, 0x40, 0); memcpy(malloc(n), buf, n)` with no
+    # success check: recv's -1 is SIZE_MAX at the copy.
+    sink = _memcpy_sink(models, *_recv_then_dup(count="const", length="sx", src="same",
+                                                at_copy=at_copy))
+    assert sink["class"] == "overread_len", sink
+    assert "src_fill" not in sink
+    assert sink["src_capacity"] == 0x40
+
+
+def test_a_non_negative_guard_proves_the_fill_return(models):
+    # `if (n < 0) return;` leaves 0..0x7fffffff: a zero-byte copy is a count too.
+    sink = _memcpy_sink(models, *_recv_then_dup(
+        count="const", length="sx", src="same",
+        at_copy=_values("SignedRangeValue", 0, 0x7fffffff)))
+    assert sink["class"] == "bounded_len"
+    assert sink["src_fill"] == {"callee": "recv", "at": "0x1010"}
