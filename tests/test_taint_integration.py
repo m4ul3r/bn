@@ -747,7 +747,6 @@ def test_sink_argument_without_a_value_role_is_incomplete(tmp_path, shared_bn, a
     entry = leaf["declare_value_role"]["entry"]
     assert leaf["declare_value_role"]["template"] is True, leaf
     entry["int_sink"]["sink"]["class"] = "alloc_size"
-    del entry["int_sink"]["OTHER_ROLES"]
     models = tmp_path / "value_roles.json"
     models.write_text(json.dumps(entry))
     declared = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "int_caller",

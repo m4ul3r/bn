@@ -55,8 +55,19 @@ from ._shared import (
 )
 from .bridge_state import require_analysis
 from .read_taint_models import PRESENCE_CATALOG_NOTE, model_catalog
+from .taint_models import load_user_models
 from .read_listing import _analysis_state_fields
 from .target_hint import positional_selector
+
+
+def _function_name_at(bv):
+    """The resolver an address-keyed model (`{"0x401000": {...}}`) is applied
+    through: the current name of the function STARTING at an address
+    (`sub_401000` on a stripped target), or None when none starts there."""
+    def resolve(addr: int) -> str | None:
+        fn = bv.get_function_at(addr)
+        return str(fn.name) if fn is not None else None
+    return resolve
 
 
 def _taint_op(ctx, selector, params: dict[str, Any]):
@@ -66,21 +77,17 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
     func = ctx._find_function(bv, params["function"])
     try:
         # `user_models` carries project-internal wrapper models supplied via
-        # `taint --models <file>` (#317); merged over the builtin/override DB.
-        models = _taint.load_models(extra=params.get("user_models"),
-                                    extra_via=params.get("user_models_via"),
-                                    extra_path=params.get("user_models_path"))
+        # `taint --models <file>` (#317); merged over the builtin/override DB,
+        # its address keys resolved against this view. #415: the overlay
+        # disclosure comes from the SAME load that produced `models` (before
+        # the long analysis), so a model file created/deleted mid-run can't
+        # desync the reported sources from what was actually used.
+        models, model_sources = load_user_models(
+            params, resolve_address=_function_name_at(bv))
     except _taint.TaintError as exc:
         # A broken builtin DB or BN_TAINT_MODELS override is now loud instead
         # of silently producing false negatives (#97).
         raise OperationFailure("unsupported", str(exc)) from exc
-    # #415: capture the overlay disclosure from the SAME load that produced
-    # `models` (before the long analysis), so a model file created/deleted
-    # mid-run can't desync the reported sources from what was actually used.
-    model_sources = _taint.model_overlay_sources(
-        params.get("user_models"), user_models_path=params.get("user_models_path"),
-        user_models_via=params.get("user_models_via"),
-        env_overridden_path=params.get("user_models_env_overridden"))
 
     def _find_variable(fn, sel):
         var, _is_param = vars_mod._find_variable_selector(fn, sel)
@@ -189,12 +196,15 @@ def _taint_models_op(ctx, selector, params: dict[str, Any]):
         raise OperationFailure(
             "unsupported",
             "--present/--callsites need a target: presence is defined against a loaded binary")
+    # The view (when named) is resolved first: address-keyed models resolve
+    # against it, and without one they are refused.
+    bv = ctx._resolve_view(selector) if selector is not None else None
     try:
-        catalog, models = model_catalog(params)
+        catalog, models = model_catalog(
+            params, resolve_address=_function_name_at(bv) if bv is not None else None)
     except _taint.TaintError as exc:
         raise OperationFailure("unsupported", str(exc)) from exc
-    if selector is not None:
-        bv = ctx._resolve_view(selector)
+    if bv is not None:
         present_keys, info = _present_models(bv, models, want_callsites, all_sites=all_sites)
         _annotate_presence(catalog, present_keys, info, present_only)
         # #811: presence is computed by walking this view's functions/symbols, so

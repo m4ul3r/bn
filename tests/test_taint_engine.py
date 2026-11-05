@@ -5085,7 +5085,7 @@ def test_load_models_rejects_non_dict_model_value(monkeypatch, tmp_path):
 def test_load_models_accepts_valid_override_with_comment(monkeypatch, tmp_path):
     ok = tmp_path / "override.json"
     ok.write_text(
-        '{"my_custom_sink": {"sink": {"class": "x", "tainted_args": [0]}}, "_comment_x": "doc text"}',
+        '{"my_custom_sink": {"sink": {"class": "overflow_len", "tainted_args": [0]}}, "_comment_x": "doc text"}',
         encoding="utf-8",
     )
     monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: ok)
@@ -10152,14 +10152,18 @@ def test_roleless_overlay_entry_is_rejected_before_the_walk_915(models):
     assert "no recognised model role" in msg2 and "sink/sources/propagates" in msg2, msg2
 
     # Only the fields that ARM a sink are "misplaced", and only with no `sink`
-    # beside them: a prose annotation beside a real role is left alone (the
-    # docstring's forward-compat promise), as is a root-level `len_arg` next
-    # to a nested sink that already arms the entry (PR-928 review P3).
-    with_sink = te.load_models(extra={"app_recv": {"sink": {"class": "x", "tainted_args": [0]}, "len_arg": 1}})
-    assert with_sink["app_recv"]["sink"]["class"] == "x"
+    # beside them. Beside a real role, prose `detail` is allowed; any other key
+    # outside the vocabulary -- a root-level `len_arg` next to a nested sink,
+    # the sink's own `optional`/`gate` written at the root -- is refused naming
+    # it (P2-09: the old forward-compat latitude loaded typos as no-ops).
+    with pytest.raises(te.TaintError, match="unknown key `len_arg`"):
+        te.load_models(extra={"app_recv": {"sink": {"class": "overflow_len", "tainted_args": [0]},
+                                           "len_arg": 1}})
+    with pytest.raises(te.TaintError, match="unknown key `optional`"):
+        te.load_models(extra={"app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                                           "optional": True, "gate": "x"}})
     annotated = te.load_models(extra={"app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
-                                                   "detail": "project copy wrapper",
-                                                   "optional": True, "gate": "x"}})
+                                                   "detail": "project copy wrapper"}})
     assert annotated["app_copy"]["propagates"][0]["to"] == "*arg:0"
 
     benign = te.load_models(extra={"app_recv": {}})

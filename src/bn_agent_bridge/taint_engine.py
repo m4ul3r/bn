@@ -15033,31 +15033,53 @@ class TaintEngine:
             # overlay replaced the callee's whole model, a printed re-run
             # dropped the query's other sinks and options, and a redirect
             # overwrote a file: the leaf names the callee and argument, and
-            # `declare_value_role` is a TEMPLATE entry (UPPER-CASE
-            # placeholders, data only) the user merges into the callee's
-            # current model and passes with `--models FILE` to the same
-            # command they ran.
+            # `declare_value_role.entry` is an overlay entry the user passes
+            # with `--models FILE` to the same command they ran. P2-09: it is
+            # the callee's CURRENT model (an overlay entry replaces it whole)
+            # with the value role merged in, so it loads as pasted once its
+            # UPPER-CASE placeholder values, if any, are filled -- it used to
+            # carry an `OTHER_ROLES` placeholder KEY the loader now refuses.
             callee = str(sink.get("callee") or "")
             addr = self._callee_as_addr(callee)
             name = (self._callee_name(addr) if addr is not None else None) or callee
             leaf["callee"] = name
             leaf["arg_index"] = idx
+            _, current = lookup_model(self.models, callee)
+            if current is None and name != callee:
+                _, current = lookup_model(self.models, name)
+            entry = ({k: json.loads(json.dumps(v)) for k, v in current.items()
+                      if not str(k).startswith("_comment")}
+                     if isinstance(current, dict) else {})
+            placeholders: dict[str, Any] = {}
+            cur_sink = entry.get("sink")
+            if not isinstance(cur_sink, dict):
+                # No sink yet: the value role is a new sink whose value class
+                # the user picks.
+                entry["sink"] = {"class": "VALUE_CLASS", "tainted_args": [idx]}
+                placeholders["VALUE_CLASS"] = sorted(self._VALUE_SINK_CLASSES)
+            else:
+                # A sink already: the argument joins its `tainted_args`. Under a
+                # value class that IS the value role; otherwise the sink's
+                # current pointer arguments are named in `pointer_args` (the
+                # mixed-sink rule) so they stay pointers and this one is a value.
+                prior = list(cur_sink.get("tainted_args") or [])
+                if cur_sink.get("class") not in self._VALUE_SINK_CLASSES \
+                        and not isinstance(cur_sink.get("pointer_args"), list):
+                    cur_sink["pointer_args"] = (
+                        prior if cur_sink.get("class") in self._POINTER_SINK_CLASSES else [])
+                cur_sink["tainted_args"] = sorted(set(prior) | {idx})
             leaf["declare_value_role"] = {
-                "template": True,
-                "entry": {name: {"sink": {"class": "VALUE_CLASS", "tainted_args": [idx]},
-                                 "OTHER_ROLES": "COPY_FROM_THE_CURRENT_MODEL"}},
-                "placeholders": {
-                    "VALUE_CLASS": sorted(self._VALUE_SINK_CLASSES),
-                    "OTHER_ROLES": "every other key of the callee's current model "
-                                   "(sources, propagates, ...), copied unchanged",
-                },
+                "template": bool(placeholders),
+                "entry": {name: entry},
+                "placeholders": placeholders,
             }
             leaf["detail"] = (
                 f"no sink model gives argument {idx} of {_code(self._prose_name(callee))} "
                 f"a role, so the slice treats it as a pointer the sink reads through "
                 f"(#931): it is NOT complete. It may read: {listed}. If the argument is "
                 f"a value (a size, a count, a flag), declare it in a model overlay: the "
-                f"leaf's `declare_value_role.entry` is a TEMPLATE")
+                f"leaf's `declare_value_role.entry` is the callee's model with that role "
+                f"added")
         if recovered:
             leaf["recovered_from_register"] = True
         if leaf not in self._bw_leaves:

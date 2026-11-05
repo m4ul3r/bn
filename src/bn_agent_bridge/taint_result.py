@@ -971,11 +971,11 @@ def backward_diagnostics(
             next_action += (
                 ". No sink model gives the selected argument a role, so it is treated as "
                 "a pointer the sink reads through (#931). If it is a value, declare it in "
-                "a model overlay: the leaf's `declare_value_role.entry` is a TEMPLATE "
-                "(replace the UPPER-CASE placeholders). An overlay entry replaces the "
-                "callee's whole model, so start from its current model -- `bn taint models "
-                "--format json` lists the catalog. Then add `--models FILE` to the same "
-                "command you ran")
+                "a model overlay: the leaf's `declare_value_role.entry` is the callee's "
+                "current model with that value role merged in (an overlay entry replaces "
+                "the callee's whole model); replace the UPPER-CASE value of each key its "
+                "`placeholders` names -- `bn taint models --format json` lists the "
+                "catalog. Then add `--models FILE` to the same command you ran")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
                for lf in unresolved_leaves):
             next_action += (

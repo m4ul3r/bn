@@ -1578,3 +1578,178 @@ def test_optional_sink_indices_may_be_null():
         "class": "net_write", "tainted_args": [1], "len_arg": None, "buf_arg": None,
         "format_arg": None, "pointer_args": None}}})
     assert ok["app_send"]["sink"]["len_arg"] is None
+
+
+# --- P2-09: a model file is accepted only as written ----------------------------
+
+_APP_COPY = {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}
+
+
+def test_an_empty_top_level_list_is_refused_like_a_non_empty_one():
+    # `[]` was falsy, so the loader skipped it and the disclosure omitted the
+    # file: a wrong-shape document accepted at exit 0.
+    for doc in ([], [{"app_copy": _APP_COPY}]):
+        with pytest.raises(tm.TaintError, match="must be a JSON object"):
+            tm.load_models(extra=doc, extra_via="--models", extra_path="/proj/m.json")
+
+
+def test_an_empty_object_is_a_disclosed_file_of_no_models():
+    assert tm.load_models(extra={}) == tm.load_models()
+    rows = tm.model_overlay_sources({}, user_models_path="/proj/m.json")
+    assert {"kind": "user", "via": "--models", "count": 0, "path": "/proj/m.json"} in rows
+
+
+@pytest.mark.parametrize("op", ["forward", "backward", "models"])
+@pytest.mark.parametrize("doc", [[], None])
+def test_bridge_refuses_a_non_object_model_file(op, doc):
+    class _Ctx(_CtxWithBV):
+        def _find_function(self, bv, name):
+            return object()
+
+    params = {"user_models": doc, "user_models_path": "/proj/m.json",
+              "user_models_via": "--models"}
+    with pytest.raises(rts.OperationFailure, match=r"/proj/m\.json.*must be a JSON object"):
+        if op == "models":
+            rts._taint_models_op(_CtxNoView(), None, params)
+        else:
+            rts._taint_op(_Ctx(_BVPlain()), "active", dict(
+                params, function="handler", direction=op,
+                sources=["param:0"], sinks=["arg:memcpy:2"]))
+
+
+@pytest.mark.parametrize("model, path", [
+    ({"sink": {"class": "alloc_size", "tainted_args": [1]},
+      "OTHER_ROLES": "COPY_FROM_THE_CURRENT_MODEL"}, "OTHER_ROLES"),
+    ({"sink": {"clas": "alloc_size", "class": "alloc_size", "tainted_args": [1]}}, "sink.clas"),
+    ({"propagates": [{"from": "*arg:1", "to": "*arg:0", "form": "arg:1"}]}, "propagates[0].form"),
+    ({"sources": [{"to": "ret"}, {"to": "*arg:0", "kind": "x"}]}, "sources[1].kind"),
+    ({"varargs": {"first_index": 1, "to": "*arg:0", "first": 1}}, "varargs.first"),
+    ({**_APP_COPY, "continuation": {"null_arg": 0, "nul_arg": 0}}, "continuation.nul_arg"),
+    ({**_APP_COPY, "return_bound": {"max_from_arg": 2, "min_from_arg": 0}}, "return_bound.min_from_arg"),
+    ({**_APP_COPY, "append": {"dest": 0, "src": 1, "len": 2}}, "append.len"),
+    ({**_APP_COPY, "ret_offset": {"count_arg": 2, "cnt_arg": 2}}, "ret_offset.cnt_arg"),
+])
+def test_unknown_keys_are_refused_at_every_level_naming_the_path(model, path):
+    with pytest.raises(tm.TaintError) as err:
+        tm.load_models(extra={"ds_resize": model})
+    msg = str(err.value)
+    assert "model 'ds_resize'" in msg and f"`{path}`" in msg, msg
+
+
+def test_comment_and_prose_keys_stay_allowed_at_every_level():
+    ok = tm.load_models(extra={"app_copy": {
+        "_comment": "wrapper", "detail": "a project copy wrapper",
+        "propagates": [{"from": "*arg:1", "to": "*arg:0", "_comment_rule": "src->dst"}],
+        "sink": {"class": "overflow_len", "tainted_args": [2], "detail": "n", "_comment": "x",
+                 "dest_size_arg": 3}}})
+    assert ok["app_copy"]["sink"]["dest_size_arg"] == 3
+
+
+def test_dest_size_arg_is_an_argument_index():
+    with pytest.raises(tm.TaintError, match=r"`sink\.dest_size_arg`"):
+        tm.load_models(extra={"app_copy": {"sink": {
+            "class": "overflow_len", "tainted_args": [2], "dest_size_arg": -1}}})
+
+
+def test_a_typoed_sink_class_is_refused_listing_the_valid_set():
+    valid = tm.builtin_sink_classes()
+    assert {"overflow_len", "alloc_size", "file_write", "net_write"} <= valid
+    with pytest.raises(tm.TaintError) as err:
+        tm.load_models(extra={"app_copy": {**_APP_COPY, "sink": {
+            "class": "overflow_unbounde", "tainted_args": [1]}}})
+    msg = str(err.value)
+    assert "model 'app_copy'" in msg and "overflow_unbounde" in msg, msg
+    assert all(c in msg for c in valid), msg
+
+
+@pytest.mark.parametrize("target", [False, True])
+def test_catalog_refuses_an_unknown_class_filter(target):
+    ctx = _CtxWithBV(_FakeBV(["memcpy"])) if target else _CtxNoView()
+    with pytest.raises(rts.OperationFailure) as err:
+        rts._taint_models_op(ctx, "active" if target else None, {"class": "nonexistent_class"})
+    msg = str(err.value)
+    assert "nonexistent_class" in msg and all(c in msg for c in tm.builtin_sink_classes()), msg
+
+
+# --- address-keyed models resolve against the target ---------------------------
+
+class _FnAt:
+    def __init__(self, name, start):
+        self.name, self.start = name, start
+
+
+class _BVWithFunctions(_FakeBV):
+    """A stripped view: functions at 0x401000 (auto-named) and 0x402000."""
+    def __init__(self):
+        super().__init__(["sub_401000", "parse_frame"])
+        self._at = {0x401000: _FnAt("sub_401000", 0x401000),
+                    0x402000: _FnAt("parse_frame", 0x402000)}
+
+    def get_function_at(self, addr):
+        return self._at.get(addr)
+
+
+_ADDR_MODEL = {"0x401000": {"sources": [{"to": "*arg:1"}, {"to": "ret"}]}}
+
+
+def _taint_with(bv, user_models):
+    seen: dict = {}
+
+    class _RecordingEngine(rts._taint.TaintEngine):
+        def __init__(self, bv, models, **kw):
+            super().__init__(bv, models, **kw)
+            seen["models"] = models
+
+        def forward(self, func, locators, **kw):
+            return {"direction": "forward", "reached_sinks": [], "leaves": []}
+
+    class _Ctx(_CtxWithBV):
+        def _find_function(self, bv, name):
+            return object()
+
+    import unittest.mock as um
+    with um.patch.object(rts._taint, "TaintEngine", _RecordingEngine):
+        result = rts._taint_op(_Ctx(bv), "active", {
+            "function": "handler", "sources": ["param:0"], "user_models": user_models,
+            "user_models_path": "/proj/m.json", "user_models_via": "--models"})
+    return result, seen["models"]
+
+
+def test_address_keyed_model_applies_under_the_functions_name_and_is_disclosed():
+    result, models = _taint_with(_BVWithFunctions(), _ADDR_MODEL)
+    assert models["sub_401000"] == _ADDR_MODEL["0x401000"]
+    assert "0x401000" not in models
+    [user] = [s for s in result["model_sources"] if s["kind"] == "user"]
+    assert user["resolved"] == {"0x401000": "sub_401000"} and user["count"] == 1, user
+    # A named function resolves to its current name; the envelope form too.
+    _, models = _taint_with(_BVWithFunctions(), {"models": {"0x402000": _APP_COPY}})
+    assert models["parse_frame"] == _APP_COPY
+
+
+def test_catalog_with_a_target_resolves_address_keys():
+    res = rts._taint_models_op(_CtxWithBV(_BVWithFunctions()), "active", {
+        "user_models": _ADDR_MODEL, "user_models_path": "/proj/m.json",
+        "user_models_via": "--models", "role": "source"})
+    assert "sub_401000" in {s["symbol"] for s in res["sources"]}
+    [user] = [o for o in res["overlays"] if o["kind"] == "user"]
+    assert user["resolved"] == {"0x401000": "sub_401000"}, user
+
+
+@pytest.mark.parametrize("doc, needle", [
+    ({"0x401004": _APP_COPY}, "0x401004"),                          # not a function start
+    ({"0x401000": _APP_COPY, "sub_401000": _APP_COPY}, "sub_401000"),  # name collision
+    ({"0x401000": _APP_COPY, "0x0401000": _APP_COPY}, "0x0401000"),    # two spellings
+])
+def test_unresolvable_or_colliding_address_keys_are_refused(doc, needle):
+    with pytest.raises(rts.OperationFailure) as err:
+        _taint_with(_BVWithFunctions(), doc)
+    assert needle in str(err.value) and "/proj/m.json" in str(err.value), str(err.value)
+
+
+def test_address_keyed_model_without_a_target_is_refused():
+    with pytest.raises(rts.OperationFailure, match="0x401000.*need a target"):
+        rts._taint_models_op(_CtxNoView(), None, {
+            "user_models": _ADDR_MODEL, "user_models_path": "/proj/m.json",
+            "user_models_via": "--models"})
+    with pytest.raises(tm.TaintError, match="0x401000.*need a target"):
+        tm.load_models(extra=_ADDR_MODEL)
