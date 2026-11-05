@@ -1761,14 +1761,28 @@ def _data_symbol_addr(binary: Path, name: str) -> str:
 
 
 def _wide_globals_binary(tmp_path, count: int = 600) -> Path:
-    """`main` copies argv into a global laid out after *count* neighbouring
-    globals, calls `reset_all()` -- which zeroes every one of them -- and
-    then hands argv to `system`."""
-    lines = ["#include <stdlib.h>", "#include <string.h>"]
-    lines += [f"long g_slot{i};" for i in range(count)]
-    lines += ["char g_name[64];", "__attribute__((noinline)) void reset_all(void) {"]
+    """`main` copies argv into `g_name`, calls `reset_all()` and then hands
+    argv to `system`. `reset_all` zeroes *count* neighbouring globals laid out
+    just before `g_name` and then calls `show_name`, the one reader of it.
+
+    The neighbours are assembler symbols with no size, so nothing DECLARES
+    where any of them ends: the search for an object enclosing `g_name` runs
+    out of hops, and whether `reset_all` touches that storage is asked of
+    every global it names. A declared (C) neighbour would end the search at
+    once and never reach that question."""
+    asm = ["  .bss", "  .balign 8"]
+    for i in range(count):
+        asm += [f"  .globl g_slot{i}", f"g_slot{i}: .zero 8"]
+    asm += ["  .text"]
+    lines = ["#include <stdio.h>", "#include <stdlib.h>", "#include <string.h>",
+             "__asm__(" + " ".join(f'"{a}\\n"' for a in asm) + ");"]
+    lines += [f"extern long g_slot{i};" for i in range(count)]
+    lines += ["char g_name[64];",
+              "__attribute__((noinline)) void show_name(void) { puts(g_name); }",
+              "__attribute__((noinline)) void reset_all(void) {"]
     lines += [f"    g_slot{i} = 0;" for i in reversed(range(count))]
-    lines += ["}", "int main(int argc, char **argv) {", "    if (argc < 2) return 1;",
+    lines += ["    show_name();", "}",
+              "int main(int argc, char **argv) {", "    if (argc < 2) return 1;",
               "    strncpy(g_name, argv[1], sizeof g_name - 1);", "    reset_all();",
               "    system(argv[1]);", "    return 0;", "}"]
     src = tmp_path / "wideglobals.c"
@@ -1781,10 +1795,13 @@ def _wide_globals_binary(tmp_path, count: int = 600) -> Path:
 @pytest.mark.parametrize("depth", ["8", "0"])
 def test_a_callee_naming_hundreds_of_globals_does_not_unwind_the_walk(tmp_path, shared_bn,
                                                                       depth):
-    """P1-02: asking whether `reset_all` touches the tainted object's region
-    re-entered the neighbouring-object scan once per global it names; the
-    walk unwound on Python's recursion limit -- at every `--max-depth`,
-    including 0 -- and the `system(argv)` after the call was never reported."""
+    """P1-02: asking whether `reset_all` touches the storage around the
+    tainted `g_name` re-entered the neighbouring-object scan once per global
+    it names; the walk unwound on Python's recursion limit and the
+    `system(argv)` after the call was never reported. Now the walk finishes:
+    the sink is kept and the call carries the continuation -- the reader
+    `show_name` one call down, or, at `--max-depth 0`, the depth bound that
+    kept the search from reaching it."""
     binary = _wide_globals_binary(tmp_path)
     target = shared_bn.load(binary, copy=False)
     result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
@@ -1794,6 +1811,11 @@ def test_a_callee_naming_hundreds_of_globals_does_not_unwind_the_walk(tmp_path, 
     assert not [lf for lf in result["leaves"] if lf["kind"] == "analysis_truncated"]
     [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
     assert leaf["global"]["address"] == _data_symbol_addr(binary, "g_name"), leaf
+    assert leaf["callee"]["display_name"] == "reset_all", leaf
+    if depth == "8":
+        assert [r["display_name"] for r in leaf["references"]] == ["show_name"], leaf
+    else:
+        assert "depth_budget" in leaf["reachability"]["causes"], leaf
 
 
 def test_a_float_infinity_in_a_consumer_does_not_crash_the_walk(tmp_path, shared_bn):
