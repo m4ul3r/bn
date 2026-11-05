@@ -43,6 +43,7 @@ from ..formatters import (
     _render_target_use_text,
 )
 from ..paths import project_root
+from ..taint_vocabulary import taint_vocabulary
 from ..target_hint import instance_option, target_option
 from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, unwrap_result
 
@@ -99,7 +100,10 @@ def _capabilities(args: argparse.Namespace) -> int:
         }
         for spec in sorted(cli._COMMANDS, key=lambda spec: spec["path"])
     ]
-    result = {"kind": "capabilities", "items": items, "count": len(items)}
+    # The taint output vocabulary (V4-05): declared sets and the engine's own
+    # literals, read by the crawler the drift tests use -- never a copy.
+    result = {"kind": "capabilities", "items": items, "count": len(items),
+              "taint": taint_vocabulary()}
     cli._emit_result(args, result, text_renderer=_render_capabilities_text, stem="capabilities")
     return 0
 

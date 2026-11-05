@@ -1,0 +1,127 @@
+"""`bn capabilities` advertises the taint output vocabulary (V4-05).
+
+An agent reading a taint result meets leaf kinds, truncation causes, origin
+kinds, `sink_status` statuses and `run_params` keys; the capability index named
+none of them, so the only way to learn the vocabulary was to run taint and read
+the docs. The `taint` entry carries each list, read from the one source the
+engine and the drift tests share -- never a copy -- so a new value in the
+engine is advertised without a second edit.
+"""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+
+import bn.cli
+import bn.taint_vocabulary as vocab
+from bn.taint_truncation import TRUNCATION_CAUSES
+from bn.taint_vocabulary import (
+    BLOCKING_LEAF_KINDS,
+    VocabularyUnresolved,
+    kind_rows,
+    origin_constructors,
+    run_params_keys,
+)
+
+BRIDGE = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge"
+FIELDS = ["leaf_kinds", "truncation_causes", "origin_kinds", "sink_status", "run_params"]
+
+
+def _capabilities(capsys, *extra: str) -> dict:
+    assert bn.cli.main(["capabilities", "--format", "json", *extra]) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_capabilities_json_carries_the_taint_vocabulary_from_its_sources(capsys):
+    data = _capabilities(capsys)
+    # The existing catalog shape is untouched.
+    assert data["kind"] == "capabilities" and data["count"] == len(data["items"])
+    taint = data["taint"]
+    assert sorted(taint) == sorted(FIELDS)
+    assert taint["leaf_kinds"] == sorted(BLOCKING_LEAF_KINDS)
+    assert taint["truncation_causes"] == sorted(TRUNCATION_CAUSES)
+    engine = BRIDGE / "taint_engine.py"
+    assert taint["origin_kinds"] == sorted(kind_rows(engine, origin_constructors))
+    assert taint["run_params"] == sorted(
+        run_params_keys(engine) | run_params_keys(BRIDGE / "read_taint_slice.py"))
+    # An independent read of the sink_status producers: every status literal an
+    # appended row spells is advertised.
+    text = engine.read_text(encoding="utf-8")
+    appended = set(re.findall(r'sink_status\.append\(\{[^}]*?"status": "(\w+)"', text, re.S))
+    assert appended and set(taint["sink_status"]) == appended
+    for field in FIELDS:
+        assert taint[field], field
+
+
+_ENGINE = textwrap.dedent('''
+    NEW_ORIGIN = "brand_new_origin"
+
+    class TaintEngine:
+        def forward(self):
+            return {"run_params": {"max_depth": 1, "brand_new_knob": 2}}
+
+        def backward(self, kind="parameter"):
+            sink_status = []
+            sink_status.append({"status": "brand_new_status", "seeded": False})
+            origin = {"kind": NEW_ORIGIN if kind else kind}
+            return {"sink_status": sink_status, "origin": origin}
+''')
+_SLICE = textwrap.dedent('''
+    def op(result):
+        run_params = result.setdefault("run_params", {})
+        run_params["brand_new_echo"] = 1
+''')
+
+
+def _bridge(tmp_path: Path, engine: str = _ENGINE, slice_: str = _SLICE) -> Path:
+    (tmp_path / "taint_engine.py").write_text(engine, encoding="utf-8")
+    (tmp_path / "read_taint_slice.py").write_text(slice_, encoding="utf-8")
+    return tmp_path
+
+
+def test_a_new_engine_literal_is_advertised_through_the_cli(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(vocab, "plugin_source_dir", lambda: _bridge(tmp_path))
+    taint = _capabilities(capsys)["taint"]
+    assert taint["origin_kinds"] == ["brand_new_origin", "parameter"]
+    assert taint["sink_status"] == ["brand_new_status"]
+    assert taint["run_params"] == ["brand_new_echo", "brand_new_knob", "max_depth"]
+
+
+@pytest.mark.parametrize(("engine", "slice_"), [
+    (_ENGINE.replace('"status": "brand_new_status"', '"status": compute()'), _SLICE),
+    (_ENGINE, _SLICE.replace('run_params["brand_new_echo"] = 1', "run_params.update(x=1)")),
+    (_ENGINE.replace('{"max_depth": 1, "brand_new_knob": 2}', "knobs"), _SLICE),
+], ids=["unreadable_status", "run_params_method_write", "non_literal_run_params"])
+def test_a_producer_the_crawler_cannot_read_is_refused_not_skipped(tmp_path, engine, slice_):
+    with pytest.raises(VocabularyUnresolved):
+        vocab.taint_vocabulary(_bridge(tmp_path, engine, slice_))
+
+
+def test_capabilities_text_lists_the_taint_vocabulary(capsys):
+    assert bn.cli.main(["capabilities"]) == 0
+    out = capsys.readouterr().out
+    assert "taint output vocabulary:" in out
+    tail = out.split("taint output vocabulary:", 1)[1]
+    taint = vocab.taint_vocabulary()
+    for field in FIELDS:
+        [line] = [ln for ln in tail.splitlines() if ln.startswith(f"  {field}: ")]
+        assert line.split(": ", 1)[1].split(", ") == taint[field]
+
+
+def test_capabilities_needs_neither_the_bridge_package_nor_binaryninja():
+    probe = (
+        "import json, sys, bn.cli\n"
+        "bn.cli.main(['capabilities', '--format', 'json'])\n"
+        "bad = sorted(m for m in sys.modules\n"
+        "             if m.split('.')[0] in ('binaryninja', 'bn_agent_bridge'))\n"
+        "assert not bad, bad\n"
+    )
+    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)["taint"]["leaf_kinds"]

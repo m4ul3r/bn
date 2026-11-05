@@ -61,7 +61,6 @@ from .taint_locators import (  # noqa: F401
     derive_flow_facts, normalize_resolve_map,
 )
 from .taint_result import (  # noqa: F401
-    BLOCKING_LEAF_KINDS,
     CALLER_ADVICE_LIMIT,
     coalesce_global_continuations,
     backward_diagnostics,
@@ -70,6 +69,7 @@ from .taint_result import (  # noqa: F401
     indirect_pointer_slot_leaf,
     misanchored_recv_leaf,
 )
+from .taint_vocabulary import BLOCKING_LEAF_KINDS
 
 # Module aliases so tests/callers can patch a moved symbol on its OWNER module
 # (a re-exported binding on the engine is a separate name -- rebinding it would

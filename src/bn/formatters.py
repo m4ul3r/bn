@@ -881,7 +881,8 @@ def _render_disasm_linear_text(value: Any) -> str:
 def _render_capabilities_text(value: Any) -> str:
     """Render the #276 capability index as a grouped, scannable catalog: each
     top-level group, its commands with one-line help, and the prefer-when /
-    see-also routing hints where a command overlaps a neighbor."""
+    see-also routing hints where a command overlaps a neighbor; then the taint
+    output vocabulary, one line per field."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     items = _field_list(value, "items")
@@ -907,6 +908,14 @@ def _render_capabilities_text(value: Any) -> str:
         see_also = _field_list(item, "see_also")
         if see_also:
             lines.append(f"      see also: {', '.join(str(x) for x in see_also)}")
+    taint = _field_dict(value, "taint")
+    if taint:
+        # The taint output vocabulary (V4-05), one line per field.
+        lines.extend(["", "taint output vocabulary:"])
+        for field, values in taint.items():
+            shown = (", ".join(str(v) for v in values) if isinstance(values, list)
+                     else repr(values))
+            lines.append(f"  {field}: {shown}")
     return "\n".join(lines)
 
 

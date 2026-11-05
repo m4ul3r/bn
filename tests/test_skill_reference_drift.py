@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+from bn.taint_vocabulary import kind_rows, origin_constructors, overlay_constructors
+
 REFERENCE = Path(__file__).resolve().parent.parent / "skills" / "bn" / "reference"
 READING = REFERENCE / "reading.md"
 MUTATING = REFERENCE / "mutating.md"
@@ -1466,7 +1468,7 @@ def test_reading_names_every_taint_leaf_kind_and_truncation_cause():
     reads the result as noise; an undocumented cause sends it to `--max-depth`
     for a bound that flag does not move."""
     from bn.taint_truncation import TRUNCATION_CAUSES
-    from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+    from bn.taint_vocabulary import BLOCKING_LEAF_KINDS
 
     reading = READING.read_text(encoding="utf-8")
     missing_kinds = sorted(k for k in BLOCKING_LEAF_KINDS if f"`{k}`" not in reading)
@@ -1483,114 +1485,6 @@ def test_reading_names_every_taint_leaf_kind_and_truncation_cause():
 
 
 SRC = Path(__file__).resolve().parent.parent / "src"
-
-
-def _scope_nodes(fn: ast.AST):
-    """The nodes of *fn*'s own body: nested functions, lambdas and classes are
-    other scopes, so a same-named variable in one of them never resolves here."""
-    stack = list(ast.iter_child_nodes(fn))
-    while stack:
-        node = stack.pop()
-        yield node
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-            stack.extend(ast.iter_child_nodes(node))
-
-
-def _str_values(expr: ast.AST, scopes: list, consts: dict[str, str], tree: ast.AST) -> set[str]:
-    """Every string *expr* can evaluate to: a literal, both arms of a
-    conditional, a module constant, a local assigned in an enclosing scope, or
-    a parameter (its default and every keyword argument a call passes it).
-    Anything else fails, so a kind built some new way cannot slip past."""
-    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
-        return {expr.value}
-    if isinstance(expr, ast.IfExp):
-        return (_str_values(expr.body, scopes, consts, tree)
-                | _str_values(expr.orelse, scopes, consts, tree))
-    if isinstance(expr, ast.Name):
-        if expr.id in consts:
-            return {consts[expr.id]}
-        for depth in range(len(scopes) - 1, -1, -1):
-            fn, outer = scopes[depth], scopes[:depth + 1]
-            values: set[str] = set()
-            found = False
-            for node in _scope_nodes(fn):
-                if isinstance(node, ast.Assign) and any(
-                        isinstance(t, ast.Name) and t.id == expr.id for t in node.targets):
-                    values |= _str_values(node.value, outer, consts, tree)
-                    found = True
-            args = fn.args
-            positional = args.posonlyargs + args.args
-            pdefaults = dict(zip([a.arg for a in positional][len(positional) - len(args.defaults):],
-                                 args.defaults))
-            kdefaults = {a.arg: d for a, d in zip(args.kwonlyargs, args.kw_defaults) if d is not None}
-            if expr.id in {a.arg for a in positional + args.kwonlyargs}:
-                found = True
-                default = pdefaults.get(expr.id) or kdefaults.get(expr.id)
-                if default is not None:
-                    values |= _str_values(default, outer, consts, tree)
-                for call in ast.walk(tree):
-                    if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
-                            and call.func.id == fn.name):
-                        for kw in call.keywords:
-                            if kw.arg == expr.id:
-                                values |= _str_values(kw.value, outer, consts, tree)
-            if found:
-                return values
-    raise AssertionError(f"cannot resolve the kind `{ast.unparse(expr)}` "
-                         f"(line {getattr(expr, 'lineno', '?')}) to string literals")
-
-
-def _kind_rows(path: Path, constructors) -> dict[str, set[str]]:
-    """``{kind: literal field keys}`` over every dict *constructors* yields
-    from *path* -- ``constructors(node)`` returns the dict nodes a node
-    builds (an origin, an overlay row), each of which must carry `kind`."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    consts = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign)
-              and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)
-              for t in n.targets if isinstance(t, ast.Name)}
-    rows: dict[str, set[str]] = {}
-
-    def visit(node: ast.AST, scopes: list) -> None:
-        for built in constructors(node, scopes):
-            assert isinstance(built, ast.Dict), (
-                f"{path.name}:{node.lineno} builds one from a non-literal "
-                f"`{ast.unparse(built)}`: the drift guard cannot read its kind")
-            fields = {k.value: v for k, v in zip(built.keys, built.values)
-                      if isinstance(k, ast.Constant) and isinstance(k.value, str)}
-            assert "kind" in fields, f"{path.name}:{built.lineno} builds one without `kind`"
-            for kind in _str_values(fields.pop("kind"), scopes, consts, tree):
-                rows.setdefault(kind, set()).update(fields)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            scopes = scopes + [node]
-        for child in ast.iter_child_nodes(node):
-            visit(child, scopes)
-
-    visit(tree, [])
-    return rows
-
-
-def _origin_constructors(node: ast.AST, scopes: list):
-    """A backward origin: the argument of `_set_origin`/`_set_source_origin`,
-    a dict assigned to `origin`, or the value under an `"origin"` key."""
-    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-            and node.func.id in ("_set_origin", "_set_source_origin")):
-        yield node.args[0]
-    elif (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
-          and any(isinstance(t, ast.Name) and t.id == "origin" for t in node.targets)):
-        yield node.value
-    elif isinstance(node, ast.Dict):
-        for k, v in zip(node.keys, node.values):
-            if isinstance(k, ast.Constant) and k.value == "origin" and isinstance(v, ast.Dict):
-                yield v
-
-
-def _overlay_constructors(node: ast.AST, scopes: list):
-    """A model overlay row: any dict with a `kind` built inside
-    `model_overlay_sources`, the one function that writes `model_sources` /
-    `overlays`."""
-    if (isinstance(node, ast.Dict) and any(s.name == "model_overlay_sources" for s in scopes)
-            and any(isinstance(k, ast.Constant) and k.value == "kind" for k in node.keys)):
-        yield node
 
 
 def _doc_table(header: str) -> dict[str, str]:
@@ -1612,8 +1506,8 @@ OVERLAY_TABLE = "| overlay row `kind` | meaning | fields |"
 
 
 @pytest.mark.parametrize(("source", "constructors", "header"), [
-    (SRC / "bn_agent_bridge" / "taint_engine.py", _origin_constructors, ORIGIN_TABLE),
-    (SRC / "bn" / "taint_models.py", _overlay_constructors, OVERLAY_TABLE),
+    (SRC / "bn_agent_bridge" / "taint_engine.py", origin_constructors, ORIGIN_TABLE),
+    (SRC / "bn" / "taint_models.py", overlay_constructors, OVERLAY_TABLE),
 ], ids=["backward_origin_kinds", "model_overlay_row_kinds"])
 def test_reading_tables_name_exactly_the_kinds_the_code_builds(source, constructors, header):
     """P2-13: an origin `kind` (`slices[].origin` / `origins[]`) or a model
@@ -1622,7 +1516,7 @@ def test_reading_tables_name_exactly_the_kinds_the_code_builds(source, construct
     code constructs -- a new kind fails until it has a row, a removed one
     until its row goes -- and each row names every literal field a
     constructor of that kind sets."""
-    built = _kind_rows(source, constructors)
+    built = kind_rows(source, constructors)
     assert built, f"no {header} constructors found in {source.name}"
     documented = _doc_table(header)
     assert set(documented) == set(built), (
