@@ -39,6 +39,7 @@ from test_taint_forward_global_frontier import (
     _interval_program,
     _leaves,
     _reader,
+    _spanning_reader,
     _unbounded_reader,
     _var,
 )
@@ -68,7 +69,7 @@ def _store_fn(name, start):
     return GFunc(name, start, FSSAFunc([store, ret]), params=[n])
 
 
-def _fill_program(*, other_reader=True, via_helper=False):
+def _fill_program(*, other_reader=True, via_helper=False, handback=False):
     """`fill(n)` stores into the global itself, or hands `n` to a helper that
     does; `use()` -- never called by the walk -- reads it."""
     use = _reader("use", 0x401200, G_DIR, 0x401210)
@@ -88,6 +89,15 @@ def _fill_program(*, other_reader=True, via_helper=False):
         names[0x401300] = "fill_helper"
         funcs[0x401300] = writer
     refs = {G_DIR: [FRef(writer, int(writer.start) + 4)]}
+    if handback:
+        # `char *handback(void) { return g; }`, laid out BEFORE the reader:
+        # it hands the address on but reads none of its bytes.
+        back = GFunc("handback", 0x401180, FSSAFunc([
+            FInstr(0, 0x401184, "MLIL_RET", f"return {hex(G_DIR)}",
+                   src=[_gptr(G_DIR)])]), params=[])
+        names[0x401180] = "handback"
+        funcs[0x401180] = back
+        refs[G_DIR].append(FRef(back, 0x401184))
     if other_reader:
         refs[G_DIR].append(FRef(use, 0x401210))
     return func, FGlobalBV(names, funcs=funcs, refs=refs)
@@ -122,6 +132,21 @@ def test_a_view_that_cannot_list_references_invents_no_frontier(models):
     bv.get_code_refs = None
     result = _forward(bv, func, models, source="param:0")
     assert _leaves(result, COARSE) == [], result["leaves"]
+
+
+def test_the_store_leaf_cites_the_function_that_reads_it(models):
+    # A function that only hands the address back comes first in the
+    # layout; the row must name the one that READS the bytes, and the
+    # other stays listed at BN's own reference to it.
+    func, bv = _fill_program(handback=True)
+    result = _forward(bv, func, models, source="param:0")
+    [leaf] = _leaves(result, COARSE)
+    assert [(r["display_name"], r["access"]) for r in leaf["references"]] == \
+        [("use", "call_arg")], leaf
+    assert leaf["reads_proven"] is True, leaf
+    assert [(o["name"], o["at"]) for o in leaf["unexamined_reference_sites"]] == \
+        [("handback", hex(0x401184))], leaf
+    assert leaf["unexamined_references_total"] == 1, leaf
 
 
 # --------------------------------------------------------------------------
@@ -167,22 +192,42 @@ class FDeclaredExtentBV(FExtentBV):
                     lambda _self, a: [("DWARF", "v", dtype(sized[a]))] if a in sized else []})()
 
 
-def test_a_declared_neighbour_is_separate_storage(models):
-    # `packet` declares 64 bytes, so it ends exactly where `packet_tail`
-    # begins: its unbounded read is of its own storage, not of the tail.
-    consumer = _unbounded_reader("string", 0x401200, G_DIR)
+def _declared_neighbour_program(consumer):
+    """`packet` (64 bytes) then `packet_tail` (32), both DECLARED by the
+    image; the copy taints the tail, then *consumer* runs."""
     func, _argv = _copy_then_call(
         0x401104, MEMCPY, _gptr(G_TAIL),
         call_sites=[(0x401108, _gptr(0x401200), [])], params_extra=[_const(32)])
-    bv = FDeclaredExtentBV(
-        {MEMCPY: "memcpy", SYSTEM: "system", 0x401200: "string"},
+    return func, FDeclaredExtentBV(
+        {MEMCPY: "memcpy", SYSTEM: "system", 0x401200: consumer.name},
         funcs={0x401200: consumer},
         refs={G_DIR: [FRef(consumer, 0x401210)], G_TAIL: [FRef(func, 0x401104)]},
         objects={G_DIR: 0, G_TAIL: 0, G_OTHER: 0}, section=(0x404000, 0x405000),
         declared={"packet": (G_DIR, 64), "packet_tail": (G_TAIL, 32)})
+
+
+def test_a_declared_neighbour_is_separate_storage(models):
+    # `packet` declares 64 bytes, so it ends exactly where `packet_tail`
+    # begins: its unbounded read is of its own storage, not of the tail.
+    func, bv = _declared_neighbour_program(
+        _unbounded_reader("string", 0x401200, G_DIR))
     result = _forward(bv, func, models)
     assert result["leaves"] == [], result["leaves"]
     assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_a_stated_read_past_a_declared_end_still_reads_the_tail(models):
+    # ...but `memcpy(out, packet, 112)` STATES that it reads 48 bytes past
+    # that end, into the tainted tail: the declaration separates storage,
+    # it does not hide an over-read of it.
+    func, bv = _declared_neighbour_program(
+        _spanning_reader("over_read", 0x401200, G_DIR, 112))
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert [(r["display_name"], r["access"]) for r in leaf["references"]] == \
+        [("over_read", "call_arg")], leaf
+    assert leaf["reads_proven"] is True, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 # --------------------------------------------------------------------------

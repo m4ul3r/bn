@@ -569,6 +569,8 @@ class TaintEngine:
         # global -> the preceding objects whose unbounded use was returned
         # as an `overlap_unverified` candidate against it.
         self._unverified_neighbours: dict[int, set[int]] = {}
+        # (function start, neighbour) -> every read-capable use of it there.
+        self._neighbour_uses_cache: dict[tuple[int, int], list] = {}
         # global -> the first DIRECT store of a tainted value into it this run
         # made (in any function the walk entered): the write a seeded
         # function's exit must not leave unfollowed (P1-04).
@@ -8615,7 +8617,15 @@ class TaintEngine:
         -- `mid1`, `mid2`, `mid3`, `tail` all inside `packet` -- so the
         search walks the whole CONTIGUOUS run of symbolled predecessors in
         the same section rather than a fixed couple of hops, which hid the
-        base reader behind the fourth alias (round-12 review F25)."""
+        base reader behind the fourth alias (round-12 review F25).
+
+        The walk stops at the first predecessor whose DECLARED size ends at
+        or before *ga*: that is separate storage, and nothing before it can
+        be an enclosing object. It is still returned as the last candidate,
+        because a read of it with a stated length may run past its end into
+        these bytes -- `memcpy(out, first, 128)` from a 64-byte `first` reads
+        the tainted object after it -- and only :meth:`_overlap_access`'s
+        interval test, which ignores its unbounded uses, can say so."""
         cached = self._alias_chain_cache.get(ga)
         if cached is not None:
             return cached
@@ -8656,7 +8666,8 @@ class TaintEngine:
                 exhausted = False   # another section is another object
                 break
             if self._authoritative_width(at) and at + self._authoritative_width(at) <= ga:
-                exhausted = False   # a human said where that object ends
+                found.append(at)
+                exhausted = False   # its declaration says where it ends
                 break
             found.append(at)
         out = (found, exhausted)
@@ -8687,6 +8698,7 @@ class TaintEngine:
         self._global_keyed_offsets.clear()
         self._global_extent_unproven.clear()
         self._unverified_neighbours.clear()
+        self._neighbour_uses_cache.clear()
         self._global_direct_stores.clear()
         self._global_search_truncated.clear()
         self._global_refs_truncated.clear()
@@ -8714,6 +8726,8 @@ class TaintEngine:
             del self._global_reach[key]
         for key in [k for k in self._global_access_cache if k[1] == ga]:
             del self._global_access_cache[key]
+        for key in [k for k in self._neighbour_uses_cache if k[1] == ga]:
+            del self._neighbour_uses_cache[key]
 
     def _forward_window(self, ga: int) -> tuple[int, bool]:
         """``(how far the NEXT symbols' storage reaches past *ga*, the alias
@@ -9039,6 +9053,25 @@ class TaintEngine:
             self._reaches_object_cache[key] = cached
         return cached
 
+    def _neighbour_uses(self, fn: Any, ssaf: Any, pb: int) -> list:
+        """Every read-capable use *fn* makes of the object at *pb*, from ONE
+        pointer scan per (function, object) -- the neighbour of several
+        tainted globals is scanned once."""
+        key = (int(getattr(fn, "start", 0)), int(pb))
+        cached = self._neighbour_uses_cache.get(key)
+        if cached is not None:
+            return cached
+        uses: list = []
+        self._pointer_access(
+            fn, self._global_base(ssaf, pb), fallback=None,
+            offset_of=lambda ins: self._global_use_offset(ins, pb),
+            offset_expr=lambda f, e: self._global_ptr_offset(f, e, pb),
+            span_of=self._model_span,
+            names_object=lambda ins: self._names_global(ins, pb),
+            collect=uses)
+        self._neighbour_uses_cache[key] = uses
+        return uses
+
     def _overlap_access(self, fn: Any, ssaf: Any, ga: int) -> Any:
         """A use of a NEIGHBOURING object whose bytes reach into *ga*.
 
@@ -9060,7 +9093,8 @@ class TaintEngine:
 
         Only an ABUTTING neighbour is considered: a separate object with a
         gap after it is not storage this write can have reached, and one
-        whose DECLARED size ends before *ga* is separate storage."""
+        whose DECLARED size ends before *ga* is separate storage that only a
+        use with a stated interval running past its end can read into."""
         tainted = self._tainted_ranges(ga)
         start = int(getattr(fn, "start", 0))
         candidates, exhausted = self._preceding_objects(ga)
@@ -9074,23 +9108,16 @@ class TaintEngine:
             self._global_search_truncated.add(ga)
         unverified: tuple[int, Any] | None = None
         for pb in candidates:
-            if start not in self._global_ref_functions(pb) \
-                    and not self._reaches_object(fn, pb):
-                # No code reference FROM this body, and no route by which
-                # its own expressions resolve to that object either. A
-                # consumer that receives the address from a CALL names
-                # nothing, so requiring a direct reference dropped
-                # `system(advance(tracked + 8))` against a write to
-                # `middle = tracked + 64` (round-24 review F63).
-                continue
             authoritative = self._authoritative_width(pb)
-            if authoritative and pb + authoritative <= ga:
-                # A DECLARED size -- a type a human applied, the image's
-                # `st_size`, debug info -- is an answer about where that
-                # object ends, unlike one BN inferred from an initialiser
-                # (round-13 review F31). This object begins past it, so they
-                # are separate storage.
-                continue
+            # A DECLARED size -- a type a human applied, the image's
+            # `st_size`, debug info -- is an answer about where that object
+            # ends, unlike one BN inferred from an initialiser (round-13
+            # review F31). When it ends before this object begins they are
+            # separate storage: a use of it with no stated length or offset
+            # is a use of ITS bytes, never a candidate here. A use whose
+            # stated interval runs past its end into these bytes is still a
+            # read of them, which the interval test below proves.
+            separate = bool(authoritative) and pb + authoritative <= ga
             # NOTE: an INFERRED type is not consulted here. BN sizes an
             # initialised buffer from the bytes it can see -- `char
             # init_packet[128] = "seed"` comes back `char[0x5]` -- so a type
@@ -9099,14 +9126,25 @@ class TaintEngine:
             # applies). Separation is established by SECTION, by a
             # declaration and by the interval test below, never by a width
             # BN inferred.
-            uses: list = []
-            self._pointer_access(
-                fn, self._global_base(ssaf, pb), fallback=None,
-                offset_of=lambda ins: self._global_use_offset(ins, pb),
-                offset_expr=lambda f, e: self._global_ptr_offset(f, e, pb),
-                span_of=self._model_span,
-                names_object=lambda ins: self._names_global(ins, pb),
-                collect=uses)
+            if separate:
+                # Only this body's own uses of the separate object can
+                # matter, and the scan below finds them -- through returned
+                # pointers too. Asking `_reaches_object` first would classify
+                # the neighbour in full, overlap of ITS neighbour included,
+                # and so on down the section: on a binary whose every object
+                # is declared that recursion cost more than the walk itself.
+                uses = self._neighbour_uses(fn, ssaf, pb)
+            elif start not in self._global_ref_functions(pb) \
+                    and not self._reaches_object(fn, pb):
+                # No code reference FROM this body, and no route by which
+                # its own expressions resolve to that object either. A
+                # consumer that receives the address from a CALL names
+                # nothing, so requiring a direct reference dropped
+                # `system(advance(tracked + 8))` against a write to
+                # `middle = tracked + 64` (round-24 review F63).
+                continue
+            else:
+                uses = self._neighbour_uses(fn, ssaf, pb)
             for use in uses:
                 if use.kind == "return":
                     # Handing the neighbour's address BACK is not a use of
@@ -9123,6 +9161,8 @@ class TaintEngine:
                     lo, hi, bounded = pb + use.offset, None, False
                 else:
                     lo, hi, bounded = pb, None, False
+                if separate and not bounded:
+                    continue
                 for tlo, thi in tainted:
                     if thi is not None and lo >= thi:
                         continue
@@ -9589,10 +9629,14 @@ class TaintEngine:
         rule the continuation itself follows.
 
         ONE reader is what makes the store blocking, so the classifier runs
-        until it finds one; the other referencing functions are listed by
-        the code reference BN records for them -- an established reference,
-        never a claimed read -- rather than each paying a full pointer scan
-        for a fact the verdict does not depend on."""
+        until it finds one that PROVABLY reads the bytes (a load, or a call
+        argument a callee reads), and cites the first use that may read them
+        only when none does -- the CRT's `deregister_tm_clones` handing back
+        an address that coincides with the object is not the reader to name
+        when `reader()` loads it. The other referencing functions are listed
+        by the code reference BN records for them -- an established
+        reference, never a claimed read -- rather than each paying a full
+        pointer scan for a fact the verdict does not depend on."""
         gtxt = hex(int(ga))
         if any(lf.get("kind") == "global_memory_continuation"
                and isinstance(lf.get("global"), dict)
@@ -9601,23 +9645,37 @@ class TaintEngine:
         if not callable(getattr(self.bv, "get_code_refs", None)):
             return None
         own = int(getattr(func, "start", 0))
-        found: list[tuple] = []
+        cited: tuple | None = None       # the first proven read, else ...
+        fallback: tuple | None = None    # ... the first use that may read
         others: list[tuple[int, int]] = []
         for start, site in sorted(self._global_ref_functions(ga).items()):
             if start == own:
                 continue        # its own re-reads were walked
-            if found:
+            if cited is not None:
                 others.append((start, site))
                 continue
             rfn = function_at(self.bv, start)
-            if rfn is None:
-                found.append((start, site, "unreadable", 0, "", True))
-                continue
-            use = self._global_access(rfn, ga)
+            use = (_Use(site, "unreadable", 0, None, None, True) if rfn is None
+                   else self._global_access(rfn, ga))
             if use.at is None or self._use_misses_tainted(ga, use):
                 continue        # writes it, or provably reads other bytes
-            found.append((start, use.at, use.kind, use.offset, use.seed or "",
-                          use.offset_known))
+            row = (start, use.at, use.kind, use.offset, use.seed or "",
+                   use.offset_known)
+            if use.kind in _PROVEN_GLOBAL_READS:
+                cited = row
+                continue
+            if fallback is None:
+                fallback = row
+            else:
+                others.append((start, site))
+        if cited is None:
+            cited = fallback
+        elif fallback is not None:
+            # Not the reader cited, but a function that references it all
+            # the same: listed with the others, at BN's reference.
+            others.append((fallback[0], self._global_ref_functions(ga)[fallback[0]]))
+        others.sort()
+        found = [cited] if cited is not None else []
         swept = ga not in self._global_refs_truncated
         if not found and swept:
             return None
