@@ -4475,10 +4475,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # Merged with #1037: 63 + #1040/#1049's four + #1037's four.
     # R2-16-05 adds the backward frontier's `dropped_callers_unmeasured`.
     # P2-04 adds the `function cfg` slice line's `offset`, `returned`,
-    # `matched_blocks` and `total_blocks`.
-    assert len(sites) == 76, (
+    # `matched_blocks` and `total_blocks`; P2-06 the exports listing's
+    # `duplicates_collapsed`.
+    assert len(sites) == 77, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 76. A "
+        "count helper, not 77. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4626,6 +4627,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # from the body it renders for a payload that claimed nothing, so the
         # exemption fails with the branch it exempts.
         "_render_name_address_list_text(self_defined_excluded) [count not "
+        "stated in this context]",
+        # P2-06: the same harness cut -- the inner paged-list boundary
+        # discloses first. The line itself is pinned in
+        # `test_exports_text_states_the_collapsed_duplicate_records`.
+        "_render_name_address_list_text(duplicates_collapsed) [count not "
         "stated in this context]",
         # #969: the same harness cut as `self_defined_excluded` above -- the
         # inner paged-list boundary discloses first. The footer's own wording

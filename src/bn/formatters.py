@@ -2334,6 +2334,13 @@ def _render_name_address_list_text(value: Any, *, mangled: bool = False) -> str:
         note = ("// the payload's self-defined-excluded count is not a number "
                 "that can be read (use --format json)")
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    # P2-06: duplicate symbol records collapsed into one row per (address,
+    # name, kind) identity; `total` counts rows, so the collapse is stated.
+    collapsed = _stated_count(value, "duplicates_collapsed")
+    if collapsed != "0":
+        note = (f"// {collapsed} duplicate symbol record(s) collapsed "
+                "(one row per address + name + kind)")
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     # #969: `library: null` rows are imports no ELF symbol version binds to a
     # library; name the DT_NEEDED list they can come from, so the null points at
     # the answer rather than reading as "no dependency".

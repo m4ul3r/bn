@@ -3897,3 +3897,22 @@ def test_raw_byte_out_path_infers_its_format_once(fake_transport, capsys, tmp_pa
                         "--out", str(out), "--target", "active"]) == 0
     assert json.loads(out.read_text(encoding="utf-8"))["data"] == "QUI="
     assert capsys.readouterr().err.count("inferring --format json") == 1
+
+
+def test_exports_text_states_the_collapsed_duplicate_records(fake_transport, capsys):
+    # P2-06: the listing and the count line say how many duplicate symbol
+    # records were folded into the rows they show.
+    fake_transport({"list_exports": {"ok": True, "result": {
+        "kind": "exports", "items": [{"name": "on_packet", "display_name": "on_packet",
+                                      "address": "0x1000", "kind": "function"}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+        "duplicates_collapsed": 3}}})
+    assert bn.cli.main(["exports", "--target", "active"]) == 0
+    assert capsys.readouterr().out.splitlines()[-1].startswith(
+        "// 3 duplicate symbol record(s) collapsed")
+
+    fake_transport({"list_exports": {"ok": True, "result": {
+        "kind": "exports", "count": 1, "total": 1, "duplicates_collapsed": 3}}})
+    assert bn.cli.main(["exports", "--count", "--target", "active"]) == 0
+    assert capsys.readouterr().out.strip() == (
+        "Total exports: 1 (3 duplicate symbol record(s) collapsed)")

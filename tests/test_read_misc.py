@@ -1726,6 +1726,32 @@ def test_exports_lists_global_weak_definitions_only(monkeypatch):
     assert instance._exports(None, count_only=True)["count"] == 2
 
 
+def test_exports_collapse_a_definition_listed_twice_and_count_it(monkeypatch):
+    """P2-06: BN's combined symbol list holds one record per symbol table that
+    names a definition, so a symbol in both `.symtab` and `.dynsym` listed as
+    two identical rows and inflated `total`. One row per address + name +
+    kind; the collapse is counted on the listing and on `--count`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    def handler():
+        return fake_bn.Symbol(fake_bn.SymbolType.FunctionSymbol, 0x1000, "on_packet",
+                              binding=fake_bn.SymbolBinding.GlobalBinding)
+
+    data = fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x1000, "on_packet",
+                          binding=fake_bn.SymbolBinding.GlobalBinding)
+    bv = _FakeBV(symbols=[handler(), handler(), data])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._exports(None)
+    assert [(it["name"], it["kind"]) for it in result["items"]] == [
+        ("on_packet", "function"), ("on_packet", "data")]       # same address, other kind stays
+    assert (result["total"], result["duplicates_collapsed"]) == (2, 1)
+    counted = instance._exports(None, count_only=True)
+    assert (counted["count"], counted["duplicates_collapsed"]) == (2, 1)
+
+
 
 
 def test_sections_query_count_only_reflects_semantics_match(monkeypatch):

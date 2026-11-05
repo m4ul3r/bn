@@ -219,7 +219,13 @@ def _plain_count_text(label: str, value: Any) -> str:
 
 @_discloses
 def _exports_count_text(value: Any) -> str:
-    return _plain_count_text("Total exports", value)
+    line = _plain_count_text("Total exports", value)
+    # P2-06: the count is of rows (one per address + name + kind); the
+    # duplicate symbol records folded into them are stated, not dropped.
+    collapsed = _stated_count(value, "duplicates_collapsed")
+    if collapsed != "0":
+        line += f" ({collapsed} duplicate symbol record(s) collapsed)"
+    return line
 
 
 @_discloses
