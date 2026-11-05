@@ -1605,7 +1605,7 @@ def test_every_role_refuses_a_malformed_argument_token(tok, field, make):
     ("sink.format_arg", lambda v: {"sink": {"class": "c", "format_arg": v, "first_dest": 300}}),
     ("varargs.first_index", lambda v: {"varargs": {"first_index": v, "to": "*arg:0"}}),
     ("continuation.null_arg", lambda v: {"propagates": [{"from": "*arg:0", "to": "ret"}],
-                                         "continuation": {"null_arg": v}}),
+                                         "returns": "pointer", "continuation": {"null_arg": v}}),
     ("string_args", lambda v: {"sink": {"class": "c", "tainted_args": [0]}, "string_args": [v]}),
     ("append.dest", lambda v: {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
                                "append": {"dest": v, "src": 1}}),
@@ -1636,7 +1636,7 @@ def test_the_grammar_accepts_every_documented_form():
         "app_recv": {"sources": [{"to": "*arg:1"}, {"to": "arg:0"}, {"to": "ret"},
                                  {"to": "*ret"}, {"to": "*iovec:1"}]},
         "app_fmt": {"varargs": {"first_index": 2, "to": "*arg:0"}},
-        "app_tok": {"propagates": [{"from": "*arg:0", "to": "ret"}],
+        "app_tok": {"propagates": [{"from": "*arg:0", "to": "ret"}], "returns": "pointer",
                     "continuation": {"null_arg": 0}},
         "app_zero": {"writes": ["*arg:0"]},
     })
@@ -1676,8 +1676,8 @@ def test_varargs_first_index_is_required_and_canonical(first_index):
 
 @pytest.mark.parametrize("field,model", [
     ("continuation.null_arg", {"propagates": [{"from": "*arg:0", "to": "ret"}],
-                               "continuation": {"null_arg": None}}),
-    ("max_from_arg", {"propagates": [{"from": "*arg:0", "to": "ret"}],
+                               "returns": "pointer", "continuation": {"null_arg": None}}),
+    ("max_from_arg", {"propagates": [{"from": "*arg:0", "to": "ret"}], "returns": "scalar",
                       "return_bound": {"max_from_arg": None}}),
     ("first_dest", {"sink": {"class": "c", "format_arg": 1, "first_dest": None}}),
     ("append.dest", {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
@@ -1872,3 +1872,23 @@ def test_address_keyed_model_without_a_target_is_refused():
             "user_models_via": "--models"})
     with pytest.raises(tm.TaintError, match="0x401000.*need a target"):
         tm.load_models(extra=_ADDR_MODEL)
+
+
+_CONTENT_RULE = [{"from": "*arg:0", "to": "ret"}]
+
+
+@pytest.mark.parametrize("bad, good", [
+    # A `*arg:N -> ret` rule must say what its return is (IC06)...
+    ({"propagates": _CONTENT_RULE}, {"propagates": _CONTENT_RULE, "returns": "scalar"}),
+    ({"propagates": _CONTENT_RULE, "returns": "length"},
+     {"propagates": _CONTENT_RULE, "returns": "pointer"}),
+    # ...and only such a rule has one to say.
+    ({"propagates": [{"from": "arg:0", "to": "ret"}], "returns": "scalar"},
+     {"propagates": [{"from": "arg:0", "to": "ret"}, *_CONTENT_RULE], "returns": "scalar"}),
+])
+def test_a_content_return_must_say_whether_it_is_a_scalar_or_a_pointer(bad, good):
+    with pytest.raises(tm.TaintError) as ei:
+        tm.load_models(extra={"app_len": bad})
+    msg = str(ei.value)
+    assert "model 'app_len'" in msg and "`returns`" in msg, msg
+    assert tm.load_models(extra={"app_len": good})["app_len"]["returns"] == good["returns"]

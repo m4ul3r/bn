@@ -103,12 +103,26 @@ taint output vocabulary.
   take the same flags.
 - `taint_models.py`, `read_taint_models.py` and `taint_models.json` live under
   `src/bn/`, symlinked into the bridge package.
+- Taint models: a `*arg:N -> ret` propagate rule now needs a model-level
+  `returns: "scalar" | "pointer"`, saying whether the return is a value
+  computed from the bytes the argument points at (`strlen`, `atoi`) or a
+  pointer into them (`strchr`, `ctime`). A `--models` overlay without it is
+  refused naming the model; every builtin rule declares it.
 
 ### Fixed
 
 - Backward slices no longer accept a may-alias store, a write-back of the slot
   it loads, or a stack probe as a writer, and a modeled source behind a
   may-alias store is evidence rather than the origin.
+- Backward slices of a value computed from memory by a modeled call
+  (`memcpy(dst, src, strlen(src) + 1)`'s length) read the bytes where the call
+  read them and never name the pointer as the origin. Where the walk cannot
+  account for the bytes, the origin is a `pointer_object_unresolved` boundary
+  at that call (`address`), also in each caller the ascent reaches. A string
+  argument is read only up to a NUL that stores prove (`terminator` on the
+  local's leaf), not the buffer's whole capacity. A pointer return
+  (`strchr(s, ',') - s`) keeps pointer semantics. One backward run solves
+  each buffer-writer question once.
 - Backward caller ascent: each caller site is counted once, depth and cap cuts
   are recorded in `stats`, and a stack-only calling convention passes no
   register argument.

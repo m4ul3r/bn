@@ -169,6 +169,52 @@ _PROOF_LEAF = "region_store_proof_not_certified"
 _AS_CONSUMER = object()
 
 
+class _ContentDemand(tuple):
+    """A demand on the BYTES a pointer leads to, placed by a call whose return
+    is a scalar COMPUTED from them (a model with ``returns: "scalar"``:
+    ``strlen``, ``atoi``) -- ``(expr, delta)`` like any demand, plus
+    ``reader``, the instruction that reads them (the modeled call, or a
+    caller's call of the function that did), and ``string``, whether it reads
+    a NUL-terminated string forward from there (the model's ``string_args``).
+    The pointer only locates the object: where the walk cannot account for
+    the bytes, the boundary at ``reader`` is the value's origin, never the
+    pointer (IC06). A tuple, so every reader of a plain demand reads it."""
+
+    reader: Any
+    string: bool
+
+    def __new__(cls, expr: Any, delta: int | None, reader: Any, string: bool) -> _ContentDemand:
+        self = super().__new__(cls, (expr, delta))
+        self.reader = reader
+        self.string = string
+        return self
+
+    def moved(self, expr: Any, delta: int | None, reader: Any = None) -> _ContentDemand:
+        """The same read of the bytes, demanded of another expression (and,
+        across a call, by the instruction that made it)."""
+        return _ContentDemand(expr, delta, self.reader if reader is None else reader, self.string)
+
+
+def _demand_at(demand: Any, expr: Any, delta: int | None) -> Any:
+    """*demand* moved onto *expr* at *delta*: a content demand stays one, any
+    other is a plain ``(expr, delta)``."""
+    if isinstance(demand, _ContentDemand):
+        return demand.moved(expr, delta)
+    return (expr, delta)
+
+
+def _demand_tag(demand: Any) -> Any:
+    """What a walk under *demand* is, for the walk's visited keys: None (no
+    demand), True (a reader through the pointer), or a content demand's
+    reader -- a formal or a returned object met under one records the
+    content boundary, under a plain demand the pointer's own origin."""
+    if demand is None:
+        return None
+    if isinstance(demand, _ContentDemand):
+        return ("content", int(getattr(demand.reader, "address", 0) or 0), demand.string)
+    return True
+
+
 def _ssa_root_key(v: Any) -> tuple:
     """The base key of the object an SSA pointer value *v* points to, for the
     writer walk of a pointer with no local behind it (a call's return, a
@@ -929,6 +975,9 @@ class TaintEngine:
         self._unverified_neighbours: dict[int, set[int]] = {}
         # (function start, neighbour) -> every read-capable use of it there.
         self._neighbour_uses_cache: dict[tuple[int, int], list] = {}
+        # (SSA function, buffer, memory version, size, region) -> its solved
+        # writer rows (`_local_buffer_writers`), for one backward run.
+        self._buffer_writer_solves: dict[tuple, dict[str, Any]] = {}
         # global -> the first write of a tainted value into it this run made
         # -- a direct store, a modeled copy, a source filling it -- in any
         # function the walk entered: the write a seeded function's exit must
@@ -4058,12 +4107,29 @@ class TaintEngine:
                 stated = data.index(b"\x00") + 1
         if stated is None or stated <= 0:
             return None
+        run = self._llil_store_run(defn)
+        if run is None:
+            return None
+        spans: tuple | None = ()
+        for off, width, _value in run:
+            spans = _iv_add(spans, off, off + width)
+        if not spans or len(spans) != 1:
+            return None
+        lo, hi = spans[0]
+        return stated if hi - lo == stated else None
+
+    def _llil_store_run(self, defn: Any) -> list[tuple[int, int, Any]] | None:
+        """The stores of an outlined ``__builtin_*`` call's own LLIL, in order,
+        as ``(offset, width, value)`` -- the offset relative to their one SSA
+        base register, the value the LLIL expression stored. None when the
+        LLIL holds a call, jump or intrinsic, a store relative to anything
+        but one base register, or no store at all."""
         try:
             llils = list(getattr(defn, "llils", None) or [])
         except Exception:
             return None
         base = None
-        spans: tuple | None = ()
+        run: list[tuple[int, int, Any]] = []
         for ll in llils:
             op = op_name(ll)
             if any(t in op for t in ("CALL", "SYSCALL", "INTRINSIC", "JUMP", "GOTO",
@@ -4094,11 +4160,8 @@ class TaintEngine:
                 return None
             if width <= 0:
                 return None
-            spans = _iv_add(spans, off, off + width)
-        if base is None or not spans or len(spans) != 1:
-            return None
-        lo, hi = spans[0]
-        return stated if hi - lo == stated else None
+            run.append((off, width, getattr(ll, "src", None)))
+        return run or None
 
     def _var_byte_size(self, v: Any) -> int | None:
         """Byte size of local *v* (a Variable / SSAVariable) from its type, or
@@ -4409,7 +4472,16 @@ class TaintEngine:
         at a full-cover writer: ``strcat`` after ``strcpy`` both feed the
         sink, and a may-analysis that drops the earlier one loses an origin.
         A partial store never masks anything either (mirrors
-        ``_load_writers``)."""
+        ``_load_writers``).
+
+        The solve is a function of its arguments alone, and every caller only
+        reads the result, so one backward run solves each question once: the
+        caller ascent re-enters a function from every seed and site, and a
+        content demand asks again at each reader's memory version (IC06)."""
+        solve_key = (ssaf, base_key, mv, base_size, region)
+        solved = self._buffer_writer_solves.get(solve_key)
+        if solved is not None:
+            return solved
         if base_size is not None and base_size <= 0:
             base_size = None
         end = base_size if base_size is not None else _REGION_OPEN
@@ -4750,9 +4822,87 @@ class TaintEngine:
         final = memo.get(int(mv), ((), False))[0]
         unproven = None if truncated else _iv_gaps(final, r_lo, r_hi)
         writers.reverse()
-        return {"writers": writers, "covered": unproven == [], "truncated": truncated,
-                "region": (r_lo, r_hi), "unproven": unproven,
-                "proven_fills": proven_fills}
+        solved = {"writers": writers, "covered": unproven == [], "truncated": truncated,
+                  "region": (r_lo, r_hi), "unproven": unproven,
+                  "proven_fills": proven_fills}
+        self._buffer_writer_solves[solve_key] = solved
+        return solved
+
+    def _store_bytes(self, ssaf: Any, defn: Any, base_key: Any) -> tuple[int, int] | None:
+        """``[k, k + width)`` of local *base_key* a store writer *defn* writes
+        at an offset the walk can name -- the same identity the coverage solve
+        credits (``_store_cover``): a whole-variable ``SET_VAR_ALIASED``, a
+        named field store, an address store whose exact slot or must-offset
+        is ``&base + k``. None for a store whose offset no one can name
+        (``buf[n] = 0``, a phi'd cursor)."""
+        op = op_name(defn)
+        if op == "MLIL_SET_VAR_ALIASED":
+            return (0, _REGION_OPEN)
+        if "STORE" in op:
+            ex = self._mem_access_slot(ssaf, defn, exact=True)
+            k = (ex[1] if ex is not None and ex[0] == base_key
+                 else self._must_offset(ssaf, getattr(defn, "dest", None), base_key))
+        else:
+            slot = self._field_store_slot(ssaf, defn)
+            k = slot[1] if slot is not None and slot[0] == base_key else None
+        try:
+            w = int(getattr(defn, "size", None))
+        except (TypeError, ValueError):
+            return None
+        return (k, k + w) if isinstance(k, int) and w > 0 else None
+
+    def _proven_terminator(self, ssaf: Any, base_key: Any, mv: Any, lo: int, end: int,
+                           base_size: int | None) -> int | None:
+        """The first offset ``t >= lo`` of local *base_key* that holds a NUL on
+        every path to memory version *mv*, else None. A string reader stops
+        at its first NUL, so from *lo* it reads only ``[lo, t]`` -- never the
+        rest of the object's capacity (IC06).
+
+        Only stores of the constant 0 prove a NUL: byte ``t`` is written on
+        every path (the coverage solve over that one byte), and every writer
+        that may write it stores 0 there -- a store at ``t``, or one whose
+        offset no one can name (``buf[n] = 0``, a may-alias store). A
+        ``__builtin_*`` call BN outlined from inline stores, once its LLIL is
+        verified as their run (``proven_fills``), is those stores: their own
+        immediates say which bytes are 0. Any other call that writes the
+        buffer may write any byte with any value, so it defeats the proof; so
+        does a truncated solve. The NUL bounds the demand, it certifies
+        nothing: the bytes up to it are checked like any consumed region."""
+        res = self._local_buffer_writers(ssaf, base_key, mv, base_size=base_size,
+                                         region=(lo, end))
+        if res["truncated"]:
+            return None
+        named: list[tuple[int, int, bool]] = []
+        for w in res["writers"]:
+            if w[0] == "escape":
+                continue                # writes no byte of the buffer
+            if w[0] == "fill" and int(getattr(w[1], "address", 0) or 0) in res["proven_fills"]:
+                run = self._llil_store_run(w[1])
+                k = self._must_offset(ssaf, w[3][0], base_key) if w[3] else None
+                if run is None or k is None:
+                    return None
+                start = min(off for off, _, _ in run)
+                named += [(k + off - start, k + off - start + width,
+                           self._int_const(value) == 0) for off, width, value in run]
+                continue
+            if w[0] not in ("store", "maybe_store"):
+                return None
+            zero = self._int_const(getattr(w[1], "src", None)) == 0
+            ext = self._store_bytes(ssaf, w[1], base_key) if w[0] == "store" else None
+            if ext is None:
+                if not zero:
+                    return None         # may write a non-zero byte anywhere
+                continue
+            named.append((ext[0], ext[1], zero))
+        candidates = sorted({max(k, lo) for k, k_end, zero in named
+                             if zero and max(k, lo) < min(k_end, end)})
+        for t in candidates:
+            if any(k <= t < k_end and not zero for k, k_end, zero in named):
+                continue
+            if self._local_buffer_writers(ssaf, base_key, mv, base_size=base_size,
+                                          region=(t, t + 1))["covered"]:
+                return t
+        return None
 
     def _param_index_of(self, func: Any, v: Any) -> int | None:
         """Index of the function parameter that *v* (an SSAVariable/Variable) is,
@@ -17140,6 +17290,7 @@ class TaintEngine:
     def backward(self, func: Any, sinks: list[dict[str, Any]], *, max_depth: int = 8) -> dict[str, Any]:
         self._bw_leaves: list[dict[str, Any]] = []
         self._bw_assumptions: list[str] = []
+        self._buffer_writer_solves = {}
         # Shared by every seed and recursive ascent in this run. Reference
         # coverage is per function/site, not per demanded formal.
         self._bw_caller_frontiers: dict[int, dict[str, Any]] = {}
@@ -17579,12 +17730,14 @@ class TaintEngine:
         terminal_params: dict[int, Any] = {}
         # Each formal's own origin row (a spill-canonicalised one keeps its
         # `via_spill`), so the slice a formal ends is the formal's, not the
-        # representative's.
+        # representative's. A formal only a content demand reached (`strlen(src)`)
+        # has the content boundary as its row: its bytes, not its value.
         param_origins: dict[int, dict[str, Any]] = {}
-        # The demand delta a consumer placed on each parameter it read through
-        # (None: at an unknown offset), so the caller ascent reads the
-        # caller's object where the callee did (round 1).
-        param_demands: dict[int, int | None] = {}
+        # The demand a consumer placed on each parameter it read through --
+        # ``(expr, delta)``, delta None at an unknown offset; a content demand
+        # stays one -- so the caller ascent reads the caller's object where,
+        # and the way, the callee did (round 1, IC06).
+        param_demands: dict[int, tuple] = {}
         # Def-chain values / loads the engine's step budget (`self.max_depth`)
         # cut on some path, keyed as `visited_vars` / `visited_loads` key them.
         # One some other path walked is no cut; each that stays one is an
@@ -17646,7 +17799,7 @@ class TaintEngine:
             the slice. Inside a may-alias store's value only a formal counts
             (it still ascends); anything else there is evidence. *keep*: the
             origin keeps a slice of its own whatever outranks it (a loop
-            recurrence, IC08)."""
+            recurrence, IC08). Returns *o*."""
             nonlocal origin, origin_rank
             if weak is True:
                 rank = 3
@@ -17654,11 +17807,14 @@ class TaintEngine:
                 rank = int(weak) + 1
             else:
                 rank = 0 if o.get("kind") == "parameter" else 1
-            if may_writers and rank:
-                return
             o["function"] = fn_ref
+            if may_writers and rank:
+                return o
             if rank == 0:
-                param_origins.setdefault(int(o["index"]), o)
+                # The formal's own row; it replaces a content boundary a
+                # content demand left there (the value is consumed too).
+                if param_origins.get(int(o["index"]), {}).get("kind") != "parameter":
+                    param_origins[int(o["index"])] = o
             elif o not in producers:
                 producers.append(o)
             if rank == 1 and o.get("kind") == "call" and o not in returned:
@@ -17668,6 +17824,7 @@ class TaintEngine:
                 origin_rank = rank
             if keep and o not in recurrences:
                 recurrences.append(o)
+            return o
 
         def _set_source_origin(o):
             """A modeled source's return IS the value: it represents the slice
@@ -17764,11 +17921,14 @@ class TaintEngine:
             are the caller's to walk -- both feed the bytes (round 4 P1: the
             walk followed only the index and claimed a complete slice).
             *anchor* is the consumer's demand (``_pointer_region``); without
-            one the whole local is consumed."""
+            one the whole local is consumed. A content demand of a string
+            reader is read up to its proven NUL (``_walk_local_buffer``)."""
             locals_, addrs = self._address_terms(expr)
+            string = isinstance(anchor, _ContentDemand) and anchor.string
             for loc in locals_:
                 _walk_local_buffer(at, loc, d, mv,
-                                   _pointer_region(anchor, loc) if anchor is not None else None)
+                                   _pointer_region(anchor, loc) if anchor is not None else None,
+                                   string=string)
             glob = False
             for addr in addrs:
                 if self._const_ptr_storage(addr) == "writable":
@@ -17795,7 +17955,8 @@ class TaintEngine:
 
             *anchor* is the demand on what the operand points at: by default
             the writer consumes the operand itself as a pointer (``(expr,
-            0)``, a fill's source); a stored value passes its own demand."""
+            0)``, a fill's source); a stored value passes its own demand, and
+            a modeled scalar return its content demand (``_ContentDemand``)."""
             if anchor is _AS_CONSUMER:
                 anchor = (expr, 0)
             reads = expr_reads(expr)
@@ -17994,14 +18155,17 @@ class TaintEngine:
                     "what a read delivered, an append does not initialise what "
                     "precedes it, a formatter can fail)")
 
-        def _walk_local_buffer(defn, local, d, mv, region=None, value_demand=None):
+        def _walk_local_buffer(defn, local, d, mv, region=None, value_demand=None, *,
+                               string=False):
             """Continue the slice through the CONTENTS of *local*, read at
             memory version *mv* by the instruction that consumed its address
             (*defn* is the address-of definition, or the consuming call for a
             folded `popen(&cmd)` seed / a nested `strcpy(&cmd, &other)`).
             *region* is ``(lo, hi, via_pointer)``: the bytes consumed, ``hi``
             None for "to the end of the object"; None is the whole object.
-            *value_demand* is passed to the stored values (``_walk_writers``)."""
+            *value_demand* is passed to the stored values (``_walk_writers``).
+            *string*: the consumer reads a NUL-terminated string from ``lo``,
+            so the region ends at the first NUL stores prove (IC06)."""
             label = var_label(local)
             if mv is None:
                 _buffer_leaf(
@@ -18018,15 +18182,27 @@ class TaintEngine:
             # The demand: where the consumer reads, as the consumer computed it.
             # A start or end outside the object is kept, never clamped (round 2).
             d_lo = region[0] if region is not None else None
-            d_hi = (region[1] if region is not None and region[1] is not None
-                    else (end if d_lo is not None else None))
+            # A string reader stops at its first NUL: from a known offset in
+            # the object it reads up to the first NUL stores of 0 prove on
+            # every path, never the rest of the capacity -- unproven, it may
+            # run to the end (IC06). Like any region, a bound, not a proof.
+            terminator = None
+            if string and d_lo is not None and 0 <= d_lo < end \
+                    and (region is None or region[1] is None):
+                terminator = self._proven_terminator(ssaf, var_key(local), mv, d_lo, end, size)
+            if region is not None and region[1] is not None:
+                d_hi = region[1]
+            elif d_lo is None:
+                d_hi = None
+            else:
+                d_hi = end if terminator is None else terminator + 1
             outside = d_lo is not None and (d_lo < 0 or d_lo >= end
                                             or (d_hi is not None and d_hi > end))
             # The store facts are solved over the demand when it lies in the
             # object, else over the whole object (they are reported, but they
             # prove nothing about bytes outside it or at an unknown offset).
             lo, hi = (d_lo, d_hi) if d_lo is not None and not outside else (0, end)
-            bkey = (var_key(local), int(mv), d_lo, d_hi, value_demand is not None)
+            bkey = (var_key(local), int(mv), d_lo, d_hi, _demand_tag(value_demand), string)
             if bkey in visited_bufs:
                 return
             visited_bufs.add(bkey)
@@ -18039,6 +18215,7 @@ class TaintEngine:
                            and d_hi < _REGION_OPEN else None},
                 "unproven": None if res["unproven"] is None else
                 [[a, b if b < _REGION_OPEN else None] for a, b in res["unproven"]],
+                **({"terminator": terminator} if string else {}),
             }
             if res["truncated"]:
                 _buffer_leaf(
@@ -18083,16 +18260,18 @@ class TaintEngine:
                 # variable recovery, which a name-only rename marks
                 # user-defined, and three review rounds forged a store proof.
                 span = f"[{lo:#x}, {hi:#x})" if hi < _REGION_OPEN else f"[{lo:#x}, end)"
+                nul = (f"the NUL stores put at {terminator:#x} only bounds the string read"
+                       if terminator is not None
+                       else "covered bytes do not establish a NUL terminator")
                 _buffer_leaf(
                     defn, label,
                     f"stores the walk can see write every byte of {span} of local "
                     f"buffer {label} on every path, but a region proof from stores is "
                     f"not certified: it rests on BN's recovery of the object's extent "
-                    f"and of the consumer's offset, and covered bytes do not establish "
-                    f"a NUL terminator, so the slice is NOT complete -- "
-                    f"check by hand that the consumer reads only those bytes and that "
-                    f"{label} is the whole object (`bn il {fn_ref} --view mlil` shows "
-                    f"the stores and the pointer arithmetic)",
+                    f"and of the consumer's offset, and {nul}, so the slice is NOT "
+                    f"complete -- check by hand that the consumer reads only those "
+                    f"bytes and that {label} is the whole object (`bn il {fn_ref} "
+                    f"--view mlil` shows the stores and the pointer arithmetic)",
                     kind=_PROOF_LEAF,
                     stores_cover=[lo, hi if hi < _REGION_OPEN else None], **facts)
                 # The origin stays what the writers established (a stored
@@ -18144,24 +18323,30 @@ class TaintEngine:
                     region={"offset": r_lo,
                             "size": (r_hi - r_lo) if r_hi < _REGION_OPEN else None},
                     unproven=[[a, b if b < _REGION_OPEN else None] for a, b in gaps],
+                    **({"terminator": terminator} if string else {}),
                     **({"calls": list(dict.fromkeys(w[7] for w in calls))} if calls else {}))
                 # Classified like `field_load_unresolved`: the origin names the
                 # stop and the leaf is the one frontier entry, so the frontier
                 # count is not inflated by counting one stop twice.
                 _set_origin({"kind": "address_of_local_unresolved", "buffer": label})
 
-        def _walk_pointer_object(at, root, d, mv, how, *, before):
+        def _walk_pointer_object(at, root, d, mv, how, *, before, content=None):
             """The consumer reads what pointer *root* points to, and no local is
             behind it -- *root* is a call's return (an allocator, an unmodeled
             helper) or a parameter (round 1). Its writers in this function are
             walked like a local's, so a `strcpy(b, host)` and its `host` stay in
             the slice. Nothing proves the bytes: the walk knows neither the
             object's extent nor what it held *before* this function wrote it.
-            Always a ``pointer_object_unresolved`` leaf -- never complete."""
+            Always a ``pointer_object_unresolved`` leaf -- never complete.
+
+            Under a *content* demand (``_ContentDemand``) the value is computed
+            FROM those bytes (`strlen(src)`), so *at* is the call that read
+            them and this boundary, not the pointer, is the value's origin --
+            returned so a formal can carry it (IC06)."""
             label = var_label(root)
-            bkey = (_ssa_root_key(root), mv)
+            bkey = (_ssa_root_key(root), mv, _demand_tag(content))
             if bkey in visited_bufs:
-                return
+                return None
             visited_bufs.add(bkey)
             calls: list = []
             if mv is not None:
@@ -18176,14 +18361,22 @@ class TaintEngine:
             check = _callsites_check(
                 calls, "inspect the code that allocates and fills the object, or seed "
                        "where it is filled")
+            reader = ""
+            if content is not None:
+                reader = (f"; {self._prose_name(self._callee_name(const_target(getattr(at, 'dest', None))))}"
+                          f" computes the value from those bytes")
             _buffer_leaf(
                 at, label,
                 f"the slice reads through {label} into the object it points to ({how}), "
                 f"which is no local of this function: the walk knows neither its extent "
                 f"nor what it held before {before}, and no store it can see proves the "
-                f"bytes read{call_txt}, so the slice is NOT complete -- {check}",
+                f"bytes read{reader}{call_txt}, so the slice is NOT complete -- {check}",
                 kind=_POINTER_LEAF,
                 **({"calls": list(dict.fromkeys(w[7] for w in calls))} if calls else {}))
+            if content is None:
+                return None
+            return _set_origin({"kind": _POINTER_LEAF, "pointer": label,
+                                "address": hex(int(getattr(at, "address", 0) or 0))})
 
         def _arg_locals(params):
             """Every local a call argument is an address into, at any offset."""
@@ -18202,14 +18395,15 @@ class TaintEngine:
             """The demand on what SSA value *v* points to, given the demand
             *anchor* on a value built from it: the anchor's must-offset from
             *v* plus its delta, or an unknown offset (``(None, None)``: the
-            whole object) when that is not one constant. None stays None."""
+            whole object) when that is not one constant. None stays None; a
+            content demand stays one."""
             if anchor is None:
                 return None
             expr, delta = anchor
             if expr is None or delta is None:
-                return (None, None)
+                return _demand_at(anchor, None, None)
             off = self._must_offset(ssaf, expr, _ssa_root_key(v))
-            return (None, None) if off is None else (v, off + delta)
+            return _demand_at(anchor, None, None) if off is None else _demand_at(anchor, v, off + delta)
 
         def _returned_object(defn, v, d, mv, anchor, name, model, *, fresh):
             """The consumer reads what call *defn* returned (``v``). The return
@@ -18223,8 +18417,10 @@ class TaintEngine:
             A return not proven to be an argument (*fresh*: an allocator, an
             unmodeled helper) is a pointer object of its own. Only for a
             consumer that reads through the value (*anchor*) and a value BN
-            types as a pointer (round 1)."""
-            if anchor is None or not _is_pointer_typed(v):
+            types as a pointer (round 1) -- or whatever BN typed it, for a
+            content demand, whose reader dereferences it by its model (IC06)."""
+            content = anchor if isinstance(anchor, _ContentDemand) else None
+            if anchor is None or not (content is not None or _is_pointer_typed(v)):
                 return
             params = self._call_params(defn)
             if model is None:
@@ -18255,7 +18451,7 @@ class TaintEngine:
                                      f"{self._prose_name(name)}")
                 if not locs:
                     for r in expr_reads(p):
-                        walk(r, d + 1, mv, (p, None))
+                        walk(r, d + 1, mv, _demand_at(anchor, p, None))
                 # Default deny (re-dogfood of round 3): the object the call was
                 # handed must end in a disclosed frontier -- a local's leaf, a
                 # `global` leaf, a pointer object's leaf. An object the walk
@@ -18290,8 +18486,9 @@ class TaintEngine:
                         f"is NOT complete -- inspect it with `bn il {fn_ref} --view mlil`",
                         kind=_POINTER_LEAF)
             if fresh:
-                _walk_pointer_object(defn, v, d, mv, f"returned by {self._prose_name(name)}",
-                                     before="it was written here")
+                _walk_pointer_object(content.reader if content is not None else defn, v, d, mv,
+                                     f"returned by {self._prose_name(name)}",
+                                     before="it was written here", content=content)
 
         def _settle_cut_under(table, key, before):
             if cut_events[0] != before:
@@ -18350,9 +18547,11 @@ class TaintEngine:
             (``expr`` None or ``delta`` None: at an unknown offset), or None
             when no consumer reads through the value (a ``var:`` sink, an
             index). It rides along unchanged, like *mv*, so the region is
-            always the consumer's, never the definition's (round 1)."""
+            always the consumer's, never the definition's (round 1). Under a
+            content demand (``_ContentDemand``) the value only locates the
+            bytes a scalar was computed from: it is never itself an origin."""
             key = (var_key(v), getattr(v, "version", None),
-                   None if anchor is None else (str(anchor[0]), anchor[1]))
+                   None if anchor is None else (str(anchor[0]), anchor[1], _demand_tag(anchor)))
             before = cut_events[0]
             try:
                 _walk_value(v, d, mv, anchor, key)
@@ -18403,8 +18602,10 @@ class TaintEngine:
                     via_spill = pidx is not None
                 if pidx is not None:
                     terminal_params[pidx] = v
-                    _set_origin({"kind": "parameter", "index": pidx, "var": var_label(v),
-                                 **({"via_spill": True} if via_spill else {})})
+                    content = anchor if isinstance(anchor, _ContentDemand) else None
+                    if content is None:
+                        _set_origin({"kind": "parameter", "index": pidx, "var": var_label(v),
+                                     **({"via_spill": True} if via_spill else {})})
                     if via_spill:
                         self._bw_assume(
                             f"stack local {var_label(v)} appears to be a spill of param "
@@ -18413,15 +18614,23 @@ class TaintEngine:
                     if anchor is not None:
                         # The ascent reads the caller's object at the same
                         # demand, relative to the argument it passed.
-                        dem = _demand_through(anchor, v)
-                        param_demands[pidx] = None if dem is None else dem[1]
-                        if _is_pointer_typed(v):
+                        param_demands[pidx] = _demand_through(anchor, v)
+                        if content is not None or _is_pointer_typed(v):
                             # A pointer parameter's object is no local here:
                             # its writers in this function are walked, and
-                            # nothing proves its bytes (round 1).
-                            _walk_pointer_object(seed_ins if seed_ins is not None else v, v,
-                                                 d, mv, f"parameter {pidx}",
-                                                 before="this function ran")
+                            # nothing proves its bytes (round 1). A value
+                            # computed from those bytes (`strlen(src)`) is not
+                            # the pointer: the boundary at the call that read
+                            # them is its origin, and the formal's own row,
+                            # while the formal still ascends for what the
+                            # callers' objects hold (IC06).
+                            at = (content.reader if content is not None
+                                  else seed_ins if seed_ins is not None else v)
+                            boundary = _walk_pointer_object(at, v, d, mv, f"parameter {pidx}",
+                                                            before="this function ran",
+                                                            content=content)
+                            if boundary is not None:
+                                param_origins.setdefault(pidx, boundary)
                 else:
                     reg = self._unbound_entry_register(func, v)
                     if reg is not None:
@@ -18485,6 +18694,12 @@ class TaintEngine:
                     states: list[str] = []
                     dem = _demand_through(anchor, v)
                     derives: list[int] = []
+                    # What a `*arg:N -> ret` return IS is the model's to say
+                    # (`returns`, IC06): a SCALAR computed from the bytes the
+                    # argument points at (`strlen`, `atoi`) or a POINTER into
+                    # them (`strchr`) or into storage derived from them.
+                    scalar = (model or {}).get("returns") == "scalar"
+                    string_args = set((model or {}).get("string_args") or [])
                     for fi, pointee in rules:
                         if fi is None or fi >= len(cparams):
                             continue
@@ -18496,19 +18711,38 @@ class TaintEngine:
                         call_step["reason"] = (
                             f"return of {mkey or name} derives from its argument "
                             + ", ".join(str(i) for i in derives))
+                        what = f"argument {fi} of {mkey or name} returned by"
+                        if pointee and scalar:
+                            # The value is computed from the BYTES: they are
+                            # demanded whatever consumes it, read where the
+                            # call read them, from the argument's own offset
+                            # -- to its first proven NUL for a string -- and
+                            # the pointer only locates them. A length that
+                            # followed `src`'s pointer value certified the
+                            # copy by the pointer's origin (IC06), where a
+                            # value read from memory follows the writers of
+                            # the bytes, never the pointer.
+                            states.append(_follow_input(
+                                defn, cparams[fi], d, self._mem_in(defn), var_label(v), what,
+                                _ContentDemand(cparams[fi], 0, defn, fi in string_args)))
+                            continue
                         # `arg:N -> ret` returns the argument itself, so the
-                        # demand carries over; `*arg:N -> ret` returns a
-                        # pointer somewhere into it (strchr), at an unknown
-                        # offset. Without a consumer, the whole object.
+                        # demand carries over; `*arg:N -> ret` of a pointer
+                        # returns a pointer somewhere into the argument's
+                        # object (strchr), at an unknown offset. Consumed as
+                        # a value, either follows the argument value.
                         arg_dem = (None if dem is None
-                                   else (cparams[fi], None if pointee else dem[1]))
-                        states.append(_follow_input(
-                            defn, cparams[fi], d, mv, var_label(v),
-                            f"argument {fi} of {mkey or name} returned by", arg_dem))
+                                   else _demand_at(dem, cparams[fi], None if pointee else dem[1]))
+                        states.append(_follow_input(defn, cparams[fi], d, mv, var_label(v),
+                                                    what, arg_dem))
                     if not states:
-                        _set_origin({"kind": "call", "callee": called_name(mkey, name),
-                                     **self._model_field(called_name(mkey, name)),
-                                     "address": hex(int(defn.address))})
+                        # Under a content demand the bytes of the object the
+                        # call returned are the value's, not the call: the
+                        # object's boundary (`_returned_object`) is its origin.
+                        if not isinstance(anchor, _ContentDemand):
+                            _set_origin({"kind": "call", "callee": called_name(mkey, name),
+                                         **self._model_field(called_name(mkey, name)),
+                                         "address": hex(int(defn.address))})
                         _returned_object(defn, v, d, mv, anchor, name, model, fresh=True)
                         # `k = f(k)` read straight off the call (-O2): the
                         # slice stops at the call, but the argument it was
@@ -18627,7 +18861,7 @@ class TaintEngine:
                 for r in expr_reads(sub):
                     if r in rest:
                         rest.remove(r)
-            demand = None if anchor is None else (None, None)
+            demand = None if anchor is None else _demand_at(anchor, None, None)
             for ld in loads:
                 _follow_load(at, ld, d, demand)
             for ae, local in aliased:
@@ -18684,7 +18918,7 @@ class TaintEngine:
             """Walk the value a writer of loaded bytes stored, once per
             (store, kind, demand); a shallower path, when a budget cut lay
             beneath the first walk, queues a re-walk as `walk` does."""
-            skey = (_ins_key(store), kind, demand is not None)
+            skey = (_ins_key(store), kind, _demand_tag(demand))
             prev = stored_walked_at.get(skey)
             if prev is not None:
                 if d < prev and stored_cut_under.get(skey, True):
@@ -18721,7 +18955,7 @@ class TaintEngine:
             from is walked for evidence but never represents the slice: the
             load's own frontier, which names the object read, does (W02-10)."""
             key = (int(getattr(at, "address", 0) or 0), str(load),
-                   getattr(load, "src_memory", None), demand is not None)
+                   getattr(load, "src_memory", None), _demand_tag(demand))
             before = cut_events[0]
             try:
                 _follow_load_once(at, load, d, demand, key)
@@ -18933,7 +19167,8 @@ class TaintEngine:
             if seed_var.local is not None:
                 _walk_local_buffer(seed_ins, seed_var.local, 0, seed_mv,
                                    _pointer_region(anchor, seed_var.local)
-                                   if anchor is not None else None)
+                                   if anchor is not None else None,
+                                   string=isinstance(anchor, _ContentDemand) and anchor.string)
             else:
                 _global_leaf(seed_ins, seed_var.name, int(seed_var.addr), "the sink argument")
         else:
@@ -19379,7 +19614,7 @@ class TaintEngine:
 
     def _continue_into_callers(self, func, demands, depth, max_depth,
                                visited_funcs, base_steps,
-                               param_demands: dict[int, int | None] | None = None
+                               param_demands: dict[int, tuple] | None = None
                                ) -> tuple[list[dict[str, Any]], set[int]]:
         """Ascend each formal demand of *func* (``{index: origin row}``) into
         every known caller, and account for each caller it did not follow.
@@ -19537,10 +19772,14 @@ class TaintEngine:
                 mark, emark = len(self._bw_cycle_hits), len(self._bw_entries)
                 for sv in seeds:
                     # A parameter the callee read through is read in the
-                    # caller's object at the same delta from the argument.
+                    # caller's object at the same delta from the argument --
+                    # a content demand as one, by this call site (IC06).
                     sub_anchor = None
                     if param_demands and pidx in param_demands:
-                        sub_anchor = (self._seed_anchor(sv, arg), param_demands[pidx])
+                        dem = param_demands[pidx]
+                        expr = self._seed_anchor(sv, arg)
+                        sub_anchor = (dem.moved(expr, dem[1], reader=call_ins)
+                                      if isinstance(dem, _ContentDemand) else (expr, dem[1]))
                     for sub in self._backward_slice(caller, sv, depth + 1, max_depth, visited_funcs,
                                                     seed_ins=call_ins, anchor=sub_anchor):
                         results.append({

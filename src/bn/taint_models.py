@@ -229,7 +229,11 @@ _SINK_ARMING_KEYS = ("class", "tainted_args", "len_arg", "buf_arg", "format_arg"
 # placeholder (`OTHER_ROLES`) used to load as a no-op that still counted as a
 # model. `_comment*` keys are documentation at every level.
 _MODEL_KEYS = frozenset(_MODEL_ROLE_KEYS) | {
-    "string_args", "append", "ret_offset", "reads_dest", "detail"}
+    "string_args", "append", "ret_offset", "reads_dest", "returns", "detail"}
+# `returns` of a model with a `*arg:N -> ret` rule: a scalar computed from the
+# bytes the argument points at, or a pointer into them / storage derived from
+# them (IC06; checked in :func:`_validate_model_interior`).
+RETURN_KINDS = ("scalar", "pointer")
 _NESTED_KEYS = {
     "sink": frozenset({"class", "tainted_args", "len_arg", "buf_arg", "pointer_args",
                        "format_arg", "first_dest", "dest_size_arg", "detail", "gate",
@@ -351,6 +355,26 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
                     _fail(f"`{key}` rule {e!r} needs a string `to` (`ret` / `*arg:N`)")
                 if key == "propagates" and not isinstance(e.get("from"), str):
                     _fail(f"`propagates` rule {e!r} needs a string `from` (`arg:N` / `*arg:N`)")
+    # What a `*arg:N -> ret` return IS decides what a backward slice of it
+    # demands (IC06): a SCALAR computed from the bytes (`strlen`, `atoi`)
+    # demands those bytes whatever consumes it; a POINTER into them or into
+    # storage derived from them (`strchr`, `ctime`) is a pointer value. The
+    # token cannot say which, so the model must: a rule with no `returns` was
+    # read one way for both and changed `strchr`'s demand with `strlen`'s.
+    content_rules = [e for e in model.get("propagates") or []
+                     if e.get("to") == "ret"
+                     and (parse_model_token(e.get("from")) or ("",))[0] == "*arg"]
+    if "returns" in model and model["returns"] not in RETURN_KINDS:
+        _fail(f"`returns` must be one of {', '.join(map(repr, RETURN_KINDS))}, "
+              f"got {model['returns']!r}")
+    if content_rules and "returns" not in model:
+        _fail(f"has the rule {content_rules[0]!r} but no `returns`; say what the return "
+              f"is: \"scalar\" for a value computed from the bytes the argument points "
+              f"at (strlen, atoi), \"pointer\" for a pointer into them or into storage "
+              f"derived from them (strchr, ctime)")
+    if "returns" in model and not content_rules:
+        _fail("declares `returns` without a `*arg:N -> ret` propagate rule for it to "
+              "describe; drop the key")
     if "varargs" in model:
         va = model["varargs"]
         if not isinstance(va, dict):
