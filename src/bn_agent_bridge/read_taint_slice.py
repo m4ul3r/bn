@@ -585,25 +585,99 @@ def _addr_base_offset_label(expr, depth: int = 0) -> tuple[str | None, int | Non
     return None, None
 
 
+# Value-preserving casts a load is commonly wrapped in (`x = zx.q(p->len)`):
+# the definition is still that load, widened or narrowed.
+_LOAD_WRAPPING_CASTS = frozenset({"MLIL_ZX", "MLIL_SX", "MLIL_LOW_PART"})
+
+
 def _load_expr_of(def_insn):
     """The load expression a definition reads from, or None. Handles both MLIL
     forms: a top-level load def, and the common ``x = [addr]`` SET_VAR whose
-    ``.src`` is the load."""
+    ``.src`` is the load -- including one wrapped in a zero/sign-extension or
+    truncation (``x = zx.q(p->len)``)."""
     if "LOAD" in il_format._il_op_name(def_insn):
         return def_insn
     src = getattr(def_insn, "src", None)
-    if src is not None and "LOAD" in il_format._il_op_name(src):
-        return src
+    for _ in range(4):
+        if src is None:
+            return None
+        op = il_format._il_op_name(src)
+        if "LOAD" in op:
+            return src
+        if op not in _LOAD_WRAPPING_CASTS:
+            return None
+        src = getattr(src, "src", None)
     return None
+
+
+def _struct_field_offset(load_expr) -> int:
+    """The member offset a typed field load (``MLIL_LOAD_STRUCT[_SSA]``,
+    ``p->len``) carries on the instruction itself rather than in its address
+    expression; 0 for every other load."""
+    if "LOAD_STRUCT" not in il_format._il_op_name(load_expr):
+        return 0
+    off = getattr(load_expr, "offset", None)
+    return int(off) if isinstance(off, int) and not isinstance(off, bool) else 0
 
 
 def _field_load_meta(load_expr) -> tuple[str | None, int | None, int | None]:
     """(base_label, offset, width) for a load expression, best-effort. Lets a
-    field load (`*(obj + off)`) carry structured metadata in the trace instead of
-    just a `memory_load` reason (#162)."""
+    field load (`*(obj + off)`, `obj->field`) carry structured metadata in the
+    trace instead of just a `memory_load` reason (#162)."""
     width = getattr(load_expr, "size", None)
     base, offset = _addr_base_offset_label(getattr(load_expr, "src", None))
+    if offset is not None:
+        offset += _struct_field_offset(load_expr)
     return base, offset, (int(width) if isinstance(width, int) else None)
+
+
+def _const_address(expr, depth: int = 0) -> int | None:
+    """The absolute address a load address expression folds to -- a constant
+    pointer, optionally plus/minus constants (``[0x404020 + 8]``) -- or None
+    when any part of it is a variable."""
+    if expr is None or depth > 4:
+        return None
+    base = _mlil_const_addr(expr)
+    if base is not None:
+        return base
+    op = il_format._il_op_name(expr)
+    if op in ("MLIL_ADD", "MLIL_SUB"):
+        left = _const_address(getattr(expr, "left", None), depth + 1)
+        right = _const_address(getattr(expr, "right", None), depth + 1)
+        if left is not None and right is not None:
+            return left + right if op == "MLIL_ADD" else left - right
+    return None
+
+
+def _global_load_address(load_expr) -> int | None:
+    """The global a load reads, when its address is a constant: the memory
+    holds whatever every OTHER writer of that global stored, which this use-def
+    walk never follows, so the step is a frontier rather than a dead end."""
+    addr = _const_address(getattr(load_expr, "src", None))
+    if addr is None:
+        return None
+    return addr + _struct_field_offset(load_expr)
+
+
+def _global_symbol_name(bv, addr: int) -> str | None:
+    try:
+        sym = bv.get_symbol_at(addr)
+    except Exception:
+        return None
+    name = getattr(sym, "full_name", None) or getattr(sym, "name", None)
+    return str(name) if name else None
+
+
+def _constant_value(expr) -> str | None:
+    """The literal a constant definition assigns (``x = 0``, ``p = nullptr``,
+    ``f = 1.5``), as text; None for anything that is not a literal."""
+    op = il_format._il_op_name(expr)
+    if not ("CONST" in op or "IMPORT" in op):
+        return None
+    c = getattr(expr, "constant", None)
+    if isinstance(c, bool) or c is None:
+        return None
+    return hex(c) if isinstance(c, int) else str(c)
 
 
 def _is_address_of(expr) -> bool:
@@ -1074,12 +1148,9 @@ def _build_backward_trace(
                 # crosses the call at all, so in both modes name the callee
                 # instead of leaving an "undefined" terminus that reads like
                 # proof of origin.
-                out_callee = _lookup_out_param_callee(out_param_map, ssa_var, ref_addr)
-                if out_callee:
-                    entry["reason"] = ("interprocedural_out_param_not_followed" if interprocedural
-                                        else "out_param_not_followed")
-                    entry["out_param_callee"] = out_callee
-                    entry["out_param_callee_display_name"] = _shown_symbol_name(bv, out_callee)
+                fill = _lookup_out_param_callee(out_param_map, ssa_var, ref_addr)
+                if fill:
+                    _mark_out_param_fill(entry, fill, bv, interprocedural=interprocedural)
             trace.append(entry)
             continue
 
@@ -1142,6 +1213,27 @@ def _build_backward_trace(
 
         load_expr = _load_expr_of(def_insn)
         if load_expr is not None:
+            def_addr = int(getattr(def_insn, "address", 0))
+            # Every load is a frontier for the VALUE: it is whatever the memory
+            # held, and no writer of that memory is followed here. Its address
+            # operands are still walked below (where the struct pointer came
+            # from, a tainted index), so the step terminates the value's
+            # provenance without ending the walk.
+            entry["terminates"] = True
+            global_addr = _global_load_address(load_expr)
+            if global_addr is not None:
+                # A constant address: a global. Name it, so the roll-up and the
+                # xrefs hint can point at its other writers.
+                entry["reason"] = "global_load"
+                entry["global_address"] = hex(global_addr)
+                gname = _global_symbol_name(bv, global_addr)
+                if gname:
+                    entry["global_name"] = gname
+                width = getattr(load_expr, "size", None)
+                if isinstance(width, int):
+                    entry["width"] = width
+                trace.append(entry)
+                continue
             base, offset, width = _field_load_meta(load_expr)
             # A resolvable base+offset means this is a struct/field load, not an
             # opaque pointer deref -- label it `field_load` and carry the
@@ -1157,35 +1249,16 @@ def _build_backward_trace(
             # was passed by-address into a call, the value was likely written
             # by that callee through an OUT-POINTER -- which interprocedural
             # tracing follows only for return values, and intra tracing never
-            # crosses the call at all. Emit an honest boundary reason naming
-            # the callee instead of letting the slice stop silently at a
-            # `field_load`/`memory_load`.
+            # crosses the call at all. Name the callee and the call site
+            # instead of letting the slice stop at a `field_load`/`memory_load`.
             load_local = _address_of_target(getattr(load_expr, "src", None))
-            out_callee = _lookup_out_param_callee(
-                out_param_map, load_local, int(getattr(def_insn, "address", 0)))
-            if out_callee:
-                entry["reason"] = ("interprocedural_out_param_not_followed" if interprocedural
-                                    else "out_param_not_followed")
-                entry["out_param_callee"] = out_callee
-                entry["out_param_callee_display_name"] = _shown_symbol_name(bv, out_callee)
-                # The value's true origin is the callee's write through the
-                # out-pointer; mark the load as a boundary. Index/base
-                # provenance (`*(&local + idx)`) is still walked below, so a
-                # tainted index is not dropped.
-                entry["terminates"] = True
-                trace.append(entry)
-                for rv in _ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
-                    if rv not in visited:
-                        worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
-                continue
-            # Preserve prior per-form walk behavior: a top-level load def
-            # terminated; a `x = [addr]` SET_VAR continued through its base
-            # pointer (so provenance reaches where the struct came from).
-            entry["terminates"] = "LOAD" in def_op
+            fill = _lookup_out_param_callee(out_param_map, load_local, def_addr)
+            if fill:
+                _mark_out_param_fill(entry, fill, bv, interprocedural=interprocedural)
             trace.append(entry)
             for rv in _ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
                 if rv not in visited:
-                    worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
+                    worklist.append((rv, node_depth + 1, def_addr))
             continue
 
         # #1001 item 2: `p = &local` (or `&local + k`) has no SSA reads, so a
@@ -1202,11 +1275,26 @@ def _build_backward_trace(
             entry["reason"] = "address_of_local"
             entry["local"] = str(getattr(taken, "name", None) or taken)
         else:
-            entry["terminates"] = False
-            # Populate `reason` from a controlled vocabulary instead of leaving it
-            # null on ordinary steps: a phi merge is `phi_source`, everything else is
-            # a plain `definition` (#162).
-            entry["reason"] = "phi_source" if "PHI" in def_op else "definition"
+            reads = _ssa_vars_from(getattr(def_insn, "vars_read", []) or [])
+            const = (_constant_value(getattr(def_insn, "src", None))
+                     if "SET_VAR" in def_op else None)
+            if const is not None:
+                # `x = 0`, `p = nullptr`: the value's origin is this literal.
+                entry["terminates"] = True
+                entry["reason"] = "constant"
+                entry["value"] = const
+            elif not reads:
+                # Nothing to walk: an intrinsic result, an undefined value, a
+                # literal BN models as something other than a constant. The
+                # walk stops here, so the roll-up must count it.
+                entry["terminates"] = True
+                entry["reason"] = "no_traced_inputs"
+            else:
+                entry["terminates"] = False
+                # Populate `reason` from a controlled vocabulary instead of leaving it
+                # null on ordinary steps: a phi merge is `phi_source`, everything else is
+                # a plain `definition` (#162).
+                entry["reason"] = "phi_source" if "PHI" in def_op else "definition"
         trace.append(entry)
 
         # Still walk any index/offset operand (`&local + i`): a tainted index
@@ -1226,7 +1314,8 @@ def _build_backward_trace(
 _FRONTIER_EXAMPLE_KEYS = (
     "ssa_label", "address", "depth", "callee", "callee_display_name", "out_param_callee",
     "base", "offset", "width", "function_context", "function_context_display_name",
-    "out_param_callee_display_name", "param_index", "param_register", "local",
+    "out_param_callee_display_name", "out_param_call_site", "param_index", "param_register",
+    "local", "global_address", "global_name", "value",
 )
 _FRONTIER_EXAMPLE_CAP = 3
 
@@ -1278,9 +1367,11 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
             callee = ((step.get("out_param_callee") if mangled else
                        step.get("out_param_callee_display_name") or step.get("out_param_callee"))
                       or "a callee")
+            site = step.get("out_param_call_site")
             assumptions.append(
-                f"value crosses an out-parameter fill by {callee} that this "
-                f"trace did not follow; the true origin may be inside it"
+                f"value crosses an out-parameter fill by {callee}"
+                + (f" at {site}" if site else "")
+                + " that this trace did not follow; the true origin may be inside it"
             )
             break
     if any(isinstance(step, dict) and step.get("ip_depth_exhausted") for step in trace):
@@ -1302,8 +1393,23 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
             "steps (the SSA form does not support the lookup there); the "
             "slice stops at that value without full provenance"
         )
-    locals_taken = [str(step.get("local")) for step in trace
-                    if isinstance(step, dict) and step.get("reason") == "address_of_local"]
+    globals_read: dict[str, str | None] = {}
+    for step in trace:
+        if isinstance(step, dict) and step.get("reason") == "global_load":
+            globals_read.setdefault(str(step.get("global_address")), step.get("global_name"))
+    if globals_read:
+        named = ", ".join(f"{name} ({addr})" if name else addr
+                          for addr, name in globals_read.items())
+        assumptions.append(
+            f"the slice loads from global memory {named}; the stores other code makes "
+            "to it are not followed -- list its writers with "
+            + ", ".join(f"`bn xrefs {addr}`" for addr in globals_read)
+        )
+    # One entry per LOCAL, not per step: a phi of three `&buf[k]` arms is
+    # three steps but one object whose stores go unfollowed.
+    locals_taken = list(dict.fromkeys(
+        str(step.get("local")) for step in trace
+        if isinstance(step, dict) and step.get("reason") == "address_of_local"))
     if locals_taken:
         assumptions.append(
             f"the slice reaches the address of local {locals_taken[0]}"
@@ -1508,17 +1614,32 @@ def _build_out_param_map(ctx, bv, ssa_func) -> dict:
     return result
 
 
-def _lookup_out_param_callee(out_param_map: dict, base_var, before_addr) -> str | None:
-    """Callee that filled *base_var* via an out-pointer at a call PRECEDING
-    *before_addr* (#416), or None. Ordering is load-bearing: a call that takes
-    ``&local`` after the value was read is not its source."""
+def _lookup_out_param_callee(out_param_map: dict, base_var, before_addr) -> tuple[int, str] | None:
+    """``(call_address, callee)`` of the call that filled *base_var* via an
+    out-pointer PRECEDING *before_addr* (#416), or None. Ordering is
+    load-bearing: a call that takes ``&local`` after the value was read is not
+    its source. Of several preceding fills (a struct read field by field) the
+    nearest one is cited -- an earlier one is the likelier to be overwritten."""
     if not out_param_map or base_var is None:
         return None
     key = _var_address_key(getattr(base_var, "var", None) or base_var)
-    for addr, callee in out_param_map.get(key, []):
-        if before_addr is None or addr < before_addr:
-            return callee
-    return None
+    preceding = [(addr, callee) for addr, callee in out_param_map.get(key, [])
+                 if before_addr is None or addr < before_addr]
+    return max(preceding, key=lambda fill: fill[0]) if preceding else None
+
+
+def _mark_out_param_fill(entry: dict[str, Any], fill: tuple[int, str], bv, *,
+                         interprocedural: bool) -> None:
+    """Stamp *entry* as an unfollowed out-parameter fill: the callee, its shown
+    name, and the call site that passed the local's address -- the one place a
+    reader has to look to continue the slice."""
+    call_addr, callee = fill
+    entry["terminates"] = True
+    entry["reason"] = ("interprocedural_out_param_not_followed" if interprocedural
+                       else "out_param_not_followed")
+    entry["out_param_callee"] = callee
+    entry["out_param_callee_display_name"] = _shown_symbol_name(bv, callee)
+    entry["out_param_call_site"] = hex(call_addr)
 
 
 def _find_return_vars(ctx, ssa_func, bv=None, _visited=None) -> list[SSAVariable]:
@@ -1781,30 +1902,44 @@ def _backward_slice(
 
 def _copied_address_of_local(ssa_func, initial_vars: list) -> str | None:
     """The local whose address the traced value IS, through pure SSA copies
-    (``x1 = x8; x8 = &var_68``), or None -- a load, phi, arithmetic on a
-    non-address or a call anywhere on the chain means the value is something
-    else that merely involves the local."""
+    (``x1 = x8; x8 = &var_68``) and phis whose every arm is such a copy of the
+    SAME local (``p#5 = ϕ(p#1, p#2)`` over ``&buf[0]``/``&buf[8]``), or None --
+    a load, a phi over two different locals, arithmetic on a non-address or a
+    call anywhere on the chain means the value is something else that merely
+    involves the local."""
     if len(initial_vars) != 1:
         return None
-    cur = initial_vars[0]
-    for _ in range(8):
-        try:
-            d = ssa_func.get_ssa_var_definition(cur)
-        except Exception:
-            return None
-        if d is None or "SET_VAR" not in il_format._il_op_name(d):
-            return None
+    return _local_whose_address(ssa_func, initial_vars[0], frozenset(), 0)
+
+
+def _local_whose_address(ssa_func, var, path: frozenset, depth: int) -> str | None:
+    if depth > 8 or var in path:
+        return None
+    try:
+        d = ssa_func.get_ssa_var_definition(var)
+    except Exception:
+        return None
+    if d is None:
+        return None
+    op = il_format._il_op_name(d)
+    path = path | {var}
+    if "PHI" in op:
         src = getattr(d, "src", None)
-        taken = _address_of_target(src)
-        if taken is not None:
-            return str(getattr(taken, "name", None) or taken)
-        if il_format._il_op_name(src) != "MLIL_VAR_SSA":
-            return None
-        reads = _ssa_vars_from(getattr(src, "vars_read", []) or [])
-        if len(reads) != 1:
-            return None
-        cur = reads[0]
-    return None
+        arms = _ssa_vars_from(src if isinstance(src, list) else getattr(d, "vars_read", []) or [])
+        names = {_local_whose_address(ssa_func, arm, path, depth + 1) for arm in arms}
+        return names.pop() if len(names) == 1 and None not in names else None
+    if "SET_VAR" not in op:
+        return None
+    src = getattr(d, "src", None)
+    taken = _address_of_target(src)
+    if taken is not None:
+        return str(getattr(taken, "name", None) or taken)
+    if il_format._il_op_name(src) != "MLIL_VAR_SSA":
+        return None
+    reads = _ssa_vars_from(getattr(src, "vars_read", []) or [])
+    if len(reads) != 1:
+        return None
+    return _local_whose_address(ssa_func, reads[0], path, depth + 1)
 
 
 def _address_of_local_hint(arg_index: int, local_name: str, arg_label: dict, func,
