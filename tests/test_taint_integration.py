@@ -1086,7 +1086,13 @@ int main(int argc, char **argv) {
     unkeyed = forward("pump", "--source", "call:recv")
     assert unkeyed["diagnostics"]["safe_to_report_all_clear"] is False
     assert any(lf.get("seed") == "call" for lf in unkeyed["leaves"]), unkeyed["leaves"]
-    assert _run_or_check_template(shared_bn, _forward_prose(unkeyed))[1] >= 1
+    # `c->buf + have` is a loaded buffer plus the integer parameter `have`: no
+    # parameter is the buffer, so no caller is offered as its owner.
+    assert not [lf for lf in unkeyed["leaves"] if lf.get("buffer_param")], unkeyed["leaves"]
+    # The advice either runs as printed (the helper runs each such command and
+    # asserts it succeeds -- a wrapper's caller reseed) or is a marked template
+    # (seed a value read from the buffer); never neither.
+    assert sum(_run_or_check_template(shared_bn, _forward_prose(unkeyed))) >= 1
 
     # Depth 0 stops at sink_len: the advice seeds inside it, filled in.
     stopped = forward("deep", "--source", "call:read", "--max-depth", "0")

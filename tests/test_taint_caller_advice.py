@@ -62,12 +62,17 @@ def _read_wrapper(*, pointer="param", callers=()):
         dest = FExpr("MLIL_LOAD_SSA", "[ctx#0 + 8]", reads=[ctx0],
                      src=FExpr("MLIL_ADD", "ctx#0 + 8", reads=[ctx0], left=_var(ctx0),
                                right=FExpr("MLIL_CONST", "0x8", constant=8)))
+        if pointer == "field_plus_param":
+            # `ctx->buf + want`: a loaded buffer plus an INTEGER parameter --
+            # the parameter is the offset, not the buffer's base.
+            dest = FExpr("MLIL_ADD", "[ctx#0 + 8] + want#0", reads=[ctx0, want0],
+                         left=dest, right=_var(want0))
     instrs = [
         *setup,
         _ext_call(1, 0x1004, "got#1 = read(fd#0, buf, want#0)", READ,
                   [_var(fd0), dest, _var(want0)], reads=[fd0, buf0, want0], writes=[got1]),
     ]
-    params = [ctx, buf, want] if pointer == "field" else [fd, buf, want]
+    params = [ctx, buf, want] if pointer.startswith("field") else [fd, buf, want]
     return FFunc("fill", 0x1000, FSSAFunc(instrs), params=params, caller_sites=callers)
 
 
@@ -127,11 +132,15 @@ def test_wrapper_buffer_with_no_caller_reports_zero_and_no_reseed(models):
     [leaf] = _misanchored(result)
     assert (leaf["buffer_param"], leaf["callers_total"], leaf["caller_seeds"]) == (
         {"function": "fill", "index": 1}, 0, [])
-    assert "arg:fill:" not in result["diagnostics"]["next_action"]
+    # No caller to reseed: the advice falls back to the marked template
+    # (`--source var:VAR`), never to nothing.
+    nxt = result["diagnostics"]["next_action"]
+    assert "arg:fill:" not in nxt and "--source var:VAR" in nxt, nxt
 
 
-def test_buffer_that_is_not_a_parameter_names_no_callers(models):
-    result = _engine(models).forward(_read_wrapper(pointer="field", callers=_sites()),
+@pytest.mark.parametrize("pointer", ["field", "field_plus_param"])
+def test_buffer_that_is_not_a_parameter_names_no_callers(models, pointer):
+    result = _engine(models).forward(_read_wrapper(pointer=pointer, callers=_sites()),
                                      [te.parse_locator("call:read")])
 
     [leaf] = _misanchored(result)
