@@ -30,6 +30,7 @@ import bisect
 import contextlib
 import itertools
 import json
+import math
 import re
 import shlex
 from typing import Any, NamedTuple
@@ -54,7 +55,7 @@ from .taint_il import (  # noqa: F401
     ssa_reads, ssa_writes, expr_reads, function_at, const_target,
     _mlil_ssa, _ssa_instructions, _symbols_by_name, _symbol_by_raw_name,
     extract_dest_address, targets_from_pvs, follow_thunk, ResolvedTarget,
-    resolve_call_target,
+    resolve_call_target, inline_expansion_length,
 )
 from .taint_locators import (  # noqa: F401
     parse_locator, _locator_index, format_locator, var_label_of,
@@ -387,6 +388,46 @@ class _Use(NamedTuple):
     # ruled out from its START alone when its length is unknown; a pointer
     # handed to something that may index either way cannot (BN23/F76).
     forward: bool = False
+
+
+class _Recurrence(NamedTuple):
+    """A phi that carries a value round a loop (:meth:`TaintEngine._phi_recurrence`).
+
+    ``increments``: what one trip adds, or None when not a constant
+    addition or unknown; ``calls``: the calls an update passes the value
+    through (`k = f(k)`); ``exhausted``: the search ran out of budget, so a
+    cycle is not ruled out rather than proven."""
+
+    increments: list[int] | None
+    calls: tuple[str, ...]
+    exhausted: bool
+
+
+class _Allocation(NamedTuple):
+    """The fresh block a call returns (:meth:`TaintEngine._returned_allocator`).
+
+    ``allocator``: the allocator named (several, comma-joined, when a
+    wrapper's returns come from different ones); ``size``: the operands whose
+    product is the requested size, each ``("arg", i)`` -- the call's own
+    argument *i* -- or ``("const", n)``, or None when no single size is
+    recoverable (G5-R4)."""
+
+    allocator: str
+    size: tuple[tuple[str, int], ...] | None
+
+
+class _FillReturn(NamedTuple):
+    """A copy length that is the return of a modeled fill with a
+    ``return_bound`` (:meth:`TaintEngine._fill_return_bound`).
+
+    ``bound``: the constant count argument that bounds a successful return,
+    or None when that argument is not a constant (or was not recovered);
+    ``proven``: whether the copy proves the return a byte count rather than
+    the failure value -1 -- the bound holds only then, and an unproven
+    return is ``return_unchecked`` whatever its bound."""
+
+    bound: int | None
+    proven: bool
 
 
 class _SettleFrame:
@@ -759,6 +800,35 @@ def _sink_signature(finding: dict) -> tuple:
     return (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
 
 
+class _ObjectDeps(NamedTuple):
+    """What a tainted value's object-wide mark rests on, within one walk
+    (V6-01). ``precise``: some chain reaches a field-precise origin.
+    ``params``: the walk's parameter seeds some chain reaches -- a callee walk
+    cannot judge those, its caller decides from the argument it passed.
+    ``barrier``: the first read of an object only an unknown-offset write
+    tainted. Routes are alternatives, so :meth:`merge` lets precision win."""
+
+    precise: bool
+    params: frozenset
+    barrier: dict[str, Any] | None
+
+    def merge(self, other: "_ObjectDeps") -> "_ObjectDeps":
+        if self.precise or other.precise:
+            return _PRECISE_DEPS
+        return _ObjectDeps(False, self.params | other.params, self.barrier or other.barrier)
+
+    def object_taint(self) -> dict[str, Any] | None:
+        """``sink.object_taint`` at the top of the walk, where a parameter seed
+        is the run's own source and so field-precise."""
+        if self.precise or self.params:
+            return None
+        return self.barrier
+
+
+_PRECISE_DEPS = _ObjectDeps(True, frozenset(), None)
+
+
+
 class TaintEngine:
     def __init__(
         self,
@@ -861,6 +931,12 @@ class TaintEngine:
         self._global_keyed_offsets: dict[int, set[int]] = {}
         self._global_write_span: dict[int, int] = {}
         self._global_tainted_ranges: dict[int, list[tuple]] = {}
+        # V6-01: the intervals tainted by writes at an offset the program
+        # states (a subset of `_global_tainted_ranges`), and the first tainted
+        # write at an offset nothing makes constant, per object. A read the
+        # first does not cover is reached only through the second.
+        self._known_offset_ranges: dict[int, list[tuple]] = {}
+        self._unknown_offset_stores: dict[int, int] = {}
         self._global_write_unbounded: set[int] = set()
         self._global_search_truncated: set[int] = set()
         self._touches_global_cache: dict[int, bool] = {}
@@ -1554,68 +1630,80 @@ class TaintEngine:
                 return node
         return None
 
-    def _return_buffer_tainted(self, ssaf: Any, ins: Any, tainted: set) -> bool:
-        """True if a RET returns a POINTER to a tainted buffer -- a callee that
-        fills a heap/stack buffer with tainted bytes and returns it (the strdup /
-        shell_quote idiom). ``read_taint`` only catches a tainted scalar return
-        value; the returned *pointer's* value is the fresh allocation address, not
-        attacker-derived, so the scalar check misses it and the caller sees a clean
-        result -- the buffer's tainted CONTENT is dropped at the call boundary.
-        Recognizing it lets the caller treat the result as tainted, so a later
-        ``%s`` / ``strlen`` / copy of the returned buffer keeps propagating
-        (#319a/#376 interprocedural return-of-tainted-buffer). Relies on the buffer
-        being keyable (stack Variable, global, or heap alloc site)."""
+    def _returned_buffers(self, ssaf: Any, ins: Any, tainted: set) -> list[tuple[tuple, Any]]:
+        """The tainted buffers a RET returns a POINTER to, as ``(node, the
+        expression naming it)`` -- a callee that fills a heap/stack buffer with
+        tainted bytes and returns it (the strdup / shell_quote idiom).
+        ``read_taint`` only catches a tainted scalar return value; the returned
+        *pointer's* value is the fresh allocation address, not attacker-derived,
+        so the scalar check misses it and the caller sees a clean result -- the
+        buffer's tainted CONTENT is dropped at the call boundary. Recognizing it
+        lets the caller treat the result as tainted, so a later ``%s`` /
+        ``strlen`` / copy of the returned buffer keeps propagating (#319a/#376
+        interprocedural return-of-tainted-buffer). Relies on the buffer being
+        keyable (stack Variable, global, or heap alloc site). Each buffer is
+        named because what the caller gets rests on it (V6-01)."""
         srcs = getattr(ins, "src", None)
         if srcs is None:
-            return False
+            return []
         if not isinstance(srcs, (list, tuple)):
             srcs = [srcs]
         seen: set = set()
-        return any(self._expr_buffer_tainted(ssaf, e, tainted, seen, 0)
-                   for e in srcs if e is not None)
+        found: list[tuple[tuple, Any]] = []
+        for e in srcs:
+            if e is not None:
+                self._expr_buffers(ssaf, e, tainted, seen, 0, found)
+        return found
 
-    def _expr_buffer_tainted(self, ssaf: Any, expr: Any, tainted: set, seen: set, depth: int) -> bool:
-        """Whether *expr* (a returned pointer) reaches a tainted buffer. First the
-        convergent/stack/global buffer target; then -- crucially for a RETURN -- OR
-        over a divergent PHI merge. A function may return ``ϕ(buf_A, buf_B)`` where
-        each branch has its own alloc site (e.g. shell_quote's escape vs no-escape
-        path, each its own ecalloc). The convergence-required heap key declines such
-        a merge for STABLE store/read correlation, but for deciding whether the
-        RESULT can carry taint, any reachable tainted buffer suffices -- the
-        conservative, no-false-all-clear direction."""
+    def _expr_buffers(self, ssaf: Any, expr: Any, tainted: set, seen: set, depth: int,
+                      found: list[tuple[tuple, Any]]) -> None:
+        """Add to *found* every tainted buffer *expr* (a returned pointer)
+        reaches. First the convergent/stack/global buffer target; then --
+        crucially for a RETURN -- every arm of a divergent PHI merge. A function
+        may return ``ϕ(buf_A, buf_B)`` where each branch has its own alloc site
+        (e.g. shell_quote's escape vs no-escape path, each its own ecalloc). The
+        convergence-required heap key declines such a merge for STABLE
+        store/read correlation, but for deciding whether the RESULT can carry
+        taint, any reachable tainted buffer suffices -- the conservative,
+        no-false-all-clear direction."""
         if expr is None or depth > 24:
-            return False
-        if self._pointee_tainted(ssaf, expr, tainted) is not None:
-            return True
+            return
+        node = self._pointee_tainted(ssaf, expr, tainted)
+        if node is not None:
+            found.append((node, expr))
+            return
         var = self._as_single_ssa_var(expr)
         if var is None:
             reads = expr_reads(expr)
             var = reads[0] if len(reads) == 1 else None
-        return self._var_buffer_tainted(ssaf, var, tainted, seen, depth + 1)
+        self._var_buffers(ssaf, var, tainted, seen, depth + 1, found)
 
-    def _var_buffer_tainted(self, ssaf: Any, var: Any, tainted: set, seen: set, depth: int) -> bool:
+    def _var_buffers(self, ssaf: Any, var: Any, tainted: set, seen: set, depth: int,
+                     found: list[tuple[tuple, Any]]) -> None:
         if var is None or depth > 24:
-            return False
+            return
         vk = self._ssa_var_key(var)
         if vk in seen:
-            return False
+            return
         seen.add(vk)
         try:
             d = ssaf.get_ssa_var_definition(var)
         except Exception:
             d = None
         if d is None:
-            return False
+            return
         dop = op_name(d)
         if "CALL" in dop:
             key = self._recognized_alloc_key(ssaf, var, d)
-            return key is not None and self._key_tainted(key, tainted)
-        if dop == "MLIL_SET_VAR_SSA":
-            return self._expr_buffer_tainted(ssaf, getattr(d, "src", None), tainted, seen, depth)
-        if "PHI" in dop:
-            return any(self._var_buffer_tainted(ssaf, sv, tainted, seen, depth + 1)
-                       for sv in (getattr(d, "src", None) or []))
-        return False
+            if key is not None and self._key_tainted(key, tainted):
+                node = (key, None) if (key, None) in tainted \
+                    else next(n for n in tainted if n[0] == key)
+                found.append((node, d))
+        elif dop == "MLIL_SET_VAR_SSA":
+            self._expr_buffers(ssaf, getattr(d, "src", None), tainted, seen, depth, found)
+        elif "PHI" in dop:
+            for sv in getattr(d, "src", None) or []:
+                self._var_buffers(ssaf, sv, tainted, seen, depth + 1, found)
 
     def _recognized_alloc_key(self, ssaf: Any, var: Any, d: Any):
         """``("heap", call_addr)`` if call-def *d* defines *var* via a recognized
@@ -2519,6 +2607,142 @@ class TaintEngine:
             return bool(fn(addr))
         except Exception:
             return False
+
+    def _is_unmapped(self, addr: int) -> bool:
+        """Whether BN says no byte of the view lives at *addr* (``0``, ``1``,
+        a small flag passed where a pointer goes). False when the view cannot
+        answer (no ``is_valid_offset``: the unit fakes) -- an unanswered
+        question proves no address is a mere value."""
+        valid = getattr(self.bv, "is_valid_offset", None)
+        if not callable(valid):
+            return False
+        try:
+            return not bool(valid(int(addr)))
+        except Exception:
+            return False
+
+    # The sink class a model gives an allocator's size: the model that marks a
+    # call as handing back a block of its own.
+    _ALLOCATOR_SINK_CLASS = "alloc_size"
+
+    def _returned_allocator(self, call: Any, name: str | None,
+                            model: dict[str, Any] | None) -> _Allocation | None:
+        """The allocator whose fresh block the call *call* returns: *name*
+        itself when its model is an allocator's (``sink.class ==
+        "alloc_size"``: malloc, calloc, g_slice_alloc, ...), else -- for an
+        in-binary callee -- the allocator every one of its exits yields: each
+        return hands back an allocator's result (`rec = g_slice_alloc0(n);
+        rec->x = ..; return rec;`), or the exit IS a tail call to one (an
+        optimised `return malloc(n)`, G5-R2). The size is the model's size
+        operands, mapped through a wrapper to the call's own arguments where
+        the wrapper passes them straight through (G5-R4). None otherwise.
+        Describes a pointer only; never decides completeness."""
+        if name and self._is_allocator_model(model):
+            return _Allocation(name, tuple(("arg", i) for i in self._size_args(model)))
+        fn = function_at(self.bv, const_target(getattr(call, "dest", None)))
+        if fn is not None and self._not_internal_reason(fn) == "thunk":
+            # A pure veneer (`jmp malloc`) forwards every formal in order, so
+            # the allocator it fronts sizes the block by the call's own
+            # arguments (G5-R2).
+            target = self._follow_thunk_cached(fn)
+            tname = (self._callee_name(int(getattr(target, "start", 0)))
+                     if target is not None else None)
+            tmodel = lookup_model(self.models, tname)[1] if tname else None
+            if self._is_allocator_model(tmodel):
+                return _Allocation(tname, tuple(("arg", i) for i in self._size_args(tmodel)))
+            fn = target
+        if fn is None or not self._is_internal(fn):
+            return None
+        ssaf = self._ssa_or_none(fn)
+        if ssaf is None:
+            return None
+        instrs = list(self._instrs(ssaf))
+        allocs: dict[tuple, str] = {}
+        sites: list[tuple[Any, str]] = []
+        tails = 0
+        for ins in instrs:
+            if not self._is_call(ins):
+                continue
+            inner = self._callee_name(self._resolve_direct_target(ins))
+            allocating = bool(inner) and self._is_allocator_model(
+                lookup_model(self.models, inner)[1])
+            if "TAILCALL" in op_name(ins):
+                if not allocating:
+                    return None
+                tails += 1
+                sites.append((ins, inner))
+            elif allocating:
+                sites.append((ins, inner))
+                for w in ssa_writes(ins):
+                    allocs[self._ssa_var_key(w)] = inner
+        rets = [i for i in instrs if op_name(i) in ("MLIL_RET", "MLIL_RET_SSA")]
+        if not rets and not tails:
+            return None
+        if rets and (not allocs or not all(
+                srcs and all(self._value_is_one_of(ssaf, s, set(allocs)) for s in srcs)
+                for srcs in (self._ret_sources(r) for r in rets))):
+            return None
+        names = sorted({inner for _ins, inner in sites})
+        sizes = {self._wrapper_size(fn, ssaf, ins, inner) for ins, inner in sites}
+        return _Allocation(names[0] if len(names) == 1 else ", ".join(names),
+                           sizes.pop() if len(sizes) == 1 else None)
+
+    def _size_args(self, model: dict[str, Any] | None) -> list[int]:
+        """The arguments an allocator model sizes the block by (its
+        ``alloc_size`` sink's ``tainted_args``: `malloc`'s 0, `calloc`'s 0
+        and 1, `realloc`'s 1)."""
+        return [i for i in ((model or {}).get("sink") or {}).get("tainted_args") or []
+                if isinstance(i, int) and not isinstance(i, bool)]
+
+    def _wrapper_size(self, fn: Any, ssaf: Any, call: Any,
+                      name: str) -> tuple[tuple[str, int], ...] | None:
+        """The size operands of the allocator call *call* inside wrapper
+        *fn*, in terms of *fn*'s own arguments (``("arg", i)``) or constants
+        (``("const", n)``); None when one is computed in the body."""
+        params = self._call_params(call)
+        out: list[tuple[str, int]] = []
+        for i in self._size_args(lookup_model(self.models, name)[1]):
+            if i >= len(params):
+                return None
+            const = self._int_const(params[i])
+            pidx = None if const is not None else self._resolve_to_param_index(
+                fn, ssaf, params[i])
+            if const is not None:
+                out.append(("const", int(const)))
+            elif pidx is not None:
+                out.append(("arg", int(pidx)))
+            else:
+                return None
+        return tuple(out) or None
+
+    def _allocation_fields(self, allocation: _Allocation, params: list) -> dict[str, Any]:
+        """A `returned` object's allocator fields at the call whose arguments
+        are *params*: ``allocator``, and the requested size -- ``size`` (bytes)
+        when every size operand is a constant, else ``size_expr`` (the
+        operands' product as BN prints them). No size key when none is
+        recoverable (G5-R4)."""
+        out: dict[str, Any] = {"allocator": allocation.allocator}
+        operands: list[Any] = []
+        for kind, value in allocation.size or ():
+            if kind == "const":
+                operands.append(value)
+                continue
+            if value >= len(params):
+                return out
+            const = self._int_const(params[value])
+            operands.append(int(const) if const is not None else params[value])
+        if not operands:
+            return out
+        if all(isinstance(o, int) for o in operands):
+            out["size"] = math.prod(operands)
+        else:
+            out["size_expr"] = " * ".join(hex(o) if isinstance(o, int) else str(o)
+                                          for o in operands)
+        return out
+
+    def _is_allocator_model(self, model: dict[str, Any] | None) -> bool:
+        sink = (model or {}).get("sink")
+        return isinstance(sink, dict) and sink.get("class") == self._ALLOCATOR_SINK_CLASS
 
     def _const_ptr_storage(self, addr: int) -> str:
         """Storage class of the constant address *addr* a writer operand points
@@ -4680,6 +4904,100 @@ class TaintEngine:
                 return i
         return None
 
+    # SSA variables a recurrence search expands from one phi before it stops
+    # looking; a loop body's update chain is short. Running out is disclosed
+    # (`recurrence_search_budget`), never read as "no cycle".
+    _RECURRENCE_NODES = 64
+
+    def _phi_recurrence(self, ssaf: Any, phi_ins: Any) -> _Recurrence | None:
+        """Whether the phi *phi_ins* the slice walks through carries a value
+        round a loop: some arm reaches the phi's own variable back through
+        the loop body's definitions (`k#2 = phi(k#1, k#4)`, `k#4 = phi(k#2,
+        k#3)`, `k#3 = k#2 + 1`), so a literal arm is where the value STARTS,
+        not what it is (IC08) -- how many trips the loop makes is its
+        CONTROL, which a value slice does not follow.
+
+        ``increments`` are the distinct amounts one trip adds (`[0, 1]` for
+        a conditional `k++`), or None when an update is not a constant
+        addition (`k = k * 2`, `k += n`, `k = f(k)` -- ``calls`` names such
+        a call) or the search ran out. None when no arm cycles back -- a phi
+        of literals is a plain choice -- or when every trip adds exactly 0 (a
+        value the loop only carries IS the literal).
+
+        The search expands each SSA variable once: its state is the
+        variable, so an inner loop's trips do not multiply it. A variable
+        reached again with another accumulated delta makes the increments
+        inexact. When the budget runs out with definitions left unexpanded,
+        the answer is ``exhausted`` -- a recurrence is not ruled out, and the
+        caller treats it as one."""
+        phi = getattr(phi_ins, "dest", None)
+        if phi is None:
+            return None
+        target = (var_key(phi), getattr(phi, "version", None))
+        increments: set[int] = set()
+        calls: list[str] = []
+        cyclic = False
+        exact = True
+        delta_of: dict[tuple, int | None] = {}
+        stack: list[tuple[Any, int | None]] = [
+            (s, 0) for s in (getattr(phi_ins, "src", None) or ())]
+        budget = self._RECURRENCE_NODES
+        while stack:
+            cur, delta = stack.pop()
+            key = (var_key(cur), getattr(cur, "version", None))
+            if key == target:
+                cyclic = True
+                if delta is None:
+                    exact = False
+                else:
+                    increments.add(delta)
+                continue
+            if key in delta_of:
+                if delta_of[key] != delta:
+                    exact = False
+                continue
+            if budget <= 0:
+                return _Recurrence(None, tuple(calls), True)
+            budget -= 1
+            delta_of[key] = delta
+            try:
+                d = ssaf.get_ssa_var_definition(cur)
+            except Exception:
+                d = None
+            if d is None:
+                continue
+            opn = op_name(d)
+            if opn == "MLIL_VAR_PHI":
+                stack.extend((s, delta) for s in (getattr(d, "src", None) or ()))
+                continue
+            if self._is_call(d):
+                name = self._callee_name(const_target(getattr(d, "dest", None)))
+                reads = ssa_reads(d)
+                if reads and name and name not in calls:
+                    calls.append(name)
+                stack.extend((r, None) for r in reads)
+                continue
+            src = getattr(d, "src", None) if opn == "MLIL_SET_VAR_SSA" else None
+            sop = op_name(src)
+            left, right = getattr(src, "left", None), getattr(src, "right", None)
+            step = None
+            if sop in ("MLIL_ADD", "MLIL_SUB") and is_ssa_var(self._as_single_ssa_var(left)) \
+                    and self._int_const(right) is not None:
+                step = int(self._int_const(right)) * (1 if sop == "MLIL_ADD" else -1)
+                nxt = self._as_single_ssa_var(left)
+            elif sop == "MLIL_ADD" and is_ssa_var(self._as_single_ssa_var(right)) \
+                    and self._int_const(left) is not None:
+                step, nxt = int(self._int_const(left)), self._as_single_ssa_var(right)
+            elif sop in _COPY_OPS and self._as_single_ssa_var(src) is not None:
+                step, nxt = 0, self._as_single_ssa_var(src)
+            if step is not None:
+                stack.append((nxt, None if delta is None else delta + step))
+            else:
+                stack.extend((r, None) for r in ssa_reads(d))
+        if not cyclic or (exact and increments == {0}):
+            return None
+        return _Recurrence(sorted(increments) if exact else None, tuple(calls), False)
+
     @staticmethod
     def _whole_field_prev(defn: Any) -> tuple | None:
         """``(var_key, version)`` of the previous version a
@@ -5307,6 +5625,9 @@ class TaintEngine:
         # an all-clear carries the receive-family caveat (#1050 review round 5).
         self._buffer_seeded = False
         self._salvage = {"findings": [], "leaves": []}
+        # IC07: calls of an opt-in sink class this run does not report whose
+        # arming arguments taint reached, keyed by (call, resolved target).
+        self._opt_in_reached: dict[tuple, dict[str, Any]] = {}
 
         try:
             sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
@@ -5357,17 +5678,28 @@ class TaintEngine:
         # sites in `sites[]`.
         sub["leaves"] = coalesce_global_continuations(sub["leaves"])
         # collapse any duplicate sink reports (same callee/site/arg) that distinct
-        # resolved targets or arg-set growth may have produced
-        seen_sink: set[tuple] = set()
-        unique_findings = []
+        # resolved targets or arg-set growth may have produced. The routes are
+        # alternatives to one reported flow, so their object dependencies merge:
+        # a field-precise route clears the object-wide mark whichever came
+        # first (G2c).
+        kept: dict[tuple, dict[str, Any]] = {}
         for f in sub["findings"]:
             sig = _sink_signature(f)
-            if sig in seen_sink:
+            if sig in kept:
+                first = kept[sig]
+                first["_object_deps"] = (first.get("_object_deps") or _PRECISE_DEPS).merge(
+                    f.get("_object_deps") or _PRECISE_DEPS)
                 continue
-            seen_sink.add(sig)
-            unique_findings.append(f)
+            kept[sig] = f
+        unique_findings = list(kept.values())
         sources_echo = [self._describe_locator(s) for s in sources]
         for f in unique_findings:
+            # V6-01: at the top a parameter seed is the run's own source, so
+            # only a flow every route of which stops at an unknown-offset
+            # object is marked.
+            object_taint = (f.pop("_object_deps", None) or _PRECISE_DEPS).object_taint()
+            if object_taint:
+                f["sink"] = {**f["sink"], "object_taint": object_taint}
             # #615 review F1 + "New": an unconditional finding (tainted_arg_index
             # is None) never traced from the run's declared --source -- and
             # neither does a DOWNSTREAM finding whose flow roots at a node the
@@ -5419,6 +5751,9 @@ class TaintEngine:
                 "max_iters": int(self.max_iters),
                 "unknown_call": str(self.unknown_call_policy),
             },
+            # IC07: what the run's scope left out, beside what it reported.
+            "opt_in_sinks_reached": sorted(self._opt_in_reached.values(),
+                                           key=lambda r: (int(r["address"], 16), r["callee"])),
             "soundness": SOUNDNESS,
         }
         # #559: a modeled source that reaches no sink returns an otherwise-empty
@@ -5467,6 +5802,7 @@ class TaintEngine:
             truncation_cause=sorted(getattr(self, "_truncation_causes", set())),
             analysis_incomplete=bool(getattr(self, "_analysis_incomplete", ())),
             buffer_seed=bool(getattr(self, "_buffer_seeded", False)),
+            opt_in_reached=list(self._opt_in_reached.values()),
             function=hex(int(func.start)))
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
@@ -5512,6 +5848,7 @@ class TaintEngine:
         truncation_causes: set[str] = set()
         per_source_diag: dict[str, dict[str, Any]] = {}
         incomplete_funcs: set[str] = set()
+        opt_in: dict[tuple, dict[str, Any]] = {}
 
         for addr in callsite_addrs:
             res = self._forward_run(func, sources, max_depth=max_depth, only_callsite_addr=addr)
@@ -5545,20 +5882,25 @@ class TaintEngine:
             truncation_causes |= set(res["stats"].get("truncation_cause") or [])
             incomplete_funcs |= set(
                 res["stats"].get("analysis_incomplete_functions") or [])
+            for row in res["opt_in_sinks_reached"]:
+                have = opt_in.setdefault((row["address"], row["callee"]), {**row})
+                have["tainted_args"] = sorted(set(have["tainted_args"]) | set(row["tainted_args"]))
 
         # Union the per-callsite results back into the historical top-level shape.
         # Stats follow the pinned rule: max_depth = max across runs; functions_visited
         # = size of the union (a function reached from two callsites counts once);
         # sinks = count of the deduped union; truncated = any run truncated.
-        seen_sink: set[tuple] = set()
-        findings: list[dict[str, Any]] = []
+        kept: dict[tuple, dict[str, Any]] = {}
         for f in union_findings:
             s = f.get("sink", {})
             sig = (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
-            if sig in seen_sink:
-                continue
-            seen_sink.add(sig)
-            findings.append(f)
+            if sig not in kept:
+                kept[sig] = f
+            elif "object_taint" in kept[sig]["sink"] and "object_taint" not in s:
+                # Another callsite's run reached the sink field-precisely (G2c).
+                first = kept[sig]
+                first["sink"] = {k: v for k, v in first["sink"].items() if k != "object_taint"}
+        findings: list[dict[str, Any]] = list(kept.values())
         leaves: list[dict[str, Any]] = []
         for lf in union_leaves:
             _add_leaf(leaves, lf)
@@ -5601,6 +5943,8 @@ class TaintEngine:
                 "max_iters": int(self.max_iters),
                 "unknown_call": str(self.unknown_call_policy),
             },
+            "opt_in_sinks_reached": sorted(opt_in.values(),
+                                           key=lambda r: (int(r["address"], 16), r["callee"])),
             "soundness": SOUNDNESS,
         }
         # #559/F2: attach a zero-sink frontier diagnostic when the whole
@@ -5638,6 +5982,10 @@ class TaintEngine:
                 "leaves": leaves,
                 "assumptions": assumptions,
                 "stats": {"truncated": truncated},
+                # What any per-callsite run carried out of the function.
+                "reached_return": any((d.get("exits") or {}).get("return") for d in _diags),
+                "out_params": {i for d in _diags
+                               for i in (d.get("exits") or {}).get("out_params") or ()},
             }
             out["diagnostics"] = forward_zero_diagnostics(
                 union_sub,
@@ -5645,6 +5993,7 @@ class TaintEngine:
                 truncated=truncated, truncation_cause=sorted(truncation_causes),
                 analysis_incomplete=bool(incomplete_funcs),
                 buffer_seed=bool(getattr(self, "_buffer_seeded", False)),
+                opt_in_reached=out["opt_in_sinks_reached"],
                 function=hex(int(func.start)))
             out["diagnostics"]["last_use_by_source"] = {
                 a: d.get("last_use") for a, d in per_source_diag.items()
@@ -6529,6 +6878,14 @@ class TaintEngine:
                                       "__builtin_memcpy", "memcpy_chk", "memmove_chk",
                                       "mempcpy_chk"})
 
+    # V7-01: a copy length that is a modeled fill's return the copy never
+    # proves a count -- its failure value -1 is SIZE_MAX at the copy.
+    _RETURN_UNCHECKED = {"return_unchecked": True}
+    _RETURN_UNCHECKED_DETAIL = (
+        "; the length is the return of a modeled receive/fill that nothing on the "
+        "path checks: its failure value -1 is SIZE_MAX here, so the count argument "
+        "does not bound the copy")
+
     def _source_side_verdict(self, ssaf: Any, params: list[Any], length_idx: int,
                              mkey: str | None, model: dict[str, Any],
                              eff_sink: dict[str, Any]) -> dict[str, Any]:
@@ -6568,13 +6925,23 @@ class TaintEngine:
                     "detail": eff_sink["detail"] + f"; the length is the return value of the "
                     f"{_fill_callee}() at {hex(_fill_at)} that filled the copy source "
                     f"(arg{srcs[0]}), so the copy reads back only bytes that call wrote"}
+        # V7-01: a fill's return no branch or value set proves a count bounds
+        # nothing; the verdict below says so, whatever it is.
+        found = self._fill_return_bound(ssaf, len_expr)
+
+        def tagged(verdict: dict[str, Any]) -> dict[str, Any]:
+            if found is None or found.proven:
+                return verdict
+            return {**verdict, **self._RETURN_UNCHECKED,
+                    "detail": verdict["detail"] + self._RETURN_UNCHECKED_DETAIL}
+
         unchecked = {**eff_sink, "src_capacity": None,
                      "relabel": eff_sink["relabel"] + "; source capacity not checked",
                      "detail": eff_sink["detail"] + f"; the copy source (arg{srcs[0]}) could not "
                      "be sized against the length, so an over-read of it is NOT ruled out -- "
                      "check that it holds at least the copied length"}
         if cap is None:
-            return unchecked
+            return tagged(unchecked)
         size, where, alloc_size = cap
         bound = self._length_upper_bound(ssaf, len_expr)
         fits = ((alloc_size is not None and self._same_ssa_value(ssaf, alloc_size, len_expr))
@@ -6589,13 +6956,13 @@ class TaintEngine:
         # length with no upper bound at all. An allocation of some other unknown
         # size could be large enough, so it stays unchecked.
         if size is None and (alloc_size is not None or bound is not None):
-            return {**unchecked, "src_capacity_source": where}
-        return {**eff_sink, "class": "overread_len", "src_capacity": size,
-                "src_capacity_source": where,
-                "relabel": eff_sink["relabel"] + f"; source is {where}, not provably >= length",
-                "detail": eff_sink["detail"] + f"; BUT the copy source (arg{srcs[0]}) is {where} "
-                "and the attacker-derived length is not provably within it -- an over-read of "
-                "the source"}
+            return tagged({**unchecked, "src_capacity_source": where})
+        return tagged({**eff_sink, "class": "overread_len", "src_capacity": size,
+                       "src_capacity_source": where,
+                       "relabel": eff_sink["relabel"] + f"; source is {where}, not provably >= length",
+                       "detail": eff_sink["detail"] + f"; BUT the copy source (arg{srcs[0]}) is "
+                       f"{where} and the attacker-derived length is not provably within it -- an "
+                       "over-read of the source"})
 
     def _fill_return_of_source(self, ssaf: Any, len_expr: Any,
                                src_expr: Any) -> tuple[str, int] | None:
@@ -6608,9 +6975,8 @@ class TaintEngine:
         ``*arg:N`` source. The length may reach the return through copies and
         width extensions only -- any arithmetic on it stops the proof. The
         return bound holds only when the fill SUCCEEDED: a failure returns -1,
-        which a sign extension turns into SIZE_MAX, so the length must be
-        proven non-negative in the return's own width where the copy uses it
-        (:meth:`_proven_non_negative`). The source must be the very pointer
+        which a sign extension turns into SIZE_MAX, so the copy must prove the
+        return a count (:meth:`_fill_count_proven`). The source must be the very pointer
         the fill was given: the same SSA value, or the same object at the
         same offset (equal buffer key AND equal capacity description, which
         carries the offset)."""
@@ -6628,7 +6994,7 @@ class TaintEngine:
         mkey, model = lookup_model(self.models, callee)
         if not model or not model.get("return_bound"):
             return None
-        if not self._proven_non_negative(len_expr, getattr(chain[-1], "size", None)):
+        if not self._fill_count_proven(ssaf, len_expr, getattr(chain[-1], "size", None), d):
             return None
         buf_idx = (model.get("sink") or {}).get("buf_arg")
         if buf_idx is None:
@@ -6717,6 +7083,27 @@ class TaintEngine:
                 return None
             cur, at = getattr(d, "src", None), getattr(d, "address", None)
         return None
+
+    def _expansion_verdict(self, ssaf: Any, call: Any, params: list[Any], length_idx: int,
+                           model: dict[str, Any]) -> dict[str, Any] | None:
+        """:func:`taint_il.inline_expansion_length` of the call's length, with a
+        ``masked_value`` length checked against the destination it writes:
+        ``destination_fit`` is ``fits``/``exceeds`` when the destination is a
+        fixed-size object (``destination_capacity`` its bytes), else
+        ``unproved``. An ``alignment_split`` length needs no capacity."""
+        verdict = inline_expansion_length(ssaf, call, length_idx, self._ssa_def)
+        if verdict is None or verdict["length_kind"] == "alignment_split":
+            return verdict
+        roles = _model_copy_roles(model)
+        dest_idx = roles[1] if roles else 0
+        cap = (self._buffer_capacity(ssaf, params[dest_idx]) if dest_idx < len(params)
+               else None)
+        size = cap[0] if cap else None
+        if size is None:
+            return {**verdict, "destination_fit": "unproved"}
+        return {**verdict, "destination_capacity": size,
+                "destination_fit": "fits" if int(verdict["length_bound"], 16) <= size
+                else "exceeds"}
 
     def _buffer_capacity(self, ssaf: Any, expr: Any,
                          depth: int = 0) -> tuple[int | None, str, Any] | None:
@@ -7011,17 +7398,27 @@ class TaintEngine:
         return None
 
     def _syscall_bound_for_length(self, ssaf: Any, length_expr: Any) -> int | None:
-        """If the copy length is the return value of a modeled receive call whose
-        bounding count argument is a constant, return that constant max, else
-        None. Recognizes e.g. ``n = read(fd, buf, 0x1000); memcpy(dst, buf, n)``
-        -- the length is attacker-derived but provably ``<= 0x1000``, so it is a
-        bounded copy, not an unbounded overflow (#159). Mirrors
-        ``_alloc_size_expr``'s def-chain walk."""
-        var = length_expr if is_ssa_var(length_expr) else None
+        """The constant count a modeled receive's return is bounded by, when
+        the copy length IS that return AND the copy proves it a byte count
+        (:meth:`_fill_return_bound`); else None. ``n = read(fd, buf, 0x1000);
+        if (n <= 0) return; memcpy(dst, buf, n)`` is attacker-derived but
+        provably ``<= 0x1000`` (#159); without the check the failure return is
+        -1, which the copy reads as SIZE_MAX (V7-01)."""
+        found = self._fill_return_bound(ssaf, length_expr)
+        return found.bound if found is not None and found.proven else None
+
+    def _fill_return_bound(self, ssaf: Any, length_expr: Any) -> _FillReturn | None:
+        """The :class:`_FillReturn` when the copy length is -- through copies
+        and width extensions -- the return of a modeled fill with a
+        ``return_bound``; None when it is not. Recognising the fill and proving
+        its return a count (:meth:`_fill_count_proven`) do not depend on the
+        count argument being a constant: `recv(fd, buf, cap, 0)` copied
+        unchecked is ``return_unchecked`` with no constant to bound it."""
+        chain = self._def_chain(ssaf, length_expr)
+        var = self._as_single_ssa_var(chain[-1]) if chain else None
         if var is None:
             reads = expr_reads(length_expr)
-            if len(reads) == 1:
-                var = reads[0]
+            var = reads[0] if len(reads) == 1 else None
         if var is None:
             return None
         var = self._canonical_ssa_var(ssaf, var)
@@ -7038,9 +7435,128 @@ class TaintEngine:
         if bidx is None:
             return None
         aparams = self._call_params(d)
-        if bidx >= len(aparams):
+        bound = self._const_value(aparams[bidx]) if bidx < len(aparams) else None
+        width = getattr(chain[-1], "size", None) if chain else None
+        return _FillReturn(bound, self._fill_count_proven(ssaf, length_expr, width, d))
+
+    def _fill_count_proven(self, ssaf: Any, len_expr: Any, width: Any, fill: Any) -> bool:
+        """Whether the copy proves the fill's return *len_expr* is the count it
+        wrote and not its failure value -1 (SIZE_MAX once a copy reads it):
+        BN's value set for it is non-negative in the return's own *width*
+        (:meth:`_proven_non_negative`, which a dominating ``n <= 0`` guard
+        narrows), or a branch on the return that excludes -1 dominates the
+        copy -- ``if (n == -1) return;`` leaves BN's set unnarrowed, yet a
+        fill returns -1 or a count, so it is proof all the same."""
+        return (self._proven_non_negative(len_expr, width)
+                or self._failure_excluded(ssaf, fill, len_expr))
+
+    # A comparison of the fill's return against a constant, by the value -1
+    # (the failure return) makes it take: the branch it does NOT take is
+    # the one on which the return is a count. Each test reads both operands
+    # as the comparison does -- signed, unsigned, or as bit patterns.
+    _FAILURE_TESTS: dict[str, tuple[str, Any]] = {
+        "MLIL_CMP_E": ("bits", lambda v, c: v == c), "MLIL_CMP_NE": ("bits", lambda v, c: v != c),
+        "MLIL_CMP_SLT": ("signed", lambda v, c: v < c), "MLIL_CMP_SLE": ("signed", lambda v, c: v <= c),
+        "MLIL_CMP_SGT": ("signed", lambda v, c: v > c), "MLIL_CMP_SGE": ("signed", lambda v, c: v >= c),
+        "MLIL_CMP_ULT": ("bits", lambda v, c: v < c), "MLIL_CMP_ULE": ("bits", lambda v, c: v <= c),
+        "MLIL_CMP_UGT": ("bits", lambda v, c: v > c), "MLIL_CMP_UGE": ("bits", lambda v, c: v >= c),
+    }
+
+    def _failure_operand(self, ssaf: Any, expr: Any) -> tuple[Any, int, int] | None:
+        """``(var, bits, width)`` for a comparison operand *expr* computed from
+        one SSA variable *var*: the bit pattern *expr* holds, in its width in
+        bytes, when *var* is the failure return -1. Read through copies and
+        width extensions (:meth:`_def_chain`) -- a sign extension carries the
+        all-ones pattern into the wider width, a zero extension does not, so
+        `(size_t)(unsigned)n` of -1 is 0xffffffff and `(size_t)n` is SIZE_MAX
+        -- and through a mask by a constant: AArch64 tests `n < 0` as
+        `(n & 1 << 63) != 0`. None when a width is unknown or the operand is
+        any other computation."""
+        if op_name(expr) == "MLIL_AND":
+            left, right = getattr(expr, "left", None), getattr(expr, "right", None)
+            mask, inner = self._int_const(right), left
+            if mask is None:
+                mask, inner = self._int_const(left), right
+            if mask is None:
+                return None
+            outer = getattr(expr, "size", None)
+            if not isinstance(outer, int) or outer <= 0:
+                return None
+            found = self._failure_operand(ssaf, inner)
+            if found is None:
+                return None
+            var, bits, _ = found
+            return var, bits & mask & ((1 << (8 * outer)) - 1), outer
+        chain = self._def_chain(ssaf, expr)
+        var = self._as_single_ssa_var(chain[-1]) if chain else None
+        widths = [getattr(e, "size", None) for e in chain]
+        if var is None or not all(isinstance(w, int) and w > 0 for w in widths):
             return None
-        return self._const_value(aparams[bidx])
+        width = widths[-1]
+        bits = (1 << (8 * width)) - 1
+        for e, outer in zip(reversed(chain[:-1]), reversed(widths[:-1])):
+            if op_name(e) == "MLIL_SX" and bits >> (8 * width - 1) & 1:
+                bits |= ((1 << (8 * outer)) - 1) ^ ((1 << (8 * width)) - 1)
+            bits &= (1 << (8 * outer)) - 1
+            width = outer
+        return var, bits, width
+
+    def _failure_excluded(self, ssaf: Any, fill: Any, len_expr: Any) -> bool:
+        """Whether a test of the fill's return against a constant guards the
+        copy reading *len_expr* on its count side: the branch the failure
+        value -1 does not take leads to a block entered only over that
+        branch edge, and no path from the fill reaches the copy without
+        entering that block. The copy may BE the block's first instruction
+        (`if (n < 0) goto err; memcpy(..)`): reaching it at all is passage
+        over the edge. False whenever the IL exposes no blocks to prove it
+        with."""
+        returned = {(var_key(w), getattr(w, "version", None)) for w in ssa_writes(fill)}
+        if not returned:
+            return False
+        copy_idx = getattr(len_expr, "instr_index", None)
+        instrs = self._instrs(ssaf)
+        copy = next((i for i in instrs if getattr(i, "instr_index", None) == copy_idx), None)
+        if copy is None:
+            return False
+        names = set(returned)
+        for ins in instrs:
+            # Copies and width extensions of the return name it too.
+            if op_name(ins) == "MLIL_SET_VAR_SSA":
+                src = self._def_chain(ssaf, getattr(ins, "src", None))
+                last = self._as_single_ssa_var(src[-1]) if src else None
+                if last is not None and (var_key(last), getattr(last, "version", None)) in names:
+                    names.update((var_key(w), getattr(w, "version", None)) for w in ssa_writes(ins))
+        for ins in instrs:
+            if op_name(ins) != "MLIL_IF":
+                continue
+            cond = getattr(ins, "condition", None)
+            how, test = self._FAILURE_TESTS.get(op_name(cond), (None, None))
+            if test is None:
+                continue
+            found = self._failure_operand(ssaf, getattr(cond, "left", None))
+            const = self._int_const(getattr(cond, "right", None))
+            if found is None or const is None \
+                    or (var_key(found[0]), getattr(found[0], "version", None)) not in names:
+                continue
+            _, bits, width = found
+            mask = (1 << (8 * width)) - 1
+            v, c = bits, const & mask
+            if how == "signed":
+                sign = 1 << (8 * width - 1)
+                v, c = (v ^ sign) - sign, (c ^ sign) - sign
+            taken, other = ("false", "true") if test(v, c) else ("true", "false")
+            target = getattr(ins, taken, None)
+            if target is None or target == getattr(ins, other, None):
+                continue
+            entry = next((i for i in instrs if getattr(i, "instr_index", None) == target), None)
+            block = getattr(entry, "il_basic_block", None)
+            edges = list(getattr(block, "incoming_edges", None) or [])
+            if entry is None or len(edges) != 1 \
+                    or getattr(edges[0], "source", None) != getattr(ins, "il_basic_block", None):
+                continue
+            if entry is copy or self._reaches_avoiding(fill, copy, [entry]) is False:
+                return True
+        return False
 
     def _local_definition_for(self, name: str | None) -> Any | None:
         """An in-binary DEFINED function with this name, or None.
@@ -7554,6 +8070,9 @@ class TaintEngine:
             # by the caller's --source once it crossed this boundary.
             if f.get("_unconditional_flow"):
                 rebuilt["_unconditional_flow"] = True
+            # V6-01: in the CALLEE's terms; the caller merge translates it.
+            if f.get("_object_deps") is not None:
+                rebuilt["_object_deps"] = f["_object_deps"]
             out["findings"].append(rebuilt)
         out["leaves"] = list(sub["leaves"])
         # Disclose a PARTIAL arg drop: taint descended with the in-range args, but
@@ -7573,6 +8092,8 @@ class TaintEngine:
                 f"-- investigate"))
         out["assumptions"] = list(sub["assumptions"])
         out["reached_return"] = sub["reached_return"]
+        # V6-01: what the callee's return rests on, in its own terms.
+        out["return_object_deps"] = sub.get("return_object_deps")
         out["out_params"] = sub.get("out_params", frozenset())
         out["out_param_elems"] = sub.get("out_param_elems", frozenset())
         # A global the callee wrote is an effect on the program, not on its
@@ -8466,10 +8987,8 @@ class TaintEngine:
             # WHICH bytes this store reached, reported beside the object --
             # the same field a modeled copy into an interior address fills.
             self._global_keyed_offsets.setdefault(ga, set()).add(offset)
-        ranges = self._global_tainted_ranges.setdefault(ga, [])
         interval = (offset, offset + size) if size > 0 else (offset, None)
-        if interval not in ranges:
-            ranges.append(interval)
+        self._note_known_offset_range(ga, interval, int(getattr(ins, "address", 0)))
         if size <= 0:
             if ga not in self._global_write_unbounded:
                 self._global_write_unbounded.add(ga)
@@ -8479,18 +8998,111 @@ class TaintEngine:
             self._global_write_span[ga] = offset + size
             self._invalidate_object(ga)
 
-    def _note_indexed_write(self, ga: int) -> None:
+    def _note_known_offset_range(self, ga: int, interval: tuple, at: int) -> None:
+        """Record bytes of the object at *ga* that the tainted write at *at*
+        reached at an offset the program states. A read of those bytes is as
+        certain as what that write stored (V6-01)."""
+        ranges = self._global_tainted_ranges.setdefault(ga, [])
+        if interval not in ranges:
+            ranges.append(interval)
+        known = self._known_offset_ranges.setdefault(ga, [])
+        if (*interval, at) not in known:
+            known.append((*interval, at))
+
+    def _note_indexed_write(self, ga: int, at: int) -> None:
         """Record a tainted write at an index nothing makes constant into the
-        object at *ga* (:meth:`_indexed_global`): it may have reached any of
-        its bytes, so the interval runs from the base with no end -- an
-        interval at the one place it COULD have landed would let a reader
-        elsewhere in the object be proven disjoint, the clearing direction."""
+        object at *ga* (:meth:`_indexed_global`), made by the instruction at
+        *at*: it may have reached any of its bytes, so the interval runs from
+        the base with no end -- an interval at the one place it COULD have
+        landed would let a reader elsewhere in the object be proven disjoint,
+        the clearing direction. It is kept apart from the known-offset
+        intervals, so a read it alone reaches is reported as object-wide."""
         ranges = self._global_tainted_ranges.setdefault(ga, [])
         if (0, None) not in ranges:
             ranges.append((0, None))
+        self._unknown_offset_stores.setdefault(ga, at)
         if ga not in self._global_write_unbounded:
             self._global_write_unbounded.add(ga)
             self._invalidate_object(ga)
+
+    def _object_deps(self, nodes: list[tuple], why: dict, consumer: Any) -> _ObjectDeps:
+        """What the value *consumer* computes from *nodes* rests on (V6-01).
+
+        Walks the provenance graph `taint_node` records. A tainted global is
+        read at the offset its consumer names (:meth:`_global_use_offset`).
+        A write at a stated offset that covers the read is followed: the bytes
+        it wrote are only as certain as its own inputs (G2c -- a copy of an
+        object-wide field into another global stays object-wide). A read only
+        a write at an unknown offset covers is a barrier. A value a descended
+        callee returned carries that callee's verdict in its caller's terms
+        (`why[node]["object_deps"]`). A parameter seed is recorded for the
+        caller to judge; any other node with no parents is field-precise."""
+        stack = [(node, consumer) for node in reversed(nodes)]
+        seen: set = set()
+        params: set[int] = set()
+        barrier: dict[str, Any] | None = None
+        while stack:
+            node, used_by = stack.pop()
+            if node is None:
+                continue
+            entry = why.get(node) or {}
+            key = node[0]
+            if type(key) is tuple and len(key) == 2 and key[0] == "global":
+                ga = int(key[1])
+                offset = self._global_use_offset(used_by, ga)
+                if (node, offset) in seen:
+                    continue
+                seen.add((node, offset))
+                covering = sorted({at for lo, hi, at in self._known_offset_ranges.get(ga) or ()
+                                   if lo <= offset and (hi is None or offset < hi)})
+                if covering:
+                    writes = entry.get("writes") or {}
+                    chains = [writes[at] for at in covering if at in writes]
+                    if not chains or any(not parents for _ins, parents in chains):
+                        # Written by another walk (that walk judged its own
+                        # inputs) or by a write with no tracked input.
+                        return _PRECISE_DEPS
+                    for write_ins, parents in chains:
+                        stack.extend((parent, write_ins) for parent in reversed(parents))
+                    continue
+                store = self._unknown_offset_stores.get(ga)
+                if store is None:
+                    return _PRECISE_DEPS
+                barrier = barrier or {"kind": "unknown_offset", "object": hex(ga),
+                                      "store": hex(store), "field_read": int(offset)}
+                continue
+            if node in seen:
+                continue
+            seen.add(node)
+            returned = entry.get("object_deps")
+            if returned is not None:
+                if returned.precise:
+                    return _PRECISE_DEPS
+                params |= returned.params
+                barrier = barrier or returned.barrier
+                continue
+            if entry.get("param_index") is not None:
+                params.add(int(entry["param_index"]))
+                continue
+            parents = entry.get("parents") or []
+            if not parents:
+                return _PRECISE_DEPS
+            stack.extend((parent, entry.get("instr")) for parent in reversed(parents))
+        return _ObjectDeps(False, frozenset(params), barrier)
+
+    def _caller_deps(self, deps: _ObjectDeps | None, tainted_args: dict, why: dict,
+                     params: list) -> _ObjectDeps:
+        """A callee walk's *deps* in its caller's terms: each parameter seed it
+        rests on is replaced by what the caller passed in that argument -- that
+        argument alone, so a field-precise sibling cannot mask an object-wide
+        one (G2c). None (a finding no walk classified) is field-precise."""
+        if deps is None or deps.precise:
+            return _PRECISE_DEPS
+        out = _ObjectDeps(False, frozenset(), deps.barrier)
+        for i in sorted(deps.params):
+            out = out.merge(self._object_deps(
+                list(tainted_args.get(i) or []), why, params[i] if i < len(params) else None))
+        return out
 
     @staticmethod
     def _pointer_range(expr: Any) -> tuple[int, int] | None:
@@ -8579,9 +9191,9 @@ class TaintEngine:
         return n is not None and int(n) == 0
 
     def _note_write_span(self, ssaf: Any, params: list, idx: int,
-                         model: dict[str, Any] | None,
+                         model: dict[str, Any] | None, at: int,
                          name: str | None = None) -> int | None:
-        """Record how far a modeled copy writes into a global object.
+        """Record how far a modeled copy at *at* writes into a global object.
 
         An untyped global's extent is otherwise inferred from LAYOUT, which
         an alias/subobject symbol inside the object silently halves
@@ -8598,7 +9210,7 @@ class TaintEngine:
             gi = self._indexed_global(ssaf, params[idx])
             if gi is None or self._copy_length_is_zero(ssaf, params, model):
                 return None
-            self._note_indexed_write(gi)
+            self._note_indexed_write(gi, at)
             reach = self._modeled_write_reach(ssaf, params, idx, model, name)
             return None if self._indexed_write_in_object(params[idx], gi, reach) else gi
         raw = self._global_addr(ssaf, params[idx], canon=False)
@@ -8616,9 +9228,7 @@ class TaintEngine:
             # is the one case this does know.
             if n is not None and int(n) == 0:
                 return
-            ranges = self._global_tainted_ranges.setdefault(ga, [])
-            if (offset, None) not in ranges:
-                ranges.append((offset, None))
+            self._note_known_offset_range(ga, (offset, None), at)
             if ga not in self._global_write_unbounded:
                 self._global_write_unbounded.add(ga)
                 self._invalidate_object(ga)
@@ -8644,10 +9254,8 @@ class TaintEngine:
             # constant is not this case: as an unsigned size it is huge, so
             # it stays on the unbounded side below.
             return
-        ranges = self._global_tainted_ranges.setdefault(ga, [])
-        interval = (offset, None if n is None or int(n) < 0 else offset + int(n))
-        if interval not in ranges:
-            ranges.append(interval)
+        self._note_known_offset_range(
+            ga, (offset, None if n is None or int(n) < 0 else offset + int(n)), at)
         if n is None or int(n) < 0:
             # An unbounded write is evidence about the object too: it is
             # recorded so the extent stops being clipped by an inferred
@@ -11117,6 +11725,8 @@ class TaintEngine:
         not what a source wrote into it."""
         self._global_write_span.clear()
         self._global_tainted_ranges.clear()
+        self._known_offset_ranges.clear()
+        self._unknown_offset_stores.clear()
         self._global_write_unbounded.clear()
         self._global_layout_truncated.clear()
         self._global_keyed_offsets.clear()
@@ -12876,7 +13486,9 @@ class TaintEngine:
         findings: list[dict[str, Any]] = _SalvageList(self._salvage["findings"])
         recorded_sinks: set[tuple] = set()
         processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set, field context) descended
-        descended_sinks: set[tuple] = set()  # `_sink_signature`s merged up from descents
+        # `_sink_signature` -> the finding merged up from descents (its later
+        # routes merge their object dependencies into it, G2c)
+        descended_sinks: dict[tuple, dict[str, Any]] = {}
         out_params: set[int] = set()         # this func's params whose pointee got tainted
         out_param_elems: set = set()         # (param_idx, field) descriptor-array elems filled (#319b)
         # IC03: the writable globals THIS run has tainted, {address: node}, kept
@@ -12947,12 +13559,24 @@ class TaintEngine:
         def ins_key(i: Any) -> int:
             return int(getattr(i, "instr_index", getattr(i, "address", 0)))
         reached_return = False
+        # RET / tail call -> its routes, each (tainted nodes, the expression
+        # consuming them), or for a tail call what its callee return rests on:
+        # the summary's `return_object_deps` is read from them once the walk
+        # has converged (V6-01).
+        tainted_returns: dict[int, list[tuple[list[tuple], Any]] | _ObjectDeps] = {}
 
         def add_assumption(msg: str) -> None:
             if msg not in assumptions:
                 assumptions.append(msg)
 
-        def taint_node(node: tuple, label: str, ins: Any, reason: str, parents: list[tuple]) -> bool:
+        # Global node -> {write address: (instruction, its tainted inputs)}, for
+        # EVERY tainting write: a node keeps the parents of the write that
+        # tainted it first, and a read is only as certain as the write that
+        # covers it (`_object_deps`, G2c).
+        global_writes: dict[tuple, dict[int, tuple]] = {}
+
+        def taint_node(node: tuple, label: str, ins: Any, reason: str, parents: list[tuple],
+                       *, param_index: int | None = None) -> bool:
             key = node[0]
             if type(key) is tuple and len(key) == 2 and key[0] == "global" \
                     and ins is not None:
@@ -12964,6 +13588,8 @@ class TaintEngine:
                 live_global_sites.setdefault(int(key[1]), set()).add(ins_key(ins))
                 global_store_only[int(key[1])] = (global_store_only.get(int(key[1]), True)
                                                   and "STORE" in op_name(ins))
+                global_writes.setdefault(node, {}).setdefault(
+                    int(getattr(ins, "address", 0)), (ins, list(parents)))
             if node in tainted:
                 return False
             tainted.add(node)
@@ -12976,6 +13602,11 @@ class TaintEngine:
                 if ins is not None:
                     self._global_write_sites.setdefault(int(key[1]), ins)
             why[node] = {"label": label, "instr": ins, "reason": reason, "parents": list(parents)}
+            if node in global_writes:
+                why[node]["writes"] = global_writes[node]
+            if param_index is not None:
+                # A seed a CALLER judges: what it passed in this argument (V6-01).
+                why[node]["param_index"] = param_index
             return True
 
         # #615 review "New": nodes the unconditional-sink block below injects
@@ -13399,9 +14030,13 @@ class TaintEngine:
                             self._truncated = True
                             self._truncation_causes.add(aggregate)
 
-        def cons_return(ins: Any, reason: str) -> bool:
+        def cons_return(ins: Any, reason: str,
+                        object_deps: _ObjectDeps | None = None) -> bool:
+            """Taint what the call at *ins* returns. *object_deps* is what that
+            value rests on in THIS walk's terms (V6-01); None is field-precise."""
             nonlocal reached_return
             if "TAILCALL" in op_name(ins):
+                tainted_returns.setdefault(ins_key(ins), object_deps or _PRECISE_DEPS)
                 if reached_return:
                     return False
                 reached_return = True
@@ -13410,6 +14045,8 @@ class TaintEngine:
             for w in ssa_writes(ins):
                 node = (var_key(w), getattr(w, "version", None))
                 if taint_node(node, var_label(w), ins, reason, []):
+                    if object_deps is not None and not object_deps.precise:
+                        why[node]["object_deps"] = object_deps
                     done = True
             return done
 
@@ -13482,7 +14119,8 @@ class TaintEngine:
                 # Tail calls have no SSA result: a modeled return instead exits
                 # this function. Only invoke this after the model's source hit.
                 if tok in ("ret", "*ret") and "TAILCALL" in op_name(ins):
-                    return cons_return(ins, f"return of {name or '?'} (model propagate)")
+                    return cons_return(ins, f"return of {name or '?'} (model propagate)",
+                                       self._object_deps(parents, why, ins))
                 return self._apply_to_token(
                     ssaf, ins, params, tok, taint_node, name or "?", parents=parents)
             addr = int(getattr(ins, "address", 0))
@@ -13648,7 +14286,10 @@ class TaintEngine:
                     for _op in operands:
                         v = _op.src
                         nodes = arg_taint(_op)
-                        if not nodes and self._var_buffer_tainted(ssaf, v, tainted, set(), 0):
+                        reached: list[tuple[tuple, Any]] = []
+                        if not nodes:
+                            self._var_buffers(ssaf, v, tainted, set(), 0, reached)
+                        if reached:
                             # A pointer reaching a tainted buffer the store/load
                             # keys do not name (a PHI of allocations): cite it.
                             nodes = [(var_key(v), getattr(v, "version", None))]
@@ -13777,7 +14418,7 @@ class TaintEngine:
                     # opposite, so the arming is disclosed as a blocking
                     # frontier naming the opt-in that would report it. A sink
                     # whose CLASS is itself the opt-in (`file_write`) is outside
-                    # the default question and stays silent.
+                    # the default question: no leaf, only a record (below).
                     def _foreign(i: int) -> bool:
                         """Taint reaching arg *i* that does NOT derive solely
                         from this same call's own outputs -- `n = read(fd,
@@ -13825,6 +14466,28 @@ class TaintEngine:
                         }
                         if _gl not in leaves:
                             leaves.append(_gl)
+                    if _gate == sink.get("class"):
+                        # IC07 / TT-PILOT-FW04-02: a sink whose CLASS is the
+                        # opt-in (`net_write`, `file_write`) is outside the
+                        # default question -- no finding and no frontier -- but
+                        # taint arming it is a fact of this run. Dropping it
+                        # without a trace made "no modeled sink" read as a
+                        # whole-program dead end; recorded, the all-clear says
+                        # what it is relative to. The same arming test a
+                        # reported sink applies, and nothing is enabled.
+                        _reached = sorted({int(i) for i in [
+                            *(sink.get("tainted_args") or []),
+                            *([sink["len_arg"]] if sink.get("len_arg") is not None else [])]
+                            if isinstance(i, int) and _sink_arg_reach(int(i), sink)[0]})
+                        if _reached:
+                            _row = self._opt_in_reached.setdefault((addr, site_taddr), {
+                                "address": hex(addr),
+                                "callee": str(shown or "?"), **self._model_field(shown),
+                                "class": str(sink.get("class") or "?"),
+                                "gate": str(_gate),
+                                "tainted_args": [],
+                            })
+                            _row["tainted_args"] = sorted(set(_row["tainted_args"]) | set(_reached))
                     sink = None
             if sink is not None and sink.get("format_arg") is not None:
                 if format_gated_sink(sink):
@@ -13932,7 +14595,39 @@ class TaintEngine:
                             # #443: for a recv-style bounded-write sink the
                             # destination is `buf_arg` (not memcpy's arg0), so the
                             # provably-bounded downgrade checks the right buffer.
-                            if argidx == sink.get("len_arg") and sink.get("buf_arg") is None:
+                            # V8-03 / G4c: an inline string expansion (`rep
+                            # stos`/`rep movs` BN synthesises a `__builtin_*`
+                            # call from) whose count is a constant total split
+                            # by its own pointer's alignment cannot be steered
+                            # by taint: bounded, and nothing below may
+                            # re-headline it. A masked attacker value (`n & 7`)
+                            # is bounded only when the destination holds the
+                            # bound; otherwise it stays an overflow and carries
+                            # the bound as a fact (added after the relabels).
+                            _expansion = (self._expansion_verdict(ssaf, ins, params, argidx, model)
+                                          if classify and sink.get("class") == "overflow_len"
+                                          else None)
+                            if _expansion is not None and (
+                                    _expansion["length_kind"] == "alignment_split"
+                                    or _expansion.get("destination_fit") == "fits"):
+                                _bnd_reason = None
+                                _why = ("a constant total split by pointer alignment -- taint "
+                                        "on the pointer does not reach it"
+                                        if _expansion["length_kind"] == "alignment_split"
+                                        else "an attacker-controlled value's low bits, which the "
+                                        f"{_expansion['destination_capacity']}-byte destination holds")
+                                eff_sink = {
+                                    **sink,
+                                    "class": "bounded_len",
+                                    "intrinsic_expansion": _expansion,
+                                    "detail": (sink.get("detail") or "")
+                                    + f" (inline {_expansion['intrinsic']} expansion: the length "
+                                    f"is at most {_expansion['length_bound']}, {_why})",
+                                    "relabel": ("inline expansion of a constant-size copy/fill"
+                                                if _expansion["length_kind"] == "alignment_split"
+                                                else "masked length within the destination"),
+                                }
+                            elif argidx == sink.get("len_arg") and sink.get("buf_arg") is None:
                                 # Armed by len_arg but NO buf_arg declared: do NOT
                                 # guess arg0 as the destination -- arg0 may be a
                                 # sibling buffer sized to the length while the real
@@ -13983,22 +14678,28 @@ class TaintEngine:
                                 # the length is not provably within.
                                 eff_sink = self._source_side_verdict(
                                     ssaf, params, argidx, mkey, model, eff_sink)
-                            elif classify and sink.get("class") == "overflow_len":
+                            elif classify and eff_sink.get("class") == "overflow_len":
                                 # Length is the return of a modeled receive
                                 # call bounded by a constant count arg
                                 # (n = read(fd, buf, MAX); memcpy(dst, buf, n)):
-                                # attacker-derived but provably <= MAX (#159).
-                                _bnd = self._syscall_bound_for_length(ssaf, params[argidx])
-                                if _bnd is not None:
+                                # attacker-derived but provably <= MAX (#159)
+                                # once the copy proves the return a count; an
+                                # unchecked failure return is SIZE_MAX (V7-01).
+                                _fill = self._fill_return_bound(ssaf, params[argidx])
+                                if _fill is not None and _fill.proven and _fill.bound is not None:
                                     eff_sink = {
                                         **sink,
                                         "class": "bounded_len",
-                                        "source_bound": hex(_bnd),
+                                        "source_bound": hex(_fill.bound),
                                         "detail": (sink.get("detail") or "")
                                         + f" (length is a modeled receive return provably "
-                                        f"bounded by {hex(_bnd)} -- bounded copy, not an "
+                                        f"bounded by {hex(_fill.bound)} -- bounded copy, not an "
                                         "unbounded overflow)",
                                     }
+                                elif _fill is not None and not _fill.proven:
+                                    eff_sink = {**sink, **self._RETURN_UNCHECKED,
+                                                "detail": (sink.get("detail") or "")
+                                                + self._RETURN_UNCHECKED_DETAIL}
                             # Reserve overflow_* for buffer/length-operand
                             # taint: if the taint reaches this sink only
                             # through an array index/offset (`base + i*stride`)
@@ -14111,6 +14812,11 @@ class TaintEngine:
                                         "build reuses registers, so read them against "
                                         "the IL rather than expecting `cap`/`progress`)",
                                     }
+                            # G4c: a masked attacker length the destination is
+                            # not known to hold keeps its class and carries the
+                            # bound (and the capacity, when known) as a fact.
+                            if _expansion is not None and "intrinsic_expansion" not in eff_sink:
+                                eff_sink = {**eff_sink, "intrinsic_expansion": _expansion}
                             # #980: a finding re-headlined away from its catalog
                             # class names that class, so `taint models` and the
                             # finding are visibly the same sink.
@@ -14261,8 +14967,9 @@ class TaintEngine:
                     if k is not None:
                         if k < len(params):
                             propagated.add(k)
-                            spilled = self._note_write_span(ssaf, params, k, model,
-                                                            name or mkey)
+                            spilled = self._note_write_span(
+                                ssaf, params, k, model, int(getattr(ins, "address", 0)),
+                                name or mkey)
                             if spilled is not None:
                                 _ixl = self._indexed_write_frontier(spilled, ins, params[k])
                                 if _ixl not in leaves:
@@ -14421,8 +15128,9 @@ class TaintEngine:
                                 # extent must stop being clipped by what BN
                                 # inferred, exactly as for a copy (round-14
                                 # review F33).
-                                spilled = self._note_write_span(ssaf, params, k, model,
-                                                                name or mkey)
+                                spilled = self._note_write_span(
+                                    ssaf, params, k, model, int(getattr(ins, "address", 0)),
+                                    name or mkey)
                                 if spilled is not None:
                                     _ixl = self._indexed_write_frontier(spilled, ins, params[k])
                                     if _ixl not in leaves:
@@ -14488,9 +15196,13 @@ class TaintEngine:
                     srcs = getattr(ins, "src", None)
                     if not isinstance(srcs, (list, tuple)):
                         srcs = [] if srcs is None else [srcs]
-                    if (read_taint(ins) or any(arg_taint(src) for src in srcs)
-                            or self._return_buffer_tainted(ssaf, ins, tainted)):
+                    ret_nodes = read_taint(ins) + [n for src in srcs for n in arg_taint(src)]
+                    routes = ([(ret_nodes, srcs[0] if len(srcs) == 1 else ins)] if ret_nodes
+                              else [([node], named) for node, named
+                                    in self._returned_buffers(ssaf, ins, tainted)])
+                    if routes:
                         reached_return = True
+                        tainted_returns[ins_key(ins)] = routes
                     continue
 
                 if self._is_call(ins):
@@ -14719,6 +15431,9 @@ class TaintEngine:
                         continue
 
                     ret_tainted = False
+                    # One entry per candidate that taints the return: what the
+                    # returned value rests on in this walk's terms (V6-01).
+                    ret_object_deps: list[_ObjectDeps] = []
                     descend_outparams: set[int] = set()
                     descend_outparam_elems: set = set()  # (param_idx, field) #319b
                     resolved_names: list[str] = []
@@ -14829,13 +15544,24 @@ class TaintEngine:
                             # the descent went (the merge at each intervening level
                             # re-applies this same check with its own hand-off nodes, so
                             # multi-level descent composes).
+                            # V6-01 / G2c: a callee finding rests on the callee's
+                            # parameter seeds; each is replaced here by what THIS
+                            # call passed in that argument, so an unrelated
+                            # field-precise sibling argument cannot mask it. The
+                            # same sink reached again (another call, a grown
+                            # context) is another route to one flow: its
+                            # dependencies merge, so a field-precise route wins
+                            # whichever call came first.
                             for f in d["findings"]:
-                                # A revisit with a grown context re-reaches
-                                # the first context's sinks: one finding each.
+                                deps = self._caller_deps(f.get("_object_deps"),
+                                                         tainted_args, why, params)
                                 sig = _sink_signature(f)
                                 if sig in descended_sinks:
+                                    first = descended_sinks[sig]
+                                    first["_object_deps"] = first["_object_deps"].merge(deps)
                                     continue
-                                descended_sinks.add(sig)
+                                f = {**f, "_object_deps": deps}
+                                descended_sinks[sig] = f
                                 findings.append(_tag_unconditional_flow(f, d.get("handoff_node") or []))
                             for lf in d["leaves"]:
                                 # One callee site reached from several argument
@@ -14844,6 +15570,13 @@ class TaintEngine:
                             for a in d["assumptions"]:
                                 add_assumption(a)
                             ret_tainted = ret_tainted or d["reached_return"]
+                            if d["reached_return"]:
+                                # A return no walk classified (a depth bound, a
+                                # cycle) may come from any tainted argument.
+                                ret_object_deps.append(self._caller_deps(
+                                    d.get("return_object_deps")
+                                    or _ObjectDeps(False, frozenset(tainted_args), None),
+                                    tainted_args, why, params))
                             descend_outparams |= set(d.get("out_params") or ())
                             descend_outparam_elems |= set(d.get("out_param_elems") or ())
                             for _ga in sorted(d.get("globals") or ()):
@@ -14897,6 +15630,7 @@ class TaintEngine:
                                 _stop_desc = "external"
                             if self.unknown_call_policy != "stop":
                                 ret_tainted = True
+                                ret_object_deps.append(_PRECISE_DEPS)
                                 add_assumption(_caveat)
                             else:
                                 # F4/#562: `stop` deliberately does NOT propagate taint
@@ -14968,8 +15702,13 @@ class TaintEngine:
                         # the "resolved via ... to:" assumption (#290 pins its form).
                         resolved_names.append(report_name)
 
-                    if ret_tainted and cons_return(ins, "return of resolved call propagates taint"):
-                        changed = True
+                    if ret_tainted:
+                        merged = None
+                        for deps in ret_object_deps:
+                            merged = deps if merged is None else merged.merge(deps)
+                        if cons_return(ins, "return of resolved call propagates taint",
+                                       merged):
+                            changed = True
                     # callee wrote tainted data through pointer arg(s) -> taint the
                     # caller's buffer, and bubble up if that buffer is our own param
                     for j in descend_outparams:
@@ -14981,12 +15720,30 @@ class TaintEngine:
                             if bt is not None and taint_node((bt[0], None), bt[1], ins,
                                                              f"out-param {j} written by callee", []):
                                 changed = True
-                            if (bt is not None and self._global_addr(ssaf, params[j]) is None
+                            out_ga = (self._global_addr(ssaf, params[j])
+                                      if bt is not None else None)
+                            if out_ga is not None and bt[0] == ("global", out_ga):
+                                # The callee wrote the object from a stated
+                                # offset, its own walk judged what it wrote
+                                # (V6-01). Only that classification reads it;
+                                # how far the write reached is the callee's
+                                # own evidence.
+                                raw = self._global_addr(ssaf, params[j], canon=False)
+                                known = self._known_offset_ranges.setdefault(out_ga, [])
+                                entry = ((int(raw) - out_ga) if raw is not None
+                                         and int(raw) >= out_ga else 0, None,
+                                         int(getattr(ins, "address", 0)))
+                                if entry not in known:
+                                    known.append(entry)
+                            if (bt is not None and out_ga is None
                                     and (gi := self._indexed_global(ssaf, params[j])) is not None
                                     and bt[0] == ("global", gi)):
                                 # The callee's write starts at `g + i` and its
                                 # length is the callee's: nothing here proves it
-                                # stays inside g (D1-01).
+                                # stays inside g (D1-01), nor which field it
+                                # tainted (V6-01).
+                                self._unknown_offset_stores.setdefault(
+                                    gi, int(getattr(ins, "address", 0)))
                                 _ixl = self._indexed_write_frontier(gi, ins, params[j])
                                 if _ixl not in leaves:
                                     leaves.append(_ixl)
@@ -15314,7 +16071,7 @@ class TaintEngine:
                             # (V5-01), and an index nothing bounds to its
                             # declared extent may have put it in the NEXT
                             # object, which that taint does not cover (D1-01).
-                            self._note_indexed_write(gi)
+                            self._note_indexed_write(gi, int(getattr(ins, "address", 0)))
                             if taint_node(((("global", gi)), None), f"glob_{hex(gi)}",
                                           ins, "store into tainted global at a "
                                           "runtime index (object base, global_approx)",
@@ -15597,7 +16354,17 @@ class TaintEngine:
                     break
             diag = {"tainted_values": len(tainted), "last_use": last_use}
 
+        # V6-01: what the returned value rests on, in this walk's terms, for
+        # the caller to translate. Every tainted return, and every buffer one
+        # returns a pointer to (each arm of a merge), is a route.
+        return_object_deps = None
+        for routes in tainted_returns.values():
+            for deps in ([routes] if isinstance(routes, _ObjectDeps)
+                         else [self._object_deps(nodes, why, used_by) for nodes, used_by in routes]):
+                return_object_deps = deps if return_object_deps is None \
+                    else return_object_deps.merge(deps)
         return {"reached_return": reached_return, "out_params": frozenset(out_params),
+                "return_object_deps": return_object_deps,
                 "out_param_elems": frozenset(out_param_elems),
                 # The globals this body made tainted. A write into a global
                 # is an effect on the PROGRAM, not on this function's
@@ -15858,7 +16625,7 @@ class TaintEngine:
                 if pv is None:
                     raise self._param_not_found_error(func, idx)
                 if taint_node((var_key(pv), None), str(getattr(pv, "name", pv)), None,
-                              f"source: parameter {idx}", []):
+                              f"source: parameter {idx}", [], param_index=idx):
                     seeded = True
             elif kind == "var":
                 v = self._resolve_var(func, src["selector"])
@@ -16344,6 +17111,14 @@ class TaintEngine:
             last["callee"] = callee
         else:
             path.append(_instr_dict(ins, reason=reason, tainted=tainted_labels, callee=callee))
+        # V6-01: what this sink's bytes rest on, in this walk's terms. The
+        # `sink.object_taint` it may come to is decided at the top of the run,
+        # once every caller has judged the parameters and every route to the
+        # same sink is merged (G2c).
+        params = self._call_params(ins) if argidx is not None else []
+        object_deps = self._object_deps(
+            hit_nodes, why, params[argidx] if argidx is not None and argidx < len(params)
+            else ins)
         return {
             "sink": {
                 "callee": callee,
@@ -16382,11 +17157,19 @@ class TaintEngine:
                 # W01-10: the copy length is the return of the modeled fill of
                 # this same source (so no overread_len).
                 **({"src_fill": sink["src_fill"]} if sink.get("src_fill") else {}),
+                # V8-03 / G4c: the inline string expansion and what bounds its
+                # length (alignment split, or a masked value and its fit).
+                **({"intrinsic_expansion": sink["intrinsic_expansion"]}
+                   if sink.get("intrinsic_expansion") else {}),
+                # V7-01: the length is a modeled fill's return nothing on the
+                # path proves a count (its failure -1 is SIZE_MAX here).
+                **({"return_unchecked": True} if sink.get("return_unchecked") else {}),
                 # W10-04: the length's last arithmetic is narrower than the
                 # parameter (widths in bytes).
                 **({"width_narrowing": sink["width_narrowing"]} if sink.get("width_narrowing") else {}),
             },
             "path": path,
+            "_object_deps": object_deps,
         }
 
     def _model_field(self, callee: Any) -> dict[str, str]:
@@ -16523,11 +17306,18 @@ class TaintEngine:
         # Resolve argument locators into individual call sites BEFORE seeding:
         # one site's SSA reads must never hide another site's constant or missing
         # operand. Non-argument locators and absent calls retain their refusal path.
+        # One row per call site (V8-04, R2-04's rule for caller sites applied to
+        # sinks): BN lifts an inline `rep movs` to two calls at ONE address, one
+        # per direction-flag value, and seeding both re-emitted every slice. A
+        # site is its address; the first call in IL order stands for it.
         selections: list[tuple[dict[str, Any], Any]] = []
         for sink in sinks:
             sites = (self._find_callsites(instrs, sink["callee"], resolve_indirect=True)
                      if sink.get("kind") == "arg" else [])
-            selections.extend((sink, site) for site in sites or [None])
+            by_address: dict[int, Any] = {}
+            for site in sites:
+                by_address.setdefault(int(getattr(site, "address", 0)), site)
+            selections.extend((sink, site) for site in list(by_address.values()) or [None])
         sink_status: list[dict[str, Any]] = []
         errors: list[tuple[dict[str, Any], str]] = []
         for sink, site in selections:
@@ -16758,6 +17548,9 @@ class TaintEngine:
                 # with no leaf.
                 unresolved_origins=sum(
                     1 for sl in slices for o in sl["origins"] if o.get("kind") == "unresolved"),
+                recurrence_origins=sum(
+                    1 for sl in slices for o in sl["origins"]
+                    if o.get("kind") == "recurrence_initializer"),
                 truncated=self._bw_truncated,
                 truncation_cause=sorted(self._bw_truncation_causes)),
             # #812: configured knobs, echoed as forward does. `max_iters` is
@@ -16959,6 +17752,13 @@ class TaintEngine:
         # its own whatever else represents the slice, so a formal beside it
         # -- or how many callers answer that formal -- never trades it away.
         returned: list[dict[str, Any]] = []
+        # Every loop recurrence the walk went through, as its initializer's
+        # origin (IC08): a root of its own whatever outranks it -- a reset
+        # call on another back edge must not trade the loop away -- and keyed
+        # by the literal arm, so that arm, reached from the phi, is not also
+        # a runtime `constant`.
+        recurrences: list[dict[str, Any]] = []
+        recurrent_arms: set[tuple] = set()
         # The (function, formal) demands each back edge closed on, for the
         # whole ascent from one sink seed: `_continue_into_callers` reads
         # which demand a cycle answered (its own, or one further up). And
@@ -16977,12 +17777,14 @@ class TaintEngine:
         # own frontier, which names the object the sink read, is.
         may_writers = 0
 
-        def _set_origin(o, *, weak: int | bool = 0):
+        def _set_origin(o, *, weak: int | bool = 0, keep: bool = False):
             """Record origin *o* ranked by *weak* (rank 0 best): a formal is
             kept for the ascent, anything else is a producer; a call's return
             at rank 1 is a root of its own; the best-ranked origin represents
             the slice. Inside a may-alias store's value only a formal counts
-            (it still ascends); anything else there is evidence. Returns *o*."""
+            (it still ascends); anything else there is evidence. *keep*: the
+            origin keeps a slice of its own whatever outranks it (a loop
+            recurrence, IC08). Returns *o*."""
             nonlocal origin, origin_rank
             if weak is True:
                 rank = 3
@@ -17005,6 +17807,8 @@ class TaintEngine:
             if origin["kind"] == "unresolved" or origin_rank > rank:
                 origin = o
                 origin_rank = rank
+            if keep and o not in recurrences:
+                recurrences.append(o)
             return o
 
         def _set_source_origin(o):
@@ -17023,6 +17827,38 @@ class TaintEngine:
             if o not in returned:
                 returned.append(o)
             origin, origin_rank = o, 0
+
+        def _note_recurrence(phi_ins):
+            """Record the phi *phi_ins* the walk is going through as a loop
+            recurrence when it is one (``_phi_recurrence``): each literal arm
+            is a ``recurrence_initializer`` origin. A search that ran out is
+            a recurrence it could not rule out, disclosed as a cut."""
+            if may_writers:
+                return
+            rec = self._phi_recurrence(ssaf, phi_ins)
+            if rec is None:
+                return
+            if rec.exhausted:
+                self._bw_truncated = True
+                self._bw_truncation_causes.add("recurrence_search_budget")
+            phi_var = getattr(phi_ins, "dest", None)
+            for arm in getattr(phi_ins, "src", None) or ():
+                try:
+                    adef = ssaf.get_ssa_var_definition(arm)
+                except Exception:
+                    adef = None
+                if adef is None or op_name(adef) != "MLIL_SET_VAR_SSA" or ssa_reads(adef):
+                    continue
+                value = self._int_const(getattr(adef, "src", None))
+                if value is None:
+                    continue
+                recurrent_arms.add((var_key(arm), getattr(arm, "version", None)))
+                _set_origin({"kind": "recurrence_initializer", "value": value,
+                             "var": var_label(arm), "phi": var_label(phi_var),
+                             "increments": rec.increments,
+                             **({"calls": list(rec.calls)} if rec.calls else {}),
+                             **({"search_exhausted": True} if rec.exhausted else {})},
+                            weak=True, keep=True)
 
         # (buffer key, memory version) pairs already walked, so two buffers that
         # copy into each other inside a loop cannot recurse without end.
@@ -17891,6 +18727,21 @@ class TaintEngine:
                                          **self._model_field(called_name(mkey, name)),
                                          "address": hex(int(defn.address))})
                         _returned_object(defn, v, d, mv, anchor, name, model, fresh=True)
+                        # `k = f(k)` read straight off the call (-O2): the
+                        # slice stops at the call, but the argument it was
+                        # handed is a loop-carried value -- its literal start
+                        # is a recurrence beside the call (V7-03).
+                        for arg in self._call_params(defn):
+                            avar = next((x for x in map(self._as_single_ssa_var,
+                                                        reversed(self._def_chain(ssaf, arg)))
+                                         if x is not None), None)
+                            try:
+                                adef = (ssaf.get_ssa_var_definition(avar)
+                                        if avar is not None else None)
+                            except Exception:
+                                adef = None
+                            if adef is not None and op_name(adef) == "MLIL_VAR_PHI":
+                                _note_recurrence(adef)
                     elif all(s == "literal" for s in states):
                         _set_origin({"kind": "call", "callee": called_name(mkey, name),
                                      **self._model_field(called_name(mkey, name)),
@@ -17943,12 +18794,19 @@ class TaintEngine:
             # immediate is already handled at seeding time. Weak: reached as one
             # input of a local buffer's writer (`rsi = " -c 1"; strcat(cmd, rsi)`)
             # it must not outrank the parameter an older writer copied in.
+            if op_name(defn) == "MLIL_VAR_PHI":
+                _note_recurrence(defn)
             if not reads:
                 src0 = getattr(defn, "src", None)
                 cval = self._int_const(src0)
                 if cval is not None:
-                    _set_origin({"kind": "constant", "value": cval, "var": var_label(v)},
-                                weak=True)
+                    # A literal arm of a loop recurrence the walk came through
+                    # is only where the value STARTS (`k = 0; for (..) if (..)
+                    # k++`): that phi recorded it as a `recurrence_initializer`,
+                    # never a runtime constant (IC08).
+                    if (var_key(v), getattr(v, "version", None)) not in recurrent_arms:
+                        _set_origin({"kind": "constant", "value": cval, "var": var_label(v)},
+                                    weak=True)
                 elif anchor is not None and op_name(src0) in ("MLIL_IMPORT", "MLIL_EXTERN_PTR"):
                     # A consumer reads through an address BN resolved through
                     # the GOT or an extern (a preemptible global in a shared
@@ -18348,9 +19206,12 @@ class TaintEngine:
         # Each independent producer keeps its own slice, the representative
         # aside (already one): on a back edge every producer the walk reached
         # (the cycle answers nothing else), elsewhere every call RETURN the
-        # value combines -- so neither a formal beside it nor the callers
-        # that answer that formal (one entry or several) trade it away.
-        extra = producers if back_edge else returned
+        # value combines and every loop recurrence it went through (IC08) --
+        # so neither a formal beside it, the callers that answer that formal
+        # (one entry or several), nor a stronger origin on another arm trades
+        # it away.
+        extra = list(producers if back_edge else returned)
+        extra += [o for o in recurrences if o not in extra]
         out += [{"steps": base_steps, "origin": o, "crossed": []}
                 for o in extra if o is not origin and o["kind"] != "unresolved"]
         if cuts:
@@ -18400,8 +19261,15 @@ class TaintEngine:
             if o["kind"] == "returned":
                 inner = ", ".join(say(i) for i in o["may_point_into"])
                 return (f"the pointer {_code(o['object'])} returned"
+                        + (f" (a block {_code(o['allocator'])} allocated"
+                           + (f", {o['size']:#x} bytes" if isinstance(o.get("size"), int)
+                              else f", {_code(o['size_expr'])} bytes" if o.get("size_expr")
+                              else "") + ")"
+                           if o.get("allocator") else "")
                         + (f", into {inner}" if inner else "")
                         + (f" ({o['note']})" if o.get("note") else ""))
+            if o["kind"] == "literal_value":
+                return f"literal value {_code(o['object'])} (not an address)"
             extra = []
             if "offset" in o:
                 extra.append(f"offset {o['offset']:#x}" if isinstance(o["offset"], int)
@@ -18620,6 +19488,15 @@ class TaintEngine:
             c = self._int_const(expr)
             if c is None:
                 return [{"kind": "unknown", "object": str(expr)}]
+            if self._is_unmapped(c) or ("PTR" not in op
+                                        and not self._pointer_width(getattr(expr, "size", None))):
+                # `consume(0)`, `consume((char *)1)`: no byte lives there, so
+                # it is a literal VALUE, never an address the sink may read --
+                # nor one "in a read-only segment" (V8-01). So is a constant
+                # narrower than a pointer that BN did not type as one, whatever
+                # its number happens to map to (G5-R3): only a `CONST_PTR` or a
+                # pointer-width constant in this pointer role is an address.
+                return [{"kind": "literal_value", "object": str(expr), "value": c}]
             storage = self._const_ptr_storage(c)
             seg = None
             wr = getattr(self.bv, "is_offset_writable", None)
@@ -18690,18 +19567,28 @@ class TaintEngine:
                             else _try_arg_index(frm) if to == "ret" else None)
                     if cand is not None and cand not in want:
                         want.append(cand)
-                picked = ([params[i] for i in want if i < len(params)] if want else params)
+                # An allocator -- modeled, or an in-binary body every return
+                # of which is one's result -- hands back a block of its own:
+                # its arguments are a size, not objects it points into, so
+                # only what its model names is listed (V8-01).
+                allocation = self._returned_allocator(d, name, model)
+                picked = ([params[i] for i in want if i < len(params)]
+                          if want or allocation else params)
                 inner: list[dict[str, Any]] = []
                 for p in picked:
                     if expr_reads(p) or any(t in op_name(p) for t in (
                             "ADDRESS_OF", "CONST_PTR", "IMPORT", "EXTERN")):
                         for o in rec(p, None):
-                            if (o["kind"] != "parameter" or o.get("pointer")) and o not in inner:
+                            if (o["kind"] not in ("parameter", "literal_value") or o.get("pointer")) \
+                                    and o not in inner:
                                 inner.append(o)
                 note = ({"note": "BN recovered no argument the return may point into"}
-                        if not picked or any(i >= len(params) for i in want) else {})
+                        if not allocation and (not picked or any(i >= len(params) for i in want))
+                        else {})
                 return [{"kind": "returned", "object": f"{name or 'an indirect call'}()",
-                         "callee": name, "may_point_into": inner, **note}]
+                         "callee": name,
+                         **(self._allocation_fields(allocation, params) if allocation else {}),
+                         "may_point_into": inner, **note}]
             return [{"kind": "unknown", "object": var_label(expr)}]
         reads = expr_reads(expr)
         if len(reads) == 1 and op in _COPY_OPS:

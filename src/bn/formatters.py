@@ -2821,12 +2821,6 @@ def _render_paged_list_text(
     return footer if body == _EMPTY_RESULT else f"{body}\n\n{footer}"
 
 
-_QUICK_PARTIAL_WARNING = (
-    "WARNING: target is quick-loaded; {what} is partial. "
-    "Run `bn refresh` for full analysis."
-)
-
-
 def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
     """A leading warning line when a read envelope is quick-loaded/partial
     (#437), so a text reader doesn't trust a partial answer as a complete one.
@@ -2837,7 +2831,9 @@ def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
     one message would otherwise tell a `decompile`/`class list`/`types`/
     `evidence function` reader that a "function list/count" was partial."""
     if isinstance(value, dict) and value.get("partial"):
-        return _QUICK_PARTIAL_WARNING.format(what=what) + "\n"
+        # The remedy runs as printed: this invocation's -i/-t (V7-02).
+        return (f"WARNING: target is quick-loaded; {what} is partial. "
+                f"Run {code_span(_bn_command('refresh'))} for full analysis.\n")
     return ""
 
 
@@ -4323,8 +4319,7 @@ def _render_message_lens_text(value: Any) -> str:
 
 
 @_discloses
-def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None,
-                        *, route_rows: bool = False) -> str:
+def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None) -> str:
     """Render an --all-instances fan-out (#169 L1): a header per instance, then
     that instance's result rendered by the command's own text renderer (or a
     fallback), and an ``error:`` line for instances that couldn't be reached/
@@ -4367,13 +4362,10 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
             inner = r.get("result")
             if inner_renderer is not None:
                 try:
-                    if route_rows:
-                        # Commands a row's renderer prints carry THIS row's
-                        # instance and target (#1037 review).
-                        with command_routing(target=r.get("target"),
-                                             instance=r.get("instance")):
-                            lines.append(inner_renderer(inner))
-                    else:
+                    # Commands a row's renderer prints carry THIS row's
+                    # instance and target (#1037 review).
+                    with command_routing(target=r.get("target"),
+                                         instance=r.get("instance")):
                         lines.append(inner_renderer(inner))
                 except BridgeError:
                     # A `BridgeError` is not a render failure: it is this CLI
@@ -4412,7 +4404,8 @@ def _render_orient_text(value: Any) -> str:
     state = value.get("analysis_state") or ("full" if value.get("analyzed") else "?")
     lines = [f"orientation: {name}  [analysis: {state}]"]
     if not value.get("analyzed", True):
-        lines.append("  ! loaded with --quick — run `bn refresh` before trusting strings/functions")
+        lines.append(f"  ! loaded with --quick — run {code_span(_bn_command('refresh'))} "
+                     "before trusting strings/functions")
     fc = value.get("function_count")
     if fc is not None:
         lines.append(f"  functions: {fc}")
@@ -4623,7 +4616,10 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         call_index = row.get("call_index")
         # A tailcall (tail-branch into the target) has no real return site, so flag
         # it -- its caller_static is the byte after the branch, not a return addr (#47).
-        kind_tag = "  [tailcall]" if row.get("call_kind") == "tailcall" else ""
+        # An inline expansion (`rep movs` lifted to a builtin call) is no call at all.
+        call_kind = row.get("call_kind")
+        kind_tag = (f"  [{call_kind}]" if call_kind in ("tailcall", "inline_expansion")
+                    else "")
         # #979: every label is the row's JSON key, so a filter written from the
         # text (`.containing_function`, `.hlil_statement`) finds the field.
         primary = (
@@ -5511,18 +5507,32 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
         classes = ", ".join(cls + _marks(cls)
                             for cls in sorted({str(s.get("class") or "?") for s in sinks}))
         return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
+    # IC07: every zero-finding verdict is scoped to the sink classes the run
+    # enabled (the default catalog plus `run_params.sink_classes`) and names
+    # the opt-in calls taint reached that the run does not report -- a run
+    # with a frontier said "NO modeled sink reached" above a listed `net_write`
+    # call it had reached.
+    enabled = [str(c) for c in _field_list(_field_dict(value, "run_params"), "sink_classes")]
+    scope = "the default sink classes" + (f" + {', '.join(enabled)}" if enabled else "")
+    opt_in = [r for r in _field_list(value, "opt_in_sinks_reached") if isinstance(r, dict)]
+    skipped = (f"; {len(opt_in)} call(s) of opt-in sink class(es) "
+               f"{', '.join(sorted({str(r.get('class')) for r in opt_in}))} reached, "
+               "not reported" if opt_in else "")
     if leaves:
-        return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
-                f"(NOT an all-clear){fns_part}{trunc}")
-    # Genuinely empty: no sink AND no frontier. This is the MOST caveated case, not
-    # the least -- the engine reaching nothing does not mean the function is safe;
-    # it is exactly the shape a structurally-invisible bug (use-after-free,
-    # temporal, or an unmodeled source) produces. Carry the same "NOT an
-    # all-clear" qualifier the partial-coverage paths do (#310).
+        return (f"verdict: no sink of {scope} reached — {len(leaves)} tainted frontier(s) "
+                f"(NOT an all-clear{skipped}){fns_part}{trunc}")
+    # No sink AND no frontier. The verdict states the SAME claim the JSON gate
+    # (`diagnostics.safe_to_report_all_clear`) makes: it said "NOT an
+    # all-clear" beside a gate that said all-clear. An absent or false gate is
+    # no all-clear.
     visited = f"visited {fns} fn(s)" if fns else "shallow coverage"
-    return (f"verdict: no taint reached any sink or frontier — NOT an all-clear "
-            f"({visited}; no modeled sink or tainted frontier found — also how a bug "
-            f"the engine can't structurally see appears){trunc}")
+    diag = _field_dict(value, "diagnostics")
+    if diag.get("safe_to_report_all_clear") is not True:
+        return (f"verdict: no sink of {scope} reached and no tainted frontier — NOT an "
+                f"all-clear ({visited}; see diagnostics{skipped}){trunc}")
+    return (f"verdict: no sink of {scope} reached and no tainted frontier — all-clear "
+            f"for those classes only, a may-analysis and not a proof ({visited}{skipped})"
+            f"{trunc}")
 
 
 def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | None:
@@ -5573,6 +5583,10 @@ def _render_flow_line(f: dict[str, Any], *, mangled: bool = False) -> str:
         sig = _elide_template_args(str(sig))
         callee = _elide_template_args(str(callee))
     head = f"[{sink.get('class') or '?'}] {callee} @ {sink.get('address')}{arg}"
+    if _field_dict(sink, "object_taint"):
+        # V6-01: reached only through an object tainted at an unknown offset
+        # -- a may-flow to rank below a field-precise one.
+        head += " [object-wide]"
     # #1041 item 6: a flow several sources each reach on their own names them
     # as candidates; the signature keeps `multiple` (#1050 review finding 3).
     cands = [str(c) for c in _field_list(f, "source_candidates")]
@@ -5686,6 +5700,13 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     if _sm:
         _fr += f", {_sm} seed-misanchored"
     out.append(_fr)
+    # IC07: where taint left the function -- callers use it, a forward run
+    # from here does not follow it there.
+    exits = _field_dict(diag, "exits")
+    ways = (["return value"] if exits.get("return") else []) + [
+        f"out-parameter {i}" for i in _field_list(exits, "out_params")]
+    if ways:
+        out.append(f"  leaves the function through: {', '.join(ways)} (not followed)")
     # #562 honesty gate, folded into the same block: the anti-verdict, never a
     # vulnerability claim. Only present when the diagnostics carry it.
     if "safe_to_report_all_clear" in diag:
@@ -5812,6 +5833,21 @@ def _backward_origin_text(o: dict[str, Any], names: dict[str, Any], *, mangled: 
         val = o["value"]
         what = (f"{val:#x}" if isinstance(val, int) and not isinstance(val, bool) else str(val)) + (
             f" ({var})" if var else "")
+    elif kind == "recurrence_initializer":
+        # The literal a loop-carried value starts from, its per-trip
+        # increments (the calls an update goes through, when any), and that
+        # the trip count is not in the slice (IC08). A search that ran out
+        # proved no increment at all.
+        val = o.get("value")
+        start = f"{val:#x}" if isinstance(val, int) and not isinstance(val, bool) else str(val)
+        steps = _field_list(o, "increments")
+        ints = [s for s in steps if isinstance(s, int) and not isinstance(s, bool)]
+        calls = [str(c) for c in _field_list(o, "calls")]
+        step = ("unknown, loop search ran out" if o.get("search_exhausted")
+                else "/".join(f"{s:+d}" for s in ints) if ints and len(ints) == len(steps)
+                else "non-constant" + (f" via {', '.join(calls)}" if calls else ""))
+        what = (f"{var or '?'} = {start} looping through {_text_value(o, 'phi') or '?'} "
+                f"(per-trip {step}; trip count not in this slice)")
     elif callee:
         what = _backward_origin_name(names, callee, mangled=mangled) + (
             f" @ {address}" if address else "")
@@ -6075,6 +6111,18 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
         lines.extend(_render_grouped_leaves(
             leaves, mangled=mangled, full=full,
             width=_text_width() if direction == "forward" else None))
+    # IC07: calls of an opt-in sink class the run did not enable that taint
+    # armed -- outside its question, so neither a flow nor a frontier, but
+    # named so the scope of what was reported is visible.
+    opt_in = [r for r in _field_list(value, "opt_in_sinks_reached") if isinstance(r, dict)]
+    if opt_in:
+        lines.append("")
+        lines.append(f"opt-in sinks reached, not reported ({len(opt_in)}; "
+                     "add --sink-class <class> to report them):")
+        for r in opt_in:
+            args = ", ".join(str(i) for i in _field_list(r, "tainted_args"))
+            lines.append(f"  [{r.get('class')}] {r.get('callee')} @ {r.get('address')} "
+                         f"(arg {args})")
     assumptions = _field_list(value, "assumptions")
     if assumptions:
         lines.append("")
@@ -6206,7 +6254,7 @@ def _sink_arg_spec(e: dict[str, Any]) -> str:
 
 
 _HIDDEN_KIND_LABELS = {"self_stub": "self stub",
-                       "inline_builtin": "constant-argument inline builtin"}
+                       "inline_builtin": "fixed-length inline builtin"}
 
 
 def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = False,
@@ -8795,6 +8843,9 @@ _TRACE_REASON_LABELS: dict[str, str] = {
     # not followed (the step names the global; the caveat cites `bn xrefs`).
     "global_load": "global load",
     "constant": "constant",
+    # V8-02: the literal a loop-carried value starts at; the trips that add to
+    # it are the loop's control, which trace does not follow (a caveat says so).
+    "recurrence_initializer": "loop recurrence start",
     # A definition with nothing to walk that is not a literal: an intrinsic's
     # result, an undefined value.
     "no_traced_inputs": "definition with no traced inputs",
@@ -8877,7 +8928,10 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
     register = _text_value(arg_lbl, "register")
     if register:
         arg_desc += f" ({register})"
-    header = f"backward trace of {arg_desc} in {fn_name} @ {target_addr}"
+    # BN6-C010: a trace answered on a quick-loaded view says so first, as every
+    # other quick-tolerant read does.
+    header = (_quick_partial_prefix(value, "backward trace")
+              + f"backward trace of {arg_desc} in {fn_name} @ {target_addr}")
     step_word = "step" if len(trace) == 1 else "steps"
     info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} {step_word}"
     if value.get("truncated"):
@@ -8984,6 +9038,10 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
                 const = _text_value(step, "value")
                 if const:
                     line += f" = {const}"
+            if reason == "recurrence_initializer":
+                start = _trace_recurrence_start(step)
+                if start:
+                    line += f" = {start}"
             if reason in ("field_load", "out_param_not_followed",
                           "interprocedural_out_param_not_followed", "memory_load"):
                 meta = " ".join(
@@ -9039,6 +9097,24 @@ def _trace_callee_sections(trace: list[Any]) -> dict[int, int]:
     return ends
 
 
+def _trace_recurrence_start(step: Any) -> str:
+    """`0x0 (start of len#2, +0x4 per trip)` for a ``recurrence_initializer``
+    terminal (V8-02), or "" when the bridge sent no integer value. The step
+    is where a loop-carried value STARTS: the per-trip step is printed beside
+    it so the literal never reads as the value."""
+    if not isinstance(step, dict):
+        return ""
+    value = step.get("value")
+    if not isinstance(value, int) or isinstance(value, bool):
+        return ""
+    inc = _field_list(step, "increments")
+    steps = [i for i in inc if isinstance(i, int) and not isinstance(i, bool)]
+    per_trip = (", ".join(f"{i:+#x}" for i in steps) + " per trip" if steps and len(steps) == len(inc)
+                else "a non-constant step per trip")
+    phi = _text_value(step, "phi")
+    return f"{value:#x} (start of {phi}, {per_trip})" if phi else f"{value:#x} ({per_trip})"
+
+
 def _trace_param_slot(step: Any, *, mangled: bool = False) -> str:
     """`param 3, x3` for a function-parameter terminal (#959): the 0-based
     parameter position and the register it arrives in, or "" when the bridge
@@ -9089,6 +9165,8 @@ def _render_trace_frontiers(frontiers: Any, *, mangled: bool = False) -> list[st
                   or ex.get("global_name") or ex.get("global_address"))
             if not nm and reason == "constant":
                 nm = ex.get("value")
+            if not nm and reason == "recurrence_initializer":
+                nm = _trace_recurrence_start(ex)
             if not nm and reason == "field_load" and ex.get("base"):
                 nm = f"{ex['base']}+{ex.get('offset') or '0x0'}"
             if not nm and reason == "function_parameter":

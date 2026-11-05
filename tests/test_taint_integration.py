@@ -779,6 +779,121 @@ def test_sink_argument_without_a_value_role_is_incomplete(tmp_path, shared_bn, a
     assert [o["kind"] for o in leaf["objects"]] == ["literal"], leaf
 
 
+_POINTER_OBJECTS_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline))
+char g_buf[64];
+volatile int sink_seen;
+N void consume(const char *p, int n) { sink_seen = n + (p != 0); }
+N char *make_rec(int n) { char *r = malloc(32); memset(r, 0, 32); r[0] = (char)n; return r; }
+__attribute__((noinline, optimize("O2"))) char *acquire(size_t n) { return malloc(n); }
+N void case_literal(int c) { consume(c ? (const char *)0 : (const char *)1, c); }
+N void case_wrapper(int n) { char *r = make_rec(n); consume(r, n); }
+N void case_malloc(int n) { char *r = malloc(n); consume(r, n); }
+N void case_sized(int n) { char *r = malloc(48); consume(r, n); }
+N void case_tail_wrapper(int n) { char *r = acquire((size_t)n); consume(r, n); }
+N void case_realloc(char *old, int n) { char *r = realloc(old, (size_t)n); consume(r, n); }
+N void case_rodata(void) { consume("hello", 2); }
+N void case_global(void) { consume(g_buf, 3); }
+int main(int c, char **v) { case_literal(c); case_wrapper(c); case_malloc(c); case_sized(c);
+    case_tail_wrapper(c); case_realloc(v[0], c); case_rodata(); case_global(); return v != 0; }
+"""
+
+
+def test_pointer_object_kinds_say_what_bn_maps(tmp_path, shared_bn):
+    """V8-01: each object an unmodeled sink's pointer may read is described
+    by what BN says about it. `0`/`1` were "literal ... in a read-only
+    segment" though nothing is mapped there; a block `malloc` returned "may
+    point into" its size argument, and a wrapper's never named the
+    allocator. G5c: the block's size is stated (a constant, or the size
+    argument), a wrapper that is one `jmp malloc` names it too, and the
+    block `realloc` returns may be the one it was handed."""
+    src = tmp_path / "objs.c"
+    src.write_text(_POINTER_OBJECTS_SRC)
+    binary = tmp_path / "objs"
+    _compile(src, binary)
+    target = shared_bn.load(binary, copy=False)
+
+    def objects(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
+                          "--sink", "arg:consume:0")
+        [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "sink_role_unknown"]
+        return leaf["objects"]
+
+    assert {(o["kind"], o.get("value"), "address" in o) for o in objects("case_literal")} \
+        == {("literal_value", 0, False), ("literal_value", 1, False)}
+    for fn, callee, size in [("case_wrapper", "make_rec", 32), ("case_malloc", "malloc", None),
+                             ("case_sized", "malloc", 48), ("case_tail_wrapper", "acquire", None)]:
+        [obj] = objects(fn)
+        assert (obj["kind"], obj["callee"], obj["allocator"], obj["may_point_into"]) \
+            == ("returned", callee, "malloc", []), (fn, obj)
+        assert obj.get("size") == size and ("size_expr" in obj) is (size is None), (fn, obj)
+    [obj] = objects("case_realloc")
+    assert (obj["kind"], obj["allocator"]) == ("returned", "realloc"), obj
+    assert [(o["kind"], o.get("index")) for o in obj["may_point_into"]] == [("parameter", 0)], obj
+    assert [(o["kind"], o["segment_writable"]) for o in objects("case_rodata")] \
+        == [("literal", False)]
+    assert [(o["kind"], o["segment_writable"]) for o in objects("case_global")] \
+        == [("global", True)]
+
+
+_LOOP_ACCUMULATOR_SRC = r"""
+#include <string.h>
+#include <stddef.h>
+#define N __attribute__((noinline))
+N size_t count_copy(char *dst, const char *src, int n) {
+    size_t len = 0;
+    for (int i = 0; i < n; i++)
+        if (src[i]) len += 4;
+    memcpy(dst, src, len);
+    return len;
+}
+N void put(char *dst, const char *src, size_t n) { memcpy(dst, src, n); }
+N size_t fixed_copy(char *dst, const char *src, int n) {
+    size_t len = 0;
+    if (n > 3) len = 1000;
+    put(dst, src, len);
+    return len;
+}
+int main(int c, char **v) { char b[64]; return (int)count_copy(b, v[0], c) + (int)fixed_copy(b, v[0], c); }
+"""
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O2"])
+def test_trace_reports_a_loop_accumulators_literal_as_its_start(tmp_path, shared_bn, opt):
+    """V8-02: `trace` rolled a loop-carried length up as `constant` with no
+    caveat, while `taint backward` on the same argument reports a
+    `recurrence_initializer`. Both now apply one recurrence test and report
+    the same fields; a phi of plain literals stays `constant`."""
+    src = tmp_path / "loopacc.c"
+    src.write_text(_LOOP_ACCUMULATOR_SRC)
+    binary = tmp_path / f"loopacc{opt}"
+    _build(["gcc", opt, "-g", "-fno-builtin", "-fno-inline", "-fno-stack-protector",
+            "-fno-optimize-sibling-calls", "-no-pie", str(src), "-o", str(binary)])
+    target = shared_bn.load(binary, copy=False)
+
+    def trace(fn, callee):
+        site = _bn_json(shared_bn, "-t", target, "callsites", callee,
+                        "--within", fn)["items"][0]["call_addr"]
+        return _bn_json(shared_bn, "-t", target, "trace", fn, site, "--arg", "2")
+
+    looped = trace("count_copy", "memcpy")
+    [start] = [s for s in looped["trace"] if s.get("reason") == "recurrence_initializer"]
+    [origin] = [o for sl in _bn_json(shared_bn, "-t", target, "taint", "backward", "-f",
+                                     "count_copy", "--sink", "arg:memcpy:2")["slices"]
+                for o in sl["origins"]]
+    assert origin["kind"] == "recurrence_initializer", origin
+    assert {k: start.get(k) for k in ("value", "var", "phi", "increments")} == \
+        {k: origin.get(k) for k in ("value", "var", "phi", "increments")}
+    assert [g["reason"] for g in looped["frontiers"]] == ["recurrence_initializer"]
+    assert len(looped["assumptions"]) == 1, looped["assumptions"]
+
+    fixed = trace("fixed_copy", "put")
+    assert {g["reason"] for g in fixed["frontiers"]} == {"constant"}, fixed["frontiers"]
+    assert fixed["assumptions"] == []
+
+
 
 def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):
     """#1041 item 2 on the architecture it was found on: two 4-byte
@@ -3208,6 +3323,16 @@ N void span_case(char *p) { memcpy(span_global + 40, p, 16); span_reader(); }
 N void fgets_case(char *p) { memcpy(tracked, p, 64); use_fgets_alias(); }
 N void fgets_ignored_case(char *p) { memcpy(tracked, p, 64); ignore_fgets(); }
 N void chain_case(char *p) { memcpy(tracked, p, 64); use_relay4(); }
+char deep_tracked[128] = "seed";
+N char *deep_relay0(void) { return memset(deep_tracked, 0, 1); }
+N char *deep_relay1(void) { return deep_relay0(); }
+N char *deep_relay2(void) { return deep_relay1(); }
+N char *deep_relay3(void) { return deep_relay2(); }
+N char *deep_relay4(void) { return deep_relay3(); }
+N char *deep_relay5(void) { return deep_relay4(); }
+N char *deep_relay6(void) { return deep_relay5(); }
+N void use_deep_relay6(void) { system(deep_relay6() + 24); }
+N void deep_chain_case(char *p) { memcpy(deep_tracked, p, 64); use_deep_relay6(); }
 int main(int argc, char **argv) {
     if (argc < 2) return 0;
     switch (argc) {
@@ -3217,7 +3342,8 @@ int main(int argc, char **argv) {
     case 5: span_case(argv[1]); break;
     case 6: fgets_case(argv[1]); break;
     case 7: fgets_ignored_case(argv[1]); break;
-    default: chain_case(argv[1]); break;
+    case 8: chain_case(argv[1]); break;
+    default: deep_chain_case(argv[1]); break;
     }
     return 0;
 }
@@ -3237,8 +3363,9 @@ def test_global_continuation_object_extent_aliases_and_internal_bounds(tmp_path,
     ALIAS-01: `fgets` hands its destination back, so a partial refill
     followed by `system(p + 8)` reads bytes it never touched; an ignored
     refill is no continuation, its live bytes end in the P2-11.1 exit store.
-    BOUND-03: a returning-wrapper chain past the INTERNAL pointer-return
-    depth is unknown, not "no alias"."""
+    BOUND-03: a returning-wrapper chain within the INTERNAL pointer-return
+    depth is followed to the reader at its end; one past it is unknown, not
+    "no alias"."""
     src = tmp_path / "r3astra.c"
     src.write_text(_ASTRA_SRC)
     binary = tmp_path / "r3astra"
@@ -3287,12 +3414,23 @@ def test_global_continuation_object_extent_aliases_and_internal_bounds(tmp_path,
         == [("use_fgets_alias", 8)], store
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
-    # BOUND-03: the internal return-pointer depth is a disclosed bound
+    # BOUND-03: five returning wrappers are within the internal pointer-return
+    # depth -- the chain resolves and its consumer is the named reader...
     result, leaves = gmc("chain_case")
     [leaf] = leaves
-    assert leaf["reachability"]["cause"] in ("pointer_return_depth", "depth_budget"), leaf
+    assert [(r["display_name"], r["access"], r["offset"]) for r in leaf["references"]] \
+        == [("use_relay4", "call_arg", 24)], leaf
+    assert (leaf["reachability"]["status"], leaf["reachability"]["causes"]) == ("complete", [])
+    assert result["stats"]["truncated"] is False, result
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
-    assert result["stats"]["truncated"] is True, result
+    # ...and seven run past it: the bound is disclosed, never read as "no alias".
+    result, leaves = gmc("deep_chain_case")
+    [leaf] = leaves
+    assert leaf["references"] == [], leaf
+    assert leaf["reachability"]["status"] == "truncated", leaf
+    assert leaf["reachability"]["cause"] == "pointer_return_depth", leaf
+    assert result["stats"]["truncation_cause"] == ["pointer_return_depth"], result["stats"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 _UNREAD_OVERLAY_SRC = r"""
@@ -7475,6 +7613,102 @@ def test_a_strlen_length_demands_the_bytes_it_measures(tmp_path, shared_bn):
     assert "copy_read" not in objects(local)
 
 
+def test_a_sink_reached_only_through_an_object_tainted_at_an_unknown_offset_says_so(
+        tmp_path, shared_bn):
+    """V6-01 on `taint_corpus/fwd_object_wide.c`: `rec.tag[i] = v[0]` taints the
+    record at an unknown offset, and the copy of `rec.note` that follows was a
+    flow indistinguishable from one into `rec.note` itself. It is kept and says
+    so: `sink.object_taint` names the store and the field read, and the text
+    flow line is tagged. A copy of `rec.note` into another global is no more
+    certain than `rec.note` (G2c). Copying the string into `rec.note` and back
+    out is field-precise and carries neither."""
+    binary = tmp_path / "fwd_object_wide"
+    # -fno-builtin: GCC inlines the fixed-size memcpy even at -O0.
+    _compile(CORPUS / "fwd_object_wide.c", binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+    stamp = _bn_json(shared_bn, "-t", target, "function", "info", "stamp")
+    span = range(int(stamp["span_start"], 16), int(stamp["span_end"], 16))
+
+    def sinks(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", "param:0")
+        return [hit["sink"] for hit in result["reached_sinks"]]
+
+    for fn in ("object_wide", "object_wide_returned", "object_wide_copied"):
+        [sink] = sinks(fn)
+        tag = sink["object_taint"]
+        assert (tag["kind"], tag["field_read"]) == ("unknown_offset", 32), sink
+        assert int(tag["store"], 16) in span, (tag, stamp["span_start"])
+
+    precise = sinks("field_precise")
+    assert len(precise) == 2 and not [s for s in precise if "object_taint" in s], precise
+
+    text = shared_bn.run("-t", target, "taint", "forward", "-f", "object_wide",
+                         "--source", "param:0")
+    assert text.returncode == 0, text.stderr
+    flows = [ln.split() for ln in text.stdout.splitlines() if ln.startswith("  [")]
+    assert len(flows) == 1 and "[object-wide]" in flows[0], text.stdout
+
+
+
+def test_a_loop_count_length_is_a_recurrence_not_a_constant(tmp_path, shared_bn):
+    """IC08 on `taint_corpus/bw_loop_count.c`: a length `k` that starts at 0
+    and grows on loop trips the comma test picks was a `constant 0` origin
+    of a complete slice; it is a `recurrence_initializer` (value 0,
+    increments 0 or +1) that withholds completeness. So is one counted in a
+    nested loop, one updated through a call, and one a call may reset on
+    another back edge (E2c: `constant 0`, or only the call, and complete).
+    Two literals chosen by a branch stay `constant` origins of a complete
+    slice (control)."""
+    binary = tmp_path / "bw_loop_count"
+    _compile(CORPUS / "bw_loop_count.c", binary)
+    target = shared_bn.load(binary, copy=False)
+
+    def slice_of(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
+                          "--sink", "arg:memcpy:2")
+        return result, [o for sl in result["slices"] for o in sl["origins"]]
+
+    counted, origins = slice_of("count_fields")
+    assert [(o["kind"], o.get("value"), o.get("increments")) for o in origins] == [
+        ("recurrence_initializer", 0, [0, 1])], origins
+    assert counted["diagnostics"]["safe_to_report_complete_slice"] is False
+
+    # A nested count, a call-defined update (named) and a resettable count
+    # each keep the recurrence beside whatever else the slice reaches.
+    for fn, others, calls in (("count_cells", set(), None),
+                              ("scale_rounds", {"call"}, ["next_round"]),
+                              ("count_or_reset", {"call"}, None)):
+        result, origins = slice_of(fn)
+        [rec] = [o for o in origins if o["kind"] == "recurrence_initializer"]
+        assert rec["value"] == 0 and rec.get("calls") == calls, (fn, rec)
+        assert {o["kind"] for o in origins} - {"recurrence_initializer"} == others, (fn, origins)
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is False, fn
+
+    fixed, origins = slice_of("fixed_header")
+    assert origins and {o["kind"] for o in origins} == {"constant"}, origins
+    assert {o["value"] for o in origins} <= {8, 16}
+    assert fixed["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
+def test_an_optimised_call_defined_count_keeps_its_recurrence(tmp_path, shared_bn):
+    """V7-03 on `taint_corpus/bw_loop_count.c` at -O2: `scale_rounds`'
+    `k = next_round(k)` is lifted with the copy length read straight off the
+    call's return, so the slice stops at the call -- which used to be the
+    only origin of a complete slice. The argument the call was handed is the
+    loop's phi: its literal start is a `recurrence_initializer` naming the
+    call, beside the call origin, and completeness is withheld."""
+    binary = tmp_path / "bw_loop_count_o2"
+    _compile(CORPUS / "bw_loop_count.c", binary, ["-O2"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "scale_rounds",
+                      "--sink", "arg:memcpy:2")
+    origins = [o for sl in result["slices"] for o in sl["origins"]]
+    assert ("call", "next_round") in {(o["kind"], o.get("callee")) for o in origins}, origins
+    [rec] = [o for o in origins if o["kind"] == "recurrence_initializer"]
+    assert (rec["value"], rec["increments"], rec.get("calls")) == (0, None, ["next_round"]), rec
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
 
 def _armv7_build(tmp_path, name: str) -> Path:
     cc = shutil.which("arm-linux-gnueabihf-gcc")
@@ -7711,29 +7945,91 @@ def _fill_copy_sink(tmp_path, shared_bn, arch, guard):
 
 
 @pytest.mark.parametrize("arch", ["a64", "x64"])
+@pytest.mark.parametrize("guard", ["if (got <= 0) return 0;", "if (got == -1) return 0;"],
+                         ids=["count-checked", "minus-one-checked"])
 def test_a_fill_return_copied_back_out_of_its_own_buffer_is_not_an_overread(
-        tmp_path, shared_bn, arch):
+        tmp_path, shared_bn, arch, guard):
     """W01-10: `got = recv(s, scratch, sizeof scratch, 0); if (got <= 0)
     return 0;` then `memcpy(calloc(1, got), scratch, got)` reads back only the
     bytes recv wrote into `scratch`: the destination-bounded copy stays
-    bounded_len and names the fill, instead of an overread_len of `scratch`."""
-    sink = _fill_copy_sink(tmp_path, shared_bn, arch, "if (got <= 0) return 0;")
+    bounded_len and names the fill, instead of an overread_len of `scratch`.
+    A dominating `got == -1` test proves the same (V7-01): recv returns -1 or
+    a count, though BN's value set is not narrowed by it."""
+    sink = _fill_copy_sink(tmp_path, shared_bn, arch, guard)
     assert sink["class"] == "bounded_len", sink
     assert sink["src_fill"]["callee"] == "recv", sink
     assert int(sink["src_fill"]["at"], 16) < int(sink["address"], 16), sink
+    assert "return_unchecked" not in sink, sink
 
 
 @pytest.mark.parametrize("arch", ["a64", "x64"])
-@pytest.mark.parametrize("guard", ["", "if (got == -1) return 0;"],
-                         ids=["unchecked", "minus-one-only"])
 def test_an_unchecked_fill_return_copied_back_out_of_its_buffer_overreads_it(
-        tmp_path, shared_bn, arch, guard):
-    """R3-01: without a check BN narrows to a non-negative range, recv's -1
-    reaches the copy as SIZE_MAX, so `scratch` is over-read: no `src_fill`."""
-    sink = _fill_copy_sink(tmp_path, shared_bn, arch, guard)
+        tmp_path, shared_bn, arch):
+    """R3-01: without a check, recv's -1 reaches the copy as SIZE_MAX, so
+    `scratch` is over-read: no `src_fill`, and `return_unchecked` (V7-01)."""
+    sink = _fill_copy_sink(tmp_path, shared_bn, arch, "")
     assert sink["class"] == "overread_len", sink
     assert "src_fill" not in sink, sink
     assert sink["src_capacity_source"], sink
+    assert sink.get("return_unchecked") is True, sink
+
+
+_RECV_COPY_SOURCE = """
+extern long recv(int, void *, unsigned long, int);
+extern void *memcpy(void *, const void *, unsigned long);
+__attribute__((noinline)) void pull(int sock, char *dst, unsigned long cap) {
+    char scratch[64];
+    TYPE got = recv(sock, scratch, COUNT, 0);
+    GUARD
+    memcpy(dst, scratch, got);
+}
+int main(void) { char out[128]; pull(0, out, 64); return out[0]; }
+"""
+
+
+@pytest.mark.parametrize("arch", ["a64", "x64"])
+@pytest.mark.parametrize("width", ["long", "int"])
+@pytest.mark.parametrize("guard, bounded", [
+    ("", False), ("if (got == -1) return;", True), ("if (got <= 0) return;", True),
+    ("if (got < 0) return;", True), ("if ((unsigned long)got > 64) return;", True)],
+    ids=["unchecked", "minus-one-checked", "count-checked", "negative-checked",
+         "unsigned-bound-checked"])
+def test_a_receive_return_bounds_a_copy_only_when_the_path_checks_it(
+        tmp_path, shared_bn, arch, width, guard, bounded):
+    """V7-01: `long got = recv(s, scratch, 64, 0); memcpy(dst, scratch, got)`
+    with no check was `bounded_len` by recv's count, though BN's value set
+    for the length is undetermined and its -1 failure is SIZE_MAX at the
+    copy. Bounded only behind a check -- a signed test, an equality, or an
+    unsigned bound (-1 is the unsigned maximum; G3-02) -- otherwise
+    `overflow_len` with `return_unchecked`."""
+    source = (_RECV_COPY_SOURCE.replace("TYPE", width).replace("GUARD", guard)
+              .replace("COUNT", "sizeof(scratch)"))
+    binary = _build_arch(tmp_path, arch, f"recv_copy_{width}", source)
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "pull",
+                      "--source", "call:recv")
+    [sink] = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    if bounded:
+        assert (sink["class"], sink.get("source_bound")) == ("bounded_len", "0x40"), sink
+        assert "return_unchecked" not in sink, sink
+    else:
+        assert (sink["class"], sink.get("return_unchecked")) == ("overflow_len", True), sink
+
+
+@pytest.mark.parametrize("arch", ["a64", "x64"])
+def test_an_unchecked_receive_return_with_a_variable_count_is_return_unchecked(
+        tmp_path, shared_bn, arch):
+    """G3-03: `recv(s, scratch, cap, 0)` copied with no check has no constant
+    bound, and the `return_unchecked` qualifier went with it."""
+    source = (_RECV_COPY_SOURCE.replace("TYPE", "long").replace("GUARD", "")
+              .replace("COUNT", "cap"))
+    binary = _build_arch(tmp_path, arch, "recv_copy_cap", source)
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "pull",
+                      "--source", "call:recv")
+    [sink] = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert (sink["class"], sink.get("return_unchecked")) == ("overflow_len", True), sink
+    assert "source_bound" not in sink, sink
 
 
 _ARGV_COPY_SOURCE = """
@@ -7921,3 +8217,210 @@ def test_a_member_pointing_into_its_own_struct_reads_the_tainted_field(tmp_path,
     assert "field_load_unresolved" in {lf["kind"] for lf in indexed["leaves"]}, \
         indexed["leaves"]
     assert indexed["diagnostics"]["safe_to_report_all_clear"] is False, indexed["diagnostics"]
+
+
+def test_the_forward_all_clear_names_its_sink_class_scope(tmp_path, shared_bn):
+    """IC07 on a real binary. `push_label` sends its seeded argument: a
+    default run reports no sink -- `net_write` is opt-in -- but records the
+    call, scopes its all-clear to the enabled classes and says so in text and
+    JSON alike; `--sink-class net_write` reports exactly the recorded
+    arguments. `scale_count`'s seed reaches only its return value: an
+    all-clear whose diagnostics name that exit, never a dead end."""
+    binary = tmp_path / "opt_in_scope"
+    _compile(CORPUS / "opt_in_scope.c", binary)
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn, source, *extra, fmt="json"):
+        args = ("-t", target, "taint", "forward", "-f", fn, "--source", source, *extra)
+        if fmt == "json":
+            return _bn_json(shared_bn, *args)
+        res = shared_bn.run(*args, timeout=120.0)
+        assert res.returncode == 0, res.stderr
+        return res.stdout
+
+    default = forward("push_label", "param:1")
+    assert default["reached_sinks"] == [] and default["run_params"]["sink_classes"] == []
+    [row] = default["opt_in_sinks_reached"]
+    assert (row["callee"], row["class"]) == ("send", "net_write")
+    assert default["diagnostics"]["safe_to_report_all_clear"] is True
+    assert default["diagnostics"]["opt_in_sink_classes_reached"] == ["net_write"]
+
+    enabled = forward("push_label", "param:1", "--sink-class", "net_write")
+    assert enabled["run_params"]["sink_classes"] == ["net_write"]
+    assert enabled["opt_in_sinks_reached"] == []
+    assert sorted((f["sink"]["address"], f["sink"]["tainted_arg_index"])
+                  for f in enabled["reached_sinks"]) == [
+        (row["address"], i) for i in row["tainted_args"]]
+
+    [verdict] = [line for line in forward("push_label", "param:1", fmt="text").splitlines()
+                 if line.startswith("verdict:")]
+    assert "NOT an all-clear" not in verdict and "net_write" in verdict
+
+    scaled = forward("scale_count", "param:0")
+    assert scaled["reached_sinks"] == [] and scaled["opt_in_sinks_reached"] == []
+    assert scaled["diagnostics"]["safe_to_report_all_clear"] is True
+    assert scaled["diagnostics"]["exits"]["return"] is True
+
+
+def test_trace_reports_observed_truncation_and_quick_view_state(tmp_path, shared_bn):
+    """BN6-C011: the memcpy source argument walks back four steps to the
+    function's only parameter. Budgets 4 and 5 are the same complete answer;
+    3 leaves the parameter pending. Budget 4 used to say `truncated: true`.
+    BN6-C010: the same trace on a quick-loaded copy discloses
+    `analysis_state: quick` / `partial: true`; it carried no state at all.
+    The quick copy has a saved database beside it, as a primed fixture does:
+    the quick view must still be the raw bytes, never that full analysis."""
+    built = {}
+    for name in ("trace_budget", "trace_budget_quick"):
+        built[name] = tmp_path / name
+        # -fno-builtin: GCC inlines an 8-byte memcpy even at -O0.
+        _compile(CORPUS / "trace_budget.c", built[name], ["-fno-builtin"])
+    full = shared_bn.load(built["trace_budget"], copy=False)
+    sidecar = tmp_path / "trace_budget_quick.bndb"
+    primed = shared_bn.load(built["trace_budget_quick"], copy=False)
+    saved = shared_bn.run("save", "--target", primed, "--path", str(sidecar), "--format", "json")
+    assert saved.returncode == 0 and sidecar.exists(), saved.stderr
+    closed = shared_bn.run("close", primed)
+    assert closed.returncode == 0, closed.stderr
+    quick = shared_bn.load(built["trace_budget_quick"], quick=True)
+
+    sites = _bn_json(shared_bn, "-t", full, "callsites", "memcpy",
+                     "--within", "publish_banner")["items"]
+    [call] = [site["call_addr"] for site in sites]
+
+    def trace(target, *extra):
+        return _bn_json(shared_bn, "-t", target, "trace", "publish_banner", call,
+                        "--arg", "1", *extra)
+
+    runs = {depth: trace(full, "--max-depth", str(depth)) for depth in (3, 4, 5)}
+    assert [s["reason"] for s in runs[5]["trace"]][-1] == "function_parameter"
+    assert {depth: (r["step_count"], r["truncated"], len(r["assumptions"]))
+            for depth, r in runs.items()} == {3: (3, True, 1), 4: (4, False, 0),
+                                              5: (4, False, 0)}
+    assert runs[4]["trace"] == runs[5]["trace"]
+    assert (runs[5]["analysis_state"], runs[5]["partial"]) == ("full", False)
+
+    partial = trace(quick)
+    assert (partial["analysis_state"], partial["partial"]) == ("quick", True)
+    # The raw binary was opened, not the database beside it.
+    assert Path(quick).suffix != ".bndb", quick
+
+
+def _inline_expansion_target(tmp_path, shared_bn) -> str:
+    """`taint_corpus/inline_expansion.c` at -O2: two constant-size `rep stos`/
+    `rep movs` expansions and one whose length byte comes from the packet."""
+    binary = tmp_path / "inline_expansion"
+    _compile(CORPUS / "inline_expansion.c", binary, ["-O2"])
+    return shared_bn.load(binary, copy=False)
+
+
+def test_an_alignment_split_inline_expansion_is_bounded_not_overflow(tmp_path, shared_bn):
+    """V8-03: `memset(r, 0, sizeof *r)` and `memcpy(d, s, sizeof *d)` inlined
+    as `rep stos`/`rep movs` were `overflow_len` sinks under a tainted pointer
+    -- their count is the constant total split by the pointer's alignment. A
+    length byte read from the packet, expanded the same way, still overflows."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+
+    def sinks(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", "param:0")
+        return [s["sink"] for s in result["reached_sinks"]]
+
+    for fn, callee, intrinsic in (("record_reset", "__builtin_memset", "__memfill_u64"),
+                                  ("record_copy", "__builtin_memcpy", "__memcpy_u64")):
+        [sink] = sinks(fn)
+        assert (sink["callee"], sink["class"], sink["catalog_class"]) == (
+            callee, "bounded_len", "overflow_len"), (fn, sink)
+        assert sink["intrinsic_expansion"]["intrinsic"] == intrinsic
+        assert sink["intrinsic_expansion"]["length_kind"] == "alignment_split"
+        assert int(sink["intrinsic_expansion"]["length_bound"], 16) <= 0x140, sink
+
+    [label] = sinks("copy_label")
+    assert (label["callee"], label["class"]) == ("__builtin_memcpy", "overflow_len"), label
+    assert "intrinsic_expansion" not in label
+
+
+def test_a_tainted_size_inline_memset_overflows_even_when_masked(tmp_path, shared_bn):
+    """G4c P1: `memset(out, 0, (pkt[0] & 0x3ff) + 16)` at -O2 is a `rep stos`
+    whose count adds the packet's masked size to the alignment correction. The
+    mask erased the size's dependency, so the sink read `bounded_len` with
+    `length_bound: 0x408` -- an overflow of any destination shorter than that.
+    It is `overflow_len` with the bound as a fact, and a catalog audit row; the
+    unmasked `memset(out, 0, pkt[0])` (`rep stos` too) stays `overflow_len`."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+
+    def sink_of(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", "param:1")
+        [sink] = [s["sink"] for s in result["reached_sinks"]]
+        return sink
+
+    masked = sink_of("clear_masked")
+    assert (masked["callee"], masked["class"]) == ("__builtin_memset", "overflow_len"), masked
+    assert masked["intrinsic_expansion"] == {
+        "intrinsic": "__memfill_u64", "length_bound": "0x408",
+        "length_kind": "masked_value", "destination_fit": "unproved"}, masked
+    tail = sink_of("clear_tail")
+    assert (tail["callee"], tail["class"]) == ("__builtin_memset", "overflow_len"), tail
+
+    catalog = _bn_json(shared_bn, "-t", target, "taint", "models", "--role", "sink",
+                       "--present", "--callsites", "--all-sites")
+    [entry] = [e for e in catalog["items"] if e["symbol"] == "__builtin_memset"]
+    kinds = {row["function"]: row["kind"] for row in entry["callsites"]}
+    assert (kinds["clear_masked"], kinds["clear_tail"], kinds["record_reset"]) == (
+        "app_caller", "app_caller", "inline_builtin"), kinds
+
+
+def test_an_inline_copy_is_one_backward_sink_site(tmp_path, shared_bn):
+    """V8-04: BN lifts the `rep movs` of an inlined variable-length copy to two
+    `__builtin_memcpy` calls at one address; backward seeded both, emitting two
+    identical `sink_status` rows and every slice twice."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                      "--sink", "arg:__builtin_memcpy:2")
+    [row] = result["sink_status"]
+    assert row["status"] == "seeded", row
+    assert row["slices"] == len(result["slices"]) >= 1
+    assert {sl["sink"]["address"] for sl in result["slices"]} == {row["address"]}
+
+
+def test_inline_expansions_are_listed_by_the_catalog_and_callsites(tmp_path, shared_bn):
+    """V8-06: the variable-length inline copy (the tainted-total `rep movs`)
+    was missing from `taint models --present --callsites --all-sites`, and
+    `callsites __builtin_memcpy` refused the synthetic builtin, so only
+    `taint forward` ever surfaced it. Both now list it where backward seeds it;
+    a fixed-size expansion stays a non-audit `inline_builtin` row."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+    backward = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                        "--sink", "arg:__builtin_memcpy:2")
+    [site] = {row["address"] for row in backward["sink_status"]}
+
+    catalog = _bn_json(shared_bn, "-t", target, "taint", "models", "--role", "sink",
+                       "--present", "--callsites", "--all-sites")
+    kinds = {}
+    for symbol in ("__builtin_memcpy", "__builtin_memset"):
+        [entry] = [e for e in catalog["items"] if e["symbol"] == symbol]
+        kinds.update({(row["function"], row["address"]): row["kind"]
+                      for row in entry["callsites"]})
+    assert kinds[("copy_label", site)] == "app_caller", kinds
+    assert {kind for (fn, _), kind in kinds.items()
+            if fn in ("record_reset", "record_copy")} == {"inline_builtin"}, kinds
+    assert {fn for fn, _ in kinds} >= {"record_reset", "record_copy"}, kinds
+
+    listed = _bn_json(shared_bn, "-t", target, "callsites", "__builtin_memcpy",
+                      "--within", "copy_label")
+    assert [(row["call_addr"], row["call_kind"]) for row in listed["items"]] == [
+        (site, "inline_expansion")]
+
+
+def test_trace_at_an_inline_copy_names_the_builtin_and_its_count_register(tmp_path, shared_bn):
+    """V8-05: `trace` at the `rep movs` taint names `__builtin_memcpy` printed
+    `<unresolved callee>` and the convention's `rdx` for the length; the
+    count of a `rep movs` is `rcx`."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+    backward = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                        "--sink", "arg:__builtin_memcpy:2")
+    [site] = {row["address"] for row in backward["sink_status"]}
+    trace = _bn_json(shared_bn, "-t", target, "trace", "copy_label", site, "--arg", "2")
+    assert trace["callee"] == "__builtin_memcpy"
+    assert trace["arg_label"]["register"] == "rcx"

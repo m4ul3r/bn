@@ -3887,34 +3887,37 @@ class TestBatchSiblingCreateGuard:
 
 
 class TestTaintEmptyVerdictHonesty:
-    """Regression for #310.1: a genuinely empty forward-taint result (no sink, no
-    frontier) must carry the same loud 'NOT an all-clear' caveat the
-    partial-coverage paths do -- it's exactly the shape a structurally-invisible
-    bug produces, so it must be the most caveated case, not the least."""
+    """#310.1 / IC07 TT-PILOT-HOST04-01: a forward result with no sink and no
+    frontier states, in its text verdict, the claim its JSON gate makes. The
+    verdict used to say "NOT an all-clear" for every such result while the
+    JSON said `safe_to_report_all_clear: true`, so a text reader and a JSON
+    reader of one run drew opposite conclusions."""
 
-    def test_empty_forward_verdict_is_caveated(self, shared_bn):
+    def test_empty_forward_verdict_agrees_with_the_json_gate(self, shared_bn):
         shared_bn.load(HELLO_BINARY)
         fns = json.loads(shared_bn.run("function", "list", "--format", "json").stdout)
         names = [f["name"] for f in (fns.get("items") if isinstance(fns, dict) else fns)]
         saw_empty = False
         for name in names[:30]:
-            out = shared_bn.run("taint", "forward", "-f", name, "--source", "param:0")
-            # Only reason about a clean, non-spilled text result: a spilled
-            # (truncated) render can cut the verdict line mid-string, which is
-            # not a real "bare phrase without caveat". (No break: the caveat
-            # invariant must hold for EVERY empty verdict, not just the first.)
-            if out.returncode != 0 or "__BN_SPILLED__" in out.stdout:
+            res = shared_bn.run("taint", "forward", "-f", name, "--source", "param:0",
+                                "--format", "json")
+            if res.returncode != 0:
                 continue
-            if "no taint reached any sink or frontier" in out.stdout:
-                saw_empty = True
-                assert "NOT an all-clear" in out.stdout, out.stdout
-                assert "structurally see" in out.stdout, out.stdout
+            payload = json.loads(res.stdout)
+            if payload["reached_sinks"] or payload["leaves"]:
+                continue
+            out = shared_bn.run("taint", "forward", "-f", name, "--source", "param:0")
+            assert out.returncode == 0, out.stderr
+            saw_empty = True
+            [verdict] = [line for line in out.stdout.splitlines()
+                         if line.startswith("verdict:")]
+            safe = payload["diagnostics"]["safe_to_report_all_clear"]
+            assert ("NOT an all-clear" in verdict) is (safe is not True), (name, verdict)
         if not saw_empty:
             refuse_silent_skip(
                 "no function in this fixture yields an empty forward-taint "
-                "verdict, so the 'NOT an all-clear' caveat #310.1 added is "
-                "unexercised; restore a fixture function whose taint run "
-                "reaches no sink and no frontier")
+                "result, so the verdict/gate agreement is unexercised; restore a "
+                "fixture function whose taint run reaches no sink and no frontier")
 
 
 class TestTaintUnderRecoveredArgFrontier:
@@ -7615,6 +7618,43 @@ class TestIdentityAcrossARestart:
                           "target", "info", "--format", "json")
             assert current.returncode == 0, current.stderr
             assert Path(json.loads(current.stdout)["filename"]).name == "second"
+        finally:
+            if inst:
+                _session_stop(inst)
+
+    def test_after_an_old_registry_restart_the_refusal_names_that_mode(self, tmp_path):
+        """V6-03: a registry without `next_view_id` (an older build) restarts
+        numbering at 1, so the restarted bridge reuses the old ids and accepts
+        none of them. Its refusal said "a restarted bridge never reuses one"
+        next to a listing that did; it names the old-registry mode instead."""
+        from bn import paths
+        from bn.commands.admin import _SHUTDOWN_TEARDOWN_TIMEOUT
+        from bn.target_hint import NUMERIC_VIEW_IDS_OFF_NOTE, PROCESS_LOCAL_VIEW_ID_NOTE
+
+        first = tmp_path / "first"
+        shutil.copyfile(HELLO_BINARY, first)
+        first.chmod(0o755)
+        inst = None
+        try:
+            inst = _session_start(str(first))["instance_id"]
+            registry = paths.instances_dir() / f"{inst}.json"
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            del payload["next_view_id"]
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            restarted = _bn(
+                "session", "restart", inst, "--format", "json",
+                timeout=_SHUTDOWN_TEARDOWN_TIMEOUT + 2.0 + _SESSION_START_TIMEOUT,
+            )
+            assert restarted.returncode == 0, f"{restarted.stdout}\n{restarted.stderr}"
+            listing = _bn("--instance", inst, "target", "list", "--format", "json")
+            [row] = json.loads(listing.stdout)["items"]
+            assert (row["view_id"], row["view_id_selects"]) == ("1", False), row
+
+            refused = _bn("--instance", inst, "-t", "1", "target", "info")
+            assert refused.returncode == 2, f"{refused.stdout}\n{refused.stderr}"
+            lines = refused.stderr.splitlines()
+            assert lines[-1] == NUMERIC_VIEW_IDS_OFF_NOTE, refused.stderr
+            assert PROCESS_LOCAL_VIEW_ID_NOTE not in lines
         finally:
             if inst:
                 _session_stop(inst)

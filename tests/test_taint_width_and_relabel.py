@@ -187,3 +187,207 @@ def test_the_overread_still_fires_when_the_length_is_not_that_fills_return(model
     sink = _memcpy_sink(models, *_recv_then_dup(count="param", length=length, src=src))
     assert sink["class"] == "overread_len", sink
     assert "src_fill" not in sink
+
+
+# ---------------------------------------------------------------------------
+# V7-01: a modeled receive's return_bound bounds a copy only once proven
+# ---------------------------------------------------------------------------
+
+#: No branch narrows the return: recv's -1 failure is a possible length.
+UNCHECKED = _value_range(-0x8000000000000000, 0x7fffffffffffffff)
+
+
+def _recv_then_copy(*, width, at_copy):
+    """``n = recv(fd, buf, 0x40, 0); memcpy(dst, buf, <n>)`` with a fixed
+    destination: an 8-byte ``ssize_t n`` read as is, or a 4-byte ``int n``
+    read as ``sx.q(n)``. ``at_copy``: BN's value set for the length."""
+    buf = FVar("buf", typ="char[0x40]")
+    fd0, dst0, n1 = FSSA(FVar("fd"), 0), FSSA(FVar("dst"), 0), FSSA(FVar("n"), 1)
+    length = (_var(n1, 8) if width == 8 else
+              _sized(FExpr("MLIL_SX", "sx.q(n#1)", reads=[n1], src=_var(n1, 4)), 8))
+    instrs = [
+        FInstr(0, 0x1010, "MLIL_CALL_SSA", "n#1 = recv(fd#0, &buf, 0x40, 0)",
+               reads=[fd0], writes=[n1],
+               dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+               params=[_var(fd0, 4), FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(1, 0x1020, "MLIL_CALL_SSA", "memcpy(dst#0, &buf, n)", reads=[dst0, n1],
+               dest=FExpr("MLIL_CONST_PTR", "0x3020", constant=0x3020),
+               params=[_var(dst0, 8), FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       _at_copy(length, at_copy)]),
+    ]
+    func = FFunc("pull", 0x1000, FSSAFunc(instrs), params=[FVar("fd"), FVar("dst")])
+    return func, FBV({0x3000: "recv", 0x3020: "memcpy"})
+
+
+@pytest.mark.parametrize("width", [8, 4], ids=["ssize_t", "int"])
+@pytest.mark.parametrize("at_copy, bounded", [
+    (GUARDED, True),        # `if (n <= 0) return;` dominates the copy
+    (UNCHECKED, False),     # nothing checks the return
+    (None, False),          # BN states nothing
+], ids=["guarded", "unchecked", "no-value-set"])
+def test_a_receive_return_bounds_the_copy_only_when_proven_a_count(models, width, at_copy,
+                                                                   bounded):
+    # V7-01: the 8-byte unchecked return was `bounded_len` by recv's count
+    # argument, though its -1 failure is SIZE_MAX at the copy.
+    sink = _memcpy_sink(models, *_recv_then_copy(width=width, at_copy=at_copy))
+    if bounded:
+        assert (sink["class"], sink.get("source_bound")) == ("bounded_len", "0x40"), sink
+        assert "return_unchecked" not in sink
+    else:
+        assert (sink["class"], sink.get("return_unchecked")) == ("overflow_len", True), sink
+        assert "source_bound" not in sink
+
+
+def test_an_unchecked_fill_return_is_no_bound_on_its_source_either(models):
+    # The destination is sized by the length, the source is a 64-byte buffer
+    # the length is the unchecked fill return of: it no longer "provably
+    # holds" the copied length.
+    sink = _memcpy_sink(models, *_recv_then_dup(count="const", length="sx", src="other",
+                                                at_copy=UNCHECKED))
+    assert (sink["class"], sink.get("return_unchecked"), sink["src_capacity"]) == (
+        "overread_len", True, 0x40), sink
+
+
+# ---------------------------------------------------------------------------
+# G3-01/02: a guard on the return that excludes -1, as the CFG proves it
+# ---------------------------------------------------------------------------
+
+class _Block:
+    def __init__(self, start, end):
+        self.start, self.end = start, end
+        self.incoming_edges, self.outgoing_edges = [], []
+
+
+def _edge(source, target):
+    e = SimpleNamespace(source=source, target=target)
+    source.outgoing_edges.append(e)
+    target.incoming_edges.append(e)
+
+
+_CMP = {"<": "MLIL_CMP_SLT", ">": "MLIL_CMP_SGT", "!=": "MLIL_CMP_NE",
+        "u>": "MLIL_CMP_UGT", "u<": "MLIL_CMP_ULT"}
+
+
+def _recv_guard_then_copy(*, guard, copy_on, copy_first=True, count="const"):
+    """``n = recv(fd, &buf, <count>, 0); if (<guard>) ...`` with the copy
+    ``memcpy(dst, &buf, sx.q(n))`` heading the block the branch's *copy_on*
+    (``"true"``/``"false"``) side enters, the other side returning. ``int n``
+    (4 bytes). *guard* is ``(left, test, const)``: *left* ``"n"`` (the return
+    as is), ``"sx"`` (``(size_t)n``) or ``"zx"`` (``(size_t)(unsigned)n``);
+    *test* a key of ``_CMP``. *copy_first*: the copy is the first instruction
+    of its block, else a store precedes it there. BN's value set at the copy
+    is unnarrowed, so only the branch can prove the return a count.
+    *count*: ``"const"`` (0x40) or ``"param"``."""
+    left, test, const = guard
+    buf = FVar("buf", typ="char[0x40]")
+    fd0, dst0, cap0, n1 = (FSSA(FVar("fd"), 0), FSSA(FVar("dst"), 0), FSSA(FVar("cap"), 0),
+                           FSSA(FVar("n"), 1))
+    left_expr = {
+        "n": _var(n1, 4),
+        "sx": _sized(FExpr("MLIL_SX", "sx.q(n#1)", reads=[n1], src=_var(n1, 4)), 8),
+        "zx": _sized(FExpr("MLIL_ZX", "zx.q(n#1)", reads=[n1], src=_var(n1, 4)), 8),
+        "sign": _sized(FExpr("MLIL_AND", "n#1 & 0x80000000", reads=[n1], left=_var(n1, 4),
+                             right=_sized(FExpr("MLIL_CONST", "0x80000000",
+                                                constant=0x80000000), 4)), 4),
+    }[left]
+    cond = FExpr(_CMP[test], f"{left_expr} {test} {const:#x}", reads=[n1], left=left_expr,
+                 right=_sized(FExpr("MLIL_CONST", hex(const), constant=const), left_expr.size))
+    fill = FInstr(0, 0x1010, "MLIL_CALL_SSA", "n#1 = recv(fd#0, &buf, count, 0)",
+                  reads=[fd0], writes=[n1],
+                  dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+                  params=[_var(fd0, 4), FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                          FExpr("MLIL_CONST", "0x40", constant=0x40) if count == "const"
+                          else _var(cap0, 8), FExpr("MLIL_CONST", "0", constant=0)])
+    branch = FInstr(1, 0x1018, "MLIL_IF", f"if ({cond})", reads=[n1])
+    branch.condition = cond
+    pre = [] if copy_first else [
+        FInstr(2, 0x1020, "MLIL_SET_VAR_SSA", "t#1 = 0", writes=[FSSA(FVar("t"), 1)],
+               src=FExpr("MLIL_CONST", "0", constant=0))]
+    k = len(pre)
+    length = _at_copy(_sized(FExpr("MLIL_SX", "sx.q(n#1)", reads=[n1], src=_var(n1, 4)), 8),
+                      UNCHECKED)
+    copy = FInstr(2 + k, 0x1024, "MLIL_CALL_SSA", "memcpy(dst#0, &buf, sx.q(n#1))",
+                  reads=[dst0, n1], dest=FExpr("MLIL_CONST_PTR", "0x3020", constant=0x3020),
+                  params=[_var(dst0, 8), FExpr("MLIL_ADDRESS_OF", "&buf", src=buf), length])
+    length.instr_index = copy.instr_index
+    err = FInstr(3 + k, 0x1030, "MLIL_RET", "return")
+    head, body, tail = _Block(0, 2), _Block(2, 3 + k), _Block(3 + k, 4 + k)
+    _edge(head, body)
+    _edge(head, tail)
+    _edge(body, tail)
+    for ins, block in [(fill, head), (branch, head), *[(p, body) for p in pre],
+                       (copy, body), (err, tail)]:
+        ins.il_basic_block = block
+    other = "false" if copy_on == "true" else "true"
+    setattr(branch, copy_on, body.start)
+    setattr(branch, other, tail.start)
+    func = FFunc("pull", 0x1000, FSSAFunc([fill, branch, *pre, copy, err]),
+                 params=[FVar("fd"), FVar("dst"), FVar("cap")])
+    return func, FBV({0x3000: "recv", 0x3020: "memcpy"})
+
+
+@pytest.mark.parametrize("copy_first", [True, False], ids=["copy-heads-block", "copy-later"])
+@pytest.mark.parametrize("guard, copy_on", [
+    (("n", "<", 0), "false"),                  # if (n < 0) goto err; memcpy(...)
+    (("n", "!=", -1), "true"),                 # if (n != -1) memcpy(...)
+    (("sx", "u>", 0x40), "false"),             # if ((size_t)n > 0x40) return; memcpy(...)
+    (("n", "u>", 0x40), "false"),              # if ((unsigned)n > 0x40) return; ...
+    (("sx", "u<", 0x41), "true"),              # if ((size_t)n < 0x41) memcpy(...)
+    (("zx", "u>", 0x40), "false"),             # (size_t)(unsigned)n: -1 is 0xffffffff
+    (("sign", "!=", 0), "false"),              # AArch64's `n < 0`: (n & 1 << 31) != 0
+], ids=["signed-lt-0", "ne-minus-1", "size_t-ugt", "unsigned-ugt", "size_t-ult", "zx-ugt",
+        "sign-bit"])
+def test_a_guard_that_excludes_the_failure_return_bounds_the_copy(models, guard, copy_on,
+                                                                  copy_first):
+    # G3-01: with the copy heading the guarded block the search for a path
+    # avoiding that block's entry started AT the copy and found one. G3-02:
+    # only signed and equality tests were read, though -1 is the unsigned
+    # maximum an unsigned bound excludes.
+    sink = _memcpy_sink(models, *_recv_guard_then_copy(guard=guard, copy_on=copy_on,
+                                                       copy_first=copy_first))
+    assert (sink["class"], sink.get("source_bound")) == ("bounded_len", "0x40"), sink
+    assert "return_unchecked" not in sink
+
+
+@pytest.mark.parametrize("guard, copy_on", [
+    (("n", ">", 0x40), "false"),               # if (n > 0x40) return: -1 passes it
+    (("zx", "u>", 0xffffffff), "false"),       # zero-extended -1 is 0xffffffff, not above it
+    (("sx", "u<", 0x41), "false"),             # the copy is where -1 (SIZE_MAX) goes
+    (("n", "<", 0), "true"),                   # the copy is on the failure side
+    (("sign", "!=", 0), "true"),               # ... as the sign bit says
+], ids=["signed-gt", "zx-ugt-wide", "size_t-ult-else", "failure-side", "sign-bit-failure-side"])
+def test_a_guard_the_failure_return_passes_leaves_it_unchecked(models, guard, copy_on):
+    sink = _memcpy_sink(models, *_recv_guard_then_copy(guard=guard, copy_on=copy_on))
+    assert (sink["class"], sink.get("return_unchecked")) == ("overflow_len", True), sink
+    assert "source_bound" not in sink
+
+
+# ---------------------------------------------------------------------------
+# G3-03: a non-constant count still leaves an unchecked return unchecked
+# ---------------------------------------------------------------------------
+
+def test_an_unchecked_return_of_a_fill_with_a_variable_count_is_return_unchecked(models):
+    # `recv(fd, buf, cap, 0)` copied unchecked: no constant bounds it, and the
+    # qualifier was dropped with the bound.
+    sink = _memcpy_sink(models, *_recv_guard_then_copy(guard=("n", ">", 0x40), copy_on="false",
+                                                       count="param"))
+    assert (sink["class"], sink.get("return_unchecked")) == ("overflow_len", True), sink
+    assert "source_bound" not in sink
+
+
+def test_a_proven_return_with_a_variable_count_keeps_its_class_unqualified(models):
+    sink = _memcpy_sink(models, *_recv_guard_then_copy(guard=("n", "<", 0), copy_on="false",
+                                                       count="param"))
+    assert sink["class"] == "overflow_len" and "return_unchecked" not in sink, sink
+    assert "source_bound" not in sink
+
+
+def test_an_unchecked_variable_count_fill_return_is_no_bound_on_its_source(models):
+    # The source side of the same fact: `memcpy(malloc(m), &spare, m)` with
+    # `m` an unchecked `recv(fd, &buf, cap, 0)` return.
+    sink = _memcpy_sink(models, *_recv_then_dup(count="param", length="sx", src="other",
+                                                at_copy=UNCHECKED))
+    assert (sink["class"], sink.get("return_unchecked")) == ("overread_len", True), sink
+

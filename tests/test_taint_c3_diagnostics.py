@@ -83,11 +83,14 @@ _LEAF_CLASS = {
 }
 
 # `"kind": "<x>"` literals the engine uses for things that are not leaves:
-# origins, objects a pointer demand may read, slice steps and model rows.
+# origins, objects a pointer demand may read, slice steps, model rows and a
+# sink's `object_taint` (V6-01).
 _NON_LEAF_KINDS = {
     "call", "constant", "constant_address", "entry", "global", "got_or_extern",
-    "indirect_call", "literal", "loaded_pointer", "local", "param", "parameter",
-    "returned", "source", "unknown", "unresolved",
+    "indirect_call", "literal", "literal_value", "loaded_pointer", "local", "param",
+    "parameter",
+    "recurrence_initializer",
+    "returned", "source", "unknown", "unknown_offset", "unresolved",
 }
 
 

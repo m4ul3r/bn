@@ -460,7 +460,7 @@ def _aarch64_param_slice_fixture(monkeypatch):
 
 def test_parameter_terminal_names_its_slot_and_register_959(monkeypatch):
     rts, ssa_func, arg4 = _aarch64_param_slice_fixture(monkeypatch)
-    trace = rts._build_backward_trace(None, None, ssa_func, [arg4], 8)
+    trace, _ = rts._build_backward_trace(None, None, ssa_func, [arg4], 8)
     assert trace[0]["reason"] == "function_parameter"
     assert trace[0]["param_index"] == 3
     assert trace[0]["param_register"] == "x3"
@@ -473,7 +473,7 @@ def test_parameter_frontier_text_cannot_read_as_a_register_959(monkeypatch):
     from bn.formatters import _render_trace_text
 
     rts, ssa_func, arg4 = _aarch64_param_slice_fixture(monkeypatch)
-    trace = rts._build_backward_trace(None, None, ssa_func, [arg4], 8)
+    trace, _ = rts._build_backward_trace(None, None, ssa_func, [arg4], 8)
     text = _render_trace_text({"trace": trace, "frontiers": rts._summarize_frontiers(trace)})
     assert "function parameter  [1 step]: arg4 (param 3, x3)" in text
     assert "arg4#0  —  function parameter (param 3, x3)" in text
@@ -485,7 +485,7 @@ def test_stack_passed_parameter_frontier_has_no_register_959(monkeypatch):
     # int-arg list would be a guess, so only the slot is shown.
     rts, ssa_func, arg4 = _aarch64_param_slice_fixture(monkeypatch)
     ssa_func.source_function.parameter_vars[3].source_type = 0
-    trace = rts._build_backward_trace(None, None, ssa_func, [arg4], 8)
+    trace, _ = rts._build_backward_trace(None, None, ssa_func, [arg4], 8)
     assert trace[0]["param_index"] == 3
     assert "param_register" not in trace[0]
 
@@ -539,7 +539,7 @@ def test_intra_mode_out_param_fill_not_mislabeled_undefined(monkeypatch):
         rts, "_build_out_param_map",
         lambda ctx, bv, ssa_func: {local_var: [(0x10, "parse_input")]})
 
-    trace = rts._build_backward_trace(
+    trace, _ = rts._build_backward_trace(
         ctx=None, bv=None, ssa_func=ssa_func, initial_vars=[ssa_var], max_depth=50,
         interprocedural=False, seed_addr=0x20)
 
@@ -562,7 +562,7 @@ def test_interprocedural_mode_out_param_fill_reason_unchanged(monkeypatch):
         rts, "_build_out_param_map",
         lambda ctx, bv, ssa_func: {local_var: [(0x10, "parse_input")]})
 
-    trace = rts._build_backward_trace(
+    trace, _ = rts._build_backward_trace(
         ctx=None, bv=None, ssa_func=ssa_func, initial_vars=[ssa_var], max_depth=50,
         interprocedural=True, seed_addr=0x20)
 
@@ -665,7 +665,7 @@ def test_build_backward_trace_call_depth_guard_marks_boundary_not_dangling_cross
 
     # ip_depth=5 (budget not spent) but _call_depth=10 (hard backstop already
     # reached) -- reproduces R2's finding A2 repro exactly.
-    trace = rts._build_backward_trace(
+    trace, _ = rts._build_backward_trace(
         instance.ctx, bv, caller.medium_level_il.ssa_form, [ret_var], max_depth=10,
         interprocedural=True, ip_depth=5, _call_depth=10, seed_addr=None)
 
@@ -703,7 +703,7 @@ def test_build_backward_trace_records_step_for_unsupported_ssa_form(monkeypatch)
             raise AttributeError("get_ssa_var_definition unsupported for this SSA form")
 
     ssa_var = _FakeSSAVariable("v#1")
-    trace = rts._build_backward_trace(
+    trace, _ = rts._build_backward_trace(
         ctx=None, bv=None, ssa_func=_RaisingSSAFunc(), initial_vars=[ssa_var], max_depth=50,
         interprocedural=True, seed_addr=0x20)
 
@@ -829,3 +829,198 @@ def test_backward_slice_assumptions_nonempty_for_unfollowed_out_param(monkeypatc
     assert result["trace"][0]["reason"] == "out_param_not_followed"
     assert len(result["assumptions"]) == 1
     assert "parse_input" in result["assumptions"][0]
+
+
+# --------------------------------------------------------------------------
+# BN6-C011: `truncated` is observed pending work, not `len(trace) >= max_depth`
+# --------------------------------------------------------------------------
+
+def _chain_slice(monkeypatch, definitions, *, max_depth, interprocedural=False, extra=()):
+    """`target_func`'s call at 0x10010 passes r0#1; *definitions* maps each
+    variable to the instruction defining it (an absent one is a terminus)."""
+    from _bridge_fakes import _FakeBV, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    seed = _var("r0#1")
+    call_insn = _FakeMLILInsn(
+        0x10010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[seed])],
+        vars_read=[seed])
+    fn = _FakeFunction(0x10000, "target_func")
+    fn.medium_level_il = _FakeMLILFunction(
+        instructions=[call_insn, *definitions.values()], definitions=definitions)
+    bv = _FakeBV(functions=[fn, *extra])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return instance._backward_slice("active", "target_func", "0x10010", arg_index=0,
+                                    max_depth=max_depth, interprocedural=interprocedural)
+
+
+def _var(name):
+    from _bridge_fakes import _FakeSSAVariable
+    return _FakeSSAVariable(name)
+
+
+def _set(addr, *reads):
+    from _bridge_fakes import _FakeMLILInsn
+    return _FakeMLILInsn(addr, operation="MLIL_SET_VAR_SSA", vars_read=[_var(r) for r in reads])
+
+
+def _four_step_chain():
+    """r0#1 <- r1#1 <- r2#1 <- r3#1, which has no definition: four steps."""
+    return {_var("r0#1"): _set(0x1000c, "r1#1"), _var("r1#1"): _set(0x10008, "r2#1"),
+            _var("r2#1"): _set(0x10004, "r3#1")}
+
+
+@pytest.mark.parametrize(("max_depth", "truncated"), [(3, True), (4, False), (5, False)])
+def test_a_trace_is_truncated_only_when_work_is_left_at_the_budget(
+        monkeypatch, max_depth, truncated):
+    """The same four-step graph at budgets 4 and 5 is the same complete answer;
+    at 3 the fourth step is still pending. Budget 4 used to report
+    `truncated: true` and a depth-cap caveat for a walk that had drained."""
+    result = _chain_slice(monkeypatch, _four_step_chain(), max_depth=max_depth)
+    assert (result["step_count"], result["truncated"]) == (min(max_depth, 4), truncated)
+    assert len(result["assumptions"]) == (1 if truncated else 0)
+
+
+@pytest.mark.parametrize(("chain_steps", "truncated"), [(4, False), (5, True)])
+def test_a_four_step_prefix_with_work_left_differs_from_a_drained_four_step_walk(
+        monkeypatch, chain_steps, truncated):
+    """E3 falsification control: at budget 4 both walks emit exactly four
+    steps, but the five-step chain still has r4#1 queued. Equal length must
+    not read as equal completeness, so only the drained walk is complete."""
+    definitions = _four_step_chain()
+    if chain_steps == 5:
+        definitions[_var("r3#1")] = _set(0x10000, "r4#1")
+    result = _chain_slice(monkeypatch, definitions, max_depth=4)
+    assert (result["step_count"], result["truncated"]) == (4, truncated)
+    assert len(result["assumptions"]) == (1 if truncated else 0)
+
+
+def test_a_variable_already_walked_left_on_the_worklist_is_no_pending_work(monkeypatch):
+    """r0#1 reads r1#1 and r2#1, and r1#1 reads r2#1 again: the walk takes
+    three steps and leaves a second r2#1 entry it has already walked, which
+    is not unfinished work."""
+    definitions = {_var("r0#1"): _set(0x1000c, "r1#1", "r2#1"),
+                   _var("r1#1"): _set(0x10008, "r2#1")}
+    result = _chain_slice(monkeypatch, definitions, max_depth=3)
+    assert (result["step_count"], result["truncated"], result["assumptions"]) == (3, False, [])
+
+
+@pytest.mark.parametrize(("max_depth", "truncated"), [(3, True), (4, False), (5, False)])
+def test_a_callee_walk_reports_its_own_pending_work_to_the_trace(
+        monkeypatch, max_depth, truncated):
+    """`--interprocedural`: r0#1 is the return of `fetch`, whose return value
+    walks back three more steps (result#1 <- tmp#1 <- tmp#2) -- four in all. The callee sub-walk gets
+    what is left of the budget; at 3 it is cut with work left and the trace
+    says so, at 4 and 5 it drains and the trace is complete."""
+    from _bridge_fakes import _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn
+
+    ret = _FakeMLILInsn(0x20010, operation="MLIL_RET", vars_read=[_var("result#1")])
+    callee = _FakeFunction(0x20000, "fetch")
+    callee.medium_level_il = _FakeMLILFunction(
+        instructions=[ret], definitions={_var("result#1"): _set(0x20008, "tmp#1"),
+                                         _var("tmp#1"): _set(0x20004, "tmp#2")})
+    inner_call = _FakeMLILInsn(0x1000c, operation="MLIL_CALL_SSA", dest=_FakeConstPtr(0x20000))
+    result = _chain_slice(monkeypatch, {_var("r0#1"): inner_call}, max_depth=max_depth,
+                          interprocedural=True, extra=[callee])
+    assert [s["reason"] for s in result["trace"]][:2] == ["cross_function", "definition"]
+    assert (result["step_count"], result["truncated"]) == (min(max_depth, 4), truncated)
+
+
+@pytest.mark.parametrize(("callee_steps", "truncated"), [(3, False), (4, True)])
+def test_a_callee_walk_cut_after_a_four_step_prefix_is_pending(
+        monkeypatch, callee_steps, truncated):
+    """The nested twin of the control above: at budget 4 the trace is four
+    steps either way (one crossing plus three callee steps), but when the
+    callee's return value has a fourth definition still queued the trace is
+    truncated; when the callee walk drains in three it is complete."""
+    from _bridge_fakes import _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn
+
+    callee_defs = {_var("result#1"): _set(0x20008, "tmp#1"),
+                   _var("tmp#1"): _set(0x20004, "tmp#2")}
+    if callee_steps == 4:
+        callee_defs[_var("tmp#2")] = _set(0x20002, "tmp#3")
+    ret = _FakeMLILInsn(0x20010, operation="MLIL_RET", vars_read=[_var("result#1")])
+    callee = _FakeFunction(0x20000, "fetch")
+    callee.medium_level_il = _FakeMLILFunction(instructions=[ret], definitions=callee_defs)
+    inner_call = _FakeMLILInsn(0x1000c, operation="MLIL_CALL_SSA", dest=_FakeConstPtr(0x20000))
+    result = _chain_slice(monkeypatch, {_var("r0#1"): inner_call}, max_depth=4,
+                          interprocedural=True, extra=[callee])
+    assert [s["reason"] for s in result["trace"]][:2] == ["cross_function", "definition"]
+    assert (result["step_count"], result["truncated"]) == (4, truncated)
+
+
+
+# --------------------------------------------------------------------------
+# BN6-C010: a trace on a quick-loaded view carries the shared disclosure
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("quick", [True, False])
+def test_a_trace_on_a_quick_view_discloses_its_analysis_state(monkeypatch, quick):
+    """The trace reads one function's IL, which a quick view still lifts, so it
+    answers -- but with the `{analysis_state, partial}` pair every
+    quick-tolerant read attaches, and the text warning first. A quick trace
+    and a full one were indistinguishable."""
+    from bn.formatters import _render_trace_text
+
+    bridge = _load_bridge(monkeypatch)
+    from _bridge_fakes import _FakeBV, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn
+
+    instance = bridge.BinaryNinjaBridge()
+    seed = _var("r0#1")
+    call_insn = _FakeMLILInsn(
+        0x10010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[seed])],
+        vars_read=[seed])
+    fn = _FakeFunction(0x10000, "target_func")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn], definitions={})
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    if quick:
+        bridge._quick_loaded_views.add(bv)
+
+    try:
+        result = instance._backward_slice("active", "target_func", "0x10010", arg_index=0)
+    finally:
+        bridge._quick_loaded_views.discard(bv)
+    assert (result["analysis_state"], result["partial"]) == (
+        ("quick", True) if quick else ("full", False))
+    first = _render_trace_text(result).splitlines()[0]
+    assert first.startswith("WARNING: target is quick-loaded") is quick
+
+
+def test_trace_labels_an_inline_expansion_by_its_builtin_and_intrinsic_registers(monkeypatch):
+    """V8-05: `trace` at a `rep movs` BN lifted to `__builtin_memcpy` printed
+    `arg[2] of <unresolved callee> (rdx)`: the synthetic builtin is no
+    function, and the count is the intrinsic's `rcx`, not the convention's
+    third argument register."""
+    rts = _load_bridge(monkeypatch).read_taint_slice
+
+    def reg(name):
+        return types.SimpleNamespace(operation=types.SimpleNamespace(name="LLIL_REG"),
+                                     src=types.SimpleNamespace(name=name))
+
+    def intrinsic(params):
+        return types.SimpleNamespace(operation=types.SimpleNamespace(name="LLIL_INTRINSIC"),
+                                     intrinsic=types.SimpleNamespace(name="__memcpy_u64"),
+                                     params=params)
+
+    shifted = types.SimpleNamespace(operation=types.SimpleNamespace(name="LLIL_SUB"))
+    lifted = [types.SimpleNamespace(operation=types.SimpleNamespace(name="LLIL_IF")),
+              intrinsic([shifted, shifted, reg("rcx")]),
+              intrinsic([reg("rdi"), reg("rsi"), reg("rcx")])]
+    caller = types.SimpleNamespace(
+        calling_convention=types.SimpleNamespace(int_arg_regs=["rdi", "rsi", "rdx", "rcx"]),
+        get_llils_at=lambda address: lifted if address == 0x40128a else [])
+    call = types.SimpleNamespace(
+        address=0x40128a,
+        dest=types.SimpleNamespace(operation=types.SimpleNamespace(name="MLIL_CONST_PTR"),
+                                   constant=0x404040))
+    bv = types.SimpleNamespace(
+        get_symbol_at=lambda a: types.SimpleNamespace(name="__builtin_memcpy") if a == 0x404040 else None,
+        get_function_at=lambda a: None)
+
+    labels = [rts._arg_label(None, bv, call, i, caller) for i in range(3)]
+    assert [(lb["callee"], lb["register"]) for lb in labels] == [
+        ("__builtin_memcpy", "rdi"), ("__builtin_memcpy", "rsi"), ("__builtin_memcpy", "rcx")]

@@ -195,7 +195,7 @@ def _taint_models_op(ctx, selector, params: dict[str, Any]):
     top-level ``presence_catalog``/``is_finding`` markers (#555)."""
     present_only = bool(params.get("present"))
     # #958: `--all-sites` shows the non-audit rows (import stubs, self stubs,
-    # constant-argument inline builtins) that are otherwise only counted.
+    # fixed-length inline builtins) that are otherwise only counted.
     all_sites = bool(params.get("all_sites"))
     want_callsites = bool(params.get("callsites")) or all_sites
     if (present_only or want_callsites) and selector is None:
@@ -318,41 +318,98 @@ def _branch_target(dest) -> int | None:
     return None
 
 
-def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int]) -> str | None:
+def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int],
+                    judge: _ExpansionJudge) -> str | None:
     """How the instruction at *addr* (a code reference to the modeled symbol)
     uses that symbol (#958):
 
-    * ``"call"``   -- a call or tail branch whose target is one of *targets*;
+    * ``"call"``   -- a call or tail branch whose target is one of *targets*,
+      or an instruction BN's MLIL synthesised a builtin call from with an
+      argument the model flags that taint can arm (an inline `rep movs` whose
+      length adds a variable size, V8-06);
     * ``"inline"`` -- not a call in LLIL, but BN's MLIL synthesised an inline
-      builtin call there (`str xzr, ...` runs lifted to `__builtin_memset`) and
-      every argument the model flags is a constant, so no taint can arm it;
+      builtin call there (`str xzr, ...` runs lifted to `__builtin_memset`, a
+      fixed-size `rep stos`) and every argument the model flags is settled
+      (:meth:`_ExpansionJudge.settled`), so no taint can arm it;
     * ``"data"``   -- anything else: the `adrp` that loads the GOT page the
       import's slot sits on, the stub's own `ldr`/`add` of its slot;
     * ``None``     -- the view cannot answer (no function, no IL API), so the
-      caller keeps the row rather than dropping a site it could not judge."""
+      caller keeps the row rather than dropping a site it could not judge.
+
+    Every LLIL instruction at *addr* is judged, not only the first: BN lifts
+    one `rep movs` to an `if` on the direction flag and an intrinsic per arm,
+    and only the intrinsics carry the synthesised calls."""
+    get_llils = getattr(fn, "get_llils_at", None) if fn is not None else None
     get_llil = getattr(fn, "get_llil_at", None) if fn is not None else None
-    if not callable(get_llil):
-        return None
     try:
-        llil = get_llil(int(addr))
+        if callable(get_llils):
+            llils = list(get_llils(int(addr)) or [])
+        elif callable(get_llil):
+            llils = [get_llil(int(addr))]
+        else:
+            return None
     except Exception:
         return None
-    if llil is None:
+    llils = [llil for llil in llils if llil is not None]
+    if not llils:
         return None
-    if il_format._il_op_name(llil) in _CALL_OPS:
-        return "call" if _branch_target(getattr(llil, "dest", None)) in targets else "data"
-    try:
-        mlil = getattr(llil, "mlil", None)
-    except Exception:
-        mlil = None
-    if mlil is not None and il_format._il_op_name(mlil) in _CALL_OPS \
-            and _branch_target(getattr(mlil, "dest", None)) in targets:
-        params = list(getattr(mlil, "params", []) or [])
-        flagged = [params[i] for i in flagged_args if 0 <= i < len(params)]
-        if flagged and all("CONST" in il_format._il_op_name(p) for p in flagged):
-            return "inline"
-        return "call"
-    return "data"
+    real_calls = [llil for llil in llils if il_format._il_op_name(llil) in _CALL_OPS]
+    if real_calls:
+        return ("call" if any(_branch_target(getattr(llil, "dest", None)) in targets
+                              for llil in real_calls) else "data")
+    synthesised = []
+    for llil in llils:
+        try:
+            mlils = list(getattr(llil, "mlils", None) or []) or [getattr(llil, "mlil", None)]
+        except Exception:
+            mlils = []
+        synthesised.extend(m for m in mlils
+                           if m is not None and il_format._il_op_name(m) in _CALL_OPS
+                           and _branch_target(getattr(m, "dest", None)) in targets)
+    if not synthesised:
+        return "data"
+    for call in synthesised:
+        params = list(getattr(call, "params", []) or [])
+        flagged = [i for i in flagged_args if 0 <= i < len(params)]
+        if not flagged or not all(judge.settled(fn, addr, call, i) for i in flagged):
+            return "call"
+    return "inline"
+
+
+class _ExpansionJudge:
+    """Whether taint can arm a flagged argument of a synthesised builtin call,
+    for ONE catalog request: a constant, or the length of an inline string
+    expansion that is a constant total split by its own pointer's alignment
+    (``alignment_split``, the length forward taint reports ``bounded_len``) --
+    gcc's `rep stos` of a fixed-size `memset`. A masked attacker value
+    (``n & 7``) is not settled. SSA forms come from one engine's per-request
+    cache, and each (function, address, argument) is judged once: a `rep stos`
+    lifts to two calls, and a catalog asks about every site of every builtin.
+    Nothing outlives the request."""
+
+    def __init__(self, bv, models) -> None:
+        self._engine = _taint.TaintEngine(bv, models)
+        self._verdicts: dict[tuple[int, int, int], bool] = {}
+
+    def settled(self, fn, addr: int, call, index: int) -> bool:
+        param = list(getattr(call, "params", []) or [])[index]
+        if "CONST" in il_format._il_op_name(param):
+            return True
+        key = (int(getattr(fn, "start", -1)), int(addr), index)
+        if key not in self._verdicts:
+            self._verdicts[key] = self._expansion_split(fn, call, index)
+        return self._verdicts[key]
+
+    def _expansion_split(self, fn, call, index: int) -> bool:
+        ssaf = self._engine._ssa_or_none(fn)
+        try:
+            ssa_call = call.ssa_form
+        except Exception:
+            return False
+        if ssaf is None or ssa_call is None:
+            return False
+        verdict = _taint.inline_expansion_length(ssaf, ssa_call, index, self._engine._ssa_def)
+        return verdict is not None and verdict["length_kind"] == "alignment_split"
 
 
 def _flagged_args(model: dict[str, Any] | None) -> list[int]:
@@ -392,14 +449,6 @@ def _disasm_at(bv, addr: int, container=None) -> str:
     return text or ""
 
 
-# Binary Ninja's loaders add this ExternalSection to EVERY view, holding one
-# placeholder symbol per compiler builtin its MLIL may synthesise
-# (`__builtin_memcpy`, `__builtin_strcpy`, ...). The placeholder proves nothing
-# about the binary; the builtin is in it only where code references it (a
-# store run BN lifted to an inline builtin call).
-_SYNTHETIC_SECTIONS = frozenset({".synthetic_builtins"})
-
-
 def _synthetic_unreferenced(bv, name: str) -> bool:
     """True when every symbol spelled *name* is a synthetic-builtin placeholder
     and no code references any of them, so the name must not mark its model
@@ -410,11 +459,7 @@ def _synthetic_unreferenced(bv, name: str) -> bool:
     if not addrs:
         return False
     for addr in addrs:
-        try:
-            sections = bv.get_sections_at(addr) or []
-        except Exception:
-            return False
-        if not any(str(getattr(s, "name", "")) in _SYNTHETIC_SECTIONS for s in sections):
+        if not il_format.in_synthetic_builtin_section(bv, addr):
             return False
     get_refs = getattr(bv, "get_code_refs", lambda a: [])
     return not any(list(get_refs(addr) or []) for addr in addrs)
@@ -432,7 +477,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
     `memcpy` "callsites" for a binary with three. An import stub's own forwarding
     jump (the x86 `.plt.sec` `jmp [GOT]`) is not a caller either, and AArch64's
     `br x17` never was one, so neither is counted and the count is the same on
-    both. The remaining non-audit rows (self stubs and constant-argument inline
+    both. The remaining non-audit rows (self stubs and fixed-length inline
     builtins) are counted but, unless ``all_sites``, left out of ``callsites``
     so the list is the work queue it is used as."""
     present: set[str] = set()
@@ -458,6 +503,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
         if want_callsites:
             keyed.setdefault(key, []).extend(
                 getattr(bv, "get_symbols_by_name", lambda n: [])(nm) or [])
+    judge = _ExpansionJudge(bv, models) if keyed else None
     for key, syms in keyed.items():
         slot = info[key]
         # Every address the symbol answers to (stub, GOT slot, extern) is a call
@@ -475,7 +521,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
                     continue
                 seen.add(ai)
                 container = _containing_fn(bv, ai)
-                shape = _callsite_shape(container, ai, targets, flagged)
+                shape = _callsite_shape(container, ai, targets, flagged, judge)
                 if shape == "data":
                     continue
                 fname, kind = _classify_callsite(bv, ai, key, models)
@@ -1044,6 +1090,21 @@ def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any
     the callsite, not necessarily anything the callee's parameter is named,
     so renderers must key headers off ``callee``, not ``name``."""
     label: dict[str, Any] = {"index": arg_index}
+    # V8-05: an inline string expansion (`rep movs`) is no call. Its operands
+    # are the registers the lifted intrinsic reads (the count is `rcx`, not the
+    # convention's third argument register), and its callee is the synthetic
+    # builtin MLIL names -- the symbol forward/backward taint report.
+    intrinsics = il_format.inline_expansion_intrinsics(
+        caller_func, int(getattr(call_insn, "address", 0) or 0))
+    if intrinsics:
+        reg = il_format.intrinsic_operand_register(intrinsics, arg_index)
+        if reg:
+            label["register"] = reg
+        dest = _branch_target(getattr(call_insn, "dest", None))
+        sym = bv.get_symbol_at(dest) if dest is not None else None
+        if sym is not None and getattr(sym, "name", None):
+            label["callee"] = label["callee_display_name"] = str(sym.name)
+        return label
     reg = _arg_register(caller_func, arg_index)
     if reg:
         label["register"] = reg
@@ -1079,8 +1140,14 @@ def _build_backward_trace(
     _call_depth: int = 0,
     base_depth: int = 0,
     seed_addr: int | None = None,
-) -> list[dict[str, Any]]:
-    """Recursively walk SSA use-def chains backward, optionally crossing call boundaries."""
+) -> tuple[list[dict[str, Any]], bool]:
+    """Recursively walk SSA use-def chains backward, optionally crossing call
+    boundaries. Returns ``(trace, pending)``: *pending* is whether work the
+    walk would still have done was left when the step budget ran out -- an
+    unvisited worklist entry here, or pending work in a callee sub-walk this
+    walk spent its remaining budget on (BN6-C011). A trace that is exactly
+    ``max_depth`` steps long with nothing left is complete, and an entry for
+    a variable already walked is no unfinished work."""
     trace: list[dict[str, Any]] = []
     # #416/#672: locals whose address is passed into a call, computed once
     # per function (not per terminus). Used in both intra and interprocedural
@@ -1094,6 +1161,12 @@ def _build_backward_trace(
     # the #416 out-param lookup can require the address-taking call to precede it.
     worklist: list[tuple[Any, int, int | None]] = [(v, 0, seed_addr) for v in initial_vars]
     visited: set[Any] = set()
+    callee_pending = False
+    # V8-02: a literal arm of a phi that carries a value round a loop is where
+    # the value STARTS, not what it is -- `taint backward`'s own recurrence
+    # test (`_phi_recurrence`) decides it, so the two never disagree.
+    recurrent_arms: dict[Any, dict[str, Any]] = {}
+    engine: list[Any] = []
 
     while worklist and len(trace) < max_depth:
         ssa_var, node_depth, ref_addr = worklist.pop(0)
@@ -1192,7 +1265,7 @@ def _build_backward_trace(
                                 entry["terminates"] = False
                                 entry["reason"] = "cross_function"
                                 trace.append(entry)
-                                callee_trace = _build_backward_trace(
+                                callee_trace, sub_pending = _build_backward_trace(
                                     ctx, bv, callee_mlil.ssa_form, callee_ret_vars,
                                     max_depth - len(trace),
                                     interprocedural=True,
@@ -1213,6 +1286,7 @@ def _build_backward_trace(
                                     ct.setdefault("function_context_display_name",
                                                   il_format._display_name(callee))
                                 trace.extend(callee_trace)
+                                callee_pending = callee_pending or sub_pending
                                 continue
             entry["terminates"] = True
             entry["reason"] = "call_or_jump_boundary"
@@ -1294,9 +1368,19 @@ def _build_backward_trace(
             entry["local"] = str(getattr(taken, "name", None) or taken)
         else:
             reads = _ssa_vars_from(getattr(def_insn, "vars_read", []) or [])
-            const = (_constant_value(getattr(def_insn, "src", None))
-                     if "SET_VAR" in def_op else None)
-            if const is not None:
+            src = getattr(def_insn, "src", None)
+            const = _constant_value(src) if "SET_VAR" in def_op else None
+            init = getattr(src, "constant", None)
+            if const is not None and ssa_var in recurrent_arms \
+                    and isinstance(init, int) and not isinstance(init, bool):
+                # `len = 0; for (..) len += 4;`: the literal is the loop's
+                # starting value; the trip count is control this slice does
+                # not follow.
+                entry["terminates"] = True
+                entry["reason"] = "recurrence_initializer"
+                entry["value"] = init
+                entry.update(recurrent_arms[ssa_var])
+            elif const is not None:
                 # `x = 0`, `p = nullptr`: the value's origin is this literal.
                 entry["terminates"] = True
                 entry["reason"] = "constant"
@@ -1313,6 +1397,8 @@ def _build_backward_trace(
                 # null on ordinary steps: a phi merge is `phi_source`, everything else is
                 # a plain `definition` (#162).
                 entry["reason"] = "phi_source" if "PHI" in def_op else "definition"
+                if "PHI" in def_op:
+                    _note_recurrence(bv, ssa_func, def_insn, engine, recurrent_arms)
         trace.append(entry)
 
         # Still walk any index/offset operand (`&local + i`): a tainted index
@@ -1321,7 +1407,34 @@ def _build_backward_trace(
             if rv not in visited:
                 worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
 
-    return trace
+    pending = callee_pending or any(
+        not isinstance(ssa_var, SSAVariable) or ssa_var not in visited
+        for ssa_var, _depth, _ref in worklist)
+    return trace, pending
+
+
+def _note_recurrence(bv, ssa_func, phi_insn, engine: list[Any],
+                     recurrent_arms: dict[Any, dict[str, Any]]) -> None:
+    """Record each arm of the phi *phi_insn* as the start of a loop
+    recurrence when ``TaintEngine._phi_recurrence`` -- the test `taint
+    backward` applies (IC08) -- says the phi carries a value round a loop.
+    The fields are backward's ``recurrence_initializer`` origin's: ``var``,
+    ``phi``, ``increments`` (None when a trip's step is not one constant),
+    ``calls`` when an update passes through one, ``search_exhausted`` when the
+    search ran out before ruling a cycle out. *engine* holds the one engine
+    the walk builds, on first need."""
+    if not engine:
+        engine.append(_taint.TaintEngine(bv, _taint.load_models()))
+    rec = engine[0]._phi_recurrence(ssa_func, phi_insn)
+    if rec is None:
+        return
+    phi = _ssa_label(getattr(phi_insn, "dest", None))
+    for arm in getattr(phi_insn, "src", None) or ():
+        if isinstance(arm, SSAVariable) and arm not in recurrent_arms:
+            recurrent_arms[arm] = {
+                "var": _ssa_label(arm), "phi": phi, "increments": rec.increments,
+                **({"calls": list(rec.calls)} if rec.calls else {}),
+                **({"search_exhausted": True} if rec.exhausted else {})}
 
 
 # Compact per-example fields carried into a frontier roll-up (#552). Kept to the
@@ -1333,7 +1446,8 @@ _FRONTIER_EXAMPLE_KEYS = (
     "ssa_label", "address", "depth", "callee", "callee_display_name", "out_param_callee",
     "base", "offset", "width", "function_context", "function_context_display_name",
     "out_param_callee_display_name", "out_param_call_site", "param_index", "param_register",
-    "local", "global_address", "global_name", "value",
+    "local", "global_address", "global_name", "value", "var", "phi", "increments", "calls",
+    "search_exhausted",
 )
 _FRONTIER_EXAMPLE_CAP = 3
 
@@ -1435,6 +1549,21 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
             + "; stores into it (array elements, struct fields) are not followed, so "
             "the bytes the call consumes have no provenance here"
         )
+    # V8-02: a loop's starting value is not the value: how many trips add to
+    # it is the loop's control, which a use-def slice does not follow.
+    for step in trace:
+        if isinstance(step, dict) and step.get("reason") == "recurrence_initializer":
+            inc = step.get("increments")
+            per_trip = (f"adds {', '.join(f'{i:+#x}' for i in inc)} per trip"
+                        if isinstance(inc, list) and inc else "changes each trip by an amount "
+                        "that is not one constant")
+            assumptions.append(
+                f"{step.get('var')} = {hex(step['value'])} is only where the loop "
+                f"recurrence {step.get('phi')} starts; it {per_trip}"
+                + (f" (through {', '.join(step['calls'])})" if step.get("calls") else "")
+                + " and the trip count is not in this slice"
+                + ("; the recurrence search ran out before ruling a cycle out"
+                   if step.get("search_exhausted") else ""))
     return assumptions
 
 
@@ -1858,7 +1987,7 @@ def _backward_slice(
                 f"immediate with no SSA definition to trace back."
             )
 
-    trace = _build_backward_trace(
+    trace, truncated = _build_backward_trace(
         ctx, bv, ssa_func, initial_vars, max_depth,
         interprocedural=interprocedural,
         ip_depth=ip_depth,
@@ -1881,7 +2010,9 @@ def _backward_slice(
         hints.append(_address_of_local_hint(arg_index, local_name, arg_label, func,
                                            mangled=mangled))
 
-    truncated = len(trace) >= max_depth
+    # BN6-C011: truncated is what the walk OBSERVED -- work left when the step
+    # budget ran out -- never inferred from the trace's length. A walk that
+    # drained in exactly `max_depth` steps is complete.
     return {
         "function": func.name,
         # #1001 item 4: text names the function and callee as `decompile` does;
@@ -1915,6 +2046,12 @@ def _backward_slice(
         "assumptions": _trace_assumptions(trace, truncated=truncated, max_depth=max_depth,
                                          mangled=mangled),
         "hints": hints,
+        # BN6-C010: the trace reads one function's IL, which a quick-loaded
+        # view still lifts, so it answers there -- with the SAME
+        # {analysis_state, partial} disclosure every quick-tolerant read
+        # attaches. Without it a trace on a quick view (call targets and
+        # callee bodies not analysed) was indistinguishable from a full one.
+        **_analysis_state_fields(bv),
     }
 
 

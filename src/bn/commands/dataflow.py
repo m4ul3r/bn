@@ -154,7 +154,6 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
         "defuse",
         {"identifier": args.identifier, "var": args.var},
         require_target=True,
-        contextual_hints=True,
         text_renderer=lambda value: _resolution_note(value) + _render_defuse_text(
             value, mangled=bool(args.mangled)),
         stem="defuse",
@@ -211,8 +210,6 @@ def _dataflow_values(args: argparse.Namespace) -> int:
         "possible_values",
         {"identifier": args.identifier, "at": args.at},
         require_target=True,
-        # #1033 item 8: the `--at` refusal prints a `bn il` command.
-        contextual_hints=True,
         text_renderer=lambda value: _resolution_note(value) + _render_values_text(
             value, mangled=bool(args.mangled)),
         stem="values",
@@ -265,7 +262,10 @@ _SINK_LOCATOR_HELP = (
                       "recv_overflow (read/recv/recvfrom length -> undersized buffer). "
                       "Use when auditing persistence / file-corruption / exfiltration, or "
                       "recv-into-fixed-buffer overflows. recv_overflow is high-FP on the "
-                      "read-loop idiom (#499) -- enable it only when deliberately hunting."),
+                      "read-loop idiom (#499) -- enable it only when deliberately hunting. "
+                      "Without it, calls of file_write/net_write that taint reaches are "
+                      "listed in `opt_in_sinks_reached`, not reported, and the all-clear "
+                      "covers only the enabled classes."),
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
@@ -292,9 +292,6 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        contextual_hints=True,
-        # The frontier block prints its own `bn xrefs` follow-up (P2-04).
-        route_rendered_commands=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
                                                     mangled=args.mangled)),
         stem="taint-forward",
@@ -347,8 +344,6 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        contextual_hints=True,
-        route_rendered_commands=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
                                                     mangled=args.mangled)),
         stem="taint-backward",
@@ -370,7 +365,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
              arg("--callsites", action="store_true", default=False,
                  help="With --present: expand each present model's call sites (application callers only)"),
              arg("--all-sites", action="store_true", default=False,
-                 help="With --callsites: also list the self-stub and constant-argument "
+                 help="With --callsites: also list the self-stub and fixed-length "
                       "inline-builtin rows that are otherwise only counted (implies --callsites)"),
              arg("--callsite-limit", dest="callsite_limit", type=_callsite_limit_int, default=10,
                  metavar="N",

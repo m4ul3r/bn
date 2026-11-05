@@ -33,7 +33,12 @@ from pathlib import Path
 
 import pytest
 
-from bn.taint_vocabulary import kind_rows, origin_constructors, overlay_constructors
+from bn.taint_vocabulary import (
+    kind_rows,
+    origin_constructors,
+    overlay_constructors,
+    pointer_object_constructors,
+)
 
 REFERENCE = Path(__file__).resolve().parent.parent / "skills" / "bn" / "reference"
 READING = REFERENCE / "reading.md"
@@ -1514,12 +1519,15 @@ def _doc_table(header: str) -> dict[str, str]:
 
 ORIGIN_TABLE = "| origin `kind` | meaning and fields |"
 OVERLAY_TABLE = "| overlay row `kind` | meaning | fields |"
+POINTER_OBJECT_TABLE = "| pointer object `kind` | meaning and fields |"
 
 
 @pytest.mark.parametrize(("source", "constructors", "header"), [
     (SRC / "bn_agent_bridge" / "taint_engine.py", origin_constructors, ORIGIN_TABLE),
     (SRC / "bn" / "taint_models.py", overlay_constructors, OVERLAY_TABLE),
-], ids=["backward_origin_kinds", "model_overlay_row_kinds"])
+    (SRC / "bn_agent_bridge" / "taint_engine.py", pointer_object_constructors,
+     POINTER_OBJECT_TABLE),
+], ids=["backward_origin_kinds", "model_overlay_row_kinds", "pointer_object_kinds"])
 def test_reading_tables_name_exactly_the_kinds_the_code_builds(source, constructors, header):
     """P2-13: an origin `kind` (`slices[].origin` / `origins[]`) or a model
     overlay row `kind` (`model_sources` / `overlays`) an agent finds in no

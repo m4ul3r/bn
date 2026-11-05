@@ -620,7 +620,7 @@ def test_forward_attributed_gate_recomputed_over_union_leaves(models):
     def _run(leaves, safe):
         return {
             "direction": "forward", "function": {"name": "parse"}, "sources": sources,
-            "reached_sinks": [], "leaves": leaves, "assumptions": [],
+            "reached_sinks": [], "opt_in_sinks_reached": [], "leaves": leaves, "assumptions": [],
             "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
             "diagnostics": {"safe_to_report_all_clear": safe, "all_clear_reason": "x",
                             "tainted_values": 1, "last_use": None, "source_callsites": 2},
@@ -659,7 +659,7 @@ def test_forward_attributed_source_callsites_is_total_not_first_run(models):
     def _run():
         return {
             "direction": "forward", "function": {"name": "parse"}, "sources": sources,
-            "reached_sinks": [], "leaves": [], "assumptions": [],
+            "reached_sinks": [], "opt_in_sinks_reached": [], "leaves": [], "assumptions": [],
             "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
             "diagnostics": {"safe_to_report_all_clear": True, "all_clear_reason": "x",
                             "tainted_values": 1, "last_use": None, "source_callsites": 1},
@@ -871,9 +871,10 @@ def test_dropped_arg_never_lowers_a_sink_class_1001(models, monkeypatch, shape, 
 
 def test_class_from_recovered_args_is_not_called_unproven_1001(models, monkeypatch):
     # #1001 review round 4: the checked length is recovered and its bound is
-    # proven from recovered args alone (`n = read(fd, b, 0x40)`, #159), while
-    # the model's buffer arg was dropped. The class is the full-prototype class
-    # and comes from the recovered args only; the row must say THAT, not
+    # proven from recovered args alone (`n = read(fd, b, 0x40)`, #159, behind
+    # `if (n <= 0) return;` -- an unchecked return bounds nothing, V7-01),
+    # while the model's buffer arg was dropped. The class is the full-prototype
+    # class and comes from the recovered args only; the row must say THAT, not
     # "the model's own and unproven".
     n1 = FSSA(FVar("n"), 1); b = FVar("b")
     rd = FInstr(0, 0x10, "MLIL_CALL_SSA", "n#1 = read(0, &b, 0x40)", reads=[], writes=[n1],
@@ -883,9 +884,12 @@ def test_class_from_recovered_args_is_not_called_unproven_1001(models, monkeypat
                         FExpr("MLIL_CONST", "0x40", constant=0x40)])
 
     def run(n_params):
-        full = [FExpr("MLIL_CONST", "0", constant=0),
-                FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]), FExpr("MLIL_CONST_PTR", "0x5000",
-                                                                constant=0x5000)]
+        length = FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])
+        length.size = 8
+        length.possible_values = FPVS("SignedRangeValue")
+        length.possible_values.ranges = [types.SimpleNamespace(start=1, end=0x40, step=1)]
+        full = [FExpr("MLIL_CONST", "0", constant=0), length,
+                FExpr("MLIL_CONST_PTR", "0x5000", constant=0x5000)]
         call = FInstr(1, 0x14, "MLIL_CALL_SSA", "app_recv(...)", reads=[n1],
                       dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
                       params=full[:n_params])
@@ -9939,7 +9943,7 @@ def test_forward_attributed_row_frontier_counts_every_blocking_kind_812(models):
     def _run(leaves):
         return {
             "direction": "forward", "function": {"name": "parse"}, "sources": sources,
-            "reached_sinks": [], "leaves": leaves, "assumptions": [],
+            "reached_sinks": [], "opt_in_sinks_reached": [], "leaves": leaves, "assumptions": [],
             "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
             "diagnostics": {"safe_to_report_all_clear": False, "all_clear_reason": "x",
                             "tainted_values": 1, "last_use": None, "source_callsites": 1},
@@ -9989,7 +9993,7 @@ def test_forward_attributed_union_keeps_the_unread_callee_disclosure_811(models)
     def _run(incomplete):
         return {
             "direction": "forward", "function": {"name": "parse"}, "sources": sources,
-            "reached_sinks": [], "leaves": [], "assumptions": [],
+            "reached_sinks": [], "opt_in_sinks_reached": [], "leaves": [], "assumptions": [],
             "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0,
                       "truncated": False,
                       "analysis_incomplete": bool(incomplete),

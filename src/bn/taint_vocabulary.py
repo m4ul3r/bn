@@ -2,15 +2,16 @@
 
 ``bn capabilities`` advertises it (V4-05) so an agent can learn, before its
 first run, which frontier leaf kinds block a claim, which truncation causes a
-run can name, which backward origin kinds and ``sink_status`` statuses exist and
-which ``run_params`` keys echo a run's configuration.
+run can name, which backward origin kinds, pointer-demand object kinds and
+``sink_status`` statuses exist and which ``run_params`` keys echo a run's
+configuration.
 
 Two kinds of source, one each:
 
 * Declared sets -- ``BLOCKING_LEAF_KINDS`` here, ``TRUNCATION_CAUSES`` in
   :mod:`taint_truncation` -- that the engine reads. Tests enumerate the engine's
   literals against them.
-* Literals only the engine spells (origin kinds, ``sink_status`` statuses,
+* Literals only the engine spells (origin and pointer-object kinds, ``sink_status`` statuses,
   ``run_params`` keys). Those are read off the bridge source by the AST crawler
   below, the same one the skill-reference drift tests use, so the advertised
   list and the documented tables cannot disagree with the code. The bridge
@@ -287,6 +288,16 @@ def sink_status_constructors(node: ast.AST, scopes: list) -> Iterator[ast.expr]:
         yield node.args[0]
 
 
+def pointer_object_constructors(node: ast.AST, scopes: list) -> Iterator[ast.expr]:
+    """A pointer-demand object (``pointer_demand_not_certified`` /
+    ``sink_role_unknown`` ``objects``): any dict with a `kind` built inside
+    `_demand_objects`, the one routine that describes what a pointer may
+    read."""
+    if (isinstance(node, ast.Dict) and any(s.name == "_demand_objects" for s in scopes)
+            and any(isinstance(k, ast.Constant) and k.value == "kind" for k in node.keys)):
+        yield node
+
+
 def run_params_keys(path: Path) -> set[str]:
     """Every key *path* writes into a ``run_params`` echo: the keys of a dict
     literal under a ``"run_params"`` key, and each ``run_params["<key>"] = ...``
@@ -321,6 +332,56 @@ def run_params_keys(path: Path) -> set[str]:
     return keys
 
 
+def sink_fields(path: Path) -> set[str]:
+    """Every key a forward reached-sink row's ``sink`` object can carry: the
+    keys of the dict under ``"sink"`` that ``_make_finding`` -- the one
+    function that builds a finding -- returns, which is an explicit
+    allow-list. A ``**`` spread contributes the keys of each dict it can be:
+    a literal, either arm of a conditional, or a method's returned dicts
+    (``**self._model_field(callee)``). Anything else raises."""
+    tree = _parse(path)
+    methods = {n.name: n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    builder = methods.get("_make_finding")
+    if builder is None:
+        raise VocabularyUnresolved(f"{path.name} defines no `_make_finding`")
+
+    def keys(expr: ast.AST, seen: frozenset[str]) -> set[str]:
+        if isinstance(expr, ast.Dict):
+            out: set[str] = set()
+            for k, v in zip(expr.keys, expr.values):
+                if k is None:
+                    out |= keys(v, seen)
+                elif isinstance(k, ast.Constant) and isinstance(k.value, str):
+                    out.add(k.value)
+                else:
+                    raise VocabularyUnresolved(
+                        f"{path.name}:{expr.lineno} builds a sink field with a non-literal key")
+            return out
+        if isinstance(expr, ast.IfExp):
+            return keys(expr.body, seen) | keys(expr.orelse, seen)
+        if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+                and isinstance(expr.func.value, ast.Name) and expr.func.value.id == "self"
+                and expr.func.attr in methods and expr.func.attr not in seen):
+            returns = [n.value for n in scope_nodes(methods[expr.func.attr])
+                       if isinstance(n, ast.Return) and n.value is not None]
+            if not returns:
+                raise VocabularyUnresolved(f"`{expr.func.attr}` returns no sink fields")
+            return set().union(*(keys(r, seen | {expr.func.attr}) for r in returns))
+        raise VocabularyUnresolved(
+            f"{path.name}:{getattr(expr, 'lineno', '?')} spreads `{ast.unparse(expr)}` "
+            "into a sink: its fields cannot be read")
+
+    built = [v for n in scope_nodes(builder) if isinstance(n, ast.Dict)
+             for k, v in zip(n.keys, n.values)
+             if isinstance(k, ast.Constant) and k.value == "sink"]
+    if len(built) != 1:
+        raise VocabularyUnresolved(
+            f"`_make_finding` builds {len(built)} `sink` objects, not one")
+    return keys(built[0], frozenset())
+
+
+
 def taint_vocabulary(bridge: Path | None = None) -> dict[str, Any]:
     """The vocabulary ``bn capabilities`` advertises, each list sorted.
 
@@ -332,7 +393,10 @@ def taint_vocabulary(bridge: Path | None = None) -> dict[str, Any]:
         "leaf_kinds": sorted(BLOCKING_LEAF_KINDS),
         "truncation_causes": sorted(TRUNCATION_CAUSES),
         "origin_kinds": sorted(kind_rows(engine, origin_constructors)),
+        # G5-R5: what a pointer demand's `objects` rows can be.
+        "pointer_object_kinds": sorted(kind_rows(engine, pointer_object_constructors)),
         "sink_status": sorted(kind_rows(engine, sink_status_constructors, key="status")),
         "run_params": sorted(run_params_keys(engine)
                              | run_params_keys(bridge / "read_taint_slice.py")),
+        "sink_fields": sorted(sink_fields(engine)),
     }

@@ -168,6 +168,7 @@ def _derive_all_clear(
     unmodeled_reached: bool = False,
     truncation_cause: list[str] | None = None,
     analysis_incomplete: bool = False,
+    opt_in_classes: list[str] | None = None,
 ) -> tuple[bool, str]:
     """The honesty claim gate for a ZERO-SINK forward result.
 
@@ -185,43 +186,59 @@ def _derive_all_clear(
     frontier). The engine returns such a callee conservatively tainted, so
     analysis genuinely ESCAPED and an empty ``reached_sinks`` is not an
     all-clear even though no blocking leaf was emitted (#562).
+
+    The claim is relative to the sink classes the run ENABLED (IC07), whether
+    the gate holds or not: every reason opens with that scope, and taint
+    reaching a sink of an opt-in class the run did not enable
+    (*opt_in_classes*, from ``opt_in_sinks_reached``) is named in it -- it
+    neither withholds the all-clear nor is left out of a withheld one, so no
+    reason reads as "nothing reached any sink".
     """
+    head = "no modeled sink of an enabled class reached"
+    opt_in = (f"; taint did reach opt-in sink class(es) {', '.join(opt_in_classes)}, "
+              "which this run does not report (see opt_in_sinks_reached)"
+              if opt_in_classes else "")
+    withheld = _withheld_all_clear(
+        leaves, assumptions, truncated=truncated, unmodeled_reached=unmodeled_reached,
+        truncation_cause=truncation_cause, analysis_incomplete=analysis_incomplete)
+    if withheld is not None:
+        return False, f"{head}, but {withheld} -- NOT an all-clear{opt_in}"
+    return True, (f"{head} and no tainted frontier in the analyzed region{opt_in}; "
+                  "still a may-analysis -- not a proof of safety")
+
+
+def _withheld_all_clear(
+    leaves: list[dict[str, Any]],
+    assumptions: list[str],
+    *,
+    truncated: bool,
+    unmodeled_reached: bool,
+    truncation_cause: list[str] | None,
+    analysis_incomplete: bool,
+) -> str | None:
+    """Why a zero-sink forward run is NOT an all-clear, or None when it is."""
     blocking = [str(lf.get("kind")) for lf in leaves
                 if lf.get("kind") in BLOCKING_LEAF_KINDS]
-    weak_seed = _assumption_has_weak_seed(assumptions)
-
     if blocking:
         # De-dup preserving order for a readable reason.
-        seen: list[str] = []
-        for k in blocking:
-            if k not in seen:
-                seen.append(k)
-        return False, (
-            f"no modeled sink reached, but {len(blocking)} blocking frontier "
-            f"leaf(s) ({', '.join(seen)}) remain -- NOT an all-clear")
+        seen = list(dict.fromkeys(blocking))
+        return (f"{len(blocking)} blocking frontier leaf(s) ({', '.join(seen)}) remain")
     if leaves:
-        return False, (
-            f"no modeled sink reached, but {len(leaves)} frontier leaf(s) "
-            f"remain -- NOT an all-clear")
+        return f"{len(leaves)} frontier leaf(s) remain"
     if any("tokenizer_state_escapes" in str(a) for a in assumptions):
         # A `continuation` model (strtok) left its static state tainted when
         # the function returned; a `strtok(NULL, ..)` in another function
         # continues it and is not followed, so the empty result speaks only
         # for this function's own tokens (PR-928 review P2).
-        return False, (
-            "no modeled sink reached, but a tokenizer's static state is left "
-            "tainted at return (see the tokenizer_state_escapes caveat) -- a "
-            "continuation in another function is not followed, NOT an all-clear")
-    if weak_seed:
-        return False, (
-            "no sinks/leaves, but the source seed was incomplete or mis-anchored "
-            "(see caveats) -- NOT an all-clear")
+        return ("a tokenizer's static state is left tainted at return (see the "
+                "tokenizer_state_escapes caveat); a continuation in another "
+                "function is not followed")
+    if _assumption_has_weak_seed(assumptions):
+        return "the source seed was incomplete or mis-anchored (see caveats)"
     if unmodeled_reached:
-        return False, (
-            "no modeled sink reached, but taint reached an unmodeled call "
-            "frontier (an unresolved in-binary callee or an external callee with "
-            "no taint model, returned conservatively tainted) -- analysis "
-            "escaped there, NOT an all-clear")
+        return ("taint reached an unmodeled call frontier (an unresolved in-binary "
+                "callee or an external callee with no taint model, returned "
+                "conservatively tainted); analysis escaped there")
     if analysis_incomplete:
         # #811: a callee whose MLIL was missing mid-run (a partially analysed
         # view, or a function BN had not finished lifting) is caught by
@@ -230,17 +247,12 @@ def _derive_all_clear(
         # under-disclosure started, so the condition is threaded structurally and
         # withholds the all-clear here: the body was never read, so "no sink in
         # it" is an absence of evidence, not evidence of absence.
-        return False, (
-            "no modeled sink reached, but one or more callee bodies could not be "
-            "analysed (MLIL unavailable -- the view may be partially analysed); "
-            "their contents were never examined, NOT an all-clear")
+        return ("one or more callee bodies could not be analysed (MLIL unavailable "
+                "-- the view may be partially analysed); their contents were never "
+                "examined")
     if truncated:
-        return False, (
-            f"analysis truncated ({_truncation_hint(truncation_cause)}) -- "
-            "incomplete coverage, NOT an all-clear")
-    return True, (
-        "no modeled sink and no tainted frontier in the analyzed region; still a "
-        "may-analysis -- not a proof of safety")
+        return f"analysis truncated ({_truncation_hint(truncation_cause)}): incomplete coverage"
+    return None
 
 
 def command_template(command: str) -> str:
@@ -262,7 +274,9 @@ _RESOLVE_MAP_SITES = 8
 
 def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int],
                          unmodeled_reached: bool, ext_no_model: bool,
-                         tainted_values: int | None, function: str | None) -> str:
+                         tainted_values: int | None, function: str | None,
+                         opt_in_reached: list[dict[str, Any]] | None = None,
+                         exits: dict[str, Any] | None = None) -> str:
     """The single suggested next step for a zero-sink forward run.
 
     Every command it prints in backticks either runs as printed (the function
@@ -562,6 +576,14 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         return ("taint escaped through a coarse-memory frontier (a pointer/store not "
                 "precisely tracked); inspect the frontier leaves or seed a value read "
                 f"back from those bytes{seed}")
+    if opt_in_reached:
+        # IC07: the run's scope, not the flow, is why nothing was reported.
+        classes = sorted({str(r.get("class")) for r in opt_in_reached})
+        calls = ", ".join(f"{r.get('callee')} @ {r.get('address')}" for r in opt_in_reached)
+        flags = " ".join(f"--sink-class {c}" for c in classes)
+        return (f"taint reached {len(opt_in_reached)} call(s) of opt-in sink class(es) "
+                f"{', '.join(classes)} ({calls}) that this run does not report; re-run "
+                f"this same query with `{flags}` added to classify them")
     if tainted_values is None:
         # No seed reach was recorded (the walk did not finish), so a dead seed
         # and a cut walk look alike here: say neither.
@@ -570,9 +592,24 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
     if tainted_values <= 1:
         return ("the source seeded but produced no further tainted uses; verify the "
                 "`--source` locator matches the intended value")
-    return ("taint propagated but reached no modeled sink and hit no unresolved "
-            "frontier; the flow appears to dead-end locally -- inspect the last "
-            "propagated use or widen `--max-depth`")
+    exits = exits or {}
+    ways = (["the return value"] if exits.get("return") else []) + [
+        f"out-parameter {i}" for i in exits.get("out_params") or ()]
+    if ways:
+        # IC07 acceptance 4: a value that leaves through the return or an
+        # out-parameter is not a dead end and not proven safe -- its callers
+        # use it, and a forward run from here does not follow it there.
+        seeds = (([f"ret:{fn}"] if exits.get("return") else [])
+                 + [f"arg:{fn}:{i}" for i in exits.get("out_params") or ()]) if fn else []
+        follow = ("; follow it from a caller, e.g. "
+                  + ", ".join(command_template(f"bn taint forward -f CALLER --source {s}")
+                              for s in seeds)) if seeds else ""
+        return (f"taint reached no enabled modeled sink and no frontier here; it leaves "
+                f"this function through {' and '.join(ways)}, which a forward run from "
+                f"here does not follow into callers{follow}")
+    return ("taint propagated but reached no enabled modeled sink, no frontier, and "
+            "neither the return value nor an out-parameter; inspect the last "
+            "propagated use")
 
 
 # #1041 item 1, narrowed after #1050 review round 5: the source-function gate
@@ -690,7 +727,9 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
                              truncation_cause: list[str] | None = None,
                              analysis_incomplete: bool = False,
                              function: str | None = None,
-                             buffer_seed: bool = False) -> dict[str, Any]:
+                             buffer_seed: bool = False,
+                             opt_in_reached: list[dict[str, Any]] | None = None,
+                             ) -> dict[str, Any]:
     """Frontier diagnostics + honesty gate for a zero-sink forward run (#559/#562).
 
     Purely descriptive: seed reach (matched source callsites, tainted SSA
@@ -705,7 +744,10 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     ``function`` is the analysed function's address, used to fill in the
     commands the next action prints (#1033 item 6). ``buffer_seed`` says a
     ``call:``/``arg:`` source seeded a buffer its model fills (a receive-family
-    seed): an all-clear then carries :data:`RECEIVE_ALL_CLEAR_CAVEAT`."""
+    seed): an all-clear then carries :data:`RECEIVE_ALL_CLEAR_CAVEAT`.
+    ``opt_in_reached`` is the run's ``opt_in_sinks_reached``: the all-clear is
+    scoped to the enabled sink classes and names the opt-in ones taint reached
+    (IC07)."""
     # Seed reach is MEASURED only by a walk that finished: the top run records
     # it as `diag`. A walk that unwound (the recursion salvage) recorded none,
     # and reading that absence as "0 values, the seed did not propagate" put
@@ -753,14 +795,21 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     propagated = (bool(diag.get("last_use")) or (tainted_values or 0) > 1
                   or any(k not in _NO_PROPAGATION_KINDS for k in by_kind))
 
+    # Where taint left the function, as the walk recorded it (IC07): a value
+    # that reaches the return or an out-parameter is used by callers.
+    exits = {"return": bool(sub.get("reached_return")),
+             "out_params": sorted(int(i) for i in sub.get("out_params") or ())}
+    opt_in_reached = list(opt_in_reached or [])
+    opt_in_classes = sorted({str(r.get("class")) for r in opt_in_reached})
     next_action = _forward_next_action(
         leaves, by_kind=by_kind, unmodeled_reached=unmodeled_reached,
-        ext_no_model=ext_no_model, tainted_values=tainted_values, function=function)
+        ext_no_model=ext_no_model, tainted_values=tainted_values, function=function,
+        opt_in_reached=opt_in_reached, exits=exits)
 
     safe, reason = _derive_all_clear(
         leaves, assumptions, truncated=truncated,
         unmodeled_reached=unmodeled_reached, truncation_cause=truncation_cause,
-        analysis_incomplete=analysis_incomplete)
+        analysis_incomplete=analysis_incomplete, opt_in_classes=opt_in_classes)
 
     return {
         "source_callsites": int(seed_callsites),
@@ -781,6 +830,11 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
             "seed_misanchored": seed_misanchored_n,
             "by_kind": by_kind,
         },
+        # IC07: where taint left the function (callers use it; not followed).
+        "exits": exits,
+        # IC07: the opt-in sink classes taint reached that this run does not
+        # report (rows in the result's `opt_in_sinks_reached`).
+        "opt_in_sink_classes_reached": opt_in_classes,
         "next_action": next_action,
         # #562 honesty gate, folded into the single diagnostics block.
         "safe_to_report_all_clear": safe,
@@ -818,6 +872,7 @@ def backward_diagnostics(
     slices: int,
     sinks_constant: int = 0,
     unresolved_origins: int = 0,
+    recurrence_origins: int = 0,
     truncated: bool = False,
     truncation_cause: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -852,6 +907,12 @@ def backward_diagnostics(
     true`` beside ``traverses_unresolved: true`` and ``frontier.unresolved: 0``
     on the same result. It is counted in ``frontier.unresolved`` and withholds
     the claim like any blocking leaf.
+
+    ``recurrence_origins`` counts origins of kind ``recurrence_initializer``:
+    the literal a loop-carried value starts from. The value slice reaches it,
+    but the value also depends on the loop's trip count -- control flow, which
+    backward slicing does not track -- so it withholds the claim too, and the
+    advice points at the loop's exit condition (IC08).
     """
     by_kind: dict[str, int] = {}
     for lf in leaves or []:
@@ -904,6 +965,13 @@ def backward_diagnostics(
             "definition (origin.kind == 'unresolved') -- the def-chain was not "
             "followed to its origin, so this slice is NOT a complete account of "
             "what reaches the sink")
+    elif recurrence_origins:
+        complete, reason = False, (
+            f"{int(recurrence_origins)} origin(s) are a loop recurrence's "
+            "initializer (origin.kind == 'recurrence_initializer'): the value "
+            "starts from that literal and is updated on the loop's trips, and how many "
+            "trips the loop makes is control flow this value slice does not "
+            "follow -- NOT evidence that the value is a runtime constant")
     elif truncated:
         complete, reason = False, (
             f"analysis truncated ({_truncation_hint(truncation_cause)}) -- "
@@ -1119,6 +1187,18 @@ def backward_diagnostics(
         next_action = (
             "the sink seeded but no slice was produced; confirm the --sink "
             "locator names the operand you meant")
+    elif recurrence_origins:
+        # Value flow reached the literal a loop-carried value starts from;
+        # how many trips the loop makes -- the rest of the value -- is its
+        # control, which no value slice follows (IC08).
+        next_action = (
+            "the slice reached its origins, but a recurrence_initializer origin "
+            "is only where a loop-carried value starts (its value and per-trip "
+            "increments are in the origin): the final value depends on how many "
+            "times the loop ran, which value-flow slicing does not follow -- read "
+            "the loop's exit condition in the MLIL of the origin's function and "
+            "slice the values it reads before treating the count as "
+            "attacker-independent")
     else:
         # A `crt_entry` row is the one frontier left: the slice did reach its
         # origins, but the formals of the function the C runtime's start
