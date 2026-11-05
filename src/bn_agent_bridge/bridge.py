@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import select
 import shlex
 import socket
 import socketserver
@@ -45,8 +46,11 @@ from ._shared import (
     _annotate_row_fields,
     _artifact_summary,
     _json_response,
+    _log_internal_error,
     _normalize_prototype,
     _parse_address,
+    _request_cancel_context,
+    _request_cancelled,
     _residue_error_disclosure,
     _run_on_main_thread,
     _serialize_error,
@@ -150,33 +154,23 @@ def _parse_idle_timeout(raw: str | None) -> float | None:
 _load_in_progress_lock = threading.Lock()
 _load_in_progress: dict[str, threading.Event] = {}
 
-# Set by BridgeHandler while a request is executing. Long operations can poll it
-# to stop work after the CLI sends a cancellation request instead of wedging a
-# bridge instance with abandoned work (#365).
-_request_cancel_checker = threading.local()
 
+def _peer_hung_up(connection) -> bool:
+    """Whether the client on *connection* has closed its end entirely.
 
-@contextlib.contextmanager
-def _request_cancel_context(checker):
-    old = getattr(_request_cancel_checker, "checker", None)
-    _request_cancel_checker.checker = checker
-    try:
-        yield
-    finally:
-        if old is None:
-            with contextlib.suppress(AttributeError):
-                delattr(_request_cancel_checker, "checker")
-        else:
-            _request_cancel_checker.checker = old
-
-
-def _request_cancelled() -> bool:
-    checker = getattr(_request_cancel_checker, "checker", None)
-    if checker is None:
+    The CLI half-closes (SHUT_WR) after sending and then waits, which reads
+    as end-of-file but not as a hang-up; only a client that is gone -- exited,
+    killed, or timed out and closed -- makes a Linux Unix stream socket report
+    POLLHUP. Other platforms answer False: their POLLHUP on a half-closed
+    Unix socket is not specified, and a false positive would cancel every
+    request."""
+    if sys.platform != "linux":
         return False
     try:
-        return bool(checker())
-    except Exception:
+        poller = select.poll()
+        poller.register(connection, select.POLLHUP)
+        return any(ev & select.POLLHUP for _fd, ev in poller.poll(0))
+    except (OSError, ValueError):
         return False
 
 
@@ -1844,9 +1838,15 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                                 lambda _request_id: False,
                             )
                             begin_request(request_id)
+                            connection = self.connection
                             try:
+                                # A client killed outside its own timeout path
+                                # (SIGTERM, `timeout`) sends no cancel; its
+                                # hang-up is the only signal that nobody is
+                                # waiting for this answer (P1-07).
                                 with _request_cancel_context(
                                     lambda: is_cancelled(request_id)
+                                    or _peer_hung_up(connection)
                                 ):
                                     response = dispatcher.dispatch(payload)
                             finally:
@@ -2593,6 +2593,7 @@ class BinaryNinjaBridge:
                 result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
+            _log_internal_error(op, exc)
             # When the failure carries an unclearable has_user_type residue, the
             # caller-visible payload must DISCLOSE it (success:false /
             # rolled_back:false / prototype_user_type_residue:true + explanation),

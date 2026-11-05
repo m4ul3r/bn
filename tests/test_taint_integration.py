@@ -1579,11 +1579,14 @@ def test_global_continuation_discloses_an_exhausted_reachability_budget(tmp_path
         "char global_buffer[64];",
         "__attribute__((noinline)) int consumer(void) { return system(global_buffer); }",
     ]
-    body += [f"__attribute__((noinline)) int q{i}(int v) {{ return v + {i}; }}"
-             for i in range(width - 1)]
-    body += ["__attribute__((noinline)) int fanout(int v) {", "    int t = 0;"]
-    body += [f"    t += q{i}(v);" for i in range(width - 1)]
-    body += ["    t += consumer();", "    return t;", "}"]
+    # Void callees: an int-returning one makes the one scan of `fanout` follow
+    # every return value as a possible pointer -- a whole pointer-scan budget
+    # spent on a shape this test is not about, which the request's sweep
+    # allowance (P1-01) then reports ahead of the function budget.
+    body += [f"__attribute__((noinline)) void q{i}(void) {{ }}" for i in range(width - 1)]
+    body += ["__attribute__((noinline)) int fanout(int v) {"]
+    body += [f"    q{i}();" for i in range(width - 1)]
+    body += ["    return consumer() + v;", "}"]
     body += [
         "__attribute__((noinline)) int transfer(const char *src) {",
         "    memcpy(global_buffer, src, 16); return fanout(1);", "}",
@@ -1620,6 +1623,114 @@ def test_global_continuation_discloses_an_exhausted_reachability_budget(tmp_path
     assert "reachability truncated" in rendered.stdout, rendered.stdout
     assert "function_budget" in rendered.stdout, rendered.stdout
     assert sum(_run_or_check_template(shared_bn, _forward_prose(result))) >= 1
+
+
+def _data_symbol_addr(binary: Path, name: str) -> str:
+    """A data symbol's address from the binary's own symbol table."""
+    res = subprocess.run(["nm", str(binary)], capture_output=True, text=True, timeout=60.0)
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2] == name:
+            return hex(int(parts[0], 16))
+    raise AssertionError(f"{name} not in the symbol table of {binary.name}")
+
+
+def _wide_globals_binary(tmp_path, count: int = 600) -> Path:
+    """`main` copies argv into a global laid out after *count* neighbouring
+    globals, calls `reset_all()` -- which zeroes every one of them -- and
+    then hands argv to `system`."""
+    lines = ["#include <stdlib.h>", "#include <string.h>"]
+    lines += [f"long g_slot{i};" for i in range(count)]
+    lines += ["char g_name[64];", "__attribute__((noinline)) void reset_all(void) {"]
+    lines += [f"    g_slot{i} = 0;" for i in reversed(range(count))]
+    lines += ["}", "int main(int argc, char **argv) {", "    if (argc < 2) return 1;",
+              "    strncpy(g_name, argv[1], sizeof g_name - 1);", "    reset_all();",
+              "    system(argv[1]);", "    return 0;", "}"]
+    src = tmp_path / "wideglobals.c"
+    src.write_text("\n".join(lines) + "\n")
+    binary = tmp_path / "wideglobals"
+    _compile(src, binary, ["-fno-builtin"])
+    return binary
+
+
+@pytest.mark.parametrize("depth", ["8", "0"])
+def test_a_callee_naming_hundreds_of_globals_does_not_unwind_the_walk(tmp_path, shared_bn,
+                                                                      depth):
+    """P1-02: asking whether `reset_all` touches the tainted object's region
+    re-entered the neighbouring-object scan once per global it names; the
+    walk unwound on Python's recursion limit -- at every `--max-depth`,
+    including 0 -- and the `system(argv)` after the call was never reported."""
+    binary = _wide_globals_binary(tmp_path)
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                      "--source", "param:1", "--max-depth", depth, timeout=300.0)
+    assert "system" in {f["sink"]["callee"] for f in result["reached_sinks"]}, result
+    assert "recursion" not in result["stats"]["truncation_cause"], result["stats"]
+    assert not [lf for lf in result["leaves"] if lf["kind"] == "analysis_truncated"]
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
+    assert leaf["global"]["address"] == _data_symbol_addr(binary, "g_name"), leaf
+
+
+def test_a_float_infinity_in_a_consumer_does_not_crash_the_walk(tmp_path, shared_bn):
+    """P1-03: `g_limit = INFINITY` lifts to an MLIL float constant `inf`;
+    reading it as an address raised OverflowError out of the whole op."""
+    src = tmp_path / "floatinf.c"
+    src.write_text(r"""
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+char g_path[64];
+double g_limit;
+__attribute__((noinline)) void apply_limits(void) {
+    g_limit = INFINITY;
+    if (g_limit > 1.0) system(g_path);
+}
+int main(int argc, char **argv) {
+    if (argc < 2) return 1;
+    strncpy(g_path, argv[1], sizeof g_path - 1);
+    apply_limits();
+    return 0;
+}
+""")
+    binary = tmp_path / "floatinf"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                      "--source", "param:1")
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
+    assert leaf["global"]["address"] == _data_symbol_addr(binary, "g_path"), leaf
+    assert [r["display_name"] for r in leaf["references"]] == ["apply_limits"], leaf
+
+
+def test_a_timed_out_taint_request_is_cancelled_and_releases_the_bridge(
+        tmp_path, shared_bn, monkeypatch):
+    """P1-07: a client that times out sends `cancel_request`; the walk polls it
+    at its next function visit, stops with a `cancelled` outcome the client
+    reports as honoured, and the bridge is free for the next request instead
+    of computing for minutes."""
+    count = 2000          # one descended helper each: seconds of walking
+    lines = ["#include <string.h>"]
+    lines += [f"__attribute__((noinline)) int h{i}(const char *s) "
+              f"{{ return (int)strlen(s) + {i}; }}" for i in range(count)]
+    lines += ["int main(int argc, char **argv) {", "    int t = 0;",
+              "    if (argc < 2) return 1;"]
+    lines += [f"    t += h{i}(argv[1]);" for i in range(count)]
+    lines += ["    return t;", "}"]
+    src = tmp_path / "longwalk.c"
+    src.write_text("\n".join(lines) + "\n")
+    binary = tmp_path / "longwalk"
+    _compile(src, binary, ["-fno-builtin"])
+    target = shared_bn.load(binary, copy=False)
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "1")
+    timed_out = shared_bn.run("-t", target, "taint", "forward", "-f", "main",
+                              "--source", "param:1", "--format", "json", timeout=120.0)
+    monkeypatch.delenv("BN_REQUEST_TIMEOUT")
+    assert timed_out.returncode == 2, (timed_out.stdout, timed_out.stderr)
+    assert "honoured" in timed_out.stdout + timed_out.stderr, (timed_out.stdout,
+                                                               timed_out.stderr)
+    listed = shared_bn.run("target", "list", "--format", "json", timeout=5.0)
+    assert listed.returncode == 0, listed.stderr
 
 
 def test_global_continuation_phi_selected_pointer_is_a_consumer(tmp_path, shared_bn):

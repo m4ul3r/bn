@@ -90,6 +90,10 @@ REFRESH_REQUEST_TIMEOUT = 3600.0
 SPAWN_LOCK_TIMEOUT = 30.0
 DEFAULT_SPAWN_TIMEOUT = 60.0
 CANCEL_REQUEST_TIMEOUT = 0.25
+# After a timed-out request's cancel is sent, how long the CLI keeps listening
+# on the request's own connection to learn whether the bridge stopped the
+# operation (it answers with status `cancelled`) or it is still running.
+CANCEL_OUTCOME_WAIT = 10.0
 # How long a request may go unanswered before the CLI asks the bridge whether it
 # is queued behind another writer, and the budget for that one question (#976).
 WRITE_GATE_NOTICE_AFTER = 2.0
@@ -1595,6 +1599,32 @@ def _send_cancel_request(instance: BridgeInstance, request_id: str) -> bool:
         return False
 
 
+def _await_cancel_outcome(sock: socket.socket) -> str:
+    """How a timed-out request ended once its cancel was sent, read from the
+    request's own connection: ``"honoured"`` -- the bridge answered with status
+    ``cancelled``; ``"finished"`` -- it answered with anything else, so the
+    operation completed before it looked at the cancel; ``"no_answer"`` -- no
+    complete answer within :data:`CANCEL_OUTCOME_WAIT`, so it may still run."""
+    deadline = time.monotonic() + CANCEL_OUTCOME_WAIT
+    data: list[bytes] = []
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "no_answer"
+            sock.settimeout(remaining)
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data.append(chunk)
+        response = json.loads(b"".join(data).decode("utf-8"))
+    except (OSError, ValueError):
+        return "no_answer"
+    if not isinstance(response, dict):
+        return "no_answer"
+    return "honoured" if response.get("status") == "cancelled" else "finished"
+
+
 def _send_request_to_instance(
     instance: BridgeInstance,
     op: str,
@@ -1699,6 +1729,10 @@ def _send_request_to_instance(
     # BridgeUnreachableError).
     reached = False
     cancel_sent = False
+    cancel_attempted = False
+    # How the request ended once a cancel sent from inside the read loop was
+    # answered (`_await_cancel_outcome`); None when nothing listened for it.
+    cancel_outcome: str | None = None
     send_attempted = False
     for attempt in range(connect_retries):
         if deadline is not None:
@@ -1741,11 +1775,25 @@ def _send_request_to_instance(
                     notice.daemon = True
                     notice.start()
                 try:
-                    while True:
-                        chunk = sock.recv(65536)
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
+                    try:
+                        while True:
+                            chunk = sock.recv(65536)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                    except TimeoutError:
+                        if not chunks:
+                            # Nothing of the answer arrived: ask the bridge to
+                            # stop, then listen on THIS connection for how the
+                            # request ended, so the message can say whether the
+                            # cancel was honoured (P1-07).
+                            if notice is not None:
+                                notice.cancel()
+                            cancel_attempted = True
+                            cancel_sent = _send_cancel_request(instance, str(payload["id"]))
+                            if cancel_sent:
+                                cancel_outcome = _await_cancel_outcome(sock)
+                        raise
                 finally:
                     if notice is not None:
                         notice.cancel()
@@ -1753,7 +1801,7 @@ def _send_request_to_instance(
             break
         except OSError as exc:
             last_error = exc
-            if isinstance(exc, TimeoutError) and send_attempted:
+            if isinstance(exc, TimeoutError) and send_attempted and not cancel_attempted:
                 cancel_sent = _send_cancel_request(instance, str(payload["id"]))
             if exc.errno not in TRANSIENT_SOCKET_ERRNOS or attempt == connect_retries - 1:
                 break
@@ -1770,6 +1818,15 @@ def _send_request_to_instance(
             time.sleep(delay)
 
     cancellation = (
+        "A cancel request was sent and honoured: the bridge stopped the operation. "
+        if cancel_outcome == "honoured" else
+        "A cancel request was sent, but the operation finished before it took "
+        "effect; its result was discarded. "
+        if cancel_outcome == "finished" else
+        f"A cancel request was sent; the operation did not stop within "
+        f"{CANCEL_OUTCOME_WAIT:g}s and may keep running until it checks for "
+        "cancellation. "
+        if cancel_outcome == "no_answer" else
         "A cancel request was sent; the operation may keep running until "
         "it checks for cancellation. "
         if cancel_sent else
