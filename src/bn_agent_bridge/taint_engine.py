@@ -15120,7 +15120,8 @@ class TaintEngine:
             return "pointer"
         if sink.get("buf_arg") == idx or sink.get("format_arg") == idx:
             return "pointer"
-        if sink.get("len_arg") == idx:
+        # A fortify guard (`dest_size_arg`, W02-06) is a size like a length.
+        if idx in (sink.get("len_arg"), sink.get("dest_size_arg")):
             return "value"
         toks = [str(r.get(k) or "") for key in ("sources", "propagates")
                 for r in (model.get(key) or []) if isinstance(r, dict) for k in ("from", "to")]

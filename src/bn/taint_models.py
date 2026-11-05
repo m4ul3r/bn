@@ -545,7 +545,27 @@ def _overlay(models: dict[str, Any], layer: dict[str, Any], *, source: str) -> N
                     f"flow role beside them, or use {{}} to mark {name} benign")
             models[name] = {**base, **model}
         else:
-            models[name] = model
+            models[name] = _with_sink_detail(name, model, source)
+
+
+def _with_sink_detail(name: str, model: Any, source: str) -> Any:
+    """*model* with a ``sink.detail`` sentence when it declares a sink without
+    one. Every builtin sink carries its own sentence and reached-sink rows
+    quote it; an overlay sink with none reported ``detail: null`` (W10-08),
+    and the relabel paths that append to the sentence would have had nothing
+    to append to. The written sentence names the class, the arming arguments
+    and the overlay that declared it. A sentence the author wrote is kept."""
+    sink = model.get("sink") if isinstance(model, dict) else None
+    if not isinstance(sink, dict) or sink.get("detail"):
+        return model
+    armed = [f"argument {i}" for i in sink.get("tainted_args") or []]
+    if sink.get("len_arg") is not None:
+        armed.append(f"length argument {sink['len_arg']}")
+    if sink.get("format_arg") is not None:
+        armed.append(f"the constant format at argument {sink['format_arg']}")
+    detail = (f"{sink.get('class')} sink of {name} as declared by {source}: "
+              f"tainted data reaches {' / '.join(armed) or 'the call'}")
+    return {**model, "sink": {**sink, "detail": detail}}
 
 
 def _override_path(honor_env: bool) -> Path | None:

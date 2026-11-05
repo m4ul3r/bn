@@ -1453,6 +1453,53 @@ def test_forwarded_scanf_destinations_bn_did_not_recover_are_a_frontier(tmp_path
             if lf["kind"] == "format_destination_unrecovered"] == [3], parsed["leaves"]
 
 
+def test_builtin_regex_and_fortify_guard_models_on_a_real_binary(tmp_path, shared_bn):
+    """W10-01: a copy sized by a regexec match offset reaches its sink with
+    the builtin catalog (no overlay). W02-06: slicing the `__strcpy_chk`
+    destination size answers with the compile-time constant, not a pointer
+    demand with a role-unknown leaf."""
+    src = tmp_path / "rx.c"
+    src.write_text(r"""
+#include <regex.h>
+#include <stdio.h>
+#include <string.h>
+#define N __attribute__((noinline, noipa))
+static regex_t re;
+N int get_field(const char *s, char *out) {
+    regmatch_t m;
+    if (regexec(&re, s, 1, &m, 0)) return -1;
+    memcpy(out, s, m.rm_eo);
+    return 0;
+}
+N void save_name(const char *s) {
+    char d[0x120];
+    strcpy(d, s);
+    puts(d);
+}
+int main(int argc, char **argv) {
+    char out[32];
+    regcomp(&re, "(a+)", REG_EXTENDED);
+    save_name(argv[0]);
+    return argc > 1 ? get_field(argv[1], out) : 0;
+}
+""")
+    binary = tmp_path / "rx"
+    _compile(src, binary, ["-O2", "-D_FORTIFY_SOURCE=2"])
+    assert "__strcpy_chk" in _dynamic_symbols(binary)
+    target = shared_bn.load(binary, copy=False)
+
+    fwd = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "get_field",
+                   "--source", "param:0")
+    assert [(s["sink"]["callee"], s["sink"]["class"], s["sink"]["tainted_arg_index"])
+            for s in fwd["reached_sinks"]] == [("memcpy", "overflow_len", 2)], fwd
+
+    bwd = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "save_name",
+                   "--sink", "arg:__strcpy_chk:2")
+    assert [(r["status"], r["scalar"]["value"]) for r in bwd["sink_status"]] == \
+        [("constant", 0x120)], bwd["sink_status"]
+    assert "sink_role_unknown" not in {lf["kind"] for lf in bwd["leaves"]}, bwd["leaves"]
+
+
 @pytest.mark.parametrize("arch", ["a64", "x64"])
 @pytest.mark.parametrize("pad", [600, 5000], ids=["nul-in-read", "nul-beyond-read"])
 def test_a_format_prefix_never_trims_a_real_destination(tmp_path, shared_bn, arch, pad):
