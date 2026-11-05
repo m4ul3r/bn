@@ -124,6 +124,19 @@ def test_plugin_install_copy_mode(tmp_path):
     )
     assert rc == 0
     assert (destination / "bridge.py").exists()
+    # The taint model module and the builtin DB it reads beside itself are
+    # links into src/bn/ in the source tree; a copy materialises both as
+    # files, and the copied module loads its own copied DB.
+    module, db = destination / "taint_models.py", destination / "taint_models.json"
+    assert module.is_file() and not module.is_symlink()
+    assert db.is_file() and not db.is_symlink()
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("copied_taint_models", module)
+    copied = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(copied)
+    assert copied._BUILTIN_MODELS == db.resolve()
+    assert copied.load_models(honor_env=False)["memcpy"]["sink"]["class"] == "overflow_len"
 
 
 def test_plugin_install_accepts_its_own_install_and_names_a_stale_one(tmp_path, capsys):

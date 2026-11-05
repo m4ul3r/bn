@@ -1026,23 +1026,41 @@ def _forward_prose(result) -> str:
     return "\n".join(parts)
 
 
+def _printed_commands(prose: str) -> list[tuple[int, str]]:
+    """``(offset, command)`` for each `bn` command *prose* prints, read as
+    the code span `code_span` writes: a fence one backtick longer than the
+    longest run inside, and one CommonMark pad space each side when the
+    command starts or ends with a backtick. A one-backtick reading stopped
+    at a selector's own backtick and checked only a prefix."""
+    from bn.formatters import CODE_SPAN_RE
+
+    out = []
+    for match in CODE_SPAN_RE.finditer(prose):
+        body = match.group(2)
+        if len(body) > 2 and body[0] == body[-1] == " " and body.strip():
+            body = body[1:-1]
+        if body.startswith("bn "):
+            out.append((match.start(), body))
+    return out
+
+
 def _run_or_check_template(shared_bn, prose: str) -> tuple[int, int]:
-    """Run each backticked `bn` command exactly as printed; a command marked as
+    """Run each fenced `bn` command exactly as printed; a command marked as
     a template must instead parse as shell words with no `<...>` placeholder
     and name its blanks in UPPER-CASE (#1033 item 6)."""
     from conftest import _BN_CLI
 
     ran = templates = 0
-    for match in re.finditer(r"`(bn [^`]+)`", prose):
-        argv = shlex.split(match.group(1))
-        if prose[:match.start()].endswith(_TEMPLATE[:-1]):
-            assert not any(c in match.group(1) for c in "<>"), match.group(1)
-            assert any(w.isupper() or w.split(":")[-1].isupper() for w in argv), match.group(1)
+    for start, command in _printed_commands(prose):
+        argv = shlex.split(command)
+        if prose[:start].endswith(_TEMPLATE[:-1]):
+            assert not any(c in command for c in "<>"), command
+            assert any(w.isupper() or w.split(":")[-1].isupper() for w in argv), command
             templates += 1
             continue
         res = subprocess.run([*_BN_CLI, *argv[1:]], capture_output=True, text=True,
                              env=shared_bn.env(), timeout=300.0)
-        assert res.returncode == 0, f"{match.group(1)}: {res.stderr}"
+        assert res.returncode == 0, f"{command}: {res.stderr}"
         ran += 1
     return ran, templates
 
