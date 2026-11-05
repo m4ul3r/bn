@@ -37,9 +37,10 @@ taint output vocabulary.
   taint reached; `diagnostics.opt_in_sink_classes_reached` names their classes
   and `diagnostics.exits` says whether taint leaves the function through its
   return value or out-parameters.
-- `run_params` on every taint result echoes the enabled `--sink-class` list,
-  the `--resolve-map` path with its matched/unmatched pins, and the model
-  overlays actually merged.
+- `run_params` on every taint result echoes the `--resolve-map` path with its
+  matched/unmatched pins and the model overlays actually merged; on a forward
+  result it also echoes the enabled `--sink-class` list (`sink_classes`;
+  backward has no `--sink-class`).
 - `stats.truncation_cause` uses one documented vocabulary; every cause is
   named in text and none advertises a flag that cannot move it.
 - `sink.width_narrowing` on `alloc_size`/`overflow_len` flows whose last
@@ -75,10 +76,12 @@ taint output vocabulary.
   routed an indirect call or jump the walk could not resolve itself.
 - Forward frontier text is one wrapped, structured block per fact, with the
   follow-up command printed as one paste-safe span.
-- The text verdict of a forward run with no sink and no frontier states the
-  same claim as `diagnostics.safe_to_report_all_clear`: an all-clear for the
-  enabled sink classes only, or "NOT an all-clear"; the next action no longer
-  calls an unexplained empty result a local dead end.
+- A forward run with no sink states the same claim in text and JSON: every
+  verdict and `all_clear_reason` is scoped to the enabled sink classes and
+  names the opt-in classes taint reached, and the verdict reads the
+  `diagnostics.safe_to_report_all_clear` gate (an all-clear for those classes
+  only, or "NOT an all-clear"); the next action no longer calls an
+  unexplained empty result a local dead end.
 - `taint`'s `--max-depth` is an analysis bound; size advice points at `--out`.
 - `exports` lists one row per definition and counts the duplicate symbol
   records it folded (`duplicates_collapsed`); `exports` and `exports list`
