@@ -2841,7 +2841,13 @@ def test_a_call_before_the_only_write_carries_nothing(models):
     func, bv = _before_after_program("before", blocks=[FBlock(0, 2)])
     result = _forward(bv, func, models, source="param:0")
     assert _leaves(result) == [], result["leaves"]
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    # P2-11: no continuation at the EARLIER call -- but the copied bytes are
+    # still live when `main` returns, and `reader`, which the walk ran only
+    # before the write, reads them: the copy is the exit frontier.
+    [store] = _leaves(result, "coarse_memory_store")
+    assert store["address"] == hex(0x401104), store
+    assert [r["display_name"] for r in store["references"]] == ["reader"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def test_a_call_after_the_write_still_blocks(models):
@@ -3102,7 +3108,11 @@ def test_a_reader_on_the_other_branch_sees_nothing(models):
     func, bv = _branch_program()
     result = _forward(bv, func, models, source="param:0")
     assert _leaves(result) == [], result["leaves"]
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    # P2-11: no continuation on the sibling branch, but `main` returns with
+    # the copied bytes live and `reader` can run after it.
+    [store] = _leaves(result, "coarse_memory_store")
+    assert store["address"] == hex(0x401110), store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def test_il_order_decides_only_inside_one_block(models):
@@ -4159,7 +4169,11 @@ def test_a_pinned_tail_jump_is_resolved_like_a_call(models, pinned, reads):
         assert result["diagnostics"]["safe_to_report_all_clear"] is False
     else:
         assert leaves == [], leaves
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True
+        # P2-11: `quiet` reads nothing of it, but `main` leaves the copied
+        # bytes live for `reader`, which the walk never runs after the write.
+        [store] = _leaves(result, "coarse_memory_store")
+        assert [r["display_name"] for r in store["references"]] == ["reader"]
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def _swap_program(swap_args=True):

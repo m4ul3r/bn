@@ -749,10 +749,16 @@ class TaintEngine:
         self._unverified_neighbours: dict[int, set[int]] = {}
         # (function start, neighbour) -> every read-capable use of it there.
         self._neighbour_uses_cache: dict[tuple[int, int], list] = {}
-        # global -> the first DIRECT store of a tainted value into it this run
-        # made (in any function the walk entered): the write a seeded
-        # function's exit must not leave unfollowed (P1-04).
-        self._global_direct_stores: dict[int, Any] = {}
+        # global -> the first write of a tainted value into it this run made
+        # -- a direct store, a modeled copy, a source filling it -- in any
+        # function the walk entered: the write a seeded function's exit must
+        # not leave unfollowed (P1-04, P2-11).
+        self._global_write_sites: dict[int, Any] = {}
+        # (function start, global) -> the instructions in that body after which
+        # the object's tainted bytes are provably clean (P2-11).
+        self._clearing_cache: dict[tuple[int, int], tuple] = {}
+        # global -> pointer globals initialised to point into it (P2-11).
+        self._alias_slots_cache: dict[int, frozenset] = {}
         self._ssa_def_cache: dict[tuple, Any] = {}
         self._returned_params_cache: dict[int, tuple] = {}
         self._returned_params_active: set[int] = set()
@@ -1309,6 +1315,25 @@ class TaintEngine:
         """
         bt = self._buffer_target(ssaf, expr)
         if bt is None:
+            # A pointer reloaded from a global slot that different paths set
+            # to different blocks (P2-11): it may point at any of them, so it
+            # carries the taint of any that is tainted. Structural, so it is
+            # computed once per expression.
+            memo = self.__dict__.setdefault("_heap_keys_memo", {})
+            idx = getattr(expr, "expr_index", None)
+            mk = (id(ssaf), idx) if idx is not None else None
+            if mk is not None and mk in memo:
+                keys = memo[mk]
+            else:
+                keys = self._heap_keys_expr(ssaf, expr, 0, set()) or ()
+                if mk is not None:
+                    memo[mk] = keys
+            for k in sorted(keys, key=repr):
+                if (k, None) in tainted:
+                    return (k, None)
+                for node in tainted:
+                    if node[0] == k:
+                        return node
             return None
         k = bt[0]
         if (k, None) in tainted:
@@ -1839,11 +1864,184 @@ class TaintEngine:
                 if k is not None:
                     return k
             return None
+        if "LOAD" in op_name(expr):
+            # P2-11: `g_heap = malloc(n); memcpy(g_heap, s, n); p = g_heap;`
+            # -- a pointer STORED INTO A GLOBAL and loaded back in the same
+            # function is the block it was stored from, exactly as a pointer
+            # kept in a local is. One key only when every reaching store agrees.
+            if self._global_addr(None, getattr(expr, "src", None), canon=False) is not None:
+                keys = self._heap_keys_expr(ssaf, expr, depth, set())
+                return next(iter(keys)) if keys and len(keys) == 1 else None
         var = self._as_single_ssa_var(expr)
         if var is None:
             reads = expr_reads(expr)
             var = reads[0] if len(reads) == 1 else None
         return self._heap_key_var(ssaf, var, depth, seen)
+
+    def _heap_keys_expr(self, ssaf: Any, expr: Any, depth: int, seen: set) -> set | None:
+        """Every heap block pointer expression *expr* may hold, through SSA
+        copies, `base +/- index`, PHI merges, calls returning an argument
+        (`memcpy`'s destination) and pointer slots in writable globals; None
+        when some path leads to a pointer that is not a recognised block.
+        A PHI or a slot reached by several stores yields several keys -- the
+        caller decides whether it needs exactly one. A root question (nothing
+        on the chase yet) is structural and answered once per expression."""
+        if expr is None or depth > 24:
+            return None
+        idx = getattr(expr, "expr_index", None)
+        if not seen and idx is not None:
+            memo = self.__dict__.setdefault("_heap_keys_memo", {})
+            mk = ("keys", id(ssaf), int(idx))
+            if mk not in memo:
+                memo[mk] = self._heap_keys_step(ssaf, expr, depth, seen)
+            got = memo[mk]
+            return set(got) if got is not None else None
+        return self._heap_keys_step(ssaf, expr, depth, seen)
+
+    def _heap_keys_step(self, ssaf: Any, expr: Any, depth: int, seen: set) -> set | None:
+        """:meth:`_heap_keys_expr` for one expression, unmemoised."""
+        opn = op_name(expr)
+        if opn in ("MLIL_ADD", "MLIL_SUB"):
+            for operand in (getattr(expr, "left", None), getattr(expr, "right", None)):
+                ks = self._heap_keys_expr(ssaf, operand, depth + 1, seen)
+                if ks:
+                    return ks
+            return None
+        if "LOAD" in opn:
+            slot = self._global_addr(None, getattr(expr, "src", None), canon=False)
+            if slot is None:
+                return None
+            memory = getattr(expr, "src_memory", None)
+            mark = ("slot", int(slot), str(memory))
+            if mark in seen:
+                return set()        # this slot state is already being resolved
+            seen.add(mark)
+            stores = self._reaching_slot_stores(ssaf, int(slot), memory)
+            if stores is None:
+                try:
+                    stores = [ins for ins in self._instrs(ssaf)
+                              if "STORE" in op_name(ins)
+                              and self._global_addr(None, getattr(ins, "dest", None),
+                                                    canon=False) == slot]
+                except TaintError:
+                    stores = []
+            if not stores:
+                return None
+            out: set = set()
+            for st in stores:
+                ks = self._heap_keys_expr(ssaf, getattr(st, "src", None), depth + 1, seen)
+                if ks is None:
+                    return None
+                out |= ks
+            return out
+        var = self._as_single_ssa_var(expr)
+        if var is None:
+            reads = expr_reads(expr)
+            var = reads[0] if len(reads) == 1 else None
+        if var is None:
+            return None
+        vk = self._ssa_var_key(var)
+        if vk in seen:
+            return set()
+        seen.add(vk)
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            d = None
+        if d is None:
+            return None
+        dop = op_name(d)
+        if "CALL" in dop:
+            k = self._recognized_alloc_key(ssaf, var, d)
+            if k is not None:
+                return {k}
+            return self._heap_keys_expr(ssaf, self._returned_arg(d), depth + 1, seen)
+        if dop == "MLIL_SET_VAR_SSA":
+            return self._heap_keys_expr(ssaf, getattr(d, "src", None), depth + 1, seen)
+        if "PHI" in dop:
+            out = set()
+            for sv in getattr(d, "src", None) or ():
+                ks = self._heap_keys_expr(ssaf, sv, depth + 1, seen)
+                if ks is None:
+                    return None
+                out |= ks
+            return out
+        return None
+
+    def _reaching_slot_stores(self, ssaf: Any, slot: int, memory: Any) -> list | None:
+        """The STOREs to *slot* whose memory version reaches *memory*, walked
+        back along memory SSA; None when the view has no memory SSA or the
+        walk meets a definition it cannot step over (a store through an
+        unknown pointer may be this slot). Proving such a pointer is a heap
+        block can itself walk a slot; that nesting is bounded."""
+        nested = getattr(self, "_slot_walk_depth", 0)
+        if nested >= 2:
+            return None
+        self._slot_walk_depth = nested + 1
+        try:
+            return self._walk_slot_stores(ssaf, slot, memory)
+        finally:
+            self._slot_walk_depth = nested
+
+    def _walk_slot_stores(self, ssaf: Any, slot: int, memory: Any) -> list | None:
+        getdef = getattr(ssaf, "get_ssa_memory_definition", None)
+        if memory is None or not callable(getdef):
+            return None
+        found: list = []
+        seen_mem: set = set()
+        work = [memory]
+        while work:
+            mem = work.pop()
+            try:
+                key = int(mem)
+            except (TypeError, ValueError):
+                return None
+            if key in seen_mem:
+                continue
+            seen_mem.add(key)
+            if len(seen_mem) > 512:
+                return None
+            try:
+                d = getdef(mem)
+            except Exception:
+                d = None
+            if d is None:
+                continue            # the entry state: no store here
+            opn = op_name(d)
+            if "MEM_PHI" in opn:
+                work.extend(getattr(d, "src_memory", None) or ())
+                continue
+            if "STORE" in opn:
+                dest = getattr(d, "dest", None)
+                hit = self._global_addr(None, dest, canon=False)
+                if hit is not None and int(hit) == slot:
+                    found.append(d)
+                    continue
+                if (hit is None and self._int_const(dest) is None
+                        and not self._heap_keys_expr(ssaf, dest, 1, set())):
+                    # Through an unknown pointer: it may be the slot. A
+                    # pointer into a heap block (one the slot itself holds
+                    # included) is not a global's storage.
+                    return None
+            nxt = getattr(d, "src_memory", None)
+            if nxt is None:
+                return None
+            work.append(nxt)
+        return found
+
+    def _returned_arg(self, call: Any) -> Any:
+        """The argument expression a modeled call returns as its pointer value
+        (`memcpy`'s destination: a rule ``arg:N -> ret``), or None."""
+        callee = self._callee_name(self._resolve_direct_target(call))
+        _, model = lookup_model(self.models, callee) if callee else (None, None)
+        params = list(getattr(call, "params", None) or ())
+        for rule in (model or {}).get("propagates") or ():
+            frm = rule.get("from")
+            if rule.get("to") == "ret" and isinstance(frm, str) and frm.startswith("arg:"):
+                idx = _try_arg_index(frm)
+                if idx is not None and idx < len(params):
+                    return params[idx]
+        return None
 
     def _heap_key_var(self, ssaf: Any, var: Any, depth: int, seen: set):
         """Chase an SSA var's definition to a recognized allocator's call site."""
@@ -1861,7 +2059,12 @@ class TaintEngine:
             return None
         dop = op_name(d)
         if "CALL" in dop:
-            return self._recognized_alloc_key(ssaf, var, d)
+            k = self._recognized_alloc_key(ssaf, var, d)
+            if k is not None:
+                return k
+            # `q = memcpy(p, s, n)`: a callee whose model returns an argument's
+            # pointer VALUE (`arg:N -> ret`) hands back the block it was given.
+            return self._heap_key_expr(ssaf, self._returned_arg(d), depth + 1, seen)
         # `ptr = base +/- index` / a pure SSA copy: chase the source expr so an
         # indexed escape/encode loop (`out = ecalloc(...); ...; cursor = out + i;
         # *cursor = ...`) resolves to `out`'s alloc site.
@@ -4111,6 +4314,7 @@ class TaintEngine:
         # from a prior run can't survive. The engine is per-request in production --
         # this is defensive, but it makes the cache lifetime provably one forward run.
         self._bt_cache = {}
+        self._heap_keys_memo = {}
         self._bt_func_token = None
 
         # optional-sink classes the caller opted into (e.g. file_write); a sink
@@ -7153,6 +7357,16 @@ class TaintEngine:
                         pass
                 covered += span
                 chunks += 1
+            # P2-11: a function that loads a pointer global initialised to
+            # this object (`char *g_ptr = g`) reads it without naming it.
+            for slot in sorted(self._alias_slots(ga)):
+                try:
+                    refs.extend(get_refs(slot, 8) or [])
+                except Exception:
+                    try:
+                        refs.extend(get_refs(slot) or [])
+                    except Exception:
+                        pass
             for ref in refs:
                 start = getattr(getattr(ref, "function", None), "start", None)
                 if start is None:
@@ -7660,6 +7874,40 @@ class TaintEngine:
                 return got
         return None
 
+    def _alias_slots(self, ga: int) -> frozenset:
+        """Writable pointer-sized data words whose INITIAL value points into
+        the object at *ga* -- `char *g_ptr = g_alias;` -- read from BN's data
+        cross-references. Empty on a view that cannot list them."""
+        ga = int(ga)
+        cached = self._alias_slots_cache.get(ga)
+        if cached is not None:
+            return cached
+        self._alias_slots_cache[ga] = frozenset()   # cycle guard (extent)
+        out: set[int] = set()
+        get_refs = getattr(self.bv, "get_data_refs", None)
+        read_ptr = getattr(self.bv, "read_pointer", None)
+        if callable(get_refs) and callable(read_ptr):
+            extent = self._global_extent(ga)
+            try:
+                refs = list(get_refs(ga, extent) or ())
+            except Exception:
+                try:
+                    refs = list(get_refs(ga) or ())
+                except Exception:
+                    refs = []
+            for ref in refs[:64]:
+                try:
+                    slot = int(ref)
+                    value = int(read_ptr(slot))
+                except Exception:
+                    continue
+                if ga <= value < ga + extent and self._is_writable(slot) \
+                        and not (ga <= slot < ga + extent):
+                    out.add(slot)
+        got = frozenset(out)
+        self._alias_slots_cache[ga] = got
+        return got
+
     def _global_base(self, ssaf: Any, ga: int):
         """The root test for the global OBJECT based at *ga*.
 
@@ -7682,10 +7930,21 @@ class TaintEngine:
         not claimed here: a read that starts in an enclosing object is
         :meth:`_overlap_access`'s question, which weighs its length
         against the tainted interval and discloses an unbounded one
-        (round-11 review F21)."""
+        (round-11 review F21).
+
+        A load of a writable pointer global whose INITIAL value points into
+        this object is this object too: `char *g_ptr = g; strcpy(dst, g_ptr)`
+        reads `g` through a pointer nothing in the consumer names (P2-11).
+        The slot may be reassigned elsewhere; counting it a reader is the
+        conservative direction."""
         extent = self._global_extent(ga)
+        slots = self._alias_slots(ga)
 
         def base(expr: Any) -> bool:
+            if slots and "LOAD" in op_name(expr):
+                slot = self._global_addr(None, getattr(expr, "src", None), canon=False)
+                if slot is not None and int(slot) in slots:
+                    return True
             if self._global_addr(None, expr) == ga:
                 return True
             raw = self._global_addr(None, expr, canon=False)
@@ -9061,7 +9320,9 @@ class TaintEngine:
         self._global_extent_unproven.clear()
         self._unverified_neighbours.clear()
         self._neighbour_uses_cache.clear()
-        self._global_direct_stores.clear()
+        self._global_write_sites.clear()
+        self._clearing_cache.clear()
+        self._alias_slots_cache.clear()
         self._global_search_truncated.clear()
         self._region_checks.clear()
         self._global_refs_truncated.clear()
@@ -10060,6 +10321,119 @@ class TaintEngine:
                          "seed": str(seed or "") or None})
         return rows, unfinished
 
+    # Calls whose effect on their destination is a CONSTANT fill: (name,
+    # destination arg, length arg, value arg or None). `memcpy(g, "safe", 5)`
+    # is not one -- its source may be anything; only a fill is a clear.
+    _CLEARING_CALLS = {
+        "memset": (0, 2, 1), "__memset_chk": (0, 2, 1), "__builtin_memset": (0, 2, 1),
+        "bzero": (0, 1, None), "explicit_bzero": (0, 1, None),
+    }
+
+    def _cleared_before_return(self, func: Any, ssaf: Any, instrs: list, ga: int,
+                               writes: list, rets: list) -> bool:
+        """Whether every path from every tainting write of the global at *ga*
+        in *func* to every return passes a write that clears ALL its tainted
+        bytes (P2-11). Without block information, or with no write or no
+        return to reason from, the answer is no -- a kill is never assumed."""
+        if not writes or not rets:
+            return False
+        clears = self._clearing_events(func, ssaf, instrs, ga, depth=0)
+        if not clears:
+            return False
+        for w in writes:
+            for r in rets:
+                if self._reaches_avoiding(w, r, list(clears)) is not False:
+                    return False
+        return True
+
+    def _covers_tainted(self, ga: int, lo: int, hi: int) -> bool:
+        """Whether the byte interval [lo, hi) of the object at *ga* covers
+        every range this run tainted in it. An unbounded range is never
+        covered: a partial reset does not sanitise the object. A fill of the
+        object's whole extent covers whatever was written into it, recorded
+        or not (a source filling it records no range)."""
+        if lo <= 0 and hi >= self._global_extent(ga):
+            return True
+        ranges = self._global_tainted_ranges.get(ga) or ()
+        if not ranges:
+            return False
+        return all(rhi is not None and lo <= rlo and int(rhi) <= hi
+                   for rlo, rhi in ranges)
+
+    def _clearing_events(self, fn: Any, ssaf: Any, instrs: list, ga: int, *,
+                         depth: int) -> tuple:
+        """The instructions of *fn* after which the tainted bytes of the
+        global at *ga* are clean: a constant fill (`memset`/`bzero`) or a
+        constant store covering them, or -- one call level down -- a call to
+        an in-binary body that does one in its ENTRY block, which every
+        execution of that body runs."""
+        key = (int(getattr(fn, "start", 0)), int(ga), int(depth))
+        cached = self._clearing_cache.get(key)
+        if cached is not None:
+            return cached
+        self._clearing_cache[key] = ()          # cycle guard
+        out: list = []
+        for ins in instrs:
+            opn = op_name(ins)
+            if self._is_call(ins):
+                taddr = self._resolve_direct_target(ins)
+                name = str(self._callee_name(taddr) or "").split("@", 1)[0]
+                shape = self._CLEARING_CALLS.get(name) or self._CLEARING_CALLS.get(
+                    name.lstrip("_"))
+                params = self._call_params(ins)
+                if shape is not None and max(i for i in shape if i is not None) < len(params):
+                    dest_i, len_i, val_i = shape
+                    if self._global_addr(ssaf, params[dest_i]) == ga \
+                            and (val_i is None or self._int_const(params[val_i]) is not None):
+                        raw = self._global_addr(ssaf, params[dest_i], canon=False)
+                        n = self._int_const(params[len_i])
+                        off = (int(raw) - ga) if raw is not None and int(raw) >= ga else None
+                        if off is not None and n is not None and int(n) > 0 \
+                                and self._covers_tainted(ga, off, off + int(n)):
+                            out.append(ins)
+                            continue
+                if depth < 1 and taddr is not None:
+                    cfn = function_at(self.bv, taddr)
+                    if cfn is not None and self._is_internal(cfn):
+                        try:
+                            cssa = self._ssa_func(cfn)
+                            cins = self._instrs(cssa)
+                        except TaintError:
+                            continue
+                        inner = self._clearing_events(cfn, cssa, cins, ga, depth=depth + 1)
+                        if any(int(getattr(getattr(e, "il_basic_block", None), "start", -1)) == 0
+                               for e in inner):
+                            out.append(ins)
+                continue
+            if "STORE" in opn:
+                dest = getattr(ins, "dest", None)
+                if self._global_addr(ssaf, dest) == ga \
+                        and self._int_const(getattr(ins, "src", None)) is not None:
+                    raw = self._global_addr(ssaf, dest, canon=False)
+                    size = int(getattr(ins, "size", 0) or 0)
+                    off = (int(raw) - ga) if raw is not None and int(raw) >= ga else None
+                    if off is not None and size > 0 \
+                            and self._covers_tainted(ga, off, off + size):
+                        out.append(ins)
+        got = tuple(out)
+        self._clearing_cache[key] = got
+        return got
+
+    # The GCC/glibc start-up and tear-down helpers. They name the start of
+    # the first writable sections only as zero-size markers (`__TMC_END__`,
+    # `__TMC_LIST__`) -- compared, subtracted, never dereferenced -- and on
+    # a `-no-pie` build that marker shares its address with the first object
+    # of the program, so their uses read as uses of that object.
+    _CRT_HELPERS = frozenset({
+        "deregister_tm_clones", "register_tm_clones", "__do_global_dtors_aux",
+        "frame_dummy", "_start", "_init", "_fini", "__libc_csu_init",
+        "__libc_csu_fini",
+    })
+
+    def _is_crt_helper(self, start: int) -> bool:
+        fn = function_at(self.bv, start)
+        return str(getattr(fn, "name", "") or "") in self._CRT_HELPERS
+
     def _unfollowed_global_leaf(self, func: Any, ga: int, write_ins: Any,
                                 leaves: list) -> dict[str, Any] | None:
         """The blocking frontier for a tainted global still live when the
@@ -10100,9 +10474,18 @@ class TaintEngine:
         cited: tuple | None = None       # the first proven read, else ...
         fallback: tuple | None = None    # ... the first use that may read
         others: list[tuple[int, int]] = []
-        for start, site in sorted(self._global_ref_functions(ga).items()):
-            if start == own:
-                continue        # its own re-reads were walked
+        # Readers of an object that may ENCLOSE this one read its bytes too
+        # (`.set tail, packet + 64`: a copy of `packet[0..112)` reads what a
+        # write to `tail` put there); `_global_access` classifies them
+        # through the overlap test.
+        refs = dict(self._global_ref_functions(ga))
+        for pb in self._preceding_objects(ga)[0]:
+            for start, site in self._global_ref_functions(pb).items():
+                refs.setdefault(start, site)
+        own_refs = self._global_ref_functions(ga)
+        for start, site in sorted(refs.items()):
+            if start == own or self._is_crt_helper(start):
+                continue        # its own re-reads were walked; CRT markers read nothing
             if cited is not None:
                 others.append((start, site))
                 continue
@@ -10116,6 +10499,12 @@ class TaintEngine:
             if use.kind in _PROVEN_GLOBAL_READS:
                 cited = row
                 continue
+            if start not in own_refs:
+                # A body that names only an enclosing object is cited only
+                # for a read its interval proves reaches these bytes; an
+                # unbounded neighbour use stays the continuation's
+                # `overlap_unverified` candidate, never an exit frontier.
+                continue
             if fallback is None:
                 fallback = row
             else:
@@ -10125,7 +10514,7 @@ class TaintEngine:
         elif fallback is not None:
             # Not the reader cited, but a function that references it all
             # the same: listed with the others, at BN's reference.
-            others.append((fallback[0], self._global_ref_functions(ga)[fallback[0]]))
+            others.append((fallback[0], refs[fallback[0]]))
         others.sort()
         found = [cited] if cited is not None else []
         swept = ga not in self._global_refs_truncated
@@ -10487,6 +10876,8 @@ class TaintEngine:
             tainted.add(node)
             if type(key) is tuple and len(key) == 2 and key[0] == "global":
                 live_globals.setdefault(int(key[1]), node)
+                if ins is not None:
+                    self._global_write_sites.setdefault(int(key[1]), ins)
             why[node] = {"label": label, "instr": ins, "reason": reason, "parents": list(parents)}
             return True
 
@@ -10984,6 +11375,14 @@ class TaintEngine:
                 di = _try_arg_index(dest_tok)
                 if di is None or di >= len(params) or self._buffer_target(ssaf, params[di]) is not None:
                     return
+                if depth > 0 and self._resolve_to_param_index(func, ssaf, params[di]) is not None:
+                    # P2-11: the destination is this DESCENDED body's own
+                    # pointer parameter. It becomes an out-param, and the
+                    # caller -- which knows what it passed (`copy_name(g_name,
+                    # s)`) -- keys that buffer, or reports the store itself
+                    # when it cannot. Reporting it here as an uncorrelated
+                    # pointer left the global unkeyed for good.
+                    return
                 leaf = {
                     "kind": "coarse_memory_store",
                     "address": hex(int(getattr(ins, "address", 0))),
@@ -11100,7 +11499,12 @@ class TaintEngine:
                                   if isinstance(i, int) and not isinstance(i, bool) and i >= len(params)})
                 reg = None
                 if argidx < len(params):
-                    hit = arg_taint(params[argidx])
+                    # A buffer this very call wrote (an out-param the callee
+                    # filled, keyed in this caller) is not taint passed IN.
+                    hit = [n for n in arg_taint(params[argidx])
+                           if not ((why.get(n) or {}).get("instr") is ins
+                                   and str((why.get(n) or {}).get("reason", "")).startswith(
+                                       "out-param"))]
                 else:
                     # An argument register with no definition at all still
                     # carries the function's ENTRY value when nothing that can
@@ -12390,14 +12794,34 @@ class TaintEngine:
                     # caller's buffer, and bubble up if that buffer is our own param
                     for j in descend_outparams:
                         if j < len(params):
-                            pv = self._pointee_var(ssaf, params[j])
-                            if pv is not None and taint_node((var_key(pv), None), var_label(pv), ins,
+                            # The buffer the CALLER passed: a stack object, a
+                            # writable global (`copy_name(g_name, s)` keys
+                            # g_name, P2-11) or a heap block.
+                            bt = self._buffer_target(ssaf, params[j])
+                            if bt is not None and taint_node((bt[0], None), bt[1], ins,
                                                              f"out-param {j} written by callee", []):
                                 changed = True
                             pidx = self._resolve_to_param_index(func, ssaf, params[j])
                             if pidx is not None and pidx not in out_params:
                                 out_params.add(pidx)
                                 changed = True
+                            if bt is None and pidx is None:
+                                # Neither keyable here nor ours to hand up: the
+                                # callee's write is not followed, said here.
+                                _ol = {
+                                    "kind": "coarse_memory_store",
+                                    "address": hex(int(getattr(ins, "address", 0))),
+                                    "dest_expr": str(params[j]),
+                                    "il_text": str(ins),
+                                    "detail": (
+                                        f"the callee writes tainted bytes through arg{j}, "
+                                        "whose pointer the engine could not correlate to a "
+                                        "tracked buffer; downstream reads of these bytes "
+                                        "are not followed -- a 'no sinks reached' result "
+                                        "past this point is not proof of safety"),
+                                }
+                                if _ol not in leaves:
+                                    leaves.append(_ol)
                     # #319b: a callee that filled a descriptor-ARRAY element field of
                     # an array we passed in -> taint the caller-side ("elem", base,
                     # field) key (base resolved on OUR side, so an alloca'd VLA's
@@ -12499,6 +12923,18 @@ class TaintEngine:
                                           "(elem_approx)")
                                 assume = ("descriptor-array element read correlated by "
                                           "(array base, field offset) (elem_approx)")
+                        if msrc is None:
+                            # P2-11: a load through a pointer into a heap block
+                            # this run tainted (`v = blk[i]`, the block reached
+                            # directly or reloaded from a global slot) reads
+                            # tainted bytes.
+                            hn = self._pointee_tainted(ssaf, getattr(src_expr, "src", None), tainted)
+                            if (hn is not None and isinstance(hn[0], tuple)
+                                    and hn[0][:1] == ("heap",)):
+                                msrc = hn
+                                reason = "loads from a tainted heap block (heap_approx)"
+                                assume = ("heap block modeled coarsely as one taint "
+                                          "location (heap_approx)")
                         if msrc is not None:
                             for w in ssa_writes(ins):
                                 node = (var_key(w), getattr(w, "version", None))
@@ -12532,10 +12968,6 @@ class TaintEngine:
                             # continuation machinery with nothing to work from
                             # (campaign item, closed here).
                             self._note_store_span(ssaf, dest, gs, ins)
-                            # P1-04: the store the unkeyed path used to report
-                            # as a blocking `coarse_memory_store`; the seeded
-                            # function's exit asks whether it is followed.
-                            self._global_direct_stores.setdefault(gs, ins)
                             if taint_node(((("global", gs)), None), f"glob_{hex(gs)}",
                                           ins, "store into tainted global "
                                           "(object base, global_approx)", reads):
@@ -12804,11 +13236,24 @@ class TaintEngine:
         # does one unconditionally). Descended runs hand their globals back to
         # the caller instead, which asks the question at its own exit.
         if top:
-            for ga in sorted(live_globals):
-                store = self._global_direct_stores.get(ga)
-                if store is None:
+            by_key = {ins_key(i): i for i in instrs}
+            rets = [i for i in instrs if op_name(i) in ("MLIL_RET", "MLIL_RET_SSA")
+                    or "TAILCALL" in op_name(i)]
+            # A seeded function Binary Ninja determined never returns
+            # (`memcpy(g, s, n); abort();`, no return in its IL) hands nothing
+            # to code after it: there is no exit for the bytes to be live at.
+            # A view that does not say keeps the frontier.
+            can_return = getattr(func, "can_return", None)
+            returns = bool(rets) or can_return is None or bool(can_return)
+            for ga in (sorted(live_globals) if returns else ()):
+                write = self._global_write_sites.get(ga)
+                if write is None:
                     continue
-                leaf = self._unfollowed_global_leaf(func, ga, store, leaves)
+                here = [by_key[k] for k in sorted(live_global_sites.get(ga) or ())
+                        if k in by_key]
+                if self._cleared_before_return(func, ssaf, instrs, ga, here, rets):
+                    continue
+                leaf = self._unfollowed_global_leaf(func, ga, write, leaves)
                 if leaf is not None and leaf not in leaves:
                     leaves.append(leaf)
 
