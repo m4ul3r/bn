@@ -370,7 +370,6 @@ class _FillReturn(NamedTuple):
     proven: bool
 
 
-
 class _SettleFrame:
     """One access on :meth:`TaintEngine._settle_access`'s stack: its
     suspended steps, which (function, global) it answers, the lowest
@@ -7166,7 +7165,6 @@ class TaintEngine:
         -- and through a mask by a constant: AArch64 tests `n < 0` as
         `(n & 1 << 63) != 0`. None when a width is unknown or the operand is
         any other computation."""
-        mask = None
         if op_name(expr) == "MLIL_AND":
             left, right = getattr(expr, "left", None), getattr(expr, "right", None)
             mask, inner = self._int_const(right), left
@@ -7198,8 +7196,8 @@ class TaintEngine:
 
     def _failure_excluded(self, ssaf: Any, fill: Any, len_expr: Any) -> bool:
         """Whether a test of the fill's return against a constant guards the
-        copy reading *len_expr* on its count side: the branch the return
-        takes when it is not -1 leads to a block entered only over that
+        copy reading *len_expr* on its count side: the branch the failure
+        value -1 does not take leads to a block entered only over that
         branch edge, and no path from the fill reaches the copy without
         entering that block. The copy may BE the block's first instruction
         (`if (n < 0) goto err; memcpy(..)`): reaching it at all is passage
