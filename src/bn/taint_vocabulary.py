@@ -2,15 +2,16 @@
 
 ``bn capabilities`` advertises it (V4-05) so an agent can learn, before its
 first run, which frontier leaf kinds block a claim, which truncation causes a
-run can name, which backward origin kinds and ``sink_status`` statuses exist and
-which ``run_params`` keys echo a run's configuration.
+run can name, which backward origin kinds, pointer-demand object kinds and
+``sink_status`` statuses exist and which ``run_params`` keys echo a run's
+configuration.
 
 Two kinds of source, one each:
 
 * Declared sets -- ``BLOCKING_LEAF_KINDS`` here, ``TRUNCATION_CAUSES`` in
   :mod:`taint_truncation` -- that the engine reads. Tests enumerate the engine's
   literals against them.
-* Literals only the engine spells (origin kinds, ``sink_status`` statuses,
+* Literals only the engine spells (origin and pointer-object kinds, ``sink_status`` statuses,
   ``run_params`` keys). Those are read off the bridge source by the AST crawler
   below, the same one the skill-reference drift tests use, so the advertised
   list and the documented tables cannot disagree with the code. The bridge
@@ -287,6 +288,16 @@ def sink_status_constructors(node: ast.AST, scopes: list) -> Iterator[ast.expr]:
         yield node.args[0]
 
 
+def pointer_object_constructors(node: ast.AST, scopes: list) -> Iterator[ast.expr]:
+    """A pointer-demand object (``pointer_demand_not_certified`` /
+    ``sink_role_unknown`` ``objects``): any dict with a `kind` built inside
+    `_demand_objects`, the one routine that describes what a pointer may
+    read."""
+    if (isinstance(node, ast.Dict) and any(s.name == "_demand_objects" for s in scopes)
+            and any(isinstance(k, ast.Constant) and k.value == "kind" for k in node.keys)):
+        yield node
+
+
 def run_params_keys(path: Path) -> set[str]:
     """Every key *path* writes into a ``run_params`` echo: the keys of a dict
     literal under a ``"run_params"`` key, and each ``run_params["<key>"] = ...``
@@ -332,6 +343,8 @@ def taint_vocabulary(bridge: Path | None = None) -> dict[str, Any]:
         "leaf_kinds": sorted(BLOCKING_LEAF_KINDS),
         "truncation_causes": sorted(TRUNCATION_CAUSES),
         "origin_kinds": sorted(kind_rows(engine, origin_constructors)),
+        # G5-R5: what a pointer demand's `objects` rows can be.
+        "pointer_object_kinds": sorted(kind_rows(engine, pointer_object_constructors)),
         "sink_status": sorted(kind_rows(engine, sink_status_constructors, key="status")),
         "run_params": sorted(run_params_keys(engine)
                              | run_params_keys(bridge / "read_taint_slice.py")),
