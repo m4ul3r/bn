@@ -2487,6 +2487,61 @@ class TaintEngine:
         except Exception:
             return False
 
+    def _is_unmapped(self, addr: int) -> bool:
+        """Whether BN says no byte of the view lives at *addr* (``0``, ``1``,
+        a small flag passed where a pointer goes). False when the view cannot
+        answer (no ``is_valid_offset``: the unit fakes) -- an unanswered
+        question proves no address is a mere value."""
+        valid = getattr(self.bv, "is_valid_offset", None)
+        if not callable(valid):
+            return False
+        try:
+            return not bool(valid(int(addr)))
+        except Exception:
+            return False
+
+    # The sink class a model gives an allocator's size: the model that marks a
+    # call as handing back a block of its own.
+    _ALLOCATOR_SINK_CLASS = "alloc_size"
+
+    def _returned_allocator(self, call: Any, name: str | None,
+                            model: dict[str, Any] | None) -> str | None:
+        """The allocator whose fresh block the call *call* returns: *name*
+        itself when its model is an allocator's (``sink.class ==
+        "alloc_size"``: malloc, calloc, g_slice_alloc, ...), else -- for an
+        in-binary callee -- the allocator every one of its returns yields
+        (`rec = g_slice_alloc0(n); rec->x = ..; return rec;`). None
+        otherwise. Describes a pointer only; never decides completeness."""
+        if self._is_allocator_model(model):
+            return name
+        fn = function_at(self.bv, const_target(getattr(call, "dest", None)))
+        if fn is None or not self._is_internal(fn):
+            return None
+        ssaf = self._ssa_or_none(fn)
+        if ssaf is None:
+            return None
+        instrs = list(self._instrs(ssaf))
+        allocs: dict[tuple, str] = {}
+        for ins in instrs:
+            if not self._is_call(ins):
+                continue
+            inner = self._callee_name(self._resolve_direct_target(ins))
+            if inner and self._is_allocator_model(lookup_model(self.models, inner)[1]):
+                for w in ssa_writes(ins):
+                    allocs[self._ssa_var_key(w)] = inner
+        rets = [i for i in instrs if op_name(i) in ("MLIL_RET", "MLIL_RET_SSA")]
+        if not allocs or not rets:
+            return None
+        if not all(srcs and all(self._value_is_one_of(ssaf, s, set(allocs)) for s in srcs)
+                   for srcs in (self._ret_sources(r) for r in rets)):
+            return None
+        names = sorted(set(allocs.values()))
+        return names[0] if len(names) == 1 else ", ".join(names)
+
+    def _is_allocator_model(self, model: dict[str, Any] | None) -> bool:
+        sink = (model or {}).get("sink")
+        return isinstance(sink, dict) and sink.get("class") == self._ALLOCATOR_SINK_CLASS
+
     def _const_ptr_storage(self, addr: int) -> str:
         """Storage class of the constant address *addr* a writer operand points
         at: ``"readonly"`` (a string literal in ``.rodata``/code -- the bytes
@@ -18385,8 +18440,12 @@ class TaintEngine:
             if o["kind"] == "returned":
                 inner = ", ".join(say(i) for i in o["may_point_into"])
                 return (f"the pointer {_code(o['object'])} returned"
+                        + (f" (a block {_code(o['allocator'])} allocated)"
+                           if o.get("allocator") else "")
                         + (f", into {inner}" if inner else "")
                         + (f" ({o['note']})" if o.get("note") else ""))
+            if o["kind"] == "literal_value":
+                return f"literal value {_code(o['object'])} (no mapped address)"
             extra = []
             if "offset" in o:
                 extra.append(f"offset {o['offset']:#x}" if isinstance(o["offset"], int)
@@ -18605,6 +18664,11 @@ class TaintEngine:
             c = self._int_const(expr)
             if c is None:
                 return [{"kind": "unknown", "object": str(expr)}]
+            if self._is_unmapped(c):
+                # `consume(0)`, `consume((char *)1)`: no byte lives there, so
+                # it is a literal VALUE, never an address the sink may read --
+                # nor one "in a read-only segment" (V8-01).
+                return [{"kind": "literal_value", "object": str(expr), "value": c}]
             storage = self._const_ptr_storage(c)
             seg = None
             wr = getattr(self.bv, "is_offset_writable", None)
@@ -18675,18 +18739,27 @@ class TaintEngine:
                             else _try_arg_index(frm) if to == "ret" else None)
                     if cand is not None and cand not in want:
                         want.append(cand)
-                picked = ([params[i] for i in want if i < len(params)] if want else params)
+                # An allocator -- modeled, or an in-binary body every return
+                # of which is one's result -- hands back a block of its own:
+                # its arguments are a size, not objects it points into, so
+                # only what its model names is listed (V8-01).
+                allocator = self._returned_allocator(d, name, model)
+                picked = ([params[i] for i in want if i < len(params)]
+                          if want or allocator else params)
                 inner: list[dict[str, Any]] = []
                 for p in picked:
                     if expr_reads(p) or any(t in op_name(p) for t in (
                             "ADDRESS_OF", "CONST_PTR", "IMPORT", "EXTERN")):
                         for o in rec(p, None):
-                            if (o["kind"] != "parameter" or o.get("pointer")) and o not in inner:
+                            if (o["kind"] not in ("parameter", "literal_value") or o.get("pointer")) \
+                                    and o not in inner:
                                 inner.append(o)
                 note = ({"note": "BN recovered no argument the return may point into"}
-                        if not picked or any(i >= len(params) for i in want) else {})
+                        if not allocator and (not picked or any(i >= len(params) for i in want))
+                        else {})
                 return [{"kind": "returned", "object": f"{name or 'an indirect call'}()",
-                         "callee": name, "may_point_into": inner, **note}]
+                         "callee": name, **({"allocator": allocator} if allocator else {}),
+                         "may_point_into": inner, **note}]
             return [{"kind": "unknown", "object": var_label(expr)}]
         reads = expr_reads(expr)
         if len(reads) == 1 and op in _COPY_OPS:

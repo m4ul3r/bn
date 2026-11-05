@@ -634,6 +634,80 @@ def test_literal_sink_is_never_complete_r6(segment_writable):
                                 "offset": 0, "segment_writable": segment_writable}], leaf
 
 
+# V8-01: what each pointer-object kind claims must be what BN says about it.
+_B_ATTACH = 0x984
+_B_NAMES.update({_B_ATTACH: "attach"})
+
+
+class _MappedView:
+    """Mixin: BN maps bytes from 0x400 up; nothing below."""
+
+    def is_valid_offset(self, addr):
+        return addr >= 0x400
+
+
+def _mapped_result(pg):
+    from test_taint_engine import FBVStorage, te
+
+    class View(_MappedView, FBVStorage):
+        pass
+    bv = View(_B_NAMES, ro=[(0x700, 0x800)], rw=[(0x900, 0xa00)])
+    return te.TaintEngine(bv, te.load_models()).backward(pg.func(),
+                                                          [te.parse_locator("arg:popen:0")])
+
+
+@pytest.mark.parametrize("value", [0, 1])
+def test_an_unmapped_constant_is_a_literal_value_not_an_address(value):
+    # `popen(NULL)`, `popen((char *)1)`: nothing is mapped there, so it is a
+    # value -- it was "literal ... in a read-only segment".
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    _set_ptr(pg, p1, f"p#1 = {value}", _cstr(value))
+    _sink_ssa(pg, p1)
+    result = _mapped_result(pg)
+    assert _demand_leaf(result)["objects"] == [
+        {"kind": "literal_value", "object": hex(value), "value": value}]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+@pytest.mark.parametrize(("address", "kind", "writable"), [
+    (0x720, "literal", False), (0x940, "global", True)])
+def test_a_mapped_constant_keeps_its_address_and_segment(address, kind, writable):
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    _set_ptr(pg, p1, f"p#1 = {address:#x}", _cstr(address))
+    _sink_ssa(pg, p1)
+    assert _demand_leaf(_mapped_result(pg))["objects"] == [
+        {"kind": kind, "object": hex(address), "address": hex(address), "offset": 0,
+         "segment_writable": writable}]
+
+
+def test_an_allocators_return_names_the_allocator_not_its_size():
+    # `p = malloc(sx.q(n)); popen(p)`: the size is no object the pointer
+    # reads -- it was listed as "unknown `sx.q(n)`" the block may point into.
+    n = FVar("n", ident=72, typ="int32_t"); n0 = FSSA(n, 0)
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[n])
+    pg.call(_B_MALLOC, [FExpr("MLIL_SX", "sx.q(n#0)", reads=[n0])], reads=[n0], writes=[p1])
+    _sink_ssa(pg, p1)
+    assert _demand_leaf(_mapped_result(pg))["objects"] == [
+        {"kind": "returned", "object": "malloc()", "callee": "malloc", "allocator": "malloc",
+         "may_point_into": []}]
+
+
+def test_a_returned_pointer_never_points_into_a_literal_value():
+    # `p = attach(NULL, &buf); popen(p)`: an unmodeled helper's return may
+    # point into the objects it was handed -- `buf`, not the `NULL` beside it.
+    buf = FVar("buf", typ="char[0x40]")
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    pg.call(_B_ATTACH, [_cstr(0), _addr_of(buf)], writes=[p1])
+    _sink_ssa(pg, p1)
+    [obj] = _demand_leaf(_mapped_result(pg))["objects"]
+    assert (obj["kind"], obj["callee"], "allocator" in obj) == ("returned", "attach", False)
+    assert obj["may_point_into"] == [{"kind": "local", "object": "buf", "offset": None}]
+
+
 @pytest.mark.parametrize("index", ["parameter", "constant"])
 def test_got_global_plus_an_index_is_not_complete_r5(index):
     # `popen(global_buf + i)` / `popen(g_req.cmd)` through the GOT: the

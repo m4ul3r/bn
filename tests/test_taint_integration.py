@@ -779,6 +779,54 @@ def test_sink_argument_without_a_value_role_is_incomplete(tmp_path, shared_bn, a
     assert [o["kind"] for o in leaf["objects"]] == ["literal"], leaf
 
 
+_POINTER_OBJECTS_SRC = r"""
+#include <stdlib.h>
+#include <string.h>
+#define N __attribute__((noinline))
+char g_buf[64];
+volatile int sink_seen;
+N void consume(const char *p, int n) { sink_seen = n + (p != 0); }
+N char *make_rec(int n) { char *r = malloc(32); memset(r, 0, 32); r[0] = (char)n; return r; }
+N void case_literal(int c) { consume(c ? (const char *)0 : (const char *)1, c); }
+N void case_wrapper(int n) { char *r = make_rec(n); consume(r, n); }
+N void case_malloc(int n) { char *r = malloc(n); consume(r, n); }
+N void case_rodata(void) { consume("hello", 2); }
+N void case_global(void) { consume(g_buf, 3); }
+int main(int c, char **v) { case_literal(c); case_wrapper(c); case_malloc(c);
+    case_rodata(); case_global(); return v != 0; }
+"""
+
+
+def test_pointer_object_kinds_say_what_bn_maps(tmp_path, shared_bn):
+    """V8-01: each object an unmodeled sink's pointer may read is described
+    by what BN says about it. `0`/`1` were "literal ... in a read-only
+    segment" though nothing is mapped there; a block `malloc` returned "may
+    point into" its size argument, and a wrapper's never named the
+    allocator."""
+    src = tmp_path / "objs.c"
+    src.write_text(_POINTER_OBJECTS_SRC)
+    binary = tmp_path / "objs"
+    _compile(src, binary)
+    target = shared_bn.load(binary, copy=False)
+
+    def objects(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn,
+                          "--sink", "arg:consume:0")
+        [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "sink_role_unknown"]
+        return leaf["objects"]
+
+    assert {(o["kind"], o.get("value"), "address" in o) for o in objects("case_literal")} \
+        == {("literal_value", 0, False), ("literal_value", 1, False)}
+    for fn, callee in [("case_wrapper", "make_rec"), ("case_malloc", "malloc")]:
+        [obj] = objects(fn)
+        assert (obj["kind"], obj["callee"], obj["allocator"], obj["may_point_into"]) \
+            == ("returned", callee, "malloc", []), (fn, obj)
+    assert [(o["kind"], o["segment_writable"]) for o in objects("case_rodata")] \
+        == [("literal", False)]
+    assert [(o["kind"], o["segment_writable"]) for o in objects("case_global")] \
+        == [("global", True)]
+
+
 
 def test_aarch64_upper_half_of_wider_store_is_not_the_allocation(tmp_path, shared_bn):
     """#1041 item 2 on the architecture it was found on: two 4-byte
