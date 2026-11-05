@@ -265,7 +265,8 @@ def test_a_thunk_is_recognised_before_anything_else_lifted_it():
     stub = _LateThunk(FFunc("__wmemcpy", 0x2000, FSSAFunc([
         FInstr(0, 0x2004, "MLIL_TAILCALL_SSA", "tailcall memcpy", reads=[],
                params=[], dest=_const(0x3000))]), params=[FVar("p")]))
-    engine = te.TaintEngine(FBV({0x2000: "__wmemcpy"}, {0x2000: stub}),
-                            te.load_models())
+    memcpy = FFunc("memcpy", 0x3000, FSSAFunc([]), symbol_type="ImportedFunctionSymbol")
+    engine = te.TaintEngine(FBV({0x2000: "__wmemcpy", 0x3000: "memcpy"},
+                                {0x2000: stub, 0x3000: memcpy}), te.load_models())
     assert engine._not_internal_reason(stub) == "thunk"
     assert engine._not_internal_reason(stub) == "thunk"

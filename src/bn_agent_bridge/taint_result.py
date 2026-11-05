@@ -160,6 +160,12 @@ BLOCKING_LEAF_KINDS = frozenset({
     # an absence of evidence. Emitted whether or not a model covers the call:
     # a model is an overlay on a body, never a substitute for reading one.
     "unread_callee_body",
+    # P2-02: a backward slice ended at a register's ENTRY value that no
+    # parameter of the function's recovered prototype is bound to (BN's armv7
+    # mapping puts a `long long`/`double` in `r2:r3` on the stack, leaving
+    # `entry_r2`). The value comes from the caller through a location the
+    # prototype does not map, so the caller ascent never ran: not an origin.
+    "abi_mapping_unbound",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -839,7 +845,8 @@ def backward_diagnostics(
                   "indirect_call_unresolved", "field_load_unresolved",
                   "address_of_local_unresolved", "pointer_object_unresolved",
                   "object_extent_unknown", "region_store_proof_not_certified",
-                  "pointer_demand_not_certified", "sink_role_unknown", "sink_unseeded")
+                  "pointer_demand_not_certified", "sink_role_unknown", "sink_unseeded",
+                  "abi_mapping_unbound")
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
