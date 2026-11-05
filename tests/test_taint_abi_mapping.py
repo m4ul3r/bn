@@ -295,3 +295,51 @@ def test_an_entry_value_that_is_not_a_register_keeps_its_entry_origin():
         func, [te.parse_locator("arg:malloc:0")])
     assert [o["kind"] for sl in result["slices"] for o in sl["origins"]] == ["entry"]
     assert not [lf for lf in result["leaves"] if lf["kind"] == "abi_mapping_unbound"]
+
+
+# --------------------------------------------------------------------------
+# P2-02(c): a PLT stub typed with its IFUNC resolver's prototype
+# --------------------------------------------------------------------------
+
+def _resolver_type():
+    fn_type = types.SimpleNamespace(type_class=types.SimpleNamespace(name="FunctionTypeClass"))
+    ret = types.SimpleNamespace(type_class=types.SimpleNamespace(name="PointerTypeClass"),
+                                target=fn_type)
+    return types.SimpleNamespace(return_value=ret)
+
+
+@pytest.mark.parametrize("resolver", [True, False])
+def test_a_plt_stub_with_a_resolver_prototype_is_routed_through_its_model(resolver):
+    # armv7 glibc: `memcpy` -> `void* (*memcpy(int32_t hwcap))(...)`, so the
+    # MLIL call carries one argument and the tainted length was read only
+    # through the ABI register, `class_from: model`, unproven. The stub's
+    # prototype is not memcpy's: the call is routed through memcpy's model
+    # by name and the length is an argument like any other.
+    p = _reg_var("p", "r0", 40)
+    stub_at = 0x112bc
+    stub = FFunc("memcpy", stub_at, FSSAFunc([]), symbol_type="ImportedFunctionSymbol")
+    stub.type = _resolver_type() if resolver else types.SimpleNamespace(return_value=None)
+    call = FInstr(0, CALL, "MLIL_CALL_SSA", "memcpy(0x5000)", reads=[], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(stub_at), constant=stub_at),
+                  params=[FExpr("MLIL_CONST_PTR", "0x5000", constant=0x5000)])
+    call.il_basic_block = [call]
+    caller = FFunc("caller", CALLER, FSSAFunc([call]), params=[p])
+    caller.calling_convention = _cc()
+    bv = FBV({stub_at: "memcpy"}, funcs={stub_at: stub})
+    bv.arch = _arch()
+    bv.platform = types.SimpleNamespace(default_calling_convention=_cc())
+    engine = te.TaintEngine(bv, te.load_models())
+    src = FSSA(_reg_var("r1_1", "r1", 90), 1)
+    regs = {1: (src, "r1"), 2: (FSSA(p, 0), "r2")}
+    engine._abi_arg_operands = lambda f, i, idx, **k: (
+        [te._RegisterOperand(regs[idx][0], regs[idx][1])] if idx in regs else [])
+    result = engine.forward(caller, [te.parse_locator("param:0")])
+    [flow] = result["reached_sinks"]
+    assert flow["sink"]["callee"] == "memcpy" and flow["sink"]["tainted_arg_index"] == 2
+    if resolver:
+        assert "arity_mismatch" not in flow["sink"] and flow["sink"].get("via") != "abi_register"
+        assert any("IFUNC resolver" in a and "r1, r2" in a for a in result["assumptions"])
+    else:
+        # An ordinary under-recovered prototype keeps the reach-only path.
+        assert flow["sink"]["via"] == "abi_register"
+        assert flow["sink"]["arity_mismatch"]["class_from"] == "model"

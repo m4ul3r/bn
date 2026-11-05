@@ -6026,6 +6026,22 @@ def test_split_body_notes_are_silent_on_an_ordinary_function_end_966(tail):
     assert read_decompile._fallthrough_successor(bv, head) is None
 
 
+@pytest.mark.parametrize("stub", ["head", "tail"])
+def test_a_plt_entry_is_never_a_split_body(stub):
+    # W06-06: armv7 PLT stubs end in `ldr pc, [r12, #x]!` and sit back to
+    # back, so each "ran into" the next and the note advised
+    # `bn function delete` on a PLT entry. A linker stub is never a split.
+    bv, head, tail = _split_view(tail_mnemonics=["str"])
+    plt = head if stub == "head" else tail
+    bv.get_symbol_at = lambda a: None
+    bv.get_sections_at = lambda a: (
+        [types.SimpleNamespace(name=".plt")] if a == plt.start else
+        [types.SimpleNamespace(name=".text")])
+    for fn in (head, tail):
+        notes = [n["detail"] for n in read_decompile._split_body_notes(bv, fn)]
+        assert not any("runs straight into" in n or "function delete" in n for n in notes), notes
+
+
 def test_disasm_discloses_where_execution_continues_966(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

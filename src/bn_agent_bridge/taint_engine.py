@@ -91,8 +91,12 @@ class _RegisterOperand:
 
     Shaped like an ``MLIL_VAR_SSA`` read of that value (``operation.name``,
     ``src``, ``vars_read``) so the forward walk's taint check can ask whether
-    the dropped arg carries taint. It is evidence of REACH only: it is never
-    handed to a sink classifier, so no class is lowered from a register read."""
+    the dropped arg carries taint. Read beside an under-recovered prototype it
+    is evidence of REACH only, never handed to a sink classifier. The one
+    exception is a call routed through its import model by name
+    (:meth:`TaintEngine._import_routed_params`): there the stub's prototype is
+    not the import's at all, the model states the arity, and the argument is
+    the call's own."""
 
     class _Op:
         name = "MLIL_VAR_SSA"
@@ -555,6 +559,20 @@ def _full_width_reg(arch: Any, name: str) -> str:
         return str(arch.regs[name].full_width_reg)
     except Exception:
         return str(name)
+
+
+def _is_resolver_prototype(ftype: Any) -> bool:
+    """Whether a function type returns a pointer to a FUNCTION -- the shape of
+    an IFUNC resolver (`void* (*memcpy(int32_t hwcap))(void*, ...)`), which BN
+    puts on an armv7 glibc PLT stub in place of the import's own prototype."""
+    try:
+        ret = ftype.return_value
+        if str(getattr(ret.type_class, "name", ret.type_class)) != "PointerTypeClass":
+            return False
+        return str(getattr(ret.target.type_class, "name", ret.target.type_class)) \
+            == "FunctionTypeClass"
+    except Exception:
+        return False
 
 
 def _unrecovered_key(leaf: dict[str, Any]) -> tuple:
@@ -1050,6 +1068,39 @@ class TaintEngine:
     def _model_arg_indices(self, callee: str) -> set[int]:
         """Thin wrapper over the shared :func:`model_arg_indices` gate (#433)."""
         return model_arg_indices(self.models, callee)
+
+    def _import_routed_params(self, func: Any, ins: Any, params: list, target: Any,
+                              name: str | None) -> tuple[list, list[tuple[int, str]]]:
+        """``(params, routed)``: this call's arguments, completed from the
+        calling convention's registers when its target is a PLT stub Binary
+        Ninja typed with the IFUNC RESOLVER's prototype (armv7 glibc: `memcpy`
+        becomes `void* (*memcpy(int32_t hwcap))(...)`, one parameter), so the
+        MLIL call carries one argument where the import takes three.
+
+        The stub's own prototype describes a different function, so it says
+        nothing about this call's arity; the import's model does, by name
+        (P2-02). Each missing index up to that arity must be ONE definition
+        reaching its register -- anything less proves nothing and the call
+        keeps BN's arguments (and the `abi_register` reach-only path).
+        ``routed`` lists the ``(index, register)`` pairs read that way."""
+        if target is None or not name:
+            return params, []
+        stub = function_at(self.bv, target)
+        if stub is None or not self._is_import_symbol(stub) \
+                or not _is_resolver_prototype(getattr(stub, "type", None)):
+            return params, []
+        want = self._model_arg_indices(name)
+        if not want or max(want) < len(params):
+            return params, []
+        routed_params = list(params)
+        routed: list[tuple[int, str]] = []
+        for i in range(len(params), max(want) + 1):
+            ops = self._abi_arg_operands(func, ins, i)
+            if len(ops) != 1:
+                return params, []
+            routed_params.append(ops[0])
+            routed.append((i, str(ops[0].register)))
+        return routed_params, routed
 
     def _arg_register(self, func: Any, idx: int) -> str | None:
         """Calling-convention integer-argument register name for ``idx`` (e.g.
@@ -12139,6 +12190,17 @@ class TaintEngine:
                     name = self._callee_name(target)
                     mkey, model = lookup_model(self.models, name)
                     params = self._call_params(ins)
+                    if model is not None:
+                        params, _routed = self._import_routed_params(func, ins, params,
+                                                                     target, name)
+                        if _routed:
+                            add_assumption(
+                                f"call at {hex(int(getattr(ins, 'address', 0)))} to "
+                                f"{self._prose_name(name)} goes through a PLT stub Binary Ninja "
+                                "typed with its IFUNC resolver's prototype; argument(s) "
+                                f"{[i for i, _r in _routed]} were read from the convention's "
+                                f"register(s) {', '.join(r for _i, r in _routed)} at the arity "
+                                "its model declares")
 
                     # 1+2) model-driven sink detection + propagation (shared helper).
                     # `modeled_key` records WHICH model was applied HERE, so the
