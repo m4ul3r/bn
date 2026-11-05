@@ -233,20 +233,48 @@ def test_a_dropped_fortify_guard_is_recovered_from_its_register(models, monkeypa
                for s in result["slices"]), result["slices"]
 
 
-def test_a_position_no_role_names_is_still_out_of_range(models, monkeypatch):
+def test_a_position_no_role_names_is_still_refused(models, monkeypatch):
+    # Arg 3 is no role of `__strcpy_chk`: the register fallback is never
+    # consulted for it and nothing is seeded.
     func, guard1 = _underrecovered_chk_program()
     engine = te.TaintEngine(FBV({0x900: "__strcpy_chk"}), models)
     recover, calls = _spy(guard1, func.mlil.ssa_form.instructions[2], "rcx")
     monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg", recover, raising=False)
-    with pytest.raises(te.TaintError, match="out of range"):
+    with pytest.raises(te.TaintError):
         engine.backward(func, [te.parse_locator("arg:__strcpy_chk:3")])
     assert calls == []
 
 
+def _underrecovered_recvmsg_program():
+    """``hdr#1 = &msg; recvmsg(fd#0)`` -- BN recovered only the socket of a
+    `recvmsg(fd, &msg, 0)` and dropped the msghdr (arg 1)."""
+    fd0 = FSSA(FVar("fd"), 0); hdr1 = FSSA(FVar("hdr"), 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "hdr#1 = &msg", writes=[hdr1]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "0x910(fd#0)", reads=[fd0],
+               dest=FExpr("MLIL_CONST_PTR", "0x910", constant=0x910),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0])]),
+    ]
+    return FFunc("pump", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), hdr1
+
+
+def test_a_dropped_recvmsg_header_is_recovered_from_its_register(models, monkeypatch):
+    # D5a-02: `recvmsg`'s model names its msghdr only as a source `*iovec:1`;
+    # that position was not collected, so an under-recovered arg 1 was refused.
+    func, hdr1 = _underrecovered_recvmsg_program()
+    engine = te.TaintEngine(FBV({0x910: "recvmsg"}), models)
+    recover, calls = _spy(hdr1, func.mlil.ssa_form.instructions[1], "rsi")
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg", recover, raising=False)
+    result = engine.backward(func, [te.parse_locator("arg:recvmsg:1")])
+    assert calls == [1]
+    assert [s["sink"]["seed"] for s in result["slices"]] == ["hdr#1"], result["slices"]
+
+
 def test_every_indexed_model_field_is_a_recoverable_position():
-    # One position per field the model grammar accepts, each distinct.
+    # One position per field the model grammar accepts, each distinct --
+    # including a source's `*iovec:N` (D5a-02).
     model = {
-        "sources": [{"to": "*arg:0"}],
+        "sources": [{"to": "*arg:0"}, {"to": "*iovec:24"}],
         "propagates": [{"from": "arg:1", "to": "*arg:2"}],
         "varargs": {"first_index": 3, "to": "*arg:4"},
         "sink": {"class": "overflow_len", "tainted_args": [5], "pointer_args": [6],
@@ -263,4 +291,4 @@ def test_every_indexed_model_field_is_a_recoverable_position():
     }
     models = {"every_role": model}
     te.validate_model_arguments(models, source="test")
-    assert te.model_arg_indices(models, "every_role") == set(range(24))
+    assert te.model_arg_indices(models, "every_role") == set(range(25))

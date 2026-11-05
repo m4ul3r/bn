@@ -1057,6 +1057,11 @@ def model_arg_indices(models: dict[str, Any], callee: str) -> set[int]:
     for field in _ARG_TOKEN_LIST_FIELDS:
         values = model.get(field)
         tokens += values if isinstance(values, list) else []
-    idxs.update(i for i in map(_try_arg_index, tokens) if i is not None)
+    # Every token form the grammar validates names a position: `arg:N`,
+    # `*arg:N`, and a source's `*iovec:N` (the iovec array `recvmsg`-family
+    # models fill, D5a-02).
+    parsed = (parse_model_token(token) for token in tokens)
+    idxs.update(n for kind, n in (p for p in parsed if p is not None)
+                if kind in ("arg", "*arg", "*iovec"))
     return idxs
 
