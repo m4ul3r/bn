@@ -113,10 +113,12 @@ class ResolveMap(dict):
     what ``run_params`` echoes beside the entry count, so an unmatched pin is
     visible. A pin is matched only by ``select`` -- at an indirect call or
     jump the walk could not resolve itself, where the pinned targets are what
-    it follows. A plain ``get`` (a helper asking what a site is pinned to) or a
-    pin on a DIRECT call, which the walk follows to its real target, matches
-    nothing (R3-02): marking every lookup reported such an inert pin as
-    matched and its warning disappeared."""
+    it follows, or one through which a source/sink locator anchored its call
+    site. A plain ``get`` (a helper asking what a site is pinned to,
+    discovery asking of every indirect call whether it routes to the
+    locator's callee) or a pin on a DIRECT call, which the walk follows to
+    its real target, matches nothing (R3-02, D5c-01): marking every lookup
+    reported such an inert pin as matched and its warning disappeared."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)

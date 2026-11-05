@@ -140,6 +140,38 @@ def test_an_engine_run_reports_a_pin_matched_only_when_it_routed_a_call(
     assert all(address in rows[0] for address in unmatched)
 
 
+def test_a_pin_on_a_call_the_walk_never_reaches_is_unmatched_though_discovery_saw_it():
+    """D5c-01: finding the `call:read` source examines every indirect call
+    for a pin that might route it to `read`. That lookup marked the pin on a
+    clean `fp(7)` at 0x108 matched -- pinned to `system`, which neither
+    anchors the source nor is followed, while the only reached sink is the
+    direct `system(n)` at 0x104 -- so its warning disappeared."""
+    from test_taint_engine import FBV, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar
+
+    fd, n, fp = FVar("fd"), FVar("n"), FVar("fp")
+    fd0, n1 = FSSA(fd, 0), FSSA(n, 1)
+    func = FFunc("walked", 0x100, FSSAFunc([
+        FInstr(0, 0x100, "MLIL_CALL_SSA", "n#1 = 0x800(fd#0, buf, 8)", reads=[fd0], writes=[n1],
+               dest=FExpr("MLIL_CONST_PTR", "0x800", constant=0x800),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_VAR_SSA", "buf"), FExpr("MLIL_CONST", "8", constant=8)]),
+        FInstr(1, 0x104, "MLIL_CALL_SSA", "0x900(n#1)", reads=[n1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]),
+        FInstr(2, 0x108, "MLIL_CALL_SSA", "fp#1(7)",
+               dest=FExpr("MLIL_VAR_SSA", "fp#1"), params=[FExpr("MLIL_CONST", "7", constant=7)]),
+    ]), params=[fd])
+    bv = FBV({0x800: "read", 0x900: "system"})
+    result = rts._taint_op(_OpCtx(bv, {"walked": func}), "active", {
+        "function": "walked", "sources": ["call:read"],
+        "resolve_map": {"0x108": ["0x900"]}, "resolve_map_path": "pins.json"})
+    assert [s["sink"]["address"] for s in result["reached_sinks"]] == ["0x104"]
+    rm = result["run_params"]["resolve_map"]
+    assert (rm["matched"], rm["unmatched"]) == ([], ["0x108"])
+    (row,) = _resolve_rows(_render_taint_text(result))
+    assert "0x108" in row
+
+
 def _estimate_help(argv: list[str], capsys) -> str:
     with pytest.raises(SystemExit):
         bn.cli.main([*argv, "--help"])

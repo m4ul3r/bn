@@ -4736,16 +4736,23 @@ class TaintEngine:
             # the same resolution the forward descent already performs for the call.
             if resolve_indirect and target is None \
                     and self._indirect_target_matches(ins, callee, wrapper_arg=wrapper_arg):
+                # The pin (if it supplied the candidates) now anchors a
+                # selected source/sink: only now is it matched (D5c-01).
+                self.resolve_map.select(int(getattr(ins, "address", 0)))
                 hits.append(ins)
         return hits
 
     def _indirect_call_resolution(self, ins: Any) -> tuple[list[int], str | None]:
         """Resolve an indirect call *ins* to candidate target addresses and the
         provenance (`agent-map` / `value-set`), mirroring the forward-descent
-        resolution. Returns ``([], None)`` for a direct call or no resolution."""
+        resolution. Returns ``([], None)`` for a direct call or no resolution.
+
+        A question, not a use: discovery asks it of every indirect call in
+        the region, so it never marks a pin matched -- the caller that
+        anchors a site through the answer does (D5c-01)."""
         if const_target(getattr(ins, "dest", None)) is not None:
             return [], None
-        mapped = self.resolve_map.select(int(getattr(ins, "address", 0)))
+        mapped = list(self.resolve_map.get(int(getattr(ins, "address", 0))) or ())
         if mapped:
             return mapped, "agent-map"
         cands = self._call_targets_from_pvs(
