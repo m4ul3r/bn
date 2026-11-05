@@ -15719,6 +15719,23 @@ class TaintEngine:
         key, _ = lookup_model(self.models, str(callee) if callee else None)
         return {"model": key} if key and key != str(callee) else {}
 
+    def _site_naming(self, site: Any, locator_callee: Any) -> dict[str, Any]:
+        """``callee``/``model`` for one call site a backward locator selected,
+        by the rule every forward row follows: ``callee`` is the symbol this
+        site calls (``__isoc99_sscanf`` for a query on ``arg:sscanf:2``) --
+        through a thunk, the symbol the thunk calls, as a forward finding
+        names it -- and ``model`` the model key the locator names when it
+        differs. A site whose call names no symbol -- an indirect call the
+        locator matched through a pin or value set -- keeps the locator's
+        spelling."""
+        key, _ = lookup_model(self.models, str(locator_callee))
+        target = (resolve_call_target(self.bv, site, follow_thunks=True).address
+                  if self.bv is not None else None)
+        name = self._callee_name(target if target is not None
+                                 else self._resolve_direct_target(site))
+        callee = called_name(key, name) if name else str(locator_callee)
+        return {"callee": callee, **({"model": key} if key and key != callee else {})}
+
     def _symbol_names(self, name: Any) -> tuple[str, str]:
         """``(raw symbol name, display name)`` for a name a taint result prints
         (#1001 item 4); both fall back to *name* itself when no symbol has it.
@@ -15834,7 +15851,13 @@ class TaintEngine:
         for sink, site in selections:
             desc = self._describe_locator(sink)
             site_instrs = instrs if site is None else [site]
+            # A row for one call site names it as a forward row would: the
+            # symbol it calls, the model key beside it (R3 residual). Only the
+            # top-level `sinks[]` echoes the query as written.
+            naming = ({"callee": sink.get("callee")} if site is None
+                      else self._site_naming(site, sink["callee"]))
             if site is not None:
+                desc.update(naming)
                 desc["address"] = hex(int(site.address))
                 params = self._call_params(site)
                 idx = int(sink["index"])
@@ -15916,7 +15939,7 @@ class TaintEngine:
                         entry = {
                             "sink": {
                                 "kind": sink.get("kind"),
-                                "callee": sink.get("callee"),
+                                **naming,
                                 "address": sink_addr,
                                 "seed": seed_label,
                             },
@@ -17077,7 +17100,8 @@ class TaintEngine:
                             defn, cparams[fi], d, mv, var_label(v),
                             f"argument {fi} of {mkey or name} returned by", arg_dem))
                     if not states:
-                        _set_origin({"kind": "call", "callee": name,
+                        _set_origin({"kind": "call", "callee": called_name(mkey, name),
+                                     **self._model_field(called_name(mkey, name)),
                                      "address": hex(int(defn.address))})
                         _returned_object(defn, v, d, mv, anchor, name, model, fresh=True)
                     elif all(s == "literal" for s in states):

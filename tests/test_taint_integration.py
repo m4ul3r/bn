@@ -1362,6 +1362,16 @@ def test_format_proven_fifth_destination_withholds_the_all_clear(tmp_path, share
     assert (short["callee"], short.get("model"), _lost(short)) == (called, "scanf", 1), short
     assert preset["diagnostics"]["safe_to_report_all_clear"] is False
 
+    # Backward, the per-call-site rows follow the same rule (R3 residual):
+    # the query `arg:sscanf:0` is echoed in `sinks[]`, but the row for the
+    # call names the symbol it calls and the model beside it.
+    sliced = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "parse_five",
+                      "--sink", "arg:sscanf:0")
+    assert [s["callee"] for s in sliced["sinks"]] == ["sscanf"]
+    assert {(r["callee"], r.get("model")) for r in sliced["sink_status"]} == {(symbol, "sscanf")}
+    assert {(sl["sink"]["callee"], sl["sink"].get("model")) for sl in sliced["slices"]} <= {
+        (symbol, "sscanf")}
+
 
 def test_a_synthetic_c23_alias_symbol_uses_the_same_model(tmp_path, shared_bn):
     """Portable control for the C23 alias: define `__isoc23_sscanf` in the
