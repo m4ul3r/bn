@@ -3710,9 +3710,10 @@ def test_session_stop_reports_a_refused_sigterm_and_signals_nothing(monkeypatch,
 
     assert rc == 1
     assert signallers[0].sent == []
-    err = capsys.readouterr().err
-    assert "refusing to signal pid 111" in err
-    assert "reused" in err
+    # The refusal is the failed stop's result (V6-02), not a stderr-only line.
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "stop failed: abc123"
+    assert lines[1].startswith("error: refusing to signal pid 111")
 
 
 def test_session_stop_reports_a_plain_timeout_without_a_verified_pin(monkeypatch, capsys):
@@ -3734,7 +3735,7 @@ def test_session_stop_reports_a_plain_timeout_without_a_verified_pin(monkeypatch
     assert rc == 1
     assert signallers[0].sent == []
     parsed = json.loads(capsys.readouterr().out)
-    assert parsed["stopped"] is False
+    assert (parsed["ok"], parsed["stopped"]) == (False, False)
     assert "timed out waiting for bridge instance abc123" in parsed["error"]
     assert "refusing to signal" not in parsed["error"]
 
@@ -6605,6 +6606,45 @@ def test_a_failed_session_stop_through_out_states_the_failure(monkeypatch, capsy
     assert "timed out waiting for bridge instance abc123" in envelope["error"]
     if fmt == "json":
         assert json.loads(out.read_text())["stopped"] is False
+
+
+@pytest.mark.parametrize("argv", [["--format", "json"], ["--format", "json", "--out", "stop.json"],
+                                  ["--format", "text", "--out", "stop.txt"]])
+def test_a_stop_whose_signal_is_refused_is_a_failure_envelope(monkeypatch, capsys, tmp_path,
+                                                              argv):
+    # V6-02: the graceful shutdown failed and the fallback signal was refused
+    # (a host without pidfd), so nothing was stopped -- exit 1 with an EMPTY
+    # stdout, no envelope under `--format json` and no `--out` artifact.
+    from pathlib import Path
+
+    from bn.transport import BridgeError
+
+    def unreachable(op, **kwargs):
+        raise BridgeError("bridge unreachable")
+
+    monkeypatch.setattr(bn.cli, "send_request", unreachable)
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance",
+                        lambda target: _unreachable_fake_instance("abc123"))
+    _fake_signaller(monkeypatch, refusal="refusing to signal pid 111: no pidfd")
+    argv = [str(tmp_path / a) if a.startswith("stop.") else a for a in argv]
+
+    rc = bn.cli.main(["session", "stop", "abc123", *argv])
+
+    assert rc == 1
+    stdout = capsys.readouterr().out
+    envelope = (json.loads(stdout) if "json" in argv
+                else dict(line.split(": ", 1) for line in stdout.splitlines()))
+    assert str(envelope["ok"]).lower() == "false"
+    assert "no pidfd" in envelope["error"]
+    if "--out" in argv:
+        assert str(envelope["written"]).lower() == "true"
+        artifact = Path(argv[-1]).read_text()
+        if "json" in argv:
+            assert json.loads(artifact)["stopped"] is False
+        else:
+            assert artifact.splitlines()[0] == "stop failed: abc123"
+    else:
+        assert envelope["stopped"] is False
 
 
 def test_a_successful_session_stop_through_out_is_ok(monkeypatch, capsys, tmp_path):

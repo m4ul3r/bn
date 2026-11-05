@@ -1461,8 +1461,15 @@ def _session_stop(args: argparse.Namespace) -> int:
                     target_id, "See `bn session list`.")) from None
             reason = signaller.send(signal.SIGTERM)
             if reason is not None:
-                print(f"error: {reason}", file=sys.stderr)
-                return 1
+                # V6-02: this is a failed stop like the teardown timeout below,
+                # so it is reported the same way -- a result through the output
+                # layer that states `ok: false`, never stderr alone, which left
+                # `--format json` and `--out` with no envelope at exit 1.
+                return cli._emit_result(
+                    args, {"ok": False, "instance_id": target_id, "stopped": False,
+                           "error": reason},
+                    exit_code=1, text_renderer=_render_session_stop_text,
+                    stem="session-stop")
             method = "sigterm"
 
         result: dict[str, Any] = {"instance_id": target_id, "stopped": True}
@@ -1488,6 +1495,7 @@ def _session_stop(args: argparse.Namespace) -> int:
                     if reason is None:
                         converged = cli.wait_for_teardown(inst, timeout=2.0)
                 if not converged:
+                    result["ok"] = False
                     result["stopped"] = False
                     detail = f" {reason}." if reason is not None else ""
                     result["error"] = (
