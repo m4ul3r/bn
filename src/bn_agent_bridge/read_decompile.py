@@ -1976,6 +1976,77 @@ def _decompile(
     return result
 
 
+def _confidence(obj) -> int | None:
+    """BN's 0-255 confidence on a type, parameter list or calling convention,
+    or None when the object carries none."""
+    value = getattr(obj, "confidence", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _prototype_provenance(ctx, bv, func) -> dict[str, Any]:
+    """Who owns the prototype and how sure BN is of it.
+
+    ``has_user_type`` is BN's per-function flag as BN reports it. It is not
+    an origin: BN sets it for an analyst's prototype, for a DWARF/PDB import,
+    and -- after a save and reopen -- for nearly every function of the
+    database (measured: 957/959 on one corpus database, see
+    ``read_call_evidence``). So ``type_source`` claims only what can be
+    proven: ``user`` when THIS bridge set and verified the prototype in this
+    session (an in-process record, gone after a restart or reopen), ``auto``
+    when the flag is clear (analysis or a platform type library), else
+    ``unknown``; None when the flag cannot be read. One flag per function,
+    covering the return type too.
+
+    Confidences are BN's own 0-255 scale (255 is its maximum). The
+    prototype's is the LOWEST of its return type's, parameter list's, each
+    parameter type's and the calling convention's, so an inferred part is
+    never hidden behind a confident one; the return type's is reported on its
+    own because an inferred return width is the common disagreement with
+    debug info."""
+    has_user = getattr(func, "has_user_type", None)
+    return_type = getattr(func, "return_type", None)
+    if return_type is None:
+        return_type = getattr(getattr(func, "type", None), "return_value", None)
+    return_conf = _confidence(return_type)
+    parameters = getattr(getattr(func, "type", None), "parameters", None) or ()
+    parts = [return_conf, _confidence(getattr(func, "parameter_vars", None)),
+             _confidence(getattr(func, "calling_convention", None)),
+             *(_confidence(getattr(param, "type", None)) for param in parameters)]
+    known = [part for part in parts if part is not None]
+    if has_user is None:
+        source = None
+    elif not has_user:
+        source = "auto"
+    elif ctx.targets.session_prototype(bv, int(func.start)):
+        source = "user"
+    else:
+        source = "unknown"
+    return {
+        "has_user_type": None if has_user is None else bool(has_user),
+        "type_source": source,
+        "prototype_confidence": min(known) if known else None,
+        "return_type_confidence": return_conf,
+    }
+
+
+def _address_span(func) -> dict[str, Any]:
+    """The function's address extent, distinct from ``size`` (the summed bytes
+    of its basic blocks). ``span_start``..``span_end`` (exclusive) bounds every
+    block; ``contiguous`` is false when bytes the function does not own -- a
+    literal pool, padding, another function -- lie between its blocks, so
+    ``span_end - span_start`` exceeds ``size``."""
+    ranges = sorted((int(block.start), int(block.end))
+                    for block in getattr(func, "basic_blocks", None) or [])
+    if not ranges:
+        return {"span_start": None, "span_end": None, "contiguous": None}
+    end = ranges[0][1]
+    contiguous = True
+    for start, stop in ranges[1:]:
+        contiguous = contiguous and start <= end
+        end = max(end, stop)
+    return {"span_start": hex(ranges[0][0]), "span_end": hex(end), "contiguous": contiguous}
+
+
 def _basic_block_ranges(func) -> list[dict[str, Any]]:
     """Address ranges of a function's basic blocks, with incoming/outgoing edges.
 
@@ -2017,9 +2088,9 @@ def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = Fals
     variables = vars_mod._list_locals(func)
     parameters = [item for item in variables if item["is_parameter"]]
     locals_only = [item for item in variables if not item["is_parameter"]]
-    # Use the genuine code-ref count so a page-aligned function isn't credited
-    # with spurious adrp page-base materializations (#284).
-    code_ref_count = read_xrefs._code_ref_count(bv, func.start)
+    # The two counts `xrefs` reports for this function, by its definitions, so
+    # the summary and the listing cannot disagree about how often it is used.
+    code_ref_count, data_ref_count = read_xrefs._ref_counts(ctx, bv, func.start)
     result = {
         "function": {
             "name": func.name,
@@ -2028,9 +2099,12 @@ def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = Fals
             "display_name": il_format._display_name(func),
         },
         **metadata,
+        **_prototype_provenance(ctx, bv, func),
+        **_address_span(func),
         "parameters": parameters,
         "locals": locals_only,
-        "xref_count": code_ref_count,
+        "code_ref_count": code_ref_count,
+        "data_ref_count": data_ref_count,
         # Count (+ addresses) of instructions BN's lifter could not model, so a
         # function with unlifted computation isn't mistaken for fully analyzed
         # (#206). count:0 means no unlifted instruction was found.
@@ -2279,6 +2353,8 @@ def _get_prototype(ctx, selector: str | None, identifier):
             "display_name": il_format._display_name(func),
         },
         **il_format._function_metadata(func),
+        **_prototype_provenance(ctx, bv, func),
+        **_address_span(func),
     }
     params = list(getattr(getattr(func, "type", None), "parameters", None) or [])
     if params:

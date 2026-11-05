@@ -1106,6 +1106,30 @@ def _mark_unverified_results(
 
 
 
+def _settle_noop_verdicts(ctx, bv, results: list[dict[str, Any]], operations,
+                          type_before) -> list[dict[str, Any]]:
+    """Give the ops that applied before a sibling's apply failure their ``noop``
+    verdict, through the same verifier and type-diff annotation the post-apply
+    phase uses (P2-02).
+
+    An apply row carries no status: ``noop`` is decided only by verification, and
+    the apply-failure path rolls back without verifying, so every applied row --
+    a genuine no-op included -- reached ``_mark_unverified_results`` looking like
+    a change and was stamped ``reverted``, contradicting #630 and zeroing
+    ``noop_count``. Run while the batch is still applied (the state those
+    deciders read). Only a ``noop`` verdict is taken: anything else (a verified
+    change, or a readback that disagrees because the post-apply reanalysis never
+    ran) keeps the apply row, which the rollback stamp then rewrites."""
+    type_diffs = _diff_type_snapshots(
+        ctx, type_before, _capture_type_snapshots(ctx, bv, operations))
+    verified = [row if row.get("status") == NOT_PREVIEWED
+                else _verify_operation(ctx, bv, row) for row in results]
+    settled = _annotate_operation_results(ctx, verified, type_diffs)
+    return [verdict if verdict.get("status") == "noop" else row
+            for row, verdict in zip(results, settled)]
+
+
+
 def _has_failed_results(ctx, results: list[dict[str, Any]]) -> bool:
     """True when any per-op result carries a FAILURE status (#777).
 
@@ -1492,7 +1516,7 @@ def _verify_rename_symbol(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if observed_name != requested_name and before_name != requested_name:
         raise OperationFailure(
             "verification_failed",
-            f"Live rename verification failed at {item['address']}",
+            f"Post-state rename verification failed at {item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1515,7 +1539,7 @@ def _verify_set_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if observed != expected:
         raise OperationFailure(
             "verification_failed",
-            f"Live comment verification failed for {item.get('function') or item['address']}",
+            f"Post-state comment verification failed for {item.get('function') or item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1658,7 +1682,7 @@ def _verify_delete_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if observed:
         raise OperationFailure(
             "verification_failed",
-            f"Live comment deletion verification failed for {item.get('function') or item['address']}",
+            f"Post-state comment deletion verification failed for {item.get('function') or item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1749,7 +1773,7 @@ def _verify_set_prototype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             if not _prototype_matches_ignoring_param_names(bv, fn.type, source):
                 raise OperationFailure(
                     "verification_failed",
-                    f"Live prototype verification failed at {item['address']}",
+                    f"Post-state prototype verification failed at {item['address']}",
                     requested=item.get("requested"),
                     observed=item["observed"],
                 )
@@ -1763,7 +1787,7 @@ def _verify_set_prototype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             and observed_can_return != expected_can_return):
         raise OperationFailure(
             "verification_failed",
-            f"Live prototype verification failed at {item['address']}: the prototype "
+            f"Post-state prototype verification failed at {item['address']}: the prototype "
             + ("requests __noreturn, but the function can still return"
                if expected_can_return is False else
                "drops __noreturn, but the function still cannot return")
@@ -1832,7 +1856,7 @@ def _verify_local_rename(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if observed_name != expected_name:
         raise OperationFailure(
             "verification_failed",
-            f"Live local rename verification failed at {item['address']}",
+            f"Post-state local rename verification failed at {item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1913,7 +1937,7 @@ def _verify_local_retype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if observed_type != expected_type:
         raise OperationFailure(
             "verification_failed",
-            f"Live local retype verification failed at {item['address']}",
+            f"Post-state local retype verification failed at {item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1943,7 +1967,7 @@ def _verify_struct_field_set(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if member is None or observed["field_type"] != item["field_type"]:
         raise OperationFailure(
             "verification_failed",
-            f"Live struct field verification failed for {item['struct_name']} at {item['offset']}",
+            f"Post-state struct field verification failed for {item['struct_name']} at {item['offset']}",
             requested=item.get("requested"),
             observed=observed,
         )
@@ -1981,7 +2005,7 @@ def _verify_struct_field_rename(ctx, bv, result: dict[str, Any]) -> dict[str, An
     if member is None:
         raise OperationFailure(
             "verification_failed",
-            f"Live struct field rename verification failed for {item['struct_name']}",
+            f"Post-state struct field rename verification failed for {item['struct_name']}",
             requested=item.get("requested"),
             observed=observed,
         )
@@ -2020,7 +2044,7 @@ def _verify_struct_field_delete(ctx, bv, result: dict[str, Any]) -> dict[str, An
     if member is not None:
         raise OperationFailure(
             "verification_failed",
-            f"Live struct field delete verification failed for {item['struct_name']}",
+            f"Post-state struct field delete verification failed for {item['struct_name']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -2083,7 +2107,7 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             "parsed_variables": list(item.get("parsed_variables") or []),
         }
         item["status"] = "verification_failed"
-        item["message"] = "No declared named types were available for live verification."
+        item["message"] = "No declared named types were available for post-state verification."
         return item
     observed_types: dict[str, str | None] = {}
     observed_type_layouts: dict[str, str | None] = {}
@@ -2096,7 +2120,7 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
                 continue
             raise OperationFailure(
                 "verification_failed",
-                f"Live type verification failed for {name}",
+                f"Post-state type verification failed for {name}",
                 requested=item.get("requested"),
                 observed={
                     "defined_types": observed_types,
@@ -3011,6 +3035,8 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
         exc = _explain_renamed_reference(operations[len(results)], results, exc)
         with exclusive_scope():
             failed_row = _operation_failure_result(ctx, operations[len(results)], exc)
+            # Before the revert: the noop deciders read the applied state.
+            settled = _settle_noop_verdicts(ctx, bv, results, operations, type_before)
             # Run BOTH revert steps unconditionally: an `and` would short-circuit
             # past the explicit restores when the undo revert fails, leaving
             # non-journaled local/prototype changes applied.
@@ -3056,7 +3082,7 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
                 "committed": False,
                 "rolled_back": reverted,
                 "message": message,
-                "results": _mark_unverified_results(ctx, results, result_note, status=result_status)
+                "results": _mark_unverified_results(ctx, settled, result_note, status=result_status)
                 + [failed_row]
                 + [_not_previewed_result(ctx, op, skipped[index]) if index in skipped
                    else _unattempted_results(ctx, [op])[0]
@@ -5959,15 +5985,16 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
     Refuses when the class has no primary vtable or BN defined no VTable type
     for it: then there is no table type for the vptr to point at."""
     from . import read_class
-    card = read_class._class_show(ctx, selector, name)
+    cards = read_class._class_cards(ctx, selector, name)
     requested = {"op": "class_apply_types", "name": name}
-    if card.get("ambiguous"):
-        names = ", ".join(str(m.get("name")) for m in card.get("matches") or [])
+    if len(cards) > 1:
+        names = ", ".join(str(card.get("name")) for card in cards)
         raise OperationFailure(
             "invalid_request",
             f"{name!r} names more than one class ({names}); pass the full name of one.",
             requested=requested,
         )
+    card = cards[0]
     cls = str(card.get("name") or name)
     bv = ctx._resolve_view(selector)
     vtable = card.get("vtable") or {}

@@ -21,7 +21,7 @@ import pytest
 from test_taint_engine import FBV, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar, te
 
 from bn import formatters
-from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+from bn.taint_vocabulary import BLOCKING_LEAF_KINDS
 
 KIND = "model_destination_unrecovered"
 

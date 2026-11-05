@@ -6527,3 +6527,52 @@ def test_session_start_help_does_not_offer_the_instance_selector(capsys):
 
     assert bn.cli.main(["session", "start", "-i", "named-1", "/tmp/sample"]) == 2
     assert "--instance-id named-1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_a_failed_session_stop_through_out_states_the_failure(monkeypatch, capsys, tmp_path,
+                                                              fmt):
+    # D4-01: a local command's failed result carries no `ok` and exits 1; read
+    # off the payload that absence was success, so the --out envelope said
+    # `ok: true` over a teardown that never completed.
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda op, **kwargs: {"ok": True, "result": {"shutting_down": True}},
+    )
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _fake_bridge_instance("abc123")  # noqa: F405
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: False)
+    _fake_signaller(monkeypatch, refusal="refusing to signal pid 111: no verifiable process identity")
+    out = tmp_path / ("stop.json" if fmt == "json" else "stop.txt")
+
+    rc = bn.cli.main(["session", "stop", "abc123", "--format", fmt, "--out", str(out)])
+
+    assert rc == 1
+    stdout = capsys.readouterr().out
+    envelope = (json.loads(stdout) if fmt == "json"
+                else dict(line.split(": ", 1) for line in stdout.splitlines()))
+    assert (str(envelope["ok"]).lower(), str(envelope["written"]).lower()) == ("false", "true")
+    assert "timed out waiting for bridge instance abc123" in envelope["error"]
+    if fmt == "json":
+        assert json.loads(out.read_text())["stopped"] is False
+
+
+def test_a_successful_session_stop_through_out_is_ok(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda op, **kwargs: {"ok": True, "result": {"shutting_down": True}},
+    )
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _fake_bridge_instance("abc123")  # noqa: F405
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
+    _fake_signaller(monkeypatch)
+
+    rc = bn.cli.main(["session", "stop", "abc123", "--format", "json",
+                      "--out", str(tmp_path / "stop.json")])
+
+    assert rc == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert (envelope["ok"], envelope["written"]) == (True, True)
+    assert "error" not in envelope

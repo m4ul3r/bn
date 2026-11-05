@@ -197,7 +197,7 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
         lambda ctx, bv, result: {
             **result,
             "status": "verification_failed",
-            "message": "Live rename verification failed at 0x401000",
+            "message": "Post-state rename verification failed at 0x401000",
         },
     )
 
@@ -3481,6 +3481,42 @@ def test_noop_op_retains_noop_status_through_rollback(monkeypatch):
 
     assert result["results"][0]["status"] == "noop"   # unchanged, NOT reverted
     assert result["results"][1]["status"] == "verification_failed"
+
+
+def test_noop_op_retains_noop_status_when_a_later_op_fails_to_apply(monkeypatch):
+    """P2-02: the same #630 rule on the APPLY-failure path. An apply row carries
+    no status (verification decides `noop`), and that path used to roll back
+    without verifying, so a rename to the name the function already had was
+    stamped `reverted` beside a real rename that was. The genuine no-op keeps
+    `noop`; the real change is `reverted`; the failing op keeps its status."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    keep = _FakeFunction(0x1000, "keep_me")
+    moved = _FakeFunction(0x2000, "old_name")
+    bv = _FakeMutationBV(functions=[keep, moved])
+
+    def apply(bv_, op, restores=None, **kwargs):
+        if op["op"] == "boom":
+            raise bridge.OperationFailure("unsupported", "Symbol not found: absent", requested={})
+        fn = bv_.get_function_at(op["address"])
+        before = fn.name
+        fn.name = op["new_name"]
+        return {"op": "rename_symbol", "kind": "function", "address": hex(fn.start),
+                "before_name": before, "new_name": op["new_name"], "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
+    monkeypatch.setattr(bridge.mutation_engine, "_revert_undo_safely", lambda ctx, bv_, s: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, r: True)
+
+    result = instance._mutation("active", False, [
+        {"op": "rename_symbol", "identifier": "keep_me", "address": 0x1000, "new_name": "keep_me"},
+        {"op": "rename_symbol", "identifier": "old_name", "address": 0x2000, "new_name": "new_name"},
+        {"op": "boom"},
+    ])
+
+    assert result["rolled_back"] is True
+    assert [r["status"] for r in result["results"]] == ["noop", "reverted", "unsupported"]
+    assert result["results"][0]["observed"] == {"address": "0x1000", "name": "keep_me"}
 
 
 # ===========================================================================
@@ -7146,7 +7182,7 @@ def test_class_apply_types_plan_builds_the_typing_batch(monkeypatch):
                 {"address": "0x4012a0", "demangled": "demo::Widget::stub", "thunk": {"is_candidate": True}},
             ]}
     slots = []
-    monkeypatch.setattr(bridge.read_class, "_class_show", lambda ctx, selector, name: dict(card))
+    monkeypatch.setattr(bridge.read_class, "_class_cards", lambda ctx, selector, name: [dict(card)])
     monkeypatch.setattr(bridge.read_class, "_bn_vtable_type_name",
                         lambda view, start: slots.append(start) or "demo::Base::demo::Widget::VTable")
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
@@ -7278,7 +7314,7 @@ def _ap_plan(monkeypatch, *, functions, slots, methods, stores, code_refs=(), ca
             "vtable": {"address": "0x404000", "slots": [
                 {"index": i, "method": {"address": hex(a), "display_name": f"sub_{a:x}"}}
                 for i, a in enumerate(slots)]}, **(card_extra or {})}
-    monkeypatch.setattr(bridge.read_class, "_class_show", lambda ctx, selector, name: dict(card))
+    monkeypatch.setattr(bridge.read_class, "_class_cards", lambda ctx, selector, name: [dict(card)])
     monkeypatch.setattr(bridge.read_class, "_bn_vtable_type_name", lambda view, start: "demo::Widget::VTable")
     monkeypatch.setattr(bridge.read_class, "_param0_address_point_stores",
                         lambda func: list(stores.get(func.start, [])))
