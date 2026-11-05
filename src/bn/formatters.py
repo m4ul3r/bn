@@ -5580,6 +5580,10 @@ def _render_flow_line(f: dict[str, Any], *, mangled: bool = False) -> str:
         sig = _elide_template_args(str(sig))
         callee = _elide_template_args(str(callee))
     head = f"[{sink.get('class') or '?'}] {callee} @ {sink.get('address')}{arg}"
+    if _field_dict(sink, "object_taint"):
+        # V6-01: reached only through an object tainted at an unknown offset
+        # -- a may-flow to rank below a field-precise one.
+        head += " [object-wide]"
     # #1041 item 6: a flow several sources each reach on their own names them
     # as candidates; the signature keeps `multiple` (#1050 review finding 3).
     cands = [str(c) for c in _field_list(f, "source_candidates")]

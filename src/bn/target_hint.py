@@ -38,10 +38,12 @@ PROCESS_LOCAL_VIEW_ID_NOTE = (
 # D2-02: a bridge restarted from a registry that recorded no `next_view_id`
 # (an older build) cannot know which ids its predecessor handed out -- the ids
 # it lists now say nothing about ones it closed -- so it accepts no numeric
-# selector at all rather than risk naming a different target.
+# selector at all rather than risk naming a different target. V6-03: it is the
+# ONLY note such a bridge gives, since its own ids DO repeat the old ones.
 NUMERIC_VIEW_IDS_OFF_NOTE = (
-    "note: this bridge accepts no numeric view_id: it was restarted from a bridge "
-    "that did not record which ids it had assigned, so a number could name a "
+    "note: this bridge accepts no numeric view_id: it was restarted from a registry "
+    "that did not record the last view_id its predecessor assigned, so it numbered "
+    "its views from 1 again and a number from before the restart could name a "
     "different target -- use a listed selector or the full target_id"
 )
 # #996 review: the tail of a destructive close's refusal when its selector named
