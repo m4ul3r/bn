@@ -16,6 +16,7 @@ import os
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -50,6 +51,8 @@ from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, u
 # workers. Give that work room on a loaded host before considering pinned signals.
 _SHUTDOWN_TEARDOWN_TIMEOUT = 30.0
 _SIGNAL_TEARDOWN_TIMEOUT = 5.0
+# `bn doctor` runs the PATH `bn`'s interpreter once to identify its code (P2-08).
+_PATH_CLI_PROBE_TIMEOUT = 15.0
 # #1036 item 6: a foreground `session start` of a large binary can block for
 # minutes; one stderr line this often says it is still working.
 _START_PROGRESS_INTERVAL = 30.0
@@ -174,6 +177,69 @@ def _instance_source_dir(instance: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _repository_root(directory: Path) -> str | None:
+    """The git repository or worktree *directory* lives in (nearest ancestor
+    holding a `.git` directory or worktree file), or None for an install that
+    is not a checkout (a wheel in site-packages)."""
+    for candidate in (directory, *directory.parents):
+        if (candidate / ".git").exists():
+            return str(candidate)
+    return None
+
+
+def _cli_identity(module_dir: Path) -> dict[str, Any]:
+    """Where a `bn` CLI's code lives: its package directory, the checkout it
+    belongs to, and a fingerprint of the whole package (P2-08)."""
+    return {
+        "module_dir": str(module_dir),
+        "repository_root": _repository_root(module_dir),
+        "build_id": cli.build_id_for_tree(module_dir),
+    }
+
+
+# Run by the interpreter of the `bn` found on PATH: where ITS package and the
+# bridge it would spawn live.
+_PATH_CLI_PROBE = (
+    "import json, pathlib, bn, bn.paths; print(json.dumps({"
+    "'module_dir': str(pathlib.Path(bn.__file__).resolve().parent), "
+    "'plugin_source_dir': str(bn.paths.plugin_source_dir())}))"
+)
+
+
+def _path_cli_identity(this_module_dir: Path) -> dict[str, Any]:
+    """Identity of the `bn` executable a bare `bn` command runs (P2-08).
+
+    `uv run bn` from one checkout and a `bn` installed from another look the
+    same in every report until something behaves differently; doctor names
+    the PATH one and whether it is this CLI. Probed by running the script's
+    own interpreter, the only reliable answer for an editable install."""
+    executable = shutil.which("bn")
+    if executable is None:
+        return {"executable": None, "same_as_this_cli": None,
+                "error": "no `bn` executable on PATH"}
+    identity: dict[str, Any] = {"executable": executable}
+    try:
+        with open(executable, "rb") as fh:
+            shebang = fh.readline().decode("utf-8", "replace")
+        if not shebang.startswith("#!"):
+            raise ValueError("it is not a Python script with a shebang line")
+        probe = subprocess.run(
+            [*shlex.split(shebang[2:].strip()), "-c", _PATH_CLI_PROBE],
+            capture_output=True, text=True, timeout=_PATH_CLI_PROBE_TIMEOUT, check=True,
+        )
+        found = json.loads(probe.stdout)
+        module_dir = Path(found["module_dir"])
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        identity.update({"same_as_this_cli": None,
+                         "error": f"could not identify its code: {exc}"})
+        return identity
+    identity.update(_cli_identity(module_dir))
+    identity["plugin_source_dir"] = str(found.get("plugin_source_dir") or "") or None
+    identity["same_as_this_cli"] = _same_dir(str(module_dir), this_module_dir)
+    return identity
+
+
+
 @command("doctor", help="Validate bridge discovery and installation")
 def _doctor(args: argparse.Namespace) -> int:
     install_dir = cli.plugin_install_dir()
@@ -186,6 +252,9 @@ def _doctor(args: argparse.Namespace) -> int:
     # (e.g. taint_engine.py) is flagged even though bridge.py is unchanged (#161).
     install_engine_id = cli.build_id_for_package(install_dir)
     source_engine_id = cli.build_id_for_package(source_dir)
+    cli_identity = _cli_identity(Path(cli.__file__).resolve().parent)
+    path_cli = _path_cli_identity(Path(cli.__file__).resolve().parent)
+    path_plugin_dir = path_cli.get("plugin_source_dir")
     requested = getattr(args, "instance", None)
     candidates = cli.list_instances()
     if requested:
@@ -279,6 +348,12 @@ def _doctor(args: argparse.Namespace) -> int:
                 # CLI's: restarting it from here would not change its code
                 # unless this CLI's interpreter spawns it (#992).
                 "other_checkout": other_checkout,
+                # P2-08: the bridge's code is not what the `bn` on PATH would
+                # spawn; None when either side is unknown.
+                "path_cli_other_checkout": (
+                    None if bridge_source is None or not path_plugin_dir
+                    else not _same_dir(bridge_source, path_plugin_dir)
+                ),
                 "installed_plugin_build_id": install_build_id,
                 "source_plugin_build_id": source_build_id,
                 "stale_plugin_version": (
@@ -309,6 +384,8 @@ def _doctor(args: argparse.Namespace) -> int:
 
     result = {
         "cli_version": cli.VERSION,
+        "cli": cli_identity,
+        "path_cli": path_cli,
         "plugin_source_dir": str(source_dir),
         "plugin_install_dir": str(install_dir),
         "plugin_source_build_id": source_build_id,

@@ -66,7 +66,9 @@ from .transport import (  # noqa: F401
     wait_for_teardown,
 )
 from .target_hint import instance_option, respell_for_option
-from .version import VERSION, build_id_for_file, build_id_for_package  # noqa: F401
+from .version import (  # noqa: F401
+    VERSION, build_id_for_file, build_id_for_package, build_id_for_tree,
+)
 
 
 class _HelpFullAction(argparse.Action):
