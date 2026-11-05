@@ -3824,6 +3824,26 @@ class TaintEngine:
                 return i
         return None
 
+    @staticmethod
+    def _whole_field_prev(defn: Any) -> tuple | None:
+        """``(var_key, version)`` of the previous version a
+        ``MLIL_SET_VAR_SSA_FIELD`` *defn* overwrites entirely -- a store at
+        offset 0 at least as wide as the variable's type (a reused 8-byte
+        spill slot BN types as a 4-byte local: ``slot#4:0.q = x @ slot#3``)
+        -- else None. No byte of that version survives the store. An unknown
+        variable width or store size keeps the previous version an input."""
+        if op_name(defn) != "MLIL_SET_VAR_SSA_FIELD" or getattr(defn, "offset", None) != 0:
+            return None
+        prev = getattr(defn, "prev", None)
+        dest = getattr(defn, "dest", None)
+        if prev is None or dest is None:
+            return None
+        width = getattr(getattr(getattr(dest, "var", dest), "type", None), "width", None)
+        size = getattr(getattr(defn, "src", None), "size", None)
+        if not isinstance(width, int) or not isinstance(size, int) or width <= 0 or size < width:
+            return None
+        return (var_key(prev), getattr(prev, "version", None))
+
     def _param_spill_index(self, func: Any, ssaf: Any, v: Any) -> int | None:
         """If terminal no-def var *v* is *provably* a spill of an incoming
         parameter, return that parameter index, else None (#434).
@@ -14680,6 +14700,15 @@ class TaintEngine:
             if walked or glob:
                 _walk_expr(defn, src_expr, d, mv, expr_reads(src_expr), anchor)
                 return
+            # A field write that covers its whole variable (`slot#k:0.q = x @
+            # slot#j`, a reused 8-byte spill slot BN types as a 4-byte local)
+            # leaves no byte of the previous version: the value read back is
+            # the store's alone, so the old version is no input -- following
+            # it reached the slot's entry version and invented an `entry`
+            # origin for a value this function defined (W06-08).
+            killed = self._whole_field_prev(defn)
+            reads = [r for r in ssa_reads(defn)
+                     if killed is None or (var_key(r), getattr(r, "version", None)) != killed]
             if src_expr is not None and (self._outer_aliased(src_expr)
                                          or self._outer_loads(src_expr)):
                 # A definition that READS MEMORY -- a bare LOAD, or one under
@@ -14690,9 +14719,8 @@ class TaintEngine:
                 # by-name read of an address-taken local (`i = buf[0] @
                 # mem#k`, round 3; `zx.q(bits @ mem#k)`, P2-01) reads the
                 # local's contents the same way: see `_walk_expr`.
-                _walk_expr(defn, src_expr, d, mv, ssa_reads(defn), anchor)
+                _walk_expr(defn, src_expr, d, mv, reads, anchor)
                 return
-            reads = ssa_reads(defn)
             # A definition that reads no further SSA vars is a leaf: if its source
             # is a compile-time constant, the slice bottoms out at that literal.
             # Label it `constant` (as `trace` does) instead of leaving the default

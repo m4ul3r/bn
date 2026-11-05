@@ -1149,9 +1149,11 @@ int main(int argc, char **argv) {
         assert _run_or_check_template(shared_bn, _forward_prose(result))[0] >= 1
 
 
-def _build_arch(tmp_path, arch: str, name: str, source: str) -> Path:
-    """Build *source* at `-O2 -fno-stack-protector -fno-builtin -no-pie` for
-    `a64` (the AArch64 cross compiler) or `x64` (host gcc)."""
+def _build_arch(tmp_path, arch: str, name: str, source: str,
+                opt: tuple[str, ...] = ("-O2",)) -> Path:
+    """Build *source* at *opt* (default `-O2`) plus `-fno-stack-protector
+    -fno-builtin -no-pie` for `a64` (the AArch64 cross compiler) or `x64`
+    (host gcc)."""
     cc = shutil.which("aarch64-linux-gnu-gcc" if arch == "a64" else "gcc")
     if cc is None:
         if arch == "a64":
@@ -1163,7 +1165,7 @@ def _build_arch(tmp_path, arch: str, name: str, source: str) -> Path:
     src.write_text(source)
     binary = tmp_path / f"{name}_{arch}"
     built = subprocess.run(
-        [cc, "-O2", "-fno-stack-protector", "-fno-builtin", "-no-pie", str(src), "-o",
+        [cc, *opt, "-fno-stack-protector", "-fno-builtin", "-no-pie", str(src), "-o",
          str(binary)], capture_output=True, text=True, timeout=120.0)
     if built.returncode != 0:
         raise FixtureBuildError(f"{arch} build of {name} failed: {built.stderr.strip()}")
@@ -1561,6 +1563,42 @@ int main(int argc, char **argv) {
     if not result["reached_sinks"]:
         assert result["diagnostics"]["safe_to_report_all_clear"] is False
         assert _run_or_check_template(shared_bn, _forward_prose(result))[0] >= 1
+
+
+def test_aarch64_whole_slot_overwrite_has_no_entry_origin(tmp_path, shared_bn):
+    """W06-08: an 8-byte store into a slot the debug info types as a 4-byte
+    local lifts to `rows#3:0.q = x @ rows#2`, `rows#2 = phi(rows#0, rows#1)`.
+    The reload reads only that store, so its origin is the call it stored --
+    following the old version invented an `entry` origin (and the earlier
+    writer's call) for a value the function defined."""
+    binary = _build_arch(tmp_path, "a64", "slot_reuse", """
+extern void *malloc(unsigned long);
+__attribute__((noinline, noipa)) int count_rows(int k) { return k * 3; }
+__attribute__((noinline, noipa)) long count_cols(int k) { return k * 5L; }
+__attribute__((noinline, noipa)) void note_rows(int v) { (void)v; }
+void *alloc_grid(int argc) {
+    int rows;
+    if (argc > 1) {
+        rows = count_rows(argc);
+        note_rows(rows);
+    }
+    *(long *)&rows = count_cols(argc);
+    return malloc(*(long *)&rows);
+}
+int main(int argc, char **argv) {
+    (void)argv;
+    return alloc_grid(argc) != 0;
+}
+""", opt=("-O0", "-g", "-fno-strict-aliasing"))
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "alloc_grid",
+                      "--sink", "arg:malloc:0")
+
+    assert len({sl["sink"]["address"] for sl in result["slices"]}) == 1, result["slices"]
+    origins = {(o["kind"], o.get("callee"))
+               for sl in result["slices"] for o in (sl.get("origins") or [sl["origin"]])}
+    assert origins == {("call", "count_cols")}, result["slices"]
+
 
 
 def test_global_memory_continuation_names_the_global_and_its_consumer(tmp_path, shared_bn):
