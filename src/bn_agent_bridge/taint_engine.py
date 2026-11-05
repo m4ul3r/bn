@@ -2304,6 +2304,29 @@ class TaintEngine:
     # it stays sound for a may-analysis while recovering heap/pointer flows the
     # AddressOf-only rule misses.
 
+    def _global_field_miss(self, ssaf: Any, load: Any, store_only: dict) -> bool:
+        """Whether *load* reads a constant address inside a global this run
+        tainted ONLY by direct stores (each recording its bytes) and misses
+        every byte those stores wrote -- another field of the struct (P2-08).
+        A global any other write tainted (a copy, a source fill) is never
+        narrowed: its tainted bytes are not all recorded."""
+        addr = getattr(load, "src", None)
+        at = self._int_const(addr)
+        if at is None:
+            return False
+        ga = self._global_addr(ssaf, addr)
+        if ga is None or not store_only.get(int(ga)):
+            return False
+        ranges = self._global_tainted_ranges.get(int(ga)) or ()
+        if not ranges:
+            return False
+        off = at - int(ga)
+        try:
+            width = max(int(getattr(load, "size", 0) or 1), 1)
+        except (TypeError, ValueError):
+            return False
+        return all(hi is not None and (off + width <= lo or off >= hi) for lo, hi in ranges)
+
     def _int_const(self, expr: Any) -> int | None:
         if expr is None or "CONST" not in op_name(expr):
             return None
@@ -2382,6 +2405,55 @@ class TaintEngine:
                     return raw[:nul].decode("latin-1", "replace")
             except Exception:
                 pass
+        return None
+
+    @staticmethod
+    def _overlaps(ranges: Any, lo: int, width: int) -> bool:
+        return any(lo < hi and rlo < lo + max(int(width), 1)
+                   for rlo, hi in ranges)
+
+    def _partial_read(self, ssaf: Any, src: Any, field_only: dict,
+                      partial_bases: dict) -> tuple | None:
+        """``(verdict, base key, base label)`` for a read of a partially
+        tainted object, or None when *src* reads no such object. ``verdict``
+        is True (it overlaps a tainted field), False (it reads only other
+        bytes) or ``"unresolved"`` (its offset into the object is not
+        established) -- P2-08."""
+        if src is None:
+            return None
+        sop = op_name(src)
+        if sop in ("MLIL_VAR_SSA_FIELD", "MLIL_VAR_ALIASED_FIELD", "MLIL_VAR_FIELD"):
+            sv = getattr(src, "src", None)
+            if sv is None:
+                return None
+            key = var_key(sv)
+            ranges = field_only.get(key)
+            if ranges is None:
+                return None
+            try:
+                lo, width = int(getattr(src, "offset", 0)), int(getattr(src, "size", 0) or 1)
+            except (TypeError, ValueError):
+                return ("unresolved", key, var_label(sv))
+            return (self._overlaps(ranges, lo, width), key, var_label(sv))
+        if "LOAD" not in sop:
+            return None
+        addr = getattr(src, "src", None)
+        bo = self._addr_base_offset(ssaf, addr)
+        try:
+            width = int(getattr(src, "size", 0) or 1)
+        except (TypeError, ValueError):
+            width = 1
+        if bo is not None:
+            ranges = field_only.get(bo[0])
+            if ranges is None:
+                ranges = partial_bases.get(bo[0])
+            if ranges is None:
+                return None
+            return (self._overlaps(ranges, int(bo[1]), width), bo[0], str(addr))
+        for r in expr_reads(addr):
+            b = self._addr_base_offset(ssaf, r)
+            if b is not None and (b[0] in field_only or b[0] in partial_bases):
+                return ("unresolved", b[0], var_label(r))
         return None
 
     def _addr_base_offset(self, ssaf: Any, expr: Any, depth: int = 0):
@@ -6201,10 +6273,14 @@ class TaintEngine:
                 targets.append(target)
         return targets
 
-    def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int) -> dict[str, Any]:
+    def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int,
+                   fields: dict | None = None) -> dict[str, Any]:
         """Analyze *callee* with the given tainted parameter indices, caching the
         result per (callee, tainted-param-set) so it is computed once."""
-        key = (int(callee.start), param_set)
+        # P2-08: a parameter pointing at a partially tainted object is its own
+        # context -- which bytes are tainted decides what the body can read.
+        fkey = tuple(sorted((i, tuple(r)) for i, r in (fields or {}).items() if i in param_set))
+        key = (int(callee.start), param_set) if not fkey else (int(callee.start), param_set, fkey)
         if key in self._cache:
             cached = self._cache[key]
             if cached is None:  # in-progress -> recursion cycle
@@ -6213,7 +6289,9 @@ class TaintEngine:
                         "frontier": "recursion cycle stopped descent"}
             return cached
         self._cache[key] = None  # mark in-progress (cycle guard)
-        locators = [{"kind": "param", "index": i} for i in sorted(param_set)]
+        locators = [dict({"kind": "param", "index": i},
+                         **({"fields": list((fields or {})[i])} if (fields or {}).get(i) else {}))
+                    for i in sorted(param_set)]
         # _run_forward(callee) repoints self._bt_func_token at the callee; restore
         # the caller's token afterward so its fixpoint keeps hitting its own cache
         # entries (the #420 _buffer_target memo is keyed by this token).
@@ -6359,7 +6437,8 @@ class TaintEngine:
 
     def _descend(self, ins: Any, callee_fn: Any, tainted_args: dict, why: dict,
                  depth: int, max_depth: int, *, via: str | None = None,
-                 caller_instrs: list | None = None) -> dict[str, Any]:
+                 caller_instrs: list | None = None,
+                 fields: dict | None = None) -> dict[str, Any]:
         """Recurse into a (direct or resolved-indirect) internal callee and return
         its findings with a caller-side path prefix prepended, plus whether it
         propagates taint to its return.
@@ -6413,7 +6492,7 @@ class TaintEngine:
                 f"tainted data passed to in-binary callee with no model; depth bound "
                 f"({max_depth}) stopped descent -- investigate or raise --max-depth"))
             return out
-        sub = self._summarize(callee_fn, valid, depth + 1, max_depth)
+        sub = self._summarize(callee_fn, valid, depth + 1, max_depth, fields=fields)
         first_hit = tainted_args[sorted(valid)[0]][0]
         prefix = self._reconstruct_path(first_hit, why)
         note = f"calls {self._prose_function(callee_fn)} with tainted arg(s) {sorted(valid)}"
@@ -10781,6 +10860,20 @@ class TaintEngine:
 
         tainted: set[tuple] = set()
         why: dict[tuple, dict[str, Any]] = {}
+        # P2-08: objects only PART of which is tainted. `field_only` maps a
+        # local struct variable to the byte ranges field stores tainted in it
+        # (`options.port = strtol(...)`); `partial_bases` maps a pointer
+        # parameter to the ranges of the object it points at that the CALLER
+        # had tainted. A read of another field of either is not a read of the
+        # tainted bytes, and a read whose offset cannot be established is a
+        # `field_load_unresolved` frontier rather than a guess either way.
+        field_only: dict = {}
+        partial_bases: dict = {}
+        field_store_active = [False]
+        # P2-08: globals every tainting write of which was a direct store --
+        # each one recorded the bytes it wrote, so a load of OTHER bytes of
+        # the object (another field) is not a load of tainted data.
+        global_store_only: dict[int, bool] = {}
         assumptions: list[str] = []
         leaves: list[dict[str, Any]] = _SalvageList(self._salvage["leaves"])
         findings: list[dict[str, Any]] = _SalvageList(self._salvage["findings"])
@@ -10871,9 +10964,15 @@ class TaintEngine:
                 # actually reaches the reader (round-12 review F24), so this
                 # runs before the already-tainted early return.
                 live_global_sites.setdefault(int(key[1]), set()).add(ins_key(ins))
+                global_store_only[int(key[1])] = (global_store_only.get(int(key[1]), True)
+                                                  and "STORE" in op_name(ins))
             if node in tainted:
                 return False
             tainted.add(node)
+            if field_only and key in field_only and not field_store_active[0]:
+                # Tainted as a whole (a copy into it, a callee filling it):
+                # every field may now carry the bytes.
+                del field_only[key]
             if type(key) is tuple and len(key) == 2 and key[0] == "global":
                 live_globals.setdefault(int(key[1]), node)
                 if ins is not None:
@@ -10934,6 +11033,14 @@ class TaintEngine:
                 raise TaintError("no taint sources resolved; check --source locator")
             return {"reached_return": False, "out_params": set(), "findings": [],
                     "leaves": [], "assumptions": []}
+
+        params_list = list(getattr(func, "parameter_vars", None) or [])
+        for loc in locators:
+            spans = loc.get("fields") if isinstance(loc, dict) else None
+            idx = loc.get("index") if isinstance(loc, dict) else None
+            if spans and loc.get("kind") == "param" and isinstance(idx, int) \
+                    and idx < len(params_list):
+                partial_bases[var_key(params_list[idx])] = tuple(spans)
 
         # Honesty signal: a visited function with unlifted instructions is a
         # potential silent dataflow hole -- BN couldn't model those ops, so taint
@@ -12611,8 +12718,26 @@ class TaintEngine:
                             if mchanged:
                                 changed = True
                         if descend_internal:
+                            # P2-08: an argument pointing into a partially
+                            # tainted object hands the callee those ranges,
+                            # rebased to where the pointer points.
+                            arg_fields: dict = {}
+                            if field_only or partial_bases:
+                                for ai in tainted_args:
+                                    if ai >= len(params):
+                                        continue
+                                    bo = self._addr_base_offset(ssaf, params[ai])
+                                    if bo is None:
+                                        continue
+                                    spans = field_only.get(bo[0])
+                                    if spans is None:
+                                        spans = partial_bases.get(bo[0])
+                                    if spans:
+                                        arg_fields[ai] = tuple(sorted(
+                                            (lo - int(bo[1]), hi - int(bo[1])) for lo, hi in spans))
                             d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth,
-                                              via=via, caller_instrs=instrs)
+                                              via=via, caller_instrs=instrs,
+                                              fields=arg_fields or None)
                             # Round-3 blocker: `_descend`'s rebuild strips per-finding
                             # taint-graph context, so a finding's provenance can only be
                             # re-checked HERE, against the CALLER's own why-chain, using
@@ -12855,6 +12980,21 @@ class TaintEngine:
                     dest = getattr(ins, "dest", None)
                     if dest is not None and is_ssa_var(dest):
                         hits = arg_taint(getattr(ins, "src", None))
+                        dk = var_key(dest)
+                        off = getattr(ins, "offset", 0)
+                        if hits and (dk in field_only
+                                     or not any(n[0] == dk for n in tainted)):
+                            # P2-08: the stored value taints THIS field only.
+                            try:
+                                lo = int(off)
+                                width = int(getattr(getattr(ins, "src", None), "size", 0)
+                                            or getattr(ins, "size", 0) or 0)
+                            except (TypeError, ValueError):
+                                width = 0
+                            if width > 0:
+                                field_only.setdefault(dk, set()).add((lo, lo + width))
+                            else:
+                                field_only.pop(dk, None)
                         if not hits:
                             prev = getattr(ins, "prev", None)
                             if prev is not None:
@@ -12864,18 +13004,62 @@ class TaintEngine:
                                         hits = [n]
                                         break
                         if hits:
-                            node = (var_key(dest), getattr(dest, "version", None))
-                            off = getattr(ins, "offset", 0)
-                            if taint_node(node, var_label(dest), ins,
-                                          f"tainted store into struct field +{off}", hits):
-                                changed = True
+                            node = (dk, getattr(dest, "version", None))
+                            field_store_active[0] = dk in field_only
+                            try:
+                                if taint_node(node, var_label(dest), ins,
+                                              f"tainted store into struct field +{off}", hits):
+                                    changed = True
+                            finally:
+                                field_store_active[0] = False
                     continue
+
+                # P2-08: a read of a partially tainted object (a struct whose
+                # fields were stored to one at a time, or the object a
+                # pointer parameter reaches) carries taint only when the bytes
+                # it reads overlap the tainted fields.
+                if opn == "MLIL_SET_VAR_SSA" and (field_only or partial_bases):
+                    part = self._partial_read(ssaf, getattr(ins, "src", None),
+                                              field_only, partial_bases)
+                    if part is not None:
+                        verdict, base_key, base_label = part
+                        if verdict == "unresolved":
+                            leaf = {
+                                "kind": "field_load_unresolved",
+                                "address": hex(int(getattr(ins, "address", 0))),
+                                "base": base_label,
+                                "offset": None,
+                                "il_text": str(ins),
+                                "detail": (
+                                    f"a load through {base_label}, an object only some of "
+                                    "whose fields carry taint, at an offset this walk could "
+                                    "not establish -- whether it reads a tainted field is "
+                                    "unknown, so it is neither followed nor ruled out"),
+                            }
+                            if leaf not in leaves:
+                                leaves.append(leaf)
+                            continue
+                        if verdict is False:
+                            continue
+                        if base_key in field_only:
+                            parent = next((n for n in tainted if n[0] == base_key), None)
+                            for w in ssa_writes(ins):
+                                if parent is not None and taint_node(
+                                        (var_key(w), getattr(w, "version", None)),
+                                        var_label(w), ins,
+                                        "reads a tainted struct field", [parent]):
+                                    changed = True
+                            continue
 
                 # memory-SSA: a load that reads bytes a tainted store wrote (heap/
                 # pointer aliasing the AddressOf rule misses). Additive + sound.
                 if opn == "MLIL_SET_VAR_SSA":
                     src_expr = getattr(ins, "src", None)
                     if src_expr is not None and "LOAD" in op_name(src_expr):
+                        if self._global_field_miss(ssaf, src_expr, global_store_only):
+                            # P2-08: another field of a global struct whose
+                            # only tainted bytes are the fields stored to.
+                            continue
                         msrc = self._load_tainted_via_memory(ssaf, src_expr, tainted)
                         reason = "loads value stored through a tainted pointer (mem-SSA)"
                         assume = "heap/pointer load resolved via memory-SSA store correlation"
