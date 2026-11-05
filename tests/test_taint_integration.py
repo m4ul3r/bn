@@ -7376,6 +7376,25 @@ def test_armv7_argument_mapping_is_disclosed_never_complete(tmp_path, shared_bn)
         padded["leaves"]
 
 
+def test_armv7_ifunc_copy_with_a_two_path_length_is_routed(tmp_path, shared_bn):
+    """W06-05: glibc's armv7 `memcpy` PLT stub carries the IFUNC resolver's
+    one-argument prototype, so the copy's length is read from r2 -- which a
+    Thumb `itee` block fills on two paths, an LLIL phi with no MLIL of its
+    own. That length was neither reached forward nor seeded backward."""
+    target = shared_bn.load(_armv7_build(tmp_path, "abi_armv7"), copy=False)
+
+    forward = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "flush_window",
+                       "--source", "param:2")
+    copies = [s["sink"] for s in forward["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert [(c["tainted_arg_index"], c.get("via")) for c in copies] == [(2, None)], copies
+
+    backward = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "flush_window",
+                        "--sink", "arg:memcpy:2")
+    assert [s["status"] for s in backward["sink_status"]] == ["seeded"], backward["sink_status"]
+    assert not [lf for lf in backward["leaves"] if lf["kind"] == "sink_unseeded"]
+    assert "parameter" in {o["kind"] for sl in backward["slices"] for o in sl["origins"]}
+
+
 _FRONTIER_SRC = r"""
 #include <alloca.h>
 #include <stdio.h>
