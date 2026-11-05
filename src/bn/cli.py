@@ -2914,13 +2914,13 @@ def _fanout_call(
             )
             # Every command the bridge's reply prints runs as printed: this
             # row's instance and target, as on a single call (G3-05).
-            value = unwrap_result(
-                _contextualize_diagnostic_hints(response, target=target, instance=iid), op)
-            row.update({"target": target, "ok": True, _RESULT_ROW_KEY: value})
+            row.update({"target": target, "ok": True, _RESULT_ROW_KEY: unwrap_result(
+                _contextualize_diagnostic_hints(response, target=target, instance=iid), op)})
             # #1037 item 4 review: the default-page note for THIS row, decided
-            # from the same reply (the helper is pure), kept beside the rows
+            # from the same reply (the helper is pure, and the note reads only
+            # its counts, which routing never rewrites), kept beside the rows
             # rather than in them so the fan-out envelope keeps its shape.
-            note = _default_page_note(args, value)
+            note = _default_page_note(args, unwrap_result(response, op))
             if note:
                 page_notes[(iid, target)] = note
         except BridgeError as exc:
