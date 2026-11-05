@@ -5863,6 +5863,15 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                     _why = _text_value(_sink_d, "relabel")
                     lines.append(f"      {_cat} → {_sink_d.get('class') or '?'}"
                                  + (f": {_why}" if _why else ""))
+                # W10-04: the length's last arithmetic ran in a narrower integer
+                # than the sink's parameter, so it can wrap before the widening.
+                _narrow = _field_dict(_sink_d, "width_narrowing")
+                if _narrow:
+                    lines.append(
+                        f"      width narrowing: length computed in "
+                        f"{_narrow.get('computed_width', '?')} byte(s) @ {_narrow.get('at', '?')}, "
+                        f"widened to the {_narrow.get('parameter_width', '?')}-byte parameter "
+                        "-- the arithmetic can wrap before the widening")
                 if full:
                     _detail = _field_dict(f, "sink").get('detail') or ''
                     if _detail:
