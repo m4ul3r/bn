@@ -1406,16 +1406,33 @@ def test_cancel_request_marks_only_active_requests(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
 
     inactive = instance._cancel_request("missing")
-    assert inactive == {"kind": "cancel_request", "request_id": "missing", "cancelled": False}
+    assert inactive == {"kind": "cancel_request", "request_id": "missing", "cancelled": False,
+                        "polls_cancel": False}
     assert instance._is_request_cancelled("missing") is False
 
     instance._begin_request("req-1")
     active = instance._cancel_request("req-1")
-    assert active == {"kind": "cancel_request", "request_id": "req-1", "cancelled": True}
+    assert active == {"kind": "cancel_request", "request_id": "req-1", "cancelled": True,
+                      "polls_cancel": False}
     assert instance._is_request_cancelled("req-1") is True
 
     instance._end_request("req-1")
     assert instance._is_request_cancelled("req-1") is False
+
+
+@pytest.mark.parametrize("op, polls", [("taint", True), ("go_rename", True),
+                                       ("list_targets", False), ("py_exec", False)])
+def test_a_cancel_says_whether_the_running_op_checks_for_it(monkeypatch, op, polls):
+    # A client that timed out waits for the outcome only when the op will
+    # look at the flag; a `list_targets` queued behind a write lock never
+    # does, and waiting on it spent a `session stop` probe's budget (P1-07).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    instance._begin_request("req-1", op)
+    ack = instance._cancel_request("req-1")
+    assert (ack["cancelled"], ack["polls_cancel"]) == (True, polls)
+    instance._end_request("req-1")
+    assert instance._cancel_request("req-1")["polls_cancel"] is False
 
 
 def _taint_one_call_program(monkeypatch, instance):
