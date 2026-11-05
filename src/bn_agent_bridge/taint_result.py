@@ -633,15 +633,19 @@ def coalesce_global_continuations(leaves: list[dict[str, Any]]) -> list[dict[str
         had_refs = bool(rep["references"])
         _union(rep["references"], lf.get("references"),
                key=lambda r: (str(r.get("address")), str(r.get("at")), str(r.get("access"))))
-        for field in ("unfinished_scans", "unverified_overlaps"):
-            if lf.get(field):
-                merged = list(rep.get(field) or [])
-                _union(merged, lf.get(field))
-                rep[field] = merged
+        if lf.get("unfinished_scans"):
+            scans = list(rep.get("unfinished_scans") or [])
+            _union(scans, lf.get("unfinished_scans"))
+            rep["unfinished_scans"] = scans
+        # A COUNT of the merged rows, not a list to union: the same candidate
+        # seen from two calls is one row, so one overlap (R1-01).
+        rep["unverified_overlaps"] = sum(
+            1 for r in rep["references"] if r.get("access") == "overlap_unverified")
         offsets = list(rep["global"].get("written_offsets") or [])
         _union(offsets, glob.get("written_offsets"))
         if offsets:
-            rep["global"]["written_offsets"] = sorted(offsets, key=repr)
+            # Hex strings, in numeric order as each site's list is.
+            rep["global"]["written_offsets"] = sorted(offsets, key=lambda o: int(o, 16))
         if lf.get("reads_proven") and not rep.get("reads_proven"):
             rep["reads_proven"] = True
             rep["detail"] = lf.get("detail")
@@ -1116,10 +1120,23 @@ def backward_diagnostics(
             "the sink seeded but no slice was produced; confirm the --sink "
             "locator names the operand you meant")
     else:
+        # A `crt_entry` row is the one frontier left: the slice did reach its
+        # origins, but the formals of the function the C runtime's start
+        # routine calls are what the process was started with -- nothing in
+        # the binary supplies them, which is why the slice is not complete.
+        entered = sorted({
+            str((lf.get("function") or {}).get("name") or lf.get("address"))
+            for lf in caller_leaves
+            if isinstance(lf.get("reasons"), dict) and "crt_entry" in lf["reasons"]})
+        boundary = (
+            f"; {', '.join(entered)} is entered from the C runtime's start routine, "
+            "which passes what the process was started with (argc, argv, envp) -- "
+            "no caller in this binary supplies those formals, so treat them as "
+            "program inputs" if entered else "")
         next_action = (
-            "the slice reached its origins; classify each origin (parameter / "
-            "modeled source / constant) to decide whether the sink is "
-            "attacker-reachable")
+            f"the slice reached its origins{boundary}; classify each origin "
+            "(parameter / modeled source / constant) to decide whether the sink "
+            "is attacker-reachable")
 
     return {
         "sinks_seeded": int(sinks_seeded),

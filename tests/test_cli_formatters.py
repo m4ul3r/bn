@@ -6312,7 +6312,7 @@ def test_save_text_says_an_export_is_not_the_targets_database():
         "default_save_path": "/ro/demod.bndb", "restart_path": "/ro/demod",
         "restart_path_is_database": False,
     })
-    assert out.splitlines()[0] == "saved: /out/demod.bndb"
+    assert out.splitlines()[0] == "saved: /out/demod.bndb  (export)"
     assert "an export, not this target's own database" in out
     assert "a plain `bn save` writes /ro/demod.bndb" in out
     assert "reopens /ro/demod (the raw file, without this analysis)" in out
@@ -10468,3 +10468,22 @@ def test_proto_text_prints_entry_value_and_undefined_type_notes_1013():
     })
     assert "\n\nnote: At 2 of 2 direct call sites ..." in text
     assert "\n\nnote: run `bn types declare 'struct `ns::Cls`;'` first." in text
+
+
+@pytest.mark.parametrize("unsaved, expected", [
+    (True, "unsaved: yes"), (False, "unsaved: no"),
+])
+def test_save_text_states_what_an_export_left_unchanged(unsaved, expected):
+    # P2-03: an export persisted nothing for the target; the text must say
+    # which database still backs it and that its unsaved state is as it was.
+    from bn.formatters import _render_save_text
+
+    out = _render_save_text({
+        "ok": True, "saved": True, "path": "/out/copy.bndb", "export": True,
+        "default_save_path": "/work/demod.bndb", "restart_path": "/work/demod.bndb",
+        "restart_path_is_database": True, "backing_database": "/work/demod.bndb",
+        "unsaved": unsaved,
+    })
+    lines = out.splitlines()
+    assert "backing database: /work/demod.bndb" in lines
+    assert any(line.startswith(expected) for line in lines)

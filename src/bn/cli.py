@@ -52,6 +52,7 @@ from .transport import (  # noqa: F401
     BridgeError,
     BridgeProcessSignal,
     DEFAULT_REQUEST_TIMEOUT,
+    MULTI_TARGET_HEADLINE,
     MultiTargetError,
     _resolve_timeout,
     _send_request_to_instance,
@@ -68,7 +69,9 @@ from .transport import (  # noqa: F401
     wait_for_teardown,
 )
 from .target_hint import instance_option, respell_for_option
-from .version import VERSION, build_id_for_file, build_id_for_package  # noqa: F401
+from .version import (  # noqa: F401
+    VERSION, build_id_for_file, build_id_for_package, build_id_for_tree,
+)
 
 
 class _HelpFullAction(argparse.Action):
@@ -515,14 +518,16 @@ def _common_io_options(
     )
 
 
-def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) -> None:
+def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False,
+                     listed: bool = True) -> None:
     parser.add_argument(
         "-i",
         "--instance",
         default=os.environ.get("BN_INSTANCE") if is_root else argparse.SUPPRESS,
-        help="Target a specific bridge instance by ID (env: BN_INSTANCE). Instances "
-             "are looked up in $BN_CACHE_DIR/instances when BN_CACHE_DIR is set: "
-             "BN_CACHE_DIR also scopes the instance registry and sticky session",
+        help=("Target a specific bridge instance by ID (env: BN_INSTANCE). Instances "
+              "are looked up in $BN_CACHE_DIR/instances when BN_CACHE_DIR is set: "
+              "BN_CACHE_DIR also scopes the instance registry and sticky session")
+        if listed else argparse.SUPPRESS,
     )
 
 
@@ -696,6 +701,7 @@ def command(
     fanout: bool = False,
     estimable: bool = False,
     analysis_bounds: tuple[str, ...] = (),
+    routes_instance: bool = True,
 ) -> Callable:
     """Register a CLI command declaratively.
 
@@ -725,6 +731,11 @@ def command(
     output: taint's ``--max-depth`` changes which calls are descended, and a
     tighter cap can grow the result rather than shrink it. They are never
     offered as the way to bound a read, and the hint says so by name.
+
+    ``routes_instance=False`` marks a command that does not run on an existing
+    bridge (`session start` creates one). Its own help then does not list
+    ``-i/--instance``; the option is still parsed so the handler can refuse it
+    and name the flag that does what was meant (W10).
     """
 
     def decorator(fn: Callable[[argparse.Namespace], int]) -> Callable[[argparse.Namespace], int]:
@@ -755,6 +766,7 @@ def command(
             # estimate then replaces with a byte count).
             "estimable": estimable,
             "analysis_bounds": tuple(analysis_bounds),
+            "routes_instance": routes_instance,
         })
         return fn
 
@@ -843,7 +855,7 @@ def _build_from_commands(root: BnArgumentParser) -> None:
                            estimable=(bool(spec.get("estimable"))
                                       and path not in group_paths),
                            analysis_bounds=tuple(spec.get("analysis_bounds", ())))
-        _instance_option(cmd)
+        _instance_option(cmd, listed=spec["routes_instance"])
         # Fan-out is an EXPLICIT allow-list (`fanout=True` on genuine whole-target
         # read surveys), not inferred from fmt -- several write/side-effecting
         # commands (save/close/refresh/py exec/load) also default to text, so a
@@ -1579,7 +1591,8 @@ def _empty_target_message(
     )
 
 
-def _implicit_target(args: argparse.Namespace) -> str:
+def _implicit_target(args: argparse.Namespace,
+                     headline: str = MULTI_TARGET_HEADLINE) -> str:
     """Resolve the single open target to its pinned ``target_id``, else refuse.
 
     Returns the stable ``target_id`` from the peek row -- never the volatile
@@ -1607,7 +1620,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
         target=None,
         instance_id=getattr(args, "instance", None),
     )
-    return implicit_target_selector(response)
+    return implicit_target_selector(response, headline)
 
 
 def _resolve_target(
@@ -3422,8 +3435,33 @@ def _single_call_argv(argv: list[str], instance: str | None) -> list[str]:
     return [*routing, *options, *argv[end:]]
 
 
+# D2-03: `bn doctor` runs the `bn` executable found on PATH with this variable
+# set to a fresh nonce; that executable answers with the code it actually runs.
+IDENTITY_PROBE_ENV = "BN_IDENTITY_PROBE"
+
+
+def _answer_identity_probe(nonce: str) -> int:
+    """Print which package this process imported and the bridge it would
+    spawn, echoing *nonce*, and do nothing else.
+
+    Answered before argument parsing and before any command runs, so the probe
+    cannot recurse: a wrapper that itself invokes `bn doctor` inherits the
+    variable and answers the probe instead of probing again. It runs through the
+    PATH executable rather than its shebang interpreter, so a broken shim fails
+    here and a wrapper that changes `sys.path` reports the package it imports."""
+    sys.stdout.write(json.dumps({
+        "identity_probe": nonce,
+        "module_dir": str(Path(__file__).resolve().parent),
+        "plugin_source_dir": str(plugin_source_dir()),
+    }) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     global _MACHINE_ERROR_FORMAT
+    probe = os.environ.get(IDENTITY_PROBE_ENV)
+    if probe:
+        return _answer_identity_probe(probe)
     parser = build_parser()
     parse_argv = sys.argv[1:] if argv is None else list(argv)
     # Capture --format before parsing so argparse usage/type errors (which fire

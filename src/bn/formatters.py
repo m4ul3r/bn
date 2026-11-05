@@ -1494,6 +1494,7 @@ def _render_save_text(value: Any) -> str:
     export = value.get("export") is True
     line = f"saved: {value.get('path', '<unknown>')}"
     if export:
+        line += "  (export)"
         # #1036 item 5: an explicit-path save is a copy. Say where the target
         # itself still saves and restarts from, so neither this agent nor a
         # second one reading `target list` mistakes the copy for its home.
@@ -1520,6 +1521,15 @@ def _render_save_text(value: Any) -> str:
             f"\nnote: an export, not this target's own database: a plain `bn save` "
             f"{plain}; `session restart` reopens {restart} ({restart_what})"
         )
+        # P2-03: what the export left as it was.
+        backing = _text_value(value, "backing_database")
+        line += f"\nbacking database: {backing or 'none (not saved to a database yet)'}"
+        unsaved = _flag_field(value, "unsaved")
+        if unsaved is not None:
+            line += (
+                "\nunsaved: yes (unchanged: the export persisted none of it; a plain "
+                "`bn save` does)" if unsaved else "\nunsaved: no"
+            )
     collision = _field_dict(value, "collides_with_open_target")
     if collision:
         # #857 r4: a save landing on a file another target already has open makes
@@ -1766,11 +1776,22 @@ def _render_session_list_text(value: Any) -> str:
         rss = item.get("rss_mb")
         if rss is not None:
             parts.append(f"rss={rss}MB")
+        if "idle_timeout" in item:
+            idle = item.get("idle_timeout")
+            parts.append(
+                f"idle={idle:g}s"
+                if isinstance(idle, (int, float)) and not isinstance(idle, bool) and idle > 0
+                else "idle=off")
         if item.get("started_at"):
             parts.append(f"started={item['started_at']}")
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
+        deferred = item.get("idle_deferred_unsaved_targets")
+        if isinstance(deferred, int) and not isinstance(deferred, bool) and deferred > 0:
+            lines.append(
+                f"  idle shutdown deferred: {deferred} target(s) with unsaved changes "
+                "-- save or close them; `bn session stop --discard-unsaved` discards them")
         # #992: which checkout this bridge runs.
         if item.get("source_dir"):
             lines.append(f"  source: {item['source_dir']}")
@@ -6969,6 +6990,47 @@ def _render_read_escaped_text(value: Any) -> str:
 
 
 
+def _doctor_cli_identity_lines(value: dict[str, Any]) -> list[str]:
+    """P2-08: which code this CLI and the `bn` on PATH run, and a warning when
+    they -- or a bridge and the PATH `bn` -- come from different checkouts."""
+    lines: list[str] = []
+    this = _field_dict(value, "cli")
+    if this:
+        lines.append(f"cli module: {_text_value(this, 'module_dir') or '<unknown>'}")
+        lines.append(f"cli repository: {_text_value(this, 'repository_root') or 'none (not a checkout)'}")
+        lines.append(f"cli build: {_text_value(this, 'build_id') or '<unknown>'}")
+    path_cli = _field_dict(value, "path_cli")
+    if not path_cli:
+        return lines
+    exe = _text_value(path_cli, "executable")
+    error = _text_value(path_cli, "error")
+    if exe and not error:
+        lines.append(
+            f"PATH bn: {exe} -> {_text_value(path_cli, 'module_dir') or '<unknown>'} "
+            f"(repository {_text_value(path_cli, 'repository_root') or 'not a checkout'}, "
+            f"build {_text_value(path_cli, 'build_id') or '<unknown>'})")
+    elif exe:
+        # D2-03: running the PATH `bn` did not identify it -- a broken shim, a
+        # timeout, or an answer that is not this probe's. A bare `bn` may not
+        # even start, so this is a warning, not a footnote.
+        lines.append(f"PATH bn: {exe}")
+        lines.append(f"warning: the `bn` on PATH could not be identified: {error}")
+    else:
+        lines.append("PATH bn: not found" + (f" ({error})" if error else ""))
+    if _flag_field(path_cli, "same_as_this_cli") is False:
+        lines.append(
+            "warning: the `bn` on PATH runs a different checkout than this command; "
+            "a bare `bn` invocation does not run the code this report describes")
+    others = [str(item.get("instance_id") or item.get("pid") or "<unknown>")
+              for item in _field_list(value, "instances")
+              if isinstance(item, dict) and _flag_field(item, "path_cli_other_checkout") is True]
+    if others:
+        lines.append(
+            "warning: bridge(s) run code from a different checkout than the `bn` on "
+            "PATH: " + ", ".join(others))
+    return lines
+
+
 @_discloses
 def _render_doctor_text(value: Any) -> str:
     if not isinstance(value, dict):
@@ -6977,6 +7039,7 @@ def _render_doctor_text(value: Any) -> str:
     kernel_dirs = _field_list(value, "bn_kernel_skill_dirs")
     lines = [
         f"cli version: {value.get('cli_version', '<unknown>')}",
+        *_doctor_cli_identity_lines(value),
         f"plugin source: {value.get('plugin_source_dir', '<unknown>')}",
         f"plugin install: {value.get('plugin_install_dir', '<unknown>')}",
         f"plugin source build: {value.get('plugin_source_build_id', '<unknown>')}",

@@ -235,13 +235,10 @@ def test_entry_stub_handing_main_to_the_imported_runtime_is_a_crt_entry_row():
     assert [(o["kind"], o.get("index")) for sl in result["slices"] for o in sl["origins"]] == [
         ("parameter", 0)]
     # No caller in the binary to slice from: no xrefs/callsites advice, and
-    # next_action is what the same result says without the caller row.
+    # next_action names the runtime boundary instead (R2).
     advice = result["diagnostics"]["next_action"]
     assert _advice_commands(advice, "xrefs") == [] and _advice_commands(advice, "callsites") == []
-    rest = [lf for lf in result["leaves"] if lf["kind"] != "caller_sites_truncated"]
-    alone = backward_diagnostics(rest, result["assumptions"], sinks_seeded=1,
-                                 slices=len(result["slices"]))
-    assert advice == alone["next_action"]
+    assert "main" in advice and "C runtime" in advice, advice
 
 
 @pytest.mark.parametrize("variant", ["in-binary", "second-use", "operand-1", "not-entry"])
@@ -283,11 +280,15 @@ def test_crt_entry_rows_add_no_caller_advice_beside_other_reasons():
     assert crt["safe_to_report_complete_slice"] is False
     assert crt["frontier"]["dropped_callers"] == 1
 
-    # Nothing else left: the origins-reached advice, still not complete.
+    # Nothing else left: the slice reached its origins, but `main` is entered
+    # from the C runtime, so the advice names that boundary -- not the
+    # complete-run wording of a slice with no frontier at all.
     only = backward_diagnostics([_caller_leaf("main", "0x4000", {"crt_entry": 1})], [],
                                 sinks_seeded=1, slices=1)
-    assert only["next_action"] == backward_diagnostics([], [], sinks_seeded=1,
-                                                       slices=1)["next_action"]
+    plain = backward_diagnostics([], [], sinks_seeded=1, slices=1)["next_action"]
+    assert only["next_action"] != plain
+    assert "main" in only["next_action"] and "C runtime" in only["next_action"]
+    assert _advice_commands(only["next_action"], "callsites") == []
     assert only["safe_to_report_complete_slice"] is False
 
     # Another function's indirect reference keeps its own xrefs advice; the
