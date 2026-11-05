@@ -336,9 +336,9 @@ def _unrecognized_arguments_hint(
       value, not the switch, so the error reads as a bad pattern. Name the
       switch; when the command takes `--query` and none was given, print the
       corrected command.
-    * `--estimate-output` on a dual-role node (`exports`, `types`): the flag is
-      withheld there on purpose (#796 r2, see `_group_paths`), so say so, and
-      print the alias subcommand form when the node has one (`exports list`).
+    * `--estimate-output` on a dual-role node with a non-estimable subcommand
+      (`types`): the flag is withheld there on purpose (#796 r2, see
+      `_estimate_withheld_paths`), so say so.
 
     Printed commands are this argv with the one change applied, so they keep
     every other option the caller passed."""
@@ -361,29 +361,10 @@ def _unrecognized_arguments_hint(
                     f"with --query: {shlex.join(['bn', *fixed])}")
         return f"{switch} is a switch and takes no value; {token!r} is left over"
     path = tuple(getattr(parsed, "_command_path", ()) or ())
-    if "--estimate-output" in extras and path and path in _group_paths():
-        node = next((spec for spec in _COMMANDS if spec["path"] == path), None)
-        # The alias leaf is the child that takes the node's own arguments (the
-        # one registration list `exports`/`exports list` share), so the printed
-        # command keeps every option the caller already passed valid.
-        alias = next((spec["path"][-1] for spec in _COMMANDS
-                      if node is not None and spec["path"][:-1] == path
-                      and spec["args"] == node["args"] and spec.get("estimable")),
-                     None)
-        label = " ".join(path)
-        lead = (f"--estimate-output is not accepted on `bn {label}` itself: it is also "
-                f"a command group, and a flag there would reach its subcommands too")
-        if alias is None:
-            return f"{lead}."
-        for index in range(len(argv) - len(path) + 1):
-            if argv[index:index + len(path)] != list(path):
-                continue
-            if index and _option_takes_value(parsers, argv[index - 1]):
-                continue
-            at = index + len(path)
-            fixed = [*argv[:at], alias, *argv[at:]]
-            return f"{lead}; use the `{label} {alias}` form: {shlex.join(['bn', *fixed])}"
-        return f"{lead}; use `bn {label} {alias} --estimate-output`."
+    if "--estimate-output" in extras and path and path in _estimate_withheld_paths():
+        return (f"--estimate-output is not accepted on `bn {' '.join(path)}` itself: it "
+                "is also a command group with a subcommand that is not an estimable "
+                "read, and a flag there would reach that subcommand too.")
     return None
 
 
@@ -769,12 +750,9 @@ def _group_paths() -> frozenset[tuple[str, ...]]:
     Those are the nodes argparse builds as GROUP parsers -- and, for a DUAL-ROLE
     path like ``types``/``exports``, the very same parser object also serves as
     the node's own leaf. A flag attached there is therefore accepted BEFORE the
-    subcommand is dispatched, which is why the estimate flag cannot be advertised
-    on such a node: `bn types --estimate-output declare ...` ran the declaration
-    and printed a byte count over it, and `bn types --estimate-output show X` had
-    the flag clobbered back to ``False`` by the leaf default -- the #251 hazard
-    (a real default on an intermediate-level parser) landing on the one node
-    class where "intermediate" and "leaf" are the same object.
+    subcommand is dispatched (see `_estimate_withheld_paths` for what that
+    means for the estimate flag, and `_build_from_commands` for how a flag
+    given there reaches the subcommand).
 
     Derived from the registry rather than a second hand-kept list, so a new
     command or subcommand cannot reopen the hole silently.
@@ -783,11 +761,28 @@ def _group_paths() -> frozenset[tuple[str, ...]]:
                      for i in range(1, len(spec["path"])))
 
 
+def _estimate_withheld_paths() -> frozenset[tuple[str, ...]]:
+    """Group nodes that cannot carry ``--estimate-output`` (#796 r2).
+
+    A flag on a group parser is accepted BEFORE a subcommand dispatches, so it
+    is withheld from a node with any non-estimable descendant: `bn types
+    --estimate-output declare ...` would run the declaration and print a byte
+    count over it. A node whose every descendant is an estimable read
+    (`exports` and its alias `exports list`) takes the flag like its alias
+    does: it can reach only reads, and `_build_from_commands` carries it to
+    them instead of letting a leaf default clobber it (the #251 hazard)."""
+    return frozenset(
+        path for path in _group_paths()
+        if any(len(spec["path"]) > len(path) and spec["path"][:len(path)] == path
+               and not spec.get("estimable") for spec in _COMMANDS))
+
+
 def _build_from_commands(root: BnArgumentParser) -> None:
     """Populate *root* with subcommands from the ``_COMMANDS`` registry."""
     subparser_actions: dict[tuple[str, ...], argparse._SubParsersAction] = {}
     node_parsers: dict[tuple[str, ...], argparse.ArgumentParser] = {(): root}
     group_paths = _group_paths()
+    estimate_withheld = _estimate_withheld_paths()
 
     def _get_subparsers(parent: tuple[str, ...]) -> argparse._SubParsersAction:
         if parent not in subparser_actions:
@@ -838,12 +833,11 @@ def _build_from_commands(root: BnArgumentParser) -> None:
                 path[-1], help=spec["help"], description=spec["help"])
             node_parsers[path] = cmd
 
-        # A group node never carries the estimate flag, even when the node is also
-        # registered as a leaf (the dual-role `types`/`exports`): see `_group_paths`
-        # for the two live failure shapes that buys.
+        # A group node carries the estimate flag only when every subcommand under
+        # it is an estimable read: see `_estimate_withheld_paths`.
         _common_io_options(cmd, default_format=spec["fmt"],
                            estimable=(bool(spec.get("estimable"))
-                                      and path not in group_paths),
+                                      and path not in estimate_withheld),
                            analysis_bounds=tuple(spec.get("analysis_bounds", ())))
         _instance_option(cmd)
         # Fan-out is an EXPLICIT allow-list (`fanout=True` on genuine whole-target
@@ -885,6 +879,25 @@ def _build_from_commands(root: BnArgumentParser) -> None:
             ),
             _analysis_bounds=spec["analysis_bounds"],
         )
+
+    # A DUAL-ROLE node (registered as a command AND a group: `exports`, `types`)
+    # parses its own options before argparse dispatches a subcommand, and the
+    # subcommand's parser then writes its defaults over the namespace -- so
+    # `bn exports --count list` silently listed and `bn exports --limit 2 list`
+    # silently returned every row (#251's hazard on the node where group and
+    # leaf are one parser). A child option the node defines identically (same
+    # strings, same dest, same default) gets a SUPPRESS default: absent, the
+    # node's identical default stands; given at either level, it is kept.
+    for path in group_paths & {spec["path"] for spec in _COMMANDS}:
+        node_defaults = {(tuple(action.option_strings), action.dest): action.default
+                         for action in node_parsers[path]._actions if action.option_strings}
+        for child_path, child in node_parsers.items():
+            if child_path[:-1] != path:
+                continue
+            for action in child._actions:
+                key = (tuple(action.option_strings), action.dest)
+                if key in node_defaults and node_defaults[key] == action.default:
+                    action.default = argparse.SUPPRESS
 
 
 def _render_result(

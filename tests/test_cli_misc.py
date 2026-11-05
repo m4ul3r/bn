@@ -3303,6 +3303,7 @@ _ESTIMATE_SUPPORTED_READ_PATHS = {
     ("trace",),
     ("strings",),
     ("imports",),
+    ("exports",),
     ("exports", "list"),
     ("sections",),
     ("data", "vars"),
@@ -3371,26 +3372,30 @@ def test_estimate_output_is_advertised_only_where_it_is_implemented_796(
     # A DUAL-ROLE node (`types`, `exports`) is a leaf AND a group: argparse builds
     # ONE parser for both roles, so a flag attached there is accepted BEFORE the
     # subcommand is dispatched -- `bn types --estimate-output declare ...` ran the
-    # declaration and printed a byte count over it, and `bn types --estimate-output
-    # show X` had the flag clobbered back to False by the leaf default (#251's
-    # hazard, on the one node class where an "intermediate" parser and a leaf are
-    # the same object). The builder therefore declines to advertise it on any
-    # group node, derived from the registry rather than a second hand-kept list --
-    # and that derivation is what the assertions below check in both
-    # directions, so neither a new command nor a new subcommand can reopen it.
+    # declaration and printed a byte count over it. The builder therefore
+    # declines to advertise it on any group node with a subcommand that is not
+    # an estimable read, derived from the registry rather than a second
+    # hand-kept list -- and that derivation is what the assertions below check
+    # in both directions, so neither a new command nor a new subcommand can
+    # reopen it. A group whose every subcommand is an estimable read (`exports`
+    # over its alias `exports list`) takes the flag like that alias (P3).
     groups = {tuple(spec["path"])[:i] for spec in bn.cli._COMMANDS
               for i in range(1, len(tuple(spec["path"])))}
     assert groups, "no group paths at all -- the derivation is broken"
+    unsafe = {group for group in groups
+              if any(len(spec["path"]) > len(group) and spec["path"][:len(group)] == group
+                     and not spec.get("estimable") for spec in bn.cli._COMMANDS)}
+    assert ("types",) in unsafe and ("exports",) not in unsafe
     assert all("--estimate-output" not in bn.cli._known_option_strings(leaf(path))
-               for path in groups), (
-        "a GROUP parser carries --estimate-output, so it is accepted before the "
-        "subcommand is dispatched: a mutation behind it runs while its outcome is "
-        f"replaced by a size ({sorted(p for p in groups if '--estimate-output' in bn.cli._known_option_strings(leaf(p)))})")
+               for path in unsafe), (
+        "a GROUP parser over a mutation carries --estimate-output, so it is accepted "
+        "before the subcommand is dispatched: a mutation behind it runs while its "
+        f"outcome is replaced by a size ({sorted(p for p in unsafe if '--estimate-output' in bn.cli._known_option_strings(leaf(p)))})")
 
-    assert advertised == marked - groups, (
-        f"advertised {sorted(advertised - (marked - groups))} without being marked, "
+    assert advertised == marked - unsafe, (
+        f"advertised {sorted(advertised - (marked - unsafe))} without being marked, "
         f"or marked-and-advertisable but not advertised "
-        f"{sorted((marked - groups) - advertised)}")
+        f"{sorted((marked - unsafe) - advertised)}")
     assert advertised == _ESTIMATE_SUPPORTED_READ_PATHS, (
         "estimator support differs from the explicit supported-read contract: "
         f"missing {sorted(_ESTIMATE_SUPPORTED_READ_PATHS - advertised)}, "
@@ -3531,15 +3536,15 @@ def test_estimate_output_is_not_advertised_on_mutations_or_side_effecting_comman
     assert "unrecognized arguments" in capsys.readouterr().err
     assert not calls                       # refused by the parser, before the request
 
-    # THE DUAL-ROLE NODES, behaviourally. The flag must not be accepted BEFORE the
-    # subcommand, because that occurrence belongs to the group parser: the
-    # mutation behind it (`types declare`) executed and reported a size in R2 of
-    # this review, and the read behind it (`types show`) ran with the flag
-    # silently dropped by the leaf default. Both refuse now, before any request.
+    # THE DUAL-ROLE NODE WITH A MUTATION UNDER IT. The flag must not be accepted
+    # BEFORE the subcommand, because that occurrence belongs to the group parser:
+    # the mutation behind it (`types declare`) executed and reported a size in R2
+    # of this review. It refuses now, before any request, for every `types`
+    # subcommand. (`exports`, whose only subcommand is its read alias, takes the
+    # flag: see `test_a_dual_role_node_takes_every_flag_its_alias_takes`.)
     for argv in (["types", "--estimate-output", "declare",
                   "struct DF879Leak { int a; int b; };"],
-                 ["types", "--estimate-output", "show", "DF879Leak"],
-                 ["exports", "--estimate-output", "list"]):
+                 ["types", "--estimate-output", "show", "DF879Leak"]):
         calls = fake_transport()
         with pytest.raises(SystemExit) as hijacked:
             bn.cli.main(argv + ["--target", "active"])

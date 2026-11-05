@@ -325,20 +325,24 @@ def test_a_value_after_regex_names_the_switch_and_prints_the_fix_1042(capsys, fa
     assert other == "--with-xrefs is a switch and takes no value; 'stray' is left over"
 
 
-def test_estimate_output_on_a_dual_role_node_prints_the_alias_form_1037(capsys):
-    """#1037 item 10: the flag is withheld on `exports` on purpose (#796 r2);
-    the refusal now says so and prints the `exports list` form, which parses
-    with the flag set."""
-    hint = _parser_hint(capsys, ["-t", "exports", "exports", "--estimate-output"])
-    assert "not accepted on `bn exports` itself" in hint
+def test_a_dual_role_node_takes_every_flag_its_alias_takes(capsys):
+    """P3: root `exports` refused `--estimate-output` while its alias `exports
+    list` took it, and a flag given BEFORE the alias subcommand was clobbered
+    by the subcommand's default (`exports --count list` listed, `exports
+    --limit 2 list` returned every row)."""
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["exports", "--estimate-output"])
+    assert ns.estimate_output is True and ns._command_path == ("exports",)
 
-    argv = _printed_command(hint)
-    # The `-t exports` VALUE is not mistaken for the command path.
-    assert argv == ["-t", "exports", "exports", "list", "--estimate-output"]
-    ns = bn.cli.build_parser().parse_args(argv)
-    assert ns.estimate_output is True and ns._command_path == ("exports", "list")
+    carried = parser.parse_args(["exports", "--count", "--limit", "2",
+                                 "--estimate-output", "list"])
+    assert (carried.count, carried.limit, carried.estimate_output,
+            carried._command_path) == (True, 2, True, ("exports", "list"))
+    root, alias = parser.parse_args(["exports"]), parser.parse_args(["exports", "list"])
+    assert (alias.count, alias.limit, alias.offset, alias.estimate_output) == (
+        root.count, root.limit, root.offset, root.estimate_output)
 
-    # `types` has no alias leaf: the refusal explains, and prints no command.
+    # `types` has a mutating subcommand, so the flag stays off the node.
     types_hint = _parser_hint(capsys, ["types", "--estimate-output"])
     assert "not accepted on `bn types` itself" in types_hint and "bn types " not in types_hint
 
@@ -416,16 +420,6 @@ def test_fanout_rows_the_default_page_cut_short_each_get_a_stderr_note_1037(
         "FILE for every row"], err
     assert sorted(target for target, _ in asked) == ["1:1:1", "1:2:2"]
     assert all(params["limit"] == 100 for _, params in asked)
-
-
-def test_abbreviated_routing_option_does_not_bend_the_exports_hint_1037(capsys):
-    """#1048 review nit: `--targ exports` is the abbreviated `--target`, so its
-    value is not the command path; the printed command must parse."""
-    hint = _parser_hint(capsys, ["--targ", "exports", "exports", "--estimate-output"])
-    argv = _printed_command(hint)
-    assert argv == ["--targ", "exports", "exports", "list", "--estimate-output"]
-    ns = bn.cli.build_parser().parse_args(argv)
-    assert ns.estimate_output is True and ns._command_path == ("exports", "list")
 
 
 def test_local_list_text_is_slim(fake_transport, capsys):

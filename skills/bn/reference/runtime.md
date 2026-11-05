@@ -120,6 +120,8 @@ A spilled artifact gets a provenance sidecar beside it, `<artifact>.meta.json` (
 
 For paged reads, `--out` removes the default 100-row limit only when `--limit` is omitted; an explicit limit still wins, and `--offset` still applies. In particular, `bn data symbols --offset 0 --out /tmp/bn-data-symbols.json` requests the whole set in one bridge call. Each `data symbols` page otherwise rebuilds the full named-symbol population under the read lock, even though it builds rows only for that page. Prefer the one-request export when building a complete index; it avoids repeated scans, not the cost of one full scan and row build. See [Data-symbol pagination cost](reading.md#data-symbol-pagination-cost) for the large-page alternative and wire-level `limit: "all"` spelling.
 
+An alias takes every flag the command it aliases takes: `bn exports` and `bn exports list` accept the same options, `--estimate-output` included, and a flag given before the alias subcommand is kept (`bn exports --count list` counts). `bn types` refuses `--estimate-output` before its subcommand, because `types declare` is a mutation; put it after `types show`.
+
 ## Discovery and troubleshooting
 
 ```bash
