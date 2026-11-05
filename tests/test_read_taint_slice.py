@@ -988,3 +988,39 @@ def test_a_trace_on_a_quick_view_discloses_its_analysis_state(monkeypatch, quick
         ("quick", True) if quick else ("full", False))
     first = _render_trace_text(result).splitlines()[0]
     assert first.startswith("WARNING: target is quick-loaded") is quick
+
+
+def test_trace_labels_an_inline_expansion_by_its_builtin_and_intrinsic_registers(monkeypatch):
+    """V8-05: `trace` at a `rep movs` BN lifted to `__builtin_memcpy` printed
+    `arg[2] of <unresolved callee> (rdx)`: the synthetic builtin is no
+    function, and the count is the intrinsic's `rcx`, not the convention's
+    third argument register."""
+    rts = _load_bridge(monkeypatch).read_taint_slice
+
+    def reg(name):
+        return types.SimpleNamespace(operation=types.SimpleNamespace(name="LLIL_REG"),
+                                     src=types.SimpleNamespace(name=name))
+
+    def intrinsic(params):
+        return types.SimpleNamespace(operation=types.SimpleNamespace(name="LLIL_INTRINSIC"),
+                                     intrinsic=types.SimpleNamespace(name="__memcpy_u64"),
+                                     params=params)
+
+    shifted = types.SimpleNamespace(operation=types.SimpleNamespace(name="LLIL_SUB"))
+    lifted = [types.SimpleNamespace(operation=types.SimpleNamespace(name="LLIL_IF")),
+              intrinsic([shifted, shifted, reg("rcx")]),
+              intrinsic([reg("rdi"), reg("rsi"), reg("rcx")])]
+    caller = types.SimpleNamespace(
+        calling_convention=types.SimpleNamespace(int_arg_regs=["rdi", "rsi", "rdx", "rcx"]),
+        get_llils_at=lambda address: lifted if address == 0x40128a else [])
+    call = types.SimpleNamespace(
+        address=0x40128a,
+        dest=types.SimpleNamespace(operation=types.SimpleNamespace(name="MLIL_CONST_PTR"),
+                                   constant=0x404040))
+    bv = types.SimpleNamespace(
+        get_symbol_at=lambda a: types.SimpleNamespace(name="__builtin_memcpy") if a == 0x404040 else None,
+        get_function_at=lambda a: None)
+
+    labels = [rts._arg_label(None, bv, call, i, caller) for i in range(3)]
+    assert [(lb["callee"], lb["register"]) for lb in labels] == [
+        ("__builtin_memcpy", "rdi"), ("__builtin_memcpy", "rsi"), ("__builtin_memcpy", "rcx")]

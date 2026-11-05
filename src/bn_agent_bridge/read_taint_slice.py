@@ -1051,6 +1051,21 @@ def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any
     the callsite, not necessarily anything the callee's parameter is named,
     so renderers must key headers off ``callee``, not ``name``."""
     label: dict[str, Any] = {"index": arg_index}
+    # V8-05: an inline string expansion (`rep movs`) is no call. Its operands
+    # are the registers the lifted intrinsic reads (the count is `rcx`, not the
+    # convention's third argument register), and its callee is the synthetic
+    # builtin MLIL names -- the symbol forward/backward taint report.
+    intrinsics = il_format.inline_expansion_intrinsics(
+        caller_func, int(getattr(call_insn, "address", 0) or 0))
+    if intrinsics:
+        reg = il_format.intrinsic_operand_register(intrinsics, arg_index)
+        if reg:
+            label["register"] = reg
+        dest = _branch_target(getattr(call_insn, "dest", None))
+        sym = bv.get_symbol_at(dest) if dest is not None else None
+        if sym is not None and getattr(sym, "name", None):
+            label["callee"] = label["callee_display_name"] = str(sym.name)
+        return label
     reg = _arg_register(caller_func, arg_index)
     if reg:
         label["register"] = reg

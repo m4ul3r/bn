@@ -8084,3 +8084,16 @@ def test_inline_expansions_are_listed_by_the_catalog_and_callsites(tmp_path, sha
                       "--within", "copy_label")
     assert [(row["call_addr"], row["call_kind"]) for row in listed["items"]] == [
         (site, "inline_expansion")]
+
+
+def test_trace_at_an_inline_copy_names_the_builtin_and_its_count_register(tmp_path, shared_bn):
+    """V8-05: `trace` at the `rep movs` taint names `__builtin_memcpy` printed
+    `<unresolved callee>` and the convention's `rdx` for the length; the
+    count of a `rep movs` is `rcx`."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+    backward = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                        "--sink", "arg:__builtin_memcpy:2")
+    [site] = {row["address"] for row in backward["sink_status"]}
+    trace = _bn_json(shared_bn, "-t", target, "trace", "copy_label", site, "--arg", "2")
+    assert trace["callee"] == "__builtin_memcpy"
+    assert trace["arg_label"]["register"] == "rcx"
