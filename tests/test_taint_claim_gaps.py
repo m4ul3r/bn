@@ -46,7 +46,7 @@ from test_taint_forward_global_frontier import (
     _var,
 )
 
-from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+from bn.taint_vocabulary import BLOCKING_LEAF_KINDS
 
 READ = 0x4010b0
 HELPER = 0x401300

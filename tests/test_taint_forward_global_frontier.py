@@ -35,7 +35,7 @@ from test_taint_engine import (
 )
 
 from bn import formatters
-from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+from bn.taint_vocabulary import BLOCKING_LEAF_KINDS
 
 KIND = "global_memory_continuation"
 
