@@ -16802,17 +16802,29 @@ class TaintEngine:
         # How many may-alias stores the walk is currently inside (W02-10). A
         # store through a pointer the walk cannot prove disjoint from a
         # loaded object is only a POSSIBLE writer of it: what produced that
-        # store's value never represents the slice over the load's own
-        # frontier, which names the object the sink actually read.
+        # store's value is walked as evidence -- its steps, its leaves -- but
+        # is no origin of the slice, neither its representative nor a
+        # producer a recursive back edge emits (R2-03, D5b-01): the load's
+        # own frontier, which names the object the sink read, is.
         may_writers = 0
 
-        def _place_origin(o, rank: int) -> None:
-            """Record origin *o* at *rank* (0 best): a formal is kept for the
-            ascent, anything else is a producer; a call's return at rank 1 is
-            a root of its own; the best-ranked origin represents the slice."""
+        def _set_origin(o, *, weak: int | bool = 0):
+            """Record origin *o* ranked by *weak* (rank 0 best): a formal is
+            kept for the ascent, anything else is a producer; a call's return
+            at rank 1 is a root of its own; the best-ranked origin represents
+            the slice. Inside a may-alias store's value only a formal counts
+            (it still ascends); anything else there is evidence."""
             nonlocal origin, origin_rank
+            if weak is True:
+                rank = 3
+            elif weak:
+                rank = int(weak) + 1
+            else:
+                rank = 0 if o.get("kind") == "parameter" else 1
+            if may_writers and rank:
+                return
             o["function"] = fn_ref
-            if rank == 0 and o.get("kind") == "parameter":
+            if rank == 0:
                 param_origins.setdefault(int(o["index"]), o)
             elif o not in producers:
                 producers.append(o)
@@ -16822,31 +16834,15 @@ class TaintEngine:
                 origin = o
                 origin_rank = rank
 
-        def _set_origin(o, *, weak: int | bool = 0):
-            if weak is True:
-                rank = 3
-            elif weak:
-                rank = int(weak) + 1
-            else:
-                rank = 0 if o.get("kind") == "parameter" else 1
-            if may_writers and rank == 1:
-                rank = 2
-            _place_origin(o, rank)
-
         def _set_source_origin(o):
             """A modeled source's return IS the value: it represents the slice
             over anything else, a formal found before or after it included.
             Pinned at the top rank, so a later weak origin cannot displace it
             (the outright assignment left a stale rank that could). A formal
-            beside it still ascends on its own (IC01).
-
-            Except behind a may-alias store: what that store wrote only MAY be
-            the loaded bytes, so the source is evidence ranked like any other
-            producer there, never the root over the load's own frontier
-            (R2-03)."""
+            beside it still ascends on its own (IC01). Behind a may-alias
+            store it is evidence only: its call step names it (R2-03)."""
             nonlocal origin, origin_rank
             if may_writers:
-                _place_origin(o, 2)
                 return
             o["function"] = fn_ref
             if o not in producers:
@@ -17581,7 +17577,13 @@ class TaintEngine:
                 target = const_target(getattr(defn, "dest", None))
                 name = self._callee_name(target)
                 mkey, model = lookup_model(self.models, name)
-                call_step = _instr_dict(defn, reason=f"defined by call to {name or 'indirect'}")
+                # The step names the call structurally: `callee`, and `model`
+                # (the key that matched) when a model judged it -- the only
+                # record of a source behind a may-alias store (D5b-02).
+                call_step = _instr_dict(defn, reason=f"defined by call to {name or 'indirect'}",
+                                        callee=called_name(mkey, name))
+                if mkey:
+                    call_step["model"] = mkey
                 steps.append(call_step)
                 if model and model.get("sources"):
                     # The representative, ranked (IC01): the outright
