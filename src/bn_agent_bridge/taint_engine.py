@@ -8257,6 +8257,79 @@ class TaintEngine:
             self._global_write_unbounded.add(ga)
             self._invalidate_object(ga)
 
+    @staticmethod
+    def _pointer_range(expr: Any) -> tuple[int, int] | None:
+        """``(lowest, highest)`` address BN's value set gives *expr*, or None
+        when it states no bounded set."""
+        pvs = getattr(expr, "possible_values", None)
+        kind = str(getattr(getattr(pvs, "type", None), "name", ""))
+        try:
+            if kind in ("ConstantValue", "ConstantPointerValue"):
+                return int(pvs.value), int(pvs.value)
+            if kind in ("UnsignedRangeValue", "SignedRangeValue"):
+                ranges = list(pvs.ranges)
+                if ranges:
+                    return (min(int(r.start) for r in ranges),
+                            max(int(r.end) for r in ranges))
+            if kind == "InSetOfValues":
+                values = [int(v) for v in pvs.values]
+                if values:
+                    return min(values), max(values)
+        except Exception:
+            return None
+        return None
+
+    def _indexed_write_in_object(self, dest: Any, ga: int, reach: int | None) -> bool:
+        """Whether a write of at most *reach* bytes at *dest* -- ``g + i``
+        into the object at *ga* -- provably stays inside the object's
+        DECLARED extent: BN's value set bounds the address, and the declared
+        width holds the furthest byte. Anything less (an index nothing
+        bounds, a length nothing states, an object of inferred width) may
+        land in the neighbouring object, which the object's taint does not
+        cover (D1-01)."""
+        width = self._authoritative_width(ga)
+        bounds = self._pointer_range(dest)
+        if reach is None or width <= 0 or bounds is None:
+            return False
+        lo, hi = bounds
+        return ga <= lo and hi + int(reach) <= ga + width
+
+    def _modeled_write_reach(self, ssaf: Any, params: list, idx: int,
+                             model: dict[str, Any] | None, name: str | None) -> int | None:
+        """The most bytes a modeled copy writes through argument *idx*, when
+        its length is bounded and bounds THIS argument; None otherwise (an
+        append writes at a terminator it finds, so it never has one)."""
+        append = (model or {}).get("append")
+        if isinstance(append, dict) and model_arg_index(append.get("dest")) == idx:
+            return None
+        length = self._model_len_index(model)
+        scope = self._model_len_scope(model)
+        if length is None or length >= len(params) or (scope is not None and idx not in scope):
+            return None
+        bound = self._length_upper_bound(ssaf, params[length])
+        return None if bound is None or bound < 0 else bound * self._count_scale(name)
+
+    def _indexed_write_frontier(self, ga: int, ins: Any, dest: Any) -> dict[str, Any]:
+        """The blocking leaf for a tainted write through ``g + i`` that is not
+        proven to stay inside the object at *ga*: the object itself is
+        tainted, but the bytes the write may have reached outside it are
+        not followed (D1-01)."""
+        label = self._global_label(ga)
+        return {
+            "kind": "coarse_memory_store",
+            "address": hex(int(getattr(ins, "address", 0))),
+            "dest_expr": str(dest),
+            "il_text": str(ins),
+            "global": {"address": hex(ga), "label": label},
+            "index_bounded": False,
+            "detail": (
+                f"a tainted write through {label} plus an index nothing bounds to "
+                f"its declared extent may land outside it, in a neighbouring "
+                f"object; {label} itself is tainted, but bytes outside it are not "
+                "followed -- a 'no sinks reached' result past this point is not "
+                "proof of safety"),
+        }
+
     def _copy_length_is_zero(self, ssaf: Any, params: list,
                              model: dict[str, Any] | None) -> bool:
         """Whether this modeled copy states a length of exactly zero.
@@ -8272,21 +8345,27 @@ class TaintEngine:
 
     def _note_write_span(self, ssaf: Any, params: list, idx: int,
                          model: dict[str, Any] | None,
-                         name: str | None = None) -> None:
+                         name: str | None = None) -> int | None:
         """Record how far a modeled copy writes into a global object.
 
         An untyped global's extent is otherwise inferred from LAYOUT, which
         an alias/subobject symbol inside the object silently halves
         (BN21-OBJ-01). What the program copies is direct evidence of how wide
-        the object is, so it is kept as a lower bound on the extent."""
+        the object is, so it is kept as a lower bound on the extent.
+
+        Returns the global a write through ``g + i`` (:meth:`_indexed_global`)
+        is NOT proven to stay inside, for the caller's frontier (D1-01);
+        None otherwise."""
         if idx >= len(params):
-            return
+            return None
         ga = self._global_addr(ssaf, params[idx])
         if ga is None:
             gi = self._indexed_global(ssaf, params[idx])
-            if gi is not None and not self._copy_length_is_zero(ssaf, params, model):
-                self._note_indexed_write(gi)
-            return
+            if gi is None or self._copy_length_is_zero(ssaf, params, model):
+                return None
+            self._note_indexed_write(gi)
+            reach = self._modeled_write_reach(ssaf, params, idx, model, name)
+            return None if self._indexed_write_in_object(params[idx], gi, reach) else gi
         raw = self._global_addr(ssaf, params[idx], canon=False)
         offset = (int(raw) - ga) if raw is not None and int(raw) >= ga else 0
         length = self._model_len_index(model)
@@ -13737,8 +13816,12 @@ class TaintEngine:
                     if k is not None:
                         if k < len(params):
                             propagated.add(k)
-                            self._note_write_span(ssaf, params, k, model,
-                                                  name or mkey)
+                            spilled = self._note_write_span(ssaf, params, k, model,
+                                                            name or mkey)
+                            if spilled is not None:
+                                _ixl = self._indexed_write_frontier(spilled, ins, params[k])
+                                if _ixl not in leaves:
+                                    leaves.append(_ixl)
                     # Visibility for a tainted copy *source* (#44): the buffer a
                     # source operand (arg N>=1) points at is copied into the
                     # destination buffer (arg 0). The flow is propagated -- so a
@@ -13893,8 +13976,12 @@ class TaintEngine:
                                 # extent must stop being clipped by what BN
                                 # inferred, exactly as for a copy (round-14
                                 # review F33).
-                                self._note_write_span(ssaf, params, k, model,
-                                                  name or mkey)
+                                spilled = self._note_write_span(ssaf, params, k, model,
+                                                                name or mkey)
+                                if spilled is not None:
+                                    _ixl = self._indexed_write_frontier(spilled, ins, params[k])
+                                    if _ixl not in leaves:
+                                        leaves.append(_ixl)
                     if eff_vsink is not None:
                         # record under the real param index i so this shares the
                         # recorded_sinks / top-level dedup with any static sink.
@@ -14433,6 +14520,15 @@ class TaintEngine:
                             if bt is not None and taint_node((bt[0], None), bt[1], ins,
                                                              f"out-param {j} written by callee", []):
                                 changed = True
+                            if (bt is not None and self._global_addr(ssaf, params[j]) is None
+                                    and (gi := self._indexed_global(ssaf, params[j])) is not None
+                                    and bt[0] == ("global", gi)):
+                                # The callee's write starts at `g + i` and its
+                                # length is the callee's: nothing here proves it
+                                # stays inside g (D1-01).
+                                _ixl = self._indexed_write_frontier(gi, ins, params[j])
+                                if _ixl not in leaves:
+                                    leaves.append(_ixl)
                             pidx = self._resolve_to_param_index(func, ssaf, params[j])
                             if pidx is not None and pidx not in out_params:
                                 out_params.add(pidx)
@@ -14752,8 +14848,11 @@ class TaintEngine:
                                     out_param_elems.add((pidx, parts[1]))
                                     changed = True
                         elif (gi := self._indexed_global(ssaf, dest)) is not None:
-                            # `g[i] = c` at an index nothing makes constant:
-                            # a write into the object, wherever in it (V5-01).
+                            # `g[i] = c` at an index nothing makes constant: the
+                            # object is tainted wherever in it the byte landed
+                            # (V5-01), and an index nothing bounds to its
+                            # declared extent may have put it in the NEXT
+                            # object, which that taint does not cover (D1-01).
                             self._note_indexed_write(gi)
                             if taint_node(((("global", gi)), None), f"glob_{hex(gi)}",
                                           ins, "store into tainted global at a "
@@ -14763,6 +14862,11 @@ class TaintEngine:
                                 add_assumption(
                                     "global buffer aliasing modeled coarsely by "
                                     "object base (global_approx)")
+                            width = int(getattr(ins, "size", 0) or 0)
+                            if not self._indexed_write_in_object(dest, gi, width or None):
+                                _ixl = self._indexed_write_frontier(gi, ins, dest)
+                                if _ixl not in leaves:
+                                    leaves.append(_ixl)
                         else:
                             # tainted store through a pointer parameter -> out-param
                             pidx = self._resolve_to_param_index(func, ssaf, dest)

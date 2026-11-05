@@ -104,14 +104,17 @@ def test_a_producer_the_crawler_cannot_read_is_refused_not_skipped(tmp_path, eng
 
 
 def test_capabilities_text_lists_the_taint_vocabulary(capsys):
+    # The vocabulary is the last block: a heading line, then one indented
+    # `field: values` row per field, in the JSON's order and with its values.
     assert bn.cli.main(["capabilities"]) == 0
-    out = capsys.readouterr().out
-    assert "taint output vocabulary:" in out
-    tail = out.split("taint output vocabulary:", 1)[1]
+    heading, *rows = capsys.readouterr().out.rstrip("\n").split("\n\n")[-1].splitlines()
+    assert heading and not heading.startswith(" ")
     taint = vocab.taint_vocabulary()
-    for field in FIELDS:
-        [line] = [ln for ln in tail.splitlines() if ln.startswith(f"  {field}: ")]
-        assert line.split(": ", 1)[1].split(", ") == taint[field]
+    assert len(rows) == len(FIELDS) == len(taint)
+    assert all(row.startswith("  ") for row in rows)
+    parsed = [row.removeprefix("  ").split(": ", 1) for row in rows]
+    assert [field for field, _ in parsed] == list(taint)
+    assert {field: values.split(", ") for field, values in parsed} == taint
 
 
 def test_capabilities_needs_neither_the_bridge_package_nor_binaryninja():

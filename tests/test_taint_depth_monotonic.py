@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 from test_taint_engine import FExpr, FInstr, FSSA, FSSAFunc, FVar, te
-from test_taint_forward_global_frontier import FGlobalBV, GFunc
+from test_taint_forward_global_frontier import FExtentBV, FGlobalBV, GFunc
 
 NAME_BUF = 0x404800      # static name buffer the helper fills
 OUT_BUF = 0x404c00       # the caller's fixed-size destination
@@ -117,4 +117,96 @@ def test_a_byte_stored_at_a_runtime_index_taints_the_static_buffer(models):
     result = te.TaintEngine(bv, models).forward(stash, [te.parse_locator("param:0")])
     assert [(f["sink"]["callee"], f["sink"]["address"]) for f in result["reached_sinks"]] \
         == [("system", hex(0x401310))]
-    assert not [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
+    # Nothing bounds `i` to the buffer: the byte may also have landed past it.
+    assert [lf["global"]["address"] for lf in result["leaves"]
+            if lf["kind"] == "coarse_memory_store" and lf.get("index_bounded") is False] \
+        == [hex(NAME_BUF)]
+
+
+# --------------------------------------------------------------------------
+# D1-01: an index nothing bounds keeps the out-of-object frontier
+# --------------------------------------------------------------------------
+
+FIRST, SECOND = 0x404800, 0x404840     # two adjacent DECLARED 64-byte globals
+SYSTEM, MEMCPY = 0x401060, 0x401070
+
+
+class _Range:
+    """BN's value set for an address: every value in [start, end]."""
+
+    def __init__(self, start, end):
+        self.type = type("T", (), {"name": "UnsignedRangeValue"})()
+        self.ranges = [type("R", (), {"start": start, "end": end})()]
+
+
+def _adjacent_globals_bv(func):
+    return FExtentBV({SYSTEM: "system", MEMCPY: "memcpy", STRCPY: "strcpy"},
+                     funcs={func.start: func}, objects={FIRST: 64, SECOND: 64},
+                     authoritative=[FIRST, SECOND], section=(0x404000, 0x405000))
+
+
+def _indexed_program(write, index_range=None):
+    """`f(v, i)`: write *v* at `first + i`, then `system(second)`.
+
+    *write* is ``"store"`` (`first[i] = v`), ``"memcpy"`` (an 8-byte copy)
+    or ``"strcpy"`` (a copy no length bounds). *index_range* is BN's value
+    set for `first + i`, or None when nothing bounds it."""
+    v, i, d = FSSA(FVar("v"), 0), FSSA(FVar("i"), 0), FSSA(FVar("d"), 1)
+    dest = _var(d)
+    if index_range is not None:
+        dest.possible_values = _Range(*index_range)
+    instrs = [FInstr(0, 0x401304, "MLIL_SET_VAR_SSA", "d#1 = first + i#0",
+                     reads=[i], writes=[d],
+                     src=FExpr("MLIL_ADD", "first + i#0", reads=[i],
+                               left=_ptr(FIRST), right=_var(i)))]
+    if write == "store":
+        store = FInstr(1, 0x401308, "MLIL_STORE_SSA", "[d#1].b = v#0", reads=[v],
+                       dest=dest, src=_var(v))
+        store.size = 1
+        instrs.append(store)
+    elif write == "memcpy":
+        instrs.append(_call(1, 0x401308, MEMCPY,
+                            [dest, _var(v), FExpr("MLIL_CONST", "8", constant=8)]))
+    else:
+        instrs.append(_call(1, 0x401308, STRCPY, [dest, _var(v)]))
+    instrs.append(_call(2, 0x401310, SYSTEM, [_ptr(SECOND)]))
+    func = GFunc("f", 0x401300, FSSAFunc(instrs), params=[v.var, i.var])
+    return func, _adjacent_globals_bv(func)
+
+
+def _index_frontiers(result):
+    return [lf for lf in result["leaves"]
+            if lf["kind"] == "coarse_memory_store" and lf.get("index_bounded") is False]
+
+
+@pytest.mark.parametrize("write", ["store", "memcpy", "strcpy"])
+def test_an_unbounded_index_into_a_declared_global_is_a_blocking_frontier(models, write):
+    # The reviewer's shape: `first[i] = v; system(second)`. The object taint
+    # cannot widen into `second` (its declared extent ends there), so without
+    # a frontier the possibility that the write landed in `second` vanished
+    # into an all-clear.
+    func, bv = _indexed_program(write)
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    # `second` is not tainted by the write (strcpy's own copy is a sink).
+    assert not [f for f in result["reached_sinks"] if f["sink"]["callee"] == "system"]
+    [leaf] = _index_frontiers(result)
+    assert (leaf["global"]["address"], leaf["address"]) == (hex(FIRST), hex(0x401308))
+    if not result["reached_sinks"]:
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+@pytest.mark.parametrize("write, reach", [("store", 1), ("memcpy", 8)])
+def test_an_index_bn_proves_inside_the_object_raises_no_frontier(models, write, reach):
+    # BN bounds the address to [first, first + 64 - reach]: the write stays in
+    # `first`, whose own taint is the whole answer.
+    func, bv = _indexed_program(write, (FIRST, FIRST + 64 - reach))
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert _index_frontiers(result) == []
+
+
+@pytest.mark.parametrize("write, reach", [("store", 1), ("memcpy", 8)])
+def test_an_index_bound_that_reaches_the_neighbour_keeps_the_frontier(models, write, reach):
+    # One byte too far: the last write may cover `second`'s first byte.
+    func, bv = _indexed_program(write, (FIRST, FIRST + 64 - reach + 1))
+    result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
+    assert [lf["global"]["address"] for lf in _index_frontiers(result)] == [hex(FIRST)]

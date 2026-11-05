@@ -83,8 +83,10 @@ def _still_loading_notice(path: str, interval: float):
 
 
 @command("capabilities",
-         help="Index of every command, what it's for, and when to pick it over a neighbor "
-              "(JSON for agents; no target needed)")
+         help="Index of every command, what it's for, and when to pick it over a neighbor, "
+              "plus the taint output vocabulary (`taint`: leaf kinds, truncation causes, "
+              "origin kinds, sink_status statuses, run_params keys) (JSON for agents; no "
+              "target needed)")
 def _capabilities(args: argparse.Namespace) -> int:
     # Derived entirely from the @command registry -- no hand-maintained second
     # list -- so the index can't drift from the actual command surface (#276).
