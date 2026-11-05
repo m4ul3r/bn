@@ -6805,3 +6805,41 @@ def test_a_tail_call_wrapper_flagged_a_thunk_is_walked(tmp_path, shared_bn):
         reached = {s["sink"]["callee"] for s in result["reached_sinks"]}
         assert {"memcpy_chk", "memmove_chk", "strncpy_chk"} <= reached, (fn, reached)
         assert not any("thunk" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def _armv7_build(tmp_path, name: str) -> Path:
+    cc = shutil.which("arm-linux-gnueabihf-gcc")
+    if cc is None:
+        refuse_silent_skip(
+            "arm-linux-gnueabihf-gcc is required for the armv7 ABI-mapping fixture; "
+            "install the cross toolchain (Debian/Ubuntu: gcc-arm-linux-gnueabihf)")
+    binary = tmp_path / name
+    _build([cc, "-O2", "-mthumb", "-g", "-fno-stack-protector",
+            str(CORPUS / f"{name}.c"), "-o", str(binary)])
+    return binary
+
+
+def test_armv7_argument_mapping_is_disclosed_never_complete(tmp_path, shared_bn):
+    """P2-02 / P2-07 on armv7: BN maps a `long long` passed in r2:r3 to a
+    stack slot. The backward slice that ends at `entry_r2` was a complete
+    slice; the forward flow into the same register vanished; and a Thumb
+    `push {r3, lr}` alignment slot was read as an under-recovered argument."""
+    target = shared_bn.load(_armv7_build(tmp_path, "abi_armv7"), copy=False)
+
+    backward = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "put_wide",
+                        "--sink", "arg:malloc:0")
+    [leaf] = [lf for lf in backward["leaves"] if lf["kind"] == "abi_mapping_unbound"]
+    assert leaf["register"] == "r2", leaf
+    assert "abi_mapping_unbound" in {o["kind"] for sl in backward["slices"] for o in sl["origins"]}
+    assert backward["diagnostics"]["safe_to_report_complete_slice"] is False
+
+    forward = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "pass_wide",
+                       "--source", "param:1")
+    under = [lf for lf in forward["leaves"] if lf.get("cause") == "arg_under_recovered"]
+    assert [(lf["callee"]["name"], lf["registers"]) for lf in under] == [("put_wide", ["r2"])], under
+    assert forward["diagnostics"]["safe_to_report_all_clear"] is False
+
+    padded = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "check_args",
+                      "--source", "param:3")
+    assert not [lf for lf in padded["leaves"] if lf.get("cause") == "arg_under_recovered"], \
+        padded["leaves"]
