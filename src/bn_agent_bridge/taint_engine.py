@@ -9406,15 +9406,24 @@ class TaintEngine:
             # bytes: it neither reads nor writes it, so there is no
             # reference here to report (round-24 review F65).
             return _Use(None, "unused", 0, None, None, True)
-        if fallback is None:
+        if fallback is None or not touched:
             # Reaching here means the scan finished with no terminal use of
             # this pointer and no bound reached: the body DROPS the formal
             # (`drop(a, b)` forwards only `b`; at -O0 it still spills `a` to
             # a stack slot, which is a carry, not a use). "Unclassified"
             # answered "it may read" and invented a blocking consumer
-            # (round-20 review F50).
+            # (round-20 review F50). The same holds when Binary Ninja records
+            # a code reference but no instruction of the lifted body names
+            # the object at all: on ARM a PC-relative BASE (`add r3, pc`)
+            # lands inside one object while the access it feeds
+            # (`ldr r3, [r3, #0xb1c]`) reads another, and the MLIL folds the
+            # intermediate away -- citing it read a flag as the tainted
+            # buffer (V3-02).
             return _Use(None, "unused", 0, None, None, True)
-        return _Use(fallback, "unclassified", 0, None, None, True)
+        # A reference the scan met but could not classify: WHERE in the
+        # object it lands was not established, so its offset is unknown,
+        # never the base (V3-02).
+        return _Use(fallback, "unclassified", 0, None, None, False)
 
     def _ptr_offset(self, ssaf: Any, expr: Any, root: Any, depth: int = 0,
                     seen: set | None = None) -> int | None:

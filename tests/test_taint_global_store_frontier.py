@@ -440,3 +440,28 @@ def test_a_static_read_only_after_its_store_stays_clear(models):
     result = _forward(bv, func, models, source="param:0")
     assert _leaves(result, COARSE) == [], result["leaves"]
     assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+# --------------------------------------------------------------------------
+# V3-02: a code reference no lifted instruction names is no reader
+# --------------------------------------------------------------------------
+
+def test_a_reference_the_lifted_body_never_names_is_not_a_reader(models):
+    # On ARM a PC-relative base (`add r3, pc`) lands inside the tainted
+    # static while the load it feeds reads another object; BN records the
+    # base as a code reference and the MLIL folds it away. That reference
+    # was cited as an `unclassified` read at offset 0 of the static.
+    func, bv = _fill_program(other_reader=False)
+    flag = FExpr("MLIL_LOAD_SSA", f"[{hex(G_OTHER)}].d", src=_gptr(G_OTHER))
+    v1 = FSSA(FVar("v"), 1)
+    pic_user = GFunc("log_flagged", 0x401200, FSSAFunc([
+        FInstr(0, 0x401212, "MLIL_SET_VAR_SSA", f"v#1 = [{hex(G_OTHER)}].d",
+               writes=[v1], src=flag),
+        FInstr(1, 0x401216, "MLIL_RET", "return v#1", reads=[v1], src=[_var(v1)]),
+    ]), params=[])
+    bv._names[0x401200] = "log_flagged"
+    bv._funcs[0x401200] = pic_user
+    bv._refs[G_DIR].append(FRef(pic_user, 0x401210))
+    result = _forward(bv, func, models, source="param:0")
+    assert _leaves(result, COARSE) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True

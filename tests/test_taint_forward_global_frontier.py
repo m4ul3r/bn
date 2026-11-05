@@ -2398,8 +2398,11 @@ def test_a_recursive_alias_chain_is_classified_without_unwinding(models):
     consumer.callees = [helper]
     func, bv = _chain_program([helper], consumer, helper)
     [leaf] = _leaves(_forward(bv, func, models))
+    # The helper's only tie to the object is the code reference the view
+    # records; its lifted body names no byte of it (the pointer arrives as a
+    # parameter), so it is no reference row -- the reader is (V3-02).
     assert [r["display_name"] for r in leaf["references"]] == [
-        "recursive_alias", "recursive_reader"], leaf
+        "recursive_reader"], leaf
 
 
 def test_a_recursion_unwind_keeps_what_was_already_found(models, monkeypatch):
