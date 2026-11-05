@@ -49,7 +49,7 @@ What the fixture keeps is the isolation that mattered: `shared_bn.load(binary)` 
 
 Keep spawning a private session when the spawn IS the subject: `session start/stop/restart`, multi-instance selection, and anything proving a BNDB survives a reload. Under `-n` each worker gets its own bridge.
 
-An expensive binary is analysed once and reloaded from its saved database: `_build_and_prime_aarch64_probe` cross-builds the `-static` AArch64 probe, loads it (~20s of analysis), saves the `.bndb` and closes it; each test then loads a copy in under a second, because the bridge prefers an adjacent `<binary>.bndb` (#717) and `SharedBridge.load` copies that sidecar along with the binary.
+An expensive binary is analysed once and reloaded from its saved database: `_build_and_prime_aarch64_probe` cross-builds the `-static` AArch64 probe, loads it (~20s of analysis), saves the `.bndb` and closes it; each test then loads a copy in under a second, because the bridge prefers an adjacent `<binary>.bndb` (#717) and `SharedBridge.load` copies that sidecar along with the binary. `SharedBridge.load(quick=True)` is the exception: a database is a full analysis, so a quick load copies no sidecar and passes `--no-bndb`, and the view it returns really is `analysis_state: quick`.
 
 ## Architecture
 

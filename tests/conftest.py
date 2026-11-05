@@ -398,18 +398,24 @@ class SharedBridge:
         assert res.returncode == 0, f"bn {' '.join(args)} failed: {res.stderr}\n{res.stdout}"
         return json.loads(res.stdout)
 
-    def load(self, binary: Path | str, *, copy: bool = True,
+    def load(self, binary: Path | str, *, copy: bool = True, quick: bool = False,
              timeout: float = SHARED_LOAD_TIMEOUT) -> str:
         """Load *binary* into the shared bridge; returns its path selector.
 
         Copied into the test's own scratch directory by default, so a test that
         mutates or saves cannot reach the shared fixture binary or another
         test's view. `copy=False` is for a binary the test already built into
-        its own `tmp_path`.
+        its own `tmp_path`. `quick=True` loads the raw bytes without analysis
+        (`bn load --quick --no-bndb`), the view a quick-tolerant read must
+        disclose as partial.
 
-        An adjacent `<binary>.bndb` travels with the copy: the bridge loads a
-        saved database in preference to the binary (#717), so leaving it behind
-        would silently turn a primed sub-second load back into a full analysis.
+        Otherwise an adjacent `<binary>.bndb` travels with the copy: the bridge
+        loads a saved database in preference to the binary (#717), so leaving
+        it behind would silently turn a primed sub-second load back into a full
+        analysis. A quick load is the opposite case -- a database IS a full
+        analysis, so the preference would silently hand a quick-view test a
+        full view -- which is why it neither copies the sidecar nor lets the
+        bridge open one beside `copy=False`'s binary.
         """
         source = Path(binary)
         if copy:
@@ -417,11 +423,12 @@ class SharedBridge:
             path = self._scratch / source.name
             shutil.copy2(source, path)
             sidecar = source.with_name(source.name + ".bndb")
-            if sidecar.exists():
+            if sidecar.exists() and not quick:
                 shutil.copy2(sidecar, path.with_name(path.name + ".bndb"))
         else:
             path = source.resolve()
-        res = self.run("load", str(path), "--format", "json", timeout=timeout)
+        res = self.run("load", str(path), *(["--quick", "--no-bndb"] if quick else []),
+                       "--format", "json", timeout=timeout)
         assert res.returncode == 0, f"load {path} failed: {res.stderr}\n{res.stdout}"
         # `path` is what the bridge actually opened -- the `.bndb` when the
         # sidecar won -- and it is the ONLY spelling `target list` and `close`

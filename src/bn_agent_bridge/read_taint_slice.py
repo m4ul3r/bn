@@ -1079,8 +1079,14 @@ def _build_backward_trace(
     _call_depth: int = 0,
     base_depth: int = 0,
     seed_addr: int | None = None,
-) -> list[dict[str, Any]]:
-    """Recursively walk SSA use-def chains backward, optionally crossing call boundaries."""
+) -> tuple[list[dict[str, Any]], bool]:
+    """Recursively walk SSA use-def chains backward, optionally crossing call
+    boundaries. Returns ``(trace, pending)``: *pending* is whether work the
+    walk would still have done was left when the step budget ran out -- an
+    unvisited worklist entry here, or pending work in a callee sub-walk this
+    walk spent its remaining budget on (BN6-C011). A trace that is exactly
+    ``max_depth`` steps long with nothing left is complete, and an entry for
+    a variable already walked is no unfinished work."""
     trace: list[dict[str, Any]] = []
     # #416/#672: locals whose address is passed into a call, computed once
     # per function (not per terminus). Used in both intra and interprocedural
@@ -1094,6 +1100,7 @@ def _build_backward_trace(
     # the #416 out-param lookup can require the address-taking call to precede it.
     worklist: list[tuple[Any, int, int | None]] = [(v, 0, seed_addr) for v in initial_vars]
     visited: set[Any] = set()
+    callee_pending = False
 
     while worklist and len(trace) < max_depth:
         ssa_var, node_depth, ref_addr = worklist.pop(0)
@@ -1192,7 +1199,7 @@ def _build_backward_trace(
                                 entry["terminates"] = False
                                 entry["reason"] = "cross_function"
                                 trace.append(entry)
-                                callee_trace = _build_backward_trace(
+                                callee_trace, sub_pending = _build_backward_trace(
                                     ctx, bv, callee_mlil.ssa_form, callee_ret_vars,
                                     max_depth - len(trace),
                                     interprocedural=True,
@@ -1213,6 +1220,7 @@ def _build_backward_trace(
                                     ct.setdefault("function_context_display_name",
                                                   il_format._display_name(callee))
                                 trace.extend(callee_trace)
+                                callee_pending = callee_pending or sub_pending
                                 continue
             entry["terminates"] = True
             entry["reason"] = "call_or_jump_boundary"
@@ -1321,7 +1329,10 @@ def _build_backward_trace(
             if rv not in visited:
                 worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
 
-    return trace
+    pending = callee_pending or any(
+        not isinstance(ssa_var, SSAVariable) or ssa_var not in visited
+        for ssa_var, _depth, _ref in worklist)
+    return trace, pending
 
 
 # Compact per-example fields carried into a frontier roll-up (#552). Kept to the
@@ -1858,7 +1869,7 @@ def _backward_slice(
                 f"immediate with no SSA definition to trace back."
             )
 
-    trace = _build_backward_trace(
+    trace, truncated = _build_backward_trace(
         ctx, bv, ssa_func, initial_vars, max_depth,
         interprocedural=interprocedural,
         ip_depth=ip_depth,
@@ -1881,7 +1892,9 @@ def _backward_slice(
         hints.append(_address_of_local_hint(arg_index, local_name, arg_label, func,
                                            mangled=mangled))
 
-    truncated = len(trace) >= max_depth
+    # BN6-C011: truncated is what the walk OBSERVED -- work left when the step
+    # budget ran out -- never inferred from the trace's length. A walk that
+    # drained in exactly `max_depth` steps is complete.
     return {
         "function": func.name,
         # #1001 item 4: text names the function and callee as `decompile` does;
@@ -1915,6 +1928,12 @@ def _backward_slice(
         "assumptions": _trace_assumptions(trace, truncated=truncated, max_depth=max_depth,
                                          mangled=mangled),
         "hints": hints,
+        # BN6-C010: the trace reads one function's IL, which a quick-loaded
+        # view still lifts, so it answers there -- with the SAME
+        # {analysis_state, partial} disclosure every quick-tolerant read
+        # attaches. Without it a trace on a quick view (call targets and
+        # callee bodies not analysed) was indistinguishable from a full one.
+        **_analysis_state_fields(bv),
     }
 
 
