@@ -49,6 +49,7 @@ from ._shared import (
     _log_internal_error,
     _normalize_prototype,
     _parse_address,
+    _refuse_negative_address,
     _request_cancel_context,
     _request_cancelled,
     _residue_error_disclosure,
@@ -5921,13 +5922,18 @@ def _bind_cfg(bridge, params, target):
 
 def _address_window(aw) -> tuple[int, int] | None:
     """``"A:B"`` -> the half-open ``(A, B)`` a windowed read keeps (hex or
-    decimal), or None when no window was asked for."""
+    decimal), or None when no window was asked for. Each endpoint is an
+    address, so a negative one -- ``-16`` or ``-0x10`` -- gets the one refusal
+    every address operand gets (D3-02): ``_parse_address`` alone returned
+    ``-16`` as parsed and failed ``-0x10`` with a generic parse error."""
     if aw is None:
         return None
     parts = str(aw).split(":", 1)
     if len(parts) != 2:
         raise OperationFailure("invalid_request",
                                f"--address-window must be A:B, got {aw!r}")
+    for endpoint in parts:
+        _refuse_negative_address(endpoint)
     window = (_parse_address(parts[0]), _parse_address(parts[1]))
     if window[1] <= window[0]:
         raise OperationFailure("invalid_request",

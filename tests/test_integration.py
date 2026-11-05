@@ -7538,7 +7538,11 @@ def test_local_pages_and_orient_collections_declare_their_rows(shared_bn):
 
 
 @pytest.mark.parametrize("argv", [("read", "--", "-16", "4"), ("read", "-0x10"),
-                                  ("decompile", "--", "-16")])
+                                  ("decompile", "--", "-16"),
+                                  # D3-02: an address-window endpoint is an address too.
+                                  ("function", "cfg", "main", "--address-window=-16:16"),
+                                  ("evidence", "function", "main",
+                                   "--address-window=-0x10:0x10")])
 def test_a_negative_address_is_an_exit_2_refusal_on_a_real_view(shared_bn, argv):
     """W10: BN's own `read` raised on `-16`, which surfaced as an internal
     error; `-0x10` was searched for as a name."""

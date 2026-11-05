@@ -2643,3 +2643,24 @@ def test_a_negative_address_is_refused_naming_the_accepted_forms(monkeypatch, op
     operand = params.get("address", params.get("identifier"))
     assert response["error"].startswith(f"{operand!r} is a negative address")
     assert "internal error" not in response["error"]
+
+
+@pytest.mark.parametrize("op", ["cfg", "function_evidence"])
+@pytest.mark.parametrize("window, negative", [
+    ("-16:16", "-16"), ("-0x10:0x10", "-0x10"), ("0x10:-16", "-16"),
+])
+def test_a_negative_address_window_endpoint_is_the_same_refusal(monkeypatch, op, window,
+                                                               negative):
+    """D3-02: `--address-window=-16:16` was accepted as (-16, 16) and
+    `-0x10:0x10` failed as a generic parse error, while every other address
+    operand gets the negative-address refusal."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x1000, "main")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    response = instance.dispatch({"op": op, "target": "active", "id": "d3-02", "params": {
+        "identifier": "main", "address_window": window}})
+
+    assert response["ok"] is False
+    assert response["error"].startswith(f"{negative!r} is a negative address")
