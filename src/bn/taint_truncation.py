@@ -84,6 +84,10 @@ TRUNCATION_CAUSES: dict[str, TruncationCause] = {
     "parameter_scan_budget": TruncationCause(
         "write-only-parameter scan ran out of hops",
         INTERNAL_BUDGET),
+    "recurrence_search_budget": TruncationCause(
+        "search for whether a loop carries a literal back to its phi ran out; "
+        "the literal is reported as a recurrence_initializer it could not rule out",
+        INTERNAL_BUDGET),
 }
 
 

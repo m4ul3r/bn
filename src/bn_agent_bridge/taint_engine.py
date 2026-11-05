@@ -343,6 +343,19 @@ class _Use(NamedTuple):
     forward: bool = False
 
 
+class _Recurrence(NamedTuple):
+    """A phi that carries a value round a loop (:meth:`TaintEngine._phi_recurrence`).
+
+    ``increments``: what one trip adds, or None when not a constant
+    addition or unknown; ``calls``: the calls an update passes the value
+    through (`k = f(k)`); ``exhausted``: the search ran out of budget, so a
+    cycle is not ruled out rather than proven."""
+
+    increments: list[int] | None
+    calls: tuple[str, ...]
+    exhausted: bool
+
+
 class _SettleFrame:
     """One access on :meth:`TaintEngine._settle_access`'s stack: its
     suspended steps, which (function, global) it answers, the lowest
@@ -4543,6 +4556,100 @@ class TaintEngine:
             if bstore is not None and getattr(p, "storage", None) == bstore and str(getattr(p, "name", p)) == bname:
                 return i
         return None
+
+    # SSA variables a recurrence search expands from one phi before it stops
+    # looking; a loop body's update chain is short. Running out is disclosed
+    # (`recurrence_search_budget`), never read as "no cycle".
+    _RECURRENCE_NODES = 64
+
+    def _phi_recurrence(self, ssaf: Any, phi_ins: Any) -> _Recurrence | None:
+        """Whether the phi *phi_ins* the slice walks through carries a value
+        round a loop: some arm reaches the phi's own variable back through
+        the loop body's definitions (`k#2 = phi(k#1, k#4)`, `k#4 = phi(k#2,
+        k#3)`, `k#3 = k#2 + 1`), so a literal arm is where the value STARTS,
+        not what it is (IC08) -- how many trips the loop makes is its
+        CONTROL, which a value slice does not follow.
+
+        ``increments`` are the distinct amounts one trip adds (`[0, 1]` for
+        a conditional `k++`), or None when an update is not a constant
+        addition (`k = k * 2`, `k += n`, `k = f(k)` -- ``calls`` names such
+        a call) or the search ran out. None when no arm cycles back -- a phi
+        of literals is a plain choice -- or when every trip adds exactly 0 (a
+        value the loop only carries IS the literal).
+
+        The search expands each SSA variable once: its state is the
+        variable, so an inner loop's trips do not multiply it. A variable
+        reached again with another accumulated delta makes the increments
+        inexact. When the budget runs out with definitions left unexpanded,
+        the answer is ``exhausted`` -- a recurrence is not ruled out, and the
+        caller treats it as one."""
+        phi = getattr(phi_ins, "dest", None)
+        if phi is None:
+            return None
+        target = (var_key(phi), getattr(phi, "version", None))
+        increments: set[int] = set()
+        calls: list[str] = []
+        cyclic = False
+        exact = True
+        delta_of: dict[tuple, int | None] = {}
+        stack: list[tuple[Any, int | None]] = [
+            (s, 0) for s in (getattr(phi_ins, "src", None) or ())]
+        budget = self._RECURRENCE_NODES
+        while stack:
+            cur, delta = stack.pop()
+            key = (var_key(cur), getattr(cur, "version", None))
+            if key == target:
+                cyclic = True
+                if delta is None:
+                    exact = False
+                else:
+                    increments.add(delta)
+                continue
+            if key in delta_of:
+                if delta_of[key] != delta:
+                    exact = False
+                continue
+            if budget <= 0:
+                return _Recurrence(None, tuple(calls), True)
+            budget -= 1
+            delta_of[key] = delta
+            try:
+                d = ssaf.get_ssa_var_definition(cur)
+            except Exception:
+                d = None
+            if d is None:
+                continue
+            opn = op_name(d)
+            if opn == "MLIL_VAR_PHI":
+                stack.extend((s, delta) for s in (getattr(d, "src", None) or ()))
+                continue
+            if self._is_call(d):
+                name = self._callee_name(const_target(getattr(d, "dest", None)))
+                reads = ssa_reads(d)
+                if reads and name and name not in calls:
+                    calls.append(name)
+                stack.extend((r, None) for r in reads)
+                continue
+            src = getattr(d, "src", None) if opn == "MLIL_SET_VAR_SSA" else None
+            sop = op_name(src)
+            left, right = getattr(src, "left", None), getattr(src, "right", None)
+            step = None
+            if sop in ("MLIL_ADD", "MLIL_SUB") and is_ssa_var(self._as_single_ssa_var(left)) \
+                    and self._int_const(right) is not None:
+                step = int(self._int_const(right)) * (1 if sop == "MLIL_ADD" else -1)
+                nxt = self._as_single_ssa_var(left)
+            elif sop == "MLIL_ADD" and is_ssa_var(self._as_single_ssa_var(right)) \
+                    and self._int_const(left) is not None:
+                step, nxt = int(self._int_const(left)), self._as_single_ssa_var(right)
+            elif sop in _COPY_OPS and self._as_single_ssa_var(src) is not None:
+                step, nxt = 0, self._as_single_ssa_var(src)
+            if step is not None:
+                stack.append((nxt, None if delta is None else delta + step))
+            else:
+                stack.extend((r, None) for r in ssa_reads(d))
+        if not cyclic or (exact and increments == {0}):
+            return None
+        return _Recurrence(sorted(increments) if exact else None, tuple(calls), False)
 
     @staticmethod
     def _whole_field_prev(defn: Any) -> tuple | None:
@@ -16662,6 +16769,9 @@ class TaintEngine:
                 # with no leaf.
                 unresolved_origins=sum(
                     1 for sl in slices for o in sl["origins"] if o.get("kind") == "unresolved"),
+                recurrence_origins=sum(
+                    1 for sl in slices for o in sl["origins"]
+                    if o.get("kind") == "recurrence_initializer"),
                 truncated=self._bw_truncated,
                 truncation_cause=sorted(self._bw_truncation_causes)),
             # #812: configured knobs, echoed as forward does. `max_iters` is
@@ -16861,6 +16971,13 @@ class TaintEngine:
         # its own whatever else represents the slice, so a formal beside it
         # -- or how many callers answer that formal -- never trades it away.
         returned: list[dict[str, Any]] = []
+        # Every loop recurrence the walk went through, as its initializer's
+        # origin (IC08): a root of its own whatever outranks it -- a reset
+        # call on another back edge must not trade the loop away -- and keyed
+        # by the literal arm, so that arm, reached from the phi, is not also
+        # a runtime `constant`.
+        recurrences: list[dict[str, Any]] = []
+        recurrent_arms: set[tuple] = set()
         # The (function, formal) demands each back edge closed on, for the
         # whole ascent from one sink seed: `_continue_into_callers` reads
         # which demand a cycle answered (its own, or one further up). And
@@ -16879,12 +16996,14 @@ class TaintEngine:
         # own frontier, which names the object the sink read, is.
         may_writers = 0
 
-        def _set_origin(o, *, weak: int | bool = 0):
+        def _set_origin(o, *, weak: int | bool = 0, keep: bool = False):
             """Record origin *o* ranked by *weak* (rank 0 best): a formal is
             kept for the ascent, anything else is a producer; a call's return
             at rank 1 is a root of its own; the best-ranked origin represents
             the slice. Inside a may-alias store's value only a formal counts
-            (it still ascends); anything else there is evidence."""
+            (it still ascends); anything else there is evidence. *keep*: the
+            origin keeps a slice of its own whatever outranks it (a loop
+            recurrence, IC08)."""
             nonlocal origin, origin_rank
             if weak is True:
                 rank = 3
@@ -16904,6 +17023,8 @@ class TaintEngine:
             if origin["kind"] == "unresolved" or origin_rank > rank:
                 origin = o
                 origin_rank = rank
+            if keep and o not in recurrences:
+                recurrences.append(o)
 
         def _set_source_origin(o):
             """A modeled source's return IS the value: it represents the slice
@@ -16921,6 +17042,38 @@ class TaintEngine:
             if o not in returned:
                 returned.append(o)
             origin, origin_rank = o, 0
+
+        def _note_recurrence(phi_ins):
+            """Record the phi *phi_ins* the walk is going through as a loop
+            recurrence when it is one (``_phi_recurrence``): each literal arm
+            is a ``recurrence_initializer`` origin. A search that ran out is
+            a recurrence it could not rule out, disclosed as a cut."""
+            if may_writers:
+                return
+            rec = self._phi_recurrence(ssaf, phi_ins)
+            if rec is None:
+                return
+            if rec.exhausted:
+                self._bw_truncated = True
+                self._bw_truncation_causes.add("recurrence_search_budget")
+            phi_var = getattr(phi_ins, "dest", None)
+            for arm in getattr(phi_ins, "src", None) or ():
+                try:
+                    adef = ssaf.get_ssa_var_definition(arm)
+                except Exception:
+                    adef = None
+                if adef is None or op_name(adef) != "MLIL_SET_VAR_SSA" or ssa_reads(adef):
+                    continue
+                value = self._int_const(getattr(adef, "src", None))
+                if value is None:
+                    continue
+                recurrent_arms.add((var_key(arm), getattr(arm, "version", None)))
+                _set_origin({"kind": "recurrence_initializer", "value": value,
+                             "var": var_label(arm), "phi": var_label(phi_var),
+                             "increments": rec.increments,
+                             **({"calls": list(rec.calls)} if rec.calls else {}),
+                             **({"search_exhausted": True} if rec.exhausted else {})},
+                            weak=True, keep=True)
 
         # (buffer key, memory version) pairs already walked, so two buffers that
         # copy into each other inside a loop cannot recurse without end.
@@ -17766,12 +17919,19 @@ class TaintEngine:
             # immediate is already handled at seeding time. Weak: reached as one
             # input of a local buffer's writer (`rsi = " -c 1"; strcat(cmd, rsi)`)
             # it must not outrank the parameter an older writer copied in.
+            if op_name(defn) == "MLIL_VAR_PHI":
+                _note_recurrence(defn)
             if not reads:
                 src0 = getattr(defn, "src", None)
                 cval = self._int_const(src0)
                 if cval is not None:
-                    _set_origin({"kind": "constant", "value": cval, "var": var_label(v)},
-                                weak=True)
+                    # A literal arm of a loop recurrence the walk came through
+                    # is only where the value STARTS (`k = 0; for (..) if (..)
+                    # k++`): that phi recorded it as a `recurrence_initializer`,
+                    # never a runtime constant (IC08).
+                    if (var_key(v), getattr(v, "version", None)) not in recurrent_arms:
+                        _set_origin({"kind": "constant", "value": cval, "var": var_label(v)},
+                                    weak=True)
                 elif anchor is not None and op_name(src0) in ("MLIL_IMPORT", "MLIL_EXTERN_PTR"):
                     # A consumer reads through an address BN resolved through
                     # the GOT or an extern (a preemptible global in a shared
@@ -18170,9 +18330,12 @@ class TaintEngine:
         # Each independent producer keeps its own slice, the representative
         # aside (already one): on a back edge every producer the walk reached
         # (the cycle answers nothing else), elsewhere every call RETURN the
-        # value combines -- so neither a formal beside it nor the callers
-        # that answer that formal (one entry or several) trade it away.
-        extra = producers if back_edge else returned
+        # value combines and every loop recurrence it went through (IC08) --
+        # so neither a formal beside it, the callers that answer that formal
+        # (one entry or several), nor a stronger origin on another arm trades
+        # it away.
+        extra = list(producers if back_edge else returned)
+        extra += [o for o in recurrences if o not in extra]
         out += [{"steps": base_steps, "origin": o, "crossed": []}
                 for o in extra if o is not origin and o["kind"] != "unresolved"]
         if cuts:
