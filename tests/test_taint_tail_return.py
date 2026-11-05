@@ -262,9 +262,13 @@ def test_a_thunk_is_recognised_before_anything_else_lifted_it():
     lifted answered False for a stub that IS one, so the first request
     descended into it and every later one did not -- two identical
     requests, two different results."""
+    # A pure veneer hands its one formal on unchanged (R2-05).
+    p = FVar("p")
+    p0 = FSSA(p, 0)
     stub = _LateThunk(FFunc("__wmemcpy", 0x2000, FSSAFunc([
-        FInstr(0, 0x2004, "MLIL_TAILCALL_SSA", "tailcall memcpy", reads=[],
-               params=[], dest=_const(0x3000))]), params=[FVar("p")]))
+        FInstr(0, 0x2004, "MLIL_TAILCALL_SSA", "tailcall memcpy(p#0)", reads=[p0],
+               params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0], src=p0)],
+               dest=_const(0x3000))]), params=[p]))
     memcpy = FFunc("memcpy", 0x3000, FSSAFunc([]), symbol_type="ImportedFunctionSymbol")
     engine = te.TaintEngine(FBV({0x2000: "__wmemcpy", 0x3000: "memcpy"},
                                 {0x2000: stub, 0x3000: memcpy}), te.load_models())

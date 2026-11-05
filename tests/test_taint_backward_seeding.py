@@ -284,8 +284,10 @@ def test_a_call_whose_return_derives_from_an_argument_is_one_step():
         at = [(st["address"], st["il_index"]) for st in sl["slice"]]
         assert len(at) == len(set(at)), sl["slice"]
         assert sl["metrics"]["steps"] == len(at)
-    calls = [st for sl in result["slices"] for st in sl["slice"] if st["address"] == "0x804"]
-    assert calls and all(st["reason"] == "return of strchr derives from its argument 0" for st in calls)
+    # The call is one step of every slice through it, whatever its wording.
+    assert result["slices"]
+    for sl in result["slices"]:
+        assert [st["address"] for st in sl["slice"]].count("0x804") == 1, sl["slice"]
 
 
 def test_caller_frontier_text_preserves_each_functions_coverage():

@@ -2089,8 +2089,9 @@ def test_a_timed_out_taint_request_is_cancelled_and_releases_the_bridge(
         tmp_path, shared_bn, monkeypatch):
     """P1-07: a client that times out sends `cancel_request`; the walk polls it
     at its next function visit, stops with a `cancelled` outcome the client
-    reports as honoured, and the bridge is free for the next request instead
-    of computing for minutes."""
+    reports in its error envelope (`status: "cancelled"`, the bridge's
+    `observed`), and the bridge is free for the next request instead of
+    computing for minutes."""
     count = 2000          # one descended helper each: seconds of walking
     lines = ["#include <string.h>"]
     lines += [f"__attribute__((noinline)) int h{i}(const char *s) "
@@ -2110,8 +2111,13 @@ def test_a_timed_out_taint_request_is_cancelled_and_releases_the_bridge(
                               "--source", "param:1", "--format", "json", timeout=120.0)
     monkeypatch.delenv("BN_REQUEST_TIMEOUT")
     assert timed_out.returncode == 2, (timed_out.stdout, timed_out.stderr)
-    assert "honoured" in timed_out.stdout + timed_out.stderr, (timed_out.stdout,
-                                                               timed_out.stderr)
+    envelope = json.loads(timed_out.stdout)
+    assert envelope["ok"] is False and envelope["status"] == "cancelled", envelope
+    observed = envelope["observed"]
+    assert (observed["timed_out"], observed["cancel_sent"], observed["polls_cancel"],
+            observed["cancel_outcome"], observed["cancelled"]) == (
+        True, True, True, "cancelled", True), observed
+    assert observed["functions_visited"] >= 1, observed
     listed = shared_bn.run("target", "list", "--format", "json", timeout=5.0)
     assert listed.returncode == 0, listed.stderr
 
@@ -7630,8 +7636,7 @@ extern void *memcpy(void *, const void *, unsigned long);
 __attribute__((noinline)) char *take_reply(int sock) {
     char scratch[2048];
     int got = recv(sock, scratch, sizeof(scratch), 0);
-    if (got == -1)
-        return 0;
+    GUARD
     char *copy = calloc(1, got);
     if (!copy)
         return 0;
@@ -7642,24 +7647,41 @@ int main(void) { char *p = take_reply(0); return p ? p[0] : 0; }
 """
 
 
-@pytest.mark.parametrize("arch", ["a64", "x64"])
-def test_a_fill_return_copied_back_out_of_its_own_buffer_is_not_an_overread(
-        tmp_path, shared_bn, arch):
-    """W01-10: `got = recv(s, scratch, sizeof scratch, 0)` then
-    `memcpy(calloc(1, got), scratch, got)` reads back only the bytes recv
-    wrote into `scratch`: the destination-bounded copy stays bounded_len and
-    names the fill, instead of an overread_len of `scratch`."""
-    binary = _build_arch(tmp_path, arch, "fill_copy", _FILL_COPY_SOURCE)
+def _fill_copy_sink(tmp_path, shared_bn, arch, guard):
+    source = _FILL_COPY_SOURCE.replace("GUARD", guard)
+    binary = _build_arch(tmp_path, arch, "fill_copy", source)
     target = shared_bn.load(binary, copy=False)
     result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "take_reply",
                       "--source", "call:recv")
-
     copies = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
     assert len(copies) == 1, result["reached_sinks"]
-    sink = copies[0]
+    return copies[0]
+
+
+@pytest.mark.parametrize("arch", ["a64", "x64"])
+def test_a_fill_return_copied_back_out_of_its_own_buffer_is_not_an_overread(
+        tmp_path, shared_bn, arch):
+    """W01-10: `got = recv(s, scratch, sizeof scratch, 0); if (got <= 0)
+    return 0;` then `memcpy(calloc(1, got), scratch, got)` reads back only the
+    bytes recv wrote into `scratch`: the destination-bounded copy stays
+    bounded_len and names the fill, instead of an overread_len of `scratch`."""
+    sink = _fill_copy_sink(tmp_path, shared_bn, arch, "if (got <= 0) return 0;")
     assert sink["class"] == "bounded_len", sink
     assert sink["src_fill"]["callee"] == "recv", sink
     assert int(sink["src_fill"]["at"], 16) < int(sink["address"], 16), sink
+
+
+@pytest.mark.parametrize("arch", ["a64", "x64"])
+@pytest.mark.parametrize("guard", ["", "if (got == -1) return 0;"],
+                         ids=["unchecked", "minus-one-only"])
+def test_an_unchecked_fill_return_copied_back_out_of_its_buffer_overreads_it(
+        tmp_path, shared_bn, arch, guard):
+    """R3-01: without a check BN narrows to a non-negative range, recv's -1
+    reaches the copy as SIZE_MAX, so `scratch` is over-read: no `src_fill`."""
+    sink = _fill_copy_sink(tmp_path, shared_bn, arch, guard)
+    assert sink["class"] == "overread_len", sink
+    assert "src_fill" not in sink, sink
+    assert sink["src_capacity_source"], sink
 
 
 _ARGV_COPY_SOURCE = """

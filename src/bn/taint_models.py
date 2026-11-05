@@ -1005,29 +1005,63 @@ def model_arg_index(value: Any) -> int | None:
 # import with a too-narrow prototype dropped the arg from the MLIL call.
 # --------------------------------------------------------------------------
 
+# Every place a model names an argument position, as `_validate_model_arguments`
+# accepts it: `(level, key)` for one index, `(level, key)` lists of indices, and
+# rule lists / token lists whose `arg:N` / `*arg:N` operands name one. `level`
+# None is the model itself.
+_ARG_INDEX_FIELDS = (
+    ("sink", "len_arg"), ("sink", "buf_arg"), ("sink", "format_arg"),
+    ("sink", "first_dest"), ("sink", "dest_size_arg"), ("varargs", "first_index"),
+    ("continuation", "null_arg"), ("return_bound", "max_from_arg"),
+    ("append", "dest"), ("append", "src"), ("ret_offset", "count_arg"),
+    ("ret_offset", "count_arg_limit"), ("ret_offset", "scan_arg"),
+    ("ret_offset", "stop_arg"), ("ret_offset", "string_length_arg"))
+_ARG_INDEX_LIST_FIELDS = (("sink", "tainted_args"), ("sink", "pointer_args"),
+                          (None, "string_args"))
+_ARG_RULE_FIELDS = (("propagates", ("from", "to")), ("sources", ("to",)))
+_ARG_TOKEN_FIELDS = (("varargs", "to"),)
+_ARG_TOKEN_LIST_FIELDS = ("writes", "reads_dest")
+
+
 def model_arg_indices(models: dict[str, Any], callee: str) -> set[int]:
-    """Argument indices a MODELED sink provably references -- the union of its
-    ``propagates`` ``*arg:N`` operands, its ``sink.tainted_args``, and its
-    ``varargs.first_index``. Empty for an unmodeled callee. Gates the register
-    fallback so it only ever recovers an argument the model proves is actually
-    passed (never fabricates one beyond the sink's real arity)."""
+    """Argument indices a MODELED callee provably takes -- every position its
+    model declares a role for (``_ARG_*_FIELDS``: a copy's operands, a length,
+    a fortified ``dest_size_arg``, a format, a fill's count, ...). Empty for an
+    unmodeled callee. Gates the register fallback so it only ever recovers an
+    argument the model proves is actually passed (never fabricates one beyond
+    the callee's real arity) -- and recovers every one it does: a role left
+    out here is refused as out of range whenever BN under-recovers the call
+    (R3-03: `arg:__strcpy_chk:2`, the guard)."""
     _, model = lookup_model(models, callee)
     if not model:
         return set()
+
+    def part(level: str | None) -> dict[str, Any]:
+        value = model if level is None else model.get(level)
+        return value if isinstance(value, dict) else {}
+
     idxs: set[int] = set()
-    for spec in (model.get("propagates") or []):
-        if not isinstance(spec, dict):
-            continue
-        for key in ("from", "to"):
-            tok = _try_arg_index(spec.get(key))
-            if tok is not None:
-                idxs.add(tok)
-    sink = model.get("sink") or {}
-    for a in (sink.get("tainted_args") or []):
-        if model_arg_index(a) is not None:
-            idxs.add(a)
-    first = model_arg_index((model.get("varargs") or {}).get("first_index"))
-    if first is not None:
-        idxs.add(first)
+    for level, key in _ARG_INDEX_FIELDS:
+        idx = model_arg_index(part(level).get(key))
+        if idx is not None:
+            idxs.add(idx)
+    for level, key in _ARG_INDEX_LIST_FIELDS:
+        values = part(level).get(key)
+        idxs.update(i for i in (values if isinstance(values, list) else [])
+                    if model_arg_index(i) is not None)
+    tokens = [part(level).get(key) for level, key in _ARG_TOKEN_FIELDS]
+    for field, keys in _ARG_RULE_FIELDS:
+        rules = model.get(field)
+        tokens += [r.get(k) for r in (rules if isinstance(rules, list) else [])
+                   if isinstance(r, dict) for k in keys]
+    for field in _ARG_TOKEN_LIST_FIELDS:
+        values = model.get(field)
+        tokens += values if isinstance(values, list) else []
+    # Every token form the grammar validates names a position: `arg:N`,
+    # `*arg:N`, and a source's `*iovec:N` (the iovec array `recvmsg`-family
+    # models fill, D5a-02).
+    parsed = (parse_model_token(token) for token in tokens)
+    idxs.update(n for kind, n in (p for p in parsed if p is not None)
+                if kind in ("arg", "*arg", "*iovec"))
     return idxs
 

@@ -89,3 +89,32 @@ def build_id_for_package(directory: Path) -> str | None:
         digest.update(data)
         digest.update(b"\0")
     return digest.hexdigest()[:12]
+
+
+def build_id_for_tree(directory: Path) -> str | None:
+    """Fingerprint of a package INCLUDING its subpackages: every ``*.py`` and
+    ``*.json`` under *directory* (``__pycache__`` excluded), hashed by relative
+    path and bytes in sorted order. The CLI package keeps its handlers in
+    ``commands/``, which :func:`build_id_for_package`'s top-level glob would
+    miss. None if the tree can't be read or holds no such file."""
+    try:
+        files = sorted(
+            (path for pattern in ("*.py", "*.json") for path in directory.rglob(pattern)
+             if "__pycache__" not in path.parts),
+            key=lambda p: p.relative_to(directory).as_posix(),
+        )
+    except OSError:
+        return None
+    if not files:
+        return None
+    digest = hashlib.sha256()
+    for path in files:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        digest.update(path.relative_to(directory).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+    return digest.hexdigest()[:12]

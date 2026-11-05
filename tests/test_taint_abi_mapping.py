@@ -300,10 +300,11 @@ def test_an_entry_value_that_is_not_a_register_keeps_its_entry_origin():
 _FRAME_REGS = ["r0", "r1", "r2", "r3", "r11", "sp", "lr"]
 
 
-def _entry_value_slice(reg):
+def _entry_value_slice(reg, convention=None):
     """`loop: x = phi(<reg>#0, x#1)`; `malloc(x)` in a function whose
-    convention passes arguments in r0-r3 -- the shape of a loop phi BN builds
-    over a register a `push {..., r11, lr}` prologue saved."""
+    convention passes arguments in r0-r3 (or *convention*) -- the shape of a
+    loop phi BN builds over a register a `push {..., r11, lr}` prologue
+    saved."""
     idx = {r: i for i, r in enumerate(_FRAME_REGS)}
     v = FVar(reg, ident=90)
     v.source_type, v.storage = 1, idx[reg]
@@ -319,7 +320,8 @@ def _entry_value_slice(reg):
                dest=FExpr("MLIL_CONST_PTR", hex(malloc), constant=malloc),
                params=[FExpr("MLIL_VAR_SSA", "x#2", reads=[merged], src=merged)]),
     ]), params=[_reg_var("src", "r0", 92)])
-    func.calling_convention = types.SimpleNamespace(int_arg_regs=["r0", "r1", "r2", "r3"])
+    func.calling_convention = convention or types.SimpleNamespace(
+        int_arg_regs=["r0", "r1", "r2", "r3"])
     func.type = "void* decode(char* src)"
     bv = FBV({malloc: "malloc"})
     bv.arch = types.SimpleNamespace(
@@ -345,6 +347,25 @@ def test_an_unmapped_argument_register_entry_value_stays_a_frontier():
     [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "abi_mapping_unbound"]
     assert leaf["register"] == "r2"
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_a_stack_only_convention_passes_no_register_argument():
+    # R2-02: a recovered convention that passes every argument on the stack
+    # (i386 cdecl) names no argument register -- that is an answer, not an
+    # unreadable convention, so a callee-saved register's entry value is an
+    # `entry` origin rather than a prototype-repair frontier.
+    result = _entry_value_slice(
+        "r11", types.SimpleNamespace(int_arg_regs=[], float_arg_regs=[]))
+    assert not [lf for lf in result["leaves"] if lf["kind"] == "abi_mapping_unbound"]
+    assert "entry" in {o["kind"] for sl in result["slices"] for o in sl["origins"]}
+
+
+def test_an_unreadable_convention_keeps_the_register_a_frontier():
+    # Control: a convention object that says nothing about its argument
+    # registers is not evidence that none exist.
+    result = _entry_value_slice("r11", types.SimpleNamespace())
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "abi_mapping_unbound"]
+    assert leaf["register"] == "r11"
 
 
 # --------------------------------------------------------------------------

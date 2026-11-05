@@ -12,6 +12,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 from bn import headless
 
 # Sentinel default for the start_headless stub: NOT True/False, so a caller that
@@ -23,11 +25,14 @@ _PLUGIN_PKG_DIR = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge
 
 
 def _fake_start_headless(captured: dict):
-    def fake(binaries=None, instance_id=None, quick=False, prefer_bndb=_SENTINEL):
+    def fake(binaries=None, instance_id=None, quick=False, prefer_bndb=_SENTINEL,
+             first_view_id=_SENTINEL, numeric_view_ids=_SENTINEL):
         captured["binaries"] = binaries
         captured["instance_id"] = instance_id
         captured["quick"] = quick
         captured["prefer_bndb"] = prefer_bndb
+        captured["first_view_id"] = first_view_id
+        captured["numeric_view_ids"] = numeric_view_ids
 
     return fake
 
@@ -68,6 +73,33 @@ def test_bn_agent_no_bndb_opt_out(monkeypatch):
 
     assert rc == 0
     assert captured["prefer_bndb"] is False
+
+
+def test_bn_agent_first_view_id_seeds_the_bridge(monkeypatch):
+    # P1-02: `session restart` hands the respawned bridge its predecessor's
+    # next view id; a bridge started any other way numbers from 1.
+    captured: dict = {}
+    _install_fake_bridge(monkeypatch, captured)
+
+    assert headless.main(["foo.bin", "--first-view-id=7"]) == 0
+    assert captured["first_view_id"] == 7
+    assert headless.main(["foo.bin"]) == 0
+    assert captured["first_view_id"] == 1
+    with pytest.raises(SystemExit) as refused:
+        headless.main(["foo.bin", "--first-view-id=0"])
+    assert refused.value.code == 2
+
+
+def test_bn_agent_no_numeric_view_ids_refuses_numeric_selectors(monkeypatch):
+    # D2-02: a restart whose predecessor recorded no next view id starts the
+    # new bridge with numeric selectors off; anything else keeps them on.
+    captured: dict = {}
+    _install_fake_bridge(monkeypatch, captured)
+
+    assert headless.main(["foo.bin", "--no-numeric-view-ids"]) == 0
+    assert captured["numeric_view_ids"] is False
+    assert headless.main(["foo.bin"]) == 0
+    assert captured["numeric_view_ids"] is True
 
 
 # --- python -m bn_agent_bridge (src/bn_agent_bridge/__main__.py) ------------
