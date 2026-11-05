@@ -3,9 +3,11 @@ sink's parameter (W10-04), and the ``overread_len`` relabel gate for a length
 that is the return of the modeled fill of the copy's own source (W01-10)."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from test_taint_engine import FBV, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar, te
+from test_taint_engine import FBV, FExpr, FFunc, FInstr, FPVS, FSSA, FSSAFunc, FVar, te
 
 
 @pytest.fixture
@@ -97,13 +99,27 @@ def test_width_narrowing_renders_one_line_under_the_flow():
 # W01-10: overread_len gate for a fill's own return
 # ---------------------------------------------------------------------------
 
-def _recv_then_dup(*, count, length, src):
+def _value_range(start, end):
+    """BN's value set for a length its dominating branches confine to
+    ``start..end``: `if (n <= 0) return;` gives ``1..0x7fffffff``."""
+    pvs = FPVS("SignedRangeValue")
+    pvs.ranges = [SimpleNamespace(start=start, end=end, step=1)]
+    return pvs
+
+
+#: The copy's length after `if (n <= 0) return;` on a 32-bit return.
+GUARDED = _value_range(1, 0x7fffffff)
+
+
+def _recv_then_dup(*, count, length, src, at_copy=GUARDED):
     """``p = &buf; n = recv(fd, p, <count>, 0); m = <length>(n);
     d = malloc(m); memcpy(d, <src>, m)`` with ``char buf[0x40]``.
 
     ``length``: ``"sx"`` (``m = sx.q(n)``) or ``"add"`` (``m = n + 4``).
     ``src``: ``"same"`` (``&buf``), ``"offset"`` (``&buf + 4``) or ``"other"``
-    (``&spare``, another 64-byte local)."""
+    (``&spare``, another 64-byte local). ``at_copy``: BN's value set for the
+    copy's length operand, which carries the guards dominating the copy
+    (``GUARDED`` by default; None when nothing is stated)."""
     buf = FVar("buf", typ="char[0x40]"); spare = FVar("spare", typ="char[0x40]")
     fd0 = FSSA(FVar("fd"), 0); cap0 = FSSA(FVar("cap"), 0)
     p1 = FSSA(FVar("p"), 1); n1 = FSSA(FVar("n"), 1); m2 = FSSA(FVar("m"), 2)
@@ -132,10 +148,16 @@ def _recv_then_dup(*, count, length, src):
                dest=FExpr("MLIL_CONST_PTR", "0x3010", constant=0x3010), params=[_var(m2, 8)]),
         FInstr(4, 0x1030, "MLIL_CALL_SSA", "memcpy(d#1, src, m#2)", reads=[d1, m2],
                dest=FExpr("MLIL_CONST_PTR", "0x3020", constant=0x3020),
-               params=[_var(d1, 8), src_expr, _var(m2, 8)]),
+               params=[_var(d1, 8), src_expr, _at_copy(_var(m2, 8), at_copy)]),
     ]
     func = FFunc("pull_reply", 0x1000, FSSAFunc(instrs), params=[FVar("fd"), FVar("cap")])
     return func, FBV({0x3000: "recv", 0x3010: "malloc", 0x3020: "memcpy"})
+
+
+def _at_copy(expr, pvs):
+    if pvs is not None:
+        expr.possible_values = pvs
+    return expr
 
 
 def _memcpy_sink(models, func, bv):
@@ -147,6 +169,8 @@ def _memcpy_sink(models, func, bv):
 
 @pytest.mark.parametrize("count", ["const", "param"])
 def test_a_fill_return_copied_back_out_of_the_same_buffer_is_not_an_overread(models, count):
+    # R3-01: `if (n <= 0) return;` dominates the copy, so the length is a
+    # byte count the fill wrote, not a failure return.
     sink = _memcpy_sink(models, *_recv_then_dup(count=count, length="sx", src="same"))
     assert sink["class"] == "bounded_len"
     assert sink["catalog_class"] == "overflow_len"

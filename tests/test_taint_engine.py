@@ -7164,13 +7164,14 @@ def test_backward_does_not_recover_arg_for_unmodeled_callee(models, monkeypatch)
 # binaryninja-import-free module; read_taint_slice (which imports binaryninja at
 # module load) wires the same helpers into trace and is verified live.
 
-def test_model_arg_indices_unions_propagate_sink_and_varargs(models):
-    # The gate: a modeled sink's referenced arg indices = propagate `*arg:N`
-    # operands ∪ sink.tainted_args ∪ varargs.first_index. Empty for an unmodeled
-    # callee, so the register fallback never fabricates an arg.
+def test_model_arg_indices_is_every_declared_argument_role(models):
+    # The gate: every argument position the model declares a role for --
+    # propagate operands, sink.tainted_args, the length, the format, varargs'
+    # first index (R3-03). Empty for an unmodeled callee, so the register
+    # fallback never fabricates an arg.
     assert te.model_arg_indices(models, "memcpy") == {0, 1, 2}
     assert te.model_arg_indices(models, "strcpy") == {0, 1}
-    assert te.model_arg_indices(models, "snprintf") == {0, 2, 3}
+    assert te.model_arg_indices(models, "snprintf") == {0, 1, 2, 3}   # len_arg 1
     assert te.model_arg_indices(models, "definitely_not_a_sink") == set()
 
 
