@@ -748,15 +748,19 @@ def coalesce_global_continuations(leaves: list[dict[str, Any]]) -> list[dict[str
         had_refs = bool(rep["references"])
         _union(rep["references"], lf.get("references"),
                key=lambda r: (str(r.get("address")), str(r.get("at")), str(r.get("access"))))
-        for field in ("unfinished_scans", "unverified_overlaps"):
-            if lf.get(field):
-                merged = list(rep.get(field) or [])
-                _union(merged, lf.get(field))
-                rep[field] = merged
+        if lf.get("unfinished_scans"):
+            scans = list(rep.get("unfinished_scans") or [])
+            _union(scans, lf.get("unfinished_scans"))
+            rep["unfinished_scans"] = scans
+        # A COUNT of the merged rows, not a list to union: the same candidate
+        # seen from two calls is one row, so one overlap (R1-01).
+        rep["unverified_overlaps"] = sum(
+            1 for r in rep["references"] if r.get("access") == "overlap_unverified")
         offsets = list(rep["global"].get("written_offsets") or [])
         _union(offsets, glob.get("written_offsets"))
         if offsets:
-            rep["global"]["written_offsets"] = sorted(offsets, key=repr)
+            # Hex strings, in numeric order as each site's list is.
+            rep["global"]["written_offsets"] = sorted(offsets, key=lambda o: int(o, 16))
         if lf.get("reads_proven") and not rep.get("reads_proven"):
             rep["reads_proven"] = True
             rep["detail"] = lf.get("detail")
