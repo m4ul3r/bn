@@ -2826,26 +2826,27 @@ class TaintEngine:
             return self._addr_root_kind(ssaf, reads[0], depth + 1)
         return None
 
-    def _store_load_relation(self, ssaf: Any, store: Any, load: Any, la: tuple) -> str:
+    def _store_load_relation(self, ssaf: Any, store: Any, load: Any, la: tuple,
+                             facts: tuple) -> str:
         """How a store's bytes relate to the bytes *load* reads at the EXACT
         slot *la*: ``"cover"`` / ``"overlap"`` / ``"disjoint"`` on a shared
         base, else ``"disjoint"`` only for provably distinct objects (two
         different locals, a local and a constant address, two non-overlapping
         constant ranges) and ``"may"`` otherwise -- a store through another
         pointer or through an address that is not exactly resolved
-        (:meth:`_exact_addr`) can write the loaded bytes."""
-        dest = getattr(store, "dest", None)
-        sa = self._mem_access_slot(ssaf, store, exact=True)
+        (:meth:`_exact_addr`) can write the loaded bytes. *facts* is the
+        store's :meth:`_store_facts`."""
+        sa, sw, sk = facts
         try:
             lw = int(getattr(load, "size", None)) if getattr(load, "size", None) is not None else None
-            sw = int(getattr(store, "size", None)) if getattr(store, "size", None) is not None else None
         except (TypeError, ValueError):
+            return "may"
+        if sw == "bad":
             return "may"
         if sa is not None and sa[0] == la[0]:
             return self._store_covers_load(sa[1], sw, la[1], lw)
         if sa is None:
             return "may"
-        sk = self._addr_root_kind(ssaf, dest)
         lk = self._addr_root_kind(ssaf, getattr(load, "src", None))
         if {sk, lk} == {"local", "abs"} or (sk == lk == "local"):
             return "disjoint"
@@ -3105,12 +3106,55 @@ class TaintEngine:
           the bytes are whatever the caller left;
         * ``("cut", None)`` -- ``MEM_CHAIN_BUDGET`` ran out.
 
-        A loop back-edge to a version already walked adds nothing new."""
+        A loop back-edge to a version already walked adds nothing new.
+
+        The walk is a function of the load's memory version, exact slot,
+        width and root kind, so one request answers it once: a backward slice
+        through a decompressor follows the same loads from every def chain
+        that reaches them (V3-04)."""
+        lw = getattr(load, "size", None)
+        lk = self._addr_root_kind(ssaf, getattr(load, "src", None))
+        memo = self._per_ssaf(ssaf, "load_writers")
+        key = (getattr(load, "src_memory", None), la, lw, lk, through_calls)
+        try:
+            hit = memo.get(key)
+        except TypeError:          # an unhashable slot or version: no sharing
+            return self._walk_load_writers(ssaf, load, la, lw, lk, through_calls)
+        if hit is None:
+            hit = memo[key] = self._walk_load_writers(ssaf, load, la, lw, lk, through_calls)
+        return list(hit)
+
+    def _per_ssaf(self, ssaf: Any, name: str) -> dict:
+        """A memo dict for *ssaf* (one function's SSA form) under *name*, for
+        the engine's life. Held beside the form itself, so the key can never
+        name a collected form's reused id."""
+        caches = self.__dict__.setdefault("_ssaf_memos", {})
+        entry = caches.get(id(ssaf))
+        if entry is None or entry[0] is not ssaf:
+            entry = caches[id(ssaf)] = (ssaf, {})
+        return entry[1].setdefault(name, {})
+
+    def _store_facts(self, ssaf: Any, mv: int, defn: Any) -> tuple:
+        """``(exact slot, width, root kind)`` of the STORE defining memory
+        version *mv* -- what :meth:`_store_load_relation` needs of a store,
+        independent of the load it is compared with."""
+        memo = self._per_ssaf(ssaf, "store_facts")
+        hit = memo.get(mv)
+        if hit is None:
+            try:
+                sw = int(getattr(defn, "size", None)) if getattr(defn, "size", None) is not None \
+                    else None
+            except (TypeError, ValueError):
+                sw = "bad"
+            hit = memo[mv] = (self._mem_access_slot(ssaf, defn, exact=True), sw,
+                              self._addr_root_kind(ssaf, getattr(defn, "dest", None)))
+        return hit
+
+    def _walk_load_writers(self, ssaf: Any, load: Any, la: tuple, lw: Any, lk: Any,
+                           through_calls: bool) -> list[tuple]:
         out: list[tuple] = []
         seen: set[int] = set()
         pending = [getattr(load, "src_memory", None)]
-        lw = getattr(load, "size", None)
-        lk = self._addr_root_kind(ssaf, getattr(load, "src", None))
         while pending:
             mv = pending.pop()
             try:
@@ -3144,7 +3188,8 @@ class TaintEngine:
                 continue
             if "STORE" in op or op in _NAMED_STORE_OPS:
                 if "STORE" in op:
-                    rel = self._store_load_relation(ssaf, defn, load, la)
+                    rel = self._store_load_relation(ssaf, defn, load, la,
+                                                    facts=self._store_facts(ssaf, mv, defn))
                 else:
                     slot = self._field_store_slot(ssaf, defn)
                     if slot is not None and slot[0] == la[0]:
@@ -3235,8 +3280,9 @@ class TaintEngine:
                 break
             op = op_name(defn)
             if "STORE" in op:
-                rel = self._store_load_relation(ssaf, defn, load, la)
-                slot = self._mem_access_slot(ssaf, defn, exact=True)
+                facts = self._store_facts(ssaf, int(version), defn)
+                rel = self._store_load_relation(ssaf, defn, load, la, facts)
+                slot = facts[0]
             elif op in _NAMED_STORE_OPS:
                 slot = self._field_store_slot(ssaf, defn)
                 if slot is not None and slot[0] == la[0]:
@@ -4284,10 +4330,7 @@ class TaintEngine:
         misattributed a reused/derived slot to the parameter. Degrades to None on
         any BN-API shortfall, so it never invents a parameter."""
         try:
-            vk = var_key(v)
-            stores = [ins for ins in self._instrs(ssaf)
-                      if any(var_key(w) == vk
-                             for w in (getattr(ins, "vars_written", None) or []))]
+            stores = self._var_writers(ssaf).get(var_key(v), [])
             if len(stores) != 1:
                 return None  # 0 = no spill store; >1 = ambiguous slot (reuse/multi-def)
             src = getattr(stores[0], "src", None)
@@ -4299,6 +4342,19 @@ class TaintEngine:
             return self._param_index_of(func, reads[0])  # None unless it is a real parameter
         except Exception:
             return None
+
+    def _var_writers(self, ssaf: Any) -> dict:
+        """``{var key: [instructions writing it]}`` over *ssaf*, built once
+        per function rather than rescanned for every terminal value a slice
+        asks about."""
+        memo = self._per_ssaf(ssaf, "var_writers")
+        built = self._per_ssaf(ssaf, "var_writers_built")
+        if not built:
+            for ins in self._instrs(ssaf):
+                for w in (getattr(ins, "vars_written", None) or []):
+                    memo.setdefault(var_key(w), []).append(ins)
+            built[True] = True
+        return memo
 
     def _resolve_to_param_index(self, func: Any, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
         """Trace a pointer-arg expression back to one of *func*'s parameters
@@ -15741,6 +15797,15 @@ class TaintEngine:
         walked_at: dict[tuple, int] = {}
         load_at: dict[tuple, int] = {}
         rewalked: set = set()
+        # Whether the subtree under each walked value / followed load met a
+        # budget cut (`cut_events` counts cuts as the walk meets them). Only
+        # such a subtree can reach more from a shallower path; re-walking a
+        # cut-free one records the same steps and origins again, which on a
+        # decompressor's hundreds of loads sharing one memory chain cost 10x
+        # the walk itself (V3-04).
+        cut_under: dict[tuple, bool] = {}
+        load_cut_under: dict[tuple, bool] = {}
+        cut_events = [0]
         # Every non-formal origin the walk reached, in order. A recursive back
         # edge contributes no formal origin (the enclosing frame answers it),
         # so these producers are all it can contribute -- kept, not dropped.
@@ -16376,6 +16441,52 @@ class TaintEngine:
                 _walk_pointer_object(defn, v, d, mv, f"returned by {self._prose_name(name)}",
                                      before="it was written here")
 
+        def _settle_cut_under(table, key, before):
+            if cut_events[0] != before:
+                table[key] = True
+            else:
+                table.setdefault(key, False)
+
+        def _met_walked(table, key):
+            """A walked node reached again: its cut, if any, is also beneath
+            the path that reached it now. One still being walked (a cycle)
+            counts as cut -- what lies beneath it is not known yet."""
+            if table.get(key, True):
+                cut_events[0] += 1
+
+        # Re-walks waiting for the walk to finish: {node: (depth, thunk,
+        # may-writer nesting)}, keeping each node's shallowest depth (see
+        # `_walk_value`). The nesting is the context the re-walk was asked
+        # from, restored while it runs, so an origin found under a may-alias
+        # store keeps its rank.
+        pending_rewalks: dict[tuple, tuple] = {}
+
+        def _defer(node, d, thunk):
+            if node not in pending_rewalks or d < pending_rewalks[node][0]:
+                pending_rewalks[node] = (d, thunk, may_writers)
+
+        def _drain_rewalks():
+            nonlocal may_writers
+            while pending_rewalks:
+                node = min(pending_rewalks, key=lambda n: pending_rewalks[n][0])
+                _, thunk, nesting = pending_rewalks.pop(node)
+                outer, may_writers = may_writers, nesting
+                try:
+                    thunk()
+                finally:
+                    may_writers = outer
+
+        def _rewalk_value(v, d, mv, anchor, key):
+            if walked_at.get(key, d + 1) <= d:
+                return          # already re-walked from this depth or shallower
+            visited_vars.discard(key)
+            rewalked.add(key)
+            for lk in [lk for lk, ld in load_at.items()
+                       if ld > d and load_cut_under.get(lk, True)]:
+                visited_loads.discard(lk)
+            walked_at[key] = d
+            walk(v, d, mv, anchor)
+
         def walk(v, d, mv, anchor=None):
             """Backward over the def-chain of SSA value *v*. *mv* is the memory
             version at which the value is CONSUMED as a buffer (the sink call,
@@ -16388,34 +16499,44 @@ class TaintEngine:
             when no consumer reads through the value (a ``var:`` sink, an
             index). It rides along unchanged, like *mv*, so the region is
             always the consumer's, never the definition's (round 1)."""
+            key = (var_key(v), getattr(v, "version", None),
+                   None if anchor is None else (str(anchor[0]), anchor[1]))
+            before = cut_events[0]
+            try:
+                _walk_value(v, d, mv, anchor, key)
+            finally:
+                _settle_cut_under(cut_under, key, before)
+
+        def _walk_value(v, d, mv, anchor, key):
             nonlocal origin
-            ckey = (var_key(v), getattr(v, "version", None),
-                    None if anchor is None else (str(anchor[0]), anchor[1]))
             if d > self.max_depth:
                 # Over budget on THIS path only: a value another path walks
                 # is no cut -- its chain is followed there. Settled when the
                 # slice is built.
-                if ckey not in visited_vars:
-                    budget_cuts[("var", ckey)] = var_label(v)
+                if key not in visited_vars:
+                    budget_cuts[("var", key)] = var_label(v)
+                cut_events[0] += 1
                 return
-            # A value first walked deeper, with the budget cutting something,
-            # is walked again from this shallower path: what was cut beneath
-            # it may be within reach now -- and so may what was cut beneath a
-            # load first entered deeper, so those loads are re-enterable too
-            # (`_follow_load` re-walks one only from a shallower depth). Only
-            # then, and only while shallower, so each value and load is walked
-            # at most `max_depth` times.
-            seen = walked_at.get(ckey)
-            if seen is None or (d < seen and budget_cuts):
-                if seen is not None:
-                    visited_vars.discard(ckey)
-                    rewalked.add(ckey)
-                    for lk in [lk for lk, ld in load_at.items() if ld > d]:
-                        visited_loads.discard(lk)
-                walked_at[ckey] = d
-            key = (var_key(v), getattr(v, "version", None),
-                   None if anchor is None else (str(anchor[0]), anchor[1]))
+            # A value first walked deeper, with the budget cutting something
+            # BENEATH it, is walked again from the shallowest path that
+            # reaches it: what was cut there may be within reach now -- and so
+            # may what was cut beneath a load first entered deeper, so those
+            # loads are re-enterable too (`_follow_load` re-walks one only
+            # from a shallower depth). The re-walk is queued, not run on the
+            # spot: a depth-first walk reaches one value from ever shallower
+            # paths, and walking its subtree again at each of them cost a
+            # decompressor body 5x the walk itself (V3-04). The queue runs
+            # shallowest first once the walk is done, so each is re-walked
+            # once, from its shallowest path.
+            seen = walked_at.get(key)
+            if seen is None:
+                walked_at[key] = d
+            elif d < seen and budget_cuts and cut_under.get(key, True):
+                _defer(("var", key), d, lambda: _rewalk_value(v, d, mv, anchor, key))
+                _met_walked(cut_under, key)
+                return
             if key in visited_vars:
+                _met_walked(cut_under, key)
                 return
             visited_vars.add(key)
             try:
@@ -16638,6 +16759,73 @@ class TaintEngine:
             for r in rest:
                 walk(r, d + 1, mv, anchor)
 
+        # Per-slice facts about a WRITER instruction, which every load whose
+        # memory chain passes it would otherwise recompute: its recorded step,
+        # its IL text, its call reference, whether it was handed a given
+        # object, and the walk of the value it stores (V3-04: on one
+        # decompressor body 459 loads shared one chain of may-alias stores).
+        step_keys: set = set()
+        il_texts: dict = {}
+        call_refs: dict = {}
+        handed_memo: dict = {}
+        stored_walked_at: dict = {}
+        stored_cut_under: dict = {}
+
+        def _ins_key(ins):
+            return (int(getattr(ins, "instr_index", -1)), int(getattr(ins, "address", 0) or 0))
+
+        def _il_text(ins):
+            k = _ins_key(ins)
+            text = il_texts.get(k)
+            if text is None:
+                text = il_texts[k] = str(ins)
+            return text
+
+        def _record_step(ins, reason):
+            """`steps.append(_instr_dict(ins, reason=reason))`, once per
+            (instruction, reason) -- the rest are duplicates of a step the
+            slice already holds."""
+            k = (_ins_key(ins), reason)
+            if k in step_keys:
+                return
+            step_keys.add(k)
+            steps.append({"il_index": k[0][0], "address": hex(k[0][1]), "op": op_name(ins),
+                          "il_text": _il_text(ins), "reason": reason})
+
+        def _call_ref(call):
+            k = _ins_key(call)
+            ref = call_refs.get(k)
+            if ref is None:
+                ref = call_refs[k] = self._writer_call_ref(call)
+            return ref
+
+        def _walk_stored_value(store, kind, value, d, demand):
+            """Walk the value a writer of loaded bytes stored, once per
+            (store, kind, demand); a shallower path, when a budget cut lay
+            beneath the first walk, queues a re-walk as `walk` does."""
+            skey = (_ins_key(store), kind, demand is not None)
+            prev = stored_walked_at.get(skey)
+            if prev is not None:
+                if d < prev and stored_cut_under.get(skey, True):
+                    _defer(("stored", skey), d,
+                           lambda: _walk_stored_value_at(store, kind, value, d, demand, skey))
+                _met_walked(stored_cut_under, skey)
+                return
+            _walk_stored_value_at(store, kind, value, d, demand, skey)
+
+        def _walk_stored_value_at(store, kind, value, d, demand, skey):
+            nonlocal may_writers
+            if stored_walked_at.get(skey, d + 1) <= d:
+                return          # already walked from this depth or shallower
+            stored_walked_at[skey] = d
+            before = cut_events[0]
+            may_writers += kind == "may"
+            try:
+                _walk_expr(store, value, d, self._mem_in(store), expr_reads(value), demand)
+            finally:
+                may_writers -= kind == "may"
+                _settle_cut_under(stored_cut_under, skey, before)
+
         def _follow_load(at, load, d, demand=None):
             """Continue the slice through the writers of the bytes *load*
             reads, on every memory path back from it (``_load_writers``). A
@@ -16651,10 +16839,17 @@ class TaintEngine:
             the walk reaches carry it. What a MAY-alias store's value comes
             from is walked for evidence but never represents the slice: the
             load's own frontier, which names the object read, does (W02-10)."""
-            nonlocal may_writers
             key = (int(getattr(at, "address", 0) or 0), str(load),
                    getattr(load, "src_memory", None), demand is not None)
+            before = cut_events[0]
+            try:
+                _follow_load_once(at, load, d, demand, key)
+            finally:
+                _settle_cut_under(load_cut_under, key, before)
+
+        def _follow_load_once(at, load, d, demand, key):
             if key in visited_loads:
+                _met_walked(load_cut_under, key)
                 return
             visited_loads.add(key)
             if d > self.max_depth:
@@ -16662,10 +16857,12 @@ class TaintEngine:
                 # settle the cut when the slice is built.
                 visited_loads.discard(key)
                 budget_cuts[("load", key)] = str(load)
+                cut_events[0] += 1
                 return
             # Re-entered after a shallower re-walk unmarked it (see `walk`):
             # walk it again only from a shallower depth than before.
             if load_at.get(key, d + 1) <= d:
+                _met_walked(load_cut_under, key)
                 return
             load_at[key] = d
             addr = getattr(load, "src", None)
@@ -16745,31 +16942,26 @@ class TaintEngine:
                         reason = {"store": "reaching store to field",
                                   "partial": "store writing part of the loaded bytes",
                                   "may": "store that may write the loaded bytes"}[kind]
-                        steps.append(_instr_dict(store, reason=reason))
+                        _record_step(store, reason)
                         value = getattr(store, "src", None)
                         if expr_reads(value) or self._outer_loads(value):
-                            may_writers += kind == "may"
-                            try:
-                                _walk_expr(store, value, d + 1, self._mem_in(store),
-                                           expr_reads(value), demand)
-                            finally:
-                                may_writers -= kind == "may"
+                            _walk_stored_value(store, kind, value, d + 1, demand)
                         elif kind == "store":
                             cval = self._int_const(value)
                             if cval is not None:
                                 _set_origin({"kind": "constant", "value": cval})
                         if kind == "may":
-                            gaps.append(f"`{store}` stores through a pointer the walk "
+                            gaps.append(f"`{_il_text(store)}` stores through a pointer the walk "
                                         "cannot prove disjoint from them")
                     elif kind == "may_source":
-                        steps.append(_instr_dict(w[1], reason=f"field may be filled by source {w[2]}"))
+                        _record_step(w[1], f"field may be filled by source {w[2]}")
                         _set_origin({"kind": "source", "callee": w[2], **self._model_field(w[2]),
                                      "address": hex(int(w[1].address))})
-                        gaps.append(f"the source {self._writer_call_phrase(self._writer_call_ref(w[1]))} "
+                        gaps.append(f"the source {self._writer_call_phrase(_call_ref(w[1]))} "
                                     "may have written them (no call's write extent is trusted)")
                     elif kind == "opaque":
                         if not self._is_call(w[1]):
-                            gaps.append(f"`{w[1]}` may have written them")
+                            gaps.append(f"`{_il_text(w[1])}` may have written them")
                     elif kind == "entry":
                         # Read-only storage is no exception: `.data.rel.ro`
                         # without RELRO is writable, and the loader may write a
@@ -16795,18 +16987,21 @@ class TaintEngine:
                            else (var_key(root), getattr(root, "version", None)))
 
                 def _handed(call) -> bool:
-                    for p in self._call_params(call):
-                        if fixed is not None and self._int_const(p) == fixed:
-                            return True
-                        pr = self._addr_base_var(ssaf, p) if root_id is not None else None
-                        if pr is not None and (var_key(pr), getattr(pr, "version", None)) == root_id:
-                            return True
-                    return False
+                    hkey = (_ins_key(call), fixed, root_id)
+                    hit = handed_memo.get(hkey)
+                    if hit is None:
+                        hit = handed_memo[hkey] = any(
+                            (fixed is not None and self._int_const(p) == fixed)
+                            or (root_id is not None
+                                and (pr := self._addr_base_var(ssaf, p)) is not None
+                                and (var_key(pr), getattr(pr, "version", None)) == root_id)
+                            for p in self._call_params(call))
+                    return hit
 
                 candidates = {}
                 for w in chain:
                     if w[0] in ("opaque", "may_source") and self._is_call(w[1]):
-                        ref = self._writer_call_ref(w[1])
+                        ref = _call_ref(w[1])
                         if ref["address"] not in candidates:
                             candidates[ref["address"]] = {**ref, "handed_object": _handed(w[1])}
                 candidate_writers = sorted(candidates.values(),
@@ -16862,6 +17057,7 @@ class TaintEngine:
                 _global_leaf(seed_ins, seed_var.name, int(seed_var.addr), "the sink argument")
         else:
             walk(seed_var, 0, seed_mv, anchor)
+        _drain_rewalks()
         base_steps = list(reversed(steps))
 
         if rewalked:
