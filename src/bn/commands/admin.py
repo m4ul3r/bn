@@ -107,7 +107,7 @@ def _capabilities(args: argparse.Namespace) -> int:
             "requires_target": bool(spec.get("target", False)),
             "default_format": spec.get("fmt", "text"),
             "output": _output_capabilities(
-                cli._selected_parser_for_argv(parser, list(spec["path"])), spec),
+                cli._selected_parser_for_argv(parser, list(spec["path"]))),
             "prefer_when": spec.get("prefer_when", ""),
             "see_also": list(spec.get("see_also", ())),
         }
@@ -121,11 +121,14 @@ def _capabilities(args: argparse.Namespace) -> int:
                             text_renderer=_render_capabilities_text, stem="capabilities")
 
 
-def _output_capabilities(sub: argparse.ArgumentParser, spec: dict[str, Any]) -> dict[str, Any]:
+def _output_capabilities(sub: argparse.ArgumentParser) -> dict[str, Any]:
     """The output surface one command's parser accepts. `slice_flags` are the
     value-taking flags the command's own size hint draws on (`--limit`,
     `--lines`, `--length`, ...); a switch such as `exports --count` is a mode,
-    not a bound, and `--out` has its own key."""
+    not a bound, and `--out` has its own key. `paged` is read off the same
+    parser -- it takes both `--limit` and `--offset` -- not the registry's
+    `paged` flag, which `function cfg` and `evidence function` page without
+    (D3-03)."""
     options = cli._known_option_strings(sub)
     fmt = next((action for action in sub._actions if "--format" in action.option_strings), None)
     takes_value = {option for action in sub._actions if action.nargs != 0
@@ -134,7 +137,7 @@ def _output_capabilities(sub: argparse.ArgumentParser, spec: dict[str, Any]) -> 
         "formats": list(fmt.choices) if fmt is not None and fmt.choices else [],
         "out": "--out" in options,
         "estimate_output": "--estimate-output" in options,
-        "paged": bool(spec.get("paged")),
+        "paged": "--limit" in options and "--offset" in options,
         "slice_flags": sorted({option for option, _ in sub._defaults.get("_slice_flags", ())}
                               & takes_value - {"--out"}),
     }

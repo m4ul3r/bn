@@ -2925,6 +2925,13 @@ def test_capabilities_advertise_each_commands_output_surface(capsys):
         "paged": True, "slice_flags": ["--limit", "--offset"]}
     assert by_cmd["types declare"]["output"]["estimate_output"] is False
     assert by_cmd["decompile"]["output"]["slice_flags"] == ["--lines"]
+    # D3-03: these two page their own rows (`has_more`) without the registry's
+    # `paged` flag; capabilities said `paged: false` beside `--limit/--offset`.
+    for command in ("function cfg", "evidence function"):
+        assert by_cmd[command]["output"]["paged"] is True, command
+        assert {"--limit", "--offset", "--address-window"} <= set(
+            by_cmd[command]["output"]["slice_flags"]), command
+    assert by_cmd["decompile"]["output"]["paged"] is False
 
     parser = bn.cli.build_parser()
     for command, item in by_cmd.items():
@@ -2932,6 +2939,7 @@ def test_capabilities_advertise_each_commands_output_surface(capsys):
         accepts = bn.cli._known_option_strings(sub)
         assert item["output"]["estimate_output"] == ("--estimate-output" in accepts), command
         assert set(item["output"]["slice_flags"]) <= accepts, command
+        assert item["output"]["paged"] == ({"--limit", "--offset"} <= accepts), command
 
 
 def test_capabilities_see_also_references_are_valid_commands(capsys):
